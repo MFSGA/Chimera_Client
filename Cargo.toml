@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = ["clash-bin"]
+
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+# homepage = "https://github.com/watfaq/clash-rs"
+
+[profile.release]
+opt-level = "s"
+codegen-units = 1
+lto = "thin"
+strip = true
+debug = 2
+panic = "abort"
