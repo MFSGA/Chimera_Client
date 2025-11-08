@@ -13,8 +13,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "clash-dns"
+version = "0.1.0"
+
+[[package]]
+name = "clash-doc"
+version = "0.1.0"
+
+[[package]]
+name = "clash-ffi"
+version = "0.1.0"
+
+[[package]]
+name = "clash-lib"
+version = "0.1.0"
+
+[[package]]
 name = "clash-rs"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "tikv-jemallocator",
 ]
