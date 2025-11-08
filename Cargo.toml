@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["clash-bin"]
+members = ["clash-bin", "clash-lib", "clash-doc", "clash-ffi", "clash-dns"]
 
 
 [workspace.package]
