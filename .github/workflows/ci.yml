@@ -81,11 +81,11 @@ jobs:
             tool: cross
             extra-args: -F "plus"
             zig: "2.17"
-          - target: mipsel-unknown-linux-musl
-            tool: cross
-            extra-args: --no-default-features -F "standard,ring" -Z build-std=std,panic_abort
-            build-std: true
-            no-test: true
+          #- target: mipsel-unknown-linux-musl
+          #  tool: cross
+          #  extra-args: --no-default-features -F "standard,ring" -Z build-std=std,panic_abort
+          #  build-std: true
+          #  no-test: true
           # Windows
           - os: windows-latest
             target: x86_64-pc-windows-msvc

@@ -12,3 +12,7 @@ standard = []
 
 plus = ["standard", "onion"]
 onion = []
+
+perf = ["plus", "jemallocator"]
+# todo
+jemallocator = [""]
