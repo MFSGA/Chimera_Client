@@ -14,5 +14,8 @@ plus = ["standard", "onion"]
 onion = []
 
 perf = ["plus", "jemallocator"]
-# todo
-jemallocator = [""]
+# for ci
+jemallocator = ["dep:tikv-jemallocator"]
+
+[dependencies]
+tikv-jemallocator = { version = "0.6", optional = true }
