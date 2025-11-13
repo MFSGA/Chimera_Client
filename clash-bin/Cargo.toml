@@ -19,3 +19,5 @@ jemallocator = ["dep:tikv-jemallocator"]
 
 [dependencies]
 tikv-jemallocator = { version = "0.6", optional = true }
+
+clap = { version = "4", features = ["derive"] }
