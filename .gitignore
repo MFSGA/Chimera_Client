@@ -1,1 +1,6 @@
 /target
+
+docs/ 
+start.ps1
+
+config.yaml

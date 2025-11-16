@@ -5,3 +5,11 @@ version = { workspace = true }
 edition = { workspace = true }
 # homepage = { workspace = true }
 # authors = { workspace = true }
+
+
+[dependencies]
+# Error handing & logging
+thiserror = "2"
+
+# Async
+# tokio = { version = "1", features = ["full"] }

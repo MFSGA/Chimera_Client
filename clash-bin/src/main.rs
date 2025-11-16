@@ -1,9 +1,12 @@
 use clap::Parser;
+use clash::TokioRuntime;
 use std::{
     io::Write,
     path::{Path, PathBuf},
     process::exit,
 };
+
+extern crate clash_lib as clash;
 
 #[derive(Parser)]
 #[clap(author, about, long_about = None)]
@@ -96,6 +99,17 @@ fn main() {
     }
 
     // todo: NOTE: set this up before Sentry
-    
-    println!("Hello, world!");
+
+    match clash::start_scaffold(clash::Options {
+        config: clash::Config::File(file),
+        cwd: cli.directory.map(|x| x.to_string_lossy().to_string()),
+        rt: Some(TokioRuntime::MultiThread),
+        log_file: cli.log_file,
+    }) {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("Failed to start clash: {e}");
+            exit(1);
+        }
+    }
 }
