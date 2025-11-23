@@ -1,11 +1,25 @@
 use serde::Deserialize;
 use serde_yaml::Value;
-use std::{path::PathBuf, str::FromStr};
+use std::{collections::HashMap, path::PathBuf, str::FromStr};
 
-use crate::Error;
+use crate::{Error, config::internal::config::BindAddress};
 
 #[derive(Deserialize)]
-pub struct Config {}
+pub struct Config {
+    /// 1. Allow connections from IP addresses other than local listening address
+    pub allow_lan: Option<bool>,
+    /// The address that the inbound listens on
+    /// 2. # Note
+    /// - setting this to `*` will listen on all interfaces, which is
+    ///   essentially the same as setting it to `0.0.0.0`
+    /// - setting this to non local IP will enable `allow_lan` automatically
+    /// - and if you don't want `allow_lan` to be enabled, you should set this
+    ///   to `localhost` or `127.1`
+    pub bind_address: BindAddress,
+    /// Proxy settings
+    #[serde(rename = "proxies")]
+    pub proxy: Option<Vec<HashMap<String, Value>>>,
+}
 
 impl TryFrom<PathBuf> for Config {
     type Error = Error;

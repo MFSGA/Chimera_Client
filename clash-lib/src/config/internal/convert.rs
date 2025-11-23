@@ -1,4 +1,9 @@
-use crate::config::def;
+use std::collections::HashMap;
+
+use crate::{Error, config::{
+    def,
+    internal::proxy::{OutboundDirect, OutboundProxy, OutboundProxyProtocol, OutboundReject, PROXY_DIRECT, PROXY_REJECT},
+}};
 
 use super::config::{self};
 
@@ -11,5 +16,47 @@ impl TryFrom<def::Config> for config::Config {
 }
 
 pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error> {
-    todo!()
+    let mut proxy_names = vec![String::from(PROXY_DIRECT), String::from(PROXY_REJECT)];
+
+    if c.allow_lan.unwrap_or_default() && c.bind_address.is_localhost() {
+        todo!()
+        /* warn!(
+            "allow-lan is set to true, but bind-address is set to localhost. This \
+             will not allow any connections from the local network."
+        ); */
+    }
+
+    config::Config {
+        proxies: c.proxy.take().unwrap_or_default().into_iter().try_fold(
+            HashMap::from([
+                (
+                    String::from(PROXY_DIRECT),
+                    OutboundProxy::ProxyServer(OutboundProxyProtocol::Direct(OutboundDirect {
+                        name: PROXY_DIRECT.to_string(),
+                    })),
+                ),
+                (
+                    String::from(PROXY_REJECT),
+                    OutboundProxy::ProxyServer(OutboundProxyProtocol::Reject(OutboundReject {
+                        name: PROXY_REJECT.to_string(),
+                    })),
+                ),
+            ]),
+            |mut rv, x| {
+                let proxy = OutboundProxy::ProxyServer(OutboundProxyProtocol::try_from(x)?);
+                let name = proxy.name();
+                if rv.contains_key(name.as_str()) {
+                    return Err(Error::InvalidConfig(format!(
+                        "duplicated proxy name: {name}"
+                    )));
+                }
+                proxy_names.push(name.clone());
+                rv.insert(name, proxy);
+                Ok(rv)
+            },
+        )?,
+        proxy_groups: { todo!() },
+        rules: { todo!() },
+    }
+    .validate()
 }
