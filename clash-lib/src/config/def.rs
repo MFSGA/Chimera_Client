@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use std::{collections::HashMap, path::PathBuf, str::FromStr};
 
@@ -24,6 +24,9 @@ pub struct Config {
     #[serde(rename = "rules")]
     /// 5. Rule settings
     pub rule: Option<Vec<String>>,
+    /// 6. Log level
+    /// Either `debug`, `info`, `warning`, `error` or `off`
+    pub log_level: LogLevel,
 }
 
 impl TryFrom<PathBuf> for Config {
@@ -53,4 +56,11 @@ impl FromStr for Config {
         serde_yaml::from_value(val)
             .map_err(|e| Error::InvalidConfig(format!("could not parse config content: {e}")))
     }
+}
+
+#[derive(PartialEq, Serialize, Deserialize, Default, Copy, Clone, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    #[default]
+    Info,
 }

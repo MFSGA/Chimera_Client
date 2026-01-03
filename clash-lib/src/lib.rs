@@ -1,9 +1,12 @@
 use std::{io, path::PathBuf};
 
 use thiserror::Error;
+use tokio::sync::broadcast;
 
 use crate::config::{def, internal::InternalConfig};
 
+/// 2
+mod app;
 /// todo: #[cfg(not(feature = "internal"))]
 mod config;
 
@@ -62,5 +65,11 @@ pub fn start_scaffold(opts: Options) -> Result<()> {
 
     let config: InternalConfig = opts.config.try_parse()?;
     let cwd = opts.cwd.unwrap_or_else(|| ".".to_string());
+    let (log_tx, _) = broadcast::channel(100);
+
+    let log_collector = app::logging::EventCollector::new(vec![log_tx.clone()]);
+
+    app::logging::setup_logging(config.general.log_level, log_collector, &cwd, opts.log_file);
+
     todo!()
 }

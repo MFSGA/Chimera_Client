@@ -5,7 +5,13 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, config::internal::{proxy::OutboundProxy, rule::RuleType}};
+use crate::{
+    Error,
+    config::{
+        def::LogLevel,
+        internal::{proxy::OutboundProxy, rule::RuleType},
+    },
+};
 
 pub struct Config {
     /// 1
@@ -14,6 +20,8 @@ pub struct Config {
     pub proxies: HashMap<String, OutboundProxy>,
     /// 3
     pub proxy_groups: HashMap<String, OutboundProxy>,
+    /// 4
+    pub general: General,
 }
 
 impl Config {
@@ -29,6 +37,10 @@ impl Config {
         }
         Ok(self)
     }
+}
+
+pub struct General {
+    pub log_level: LogLevel,
 }
 
 #[derive(Serialize, Clone, Debug, Copy, PartialEq, Hash, Eq)]

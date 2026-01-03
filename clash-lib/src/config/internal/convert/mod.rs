@@ -9,11 +9,13 @@ use crate::{
             proxy::{
                 OutboundDirect, OutboundProxy, OutboundProxyProtocol, OutboundReject, PROXY_DIRECT,
                 PROXY_REJECT,
-            }, rule::RuleType,
+            },
+            rule::RuleType,
         },
     },
 };
 
+mod general;
 mod proxy_group;
 
 impl TryFrom<def::Config> for config::Config {
@@ -75,6 +77,7 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
                     .map_err(|x| Error::InvalidConfig(x.to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?,
+        general: general::convert(&c)?,
     }
     .validate()
 }
