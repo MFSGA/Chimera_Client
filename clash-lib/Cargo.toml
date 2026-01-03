@@ -14,6 +14,7 @@ anyhow = "1"
 
 # Async
 tokio = { version = "1", features = ["full"] }
+futures = "0.3"
 
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
@@ -21,5 +22,17 @@ serde_yaml = "0.9"
 tracing = "0.1"
 tracing-log = "0.2"
 tracing-appender = { version = "0.2" }
-tracing-subscriber = { version = "0.3", features = ["env-filter", "local-time"] }
+tracing-subscriber = { version = "0.3", features = [
+    "env-filter",
+    "local-time",
+] }
 time = { version = "=0.3", features = ["macros", "local-offset"] }
+
+rustls = { version = "0.23", default-features = false }
+
+[features]
+default = ["zero_copy", "aws-lc-rs"]
+
+zero_copy = []
+
+aws-lc-rs = ["rustls/aws-lc-rs"]

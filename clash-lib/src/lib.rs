@@ -1,9 +1,17 @@
-use std::{io, path::PathBuf};
+use std::{
+    collections::HashMap,
+    io,
+    path::PathBuf,
+    sync::{LazyLock, OnceLock, atomic::AtomicUsize},
+};
 
 use thiserror::Error;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
-use crate::config::{def, internal::InternalConfig};
+use crate::{
+    app::logging::LogEvent,
+    config::{def, internal::InternalConfig},
+};
 
 /// 2
 mod app;
@@ -52,6 +60,30 @@ impl Config {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+pub type Runner = futures::future::BoxFuture<'static, Result<()>>;
+
+#[derive(Default)]
+pub struct RuntimeController {
+    runtime_counter: AtomicUsize,
+    shutdown_txs: HashMap<usize, mpsc::Sender<()>>,
+}
+
+impl RuntimeController {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register_runtime(&mut self, shutdown_tx: mpsc::Sender<()>) -> usize {
+        let id = self
+            .runtime_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.shutdown_txs.insert(id, shutdown_tx);
+        id
+    }
+}
+
+static RUNTIME_CONTROLLER: LazyLock<std::sync::Mutex<RuntimeController>> =
+    LazyLock::new(|| std::sync::Mutex::new(RuntimeController::new()));
 
 pub fn start_scaffold(opts: Options) -> Result<()> {
     let rt = match opts.rt.as_ref().unwrap_or(&TokioRuntime::MultiThread) {
@@ -71,5 +103,70 @@ pub fn start_scaffold(opts: Options) -> Result<()> {
 
     app::logging::setup_logging(config.general.log_level, log_collector, &cwd, opts.log_file);
 
+    rt.block_on(async {
+        match start(config, cwd, log_tx).await {
+            Err(e) => {
+                eprintln!("start error: {e}");
+                Err(e)
+            }
+            Ok(_) => Ok(()),
+        }
+    })
+}
+
+static CRYPTO_PROVIDER_LOCK: OnceLock<()> = OnceLock::new();
+
+pub fn setup_default_crypto_provider() {
+    CRYPTO_PROVIDER_LOCK.get_or_init(|| {
+        #[cfg(feature = "aws-lc-rs")]
+        {
+            rustls::crypto::aws_lc_rs::default_provider()
+                .install_default()
+                .unwrap()
+        }
+        #[cfg(feature = "ring")]
+        {
+            rustls::crypto::ring::default_provider()
+                .install_default()
+                .unwrap()
+        }
+    });
+}
+
+pub async fn start(
+    config: InternalConfig,
+    cwd: String,
+    log_tx: broadcast::Sender<LogEvent>,
+) -> Result<()> {
+    setup_default_crypto_provider();
+
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
+
+    {
+        let mut rt_ctrl = RUNTIME_CONTROLLER.lock().unwrap();
+        rt_ctrl.register_runtime(shutdown_tx);
+    }
+
+    // let mut tasks = Vec::<Runner>::new();
+    // let mut runners = Vec::new();
+
+    let cwd = PathBuf::from(cwd);
+
+    // things we need to clone before consuming config
+    let controller_cfg = config.general.controller.clone();
+
+    let api_runner = app::api::get_api_runner(
+        controller_cfg,
+        log_tx.clone(),
+        /* components.inbound_manager,
+        components.dispatcher,
+        global_state.clone(),
+        components.dns_resolver,
+        components.outbound_manager,
+        components.statistics_manager,
+        components.cache_store,
+        components.router, */
+        cwd.to_string_lossy().to_string(),
+    );
     todo!()
 }

@@ -1,6 +1,6 @@
 use crate::config::{
     def,
-    internal::config::{BindAddress, General},
+    internal::config::{BindAddress, Controller, General},
 };
 
 pub(super) fn convert(c: &def::Config) -> Result<General, crate::Error> {
@@ -11,5 +11,12 @@ pub(super) fn convert(c: &def::Config) -> Result<General, crate::Error> {
     }; */
     Ok(General {
         log_level: c.log_level,
+        controller: Controller {
+            external_controller: c.external_controller.clone(),
+            external_ui: c.external_ui.clone(),
+            secret: c.secret.clone(),
+            cors_allow_origins: c.cors_allow_origins.clone(),
+            external_controller_ipc: c.external_controller_ipc.clone(),
+        },
     })
 }

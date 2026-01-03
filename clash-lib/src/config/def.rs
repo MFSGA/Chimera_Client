@@ -27,6 +27,22 @@ pub struct Config {
     /// 6. Log level
     /// Either `debug`, `info`, `warning`, `error` or `off`
     pub log_level: LogLevel,
+    /// external controller address
+    pub external_controller: Option<String>,
+    /// dashboard folder path relative to the $CWD
+    pub external_ui: Option<String>,
+    /// external controller secret
+    pub secret: Option<String>,
+    /// CORS allowed origins
+    /// # examples
+    /// ```yaml
+    /// cors-allow-origins:
+    ///   - "https://example.com"
+    #[serde(rename = "cors-allow-origins")]
+    pub cors_allow_origins: Option<Vec<String>>,
+    #[cfg_attr(not(unix), serde(alias = "external-controller-pipe"))]
+    #[cfg_attr(unix, serde(alias = "external-controller-unix"))]
+    pub external_controller_ipc: Option<String>,
 }
 
 impl TryFrom<PathBuf> for Config {

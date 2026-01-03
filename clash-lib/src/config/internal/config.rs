@@ -40,7 +40,10 @@ impl Config {
 }
 
 pub struct General {
+    /// 1
     pub log_level: LogLevel,
+    /// 2
+    pub(crate) controller: Controller,
 }
 
 #[derive(Serialize, Clone, Debug, Copy, PartialEq, Hash, Eq)]
@@ -88,4 +91,13 @@ impl<'de> Deserialize<'de> for BindAddress {
             }
         }
     }
+}
+
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub struct Controller {
+    pub external_controller: Option<String>,
+    pub external_controller_ipc: Option<String>,
+    pub external_ui: Option<String>,
+    pub secret: Option<String>,
+    pub cors_allow_origins: Option<Vec<String>>,
 }
