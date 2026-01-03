@@ -10,9 +10,14 @@ edition = { workspace = true }
 [dependencies]
 # Error handing & logging
 thiserror = "2"
+anyhow = "1"
 
 # Async
 tokio = { version = "1", features = ["full"] }
 
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
+
+# tracing = "0.1"
+tracing-log = "0.2"
+tracing-appender = { version = "0.2" }
