@@ -1,5 +1,7 @@
+use educe::Educe;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
+
 use std::{collections::HashMap, fmt::Display, path::PathBuf, str::FromStr};
 
 use crate::{Error, config::internal::config::BindAddress};
@@ -43,6 +45,8 @@ pub struct Config {
     #[cfg_attr(not(unix), serde(alias = "external-controller-pipe"))]
     #[cfg_attr(unix, serde(alias = "external-controller-unix"))]
     pub external_controller_ipc: Option<String>,
+    /// 8. DNS client/server settings
+    pub dns: DNS,
 }
 
 impl TryFrom<PathBuf> for Config {
@@ -87,4 +91,45 @@ impl Display for LogLevel {
             LogLevel::Info => write!(f, "info"),
         }
     }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(untagged)]
+pub enum DNSListen {
+    Udp(String),
+    // todo
+    // Multiple(HashMap<String, Value>),
+}
+
+/// DNS client/server settings
+/// This section is optional. When not present, the DNS server will be disabled
+/// and system DNS config will be used # Example
+/// ```yaml
+/// dns:
+///   enable: true
+///   ipv6: false # when the false, response to AAAA questions will be empty
+///   listen:
+///     udp: 127.0.0.1:53553
+///     tcp: 127.0.0.1:53553
+///     dot:
+///       addr: 127.0.0.1:53554
+///       hostname: dns.clash
+///       ca-cert: dns.crt
+///       ca-key: dns.key
+///     doh:
+///       addr: 127.0.0.1:53555
+///       ca-cert: dns.crt
+///       ca-key: dns.key
+///   # edns-client-subnet:
+///   #   ipv4: 1.2.3.0/24
+///   #   ipv6: 2001:db8::/56
+/// ```
+
+#[derive(Serialize, Deserialize, Educe)]
+#[serde(rename_all = "kebab-case", default)]
+#[educe(Default)]
+pub struct DNS {
+    /// DNS server listening address. If not present, the DNS server will be
+    /// disabled.
+    pub listen: Option<DNSListen>,
 }

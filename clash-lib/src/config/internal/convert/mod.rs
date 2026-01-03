@@ -78,6 +78,7 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
             })
             .collect::<Result<Vec<_>, _>>()?,
         general: general::convert(&c)?,
+        // relate to dns::Config
         dns: (&c).try_into()?,
     }
     .validate()
