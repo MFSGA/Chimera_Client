@@ -12,13 +12,14 @@ pub const PROXY_GLOBAL: &str = "GLOBAL";
 #[allow(clippy::large_enum_variant)]
 pub enum OutboundProxy {
     ProxyServer(OutboundProxyProtocol),
+    ProxyGroup(OutboundGroupProtocol),
 }
 
 impl OutboundProxy {
     pub(crate) fn name(&self) -> String {
         match self {
             OutboundProxy::ProxyServer(s) => s.name().to_string(),
-            // OutboundProxy::ProxyGroup(g) => g.name().to_string(),
+            OutboundProxy::ProxyGroup(g) => todo!(),
         }
     }
 }
@@ -101,3 +102,8 @@ pub fn map_serde_error(name: String) -> impl FnOnce(serde_yaml::Error) -> crate:
         }
     }
 }
+
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[serde(tag = "type")]
+pub enum OutboundGroupProtocol {}

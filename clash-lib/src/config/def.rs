@@ -16,9 +16,14 @@ pub struct Config {
     /// - and if you don't want `allow_lan` to be enabled, you should set this
     ///   to `localhost` or `127.1`
     pub bind_address: BindAddress,
-    /// Proxy settings
+    /// 3. Proxy settings
     #[serde(rename = "proxies")]
     pub proxy: Option<Vec<HashMap<String, Value>>>,
+    /// 4. Proxy group settings
+    pub proxy_group: Option<Vec<HashMap<String, Value>>>,
+    #[serde(rename = "rules")]
+    /// 5. Rule settings
+    pub rule: Option<Vec<String>>,
 }
 
 impl TryFrom<PathBuf> for Config {
