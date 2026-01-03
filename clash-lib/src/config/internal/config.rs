@@ -6,10 +6,12 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Error, app::dns, config::{
+    Error,
+    app::dns,
+    config::{
         def::LogLevel,
         internal::{proxy::OutboundProxy, rule::RuleType},
-    }
+    },
 };
 
 pub struct Config {

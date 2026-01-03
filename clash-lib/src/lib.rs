@@ -13,17 +13,20 @@ use tokio::{
 use tracing::{debug, error, info};
 
 use crate::{
-    app::{dispatcher::StatisticsManager, dns, logging::LogEvent},
+    app::{dispatcher::StatisticsManager, dns, logging::LogEvent, outbound::OutboundManager},
     config::{
         def::{self, LogLevel},
-        internal::InternalConfig,
+        internal::{InternalConfig, proxy::OutboundProxy},
     },
+    proxy::OutboundHandler,
 };
 
 /// 2
 mod app;
 /// todo: #[cfg(not(feature = "internal"))]
 mod config;
+/// 3
+mod proxy;
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -242,13 +245,25 @@ struct RuntimeComponents {
 async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<RuntimeComponents> {
     info!("all components initialized");
 
+    debug!("initializing bootstrap outbounds");
+    let plain_outbounds = OutboundManager::load_plain_outbounds(
+        config
+            .proxies
+            .into_values()
+            .filter_map(|x| match x {
+                OutboundProxy::ProxyServer(s) => Some(s),
+                _ => None,
+            })
+            .collect(),
+    );
+
     let dns_listen = config.dns.listen.clone();
-    /* let plain_outbounds_map = HashMap::<String, Arc<dyn OutboundHandler>>::from_iter(
+    let plain_outbounds_map = HashMap::<String, Arc<dyn OutboundHandler>>::from_iter(
         plain_outbounds
             .iter()
             .map(|x| (x.name().to_string(), x.clone())),
     );
-    let dns_resolver = dns::new_resolver(
+    /* let dns_resolver = dns::new_resolver(
         config.dns,
         Some(cache_store.clone()),
         country_mmdb.clone(),
