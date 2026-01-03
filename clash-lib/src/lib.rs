@@ -2,14 +2,15 @@ use std::{
     collections::HashMap,
     io,
     path::PathBuf,
-    sync::{LazyLock, OnceLock, atomic::AtomicUsize},
+    sync::{Arc, LazyLock, OnceLock, atomic::AtomicUsize},
 };
 
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc};
+use tracing::info;
 
 use crate::{
-    app::logging::LogEvent,
+    app::{dispatcher::StatisticsManager, logging::LogEvent},
     config::{def, internal::InternalConfig},
 };
 
@@ -155,18 +156,33 @@ pub async fn start(
     // things we need to clone before consuming config
     let controller_cfg = config.general.controller.clone();
 
+    let components = create_components(cwd.clone(), config).await?;
+
     let api_runner = app::api::get_api_runner(
         controller_cfg,
         log_tx.clone(),
+        components.statistics_manager,
         /* components.inbound_manager,
         components.dispatcher,
         global_state.clone(),
         components.dns_resolver,
         components.outbound_manager,
-        components.statistics_manager,
         components.cache_store,
         components.router, */
         cwd.to_string_lossy().to_string(),
     );
+
     todo!()
+}
+
+struct RuntimeComponents {
+    statistics_manager: Arc<StatisticsManager>,
+}
+
+async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<RuntimeComponents> {
+    info!("all components initialized");
+
+    let statistics_manager = StatisticsManager::new();
+
+    Ok(RuntimeComponents { statistics_manager })
 }
