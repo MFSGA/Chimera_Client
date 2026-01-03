@@ -4,3 +4,5 @@ pub mod api;
 pub mod dispatcher;
 /// 1
 pub mod logging;
+/// 4
+pub mod dns;

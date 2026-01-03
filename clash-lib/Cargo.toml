@@ -15,6 +15,7 @@ anyhow = "1"
 # Async
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
+async-trait = "0.1"
 
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
@@ -31,6 +32,9 @@ time = { version = "=0.3", features = ["macros", "local-offset"] }
 rustls = { version = "0.23", default-features = false }
 
 uuid = { version = "1", features = ["v4", "fast-rng", "macro-diagnostics", "serde"] }
+
+# dns
+chimera-dns = { path = "../clash-dns", default-features = false }
 
 [features]
 default = ["zero_copy", "aws-lc-rs"]

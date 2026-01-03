@@ -6,12 +6,18 @@ use std::{
 };
 
 use thiserror::Error;
-use tokio::sync::{broadcast, mpsc};
-use tracing::{error, info};
+use tokio::{
+    sync::{Mutex, broadcast, mpsc, oneshot},
+    task::JoinHandle,
+};
+use tracing::{debug, error, info};
 
 use crate::{
-    app::{dispatcher::StatisticsManager, logging::LogEvent},
-    config::{def, internal::InternalConfig},
+    app::{dispatcher::StatisticsManager, dns, logging::LogEvent},
+    config::{
+        def::{self, LogLevel},
+        internal::InternalConfig,
+    },
 };
 
 /// 2
@@ -58,6 +64,16 @@ impl Config {
             }
         }
     }
+}
+
+pub struct GlobalState {
+    log_level: LogLevel,
+    #[cfg(feature = "tun")]
+    tunnel_listener_handle: Option<JoinHandle<Result<()>>>,
+    api_listener_handle: Option<JoinHandle<Result<()>>>,
+    dns_listener_handle: Option<JoinHandle<Result<()>>>,
+    reload_tx: mpsc::Sender<(Config, oneshot::Sender<()>)>,
+    cwd: String,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -155,8 +171,23 @@ pub async fn start(
 
     // things we need to clone before consuming config
     let controller_cfg = config.general.controller.clone();
+    let log_level = config.general.log_level;
 
     let components = create_components(cwd.clone(), config).await?;
+
+    let dns_listener_handle = components.dns_listener.map(tokio::spawn);
+
+    let (reload_tx, mut reload_rx) = mpsc::channel(1);
+
+    let global_state = Arc::new(Mutex::new(GlobalState {
+        log_level,
+        #[cfg(feature = "tun")]
+        tunnel_listener_handle: tun_runner_handle,
+        dns_listener_handle,
+        reload_tx,
+        api_listener_handle: None,
+        cwd: cwd.to_string_lossy().to_string(),
+    }));
 
     let api_runner = app::api::get_api_runner(
         controller_cfg,
@@ -202,13 +233,36 @@ pub async fn start(
 }
 
 struct RuntimeComponents {
+    /// 1
     statistics_manager: Arc<StatisticsManager>,
+    /// 2
+    dns_listener: Option<Runner>,
 }
 
 async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<RuntimeComponents> {
     info!("all components initialized");
 
+    let dns_listen = config.dns.listen.clone();
+    /* let plain_outbounds_map = HashMap::<String, Arc<dyn OutboundHandler>>::from_iter(
+        plain_outbounds
+            .iter()
+            .map(|x| (x.name().to_string(), x.clone())),
+    );
+    let dns_resolver = dns::new_resolver(
+        config.dns,
+        Some(cache_store.clone()),
+        country_mmdb.clone(),
+        plain_outbounds_map,
+    )
+    .await; */
+
     let statistics_manager = StatisticsManager::new();
 
-    Ok(RuntimeComponents { statistics_manager })
+    debug!("initializing dns listener");
+    let dns_listener = dns::get_dns_listener(dns_listen, &cwd).await;
+
+    Ok(RuntimeComponents {
+        statistics_manager,
+        dns_listener,
+    })
 }

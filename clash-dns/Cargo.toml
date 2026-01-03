@@ -1,5 +1,5 @@
 [package]
-name = "clash-dns"
+name = "chimera-dns"
 # repository = { workspace = true }
 version = { workspace = true }
 edition = { workspace = true }
