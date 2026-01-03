@@ -7,7 +7,7 @@ use std::{
 
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc};
-use tracing::info;
+use tracing::{error, info};
 
 use crate::{
     app::{dispatcher::StatisticsManager, logging::LogEvent},
@@ -148,8 +148,8 @@ pub async fn start(
         rt_ctrl.register_runtime(shutdown_tx);
     }
 
-    // let mut tasks = Vec::<Runner>::new();
-    // let mut runners = Vec::new();
+    let mut tasks = Vec::<Runner>::new();
+    let mut runners = Vec::new();
 
     let cwd = PathBuf::from(cwd);
 
@@ -172,7 +172,33 @@ pub async fn start(
         cwd.to_string_lossy().to_string(),
     );
 
-    todo!()
+    if let Some(r) = api_runner {
+        let api_listener_handle = tokio::spawn(r);
+        todo!()
+        // global_state.lock().await.api_listener_handle = Some(api_listener_handle);
+    }
+
+    runners.push(Box::pin(async move {
+        match shutdown_rx.recv().await {
+            Some(_) => {
+                info!("received shutdown signal");
+                Ok(())
+            }
+            None => {
+                info!("runtime controller shutdown");
+                Ok(())
+            }
+        }
+    }));
+
+    tasks.push(Box::pin(async move {
+        futures::future::select_all(runners).await.0
+    }));
+
+    futures::future::select_all(tasks).await.0.map_err(|x| {
+        error!("runtime error: {}, shutting down", x);
+        x
+    })
 }
 
 struct RuntimeComponents {
