@@ -9,6 +9,8 @@ pub struct DNSConfig {
     pub listen: DNSListenAddr,
     /// 2
     pub ipv6: bool,
+    /// 3
+    pub enable: bool,
 }
 
 impl TryFrom<crate::config::def::Config> for DNSConfig {
@@ -44,6 +46,7 @@ impl TryFrom<&crate::config::def::Config> for DNSConfig {
                 .transpose()?
                 .unwrap_or_default(),
             ipv6: dc.ipv6,
+            enable: dc.enable,
         })
     }
 }

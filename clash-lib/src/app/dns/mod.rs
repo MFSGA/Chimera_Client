@@ -4,14 +4,15 @@ use std::sync::Arc;
 
 /// 2
 mod config;
-/// 1
-mod server;
 /// 3
 pub mod resolver;
-
+/// 1
+mod server;
 
 pub use config::DNSConfig;
 pub use server::get_dns_listener;
+
+pub use resolver::new as new_resolver;
 
 pub type ThreadSafeDNSResolver = Arc<dyn ClashResolver>;
 

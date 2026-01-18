@@ -141,6 +141,9 @@ pub struct DNS {
     /// DNS server listening address. If not present, the DNS server will be
     /// disabled.
     pub listen: Option<DNSListen>,
+    /// 3. When disabled, system DNS config will be used
+    /// All other DNS related options will only be used when this is enabled
+    pub enable: bool,
 }
 
 #[derive(Serialize, Deserialize)]

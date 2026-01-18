@@ -307,13 +307,13 @@ async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<Runti
             .iter()
             .map(|x| (x.name().to_string(), x.clone())),
     );
-    /* let dns_resolver = dns::new_resolver(
+    let dns_resolver = dns::new_resolver(
         config.dns,
         Some(cache_store.clone()),
-        // country_mmdb.clone(),
+        country_mmdb.clone(),
         plain_outbounds_map,
     )
-    .await; */
+    .await;
 
     let statistics_manager = StatisticsManager::new();
 
