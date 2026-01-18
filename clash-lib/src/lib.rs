@@ -20,7 +20,10 @@ use crate::{
         outbound::OutboundManager,
         profile,
     },
-    common::http::new_http_client,
+    common::{
+        http::new_http_client,
+        mmdb::{self, MmdbLookup, DEFAULT_COUNTRY_MMDB_DOWNLOAD_URL},
+    },
     config::{
         def::{self, LogLevel},
         internal::{InternalConfig, proxy::OutboundProxy},
@@ -279,6 +282,24 @@ async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<Runti
 
     let client = new_http_client(system_resolver.clone(), Some(plain_outbounds.clone()))
         .map_err(|x| Error::DNSError(x.to_string()))?;
+
+    debug!("initializing mmdb");
+    let country_mmdb = if let Some(country_mmdb_file) = config.general.mmdb {
+        Some(Arc::new(
+            mmdb::Mmdb::new(
+                cwd.join(&country_mmdb_file),
+                config
+                    .general
+                    .mmdb_download_url
+                    .unwrap_or(DEFAULT_COUNTRY_MMDB_DOWNLOAD_URL.to_string()),
+                client.clone(),
+            )
+            .await?,
+        ) as MmdbLookup)
+    } else {
+        debug!("country mmdb not set, skipping");
+        None
+    };
 
     let dns_listen = config.dns.listen.clone();
     let plain_outbounds_map = HashMap::<String, Arc<dyn OutboundHandler>>::from_iter(

@@ -47,8 +47,13 @@ pub struct Config {
     pub external_controller_ipc: Option<String>,
     /// 8. DNS client/server settings
     pub dns: DNS,
-    /// Profile settings
+    /// 9 Profile settings
     pub profile: Profile,
+    /// 10.1 Path to country mmdb file (GeoIP)
+    pub mmdb: Option<String>,
+    /// 10.2 Download URL for country mmdb file
+    #[serde(rename = "mmdb-download-url")]
+    pub mmdb_download_url: Option<String>,
 }
 
 impl TryFrom<PathBuf> for Config {

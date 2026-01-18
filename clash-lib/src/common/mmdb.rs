@@ -1,0 +1,145 @@
+use super::http::HttpClient;
+use crate::{
+    Error,
+    common::{
+        errors::{map_io_error, new_io_error},
+        utils::download,
+    },
+};
+use maxminddb::geoip2;
+use std::{fs, net::IpAddr, path::Path, sync::Arc};
+use tracing::{debug, info, warn};
+
+pub static DEFAULT_COUNTRY_MMDB_DOWNLOAD_URL: &str =
+    "https://github.com/Loyalsoldier/geoip/releases/latest/download/Country.mmdb";
+pub static DEFAULT_ASN_MMDB_DOWNLOAD_URL: &str = "https://git.io/GeoLite2-ASN.mmdb";
+
+pub struct Mmdb {
+    reader: maxminddb::Reader<Vec<u8>>,
+}
+
+pub type MmdbLookup = Arc<dyn MmdbLookupTrait + Send + Sync>;
+
+// mockall can't seem to mock the return value mmdb::Country<'a> with lifetime
+// issue
+#[derive(Debug)]
+pub struct MmdbLookupCountry {
+    pub country_code: String,
+}
+
+#[derive(Debug)]
+pub struct MmdbLookupAsn {
+    pub asn_name: String,
+}
+
+// todo
+// #[cfg_attr(test, mockall::automock)]
+pub trait MmdbLookupTrait {
+    fn lookup_country(&self, ip: IpAddr) -> std::io::Result<MmdbLookupCountry>;
+    fn lookup_asn(&self, ip: IpAddr) -> std::io::Result<MmdbLookupAsn>;
+}
+
+impl MmdbLookupTrait for Mmdb {
+    fn lookup_country(&self, ip: IpAddr) -> std::io::Result<MmdbLookupCountry> {
+        match self
+            .reader
+            .lookup(ip)
+            .map_err(map_io_error)?
+            .decode::<geoip2::Country>()
+        {
+            Err(err) => Err(new_io_error(err)),
+            Ok(Some(country)) => Ok(MmdbLookupCountry {
+                country_code: country
+                    .country
+                    .iso_code
+                    .unwrap_or_default()
+                    .to_string(),
+            }),
+            Ok(None) => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "country not found",
+            )),
+        }
+    }
+
+    fn lookup_asn(&self, ip: IpAddr) -> std::io::Result<MmdbLookupAsn> {
+        match self
+            .reader
+            .lookup(ip)
+            .map_err(map_io_error)?
+            .decode::<geoip2::Asn>()
+        {
+            Err(err) => Err(new_io_error(err)),
+            Ok(Some(asn)) => Ok(MmdbLookupAsn {
+                asn_name: asn
+                    .autonomous_system_organization
+                    .unwrap_or_default()
+                    .to_string(),
+            }),
+            Ok(None) => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "asn not found",
+            )),
+        }
+    }
+}
+
+impl Mmdb {
+    pub async fn new<P: AsRef<Path>>(
+        path: P,
+        download_url: String,
+        http_client: HttpClient,
+    ) -> Result<Mmdb, Error> {
+        debug!("mmdb path: {}", path.as_ref().to_string_lossy());
+        let reader = Self::load_mmdb(path, download_url, &http_client).await?;
+        Ok(Self { reader })
+    }
+
+    async fn load_mmdb<P: AsRef<Path>>(
+        path: P,
+        download_url: String,
+        http_client: &HttpClient,
+    ) -> Result<maxminddb::Reader<Vec<u8>>, Error> {
+        let mmdb_file = path.as_ref().to_path_buf();
+
+        if !mmdb_file.exists() || download_url.contains("force=true") {
+            info!("downloading mmdb from {}", download_url);
+            download(&download_url, &mmdb_file, http_client)
+                .await
+                .map_err(|x| {
+                    Error::InvalidConfig(format!("mmdb download failed: {x}"))
+                })?;
+        }
+
+        match maxminddb::Reader::open_readfile(&path) {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                warn!(
+                    "invalid mmdb `{}`: {}, trying to download again",
+                    path.as_ref().to_string_lossy(),
+                    e.to_string()
+                );
+
+                // try to download again
+                fs::remove_file(&mmdb_file)?;
+
+                info!(
+                    "mmdb {:?} corrupt, re-downloading mmdb from {download_url}",
+                    mmdb_file.file_name()
+                );
+                download(&download_url, &mmdb_file, http_client)
+                    .await
+                    .map_err(|x| {
+                        Error::InvalidConfig(format!("mmdb download failed: {x}"))
+                    })?;
+                Ok(maxminddb::Reader::open_readfile(&path).map_err(|x| {
+                    Error::InvalidConfig(format!(
+                        "cant open mmdb `{}`: {}",
+                        path.as_ref().to_string_lossy(),
+                        x
+                    ))
+                })?)
+            }
+        }
+    }
+}

@@ -1,14 +1,21 @@
 use std::{collections::HashMap, io, sync::Arc};
 
+use futures::FutureExt;
+use hyper_util::rt::TokioIo;
+use tokio::net::TcpStream;
+use tracing::{trace, warn};
+
 use crate::{
-    app::dns::ThreadSafeDNSResolver, common::tls::GLOBAL_ROOT_STORE, proxy::AnyOutboundHandler,
+    app::dns::ThreadSafeDNSResolver,
+    common::tls::GLOBAL_ROOT_STORE,
+    config::internal::proxy::PROXY_DIRECT,
+    proxy::AnyOutboundHandler,
 };
 
-/* #[derive(Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct ClashHTTPClientExt {
     pub outbound: Option<String>,
 }
- */
 
 /// A simple HTTP client that can be used to make HTTP requests.
 /// Not performant for lack of connection pooling, but useful for simple tasks.
@@ -45,6 +52,123 @@ impl HttpClient {
             tls_config: Arc::new(tls_config),
             timeout: timeout.unwrap_or(tokio::time::Duration::from_secs(10)),
         })
+    }
+
+    async fn connect_tcp(&self, host: &str, port: u16) -> io::Result<TcpStream> {
+        let connect = TcpStream::connect((host, port));
+        tokio::time::timeout(self.timeout, connect)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tcp connect timeout"))?
+    }
+
+    pub async fn request<T>(
+        &self,
+        mut req: http::Request<T>,
+    ) -> Result<http::Response<hyper::body::Incoming>, io::Error>
+    where
+        T: hyper::body::Body + Send + 'static,
+        <T as hyper::body::Body>::Data: Send,
+        <T as hyper::body::Body>::Error: std::error::Error + Send + Sync,
+    {
+        let uri = req.uri().clone();
+
+        let host = uri
+            .host()
+            .ok_or(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("uri must have a host: {uri}"),
+            ))?
+            .to_owned();
+        let port = uri.port_u16().unwrap_or(match uri.scheme_str() {
+            None => 80,
+            Some("http") => 80,
+            Some("https") => 443,
+            Some(s) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unsupported scheme: {s}"),
+                ));
+            }
+        });
+
+        if req.headers_mut().get(http::header::HOST).is_none() {
+            req.headers_mut().insert(
+                http::header::HOST,
+                uri.host()
+                    .ok_or(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "uri must have a host",
+                    ))?
+                    .parse()
+                    .expect("must parse host header"),
+            );
+        }
+
+        let req_ext = req.extensions().get::<ClashHTTPClientExt>();
+        let outbound_name = req_ext
+            .and_then(|ext| ext.outbound.as_deref())
+            .unwrap_or(PROXY_DIRECT);
+        if let Some(outbounds) = self.outbounds.as_ref() {
+            if let Some(outbound) = outbounds.get(outbound_name) {
+                trace!(outbound = %outbound.name(), "using outbound for http client");
+            }
+        }
+
+        let stream = self.connect_tcp(&host, port).await?;
+
+        let resp = match uri.scheme() {
+            Some(scheme) if scheme == &http::uri::Scheme::HTTP => {
+                let io = TokioIo::new(stream);
+                let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+                    .await
+                    .map_err(io::Error::other)?;
+
+                tokio::task::spawn(async move {
+                    if let Err(err) = conn.await {
+                        warn!("HTTP connection error: {}", err);
+                    }
+                });
+
+                sender.send_request(req).boxed()
+            }
+            Some(scheme) if scheme == &http::uri::Scheme::HTTPS => {
+                let connector = tokio_rustls::TlsConnector::from(self.tls_config.clone());
+
+                let stream = tokio::time::timeout(
+                    self.timeout,
+                    connector.connect(
+                        host.try_into()
+                            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad SNI"))?,
+                        stream,
+                    ),
+                )
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tls connect timeout"))?
+                .map_err(io::Error::other)?;
+
+                let io = TokioIo::new(stream);
+                let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+                    .await
+                    .map_err(io::Error::other)?;
+
+                tokio::task::spawn(async move {
+                    if let Err(err) = conn.await {
+                        warn!("HTTP connection error: {}", err);
+                    }
+                });
+
+                sender.send_request(req).boxed()
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid url: {uri}: unsupported scheme"),
+                ));
+            }
+        };
+
+        resp.await
+            .map_err(|e| io::Error::other(format!("HTTP request failed: {e}")))
     }
 }
 

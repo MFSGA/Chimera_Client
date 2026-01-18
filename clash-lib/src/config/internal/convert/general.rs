@@ -18,5 +18,7 @@ pub(super) fn convert(c: &def::Config) -> Result<General, crate::Error> {
             cors_allow_origins: c.cors_allow_origins.clone(),
             external_controller_ipc: c.external_controller_ipc.clone(),
         },
+        mmdb: c.mmdb.clone(),
+        mmdb_download_url: c.mmdb_download_url.clone(),
     })
 }

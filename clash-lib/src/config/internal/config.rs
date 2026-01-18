@@ -49,6 +49,10 @@ pub struct General {
     pub log_level: LogLevel,
     /// 2
     pub(crate) controller: Controller,
+    /// 3
+    pub mmdb: Option<String>,
+    /// 4
+    pub mmdb_download_url: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug, Copy, PartialEq, Hash, Eq)]
