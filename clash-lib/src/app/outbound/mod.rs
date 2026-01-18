@@ -1,4 +1,6 @@
-use crate::{config::internal::proxy::OutboundProxyProtocol, proxy::AnyOutboundHandler};
+use std::sync::Arc;
+
+use crate::{config::internal::proxy::OutboundProxyProtocol, proxy::{AnyOutboundHandler, direct, reject}};
 
 pub struct OutboundManager {}
 
@@ -20,6 +22,20 @@ pub struct OutboundManager {}
 /// TODO: refactor this giant class
 impl OutboundManager {
     pub fn load_plain_outbounds(outbounds: Vec<OutboundProxyProtocol>) -> Vec<AnyOutboundHandler> {
-        todo!()
+        outbounds
+            .into_iter()
+            .filter_map(|outbound| match outbound {
+                OutboundProxyProtocol::Direct(d) => {
+                    Some(Arc::new(direct::Handler::new(&d.name)) as _)
+                }
+                OutboundProxyProtocol::Reject(r) => {
+                    Some(Arc::new(reject::Handler::new(&r.name)) as _)
+                }
+                // todo: support more outbound protocols
+                _ => {
+                    todo!("unsupported outbound protocol in plain outbound: {:?}", outbound)
+                }
+            })
+            .collect()
     }
 }
