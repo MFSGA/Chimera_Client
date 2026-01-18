@@ -1,8 +1,14 @@
-use std::sync::atomic::AtomicBool;
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use tracing::debug;
 
-use crate::app::dns::ClashResolver;
+use async_trait::async_trait;
+use hickory_proto::op::Message;
+
+use crate::app::dns::{ClashResolver, ResolverKind};
 
 pub struct SystemResolver {
     ipv6: AtomicBool,
@@ -19,4 +25,19 @@ impl SystemResolver {
     }
 }
 
-impl ClashResolver for SystemResolver {}
+#[async_trait]
+impl ClashResolver for SystemResolver {
+    async fn exchange(
+        &self,
+        _: &hickory_proto::op::Message,
+    ) -> anyhow::Result<hickory_proto::op::Message> {
+        Err(anyhow::anyhow!(
+            "system resolver does not support advanced dns features, please enable \
+             the dns server in your config"
+        ))
+    }
+
+    fn ipv6(&self) -> bool {
+        self.ipv6.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}

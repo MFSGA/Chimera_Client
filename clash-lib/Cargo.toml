@@ -24,6 +24,7 @@ bytes = "1"
 tokio-rustls = "0.26"
 webpki-roots = "0.26"
 maxminddb = "0.27"
+hickory-proto = "0.24"
 
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"

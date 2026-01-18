@@ -22,7 +22,7 @@ use crate::{
     },
     common::{
         http::new_http_client,
-        mmdb::{self, MmdbLookup, DEFAULT_COUNTRY_MMDB_DOWNLOAD_URL},
+        mmdb::{self, DEFAULT_COUNTRY_MMDB_DOWNLOAD_URL, MmdbLookup},
     },
     config::{
         def::{self, LogLevel},
@@ -318,7 +318,7 @@ async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<Runti
     let statistics_manager = StatisticsManager::new();
 
     debug!("initializing dns listener");
-    let dns_listener = dns::get_dns_listener(dns_listen, &cwd).await;
+    let dns_listener = dns::get_dns_listener(dns_listen, dns_resolver, &cwd).await;
 
     Ok(RuntimeComponents {
         statistics_manager,

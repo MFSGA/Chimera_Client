@@ -5,3 +5,8 @@ version = { workspace = true }
 edition = { workspace = true }
 # homepage = { workspace = true }
 # authors = { workspace = true }
+
+[dependencies]
+# hickory-proto = "0.24"
+thiserror = "2"
+futures = "0.3"
