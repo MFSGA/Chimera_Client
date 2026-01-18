@@ -47,6 +47,8 @@ pub struct Config {
     pub external_controller_ipc: Option<String>,
     /// 8. DNS client/server settings
     pub dns: DNS,
+    /// Profile settings
+    pub profile: Profile,
 }
 
 impl TryFrom<PathBuf> for Config {
@@ -132,4 +134,28 @@ pub struct DNS {
     /// DNS server listening address. If not present, the DNS server will be
     /// disabled.
     pub listen: Option<DNSListen>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
+#[serde(rename_all = "kebab-case")]
+pub struct Profile {
+    /// Store the `select` results in $CWD/cache.db
+    pub store_selected: bool,
+    /// persistence fakeip
+    #[serde(rename = "store-fake-ip")]
+    pub store_fake_ip: bool,
+    /// Store smart proxy group statistics and preferences
+    #[serde(rename = "store-smart-stats")]
+    pub store_smart_stats: bool,
+}
+
+impl Default for Profile {
+    fn default() -> Self {
+        Self {
+            store_selected: true,
+            store_fake_ip: false,
+            store_smart_stats: true,
+        }
+    }
 }

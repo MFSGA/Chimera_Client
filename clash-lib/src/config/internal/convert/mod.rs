@@ -5,7 +5,7 @@ use crate::{
     config::{
         def,
         internal::{
-            config,
+            config::{self, Profile},
             proxy::{
                 OutboundDirect, OutboundProxy, OutboundProxyProtocol, OutboundReject, PROXY_DIRECT,
                 PROXY_REJECT,
@@ -80,6 +80,10 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
         general: general::convert(&c)?,
         // relate to dns::Config
         dns: (&c).try_into()?,
+        profile: Profile {
+            store_selected: c.profile.store_selected,
+            store_smart_stats: c.profile.store_smart_stats,
+        },
     }
     .validate()
 }

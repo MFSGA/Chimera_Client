@@ -13,7 +13,9 @@ use tokio::{
 use tracing::{debug, error, info};
 
 use crate::{
-    app::{dispatcher::StatisticsManager, dns, logging::LogEvent, outbound::OutboundManager},
+    app::{
+        dispatcher::StatisticsManager, dns, logging::LogEvent, outbound::OutboundManager, profile,
+    },
     config::{
         def::{self, LogLevel},
         internal::{InternalConfig, proxy::OutboundProxy},
@@ -23,6 +25,8 @@ use crate::{
 
 /// 2
 mod app;
+/// 4
+// mod common;
 /// todo: #[cfg(not(feature = "internal"))]
 mod config;
 /// 3
@@ -245,6 +249,12 @@ struct RuntimeComponents {
 async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<RuntimeComponents> {
     info!("all components initialized");
 
+    debug!("initializing cache store");
+    let cache_store = profile::ThreadSafeCacheFile::new(
+        cwd.join("cache.db").as_path().to_str().unwrap(),
+        config.profile.store_selected,
+    );
+
     debug!("initializing bootstrap outbounds");
     let plain_outbounds = OutboundManager::load_plain_outbounds(
         config
@@ -266,7 +276,7 @@ async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<Runti
     /* let dns_resolver = dns::new_resolver(
         config.dns,
         Some(cache_store.clone()),
-        country_mmdb.clone(),
+        // country_mmdb.clone(),
         plain_outbounds_map,
     )
     .await; */

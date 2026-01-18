@@ -5,11 +5,11 @@ use chimera_dns::DNSListenAddr;
 use crate::{Error, config::def::DNSListen};
 
 #[derive(Default)]
-pub struct Config {
+pub struct DNSConfig {
     pub listen: DNSListenAddr,
 }
 
-impl TryFrom<crate::config::def::Config> for Config {
+impl TryFrom<crate::config::def::Config> for DNSConfig {
     type Error = Error;
 
     fn try_from(value: crate::def::Config) -> Result<Self, Self::Error> {
@@ -17,7 +17,7 @@ impl TryFrom<crate::config::def::Config> for Config {
     }
 }
 
-impl TryFrom<&crate::config::def::Config> for Config {
+impl TryFrom<&crate::config::def::Config> for DNSConfig {
     type Error = Error;
 
     fn try_from(c: &crate::config::def::Config) -> Result<Self, Self::Error> {

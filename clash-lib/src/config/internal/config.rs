@@ -24,7 +24,9 @@ pub struct Config {
     /// 4
     pub general: General,
     /// 5
-    pub dns: dns::Config,
+    pub dns: dns::DNSConfig,
+    /// 6
+    pub profile: Profile,
 }
 
 impl Config {
@@ -103,4 +105,11 @@ pub struct Controller {
     pub external_ui: Option<String>,
     pub secret: Option<String>,
     pub cors_allow_origins: Option<Vec<String>>,
+}
+
+pub struct Profile {
+    pub store_selected: bool,
+    pub store_smart_stats: bool,
+    // this is read to dns config directly
+    // store_fake_ip: bool,
 }

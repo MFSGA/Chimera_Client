@@ -7,7 +7,7 @@ mod config;
 /// 1
 mod server;
 
-pub use config::Config;
+pub use config::DNSConfig;
 pub use server::get_dns_listener;
 
 pub type ThreadSafeDNSResolver = Arc<dyn ClashResolver>;
