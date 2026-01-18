@@ -6,6 +6,9 @@ use std::sync::Arc;
 mod config;
 /// 1
 mod server;
+/// 3
+pub mod resolver;
+
 
 pub use config::DNSConfig;
 pub use server::get_dns_listener;

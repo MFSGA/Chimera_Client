@@ -13,9 +13,7 @@ use tokio::{
 use tracing::{debug, error, info};
 
 use crate::{
-    app::{
-        dispatcher::StatisticsManager, dns, logging::LogEvent, outbound::OutboundManager, profile,
-    },
+    app::{ dispatcher::StatisticsManager, dns::{self, resolver::SystemResolver}, logging::LogEvent, outbound::OutboundManager, profile},
     config::{
         def::{self, LogLevel},
         internal::{InternalConfig, proxy::OutboundProxy},
@@ -38,6 +36,8 @@ pub enum Error {
     Io(#[from] io::Error),
     #[error("invalid config: {0}")]
     InvalidConfig(String),
+    #[error("dns error: {0}")]
+    DNSError(String),
 }
 
 pub enum TokioRuntime {
@@ -254,6 +254,9 @@ async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<Runti
         cwd.join("cache.db").as_path().to_str().unwrap(),
         config.profile.store_selected,
     );
+
+    let system_resolver =
+        Arc::new(SystemResolver::new(config.dns.ipv6).map_err(|x| Error::DNSError(x.to_string()))?);
 
     debug!("initializing bootstrap outbounds");
     let plain_outbounds = OutboundManager::load_plain_outbounds(

@@ -131,6 +131,8 @@ pub enum DNSListen {
 #[serde(rename_all = "kebab-case", default)]
 #[educe(Default)]
 pub struct DNS {
+    /// Enable IPv6 DNS responses (AAAA)
+    pub ipv6: bool,
     /// DNS server listening address. If not present, the DNS server will be
     /// disabled.
     pub listen: Option<DNSListen>,

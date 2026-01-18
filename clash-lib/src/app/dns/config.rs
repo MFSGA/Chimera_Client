@@ -7,6 +7,8 @@ use crate::{Error, config::def::DNSListen};
 #[derive(Default)]
 pub struct DNSConfig {
     pub listen: DNSListenAddr,
+    /// 2
+    pub ipv6: bool,
 }
 
 impl TryFrom<crate::config::def::Config> for DNSConfig {
@@ -41,6 +43,7 @@ impl TryFrom<&crate::config::def::Config> for DNSConfig {
                 })
                 .transpose()?
                 .unwrap_or_default(),
+            ipv6: dc.ipv6,
         })
     }
 }
