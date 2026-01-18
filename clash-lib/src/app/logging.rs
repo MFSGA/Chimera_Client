@@ -38,7 +38,7 @@ where
 
         let event = LogEvent {
             level: match *event.metadata().level() {
-                // tracing::Level::ERROR => LogLevel::Error,
+                tracing::Level::ERROR => LogLevel::Error,
                 // tracing::Level::WARN => LogLevel::Warning,
                 tracing::Level::INFO => LogLevel::Info,
                 _ => {
