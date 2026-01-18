@@ -2,6 +2,7 @@ use std::sync::atomic::AtomicBool;
 
 use tracing::debug;
 
+use crate::app::dns::ClashResolver;
 
 pub struct SystemResolver {
     ipv6: AtomicBool,
@@ -17,3 +18,5 @@ impl SystemResolver {
         })
     }
 }
+
+impl ClashResolver for SystemResolver {}

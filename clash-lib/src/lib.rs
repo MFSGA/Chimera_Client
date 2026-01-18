@@ -13,7 +13,14 @@ use tokio::{
 use tracing::{debug, error, info};
 
 use crate::{
-    app::{ dispatcher::StatisticsManager, dns::{self, resolver::SystemResolver}, logging::LogEvent, outbound::OutboundManager, profile},
+    app::{
+        dispatcher::StatisticsManager,
+        dns::{self, resolver::SystemResolver},
+        logging::LogEvent,
+        outbound::OutboundManager,
+        profile,
+    },
+    common::http::new_http_client,
     config::{
         def::{self, LogLevel},
         internal::{InternalConfig, proxy::OutboundProxy},
@@ -24,7 +31,7 @@ use crate::{
 /// 2
 mod app;
 /// 4
-// mod common;
+mod common;
 /// todo: #[cfg(not(feature = "internal"))]
 mod config;
 /// 3
@@ -269,6 +276,9 @@ async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<Runti
             })
             .collect(),
     );
+
+    let client = new_http_client(system_resolver.clone(), Some(plain_outbounds.clone()))
+        .map_err(|x| Error::DNSError(x.to_string()))?;
 
     let dns_listen = config.dns.listen.clone();
     let plain_outbounds_map = HashMap::<String, Arc<dyn OutboundHandler>>::from_iter(

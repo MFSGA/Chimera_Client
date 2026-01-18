@@ -16,6 +16,11 @@ anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 async-trait = "0.1"
+# http = "1"
+# hyper = { version = "1", features = ["client", "http1"] }
+# hyper-util = { version = "0.1", features = ["tokio"] }
+tokio-rustls = "0.26"
+webpki-roots = "0.26"
 
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
