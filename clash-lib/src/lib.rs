@@ -14,7 +14,7 @@ use tracing::{debug, error, info};
 
 use crate::{
     app::{
-        dispatcher::StatisticsManager,
+        dispatcher::{Dispatcher, StatisticsManager},
         dns::{self, ThreadSafeDNSResolver, resolver::SystemResolver},
         logging::LogEvent,
         outbound::manager::OutboundManager,
@@ -212,11 +212,11 @@ pub async fn start(
         components.statistics_manager,
         components.outbound_manager,
         /* components.inbound_manager,
-        
+
         components.dispatcher,
         global_state.clone(),
         components.dns_resolver,
-        
+
         components.cache_store,
         components.router, */
         cwd.to_string_lossy().to_string(),
@@ -259,6 +259,7 @@ struct RuntimeComponents {
     cache_store: profile::ThreadSafeCacheFile,
     dns_resolver: ThreadSafeDNSResolver,
     outbound_manager: Arc<OutboundManager>,
+    dispatcher: Arc<Dispatcher>,
     // inbound_manager: Arc<InboundManager>,
 }
 
@@ -344,6 +345,14 @@ async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<Runti
 
     let statistics_manager = StatisticsManager::new();
 
+    debug!("initializing dispatcher");
+    let dispatcher = Arc::new(Dispatcher::new(
+        outbound_manager.clone(),
+        dns_resolver.clone(),
+        statistics_manager.clone(),
+        None,
+    ));
+
     debug!("initializing dns listener");
     let dns_listener = dns::get_dns_listener(dns_listen, dns_resolver.clone(), &cwd).await;
 
@@ -352,6 +361,7 @@ async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<Runti
         dns_listener,
         cache_store,
         dns_resolver,
-        outbound_manager
+        outbound_manager,
+        dispatcher,
     })
 }
