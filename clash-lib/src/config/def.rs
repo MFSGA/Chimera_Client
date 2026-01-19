@@ -96,6 +96,7 @@ pub enum LogLevel {
     Error,
     #[serde(alias = "warn")]
     Warning,
+    Debug,
 }
 
 impl Display for LogLevel {
@@ -104,6 +105,7 @@ impl Display for LogLevel {
             LogLevel::Info => write!(f, "info"),
             LogLevel::Error => write!(f, "error"),
             LogLevel::Warning => write!(f, "warn"),
+            LogLevel::Debug => write!(f, "debug"),
         }
     }
 }

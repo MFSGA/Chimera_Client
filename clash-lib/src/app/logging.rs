@@ -41,9 +41,10 @@ where
                 tracing::Level::ERROR => LogLevel::Error,
                 tracing::Level::WARN => LogLevel::Warning,
                 tracing::Level::INFO => LogLevel::Info,
+                tracing::Level::DEBUG => LogLevel::Debug,
                 _ => {
                     todo!()
-                } // tracing::Level::DEBUG => LogLevel::Debug,
+                } //
                   // tracing::Level::TRACE => LogLevel::Trace,
             },
             msg: strs.join(" "),
