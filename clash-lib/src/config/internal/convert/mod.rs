@@ -67,6 +67,8 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
             },
         )?,
         proxy_groups: proxy_group::convert(c.proxy_group.take(), &mut proxy_names)?,
+        proxy_providers: HashMap::new(),
+        proxy_names,
         rules: c
             .rule
             .take()

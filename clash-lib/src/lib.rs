@@ -17,7 +17,7 @@ use crate::{
         dispatcher::StatisticsManager,
         dns::{self, ThreadSafeDNSResolver, resolver::SystemResolver},
         logging::LogEvent,
-        outbound::OutboundManager,
+        outbound::manager::OutboundManager,
         profile,
     },
     common::{
@@ -210,11 +210,13 @@ pub async fn start(
         controller_cfg,
         log_tx.clone(),
         components.statistics_manager,
+        components.outbound_manager,
         /* components.inbound_manager,
+        
         components.dispatcher,
         global_state.clone(),
         components.dns_resolver,
-        components.outbound_manager,
+        
         components.cache_store,
         components.router, */
         cwd.to_string_lossy().to_string(),
@@ -256,6 +258,7 @@ struct RuntimeComponents {
     dns_listener: Option<Runner>,
     cache_store: profile::ThreadSafeCacheFile,
     dns_resolver: ThreadSafeDNSResolver,
+    outbound_manager: Arc<OutboundManager>,
     // inbound_manager: Arc<InboundManager>,
 }
 
@@ -318,6 +321,27 @@ async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<Runti
     )
     .await;
 
+    debug!("initializing outbound manager");
+    let outbound_manager = Arc::new(
+        OutboundManager::new(
+            plain_outbounds,
+            config
+                .proxy_groups
+                .into_values()
+                .filter_map(|x| match x {
+                    OutboundProxy::ProxyGroup(g) => Some(g),
+                    _ => None,
+                })
+                .collect(),
+            config.proxy_providers,
+            config.proxy_names,
+            dns_resolver.clone(),
+            cache_store.clone(),
+            cwd.to_string_lossy().to_string(),
+        )
+        .await?,
+    );
+
     let statistics_manager = StatisticsManager::new();
 
     debug!("initializing dns listener");
@@ -328,5 +352,6 @@ async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<Runti
         dns_listener,
         cache_store,
         dns_resolver,
+        outbound_manager
     })
 }

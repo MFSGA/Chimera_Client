@@ -10,7 +10,10 @@ use crate::{
     app::dns,
     config::{
         def::LogLevel,
-        internal::{proxy::OutboundProxy, rule::RuleType},
+        internal::{
+            proxy::{OutboundProxy, OutboundProxyProviderDef},
+            rule::RuleType,
+        },
     },
 };
 
@@ -21,6 +24,10 @@ pub struct Config {
     pub proxies: HashMap<String, OutboundProxy>,
     /// 3
     pub proxy_groups: HashMap<String, OutboundProxy>,
+    /// 3.1
+    pub proxy_providers: HashMap<String, OutboundProxyProviderDef>,
+    /// 3.2
+    pub proxy_names: Vec<String>,
     /// 4
     pub general: General,
     /// 5
