@@ -4,3 +4,5 @@ docs/
 start.ps1
 
 config.yaml
+
+cache.db
