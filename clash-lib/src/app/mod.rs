@@ -7,6 +7,8 @@ pub mod dns;
 /// 1
 pub mod logging;
 /// 5
+pub mod inbound;
+/// 5
 pub mod outbound;
 /// 6
 pub mod profile;

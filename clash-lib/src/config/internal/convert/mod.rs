@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     Error,
@@ -81,6 +81,7 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
                 auth::User::new(username, password)
             })
             .collect(),
+        listeners: HashSet::new(),
         rules: c
             .rule
             .take()

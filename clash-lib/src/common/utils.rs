@@ -12,6 +12,10 @@ use crate::{
     },
 };
 
+pub fn default_bool_true() -> bool {
+    true
+}
+
 pub async fn download<P>(url: &str, path: P, http_client: &HttpClient) -> anyhow::Result<()>
 where
     P: AsRef<Path> + std::marker::Send,

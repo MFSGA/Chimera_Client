@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
 };
 
@@ -12,6 +12,7 @@ use crate::{
     config::{
         def::LogLevel,
         internal::{
+            listener::InboundOpts,
             proxy::{OutboundProxy, OutboundProxyProviderDef},
             rule::RuleType,
         },
@@ -31,6 +32,8 @@ pub struct Config {
     pub proxy_names: Vec<String>,
     /// 3.3
     pub users: Vec<auth::User>,
+    /// 3.4
+    pub listeners: HashSet<InboundOpts>,
     /// 4
     pub general: General,
     /// 5

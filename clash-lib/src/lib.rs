@@ -16,6 +16,7 @@ use crate::{
     app::{
         dispatcher::{Dispatcher, StatisticsManager},
         dns::{self, ThreadSafeDNSResolver, resolver::SystemResolver},
+        inbound::manager::InboundManager,
         logging::LogEvent,
         outbound::manager::OutboundManager,
         profile,
@@ -192,6 +193,8 @@ pub async fn start(
     let log_level = config.general.log_level;
 
     let components = create_components(cwd.clone(), config).await?;
+    let inbound_manager = components.inbound_manager.clone();
+    inbound_manager.start_all_listeners().await;
 
     let dns_listener_handle = components.dns_listener.map(tokio::spawn);
 
@@ -261,7 +264,7 @@ struct RuntimeComponents {
     dns_resolver: ThreadSafeDNSResolver,
     outbound_manager: Arc<OutboundManager>,
     dispatcher: Arc<Dispatcher>,
-    // inbound_manager: Arc<InboundManager>,
+    inbound_manager: Arc<InboundManager>,
 }
 
 async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<RuntimeComponents> {
@@ -357,6 +360,10 @@ async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<Runti
     debug!("initializing authenticator");
     let authenticator = Arc::new(auth::PlainAuthenticator::new(config.users));
 
+    debug!("initializing inbound manager");
+    let inbound_manager =
+        Arc::new(InboundManager::new(dispatcher.clone(), authenticator, config.listeners).await);
+
     debug!("initializing dns listener");
     let dns_listener = dns::get_dns_listener(dns_listen, dns_resolver.clone(), &cwd).await;
 
@@ -367,5 +374,6 @@ async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<Runti
         dns_resolver,
         outbound_manager,
         dispatcher,
+        inbound_manager,
     })
 }
