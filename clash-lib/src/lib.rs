@@ -21,6 +21,7 @@ use crate::{
         profile,
     },
     common::{
+        auth,
         http::new_http_client,
         mmdb::{self, DEFAULT_COUNTRY_MMDB_DOWNLOAD_URL, MmdbLookup},
     },
@@ -352,6 +353,9 @@ async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<Runti
         statistics_manager.clone(),
         None,
     ));
+
+    debug!("initializing authenticator");
+    let authenticator = Arc::new(auth::PlainAuthenticator::new(config.users));
 
     debug!("initializing dns listener");
     let dns_listener = dns::get_dns_listener(dns_listen, dns_resolver.clone(), &cwd).await;

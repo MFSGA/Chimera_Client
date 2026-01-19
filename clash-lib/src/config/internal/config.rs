@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Error,
     app::dns,
+    common::auth,
     config::{
         def::LogLevel,
         internal::{
@@ -28,6 +29,8 @@ pub struct Config {
     pub proxy_providers: HashMap<String, OutboundProxyProviderDef>,
     /// 3.2
     pub proxy_names: Vec<String>,
+    /// 3.3
+    pub users: Vec<auth::User>,
     /// 4
     pub general: General,
     /// 5

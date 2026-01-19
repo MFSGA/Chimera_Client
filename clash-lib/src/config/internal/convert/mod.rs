@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::{
     Error,
+    common::auth,
     config::{
         def,
         internal::{
@@ -69,6 +70,17 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
         proxy_groups: proxy_group::convert(c.proxy_group.take(), &mut proxy_names)?,
         proxy_providers: HashMap::new(),
         proxy_names,
+        users: c
+            .authentication
+            .clone()
+            .into_iter()
+            .map(|u| {
+                let mut parts = u.splitn(2, ':');
+                let username = parts.next().unwrap_or_default().to_string();
+                let password = parts.next().unwrap_or_default().to_string();
+                auth::User::new(username, password)
+            })
+            .collect(),
         rules: c
             .rule
             .take()
