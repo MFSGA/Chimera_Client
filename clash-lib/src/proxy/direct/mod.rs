@@ -2,7 +2,10 @@ use std::fmt::Debug;
 
 use async_trait::async_trait;
 
-use crate::{config::internal::proxy::PROXY_DIRECT, proxy::{DialWithConnector, OutboundHandler}};
+use crate::{
+    config::internal::proxy::PROXY_DIRECT,
+    proxy::{DialWithConnector, OutboundHandler},
+};
 
 #[derive(Clone)]
 pub struct Handler {

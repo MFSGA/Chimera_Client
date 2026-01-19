@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use crate::{config::internal::proxy::OutboundProxyProtocol, proxy::{AnyOutboundHandler, direct, reject}};
+use crate::{
+    config::internal::proxy::OutboundProxyProtocol,
+    proxy::{AnyOutboundHandler, direct, reject},
+};
 
 pub struct OutboundManager {}
 
@@ -33,7 +36,10 @@ impl OutboundManager {
                 }
                 // todo: support more outbound protocols
                 _ => {
-                    todo!("unsupported outbound protocol in plain outbound: {:?}", outbound)
+                    todo!(
+                        "unsupported outbound protocol in plain outbound: {:?}",
+                        outbound
+                    )
                 }
             })
             .collect()

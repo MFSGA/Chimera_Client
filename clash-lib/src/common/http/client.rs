@@ -6,10 +6,8 @@ use tokio::net::TcpStream;
 use tracing::{trace, warn};
 
 use crate::{
-    app::dns::ThreadSafeDNSResolver,
-    common::tls::GLOBAL_ROOT_STORE,
-    config::internal::proxy::PROXY_DIRECT,
-    proxy::AnyOutboundHandler,
+    app::dns::ThreadSafeDNSResolver, common::tls::GLOBAL_ROOT_STORE,
+    config::internal::proxy::PROXY_DIRECT, proxy::AnyOutboundHandler,
 };
 
 #[derive(Clone, Debug)]

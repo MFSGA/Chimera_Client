@@ -15,7 +15,7 @@ use tracing::{debug, error, info};
 use crate::{
     app::{
         dispatcher::StatisticsManager,
-        dns::{self, resolver::SystemResolver},
+        dns::{self, ThreadSafeDNSResolver, resolver::SystemResolver},
         logging::LogEvent,
         outbound::OutboundManager,
         profile,
@@ -254,6 +254,9 @@ struct RuntimeComponents {
     statistics_manager: Arc<StatisticsManager>,
     /// 2
     dns_listener: Option<Runner>,
+    cache_store: profile::ThreadSafeCacheFile,
+    dns_resolver: ThreadSafeDNSResolver,
+    // inbound_manager: Arc<InboundManager>,
 }
 
 async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<RuntimeComponents> {
@@ -318,10 +321,12 @@ async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<Runti
     let statistics_manager = StatisticsManager::new();
 
     debug!("initializing dns listener");
-    let dns_listener = dns::get_dns_listener(dns_listen, dns_resolver, &cwd).await;
+    let dns_listener = dns::get_dns_listener(dns_listen, dns_resolver.clone(), &cwd).await;
 
     Ok(RuntimeComponents {
         statistics_manager,
         dns_listener,
+        cache_store,
+        dns_resolver,
     })
 }

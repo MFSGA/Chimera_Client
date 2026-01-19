@@ -49,11 +49,7 @@ impl MmdbLookupTrait for Mmdb {
         {
             Err(err) => Err(new_io_error(err)),
             Ok(Some(country)) => Ok(MmdbLookupCountry {
-                country_code: country
-                    .country
-                    .iso_code
-                    .unwrap_or_default()
-                    .to_string(),
+                country_code: country.country.iso_code.unwrap_or_default().to_string(),
             }),
             Ok(None) => Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -106,9 +102,7 @@ impl Mmdb {
             info!("downloading mmdb from {}", download_url);
             download(&download_url, &mmdb_file, http_client)
                 .await
-                .map_err(|x| {
-                    Error::InvalidConfig(format!("mmdb download failed: {x}"))
-                })?;
+                .map_err(|x| Error::InvalidConfig(format!("mmdb download failed: {x}")))?;
         }
 
         match maxminddb::Reader::open_readfile(&path) {
@@ -129,9 +123,7 @@ impl Mmdb {
                 );
                 download(&download_url, &mmdb_file, http_client)
                     .await
-                    .map_err(|x| {
-                        Error::InvalidConfig(format!("mmdb download failed: {x}"))
-                    })?;
+                    .map_err(|x| Error::InvalidConfig(format!("mmdb download failed: {x}")))?;
                 Ok(maxminddb::Reader::open_readfile(&path).map_err(|x| {
                     Error::InvalidConfig(format!(
                         "cant open mmdb `{}`: {}",
