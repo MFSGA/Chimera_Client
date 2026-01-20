@@ -16,7 +16,8 @@ use crate::{
     common::auth::ThreadSafeAuthenticator,
     config::internal::listener::CommonInboundOpts,
     proxy::{
-        inbound::InboundHandlerTrait, utils::socket_helpers::try_create_dualstack_tcplistener,
+        inbound::InboundHandlerTrait,
+        utils::{apply_tcp_options, try_create_dualstack_tcplistener, ToCanonical},
     },
 };
 
@@ -80,15 +81,15 @@ impl InboundHandlerTrait for SocksInbound {
                 "SOCKS5 TCP accepted connection from {}",
                 socket.peer_addr()?
             );
-            todo!()
-            /* let src_addr = socket.peer_addr()?.to_canonical();
+
+            let src_addr = socket.peer_addr()?.to_canonical();
             if !self.allow_lan && src_addr.ip() != socket.local_addr()?.ip().to_canonical() {
                 warn!("Connection from {} is not allowed", src_addr);
                 continue;
             }
             apply_tcp_options(&socket)?;
-
-            let mut sess = Session {
+            todo!()
+            /* let mut sess = Session {
                 network: Network::Tcp,
                 typ: Type::Socks5,
                 source: socket.peer_addr()?.to_canonical(),

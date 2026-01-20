@@ -1,5 +1,9 @@
 use std::{io, net::SocketAddr};
 
+use std::time::Duration;
+
+use socket2::TcpKeepalive;
+
 use tokio::net::{TcpListener, TcpStream};
 
 pub fn apply_tcp_options(s: &TcpStream) -> std::io::Result<()> {
@@ -15,13 +19,12 @@ pub fn apply_tcp_options(s: &TcpStream) -> std::io::Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        todo!()
-        /* let s = socket2::SockRef::from(s);
+        let s = socket2::SockRef::from(s);
         s.set_tcp_keepalive(
             &TcpKeepalive::new()
                 .with_time(Duration::from_secs(10))
                 .with_interval(Duration::from_secs(1)),
-        ) */
+        )
     }
 }
 
@@ -60,4 +63,17 @@ pub fn try_create_dualstack_tcplistener(addr: SocketAddr) -> io::Result<TcpListe
 
     let listener = TcpListener::from_std(socket.into())?;
     Ok(listener)
+}
+
+/// Convert ipv6 mapped ipv4 address back to ipv4. Other address remain
+/// unchanged. e.g. ::ffff:127.0.0.1 -> 127.0.0.1
+pub trait ToCanonical {
+    fn to_canonical(self) -> SocketAddr;
+}
+
+impl ToCanonical for SocketAddr {
+    fn to_canonical(mut self) -> SocketAddr {
+        self.set_ip(self.ip().to_canonical());
+        self
+    }
 }
