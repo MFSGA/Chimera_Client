@@ -355,6 +355,7 @@ async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<Runti
     let dispatcher = Arc::new(Dispatcher::new(
         outbound_manager.clone(),
         dns_resolver.clone(),
+        config.general.mode,
         statistics_manager.clone(),
         None,
     ));

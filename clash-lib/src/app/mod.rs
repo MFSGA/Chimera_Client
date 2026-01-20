@@ -12,3 +12,5 @@ pub mod inbound;
 pub mod outbound;
 /// 6
 pub mod profile;
+/// 7
+pub mod router;

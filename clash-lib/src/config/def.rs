@@ -30,6 +30,7 @@ pub struct Config {
     #[serde(rename = "rules")]
     /// 5. Rule settings
     pub rule: Option<Vec<String>>,
+
     /// 6. Log level
     /// Either `debug`, `info`, `warning`, `error` or `off`
     pub log_level: LogLevel,
@@ -87,6 +88,10 @@ pub struct Config {
     /// - so you can use this value to match the traffic in iptables to avoid
     ///   traffic loops
     pub routing_mark: Option<u32>,
+    /// 15. Clash router working mode
+    /// Either `rule`, `global` or `direct`
+    #[serde(default)]
+    pub mode: RunMode,
 }
 
 impl TryFrom<PathBuf> for Config {
@@ -242,6 +247,28 @@ impl<'de> Deserialize<'de> for Port {
             StrOrNum::Str(s) => s.parse::<u16>().map(Port).map_err(serde::de::Error::custom),
 
             StrOrNum::Other => Err(serde::de::Error::custom("Invalid type for port")),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Default, Copy, Clone)]
+#[serde(rename_all = "lowercase")]
+pub enum RunMode {
+    #[serde(alias = "Global")]
+    Global,
+    #[default]
+    #[serde(alias = "Rule")]
+    Rule,
+    #[serde(alias = "Direct")]
+    Direct,
+}
+
+impl Display for RunMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunMode::Global => write!(f, "global"),
+            RunMode::Rule => write!(f, "rule"),
+            RunMode::Direct => write!(f, "direct"),
         }
     }
 }

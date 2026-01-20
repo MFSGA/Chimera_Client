@@ -20,5 +20,6 @@ pub(super) fn convert(c: &def::Config) -> Result<General, crate::Error> {
         },
         mmdb: c.mmdb.clone(),
         mmdb_download_url: c.mmdb_download_url.clone(),
+        mode: c.mode,
     })
 }

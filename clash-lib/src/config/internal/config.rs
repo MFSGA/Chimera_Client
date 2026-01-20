@@ -10,7 +10,7 @@ use crate::{
     app::dns,
     common::auth,
     config::{
-        def::LogLevel,
+        def::{LogLevel, RunMode},
         internal::{
             listener::InboundOpts,
             proxy::{OutboundProxy, OutboundProxyProviderDef},
@@ -66,6 +66,8 @@ pub struct General {
     pub mmdb: Option<String>,
     /// 4
     pub mmdb_download_url: Option<String>,
+    /// 5
+    pub mode: RunMode,
 }
 
 #[derive(Serialize, Clone, Debug, Copy, PartialEq, Hash, Eq)]

@@ -1,6 +1,5 @@
 use std::{
-    io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    fmt::{Display, Formatter}, io, net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr}
 };
 
 use bytes::BufMut;
@@ -152,6 +151,19 @@ impl Default for Session {
             destination: SocksAddr::any_ipv4(),
             so_mark: None,
         }
+    }
+}
+
+impl Display for Session {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "[todo] {} -> []",
+            // self.network,
+            self.source,
+            // self.destination,
+            //self.resolved_ip.unwrap_or(IpAddr::V4(Ipv4Addr::from(0)))
+        )
     }
 }
 
