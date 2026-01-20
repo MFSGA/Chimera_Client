@@ -48,6 +48,8 @@ chimera-dns = { path = "../clash-dns", default-features = false }
 # Macro Magic
 educe = "0.6"
 
+socket2 = { version = "0.6", features = ["all"] }
+
 [features]
 default = ["zero_copy", "aws-lc-rs"]
 

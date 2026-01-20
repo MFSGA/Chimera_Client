@@ -12,8 +12,12 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::{
-    app::dispatcher::Dispatcher, common::auth::ThreadSafeAuthenticator,
-    config::internal::listener::CommonInboundOpts, proxy::{inbound::InboundHandlerTrait, utils::socket_helpers::try_create_dualstack_tcplistener},
+    app::dispatcher::Dispatcher,
+    common::auth::ThreadSafeAuthenticator,
+    config::internal::listener::CommonInboundOpts,
+    proxy::{
+        inbound::InboundHandlerTrait, utils::socket_helpers::try_create_dualstack_tcplistener,
+    },
 };
 
 const SOCKS5_VERSION: u8 = 0x05;
@@ -69,9 +73,13 @@ impl InboundHandlerTrait for SocksInbound {
 
     async fn listen_tcp(&self) -> std::io::Result<()> {
         let listener = try_create_dualstack_tcplistener(self.addr)?;
-
+        info!("SOCKS5 TCP prepared. listening on {}", self.addr);
         loop {
             let (socket, _) = listener.accept().await?;
+            info!(
+                "SOCKS5 TCP accepted connection from {}",
+                socket.peer_addr()?
+            );
             todo!()
             /* let src_addr = socket.peer_addr()?.to_canonical();
             if !self.allow_lan && src_addr.ip() != socket.local_addr()?.ip().to_canonical() {
