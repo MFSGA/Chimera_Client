@@ -92,6 +92,12 @@ impl BindAddress {
     }
 }
 
+impl Default for BindAddress {
+    fn default() -> Self {
+        Self::all_v4()
+    }
+}
+
 impl<'de> Deserialize<'de> for BindAddress {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where

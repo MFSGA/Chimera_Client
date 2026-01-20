@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use tracing::warn;
+
 use crate::{
     Error,
     common::auth,
@@ -18,6 +20,8 @@ use crate::{
 
 mod general;
 mod proxy_group;
+/// 3
+mod listener;
 
 impl TryFrom<def::Config> for config::Config {
     type Error = crate::Error;
@@ -31,11 +35,10 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
     let mut proxy_names = vec![String::from(PROXY_DIRECT), String::from(PROXY_REJECT)];
 
     if c.allow_lan.unwrap_or_default() && c.bind_address.is_localhost() {
-        todo!()
-        /* warn!(
+        warn!(
             "allow-lan is set to true, but bind-address is set to localhost. This \
              will not allow any connections from the local network."
-        ); */
+        );
     }
 
     config::Config {
@@ -81,7 +84,7 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
                 auth::User::new(username, password)
             })
             .collect(),
-        listeners: HashSet::new(),
+        listeners: listener::convert(c.listeners.take(), &c)?,
         rules: c
             .rule
             .take()

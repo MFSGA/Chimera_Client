@@ -1,11 +1,12 @@
 use educe::Educe;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_yaml::Value;
 
 use std::{collections::HashMap, fmt::Display, path::PathBuf, str::FromStr};
 
 use crate::{Error, config::internal::config::BindAddress};
 
+// todo: rename to DefConfig
 #[derive(Deserialize)]
 pub struct Config {
     /// 1. Allow connections from IP addresses other than local listening address
@@ -57,6 +58,35 @@ pub struct Config {
     /// 10.2 Download URL for country mmdb file
     #[serde(rename = "mmdb-download-url")]
     pub mmdb_download_url: Option<String>,
+    /// 11.1 The HTTP proxy port
+    #[serde(alias = "http_port")]
+    pub port: Option<Port>,
+    /// The SOCKS5 proxy port
+    pub socks_port: Option<Port>,
+    /// The redir port
+    #[doc(hidden)]
+    pub redir_port: Option<Port>,
+    pub tproxy_port: Option<Port>,
+    /// The HTTP/SOCKS5 mixed proxy port
+    /// # Example
+    /// ```yaml
+    /// mixed-port: 7892
+    /// ```
+    pub mixed_port: Option<Port>,
+    /// 12
+    pub listeners: Option<Vec<HashMap<String, Value>>>,
+    // 13. these options has default vals,
+    // and needs extra processing
+    /// whether your network environment supports IPv6
+    /// this will affect the DNS server response to AAAA questions
+    /// default is `false`
+    pub ipv6: bool,
+    /// 14. fwmark on Linux only
+    /// # Note
+    /// - traffics originated from clash will be marked with this value
+    /// - so you can use this value to match the traffic in iptables to avoid
+    ///   traffic loops
+    pub routing_mark: Option<u32>,
 }
 
 impl TryFrom<PathBuf> for Config {
@@ -176,6 +206,42 @@ impl Default for Profile {
             store_selected: true,
             store_fake_ip: false,
             store_smart_stats: true,
+        }
+    }
+}
+
+#[derive(PartialEq, Debug, Clone, Serialize, Copy)]
+pub struct Port(pub u16);
+
+impl From<Port> for u16 {
+    fn from(val: Port) -> Self {
+        val.0
+    }
+}
+
+impl<'de> Deserialize<'de> for Port {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum StrOrNum {
+            Str(String),
+            Num(u64),
+            Other,
+        }
+
+        let value = StrOrNum::deserialize(deserializer)?;
+
+        match value {
+            StrOrNum::Num(num) => u16::try_from(num)
+                .map(Port)
+                .map_err(|_| serde::de::Error::custom("Port number out of range")),
+
+            StrOrNum::Str(s) => s.parse::<u16>().map(Port).map_err(serde::de::Error::custom),
+
+            StrOrNum::Other => Err(serde::de::Error::custom("Invalid type for port")),
         }
     }
 }
