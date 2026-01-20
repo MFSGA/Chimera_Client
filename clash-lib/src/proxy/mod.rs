@@ -11,6 +11,8 @@ pub mod reject;
 
 pub mod socks;
 
+pub mod utils;
+
 #[async_trait]
 pub trait OutboundHandler: Sync + Send + Unpin + DialWithConnector + Debug {
     /// The name of the outbound handler

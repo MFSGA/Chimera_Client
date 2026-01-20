@@ -1,10 +1,13 @@
 use std::sync::Arc;
 
-use tracing::{debug, warn};
+use tracing::{error, info, warn};
 
 use crate::{
-    Runner, app::dispatcher::Dispatcher, common::auth::ThreadSafeAuthenticator,
-    config::internal::listener::InboundOpts, proxy::{inbound::InboundHandlerTrait, socks::inbound::SocksInbound},
+    Runner,
+    app::dispatcher::Dispatcher,
+    common::auth::ThreadSafeAuthenticator,
+    config::internal::listener::InboundOpts,
+    proxy::{inbound::InboundHandlerTrait, socks::inbound::SocksInbound},
 };
 
 pub(crate) fn build_network_listeners(
@@ -12,64 +15,67 @@ pub(crate) fn build_network_listeners(
     dispatcher: Arc<Dispatcher>,
     authenticator: ThreadSafeAuthenticator,
 ) -> Option<Vec<Runner>> {
-    let handler = build_handler(inbound_opts, dispatcher, authenticator)?;
-    let name = inbound_opts.common_opts().name.clone();
+    let name = &inbound_opts.common_opts().name;
+    let addr = inbound_opts.common_opts().listen.0;
+    let port = inbound_opts.common_opts().port;
 
-    let mut runners: Vec<Runner> = Vec::new();
+    if let Some(handler) = build_handler(inbound_opts, dispatcher, authenticator) {
+        let mut runners: Vec<Runner> = Vec::new();
 
-    if handler.handle_tcp() {
-        let handler = handler.clone();
-        let name = name.clone();
-        runners.push(Box::pin(async move {
-            if let Err(err) = handler.listen_tcp().await {
-                warn!("{} inbound tcp listener stopped: {}", name, err);
-                return Err(err.into());
-            }
-            Ok(())
-        }));
+        if handler.handle_tcp() {
+            let tcp_listener = handler.clone();
+
+            let name = name.clone();
+            runners.push(Box::pin(async move {
+                info!("{} TCP listening at: {}:{}", name, addr, port,);
+                tcp_listener
+                    .listen_tcp()
+                    .await
+                    .inspect_err(|x| {
+                        error!("handler {} tcp listen failed: {x}", name);
+                    })
+                    .map_err(|e| e.into())
+            }));
+        }
+
+        if handler.handle_udp() {
+            let udp_listener = handler.clone();
+            let name = name.clone();
+            runners.push(Box::pin(async move {
+                info!("{} UDP listening at: {}:{}", name, addr, port,);
+                udp_listener
+                    .listen_udp()
+                    .await
+                    .inspect_err(|x| {
+                        error!("handler {} udp listen failed: {x}", name);
+                    })
+                    .map_err(|e| e.into())
+            }));
+        }
+
+        if runners.is_empty() {
+            warn!("no listener for {}", name);
+            return None;
+        }
+        Some(runners)
+    } else {
+        None
     }
-
-    if handler.handle_udp() {
-        let handler = handler.clone();
-        let name = name.clone();
-        runners.push(Box::pin(async move {
-            if let Err(err) = handler.listen_udp().await {
-                warn!("{} inbound udp listener stopped: {}", name, err);
-                return Err(err.into());
-            }
-            Ok(())
-        }));
-    }
-
-    Some(runners)
 }
 
 fn build_handler(
-    inbound_opts: &InboundOpts,
+    listener: &InboundOpts,
     dispatcher: Arc<Dispatcher>,
     authenticator: ThreadSafeAuthenticator,
 ) -> Option<Arc<dyn InboundHandlerTrait>> {
-    #[allow(unreachable_patterns)]
-    match inbound_opts {
-        InboundOpts::Socks { common_opts, udp } => {
-            if *udp {
-                warn!(
-                    "{} SOCKS UDP is not implemented in this build",
-                    common_opts.name
-                );
-            }
-            Some(Arc::new(SocksInbound::new(
-                common_opts.clone(),
-                dispatcher,
-                authenticator,
-            )))
-        }
-        _ => {
-            debug!(
-                "inbound listener {} is not implemented in this build",
-                inbound_opts.common_opts().name
-            );
-            None
-        }
+    let fw_mark = listener.common_opts().fw_mark;
+    match listener {
+        InboundOpts::Socks { common_opts, .. } => Some(Arc::new(SocksInbound::new(
+            (common_opts.listen.0, common_opts.port).into(),
+            common_opts.allow_lan,
+            dispatcher,
+            authenticator,
+            fw_mark,
+        ))),
     }
 }

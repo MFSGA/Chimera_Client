@@ -12,10 +12,8 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::{
-    app::dispatcher::Dispatcher,
-    common::auth::ThreadSafeAuthenticator,
-    config::internal::listener::CommonInboundOpts,
-    proxy::inbound::InboundHandlerTrait,
+    app::dispatcher::Dispatcher, common::auth::ThreadSafeAuthenticator,
+    config::internal::listener::CommonInboundOpts, proxy::{inbound::InboundHandlerTrait, utils::socket_helpers::try_create_dualstack_tcplistener},
 };
 
 const SOCKS5_VERSION: u8 = 0x05;
@@ -28,26 +26,33 @@ const REP_GENERAL_FAILURE: u8 = 0x01;
 const REP_COMMAND_NOT_SUPPORTED: u8 = 0x07;
 
 pub struct SocksInbound {
-    name: String,
-    listen_addr: SocketAddr,
+    addr: SocketAddr,
     allow_lan: bool,
     dispatcher: Arc<Dispatcher>,
     authenticator: ThreadSafeAuthenticator,
+    fw_mark: Option<u32>,
+}
+
+impl Drop for SocksInbound {
+    fn drop(&mut self) {
+        warn!("SOCKS5 inbound listener on {} stopped", self.addr);
+    }
 }
 
 impl SocksInbound {
     pub fn new(
-        common_opts: CommonInboundOpts,
+        addr: SocketAddr,
+        allow_lan: bool,
         dispatcher: Arc<Dispatcher>,
         authenticator: ThreadSafeAuthenticator,
+        fw_mark: Option<u32>,
     ) -> Self {
-        let listen_addr = SocketAddr::new(common_opts.listen.0, common_opts.port);
         Self {
-            name: common_opts.name,
-            listen_addr,
-            allow_lan: common_opts.allow_lan,
+            addr,
+            allow_lan,
             dispatcher,
             authenticator,
+            fw_mark,
         }
     }
 }
@@ -62,27 +67,34 @@ impl InboundHandlerTrait for SocksInbound {
         false
     }
 
-    async fn listen_tcp(&self) -> io::Result<()> {
-        let listener = TcpListener::bind(self.listen_addr).await?;
-        info!(
-            "{} SOCKS5 listening at: {}",
-            self.name, self.listen_addr
-        );
+    async fn listen_tcp(&self) -> std::io::Result<()> {
+        let listener = try_create_dualstack_tcplistener(self.addr)?;
 
         loop {
-            let (socket, peer) = listener.accept().await?;
-            if !self.allow_lan && !peer.ip().is_loopback() {
-                warn!("{} connection from {} is not allowed", self.name, peer);
+            let (socket, _) = listener.accept().await?;
+            todo!()
+            /* let src_addr = socket.peer_addr()?.to_canonical();
+            if !self.allow_lan && src_addr.ip() != socket.local_addr()?.ip().to_canonical() {
+                warn!("Connection from {} is not allowed", src_addr);
                 continue;
             }
+            apply_tcp_options(&socket)?;
 
+            let mut sess = Session {
+                network: Network::Tcp,
+                typ: Type::Socks5,
+                source: socket.peer_addr()?.to_canonical(),
+                so_mark: self.fw_mark,
+
+                ..Default::default()
+            };
+
+            let dispatcher = self.dispatcher.clone();
             let authenticator = self.authenticator.clone();
-            let name = self.name.clone();
-            tokio::spawn(async move {
-                if let Err(err) = handle_socks5_connection(socket, authenticator).await {
-                    warn!("{} SOCKS5 connection failed: {}", name, err);
-                }
-            });
+
+            tokio::spawn(
+                async move { handle_tcp(&mut sess, socket, dispatcher, authenticator).await },
+            ); */
         }
     }
 
@@ -143,9 +155,9 @@ async fn handle_socks5_connection(
         }
     };
 
-    let bind_addr = outbound.local_addr().unwrap_or_else(|_| {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
-    });
+    let bind_addr = outbound
+        .local_addr()
+        .unwrap_or_else(|_| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
     send_reply(&mut stream, REP_SUCCEEDED, Some(bind_addr)).await?;
 
     let _ = tokio::io::copy_bidirectional(&mut stream, &mut outbound).await?;
@@ -207,7 +219,11 @@ async fn negotiate_auth(
         let pass = String::from_utf8_lossy(&pass);
 
         let ok = authenticator.authenticate(&user, &pass);
-        let status = if ok { REP_SUCCEEDED } else { REP_GENERAL_FAILURE };
+        let status = if ok {
+            REP_SUCCEEDED
+        } else {
+            REP_GENERAL_FAILURE
+        };
         stream.write_all(&[0x01, status]).await?;
 
         if !ok {
@@ -281,9 +297,7 @@ async fn send_reply(
     rep: u8,
     bind_addr: Option<SocketAddr>,
 ) -> io::Result<()> {
-    let addr = bind_addr.unwrap_or_else(|| {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
-    });
+    let addr = bind_addr.unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
 
     let mut buf = Vec::with_capacity(22);
     buf.push(SOCKS5_VERSION);
