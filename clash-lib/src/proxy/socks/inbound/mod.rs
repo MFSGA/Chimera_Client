@@ -16,10 +16,11 @@ use crate::{
     common::auth::ThreadSafeAuthenticator,
     config::internal::listener::CommonInboundOpts,
     proxy::{
-        inbound::InboundHandlerTrait,
-        utils::{apply_tcp_options, try_create_dualstack_tcplistener, ToCanonical},
-    },
+        inbound::InboundHandlerTrait, socks::inbound::stream::handle_tcp, utils::{ToCanonical, apply_tcp_options, try_create_dualstack_tcplistener}
+    }, session::{Network, Session, Type},
 };
+
+mod stream;
 
 const SOCKS5_VERSION: u8 = 0x05;
 const METHOD_NO_AUTH: u8 = 0x00;
@@ -88,8 +89,8 @@ impl InboundHandlerTrait for SocksInbound {
                 continue;
             }
             apply_tcp_options(&socket)?;
-            todo!()
-            /* let mut sess = Session {
+
+            let mut sess = Session {
                 network: Network::Tcp,
                 typ: Type::Socks5,
                 source: socket.peer_addr()?.to_canonical(),
@@ -102,8 +103,8 @@ impl InboundHandlerTrait for SocksInbound {
             let authenticator = self.authenticator.clone();
 
             tokio::spawn(
-                async move { handle_tcp(&mut sess, socket, dispatcher, authenticator).await },
-            ); */
+                async move { handle_tcp(&mut sess, socket, dispatcher, authenticator).await }
+            );
         }
     }
 

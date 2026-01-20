@@ -41,6 +41,8 @@ mod common;
 mod config;
 /// 3
 mod proxy;
+/// 5
+mod session;
 
 #[derive(Error, Debug)]
 pub enum Error {
