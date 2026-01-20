@@ -3,10 +3,9 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use tracing::debug;
-
 use async_trait::async_trait;
-use hickory_proto::op::Message;
+use rand::seq::IteratorRandom;
+use tracing::{debug, warn};
 
 use crate::app::dns::{ClashResolver, ResolverKind};
 
@@ -39,5 +38,25 @@ impl ClashResolver for SystemResolver {
 
     fn ipv6(&self) -> bool {
         self.ipv6.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    async fn resolve(&self, host: &str, _: bool) -> anyhow::Result<Option<std::net::IpAddr>> {
+        let response = tokio::net::lookup_host(format!("{host}:0"))
+            .await?
+            .filter_map(|x| {
+                if self.ipv6() || x.is_ipv4() {
+                    Some(x.ip())
+                } else {
+                    warn!(
+                        "resolved v6 address {} for {} but ipv6 is disabled",
+                        x.ip(),
+                        host
+                    );
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        // todo: use the first address for now, we may want to randomize it later
+        Ok(response.into_iter().choose(&mut rand::rng()))
     }
 }

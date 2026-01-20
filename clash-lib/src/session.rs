@@ -1,5 +1,7 @@
 use std::{
-    fmt::{Display, Formatter}, io, net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr}
+    fmt::{Display, Formatter},
+    io,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
 };
 
 use bytes::BufMut;
@@ -72,6 +74,13 @@ impl SocksAddr {
                 buf.put_slice(domain.as_bytes());
                 buf.put_u16(*port);
             }
+        }
+    }
+
+    pub fn host(&self) -> String {
+        match self {
+            SocksAddr::Ip(ip) => ip.ip().to_string(),
+            SocksAddr::Domain(domain, _) => domain.to_string(),
         }
     }
 }

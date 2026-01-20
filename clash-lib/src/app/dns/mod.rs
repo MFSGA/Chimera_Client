@@ -35,4 +35,7 @@ pub trait ClashResolver: Sync + Send {
     async fn exchange(&self, message: &op::Message) -> anyhow::Result<op::Message>;
 
     fn ipv6(&self) -> bool;
+
+    async fn resolve(&self, host: &str, enhanced: bool)
+    -> anyhow::Result<Option<std::net::IpAddr>>;
 }
