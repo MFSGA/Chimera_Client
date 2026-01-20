@@ -4,7 +4,8 @@ mod statistics_manager;
 mod tracked;
 
 pub use dispatcher_impl::Dispatcher;
-pub use statistics_manager::Manager as StatisticsManager;
+pub use statistics_manager::StatisticsManager;
 
+pub use tracked::{BoxedChainedStream, TrackedStream};
 // #[cfg(all(target_os = "linux", feature = "zero_copy"))]
 // pub use tracked::TrackCopy;

@@ -1,7 +1,11 @@
-use std::{fmt::Debug, sync::Arc};
+use std::{fmt::Debug, io, sync::Arc};
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
+
+use crate::{
+    app::dispatcher::BoxedChainedStream, app::dns::ThreadSafeDNSResolver, session::Session,
+};
 
 use downcast_rs::{Downcast, impl_downcast};
 
@@ -19,6 +23,13 @@ pub mod utils;
 pub trait OutboundHandler: Sync + Send + Unpin + DialWithConnector + Debug {
     /// The name of the outbound handler
     fn name(&self) -> &str;
+
+    /// connect to remote target via TCP
+    async fn connect_stream(
+        &self,
+        sess: &Session,
+        resolver: ThreadSafeDNSResolver,
+    ) -> io::Result<BoxedChainedStream>;
 }
 
 #[async_trait]

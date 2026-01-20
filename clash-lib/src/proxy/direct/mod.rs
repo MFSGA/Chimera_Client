@@ -3,6 +3,8 @@ use std::fmt::Debug;
 use async_trait::async_trait;
 
 use crate::{
+    Session,
+    app::{dispatcher::BoxedChainedStream, dns::ThreadSafeDNSResolver},
     config::internal::proxy::PROXY_DIRECT,
     proxy::{DialWithConnector, OutboundHandler},
 };
@@ -32,5 +34,13 @@ impl DialWithConnector for Handler {}
 impl OutboundHandler for Handler {
     fn name(&self) -> &str {
         PROXY_DIRECT
+    }
+
+    async fn connect_stream(
+        &self,
+        sess: &Session,
+        resolver: ThreadSafeDNSResolver,
+    ) -> std::io::Result<BoxedChainedStream> {
+        todo!()
     }
 }

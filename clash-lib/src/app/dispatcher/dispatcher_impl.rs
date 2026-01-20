@@ -1,12 +1,11 @@
 use std::{fmt, sync::Arc};
 
 use tokio::{io::AsyncWriteExt, sync::RwLock};
-use tracing::{debug, info_span, instrument, trace, warn};
-use tracing_log::log;
+use tracing::{Instrument, debug, info_span, instrument, trace, warn};
 
 use crate::{
     app::{
-        dispatcher::statistics_manager::Manager,
+        dispatcher::{TrackedStream, statistics_manager::StatisticsManager},
         dns::{ClashResolver, ThreadSafeDNSResolver},
         outbound::manager::ThreadSafeOutboundManager,
     },
@@ -23,7 +22,7 @@ const DEFAULT_BUFFER_SIZE: usize = 16 * 1024;
 pub struct Dispatcher {
     outbound_manager: ThreadSafeOutboundManager,
     resolver: ThreadSafeDNSResolver,
-    statistics_manager: Arc<Manager>,
+    manager: Arc<StatisticsManager>,
     tcp_buffer_size: usize,
     mode: Arc<RwLock<RunMode>>,
 }
@@ -39,13 +38,13 @@ impl Dispatcher {
         outbound_manager: ThreadSafeOutboundManager,
         resolver: ThreadSafeDNSResolver,
         mode: RunMode,
-        statistics_manager: Arc<Manager>,
+        statistics_manager: Arc<StatisticsManager>,
         tcp_buffer_size: Option<usize>,
     ) -> Self {
         Self {
             outbound_manager,
             resolver,
-            statistics_manager,
+            manager: statistics_manager,
             tcp_buffer_size: tcp_buffer_size.unwrap_or(DEFAULT_BUFFER_SIZE),
             mode: Arc::new(RwLock::new(mode)),
         }
@@ -63,8 +62,8 @@ impl Dispatcher {
         self.resolver.clone()
     }
 
-    pub fn statistics_manager(&self) -> Arc<Manager> {
-        self.statistics_manager.clone()
+    pub fn statistics_manager(&self) -> Arc<StatisticsManager> {
+        self.manager.clone()
     }
 
     #[instrument(skip(self, sess, lhs))]
@@ -81,13 +80,13 @@ impl Dispatcher {
 
         let mode = *self.mode.read().await;
         // todo: fix the following code
-        let (outbound_name) = match mode {
-            RunMode::Global => (PROXY_GLOBAL),
+        let (outbound_name, rule) = match mode {
+            RunMode::Global => (PROXY_GLOBAL, None),
             RunMode::Rule => {
                 todo!();
                 // self.router.match_route(&mut sess).await,
             }
-            RunMode::Direct => (PROXY_DIRECT),
+            RunMode::Direct => (PROXY_DIRECT, None),
         };
 
         debug!("dispatching {} to {}[{}]", sess, outbound_name, mode);
@@ -98,7 +97,26 @@ impl Dispatcher {
             mgr.get_outbound(PROXY_DIRECT).unwrap()
         });
 
-        log::debug!(" todo: implement dispatch logic ");
+        match handler
+            .connect_stream(&sess, self.resolver.clone())
+            .instrument(info_span!("connect_stream", outbound_name = outbound_name,))
+            .await
+        {
+            Ok(rhs) => {
+                debug!("remote connection established {}", sess);
+                let rhs = TrackedStream::new(rhs, self.manager.clone(), sess.clone(), rule).await;
+                todo!()
+            }
+            Err(err) => {
+                warn!(
+                    "failed to establish remote connection {}, error: {}",
+                    sess, err
+                );
+                if let Err(e) = lhs.shutdown().await {
+                    warn!("error closing local connection {}: {}", sess, e)
+                }
+            }
+        }
     }
 }
 

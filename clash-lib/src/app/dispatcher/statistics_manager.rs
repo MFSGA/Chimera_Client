@@ -7,13 +7,16 @@ use std::{
 };
 
 use serde::Serialize;
-use tokio::sync::{Mutex, oneshot::Sender};
+use tokio::sync::{Mutex, RwLock, oneshot::Sender};
 
-use crate::app::dispatcher::tracked::Tracked;
+use crate::{app::dispatcher::tracked::Tracked, session::Session};
+
+#[derive(Default, Clone, Debug)]
+pub struct ProxyChain(Arc<RwLock<Vec<String>>>);
 
 type ConnectionMap = HashMap<uuid::Uuid, (Tracked, Sender<()>)>;
 
-pub struct Manager {
+pub struct StatisticsManager {
     connections: Arc<Mutex<ConnectionMap>>,
     upload_temp: AtomicU64,
     download_temp: AtomicU64,
@@ -23,7 +26,7 @@ pub struct Manager {
     download_total: AtomicU64,
 }
 
-impl Manager {
+impl StatisticsManager {
     pub fn new() -> Arc<Self> {
         let v = Arc::new(Self {
             connections: Arc::new(Mutex::new(HashMap::new())),
@@ -55,7 +58,16 @@ impl Manager {
             self.download_temp.store(0, Ordering::Relaxed);
         }
     }
+
+    pub async fn track(&self, item: Tracked, close_notify: Sender<()>) {
+        let mut connections = self.connections.lock().await;
+
+        connections.insert(item.id(), (item, close_notify));
+    }
 }
 
 #[derive(Serialize, Default)]
-pub struct TrackerInfo {}
+pub struct TrackerInfo {
+    #[serde(rename = "id")]
+    pub uuid: uuid::Uuid,
+}

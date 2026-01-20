@@ -44,6 +44,8 @@ mod proxy;
 /// 5
 mod session;
 
+pub use session::Session;
+
 #[derive(Error, Debug)]
 pub enum Error {
     #[error(transparent)]
