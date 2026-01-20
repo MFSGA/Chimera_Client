@@ -3,6 +3,8 @@ use std::{fmt::Debug, sync::Arc};
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use downcast_rs::{Downcast, impl_downcast};
+
 pub mod direct;
 
 pub mod inbound;
@@ -27,3 +29,7 @@ pub type AnyOutboundHandler = Arc<dyn OutboundHandler>;
 pub trait ProxyStream: AsyncRead + AsyncWrite + Send + Sync + Unpin {}
 impl<T> ProxyStream for T where T: AsyncRead + AsyncWrite + Send + Sync + Unpin {}
 pub type AnyStream = Box<dyn ProxyStream>;
+
+pub trait ClientStream: Downcast + AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T> ClientStream for T where T: Downcast + AsyncRead + AsyncWrite + Send + Unpin {}
+impl_downcast!(ClientStream);

@@ -50,6 +50,9 @@ educe = "0.6"
 
 socket2 = { version = "0.6", features = ["all"] }
 
+# experimental
+downcast-rs = "2.0"
+
 [features]
 default = ["zero_copy", "aws-lc-rs"]
 

@@ -1,12 +1,13 @@
 use std::{fmt, sync::Arc};
 
+use tracing::instrument;
+
 use crate::{
     app::{
-        dispatcher::statistics_manager::Manager,
-        dns::ThreadSafeDNSResolver,
+        dispatcher::statistics_manager::Manager, dns::ThreadSafeDNSResolver,
         outbound::manager::ThreadSafeOutboundManager,
     },
-    proxy::AnyOutboundHandler,
+    proxy::{AnyOutboundHandler, ClientStream}, session::Session,
 };
 
 const DEFAULT_BUFFER_SIZE: usize = 16 * 1024;
@@ -18,7 +19,6 @@ pub struct Dispatcher {
     tcp_buffer_size: usize,
     // todo
     // mode: RunMode,
-
 }
 
 impl fmt::Debug for Dispatcher {
@@ -56,5 +56,10 @@ impl Dispatcher {
 
     pub fn statistics_manager(&self) -> Arc<Manager> {
         self.statistics_manager.clone()
+    }
+
+    #[instrument(skip(self, sess, lhs))]
+    pub async fn dispatch_stream(&self, mut sess: Session, mut lhs: Box<dyn ClientStream>) {
+        todo!()
     }
 }
