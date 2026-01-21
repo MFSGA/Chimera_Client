@@ -71,10 +71,29 @@ impl StatisticsManager {
 
         connections.insert(item.id(), (item, close_notify));
     }
+
+    pub fn push_downloaded(&self, n: usize) {
+        self.download_temp
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        self.download_total
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn push_uploaded(&self, n: usize) {
+        self.upload_temp
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        self.upload_total
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[derive(Serialize, Default)]
 pub struct TrackerInfo {
     #[serde(rename = "id")]
     pub uuid: uuid::Uuid,
+
+    #[serde(rename = "upload")]
+    pub upload_total: AtomicU64,
+    #[serde(rename = "download")]
+    pub download_total: AtomicU64,
 }

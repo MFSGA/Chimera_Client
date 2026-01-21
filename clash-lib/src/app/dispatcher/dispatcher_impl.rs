@@ -1,7 +1,8 @@
-use std::{fmt, sync::Arc};
+use std::{fmt, sync::Arc, time::Duration};
 
 use tokio::{io::AsyncWriteExt, sync::RwLock};
 use tracing::{Instrument, debug, info_span, instrument, trace, warn};
+use tracing_log::log;
 
 use crate::{
     app::{
@@ -9,6 +10,7 @@ use crate::{
         dns::{ClashResolver, ThreadSafeDNSResolver},
         outbound::manager::ThreadSafeOutboundManager,
     },
+    common::io::copy_bidirectional,
     config::{
         def::RunMode,
         internal::proxy::{PROXY_DIRECT, PROXY_GLOBAL},
@@ -105,7 +107,63 @@ impl Dispatcher {
             Ok(rhs) => {
                 debug!("remote connection established {}", sess);
                 let rhs = TrackedStream::new(rhs, self.manager.clone(), sess.clone(), rule).await;
-                todo!()
+                log::debug!("todo use custom error");
+                match copy_bidirectional(
+                    lhs,
+                    rhs,
+                    self.tcp_buffer_size,
+                    Duration::from_secs(10),
+                    Duration::from_secs(10),
+                )
+                .instrument(info_span!(
+                    "copy_bidirectional",
+                    outbound_name = outbound_name,
+                ))
+                .await
+                {
+                    Ok((up, down)) => {
+                        debug!(
+                            "connection {} closed with {} bytes up, {} bytes down",
+                            sess, up, down
+                        );
+                    }
+                    Err(err) => match err {
+                        crate::common::io::CopyBidirectionalError::LeftClosed(err) => match err
+                            .kind()
+                        {
+                            std::io::ErrorKind::UnexpectedEof
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::BrokenPipe => {
+                                debug!("connection {} closed with error {} by local", sess, err);
+                            }
+                            _ => {
+                                warn!("connection {} closed with error {} by local", sess, err);
+                            }
+                        },
+                        crate::common::io::CopyBidirectionalError::RightClosed(err) => match err
+                            .kind()
+                        {
+                            std::io::ErrorKind::UnexpectedEof
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::BrokenPipe => {
+                                debug!("connection {} closed with error {} by remote", sess, err);
+                            }
+                            _ => {
+                                warn!("connection {} closed with error {} by remote", sess, err);
+                            }
+                        },
+                        crate::common::io::CopyBidirectionalError::Other(err) => match err.kind() {
+                            std::io::ErrorKind::UnexpectedEof
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::BrokenPipe => {
+                                debug!("connection {} closed with error {}", sess, err);
+                            }
+                            _ => {
+                                warn!("connection {} closed with error {}", sess, err);
+                            }
+                        },
+                    },
+                }
             }
             Err(err) => {
                 warn!(
