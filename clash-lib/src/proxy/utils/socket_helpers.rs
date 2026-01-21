@@ -4,7 +4,12 @@ use std::time::Duration;
 
 use socket2::TcpKeepalive;
 
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
+use tokio::time::timeout;
+use tracing::{debug, trace};
+
+use crate::app::net::OutboundInterface;
+use crate::proxy::utils::platform::win::must_bind_socket_on_interface;
 
 pub fn apply_tcp_options(s: &TcpStream) -> std::io::Result<()> {
     #[cfg(not(target_os = "windows"))]
@@ -76,4 +81,46 @@ impl ToCanonical for SocketAddr {
         self.set_ip(self.ip().to_canonical());
         self
     }
+}
+
+// #[instrument(skip(so_mark))]
+pub async fn new_tcp_stream(
+    endpoint: SocketAddr,
+    iface: Option<&OutboundInterface>,
+    #[cfg(target_os = "linux")] so_mark: Option<u32>,
+) -> std::io::Result<TcpStream> {
+    let (socket, family) = match endpoint {
+        SocketAddr::V4(_) => (
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?,
+            socket2::Domain::IPV4,
+        ),
+        SocketAddr::V6(_) => (
+            socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::STREAM, None)?,
+            socket2::Domain::IPV6,
+        ),
+    };
+    debug!("created tcp socket");
+
+    if !cfg!(target_os = "android")
+        && let Some(iface) = iface
+    {
+        must_bind_socket_on_interface(&socket, iface, family)?;
+        trace!("tcp socket bound to interface: {socket:?}");
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[cfg(target_os = "linux")]
+    if let Some(so_mark) = so_mark {
+        socket.set_mark(so_mark)?;
+    }
+
+    socket.set_keepalive(true)?;
+    socket.set_tcp_nodelay(true)?;
+    socket.set_nonblocking(true)?;
+
+    timeout(
+        Duration::from_secs(10),
+        TcpSocket::from_std_stream(socket.into()).connect(endpoint),
+    )
+    .await?
 }

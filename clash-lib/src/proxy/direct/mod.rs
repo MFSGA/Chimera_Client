@@ -5,10 +5,13 @@ use futures::TryFutureExt;
 
 use crate::{
     Session,
-    app::{dispatcher::BoxedChainedStream, dns::ThreadSafeDNSResolver},
+    app::{
+        dispatcher::{BoxedChainedStream, ChainedStream, ChainedStreamWrapper},
+        dns::ThreadSafeDNSResolver,
+    },
     common::errors::map_io_error,
     config::internal::proxy::PROXY_DIRECT,
-    proxy::{DialWithConnector, OutboundHandler},
+    proxy::{DialWithConnector, OutboundHandler, utils::new_tcp_stream},
 };
 
 #[derive(Clone)]
@@ -49,8 +52,7 @@ impl OutboundHandler for Handler {
             .await?
             .ok_or_else(|| std::io::Error::other("no dns result"))?;
 
-        todo!()
-        /* let s = new_tcp_stream(
+        let s = new_tcp_stream(
             (remote_ip, sess.destination.port()).into(),
             sess.iface.as_ref(),
             #[cfg(target_os = "linux")]
@@ -60,6 +62,6 @@ impl OutboundHandler for Handler {
 
         let s = ChainedStreamWrapper::new(s);
         s.append_to_chain(self.name()).await;
-        Ok(Box::new(s)) */
+        Ok(Box::new(s))
     }
 }

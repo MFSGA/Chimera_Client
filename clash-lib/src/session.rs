@@ -8,6 +8,8 @@ use bytes::BufMut;
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
+use crate::app::net::OutboundInterface;
+
 pub struct SocksAddrType;
 
 impl SocksAddrType {
@@ -83,6 +85,13 @@ impl SocksAddr {
             SocksAddr::Domain(domain, _) => domain.to_string(),
         }
     }
+
+    pub fn port(&self) -> u16 {
+        match self {
+            SocksAddr::Ip(ip) => ip.port(),
+            SocksAddr::Domain(_, port) => *port,
+        }
+    }
 }
 
 impl Clone for SocksAddr {
@@ -149,6 +158,8 @@ pub struct Session {
     pub destination: SocksAddr,
     /// The packet mark SO_MARK
     pub so_mark: Option<u32>,
+    /// The bind interface
+    pub iface: Option<OutboundInterface>,
 }
 
 impl Default for Session {
@@ -159,6 +170,7 @@ impl Default for Session {
             source: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0),
             destination: SocksAddr::any_ipv4(),
             so_mark: None,
+            iface: None,
         }
     }
 }
@@ -185,7 +197,8 @@ impl Clone for Session {
             destination: self.destination.clone(),
             // resolved_ip: self.resolved_ip,
             so_mark: self.so_mark,
-            /* iface: self.iface.as_ref().cloned(),
+            iface: self.iface.as_ref().cloned(),
+            /*
             asn: self.asn.clone(),
             traffic_stats: self.traffic_stats.clone(), */
         }

@@ -1,12 +1,14 @@
-use std::sync::Arc;
+use std::{pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
 use downcast_rs::{Downcast, impl_downcast};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::{
     app::{
         dispatcher::{
             StatisticsManager,
+            
             statistics_manager::{ProxyChain, TrackerInfo},
         },
         router::RuleMatcher,
@@ -35,6 +37,74 @@ pub trait ChainedStream: ProxyStream + Downcast {
 impl_downcast!(ChainedStream);
 
 pub type BoxedChainedStream = Box<dyn ChainedStream>;
+
+pub struct ChainedStreamWrapper<T> {
+    inner: T,
+    chain: ProxyChain,
+}
+
+impl<T> ChainedStreamWrapper<T> {
+    pub fn new(inner: T) -> Self {
+        Self {
+            inner,
+            chain: ProxyChain::default(),
+        }
+    }
+}
+
+#[async_trait]
+impl<T> ChainedStream for ChainedStreamWrapper<T>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
+{
+    fn chain(&self) -> &ProxyChain {
+        &self.chain
+    }
+
+    async fn append_to_chain(&self, name: &str) {
+        self.chain.push(name.to_owned()).await;
+    }
+}
+
+impl<T> AsyncRead for ChainedStreamWrapper<T>
+where
+    T: AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<T> AsyncWrite for ChainedStreamWrapper<T>
+where
+    T: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
 
 pub struct TrackedStream {
     inner: BoxedChainedStream,

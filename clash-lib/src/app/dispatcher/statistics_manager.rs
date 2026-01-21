@@ -14,6 +14,13 @@ use crate::{app::dispatcher::tracked::Tracked, session::Session};
 #[derive(Default, Clone, Debug)]
 pub struct ProxyChain(Arc<RwLock<Vec<String>>>);
 
+impl ProxyChain {
+    pub async fn push(&self, s: String) {
+        let mut chain = self.0.write().await;
+        chain.push(s);
+    }
+}
+
 type ConnectionMap = HashMap<uuid::Uuid, (Tracked, Sender<()>)>;
 
 pub struct StatisticsManager {
