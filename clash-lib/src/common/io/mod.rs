@@ -145,8 +145,7 @@ impl CopyBuffer {
             // If our buffer has some data, let's write it out!
             while self.pos < self.cap {
                 let me = &mut *self;
-                let i =
-                    ready!(writer.as_mut().poll_write(cx, &me.buf[me.pos..me.cap]))?;
+                let i = ready!(writer.as_mut().poll_write(cx, &me.buf[me.pos..me.cap]))?;
                 if i == 0 {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::WriteZero,
@@ -231,17 +230,14 @@ where
                             continue;
                         }
                         Poll::Ready(Err(err)) => {
-                            return Poll::Ready(Err(
-                                CopyBidirectionalError::LeftClosed(err),
-                            ));
+                            return Poll::Ready(Err(CopyBidirectionalError::LeftClosed(err)));
                         }
                         Poll::Pending => {
                             if let Some(delay) = a_to_b_delay {
                                 match delay.as_mut().poll(cx) {
                                     Poll::Ready(()) => {
-                                        *a_to_b = TransferState::ShuttingDown(
-                                            buf.amount_transferred(),
-                                        );
+                                        *a_to_b =
+                                            TransferState::ShuttingDown(buf.amount_transferred());
                                         continue;
                                     }
                                     Poll::Pending => (),
@@ -256,15 +252,12 @@ where
                         Poll::Ready(Ok(())) => {
                             *a_to_b_count += *count;
                             *a_to_b = TransferState::Done;
-                            b_to_a_delay.replace(Box::pin(tokio::time::sleep(
-                                *b_to_a_timeout_duration,
-                            )));
+                            b_to_a_delay
+                                .replace(Box::pin(tokio::time::sleep(*b_to_a_timeout_duration)));
                             continue;
                         }
                         Poll::Ready(Err(err)) => {
-                            return Poll::Ready(Err(
-                                CopyBidirectionalError::LeftClosed(err),
-                            ));
+                            return Poll::Ready(Err(CopyBidirectionalError::LeftClosed(err)));
                         }
                         Poll::Pending => (),
                     }
@@ -281,17 +274,14 @@ where
                             continue;
                         }
                         Poll::Ready(Err(err)) => {
-                            return Poll::Ready(Err(
-                                CopyBidirectionalError::RightClosed(err),
-                            ));
+                            return Poll::Ready(Err(CopyBidirectionalError::RightClosed(err)));
                         }
                         Poll::Pending => {
                             if let Some(delay) = b_to_a_delay {
                                 match delay.as_mut().poll(cx) {
                                     Poll::Ready(()) => {
-                                        *b_to_a = TransferState::ShuttingDown(
-                                            buf.amount_transferred(),
-                                        );
+                                        *b_to_a =
+                                            TransferState::ShuttingDown(buf.amount_transferred());
                                         continue;
                                     }
                                     Poll::Pending => (),
@@ -306,15 +296,12 @@ where
                         Poll::Ready(Ok(())) => {
                             *b_to_a_count += *count;
                             *b_to_a = TransferState::Done;
-                            a_to_b_delay.replace(Box::pin(tokio::time::sleep(
-                                *a_to_b_timeout_duration,
-                            )));
+                            a_to_b_delay
+                                .replace(Box::pin(tokio::time::sleep(*a_to_b_timeout_duration)));
                             continue;
                         }
                         Poll::Ready(Err(err)) => {
-                            return Poll::Ready(Err(
-                                CopyBidirectionalError::RightClosed(err),
-                            ));
+                            return Poll::Ready(Err(CopyBidirectionalError::RightClosed(err)));
                         }
                         Poll::Pending => (),
                     }
@@ -448,8 +435,7 @@ impl<T: ReadExactBase> ReadExt for T {
                 // # safety: read_pos<size==read_buf.len(), and
                 // read_buf[0..read_pos] is initialized
                 let dst = unsafe {
-                    &mut *((&mut read_buf[*read_pos..size]) as *mut _
-                        as *mut [MaybeUninit<u8>])
+                    &mut *((&mut read_buf[*read_pos..size]) as *mut _ as *mut [MaybeUninit<u8>])
                 };
                 let mut buf = ReadBuf::uninit(dst);
                 let ptr = buf.filled().as_ptr();

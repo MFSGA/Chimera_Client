@@ -16,11 +16,7 @@ pub(crate) fn must_bind_socket_on_interface(
                 error!("failed to bind socket to interface {}: {e}", iface.name);
             })
     }
-    #[cfg(not(any(
-        target_os = "android",
-        target_os = "fuchsia",
-        target_os = "linux",
-    )))]
+    #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux",)))]
     {
         use crate::common::errors::new_io_error;
         Err(new_io_error(format!(

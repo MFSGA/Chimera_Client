@@ -11,7 +11,10 @@ use crate::{
     config::internal::proxy::{
         OutboundGroupProtocol, OutboundProxyProtocol, OutboundProxyProviderDef,
     },
-    proxy::{AnyOutboundHandler, direct, reject, utils::{DirectConnector, ProxyConnector}},
+    proxy::{
+        AnyOutboundHandler, direct, reject,
+        utils::{DirectConnector, ProxyConnector},
+    },
 };
 
 pub struct OutboundManager {

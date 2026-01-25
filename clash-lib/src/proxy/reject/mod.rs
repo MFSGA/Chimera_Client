@@ -1,3 +1,5 @@
+use std::io;
+
 use async_trait::async_trait;
 use serde::Serialize;
 
@@ -41,9 +43,9 @@ impl OutboundHandler for Handler {
 
     async fn connect_stream(
         &self,
-        sess: &Session,
-        resolver: ThreadSafeDNSResolver,
-    ) -> std::io::Result<BoxedChainedStream> {
-        todo!()
+        #[allow(unused_variables)] sess: &Session,
+        #[allow(unused_variables)] _resolver: ThreadSafeDNSResolver,
+    ) -> io::Result<BoxedChainedStream> {
+        Err(io::Error::other("REJECT"))
     }
 }

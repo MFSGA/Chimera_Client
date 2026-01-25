@@ -19,9 +19,9 @@ use crate::{
 };
 
 mod general;
-mod proxy_group;
 /// 3
 mod listener;
+mod proxy_group;
 
 impl TryFrom<def::Config> for config::Config {
     type Error = crate::Error;

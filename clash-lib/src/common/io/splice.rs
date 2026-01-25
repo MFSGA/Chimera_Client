@@ -176,29 +176,18 @@ where
         self.amt
     }
 
-    fn poll_fill_buf(
-        &mut self,
-        cx: &mut Context<'_>,
-        stream: &mut R,
-    ) -> Poll<Result<usize>> {
+    fn poll_fill_buf(&mut self, cx: &mut Context<'_>, stream: &mut R) -> Poll<Result<usize>> {
         loop {
             ready!(stream.poll_read_ready_n(cx))?;
 
             let res: std::result::Result<_, std::io::Error> =
                 stream.try_io_n(Interest::READABLE, || {
-                    match splice(
-                        stream.as_raw_fd(),
-                        self.buf.write_fd(),
-                        isize::MAX as usize,
-                    ) {
+                    match splice(stream.as_raw_fd(), self.buf.write_fd(), isize::MAX as usize) {
                         size if size >= 0 => Ok(size as usize),
                         _ => {
                             let err = Error::last_os_error();
                             match err.raw_os_error() {
-                                Some(e)
-                                    if e == libc::EWOULDBLOCK
-                                        || e == libc::EAGAIN =>
-                                {
+                                Some(e) if e == libc::EWOULDBLOCK || e == libc::EAGAIN => {
                                     Err(ErrorKind::WouldBlock.into())
                                 }
                                 _ => Err(err),
@@ -226,27 +215,17 @@ where
         }
     }
 
-    fn poll_write_buf(
-        &mut self,
-        cx: &mut Context<'_>,
-        stream: &mut W,
-    ) -> Poll<Result<usize>> {
+    fn poll_write_buf(&mut self, cx: &mut Context<'_>, stream: &mut W) -> Poll<Result<usize>> {
         loop {
             ready!(stream.poll_write_ready_n(cx)?);
 
             let res = stream.try_io_n(Interest::WRITABLE, || {
-                match splice(
-                    self.buf.read_fd(),
-                    stream.as_raw_fd(),
-                    self.cap - self.pos,
-                ) {
+                match splice(self.buf.read_fd(), stream.as_raw_fd(), self.cap - self.pos) {
                     size if size >= 0 => Ok(size as usize),
                     _ => {
                         let err = Error::last_os_error();
                         match err.raw_os_error() {
-                            Some(e)
-                                if e == libc::EWOULDBLOCK || e == libc::EAGAIN =>
-                            {
+                            Some(e) if e == libc::EWOULDBLOCK || e == libc::EAGAIN => {
                                 Err(ErrorKind::WouldBlock.into())
                             }
                             _ => Err(err),
@@ -268,11 +247,7 @@ where
         }
     }
 
-    fn poll_flush_buf(
-        &mut self,
-        cx: &mut Context<'_>,
-        stream: &mut W,
-    ) -> Poll<Result<()>> {
+    fn poll_flush_buf(&mut self, cx: &mut Context<'_>, stream: &mut W) -> Poll<Result<()>> {
         Pin::new(stream).poll_flush(cx).map_err(|e| e.into())
     }
 }
@@ -282,12 +257,7 @@ where
     R: Stream + Unpin,
     W: Stream + Unpin,
 {
-    fn poll_copy(
-        &mut self,
-        cx: &mut Context<'_>,
-        r: &mut R,
-        w: &mut W,
-    ) -> Poll<Result<u64>> {
+    fn poll_copy(&mut self, cx: &mut Context<'_>, r: &mut R, w: &mut W) -> Poll<Result<u64>> {
         loop {
             // If our buffer is empty, then we need to read some data to
             // continue.
@@ -316,12 +286,10 @@ where
                 let size = ready!(self.poll_write_buf(cx, w))?;
 
                 if size == 0 {
-                    return Poll::Ready(Err(CopyBidirectionalError::Other(
-                        Error::new(
-                            ErrorKind::WriteZero,
-                            "write zero byte into writer",
-                        ),
-                    )));
+                    return Poll::Ready(Err(CopyBidirectionalError::Other(Error::new(
+                        ErrorKind::WriteZero,
+                        "write zero byte into writer",
+                    ))));
                 } else {
                     self.pos += size;
                     self.amt += size as u64;
@@ -511,9 +479,8 @@ where
                             if let Some(delay) = a_to_b_delay {
                                 match delay.as_mut().poll(cx) {
                                     Poll::Ready(()) => {
-                                        *a_to_b = TransferState::ShuttingDown(
-                                            buf.amount_transferred(),
-                                        );
+                                        *a_to_b =
+                                            TransferState::ShuttingDown(buf.amount_transferred());
                                         continue;
                                     }
                                     Poll::Pending => (),
@@ -529,15 +496,12 @@ where
                             *a_to_b_count += *count;
                             write_tracker.track(*count as _);
                             *a_to_b = TransferState::Done;
-                            b_to_a_delay.replace(Box::pin(tokio::time::sleep(
-                                *b_to_a_timeout_duration,
-                            )));
+                            b_to_a_delay
+                                .replace(Box::pin(tokio::time::sleep(*b_to_a_timeout_duration)));
                             continue;
                         }
                         Poll::Ready(Err(err)) => {
-                            return Poll::Ready(Err(
-                                CopyBidirectionalError::LeftClosed(err),
-                            ));
+                            return Poll::Ready(Err(CopyBidirectionalError::LeftClosed(err)));
                         }
                         Poll::Pending => (),
                     }
@@ -565,9 +529,8 @@ where
                             if let Some(delay) = b_to_a_delay {
                                 match delay.as_mut().poll(cx) {
                                     Poll::Ready(()) => {
-                                        *b_to_a = TransferState::ShuttingDown(
-                                            buf.amount_transferred(),
-                                        );
+                                        *b_to_a =
+                                            TransferState::ShuttingDown(buf.amount_transferred());
                                         continue;
                                     }
                                     Poll::Pending => (),
@@ -583,15 +546,12 @@ where
                             *b_to_a_count += *count;
                             read_tracker.track(*count as _);
                             *b_to_a = TransferState::Done;
-                            a_to_b_delay.replace(Box::pin(tokio::time::sleep(
-                                *a_to_b_timeout_duration,
-                            )));
+                            a_to_b_delay
+                                .replace(Box::pin(tokio::time::sleep(*a_to_b_timeout_duration)));
                             continue;
                         }
                         Poll::Ready(Err(err)) => {
-                            return Poll::Ready(Err(
-                                CopyBidirectionalError::RightClosed(err),
-                            ));
+                            return Poll::Ready(Err(CopyBidirectionalError::RightClosed(err)));
                         }
                         Poll::Pending => (),
                     }

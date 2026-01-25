@@ -66,7 +66,7 @@ pub(super) fn convert(
         warn!("Duplicate HTTP inbound listener found: {}", http_port);
     } */
 
-    warn!("support socks5 udp later" );
+    warn!("support socks5 udp later");
     if let Some(Port(socks_port)) = socks_port
         && !all_inbounds.insert(InboundOpts::Socks {
             common_opts: CommonInboundOpts {

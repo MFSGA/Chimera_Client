@@ -8,7 +8,8 @@ use crate::{
     app::{
         dispatcher::{TrackedStream, statistics_manager::StatisticsManager},
         dns::{ClashResolver, ThreadSafeDNSResolver},
-        outbound::manager::ThreadSafeOutboundManager, router::ThreadSafeRouter,
+        outbound::manager::ThreadSafeOutboundManager,
+        router::ThreadSafeRouter,
     },
     common::io::copy_bidirectional,
     config::{

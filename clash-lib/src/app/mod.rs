@@ -4,18 +4,17 @@ pub mod api;
 pub mod dispatcher;
 /// 4
 pub mod dns;
-/// 1
-pub mod logging;
 /// 5
 pub mod inbound;
+/// 1
+pub mod logging;
+/// 8
+pub mod net;
 /// 5
 pub mod outbound;
 /// 6
 pub mod profile;
 /// 7
 pub mod router;
-/// 8
-pub mod net;
-
+/// 9
 pub mod remote_content_manager;
-
