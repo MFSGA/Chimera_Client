@@ -55,6 +55,8 @@ downcast-rs = "2.0"
 
 rand = "0.9"
 
+chrono = { version = "0.4", features = ["serde"] }
+
 [features]
 default = ["zero_copy", "aws-lc-rs"]
 

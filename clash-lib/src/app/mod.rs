@@ -16,3 +16,6 @@ pub mod profile;
 pub mod router;
 /// 8
 pub mod net;
+
+pub mod remote_content_manager;
+

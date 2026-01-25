@@ -19,7 +19,8 @@ use crate::{
         inbound::manager::InboundManager,
         logging::LogEvent,
         outbound::manager::OutboundManager,
-        profile, router::Router,
+        profile,
+        router::Router,
     },
     common::{
         auth,
@@ -347,6 +348,7 @@ async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<Runti
             dns_resolver.clone(),
             cache_store.clone(),
             cwd.to_string_lossy().to_string(),
+            // config.general.routing_mask,
         )
         .await?,
     );

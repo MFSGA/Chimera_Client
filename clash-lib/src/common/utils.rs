@@ -99,3 +99,13 @@ where
         return Ok(());
     }
 }
+
+pub fn serialize_duration<S>(
+    duration: &std::time::Duration,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_u128(duration.as_millis())
+}

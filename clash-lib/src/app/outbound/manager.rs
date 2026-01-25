@@ -1,8 +1,13 @@
 use std::{collections::HashMap, sync::Arc};
 
+use tracing::debug;
+
 use crate::{
     Error,
-    app::{dns::ThreadSafeDNSResolver, profile::ThreadSafeCacheFile},
+    app::{
+        dns::ThreadSafeDNSResolver, profile::ThreadSafeCacheFile,
+        remote_content_manager::ProxyManager,
+    },
     config::internal::proxy::{
         OutboundGroupProtocol, OutboundProxyProtocol, OutboundProxyProviderDef,
     },
@@ -11,7 +16,8 @@ use crate::{
 
 pub struct OutboundManager {
     handlers: HashMap<String, AnyOutboundHandler>,
-    proxy_names: Vec<String>,
+    proxy_manager: ProxyManager,
+    // proxy_names: Vec<String>,
 }
 
 pub type ThreadSafeOutboundManager = Arc<OutboundManager>;
@@ -39,10 +45,22 @@ impl OutboundManager {
         outbound_groups: Vec<OutboundGroupProtocol>,
         proxy_providers: HashMap<String, OutboundProxyProviderDef>,
         proxy_names: Vec<String>,
-        _dns_resolver: ThreadSafeDNSResolver,
+        dns_resolver: ThreadSafeDNSResolver,
         _cache_store: ThreadSafeCacheFile,
         _cwd: String,
+        // fw_mark: Option<u32>,
     ) -> Result<Self, Error> {
+        let handlers = HashMap::new();
+
+        let proxy_manager = ProxyManager::new(dns_resolver.clone());
+
+        let mut m = Self {
+            handlers,
+            proxy_manager,
+            // selector_control,
+            // proxy_providers: provider_registry,
+        };
+
         if !proxy_providers.is_empty() {
             return Err(Error::InvalidConfig(
                 "proxy providers are not supported yet".to_string(),
@@ -55,14 +73,12 @@ impl OutboundManager {
             ));
         }
 
-        let mut manager = Self {
-            handlers: HashMap::new(),
-            proxy_names,
-        };
+        m.load_handlers(outbounds)?;
 
-        manager.load_handlers(outbounds)?;
+        debug!("initializing connectors");
+        m.init_handler_connectors().await?;
 
-        Ok(manager)
+        Ok(m)
     }
 
     pub fn get_outbound(&self, name: &str) -> Option<AnyOutboundHandler> {
@@ -70,7 +86,8 @@ impl OutboundManager {
     }
 
     pub fn proxy_names(&self) -> &[String] {
-        &self.proxy_names
+        todo!()
+        // &self.proxy_names
     }
 
     fn load_handlers(&mut self, outbounds: Vec<AnyOutboundHandler>) -> Result<(), Error> {
@@ -99,9 +116,18 @@ impl OutboundManager {
                 }
                 // todo: support more outbound protocols
                 _ => {
-                    todo!("unsupported outbound protocol in plain outbound: {:?}", outbound)
+                    todo!(
+                        "unsupported outbound protocol in plain outbound: {:?}",
+                        outbound
+                    )
                 }
             })
             .collect()
+    }
+
+    /// Lazy initialization of connectors for each handler.
+    async fn init_handler_connectors(&self) -> Result<(), Error> {
+        todo!();
+        Ok(())
     }
 }
