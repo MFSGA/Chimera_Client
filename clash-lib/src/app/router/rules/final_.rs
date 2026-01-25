@@ -11,4 +11,16 @@ impl std::fmt::Display for Final {
     }
 }
 
-impl RuleMatcher for Final {}
+impl RuleMatcher for Final {
+    fn apply(&self, _sess: &Session) -> bool {
+        true
+    }
+
+    fn target(&self) -> &str {
+        self.target.as_str()
+    }
+
+    fn type_name(&self) -> &str {
+        "Match"
+    }
+}
