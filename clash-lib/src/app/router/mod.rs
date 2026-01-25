@@ -6,7 +6,7 @@ pub use rules::RuleMatcher;
 
 use crate::{
     Session,
-    app::dns::ThreadSafeDNSResolver,
+    app::{dns::ThreadSafeDNSResolver, router::rules::{domain::Domain, final_::Final}},
     common::mmdb::MmdbLookup,
     config::internal::{config::RuleProviderDef, rule::RuleType},
 };
@@ -61,5 +61,10 @@ pub fn map_rule_type(
     // geodata: Option<GeoDataLookup>,
     // rule_provider_registry: Option<&HashMap<String, ThreadSafeRuleProvider>>,
 ) -> Box<dyn RuleMatcher> {
-    todo!()
+    match rule_type {
+        RuleType::Domain { domain, target } => {
+            Box::new(Domain { domain, target }) as Box<dyn RuleMatcher>
+        }
+        RuleType::Match { target } => Box::new(Final { target }),
+    }
 }
