@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use tracing::debug;
+use tracing::{debug, error};
 
 use crate::{
     Error,
@@ -12,8 +12,7 @@ use crate::{
         OutboundGroupProtocol, OutboundProxyProtocol, OutboundProxyProviderDef,
     },
     proxy::{
-        AnyOutboundHandler, direct, reject,
-        utils::{DirectConnector, ProxyConnector},
+        AnyOutboundHandler, direct, reject, trojan, utils::{DirectConnector, ProxyConnector}
     },
 };
 
@@ -116,6 +115,15 @@ impl OutboundManager {
                 }
                 OutboundProxyProtocol::Reject(r) => {
                     Some(Arc::new(reject::Handler::new(&r.name)) as _)
+                }
+                OutboundProxyProtocol::Trojan(v) => {
+                    let name = v.common_opts.name.clone();
+                    v.try_into()
+                        .map(|x: trojan::Handler| Arc::new(x) as _)
+                        .inspect_err(|e| {
+                            error!("failed to load trojan outbound {}: {}", name, e);
+                        })
+                        .ok()
                 }
                 // todo: support more outbound protocols
                 _ => {

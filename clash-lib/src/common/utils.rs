@@ -11,6 +11,8 @@ use crate::{
         http::{ClashHTTPClientExt, DEFAULT_USER_AGENT, HttpClient},
     },
 };
+use std::fmt::Write;
+use sha2::Digest;
 
 pub fn default_bool_true() -> bool {
     true
@@ -108,4 +110,18 @@ where
     S: serde::Serializer,
 {
     serializer.serialize_u128(duration.as_millis())
+}
+
+pub fn encode_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        write!(&mut s, "{b:02x}").unwrap();
+    }
+    s
+}
+
+pub fn sha256(bytes: &[u8]) -> Vec<u8> {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize().to_vec()
 }

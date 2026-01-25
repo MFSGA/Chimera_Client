@@ -25,7 +25,19 @@ pub mod reject;
 
 pub mod socks;
 
+/// 9
+mod common;
+/// 7
+mod options;
+/// 8
+mod transport;
+/// 6
+pub mod trojan;
 pub mod utils;
+
+pub mod converters;
+
+pub use options::HandlerCommonOptions;
 
 #[async_trait]
 pub trait OutboundHandler: Sync + Send + Unpin + DialWithConnector + Debug {
@@ -82,6 +94,7 @@ impl_downcast!(ClientStream);
 pub enum OutboundType {
     Direct,
     Reject,
+    Trojan,
 }
 
 impl Display for OutboundType {
@@ -90,7 +103,6 @@ impl Display for OutboundType {
             /* OutboundType::Shadowsocks => write!(f, "Shadowsocks"),
             OutboundType::Vmess => write!(f, "Vmess"),
             OutboundType::Vless => write!(f, "Vless"),
-            OutboundType::Trojan => write!(f, "Trojan"),
             OutboundType::WireGuard => write!(f, "WireGuard"),
             OutboundType::Tor => write!(f, "Tor"),
             OutboundType::Tuic => write!(f, "Tuic"),
@@ -105,6 +117,7 @@ impl Display for OutboundType {
             OutboundType::LoadBalance => write!(f, "LoadBalance"),
             OutboundType::Smart => write!(f, "Smart"),
             OutboundType::Fallback => write!(f, "Fallback"), */
+            OutboundType::Trojan => write!(f, "Trojan"),
             OutboundType::Direct => write!(f, "Direct"),
             OutboundType::Reject => write!(f, "Reject"),
         }
