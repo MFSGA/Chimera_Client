@@ -138,3 +138,18 @@ pub struct Profile {
     // this is read to dns config directly
     // store_fake_ip: bool,
 }
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type")]
+#[serde(rename_all = "kebab-case")]
+pub enum RuleProviderDef {
+    // Http(HttpRuleProvider),
+    File(FileRuleProvider),
+    // Inline(InlineRuleProvider),
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct FileRuleProvider {
+    pub path: String,
+    // todo
+}

@@ -8,7 +8,7 @@ use crate::{
     app::{
         dispatcher::{TrackedStream, statistics_manager::StatisticsManager},
         dns::{ClashResolver, ThreadSafeDNSResolver},
-        outbound::manager::ThreadSafeOutboundManager,
+        outbound::manager::ThreadSafeOutboundManager, router::ThreadSafeRouter,
     },
     common::io::copy_bidirectional,
     config::{
@@ -27,6 +27,7 @@ pub struct Dispatcher {
     manager: Arc<StatisticsManager>,
     tcp_buffer_size: usize,
     mode: Arc<RwLock<RunMode>>,
+    router: ThreadSafeRouter,
 }
 
 impl fmt::Debug for Dispatcher {
@@ -38,6 +39,7 @@ impl fmt::Debug for Dispatcher {
 impl Dispatcher {
     pub fn new(
         outbound_manager: ThreadSafeOutboundManager,
+        router: ThreadSafeRouter,
         resolver: ThreadSafeDNSResolver,
         mode: RunMode,
         statistics_manager: Arc<StatisticsManager>,
@@ -49,6 +51,7 @@ impl Dispatcher {
             manager: statistics_manager,
             tcp_buffer_size: tcp_buffer_size.unwrap_or(DEFAULT_BUFFER_SIZE),
             mode: Arc::new(RwLock::new(mode)),
+            router,
         }
     }
 
@@ -84,10 +87,7 @@ impl Dispatcher {
         // todo: fix the following code
         let (outbound_name, rule) = match mode {
             RunMode::Global => (PROXY_GLOBAL, None),
-            RunMode::Rule => {
-                todo!();
-                // self.router.match_route(&mut sess).await,
-            }
+            RunMode::Rule => self.router.match_route(&mut sess).await,
             RunMode::Direct => (PROXY_DIRECT, None),
         };
 

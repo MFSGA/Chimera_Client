@@ -19,7 +19,7 @@ use crate::{
         inbound::manager::InboundManager,
         logging::LogEvent,
         outbound::manager::OutboundManager,
-        profile,
+        profile, router::Router,
     },
     common::{
         auth,
@@ -351,11 +351,26 @@ async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<Runti
         .await?,
     );
 
+    debug!("initializing router");
+    let router = Arc::new(
+        Router::new(
+            config.rules,
+            // config.rule_providers,
+            dns_resolver.clone(),
+            country_mmdb,
+            // asn_mmdb,
+            // geodata,
+            cwd.to_string_lossy().to_string(),
+        )
+        .await,
+    );
+
     let statistics_manager = StatisticsManager::new();
 
     debug!("initializing dispatcher");
     let dispatcher = Arc::new(Dispatcher::new(
         outbound_manager.clone(),
+        router.clone(),
         dns_resolver.clone(),
         config.general.mode,
         statistics_manager.clone(),
