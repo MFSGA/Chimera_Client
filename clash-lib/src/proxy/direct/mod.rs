@@ -11,7 +11,7 @@ use crate::{
     },
     common::errors::map_io_error,
     config::internal::proxy::PROXY_DIRECT,
-    proxy::{DialWithConnector, OutboundHandler, utils::new_tcp_stream},
+    proxy::{DialWithConnector, OutboundHandler, OutboundType, utils::new_tcp_stream},
 };
 
 #[derive(Clone)]
@@ -39,6 +39,10 @@ impl DialWithConnector for Handler {}
 impl OutboundHandler for Handler {
     fn name(&self) -> &str {
         PROXY_DIRECT
+    }
+
+    fn proto(&self) -> OutboundType {
+        OutboundType::Direct
     }
 
     async fn connect_stream(

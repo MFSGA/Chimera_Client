@@ -11,7 +11,7 @@ use crate::{
     config::internal::proxy::{
         OutboundGroupProtocol, OutboundProxyProtocol, OutboundProxyProviderDef,
     },
-    proxy::{AnyOutboundHandler, direct, reject},
+    proxy::{AnyOutboundHandler, direct, reject, utils::{DirectConnector, ProxyConnector}},
 };
 
 pub struct OutboundManager {
@@ -127,7 +127,24 @@ impl OutboundManager {
 
     /// Lazy initialization of connectors for each handler.
     async fn init_handler_connectors(&self) -> Result<(), Error> {
-        todo!();
+        let mut connectors = HashMap::new();
+        for handler in self.handlers.values() {
+            if let Some(connector_name) = handler.support_dialer() {
+                let outbound = self
+                    .get_outbound(connector_name)
+                    .ok_or(Error::InvalidConfig(format!(
+                        "connector {connector_name} not found"
+                    )))?;
+                let connector = connectors.entry(connector_name).or_insert_with(|| {
+                    Arc::new(ProxyConnector::new(
+                        outbound,
+                        Box::new(DirectConnector::new()),
+                    ))
+                });
+                handler.register_connector(connector.clone()).await;
+            }
+        }
+
         Ok(())
     }
 }

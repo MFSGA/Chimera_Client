@@ -5,7 +5,7 @@ use crate::{
     Session,
     app::{dispatcher::BoxedChainedStream, dns::ThreadSafeDNSResolver},
     config::internal::proxy::PROXY_REJECT,
-    proxy::{DialWithConnector, OutboundHandler},
+    proxy::{DialWithConnector, OutboundHandler, OutboundType},
 };
 
 #[derive(Serialize)]
@@ -33,6 +33,10 @@ impl DialWithConnector for Handler {}
 impl OutboundHandler for Handler {
     fn name(&self) -> &str {
         PROXY_REJECT
+    }
+
+    fn proto(&self) -> OutboundType {
+        OutboundType::Reject
     }
 
     async fn connect_stream(

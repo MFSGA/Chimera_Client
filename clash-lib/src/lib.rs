@@ -296,6 +296,8 @@ async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<Runti
             .collect(),
     );
 
+    debug!("todo del the line outbounds {}", plain_outbounds.len());
+
     let client = new_http_client(system_resolver.clone(), Some(plain_outbounds.clone()))
         .map_err(|x| Error::DNSError(x.to_string()))?;
 
