@@ -9,7 +9,7 @@ use tokio::time::timeout;
 use tracing::{debug, trace};
 
 use crate::app::net::OutboundInterface;
-use crate::proxy::utils::platform::win::must_bind_socket_on_interface;
+use crate::proxy::utils::platform::must_bind_socket_on_interface;
 
 pub fn apply_tcp_options(s: &TcpStream) -> std::io::Result<()> {
     #[cfg(not(target_os = "windows"))]
