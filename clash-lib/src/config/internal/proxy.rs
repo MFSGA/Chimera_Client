@@ -33,6 +33,9 @@ pub enum OutboundProxyProtocol {
     Reject(OutboundReject),
     #[serde(rename = "socks5")]
     Socks5(OutboundSocks5),
+
+    #[serde(rename = "trojan")]
+    Trojan(OutboundTrojan),
 }
 
 impl OutboundProxyProtocol {
@@ -43,6 +46,7 @@ impl OutboundProxyProtocol {
             OutboundProxyProtocol::Socks5(socks5) => {
                 todo!()
             }
+            OutboundProxyProtocol::Trojan(trojan) => &trojan.common_opts.name,
         }
     }
 }
@@ -110,3 +114,41 @@ pub enum OutboundGroupProtocol {}
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 pub enum OutboundProxyProviderDef {}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct OutboundTrojan {
+    #[serde(flatten)]
+    pub common_opts: CommonConfigOptions,
+    pub password: String,
+    pub alpn: Option<Vec<String>>,
+    pub sni: Option<String>,
+    pub skip_cert_verify: Option<bool>,
+    pub udp: Option<bool>,
+    pub network: Option<String>,
+    // pub grpc_opts: Option<GrpcOpt>,
+    pub ws_opts: Option<WsOpt>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct CommonConfigOptions {
+    pub name: String,
+    pub server: String,
+    pub port: u16,
+    /// this can be a proxy name or a group name
+    /// can't be a name in a proxy provider
+    /// only applies to raw proxy, i.e. applying this to a proxy group does
+    /// nothing
+    #[serde(alias = "dialer-proxy")]
+    pub connect_via: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct WsOpt {
+    pub path: Option<String>,
+    pub headers: Option<HashMap<String, String>>,
+    pub max_early_data: Option<i32>,
+    pub early_data_header_name: Option<String>,
+}
