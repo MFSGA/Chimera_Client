@@ -32,6 +32,7 @@ mod options;
 /// 8
 mod transport;
 /// 6
+#[cfg(feature = "trojan")]
 pub mod trojan;
 pub mod utils;
 

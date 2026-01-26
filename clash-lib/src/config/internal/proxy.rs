@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde::{Deserialize, de::value::MapDeserializer};
+use serde::{de::value::MapDeserializer, Deserialize};
 use serde_yaml::Value;
 
 use crate::Error;
@@ -34,6 +34,7 @@ pub enum OutboundProxyProtocol {
     #[serde(rename = "socks5")]
     Socks5(OutboundSocks5),
 
+    #[cfg(feature = "trojan")]
     #[serde(rename = "trojan")]
     Trojan(OutboundTrojan),
 }
@@ -46,6 +47,7 @@ impl OutboundProxyProtocol {
             OutboundProxyProtocol::Socks5(socks5) => {
                 todo!()
             }
+            #[cfg(feature = "trojan")]
             OutboundProxyProtocol::Trojan(trojan) => &trojan.common_opts.name,
         }
     }
@@ -115,6 +117,7 @@ pub enum OutboundGroupProtocol {}
 #[serde(tag = "type")]
 pub enum OutboundProxyProviderDef {}
 
+#[cfg(feature = "trojan")]
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct OutboundTrojan {
@@ -130,6 +133,7 @@ pub struct OutboundTrojan {
     pub ws_opts: Option<WsOpt>,
 }
 
+#[cfg(feature = "trojan")]
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
 #[serde(rename_all = "kebab-case")]
 pub struct CommonConfigOptions {
@@ -144,6 +148,7 @@ pub struct CommonConfigOptions {
     pub connect_via: Option<String>,
 }
 
+#[cfg(feature = "trojan")]
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct WsOpt {

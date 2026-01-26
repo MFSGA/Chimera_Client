@@ -12,9 +12,12 @@ use crate::{
         OutboundGroupProtocol, OutboundProxyProtocol, OutboundProxyProviderDef,
     },
     proxy::{
-        AnyOutboundHandler, direct, reject, trojan, utils::{DirectConnector, ProxyConnector}
+        AnyOutboundHandler, direct, reject, utils::{DirectConnector, ProxyConnector}
     },
 };
+
+#[cfg(feature = "trojan")]
+use crate::proxy::trojan;
 
 pub struct OutboundManager {
     handlers: HashMap<String, AnyOutboundHandler>,
@@ -116,6 +119,7 @@ impl OutboundManager {
                 OutboundProxyProtocol::Reject(r) => {
                     Some(Arc::new(reject::Handler::new(&r.name)) as _)
                 }
+                #[cfg(feature = "trojan")]
                 OutboundProxyProtocol::Trojan(v) => {
                     let name = v.common_opts.name.clone();
                     v.try_into()
