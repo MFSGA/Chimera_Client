@@ -1,12 +1,11 @@
 // use http::uri::InvalidUri;
+#![cfg(all(feature = "trojan", feature = "ws"))]
 
-#[cfg(feature = "trojan")]
 use crate::{
     config::internal::proxy::{CommonConfigOptions, WsOpt},
     proxy::transport::{self, WsClient},
 };
 
-#[cfg(feature = "trojan")]
 impl TryFrom<(&WsOpt, &CommonConfigOptions)> for WsClient {
     type Error = std::io::Error;
 

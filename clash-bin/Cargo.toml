@@ -8,12 +8,14 @@ edition = { workspace = true }
 
 [features]
 default = ["standard"]
-standard = ["trojan"]
+standard = ["trojan", "ws"]
 
 plus = ["standard", "onion"]
 onion = []
 
-trojan = [ "clash-lib/trojan"]
+ws = ["clash-lib/ws"]
+
+trojan = ["clash-lib/trojan"]
 
 perf = ["plus", "jemallocator"]
 # for ci

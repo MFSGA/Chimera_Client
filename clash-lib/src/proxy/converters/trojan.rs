@@ -4,14 +4,17 @@ const DEFAULT_ALPN: [&str; 2] = ["h2", "http/1.1"];
 const DEFAULT_WS_ALPN: [&str; 1] = ["http/1.1"];
 
 use crate::{
-    Error,
     config::internal::proxy::OutboundTrojan,
     proxy::{
-        HandlerCommonOptions,
-        transport::{TlsClient, WsClient},
+        transport::TlsClient,
         trojan::{Handler, HandlerOptions},
+        HandlerCommonOptions,
     },
+    Error,
 };
+
+#[cfg(feature = "ws")]
+use crate::proxy::transport::WsClient;
 
 impl TryFrom<OutboundTrojan> for Handler {
     type Error = crate::Error;
@@ -71,29 +74,39 @@ impl TryFrom<&OutboundTrojan> for Handler {
                 .network
                 .as_ref()
                 .map(|x| match x.as_str() {
-                    "ws" => s
-                        .ws_opts
-                        .as_ref()
-                        .map(|x| {
-                            let client: WsClient =
-                                (x, &s.common_opts).try_into().expect("invalid ws_opts");
-                            Box::new(client) as _
-                        })
-                        .ok_or(Error::InvalidConfig(
-                            "ws_opts is required for ws".to_owned(),
-                        )),
+                    "ws" => {
+                        #[cfg(feature = "ws")]
+                        {
+                            s.ws_opts
+                                .as_ref()
+                                .map(|x| {
+                                    let client: WsClient =
+                                        (x, &s.common_opts).try_into().expect("invalid ws_opts");
+                                    Box::new(client) as _
+                                })
+                                .ok_or(Error::InvalidConfig(
+                                    "ws_opts is required for ws".to_owned(),
+                                ))
+                        }
+                        #[cfg(not(feature = "ws"))]
+                        {
+                            Err(Error::InvalidConfig(
+                                "trojan ws network requires ws feature".to_owned(),
+                            ))
+                        }
+                    }
                     /* "grpc" => s
-                        .grpc_opts
-                        .as_ref()
-                        .map(|x| {
-                            let client: GrpcClient = (s.sni.clone(), x, &s.common_opts)
-                                .try_into()
-                                .expect("invalid grpc_opts");
-                            Box::new(client) as _
-                        })
-                        .ok_or(Error::InvalidConfig(
-                            "grpc_opts is required for grpc".to_owned(),
-                        )), */
+                    .grpc_opts
+                    .as_ref()
+                    .map(|x| {
+                        let client: GrpcClient = (s.sni.clone(), x, &s.common_opts)
+                            .try_into()
+                            .expect("invalid grpc_opts");
+                        Box::new(client) as _
+                    })
+                    .ok_or(Error::InvalidConfig(
+                        "grpc_opts is required for grpc".to_owned(),
+                    )), */
                     _ => Err(Error::InvalidConfig(format!(
                         "unsupported trojan network: {x}"
                     ))),

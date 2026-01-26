@@ -130,6 +130,7 @@ pub struct OutboundTrojan {
     pub udp: Option<bool>,
     pub network: Option<String>,
     // pub grpc_opts: Option<GrpcOpt>,
+    #[cfg(feature = "ws")]
     pub ws_opts: Option<WsOpt>,
 }
 
@@ -148,7 +149,7 @@ pub struct CommonConfigOptions {
     pub connect_via: Option<String>,
 }
 
-#[cfg(feature = "trojan")]
+#[cfg(all(feature = "trojan", feature = "ws"))]
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct WsOpt {

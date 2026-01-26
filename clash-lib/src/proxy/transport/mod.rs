@@ -1,7 +1,10 @@
 mod tls;
+
+#[cfg(feature = "ws")]
 mod ws;
 
 pub use tls::Client as TlsClient;
+#[cfg(feature = "ws")]
 pub use ws::Client as WsClient;
 
 #[async_trait::async_trait]
