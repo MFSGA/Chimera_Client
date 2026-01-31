@@ -40,7 +40,12 @@ time = { version = "=0.3", features = ["macros", "local-offset"] }
 
 rustls = { version = "0.23", default-features = false }
 
-uuid = { version = "1", features = ["v4", "fast-rng", "macro-diagnostics", "serde"] }
+uuid = { version = "1", features = [
+    "v4",
+    "fast-rng",
+    "macro-diagnostics",
+    "serde",
+] }
 
 # dns
 chimera-dns = { path = "../clash-dns", default-features = false }
@@ -72,7 +77,9 @@ aws-lc-rs = ["rustls/aws-lc-rs"]
 
 ws = ["tokio-tungstenite"]
 
-trojan = []
+tls = []
+
+trojan = ["tls", "ws"]
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [

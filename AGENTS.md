@@ -107,6 +107,7 @@
 ### Feature gates & conditional logic
 - Wrap optional systems (`tun`, `onion`, `shadowquic`) with `#[cfg(feature = "...")]` and document their toggles in the README or crate docs.
 - Use the `ws` feature for WebSocket-only transports (the `proxy::transport::ws` module and trojan `network: ws` branch) so those code paths compile only when the feature is explicitly enabled.
+- Use the `tls` feature for TLS-only transports (the `proxy::transport::tls` module and the Trojan TLS handshake) so TLS clients remain gated and `trojan` automatically pulls in that feature.
 - Prefer runtime checks with `cfg!(feature = "foo")` sparingly; compile-time gating keeps the binary lean.
 
 ### Dependencies & re-exports

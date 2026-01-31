@@ -1,8 +1,10 @@
+#[cfg(feature = "tls")]
 mod tls;
 
 #[cfg(feature = "ws")]
 mod ws;
 
+#[cfg(feature = "tls")]
 pub use tls::Client as TlsClient;
 #[cfg(feature = "ws")]
 pub use ws::Client as WsClient;

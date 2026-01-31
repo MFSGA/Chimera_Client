@@ -15,6 +15,8 @@ onion = []
 
 ws = ["clash-lib/ws"]
 
+tls = ["clash-lib/tls"]
+
 trojan = ["clash-lib/trojan"]
 
 perf = ["plus", "jemallocator"]
