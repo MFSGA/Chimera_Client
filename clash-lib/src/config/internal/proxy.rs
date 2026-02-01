@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde::{de::value::MapDeserializer, Deserialize};
+use serde::{Deserialize, de::value::MapDeserializer};
 use serde_yaml::Value;
 
 use crate::Error;
@@ -86,9 +86,12 @@ pub struct OutboundReject {
 pub struct OutboundSocks5 {
     pub username: Option<String>,
     pub password: Option<String>,
+    #[cfg(feature = "tls")]
     #[serde(default = "Default::default")]
     pub tls: bool,
+    #[cfg(feature = "tls")]
     pub sni: Option<String>,
+    #[cfg(feature = "tls")]
     #[serde(default = "Default::default")]
     pub skip_cert_verify: bool,
 }

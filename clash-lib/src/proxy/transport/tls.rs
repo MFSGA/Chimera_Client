@@ -61,18 +61,20 @@ impl Transport for Client {
             .map(|x| x.as_bytes().to_vec())
             .collect();
 
-        tls_config.dangerous().set_certificate_verifier(Arc::new(
-            DefaultTlsVerifier::new(None, self.skip_cert_verify),
-        ));
+        tls_config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(DefaultTlsVerifier::new(
+                None,
+                self.skip_cert_verify,
+            )));
 
         if std::env::var("SSLKEYLOGFILE").is_ok() {
             tls_config.key_log = Arc::new(rustls::KeyLogFile::new());
         }
 
         let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
-        let dns_name =
-            rustls::pki_types::ServerName::try_from(self.sni.as_str().to_owned())
-                .map_err(map_io_error)?;
+        let dns_name = rustls::pki_types::ServerName::try_from(self.sni.as_str().to_owned())
+            .map_err(map_io_error)?;
 
         let c = connector.connect(dns_name, stream).await.and_then(|x| {
             if let Some(expected_alpn) = self.expected_alpn.as_ref()
