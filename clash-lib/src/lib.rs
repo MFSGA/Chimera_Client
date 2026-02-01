@@ -24,6 +24,7 @@ use crate::{
     },
     common::{
         auth,
+        geodata::{self, DEFAULT_GEOSITE_DOWNLOAD_URL, GeoDataLookup},
         http::new_http_client,
         mmdb::{self, DEFAULT_COUNTRY_MMDB_DOWNLOAD_URL, MmdbLookup},
     },
@@ -360,6 +361,24 @@ async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<Runti
         .await?,
     );
 
+    debug!("initializing geosite");
+    let geodata = if let Some(geosite_file) = config.general.geosite {
+        Some(Arc::new(
+            geodata::GeoData::new(
+                cwd.join(&geosite_file),
+                config
+                    .general
+                    .geosite_download_url
+                    .unwrap_or(DEFAULT_GEOSITE_DOWNLOAD_URL.to_string()),
+                client.clone(),
+            )
+            .await?,
+        ) as GeoDataLookup)
+    } else {
+        debug!("geosite not set, skipping");
+        None
+    };
+
     debug!("initializing router");
     let router = Arc::new(
         Router::new(
@@ -368,10 +387,10 @@ async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<Runti
             dns_resolver.clone(),
             country_mmdb,
             // asn_mmdb,
-            // geodata,
+            geodata,
             cwd.to_string_lossy().to_string(),
         )
-        .await,
+        .await?,
     );
 
     let statistics_manager = StatisticsManager::new();

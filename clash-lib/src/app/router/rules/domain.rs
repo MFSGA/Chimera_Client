@@ -26,6 +26,10 @@ impl RuleMatcher for Domain {
         &self.target
     }
 
+    fn payload(&self) -> String {
+        self.domain.clone()
+    }
+
     fn type_name(&self) -> &str {
         "Domain"
     }

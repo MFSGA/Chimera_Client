@@ -66,6 +66,10 @@ pub struct General {
     pub mmdb: Option<String>,
     /// 4
     pub mmdb_download_url: Option<String>,
+    /// 4.1
+    pub geosite: Option<String>,
+    /// 4.2
+    pub geosite_download_url: Option<String>,
     /// 5
     pub mode: RunMode,
 }

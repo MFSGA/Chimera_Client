@@ -6,11 +6,12 @@ pub use rules::RuleMatcher;
 use tracing::{info, trace};
 
 use crate::{
-    Session,
+    Error, Session,
     app::{
         dns::ThreadSafeDNSResolver,
-        router::rules::{domain::Domain, final_::Final},
+        router::rules::{domain::Domain, final_::Final, geodata::GeoSiteMatcher},
     },
+    common::geodata::GeoDataLookup,
     common::mmdb::MmdbLookup,
     config::internal::{config::RuleProviderDef, rule::RuleType},
 };
@@ -32,24 +33,25 @@ impl Router {
         dns_resolver: ThreadSafeDNSResolver,
         country_mmdb: Option<MmdbLookup>,
         // asn_mmdb: Option<MmdbLookup>,
-        // geodata: Option<GeoDataLookup>,
+        geodata: Option<GeoDataLookup>,
         cwd: String,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, Error> {
+        let _ = (country_mmdb, cwd);
+        Ok(Self {
             rules: rules
                 .into_iter()
                 .map(|r| {
                     map_rule_type(
                         r,
                         // country_mmdb.clone(),
-                        // geodata.clone(),
+                        geodata.clone(),
                         // Some(&rule_provider_registry),
                     )
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, Error>>()?,
             dns_resolver,
             // asn_mmdb,
-        }
+        })
     }
 
     /// this mutates the session, attaching resolved IP and ASN
@@ -108,13 +110,20 @@ impl Router {
 pub fn map_rule_type(
     rule_type: RuleType,
     // mmdb: Option<MmdbLookup>,
-    // geodata: Option<GeoDataLookup>,
+    geodata: Option<GeoDataLookup>,
     // rule_provider_registry: Option<&HashMap<String, ThreadSafeRuleProvider>>,
-) -> Box<dyn RuleMatcher> {
+) -> Result<Box<dyn RuleMatcher>, Error> {
     match rule_type {
         RuleType::Domain { domain, target } => {
-            Box::new(Domain { domain, target }) as Box<dyn RuleMatcher>
+            Ok(Box::new(Domain { domain, target }) as Box<dyn RuleMatcher>)
         }
-        RuleType::Match { target } => Box::new(Final { target }),
+        RuleType::GeoSite {
+            country_code,
+            target,
+        } => Ok(
+            Box::new(GeoSiteMatcher::new(country_code, target, geodata.as_ref())?)
+                as Box<dyn RuleMatcher>,
+        ),
+        RuleType::Match { target } => Ok(Box::new(Final { target })),
     }
 }

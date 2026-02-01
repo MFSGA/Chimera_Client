@@ -20,6 +20,10 @@ impl RuleMatcher for Final {
         self.target.as_str()
     }
 
+    fn payload(&self) -> String {
+        "".to_owned()
+    }
+
     fn type_name(&self) -> &str {
         "Match"
     }

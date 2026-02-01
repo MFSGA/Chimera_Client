@@ -59,6 +59,11 @@ pub struct Config {
     /// 10.2 Download URL for country mmdb file
     #[serde(rename = "mmdb-download-url")]
     pub mmdb_download_url: Option<String>,
+    /// 10.3 Path to geosite file (GeoSite)
+    pub geosite: Option<String>,
+    /// 10.4 Download URL for geosite file
+    #[serde(rename = "geosite-download-url")]
+    pub geosite_download_url: Option<String>,
     /// 11.1 The HTTP proxy port
     #[serde(alias = "http_port")]
     pub port: Option<Port>,

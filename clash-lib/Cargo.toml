@@ -26,6 +26,8 @@ tokio-rustls = { version = "0.26", optional = true }
 webpki-roots = { version = "0.26", optional = true }
 maxminddb = "0.27"
 hickory-proto = "0.24"
+prost = "0.14"
+regex = "1"
 
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
@@ -68,6 +70,12 @@ sha2 = "0.10"
 tokio-tungstenite = { version = "0.28.0", optional = true }
 
 base64 = "0.22"
+
+[dev-dependencies]
+mockall = "0.14.0"
+
+[build-dependencies]
+prost-build = "0.14"
 
 [features]
 default = ["zero_copy", "tls", "aws-lc-rs"]

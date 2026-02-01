@@ -4,8 +4,17 @@ use crate::Error;
 
 /// todo: support more rule type
 pub enum RuleType {
-    Domain { domain: String, target: String },
-    Match { target: String },
+    Domain {
+        domain: String,
+        target: String,
+    },
+    GeoSite {
+        target: String,
+        country_code: String,
+    },
+    Match {
+        target: String,
+    },
 }
 
 impl RuleType {
@@ -20,6 +29,10 @@ impl RuleType {
                 domain: payload.to_string(),
                 target: target.to_string(),
             }),
+            "GEOSITE" => Ok(RuleType::GeoSite {
+                target: target.to_string(),
+                country_code: payload.to_string(),
+            }),
             "MATCH" => Ok(RuleType::Match {
                 target: target.to_string(),
             }),
@@ -32,6 +45,7 @@ impl RuleType {
     pub fn target(&self) -> &str {
         match self {
             RuleType::Domain { target, .. } => target,
+            RuleType::GeoSite { target, .. } => target,
             RuleType::Match { target } => target,
         }
     }
