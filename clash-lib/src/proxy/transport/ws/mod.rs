@@ -79,10 +79,9 @@ impl Transport for Client {
             );
             Ok(Box::new(early_data_conn))
         } else {
-            let (stream, resp) =
-                client_async_with_config(req, stream, self.ws_config)
-                    .await
-                    .map_err(map_io_error)?;
+            let (stream, resp) = client_async_with_config(req, stream, self.ws_config)
+                .await
+                .map_err(map_io_error)?;
 
             if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
                 return Err(std::io::Error::new(

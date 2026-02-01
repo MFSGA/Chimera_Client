@@ -4,13 +4,13 @@ const DEFAULT_ALPN: [&str; 2] = ["h2", "http/1.1"];
 const DEFAULT_WS_ALPN: [&str; 1] = ["http/1.1"];
 
 use crate::{
+    Error,
     config::internal::proxy::OutboundTrojan,
     proxy::{
+        HandlerCommonOptions,
         transport::TlsClient,
         trojan::{Handler, HandlerOptions},
-        HandlerCommonOptions,
     },
-    Error,
 };
 
 #[cfg(feature = "ws")]
