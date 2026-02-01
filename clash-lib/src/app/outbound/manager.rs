@@ -12,7 +12,8 @@ use crate::{
         OutboundGroupProtocol, OutboundProxyProtocol, OutboundProxyProviderDef,
     },
     proxy::{
-        AnyOutboundHandler, direct, reject, utils::{DirectConnector, ProxyConnector}
+        AnyOutboundHandler, direct, reject,
+        utils::{DirectConnector, ProxyConnector},
     },
 };
 

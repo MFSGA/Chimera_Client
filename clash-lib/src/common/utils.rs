@@ -11,8 +11,8 @@ use crate::{
         http::{ClashHTTPClientExt, DEFAULT_USER_AGENT, HttpClient},
     },
 };
-use std::fmt::Write;
 use sha2::Digest;
+use std::fmt::Write;
 
 pub fn default_bool_true() -> bool {
     true
