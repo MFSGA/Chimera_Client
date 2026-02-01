@@ -25,6 +25,9 @@ pub mod reject;
 
 pub mod socks;
 
+#[cfg(feature = "snell")]
+pub mod snell;
+
 /// 9
 mod common;
 /// 7
@@ -95,7 +98,10 @@ impl_downcast!(ClientStream);
 pub enum OutboundType {
     Direct,
     Reject,
+    #[cfg(feature = "trojan")]
     Trojan,
+    #[cfg(feature = "snell")]
+    Snell,
 }
 
 impl Display for OutboundType {
@@ -118,7 +124,10 @@ impl Display for OutboundType {
             OutboundType::LoadBalance => write!(f, "LoadBalance"),
             OutboundType::Smart => write!(f, "Smart"),
             OutboundType::Fallback => write!(f, "Fallback"), */
+            #[cfg(feature = "trojan")]
             OutboundType::Trojan => write!(f, "Trojan"),
+            #[cfg(feature = "snell")]
+            OutboundType::Snell => write!(f, "Snell"),
             OutboundType::Direct => write!(f, "Direct"),
             OutboundType::Reject => write!(f, "Reject"),
         }

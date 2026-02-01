@@ -10,7 +10,11 @@ use crate::{
     app::{
         dispatcher::{BoxedChainedStream, ChainedStream, ChainedStreamWrapper},
         dns::ThreadSafeDNSResolver,
-    }, common::utils, impl_default_connector, proxy::{HandlerCommonOptions, transport::Transport}, session::Session
+    },
+    common::utils,
+    impl_default_connector,
+    proxy::{HandlerCommonOptions, transport::Transport},
+    session::Session,
 };
 
 use super::{

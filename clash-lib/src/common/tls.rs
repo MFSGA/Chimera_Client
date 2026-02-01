@@ -1,6 +1,9 @@
 use std::sync::{Arc, LazyLock};
 
-use rustls::{RootCertStore, client::{WebPkiServerVerifier, danger::ServerCertVerifier}};
+use rustls::{
+    RootCertStore,
+    client::{WebPkiServerVerifier, danger::ServerCertVerifier},
+};
 
 pub static GLOBAL_ROOT_STORE: LazyLock<Arc<RootCertStore>> = LazyLock::new(|| {
     let store = webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
@@ -26,7 +29,6 @@ impl DefaultTlsVerifier {
     }
 }
 
-
 impl ServerCertVerifier for DefaultTlsVerifier {
     fn verify_server_cert(
         &self,
@@ -37,8 +39,7 @@ impl ServerCertVerifier for DefaultTlsVerifier {
         now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         if let Some(ref fingerprint) = self.fingerprint {
-            let cert_hex =
-                super::utils::encode_hex(&super::utils::sha256(end_entity.as_ref()));
+            let cert_hex = super::utils::encode_hex(&super::utils::sha256(end_entity.as_ref()));
             if &cert_hex != fingerprint {
                 return Err(rustls::Error::General(format!(
                     "cert hash mismatch: found: {cert_hex}\nexcept: {fingerprint}"
@@ -50,13 +51,8 @@ impl ServerCertVerifier for DefaultTlsVerifier {
             return Ok(rustls::client::danger::ServerCertVerified::assertion());
         }
 
-        self.pki.verify_server_cert(
-            end_entity,
-            intermediates,
-            server_name,
-            ocsp_response,
-            now,
-        )
+        self.pki
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
     }
 
     fn verify_tls12_signature(
@@ -87,4 +83,3 @@ impl ServerCertVerifier for DefaultTlsVerifier {
         self.pki.supported_verify_schemes()
     }
 }
-

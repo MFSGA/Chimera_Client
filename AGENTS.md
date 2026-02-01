@@ -5,6 +5,9 @@
 - Treat every change as part of a workspace that mirrors Clash but lives in Rust; keep things fast, observable, and safe.
 - When in doubt, read this file first, then consult a crate README or the `docs/` folder for deeper context.
 
+## reference codes
+The codes are under ref/
+
 ## Workspace at a glance
 - **Rust workspace** defined in `Cargo.toml` with pinned toolchain `nightly-2025-09-15` (see `rust-toolchain.toml`).
 - **Crates:**

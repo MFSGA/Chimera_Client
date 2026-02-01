@@ -17,6 +17,8 @@ ws = ["clash-lib/ws"]
 
 trojan = ["clash-lib/trojan"]
 
+snell = ["clash-lib/snell"]
+
 perf = ["plus", "jemallocator"]
 # for ci
 jemallocator = ["dep:tikv-jemallocator"]

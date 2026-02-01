@@ -12,10 +12,13 @@ use crate::{
         OutboundGroupProtocol, OutboundProxyProtocol, OutboundProxyProviderDef,
     },
     proxy::{
-        AnyOutboundHandler, direct, reject, utils::{DirectConnector, ProxyConnector}
+        AnyOutboundHandler, direct, reject,
+        utils::{DirectConnector, ProxyConnector},
     },
 };
 
+#[cfg(feature = "snell")]
+use crate::proxy::snell;
 #[cfg(feature = "trojan")]
 use crate::proxy::trojan;
 
@@ -126,6 +129,16 @@ impl OutboundManager {
                         .map(|x: trojan::Handler| Arc::new(x) as _)
                         .inspect_err(|e| {
                             error!("failed to load trojan outbound {}: {}", name, e);
+                        })
+                        .ok()
+                }
+                #[cfg(feature = "snell")]
+                OutboundProxyProtocol::Snell(s) => {
+                    let name = s.common_opts.name.clone();
+                    snell::Handler::try_from(&s)
+                        .map(|x| Arc::new(x) as _)
+                        .inspect_err(|e| {
+                            error!("failed to load snell outbound {}: {}", name, e);
                         })
                         .ok()
                 }

@@ -34,6 +34,10 @@ pub enum OutboundProxyProtocol {
     #[serde(rename = "socks5")]
     Socks5(OutboundSocks5),
 
+    #[cfg(feature = "snell")]
+    #[serde(rename = "snell")]
+    Snell(OutboundSnell),
+
     #[cfg(feature = "trojan")]
     #[serde(rename = "trojan")]
     Trojan(OutboundTrojan),
@@ -47,6 +51,8 @@ impl OutboundProxyProtocol {
             OutboundProxyProtocol::Socks5(socks5) => {
                 todo!()
             }
+            #[cfg(feature = "snell")]
+            OutboundProxyProtocol::Snell(snell) => &snell.common_opts.name,
             #[cfg(feature = "trojan")]
             OutboundProxyProtocol::Trojan(trojan) => &trojan.common_opts.name,
         }
@@ -117,6 +123,20 @@ pub enum OutboundGroupProtocol {}
 #[serde(tag = "type")]
 pub enum OutboundProxyProviderDef {}
 
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct CommonConfigOptions {
+    pub name: String,
+    pub server: String,
+    pub port: u16,
+    /// this can be a proxy name or a group name
+    /// can't be a name in a proxy provider
+    /// only applies to raw proxy, i.e. applying this to a proxy group does
+    /// nothing
+    #[serde(alias = "dialer-proxy")]
+    pub connect_via: Option<String>,
+}
+
 #[cfg(feature = "trojan")]
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -134,19 +154,39 @@ pub struct OutboundTrojan {
     pub ws_opts: Option<WsOpt>,
 }
 
-#[cfg(feature = "trojan")]
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+#[cfg(feature = "snell")]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 #[serde(rename_all = "kebab-case")]
-pub struct CommonConfigOptions {
-    pub name: String,
-    pub server: String,
-    pub port: u16,
-    /// this can be a proxy name or a group name
-    /// can't be a name in a proxy provider
-    /// only applies to raw proxy, i.e. applying this to a proxy group does
-    /// nothing
-    #[serde(alias = "dialer-proxy")]
-    pub connect_via: Option<String>,
+pub struct OutboundSnell {
+    #[serde(flatten)]
+    pub common_opts: CommonConfigOptions,
+    pub psk: String,
+    #[serde(default)]
+    pub version: Option<u8>,
+    pub obfs: Option<String>,
+    #[serde(rename = "obfs-opts")]
+    pub obfs_opts: Option<SnellObfsOptions>,
+}
+
+#[cfg(feature = "snell")]
+impl Default for OutboundSnell {
+    fn default() -> Self {
+        Self {
+            common_opts: CommonConfigOptions::default(),
+            psk: String::new(),
+            version: Some(2),
+            obfs: None,
+            obfs_opts: None,
+        }
+    }
+}
+
+#[cfg(feature = "snell")]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct SnellObfsOptions {
+    pub host: Option<String>,
+    pub mode: Option<String>,
 }
 
 #[cfg(all(feature = "trojan", feature = "ws"))]
