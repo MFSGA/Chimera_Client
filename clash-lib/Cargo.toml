@@ -22,9 +22,9 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"
 tokio-rustls = "0.26"
-webpki-roots = "0.26"
+webpki-roots = "1.0"
 maxminddb = "0.27"
-hickory-proto = "0.24"
+hickory-proto = "0.25"
 
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
