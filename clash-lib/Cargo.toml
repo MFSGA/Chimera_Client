@@ -66,6 +66,7 @@ chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
 
 tokio-tungstenite = { version = "0.28.0", optional = true }
+etherparse = { version = "0.12", optional = true }
 
 base64 = "0.22"
 
@@ -77,10 +78,15 @@ zero_copy = []
 tls = ["dep:rustls", "dep:tokio-rustls", "dep:webpki-roots"]
 
 aws-lc-rs = ["tls", "rustls/aws-lc-rs"]
+ring = ["tls", "rustls/ring"]
 
 ws = ["tokio-tungstenite"]
 
 trojan = []
+tun = []
+tproxy = ["dep:etherparse"]
+redir = []
+tracing = ["tokio/tracing"]
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
