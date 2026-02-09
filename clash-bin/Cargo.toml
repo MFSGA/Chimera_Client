@@ -18,6 +18,11 @@ ws = ["clash-lib/ws"]
 tls = ["clash-lib/tls"]
 
 trojan = ["clash-lib/trojan"]
+tun = ["clash-lib/tun"]
+tproxy = ["clash-lib/tproxy"]
+redir = ["clash-lib/redir"]
+ring = ["clash-lib/ring"]
+tracing = ["clash-lib/tracing"]
 
 perf = ["plus", "jemallocator"]
 # for ci
