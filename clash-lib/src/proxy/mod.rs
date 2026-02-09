@@ -24,6 +24,8 @@ pub mod inbound;
 pub mod reject;
 
 pub mod socks;
+#[cfg(feature = "tun")]
+pub mod tun;
 
 /// 9
 mod common;
