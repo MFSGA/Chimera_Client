@@ -11,6 +11,7 @@ edition = { workspace = true }
 # Error handing & logging
 thiserror = "2"
 anyhow = "1"
+libc = "0.2"
 
 # Async
 tokio = { version = "1", features = ["full"] }
@@ -21,8 +22,8 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"
-tokio-rustls = "0.26"
-webpki-roots = "0.26"
+tokio-rustls = { version = "0.26", optional = true }
+webpki-roots = { version = "0.26", optional = true }
 maxminddb = "0.27"
 hickory-proto = "0.24"
 
@@ -38,7 +39,7 @@ tracing-subscriber = { version = "0.3", features = [
 ] }
 time = { version = "=0.3", features = ["macros", "local-offset"] }
 
-rustls = { version = "0.23", default-features = false }
+rustls = { version = "0.23", default-features = false, optional = true }
 
 uuid = { version = "1", features = [
     "v4",
@@ -69,17 +70,17 @@ tokio-tungstenite = { version = "0.28.0", optional = true }
 base64 = "0.22"
 
 [features]
-default = ["zero_copy", "aws-lc-rs"]
+default = ["zero_copy", "tls", "aws-lc-rs"]
 
 zero_copy = []
 
-aws-lc-rs = ["rustls/aws-lc-rs"]
+tls = ["dep:rustls", "dep:tokio-rustls", "dep:webpki-roots"]
+
+aws-lc-rs = ["tls", "rustls/aws-lc-rs"]
 
 ws = ["tokio-tungstenite"]
 
-tls = []
-
-trojan = ["tls", "ws"]
+trojan = []
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
@@ -87,5 +88,5 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_Rras",
     "Win32_NetworkManagement_IpHelper",
-    "Win32_NetworkManagement_Ndis"
+    "Win32_NetworkManagement_Ndis",
 ] }

@@ -6,9 +6,12 @@ use tokio::net::TcpStream;
 use tracing::{trace, warn};
 
 use crate::{
-    app::dns::ThreadSafeDNSResolver, common::tls::GLOBAL_ROOT_STORE,
-    config::internal::proxy::PROXY_DIRECT, proxy::AnyOutboundHandler,
+    app::dns::ThreadSafeDNSResolver, config::internal::proxy::PROXY_DIRECT,
+    proxy::AnyOutboundHandler,
 };
+
+#[cfg(feature = "tls")]
+use crate::common::tls::GLOBAL_ROOT_STORE;
 
 #[derive(Clone, Debug)]
 pub struct ClashHTTPClientExt {
@@ -21,6 +24,7 @@ pub struct ClashHTTPClientExt {
 pub struct HttpClient {
     dns_resolver: ThreadSafeDNSResolver,
     outbounds: Option<HashMap<String, AnyOutboundHandler>>,
+    #[cfg(feature = "tls")]
     tls_config: Arc<rustls::ClientConfig>,
     timeout: tokio::time::Duration,
 }
@@ -31,9 +35,11 @@ impl HttpClient {
         bootstrap_outbounds: Option<Vec<AnyOutboundHandler>>,
         timeout: Option<tokio::time::Duration>,
     ) -> io::Result<HttpClient> {
+        #[cfg(feature = "tls")]
         let mut tls_config = rustls::ClientConfig::builder()
             .with_root_certificates(GLOBAL_ROOT_STORE.clone())
             .with_no_client_auth();
+        #[cfg(feature = "tls")]
         if std::env::var("SSLKEYLOGFILE").is_ok() {
             tls_config.key_log = Arc::new(rustls::KeyLogFile::new());
         }
@@ -47,6 +53,7 @@ impl HttpClient {
                 }
                 map
             }),
+            #[cfg(feature = "tls")]
             tls_config: Arc::new(tls_config),
             timeout: timeout.unwrap_or(tokio::time::Duration::from_secs(10)),
         })
@@ -114,6 +121,14 @@ impl HttpClient {
 
         let stream = self.connect_tcp(&host, port).await?;
 
+        #[cfg(not(feature = "tls"))]
+        if uri.scheme() == Some(&http::uri::Scheme::HTTPS) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "https requires the tls feature",
+            ));
+        }
+
         let resp = match uri.scheme() {
             Some(scheme) if scheme == &http::uri::Scheme::HTTP => {
                 let io = TokioIo::new(stream);
@@ -129,6 +144,7 @@ impl HttpClient {
 
                 sender.send_request(req).boxed()
             }
+            #[cfg(feature = "tls")]
             Some(scheme) if scheme == &http::uri::Scheme::HTTPS => {
                 let connector = tokio_rustls::TlsConnector::from(self.tls_config.clone());
 
