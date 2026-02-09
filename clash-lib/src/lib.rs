@@ -206,6 +206,8 @@ pub async fn start(
     let inbound_manager = components.inbound_manager.clone();
     inbound_manager.start_all_listeners().await;
 
+    #[cfg(feature = "tun")]
+    let tun_runner_handle = None;
     let dns_listener_handle = components.dns_listener.map(tokio::spawn);
 
     let (reload_tx, mut reload_rx) = mpsc::channel(1);
