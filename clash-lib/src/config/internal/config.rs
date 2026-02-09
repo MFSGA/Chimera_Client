@@ -3,6 +3,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
 };
 
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -39,6 +40,8 @@ pub struct Config {
     /// 5
     pub dns: dns::DNSConfig,
     /// 6
+    pub tun: TunConfig,
+    /// 7
     pub profile: Profile,
 }
 
@@ -137,6 +140,20 @@ pub struct Profile {
     pub store_smart_stats: bool,
     // this is read to dns config directly
     // store_fake_ip: bool,
+}
+
+#[derive(Default)]
+pub struct TunConfig {
+    pub enable: bool,
+    pub device_id: String,
+    pub route_all: bool,
+    pub routes: Vec<IpNet>,
+    pub gateway: Ipv4Net,
+    pub gateway_v6: Option<Ipv6Net>,
+    pub mtu: Option<u16>,
+    pub so_mark: Option<u32>,
+    pub route_table: u32,
+    pub dns_hijack: bool,
 }
 
 #[derive(Serialize, Deserialize)]
