@@ -23,9 +23,12 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"
 tokio-rustls = { version = "0.26", optional = true }
-webpki-roots = { version = "0.26", optional = true }
+webpki-roots = { version = "1.0", optional = true }
 maxminddb = "0.27"
-hickory-proto = "0.24"
+hickory-proto = "0.25"
+url = { version = "2", optional = true }
+ipnet = { version = "2" }
+network-interface = { version = "2", optional = true }
 
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
@@ -59,28 +62,54 @@ socket2 = { version = "0.6", features = ["all"] }
 # experimental
 downcast-rs = "2.0"
 
-rand = "0.9"
+rand = "0.10"
 
 chrono = { version = "0.4", features = ["serde"] }
 
 sha2 = "0.10"
 
 tokio-tungstenite = { version = "0.28.0", optional = true }
+tun-rs = { version = "2", features = [
+    "async",
+    "async_framed",
+], optional = true }
+watfaq-netstack = { path = "../clash-netstack", optional = true }
+smoltcp = { version = "0.12", default-features = false, features = [
+    "std",
+    "log",
+    "medium-ip",
+    "proto-ipv4",
+    "proto-ipv6",
+    "socket-udp",
+    "socket-tcp",
+], optional = true }
+etherparse = { version = "0.19", optional = true }
 
 base64 = "0.22"
 
 [features]
-default = ["zero_copy", "tls", "aws-lc-rs"]
+default = ["zero_copy", "tls", "aws-lc-rs", "tun"]
 
 zero_copy = []
 
 tls = ["dep:rustls", "dep:tokio-rustls", "dep:webpki-roots"]
 
 aws-lc-rs = ["tls", "rustls/aws-lc-rs"]
+ring = ["tls", "rustls/ring"]
 
 ws = ["tokio-tungstenite"]
 
 trojan = []
+tun = [
+    "dep:tun-rs",
+    "dep:watfaq-netstack",
+    "dep:smoltcp",
+    "dep:network-interface",
+    "dep:url",
+]
+tproxy = ["dep:etherparse"]
+redir = []
+tracing = ["tokio/tracing"]
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [

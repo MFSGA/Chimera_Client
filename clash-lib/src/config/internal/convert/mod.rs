@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use tracing::warn;
 
@@ -22,6 +22,7 @@ mod general;
 /// 3
 mod listener;
 mod proxy_group;
+mod tun;
 
 impl TryFrom<def::Config> for config::Config {
     type Error = crate::Error;
@@ -39,6 +40,11 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
             "allow-lan is set to true, but bind-address is set to localhost. This \
              will not allow any connections from the local network."
         );
+    }
+    if let Some(tun) = &mut c.tun
+        && tun.so_mark.is_none()
+    {
+        tun.so_mark = c.routing_mark;
     }
 
     config::Config {
@@ -98,10 +104,62 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
         general: general::convert(&c)?,
         // relate to dns::Config
         dns: (&c).try_into()?,
+        tun: tun::convert(c.tun.take())?,
         profile: Profile {
             store_selected: c.profile.store_selected,
             store_smart_stats: c.profile.store_smart_stats,
         },
     }
     .validate()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::def;
+
+    use super::convert;
+
+    fn parse_config(extra_yaml: &str) -> def::Config {
+        let yaml = format!(
+            r#"
+bind_address: "*"
+log_level: info
+ipv6: false
+dns: {{}}
+profile: {{}}
+{extra_yaml}
+"#
+        );
+        yaml.parse::<def::Config>()
+            .expect("def config should parse")
+    }
+
+    #[test]
+    fn fill_tun_so_mark_from_routing_mark() {
+        let cfg = parse_config(
+            r#"
+routing_mark: 6666
+tun:
+  enable: true
+"#,
+        );
+
+        let converted = convert(cfg).expect("internal convert should succeed");
+        assert_eq!(converted.tun.so_mark, Some(6666));
+    }
+
+    #[test]
+    fn keep_tun_so_mark_if_explicitly_set() {
+        let cfg = parse_config(
+            r#"
+routing_mark: 6666
+tun:
+  enable: true
+  so-mark: 7777
+"#,
+        );
+
+        let converted = convert(cfg).expect("internal convert should succeed");
+        assert_eq!(converted.tun.so_mark, Some(7777));
+    }
 }

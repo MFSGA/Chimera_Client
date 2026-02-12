@@ -6,6 +6,56 @@ use std::{collections::HashMap, fmt::Display, path::PathBuf, str::FromStr};
 
 use crate::{Error, config::internal::config::BindAddress};
 
+const DEFAULT_ROUTE_TABLE: u32 = 2468;
+
+fn default_tun_device_id() -> String {
+    "utun1989".to_string()
+}
+
+fn default_tun_address() -> String {
+    "198.18.0.1/24".to_string()
+}
+
+fn default_route_table() -> u32 {
+    DEFAULT_ROUTE_TABLE
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DnsHijack {
+    Switch(bool),
+    List(Vec<String>),
+}
+
+impl Default for DnsHijack {
+    fn default() -> Self {
+        Self::Switch(false)
+    }
+}
+
+#[derive(Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct TunConfig {
+    pub enable: bool,
+    #[serde(alias = "device_id", alias = "device-url", alias = "device")]
+    #[serde(default = "default_tun_device_id")]
+    pub device_id: String,
+    #[serde(default = "default_tun_address")]
+    pub gateway: String,
+    #[serde(alias = "gateway_v6", alias = "gateway-v6")]
+    pub gateway_v6: Option<String>,
+    pub routes: Option<Vec<String>>,
+    #[serde(default, alias = "route_all")]
+    pub route_all: bool,
+    pub mtu: Option<u16>,
+    #[serde(alias = "so_mark")]
+    pub so_mark: Option<u32>,
+    #[serde(default = "default_route_table", alias = "route_table")]
+    pub route_table: u32,
+    #[serde(default, alias = "dns_hijack")]
+    pub dns_hijack: DnsHijack,
+}
+
 // todo: rename to DefConfig
 #[derive(Deserialize)]
 pub struct Config {
@@ -74,6 +124,8 @@ pub struct Config {
     /// mixed-port: 7892
     /// ```
     pub mixed_port: Option<Port>,
+    /// TUN settings
+    pub tun: Option<TunConfig>,
     /// 12
     pub listeners: Option<Vec<HashMap<String, Value>>>,
     // 13. these options has default vals,

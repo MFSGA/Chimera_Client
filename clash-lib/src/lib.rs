@@ -12,6 +12,8 @@ use tokio::{
 };
 use tracing::{debug, error, info};
 
+#[cfg(feature = "tun")]
+use crate::{app::net::init_net_config, proxy::tun::get_tun_runner};
 use crate::{
     app::{
         dispatcher::{Dispatcher, StatisticsManager},
@@ -55,6 +57,8 @@ pub enum Error {
     InvalidConfig(String),
     #[error("dns error: {0}")]
     DNSError(String),
+    #[error("operation error: {0}")]
+    Operation(String),
 }
 
 pub enum TokioRuntime {
@@ -206,6 +210,8 @@ pub async fn start(
     let inbound_manager = components.inbound_manager.clone();
     inbound_manager.start_all_listeners().await;
 
+    #[cfg(feature = "tun")]
+    let tun_runner_handle = components.tun_runner.map(tokio::spawn);
     let dns_listener_handle = components.dns_listener.map(tokio::spawn);
 
     let (reload_tx, mut reload_rx) = mpsc::channel(1);
@@ -238,8 +244,7 @@ pub async fn start(
 
     if let Some(r) = api_runner {
         let api_listener_handle = tokio::spawn(r);
-        todo!()
-        // global_state.lock().await.api_listener_handle = Some(api_listener_handle);
+        global_state.lock().await.api_listener_handle = Some(api_listener_handle);
     }
 
     runners.push(Box::pin(async move {
@@ -275,9 +280,17 @@ struct RuntimeComponents {
     outbound_manager: Arc<OutboundManager>,
     dispatcher: Arc<Dispatcher>,
     inbound_manager: Arc<InboundManager>,
+    #[cfg(feature = "tun")]
+    tun_runner: Option<Runner>,
 }
 
 async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<RuntimeComponents> {
+    #[cfg(feature = "tun")]
+    if config.tun.enable {
+        debug!("tun enabled, initializing default outbound interface");
+        init_net_config(config.tun.so_mark).await;
+    }
+
     info!("all components initialized");
 
     debug!("initializing cache store");
@@ -393,6 +406,11 @@ async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<Runti
     let inbound_manager =
         Arc::new(InboundManager::new(dispatcher.clone(), authenticator, config.listeners).await);
 
+    #[cfg(feature = "tun")]
+    debug!("initializing tun runner");
+    #[cfg(feature = "tun")]
+    let tun_runner = get_tun_runner(config.tun, dispatcher.clone(), dns_resolver.clone())?;
+
     debug!("initializing dns listener");
     let dns_listener = dns::get_dns_listener(dns_listen, dns_resolver.clone(), &cwd).await;
 
@@ -404,5 +422,7 @@ async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<Runti
         outbound_manager,
         dispatcher,
         inbound_manager,
+        #[cfg(feature = "tun")]
+        tun_runner,
     })
 }
