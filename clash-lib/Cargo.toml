@@ -23,9 +23,9 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"
 tokio-rustls = { version = "0.26", optional = true }
-webpki-roots = { version = "0.26", optional = true }
+webpki-roots = { version = "1.0", optional = true }
 maxminddb = "0.27"
-hickory-proto = "0.24"
+hickory-proto = "0.25"
 url = { version = "2", optional = true }
 ipnet = { version = "2" }
 network-interface = { version = "2", optional = true }
@@ -62,7 +62,7 @@ socket2 = { version = "0.6", features = ["all"] }
 # experimental
 downcast-rs = "2.0"
 
-rand = "0.9"
+rand = "0.10"
 
 chrono = { version = "0.4", features = ["serde"] }
 
@@ -83,7 +83,7 @@ smoltcp = { version = "0.12", default-features = false, features = [
     "socket-udp",
     "socket-tcp",
 ], optional = true }
-etherparse = { version = "0.12", optional = true }
+etherparse = { version = "0.19", optional = true }
 
 base64 = "0.22"
 

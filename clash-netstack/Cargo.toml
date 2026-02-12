@@ -24,7 +24,7 @@ bytes = "1.11"
 tokio = { version = "1.49", features = ["full"] }
 futures = "0.3"
 log = "0.4"
-rand = "0.9"
+rand = "0.10"
 etherparse = "0.19"
 
 
