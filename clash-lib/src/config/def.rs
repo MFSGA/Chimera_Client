@@ -126,21 +126,23 @@ impl FromStr for Config {
 #[derive(PartialEq, Serialize, Deserialize, Default, Copy, Clone, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
+    Trace,
+    Debug,
     #[default]
     Info,
     Error,
     #[serde(alias = "warn")]
     Warning,
-    Debug,
 }
 
 impl Display for LogLevel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            LogLevel::Trace => write!(f, "trace"),
+            LogLevel::Debug => write!(f, "debug"),
             LogLevel::Info => write!(f, "info"),
             LogLevel::Error => write!(f, "error"),
             LogLevel::Warning => write!(f, "warn"),
-            LogLevel::Debug => write!(f, "debug"),
         }
     }
 }
