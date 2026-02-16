@@ -20,7 +20,7 @@ env:
   REGISTRY: "ghcr.io"
   IMAGE_NAME: "clash-rs"
   RUST_LOG: "clash=TRACE"
-  RUST_TOOLCHAIN: "nightly-2025-09-15"
+  RUST_TOOLCHAIN: "stable"
   SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
   CROSS_CONTAINER_UID: 1001
   CROSS_CONTAINER_GID: 118
@@ -130,9 +130,13 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ matrix.toolchain || env.RUST_TOOLCHAIN || 'nightly' }}
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
           targets: ${{ matrix.build-std && 'x86_64-unknown-linux-gnu' || matrix.target }}
           components: ${{ matrix.components || matrix.build-std && 'rustfmt,clippy,rust-src' || 'rustfmt,clippy' }}
+
+      - name: Install target for native cargo builds
+        if: ${{ matrix.tool != 'cross' }}
+        run: rustup target add ${{ matrix.target }} --toolchain ${{ env.RUSTUP_TOOLCHAIN }}
 
       - name: Install cross-rs/cross
         if: matrix.tool == 'cross'
@@ -292,4 +296,3 @@ jobs:
           files: |
             packages/*
             LICENSE*
-
