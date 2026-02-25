@@ -29,6 +29,8 @@ pub mod tun;
 
 /// 9
 mod common;
+#[cfg(feature = "hysteria")]
+pub mod hysteria2;
 /// 7
 mod options;
 /// 8
@@ -98,6 +100,7 @@ pub enum OutboundType {
     Direct,
     Reject,
     Trojan,
+    Hysteria2,
 }
 
 impl Display for OutboundType {
@@ -121,6 +124,7 @@ impl Display for OutboundType {
             OutboundType::Smart => write!(f, "Smart"),
             OutboundType::Fallback => write!(f, "Fallback"), */
             OutboundType::Trojan => write!(f, "Trojan"),
+            OutboundType::Hysteria2 => write!(f, "Hysteria2"),
             OutboundType::Direct => write!(f, "Direct"),
             OutboundType::Reject => write!(f, "Reject"),
         }

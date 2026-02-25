@@ -8,7 +8,7 @@ edition = { workspace = true }
 
 [features]
 default = ["standard"]
-standard = ["trojan", "ws", "tls"]
+standard = ["trojan", "ws", "tls", "hysteria"]
 
 plus = ["standard", "onion"]
 onion = []
@@ -18,6 +18,7 @@ ws = ["clash-lib/ws"]
 tls = ["clash-lib/tls"]
 
 trojan = ["clash-lib/trojan"]
+hysteria = ["clash-lib/hysteria"]
 tun = ["clash-lib/tun"]
 tproxy = ["clash-lib/tproxy"]
 redir = ["clash-lib/redir"]

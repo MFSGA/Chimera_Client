@@ -37,6 +37,9 @@ pub enum OutboundProxyProtocol {
     #[cfg(feature = "trojan")]
     #[serde(rename = "trojan")]
     Trojan(OutboundTrojan),
+    #[cfg(feature = "hysteria")]
+    #[serde(rename = "hysteria2")]
+    Hysteria2(OutboundHysteria2),
 }
 
 impl OutboundProxyProtocol {
@@ -49,6 +52,8 @@ impl OutboundProxyProtocol {
             }
             #[cfg(feature = "trojan")]
             OutboundProxyProtocol::Trojan(trojan) => &trojan.common_opts.name,
+            #[cfg(feature = "hysteria")]
+            OutboundProxyProtocol::Hysteria2(hysteria2) => &hysteria2.name,
         }
     }
 }
@@ -150,6 +155,38 @@ pub struct CommonConfigOptions {
     /// nothing
     #[serde(alias = "dialer-proxy")]
     pub connect_via: Option<String>,
+}
+
+#[cfg(feature = "hysteria")]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct OutboundHysteria2 {
+    pub name: String,
+    pub server: String,
+    pub port: u16,
+    pub ports: Option<String>,
+    pub password: String,
+    pub obfs: Option<Hysteria2Obfs>,
+    pub obfs_password: Option<String>,
+    pub alpn: Option<Vec<String>>,
+    pub up: Option<u64>,
+    pub down: Option<u64>,
+    pub sni: Option<String>,
+    #[serde(default)]
+    pub skip_cert_verify: bool,
+    pub ca: Option<String>,
+    pub ca_str: Option<String>,
+    pub fingerprint: Option<String>,
+    pub udp_mtu: Option<u32>,
+    pub disable_mtu_discovery: Option<bool>,
+    pub cwnd: Option<u64>,
+}
+
+#[cfg(feature = "hysteria")]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum Hysteria2Obfs {
+    Salamander,
 }
 
 #[cfg(all(feature = "trojan", feature = "ws"))]

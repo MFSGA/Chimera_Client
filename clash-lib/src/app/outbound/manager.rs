@@ -17,6 +17,8 @@ use crate::{
     },
 };
 
+#[cfg(feature = "hysteria")]
+use crate::proxy::hysteria2;
 #[cfg(feature = "trojan")]
 use crate::proxy::trojan;
 
@@ -127,6 +129,16 @@ impl OutboundManager {
                         .map(|x: trojan::Handler| Arc::new(x) as _)
                         .inspect_err(|e| {
                             error!("failed to load trojan outbound {}: {}", name, e);
+                        })
+                        .ok()
+                }
+                #[cfg(feature = "hysteria")]
+                OutboundProxyProtocol::Hysteria2(v) => {
+                    let name = v.name.clone();
+                    v.try_into()
+                        .map(|x: hysteria2::Handler| Arc::new(x) as _)
+                        .inspect_err(|e| {
+                            error!("failed to load hysteria2 outbound {}: {}", name, e);
                         })
                         .ok()
                 }
