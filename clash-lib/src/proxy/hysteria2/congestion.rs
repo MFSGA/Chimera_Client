@@ -5,11 +5,28 @@ use std::{
 
 use quinn_proto::congestion::{Bbr, BbrConfig, Controller, ControllerFactory};
 
-pub struct DynCongestion;
+pub struct DynCongestion {
+    cwnd_packets: Option<u64>,
+}
+
+impl DynCongestion {
+    pub fn new(cwnd_packets: Option<u64>) -> Self {
+        Self {
+            cwnd_packets: cwnd_packets.filter(|value| *value > 0),
+        }
+    }
+}
 
 impl ControllerFactory for DynCongestion {
     fn build(self: Arc<Self>, _now: Instant, current_mtu: u16) -> Box<dyn Controller> {
-        let bbr = Bbr::new(Arc::new(BbrConfig::default()), current_mtu);
+        let mut bbr_config = BbrConfig::default();
+        if let Some(cwnd_packets) = self.cwnd_packets {
+            let cwnd_bytes = cwnd_packets.saturating_mul(current_mtu as u64);
+            let min_cwnd_bytes = 2 * current_mtu as u64;
+            bbr_config.initial_window(cwnd_bytes.max(min_cwnd_bytes));
+        }
+
+        let bbr = Bbr::new(Arc::new(bbr_config), current_mtu);
         Box::new(DynController::new(Box::new(bbr)))
     }
 }
@@ -285,5 +302,17 @@ impl Controller for DynController {
 
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dyn_congestion_applies_cwnd_packets() {
+        let mtu = 1_250;
+        let controller = Arc::new(DynCongestion::new(Some(8))).build(Instant::now(), mtu);
+        assert_eq!(controller.initial_window(), 8 * mtu as u64);
     }
 }

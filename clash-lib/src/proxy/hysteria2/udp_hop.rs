@@ -28,17 +28,44 @@ pub struct UdpHop {
     initial_port: u16,
     port_generator: PortGenerator,
     interval: Duration,
+    bind_addr: SocketAddr,
+    #[cfg(target_os = "linux")]
+    so_mark: Option<u32>,
 }
 
 impl UdpHop {
     const DEFAULT_INTERVAL: Duration = Duration::from_secs(30);
 
+    fn build_socket(
+        bind_addr: SocketAddr,
+        #[cfg(target_os = "linux")] so_mark: Option<u32>,
+    ) -> io::Result<std::net::UdpSocket> {
+        let domain = match bind_addr {
+            SocketAddr::V4(_) => socket2::Domain::IPV4,
+            SocketAddr::V6(_) => socket2::Domain::IPV6,
+        };
+        let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
+        #[cfg(target_os = "linux")]
+        if let Some(so_mark) = so_mark {
+            socket.set_mark(so_mark)?;
+        }
+        socket.set_nonblocking(true)?;
+        socket.bind(&bind_addr.into())?;
+        Ok(socket.into())
+    }
+
     pub fn new(
         initial_port: u16,
         port_generator: PortGenerator,
         interval: Option<Duration>,
+        bind_addr: SocketAddr,
+        #[cfg(target_os = "linux")] so_mark: Option<u32>,
     ) -> io::Result<Self> {
-        let socket = std::net::UdpSocket::bind(SocketAddr::new([0, 0, 0, 0].into(), 0))?;
+        let socket = Self::build_socket(
+            bind_addr,
+            #[cfg(target_os = "linux")]
+            so_mark,
+        )?;
         let state = HopState {
             prev_conn: None,
             cur_conn: TokioRuntime.wrap_udp_socket(socket)?,
@@ -51,14 +78,21 @@ impl UdpHop {
             initial_port,
             port_generator,
             interval: interval.unwrap_or(Self::DEFAULT_INTERVAL),
+            bind_addr,
+            #[cfg(target_os = "linux")]
+            so_mark,
         })
     }
 
     fn maybe_hop(&self) -> u16 {
         let mut lock = self.state.lock().expect("udp hop lock poisoned");
         if Instant::now().sub(lock.last_hop) > self.interval && lock.prev_conn.is_none() {
-            match std::net::UdpSocket::bind(SocketAddr::new([0, 0, 0, 0].into(), 0))
-                .and_then(|socket| TokioRuntime.wrap_udp_socket(socket))
+            match Self::build_socket(
+                self.bind_addr,
+                #[cfg(target_os = "linux")]
+                self.so_mark,
+            )
+            .and_then(|socket| TokioRuntime.wrap_udp_socket(socket))
             {
                 Ok(new_conn) => {
                     lock.last_hop = Instant::now();

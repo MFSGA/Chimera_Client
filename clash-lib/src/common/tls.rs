@@ -19,12 +19,18 @@ pub struct DefaultTlsVerifier {
 
 impl DefaultTlsVerifier {
     pub fn new(fingerprint: Option<String>, skip: bool) -> Self {
+        Self::with_root_store(fingerprint, skip, GLOBAL_ROOT_STORE.clone())
+    }
+
+    pub fn with_root_store(
+        fingerprint: Option<String>,
+        skip: bool,
+        root_store: Arc<RootCertStore>,
+    ) -> Self {
         Self {
             fingerprint,
             skip,
-            pki: WebPkiServerVerifier::builder(GLOBAL_ROOT_STORE.clone())
-                .build()
-                .unwrap(),
+            pki: WebPkiServerVerifier::builder(root_store).build().unwrap(),
         }
     }
 }

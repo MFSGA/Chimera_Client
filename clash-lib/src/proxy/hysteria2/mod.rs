@@ -5,9 +5,11 @@ mod udp_hop;
 
 use std::{
     fmt::{Debug, Formatter},
-    io,
+    fs,
+    io::{self, BufReader},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     num::ParseIntError,
+    path::Path,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -24,7 +26,7 @@ use quinn::{
     ClientConfig, Connection, EndpointConfig, TokioRuntime, crypto::rustls::QuicClientConfig,
 };
 use quinn_proto::TransportConfig;
-use rustls::ClientConfig as RustlsClientConfig;
+use rustls::{ClientConfig as RustlsClientConfig, RootCertStore};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::Mutex,
@@ -36,7 +38,7 @@ use crate::{
         dispatcher::{BoxedChainedStream, ChainedStream, ChainedStreamWrapper},
         dns::ThreadSafeDNSResolver,
     },
-    common::tls::DefaultTlsVerifier,
+    common::tls::{DefaultTlsVerifier, GLOBAL_ROOT_STORE},
     proxy::{
         DialWithConnector, OutboundHandler, OutboundType, converters::hysteria2::PortGenerator,
     },
@@ -108,19 +110,157 @@ impl Debug for Handler {
 
 impl Handler {
     const DEFAULT_MAX_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+    const MIN_INITIAL_CWND_PACKETS: u64 = 2;
+
+    fn default_bind_addr(server_addr: SocketAddr) -> SocketAddr {
+        match server_addr {
+            SocketAddr::V4(_) => SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
+            SocketAddr::V6(_) => SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0),
+        }
+    }
+
+    fn select_bind_addr(server_addr: SocketAddr, sess: &Session) -> SocketAddr {
+        let default_bind_addr = Self::default_bind_addr(server_addr);
+
+        let Some(iface) = sess.iface.as_ref() else {
+            return default_bind_addr;
+        };
+
+        match server_addr {
+            SocketAddr::V4(_) => match iface.addr_v4 {
+                Some(bind_ip) => {
+                    let bind_addr = SocketAddr::new(bind_ip.into(), 0);
+                    debug!(
+                        server_addr = %server_addr,
+                        iface = %iface.name,
+                        bind_addr = %bind_addr,
+                        "hysteria2 socket bound to interface address"
+                    );
+                    bind_addr
+                }
+                None => {
+                    warn!(
+                        server_addr = %server_addr,
+                        iface = %iface.name,
+                        "hysteria2 connect-via has no IPv4 address on selected interface, using wildcard bind"
+                    );
+                    default_bind_addr
+                }
+            },
+            SocketAddr::V6(_) => match iface.addr_v6 {
+                Some(bind_ip) => {
+                    let bind_addr = SocketAddr::new(bind_ip.into(), 0);
+                    debug!(
+                        server_addr = %server_addr,
+                        iface = %iface.name,
+                        bind_addr = %bind_addr,
+                        "hysteria2 socket bound to interface address"
+                    );
+                    bind_addr
+                }
+                None => {
+                    warn!(
+                        server_addr = %server_addr,
+                        iface = %iface.name,
+                        "hysteria2 connect-via has no IPv6 address on selected interface, using wildcard bind"
+                    );
+                    default_bind_addr
+                }
+            },
+        }
+    }
+
+    fn append_custom_ca(
+        root_store: &mut RootCertStore,
+        source: &str,
+        bytes: &[u8],
+    ) -> io::Result<usize> {
+        let mut reader = BufReader::new(bytes);
+        let pem_certs: io::Result<Vec<_>> = rustls_pemfile::certs(&mut reader).collect();
+        let certs = match pem_certs {
+            Ok(certs) if !certs.is_empty() => certs,
+            Ok(_) => vec![rustls::pki_types::CertificateDer::from(bytes.to_vec())],
+            Err(err) => {
+                return Err(io::Error::other(format!(
+                    "failed to parse certificate from {source}: {err}"
+                )));
+            }
+        };
+
+        let (added, ignored) = root_store.add_parsable_certificates(certs);
+        if added == 0 {
+            return Err(io::Error::other(format!(
+                "no valid certificate found in {source}"
+            )));
+        }
+        if ignored > 0 {
+            warn!(
+                source,
+                ignored, "hysteria2 ignored invalid certificate entries"
+            );
+        }
+        Ok(added)
+    }
+
+    fn load_custom_root_store(opts: &HystOption) -> Option<Arc<RootCertStore>> {
+        if opts.ca.is_none() && opts.ca_str.is_none() {
+            return None;
+        }
+
+        let mut root_store = (*GLOBAL_ROOT_STORE).as_ref().clone();
+        let mut loaded = 0usize;
+
+        if let Some(ca_path) = opts.ca.as_deref() {
+            let source = format!("ca file `{}`", Path::new(ca_path).display());
+            match fs::read(ca_path)
+                .and_then(|content| Self::append_custom_ca(&mut root_store, &source, &content))
+            {
+                Ok(added) => {
+                    debug!(source, added, "hysteria2 loaded custom CA certificates");
+                    loaded += added;
+                }
+                Err(err) => warn!("hysteria2 failed to load {source}: {err}"),
+            }
+        }
+
+        if let Some(ca_str) = opts.ca_str.as_deref() {
+            let source = "inline ca_str".to_owned();
+            match Self::append_custom_ca(&mut root_store, &source, ca_str.as_bytes()) {
+                Ok(added) => {
+                    debug!(source, added, "hysteria2 loaded custom CA certificates");
+                    loaded += added;
+                }
+                Err(err) => warn!("hysteria2 failed to load {source}: {err}"),
+            }
+        }
+
+        if loaded == 0 {
+            warn!(
+                "hysteria2 custom CA configured but no valid certificates loaded, using default root store"
+            );
+            return None;
+        }
+
+        Some(Arc::new(root_store))
+    }
 
     pub fn new(opts: HystOption) -> Self {
-        if opts.ca.is_some() || opts.ca_str.is_some() {
-            warn!("hysteria2 custom CA is not implemented yet, using default root store");
-        }
-        if opts.cwnd.is_some() {
-            warn!("hysteria2 `cwnd` option is not implemented yet");
-        }
         if opts.udp_mtu.is_some() {
             warn!("hysteria2 `udp-mtu` is ignored in TCP-only implementation");
         }
+        if matches!(opts.cwnd, Some(0)) {
+            warn!("hysteria2 `cwnd` must be greater than 0, falling back to default window");
+        }
 
-        let verifier = DefaultTlsVerifier::new(opts.fingerprint.clone(), opts.skip_cert_verify);
+        let custom_root_store = Self::load_custom_root_store(&opts);
+        let verifier = match custom_root_store {
+            Some(root_store) => DefaultTlsVerifier::with_root_store(
+                opts.fingerprint.clone(),
+                opts.skip_cert_verify,
+                root_store,
+            ),
+            None => DefaultTlsVerifier::new(opts.fingerprint.clone(), opts.skip_cert_verify),
+        };
         let mut tls_config = RustlsClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(verifier))
@@ -139,7 +279,17 @@ impl Handler {
         if opts.disable_mtu_discovery {
             transport.mtu_discovery_config(None);
         }
-        transport.congestion_controller_factory(Arc::new(DynCongestion));
+        let cwnd_packets = opts
+            .cwnd
+            .filter(|value| *value >= Self::MIN_INITIAL_CWND_PACKETS);
+        if opts.cwnd.is_some() && cwnd_packets.is_none() {
+            warn!(
+                min = Self::MIN_INITIAL_CWND_PACKETS,
+                "hysteria2 `cwnd` is too small, falling back to default window"
+            );
+        }
+
+        transport.congestion_controller_factory(Arc::new(DynCongestion::new(cwnd_packets)));
         transport.max_idle_timeout(Some(Self::DEFAULT_MAX_IDLE_TIMEOUT.try_into().unwrap()));
         transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
 
@@ -176,20 +326,12 @@ impl Handler {
         server_addr: SocketAddr,
         sess: &Session,
     ) -> io::Result<std::net::UdpSocket> {
-        let (domain, bind_addr) = match server_addr {
-            SocketAddr::V4(_) => (
-                socket2::Domain::IPV4,
-                SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
-            ),
-            SocketAddr::V6(_) => (
-                socket2::Domain::IPV6,
-                SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0),
-            ),
+        let domain = match server_addr {
+            SocketAddr::V4(_) => socket2::Domain::IPV4,
+            SocketAddr::V6(_) => socket2::Domain::IPV6,
         };
+        let bind_addr = Self::select_bind_addr(server_addr, sess);
         let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
-        if sess.iface.is_some() {
-            debug!("hysteria2 currently ignores `connect-via` interface binding");
-        }
         #[cfg(target_os = "linux")]
         if let Some(so_mark) = sess.so_mark {
             socket.set_mark(so_mark)?;
@@ -257,6 +399,7 @@ impl Handler {
     ) -> anyhow::Result<(Arc<Connection>, SendRequest<OpenStreams, Bytes>)> {
         let server_addr = self.resolve_server_addr(resolver).await?;
         let socket_factory = || Self::create_udp_socket(server_addr, sess);
+        let bind_addr = Self::select_bind_addr(server_addr, sess);
 
         let mut endpoint = if let Some(obfs) = self.opts.obfs.as_ref() {
             match obfs {
@@ -273,7 +416,14 @@ impl Handler {
                 }
             }
         } else if let Some(port_generator) = self.opts.ports.as_ref() {
-            let socket = udp_hop::UdpHop::new(server_addr.port(), port_generator.clone(), None)?;
+            let socket = udp_hop::UdpHop::new(
+                server_addr.port(),
+                port_generator.clone(),
+                None,
+                bind_addr,
+                #[cfg(target_os = "linux")]
+                sess.so_mark,
+            )?;
             quinn::Endpoint::new_with_abstract_socket(
                 self.ep_config.clone(),
                 None,
