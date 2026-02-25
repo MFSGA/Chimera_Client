@@ -1,4 +1,5 @@
 mod codec;
+mod congestion;
 mod salamander;
 mod udp_hop;
 
@@ -6,6 +7,7 @@ use std::{
     fmt::{Debug, Formatter},
     io,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    num::ParseIntError,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -14,6 +16,7 @@ use std::{
 use anyhow::anyhow;
 use bytes::Bytes;
 use codec::Hy2TcpCodec;
+use congestion::{Brutal, DynCongestion, DynController};
 use futures::{SinkExt, StreamExt};
 use h3::client::SendRequest;
 use h3_quinn::OpenStreams;
@@ -69,6 +72,24 @@ pub struct HystOption {
     pub udp_mtu: Option<u32>,
 }
 
+#[derive(Debug, Copy, Clone)]
+enum CcRx {
+    Auto,
+    Fixed(u64),
+}
+
+impl std::str::FromStr for CcRx {
+    type Err = ParseIntError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.eq_ignore_ascii_case("auto") {
+            Ok(Self::Auto)
+        } else {
+            Ok(Self::Fixed(value.parse::<u64>()?))
+        }
+    }
+}
+
 pub struct Handler {
     opts: HystOption,
     ep_config: EndpointConfig,
@@ -92,8 +113,8 @@ impl Handler {
         if opts.ca.is_some() || opts.ca_str.is_some() {
             warn!("hysteria2 custom CA is not implemented yet, using default root store");
         }
-        if opts.up_down.is_some() || opts.cwnd.is_some() {
-            warn!("hysteria2 custom congestion options are not implemented yet");
+        if opts.cwnd.is_some() {
+            warn!("hysteria2 `cwnd` option is not implemented yet");
         }
         if opts.udp_mtu.is_some() {
             warn!("hysteria2 `udp-mtu` is ignored in TCP-only implementation");
@@ -118,6 +139,7 @@ impl Handler {
         if opts.disable_mtu_discovery {
             transport.mtu_discovery_config(None);
         }
+        transport.congestion_controller_factory(Arc::new(DynCongestion));
         transport.max_idle_timeout(Some(Self::DEFAULT_MAX_IDLE_TIMEOUT.try_into().unwrap()));
         transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
 
@@ -194,6 +216,40 @@ impl Handler {
         }
     }
 
+    fn client_cc_rx_header(&self) -> String {
+        self.opts
+            .up_down
+            .map(|(_, down)| down.to_string())
+            .unwrap_or_else(|| "0".to_owned())
+    }
+
+    fn select_brutal_bps(&self, cc_rx: CcRx) -> Option<u64> {
+        match cc_rx {
+            CcRx::Fixed(rate) if rate > 0 => Some(rate),
+            _ => self.opts.up_down.map(|(up, _)| up).filter(|up| *up > 0),
+        }
+    }
+
+    fn configure_brutal_cc(conn: &Connection, brutal_bps: Option<u64>) {
+        let Some(brutal_bps) = brutal_bps else {
+            return;
+        };
+
+        match conn
+            .congestion_state()
+            .into_any()
+            .downcast::<DynController>()
+        {
+            Ok(controller) => {
+                controller.set_controller(Box::new(Brutal::new(brutal_bps, conn.clone())));
+                debug!(brutal_bps, "hysteria2 enabled brutal congestion control");
+            }
+            Err(_) => {
+                warn!("hysteria2 failed to switch congestion controller to brutal");
+            }
+        }
+    }
+
     async fn new_authed_connection_inner(
         &self,
         sess: &Session,
@@ -233,7 +289,10 @@ impl Handler {
 
         let server_name = self.tls_server_name(server_addr);
         let conn = endpoint.connect(server_addr, &server_name)?.await?;
-        let (guard, _udp_supported) = Self::auth(&conn, &self.opts.password).await?;
+        let cc_rx_header = self.client_cc_rx_header();
+        let (guard, cc_rx, _udp_supported) =
+            Self::auth(&conn, &self.opts.password, cc_rx_header.as_str()).await?;
+        Self::configure_brutal_cc(&conn, self.select_brutal_bps(cc_rx));
 
         Ok((Arc::new(conn), guard))
     }
@@ -241,13 +300,14 @@ impl Handler {
     async fn auth(
         conn: &Connection,
         password: &str,
-    ) -> anyhow::Result<(SendRequest<OpenStreams, Bytes>, bool)> {
+        cc_rx_header: &str,
+    ) -> anyhow::Result<(SendRequest<OpenStreams, Bytes>, CcRx, bool)> {
         let h3_conn = h3_quinn::Connection::new(conn.clone());
         let (_, mut sender) = h3::client::builder().build::<_, _, Bytes>(h3_conn).await?;
 
         let request = http::Request::post("https://hysteria/auth")
             .header("Hysteria-Auth", password)
-            .header("Hysteria-CC-RX", "0")
+            .header("Hysteria-CC-RX", cc_rx_header)
             .header("Hysteria-Padding", codec::padding(64..=512))
             .body(())
             .expect("request builder should be valid");
@@ -264,6 +324,25 @@ impl Handler {
             ));
         }
 
+        let cc_rx = match response.headers().get("Hysteria-CC-RX") {
+            Some(header) => match header.to_str() {
+                Ok(value) => match value.parse::<CcRx>() {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        warn!(
+                            "hysteria2 invalid Hysteria-CC-RX value `{value}`: {err}, fallback to auto"
+                        );
+                        CcRx::Auto
+                    }
+                },
+                Err(err) => {
+                    warn!("hysteria2 invalid Hysteria-CC-RX header: {err}, fallback to auto");
+                    CcRx::Auto
+                }
+            },
+            None => CcRx::Auto,
+        };
+
         let udp_supported = response
             .headers()
             .get("Hysteria-UDP")
@@ -271,7 +350,7 @@ impl Handler {
             .and_then(|value| value.parse::<bool>().ok())
             .unwrap_or(false);
 
-        Ok((sender, udp_supported))
+        Ok((sender, cc_rx, udp_supported))
     }
 
     async fn new_authed_connection(
