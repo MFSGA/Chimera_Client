@@ -16,7 +16,8 @@ defaults:
     shell: bash
 
 env:
-  PACKAGE: "clash"
+  # PACKAGE Name
+  PACKAGE: "clash_chimera"
   REGISTRY: "ghcr.io"
   IMAGE_NAME: "clash-rs"
   RUST_LOG: "clash=TRACE"
@@ -242,10 +243,14 @@ jobs:
       - name: Create SHA256Sums.txt and version.txt
         run: |
           cd packages
-          sha256sum * >> sha256sums.txt
+          sha256sum * > sha256sums.txt
           cat sha256sums.txt
-          chmod +x ./clash-x86_64-unknown-linux-musl
-          ./clash-x86_64-unknown-linux-musl -v >> version.txt
+
+          BIN="./${{ env.PACKAGE }}-x86_64-unknown-linux-musl"
+          test -f "$BIN" || { echo "missing binary: $BIN"; ls -la; exit 1; }
+
+          chmod +x "$BIN"
+          "$BIN" -v > version.txt
           cat version.txt
 
       - name: Clean git tag & release
