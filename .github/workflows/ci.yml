@@ -16,7 +16,8 @@ defaults:
     shell: bash
 
 env:
-  PACKAGE: "clash"
+  # PACKAGE Name
+  PACKAGE: "clash_chimera"
   REGISTRY: "ghcr.io"
   IMAGE_NAME: "clash-rs"
   RUST_LOG: "clash=TRACE"
