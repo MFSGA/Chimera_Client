@@ -7,7 +7,7 @@ edition = { workspace = true }
 # authors = { workspace = true }
 
 [features]
-default = ["standard"]
+default = ["standard", "aws-lc-rs"]
 standard = ["trojan", "ws", "tls", "hysteria"]
 
 plus = ["standard", "onion"]
@@ -22,6 +22,7 @@ hysteria = ["clash-lib/hysteria"]
 tun = ["clash-lib/tun"]
 tproxy = ["clash-lib/tproxy"]
 redir = ["clash-lib/redir"]
+aws-lc-rs = ["dep:aws-lc-rs", "clash-lib/aws-lc-rs"]
 ring = ["clash-lib/ring"]
 tracing = ["clash-lib/tracing"]
 
@@ -35,3 +36,4 @@ tikv-jemallocator = { version = "0.6", optional = true }
 clap = { version = "4", features = ["derive"] }
 
 clash-lib = { path = "../clash-lib", default-features = false }
+aws-lc-rs = { version = "1", optional = true, default-features = false, features = ["bindgen", "aws-lc-sys"] }

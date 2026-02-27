@@ -159,29 +159,20 @@ pub fn start_scaffold(opts: Options) -> Result<()> {
     })
 }
 
-#[cfg(feature = "tls")]
 static CRYPTO_PROVIDER_LOCK: OnceLock<()> = OnceLock::new();
 
-#[cfg(feature = "tls")]
 pub fn setup_default_crypto_provider() {
     CRYPTO_PROVIDER_LOCK.get_or_init(|| {
         #[cfg(feature = "aws-lc-rs")]
         {
-            rustls::crypto::aws_lc_rs::default_provider()
-                .install_default()
-                .unwrap()
+            _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         }
         #[cfg(feature = "ring")]
         {
-            rustls::crypto::ring::default_provider()
-                .install_default()
-                .unwrap()
+            _ = rustls::crypto::ring::default_provider().install_default();
         }
     });
 }
-
-#[cfg(not(feature = "tls"))]
-pub fn setup_default_crypto_provider() {}
 
 pub async fn start(
     config: InternalConfig,
