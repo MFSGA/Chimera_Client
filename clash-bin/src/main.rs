@@ -95,7 +95,16 @@ fn main() {
     }
 
     if cli.test_config {
-        todo!()
+        match clash::Config::File(file.clone()).try_parse() {
+            Ok(_) => {
+                println!("configuration file {file} test is successful");
+                exit(0);
+            }
+            Err(e) => {
+                eprintln!("configuration file {file} test failed: {e}");
+                exit(1);
+            }
+        }
     }
 
     // todo: NOTE: set this up before Sentry
