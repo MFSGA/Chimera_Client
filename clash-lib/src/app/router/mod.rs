@@ -9,7 +9,7 @@ use crate::{
     Session,
     app::{
         dns::ThreadSafeDNSResolver,
-        router::rules::{domain::Domain, final_::Final},
+        router::rules::{domain::Domain, domain_suffix::DomainSuffix, final_::Final},
     },
     common::mmdb::MmdbLookup,
     config::internal::{config::RuleProviderDef, rule::RuleType},
@@ -115,6 +115,13 @@ pub fn map_rule_type(
         RuleType::Domain { domain, target } => {
             Box::new(Domain { domain, target }) as Box<dyn RuleMatcher>
         }
+        RuleType::DomainSuffix {
+            domain_suffix,
+            target,
+        } => Box::new(DomainSuffix {
+            suffix: domain_suffix,
+            target,
+        }),
         RuleType::Match { target } => Box::new(Final { target }),
     }
 }

@@ -4,8 +4,17 @@ use crate::Error;
 
 /// todo: support more rule type
 pub enum RuleType {
-    Domain { domain: String, target: String },
-    Match { target: String },
+    Domain {
+        domain: String,
+        target: String,
+    },
+    DomainSuffix {
+        domain_suffix: String,
+        target: String,
+    },
+    Match {
+        target: String,
+    },
 }
 
 impl RuleType {
@@ -20,6 +29,10 @@ impl RuleType {
                 domain: payload.to_string(),
                 target: target.to_string(),
             }),
+            "DOMAIN-SUFFIX" => Ok(RuleType::DomainSuffix {
+                domain_suffix: payload.to_string(),
+                target: target.to_string(),
+            }),
             "MATCH" => Ok(RuleType::Match {
                 target: target.to_string(),
             }),
@@ -32,6 +45,7 @@ impl RuleType {
     pub fn target(&self) -> &str {
         match self {
             RuleType::Domain { target, .. } => target,
+            RuleType::DomainSuffix { target, .. } => target,
             RuleType::Match { target } => target,
         }
     }
@@ -59,5 +73,40 @@ impl FromStr for RuleType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         s.to_string().try_into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RuleType;
+
+    #[test]
+    fn parse_domain_suffix_rule() {
+        let rule = RuleType::try_from("DOMAIN-SUFFIX,example.com,PROXY".to_string()).unwrap();
+        match rule {
+            RuleType::DomainSuffix {
+                domain_suffix,
+                target,
+            } => {
+                assert_eq!(domain_suffix, "example.com");
+                assert_eq!(target, "PROXY");
+            }
+            _ => panic!("Expected DomainSuffix rule"),
+        }
+    }
+
+    #[test]
+    fn domain_suffix_target_returns_proxy_name() {
+        let rule = RuleType::DomainSuffix {
+            domain_suffix: "example.com".to_string(),
+            target: "PROXY".to_string(),
+        };
+        assert_eq!(rule.target(), "PROXY");
+    }
+
+    #[test]
+    fn invalid_rule_line_still_errors() {
+        let rule = RuleType::try_from("DOMAIN-SUFFIX".to_string());
+        assert!(rule.is_err());
     }
 }
