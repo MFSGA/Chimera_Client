@@ -107,6 +107,8 @@ tower = { version = "0.5", features = ["util"] }
 
 tower-http = { version = "0.6", features = ["fs", "trace", "cors"] }
 
+erased-serde = "0.4"
+
 [features]
 default = ["zero_copy", "tls", "aws-lc-rs", "tun"]
 

@@ -2,6 +2,8 @@ use std::{collections::HashMap, sync::Arc};
 
 use tracing::{debug, error};
 
+use erased_serde::Serialize;
+
 use crate::{
     Error,
     app::{
@@ -96,6 +98,37 @@ impl OutboundManager {
     pub fn proxy_names(&self) -> &[String] {
         todo!()
         // &self.proxy_names
+    }
+
+    /// Get all proxies in the manager, excluding those in providers.
+    pub async fn get_proxies(&self) -> HashMap<String, Box<dyn Serialize + Send>> {
+        let mut r = HashMap::new();
+
+        let proxy_manager = &self.proxy_manager;
+
+        for (k, v) in self.handlers.iter() {
+            let mut m = if let Some(g) = v.try_as_group_handler() {
+                g.as_map().await
+            } else {
+                let mut m = HashMap::new();
+                m.insert("type".to_string(), Box::new(v.proto()) as _);
+                m
+            };
+
+            /* todo: api
+            let alive = proxy_manager.alive(k).await;
+            let history = proxy_manager.delay_history(k).await;
+            let support_udp = v.support_udp().await; */
+
+            m.insert("history".to_string(), Box::new(Vec::<u32>::new()));
+            m.insert("alive".to_string(), Box::new(false));
+            m.insert("name".to_string(), Box::new(k.to_owned()));
+            m.insert("udp".to_string(), Box::new(false));
+
+            r.insert(k.clone(), Box::new(m) as _);
+        }
+
+        r
     }
 
     fn load_handlers(&mut self, outbounds: Vec<AnyOutboundHandler>) -> Result<(), Error> {

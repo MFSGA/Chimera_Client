@@ -5,7 +5,7 @@ use axum::{
     routing::{get, post},
 };
 use http::{Method, header};
-use tokio::{net::TcpListener, sync::broadcast::Sender};
+use tokio::sync::broadcast::Sender;
 use tower::ServiceBuilder;
 use tower_http::{
     cors::{AllowOrigin, Any, CorsLayer},
@@ -34,7 +34,7 @@ pub fn get_api_runner(
     controller_cfg: Controller,
     log_source: Sender<LogEvent>,
     statistics_manager: Arc<StatisticsManager>,
-    _outbound_manager: ThreadSafeOutboundManager,
+    outbound_manager: ThreadSafeOutboundManager,
     _cwd: String,
 ) -> Option<Runner> {
     tracing::debug!("API controller configuration: {:?}", controller_cfg);
@@ -80,6 +80,10 @@ pub fn get_api_runner(
             .route("/", get(handlers::hello::handle))
             .route("/version", get(handlers::version::handle))
             .route("/restart", post(handlers::restart::handle))
+            .nest(
+                "/proxies",
+                handlers::proxy::routes(outbound_manager.clone()),
+            )
             .layer(cors)
             .with_state(app_state.clone())
             .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()));

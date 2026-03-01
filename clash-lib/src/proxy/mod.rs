@@ -11,7 +11,7 @@ use tracing::error;
 
 use crate::{
     app::{dispatcher::BoxedChainedStream, dns::ThreadSafeDNSResolver},
-    proxy::utils::RemoteConnector,
+    proxy::{group::GroupProxyAPIResponse, utils::RemoteConnector},
     session::Session,
 };
 
@@ -42,6 +42,8 @@ pub mod utils;
 
 pub mod converters;
 
+pub mod group;
+
 pub use options::HandlerCommonOptions;
 
 #[async_trait]
@@ -71,6 +73,10 @@ pub trait OutboundHandler: Sync + Send + Unpin + DialWithConnector + Debug {
             "tcp relay not supported for {}",
             self.proto()
         )))
+    }
+
+    fn try_as_group_handler(&self) -> Option<&dyn GroupProxyAPIResponse> {
+        None
     }
 }
 
