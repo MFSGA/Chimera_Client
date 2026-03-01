@@ -17,13 +17,15 @@ use crate::{
     config::internal::listener::CommonInboundOpts,
     proxy::{
         inbound::InboundHandlerTrait,
-        socks::{SOCKS5_VERSION, inbound::stream::handle_tcp},
+        socks::SOCKS5_VERSION,
         utils::{ToCanonical, apply_tcp_options, try_create_dualstack_tcplistener},
     },
     session::{Network, Session, Type},
 };
 
 mod stream;
+
+pub use stream::handle_tcp;
 
 pub struct SocksInbound {
     addr: SocketAddr,

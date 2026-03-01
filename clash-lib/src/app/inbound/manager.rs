@@ -101,7 +101,9 @@ impl InboundManager {
         let guard = self.inbound_handlers.read().await;
         for opts in guard.keys() {
             match &opts {
+                InboundOpts::Http { common_opts } => ports.port = Some(common_opts.port),
                 InboundOpts::Socks { common_opts, .. } => ports.socks_port = Some(common_opts.port),
+                InboundOpts::Mixed { common_opts, .. } => ports.mixed_port = Some(common_opts.port),
             }
         }
         ports
@@ -145,19 +147,28 @@ impl InboundManager {
 
         let listeners: HashMap<InboundOpts, Option<_>> = guard
             .extract_if(|opts, _| match &opts {
+                InboundOpts::Http { common_opts } => {
+                    ports.port.is_some() && Some(common_opts.port) == ports.port
+                }
                 InboundOpts::Socks { common_opts, .. } => {
                     ports.socks_port.is_some() && Some(common_opts.port) == ports.socks_port
+                }
+                InboundOpts::Mixed { common_opts, .. } => {
+                    ports.mixed_port.is_some() && Some(common_opts.port) == ports.mixed_port
                 }
             })
             .collect();
 
         for (mut opts, handle) in listeners {
             opts.common_opts_mut().port = match &opts {
+                InboundOpts::Http { common_opts } => ports.port.unwrap_or(common_opts.port),
                 InboundOpts::Socks { common_opts, .. } => {
                     ports.socks_port.unwrap_or(common_opts.port)
                 }
+                InboundOpts::Mixed { common_opts, .. } => {
+                    ports.mixed_port.unwrap_or(common_opts.port)
+                }
             };
-
             guard.insert(opts, handle);
         }
     }

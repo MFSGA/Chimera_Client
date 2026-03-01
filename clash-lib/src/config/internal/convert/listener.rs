@@ -52,7 +52,7 @@ pub(super) fn convert(
 
     debug!("todo HTTP Port: ");
     // Add short-handed top-level proxies to inbounds
-    /* if let Some(Port(http_port)) = http_port
+    if let Some(Port(http_port)) = http_port
         && !all_inbounds.insert(InboundOpts::Http {
             common_opts: CommonInboundOpts {
                 name: "HTTP-IN".into(),
@@ -64,7 +64,7 @@ pub(super) fn convert(
         })
     {
         warn!("Duplicate HTTP inbound listener found: {}", http_port);
-    } */
+    }
 
     warn!("support socks5 udp later");
     if let Some(Port(socks_port)) = socks_port
@@ -84,6 +84,20 @@ pub(super) fn convert(
     }
 
     debug!("todo Mixed Port: ");
+    if let Some(Port(mixed_port)) = mixed_port
+        && !all_inbounds.insert(InboundOpts::Mixed {
+            common_opts: CommonInboundOpts {
+                name: "MIXED-IN".into(),
+                listen: bind_address,
+                port: mixed_port,
+                allow_lan: c.allow_lan.unwrap_or_default(),
+                fw_mark: c.routing_mark,
+            },
+            udp: true,
+        })
+    {
+        warn!("Duplicate MIXED inbound listener found: {}", mixed_port);
+    }
     Ok(all_inbounds)
 }
 

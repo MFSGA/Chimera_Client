@@ -7,7 +7,7 @@ use crate::{
     app::dispatcher::Dispatcher,
     common::auth::ThreadSafeAuthenticator,
     config::internal::listener::InboundOpts,
-    proxy::{inbound::InboundHandlerTrait, socks::inbound::SocksInbound},
+    proxy::{http::HttpInbound, inbound::InboundHandlerTrait, mixed::MixedInbound, socks::inbound::SocksInbound},
 };
 
 pub(crate) fn build_network_listeners(
@@ -71,6 +71,21 @@ fn build_handler(
     let fw_mark = listener.common_opts().fw_mark;
     match listener {
         InboundOpts::Socks { common_opts, .. } => Some(Arc::new(SocksInbound::new(
+            (common_opts.listen.0, common_opts.port).into(),
+            common_opts.allow_lan,
+            dispatcher,
+            authenticator,
+            fw_mark,
+        ))),
+
+        InboundOpts::Http { common_opts, .. } => Some(Arc::new(HttpInbound::new(
+            (common_opts.listen.0, common_opts.port).into(),
+            common_opts.allow_lan,
+            dispatcher,
+            authenticator,
+            fw_mark,
+        ))),
+        InboundOpts::Mixed { common_opts, .. } => Some(Arc::new(MixedInbound::new(
             (common_opts.listen.0, common_opts.port).into(),
             common_opts.allow_lan,
             dispatcher,

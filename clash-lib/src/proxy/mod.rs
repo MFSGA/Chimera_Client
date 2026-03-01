@@ -46,6 +46,23 @@ pub mod group;
 
 pub use options::HandlerCommonOptions;
 
+pub mod http;
+pub mod mixed;
+
+
+#[derive(thiserror::Error, Debug)]
+pub enum ProxyError {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error("proxy error: {0}")]
+    General(String),
+    #[error("invalid url: {0}")]
+    InvalidUrl(String),
+    #[allow(dead_code)]
+    #[error("socks5 error: {0}")]
+    Socks5(String),
+}
+
 #[async_trait]
 pub trait OutboundHandler: Sync + Send + Unpin + DialWithConnector + Debug {
     /// The name of the outbound handler
