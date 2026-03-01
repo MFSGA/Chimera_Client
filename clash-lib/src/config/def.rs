@@ -56,8 +56,9 @@ pub struct TunConfig {
     pub dns_hijack: DnsHijack,
 }
 
-// todo: rename to DefConfig
-#[derive(Deserialize)]
+#[derive(Deserialize, Educe)]
+#[serde(rename_all = "kebab-case", default)]
+#[educe(Default)]
 pub struct Config {
     /// 1. Allow connections from IP addresses other than local listening address
     pub allow_lan: Option<bool>,
