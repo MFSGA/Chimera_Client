@@ -7,7 +7,10 @@ use crate::{
     app::dispatcher::Dispatcher,
     common::auth::ThreadSafeAuthenticator,
     config::internal::listener::InboundOpts,
-    proxy::{http::HttpInbound, inbound::InboundHandlerTrait, mixed::MixedInbound, socks::inbound::SocksInbound},
+    proxy::{
+        http::HttpInbound, inbound::InboundHandlerTrait, mixed::MixedInbound,
+        socks::inbound::SocksInbound,
+    },
 };
 
 pub(crate) fn build_network_listeners(

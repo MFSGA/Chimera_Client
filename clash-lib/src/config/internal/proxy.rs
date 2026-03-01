@@ -34,6 +34,8 @@ pub enum OutboundProxyProtocol {
     #[serde(rename = "socks5")]
     Socks5(OutboundSocks5),
 
+    #[serde(rename = "vless")]
+    Vless(OutboundVless),
     #[cfg(feature = "trojan")]
     #[serde(rename = "trojan")]
     Trojan(OutboundTrojan),
@@ -50,6 +52,7 @@ impl OutboundProxyProtocol {
             OutboundProxyProtocol::Socks5(socks5) => {
                 todo!()
             }
+            OutboundProxyProtocol::Vless(vless) => &vless.common_opts.name,
             #[cfg(feature = "trojan")]
             OutboundProxyProtocol::Trojan(trojan) => &trojan.common_opts.name,
             #[cfg(feature = "hysteria")]
@@ -69,6 +72,7 @@ impl TryFrom<HashMap<String, Value>> for OutboundProxyProtocol {
                 "missing field `name` in outbound proxy protocol".to_owned(),
             ))?
             .to_owned();
+        println!("parsing proxy protocol for {name}");
         OutboundProxyProtocol::deserialize(MapDeserializer::new(mapping.into_iter()))
             .map_err(map_serde_error(name))
     }
@@ -112,9 +116,63 @@ pub fn map_serde_error(name: String) -> impl FnOnce(serde_yaml::Error) -> crate:
                 name
             ))
         } else {
-            Error::InvalidConfig(format!("error while parsing {name}: {x}"))
+            Error::InvalidConfig(format!("error while parsing  {name}: {x}"))
         }
     }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct CommonConfigOptions {
+    pub name: String,
+    pub server: String,
+    pub port: u16,
+    /// this can be a proxy name or a group name
+    /// can't be a name in a proxy provider
+    /// only applies to raw proxy, i.e. applying this to a proxy group does
+    /// nothing
+    #[serde(alias = "dialer-proxy")]
+    pub connect_via: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct WsOpt {
+    pub path: Option<String>,
+    pub headers: Option<HashMap<String, String>>,
+    pub max_early_data: Option<i32>,
+    pub early_data_header_name: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct H2Opt {
+    pub host: Option<Vec<String>>,
+    pub path: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct GrpcOpt {
+    pub grpc_service_name: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct OutboundVless {
+    #[serde(flatten)]
+    pub common_opts: CommonConfigOptions,
+    pub uuid: String,
+    pub udp: Option<bool>,
+    pub tls: Option<bool>,
+    pub skip_cert_verify: Option<bool>,
+    #[serde(alias = "servername")]
+    pub server_name: Option<String>,
+    pub network: Option<String>,
+    pub ws_opts: Option<WsOpt>,
+    pub h2_opts: Option<H2Opt>,
+    pub grpc_opts: Option<GrpcOpt>,
+    pub reality_opts: Option<OutboundTrojanRealityOpts>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -143,18 +201,12 @@ pub struct OutboundTrojan {
 }
 
 #[cfg(feature = "trojan")]
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
-pub struct CommonConfigOptions {
-    pub name: String,
-    pub server: String,
-    pub port: u16,
-    /// this can be a proxy name or a group name
-    /// can't be a name in a proxy provider
-    /// only applies to raw proxy, i.e. applying this to a proxy group does
-    /// nothing
-    #[serde(alias = "dialer-proxy")]
-    pub connect_via: Option<String>,
+pub struct OutboundTrojanRealityOpts {
+    pub enabled: bool,
+    pub public_key: String,
+    pub short_id: Option<String>,
 }
 
 #[cfg(feature = "hysteria")]
@@ -187,14 +239,4 @@ pub struct OutboundHysteria2 {
 #[serde(rename_all = "lowercase")]
 pub enum Hysteria2Obfs {
     Salamander,
-}
-
-#[cfg(all(feature = "trojan", feature = "ws"))]
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
-#[serde(rename_all = "kebab-case")]
-pub struct WsOpt {
-    pub path: Option<String>,
-    pub headers: Option<HashMap<String, String>>,
-    pub max_early_data: Option<i32>,
-    pub early_data_header_name: Option<String>,
 }

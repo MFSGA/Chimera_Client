@@ -66,9 +66,7 @@ impl InboundHandlerTrait for HttpInbound {
             let (socket, _) = listener.accept().await?;
             let src_addr = socket.peer_addr()?.to_canonical();
 
-            if !self.allow_lan
-                && src_addr.ip() != socket.local_addr()?.ip().to_canonical()
-            {
+            if !self.allow_lan && src_addr.ip() != socket.local_addr()?.ip().to_canonical() {
                 warn!("Connection from {} is not allowed", src_addr);
                 continue;
             }

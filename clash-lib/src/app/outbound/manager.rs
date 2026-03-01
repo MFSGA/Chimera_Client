@@ -16,6 +16,7 @@ use crate::{
     proxy::{
         AnyOutboundHandler, direct, reject,
         utils::{DirectConnector, ProxyConnector},
+        vless,
     },
 };
 
@@ -172,6 +173,15 @@ impl OutboundManager {
                         .map(|x: hysteria2::Handler| Arc::new(x) as _)
                         .inspect_err(|e| {
                             error!("failed to load hysteria2 outbound {}: {}", name, e);
+                        })
+                        .ok()
+                }
+                OutboundProxyProtocol::Vless(v) => {
+                    let name = v.common_opts.name.clone();
+                    v.try_into()
+                        .map(|x: vless::Handler| Arc::new(x) as AnyOutboundHandler)
+                        .inspect_err(|e| {
+                            error!("failed to load vless outbound {}: {}", name, e);
                         })
                         .ok()
                 }

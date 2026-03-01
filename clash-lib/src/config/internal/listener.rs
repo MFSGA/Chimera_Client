@@ -19,7 +19,7 @@ pub enum InboundOpts {
         #[serde(flatten)]
         common_opts: CommonInboundOpts,
     },
-     #[serde(alias = "mixed")]
+    #[serde(alias = "mixed")]
     Mixed {
         #[serde(flatten)]
         common_opts: CommonInboundOpts,

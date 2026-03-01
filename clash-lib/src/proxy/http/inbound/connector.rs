@@ -25,11 +25,7 @@ pub struct Connector {
 }
 
 impl Connector {
-    pub fn new(
-        src: SocketAddr,
-        dispatcher: Arc<Dispatcher>,
-        fw_mark: Option<u32>,
-    ) -> Self {
+    pub fn new(src: SocketAddr, dispatcher: Arc<Dispatcher>, fw_mark: Option<u32>) -> Self {
         Self {
             src,
             dispatcher,
@@ -46,9 +42,7 @@ impl hyper_util::client::legacy::connect::Connection for AnyStream {
 
 impl tower::Service<Uri> for Connector {
     type Error = ProxyError;
-    type Future = Pin<
-        Box<dyn Future<Output = Result<TokioIo<AnyStream>, Self::Error>> + Send>,
-    >;
+    type Future = Pin<Box<dyn Future<Output = Result<TokioIo<AnyStream>, Self::Error>> + Send>>;
     type Response = TokioIo<AnyStream>;
 
     fn poll_ready(
@@ -71,8 +65,7 @@ impl tower::Service<Uri> for Connector {
                 network: Network::Tcp,
                 typ: Type::Http,
                 source: src,
-                destination: destination
-                    .ok_or(ProxyError::InvalidUrl(url.to_string()))?,
+                destination: destination.ok_or(ProxyError::InvalidUrl(url.to_string()))?,
                 so_mark: fw_mark,
                 ..Default::default()
             };

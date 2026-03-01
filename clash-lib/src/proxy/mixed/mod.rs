@@ -72,9 +72,7 @@ impl InboundHandlerTrait for MixedInbound {
                     continue;
                 }
             };
-            if !self.allow_lan
-                && src_addr.ip() != socket.local_addr()?.ip().to_canonical()
-            {
+            if !self.allow_lan && src_addr.ip() != socket.local_addr()?.ip().to_canonical() {
                 warn!("Connection from {} is not allowed", src_addr);
                 continue;
             }
@@ -110,13 +108,8 @@ impl InboundHandlerTrait for MixedInbound {
                     };
 
                     tokio::spawn(async move {
-                        socks::inbound::handle_tcp(
-                            &mut sess,
-                            socket,
-                            dispatcher,
-                            authenticator,
-                        )
-                        .await
+                        socks::inbound::handle_tcp(&mut sess, socket, dispatcher, authenticator)
+                            .await
                     });
                 }
 
