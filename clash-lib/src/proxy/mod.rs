@@ -10,13 +10,17 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::error;
 
 use crate::{
-    app::{dispatcher::BoxedChainedStream, dns::ThreadSafeDNSResolver},
+    app::{
+        dispatcher::{BoxedChainedDatagram, BoxedChainedStream},
+        dns::ThreadSafeDNSResolver,
+    },
     proxy::{group::GroupProxyAPIResponse, utils::RemoteConnector},
     session::Session,
 };
 
 use downcast_rs::{Downcast, impl_downcast};
 
+pub mod datagram;
 pub mod direct;
 
 pub mod inbound;
@@ -50,6 +54,7 @@ pub use options::HandlerCommonOptions;
 pub mod http;
 #[cfg(feature = "mixed_port")]
 pub mod mixed;
+pub mod vless;
 
 #[cfg(feature = "http_port")]
 #[derive(thiserror::Error, Debug)]
@@ -74,6 +79,11 @@ pub trait OutboundHandler: Sync + Send + Unpin + DialWithConnector + Debug {
     /// only contains Type information, do not rely on the underlying value
     fn proto(&self) -> OutboundType;
 
+    /// whether the outbound handler supports UDP
+    async fn support_udp(&self) -> bool {
+        false
+    }
+
     /// connect to remote target via TCP
     async fn connect_stream(
         &self,
@@ -90,6 +100,34 @@ pub trait OutboundHandler: Sync + Send + Unpin + DialWithConnector + Debug {
         error!("tcp relay not supported for {}", self.proto());
         Err(io::Error::other(format!(
             "tcp relay not supported for {}",
+            self.proto()
+        )))
+    }
+
+    async fn connect_datagram(
+        &self,
+        _sess: &Session,
+        _resolver: ThreadSafeDNSResolver,
+    ) -> io::Result<BoxedChainedDatagram> {
+        Err(io::Error::other(format!(
+            "udp relay not supported for {}",
+            self.proto()
+        )))
+    }
+
+    /// relay related
+    async fn support_connector(&self) -> ConnectorType {
+        ConnectorType::None
+    }
+
+    async fn connect_datagram_with_connector(
+        &self,
+        _sess: &Session,
+        _resolver: ThreadSafeDNSResolver,
+        _connector: &dyn RemoteConnector,
+    ) -> io::Result<BoxedChainedDatagram> {
+        Err(io::Error::other(format!(
+            "udp relay not supported for {}",
             self.proto()
         )))
     }
@@ -112,6 +150,12 @@ pub trait DialWithConnector {
 
 pub type AnyOutboundHandler = Arc<dyn OutboundHandler>;
 
+pub enum ConnectorType {
+    Tcp,
+    All,
+    None,
+}
+
 pub trait ProxyStream: AsyncRead + AsyncWrite + Send + Sync + Unpin {}
 impl<T> ProxyStream for T where T: AsyncRead + AsyncWrite + Send + Sync + Unpin {}
 pub type AnyStream = Box<dyn ProxyStream>;
@@ -126,6 +170,7 @@ pub enum OutboundType {
     Reject,
     Trojan,
     Hysteria2,
+    Vless,
 }
 
 impl Display for OutboundType {
@@ -133,7 +178,7 @@ impl Display for OutboundType {
         match self {
             /* OutboundType::Shadowsocks => write!(f, "Shadowsocks"),
             OutboundType::Vmess => write!(f, "Vmess"),
-            OutboundType::Vless => write!(f, "Vless"),
+
             OutboundType::WireGuard => write!(f, "WireGuard"),
             OutboundType::Tor => write!(f, "Tor"),
             OutboundType::Tuic => write!(f, "Tuic"),
@@ -148,6 +193,7 @@ impl Display for OutboundType {
             OutboundType::LoadBalance => write!(f, "LoadBalance"),
             OutboundType::Smart => write!(f, "Smart"),
             OutboundType::Fallback => write!(f, "Fallback"), */
+            OutboundType::Vless => write!(f, "Vless"),
             OutboundType::Trojan => write!(f, "Trojan"),
             OutboundType::Hysteria2 => write!(f, "Hysteria2"),
             OutboundType::Direct => write!(f, "Direct"),

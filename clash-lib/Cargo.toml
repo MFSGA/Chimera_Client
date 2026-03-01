@@ -110,6 +110,12 @@ tower-http = { version = "0.6", features = ["fs", "trace", "cors"] }
 
 erased-serde = "0.4"
 
+log = { version = "0.4", optional = true }
+memchr = { version = "2", optional = true }
+subtle = { version = "2", optional = true }
+ring-compat = { version = "0.8", features = ["aead"] }
+x509-parser = { version = "0.16", default-features = false, optional = true }
+
 [features]
 default = ["zero_copy", "tls", "aws-lc-rs", "tun"]
 
@@ -121,6 +127,10 @@ aws-lc-rs = [
     "dep:aws-lc-rs",
     "rustls/aws-lc-rs",
     "quinn-proto?/rustls-aws-lc-rs",
+    "dep:log",
+    "dep:memchr",
+    "dep:subtle",
+    "dep:x509-parser",
 ]
 ring = ["tls", "rustls/ring", "quinn-proto?/ring"]
 

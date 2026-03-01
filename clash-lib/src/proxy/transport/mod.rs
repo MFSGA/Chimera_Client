@@ -13,3 +13,10 @@ pub use ws::Client as WsClient;
 pub trait Transport: Send + Sync {
     async fn proxy_stream(&self, stream: super::AnyStream) -> std::io::Result<super::AnyStream>;
 }
+#[cfg(feature = "aws-lc-rs")]
+pub mod reality;
+
+#[cfg(feature = "aws-lc-rs")]
+pub use reality::{
+    Client as RealityClient, DEFAULT_REALITY_SHORT_ID, decode_public_key, decode_short_id,
+};
