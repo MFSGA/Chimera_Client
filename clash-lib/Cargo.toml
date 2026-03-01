@@ -41,6 +41,7 @@ network-interface = { version = "2", optional = true }
 
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
+serde_json = "1"
 
 tracing = "0.1"
 tracing-log = "0.2"
@@ -100,6 +101,11 @@ etherparse = { version = "0.19", optional = true }
 base64 = "0.22"
 
 aws-lc-rs = { version = "1", default-features = false, optional = true }
+
+axum = { version = "0.8" }
+tower = { version = "0.5", features = ["util"] }
+
+tower-http = { version = "0.6", features = ["fs", "trace", "cors"] }
 
 [features]
 default = ["zero_copy", "tls", "aws-lc-rs", "tun"]
