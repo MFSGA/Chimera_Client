@@ -269,6 +269,7 @@ impl RealityClientConnection {
     /// Like rustls, this loops until no more progress can be made, ensuring
     /// that piggybacked application data is processed in the same call.
     pub fn process_new_packets(&mut self) -> io::Result<RealityIoState> {
+        tracing::debug!("REALITY CLIENT: Starting process_new_packets");
         if let Some(error_kind) = self.fatal_error {
             return Err(io::Error::new(error_kind, "connection previously failed"));
         }
@@ -278,6 +279,7 @@ impl RealityClientConnection {
             return Ok(RealityIoState::new(self.plaintext_read_buf.len()));
         }
 
+        tracing::debug!("REALITY CLIENT: Processing new packets - ciphertext buffer has {} bytes", self.ciphertext_read_buf.len());
         let result = self.process_new_packets_inner();
 
         if let Err(ref e) = result {

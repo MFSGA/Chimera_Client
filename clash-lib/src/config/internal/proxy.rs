@@ -200,7 +200,6 @@ pub struct OutboundTrojan {
     pub ws_opts: Option<WsOpt>,
 }
 
-#[cfg(feature = "trojan")]
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct OutboundTrojanRealityOpts {
