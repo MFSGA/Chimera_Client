@@ -79,6 +79,7 @@ impl Client {
 #[async_trait]
 impl Transport for Client {
     async fn proxy_stream(&self, stream: AnyStream) -> io::Result<AnyStream> {
+        tracing::debug!("Starting Reality client handshake for server '{}'", self.server_name);
         let tls_stream = self.handshake_stream(stream).await?;
         Ok(Box::new(tls_stream))
     }
