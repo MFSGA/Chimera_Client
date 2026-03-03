@@ -831,12 +831,16 @@ impl RealityClientConnection {
                         }
                     }
                 }
-                // CONTENT_TYPE_HANDSHAKE is invalid after handshake complete
-                // strip_content_type() validates and returns error for invalid types
-                _ => unreachable!(
-                    "strip_content_type validates content type; unexpected: 0x{:02x}",
-                    content_type
-                ),
+                CONTENT_TYPE_HANDSHAKE => {
+                    // TLS 1.3 post-handshake messages (for example NewSessionTicket)
+                    // are valid and can appear after handshake completion.
+                    // We don't consume session tickets, so ignore the payload.
+                    log::debug!(
+                        "REALITY CLIENT: Ignoring post-handshake message ({} bytes)",
+                        plaintext.len()
+                    );
+                }
+                _ => unreachable!("validated content type should never reach here: 0x{content_type:02x}"),
             }
 
             // Consume the processed record from the buffer (after plaintext borrow ends)

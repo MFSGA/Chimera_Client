@@ -354,11 +354,30 @@ pub fn construct_client_hello(
     }
 
     // signature_algorithms extension (type 13)
+    //
+    // A single Ed25519 algorithm is too restrictive for many real TLS targets
+    // (for example RSA certificate chains), which causes REALITY target-side
+    // handshake failure before ServerHello.
     {
+        const SIGNATURE_ALGOS: &[u16] = &[
+            0x0403, // ecdsa_secp256r1_sha256
+            0x0804, // rsa_pss_rsae_sha256
+            0x0805, // rsa_pss_rsae_sha384
+            0x0806, // rsa_pss_rsae_sha512
+            0x0807, // ed25519
+            0x0401, // rsa_pkcs1_sha256
+            0x0501, // rsa_pkcs1_sha384
+            0x0601, // rsa_pkcs1_sha512
+        ];
+
         extensions.extend_from_slice(&[0x00, 0x0d]); // Extension type: signature_algorithms
-        extensions.extend_from_slice(&[0x00, 0x04]); // Extension length: 4
-        extensions.extend_from_slice(&[0x00, 0x02]); // Signature algorithms length: 2
-        extensions.extend_from_slice(&[0x08, 0x07]); // ed25519
+        let sig_list_len = (SIGNATURE_ALGOS.len() * 2) as u16;
+        let ext_len = 2 + sig_list_len;
+        extensions.extend_from_slice(&ext_len.to_be_bytes()); // Extension length
+        extensions.extend_from_slice(&sig_list_len.to_be_bytes()); // Signature algorithms length
+        for sig in SIGNATURE_ALGOS {
+            extensions.extend_from_slice(&sig.to_be_bytes());
+        }
     }
 
     // ALPN extension (type 16)

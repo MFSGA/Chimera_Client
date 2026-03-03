@@ -77,19 +77,25 @@ pub const OUTGOING_BUFFER_LIMIT: usize = 64 * 1024;
 
 /// Strip TLS 1.3 content type trailer from decrypted plaintext slice.
 ///
-/// TLS 1.3 format: content || type_byte
+/// TLS 1.3 format: content || type_byte || optional_zero_padding
 /// Returns (content_type, valid_content_length) without modifying the slice.
 ///
 /// This is the zero-allocation version for use with in-place decryption.
-/// NOTE: Does NOT strip padding zeros - our implementation doesn't add padding.
+/// It is padding-aware so it can interoperate with external TLS stacks that
+/// add optional TLS 1.3 inner padding.
 #[inline]
 pub fn strip_content_type_slice(plaintext: &[u8]) -> io::Result<(u8, usize)> {
     if plaintext.is_empty() {
         return Err(Error::new(ErrorKind::InvalidData, "Empty plaintext"));
     }
 
-    // No padding in our implementation
-    let content_type = plaintext[plaintext.len() - 1];
+    // Skip optional TLS 1.3 inner padding zeros from the end.
+    let mut trailer_index = plaintext.len() - 1;
+    while trailer_index > 0 && plaintext[trailer_index] == 0 {
+        trailer_index -= 1;
+    }
+
+    let content_type = plaintext[trailer_index];
 
     if content_type != CONTENT_TYPE_HANDSHAKE
         && content_type != CONTENT_TYPE_APPLICATION_DATA
@@ -101,7 +107,7 @@ pub fn strip_content_type_slice(plaintext: &[u8]) -> io::Result<(u8, usize)> {
         ));
     }
 
-    Ok((content_type, plaintext.len() - 1))
+    Ok((content_type, trailer_index))
 }
 
 /// Strip TLS 1.3 content type trailer from decrypted plaintext.
@@ -205,6 +211,15 @@ mod tests {
     fn test_strip_content_type_invalid() {
         let mut plaintext = vec![0x01, 0xFF]; // 0xFF is invalid
         assert!(strip_content_type(&mut plaintext).is_err());
+    }
+
+    #[test]
+    fn test_strip_content_type_slice_with_padding() {
+        // TLS 1.3 format: content || type || optional zero padding
+        let plaintext = vec![0x10, 0x20, CONTENT_TYPE_HANDSHAKE, 0x00, 0x00];
+        let (content_type, valid_len) = strip_content_type_slice(&plaintext).unwrap();
+        assert_eq!(content_type, CONTENT_TYPE_HANDSHAKE);
+        assert_eq!(&plaintext[..valid_len], &[0x10, 0x20]);
     }
 
     #[test]
