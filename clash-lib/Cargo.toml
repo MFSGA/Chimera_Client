@@ -111,7 +111,7 @@ tower-http = { version = "0.6", features = ["fs", "trace", "cors"] }
 erased-serde = "0.4"
 
 [features]
-default = ["zero_copy", "tls", "aws-lc-rs", "tun"]
+default = ["zero_copy", "tls", "aws-lc-rs", "tun", "port"]
 
 zero_copy = []
 
@@ -150,6 +150,7 @@ http_port = []
 mixed_port = ["http_port"]
 tracing = ["tokio/tracing"]
 
+port = ["http_port", "mixed_port"]
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_Networking_WinSock",
