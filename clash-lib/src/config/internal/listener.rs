@@ -14,18 +14,28 @@ pub enum InboundOpts {
         #[serde(default = "default_bool_true")]
         udp: bool,
     },
+    #[cfg(feature = "http_port")]
+    #[serde(alias = "http")]
+    Http {
+        #[serde(flatten)]
+        common_opts: CommonInboundOpts,
+    },
 }
 
 impl InboundOpts {
     pub fn common_opts(&self) -> &CommonInboundOpts {
         match self {
             InboundOpts::Socks { common_opts, .. } => common_opts,
+            #[cfg(feature = "http_port")]
+            InboundOpts::Http { common_opts, .. } => common_opts,
         }
     }
 
     pub fn common_opts_mut(&mut self) -> &mut CommonInboundOpts {
         match self {
             InboundOpts::Socks { common_opts, .. } => common_opts,
+            #[cfg(feature = "http_port")]
+            InboundOpts::Http { common_opts, .. } => common_opts,
         }
     }
 }

@@ -101,6 +101,8 @@ impl InboundManager {
         let guard = self.inbound_handlers.read().await;
         for opts in guard.keys() {
             match &opts {
+                #[cfg(feature = "http_port")]
+                InboundOpts::Http { common_opts } => ports.port = Some(common_opts.port),
                 InboundOpts::Socks { common_opts, .. } => ports.socks_port = Some(common_opts.port),
             }
         }
@@ -145,6 +147,10 @@ impl InboundManager {
 
         let listeners: HashMap<InboundOpts, Option<_>> = guard
             .extract_if(|opts, _| match &opts {
+                #[cfg(feature = "http_port")]
+                InboundOpts::Http { common_opts } => {
+                    ports.port.is_some() && Some(common_opts.port) == ports.port
+                }
                 InboundOpts::Socks { common_opts, .. } => {
                     ports.socks_port.is_some() && Some(common_opts.port) == ports.socks_port
                 }
@@ -153,11 +159,12 @@ impl InboundManager {
 
         for (mut opts, handle) in listeners {
             opts.common_opts_mut().port = match &opts {
+                #[cfg(feature = "http_port")]
+                InboundOpts::Http { common_opts } => ports.port.unwrap_or(common_opts.port),
                 InboundOpts::Socks { common_opts, .. } => {
                     ports.socks_port.unwrap_or(common_opts.port)
                 }
             };
-
             guard.insert(opts, handle);
         }
     }

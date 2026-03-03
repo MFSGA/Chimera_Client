@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use tracing::{error, info, warn};
 
+#[cfg(feature = "http_port")]
+use crate::proxy::http::HttpInbound;
 use crate::{
     Runner,
     app::dispatcher::Dispatcher,
@@ -71,6 +73,15 @@ fn build_handler(
     let fw_mark = listener.common_opts().fw_mark;
     match listener {
         InboundOpts::Socks { common_opts, .. } => Some(Arc::new(SocksInbound::new(
+            (common_opts.listen.0, common_opts.port).into(),
+            common_opts.allow_lan,
+            dispatcher,
+            authenticator,
+            fw_mark,
+        ))),
+
+        #[cfg(feature = "http_port")]
+        InboundOpts::Http { common_opts, .. } => Some(Arc::new(HttpInbound::new(
             (common_opts.listen.0, common_opts.port).into(),
             common_opts.allow_lan,
             dispatcher,

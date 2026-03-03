@@ -21,6 +21,7 @@ pub(super) fn convert(
     raw: Option<Vec<HashMap<String, Value>>>,
     c: &def::Config,
 ) -> Result<HashSet<InboundOpts>, crate::Error> {
+    #[cfg(feature = "http_port")]
     let http_port = c.port;
     let socks_port = c.socks_port;
     let mixed_port = c.mixed_port;
@@ -50,9 +51,10 @@ pub(super) fn convert(
         all_inbounds.insert(inbound);
     }
 
-    debug!("todo HTTP Port: ");
-    // Add short-handed top-level proxies to inbounds
-    /* if let Some(Port(http_port)) = http_port
+    #[cfg(feature = "http_port")]
+    debug!("todo HTTP Port:");
+    #[cfg(feature = "http_port")]
+    if let Some(Port(http_port)) = http_port
         && !all_inbounds.insert(InboundOpts::Http {
             common_opts: CommonInboundOpts {
                 name: "HTTP-IN".into(),
@@ -64,7 +66,11 @@ pub(super) fn convert(
         })
     {
         warn!("Duplicate HTTP inbound listener found: {}", http_port);
-    } */
+    }
+    #[cfg(not(feature = "http_port"))]
+    if c.port.is_some() {
+        warn!("ignoring top-level `port` because `http_port` feature is disabled");
+    }
 
     warn!("support socks5 udp later");
     if let Some(Port(socks_port)) = socks_port

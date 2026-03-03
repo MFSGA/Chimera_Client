@@ -19,8 +19,9 @@ tokio-util = { version = "0.7", features = ["codec"], optional = true }
 futures = "0.3"
 async-trait = "0.1"
 http = "1"
-hyper = { version = "1", features = ["client", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
+hyper = { version = "1", features = ["http1", "http2", "client", "server"] }
+hyper-util = { version = "0.1", features = ["full"] }
+
 http-body-util = "0.1"
 bytes = "1"
 tokio-rustls = { version = "0.26", optional = true }
@@ -145,6 +146,7 @@ tun = [
 ]
 tproxy = ["dep:etherparse"]
 redir = []
+http_port = []
 tracing = ["tokio/tracing"]
 
 [target.'cfg(windows)'.dependencies]
