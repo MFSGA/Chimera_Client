@@ -48,6 +48,8 @@ pub use options::HandlerCommonOptions;
 
 #[cfg(feature = "http_port")]
 pub mod http;
+#[cfg(feature = "mixed_port")]
+pub mod mixed;
 
 #[cfg(feature = "http_port")]
 #[derive(thiserror::Error, Debug)]

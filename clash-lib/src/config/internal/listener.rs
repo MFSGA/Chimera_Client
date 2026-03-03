@@ -20,6 +20,14 @@ pub enum InboundOpts {
         #[serde(flatten)]
         common_opts: CommonInboundOpts,
     },
+    #[cfg(feature = "mixed_port")]
+    #[serde(alias = "mixed")]
+    Mixed {
+        #[serde(flatten)]
+        common_opts: CommonInboundOpts,
+        #[serde(default = "default_bool_true")]
+        udp: bool,
+    },
 }
 
 impl InboundOpts {
@@ -28,6 +36,8 @@ impl InboundOpts {
             InboundOpts::Socks { common_opts, .. } => common_opts,
             #[cfg(feature = "http_port")]
             InboundOpts::Http { common_opts, .. } => common_opts,
+            #[cfg(feature = "mixed_port")]
+            InboundOpts::Mixed { common_opts, .. } => common_opts,
         }
     }
 
@@ -36,6 +46,8 @@ impl InboundOpts {
             InboundOpts::Socks { common_opts, .. } => common_opts,
             #[cfg(feature = "http_port")]
             InboundOpts::Http { common_opts, .. } => common_opts,
+            #[cfg(feature = "mixed_port")]
+            InboundOpts::Mixed { common_opts, .. } => common_opts,
         }
     }
 }

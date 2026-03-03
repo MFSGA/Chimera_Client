@@ -147,6 +147,7 @@ tun = [
 tproxy = ["dep:etherparse"]
 redir = []
 http_port = []
+mixed_port = ["http_port"]
 tracing = ["tokio/tracing"]
 
 [target.'cfg(windows)'.dependencies]

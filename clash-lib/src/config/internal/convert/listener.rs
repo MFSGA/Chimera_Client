@@ -24,6 +24,7 @@ pub(super) fn convert(
     #[cfg(feature = "http_port")]
     let http_port = c.port;
     let socks_port = c.socks_port;
+    #[cfg(feature = "mixed_port")]
     let mixed_port = c.mixed_port;
     #[cfg(feature = "tproxy")]
     let tproxy_port = c.tproxy_port;
@@ -90,6 +91,25 @@ pub(super) fn convert(
     }
 
     debug!("todo Mixed Port: ");
+    #[cfg(feature = "mixed_port")]
+    if let Some(Port(mixed_port)) = mixed_port
+        && !all_inbounds.insert(InboundOpts::Mixed {
+            common_opts: CommonInboundOpts {
+                name: "MIXED-IN".into(),
+                listen: bind_address,
+                port: mixed_port,
+                allow_lan: c.allow_lan.unwrap_or_default(),
+                fw_mark: c.routing_mark,
+            },
+            udp: true,
+        })
+    {
+        warn!("Duplicate MIXED inbound listener found: {}", mixed_port);
+    }
+    #[cfg(not(feature = "mixed_port"))]
+    if c.mixed_port.is_some() {
+        warn!("ignoring top-level `mixed-port` because `mixed_port` feature is disabled");
+    }
     Ok(all_inbounds)
 }
 

@@ -4,6 +4,8 @@ use tracing::{error, info, warn};
 
 #[cfg(feature = "http_port")]
 use crate::proxy::http::HttpInbound;
+#[cfg(feature = "mixed_port")]
+use crate::proxy::mixed::MixedInbound;
 use crate::{
     Runner,
     app::dispatcher::Dispatcher,
@@ -82,6 +84,14 @@ fn build_handler(
 
         #[cfg(feature = "http_port")]
         InboundOpts::Http { common_opts, .. } => Some(Arc::new(HttpInbound::new(
+            (common_opts.listen.0, common_opts.port).into(),
+            common_opts.allow_lan,
+            dispatcher,
+            authenticator,
+            fw_mark,
+        ))),
+        #[cfg(feature = "mixed_port")]
+        InboundOpts::Mixed { common_opts, .. } => Some(Arc::new(MixedInbound::new(
             (common_opts.listen.0, common_opts.port).into(),
             common_opts.allow_lan,
             dispatcher,

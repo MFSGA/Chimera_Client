@@ -104,6 +104,8 @@ impl InboundManager {
                 #[cfg(feature = "http_port")]
                 InboundOpts::Http { common_opts } => ports.port = Some(common_opts.port),
                 InboundOpts::Socks { common_opts, .. } => ports.socks_port = Some(common_opts.port),
+                #[cfg(feature = "mixed_port")]
+                InboundOpts::Mixed { common_opts, .. } => ports.mixed_port = Some(common_opts.port),
             }
         }
         ports
@@ -154,6 +156,10 @@ impl InboundManager {
                 InboundOpts::Socks { common_opts, .. } => {
                     ports.socks_port.is_some() && Some(common_opts.port) == ports.socks_port
                 }
+                #[cfg(feature = "mixed_port")]
+                InboundOpts::Mixed { common_opts, .. } => {
+                    ports.mixed_port.is_some() && Some(common_opts.port) == ports.mixed_port
+                }
             })
             .collect();
 
@@ -163,6 +169,10 @@ impl InboundManager {
                 InboundOpts::Http { common_opts } => ports.port.unwrap_or(common_opts.port),
                 InboundOpts::Socks { common_opts, .. } => {
                     ports.socks_port.unwrap_or(common_opts.port)
+                }
+                #[cfg(feature = "mixed_port")]
+                InboundOpts::Mixed { common_opts, .. } => {
+                    ports.mixed_port.unwrap_or(common_opts.port)
                 }
             };
             guard.insert(opts, handle);
