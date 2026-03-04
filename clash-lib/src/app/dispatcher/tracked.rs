@@ -1,8 +1,8 @@
-use std::{pin::Pin, sync::Arc};
+use std::{io, pin::Pin, sync::Arc, task::Poll};
 
 use async_trait::async_trait;
 use downcast_rs::{Downcast, impl_downcast};
-use std::task::Poll;
+use futures::{Sink, Stream};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::oneshot::{Receiver, error::TryRecvError},
@@ -17,7 +17,7 @@ use crate::{
         },
         router::RuleMatcher,
     },
-    proxy::ProxyStream,
+    proxy::{ProxyStream, datagram::UdpPacket},
     session::Session,
 };
 
@@ -328,5 +328,231 @@ impl AsyncWrite for TrackedStream {
         }
 
         Pin::new(self.inner.as_mut()).poll_shutdown(cx)
+    }
+}
+
+#[async_trait]
+pub trait ChainedDatagram:
+    Stream<Item = UdpPacket> + Sink<UdpPacket, Error = io::Error> + Send + Sync + Unpin
+{
+    fn chain(&self) -> &ProxyChain;
+    async fn append_to_chain(&self, name: &str);
+}
+
+pub type BoxedChainedDatagram = Box<dyn ChainedDatagram + Send + Sync>;
+
+#[async_trait]
+impl<T> ChainedDatagram for ChainedDatagramWrapper<T>
+where
+    T: Stream<Item = UdpPacket> + Unpin + Send + Sync + 'static,
+    T: Sink<UdpPacket, Error = io::Error>,
+{
+    fn chain(&self) -> &ProxyChain {
+        &self.chain
+    }
+
+    async fn append_to_chain(&self, name: &str) {
+        self.chain.push(name.to_owned()).await;
+    }
+}
+
+pub struct ChainedDatagramWrapper<T> {
+    inner: T,
+    chain: ProxyChain,
+}
+
+impl<T> ChainedDatagramWrapper<T> {
+    pub fn new(inner: T) -> Self {
+        Self {
+            inner,
+            chain: ProxyChain::default(),
+        }
+    }
+}
+
+impl<T> Stream for ChainedDatagramWrapper<T>
+where
+    T: Stream<Item = UdpPacket> + Unpin,
+{
+    type Item = UdpPacket;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+impl<T> Sink<UdpPacket> for ChainedDatagramWrapper<T>
+where
+    T: Sink<UdpPacket, Error = io::Error> + Unpin,
+{
+    type Error = io::Error;
+
+    fn poll_ready(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.inner).poll_ready(cx)
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: UdpPacket) -> Result<(), Self::Error> {
+        Pin::new(&mut self.get_mut().inner).start_send(item)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_close(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.inner).poll_close(cx)
+    }
+}
+
+pub struct TrackedDatagram {
+    inner: BoxedChainedDatagram,
+    manager: Arc<StatisticsManager>,
+    tracker: Arc<TrackerInfo>,
+    close_notify: Receiver<()>,
+}
+
+impl TrackedDatagram {
+    #[allow(clippy::borrowed_box)]
+    pub async fn new(
+        inner: BoxedChainedDatagram,
+        manager: Arc<StatisticsManager>,
+        _sess: Session,
+        _rule: Option<&Box<dyn RuleMatcher>>,
+    ) -> Self {
+        let uuid = uuid::Uuid::new_v4();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tracker = Arc::new(TrackerInfo {
+            uuid,
+            ..Default::default()
+        });
+        let s = Self {
+            inner,
+            manager: manager.clone(),
+            tracker: tracker.clone(),
+            close_notify: rx,
+        };
+
+        manager.track(Tracked(uuid, tracker), tx).await;
+
+        s
+    }
+
+    pub fn id(&self) -> uuid::Uuid {
+        self.tracker.uuid
+    }
+
+    pub fn tracker_info(&self) -> Arc<TrackerInfo> {
+        self.tracker.clone()
+    }
+}
+
+impl Stream for TrackedDatagram {
+    type Item = UdpPacket;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        match self.close_notify.try_recv() {
+            Ok(_) => return Poll::Ready(None),
+            Err(e) => match e {
+                TryRecvError::Empty => {}
+                TryRecvError::Closed => return Poll::Ready(None),
+            },
+        }
+
+        let r = Pin::new(self.inner.as_mut()).poll_next(cx);
+        if let Poll::Ready(Some(pkt)) = &r {
+            self.manager.push_downloaded(pkt.data.len());
+            self.tracker
+                .download_total
+                .fetch_add(pkt.data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        r
+    }
+}
+
+impl Sink<UdpPacket> for TrackedDatagram {
+    type Error = io::Error;
+
+    fn poll_ready(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        match self.close_notify.try_recv() {
+            Ok(_) => return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
+            Err(e) => match e {
+                TryRecvError::Empty => {}
+                TryRecvError::Closed => {
+                    return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+                }
+            },
+        }
+        Pin::new(self.inner.as_mut()).poll_ready(cx)
+    }
+
+    fn start_send(mut self: Pin<&mut Self>, item: UdpPacket) -> Result<(), Self::Error> {
+        match self.close_notify.try_recv() {
+            Ok(_) => return Err(io::ErrorKind::BrokenPipe.into()),
+            Err(e) => match e {
+                TryRecvError::Empty => {}
+                TryRecvError::Closed => {
+                    return Err(io::ErrorKind::BrokenPipe.into());
+                }
+            },
+        }
+
+        let upload = item.data.len();
+        self.manager.push_uploaded(upload);
+        self.tracker
+            .upload_total
+            .fetch_add(upload as u64, std::sync::atomic::Ordering::Relaxed);
+        Pin::new(self.inner.as_mut()).start_send(item)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        match self.close_notify.try_recv() {
+            Ok(_) => return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
+            Err(e) => match e {
+                TryRecvError::Empty => {}
+                TryRecvError::Closed => {
+                    return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+                }
+            },
+        }
+
+        Pin::new(self.inner.as_mut()).poll_flush(cx)
+    }
+
+    fn poll_close(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        match self.close_notify.try_recv() {
+            Ok(_) => return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
+            Err(e) => match e {
+                TryRecvError::Empty => {}
+                TryRecvError::Closed => {
+                    return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+                }
+            },
+        }
+
+        Pin::new(self.inner.as_mut()).poll_close(cx)
     }
 }

@@ -24,9 +24,41 @@ pub enum SocksAddr {
     Domain(String, u16),
 }
 
+impl Display for SocksAddr {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SocksAddr::Ip(ip) => write!(f, "{}", ip),
+            SocksAddr::Domain(host, port) => write!(f, "{host}:{port}"),
+        }
+    }
+}
+
 impl SocksAddr {
     pub fn any_ipv4() -> Self {
         Self::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0))
+    }
+
+    pub(crate) fn write_to_buf_vmess<B: BufMut>(&self, buf: &mut B) {
+        match self {
+            Self::Ip(SocketAddr::V4(addr)) => {
+                buf.put_u16(addr.port());
+                buf.put_u8(0x01);
+                buf.put_slice(&addr.ip().octets());
+            }
+            Self::Ip(SocketAddr::V6(addr)) => {
+                buf.put_u16(addr.port());
+                buf.put_u8(0x03);
+                for seg in &addr.ip().segments() {
+                    buf.put_u16(*seg);
+                }
+            }
+            Self::Domain(domain_name, port) => {
+                buf.put_u16(*port);
+                buf.put_u8(0x02);
+                buf.put_u8(domain_name.len() as u8);
+                buf.put_slice(domain_name.as_bytes());
+            }
+        }
     }
 
     pub async fn read_from<T: AsyncRead + Unpin>(r: &mut T) -> io::Result<Self> {
