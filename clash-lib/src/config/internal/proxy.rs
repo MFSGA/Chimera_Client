@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde::{de::value::MapDeserializer, Deserialize};
+use serde::{Deserialize, de::value::MapDeserializer};
 use serde_yaml::Value;
 
 use crate::Error;
@@ -166,14 +166,12 @@ pub struct OutboundVless {
     pub udp: Option<bool>,
     pub tls: Option<bool>,
     pub skip_cert_verify: Option<bool>,
-    #[serde(alias = "servername", alias = "serverName", alias = "sni")]
+    #[serde(alias = "servername", alias = "serverName")]
     pub server_name: Option<String>,
+    pub sni: Option<String>,
     #[serde(alias = "fingerprint")]
     pub client_fingerprint: Option<String>,
     pub network: Option<String>,
-    pub ws_opts: Option<WsOpt>,
-    pub h2_opts: Option<H2Opt>,
-    pub grpc_opts: Option<GrpcOpt>,
     #[serde(alias = "realityOpts")]
     pub reality_opts: Option<OutboundTrojanRealityOpts>,
 }

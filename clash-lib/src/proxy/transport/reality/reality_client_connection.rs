@@ -279,7 +279,10 @@ impl RealityClientConnection {
             return Ok(RealityIoState::new(self.plaintext_read_buf.len()));
         }
 
-        tracing::debug!("REALITY CLIENT: Processing new packets - ciphertext buffer has {} bytes", self.ciphertext_read_buf.len());
+        tracing::debug!(
+            "REALITY CLIENT: Processing new packets - ciphertext buffer has {} bytes",
+            self.ciphertext_read_buf.len()
+        );
         let result = self.process_new_packets_inner();
 
         if let Err(ref e) = result {
@@ -840,7 +843,9 @@ impl RealityClientConnection {
                         plaintext.len()
                     );
                 }
-                _ => unreachable!("validated content type should never reach here: 0x{content_type:02x}"),
+                _ => unreachable!(
+                    "validated content type should never reach here: 0x{content_type:02x}"
+                ),
             }
 
             // Consume the processed record from the buffer (after plaintext borrow ends)
