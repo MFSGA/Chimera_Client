@@ -1,6 +1,6 @@
 mod rules;
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 pub use rules::RuleMatcher;
 use tracing::{info, trace};
@@ -10,11 +10,12 @@ use crate::{
     app::{
         dns::ThreadSafeDNSResolver,
         router::rules::{
-            domain::Domain, domain_suffix::DomainSuffix, final_::Final,
+            domain::Domain, domain_keyword::DomainKeyword,
+            domain_suffix::DomainSuffix, final_::Final,
         },
     },
     common::mmdb::MmdbLookup,
-    config::internal::{config::RuleProviderDef, rule::RuleType},
+    config::internal::rule::RuleType,
 };
 
 const MATCH: &str = "MATCH";
@@ -30,7 +31,6 @@ pub type ThreadSafeRouter = Arc<Router>;
 impl Router {
     pub async fn new(
         rules: Vec<RuleType>,
-        // rule_providers: HashMap<String, RuleProviderDef>,
         dns_resolver: ThreadSafeDNSResolver,
         country_mmdb: Option<MmdbLookup>,
         // asn_mmdb: Option<MmdbLookup>,
@@ -40,17 +40,9 @@ impl Router {
         Self {
             rules: rules
                 .into_iter()
-                .map(|r| {
-                    map_rule_type(
-                        r,
-                        // country_mmdb.clone(),
-                        // geodata.clone(),
-                        // Some(&rule_provider_registry),
-                    )
-                })
+                .map(|r| map_rule_type(r, country_mmdb.clone()))
                 .collect(),
             dns_resolver,
-            // asn_mmdb,
         }
     }
 
@@ -112,9 +104,7 @@ impl Router {
 
 pub fn map_rule_type(
     rule_type: RuleType,
-    // mmdb: Option<MmdbLookup>,
-    // geodata: Option<GeoDataLookup>,
-    // rule_provider_registry: Option<&HashMap<String, ThreadSafeRuleProvider>>,
+    mmdb: Option<MmdbLookup>,
 ) -> Box<dyn RuleMatcher> {
     match rule_type {
         RuleType::Domain { domain, target } => {
@@ -125,6 +115,13 @@ pub fn map_rule_type(
             target,
         } => Box::new(DomainSuffix {
             suffix: domain_suffix,
+            target,
+        }),
+        RuleType::DomainKeyword {
+            domain_keyword,
+            target,
+        } => Box::new(DomainKeyword {
+            keyword: domain_keyword,
             target,
         }),
         RuleType::Match { target } => Box::new(Final { target }),

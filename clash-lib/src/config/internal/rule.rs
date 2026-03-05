@@ -12,6 +12,10 @@ pub enum RuleType {
         domain_suffix: String,
         target: String,
     },
+    DomainKeyword {
+        domain_keyword: String,
+        target: String,
+    },
     Match {
         target: String,
     },
@@ -33,6 +37,10 @@ impl RuleType {
                 domain_suffix: payload.to_string(),
                 target: target.to_string(),
             }),
+            "DOMAIN-KEYWORD" => Ok(RuleType::DomainKeyword {
+                domain_keyword: payload.to_string(),
+                target: target.to_string(),
+            }),
             "MATCH" => Ok(RuleType::Match {
                 target: target.to_string(),
             }),
@@ -46,6 +54,7 @@ impl RuleType {
         match self {
             RuleType::Domain { target, .. } => target,
             RuleType::DomainSuffix { target, .. } => target,
+            RuleType::DomainKeyword { target, .. } => target,
             RuleType::Match { target } => target,
         }
     }
@@ -93,6 +102,22 @@ mod tests {
                 assert_eq!(target, "PROXY");
             }
             _ => panic!("Expected DomainSuffix rule"),
+        }
+    }
+
+    #[test]
+    fn parse_domain_keyword_rule() {
+        let rule =
+            RuleType::try_from("DOMAIN-KEYWORD,example,PROXY".to_string()).unwrap();
+        match rule {
+            RuleType::DomainKeyword {
+                domain_keyword,
+                target,
+            } => {
+                assert_eq!(domain_keyword, "example");
+                assert_eq!(target, "PROXY");
+            }
+            _ => panic!("Expected DomainKeyword rule"),
         }
     }
 
