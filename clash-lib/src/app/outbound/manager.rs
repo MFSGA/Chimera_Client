@@ -116,15 +116,14 @@ impl OutboundManager {
                 m
             };
 
-            /* todo: api
             let alive = proxy_manager.alive(k).await;
             let history = proxy_manager.delay_history(k).await;
-            let support_udp = v.support_udp().await; */
+            let support_udp = v.support_udp().await;
 
-            m.insert("history".to_string(), Box::new(Vec::<u32>::new()));
-            m.insert("alive".to_string(), Box::new(false));
+            m.insert("history".to_string(), Box::new(history));
+            m.insert("alive".to_string(), Box::new(alive));
             m.insert("name".to_string(), Box::new(k.to_owned()));
-            m.insert("udp".to_string(), Box::new(false));
+            m.insert("udp".to_string(), Box::new(support_udp));
 
             r.insert(k.clone(), Box::new(m) as _);
         }
