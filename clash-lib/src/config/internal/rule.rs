@@ -19,6 +19,11 @@ pub enum RuleType {
     Match {
         target: String,
     },
+    IpCidr {
+        ipnet: ipnet::IpNet,
+        target: String,
+        no_resolve: bool,
+    },
 }
 
 impl RuleType {
@@ -41,6 +46,15 @@ impl RuleType {
                 domain_keyword: payload.to_string(),
                 target: target.to_string(),
             }),
+            "IP-CIDR" | "IP-CIDR6" => Ok(RuleType::IpCidr {
+                ipnet: payload.parse()?,
+                target: target.to_string(),
+                no_resolve: if let Some(params) = params {
+                    params.contains(&"no-resolve")
+                } else {
+                    false
+                },
+            }),
             "MATCH" => Ok(RuleType::Match {
                 target: target.to_string(),
             }),
@@ -56,6 +70,7 @@ impl RuleType {
             RuleType::DomainSuffix { target, .. } => target,
             RuleType::DomainKeyword { target, .. } => target,
             RuleType::Match { target } => target,
+            RuleType::IpCidr { target, .. } => target,
         }
     }
 }

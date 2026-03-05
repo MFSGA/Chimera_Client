@@ -53,6 +53,8 @@ pub use session::Session;
 pub enum Error {
     #[error(transparent)]
     Io(#[from] io::Error),
+    #[error(transparent)]
+    IpNet(#[from] ipnet::AddrParseError),
     #[error("invalid config: {0}")]
     InvalidConfig(String),
     #[error("dns error: {0}")]

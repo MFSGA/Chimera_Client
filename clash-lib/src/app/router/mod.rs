@@ -11,7 +11,7 @@ use crate::{
         dns::ThreadSafeDNSResolver,
         router::rules::{
             domain::Domain, domain_keyword::DomainKeyword,
-            domain_suffix::DomainSuffix, final_::Final,
+            domain_suffix::DomainSuffix, final_::Final, ipcidr::IpCidr,
         },
     },
     common::mmdb::MmdbLookup,
@@ -124,6 +124,8 @@ pub fn map_rule_type(
             keyword: domain_keyword,
             target,
         }),
+        RuleType::IpCidr { ipnet, target, .. } => Box::new(IpCidr { ipnet, target }),
+
         RuleType::Match { target } => Box::new(Final { target }),
     }
 }
