@@ -12,9 +12,16 @@ pub fn convert(
         HashMap::<String, OutboundProxy>::new(),
         |mut rv, mapping| {
             let name = mapping.get("name").cloned();
-            let group = OutboundProxy::ProxyGroup({ todo!() });
+            let group =
+                OutboundProxy::ProxyGroup(mapping.try_into().map_err(|x| {
+                    if let Some(name) = name {
+                        Error::InvalidConfig(format!("proxy group: {name:#?}: {x}"))
+                    } else {
+                        Error::InvalidConfig("proxy group name missing".to_string())
+                    }
+                })?);
             proxy_names.push(group.name());
-            rv.insert(group.name().to_string(), group);
+            rv.insert(group.name(), group);
             Ok::<HashMap<String, OutboundProxy>, Error>(rv)
         },
     )

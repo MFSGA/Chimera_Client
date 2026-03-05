@@ -76,6 +76,7 @@ pub struct Config {
     /// 11. HTTP and SOCKS5 proxy authentication
     #[serde(default)]
     pub authentication: Vec<String>,
+    #[serde(rename = "proxy-groups")]
     /// 4. Proxy group settings
     pub proxy_group: Option<Vec<HashMap<String, Value>>>,
     #[serde(rename = "rules")]
