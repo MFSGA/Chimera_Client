@@ -61,6 +61,22 @@ impl ThreadSafeCacheFile {
 
         Self(store)
     }
+
+    pub async fn set_selected(&self, group: &str, server: &str) {
+        let mut g = self.0.write().await;
+        if g.store_selected() {
+            g.set_selected(group, server);
+        }
+    }
+
+    pub async fn get_selected(&self, group: &str) -> Option<String> {
+        let g = self.0.read().await;
+        if g.store_selected() {
+            g.db.selected.get(group).cloned()
+        } else {
+            None
+        }
+    }
 }
 
 struct CacheFile {
@@ -101,5 +117,15 @@ impl CacheFile {
         };
 
         Self { db, store_selected }
+    }
+
+    pub fn store_selected(&self) -> bool {
+        self.store_selected
+    }
+
+    pub fn set_selected(&mut self, group: &str, server: &str) {
+        self.db
+            .selected
+            .insert(group.to_string(), server.to_string());
     }
 }

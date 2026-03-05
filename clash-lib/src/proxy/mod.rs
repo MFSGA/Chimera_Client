@@ -168,6 +168,7 @@ impl_downcast!(ClientStream);
 pub enum OutboundType {
     Direct,
     Reject,
+    Selector,
     Trojan,
     Hysteria2,
     Vless,
@@ -196,6 +197,7 @@ impl Display for OutboundType {
             OutboundType::Vless => write!(f, "Vless"),
             OutboundType::Trojan => write!(f, "Trojan"),
             OutboundType::Hysteria2 => write!(f, "Hysteria2"),
+            OutboundType::Selector => write!(f, "Selector"),
             OutboundType::Direct => write!(f, "Direct"),
             OutboundType::Reject => write!(f, "Reject"),
         }

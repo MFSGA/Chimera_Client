@@ -17,11 +17,11 @@ use crate::{
     },
     config::internal::proxy::{
         OutboundGroupProtocol, OutboundProxyProtocol, OutboundProxyProviderDef,
-        PROXY_DIRECT, PROXY_REJECT,
+        PROXY_DIRECT, PROXY_GLOBAL, PROXY_REJECT,
     },
     proxy::{
         AnyOutboundHandler, direct,
-        group::selector::ThreadSafeSelectorControl,
+        group::selector::{self, ThreadSafeSelectorControl},
         reject,
         utils::{DirectConnector, ProxyConnector},
         vless,
@@ -152,7 +152,48 @@ impl OutboundManager {
 
         self.load_group_outbounds(outbound_groups, cache_store.clone())
             .await?;
-        todo!()
+
+        // insert GLOBAL selector to keep behavior aligned with clash-rs bootstrap
+        let mut all = vec![];
+        let mut keys = self.handlers.keys().collect::<Vec<_>>();
+        keys.sort_by(|a, b| {
+            self.proxy_names
+                .iter()
+                .position(|x| x == *a)
+                .cmp(&self.proxy_names.iter().position(|x| x == *b))
+        });
+        for name in keys {
+            if let Some(handler) = self.handlers.get(name) {
+                all.push(handler.clone());
+            }
+        }
+
+        if !all.is_empty() {
+            let pd = Arc::new(RwLock::new(
+                PlainProvider::new(PROXY_GLOBAL.to_owned(), all).map_err(|x| {
+                    Error::InvalidConfig(format!("invalid provider config: {x}"))
+                })?,
+            ));
+            let stored_selection = cache_store.get_selected(PROXY_GLOBAL).await;
+            let selector = selector::Handler::new(
+                selector::HandlerOptions {
+                    name: PROXY_GLOBAL.to_owned(),
+                    udp: true,
+                    common_opts: crate::proxy::HandlerCommonOptions::default(),
+                },
+                vec![pd.clone()],
+                stored_selection,
+            )
+            .await;
+
+            self.handlers
+                .insert(PROXY_GLOBAL.to_owned(), Arc::new(selector.clone()));
+            self.selector_control
+                .insert(PROXY_GLOBAL.to_owned(), Arc::new(selector));
+            self.proxy_providers.insert(PROXY_GLOBAL.to_owned(), pd);
+        }
+
+        Ok(())
     }
 
     pub fn load_plain_outbounds(
@@ -305,6 +346,27 @@ impl OutboundManager {
                 == 0
         }
 
+        fn maybe_append_use_providers(
+            provider_names: &Option<Vec<String>>,
+            provider_registry: &HashMap<String, ThreadSafeProxyProvider>,
+            providers: &mut Vec<ThreadSafeProxyProvider>,
+        ) -> Result<(), Error> {
+            if let Some(provider_names) = provider_names {
+                for provider_name in provider_names {
+                    let provider = provider_registry
+                        .get(provider_name)
+                        .cloned()
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "provider {provider_name} not found"
+                            ))
+                        })?;
+                    providers.push(provider);
+                }
+            }
+            Ok(())
+        }
+
         // Initialize handlers for each outbound group protocol
         for outbound_group in outbound_groups.iter() {
             match outbound_group {
@@ -330,13 +392,12 @@ impl OutboundManager {
                         )?);
                     }
 
-                    todo!()
-                    /*
                     maybe_append_use_providers(
                         &proto.use_provider,
                         provider_registry,
                         &mut providers,
-                    ); let stored_selection =
+                    )?;
+                    let stored_selection =
                         cache_store.get_selected(&proto.name).await;
 
                     let selector = selector::Handler::new(
@@ -355,7 +416,7 @@ impl OutboundManager {
                     .await;
 
                     handlers.insert(proto.name.clone(), Arc::new(selector.clone()));
-                    selector_control.insert(proto.name.clone(), Arc::new(selector)); */
+                    selector_control.insert(proto.name.clone(), Arc::new(selector));
                 }
             }
         }
@@ -373,17 +434,23 @@ impl OutboundManager {
         let provider_registry = &mut self.proxy_providers;
         for (name, provider) in proxy_providers.into_iter() {
             match provider {
-                OutboundProxyProviderDef::Http(http) => {
-                    todo!()
+                OutboundProxyProviderDef::Http(_http) => {
+                    debug!(
+                        "http proxy provider `{}` is not implemented yet, skipping",
+                        name
+                    );
                 }
-                OutboundProxyProviderDef::File(file) => {
-                    todo!()
+                OutboundProxyProviderDef::File(_file) => {
+                    debug!(
+                        "file proxy provider `{}` is not implemented yet, skipping",
+                        name
+                    );
                 }
             }
         }
 
-        for p in provider_registry.values() {
-            todo!()
+        for _p in provider_registry.values() {
+            debug!("proxy provider init hook is not implemented yet");
         }
 
         Ok(())
