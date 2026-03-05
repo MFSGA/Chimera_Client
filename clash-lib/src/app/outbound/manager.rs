@@ -7,11 +7,9 @@ use erased_serde::Serialize;
 use crate::{
     Error,
     app::{
-        dns::ThreadSafeDNSResolver,
-        profile::ThreadSafeCacheFile,
-        remote_content_manager::{
+        dns::ThreadSafeDNSResolver, outbound::utils::proxy_groups_dag_sort, profile::ThreadSafeCacheFile, remote_content_manager::{
             ProxyManager, providers::proxy_provider::ThreadSafeProxyProvider,
-        },
+        }
     },
     config::internal::proxy::{
         OutboundGroupProtocol, OutboundProxyProtocol, OutboundProxyProviderDef,
@@ -86,8 +84,8 @@ impl OutboundManager {
             .await?;
 
         debug!("todo initializing handlers");
-        /* m.load_handlers(outbounds, outbound_groups, proxy_names, cache_store)
-        .await?; */
+        m.load_handlers(outbounds, outbound_groups, proxy_names, cache_store)
+            .await?;
 
         debug!("initializing connectors");
         m.init_handler_connectors().await?;
@@ -134,21 +132,21 @@ impl OutboundManager {
         r
     }
 
-    fn load_handlers(
+    async fn load_handlers(
         &mut self,
         outbounds: Vec<AnyOutboundHandler>,
+        outbound_groups: Vec<OutboundGroupProtocol>,
+        proxy_names: Vec<String>,
+        cache_store: ThreadSafeCacheFile,
     ) -> Result<(), Error> {
-        for outbound in outbounds {
-            let name = outbound.name().to_string();
-            if self.handlers.contains_key(&name) {
-                return Err(Error::InvalidConfig(format!(
-                    "duplicated proxy name: {name}"
-                )));
-            }
-            self.handlers.insert(name, outbound);
-        }
+        self.handlers.extend(outbounds.into_iter().map(|h| {
+            let name = h.name().to_owned();
+            (name, h)
+        }));
 
-        Ok(())
+        self.load_group_outbounds(outbound_groups, cache_store.clone())
+            .await?;
+        todo!()
     }
 
     pub fn load_plain_outbounds(
@@ -228,6 +226,18 @@ impl OutboundManager {
         }
 
         Ok(())
+    }
+
+    async fn load_group_outbounds(
+        &mut self,
+        outbound_groups: Vec<OutboundGroupProtocol>,
+        cache_store: ThreadSafeCacheFile,
+    ) -> Result<(), Error> {
+        // Sort outbound groups to ensure dependencies are resolved
+        let mut outbound_groups = outbound_groups;
+        proxy_groups_dag_sort(&mut outbound_groups)?;
+
+        todo!()
     }
 
     async fn load_proxy_providers(

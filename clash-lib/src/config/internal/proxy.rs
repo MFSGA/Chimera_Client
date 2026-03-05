@@ -199,6 +199,13 @@ impl OutboundGroupProtocol {
             OutboundGroupProtocol::Select(g) => &g.name,
         }
     }
+
+    /// Returns the proxies in the group, if any.
+    pub fn proxies(&self) -> Option<&Vec<String>> {
+        match &self {
+            OutboundGroupProtocol::Select(g) => g.proxies.as_ref(),
+        }
+    }
 }
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
 pub struct OutboundGroupSelect {
