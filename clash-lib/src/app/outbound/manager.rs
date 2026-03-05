@@ -36,6 +36,7 @@ use crate::proxy::trojan;
 pub struct OutboundManager {
     /// name -> handler
     handlers: HashMap<String, AnyOutboundHandler>,
+    proxy_names: Vec<String>,
     /// name -> provider
     proxy_providers: HashMap<String, ThreadSafeProxyProvider>,
     proxy_manager: ProxyManager,
@@ -73,12 +74,14 @@ impl OutboundManager {
         fw_mark: Option<u32>,
     ) -> Result<Self, Error> {
         let handlers = HashMap::new();
+        let proxy_names_ref = proxy_names;
         let provider_registry = HashMap::new();
         let selector_control = HashMap::new();
         let proxy_manager = ProxyManager::new(dns_resolver.clone(), fw_mark);
 
         let mut m = Self {
             handlers,
+            proxy_names: proxy_names_ref,
             proxy_manager,
             selector_control,
             proxy_providers: provider_registry,
@@ -89,7 +92,7 @@ impl OutboundManager {
             .await?;
 
         debug!("todo initializing handlers");
-        m.load_handlers(outbounds, outbound_groups, proxy_names, cache_store)
+        m.load_handlers(outbounds, outbound_groups, cache_store)
             .await?;
 
         debug!("initializing connectors");
@@ -103,8 +106,7 @@ impl OutboundManager {
     }
 
     pub fn proxy_names(&self) -> &[String] {
-        todo!()
-        // &self.proxy_names
+        &self.proxy_names
     }
 
     /// Get all proxies in the manager, excluding those in providers.
@@ -141,7 +143,6 @@ impl OutboundManager {
         &mut self,
         outbounds: Vec<AnyOutboundHandler>,
         outbound_groups: Vec<OutboundGroupProtocol>,
-        proxy_names: Vec<String>,
         cache_store: ThreadSafeCacheFile,
     ) -> Result<(), Error> {
         self.handlers.extend(outbounds.into_iter().map(|h| {

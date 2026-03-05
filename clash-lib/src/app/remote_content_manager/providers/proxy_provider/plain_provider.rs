@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 
 use crate::{
+    Error,
     app::remote_content_manager::providers::{
         Provider, proxy_provider::ProxyProvider,
     },
@@ -20,9 +21,14 @@ impl PlainProvider {
     pub fn new(
         name: String,
         proxies: Vec<AnyOutboundHandler>,
-        // hc: HealthCheck,
     ) -> anyhow::Result<Self> {
-        todo!()
+        if proxies.is_empty() {
+            return Err(
+                Error::InvalidConfig(format!("{name}: proxies is empty")).into()
+            );
+        }
+
+        Ok(Self { name, proxies })
     }
 }
 
