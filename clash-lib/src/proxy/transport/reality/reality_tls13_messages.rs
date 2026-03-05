@@ -436,7 +436,7 @@ pub fn write_record_header(record_type: u8, length: u16) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::common::CONTENT_TYPE_HANDSHAKE;
+    use super::super::common::CONTENT_TYPE_HANDSHAKE;
     use super::*;
 
     #[test]

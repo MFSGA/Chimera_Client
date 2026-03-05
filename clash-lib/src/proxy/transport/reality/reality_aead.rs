@@ -397,7 +397,7 @@ mod tests {
 
     #[test]
     fn test_decrypt_handshake_message() {
-        use super::common::CONTENT_TYPE_HANDSHAKE;
+        use super::super::common::CONTENT_TYPE_HANDSHAKE;
         use super::decrypt_handshake_message;
 
         let key = vec![0x42u8; 16];
@@ -435,7 +435,7 @@ mod tests {
 
     #[test]
     fn test_decrypt_handshake_message_with_padding() {
-        use super::common::CONTENT_TYPE_HANDSHAKE;
+        use super::super::common::CONTENT_TYPE_HANDSHAKE;
         use super::decrypt_handshake_message;
 
         let key = vec![0x42u8; 16];
