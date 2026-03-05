@@ -14,6 +14,8 @@ use tokio::sync::RwLock;
 use crate::app::dns::ThreadSafeDNSResolver;
 use crate::common::utils::serialize_duration;
 
+pub mod providers;
+
 #[derive(Default)]
 struct ProxyState {
     alive: AtomicBool,

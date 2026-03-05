@@ -7,8 +7,11 @@ use erased_serde::Serialize;
 use crate::{
     Error,
     app::{
-        dns::ThreadSafeDNSResolver, profile::ThreadSafeCacheFile,
-        remote_content_manager::ProxyManager,
+        dns::ThreadSafeDNSResolver,
+        profile::ThreadSafeCacheFile,
+        remote_content_manager::{
+            ProxyManager, providers::proxy_provider::ThreadSafeProxyProvider,
+        },
     },
     config::internal::proxy::{
         OutboundGroupProtocol, OutboundProxyProtocol, OutboundProxyProviderDef,
@@ -28,7 +31,10 @@ use crate::proxy::hysteria2;
 use crate::proxy::trojan;
 
 pub struct OutboundManager {
+    /// name -> handler
     handlers: HashMap<String, AnyOutboundHandler>,
+    /// name -> provider
+    proxy_providers: HashMap<String, ThreadSafeProxyProvider>,
     proxy_manager: ProxyManager,
     selector_control: HashMap<String, ThreadSafeSelectorControl>,
 }
@@ -60,11 +66,11 @@ impl OutboundManager {
         proxy_names: Vec<String>,
         dns_resolver: ThreadSafeDNSResolver,
         cache_store: ThreadSafeCacheFile,
-        _cwd: String,
+        cwd: String,
         fw_mark: Option<u32>,
     ) -> Result<Self, Error> {
         let handlers = HashMap::new();
-        // let provider_registry = HashMap::new();
+        let provider_registry = HashMap::new();
         let selector_control = HashMap::new();
         let proxy_manager = ProxyManager::new(dns_resolver.clone(), fw_mark);
 
@@ -72,13 +78,12 @@ impl OutboundManager {
             handlers,
             proxy_manager,
             selector_control,
-            // proxy_providers: provider_registry,
+            proxy_providers: provider_registry,
         };
 
-        debug!("todo: initializing proxy providers");
-        /*
+        debug!("initializing proxy providers");
         m.load_proxy_providers(cwd, proxy_providers, dns_resolver)
-            .await?; */
+            .await?;
 
         debug!("todo initializing handlers");
         /* m.load_handlers(outbounds, outbound_groups, proxy_names, cache_store)
@@ -220,6 +225,32 @@ impl OutboundManager {
                     });
                 handler.register_connector(connector.clone()).await;
             }
+        }
+
+        Ok(())
+    }
+
+    async fn load_proxy_providers(
+        &mut self,
+        cwd: String,
+        proxy_providers: HashMap<String, OutboundProxyProviderDef>,
+        resolver: ThreadSafeDNSResolver,
+    ) -> Result<(), Error> {
+        let proxy_manager = &self.proxy_manager;
+        let provider_registry = &mut self.proxy_providers;
+        for (name, provider) in proxy_providers.into_iter() {
+            match provider {
+                OutboundProxyProviderDef::Http(http) => {
+                    todo!()
+                }
+                OutboundProxyProviderDef::File(file) => {
+                    todo!()
+                }
+            }
+        }
+
+        for p in provider_registry.values() {
+            todo!()
         }
 
         Ok(())

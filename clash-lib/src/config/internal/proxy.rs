@@ -213,9 +213,26 @@ pub struct OutboundGroupSelect {
     pub icon: Option<String>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
 #[serde(tag = "type")]
-pub enum OutboundProxyProviderDef {}
+pub enum OutboundProxyProviderDef {
+    Http(OutboundHttpProvider),
+    File(OutboundFileProvider),
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[serde(rename_all = "kebab-case")]
+pub struct OutboundHttpProvider {}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[serde(rename_all = "kebab-case")]
+pub struct OutboundFileProvider {
+    #[serde(skip)]
+    pub name: String,
+    pub path: String,
+    pub interval: Option<u64>,
+    // pub health_check: HealthCheck,
+}
 
 #[cfg(feature = "trojan")]
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
