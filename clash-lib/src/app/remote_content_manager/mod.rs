@@ -32,16 +32,15 @@ pub struct DelayHistory {
 pub struct ProxyManager {
     proxy_state: Arc<RwLock<HashMap<String, ProxyState>>>,
     dns_resolver: ThreadSafeDNSResolver,
-    // todo Firewall Mark for url test
-    // fw_mark: Option<u32>,
+    fw_mark: Option<u32>,
 }
 
 impl ProxyManager {
-    pub fn new(dns_resolver: ThreadSafeDNSResolver) -> Self {
+    pub fn new(dns_resolver: ThreadSafeDNSResolver, fw_mark: Option<u32>) -> Self {
         Self {
             dns_resolver,
             proxy_state: Default::default(),
-            // fw_mark,
+            fw_mark,
         }
     }
 

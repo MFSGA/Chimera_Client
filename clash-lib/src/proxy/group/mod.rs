@@ -5,6 +5,8 @@ use async_trait::async_trait;
 use crate::proxy::{AnyOutboundHandler, OutboundHandler};
 use erased_serde::Serialize;
 
+pub mod selector;
+
 /// Convenience trait for group proxy serializing API responses.
 #[async_trait]
 pub trait GroupProxyAPIResponse: OutboundHandler {

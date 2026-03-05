@@ -14,7 +14,9 @@ use crate::{
         OutboundGroupProtocol, OutboundProxyProtocol, OutboundProxyProviderDef,
     },
     proxy::{
-        AnyOutboundHandler, direct, reject,
+        AnyOutboundHandler, direct,
+        group::selector::ThreadSafeSelectorControl,
+        reject,
         utils::{DirectConnector, ProxyConnector},
         vless,
     },
@@ -28,7 +30,7 @@ use crate::proxy::trojan;
 pub struct OutboundManager {
     handlers: HashMap<String, AnyOutboundHandler>,
     proxy_manager: ProxyManager,
-    // proxy_names: Vec<String>,
+    selector_control: HashMap<String, ThreadSafeSelectorControl>,
 }
 
 pub type ThreadSafeOutboundManager = Arc<OutboundManager>;
@@ -57,34 +59,30 @@ impl OutboundManager {
         proxy_providers: HashMap<String, OutboundProxyProviderDef>,
         proxy_names: Vec<String>,
         dns_resolver: ThreadSafeDNSResolver,
-        _cache_store: ThreadSafeCacheFile,
+        cache_store: ThreadSafeCacheFile,
         _cwd: String,
-        // fw_mark: Option<u32>,
+        fw_mark: Option<u32>,
     ) -> Result<Self, Error> {
         let handlers = HashMap::new();
-
-        let proxy_manager = ProxyManager::new(dns_resolver.clone());
+        // let provider_registry = HashMap::new();
+        let selector_control = HashMap::new();
+        let proxy_manager = ProxyManager::new(dns_resolver.clone(), fw_mark);
 
         let mut m = Self {
             handlers,
             proxy_manager,
-            // selector_control,
+            selector_control,
             // proxy_providers: provider_registry,
         };
 
-        if !proxy_providers.is_empty() {
-            return Err(Error::InvalidConfig(
-                "proxy providers are not supported yet".to_string(),
-            ));
-        }
+        debug!("todo: initializing proxy providers");
+        /*
+        m.load_proxy_providers(cwd, proxy_providers, dns_resolver)
+            .await?; */
 
-        if !outbound_groups.is_empty() {
-            return Err(Error::InvalidConfig(
-                "proxy groups are not supported yet".to_string(),
-            ));
-        }
-
-        m.load_handlers(outbounds)?;
+        debug!("todo initializing handlers");
+        /* m.load_handlers(outbounds, outbound_groups, proxy_names, cache_store)
+        .await?; */
 
         debug!("initializing connectors");
         m.init_handler_connectors().await?;

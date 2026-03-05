@@ -72,6 +72,8 @@ pub struct General {
     pub mmdb_download_url: Option<String>,
     /// 5
     pub mode: RunMode,
+    /// 6
+    pub routing_mask: Option<u32>,
 }
 
 #[derive(Serialize, Clone, Debug, Copy, PartialEq, Hash, Eq)]
