@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
+use tokio::sync::RwLock;
 use tracing::{debug, error};
 
 use erased_serde::Serialize;
@@ -11,10 +12,7 @@ use crate::{
         outbound::utils::proxy_groups_dag_sort,
         profile::ThreadSafeCacheFile,
         remote_content_manager::{
-            ProxyManager,
-            providers::proxy_provider::{
-                ThreadSafeProxyProvider
-            },
+            ProxyManager, providers::proxy_provider::{ThreadSafeProxyProvider, plain_provider::PlainProvider},
         },
     },
     config::internal::proxy::{
@@ -277,14 +275,14 @@ impl OutboundManager {
                 .collect::<Result<Vec<_>, _>>()?;
 
             debug!("todo creating PlainProvider for group ");
-            todo!()
+
             /* let hc = HealthCheck::new(
-                           proxies.clone(),
-                           DEFAULT_LATENCY_TEST_URL.to_owned(),
-                           interval,
-                           lazy,
-                           proxy_manager,
-                       );
+                proxies.clone(),
+                DEFAULT_LATENCY_TEST_URL.to_owned(),
+                interval,
+                lazy,
+                proxy_manager,
+            ); */
 
             let pd = Arc::new(RwLock::new(
                 PlainProvider::new(name.to_owned(), proxies).map_err(|x| {
@@ -295,7 +293,6 @@ impl OutboundManager {
             provider_registry.insert(name.to_owned(), pd.clone());
 
             Ok(pd)
-            */
         }
 
         fn check_group_empty(

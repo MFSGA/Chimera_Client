@@ -7,6 +7,8 @@ use crate::{
     app::remote_content_manager::providers::Provider, proxy::AnyOutboundHandler,
 };
 
+pub mod plain_provider;
+
 pub type ThreadSafeProxyProvider = Arc<RwLock<dyn ProxyProvider + Send + Sync>>;
 
 #[async_trait]
