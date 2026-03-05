@@ -5,7 +5,7 @@ use serde::Serialize;
 use tokio::sync::broadcast::Sender;
 use tracing_log::LogTracer;
 use tracing_subscriber::{
-    EnvFilter, Layer, filter::filter_fn, fmt::time::LocalTime,
+    EnvFilter, Layer, filter::filter_fn, fmt::time::LocalTime, prelude::*,
 };
 
 use crate::config::def::LogLevel;
@@ -40,15 +40,11 @@ where
 
         let event = LogEvent {
             level: match *event.metadata().level() {
-                tracing::Level::TRACE => LogLevel::Trace,
-                tracing::Level::DEBUG => LogLevel::Debug,
                 tracing::Level::ERROR => LogLevel::Error,
                 tracing::Level::WARN => LogLevel::Warning,
                 tracing::Level::INFO => LogLevel::Info,
-                _ => {
-                    todo!()
-                } //
-                  //
+                tracing::Level::DEBUG => LogLevel::Debug,
+                tracing::Level::TRACE => LogLevel::Trace,
             },
             msg: strs.join(" "),
         };
@@ -162,10 +158,16 @@ fn setup_logging_inner(
         .with_filter(exclude.clone());
 
     let subscriber = {
+        #[cfg(feature = "tracing")]
+        {
+            subscriber
+                .with(filter)
+                .with(collector.with_filter(exclude.clone()))
+                .with(log_to_file_layer)
+                .with(log_stdout_layer)
+        }
         #[cfg(not(feature = "tracing"))]
         {
-            use tracing_subscriber::layer::SubscriberExt;
-
             subscriber
                 .with(filter) // Global filter
                 .with(collector.with_filter(exclude.clone()))
