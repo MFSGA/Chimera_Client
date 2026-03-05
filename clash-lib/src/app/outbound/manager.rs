@@ -7,12 +7,19 @@ use erased_serde::Serialize;
 use crate::{
     Error,
     app::{
-        dns::ThreadSafeDNSResolver, outbound::utils::proxy_groups_dag_sort, profile::ThreadSafeCacheFile, remote_content_manager::{
-            ProxyManager, providers::proxy_provider::ThreadSafeProxyProvider,
-        }
+        dns::ThreadSafeDNSResolver,
+        outbound::utils::proxy_groups_dag_sort,
+        profile::ThreadSafeCacheFile,
+        remote_content_manager::{
+            ProxyManager,
+            providers::proxy_provider::{
+                ThreadSafeProxyProvider
+            },
+        },
     },
     config::internal::proxy::{
         OutboundGroupProtocol, OutboundProxyProtocol, OutboundProxyProviderDef,
+        PROXY_DIRECT, PROXY_REJECT,
     },
     proxy::{
         AnyOutboundHandler, direct,
@@ -237,7 +244,125 @@ impl OutboundManager {
         let mut outbound_groups = outbound_groups;
         proxy_groups_dag_sort(&mut outbound_groups)?;
 
-        todo!()
+        let handlers = &mut self.handlers;
+        let proxy_manager = &self.proxy_manager;
+        let provider_registry = &mut self.proxy_providers;
+        let selector_control = &mut self.selector_control;
+
+        #[allow(clippy::too_many_arguments)]
+        fn make_provider_from_proxies(
+            name: &str,
+            proxies: &[String],
+            interval: u64,
+            lazy: bool,
+            handlers: &HashMap<String, AnyOutboundHandler>,
+            proxy_manager: ProxyManager,
+            provider_registry: &mut HashMap<String, ThreadSafeProxyProvider>,
+        ) -> Result<ThreadSafeProxyProvider, Error> {
+            if name == PROXY_DIRECT || name == PROXY_REJECT {
+                return Err(Error::InvalidConfig(format!(
+                    "proxy group name `{name}` is reserved"
+                )));
+            }
+            let proxies = proxies
+                .iter()
+                .map(|x| {
+                    handlers
+                        .get(x)
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(format!("proxy {x} not found"))
+                        })
+                        .cloned()
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            debug!("todo creating PlainProvider for group ");
+            todo!()
+            /* let hc = HealthCheck::new(
+                           proxies.clone(),
+                           DEFAULT_LATENCY_TEST_URL.to_owned(),
+                           interval,
+                           lazy,
+                           proxy_manager,
+                       );
+
+            let pd = Arc::new(RwLock::new(
+                PlainProvider::new(name.to_owned(), proxies).map_err(|x| {
+                    Error::InvalidConfig(format!("invalid provider config: {x}"))
+                })?,
+            ));
+
+            provider_registry.insert(name.to_owned(), pd.clone());
+
+            Ok(pd)
+            */
+        }
+
+        fn check_group_empty(
+            proxies: &Option<Vec<String>>,
+            use_provider: &Option<Vec<String>>,
+        ) -> bool {
+            proxies.as_ref().map(|x| x.len()).unwrap_or_default()
+                + use_provider.as_ref().map(|x| x.len()).unwrap_or_default()
+                == 0
+        }
+
+        // Initialize handlers for each outbound group protocol
+        for outbound_group in outbound_groups.iter() {
+            match outbound_group {
+                OutboundGroupProtocol::Select(proto) => {
+                    if check_group_empty(&proto.proxies, &proto.use_provider) {
+                        return Err(Error::InvalidConfig(format!(
+                            "proxy group {} has no proxies",
+                            proto.name
+                        )));
+                    }
+
+                    let mut providers: Vec<ThreadSafeProxyProvider> = vec![];
+
+                    if let Some(proxies) = &proto.proxies {
+                        providers.push(make_provider_from_proxies(
+                            &proto.name,
+                            proxies,
+                            0,
+                            true,
+                            handlers,
+                            proxy_manager.clone(),
+                            provider_registry,
+                        )?);
+                    }
+
+                    todo!()
+                    /*
+                    maybe_append_use_providers(
+                        &proto.use_provider,
+                        provider_registry,
+                        &mut providers,
+                    ); let stored_selection =
+                        cache_store.get_selected(&proto.name).await;
+
+                    let selector = selector::Handler::new(
+                        selector::HandlerOptions {
+                            name: proto.name.clone(),
+                            udp: proto.udp.unwrap_or(true),
+                            common_opts: crate::proxy::HandlerCommonOptions {
+                                icon: proto.icon.clone(),
+                                url: proto.url.clone(),
+                                connector: None,
+                            },
+                        },
+                        providers,
+                        stored_selection,
+                    )
+                    .await;
+
+                    handlers.insert(proto.name.clone(), Arc::new(selector.clone()));
+                    selector_control.insert(proto.name.clone(), Arc::new(selector)); */
+                }
+            }
+        }
+
+        Ok(())
     }
 
     async fn load_proxy_providers(
