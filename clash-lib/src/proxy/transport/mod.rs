@@ -16,10 +16,10 @@ pub trait Transport: Send + Sync {
         stream: super::AnyStream,
     ) -> std::io::Result<super::AnyStream>;
 }
-#[cfg(feature = "aws-lc-rs")]
+#[cfg(feature = "reality")]
 pub mod reality;
 
-#[cfg(feature = "aws-lc-rs")]
+#[cfg(feature = "reality")]
 pub use reality::{
     Client as RealityClient, DEFAULT_REALITY_SHORT_ID, decode_public_key,
     decode_short_id,

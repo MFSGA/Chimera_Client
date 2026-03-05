@@ -117,7 +117,7 @@ ring-compat = { version = "0.8", features = ["aead"] }
 x509-parser = { version = "0.16", default-features = false, optional = true }
 
 [features]
-default = ["zero_copy", "tls", "aws-lc-rs", "tun", "port"]
+default = ["zero_copy", "tls", "aws-lc-rs", "tun", "port", "reality"]
 
 zero_copy = []
 
@@ -161,6 +161,8 @@ mixed_port = ["http_port"]
 tracing = ["tokio/tracing"]
 
 port = ["http_port", "mixed_port"]
+
+reality = ["tls", "aws-lc-rs", "dep:aws-lc-rs"]
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_Networking_WinSock",

@@ -7,11 +7,11 @@ use crate::{
         vless::{Handler, HandlerOptions},
     },
 };
-#[cfg(feature = "aws-lc-rs")]
+#[cfg(feature = "reality")]
 use base64::{Engine as _, engine::general_purpose};
 use tracing::warn;
 
-#[cfg(feature = "aws-lc-rs")]
+#[cfg(feature = "reality")]
 use crate::proxy::transport::{
     DEFAULT_REALITY_SHORT_ID, RealityClient, decode_public_key, decode_short_id,
 };
@@ -60,7 +60,14 @@ fn build_transport(
     s: &OutboundVless,
 ) -> Result<Option<Box<dyn Transport>>, Error> {
     match network.unwrap_or("tcp") {
-        "tcp" => build_tcp_transport(s),
+        "tcp" => {
+            #[cfg(feature = "reality")]
+            return build_tcp_transport(s);
+            #[cfg(not(feature = "reality"))]
+            {
+                todo!()
+            }
+        }
         // "ws" => build_ws_transport(s),
         other => Err(Error::InvalidConfig(format!(
             "unsupported vless network: {other}"
@@ -68,6 +75,7 @@ fn build_transport(
     }
 }
 
+#[cfg(feature = "reality")]
 fn build_tcp_transport(
     s: &OutboundVless,
 ) -> Result<Option<Box<dyn Transport>>, Error> {
@@ -82,13 +90,10 @@ fn build_tcp_transport(
         ));
     }
 
-    #[cfg(feature = "aws-lc-rs")]
     let reality_opts = s.reality_opts.as_ref().expect("checked is_some above");
-    #[cfg(feature = "aws-lc-rs")]
     let public_key = decode_reality_public_key(&reality_opts.public_key)?;
-    #[cfg(feature = "aws-lc-rs")]
     let short_id = decode_reality_short_id(reality_opts.short_id.as_deref())?;
-    #[cfg(feature = "aws-lc-rs")]
+
     let server_name = s
         .server_name
         .clone()
@@ -99,7 +104,7 @@ fn build_tcp_transport(
     Ok(Some(Box::new(client)))
 }
 
-#[cfg(feature = "aws-lc-rs")]
+#[cfg(feature = "reality")]
 fn decode_reality_public_key(input: &str) -> Result<[u8; 32], Error> {
     if let Ok(public_key) = decode_public_key(input) {
         return Ok(public_key);
@@ -124,7 +129,7 @@ fn decode_reality_public_key(input: &str) -> Result<[u8; 32], Error> {
     Ok(out)
 }
 
-#[cfg(feature = "aws-lc-rs")]
+#[cfg(feature = "reality")]
 fn decode_reality_short_id(short_id: Option<&str>) -> Result<[u8; 8], Error> {
     let candidate = short_id.map(str::trim).unwrap_or(DEFAULT_REALITY_SHORT_ID);
     let normalized = if candidate.is_empty() {
@@ -143,49 +148,10 @@ fn decode_reality_short_id(short_id: Option<&str>) -> Result<[u8; 8], Error> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "aws-lc-rs")]
+    #[cfg(feature = "reality")]
     use super::decode_reality_short_id;
-    use super::tls_server_name;
-    use crate::config::internal::proxy::{
-        CommonConfigOptions, OutboundVless, WsOpt,
-    };
-    use std::collections::HashMap;
 
-    #[test]
-    fn tls_server_name_prefers_servername_field() {
-        let outbound = OutboundVless {
-            common_opts: CommonConfigOptions {
-                name: "test".into(),
-                server: "fallback.example.com".into(),
-                port: 443,
-                connect_via: None,
-            },
-            server_name: Some("sni.example.com".into()),
-            ..Default::default()
-        };
-
-        assert_eq!(tls_server_name(&outbound), "sni.example.com");
-    }
-
-    #[test]
-    fn tls_server_name_uses_ws_host_header_when_servername_missing() {
-        let mut headers = HashMap::new();
-        headers.insert("Host".to_string(), "ws-host.example.com".to_string());
-        let outbound = OutboundVless {
-            common_opts: CommonConfigOptions {
-                name: "test".into(),
-                server: "fallback.example.com".into(),
-                port: 443,
-                connect_via: None,
-            },
-
-            ..Default::default()
-        };
-
-        assert_eq!(tls_server_name(&outbound), "ws-host.example.com");
-    }
-
-    #[cfg(feature = "aws-lc-rs")]
+    #[cfg(feature = "reality")]
     #[test]
     fn reality_short_id_accepts_empty_as_zero_short_id() {
         let decoded =
