@@ -16,7 +16,9 @@ use crate::{
         remote_content_manager::{
             ProxyManager,
             healthcheck::HealthCheck,
-            providers::proxy_provider::{ThreadSafeProxyProvider, plain_provider::PlainProvider},
+            providers::proxy_provider::{
+                ThreadSafeProxyProvider, plain_provider::PlainProvider,
+            },
         },
     },
     config::internal::proxy::{
@@ -187,9 +189,11 @@ impl OutboundManager {
                 self.proxy_manager.clone(),
             );
             let pd = Arc::new(RwLock::new(
-                PlainProvider::new(PROXY_GLOBAL.to_owned(), all, hc).map_err(|x| {
-                    Error::InvalidConfig(format!("invalid provider config: {x}"))
-                })?,
+                PlainProvider::new(PROXY_GLOBAL.to_owned(), all, hc).map_err(
+                    |x| {
+                        Error::InvalidConfig(format!("invalid provider config: {x}"))
+                    },
+                )?,
             ));
             let stored_selection = cache_store.get_selected(PROXY_GLOBAL).await;
             let selector = selector::Handler::new(
@@ -507,7 +511,9 @@ impl OutboundManager {
                             ),
                         )
                         .map_err(|x| {
-                            Error::InvalidConfig(format!("invalid provider config: {x}"))
+                            Error::InvalidConfig(format!(
+                                "invalid provider config: {x}"
+                            ))
                         })?,
                     ));
                     provider_registry.insert(name, provider);

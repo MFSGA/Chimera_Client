@@ -18,8 +18,7 @@ use crate::{
     },
     proxy::{
         AnyOutboundHandler, ConnectorType, DialWithConnector, HandlerCommonOptions,
-        OutboundHandler, OutboundType,
-        group::GroupProxyAPIResponse,
+        OutboundHandler, OutboundType, group::GroupProxyAPIResponse,
         utils::RemoteConnector,
     },
     session::Session,
@@ -89,7 +88,8 @@ impl Handler {
             )));
         }
 
-        let current_index = self.current_selected_index.load(Ordering::Relaxed) as usize;
+        let current_index =
+            self.current_selected_index.load(Ordering::Relaxed) as usize;
         if let Some(proxy) = proxies.get(current_index) {
             return Ok(proxy.clone());
         }
@@ -125,7 +125,8 @@ impl SelectorControl for Handler {
     async fn select(&self, name: &str) -> Result<(), Error> {
         let proxies = get_proxies_from_providers(&self.providers, false).await;
         if let Some(index) = proxies.iter().position(|p| p.name() == name) {
-            self.current_selected_index.store(index as u16, Ordering::Relaxed);
+            self.current_selected_index
+                .store(index as u16, Ordering::Relaxed);
             Ok(())
         } else {
             Err(Error::Operation(format!("proxy {name} not found")))

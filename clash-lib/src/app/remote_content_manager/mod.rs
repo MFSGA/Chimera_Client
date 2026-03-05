@@ -7,17 +7,27 @@ use std::{
     time::Duration,
 };
 
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures::{StreamExt, stream::FuturesUnordered};
+use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
+use http_body_util::Empty;
+use hyper::Request;
+use hyper_util::rt::TokioIo;
 use serde::Serialize;
 use tokio::sync::RwLock;
 use tracing::warn;
 
-use crate::{app::dns::ThreadSafeDNSResolver, proxy::AnyOutboundHandler, session::{Session, SocksAddr, Type, Network}};
+#[cfg(feature = "tls")]
+use crate::common::tls::GLOBAL_ROOT_STORE;
 use crate::common::utils::serialize_duration;
+use crate::{
+    app::dns::ThreadSafeDNSResolver,
+    proxy::AnyOutboundHandler,
+    session::{Network, Session, SocksAddr, Type},
+};
 
-pub mod providers;
 pub mod healthcheck;
+pub mod providers;
 
 #[derive(Default)]
 struct ProxyState {
@@ -74,13 +84,13 @@ impl ProxyManager {
             .into()
     }
 
-    pub async fn last_delay(&self, name: &str) -> Option<Duration> {
-        self.proxy_state
-            .read()
-            .await
-            .get(name)
-            .and_then(|state| state.delay_history.back().map(|x| x.delay))
-    }
+    // pub async fn last_delay(&self, name: &str) -> Option<Duration> {
+    //     self.proxy_state
+    //         .read()
+    //         .await
+    //         .get(name)
+    //         .and_then(|state| state.delay_history.back().map(|x| x.delay))
+    // }
 
     pub async fn report_delay(
         &self,
@@ -116,9 +126,12 @@ impl ProxyManager {
             let manager = self.clone();
             futs.push(tokio::spawn(async move {
                 let proxy_name = outbound.name().to_owned();
-                manager.url_test(outbound, &url, timeout).await.inspect_err(|e| {
-                    warn!("healthcheck {} -> {} failed: {}", proxy_name, url, e);
-                })
+                manager
+                    .url_test(outbound, &url, timeout)
+                    .await
+                    .inspect_err(|e| {
+                        warn!("healthcheck {} -> {} failed: {}", proxy_name, url, e);
+                    })
             }));
         }
 
@@ -150,43 +163,146 @@ impl ProxyManager {
             .ok_or_else(|| std::io::Error::other("url has no host"))?
             .to_owned();
         let port = uri.port_u16().unwrap_or_else(|| {
-            if uri.scheme_str() == Some("https") { 443 } else { 80 }
+            if uri.scheme_str() == Some("https") {
+                443
+            } else {
+                80
+            }
         });
 
         let sess = Session {
             network: Network::Tcp,
             typ: Type::Tunnel,
-            destination: SocksAddr::Domain(host, port),
+            destination: SocksAddr::Domain(host.clone(), port),
             so_mark: self.fw_mark,
             ..Default::default()
         };
 
-        let started = tokio::time::Instant::now();
-        let result = tokio::time::timeout(
+        let connect_started = tokio::time::Instant::now();
+        let stream = tokio::time::timeout(
             timeout,
             outbound.connect_stream(&sess, self.dns_resolver.clone()),
         )
         .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "urltest timeout"))
-        .and_then(|r| r);
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "urltest timeout")
+        })??;
+        let connect_delay = connect_started.elapsed();
 
-        let elapsed = started.elapsed();
-        self.report_alive(&name, result.is_ok()).await;
+        let req = Request::get(url)
+            .header(hyper::header::HOST, host.as_str())
+            .header("Connection", "Close")
+            .version(hyper::Version::HTTP_11)
+            .body(Empty::<Bytes>::new())
+            .map_err(std::io::Error::other)?;
+
+        let mut tls_handshake_delay = Duration::default();
+
+        let request_started = tokio::time::Instant::now();
+        let request_result = match uri.scheme() {
+            Some(scheme) if scheme == &http::uri::Scheme::HTTP => {
+                let io = TokioIo::new(stream);
+                let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+                    .await
+                    .map_err(std::io::Error::other)?;
+                tokio::task::spawn(async move {
+                    let _ = conn.await;
+                });
+                tokio::time::timeout(timeout, sender.send_request(req).boxed())
+                    .await
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "urltest request timeout",
+                        )
+                    })?
+                    .map_err(std::io::Error::other)
+            }
+            #[cfg(feature = "tls")]
+            Some(scheme) if scheme == &http::uri::Scheme::HTTPS => {
+                let tls_config = rustls::ClientConfig::builder()
+                    .with_root_certificates(GLOBAL_ROOT_STORE.clone())
+                    .with_no_client_auth();
+                let connector = tokio_rustls::TlsConnector::from(
+                    std::sync::Arc::new(tls_config),
+                );
+                let tls_started = tokio::time::Instant::now();
+                let tls_stream = tokio::time::timeout(
+                    timeout,
+                    connector.connect(
+                        host.try_into().map_err(|_| {
+                            std::io::Error::other("invalid SNI host")
+                        })?,
+                        stream,
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "urltest tls timeout",
+                    )
+                })?
+                .map_err(std::io::Error::other)?;
+                tls_handshake_delay = tls_started.elapsed();
+
+                let io = TokioIo::new(tls_stream);
+                let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+                    .await
+                    .map_err(std::io::Error::other)?;
+                tokio::task::spawn(async move {
+                    let _ = conn.await;
+                });
+                tokio::time::timeout(timeout, sender.send_request(req).boxed())
+                    .await
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "urltest request timeout",
+                        )
+                    })?
+                    .map_err(std::io::Error::other)
+            }
+            #[cfg(not(feature = "tls"))]
+            Some(scheme) if scheme == &http::uri::Scheme::HTTPS => {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "https requires tls feature",
+                ))
+            }
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "unsupported scheme",
+            )),
+        };
+        let request_delay = request_started.elapsed();
+
+        let ok = request_result.is_ok();
+        self.report_alive(&name, ok).await;
         self.report_delay(
             &name,
-            result.is_ok(),
-            if result.is_ok() { Some(elapsed) } else { None },
+            ok,
+            Some(if ok {
+                request_delay
+            } else {
+                Duration::default()
+            }),
         )
         .await;
 
-        result.map(|_| (elapsed, elapsed))
+        request_result.map(|_| {
+            (
+                request_delay,
+                connect_delay + tls_handshake_delay + request_delay,
+            )
+        })
     }
 
-    pub fn dns_resolver(&self) -> ThreadSafeDNSResolver {
-        self.dns_resolver.clone()
-    }
+    // pub fn dns_resolver(&self) -> ThreadSafeDNSResolver {
+    //     self.dns_resolver.clone()
+    // }
 
-    pub fn fw_mark(&self) -> Option<u32> {
-        self.fw_mark
-    }
+    // pub fn fw_mark(&self) -> Option<u32> {
+    //     self.fw_mark
+    // }
 }

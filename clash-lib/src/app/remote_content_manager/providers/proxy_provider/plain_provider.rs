@@ -1,21 +1,19 @@
-use async_trait::async_trait;
 use std::sync::Arc;
+
+use async_trait::async_trait;
 use tracing::debug;
 
 use crate::{
-    Error,
-    app::remote_content_manager::{
-        healthcheck::HealthCheck,
-        providers::{Provider, proxy_provider::ProxyProvider},
-    },
+    Error, app::remote_content_manager::healthcheck::HealthCheck,
     proxy::AnyOutboundHandler,
 };
+
+use super::ProxyProvider;
 
 /// A plain provider that holds a list of outbound handlers (proxies).
 /// No vehicle no background update.
 /// Used in GroupOutbounds to manage proxy health checks.
 pub struct PlainProvider {
-    name: String,
     proxies: Vec<AnyOutboundHandler>,
     hc: Arc<HealthCheck>,
 }
@@ -42,14 +40,7 @@ impl PlainProvider {
             });
         }
 
-        Ok(Self { name, proxies, hc })
-    }
-}
-
-#[async_trait]
-impl Provider for PlainProvider {
-    fn name(&self) -> &str {
-        &self.name
+        Ok(Self { proxies, hc })
     }
 }
 
@@ -62,8 +53,7 @@ impl ProxyProvider for PlainProvider {
     async fn touch(&self) {
         self.hc.touch().await;
     }
-
-    async fn healthcheck(&self) {
-        self.hc.check().await;
-    }
+    // async fn healthcheck(&self) {
+    //     self.hc.check().await;
+    // }
 }
