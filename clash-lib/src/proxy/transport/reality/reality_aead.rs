@@ -31,8 +31,9 @@ impl AeadKey {
             ));
         }
 
-        let unbound = UnboundKey::new(algorithm, key)
-            .map_err(|e| Error::new(ErrorKind::InvalidInput, format!("Invalid key: {:?}", e)))?;
+        let unbound = UnboundKey::new(algorithm, key).map_err(|e| {
+            Error::new(ErrorKind::InvalidInput, format!("Invalid key: {:?}", e))
+        })?;
 
         Ok(Self(LessSafeKey::new(unbound)))
     }
@@ -64,7 +65,13 @@ impl AeadKey {
     /// Use this for small buffers where allocation overhead doesn't matter.
     #[inline]
     #[cfg_attr(not(test), allow(dead_code))] // Used by test helpers
-    pub fn seal(&self, plaintext: &[u8], iv: &[u8], seq: u64, aad: &[u8]) -> io::Result<Vec<u8>> {
+    pub fn seal(
+        &self,
+        plaintext: &[u8],
+        iv: &[u8],
+        seq: u64,
+        aad: &[u8],
+    ) -> io::Result<Vec<u8>> {
         let mut buf = plaintext.to_vec();
         self.seal_in_place(&mut buf, iv, seq, aad)?;
         Ok(buf)
@@ -106,7 +113,13 @@ impl AeadKey {
     ///
     /// Used for handshake decryption and tests where allocation is acceptable.
     #[inline]
-    pub fn open(&self, ciphertext: &[u8], iv: &[u8], seq: u64, aad: &[u8]) -> io::Result<Vec<u8>> {
+    pub fn open(
+        &self,
+        ciphertext: &[u8],
+        iv: &[u8],
+        seq: u64,
+        aad: &[u8],
+    ) -> io::Result<Vec<u8>> {
         let mut buf = ciphertext.to_vec();
         let plaintext = self.open_in_place_slice(&mut buf, iv, seq, aad)?;
         let plaintext_len = plaintext.len();
@@ -132,8 +145,9 @@ impl AeadKey {
             nonce_bytes[4 + i] ^= seq_bytes[i];
         }
 
-        Nonce::try_assume_unique_for_key(&nonce_bytes)
-            .map_err(|e| Error::new(ErrorKind::InvalidInput, format!("Invalid nonce: {:?}", e)))
+        Nonce::try_assume_unique_for_key(&nonce_bytes).map_err(|e| {
+            Error::new(ErrorKind::InvalidInput, format!("Invalid nonce: {:?}", e))
+        })
     }
 }
 
@@ -204,9 +218,11 @@ mod tests {
         let plaintext = b"Hello, TLS 1.3!";
         let aad = b"additional data";
 
-        let ciphertext = encrypt_tls13_record(CS, &key, &iv, 0, plaintext, aad).unwrap();
+        let ciphertext =
+            encrypt_tls13_record(CS, &key, &iv, 0, plaintext, aad).unwrap();
 
-        let decrypted = decrypt_tls13_record(CS, &key, &iv, 0, &ciphertext, aad).unwrap();
+        let decrypted =
+            decrypt_tls13_record(CS, &key, &iv, 0, &ciphertext, aad).unwrap();
 
         assert_eq!(&decrypted[..], plaintext);
     }
@@ -249,9 +265,12 @@ mod tests {
         let aad = b"aad";
 
         // Test that different sequence numbers produce different ciphertexts
-        let cipher1 = encrypt_tls13_record(CS, &key, &iv, 1, plaintext, aad).unwrap();
-        let cipher2 = encrypt_tls13_record(CS, &key, &iv, 2, plaintext, aad).unwrap();
-        let cipher3 = encrypt_tls13_record(CS, &key, &iv, 100, plaintext, aad).unwrap();
+        let cipher1 =
+            encrypt_tls13_record(CS, &key, &iv, 1, plaintext, aad).unwrap();
+        let cipher2 =
+            encrypt_tls13_record(CS, &key, &iv, 2, plaintext, aad).unwrap();
+        let cipher3 =
+            encrypt_tls13_record(CS, &key, &iv, 100, plaintext, aad).unwrap();
 
         // Ciphertexts should all be different
         assert_ne!(cipher1, cipher2);
@@ -259,9 +278,12 @@ mod tests {
         assert_ne!(cipher1, cipher3);
 
         // But they should all decrypt correctly
-        let decrypt1 = decrypt_tls13_record(CS, &key, &iv, 1, &cipher1, aad).unwrap();
-        let decrypt2 = decrypt_tls13_record(CS, &key, &iv, 2, &cipher2, aad).unwrap();
-        let decrypt3 = decrypt_tls13_record(CS, &key, &iv, 100, &cipher3, aad).unwrap();
+        let decrypt1 =
+            decrypt_tls13_record(CS, &key, &iv, 1, &cipher1, aad).unwrap();
+        let decrypt2 =
+            decrypt_tls13_record(CS, &key, &iv, 2, &cipher2, aad).unwrap();
+        let decrypt3 =
+            decrypt_tls13_record(CS, &key, &iv, 100, &cipher3, aad).unwrap();
 
         assert_eq!(decrypt1, plaintext);
         assert_eq!(decrypt2, plaintext);
@@ -275,7 +297,8 @@ mod tests {
         let plaintext = b"Test sequence";
         let aad = b"aad";
 
-        let ciphertext = encrypt_tls13_record(CS, &key, &iv, 5, plaintext, aad).unwrap();
+        let ciphertext =
+            encrypt_tls13_record(CS, &key, &iv, 5, plaintext, aad).unwrap();
 
         // Decrypting with wrong sequence number should fail
         let result = decrypt_tls13_record(CS, &key, &iv, 6, &ciphertext, aad);
@@ -290,7 +313,8 @@ mod tests {
         let aad = b"correct aad";
         let wrong_aad = b"wrong aad";
 
-        let ciphertext = encrypt_tls13_record(CS, &key, &iv, 0, plaintext, aad).unwrap();
+        let ciphertext =
+            encrypt_tls13_record(CS, &key, &iv, 0, plaintext, aad).unwrap();
 
         // Decrypting with wrong AAD should fail
         let result = decrypt_tls13_record(CS, &key, &iv, 0, &ciphertext, wrong_aad);
@@ -328,7 +352,8 @@ mod tests {
         let plaintext = b"Test corruption";
         let aad = b"aad";
 
-        let mut ciphertext = encrypt_tls13_record(CS, &key, &iv, 0, plaintext, aad).unwrap();
+        let mut ciphertext =
+            encrypt_tls13_record(CS, &key, &iv, 0, plaintext, aad).unwrap();
 
         // Corrupt the ciphertext
         ciphertext[5] ^= 0xFF;
@@ -344,12 +369,14 @@ mod tests {
         let plaintext = b"";
         let aad = b"aad";
 
-        let ciphertext = encrypt_tls13_record(CS, &key, &iv, 0, plaintext, aad).unwrap();
+        let ciphertext =
+            encrypt_tls13_record(CS, &key, &iv, 0, plaintext, aad).unwrap();
 
         // Should still produce a ciphertext with auth tag
         assert!(ciphertext.len() >= 16); // At least the auth tag
 
-        let decrypted = decrypt_tls13_record(CS, &key, &iv, 0, &ciphertext, aad).unwrap();
+        let decrypted =
+            decrypt_tls13_record(CS, &key, &iv, 0, &ciphertext, aad).unwrap();
         assert_eq!(decrypted, plaintext);
     }
 
@@ -360,8 +387,10 @@ mod tests {
         let plaintext = vec![0xAB; 16384]; // 16KB
         let aad = b"aad";
 
-        let ciphertext = encrypt_tls13_record(CS, &key, &iv, 42, &plaintext, aad).unwrap();
-        let decrypted = decrypt_tls13_record(CS, &key, &iv, 42, &ciphertext, aad).unwrap();
+        let ciphertext =
+            encrypt_tls13_record(CS, &key, &iv, 42, &plaintext, aad).unwrap();
+        let decrypted =
+            decrypt_tls13_record(CS, &key, &iv, 42, &ciphertext, aad).unwrap();
 
         assert_eq!(decrypted, plaintext);
     }
@@ -393,11 +422,13 @@ mod tests {
 
         // Encrypt
         let ciphertext =
-            encrypt_tls13_record(CS, &key, &iv, 0, &plaintext_with_type, &aad).unwrap();
+            encrypt_tls13_record(CS, &key, &iv, 0, &plaintext_with_type, &aad)
+                .unwrap();
 
         // Decrypt using decrypt_handshake_message
         let decrypted =
-            decrypt_handshake_message(CS, &key, &iv, 0, &ciphertext, ciphertext_len).unwrap();
+            decrypt_handshake_message(CS, &key, &iv, 0, &ciphertext, ciphertext_len)
+                .unwrap();
 
         assert_eq!(decrypted, handshake_msg);
     }
@@ -426,12 +457,20 @@ mod tests {
             (ciphertext_len & 0xff) as u8,
         ];
 
-        let ciphertext =
-            encrypt_tls13_record(CS, &key, &iv, 0, &plaintext_with_type_and_padding, &aad).unwrap();
+        let ciphertext = encrypt_tls13_record(
+            CS,
+            &key,
+            &iv,
+            0,
+            &plaintext_with_type_and_padding,
+            &aad,
+        )
+        .unwrap();
 
         // Padding should be stripped
         let decrypted =
-            decrypt_handshake_message(CS, &key, &iv, 0, &ciphertext, ciphertext_len).unwrap();
+            decrypt_handshake_message(CS, &key, &iv, 0, &ciphertext, ciphertext_len)
+                .unwrap();
 
         assert_eq!(decrypted, handshake_msg);
     }

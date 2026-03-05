@@ -34,7 +34,9 @@ impl TryFrom<&crate::config::def::Config> for DNSConfig {
                 .map(|l| match l {
                     DNSListen::Udp(u) => {
                         let addr = u.parse::<SocketAddr>().map_err(|_| {
-                            Error::InvalidConfig(format!("invalid dns udp listen address: {u}"))
+                            Error::InvalidConfig(format!(
+                                "invalid dns udp listen address: {u}"
+                            ))
                         })?;
                         // future: will delete
                         Ok::<DNSListenAddr, Error>(DNSListenAddr {

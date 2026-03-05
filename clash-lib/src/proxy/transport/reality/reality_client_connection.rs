@@ -6,18 +6,21 @@ use aws_lc_rs::{agreement, digest};
 use rand::Rng;
 
 use super::common::{
-    ALERT_DESC_CLOSE_NOTIFY, ALERT_LEVEL_WARNING, CIPHERTEXT_READ_BUF_CAPACITY, CONTENT_TYPE_ALERT,
-    CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_CHANGE_CIPHER_SPEC, CONTENT_TYPE_HANDSHAKE,
+    ALERT_DESC_CLOSE_NOTIFY, ALERT_LEVEL_WARNING, CIPHERTEXT_READ_BUF_CAPACITY,
+    CONTENT_TYPE_ALERT, CONTENT_TYPE_APPLICATION_DATA,
+    CONTENT_TYPE_CHANGE_CIPHER_SPEC, CONTENT_TYPE_HANDSHAKE,
     HANDSHAKE_TYPE_CERTIFICATE, HANDSHAKE_TYPE_CERTIFICATE_VERIFY,
-    HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS, HANDSHAKE_TYPE_FINISHED, OUTGOING_BUFFER_LIMIT,
-    PLAINTEXT_READ_BUF_CAPACITY, TLS_MAX_RECORD_SIZE, TLS_RECORD_HEADER_SIZE,
+    HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS, HANDSHAKE_TYPE_FINISHED,
+    OUTGOING_BUFFER_LIMIT, PLAINTEXT_READ_BUF_CAPACITY, TLS_MAX_RECORD_SIZE,
+    TLS_RECORD_HEADER_SIZE,
 };
 use super::reality_aead::{AeadKey, decrypt_handshake_message};
 use super::reality_auth::{derive_auth_key, encrypt_session_id, perform_ecdh};
 use super::reality_cipher_suite::{CipherSuite, DEFAULT_CIPHER_SUITES};
 use super::reality_client_verify::{
-    extract_certificate_der, extract_certificate_verify_signature, extract_ed25519_public_key,
-    verify_certificate_hmac, verify_certificate_verify_signature,
+    extract_certificate_der, extract_certificate_verify_signature,
+    extract_ed25519_public_key, verify_certificate_hmac,
+    verify_certificate_verify_signature,
 };
 use super::reality_io_state::RealityIoState;
 use super::reality_reader_writer::{RealityReader, RealityWriter};
@@ -27,7 +30,8 @@ use super::reality_tls13_keys::{
     derive_traffic_keys,
 };
 use super::reality_tls13_messages::{
-    DEFAULT_ALPN_PROTOCOLS, construct_client_hello, construct_finished, write_record_header,
+    DEFAULT_ALPN_PROTOCOLS, construct_client_hello, construct_finished,
+    write_record_header,
 };
 use super::reality_util::{extract_server_cipher_suite, extract_server_public_key};
 use super::slide_buffer::SlideBuffer;
@@ -61,12 +65,12 @@ enum HandshakeState {
         master_secret: Vec<u8>,
         cipher_suite: CipherSuite,
         handshake_transcript_bytes: Vec<u8>, // Accumulated transcript for hash computation
-        auth_key: [u8; 32],                  // REALITY authentication key for HMAC verification
+        auth_key: [u8; 32], // REALITY authentication key for HMAC verification
         // State for handling multiple encrypted handshake records (separate mode)
-        handshake_seq: u64,             // Sequence number for decrypting records
+        handshake_seq: u64, // Sequence number for decrypting records
         accumulated_plaintext: Vec<u8>, // Accumulated plaintext across records
-        messages_found: u8,             // Number of handshake messages found so far
-        certificate_verified: bool,     // Whether Certificate HMAC was verified
+        messages_found: u8, // Number of handshake messages found so far
+        certificate_verified: bool, // Whether Certificate HMAC was verified
         ed25519_public_key: Option<[u8; 32]>, // Public key from Certificate for CV verification
         cert_verify_offset: Option<usize>, // Offset of CertificateVerify in accumulated plaintext
     },
@@ -102,7 +106,7 @@ pub struct RealityClientConnection {
     plaintext_write_buf: Vec<u8>,     // Application data to encrypt
 
     // Connection state flags (mirrors rustls patterns)
-    received_close_notify: bool,        // Peer sent close_notify alert
+    received_close_notify: bool, // Peer sent close_notify alert
     fatal_error: Option<io::ErrorKind>, // Fatal error occurred, connection unusable
 }
 
@@ -144,9 +148,11 @@ impl RealityClientConnection {
         let mut our_private_bytes = [0u8; 32];
         rng.fill_bytes(&mut our_private_bytes);
 
-        let our_private_key =
-            agreement::PrivateKey::from_private_key(&agreement::X25519, &our_private_bytes)
-                .map_err(|_| io::Error::other("Failed to create X25519 key"))?;
+        let our_private_key = agreement::PrivateKey::from_private_key(
+            &agreement::X25519,
+            &our_private_bytes,
+        )
+        .map_err(|_| io::Error::other("Failed to create X25519 key"))?;
         let our_public_key_bytes = our_private_key
             .compute_public_key()
             .map_err(|_| io::Error::other("Failed to compute public key"))?;
@@ -155,12 +161,17 @@ impl RealityClientConnection {
         rng.fill_bytes(&mut client_random);
 
         // Perform ECDH with server's public key to derive auth key
-        let shared_secret = perform_ecdh(&our_private_bytes, &self.config.public_key)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let shared_secret =
+            perform_ecdh(&our_private_bytes, &self.config.public_key).map_err(
+                |e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()),
+            )?;
 
         // Use slice directly from client_random to avoid copying
-        let auth_key = derive_auth_key(&shared_secret, &client_random[0..20], b"REALITY")
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let auth_key =
+            derive_auth_key(&shared_secret, &client_random[0..20], b"REALITY")
+                .map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                })?;
 
         // Create session ID with REALITY metadata
         let timestamp = std::time::SystemTime::now()
@@ -174,7 +185,8 @@ impl RealityClientConnection {
         session_id_plaintext[2] = 0; // Protocol version patch
         session_id_plaintext[3] = 0; // Padding byte
         // Timestamp (4 bytes as uint32, in seconds)
-        session_id_plaintext[4..8].copy_from_slice(&(timestamp as u32).to_be_bytes());
+        session_id_plaintext[4..8]
+            .copy_from_slice(&(timestamp as u32).to_be_bytes());
         // Short ID (8 bytes)
         session_id_plaintext[8..16].copy_from_slice(&self.config.short_id);
 
@@ -189,7 +201,8 @@ impl RealityClientConnection {
         } else {
             self.config.cipher_suites.clone()
         };
-        let cipher_suite_ids: Vec<u16> = cipher_suites.iter().map(|cs| cs.id()).collect();
+        let cipher_suite_ids: Vec<u16> =
+            cipher_suites.iter().map(|cs| cs.id()).collect();
         let mut client_hello = construct_client_hello(
             &client_random,
             &session_id_for_hello,
@@ -217,9 +230,13 @@ impl RealityClientConnection {
         );
         log::debug!("  aad[0..4]={:02x?}", &client_hello[0..4]);
 
-        let encrypted_session_id =
-            encrypt_session_id(&session_id_plaintext, &auth_key, nonce, &client_hello)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let encrypted_session_id = encrypt_session_id(
+            &session_id_plaintext,
+            &auth_key,
+            nonce,
+            &client_hello,
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
         log::debug!(
             "REALITY CLIENT: Encrypted SessionId={:02x?}",
@@ -228,7 +245,8 @@ impl RealityClientConnection {
 
         client_hello[39..71].copy_from_slice(&encrypted_session_id);
 
-        let mut record = write_record_header(CONTENT_TYPE_HANDSHAKE, client_hello.len() as u16);
+        let mut record =
+            write_record_header(CONTENT_TYPE_HANDSHAKE, client_hello.len() as u16);
         record.extend_from_slice(&client_hello);
         self.ciphertext_write_buf.extend_from_slice(&record);
 
@@ -340,11 +358,9 @@ impl RealityClientConnection {
             return Ok(false);
         }
 
-        let record_len = self
-            .ciphertext_read_buf
-            .get_u16_be(3)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Buffer too short"))?
-            as usize;
+        let record_len = self.ciphertext_read_buf.get_u16_be(3).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "Buffer too short")
+        })? as usize;
 
         let total_record_len = TLS_RECORD_HEADER_SIZE + record_len;
         if self.ciphertext_read_buf.len() < total_record_len {
@@ -366,22 +382,24 @@ impl RealityClientConnection {
 
         let server_public_key = extract_server_public_key(&record)?;
         let cipher_suite_id = extract_server_cipher_suite(&record)?;
-        let cipher_suite = CipherSuite::from_id(cipher_suite_id).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Server selected unsupported cipher suite: 0x{:04x}",
-                    cipher_suite_id
-                ),
-            )
-        })?;
+        let cipher_suite =
+            CipherSuite::from_id(cipher_suite_id).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Server selected unsupported cipher suite: 0x{:04x}",
+                        cipher_suite_id
+                    ),
+                )
+            })?;
         log::debug!(
             "REALITY CLIENT: Server selected cipher suite 0x{:04x}",
             cipher_suite_id
         );
 
         // Compute transcript hash using negotiated cipher suite's algorithm
-        let mut full_transcript = digest::Context::new(cipher_suite.digest_algorithm());
+        let mut full_transcript =
+            digest::Context::new(cipher_suite.digest_algorithm());
         log::debug!(
             "REALITY CLIENT: Transcript includes ClientHello ({} bytes), first bytes: {:02x?}",
             client_hello_bytes.len(),
@@ -403,11 +421,15 @@ impl RealityClientConnection {
             ctx.finish().as_ref().to_vec()
         };
 
-        let peer_public_key =
-            agreement::UnparsedPublicKey::new(&agreement::X25519, &server_public_key);
-        let my_private_key =
-            agreement::PrivateKey::from_private_key(&agreement::X25519, client_private_key)
-                .map_err(|_| io::Error::other("Failed to create private key"))?;
+        let peer_public_key = agreement::UnparsedPublicKey::new(
+            &agreement::X25519,
+            &server_public_key,
+        );
+        let my_private_key = agreement::PrivateKey::from_private_key(
+            &agreement::X25519,
+            client_private_key,
+        )
+        .map_err(|_| io::Error::other("Failed to create private key"))?;
 
         let mut tls_shared_secret = [0u8; 32];
         agreement::agree(
@@ -435,8 +457,12 @@ impl RealityClientConnection {
         transcript_bytes.extend_from_slice(server_hello);
 
         self.handshake_state = HandshakeState::ProcessingHandshake {
-            client_handshake_traffic_secret: hs_keys.client_handshake_traffic_secret.clone(),
-            server_handshake_traffic_secret: hs_keys.server_handshake_traffic_secret.clone(),
+            client_handshake_traffic_secret: hs_keys
+                .client_handshake_traffic_secret
+                .clone(),
+            server_handshake_traffic_secret: hs_keys
+                .server_handshake_traffic_secret
+                .clone(),
             master_secret: hs_keys.master_secret.clone(),
             cipher_suite,
             handshake_transcript_bytes: transcript_bytes,
@@ -492,15 +518,13 @@ impl RealityClientConnection {
         }
 
         let record_type = self.ciphertext_read_buf[0];
-        let tls_version = self
-            .ciphertext_read_buf
-            .get_u16_be(1)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Buffer too short"))?;
-        let record_len = self
-            .ciphertext_read_buf
-            .get_u16_be(3)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Buffer too short"))?
-            as usize;
+        let tls_version =
+            self.ciphertext_read_buf.get_u16_be(1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "Buffer too short")
+            })?;
+        let record_len = self.ciphertext_read_buf.get_u16_be(3).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "Buffer too short")
+        })? as usize;
 
         log::debug!(
             "REALITY CLIENT: TLS record header: type=0x{:02x}, version=0x{:04x}, len={}",
@@ -549,8 +573,9 @@ impl RealityClientConnection {
         let mut cert_verify_offset = *cert_verify_offset;
 
         // Copy and extract the encrypted handshake record
-        let ciphertext: Vec<u8> =
-            self.ciphertext_read_buf[TLS_RECORD_HEADER_SIZE..total_record_len].to_vec();
+        let ciphertext: Vec<u8> = self.ciphertext_read_buf
+            [TLS_RECORD_HEADER_SIZE..total_record_len]
+            .to_vec();
         self.ciphertext_read_buf.consume(total_record_len);
 
         log::debug!(
@@ -618,8 +643,9 @@ impl RealityClientConnection {
 
             // Verify HMAC signature when we encounter the Certificate message
             if msg_type == HANDSHAKE_TYPE_CERTIFICATE {
-                let cert_der =
-                    extract_certificate_der(&accumulated_plaintext[offset..offset + 4 + msg_len])?;
+                let cert_der = extract_certificate_der(
+                    &accumulated_plaintext[offset..offset + 4 + msg_len],
+                )?;
                 verify_certificate_hmac(cert_der, &auth_key)?;
                 ed25519_public_key = Some(extract_ed25519_public_key(cert_der)?);
                 certificate_verified = true;
@@ -671,9 +697,12 @@ impl RealityClientConnection {
 
         // Verify CertificateVerify signature
         let mut cert_verify_verified = false;
-        if let (Some(public_key), Some(cv_offset)) = (ed25519_public_key, cert_verify_offset) {
+        if let (Some(public_key), Some(cv_offset)) =
+            (ed25519_public_key, cert_verify_offset)
+        {
             // Transcript up to (not including) CertificateVerify
-            let mut cv_transcript = digest::Context::new(cipher_suite.digest_algorithm());
+            let mut cv_transcript =
+                digest::Context::new(cipher_suite.digest_algorithm());
             cv_transcript.update(&transcript_bytes);
             cv_transcript.update(&accumulated_plaintext[..cv_offset]);
             let cv_transcript_hash = cv_transcript.finish();
@@ -684,7 +713,8 @@ impl RealityClientConnection {
                 accumulated_plaintext[cv_offset + 2],
                 accumulated_plaintext[cv_offset + 3],
             ]) as usize;
-            let cv_message = &accumulated_plaintext[cv_offset..cv_offset + 4 + cv_msg_len];
+            let cv_message =
+                &accumulated_plaintext[cv_offset..cv_offset + 4 + cv_msg_len];
             let signature = extract_certificate_verify_signature(cv_message)?;
 
             verify_certificate_verify_signature(
@@ -702,7 +732,8 @@ impl RealityClientConnection {
             ));
         }
 
-        let mut handshake_transcript = digest::Context::new(cipher_suite.digest_algorithm());
+        let mut handshake_transcript =
+            digest::Context::new(cipher_suite.digest_algorithm());
         handshake_transcript.update(&transcript_bytes);
         handshake_transcript.update(&accumulated_plaintext);
 
@@ -719,23 +750,33 @@ impl RealityClientConnection {
             accumulated_plaintext.len()
         );
 
-        let client_verify_data =
-            compute_finished_verify_data(cipher_suite, &client_hs_secret, &handshake_hash_vec)?;
+        let client_verify_data = compute_finished_verify_data(
+            cipher_suite,
+            &client_hs_secret,
+            &handshake_hash_vec,
+        )?;
         log::debug!(
             "REALITY CLIENT: Client verify data: {:02x?}",
             client_verify_data
         );
         let client_finished = construct_finished(&client_verify_data)?;
 
-        let (client_hs_key, client_hs_iv) = derive_traffic_keys(&client_hs_secret, cipher_suite)?;
+        let (client_hs_key, client_hs_iv) =
+            derive_traffic_keys(&client_hs_secret, cipher_suite)?;
 
         let mut client_hs_seq = 0u64;
         let buf_len_before = self.ciphertext_write_buf.len();
         let hs_aead_key = AeadKey::new(cipher_suite, &client_hs_key)?;
         {
-            let mut encryptor =
-                RecordEncryptor::new(&hs_aead_key, &client_hs_iv, &mut client_hs_seq);
-            encryptor.encrypt_handshake(&client_finished, &mut self.ciphertext_write_buf)?;
+            let mut encryptor = RecordEncryptor::new(
+                &hs_aead_key,
+                &client_hs_iv,
+                &mut client_hs_seq,
+            );
+            encryptor.encrypt_handshake(
+                &client_finished,
+                &mut self.ciphertext_write_buf,
+            )?;
         }
 
         log::debug!(
@@ -743,8 +784,11 @@ impl RealityClientConnection {
             self.ciphertext_write_buf.len() - buf_len_before
         );
 
-        let (client_app_secret, server_app_secret) =
-            derive_application_secrets(cipher_suite, &master_secret, &handshake_hash_vec)?;
+        let (client_app_secret, server_app_secret) = derive_application_secrets(
+            cipher_suite,
+            &master_secret,
+            &handshake_hash_vec,
+        )?;
 
         let (client_app_key_bytes, client_app_iv) =
             derive_traffic_keys(&client_app_secret, cipher_suite)?;
@@ -772,17 +816,17 @@ impl RealityClientConnection {
     /// Processes all complete TLS records in the buffer
     #[inline]
     fn process_application_data(&mut self) -> io::Result<()> {
-        let (app_read_key, app_read_iv) = match (&self.app_read_key, &self.app_read_iv) {
-            (Some(key), Some(iv)) => (key, iv),
-            _ => unreachable!(), // Wrong state
-        };
+        let (app_read_key, app_read_iv) =
+            match (&self.app_read_key, &self.app_read_iv) {
+                (Some(key), Some(iv)) => (key, iv),
+                _ => unreachable!(), // Wrong state
+            };
 
         while self.ciphertext_read_buf.len() >= TLS_RECORD_HEADER_SIZE {
-            let record_len = self
-                .ciphertext_read_buf
-                .get_u16_be(3)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Buffer too short"))?
-                as usize;
+            let record_len =
+                self.ciphertext_read_buf.get_u16_be(3).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "Buffer too short")
+                })? as usize;
 
             let total_record_len = TLS_RECORD_HEADER_SIZE + record_len;
             if self.ciphertext_read_buf.len() < total_record_len {
@@ -793,9 +837,10 @@ impl RealityClientConnection {
             let ciphertext_slice = self
                 .ciphertext_read_buf
                 .slice_mut(TLS_RECORD_HEADER_SIZE..total_record_len);
-            let mut decryptor = RecordDecryptor::new(app_read_key, app_read_iv, &mut self.read_seq);
-            let (content_type, plaintext) =
-                decryptor.decrypt_record_in_place(ciphertext_slice, record_len as u16)?;
+            let mut decryptor =
+                RecordDecryptor::new(app_read_key, app_read_iv, &mut self.read_seq);
+            let (content_type, plaintext) = decryptor
+                .decrypt_record_in_place(ciphertext_slice, record_len as u16)?;
 
             match content_type {
                 CONTENT_TYPE_APPLICATION_DATA => {
@@ -810,7 +855,9 @@ impl RealityClientConnection {
                         let alert_desc = plaintext[1];
 
                         if alert_desc == ALERT_DESC_CLOSE_NOTIFY {
-                            log::debug!("REALITY CLIENT: Received close_notify alert");
+                            log::debug!(
+                                "REALITY CLIENT: Received close_notify alert"
+                            );
                             self.received_close_notify = true;
                             // Per RFC 8446: "Any data received after a closure alert
                             // has been received MUST be ignored."
@@ -882,18 +929,22 @@ impl RealityClientConnection {
 
         // Encrypt any pending plaintext (with automatic fragmentation for large data)
         if !self.plaintext_write_buf.is_empty() {
-            let (app_write_key, app_write_iv) = match (&self.app_write_key, &self.app_write_iv) {
-                (Some(key), Some(iv)) => (key, iv),
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Application keys not available",
-                    ));
-                }
-            };
+            let (app_write_key, app_write_iv) =
+                match (&self.app_write_key, &self.app_write_iv) {
+                    (Some(key), Some(iv)) => (key, iv),
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Application keys not available",
+                        ));
+                    }
+                };
 
-            let mut encryptor =
-                RecordEncryptor::new(app_write_key, app_write_iv, &mut self.write_seq);
+            let mut encryptor = RecordEncryptor::new(
+                app_write_key,
+                app_write_iv,
+                &mut self.write_seq,
+            );
             encryptor.encrypt_app_data(
                 &mut self.plaintext_write_buf,
                 &mut self.ciphertext_write_buf,
@@ -948,12 +999,17 @@ impl RealityClientConnection {
     pub fn send_close_notify(&mut self) {
         // In TLS 1.3, alerts must be encrypted like application data
         if !matches!(self.handshake_state, HandshakeState::Complete) {
-            log::debug!("REALITY CLIENT: Cannot send close_notify - handshake not complete");
+            log::debug!(
+                "REALITY CLIENT: Cannot send close_notify - handshake not complete"
+            );
             return;
         }
 
         // Get application keys
-        let (app_write_key, app_write_iv) = match (&self.app_write_key, &self.app_write_iv) {
+        let (app_write_key, app_write_iv) = match (
+            &self.app_write_key,
+            &self.app_write_iv,
+        ) {
             (Some(key), Some(iv)) => (key, iv),
             _ => {
                 log::debug!(
@@ -964,7 +1020,8 @@ impl RealityClientConnection {
         };
 
         // Encrypt close_notify alert using RecordEncryptor
-        let mut encryptor = RecordEncryptor::new(app_write_key, app_write_iv, &mut self.write_seq);
+        let mut encryptor =
+            RecordEncryptor::new(app_write_key, app_write_iv, &mut self.write_seq);
         match encryptor.encrypt_close_notify(&mut self.ciphertext_write_buf) {
             Ok(()) => {
                 log::debug!("REALITY CLIENT: Encrypted close_notify alert queued");

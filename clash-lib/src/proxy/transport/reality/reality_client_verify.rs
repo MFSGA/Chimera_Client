@@ -88,7 +88,10 @@ pub fn extract_certificate_der(certificate_message: &[u8]) -> io::Result<&[u8]> 
 ///
 /// Uses x509-parser for robust extraction.
 #[inline]
-pub fn verify_certificate_hmac(cert_der: &[u8], auth_key: &[u8; 32]) -> io::Result<()> {
+pub fn verify_certificate_hmac(
+    cert_der: &[u8],
+    auth_key: &[u8; 32],
+) -> io::Result<()> {
     let (_, cert) = X509Certificate::from_der(cert_der).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -211,7 +214,9 @@ pub fn extract_ed25519_public_key(cert_der: &[u8]) -> io::Result<[u8; 32]> {
 ///
 /// Returns the signature bytes.
 #[inline]
-pub fn extract_certificate_verify_signature(cert_verify_message: &[u8]) -> io::Result<Vec<u8>> {
+pub fn extract_certificate_verify_signature(
+    cert_verify_message: &[u8],
+) -> io::Result<Vec<u8>> {
     // Minimum: 1 (type) + 3 (len) + 2 (alg) + 2 (sig len) + 64 (ed25519 sig) = 72
     if cert_verify_message.len() < 72 {
         return Err(io::Error::new(
@@ -237,7 +242,8 @@ pub fn extract_certificate_verify_signature(cert_verify_message: &[u8]) -> io::R
     let pos = 4;
 
     // Signature algorithm (2 bytes)
-    let sig_alg = u16::from_be_bytes([cert_verify_message[pos], cert_verify_message[pos + 1]]);
+    let sig_alg =
+        u16::from_be_bytes([cert_verify_message[pos], cert_verify_message[pos + 1]]);
 
     // We only support Ed25519 (0x0807)
     if sig_alg != 0x0807 {
@@ -251,8 +257,10 @@ pub fn extract_certificate_verify_signature(cert_verify_message: &[u8]) -> io::R
     }
 
     // Signature length (2 bytes)
-    let sig_len =
-        u16::from_be_bytes([cert_verify_message[pos + 2], cert_verify_message[pos + 3]]) as usize;
+    let sig_len = u16::from_be_bytes([
+        cert_verify_message[pos + 2],
+        cert_verify_message[pos + 3],
+    ]) as usize;
 
     // Ed25519 signatures are always 64 bytes
     if sig_len != 64 {
@@ -308,7 +316,9 @@ pub fn verify_certificate_verify_signature(
     // Verify the Ed25519 signature
     let public_key = UnparsedPublicKey::new(&ED25519, public_key);
     public_key.verify(&signed_content, signature).map_err(|_| {
-        log::warn!("REALITY CLIENT: CertificateVerify signature verification failed");
+        log::warn!(
+            "REALITY CLIENT: CertificateVerify signature verification failed"
+        );
         io::Error::new(
             io::ErrorKind::PermissionDenied,
             "CertificateVerify signature verification failed",
@@ -398,8 +408,9 @@ mod tests {
         let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
             .expect("Failed to generate Ed25519 key pair");
 
-        let params = rcgen::CertificateParams::new(vec!["test.example.com".to_string()])
-            .expect("Failed to create certificate params");
+        let params =
+            rcgen::CertificateParams::new(vec!["test.example.com".to_string()])
+                .expect("Failed to create certificate params");
 
         let cert = params
             .self_signed(&key_pair)
@@ -408,16 +419,17 @@ mod tests {
         let mut cert_der = cert.der().to_vec();
 
         // Get the public key
-        let signing_key =
-            aws_lc_rs::signature::Ed25519KeyPair::from_pkcs8(key_pair.serialized_der())
-                .expect("Failed to parse key");
+        let signing_key = aws_lc_rs::signature::Ed25519KeyPair::from_pkcs8(
+            key_pair.serialized_der(),
+        )
+        .expect("Failed to parse key");
         let public_key_bytes = signing_key.public_key().as_ref();
 
         // Parse the certificate to find where the signature actually is
-        let (_, parsed_cert) =
-            X509Certificate::from_der(&cert_der).expect("Failed to parse certificate");
-        let sig_offset =
-            parsed_cert.signature_value.data.as_ptr() as usize - cert_der.as_ptr() as usize;
+        let (_, parsed_cert) = X509Certificate::from_der(&cert_der)
+            .expect("Failed to parse certificate");
+        let sig_offset = parsed_cert.signature_value.data.as_ptr() as usize
+            - cert_der.as_ptr() as usize;
 
         // Create auth_key and compute HMAC
         let auth_key = [0x42u8; 32];
@@ -439,8 +451,9 @@ mod tests {
         let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
             .expect("Failed to generate Ed25519 key pair");
 
-        let params = rcgen::CertificateParams::new(vec!["test.example.com".to_string()])
-            .expect("Failed to create certificate params");
+        let params =
+            rcgen::CertificateParams::new(vec!["test.example.com".to_string()])
+                .expect("Failed to create certificate params");
 
         let cert = params
             .self_signed(&key_pair)
@@ -472,8 +485,9 @@ mod tests {
         let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
             .expect("Failed to generate Ed25519 key pair");
 
-        let params = rcgen::CertificateParams::new(vec!["test.example.com".to_string()])
-            .expect("Failed to create certificate params");
+        let params =
+            rcgen::CertificateParams::new(vec!["test.example.com".to_string()])
+                .expect("Failed to create certificate params");
 
         let cert = params
             .self_signed(&key_pair)
@@ -489,9 +503,10 @@ mod tests {
         assert_eq!(public_key.len(), 32);
 
         // Verify it matches the original key
-        let signing_key =
-            aws_lc_rs::signature::Ed25519KeyPair::from_pkcs8(key_pair.serialized_der())
-                .expect("Failed to parse key");
+        let signing_key = aws_lc_rs::signature::Ed25519KeyPair::from_pkcs8(
+            key_pair.serialized_der(),
+        )
+        .expect("Failed to parse key");
         assert_eq!(public_key, signing_key.public_key().as_ref());
     }
 
@@ -578,7 +593,8 @@ mod tests {
         let key_pair = aws_lc_rs::signature::Ed25519KeyPair::generate()
             .expect("Failed to generate Ed25519 key pair");
 
-        let public_key: [u8; 32] = key_pair.public_key().as_ref().try_into().unwrap();
+        let public_key: [u8; 32] =
+            key_pair.public_key().as_ref().try_into().unwrap();
 
         // Create a fake transcript hash
         let transcript_hash = [0x42u8; 32];
@@ -594,8 +610,11 @@ mod tests {
         let signature = key_pair.sign(&signed_content);
 
         // Verify
-        let result =
-            verify_certificate_verify_signature(&public_key, signature.as_ref(), &transcript_hash);
+        let result = verify_certificate_verify_signature(
+            &public_key,
+            signature.as_ref(),
+            &transcript_hash,
+        );
         assert!(result.is_ok(), "Signature verification should succeed");
     }
 
@@ -608,7 +627,8 @@ mod tests {
         let key_pair2 = aws_lc_rs::signature::Ed25519KeyPair::generate()
             .expect("Failed to generate Ed25519 key pair");
 
-        let public_key2: [u8; 32] = key_pair2.public_key().as_ref().try_into().unwrap();
+        let public_key2: [u8; 32] =
+            key_pair2.public_key().as_ref().try_into().unwrap();
 
         let transcript_hash = [0x42u8; 32];
 
@@ -622,8 +642,11 @@ mod tests {
         let signature = key_pair1.sign(&signed_content);
 
         // Try to verify with key_pair2's public key - should fail
-        let result =
-            verify_certificate_verify_signature(&public_key2, signature.as_ref(), &transcript_hash);
+        let result = verify_certificate_verify_signature(
+            &public_key2,
+            signature.as_ref(),
+            &transcript_hash,
+        );
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
     }
@@ -634,7 +657,8 @@ mod tests {
         let key_pair = aws_lc_rs::signature::Ed25519KeyPair::generate()
             .expect("Failed to generate Ed25519 key pair");
 
-        let public_key: [u8; 32] = key_pair.public_key().as_ref().try_into().unwrap();
+        let public_key: [u8; 32] =
+            key_pair.public_key().as_ref().try_into().unwrap();
 
         let transcript_hash1 = [0x42u8; 32];
         let transcript_hash2 = [0x43u8; 32]; // Different hash
@@ -649,8 +673,11 @@ mod tests {
         let signature = key_pair.sign(&signed_content);
 
         // Try to verify with transcript_hash2 - should fail
-        let result =
-            verify_certificate_verify_signature(&public_key, signature.as_ref(), &transcript_hash2);
+        let result = verify_certificate_verify_signature(
+            &public_key,
+            signature.as_ref(),
+            &transcript_hash2,
+        );
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
     }
@@ -662,8 +689,11 @@ mod tests {
         let transcript_hash = [0x42u8; 32];
         let invalid_signature = [0x00u8; 32]; // Should be 64 bytes
 
-        let result =
-            verify_certificate_verify_signature(&public_key, &invalid_signature, &transcript_hash);
+        let result = verify_certificate_verify_signature(
+            &public_key,
+            &invalid_signature,
+            &transcript_hash,
+        );
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
@@ -677,7 +707,8 @@ mod tests {
         let key_pair = aws_lc_rs::signature::Ed25519KeyPair::generate()
             .expect("Failed to generate Ed25519 key pair");
 
-        let public_key: [u8; 32] = key_pair.public_key().as_ref().try_into().unwrap();
+        let public_key: [u8; 32] =
+            key_pair.public_key().as_ref().try_into().unwrap();
 
         // Simulate a transcript hash (in real life, this would be hash of handshake messages)
         let fake_client_hello = b"ClientHello data here";
@@ -715,8 +746,8 @@ mod tests {
         cv_message.extend_from_slice(signature.as_ref());
 
         // Client side: extract and verify
-        let extracted_sig =
-            extract_certificate_verify_signature(&cv_message).expect("Failed to extract signature");
+        let extracted_sig = extract_certificate_verify_signature(&cv_message)
+            .expect("Failed to extract signature");
 
         let result = verify_certificate_verify_signature(
             &public_key,

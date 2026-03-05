@@ -46,7 +46,10 @@ pub struct UdpSocket {
 }
 
 impl UdpSocket {
-    pub fn new(inbound: mpsc::UnboundedReceiver<Packet>, outbound: mpsc::Sender<Packet>) -> Self {
+    pub fn new(
+        inbound: mpsc::UnboundedReceiver<Packet>,
+        outbound: mpsc::Sender<Packet>,
+    ) -> Self {
         Self { inbound, outbound }
     }
 
@@ -133,7 +136,8 @@ impl SplitWrite {
             }
         };
 
-        let mut ip_packet_writer = Vec::with_capacity(builder.size(packet.data.data().len()));
+        let mut ip_packet_writer =
+            Vec::with_capacity(builder.size(packet.data.data().len()));
         builder
             .write(&mut ip_packet_writer, packet.data.data())
             .map_err(std::io::Error::other)?;

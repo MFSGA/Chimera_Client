@@ -80,8 +80,9 @@ impl TryFrom<&OutboundTrojan> for Handler {
                             s.ws_opts
                                 .as_ref()
                                 .map(|x| {
-                                    let client: WsClient =
-                                        (x, &s.common_opts).try_into().expect("invalid ws_opts");
+                                    let client: WsClient = (x, &s.common_opts)
+                                        .try_into()
+                                        .expect("invalid ws_opts");
                                     Box::new(client) as _
                                 })
                                 .ok_or(Error::InvalidConfig(

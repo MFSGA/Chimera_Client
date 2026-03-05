@@ -4,7 +4,9 @@ use anyhow::anyhow;
 use serde::Serialize;
 use tokio::sync::broadcast::Sender;
 use tracing_log::LogTracer;
-use tracing_subscriber::{EnvFilter, Layer, filter::filter_fn, fmt::time::LocalTime};
+use tracing_subscriber::{
+    EnvFilter, Layer, filter::filter_fn, fmt::time::LocalTime,
+};
 
 use crate::config::def::LogLevel;
 
@@ -78,8 +80,8 @@ pub fn setup_logging(
                      have been initialized"
                 );
             });
-            LOGGING_GUARD =
-                setup_logging_inner(level, collector, cwd, log_file).unwrap_or_else(|e| {
+            LOGGING_GUARD = setup_logging_inner(level, collector, cwd, log_file)
+                .unwrap_or_else(|e| {
                     eprintln!("Failed to setup logging: {e}");
                     None
                 });
@@ -114,11 +116,12 @@ fn setup_logging_inner(
             format!("{cwd}/{log_file}")
         };
         let writer = std::fs::File::options().append(true).open(log_path)?;
-        let (non_blocking, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
-            .buffered_lines_limit(16_000)
-            .lossy(true)
-            .thread_name("clash-logger-appender")
-            .finish(writer);
+        let (non_blocking, guard) =
+            tracing_appender::non_blocking::NonBlockingBuilder::default()
+                .buffered_lines_limit(16_000)
+                .lossy(true)
+                .thread_name("clash-logger-appender")
+                .finish(writer);
         (Some(non_blocking), Some(guard))
     } else {
         (None, None)
@@ -127,7 +130,8 @@ fn setup_logging_inner(
     let subscriber = tracing_subscriber::registry();
 
     let exclude = filter_fn(|metadata| {
-        !metadata.target().contains("tokio") && !metadata.target().contains("runtime")
+        !metadata.target().contains("tokio")
+            && !metadata.target().contains("runtime")
     });
 
     let timer = LocalTime::new(time::macros::format_description!(
@@ -217,7 +221,11 @@ impl tracing::field::Visit for EventVisitor<'_> {
         println!("error {} = {}", field.name(), value);
     }
 
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+    fn record_debug(
+        &mut self,
+        field: &tracing::field::Field,
+        value: &dyn std::fmt::Debug,
+    ) {
         if field.name() == "message" {
             self.0.push(format!("{value:?}"));
         } else {

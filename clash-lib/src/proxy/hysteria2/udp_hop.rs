@@ -86,7 +86,9 @@ impl UdpHop {
 
     fn maybe_hop(&self) -> u16 {
         let mut lock = self.state.lock().expect("udp hop lock poisoned");
-        if Instant::now().sub(lock.last_hop) > self.interval && lock.prev_conn.is_none() {
+        if Instant::now().sub(lock.last_hop) > self.interval
+            && lock.prev_conn.is_none()
+        {
             match Self::build_socket(
                 self.bind_addr,
                 #[cfg(target_os = "linux")]
@@ -97,7 +99,8 @@ impl UdpHop {
                 Ok(new_conn) => {
                     lock.last_hop = Instant::now();
                     lock.next_port = self.port_generator.get();
-                    lock.prev_conn = Some(std::mem::replace(&mut lock.cur_conn, new_conn));
+                    lock.prev_conn =
+                        Some(std::mem::replace(&mut lock.cur_conn, new_conn));
                 }
                 Err(err) => {
                     tracing::error!("hysteria2 port hopping failed: {err}");
@@ -107,7 +110,9 @@ impl UdpHop {
         lock.next_port
     }
 
-    fn get_connections(&self) -> (Option<Arc<dyn AsyncUdpSocket>>, Arc<dyn AsyncUdpSocket>) {
+    fn get_connections(
+        &self,
+    ) -> (Option<Arc<dyn AsyncUdpSocket>>, Arc<dyn AsyncUdpSocket>) {
         let lock = self.state.lock().expect("udp hop lock poisoned");
         (lock.prev_conn.clone(), lock.cur_conn.clone())
     }
@@ -178,10 +183,9 @@ impl AsyncUdpSocket for UdpHop {
                 }
             }
             Poll::Ready(Ok(current_len)) => {
-                meta.iter_mut()
-                    .skip(prev_len)
-                    .take(current_len)
-                    .for_each(|recv_meta| recv_meta.addr.set_port(self.initial_port));
+                meta.iter_mut().skip(prev_len).take(current_len).for_each(
+                    |recv_meta| recv_meta.addr.set_port(self.initial_port),
+                );
                 Poll::Ready(Ok(prev_len + current_len))
             }
             Poll::Ready(Err(err)) => Poll::Ready(Err(err)),

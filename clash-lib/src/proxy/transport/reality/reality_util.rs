@@ -109,11 +109,14 @@ fn hex_char_to_value(c: u8) -> Result<u8, &'static str> {
 /// - Length: 3 bytes
 /// - Protocol Version: 2 bytes
 /// - ClientRandom: 32 bytes (starts at offset 11)
-pub fn extract_client_random(client_hello: &[u8]) -> Result<[u8; 32], std::io::Error> {
+pub fn extract_client_random(
+    client_hello: &[u8],
+) -> Result<[u8; 32], std::io::Error> {
     const TLS_HEADER_LEN: usize = 5;
     const HANDSHAKE_HEADER_LEN: usize = 4; // type(1) + length(3)
     const PROTOCOL_VERSION_LEN: usize = 2;
-    const RANDOM_OFFSET: usize = TLS_HEADER_LEN + HANDSHAKE_HEADER_LEN + PROTOCOL_VERSION_LEN;
+    const RANDOM_OFFSET: usize =
+        TLS_HEADER_LEN + HANDSHAKE_HEADER_LEN + PROTOCOL_VERSION_LEN;
 
     if client_hello.len() < RANDOM_OFFSET + 32 {
         return Err(std::io::Error::new(
@@ -131,7 +134,9 @@ pub fn extract_client_random(client_hello: &[u8]) -> Result<[u8; 32], std::io::E
 ///
 /// SessionId comes after ClientRandom and has a 1-byte length prefix.
 /// Returns a slice pointing into the original buffer.
-pub fn extract_session_id_slice(client_hello: &[u8]) -> Result<&[u8], std::io::Error> {
+pub fn extract_session_id_slice(
+    client_hello: &[u8],
+) -> Result<&[u8], std::io::Error> {
     const TLS_HEADER_LEN: usize = 5;
     const HANDSHAKE_HEADER_LEN: usize = 4;
     const PROTOCOL_VERSION_LEN: usize = 2;
@@ -155,14 +160,17 @@ pub fn extract_session_id_slice(client_hello: &[u8]) -> Result<&[u8], std::io::E
         ));
     }
 
-    Ok(&client_hello[SESSION_ID_LEN_OFFSET + 1..SESSION_ID_LEN_OFFSET + 1 + session_id_len])
+    Ok(&client_hello
+        [SESSION_ID_LEN_OFFSET + 1..SESSION_ID_LEN_OFFSET + 1 + session_id_len])
 }
 
 /// Extracts X25519 public key from ClientHello KeyShare extension
 ///
 /// This parses the TLS 1.3 extensions to find the KeyShare extension
 /// and extracts the X25519 public key (group 0x001d).
-pub fn extract_client_public_key(client_hello: &[u8]) -> Result<[u8; 32], std::io::Error> {
+pub fn extract_client_public_key(
+    client_hello: &[u8],
+) -> Result<[u8; 32], std::io::Error> {
     const TLS_HEADER_LEN: usize = 5;
 
     if client_hello.len() < TLS_HEADER_LEN {
@@ -275,7 +283,9 @@ fn parse_keyshare_extension(data: &[u8]) -> Result<[u8; 32], std::io::Error> {
 ///
 /// This parses the TLS 1.3 ServerHello to find the KeyShare extension
 /// and extracts the X25519 public key (group 0x001d).
-pub fn extract_server_public_key(server_hello: &[u8]) -> Result<[u8; 32], std::io::Error> {
+pub fn extract_server_public_key(
+    server_hello: &[u8],
+) -> Result<[u8; 32], std::io::Error> {
     const TLS_HEADER_LEN: usize = 5;
 
     if server_hello.len() < TLS_HEADER_LEN {
@@ -365,7 +375,9 @@ fn parse_server_keyshare_extension(data: &[u8]) -> Result<[u8; 32], std::io::Err
 ///
 /// This parses the TLS 1.3 ServerHello to find the cipher suite.
 /// ServerHello contains a single cipher suite (the server's choice).
-pub fn extract_server_cipher_suite(server_hello: &[u8]) -> Result<u16, std::io::Error> {
+pub fn extract_server_cipher_suite(
+    server_hello: &[u8],
+) -> Result<u16, std::io::Error> {
     const TLS_HEADER_LEN: usize = 5;
 
     if server_hello.len() < TLS_HEADER_LEN {
@@ -398,7 +410,9 @@ pub fn extract_server_cipher_suite(server_hello: &[u8]) -> Result<u16, std::io::
 /// Extracts cipher suites offered by client from ClientHello
 ///
 /// Returns a Vec of cipher suite IDs in the order they appear in the ClientHello.
-pub fn extract_client_cipher_suites(client_hello: &[u8]) -> Result<Vec<u16>, std::io::Error> {
+pub fn extract_client_cipher_suites(
+    client_hello: &[u8],
+) -> Result<Vec<u16>, std::io::Error> {
     const TLS_HEADER_LEN: usize = 5;
 
     if client_hello.len() < TLS_HEADER_LEN {
@@ -464,9 +478,11 @@ pub fn generate_keypair() -> std::io::Result<(String, String)> {
     rand::rng().fill_bytes(&mut private_key_bytes);
 
     // Create X25519 private key from the random bytes
-    let private_key =
-        agreement::PrivateKey::from_private_key(&agreement::X25519, &private_key_bytes)
-            .map_err(|_| std::io::Error::other("Failed to create X25519 key"))?;
+    let private_key = agreement::PrivateKey::from_private_key(
+        &agreement::X25519,
+        &private_key_bytes,
+    )
+    .map_err(|_| std::io::Error::other("Failed to create X25519 key"))?;
 
     // Derive public key from private key
     let public_key_bytes = private_key

@@ -7,7 +7,8 @@ pub struct TcpStream {
     pub(crate) remote_addr: SocketAddr,
 
     pub(crate) handle: Arc<TcpStreamHandle>,
-    pub(crate) stack_notifier: tokio::sync::mpsc::UnboundedSender<IfaceEvent<'static>>,
+    pub(crate) stack_notifier:
+        tokio::sync::mpsc::UnboundedSender<IfaceEvent<'static>>,
 }
 
 impl Drop for TcpStream {
@@ -72,7 +73,9 @@ impl tokio::io::AsyncRead for TcpStream {
 
         buf.initialize_unfilled();
         let recv_buf = unsafe {
-            std::mem::transmute::<&mut [std::mem::MaybeUninit<u8>], &mut [u8]>(buf.unfilled_mut())
+            std::mem::transmute::<&mut [std::mem::MaybeUninit<u8>], &mut [u8]>(
+                buf.unfilled_mut(),
+            )
         };
         let n = read_buf.dequeue_slice(recv_buf);
         buf.advance(n);

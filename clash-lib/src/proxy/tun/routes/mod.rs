@@ -25,7 +25,9 @@ pub fn maybe_add_routes(cfg: &TunConfig, tun_name: &str) -> std::io::Result<()> 
             .ok_or_else(|| std::io::Error::other("tun interface not found"))?;
 
         if cfg.route_all {
-            warn!("route_all is enabled, all traffic will be routed through the tun interface");
+            warn!(
+                "route_all is enabled, all traffic will be routed through the tun interface"
+            );
 
             #[cfg(target_os = "linux")]
             {

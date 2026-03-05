@@ -132,7 +132,10 @@ impl OutboundManager {
         r
     }
 
-    fn load_handlers(&mut self, outbounds: Vec<AnyOutboundHandler>) -> Result<(), Error> {
+    fn load_handlers(
+        &mut self,
+        outbounds: Vec<AnyOutboundHandler>,
+    ) -> Result<(), Error> {
         for outbound in outbounds {
             let name = outbound.name().to_string();
             if self.handlers.contains_key(&name) {
@@ -146,7 +149,9 @@ impl OutboundManager {
         Ok(())
     }
 
-    pub fn load_plain_outbounds(outbounds: Vec<OutboundProxyProtocol>) -> Vec<AnyOutboundHandler> {
+    pub fn load_plain_outbounds(
+        outbounds: Vec<OutboundProxyProtocol>,
+    ) -> Vec<AnyOutboundHandler> {
         outbounds
             .into_iter()
             .filter_map(|outbound| match outbound {
@@ -172,7 +177,10 @@ impl OutboundManager {
                     v.try_into()
                         .map(|x: hysteria2::Handler| Arc::new(x) as _)
                         .inspect_err(|e| {
-                            error!("failed to load hysteria2 outbound {}: {}", name, e);
+                            error!(
+                                "failed to load hysteria2 outbound {}: {}",
+                                name, e
+                            );
                         })
                         .ok()
                 }
@@ -201,17 +209,18 @@ impl OutboundManager {
         let mut connectors = HashMap::new();
         for handler in self.handlers.values() {
             if let Some(connector_name) = handler.support_dialer() {
-                let outbound = self
-                    .get_outbound(connector_name)
-                    .ok_or(Error::InvalidConfig(format!(
+                let outbound = self.get_outbound(connector_name).ok_or(
+                    Error::InvalidConfig(format!(
                         "connector {connector_name} not found"
-                    )))?;
-                let connector = connectors.entry(connector_name).or_insert_with(|| {
-                    Arc::new(ProxyConnector::new(
-                        outbound,
-                        Box::new(DirectConnector::new()),
-                    ))
-                });
+                    )),
+                )?;
+                let connector =
+                    connectors.entry(connector_name).or_insert_with(|| {
+                        Arc::new(ProxyConnector::new(
+                            outbound,
+                            Box::new(DirectConnector::new()),
+                        ))
+                    });
                 handler.register_connector(connector.clone()).await;
             }
         }

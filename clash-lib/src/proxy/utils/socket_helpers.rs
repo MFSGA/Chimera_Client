@@ -49,7 +49,9 @@ pub fn try_create_dualstack_socket(
     if addr.is_ipv6() && addr.ip().is_unspecified() {
         if let Err(e) = socket.set_only_v6(false) {
             // If setting dualstack fails, fallback to single stack
-            tracing::warn!("dualstack not supported, falling back to ipv6 only: {e}");
+            tracing::warn!(
+                "dualstack not supported, falling back to ipv6 only: {e}"
+            );
         } else {
             dualstack = true;
         }
@@ -57,8 +59,11 @@ pub fn try_create_dualstack_socket(
     Ok((socket, dualstack))
 }
 
-pub fn try_create_dualstack_tcplistener(addr: SocketAddr) -> io::Result<TcpListener> {
-    let (socket, _dualstack) = try_create_dualstack_socket(addr, socket2::Type::STREAM)?;
+pub fn try_create_dualstack_tcplistener(
+    addr: SocketAddr,
+) -> io::Result<TcpListener> {
+    let (socket, _dualstack) =
+        try_create_dualstack_socket(addr, socket2::Type::STREAM)?;
 
     socket.set_nonblocking(true)?;
     // For fast restart avoid Address In Use Error
@@ -91,11 +96,19 @@ pub async fn new_tcp_stream(
 ) -> std::io::Result<TcpStream> {
     let (socket, family) = match endpoint {
         SocketAddr::V4(_) => (
-            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?,
+            socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::STREAM,
+                None,
+            )?,
             socket2::Domain::IPV4,
         ),
         SocketAddr::V6(_) => (
-            socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::STREAM, None)?,
+            socket2::Socket::new(
+                socket2::Domain::IPV6,
+                socket2::Type::STREAM,
+                None,
+            )?,
             socket2::Domain::IPV6,
         ),
     };

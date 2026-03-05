@@ -31,6 +31,8 @@ pub async fn new(
             _ => print_and_exit!("enhanced resolver requires cache store"),
         }
     } else {
-        Arc::new(SystemResolver::new(cfg.ipv6).expect("failed to create system resolver"))
+        Arc::new(
+            SystemResolver::new(cfg.ipv6).expect("failed to create system resolver"),
+        )
     }
 }

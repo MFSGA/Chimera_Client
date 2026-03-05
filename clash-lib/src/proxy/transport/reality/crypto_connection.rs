@@ -2,7 +2,9 @@
 
 use std::io::{self, Read, Write};
 
-use super::reality_client_connection::{RealityClientConnection, feed_reality_client_connection};
+use super::reality_client_connection::{
+    RealityClientConnection, feed_reality_client_connection,
+};
 use super::reality_io_state::RealityIoState;
 use super::reality_reader_writer::{RealityReader, RealityWriter};
 
@@ -69,6 +71,9 @@ impl CryptoConnection {
 }
 
 #[inline]
-pub fn feed_crypto_connection(connection: &mut CryptoConnection, data: &[u8]) -> io::Result<()> {
+pub fn feed_crypto_connection(
+    connection: &mut CryptoConnection,
+    data: &[u8],
+) -> io::Result<()> {
     feed_reality_client_connection(&mut connection.inner, data)
 }

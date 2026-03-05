@@ -4,8 +4,8 @@
 
 use super::common::{
     HANDSHAKE_TYPE_CERTIFICATE, HANDSHAKE_TYPE_CERTIFICATE_VERIFY,
-    HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS, HANDSHAKE_TYPE_FINISHED, HANDSHAKE_TYPE_SERVER_HELLO,
-    VERSION_TLS_1_2_MAJOR, VERSION_TLS_1_2_MINOR,
+    HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS, HANDSHAKE_TYPE_FINISHED,
+    HANDSHAKE_TYPE_SERVER_HELLO, VERSION_TLS_1_2_MAJOR, VERSION_TLS_1_2_MINOR,
 };
 use aws_lc_rs::signature::Ed25519KeyPair;
 use std::io::Result;
@@ -349,7 +349,8 @@ pub fn construct_client_hello(
         let key_share_list_len = 4 + client_public_key.len();
         extensions.extend_from_slice(&(key_share_list_len as u16).to_be_bytes()); // Key share list length
         extensions.extend_from_slice(&[0x00, 0x1d]); // Group: x25519
-        extensions.extend_from_slice(&(client_public_key.len() as u16).to_be_bytes()); // Key length
+        extensions
+            .extend_from_slice(&(client_public_key.len() as u16).to_be_bytes()); // Key length
         extensions.extend_from_slice(client_public_key); // Public key
     }
 
@@ -445,7 +446,12 @@ mod tests {
         let cipher_suite = 0x1301; // TLS_AES_128_GCM_SHA256
         let key_share = vec![0xAAu8; 32];
 
-        let result = construct_server_hello(&server_random, &session_id, cipher_suite, &key_share);
+        let result = construct_server_hello(
+            &server_random,
+            &session_id,
+            cipher_suite,
+            &key_share,
+        );
 
         assert!(result.is_ok());
         let msg = result.unwrap();

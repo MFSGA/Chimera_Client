@@ -91,7 +91,9 @@ pub fn get_api_runner(
         // Handle TCP listening
         let tcp_fut = if let Some(bind_addr) = tcp_addr {
             let bind_addr = if bind_addr.starts_with(':') {
-                info!("TCP API Server address not supplied, listening on `localhost`");
+                info!(
+                    "TCP API Server address not supplied, listening on `localhost`"
+                );
                 format!("127.0.0.1{bind_addr}")
             } else {
                 bind_addr
@@ -119,7 +121,9 @@ pub fn get_api_runner(
                                 .to_string(),
                         ));
                     }
-                    if !addr.ip().is_loopback() && controller_cfg.cors_allow_origins.is_none() {
+                    if !addr.ip().is_loopback()
+                        && controller_cfg.cors_allow_origins.is_none()
+                    {
                         error!(
                             "API server is listening on a non-loopback address \
                              without CORS origins configured. This is insecure!"

@@ -71,7 +71,12 @@ impl Client {
         let conn = reality_client_connection::RealityClientConnection::new(config)?;
         let mut connection = CryptoConnection::new_reality_client(conn);
         let mut stream = stream;
-        perform_crypto_handshake(&mut connection, &mut stream, common::TLS_MAX_RECORD_SIZE).await?;
+        perform_crypto_handshake(
+            &mut connection,
+            &mut stream,
+            common::TLS_MAX_RECORD_SIZE,
+        )
+        .await?;
         Ok(CryptoTlsStream::new(stream, connection))
     }
 }

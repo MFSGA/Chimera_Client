@@ -20,7 +20,12 @@ pub fn ipv4_checksum(header: &[u8]) -> u16 {
     !(sum as u16)
 }
 
-pub fn tcp_udp_checksum(src_ip: [u8; 4], dst_ip: [u8; 4], proto: u8, tcp_udp: &[u8]) -> u16 {
+pub fn tcp_udp_checksum(
+    src_ip: [u8; 4],
+    dst_ip: [u8; 4],
+    proto: u8,
+    tcp_udp: &[u8],
+) -> u16 {
     let mut sum = 0u32;
     // Pseudo-header
     sum += u16::from_be_bytes([src_ip[0], src_ip[1]]) as u32;
@@ -53,7 +58,8 @@ pub fn build_tcp_syn_packet() -> Bytes {
         0x45, 0x00, 0x00, 40, // Version, IHL, Total Length
         0x00, 0x00, 0x40, 0x00, // ID, Flags/Frag
         0x40, 0x06, 0x00, 0x00, // TTL, Protocol (TCP), Checksum (to fill)
-        src_ip[0], src_ip[1], src_ip[2], src_ip[3], dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3],
+        src_ip[0], src_ip[1], src_ip[2], src_ip[3], dst_ip[0], dst_ip[1], dst_ip[2],
+        dst_ip[3],
     ]);
     // TCP header (20 bytes)
     let mut tcp = [
@@ -86,7 +92,8 @@ pub fn build_udp_packet() -> Bytes {
         0x45, 0x00, 0x00, 28, // Version, IHL, Total Length
         0x00, 0x00, 0x40, 0x00, // ID, Flags/Frag
         0x40, 0x11, 0x00, 0x00, // TTL, Protocol (UDP), Checksum (to fill)
-        src_ip[0], src_ip[1], src_ip[2], src_ip[3], dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3],
+        src_ip[0], src_ip[1], src_ip[2], src_ip[3], dst_ip[0], dst_ip[1], dst_ip[2],
+        dst_ip[3],
     ]);
     // UDP header (8 bytes)
     let mut udp = [

@@ -79,7 +79,10 @@ impl OutboundDatagramVless {
 impl Sink<UdpPacket> for OutboundDatagramVless {
     type Error = io::Error;
 
-    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
         if !self.flushed {
             match self.poll_flush(cx)? {
                 Poll::Ready(()) => {}
@@ -119,7 +122,10 @@ impl Sink<UdpPacket> for OutboundDatagramVless {
         Ok(())
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
         if self.flushed {
             return Poll::Ready(Ok(()));
         }
@@ -159,7 +165,10 @@ impl Sink<UdpPacket> for OutboundDatagramVless {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn poll_close(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
         ready!(self.as_mut().poll_flush(cx))?;
         Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
@@ -168,14 +177,18 @@ impl Sink<UdpPacket> for OutboundDatagramVless {
 impl Stream for OutboundDatagramVless {
     type Item = UdpPacket;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         let mut inner = Pin::new(&mut this.inner);
 
         loop {
             // If we have remaining bytes from a previous packet, read them
             if this.remaining_bytes > 0 {
-                let to_read = std::cmp::min(this.remaining_bytes, this.read_buf.len());
+                let to_read =
+                    std::cmp::min(this.remaining_bytes, this.read_buf.len());
                 let mut read_buf = ReadBuf::new(&mut this.read_buf[..to_read]);
 
                 match ready!(inner.as_mut().poll_read(cx, &mut read_buf)) {

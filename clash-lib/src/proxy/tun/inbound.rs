@@ -52,7 +52,9 @@ pub fn get_runner(
             "fd" => {
                 let fd = url
                     .host()
-                    .ok_or_else(|| Error::InvalidConfig("tun fd must be provided".to_string()))?
+                    .ok_or_else(|| {
+                        Error::InvalidConfig("tun fd must be provided".to_string())
+                    })?
                     .to_string()
                     .parse()
                     .map_err(|e| Error::InvalidConfig(format!("tun fd {e}")))?;
@@ -61,7 +63,9 @@ pub fn get_runner(
             "dev" => {
                 let dev = url
                     .host()
-                    .ok_or_else(|| Error::InvalidConfig("tun dev must be provided".to_string()))?
+                    .ok_or_else(|| {
+                        Error::InvalidConfig("tun dev must be provided".to_string())
+                    })?
                     .to_string();
                 tun_init_config.tun_name = Some(dev);
             }
@@ -97,9 +101,9 @@ pub fn get_runner(
             use network_interface::NetworkInterfaceConfig;
             use tun_rs::DeviceBuilder;
 
-            let tun_name = tun_init_config
-                .tun_name
-                .ok_or_else(|| Error::InvalidConfig("tun name must be provided".to_string()))?;
+            let tun_name = tun_init_config.tun_name.ok_or_else(|| {
+                Error::InvalidConfig("tun name must be provided".to_string())
+            })?;
             let tun_exist = network_interface::NetworkInterface::show()
                 .map(|ifs| ifs.into_iter().any(|iface| iface.name == tun_name))
                 .unwrap_or_default();
@@ -117,11 +121,16 @@ pub fn get_runner(
 
             if !tun_exist {
                 debug!("setting tun ipv4 addr: {:?}", cfg.gateway);
-                tun_builder = tun_builder.ipv4(cfg.gateway.addr(), cfg.gateway.netmask(), None);
+                tun_builder = tun_builder.ipv4(
+                    cfg.gateway.addr(),
+                    cfg.gateway.netmask(),
+                    None,
+                );
 
                 if let Some(gateway_v6) = cfg.gateway_v6.as_ref() {
                     debug!("setting tun ipv6 addr: {:?}", cfg.gateway_v6);
-                    tun_builder = tun_builder.ipv6(gateway_v6.addr(), gateway_v6.netmask());
+                    tun_builder =
+                        tun_builder.ipv6(gateway_v6.addr(), gateway_v6.netmask());
                 }
             }
 
@@ -150,8 +159,10 @@ pub fn get_runner(
         let so_mark = cfg.so_mark;
         let _route_cleanup_guard = RouteCleanupGuard::new(cfg);
 
-        let framed =
-            tun_rs::async_framed::DeviceFramed::new(tun, tun_rs::async_framed::BytesCodec::new());
+        let framed = tun_rs::async_framed::DeviceFramed::new(
+            tun,
+            tun_rs::async_framed::BytesCodec::new(),
+        );
 
         let (mut tun_sink, mut tun_stream) = framed.split::<bytes::Bytes>();
         let (mut stack_sink, mut stack_stream) = stack.split();
@@ -183,7 +194,9 @@ pub fn get_runner(
             while let Some(pkt) = tun_stream.next().await {
                 match pkt {
                     Ok(pkt) => {
-                        if let Err(e) = stack_sink.send(watfaq_netstack::Packet::new(pkt)).await {
+                        if let Err(e) =
+                            stack_sink.send(watfaq_netstack::Packet::new(pkt)).await
+                        {
                             error!("failed to send pkt to stack: {}", e);
                             break;
                         }

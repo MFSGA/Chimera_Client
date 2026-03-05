@@ -80,7 +80,9 @@ impl InboundHandlerTrait for SocksInbound {
             );
 
             let src_addr = socket.peer_addr()?.to_canonical();
-            if !self.allow_lan && src_addr.ip() != socket.local_addr()?.ip().to_canonical() {
+            if !self.allow_lan
+                && src_addr.ip() != socket.local_addr()?.ip().to_canonical()
+            {
                 warn!("Connection from {} is not allowed", src_addr);
                 continue;
             }
@@ -98,9 +100,9 @@ impl InboundHandlerTrait for SocksInbound {
             let dispatcher = self.dispatcher.clone();
             let authenticator = self.authenticator.clone();
 
-            tokio::spawn(
-                async move { handle_tcp(&mut sess, socket, dispatcher, authenticator).await },
-            );
+            tokio::spawn(async move {
+                handle_tcp(&mut sess, socket, dispatcher, authenticator).await
+            });
         }
     }
 

@@ -35,7 +35,10 @@ mod macos {
         }
     }
 
-    async fn new_tcp_stream<'a>(addr: SocketAddr, iface: &str) -> std::io::Result<TcpStream> {
+    async fn new_tcp_stream<'a>(
+        addr: SocketAddr,
+        iface: &str,
+    ) -> std::io::Result<TcpStream> {
         let socket = socket2::Socket::new(
             if addr.is_ipv4() {
                 socket2::Domain::IPV4
@@ -64,7 +67,8 @@ mod macos {
     }
 
     async fn new_udp_packet(iface: &str) -> std::io::Result<tokio::net::UdpSocket> {
-        let socket = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::DGRAM, None)?;
+        let socket =
+            socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::DGRAM, None)?;
         socket.set_only_v6(false)?;
         let iface_index = get_interface_index(iface);
         assert_ne!(iface_index, 0, "interface index must not be zero");
@@ -76,9 +80,10 @@ mod macos {
 
     async fn handle_inbound_stream(mut stream: watfaq_netstack::TcpStream) {
         let start = std::time::Instant::now();
-        let mut remote_stream = new_tcp_stream(stream.remote_addr(), &OUTBOUND_INTERFACE)
-            .await
-            .expect("Failed to connect to remote stream");
+        let mut remote_stream =
+            new_tcp_stream(stream.remote_addr(), &OUTBOUND_INTERFACE)
+                .await
+                .expect("Failed to connect to remote stream");
 
         trace!(
             "Connected to remote {} in {} ms",
@@ -241,8 +246,10 @@ mod macos {
 
         let (stack, mut tcp_listener, udp_socket) = watfaq_netstack::NetStack::new();
 
-        let framed =
-            tun_rs::async_framed::DeviceFramed::new(dev, tun_rs::async_framed::BytesCodec::new());
+        let framed = tun_rs::async_framed::DeviceFramed::new(
+            dev,
+            tun_rs::async_framed::BytesCodec::new(),
+        );
 
         let (mut tun_sink, mut tun_stream) = framed.split::<bytes::Bytes>();
         let (mut stack_sink, mut stack_stream) = stack.split();
@@ -277,7 +284,9 @@ mod macos {
             while let Some(pkt) = tun_stream.next().await {
                 match pkt {
                     Ok(pkt) => {
-                        if let Err(e) = stack_sink.send(watfaq_netstack::Packet::new(pkt)).await {
+                        if let Err(e) =
+                            stack_sink.send(watfaq_netstack::Packet::new(pkt)).await
+                        {
                             error!("failed to send pkt to stack: {}", e);
                             break;
                         }
@@ -333,10 +342,12 @@ mod macos {
 
 #[tokio::main]
 async fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
-        .format_source_path(true)
-        .format_timestamp_micros()
-        .init();
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("warn"),
+    )
+    .format_source_path(true)
+    .format_timestamp_micros()
+    .init();
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     macos::main().await;

@@ -3,7 +3,9 @@ use crate::{
     config::{def, internal::config},
 };
 
-pub(super) fn convert(before: Option<def::TunConfig>) -> Result<config::TunConfig, crate::Error> {
+pub(super) fn convert(
+    before: Option<def::TunConfig>,
+) -> Result<config::TunConfig, crate::Error> {
     match before {
         Some(t) => Ok(config::TunConfig {
             enable: t.enable,
@@ -20,16 +22,15 @@ pub(super) fn convert(before: Option<def::TunConfig>) -> Result<config::TunConfi
                 .transpose()
                 .map_err(|e| Error::InvalidConfig(format!("parse tun routes: {e}")))?
                 .unwrap_or_default(),
-            gateway: t
-                .gateway
-                .parse()
-                .map_err(|e| Error::InvalidConfig(format!("parse tun gateway: {e}")))?,
+            gateway: t.gateway.parse().map_err(|e| {
+                Error::InvalidConfig(format!("parse tun gateway: {e}"))
+            })?,
             gateway_v6: t
                 .gateway_v6
                 .map(|gateway| {
-                    gateway
-                        .parse()
-                        .map_err(|e| Error::InvalidConfig(format!("parse tun gateway_v6: {e}")))
+                    gateway.parse().map_err(|e| {
+                        Error::InvalidConfig(format!("parse tun gateway_v6: {e}"))
+                    })
                 })
                 .transpose()?,
             mtu: t.mtu,
@@ -97,7 +98,9 @@ routes:
 "#,
         );
         match convert(Some(tun)) {
-            Err(crate::Error::InvalidConfig(msg)) => assert!(msg.contains("parse tun routes")),
+            Err(crate::Error::InvalidConfig(msg)) => {
+                assert!(msg.contains("parse tun routes"))
+            }
             Err(other) => panic!("unexpected error: {other}"),
             Ok(_) => panic!("invalid route cidr should fail"),
         }
@@ -112,7 +115,9 @@ gateway: 198.18.0.1
 "#,
         );
         match convert(Some(tun)) {
-            Err(crate::Error::InvalidConfig(msg)) => assert!(msg.contains("parse tun gateway")),
+            Err(crate::Error::InvalidConfig(msg)) => {
+                assert!(msg.contains("parse tun gateway"))
+            }
             Err(other) => panic!("unexpected error: {other}"),
             Ok(_) => panic!("invalid gateway cidr should fail"),
         }

@@ -48,7 +48,8 @@ pub struct Config {
 impl Config {
     pub fn validate(self) -> Result<Self, crate::Error> {
         for r in self.rules.iter() {
-            if !self.proxies.contains_key(r.target()) && !self.proxy_groups.contains_key(r.target())
+            if !self.proxies.contains_key(r.target())
+                && !self.proxy_groups.contains_key(r.target())
             {
                 return Err(Error::InvalidConfig(format!(
                     "proxy `{}` referenced in a rule was not found",

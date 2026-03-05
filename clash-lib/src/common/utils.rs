@@ -18,7 +18,11 @@ pub fn default_bool_true() -> bool {
     true
 }
 
-pub async fn download<P>(url: &str, path: P, http_client: &HttpClient) -> anyhow::Result<()>
+pub async fn download<P>(
+    url: &str,
+    path: P,
+    http_client: &HttpClient,
+) -> anyhow::Result<()>
 where
     P: AsRef<Path> + std::marker::Send,
 {
@@ -86,9 +90,11 @@ where
         }
 
         if !res.status().is_success() {
-            return Err(
-                Error::InvalidConfig(format!("data download failed: {}", res.status())).into(),
-            );
+            return Err(Error::InvalidConfig(format!(
+                "data download failed: {}",
+                res.status()
+            ))
+            .into());
         }
 
         debug!("downloading data to {}", path.as_ref().to_string_lossy());

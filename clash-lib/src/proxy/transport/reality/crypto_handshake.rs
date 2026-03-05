@@ -81,7 +81,9 @@ pub async fn perform_crypto_handshake(
         if !connection.wants_read() && !connection.wants_write() {
             if connection.is_handshaking() {
                 // Still handshaking but nothing to do - this shouldn't happen
-                log::error!("TLS handshake stalled: neither wants_read nor wants_write");
+                log::error!(
+                    "TLS handshake stalled: neither wants_read nor wants_write"
+                );
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "TLS handshake stalled: neither wants_read nor wants_write",
@@ -160,8 +162,13 @@ pub async fn perform_crypto_handshake(
 
         // If handshake just completed but there are pending writes, continue loop to flush them
         // (matches rustls complete_io behavior)
-        if until_handshaked && !connection.is_handshaking() && connection.wants_write() {
-            log::debug!("TLS handshake: complete but has pending writes, continuing");
+        if until_handshaked
+            && !connection.is_handshaking()
+            && connection.wants_write()
+        {
+            log::debug!(
+                "TLS handshake: complete but has pending writes, continuing"
+            );
             continue;
         }
 
@@ -197,7 +204,10 @@ pub async fn perform_crypto_handshake(
                         "TLS handshake exceeded maximum iterations",
                     ));
                 }
-                log::debug!("TLS handshake continuing to iteration {}", iteration + 1);
+                log::debug!(
+                    "TLS handshake continuing to iteration {}",
+                    iteration + 1
+                );
                 continue;
             }
         }
@@ -268,7 +278,10 @@ async fn read_and_process_data(
     // This is called after every feed, just like tokio-rustls does
     connection.process_new_packets().map_err(|e| {
         log::error!("TLS error processing packets: {}", e);
-        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("TLS error: {}", e))
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("TLS error: {}", e),
+        )
     })?;
 
     log::debug!("TLS: processed packets successfully");
@@ -334,7 +347,8 @@ mod tests {
             .unwrap()
             .to_owned();
 
-        let client_conn = rustls::ClientConnection::new(config, server_name).unwrap();
+        let client_conn =
+            rustls::ClientConnection::new(config, server_name).unwrap();
         let connection = rustls::Connection::Client(client_conn);
 
         // These method calls will fail to compile if the methods don't exist

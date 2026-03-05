@@ -38,7 +38,9 @@ impl PortGenerator {
 
     pub fn get(&self) -> u16 {
         let mut rng = rand::rng();
-        let len = 1 + self.ports.len() + self.ranges.iter().map(|range| range.len()).sum::<usize>();
+        let len = 1
+            + self.ports.len()
+            + self.ranges.iter().map(|range| range.len()).sum::<usize>();
         let idx = rng.random_range(0..len);
         match idx {
             0 => self.default,
@@ -90,13 +92,16 @@ impl TryFrom<OutboundHysteria2> for Handler {
 
         let obfs = match (value.obfs, value.obfs_password.as_ref()) {
             (Some(obfs), Some(password)) => match obfs {
-                Hysteria2Obfs::Salamander => Some(Obfs::Salamander(SalamanderObfs {
-                    key: password.to_owned().into_bytes(),
-                })),
+                Hysteria2Obfs::Salamander => {
+                    Some(Obfs::Salamander(SalamanderObfs {
+                        key: password.to_owned().into_bytes(),
+                    }))
+                }
             },
             (Some(_), None) => {
                 return Err(crate::Error::InvalidConfig(
-                    "hysteria2 `obfs-password` is required when `obfs` is set".to_owned(),
+                    "hysteria2 `obfs-password` is required when `obfs` is set"
+                        .to_owned(),
                 ));
             }
             _ => None,

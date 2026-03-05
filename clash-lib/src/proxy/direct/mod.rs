@@ -11,7 +11,9 @@ use crate::{
     },
     common::errors::map_io_error,
     config::internal::proxy::PROXY_DIRECT,
-    proxy::{DialWithConnector, OutboundHandler, OutboundType, utils::new_tcp_stream},
+    proxy::{
+        DialWithConnector, OutboundHandler, OutboundType, utils::new_tcp_stream,
+    },
 };
 
 #[derive(Clone)]

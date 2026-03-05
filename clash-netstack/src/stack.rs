@@ -14,7 +14,7 @@ use crate::{
 };
 
 pub(crate) enum IfaceEvent<'a> {
-    Icmp,                                                                     // ICMP packet received
+    Icmp, // ICMP packet received
     TcpStream(Box<(smoltcp::socket::tcp::Socket<'a>, Arc<TcpStreamHandle>)>), /* new TCP stream created */
     TcpSocketReady, // at least one TCP socket is ready to read/write
     TcpSocketClosed, /* TCP socket closed by the application, e.g. the TcpStream
@@ -84,13 +84,16 @@ impl NetStack {
     ) {
         let (packet_sender, packet_receiver) = mpsc::channel::<Packet>(1024);
 
-        let (udp_inbound_app, udp_outbound_stack) = mpsc::unbounded_channel::<Packet>();
+        let (udp_inbound_app, udp_outbound_stack) =
+            mpsc::unbounded_channel::<Packet>();
 
         // this UdpSocket is essentially an Iface for UDP but much simpler as it only
         // does packets forwarding
         let udp_socket = UdpSocket::new(udp_outbound_stack, packet_sender.clone());
-        let (tcp_inbound_app, tcp_outbound_stack) = mpsc::unbounded_channel::<Packet>();
-        let tcp_listener = TcpListener::new(tcp_outbound_stack, packet_sender.clone());
+        let (tcp_inbound_app, tcp_outbound_stack) =
+            mpsc::unbounded_channel::<Packet>();
+        let tcp_listener =
+            TcpListener::new(tcp_outbound_stack, packet_sender.clone());
 
         let stack = NetStack {
             udp_inbound: udp_inbound_app,
@@ -141,7 +144,10 @@ impl futures::Sink<Packet> for StackSplitSink {
         }
     }
 
-    fn start_send(mut self: std::pin::Pin<&mut Self>, item: Packet) -> Result<(), Self::Error> {
+    fn start_send(
+        mut self: std::pin::Pin<&mut Self>,
+        item: Packet,
+    ) -> Result<(), Self::Error> {
         if item.data().is_empty() {
             return Ok(());
         }
@@ -154,7 +160,10 @@ impl futures::Sink<Packet> for StackSplitSink {
         let protocol = packet.protocol();
         if matches!(
             protocol,
-            IpProtocol::Tcp | IpProtocol::Udp | IpProtocol::Icmp | IpProtocol::Icmpv6
+            IpProtocol::Tcp
+                | IpProtocol::Udp
+                | IpProtocol::Icmp
+                | IpProtocol::Icmpv6
         ) {
             self.packet_container.replace((item, protocol));
         } else {
@@ -222,10 +231,12 @@ impl futures::Stream for StackSplitStream {
                 trace_ip_packet("tun reply packet", packet.data());
                 std::task::Poll::Ready(Some(Ok(packet)))
             }
-            std::task::Poll::Ready(None) => std::task::Poll::Ready(Some(Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "Tun stream closed",
-            )))),
+            std::task::Poll::Ready(None) => {
+                std::task::Poll::Ready(Some(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "Tun stream closed",
+                ))))
+            }
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }

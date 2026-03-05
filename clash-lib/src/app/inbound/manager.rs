@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 use tokio::{sync::RwLock, task::JoinHandle};
 
 use crate::{
-    app::{dispatcher::Dispatcher, inbound::network_listener::build_network_listeners},
+    app::{
+        dispatcher::Dispatcher, inbound::network_listener::build_network_listeners,
+    },
     common::auth::ThreadSafeAuthenticator,
     config::internal::{config::BindAddress, listener::InboundOpts},
 };
@@ -72,13 +74,16 @@ impl InboundManager {
         }
 
         for (opts, handler) in self.inbound_handlers.write().await.iter_mut() {
-            *handler =
-                build_network_listeners(opts, self.dispatcher.clone(), self.authenticator.clone())
-                    .map(|r| {
-                        tokio::spawn(async move {
-                            futures::future::join_all(r).await;
-                        })
-                    });
+            *handler = build_network_listeners(
+                opts,
+                self.dispatcher.clone(),
+                self.authenticator.clone(),
+            )
+            .map(|r| {
+                tokio::spawn(async move {
+                    futures::future::join_all(r).await;
+                })
+            });
         }
     }
 
@@ -102,10 +107,16 @@ impl InboundManager {
         for opts in guard.keys() {
             match &opts {
                 #[cfg(feature = "http_port")]
-                InboundOpts::Http { common_opts } => ports.port = Some(common_opts.port),
-                InboundOpts::Socks { common_opts, .. } => ports.socks_port = Some(common_opts.port),
+                InboundOpts::Http { common_opts } => {
+                    ports.port = Some(common_opts.port)
+                }
+                InboundOpts::Socks { common_opts, .. } => {
+                    ports.socks_port = Some(common_opts.port)
+                }
                 #[cfg(feature = "mixed_port")]
-                InboundOpts::Mixed { common_opts, .. } => ports.mixed_port = Some(common_opts.port),
+                InboundOpts::Mixed { common_opts, .. } => {
+                    ports.mixed_port = Some(common_opts.port)
+                }
             }
         }
         ports
@@ -154,11 +165,13 @@ impl InboundManager {
                     ports.port.is_some() && Some(common_opts.port) == ports.port
                 }
                 InboundOpts::Socks { common_opts, .. } => {
-                    ports.socks_port.is_some() && Some(common_opts.port) == ports.socks_port
+                    ports.socks_port.is_some()
+                        && Some(common_opts.port) == ports.socks_port
                 }
                 #[cfg(feature = "mixed_port")]
                 InboundOpts::Mixed { common_opts, .. } => {
-                    ports.mixed_port.is_some() && Some(common_opts.port) == ports.mixed_port
+                    ports.mixed_port.is_some()
+                        && Some(common_opts.port) == ports.mixed_port
                 }
             })
             .collect();
@@ -166,7 +179,9 @@ impl InboundManager {
         for (mut opts, handle) in listeners {
             opts.common_opts_mut().port = match &opts {
                 #[cfg(feature = "http_port")]
-                InboundOpts::Http { common_opts } => ports.port.unwrap_or(common_opts.port),
+                InboundOpts::Http { common_opts } => {
+                    ports.port.unwrap_or(common_opts.port)
+                }
                 InboundOpts::Socks { common_opts, .. } => {
                     ports.socks_port.unwrap_or(common_opts.port)
                 }

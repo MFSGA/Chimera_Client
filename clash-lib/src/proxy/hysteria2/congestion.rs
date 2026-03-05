@@ -18,7 +18,11 @@ impl DynCongestion {
 }
 
 impl ControllerFactory for DynCongestion {
-    fn build(self: Arc<Self>, _now: Instant, current_mtu: u16) -> Box<dyn Controller> {
+    fn build(
+        self: Arc<Self>,
+        _now: Instant,
+        current_mtu: u16,
+    ) -> Box<dyn Controller> {
         let mut bbr_config = BbrConfig::default();
         if let Some(cwnd_packets) = self.cwnd_packets {
             let cwnd_bytes = cwnd_packets.saturating_mul(current_mtu as u64);
@@ -97,7 +101,9 @@ impl Controller for Brutal {
     }
 
     fn window(&self) -> u64 {
-        if self.budget_at_last_sent < self.max_datagram_size && self.last_send_time.is_some() {
+        if self.budget_at_last_sent < self.max_datagram_size
+            && self.last_send_time.is_some()
+        {
             return 0;
         }
 
@@ -105,9 +111,10 @@ impl Controller for Brutal {
             return 10_240;
         }
 
-        let window =
-            (self.bps as f64 * self.rtt.as_secs_f64() * CONGESTION_WINDOW_MULTIPLIER as f64
-                / self.ack_rate.max(MIN_ACK_RATE)) as u64;
+        let window = (self.bps as f64
+            * self.rtt.as_secs_f64()
+            * CONGESTION_WINDOW_MULTIPLIER as f64
+            / self.ack_rate.max(MIN_ACK_RATE)) as u64;
         window.max(self.max_datagram_size)
     }
 
@@ -117,9 +124,11 @@ impl Controller for Brutal {
 
         let budget = match self.last_send_time {
             Some(last_send_time) => {
-                let elapsed = now.saturating_duration_since(last_send_time).as_secs_f64();
-                (self.budget_at_last_sent as f64 + elapsed * self.effective_bandwidth())
-                    .min(max_budget)
+                let elapsed =
+                    now.saturating_duration_since(last_send_time).as_secs_f64();
+                (self.budget_at_last_sent as f64
+                    + elapsed * self.effective_bandwidth())
+                .min(max_budget)
             }
             None => max_budget,
         };
@@ -156,7 +165,8 @@ impl Controller for Brutal {
         let slot_time = now.saturating_duration_since(self.start_time).as_secs();
         let slot_idx = (slot_time % SLOT_COUNT) as usize;
         let current_lost_packet_num = self.connection.stats().path.lost_packets;
-        let lost_delta = current_lost_packet_num.saturating_sub(self.last_lost_packet_num);
+        let lost_delta =
+            current_lost_packet_num.saturating_sub(self.last_lost_packet_num);
 
         if self.slots[slot_idx].time != slot_time {
             self.slots[slot_idx] = SlotInfo {
@@ -165,8 +175,10 @@ impl Controller for Brutal {
                 lost: lost_delta,
             };
         } else {
-            self.slots[slot_idx].ack = self.slots[slot_idx].ack.saturating_add(self.ack);
-            self.slots[slot_idx].lost = self.slots[slot_idx].lost.saturating_add(lost_delta);
+            self.slots[slot_idx].ack =
+                self.slots[slot_idx].ack.saturating_add(self.ack);
+            self.slots[slot_idx].lost =
+                self.slots[slot_idx].lost.saturating_add(lost_delta);
         }
 
         self.last_lost_packet_num = current_lost_packet_num;
@@ -312,7 +324,8 @@ mod tests {
     #[test]
     fn dyn_congestion_applies_cwnd_packets() {
         let mtu = 1_250;
-        let controller = Arc::new(DynCongestion::new(Some(8))).build(Instant::now(), mtu);
+        let controller =
+            Arc::new(DynCongestion::new(Some(8))).build(Instant::now(), mtu);
         assert_eq!(controller.initial_window(), 8 * mtu as u64);
     }
 }

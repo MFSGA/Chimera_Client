@@ -108,7 +108,9 @@ pub(super) fn convert(
     }
     #[cfg(not(feature = "mixed_port"))]
     if c.mixed_port.is_some() {
-        warn!("ignoring top-level `mixed-port` because `mixed_port` feature is disabled");
+        warn!(
+            "ignoring top-level `mixed-port` because `mixed_port` feature is disabled"
+        );
     }
     Ok(all_inbounds)
 }

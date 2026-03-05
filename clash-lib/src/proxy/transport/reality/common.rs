@@ -61,7 +61,8 @@ pub const MAX_TLS_PLAINTEXT_LEN: usize = 16384;
 pub const TLS_RECORD_HEADER_SIZE: usize = 5;
 
 /// Maximum TLS record size (ciphertext + header)
-pub const TLS_MAX_RECORD_SIZE: usize = MAX_TLS_CIPHERTEXT_LEN + TLS_RECORD_HEADER_SIZE;
+pub const TLS_MAX_RECORD_SIZE: usize =
+    MAX_TLS_CIPHERTEXT_LEN + TLS_RECORD_HEADER_SIZE;
 
 /// Buffer capacity for ciphertext read (2x TLS max record for safety)
 pub const CIPHERTEXT_READ_BUF_CAPACITY: usize = TLS_MAX_RECORD_SIZE * 2;
@@ -217,7 +218,8 @@ mod tests {
     fn test_strip_content_type_slice_with_padding() {
         // TLS 1.3 format: content || type || optional zero padding
         let plaintext = vec![0x10, 0x20, CONTENT_TYPE_HANDSHAKE, 0x00, 0x00];
-        let (content_type, valid_len) = strip_content_type_slice(&plaintext).unwrap();
+        let (content_type, valid_len) =
+            strip_content_type_slice(&plaintext).unwrap();
         assert_eq!(content_type, CONTENT_TYPE_HANDSHAKE);
         assert_eq!(&plaintext[..valid_len], &[0x10, 0x20]);
     }
@@ -233,7 +235,8 @@ mod tests {
     #[test]
     fn test_strip_with_padding_strips_zeros() {
         // TLS 1.3 format: content || type || padding
-        let mut plaintext = vec![0x01, 0x02, CONTENT_TYPE_HANDSHAKE, 0x00, 0x00, 0x00];
+        let mut plaintext =
+            vec![0x01, 0x02, CONTENT_TYPE_HANDSHAKE, 0x00, 0x00, 0x00];
         let ct = strip_content_type_with_padding(&mut plaintext).unwrap();
         assert_eq!(ct, CONTENT_TYPE_HANDSHAKE);
         assert_eq!(plaintext, vec![0x01, 0x02]);

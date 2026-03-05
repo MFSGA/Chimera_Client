@@ -68,7 +68,9 @@ fn build_transport(
     }
 }
 
-fn build_tcp_transport(s: &OutboundVless) -> Result<Option<Box<dyn Transport>>, Error> {
+fn build_tcp_transport(
+    s: &OutboundVless,
+) -> Result<Option<Box<dyn Transport>>, Error> {
     if s.reality_opts.is_none() {
         return Ok(None);
     }
@@ -104,7 +106,10 @@ fn decode_reality_public_key(input: &str) -> Result<[u8; 32], Error> {
     }
 
     let bytes = general_purpose::STANDARD.decode(input).map_err(|err| {
-        Error::InvalidConfig(format!("invalid reality public-key '{}': {err}", input))
+        Error::InvalidConfig(format!(
+            "invalid reality public-key '{}': {err}",
+            input
+        ))
     })?;
 
     if bytes.len() != 32 {
@@ -129,7 +134,10 @@ fn decode_reality_short_id(short_id: Option<&str>) -> Result<[u8; 8], Error> {
     };
 
     decode_short_id(normalized).map_err(|err| {
-        Error::InvalidConfig(format!("invalid reality short-id '{}': {err}", normalized))
+        Error::InvalidConfig(format!(
+            "invalid reality short-id '{}': {err}",
+            normalized
+        ))
     })
 }
 
@@ -138,7 +146,9 @@ mod tests {
     #[cfg(feature = "aws-lc-rs")]
     use super::decode_reality_short_id;
     use super::tls_server_name;
-    use crate::config::internal::proxy::{CommonConfigOptions, OutboundVless, WsOpt};
+    use crate::config::internal::proxy::{
+        CommonConfigOptions, OutboundVless, WsOpt,
+    };
     use std::collections::HashMap;
 
     #[test]
@@ -178,7 +188,8 @@ mod tests {
     #[cfg(feature = "aws-lc-rs")]
     #[test]
     fn reality_short_id_accepts_empty_as_zero_short_id() {
-        let decoded = decode_reality_short_id(Some("")).expect("empty short-id should decode");
+        let decoded =
+            decode_reality_short_id(Some("")).expect("empty short-id should decode");
         assert_eq!(decoded, [0; 8]);
     }
 }

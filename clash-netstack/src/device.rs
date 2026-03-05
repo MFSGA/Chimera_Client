@@ -44,8 +44,13 @@ impl Device for NetstackDevice {
     type RxToken<'a> = RxTokenImpl;
     type TxToken<'a> = TxTokenImpl<'a>;
 
-    fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        if let (Ok(packet), Ok(permit)) = (self.rx_queue.try_recv(), self.tx_sender.try_reserve()) {
+    fn receive(
+        &mut self,
+        _timestamp: Instant,
+    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        if let (Ok(packet), Ok(permit)) =
+            (self.rx_queue.try_recv(), self.tx_sender.try_reserve())
+        {
             let rx_token = RxTokenImpl { packet };
             let tx_token = TxTokenImpl { tx_sender: permit };
             self.iface_notifier

@@ -67,13 +67,17 @@ pub async fn handle_tcp(
             let ulen = buf[1] as usize;
             buf.resize(ulen, 0);
             s.read_exact(&mut buf[..]).await?;
-            let user = unsafe { str::from_utf8_unchecked(buf.to_owned().as_ref()).to_owned() };
+            let user = unsafe {
+                str::from_utf8_unchecked(buf.to_owned().as_ref()).to_owned()
+            };
 
             s.read_exact(&mut buf[..1]).await?;
             let plen = buf[0] as usize;
             buf.resize(plen, 0);
             s.read_exact(&mut buf[..]).await?;
-            let pass = unsafe { str::from_utf8_unchecked(buf.to_owned().as_ref()).to_owned() };
+            let pass = unsafe {
+                str::from_utf8_unchecked(buf.to_owned().as_ref()).to_owned()
+            };
 
             match authenticator.authenticate(&user, &pass) {
                 // +----+--------+

@@ -45,6 +45,8 @@ pub async fn handle() -> impl IntoResponse {
             });
             Json(map).into_response()
         }
-        Err(e) => (http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => {
+            (http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
     }
 }

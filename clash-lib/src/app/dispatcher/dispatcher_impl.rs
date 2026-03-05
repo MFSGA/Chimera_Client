@@ -73,14 +73,19 @@ impl Dispatcher {
     }
 
     #[instrument(skip(self, sess, lhs))]
-    pub async fn dispatch_stream(&self, mut sess: Session, mut lhs: Box<dyn ClientStream>) {
-        let dest: SocksAddr = match reverse_lookup(&self.resolver, &sess.destination).await {
-            Some(dest) => dest,
-            None => {
-                warn!("failed to resolve destination {}", sess);
-                return;
-            }
-        };
+    pub async fn dispatch_stream(
+        &self,
+        mut sess: Session,
+        mut lhs: Box<dyn ClientStream>,
+    ) {
+        let dest: SocksAddr =
+            match reverse_lookup(&self.resolver, &sess.destination).await {
+                Some(dest) => dest,
+                None => {
+                    warn!("failed to resolve destination {}", sess);
+                    return;
+                }
+            };
 
         sess.destination = dest.clone();
 
@@ -107,7 +112,13 @@ impl Dispatcher {
         {
             Ok(rhs) => {
                 debug!("remote connection established {}", sess);
-                let rhs = TrackedStream::new(rhs, self.manager.clone(), sess.clone(), rule).await;
+                let rhs = TrackedStream::new(
+                    rhs,
+                    self.manager.clone(),
+                    sess.clone(),
+                    rule,
+                )
+                .await;
                 log::debug!("todo use custom error");
                 match copy_bidirectional(
                     lhs,
@@ -129,40 +140,60 @@ impl Dispatcher {
                         );
                     }
                     Err(err) => match err {
-                        crate::common::io::CopyBidirectionalError::LeftClosed(err) => match err
-                            .kind()
-                        {
+                        crate::common::io::CopyBidirectionalError::LeftClosed(
+                            err,
+                        ) => match err.kind() {
                             std::io::ErrorKind::UnexpectedEof
                             | std::io::ErrorKind::ConnectionReset
                             | std::io::ErrorKind::BrokenPipe => {
-                                debug!("connection {} closed with error {} by local", sess, err);
+                                debug!(
+                                    "connection {} closed with error {} by local",
+                                    sess, err
+                                );
                             }
                             _ => {
-                                warn!("connection {} closed with error {} by local", sess, err);
+                                warn!(
+                                    "connection {} closed with error {} by local",
+                                    sess, err
+                                );
                             }
                         },
-                        crate::common::io::CopyBidirectionalError::RightClosed(err) => match err
-                            .kind()
-                        {
+                        crate::common::io::CopyBidirectionalError::RightClosed(
+                            err,
+                        ) => match err.kind() {
                             std::io::ErrorKind::UnexpectedEof
                             | std::io::ErrorKind::ConnectionReset
                             | std::io::ErrorKind::BrokenPipe => {
-                                debug!("connection {} closed with error {} by remote", sess, err);
+                                debug!(
+                                    "connection {} closed with error {} by remote",
+                                    sess, err
+                                );
                             }
                             _ => {
-                                warn!("connection {} closed with error {} by remote", sess, err);
+                                warn!(
+                                    "connection {} closed with error {} by remote",
+                                    sess, err
+                                );
                             }
                         },
-                        crate::common::io::CopyBidirectionalError::Other(err) => match err.kind() {
-                            std::io::ErrorKind::UnexpectedEof
-                            | std::io::ErrorKind::ConnectionReset
-                            | std::io::ErrorKind::BrokenPipe => {
-                                debug!("connection {} closed with error {}", sess, err);
+                        crate::common::io::CopyBidirectionalError::Other(err) => {
+                            match err.kind() {
+                                std::io::ErrorKind::UnexpectedEof
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::BrokenPipe => {
+                                    debug!(
+                                        "connection {} closed with error {}",
+                                        sess, err
+                                    );
+                                }
+                                _ => {
+                                    warn!(
+                                        "connection {} closed with error {}",
+                                        sess, err
+                                    );
+                                }
                             }
-                            _ => {
-                                warn!("connection {} closed with error {}", sess, err);
-                            }
-                        },
+                        }
                     },
                 }
             }
@@ -183,7 +214,10 @@ impl Dispatcher {
 // if the destination is an IP address, check if it's a fake IP
 // or look for cached IP
 // if the destination is a domain name, don't resolve
-async fn reverse_lookup(resolver: &Arc<dyn ClashResolver>, dst: &SocksAddr) -> Option<SocksAddr> {
+async fn reverse_lookup(
+    resolver: &Arc<dyn ClashResolver>,
+    dst: &SocksAddr,
+) -> Option<SocksAddr> {
     let dst = match dst {
         crate::session::SocksAddr::Ip(socket_addr) => {
             todo!()

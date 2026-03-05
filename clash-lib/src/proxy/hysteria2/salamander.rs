@@ -77,7 +77,9 @@ impl std::fmt::Debug for Salamander {
 }
 
 impl AsyncUdpSocket for Salamander {
-    fn create_io_poller(self: Arc<Self>) -> std::pin::Pin<Box<dyn quinn::UdpPoller>> {
+    fn create_io_poller(
+        self: Arc<Self>,
+    ) -> std::pin::Pin<Box<dyn quinn::UdpPoller>> {
         self.inner.clone().create_io_poller()
     }
 

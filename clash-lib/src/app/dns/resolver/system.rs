@@ -40,7 +40,11 @@ impl ClashResolver for SystemResolver {
         self.ipv6.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    async fn resolve(&self, host: &str, _: bool) -> anyhow::Result<Option<std::net::IpAddr>> {
+    async fn resolve(
+        &self,
+        host: &str,
+        _: bool,
+    ) -> anyhow::Result<Option<std::net::IpAddr>> {
         let response = tokio::net::lookup_host(format!("{host}:0"))
             .await?
             .filter_map(|x| {

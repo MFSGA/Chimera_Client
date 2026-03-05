@@ -7,7 +7,9 @@ use tracing::warn;
 
 use crate::common::{auth::ThreadSafeAuthenticator, errors::map_io_error};
 
-fn parse_basic_proxy_authorization(req: &Request<hyper::body::Incoming>) -> Option<&str> {
+fn parse_basic_proxy_authorization(
+    req: &Request<hyper::body::Incoming>,
+) -> Option<&str> {
     req.headers()
         .get(hyper::header::PROXY_AUTHORIZATION)
         .map(|v| v.to_str().unwrap_or_default())

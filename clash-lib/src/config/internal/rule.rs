@@ -82,7 +82,8 @@ mod tests {
 
     #[test]
     fn parse_domain_suffix_rule() {
-        let rule = RuleType::try_from("DOMAIN-SUFFIX,example.com,PROXY".to_string()).unwrap();
+        let rule = RuleType::try_from("DOMAIN-SUFFIX,example.com,PROXY".to_string())
+            .unwrap();
         match rule {
             RuleType::DomainSuffix {
                 domain_suffix,

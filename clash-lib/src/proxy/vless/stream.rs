@@ -31,8 +31,9 @@ impl VlessStream {
         destination: &SocksAddr,
         is_udp: bool,
     ) -> io::Result<Self> {
-        let uuid = uuid::Uuid::parse_str(uuid)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid UUID format"))?;
+        let uuid = uuid::Uuid::parse_str(uuid).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid UUID format")
+        })?;
 
         debug!("VLESS stream created for destination: {}", destination);
 
@@ -124,12 +125,15 @@ impl VlessStream {
 
         if additional_info_len > 0 {
             let mut additional_info = vec![0u8; additional_info_len as usize];
-            tokio::io::AsyncReadExt::read_exact(&mut self.inner, &mut additional_info)
-                .await
-                .map_err(|e| {
-                    error!("Failed to read VLESS additional info: {}", e);
-                    e
-                })?;
+            tokio::io::AsyncReadExt::read_exact(
+                &mut self.inner,
+                &mut additional_info,
+            )
+            .await
+            .map_err(|e| {
+                error!("Failed to read VLESS additional info: {}", e);
+                e
+            })?;
             debug!(
                 "VLESS additional info received: {} bytes",
                 additional_info_len
@@ -185,7 +189,10 @@ impl AsyncWrite for VlessStream {
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 

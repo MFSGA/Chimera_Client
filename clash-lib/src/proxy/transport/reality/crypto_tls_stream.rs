@@ -334,7 +334,10 @@ where
         Poll::Ready(Ok(pos))
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
         // Flush the session writer first (tokio-rustls pattern)
         // This ensures any buffered plaintext is moved to the TLS output buffer
         self.session.writer().flush()?;
@@ -368,7 +371,10 @@ where
         }
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
         // 1. First drain any pending application data (before sending close_notify)
         //    This is important because REALITY's write_tls() does lazy encryption -
         //    plaintext is encrypted when write_tls() is called, not when written to

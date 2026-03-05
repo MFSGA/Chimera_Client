@@ -35,7 +35,8 @@ pub trait GroupProxyAPIResponse: OutboundHandler {
 
         m.insert(
             "all".to_string(),
-            Box::new(all.iter().map(|x| x.name().to_owned()).collect::<Vec<_>>()) as _,
+            Box::new(all.iter().map(|x| x.name().to_owned()).collect::<Vec<_>>())
+                as _,
         );
         m
     }

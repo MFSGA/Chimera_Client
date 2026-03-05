@@ -164,7 +164,8 @@ impl TrackedStream {
         Arc<dyn TrackCopy + Send + Sync>,
         Arc<dyn TrackCopy + Send + Sync>,
     ) {
-        let r = Arc::new(ReadTracker::new(self.tracker.clone(), self.manager.clone()));
+        let r =
+            Arc::new(ReadTracker::new(self.tracker.clone(), self.manager.clone()));
         let w = Arc::new(WriteTracker::new(
             self.tracker.clone(),
             self.manager.clone(),
@@ -476,9 +477,10 @@ impl Stream for TrackedDatagram {
         let r = Pin::new(self.inner.as_mut()).poll_next(cx);
         if let Poll::Ready(Some(pkt)) = &r {
             self.manager.push_downloaded(pkt.data.len());
-            self.tracker
-                .download_total
-                .fetch_add(pkt.data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            self.tracker.download_total.fetch_add(
+                pkt.data.len() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         r
     }
@@ -503,7 +505,10 @@ impl Sink<UdpPacket> for TrackedDatagram {
         Pin::new(self.inner.as_mut()).poll_ready(cx)
     }
 
-    fn start_send(mut self: Pin<&mut Self>, item: UdpPacket) -> Result<(), Self::Error> {
+    fn start_send(
+        mut self: Pin<&mut Self>,
+        item: UdpPacket,
+    ) -> Result<(), Self::Error> {
         match self.close_notify.try_recv() {
             Ok(_) => return Err(io::ErrorKind::BrokenPipe.into()),
             Err(e) => match e {

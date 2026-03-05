@@ -46,12 +46,14 @@ impl LockFreeRingBuffer {
             // Handle wrap-around
             if write_pos + to_write <= self.capacity {
                 // No wrap
-                buffer[write_pos..write_pos + to_write].copy_from_slice(&data[..to_write]);
+                buffer[write_pos..write_pos + to_write]
+                    .copy_from_slice(&data[..to_write]);
             } else {
                 // Wrap around
                 let first_part = self.capacity - write_pos;
                 buffer[write_pos..].copy_from_slice(&data[..first_part]);
-                buffer[..to_write - first_part].copy_from_slice(&data[first_part..to_write]);
+                buffer[..to_write - first_part]
+                    .copy_from_slice(&data[first_part..to_write]);
             }
         }
 
@@ -85,12 +87,14 @@ impl LockFreeRingBuffer {
             // Handle wrap-around
             if read_pos + to_read <= self.capacity {
                 // No wrap
-                buf[..to_read].copy_from_slice(&buffer[read_pos..read_pos + to_read]);
+                buf[..to_read]
+                    .copy_from_slice(&buffer[read_pos..read_pos + to_read]);
             } else {
                 // Wrap around
                 let first_part = self.capacity - read_pos;
                 buf[..first_part].copy_from_slice(&buffer[read_pos..]);
-                buf[first_part..to_read].copy_from_slice(&buffer[..to_read - first_part]);
+                buf[first_part..to_read]
+                    .copy_from_slice(&buffer[..to_read - first_part]);
             }
         }
 
@@ -102,7 +106,8 @@ impl LockFreeRingBuffer {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.read_pos.load(Ordering::Acquire) == self.write_pos.load(Ordering::Acquire)
+        self.read_pos.load(Ordering::Acquire)
+            == self.write_pos.load(Ordering::Acquire)
     }
 
     pub fn is_full(&self) -> bool {

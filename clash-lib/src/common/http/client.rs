@@ -63,7 +63,9 @@ impl HttpClient {
         let connect = TcpStream::connect((host, port));
         tokio::time::timeout(self.timeout, connect)
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tcp connect timeout"))?
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "tcp connect timeout")
+            })?
     }
 
     pub async fn request<T>(
@@ -146,18 +148,22 @@ impl HttpClient {
             }
             #[cfg(feature = "tls")]
             Some(scheme) if scheme == &http::uri::Scheme::HTTPS => {
-                let connector = tokio_rustls::TlsConnector::from(self.tls_config.clone());
+                let connector =
+                    tokio_rustls::TlsConnector::from(self.tls_config.clone());
 
                 let stream = tokio::time::timeout(
                     self.timeout,
                     connector.connect(
-                        host.try_into()
-                            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad SNI"))?,
+                        host.try_into().map_err(|_| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "bad SNI")
+                        })?,
                         stream,
                     ),
                 )
                 .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tls connect timeout"))?
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "tls connect timeout")
+                })?
                 .map_err(io::Error::other)?;
 
                 let io = TokioIo::new(stream);

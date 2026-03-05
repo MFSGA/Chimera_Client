@@ -162,7 +162,9 @@ impl FromStr for Config {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut val: Value = serde_yaml::from_str(s).map_err(|e| {
-            Error::InvalidConfig(format!("couldn't not parse config content {s}: {e}"))
+            Error::InvalidConfig(format!(
+                "couldn't not parse config content {s}: {e}"
+            ))
         })?;
 
         val.apply_merge().map_err(|e| {
@@ -171,8 +173,9 @@ impl FromStr for Config {
             ))
         })?;
 
-        serde_yaml::from_value(val)
-            .map_err(|e| Error::InvalidConfig(format!("could not parse config content: {e}")))
+        serde_yaml::from_value(val).map_err(|e| {
+            Error::InvalidConfig(format!("could not parse config content: {e}"))
+        })
     }
 }
 
@@ -299,9 +302,13 @@ impl<'de> Deserialize<'de> for Port {
                 .map(Port)
                 .map_err(|_| serde::de::Error::custom("Port number out of range")),
 
-            StrOrNum::Str(s) => s.parse::<u16>().map(Port).map_err(serde::de::Error::custom),
+            StrOrNum::Str(s) => {
+                s.parse::<u16>().map(Port).map_err(serde::de::Error::custom)
+            }
 
-            StrOrNum::Other => Err(serde::de::Error::custom("Invalid type for port")),
+            StrOrNum::Other => {
+                Err(serde::de::Error::custom("Invalid type for port"))
+            }
         }
     }
 }

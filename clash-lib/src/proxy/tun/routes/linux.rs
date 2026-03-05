@@ -2,7 +2,8 @@ use ipnet::IpNet;
 use tracing::warn;
 
 use crate::{
-    app::net::OutboundInterface, common::errors::new_io_error, config::internal::config::TunConfig,
+    app::net::OutboundInterface, common::errors::new_io_error,
+    config::internal::config::TunConfig,
 };
 
 pub fn check_ip_command_installed() -> std::io::Result<()> {
@@ -66,7 +67,10 @@ fn run_ip_cmd(args: &[&str], enable_v6: bool) -> std::io::Result<()> {
     Ok(())
 }
 
-pub fn setup_policy_routing(tun_cfg: &TunConfig, via: &OutboundInterface) -> std::io::Result<()> {
+pub fn setup_policy_routing(
+    tun_cfg: &TunConfig,
+    via: &OutboundInterface,
+) -> std::io::Result<()> {
     let table = tun_cfg.route_table.to_string();
     let dev = via.name.as_str();
     let enable_v6 = tun_cfg.gateway_v6.is_some();

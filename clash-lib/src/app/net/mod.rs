@@ -1,7 +1,9 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 #[cfg(feature = "tun")]
-use network_interface::{NetworkInterface, NetworkInterfaceConfig, V4IfAddr, V6IfAddr};
+use network_interface::{
+    NetworkInterface, NetworkInterfaceConfig, V4IfAddr, V6IfAddr,
+};
 use serde::Serialize;
 #[cfg(feature = "tun")]
 use std::sync::{Arc, LazyLock};
@@ -13,7 +15,8 @@ pub static DEFAULT_OUTBOUND_INTERFACE: LazyLock<
     Arc<tokio::sync::RwLock<Option<OutboundInterface>>>,
 > = LazyLock::new(Default::default);
 #[cfg(feature = "tun")]
-pub static TUN_SOMARK: LazyLock<tokio::sync::RwLock<Option<u32>>> = LazyLock::new(Default::default);
+pub static TUN_SOMARK: LazyLock<tokio::sync::RwLock<Option<u32>>> =
+    LazyLock::new(Default::default);
 
 #[cfg(feature = "tun")]
 fn is_documentation_v6(addr: Ipv6Addr) -> bool {
@@ -141,7 +144,8 @@ pub fn get_outbound_interface() -> Option<OutboundInterface> {
         .into_iter()
         .map(Into::into)
         .filter(|iface: &OutboundInterface| {
-            !iface.name.contains("tun") && (iface.addr_v4.is_some() || iface.addr_v6.is_some())
+            !iface.name.contains("tun")
+                && (iface.addr_v4.is_some() || iface.addr_v6.is_some())
         })
         .collect::<Vec<_>>();
 
@@ -167,7 +171,9 @@ pub fn get_outbound_interface() -> Option<OutboundInterface> {
             (Some(left), Some(right)) => {
                 if is_global_unicast_like(left) && !is_global_unicast_like(right) {
                     return std::cmp::Ordering::Less;
-                } else if !is_global_unicast_like(left) && is_global_unicast_like(right) {
+                } else if !is_global_unicast_like(left)
+                    && is_global_unicast_like(right)
+                {
                     return std::cmp::Ordering::Greater;
                 }
             }

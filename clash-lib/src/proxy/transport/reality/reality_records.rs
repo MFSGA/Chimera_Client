@@ -50,7 +50,11 @@ impl<'a> RecordEncryptor<'a> {
 
         if plaintext.len() <= MAX_TLS_PLAINTEXT_LEN {
             // Fast path: single record, encrypt in-place
-            self.encrypt_record_in_place(plaintext, out, CONTENT_TYPE_APPLICATION_DATA)?;
+            self.encrypt_record_in_place(
+                plaintext,
+                out,
+                CONTENT_TYPE_APPLICATION_DATA,
+            )?;
         } else {
             // Slow path: fragment into multiple records
             self.encrypt_fragmented(plaintext, out, CONTENT_TYPE_APPLICATION_DATA)?;
@@ -62,7 +66,11 @@ impl<'a> RecordEncryptor<'a> {
 
     /// Encrypt handshake data into TLS 1.3 records.
     #[inline]
-    pub fn encrypt_handshake(&mut self, data: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
+    pub fn encrypt_handshake(
+        &mut self,
+        data: &[u8],
+        out: &mut Vec<u8>,
+    ) -> io::Result<()> {
         if data.is_empty() {
             return Ok(());
         }
@@ -112,7 +120,11 @@ impl<'a> RecordEncryptor<'a> {
                         target_record_size,
                     )?;
                 } else {
-                    self.encrypt_record_in_place(&mut buf, out, CONTENT_TYPE_HANDSHAKE)?;
+                    self.encrypt_record_in_place(
+                        &mut buf,
+                        out,
+                        CONTENT_TYPE_HANDSHAKE,
+                    )?;
                 }
             }
             return Ok(());
@@ -203,9 +215,12 @@ impl<'a> RecordEncryptor<'a> {
         // So: inner_plaintext_with_padding = target_record_size - 5 - 16 = target_record_size - 21
         // Padding = inner_plaintext_with_padding - buf.len()
         let current_inner_len = buf.len();
-        let target_inner_len = target_record_size.saturating_sub(TLS_RECORD_HEADER_SIZE + 16);
+        let target_inner_len =
+            target_record_size.saturating_sub(TLS_RECORD_HEADER_SIZE + 16);
 
-        if target_inner_len > current_inner_len && target_inner_len <= MAX_TLS_PLAINTEXT_LEN + 1 {
+        if target_inner_len > current_inner_len
+            && target_inner_len <= MAX_TLS_PLAINTEXT_LEN + 1
+        {
             let padding = target_inner_len - current_inner_len;
             buf.resize(buf.len() + padding, 0);
             log::trace!(
@@ -359,7 +374,8 @@ mod tests {
         record_len: u16,
     ) -> io::Result<(u8, Vec<u8>)> {
         let mut buf = ciphertext.to_vec();
-        let (content_type, plaintext) = decryptor.decrypt_record_in_place(&mut buf, record_len)?;
+        let (content_type, plaintext) =
+            decryptor.decrypt_record_in_place(&mut buf, record_len)?;
         Ok((content_type, plaintext.to_vec()))
     }
 
@@ -412,7 +428,8 @@ mod tests {
         assert_eq!(ciphertext_buf[0], CONTENT_TYPE_APPLICATION_DATA);
         assert_eq!(ciphertext_buf[1], 0x03);
         assert_eq!(ciphertext_buf[2], 0x03);
-        let record_len = u16::from_be_bytes([ciphertext_buf[3], ciphertext_buf[4]]) as usize;
+        let record_len =
+            u16::from_be_bytes([ciphertext_buf[3], ciphertext_buf[4]]) as usize;
         assert_eq!(record_len, 100 + 1 + 16);
     }
 
@@ -464,14 +481,16 @@ mod tests {
         assert_eq!(seq, 2); // Two records encrypted
 
         // First record: full MAX_TLS_PLAINTEXT_LEN
-        let first_record_len = TLS_RECORD_HEADER_SIZE + MAX_TLS_PLAINTEXT_LEN + 1 + 16;
+        let first_record_len =
+            TLS_RECORD_HEADER_SIZE + MAX_TLS_PLAINTEXT_LEN + 1 + 16;
         // Second record: 1 byte
         let second_record_len = TLS_RECORD_HEADER_SIZE + 1 + 1 + 16;
         assert_eq!(ciphertext_buf.len(), first_record_len + second_record_len);
 
         // Verify first record header
         assert_eq!(ciphertext_buf[0], CONTENT_TYPE_APPLICATION_DATA);
-        let first_payload_len = u16::from_be_bytes([ciphertext_buf[3], ciphertext_buf[4]]) as usize;
+        let first_payload_len =
+            u16::from_be_bytes([ciphertext_buf[3], ciphertext_buf[4]]) as usize;
         assert_eq!(first_payload_len, MAX_TLS_PLAINTEXT_LEN + 1 + 16);
 
         // Verify second record header
@@ -560,8 +579,15 @@ mod tests {
         let initial_len = ciphertext_buf.len();
 
         let mut plaintext = vec![0x48u8; 100];
-        encrypt_plaintext_to_records(CS, &mut plaintext, &key, &iv, &mut seq, &mut ciphertext_buf)
-            .unwrap();
+        encrypt_plaintext_to_records(
+            CS,
+            &mut plaintext,
+            &key,
+            &iv,
+            &mut seq,
+            &mut ciphertext_buf,
+        )
+        .unwrap();
 
         // Should append, not overwrite
         assert!(ciphertext_buf.len() > initial_len);
@@ -642,7 +668,8 @@ mod tests {
         assert_eq!(ciphertext_buf[0], CONTENT_TYPE_APPLICATION_DATA);
         assert_eq!(ciphertext_buf[1], 0x03);
         assert_eq!(ciphertext_buf[2], 0x03);
-        let record_len = u16::from_be_bytes([ciphertext_buf[3], ciphertext_buf[4]]) as usize;
+        let record_len =
+            u16::from_be_bytes([ciphertext_buf[3], ciphertext_buf[4]]) as usize;
         assert_eq!(record_len, 500 + 1 + 16);
     }
 
@@ -691,7 +718,8 @@ mod tests {
         assert_eq!(seq, 2); // Two records encrypted
 
         // First record: full MAX_TLS_PLAINTEXT_LEN
-        let first_record_len = TLS_RECORD_HEADER_SIZE + MAX_TLS_PLAINTEXT_LEN + 1 + 16;
+        let first_record_len =
+            TLS_RECORD_HEADER_SIZE + MAX_TLS_PLAINTEXT_LEN + 1 + 16;
         // Second record: 1 byte
         let second_record_len = TLS_RECORD_HEADER_SIZE + 1 + 1 + 16;
         assert_eq!(ciphertext_buf.len(), first_record_len + second_record_len);
@@ -827,7 +855,8 @@ mod tests {
         let ciphertext = &ciphertext_buf[5..];
 
         let mut dec = RecordDecryptor::new(&aead_key, &iv, &mut dec_seq);
-        let (ct, decrypted) = decrypt_record(&mut dec, ciphertext, record_len).unwrap();
+        let (ct, decrypted) =
+            decrypt_record(&mut dec, ciphertext, record_len).unwrap();
 
         assert_eq!(ct, CONTENT_TYPE_APPLICATION_DATA);
         assert_eq!(decrypted, original);
@@ -860,11 +889,15 @@ mod tests {
         let mut offset = 0;
 
         while offset < ciphertext_buf.len() {
-            let record_len =
-                u16::from_be_bytes([ciphertext_buf[offset + 3], ciphertext_buf[offset + 4]]);
-            let ciphertext = &ciphertext_buf[offset + 5..offset + 5 + record_len as usize];
+            let record_len = u16::from_be_bytes([
+                ciphertext_buf[offset + 3],
+                ciphertext_buf[offset + 4],
+            ]);
+            let ciphertext =
+                &ciphertext_buf[offset + 5..offset + 5 + record_len as usize];
 
-            let (ct, decrypted) = decrypt_record(&mut dec, ciphertext, record_len).unwrap();
+            let (ct, decrypted) =
+                decrypt_record(&mut dec, ciphertext, record_len).unwrap();
             assert_eq!(ct, CONTENT_TYPE_APPLICATION_DATA);
             reassembled.extend_from_slice(&decrypted);
 

@@ -1,6 +1,6 @@
 use crate::{
-    Packet, device::NetstackDevice, packet::IpPacket, ring_buffer::LockFreeRingBuffer,
-    stack::IfaceEvent, tcp_stream::TcpStream,
+    Packet, device::NetstackDevice, packet::IpPacket,
+    ring_buffer::LockFreeRingBuffer, stack::IfaceEvent, tcp_stream::TcpStream,
 };
 use futures::task::AtomicWaker;
 use log::{error, trace, warn};
@@ -32,9 +32,13 @@ pub(crate) struct TcpStreamHandle {
 impl TcpStreamHandle {
     pub fn new() -> Self {
         Self {
-            recv_buffer: LockFreeRingBuffer::new(DEFAULT_TCP_RECV_BUFFER_SIZE as usize),
+            recv_buffer: LockFreeRingBuffer::new(
+                DEFAULT_TCP_RECV_BUFFER_SIZE as usize,
+            ),
             recv_waker: AtomicWaker::new(),
-            send_buffer: LockFreeRingBuffer::new(DEFAULT_TCP_SEND_BUFFER_SIZE as usize),
+            send_buffer: LockFreeRingBuffer::new(
+                DEFAULT_TCP_SEND_BUFFER_SIZE as usize,
+            ),
             send_waker: AtomicWaker::new(),
             socket_dropped: AtomicBool::new(false),
         }
@@ -62,15 +66,22 @@ impl Drop for TcpListener {
 }
 
 impl TcpListener {
-    pub fn new(inbound: mpsc::UnboundedReceiver<Packet>, outbound: mpsc::Sender<Packet>) -> Self {
+    pub fn new(
+        inbound: mpsc::UnboundedReceiver<Packet>,
+        outbound: mpsc::Sender<Packet>,
+    ) -> Self {
         // the global bus that drives the iface polling
         let (iface_notifier, iface_notifier_rx) = mpsc::unbounded_channel();
 
-        let mut config = smoltcp::iface::Config::new(smoltcp::wire::HardwareAddress::Ip);
+        let mut config =
+            smoltcp::iface::Config::new(smoltcp::wire::HardwareAddress::Ip);
         config.random_seed = rand::random();
         let mut device = NetstackDevice::new(outbound, iface_notifier.clone());
-        let mut iface =
-            smoltcp::iface::Interface::new(config, &mut device, smoltcp::time::Instant::now());
+        let mut iface = smoltcp::iface::Interface::new(
+            config,
+            &mut device,
+            smoltcp::time::Instant::now(),
+        );
         iface.set_any_ip(true);
         iface.update_ip_addrs(|ip_addrs| {
             let _ = ip_addrs.push(smoltcp::wire::IpCidr::new(
@@ -94,7 +105,8 @@ impl TcpListener {
             ))
             .expect("Failed to add default IPv6 route");
 
-        let (socket_stream_emitter, socket_stream) = mpsc::unbounded_channel::<TcpStream>();
+        let (socket_stream_emitter, socket_stream) =
+            mpsc::unbounded_channel::<TcpStream>();
 
         let socket_stream_waker = Arc::new(AtomicWaker::new());
 
@@ -139,7 +151,8 @@ impl TcpListener {
                 };
 
                 // Specially handle icmp packet by TCP interface.
-                if matches!(packet.protocol(), IpProtocol::Icmp | IpProtocol::Icmpv6) {
+                if matches!(packet.protocol(), IpProtocol::Icmp | IpProtocol::Icmpv6)
+                {
                     match device_injector.send(frame) {
                         Ok(_) => {}
                         Err(err) => {
@@ -178,10 +191,20 @@ impl TcpListener {
 
                 if packet.syn() && !packet.ack() {
                     let mut socket = tcp::Socket::new(
-                        tcp::SocketBuffer::new(vec![0u8; DEFAULT_TCP_RECV_BUFFER_SIZE as usize]),
-                        tcp::SocketBuffer::new(vec![0u8; DEFAULT_TCP_SEND_BUFFER_SIZE as usize]),
+                        tcp::SocketBuffer::new(vec![
+                            0u8;
+                            DEFAULT_TCP_RECV_BUFFER_SIZE
+                                as usize
+                        ]),
+                        tcp::SocketBuffer::new(vec![
+                            0u8;
+                            DEFAULT_TCP_SEND_BUFFER_SIZE
+                                as usize
+                        ]),
                     );
-                    socket.set_keep_alive(Some(smoltcp::time::Duration::from_secs(28)));
+                    socket.set_keep_alive(Some(smoltcp::time::Duration::from_secs(
+                        28,
+                    )));
 
                     socket.set_timeout(Some(smoltcp::time::Duration::from_secs(
                         if cfg!(target_os = "linux") { 7200 } else { 60 },
@@ -244,8 +267,10 @@ impl TcpListener {
     ) -> std::io::Result<()> {
         // Create a socket set for TCP sockets
         let mut sockets = smoltcp::iface::SocketSet::new(vec![]);
-        let mut socket_maps: HashMap<smoltcp::iface::SocketHandle, Arc<TcpStreamHandle>> =
-            HashMap::new();
+        let mut socket_maps: HashMap<
+            smoltcp::iface::SocketHandle,
+            Arc<TcpStreamHandle>,
+        > = HashMap::new();
         let mut next_poll = None;
 
         loop {
@@ -395,7 +420,9 @@ impl futures::Stream for TcpListener {
                     self.socket_stream_waker.register(cx.waker());
                     std::task::Poll::Pending
                 }
-                mpsc::error::TryRecvError::Disconnected => std::task::Poll::Ready(None),
+                mpsc::error::TryRecvError::Disconnected => {
+                    std::task::Poll::Ready(None)
+                }
             },
         }
     }

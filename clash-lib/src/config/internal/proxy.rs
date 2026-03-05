@@ -105,7 +105,9 @@ pub struct OutboundSocks5 {
     pub skip_cert_verify: bool,
 }
 
-pub fn map_serde_error(name: String) -> impl FnOnce(serde_yaml::Error) -> crate::Error {
+pub fn map_serde_error(
+    name: String,
+) -> impl FnOnce(serde_yaml::Error) -> crate::Error {
     move |x| {
         if let Some(loc) = x.location() {
             Error::InvalidConfig(format!(

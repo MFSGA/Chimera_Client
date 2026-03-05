@@ -117,7 +117,13 @@ fn derive_secret_with_algorithm(
     messages_hash: &[u8],
 ) -> Result<Vec<u8>> {
     let hash_len = hmac_algorithm.digest_algorithm().output_len();
-    hkdf_expand_label_with_algorithm(hmac_algorithm, secret, label, messages_hash, hash_len)
+    hkdf_expand_label_with_algorithm(
+        hmac_algorithm,
+        secret,
+        label,
+        messages_hash,
+        hash_len,
+    )
 }
 
 /// HKDF-Extract operation with configurable HMAC algorithm
@@ -158,12 +164,22 @@ pub fn derive_traffic_keys(
     log::debug!("TRAFFIC_KEY_DERIVE: traffic_secret={:02x?}", traffic_secret);
 
     // key = HKDF-Expand-Label(Secret, "key", "", key_length)
-    let key =
-        hkdf_expand_label_with_algorithm(hmac_algorithm, traffic_secret, b"key", b"", key_length)?;
+    let key = hkdf_expand_label_with_algorithm(
+        hmac_algorithm,
+        traffic_secret,
+        b"key",
+        b"",
+        key_length,
+    )?;
 
     // iv = HKDF-Expand-Label(Secret, "iv", "", iv_length)
-    let iv =
-        hkdf_expand_label_with_algorithm(hmac_algorithm, traffic_secret, b"iv", b"", iv_length)?;
+    let iv = hkdf_expand_label_with_algorithm(
+        hmac_algorithm,
+        traffic_secret,
+        b"iv",
+        b"",
+        iv_length,
+    )?;
 
     log::debug!("TRAFFIC_KEY_DERIVE: key={:02x?}", key);
     log::debug!("TRAFFIC_KEY_DERIVE: iv={:02x?}", iv);
@@ -223,7 +239,8 @@ pub fn derive_handshake_keys(
 
     // 1. Early Secret = HKDF-Extract(salt=0, IKM=0)
     let zero_salt = vec![0u8; hash_len];
-    let early_secret = hkdf_extract_with_algorithm(hmac_algorithm, &zero_salt, &zero_salt);
+    let early_secret =
+        hkdf_extract_with_algorithm(hmac_algorithm, &zero_salt, &zero_salt);
 
     // 2. Derive-Secret(., "derived", "")
     let mut empty_ctx = digest::Context::new(digest_algorithm);
@@ -268,7 +285,8 @@ pub fn derive_handshake_keys(
     )?;
 
     // 7. Master Secret = HKDF-Extract(salt=derived_secret, IKM=0)
-    let master_secret = hkdf_extract_with_algorithm(hmac_algorithm, &derived_secret_2, &zero_salt);
+    let master_secret =
+        hkdf_extract_with_algorithm(hmac_algorithm, &derived_secret_2, &zero_salt);
 
     log::debug!("  master_secret: {:?}", &master_secret[..8]);
 
@@ -371,8 +389,13 @@ pub fn compute_finished_verify_data(
     let hmac_algorithm = cipher_suite.hmac_algorithm();
 
     // finished_key = HKDF-Expand-Label(BaseKey, "finished", "", hash_len)
-    let finished_key =
-        hkdf_expand_label_with_algorithm(hmac_algorithm, base_key, b"finished", b"", hash_len)?;
+    let finished_key = hkdf_expand_label_with_algorithm(
+        hmac_algorithm,
+        base_key,
+        b"finished",
+        b"",
+        hash_len,
+    )?;
 
     // verify_data = HMAC(finished_key, handshake_hash)
     let key = hmac::Key::new(hmac_algorithm, &finished_key);
@@ -393,9 +416,9 @@ mod tests {
     fn test_hkdf_expand_sha256_rfc_vector() {
         // Test Case 1 from RFC 5869 (simplified - using extracted PRK directly)
         let prk = [
-            0x07, 0x77, 0x09, 0x36, 0x2c, 0x2e, 0x32, 0xdf, 0x0d, 0xdc, 0x3f, 0x0d, 0xc4, 0x7b,
-            0xba, 0x63, 0x90, 0xb6, 0xc7, 0x3b, 0xb5, 0x0f, 0x9c, 0x31, 0x22, 0xec, 0x84, 0x4a,
-            0xd7, 0xc2, 0xb3, 0xe5,
+            0x07, 0x77, 0x09, 0x36, 0x2c, 0x2e, 0x32, 0xdf, 0x0d, 0xdc, 0x3f, 0x0d,
+            0xc4, 0x7b, 0xba, 0x63, 0x90, 0xb6, 0xc7, 0x3b, 0xb5, 0x0f, 0x9c, 0x31,
+            0x22, 0xec, 0x84, 0x4a, 0xd7, 0xc2, 0xb3, 0xe5,
         ];
         let info = [0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9];
 
@@ -434,7 +457,13 @@ mod tests {
     #[test]
     fn test_hkdf_expand_label() {
         let secret = vec![0x42u8; 32];
-        let result = hkdf_expand_label_with_algorithm(hmac::HMAC_SHA256, &secret, b"test", b"", 16);
+        let result = hkdf_expand_label_with_algorithm(
+            hmac::HMAC_SHA256,
+            &secret,
+            b"test",
+            b"",
+            16,
+        );
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 16);
     }
@@ -443,16 +472,26 @@ mod tests {
     fn test_hkdf_expand_label_with_context() {
         let secret = vec![0x42u8; 32];
         let context = vec![0x11u8; 32];
-        let result =
-            hkdf_expand_label_with_algorithm(hmac::HMAC_SHA256, &secret, b"finished", &context, 32);
+        let result = hkdf_expand_label_with_algorithm(
+            hmac::HMAC_SHA256,
+            &secret,
+            b"finished",
+            &context,
+            32,
+        );
         assert!(result.is_ok());
         let output = result.unwrap();
         assert_eq!(output.len(), 32);
 
         // Result should be deterministic
-        let result2 =
-            hkdf_expand_label_with_algorithm(hmac::HMAC_SHA256, &secret, b"finished", &context, 32)
-                .unwrap();
+        let result2 = hkdf_expand_label_with_algorithm(
+            hmac::HMAC_SHA256,
+            &secret,
+            b"finished",
+            &context,
+            32,
+        )
+        .unwrap();
         assert_eq!(output, result2);
     }
 
@@ -491,7 +530,8 @@ mod tests {
         let base_key = vec![0xAAu8; 32];
         let handshake_hash = vec![0xBBu8; 32];
 
-        let result = compute_finished_verify_data(CS_SHA256, &base_key, &handshake_hash);
+        let result =
+            compute_finished_verify_data(CS_SHA256, &base_key, &handshake_hash);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 32);
     }

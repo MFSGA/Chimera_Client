@@ -10,8 +10,8 @@ use crate::{
         internal::{
             config::{self, Profile},
             proxy::{
-                OutboundDirect, OutboundProxy, OutboundProxyProtocol, OutboundReject, PROXY_DIRECT,
-                PROXY_REJECT,
+                OutboundDirect, OutboundProxy, OutboundProxyProtocol,
+                OutboundReject, PROXY_DIRECT, PROXY_REJECT,
             },
             rule::RuleType,
         },
@@ -33,7 +33,8 @@ impl TryFrom<def::Config> for config::Config {
 }
 
 pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error> {
-    let mut proxy_names = vec![String::from(PROXY_DIRECT), String::from(PROXY_REJECT)];
+    let mut proxy_names =
+        vec![String::from(PROXY_DIRECT), String::from(PROXY_REJECT)];
 
     if c.allow_lan.unwrap_or_default() && c.bind_address.is_localhost() {
         warn!(
@@ -52,19 +53,24 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
             HashMap::from([
                 (
                     String::from(PROXY_DIRECT),
-                    OutboundProxy::ProxyServer(OutboundProxyProtocol::Direct(OutboundDirect {
-                        name: PROXY_DIRECT.to_string(),
-                    })),
+                    OutboundProxy::ProxyServer(OutboundProxyProtocol::Direct(
+                        OutboundDirect {
+                            name: PROXY_DIRECT.to_string(),
+                        },
+                    )),
                 ),
                 (
                     String::from(PROXY_REJECT),
-                    OutboundProxy::ProxyServer(OutboundProxyProtocol::Reject(OutboundReject {
-                        name: PROXY_REJECT.to_string(),
-                    })),
+                    OutboundProxy::ProxyServer(OutboundProxyProtocol::Reject(
+                        OutboundReject {
+                            name: PROXY_REJECT.to_string(),
+                        },
+                    )),
                 ),
             ]),
             |mut rv, x| {
-                let proxy = OutboundProxy::ProxyServer(OutboundProxyProtocol::try_from(x)?);
+                let proxy =
+                    OutboundProxy::ProxyServer(OutboundProxyProtocol::try_from(x)?);
                 let name = proxy.name();
                 if rv.contains_key(name.as_str()) {
                     return Err(Error::InvalidConfig(format!(

@@ -9,7 +9,9 @@ use crate::{
     Session,
     app::{
         dns::ThreadSafeDNSResolver,
-        router::rules::{domain::Domain, domain_suffix::DomainSuffix, final_::Final},
+        router::rules::{
+            domain::Domain, domain_suffix::DomainSuffix, final_::Final,
+        },
     },
     common::mmdb::MmdbLookup,
     config::internal::{config::RuleProviderDef, rule::RuleType},
@@ -53,7 +55,10 @@ impl Router {
     }
 
     /// this mutates the session, attaching resolved IP and ASN
-    pub async fn match_route(&self, sess: &mut Session) -> (&str, Option<&Box<dyn RuleMatcher>>) {
+    pub async fn match_route(
+        &self,
+        sess: &mut Session,
+    ) -> (&str, Option<&Box<dyn RuleMatcher>>) {
         let mut sess_resolved = false;
 
         for r in self.rules.iter() {

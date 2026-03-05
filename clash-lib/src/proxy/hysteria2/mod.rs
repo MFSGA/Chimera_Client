@@ -23,7 +23,8 @@ use futures::{SinkExt, StreamExt};
 use h3::client::SendRequest;
 use h3_quinn::OpenStreams;
 use quinn::{
-    ClientConfig, Connection, EndpointConfig, TokioRuntime, crypto::rustls::QuicClientConfig,
+    ClientConfig, Connection, EndpointConfig, TokioRuntime,
+    crypto::rustls::QuicClientConfig,
 };
 use quinn_proto::TransportConfig;
 use rustls::{ClientConfig as RustlsClientConfig, RootCertStore};
@@ -40,7 +41,8 @@ use crate::{
     },
     common::tls::{DefaultTlsVerifier, GLOBAL_ROOT_STORE},
     proxy::{
-        DialWithConnector, OutboundHandler, OutboundType, converters::hysteria2::PortGenerator,
+        DialWithConnector, OutboundHandler, OutboundType,
+        converters::hysteria2::PortGenerator,
     },
     session::{Session, SocksAddr},
 };
@@ -109,7 +111,8 @@ impl Debug for Handler {
 }
 
 impl Handler {
-    const DEFAULT_MAX_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+    const DEFAULT_MAX_IDLE_TIMEOUT: std::time::Duration =
+        std::time::Duration::from_secs(300);
     const MIN_INITIAL_CWND_PACKETS: u64 = 2;
 
     fn default_bind_addr(server_addr: SocketAddr) -> SocketAddr {
@@ -176,7 +179,8 @@ impl Handler {
         bytes: &[u8],
     ) -> io::Result<usize> {
         let mut reader = BufReader::new(bytes);
-        let pem_certs: io::Result<Vec<_>> = rustls_pemfile::certs(&mut reader).collect();
+        let pem_certs: io::Result<Vec<_>> =
+            rustls_pemfile::certs(&mut reader).collect();
         let certs = match pem_certs {
             Ok(certs) if !certs.is_empty() => certs,
             Ok(_) => vec![rustls::pki_types::CertificateDer::from(bytes.to_vec())],
@@ -212,9 +216,9 @@ impl Handler {
 
         if let Some(ca_path) = opts.ca.as_deref() {
             let source = format!("ca file `{}`", Path::new(ca_path).display());
-            match fs::read(ca_path)
-                .and_then(|content| Self::append_custom_ca(&mut root_store, &source, &content))
-            {
+            match fs::read(ca_path).and_then(|content| {
+                Self::append_custom_ca(&mut root_store, &source, &content)
+            }) {
                 Ok(added) => {
                     debug!(source, added, "hysteria2 loaded custom CA certificates");
                     loaded += added;
@@ -225,7 +229,8 @@ impl Handler {
 
         if let Some(ca_str) = opts.ca_str.as_deref() {
             let source = "inline ca_str".to_owned();
-            match Self::append_custom_ca(&mut root_store, &source, ca_str.as_bytes()) {
+            match Self::append_custom_ca(&mut root_store, &source, ca_str.as_bytes())
+            {
                 Ok(added) => {
                     debug!(source, added, "hysteria2 loaded custom CA certificates");
                     loaded += added;
@@ -249,7 +254,9 @@ impl Handler {
             warn!("hysteria2 `udp-mtu` is ignored in TCP-only implementation");
         }
         if matches!(opts.cwnd, Some(0)) {
-            warn!("hysteria2 `cwnd` must be greater than 0, falling back to default window");
+            warn!(
+                "hysteria2 `cwnd` must be greater than 0, falling back to default window"
+            );
         }
 
         let custom_root_store = Self::load_custom_root_store(&opts);
@@ -259,7 +266,10 @@ impl Handler {
                 opts.skip_cert_verify,
                 root_store,
             ),
-            None => DefaultTlsVerifier::new(opts.fingerprint.clone(), opts.skip_cert_verify),
+            None => DefaultTlsVerifier::new(
+                opts.fingerprint.clone(),
+                opts.skip_cert_verify,
+            ),
         };
         let mut tls_config = RustlsClientConfig::builder()
             .dangerous()
@@ -289,11 +299,16 @@ impl Handler {
             );
         }
 
-        transport.congestion_controller_factory(Arc::new(DynCongestion::new(cwnd_packets)));
-        transport.max_idle_timeout(Some(Self::DEFAULT_MAX_IDLE_TIMEOUT.try_into().unwrap()));
+        transport.congestion_controller_factory(Arc::new(DynCongestion::new(
+            cwnd_packets,
+        )));
+        transport.max_idle_timeout(Some(
+            Self::DEFAULT_MAX_IDLE_TIMEOUT.try_into().unwrap(),
+        ));
         transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
 
-        let quic_config: QuicClientConfig = tls_config.try_into().expect("valid quic config");
+        let quic_config: QuicClientConfig =
+            tls_config.try_into().expect("valid quic config");
         let mut client_config = ClientConfig::new(Arc::new(quic_config));
         client_config.transport_config(Arc::new(transport));
 
@@ -383,7 +398,8 @@ impl Handler {
             .downcast::<DynController>()
         {
             Ok(controller) => {
-                controller.set_controller(Box::new(Brutal::new(brutal_bps, conn.clone())));
+                controller
+                    .set_controller(Box::new(Brutal::new(brutal_bps, conn.clone())));
                 debug!(brutal_bps, "hysteria2 enabled brutal congestion control");
             }
             Err(_) => {
@@ -405,8 +421,10 @@ impl Handler {
             match obfs {
                 Obfs::Salamander(salamander_obfs) => {
                     let socket = socket_factory()?;
-                    let obfs_socket =
-                        salamander::Salamander::new(socket, salamander_obfs.key.clone())?;
+                    let obfs_socket = salamander::Salamander::new(
+                        socket,
+                        salamander_obfs.key.clone(),
+                    )?;
                     quinn::Endpoint::new_with_abstract_socket(
                         self.ep_config.clone(),
                         None,
@@ -432,7 +450,12 @@ impl Handler {
             )?
         } else {
             let socket = socket_factory()?;
-            quinn::Endpoint::new(self.ep_config.clone(), None, socket, Arc::new(TokioRuntime))?
+            quinn::Endpoint::new(
+                self.ep_config.clone(),
+                None,
+                socket,
+                Arc::new(TokioRuntime),
+            )?
         };
 
         endpoint.set_default_client_config(self.client_config.clone());
@@ -453,7 +476,8 @@ impl Handler {
         cc_rx_header: &str,
     ) -> anyhow::Result<(SendRequest<OpenStreams, Bytes>, CcRx, bool)> {
         let h3_conn = h3_quinn::Connection::new(conn.clone());
-        let (_, mut sender) = h3::client::builder().build::<_, _, Bytes>(h3_conn).await?;
+        let (_, mut sender) =
+            h3::client::builder().build::<_, _, Bytes>(h3_conn).await?;
 
         let request = http::Request::post("https://hysteria/auth")
             .header("Hysteria-Auth", password)
@@ -486,7 +510,9 @@ impl Handler {
                     }
                 },
                 Err(err) => {
-                    warn!("hysteria2 invalid Hysteria-CC-RX header: {err}, fallback to auto");
+                    warn!(
+                        "hysteria2 invalid Hysteria-CC-RX header: {err}, fallback to auto"
+                    );
                     CcRx::Auto
                 }
             },
@@ -520,15 +546,21 @@ impl Handler {
             .new_authed_connection_inner(sess, resolver)
             .await
             .map_err(|err| {
-                io::Error::other(format!("connect to {} failed: {err}", self.server_label()))
-            })?;
+            io::Error::other(format!(
+                "connect to {} failed: {err}",
+                self.server_label()
+            ))
+        })?;
 
         *lock = Some(conn.clone());
         *self.guard.lock().await = Some(guard);
         Ok(conn)
     }
 
-    async fn connect_tcp(conn: &Connection, sess: &Session) -> io::Result<HystStream> {
+    async fn connect_tcp(
+        conn: &Connection,
+        sess: &Session,
+    ) -> io::Result<HystStream> {
         let (mut send, mut recv) = conn.open_bi().await?;
 
         tokio_util::codec::FramedWrite::new(&mut send, Hy2TcpCodec)
@@ -615,11 +647,17 @@ impl AsyncWrite for HystStream {
             .map(|result| result.map_err(io::Error::other))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().send).poll_flush(cx)
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().send).poll_shutdown(cx)
     }
 }

@@ -1,15 +1,15 @@
 use self::stream::VlessStream;
 use super::{
-    AnyStream, ConnectorType, DialWithConnector, HandlerCommonOptions, OutboundHandler,
-    OutboundType,
+    AnyStream, ConnectorType, DialWithConnector, HandlerCommonOptions,
+    OutboundHandler, OutboundType,
     transport::Transport,
     utils::{GLOBAL_DIRECT_CONNECTOR, RemoteConnector},
 };
 use crate::{
     app::{
         dispatcher::{
-            BoxedChainedDatagram, BoxedChainedStream, ChainedDatagram, ChainedDatagramWrapper,
-            ChainedStream, ChainedStreamWrapper,
+            BoxedChainedDatagram, BoxedChainedStream, ChainedDatagram,
+            ChainedDatagramWrapper, ChainedStream, ChainedStreamWrapper,
         },
         dns::ThreadSafeDNSResolver,
     },
@@ -76,7 +76,8 @@ impl Handler {
             s
         };
 
-        let vless_stream = VlessStream::new(s, &self.opts.uuid, &sess.destination, is_udp)?;
+        let vless_stream =
+            VlessStream::new(s, &self.opts.uuid, &sess.destination, is_udp)?;
 
         Ok(Box::new(vless_stream))
     }

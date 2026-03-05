@@ -86,7 +86,9 @@ impl Config {
         match self {
             // Config::Def(c) => c.try_into(),
             Config::Internal(c) => Ok(c),
-            Config::File(file) => TryInto::<def::Config>::try_into(PathBuf::from(file))?.try_into(),
+            Config::File(file) => {
+                TryInto::<def::Config>::try_into(PathBuf::from(file))?.try_into()
+            }
             Config::Str(s) => {
                 todo!()
             }
@@ -146,7 +148,12 @@ pub fn start_scaffold(opts: Options) -> Result<()> {
 
     let log_collector = app::logging::EventCollector::new(vec![log_tx.clone()]);
 
-    app::logging::setup_logging(config.general.log_level, log_collector, &cwd, opts.log_file);
+    app::logging::setup_logging(
+        config.general.log_level,
+        log_collector,
+        &cwd,
+        opts.log_file,
+    );
 
     rt.block_on(async {
         match start(config, cwd, log_tx).await {
@@ -275,7 +282,10 @@ struct RuntimeComponents {
     tun_runner: Option<Runner>,
 }
 
-async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<RuntimeComponents> {
+async fn create_components(
+    cwd: PathBuf,
+    config: InternalConfig,
+) -> Result<RuntimeComponents> {
     #[cfg(feature = "tun")]
     if config.tun.enable {
         debug!("tun enabled, initializing default outbound interface");
@@ -290,8 +300,10 @@ async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<Runti
         config.profile.store_selected,
     );
 
-    let system_resolver =
-        Arc::new(SystemResolver::new(config.dns.ipv6).map_err(|x| Error::DNSError(x.to_string()))?);
+    let system_resolver = Arc::new(
+        SystemResolver::new(config.dns.ipv6)
+            .map_err(|x| Error::DNSError(x.to_string()))?,
+    );
 
     debug!("initializing bootstrap outbounds");
     let plain_outbounds = OutboundManager::load_plain_outbounds(
@@ -307,8 +319,9 @@ async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<Runti
 
     debug!("todo del the line outbounds {}", plain_outbounds.len());
 
-    let client = new_http_client(system_resolver.clone(), Some(plain_outbounds.clone()))
-        .map_err(|x| Error::DNSError(x.to_string()))?;
+    let client =
+        new_http_client(system_resolver.clone(), Some(plain_outbounds.clone()))
+            .map_err(|x| Error::DNSError(x.to_string()))?;
 
     debug!("initializing mmdb");
     let country_mmdb = if let Some(country_mmdb_file) = config.general.mmdb {
@@ -394,16 +407,20 @@ async fn create_components(cwd: PathBuf, config: InternalConfig) -> Result<Runti
     let authenticator = Arc::new(auth::PlainAuthenticator::new(config.users));
 
     debug!("initializing inbound manager");
-    let inbound_manager =
-        Arc::new(InboundManager::new(dispatcher.clone(), authenticator, config.listeners).await);
+    let inbound_manager = Arc::new(
+        InboundManager::new(dispatcher.clone(), authenticator, config.listeners)
+            .await,
+    );
 
     #[cfg(feature = "tun")]
     debug!("initializing tun runner");
     #[cfg(feature = "tun")]
-    let tun_runner = get_tun_runner(config.tun, dispatcher.clone(), dns_resolver.clone())?;
+    let tun_runner =
+        get_tun_runner(config.tun, dispatcher.clone(), dns_resolver.clone())?;
 
     debug!("initializing dns listener");
-    let dns_listener = dns::get_dns_listener(dns_listen, dns_resolver.clone(), &cwd).await;
+    let dns_listener =
+        dns::get_dns_listener(dns_listen, dns_resolver.clone(), &cwd).await;
 
     Ok(RuntimeComponents {
         statistics_manager,

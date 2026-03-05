@@ -23,7 +23,9 @@ impl std::fmt::Display for CryptoError {
         match self {
             CryptoError::InvalidKeyLength => write!(f, "Invalid key length"),
             CryptoError::InvalidNonceLength => write!(f, "Invalid nonce length"),
-            CryptoError::InvalidCiphertextLength => write!(f, "Invalid ciphertext length"),
+            CryptoError::InvalidCiphertextLength => {
+                write!(f, "Invalid ciphertext length")
+            }
             CryptoError::EncryptionFailed => write!(f, "Encryption failed"),
             CryptoError::DecryptionFailed => write!(f, "Decryption failed"),
             CryptoError::EcdhFailed => write!(f, "ECDH key exchange failed"),
@@ -56,8 +58,9 @@ pub fn perform_ecdh(
     public_key: &[u8; 32],
 ) -> Result<[u8; 32], CryptoError> {
     // Create private key from raw bytes
-    let my_private_key = agreement::PrivateKey::from_private_key(&agreement::X25519, private_key)
-        .map_err(|_| CryptoError::EcdhFailed)?;
+    let my_private_key =
+        agreement::PrivateKey::from_private_key(&agreement::X25519, private_key)
+            .map_err(|_| CryptoError::EcdhFailed)?;
 
     // Compute public key from private key (not used, but verifies key is valid)
     let _my_public_key = my_private_key
@@ -133,12 +136,12 @@ pub fn encrypt_session_id(
     aad: &[u8],
 ) -> Result<[u8; 32], CryptoError> {
     debug_assert_eq!(nonce.len(), 12, "nonce must be exactly 12 bytes");
-    let unbound_key =
-        UnboundKey::new(&AES_256_GCM, auth_key).map_err(|_| CryptoError::EncryptionFailed)?;
+    let unbound_key = UnboundKey::new(&AES_256_GCM, auth_key)
+        .map_err(|_| CryptoError::EncryptionFailed)?;
     let sealing_key = LessSafeKey::new(unbound_key);
 
-    let nonce_obj =
-        Nonce::try_assume_unique_for_key(nonce).map_err(|_| CryptoError::InvalidNonceLength)?;
+    let nonce_obj = Nonce::try_assume_unique_for_key(nonce)
+        .map_err(|_| CryptoError::InvalidNonceLength)?;
 
     let aad_obj = Aad::from(aad);
 
@@ -177,12 +180,12 @@ pub fn decrypt_session_id(
     aad: &[u8],
 ) -> Result<[u8; 16], CryptoError> {
     debug_assert_eq!(nonce.len(), 12, "nonce must be exactly 12 bytes");
-    let unbound_key =
-        UnboundKey::new(&AES_256_GCM, auth_key).map_err(|_| CryptoError::DecryptionFailed)?;
+    let unbound_key = UnboundKey::new(&AES_256_GCM, auth_key)
+        .map_err(|_| CryptoError::DecryptionFailed)?;
     let opening_key = LessSafeKey::new(unbound_key);
 
-    let nonce_obj =
-        Nonce::try_assume_unique_for_key(nonce).map_err(|_| CryptoError::InvalidNonceLength)?;
+    let nonce_obj = Nonce::try_assume_unique_for_key(nonce)
+        .map_err(|_| CryptoError::InvalidNonceLength)?;
 
     let aad_obj = Aad::from(aad);
 
@@ -203,7 +206,11 @@ pub fn decrypt_session_id(
 
 #[cfg(test)]
 /// Creates a REALITY SessionId (test helper)
-fn create_session_id(version: [u8; 3], timestamp: u32, short_id: &[u8; 8]) -> [u8; 32] {
+fn create_session_id(
+    version: [u8; 3],
+    timestamp: u32,
+    short_id: &[u8; 8],
+) -> [u8; 32] {
     let mut session_id = [0u8; 32];
     session_id[0] = version[0]; // Major version
     session_id[1] = version[1]; // Minor version
@@ -235,12 +242,18 @@ mod tests {
         let private_key_b = [2u8; 32];
 
         // Compute public keys using aws-lc-rs
-        let priv_a =
-            agreement::PrivateKey::from_private_key(&agreement::X25519, &private_key_a).unwrap();
+        let priv_a = agreement::PrivateKey::from_private_key(
+            &agreement::X25519,
+            &private_key_a,
+        )
+        .unwrap();
         let pub_a = priv_a.compute_public_key().unwrap();
 
-        let priv_b =
-            agreement::PrivateKey::from_private_key(&agreement::X25519, &private_key_b).unwrap();
+        let priv_b = agreement::PrivateKey::from_private_key(
+            &agreement::X25519,
+            &private_key_b,
+        )
+        .unwrap();
         let pub_b = priv_b.compute_public_key().unwrap();
 
         // Perform ECDH both ways
@@ -287,8 +300,12 @@ mod tests {
         assert_eq!(session_id[3], 0); // reserved
 
         // Verify timestamp
-        let extracted_timestamp =
-            u32::from_be_bytes([session_id[4], session_id[5], session_id[6], session_id[7]]);
+        let extracted_timestamp = u32::from_be_bytes([
+            session_id[4],
+            session_id[5],
+            session_id[6],
+            session_id[7],
+        ]);
         assert_eq!(extracted_timestamp, timestamp);
 
         // Verify short_id
@@ -371,10 +388,12 @@ mod tests {
         let nonce = [0x04; 12];
         let aad = b"test additional authenticated data";
 
-        let encrypted = encrypt_session_id(&plaintext, &auth_key, &nonce, aad).unwrap();
+        let encrypted =
+            encrypt_session_id(&plaintext, &auth_key, &nonce, aad).unwrap();
 
         // Decrypt session ID
-        let decrypted = decrypt_session_id(&encrypted, &auth_key, &nonce, aad).unwrap();
+        let decrypted =
+            decrypt_session_id(&encrypted, &auth_key, &nonce, aad).unwrap();
 
         // Verify we can recover the structure
         assert_eq!(decrypted[0], version[0]);
@@ -382,8 +401,12 @@ mod tests {
         assert_eq!(decrypted[2], version[2]);
         assert_eq!(decrypted[3], 0); // reserved
 
-        let recovered_timestamp =
-            u32::from_be_bytes([decrypted[4], decrypted[5], decrypted[6], decrypted[7]]);
+        let recovered_timestamp = u32::from_be_bytes([
+            decrypted[4],
+            decrypted[5],
+            decrypted[6],
+            decrypted[7],
+        ]);
         assert_eq!(recovered_timestamp, timestamp);
 
         assert_eq!(&decrypted[8..16], &short_id[..]);
@@ -417,10 +440,12 @@ mod tests {
         let nonce = [0x77u8; 12];
         let aad = b"additional authenticated data";
 
-        let encrypted = encrypt_session_id(&plaintext, &auth_key, &nonce, aad).unwrap();
+        let encrypted =
+            encrypt_session_id(&plaintext, &auth_key, &nonce, aad).unwrap();
         assert_eq!(encrypted.len(), 32);
 
-        let decrypted = decrypt_session_id(&encrypted, &auth_key, &nonce, aad).unwrap();
+        let decrypted =
+            decrypt_session_id(&encrypted, &auth_key, &nonce, aad).unwrap();
         assert_eq!(plaintext, decrypted);
     }
 
@@ -432,7 +457,8 @@ mod tests {
         let nonce = [0x77u8; 12];
         let aad = b"additional authenticated data";
 
-        let encrypted = encrypt_session_id(&plaintext, &auth_key, &nonce, aad).unwrap();
+        let encrypted =
+            encrypt_session_id(&plaintext, &auth_key, &nonce, aad).unwrap();
 
         let result = decrypt_session_id(&encrypted, &wrong_key, &nonce, aad);
         assert!(result.is_err());
@@ -446,7 +472,8 @@ mod tests {
         let aad = b"additional authenticated data";
         let wrong_aad = b"wrong additional authenticated data";
 
-        let encrypted = encrypt_session_id(&plaintext, &auth_key, &nonce, aad).unwrap();
+        let encrypted =
+            encrypt_session_id(&plaintext, &auth_key, &nonce, aad).unwrap();
 
         let result = decrypt_session_id(&encrypted, &auth_key, &nonce, wrong_aad);
         assert!(result.is_err());
@@ -465,7 +492,12 @@ mod tests {
         assert_eq!(session_id[2], 1);
         assert_eq!(session_id[3], 0);
 
-        let ts = u32::from_be_bytes([session_id[4], session_id[5], session_id[6], session_id[7]]);
+        let ts = u32::from_be_bytes([
+            session_id[4],
+            session_id[5],
+            session_id[6],
+            session_id[7],
+        ]);
         assert_eq!(ts, timestamp);
 
         assert_eq!(&session_id[8..16], &short_id[..]);

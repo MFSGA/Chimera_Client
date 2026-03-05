@@ -130,7 +130,9 @@ impl Clone for SocksAddr {
     fn clone(&self) -> Self {
         match self {
             SocksAddr::Ip(a) => Self::from(a.to_owned()),
-            SocksAddr::Domain(domain, port) => Self::try_from((domain.clone(), *port)).unwrap(),
+            SocksAddr::Domain(domain, port) => {
+                Self::try_from((domain.clone(), *port)).unwrap()
+            }
         }
     }
 }
