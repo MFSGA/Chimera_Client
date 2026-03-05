@@ -1,9 +1,11 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use tokio::sync::RwLock;
 use tracing::{debug, error};
 
 use erased_serde::Serialize;
+use serde::Deserialize;
+use serde_yaml::Value;
 
 use crate::{
     Error,
@@ -12,7 +14,9 @@ use crate::{
         outbound::utils::proxy_groups_dag_sort,
         profile::ThreadSafeCacheFile,
         remote_content_manager::{
-            ProxyManager, providers::proxy_provider::{ThreadSafeProxyProvider, plain_provider::PlainProvider},
+            ProxyManager,
+            healthcheck::HealthCheck,
+            providers::proxy_provider::{ThreadSafeProxyProvider, plain_provider::PlainProvider},
         },
     },
     config::internal::proxy::{
@@ -44,6 +48,12 @@ pub struct OutboundManager {
 }
 
 pub type ThreadSafeOutboundManager = Arc<OutboundManager>;
+static DEFAULT_LATENCY_TEST_URL: &str = "http://www.gstatic.com/generate_204";
+
+#[derive(Deserialize)]
+struct ProviderScheme {
+    proxies: Option<Vec<HashMap<String, Value>>>,
+}
 
 /// Init process:
 /// 1. Load all plaint outbounds from config using the unbounded function
@@ -169,8 +179,15 @@ impl OutboundManager {
         }
 
         if !all.is_empty() {
+            let hc = HealthCheck::new(
+                all.clone(),
+                DEFAULT_LATENCY_TEST_URL.to_owned(),
+                0,
+                true,
+                self.proxy_manager.clone(),
+            );
             let pd = Arc::new(RwLock::new(
-                PlainProvider::new(PROXY_GLOBAL.to_owned(), all).map_err(|x| {
+                PlainProvider::new(PROXY_GLOBAL.to_owned(), all, hc).map_err(|x| {
                     Error::InvalidConfig(format!("invalid provider config: {x}"))
                 })?,
             ));
@@ -318,16 +335,16 @@ impl OutboundManager {
 
             debug!("todo creating PlainProvider for group ");
 
-            /* let hc = HealthCheck::new(
+            let hc = HealthCheck::new(
                 proxies.clone(),
                 DEFAULT_LATENCY_TEST_URL.to_owned(),
                 interval,
                 lazy,
                 proxy_manager,
-            ); */
+            );
 
             let pd = Arc::new(RwLock::new(
-                PlainProvider::new(name.to_owned(), proxies).map_err(|x| {
+                PlainProvider::new(name.to_owned(), proxies, hc).map_err(|x| {
                     Error::InvalidConfig(format!("invalid provider config: {x}"))
                 })?,
             ));
@@ -428,9 +445,8 @@ impl OutboundManager {
         &mut self,
         cwd: String,
         proxy_providers: HashMap<String, OutboundProxyProviderDef>,
-        resolver: ThreadSafeDNSResolver,
+        _resolver: ThreadSafeDNSResolver,
     ) -> Result<(), Error> {
-        let proxy_manager = &self.proxy_manager;
         let provider_registry = &mut self.proxy_providers;
         for (name, provider) in proxy_providers.into_iter() {
             match provider {
@@ -440,17 +456,63 @@ impl OutboundManager {
                         name
                     );
                 }
-                OutboundProxyProviderDef::File(_file) => {
-                    debug!(
-                        "file proxy provider `{}` is not implemented yet, skipping",
-                        name
-                    );
+                OutboundProxyProviderDef::File(file) => {
+                    debug!("loading file proxy provider `{}`", name);
+                    let path_buf = PathBuf::from(&file.path);
+                    let path = if path_buf.is_absolute() {
+                        path_buf
+                    } else {
+                        PathBuf::from(&cwd).join(path_buf)
+                    };
+
+                    let content = tokio::fs::read(&path).await.map_err(|e| {
+                        Error::InvalidConfig(format!(
+                            "failed to read file provider `{name}` from {}: {e}",
+                            path.display()
+                        ))
+                    })?;
+
+                    let scheme: ProviderScheme = serde_yaml::from_slice(&content).map_err(|e| {
+                        Error::InvalidConfig(format!(
+                            "failed to parse file provider `{name}` from {}: {e}",
+                            path.display()
+                        ))
+                    })?;
+
+                    let proxy_defs = scheme.proxies.ok_or_else(|| {
+                        Error::InvalidConfig(format!(
+                            "file provider `{name}` has empty proxies"
+                        ))
+                    })?;
+
+                    let mut proxies = Vec::with_capacity(proxy_defs.len());
+                    for def in proxy_defs {
+                        let protocol = OutboundProxyProtocol::try_from(def)?;
+                        let mut loaded = Self::load_plain_outbounds(vec![protocol]);
+                        if let Some(handler) = loaded.pop() {
+                            proxies.push(handler);
+                        }
+                    }
+
+                    let provider = Arc::new(RwLock::new(
+                        PlainProvider::new(
+                            name.clone(),
+                            proxies.clone(),
+                            HealthCheck::new(
+                                proxies,
+                                DEFAULT_LATENCY_TEST_URL.to_owned(),
+                                file.interval.unwrap_or_default(),
+                                true,
+                                self.proxy_manager.clone(),
+                            ),
+                        )
+                        .map_err(|x| {
+                            Error::InvalidConfig(format!("invalid provider config: {x}"))
+                        })?,
+                    ));
+                    provider_registry.insert(name, provider);
                 }
             }
-        }
-
-        for _p in provider_registry.values() {
-            debug!("proxy provider init hook is not implemented yet");
         }
 
         Ok(())

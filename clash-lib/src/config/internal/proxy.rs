@@ -238,7 +238,17 @@ pub struct OutboundFileProvider {
     pub name: String,
     pub path: String,
     pub interval: Option<u64>,
-    // pub health_check: HealthCheck,
+    #[serde(default)]
+    pub health_check: HealthCheck,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct HealthCheck {
+    pub enable: Option<bool>,
+    pub url: Option<String>,
+    pub interval: Option<u64>,
+    pub lazy: Option<bool>,
 }
 
 #[cfg(feature = "trojan")]

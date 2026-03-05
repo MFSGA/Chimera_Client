@@ -1,9 +1,12 @@
 use async_trait::async_trait;
+use std::sync::Arc;
+use tracing::debug;
 
 use crate::{
     Error,
-    app::remote_content_manager::providers::{
-        Provider, proxy_provider::ProxyProvider,
+    app::remote_content_manager::{
+        healthcheck::HealthCheck,
+        providers::{Provider, proxy_provider::ProxyProvider},
     },
     proxy::AnyOutboundHandler,
 };
@@ -14,21 +17,32 @@ use crate::{
 pub struct PlainProvider {
     name: String,
     proxies: Vec<AnyOutboundHandler>,
-    // hc: Arc<HealthCheck>,
+    hc: Arc<HealthCheck>,
 }
 
 impl PlainProvider {
     pub fn new(
         name: String,
         proxies: Vec<AnyOutboundHandler>,
+        hc: HealthCheck,
     ) -> anyhow::Result<Self> {
+        let hc = Arc::new(hc);
+
         if proxies.is_empty() {
             return Err(
                 Error::InvalidConfig(format!("{name}: proxies is empty")).into()
             );
         }
 
-        Ok(Self { name, proxies })
+        if hc.auto() {
+            debug!("kicking off healthcheck: {}", name);
+            let hc = hc.clone();
+            tokio::spawn(async move {
+                hc.kick_off().await;
+            });
+        }
+
+        Ok(Self { name, proxies, hc })
     }
 }
 
@@ -46,12 +60,10 @@ impl ProxyProvider for PlainProvider {
     }
 
     async fn touch(&self) {
-        todo!()
-        // self.hc.touch().await;
+        self.hc.touch().await;
     }
 
     async fn healthcheck(&self) {
-        todo!()
-        // self.hc.check().await;
+        self.hc.check().await;
     }
 }
