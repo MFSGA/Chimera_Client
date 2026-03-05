@@ -16,6 +16,11 @@ pub enum RuleType {
         domain_keyword: String,
         target: String,
     },
+    GeoIP {
+        target: String,
+        country_code: String,
+        no_resolve: bool,
+    },
     Match {
         target: String,
     },
@@ -46,6 +51,15 @@ impl RuleType {
                 domain_keyword: payload.to_string(),
                 target: target.to_string(),
             }),
+            "GEOIP" => Ok(RuleType::GeoIP {
+                target: target.to_string(),
+                country_code: payload.to_string(),
+                no_resolve: if let Some(params) = params {
+                    params.contains(&"no-resolve")
+                } else {
+                    false
+                },
+            }),
             "IP-CIDR" | "IP-CIDR6" => Ok(RuleType::IpCidr {
                 ipnet: payload.parse()?,
                 target: target.to_string(),
@@ -69,6 +83,7 @@ impl RuleType {
             RuleType::Domain { target, .. } => target,
             RuleType::DomainSuffix { target, .. } => target,
             RuleType::DomainKeyword { target, .. } => target,
+            RuleType::GeoIP { target, .. } => target,
             RuleType::Match { target } => target,
             RuleType::IpCidr { target, .. } => target,
         }

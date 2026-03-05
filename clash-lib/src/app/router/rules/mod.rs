@@ -5,6 +5,7 @@ use crate::Session;
 pub mod domain;
 pub mod domain_keyword;
 pub mod domain_suffix;
+pub mod geoip;
 pub mod ipcidr;
 
 pub mod final_;

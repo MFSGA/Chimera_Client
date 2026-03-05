@@ -124,6 +124,16 @@ pub fn map_rule_type(
             keyword: domain_keyword,
             target,
         }),
+        RuleType::GeoIP {
+            target,
+            country_code,
+            no_resolve,
+        } => Box::new(rules::geoip::GeoIP {
+            target,
+            country_code,
+            no_resolve,
+            mmdb: mmdb.clone(),
+        }),
         RuleType::IpCidr { ipnet, target, .. } => Box::new(IpCidr { ipnet, target }),
 
         RuleType::Match { target } => Box::new(Final { target }),
