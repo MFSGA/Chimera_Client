@@ -231,6 +231,10 @@ impl GroupProxyAPIResponse for Handler {
         self.selected_proxy(false).await.ok()
     }
 
+    fn get_latency_test_url(&self) -> Option<String> {
+        self.opts.common_opts.url.clone()
+    }
+
     fn icon(&self) -> Option<String> {
         self.opts.common_opts.icon.clone()
     }

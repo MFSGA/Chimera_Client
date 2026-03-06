@@ -1,12 +1,13 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
-    http::StatusCode,
+    extract::{Path, Query, State},
+    http::{StatusCode, header},
     response::IntoResponse,
     routing::{get, put},
 };
+use http::HeaderMap;
 use serde::Deserialize;
 
 use crate::app::{api::AppState, outbound::manager::ThreadSafeOutboundManager};
@@ -22,6 +23,7 @@ pub fn routes(outbound_manager: ThreadSafeOutboundManager) -> Router<Arc<AppStat
     Router::new()
         .route("/", get(get_proxies))
         .route("/{group}", put(update_proxy))
+        .route("/{name}/delay", get(get_proxy_delay))
         .with_state(state)
 }
 
@@ -52,4 +54,85 @@ async fn update_proxy(
         ),
         Err(err) => (StatusCode::BAD_REQUEST, err.to_string()),
     }
+}
+
+#[derive(Deserialize)]
+struct DelayRequest {
+    url: String,
+    timeout: u16,
+}
+
+async fn get_proxy_delay(
+    State(state): State<ProxyState>,
+    Path(name): Path<String>,
+    Query(q): Query<DelayRequest>,
+) -> impl IntoResponse {
+    let outbound_manager = state.outbound_manager.clone();
+    let Some(proxy) = outbound_manager.get_outbound(&name) else {
+        return (StatusCode::NOT_FOUND, format!("proxy {name} not found"))
+            .into_response();
+    };
+
+    let timeout = Duration::from_millis(q.timeout.into());
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONNECTION, "close".parse().unwrap());
+
+    let (actual, overall) = if let Some(group) = proxy.try_as_group_handler() {
+        let proxies = group.get_proxies().await;
+        let latency_test_url = group.get_latency_test_url();
+        let results = outbound_manager
+            .url_test(
+                &[vec![proxy.clone()], proxies].concat(),
+                &latency_test_url.unwrap_or(q.url),
+                timeout,
+            )
+            .await;
+        match results.first() {
+            Some(Ok(latency)) => *latency,
+            Some(Err(err)) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    headers,
+                    format!("get delay for {name} failed with error: {err}"),
+                )
+                    .into_response();
+            }
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    headers,
+                    format!("get delay for {name} failed: empty result"),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        let results = outbound_manager
+            .url_test(&vec![proxy], &q.url, timeout)
+            .await;
+        match results.first() {
+            Some(Ok(latency)) => *latency,
+            Some(Err(err)) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    headers,
+                    format!("get delay for {name} failed with error: {err}"),
+                )
+                    .into_response();
+            }
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    headers,
+                    format!("get delay for {name} failed: empty result"),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    let mut response = HashMap::new();
+    response.insert("delay".to_owned(), actual.as_millis());
+    response.insert("overall".to_owned(), overall.as_millis());
+    (headers, Json(response)).into_response()
 }

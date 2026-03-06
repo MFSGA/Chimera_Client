@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use tokio::sync::RwLock;
 use tracing::{debug, error};
@@ -160,6 +160,18 @@ impl OutboundManager {
         }
 
         r
+    }
+
+    /// A thin wrapper so the API layer does not access proxy_manager directly.
+    pub async fn url_test(
+        &self,
+        outbounds: &Vec<AnyOutboundHandler>,
+        url: &str,
+        timeout: Duration,
+    ) -> Vec<std::io::Result<(Duration, Duration)>> {
+        self.proxy_manager
+            .check(outbounds, url, Some(timeout))
+            .await
     }
 
     async fn load_handlers(
