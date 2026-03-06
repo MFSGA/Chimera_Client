@@ -90,6 +90,7 @@ pub fn get_api_runner(
             .route("/version", get(handlers::version::handle))
             .route("/memory", get(handlers::memory::handle))
             .route("/restart", post(handlers::restart::handle))
+            .nest("/connections", handlers::connections::routes())
             .nest(
                 "/configs",
                 handlers::config::routes(

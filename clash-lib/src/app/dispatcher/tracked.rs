@@ -13,7 +13,7 @@ use crate::{
     app::{
         dispatcher::{
             StatisticsManager,
-            statistics_manager::{ProxyChain, TrackerInfo},
+            statistics_manager::{ProxyChain, TrackerInfo, TrackerMetadata},
         },
         router::RuleMatcher,
     },
@@ -139,6 +139,11 @@ impl TrackedStream {
             manager: manager.clone(),
             tracker: Arc::new(TrackerInfo {
                 uuid,
+                metadata: TrackerMetadata {
+                    chains: chain,
+                    session: sess,
+                    ..Default::default()
+                },
                 ..Default::default()
             }),
             close_notify: rx,
@@ -429,13 +434,19 @@ impl TrackedDatagram {
     pub async fn new(
         inner: BoxedChainedDatagram,
         manager: Arc<StatisticsManager>,
-        _sess: Session,
+        sess: Session,
         _rule: Option<&Box<dyn RuleMatcher>>,
     ) -> Self {
         let uuid = uuid::Uuid::new_v4();
+        let chain = inner.chain().clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         let tracker = Arc::new(TrackerInfo {
             uuid,
+            metadata: TrackerMetadata {
+                chains: chain,
+                session: sess,
+                ..Default::default()
+            },
             ..Default::default()
         });
         let s = Self {
@@ -559,5 +570,25 @@ impl Sink<UdpPacket> for TrackedDatagram {
         }
 
         Pin::new(self.inner.as_mut()).poll_close(cx)
+    }
+}
+
+impl Drop for TrackedStream {
+    fn drop(&mut self) {
+        let manager = self.manager.clone();
+        let id = self.id();
+        tokio::spawn(async move {
+            manager.untrack(id).await;
+        });
+    }
+}
+
+impl Drop for TrackedDatagram {
+    fn drop(&mut self) {
+        let manager = self.manager.clone();
+        let id = self.id();
+        tokio::spawn(async move {
+            manager.untrack(id).await;
+        });
     }
 }
