@@ -1,8 +1,10 @@
 /target
 
 docs/ 
-start.ps1
+start*.*
+release*.*
 
-config.yaml
+config*.yaml
 
 cache.db
+scripts/
