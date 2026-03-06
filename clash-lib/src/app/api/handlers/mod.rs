@@ -1,6 +1,7 @@
 pub mod config;
 pub mod connections;
 pub mod hello;
+pub mod logs;
 pub mod memory;
 pub mod proxy;
 pub mod restart;
