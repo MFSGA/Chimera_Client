@@ -2,7 +2,7 @@
 pub mod hysteria2;
 #[cfg(feature = "trojan")]
 pub mod trojan;
-#[cfg(all(feature = "trojan", feature = "ws"))]
+#[cfg(feature = "ws")]
 mod utils;
 
 pub mod vless;

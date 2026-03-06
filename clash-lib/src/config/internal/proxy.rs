@@ -174,6 +174,8 @@ pub struct OutboundVless {
     #[serde(alias = "fingerprint")]
     pub client_fingerprint: Option<String>,
     pub network: Option<String>,
+    #[cfg(feature = "ws")]
+    pub ws_opts: Option<WsOpt>,
     #[serde(alias = "realityOpts")]
     pub reality_opts: Option<OutboundTrojanRealityOpts>,
 }

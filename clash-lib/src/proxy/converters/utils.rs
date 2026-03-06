@@ -1,5 +1,5 @@
 // use http::uri::InvalidUri;
-#![cfg(all(feature = "trojan", feature = "ws"))]
+#![cfg(feature = "ws")]
 
 use crate::{
     config::internal::proxy::{CommonConfigOptions, WsOpt},
