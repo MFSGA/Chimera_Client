@@ -22,6 +22,10 @@ impl std::fmt::Display for GeoIP {
 }
 
 impl RuleMatcher for GeoIP {
+    fn payload(&self) -> String {
+        self.country_code.clone()
+    }
+
     fn apply(&self, sess: &Session) -> bool {
         match &sess.destination {
             session::SocksAddr::Ip(addr) => {

@@ -17,6 +17,10 @@ impl std::fmt::Display for IpCidr {
 }
 
 impl RuleMatcher for IpCidr {
+    fn payload(&self) -> String {
+        self.ipnet.to_string()
+    }
+
     fn apply(&self, sess: &session::Session) -> bool {
         match &sess.destination {
             session::SocksAddr::Ip(addr) => self.ipnet.contains(&addr.ip()),

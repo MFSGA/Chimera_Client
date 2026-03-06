@@ -28,6 +28,14 @@ pub struct Router {
 
 pub type ThreadSafeRouter = Arc<Router>;
 
+#[derive(serde::Serialize)]
+pub struct RuleSnapshot {
+    #[serde(rename = "type")]
+    pub type_name: String,
+    pub proxy: String,
+    pub payload: String,
+}
+
 impl Router {
     pub async fn new(
         rules: Vec<RuleType>,
@@ -44,6 +52,17 @@ impl Router {
                 .collect(),
             dns_resolver,
         }
+    }
+
+    pub fn get_all_rules(&self) -> Vec<RuleSnapshot> {
+        self.rules
+            .iter()
+            .map(|rule| RuleSnapshot {
+                type_name: rule.type_name().to_string(),
+                proxy: rule.target().to_string(),
+                payload: rule.payload(),
+            })
+            .collect()
     }
 
     /// this mutates the session, attaching resolved IP and ASN

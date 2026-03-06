@@ -15,6 +15,10 @@ impl std::fmt::Display for DomainSuffix {
 }
 
 impl RuleMatcher for DomainSuffix {
+    fn payload(&self) -> String {
+        self.suffix.clone()
+    }
+
     fn apply(&self, sess: &session::Session) -> bool {
         match &sess.destination {
             session::SocksAddr::Ip(_) => false,

@@ -12,6 +12,10 @@ impl std::fmt::Display for Final {
 }
 
 impl RuleMatcher for Final {
+    fn payload(&self) -> String {
+        String::new()
+    }
+
     fn apply(&self, _sess: &Session) -> bool {
         true
     }

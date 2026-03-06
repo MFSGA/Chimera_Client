@@ -14,6 +14,9 @@ pub trait RuleMatcher: Send + Sync + Unpin + Display {
     /// the Proxy to use
     fn target(&self) -> &str;
 
+    /// the actual content of the rule
+    fn payload(&self) -> String;
+
     /// check if the rule should apply to the session
     fn apply(&self, sess: &Session) -> bool;
 

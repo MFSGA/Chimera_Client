@@ -241,6 +241,7 @@ pub async fn start(
         global_state.clone(),
         components.dns_resolver.clone(),
         components.outbound_manager,
+        components.router.clone(),
         /* components.inbound_manager,
 
         components.dispatcher,
@@ -289,6 +290,7 @@ struct RuntimeComponents {
     dns_resolver: ThreadSafeDNSResolver,
     outbound_manager: Arc<OutboundManager>,
     dispatcher: Arc<Dispatcher>,
+    router: Arc<Router>,
     inbound_manager: Arc<InboundManager>,
     #[cfg(feature = "tun")]
     tun_runner: Option<Runner>,
@@ -441,6 +443,7 @@ async fn create_components(
         dns_resolver,
         outbound_manager,
         dispatcher,
+        router,
         inbound_manager,
         #[cfg(feature = "tun")]
         tun_runner,

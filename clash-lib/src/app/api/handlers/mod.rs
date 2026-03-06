@@ -3,5 +3,6 @@ pub mod hello;
 pub mod memory;
 pub mod proxy;
 pub mod restart;
+pub mod rule;
 pub mod utils;
 pub mod version;

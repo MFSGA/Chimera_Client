@@ -21,6 +21,7 @@ use crate::{
         inbound::manager::InboundManager,
         logging::LogEvent,
         outbound::manager::ThreadSafeOutboundManager,
+        router::ThreadSafeRouter,
     },
     config::internal::config::Controller,
 };
@@ -42,6 +43,7 @@ pub fn get_api_runner(
     global_state: Arc<Mutex<GlobalState>>,
     dns_resolver: ThreadSafeDNSResolver,
     outbound_manager: ThreadSafeOutboundManager,
+    router_state: ThreadSafeRouter,
     _cwd: String,
 ) -> Option<Runner> {
     tracing::debug!("API controller configuration: {:?}", controller_cfg);
@@ -101,6 +103,7 @@ pub fn get_api_runner(
                 "/proxies",
                 handlers::proxy::routes(outbound_manager.clone()),
             )
+            .nest("/rules", handlers::rule::routes(router_state.clone()))
             .layer(cors)
             .with_state(app_state.clone())
             .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()));

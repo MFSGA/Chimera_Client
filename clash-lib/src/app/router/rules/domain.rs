@@ -15,6 +15,10 @@ impl std::fmt::Display for Domain {
 }
 
 impl RuleMatcher for Domain {
+    fn payload(&self) -> String {
+        self.domain.clone()
+    }
+
     fn apply(&self, sess: &session::Session) -> bool {
         match &sess.destination {
             session::SocksAddr::Ip(_) => false,
