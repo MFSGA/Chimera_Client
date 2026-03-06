@@ -47,6 +47,7 @@ pub struct OutboundManager {
     proxy_providers: HashMap<String, ThreadSafeProxyProvider>,
     proxy_manager: ProxyManager,
     selector_control: HashMap<String, ThreadSafeSelectorControl>,
+    cache_store: ThreadSafeCacheFile,
 }
 
 pub type ThreadSafeOutboundManager = Arc<OutboundManager>;
@@ -97,6 +98,7 @@ impl OutboundManager {
             proxy_manager,
             selector_control,
             proxy_providers: provider_registry,
+            cache_store: cache_store.clone(),
         };
 
         debug!("initializing proxy providers");
@@ -119,6 +121,15 @@ impl OutboundManager {
 
     pub fn proxy_names(&self) -> &[String] {
         &self.proxy_names
+    }
+
+    pub async fn select(&self, group: &str, proxy: &str) -> Result<(), Error> {
+        let selector = self.selector_control.get(group).ok_or_else(|| {
+            Error::Operation(format!("selector group `{group}` not found"))
+        })?;
+        selector.select(proxy).await?;
+        self.cache_store.set_selected(group, proxy).await;
+        Ok(())
     }
 
     /// Get all proxies in the manager, excluding those in providers.
