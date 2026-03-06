@@ -6,6 +6,7 @@ use std::{
     },
 };
 
+use memory_stats::memory_stats;
 use serde::Serialize;
 use tokio::sync::{Mutex, RwLock, oneshot::Sender};
 
@@ -84,6 +85,10 @@ impl StatisticsManager {
             .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         self.upload_total
             .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn memory_usage(&self) -> usize {
+        memory_stats().map(|x| x.physical_mem).unwrap_or(0)
     }
 }
 

@@ -245,6 +245,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b52af3cb4058c895d37317bb27508dccc8e5f2d39454016b297bf4a400597b8"
 dependencies = [
  "axum-core",
+ "base64",
  "bytes",
  "form_urlencoded",
  "futures-util",
@@ -263,8 +264,10 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "serde_urlencoded",
+ "sha1",
  "sync_wrapper",
  "tokio",
+ "tokio-tungstenite",
  "tower",
  "tower-layer",
  "tower-service",
@@ -476,7 +479,7 @@ dependencies = [
 
 [[package]]
 name = "chimera-dns"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -553,15 +556,15 @@ checksum = "3a822ea5bc7590f9d40f1ba12c0dc3c2760f3482c6984db1573ad11031420831"
 
 [[package]]
 name = "clash-doc"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "clash-ffi"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "clash-lib"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -590,6 +593,7 @@ dependencies = [
  "log",
  "maxminddb",
  "memchr",
+ "memory-stats",
  "network-interface",
  "quinn",
  "quinn-proto",
@@ -628,7 +632,7 @@ dependencies = [
 
 [[package]]
 name = "clash-rs"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "aws-lc-rs",
  "clap",
@@ -1863,6 +1867,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "memory-stats"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c73f5c649995a115e1a0220b35e4df0a1294500477f97a91d0660fb5abeb574a"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3560,7 +3574,7 @@ dependencies = [
 
 [[package]]
 name = "watfaq-netstack"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bytes",
  "env_logger",

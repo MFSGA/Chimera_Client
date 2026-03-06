@@ -75,6 +75,7 @@ socket2 = { version = "0.6", features = ["all"] }
 downcast-rs = "2.0"
 
 rand = "0.10"
+memory-stats = "1"
 
 chrono = { version = "0.4", features = ["serde"] }
 
@@ -103,7 +104,7 @@ base64 = "0.22"
 
 aws-lc-rs = { version = "1", default-features = false, optional = true }
 
-axum = { version = "0.8" }
+axum = { version = "0.8", features = ["ws"] }
 tower = { version = "0.5", features = ["util"] }
 
 tower-http = { version = "0.6", features = ["fs", "trace", "cors"] }
