@@ -108,6 +108,12 @@ pub struct GlobalState {
     cwd: String,
 }
 
+impl GlobalState {
+    pub(crate) fn log_level(&self) -> LogLevel {
+        self.log_level
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 pub type Runner = futures::future::BoxFuture<'static, Result<()>>;
 
@@ -230,6 +236,10 @@ pub async fn start(
         controller_cfg,
         log_tx.clone(),
         components.statistics_manager,
+        components.inbound_manager.clone(),
+        components.dispatcher.clone(),
+        global_state.clone(),
+        components.dns_resolver.clone(),
         components.outbound_manager,
         /* components.inbound_manager,
 

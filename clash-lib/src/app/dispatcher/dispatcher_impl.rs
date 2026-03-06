@@ -72,6 +72,14 @@ impl Dispatcher {
         self.manager.clone()
     }
 
+    pub async fn get_mode(&self) -> RunMode {
+        *self.mode.read().await
+    }
+
+    pub async fn set_mode(&self, mode: RunMode) {
+        *self.mode.write().await = mode;
+    }
+
     #[instrument(skip(self, sess, lhs))]
     pub async fn dispatch_stream(
         &self,

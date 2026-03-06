@@ -131,6 +131,15 @@ impl InboundManager {
         }
     }
 
+    pub async fn get_bind_address(&self) -> BindAddress {
+        let guard = self.inbound_handlers.read().await;
+        if let Some((opts, _)) = guard.iter().next() {
+            opts.common_opts().listen
+        } else {
+            BindAddress::default()
+        }
+    }
+
     pub async fn set_allow_lan(&self, allow_lan: bool) {
         let mut guard = self.inbound_handlers.write().await;
         let new_map = guard

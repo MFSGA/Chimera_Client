@@ -5,7 +5,7 @@ use axum::{
     routing::{get, post},
 };
 use http::{Method, header};
-use tokio::sync::broadcast::Sender;
+use tokio::sync::{Mutex, broadcast::Sender};
 use tower::ServiceBuilder;
 use tower_http::{
     cors::{AllowOrigin, Any, CorsLayer},
@@ -14,9 +14,12 @@ use tower_http::{
 use tracing::{error, info, warn};
 
 use crate::{
-    Runner,
+    GlobalState, Runner,
     app::{
-        dispatcher::StatisticsManager, logging::LogEvent,
+        dispatcher::{Dispatcher, StatisticsManager},
+        dns::ThreadSafeDNSResolver,
+        inbound::manager::InboundManager,
+        logging::LogEvent,
         outbound::manager::ThreadSafeOutboundManager,
     },
     config::internal::config::Controller,
@@ -34,6 +37,10 @@ pub fn get_api_runner(
     controller_cfg: Controller,
     log_source: Sender<LogEvent>,
     statistics_manager: Arc<StatisticsManager>,
+    inbound_manager: Arc<InboundManager>,
+    dispatcher: Arc<Dispatcher>,
+    global_state: Arc<Mutex<GlobalState>>,
+    dns_resolver: ThreadSafeDNSResolver,
     outbound_manager: ThreadSafeOutboundManager,
     _cwd: String,
 ) -> Option<Runner> {
@@ -81,6 +88,15 @@ pub fn get_api_runner(
             .route("/version", get(handlers::version::handle))
             .route("/memory", get(handlers::memory::handle))
             .route("/restart", post(handlers::restart::handle))
+            .nest(
+                "/configs",
+                handlers::config::routes(
+                    inbound_manager.clone(),
+                    dispatcher.clone(),
+                    global_state.clone(),
+                    dns_resolver.clone(),
+                ),
+            )
             .nest(
                 "/proxies",
                 handlers::proxy::routes(outbound_manager.clone()),
