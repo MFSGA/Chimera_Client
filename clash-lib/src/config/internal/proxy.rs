@@ -159,6 +159,20 @@ pub struct GrpcOpt {
     pub grpc_service_name: Option<String>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct XhttpOpt {
+    pub path: Option<String>,
+    pub mode: Option<String>,
+    pub host: Option<Vec<String>>,
+    pub headers: Option<HashMap<String, String>>,
+    pub download_mode: Option<String>,
+    pub upload_mode: Option<String>,
+    pub max_each_post_bytes: Option<usize>,
+    pub max_buffered_posts: Option<usize>,
+    pub session_ttl: Option<u64>,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct OutboundVless {
@@ -174,6 +188,8 @@ pub struct OutboundVless {
     #[serde(alias = "fingerprint")]
     pub client_fingerprint: Option<String>,
     pub network: Option<String>,
+    #[serde(alias = "xhttpOpts")]
+    pub xhttp_opts: Option<XhttpOpt>,
     #[cfg(feature = "ws")]
     pub ws_opts: Option<WsOpt>,
     #[serde(alias = "realityOpts")]
@@ -309,4 +325,46 @@ pub struct OutboundHysteria2 {
 #[serde(rename_all = "lowercase")]
 pub enum Hysteria2Obfs {
     Salamander,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OutboundProxyProtocol;
+
+    #[test]
+    fn outbound_vless_parses_xhttp_opts() {
+        let config = r#"
+name: xhttp-demo
+type: vless
+server: 127.0.0.1
+port: 3000
+uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+network: xhttp
+xhttp-opts:
+  path: /xhttp/
+  mode: split
+  download-mode: stream-down
+  upload-mode: packet-up
+  max-each-post-bytes: 1000000
+  max-buffered-posts: 30
+  session-ttl: 30
+"#;
+
+        let parsed: OutboundProxyProtocol =
+            serde_yaml::from_str(config).expect("xhttp config should parse");
+
+        let OutboundProxyProtocol::Vless(vless) = parsed else {
+            panic!("expected vless proxy");
+        };
+
+        assert_eq!(vless.network.as_deref(), Some("xhttp"));
+        let opts = vless.xhttp_opts.expect("xhttp_opts should be present");
+        assert_eq!(opts.path.as_deref(), Some("/xhttp/"));
+        assert_eq!(opts.mode.as_deref(), Some("split"));
+        assert_eq!(opts.download_mode.as_deref(), Some("stream-down"));
+        assert_eq!(opts.upload_mode.as_deref(), Some("packet-up"));
+        assert_eq!(opts.max_each_post_bytes, Some(1_000_000));
+        assert_eq!(opts.max_buffered_posts, Some(30));
+        assert_eq!(opts.session_ttl, Some(30));
+    }
 }

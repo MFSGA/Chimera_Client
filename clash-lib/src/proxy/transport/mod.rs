@@ -3,11 +3,13 @@ mod tls;
 
 #[cfg(feature = "ws")]
 mod ws;
+mod xhttp;
 
 #[cfg(feature = "tls")]
 pub use tls::Client as TlsClient;
 #[cfg(feature = "ws")]
 pub use ws::Client as WsClient;
+pub use xhttp::{Client as XhttpClient, XhttpMode};
 
 #[async_trait::async_trait]
 pub trait Transport: Send + Sync {

@@ -1,9 +1,9 @@
 use crate::{
     Error,
-    config::internal::proxy::OutboundVless,
+    config::internal::proxy::{OutboundVless, XhttpOpt},
     proxy::{
         HandlerCommonOptions,
-        transport::{TlsClient, Transport},
+        transport::{TlsClient, Transport, XhttpClient, XhttpMode},
         vless::{Handler, HandlerOptions},
     },
 };
@@ -15,6 +15,7 @@ use tracing::warn;
 use crate::proxy::transport::WsClient;
 
 const DEFAULT_WS_ALPN: [&str; 1] = ["http/1.1"];
+const DEFAULT_XHTTP_ALPN: [&str; 1] = ["h2"];
 
 #[cfg(feature = "reality")]
 use crate::proxy::transport::{
@@ -74,6 +75,7 @@ fn build_transport(
             }
         }
         "ws" => build_ws_transport(s),
+        "xhttp" => build_xhttp_transport(s),
         other => Err(Error::InvalidConfig(format!(
             "unsupported vless network: {other}"
         ))),
@@ -101,6 +103,12 @@ fn build_tls_transport(
     let alpn = match network {
         Some("ws") => Some(
             DEFAULT_WS_ALPN
+                .iter()
+                .map(|item| (*item).to_owned())
+                .collect::<Vec<_>>(),
+        ),
+        Some("xhttp") => Some(
+            DEFAULT_XHTTP_ALPN
                 .iter()
                 .map(|item| (*item).to_owned())
                 .collect::<Vec<_>>(),
@@ -150,6 +158,89 @@ fn build_ws_transport(
             "vless ws network requires ws feature".to_owned(),
         ))
     }
+}
+
+fn build_xhttp_transport(
+    s: &OutboundVless,
+) -> Result<Option<Box<dyn Transport>>, Error> {
+    if s.reality_opts.is_some() {
+        return Err(Error::InvalidConfig(
+            "vless xhttp with reality is not implemented yet".to_owned(),
+        ));
+    }
+
+    let xhttp_opts = s.xhttp_opts.as_ref().ok_or_else(|| {
+        Error::InvalidConfig("xhttp_opts is required for vless xhttp".to_owned())
+    })?;
+
+    validate_xhttp_opts(xhttp_opts)?;
+    let mode = parse_xhttp_mode(xhttp_opts)?;
+
+    Ok(Some(Box::new(XhttpClient::new(
+        s.common_opts.server.clone(),
+        s.common_opts.port,
+        normalized_xhttp_path(xhttp_opts.path.as_deref()),
+        xhttp_opts.host.clone(),
+        xhttp_opts.headers.clone().unwrap_or_default(),
+        s.tls.unwrap_or_default(),
+        mode,
+        xhttp_opts.max_each_post_bytes.unwrap_or(1_000_000),
+    ))))
+}
+
+fn validate_xhttp_opts(xhttp_opts: &XhttpOpt) -> Result<(), Error> {
+    if matches!(xhttp_opts.path.as_deref(), Some("")) {
+        return Err(Error::InvalidConfig(
+            "xhttp path must not be empty".to_owned(),
+        ));
+    }
+
+    for (name, value) in [
+        ("max_each_post_bytes", xhttp_opts.max_each_post_bytes),
+        ("max_buffered_posts", xhttp_opts.max_buffered_posts),
+    ] {
+        if matches!(value, Some(0)) {
+            return Err(Error::InvalidConfig(format!(
+                "xhttp {name} must be greater than zero"
+            )));
+        }
+    }
+
+    if matches!(xhttp_opts.session_ttl, Some(0)) {
+        return Err(Error::InvalidConfig(
+            "xhttp session_ttl must be greater than zero".to_owned(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn parse_xhttp_mode(xhttp_opts: &XhttpOpt) -> Result<XhttpMode, Error> {
+    let mode = xhttp_opts.mode.as_deref().unwrap_or("auto");
+    match mode {
+        "stream-one" => Ok(XhttpMode::StreamOne),
+        "stream-up" => Ok(XhttpMode::StreamUp),
+        "packet-up" | "split" => Ok(XhttpMode::PacketUp),
+        "auto" => Ok(XhttpMode::PacketUp),
+        other => Err(Error::InvalidConfig(format!(
+            "unsupported xhttp mode: {other}"
+        ))),
+    }
+}
+
+fn normalized_xhttp_path(path: Option<&str>) -> String {
+    let raw = path.unwrap_or("/");
+    let mut normalized = if raw.starts_with('/') {
+        raw.to_owned()
+    } else {
+        format!("/{raw}")
+    };
+
+    if !normalized.ends_with('/') {
+        normalized.push('/');
+    }
+
+    normalized
 }
 
 #[cfg(feature = "reality")]
@@ -225,14 +316,15 @@ fn decode_reality_short_id(short_id: Option<&str>) -> Result<[u8; 8], Error> {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::internal::proxy::CommonConfigOptions;
+    #[cfg(feature = "reality")]
+    use crate::config::internal::proxy::OutboundTrojanRealityOpts;
+    use crate::config::internal::proxy::{CommonConfigOptions, XhttpOpt};
 
     use super::{OutboundVless, build_tls_transport};
 
     #[cfg(feature = "ws")]
     use crate::config::internal::proxy::WsOpt;
 
-    #[cfg(feature = "ws")]
     use super::build_transport;
 
     #[cfg(feature = "reality")]
@@ -289,6 +381,201 @@ mod tests {
         let tls = build_tls_transport(outbound.network.as_deref(), &outbound, false)
             .expect("tls build should succeed");
         assert!(tls.is_some(), "tls transport should be present");
+    }
+
+    #[test]
+    fn vless_xhttp_requires_xhttp_opts() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            network: Some("xhttp".to_owned()),
+            ..Default::default()
+        };
+
+        let err = match build_transport(outbound.network.as_deref(), &outbound) {
+            Ok(_) => panic!("missing xhttp_opts must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("xhttp_opts is required"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vless_xhttp_stream_one_transport_builds() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            network: Some("xhttp".to_owned()),
+            xhttp_opts: Some(XhttpOpt {
+                path: Some("/xhttp/".to_owned()),
+                mode: Some("stream-one".to_owned()),
+                max_each_post_bytes: Some(1_000_000),
+                max_buffered_posts: Some(30),
+                session_ttl: Some(30),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let transport = build_transport(outbound.network.as_deref(), &outbound)
+            .expect("xhttp stream-one should build");
+        assert!(transport.is_some(), "xhttp transport should be present");
+    }
+
+    #[test]
+    fn vless_xhttp_rejects_zero_limits() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            network: Some("xhttp".to_owned()),
+            xhttp_opts: Some(XhttpOpt {
+                path: Some("/xhttp/".to_owned()),
+                max_buffered_posts: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = match build_transport(outbound.network.as_deref(), &outbound) {
+            Ok(_) => panic!("zero xhttp limits must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("must be greater than zero"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vless_xhttp_stream_up_transport_builds() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            network: Some("xhttp".to_owned()),
+            xhttp_opts: Some(XhttpOpt {
+                path: Some("/xhttp/".to_owned()),
+                mode: Some("stream-up".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let transport = build_transport(outbound.network.as_deref(), &outbound)
+            .expect("stream-up mode should build");
+        assert!(
+            transport.is_some(),
+            "xhttp stream-up transport should be present"
+        );
+    }
+
+    #[test]
+    fn vless_xhttp_packet_up_transport_builds() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            network: Some("xhttp".to_owned()),
+            xhttp_opts: Some(XhttpOpt {
+                path: Some("/xhttp/".to_owned()),
+                mode: Some("split".to_owned()),
+                upload_mode: Some("packet-up".to_owned()),
+                download_mode: Some("stream-down".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let transport = build_transport(outbound.network.as_deref(), &outbound)
+            .expect("split mode should build");
+        assert!(
+            transport.is_some(),
+            "xhttp packet-up transport should be present"
+        );
+    }
+
+    #[test]
+    fn vless_xhttp_auto_defaults_to_packet_up() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            network: Some("xhttp".to_owned()),
+            xhttp_opts: Some(XhttpOpt {
+                path: Some("/xhttp/".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let transport = build_transport(outbound.network.as_deref(), &outbound)
+            .expect("auto mode should build");
+        assert!(
+            transport.is_some(),
+            "xhttp auto transport should be present"
+        );
+    }
+
+    #[cfg(feature = "reality")]
+    #[test]
+    fn vless_xhttp_rejects_reality() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            network: Some("xhttp".to_owned()),
+            xhttp_opts: Some(XhttpOpt {
+                path: Some("/xhttp/".to_owned()),
+                ..Default::default()
+            }),
+            reality_opts: Some(OutboundTrojanRealityOpts {
+                public_key: "a".repeat(43),
+                short_id: None,
+            }),
+            ..Default::default()
+        };
+
+        let err = match build_transport(outbound.network.as_deref(), &outbound) {
+            Ok(_) => panic!("xhttp reality should be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("reality is not implemented"),
+            "unexpected error: {err}"
+        );
     }
 
     #[cfg(feature = "ws")]
