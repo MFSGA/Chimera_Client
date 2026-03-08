@@ -161,11 +161,47 @@ pub struct GrpcOpt {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
 #[serde(rename_all = "kebab-case")]
+pub struct XhttpDownloadTlsSettings {
+    #[serde(alias = "serverName")]
+    pub server_name: Option<String>,
+    #[serde(alias = "allowInsecure")]
+    pub insecure: Option<bool>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct XhttpDownloadXhttpSettings {
+    pub path: Option<String>,
+    pub host: Option<Vec<String>>,
+    pub headers: Option<HashMap<String, String>>,
+    pub mode: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct XhttpDownloadSettings {
+    pub address: String,
+    pub port: u16,
+    pub network: String,
+    pub security: Option<String>,
+    #[serde(alias = "servername", alias = "serverName")]
+    pub server_name: Option<String>,
+    pub sni: Option<String>,
+    #[serde(alias = "tlsSettings")]
+    pub tls_settings: Option<XhttpDownloadTlsSettings>,
+    #[serde(alias = "xhttpSettings")]
+    pub xhttp_settings: Option<XhttpDownloadXhttpSettings>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+#[serde(rename_all = "kebab-case")]
 pub struct XhttpOpt {
     pub path: Option<String>,
     pub mode: Option<String>,
     pub host: Option<Vec<String>>,
     pub headers: Option<HashMap<String, String>>,
+    #[serde(alias = "downloadSettings")]
+    pub download_settings: Option<XhttpDownloadSettings>,
     pub download_mode: Option<String>,
     pub upload_mode: Option<String>,
     pub max_each_post_bytes: Option<usize>,
@@ -343,6 +379,13 @@ network: xhttp
 xhttp-opts:
   path: /xhttp/
   mode: split
+  download-settings:
+    address: download.example.com
+    port: 8443
+    network: xhttp
+    security: tls
+    xhttp-settings:
+      path: /download/
   download-mode: stream-down
   upload-mode: packet-up
   max-each-post-bytes: 1000000
@@ -360,6 +403,20 @@ xhttp-opts:
         assert_eq!(vless.network.as_deref(), Some("xhttp"));
         let opts = vless.xhttp_opts.expect("xhttp_opts should be present");
         assert_eq!(opts.path.as_deref(), Some("/xhttp/"));
+        let download = opts
+            .download_settings
+            .expect("download_settings should be present");
+        assert_eq!(download.address, "download.example.com");
+        assert_eq!(download.port, 8443);
+        assert_eq!(download.network, "xhttp");
+        assert_eq!(download.security.as_deref(), Some("tls"));
+        assert_eq!(
+            download
+                .xhttp_settings
+                .and_then(|settings| settings.path)
+                .as_deref(),
+            Some("/download/")
+        );
         assert_eq!(opts.mode.as_deref(), Some("split"));
         assert_eq!(opts.download_mode.as_deref(), Some("stream-down"));
         assert_eq!(opts.upload_mode.as_deref(), Some("packet-up"));

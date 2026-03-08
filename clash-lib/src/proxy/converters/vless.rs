@@ -1,9 +1,12 @@
 use crate::{
     Error,
-    config::internal::proxy::{OutboundVless, XhttpOpt},
+    config::internal::proxy::{OutboundVless, XhttpDownloadSettings, XhttpOpt},
     proxy::{
         HandlerCommonOptions,
-        transport::{TlsClient, Transport, XhttpClient, XhttpMode},
+        transport::{
+            TlsClient, Transport, XhttpClient, XhttpDownloadConfig, XhttpMode,
+            XhttpSecurity,
+        },
         vless::{Handler, HandlerOptions},
     },
 };
@@ -185,7 +188,64 @@ fn build_xhttp_transport(
         s.tls.unwrap_or_default(),
         mode,
         xhttp_opts.max_each_post_bytes.unwrap_or(1_000_000),
+        build_xhttp_download_config(xhttp_opts)?,
     ))))
+}
+
+fn build_xhttp_download_config(
+    xhttp_opts: &XhttpOpt,
+) -> Result<Option<XhttpDownloadConfig>, Error> {
+    let Some(download_settings) = xhttp_opts.download_settings.as_ref() else {
+        return Ok(None);
+    };
+
+    validate_xhttp_download_settings(download_settings)?;
+
+    let xhttp_settings = download_settings.xhttp_settings.as_ref();
+    let host = xhttp_settings.and_then(|settings| settings.host.clone());
+    let security = match download_settings.security.as_deref().unwrap_or("none") {
+        "none" => XhttpSecurity::None,
+        "tls" => XhttpSecurity::Tls,
+        other => {
+            return Err(Error::InvalidConfig(format!(
+                "unsupported xhttp download_settings security: {other}"
+            )));
+        }
+    };
+
+    let server_name = download_settings
+        .sni
+        .clone()
+        .or_else(|| download_settings.server_name.clone())
+        .or_else(|| {
+            download_settings
+                .tls_settings
+                .as_ref()
+                .and_then(|settings| settings.server_name.clone())
+        })
+        .or_else(|| host.as_ref().and_then(|hosts| hosts.first().cloned()))
+        .unwrap_or_else(|| download_settings.address.clone());
+
+    let skip_cert_verify = download_settings
+        .tls_settings
+        .as_ref()
+        .and_then(|settings| settings.insecure)
+        .unwrap_or(false);
+
+    Ok(Some(XhttpDownloadConfig {
+        server: download_settings.address.clone(),
+        port: download_settings.port,
+        path: normalized_xhttp_path(
+            xhttp_settings.and_then(|settings| settings.path.as_deref()),
+        ),
+        host,
+        headers: xhttp_settings
+            .and_then(|settings| settings.headers.clone())
+            .unwrap_or_default(),
+        security,
+        server_name,
+        skip_cert_verify,
+    }))
 }
 
 fn validate_xhttp_opts(xhttp_opts: &XhttpOpt) -> Result<(), Error> {
@@ -209,6 +269,58 @@ fn validate_xhttp_opts(xhttp_opts: &XhttpOpt) -> Result<(), Error> {
     if matches!(xhttp_opts.session_ttl, Some(0)) {
         return Err(Error::InvalidConfig(
             "xhttp session_ttl must be greater than zero".to_owned(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_xhttp_download_settings(
+    download_settings: &XhttpDownloadSettings,
+) -> Result<(), Error> {
+    if download_settings.address.is_empty() {
+        return Err(Error::InvalidConfig(
+            "xhttp download_settings address must not be empty".to_owned(),
+        ));
+    }
+
+    if download_settings.port == 0 {
+        return Err(Error::InvalidConfig(
+            "xhttp download_settings port must be greater than zero".to_owned(),
+        ));
+    }
+
+    if download_settings.network != "xhttp" {
+        return Err(Error::InvalidConfig(format!(
+            "xhttp download_settings network must be xhttp, got {}",
+            download_settings.network
+        )));
+    }
+
+    if let Some(security) = download_settings.security.as_deref()
+        && !matches!(security, "none" | "tls")
+    {
+        return Err(Error::InvalidConfig(format!(
+            "unsupported xhttp download_settings security: {security}"
+        )));
+    }
+
+    if matches!(
+        download_settings
+            .xhttp_settings
+            .as_ref()
+            .and_then(|settings| settings.path.as_deref()),
+        Some("")
+    ) {
+        return Err(Error::InvalidConfig(
+            "xhttp download_settings path must not be empty".to_owned(),
+        ));
+    }
+
+    #[cfg(not(feature = "tls"))]
+    if matches!(download_settings.security.as_deref(), Some("tls")) {
+        return Err(Error::InvalidConfig(
+            "xhttp download_settings tls requires tls feature".to_owned(),
         ));
     }
 
@@ -318,7 +430,10 @@ fn decode_reality_short_id(short_id: Option<&str>) -> Result<[u8; 8], Error> {
 mod tests {
     #[cfg(feature = "reality")]
     use crate::config::internal::proxy::OutboundTrojanRealityOpts;
-    use crate::config::internal::proxy::{CommonConfigOptions, XhttpOpt};
+    use crate::config::internal::proxy::{
+        CommonConfigOptions, XhttpDownloadSettings, XhttpDownloadXhttpSettings,
+        XhttpOpt,
+    };
 
     use super::{OutboundVless, build_tls_transport};
 
@@ -542,6 +657,79 @@ mod tests {
         assert!(
             transport.is_some(),
             "xhttp auto transport should be present"
+        );
+    }
+
+    #[test]
+    fn vless_xhttp_download_settings_transport_builds() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp".to_owned(),
+                server: "upload.example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            network: Some("xhttp".to_owned()),
+            xhttp_opts: Some(XhttpOpt {
+                path: Some("/upload/".to_owned()),
+                mode: Some("packet-up".to_owned()),
+                download_settings: Some(XhttpDownloadSettings {
+                    address: "download.example.com".to_owned(),
+                    port: 8443,
+                    network: "xhttp".to_owned(),
+                    security: Some("tls".to_owned()),
+                    xhttp_settings: Some(XhttpDownloadXhttpSettings {
+                        path: Some("/download/".to_owned()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let transport = build_transport(outbound.network.as_deref(), &outbound)
+            .expect("download settings transport should build");
+        assert!(
+            transport.is_some(),
+            "xhttp transport with download settings should be present"
+        );
+    }
+
+    #[test]
+    fn vless_xhttp_rejects_non_xhttp_download_network() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp".to_owned(),
+                server: "upload.example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            network: Some("xhttp".to_owned()),
+            xhttp_opts: Some(XhttpOpt {
+                path: Some("/upload/".to_owned()),
+                download_settings: Some(XhttpDownloadSettings {
+                    address: "download.example.com".to_owned(),
+                    port: 8443,
+                    network: "ws".to_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = match build_transport(outbound.network.as_deref(), &outbound) {
+            Ok(_) => panic!("non-xhttp download network should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("download_settings network must be xhttp"),
+            "unexpected error: {err}"
         );
     }
 

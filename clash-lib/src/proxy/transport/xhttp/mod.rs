@@ -8,23 +8,48 @@ use hyper::body::{Frame, Incoming};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
     sync::mpsc,
 };
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
+#[cfg(feature = "tls")]
+use super::TlsClient;
 use super::Transport;
 use crate::{common::errors::map_io_error, proxy::AnyStream};
 
 const DUPLEX_BUFFER_SIZE: usize = 64 * 1024;
 const FRAME_CHANNEL_CAPACITY: usize = 32;
 const READ_CHUNK_SIZE: usize = 8 * 1024;
+const DEFAULT_XHTTP_ALPN: [&str; 1] = ["h2"];
+
+type H2SendRequest =
+    hyper::client::conn::http2::SendRequest<BoxBody<Bytes, Infallible>>;
 
 #[derive(Clone, Debug)]
 pub enum XhttpMode {
     StreamOne,
     StreamUp,
     PacketUp,
+}
+
+#[derive(Clone, Debug)]
+pub enum XhttpSecurity {
+    None,
+    Tls,
+}
+
+#[derive(Clone, Debug)]
+pub struct XhttpDownloadConfig {
+    pub server: String,
+    pub port: u16,
+    pub path: String,
+    pub host: Option<Vec<String>>,
+    pub headers: HashMap<String, String>,
+    pub security: XhttpSecurity,
+    pub server_name: String,
+    pub skip_cert_verify: bool,
 }
 
 pub struct Client {
@@ -36,6 +61,7 @@ pub struct Client {
     use_tls: bool,
     mode: XhttpMode,
     max_each_post_bytes: usize,
+    download: Option<XhttpDownloadConfig>,
 }
 
 impl Client {
@@ -48,6 +74,7 @@ impl Client {
         use_tls: bool,
         mode: XhttpMode,
         max_each_post_bytes: usize,
+        download: Option<XhttpDownloadConfig>,
     ) -> Self {
         Self {
             server,
@@ -58,6 +85,7 @@ impl Client {
             use_tls,
             mode,
             max_each_post_bytes,
+            download,
         }
     }
 
@@ -78,6 +106,107 @@ impl Client {
             body,
         )
     }
+}
+
+async fn handshake_http2(stream: AnyStream) -> io::Result<H2SendRequest> {
+    let io = TokioIo::new(stream);
+    let (sender, conn) = hyper::client::conn::http2::handshake::<
+        _,
+        _,
+        BoxBody<Bytes, Infallible>,
+    >(TokioExecutor::new(), io)
+    .await
+    .map_err(map_io_error)?;
+
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    Ok(sender)
+}
+
+async fn connect_download_stream(
+    config: &XhttpDownloadConfig,
+) -> io::Result<AnyStream> {
+    let tcp = TcpStream::connect((config.server.as_str(), config.port)).await?;
+    let stream: AnyStream = Box::new(tcp);
+
+    match config.security {
+        XhttpSecurity::None => Ok(stream),
+        XhttpSecurity::Tls => {
+            #[cfg(feature = "tls")]
+            {
+                let tls = TlsClient::new(
+                    config.skip_cert_verify,
+                    config.server_name.clone(),
+                    Some(
+                        DEFAULT_XHTTP_ALPN
+                            .iter()
+                            .map(|item| (*item).to_owned())
+                            .collect(),
+                    ),
+                    None,
+                );
+                tls.proxy_stream(stream).await
+            }
+            #[cfg(not(feature = "tls"))]
+            {
+                let _ = stream;
+                Err(io::Error::other(
+                    "xhttp download_settings tls requires tls feature",
+                ))
+            }
+        }
+    }
+}
+
+async fn open_downlink_response(
+    client: &Client,
+    sender: &mut H2SendRequest,
+    session_id: &str,
+) -> io::Result<Incoming> {
+    if let Some(download) = client.download.as_ref() {
+        let stream = connect_download_stream(download).await?;
+        let mut downlink_sender = handshake_http2(stream).await?;
+        let path = format!("{}{}", download.path, session_id);
+        let request = build_request(
+            &download.server,
+            download.port,
+            &path,
+            download.host.as_ref(),
+            &download.headers,
+            matches!(download.security, XhttpSecurity::Tls),
+            "GET",
+            http_body_util::Empty::<Bytes>::new().boxed(),
+        )?;
+        let response = downlink_sender
+            .send_request(request)
+            .await
+            .map_err(map_io_error)?;
+        validate_response_status(response)
+    } else {
+        let path = format!("{}{}", client.path, session_id);
+        let request = client.request(
+            "GET",
+            &path,
+            http_body_util::Empty::<Bytes>::new().boxed(),
+        )?;
+        let response = sender.send_request(request).await.map_err(map_io_error)?;
+        validate_response_status(response)
+    }
+}
+
+fn validate_response_status(
+    response: http::Response<Incoming>,
+) -> io::Result<Incoming> {
+    if response.status() != StatusCode::OK {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected xhttp response status: {}", response.status()),
+        ));
+    }
+
+    Ok(response.into_body())
 }
 
 fn build_request(
@@ -128,31 +257,14 @@ async fn proxy_stream_one(
     client: &Client,
     stream: AnyStream,
 ) -> io::Result<AnyStream> {
-    let io = TokioIo::new(stream);
-    let (mut sender, conn) = hyper::client::conn::http2::handshake::<
-        _,
-        _,
-        BoxBody<Bytes, Infallible>,
-    >(TokioExecutor::new(), io)
-    .await
-    .map_err(map_io_error)?;
-
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-
+    let mut sender = handshake_http2(stream).await?;
     let (tx, rx) =
         mpsc::channel::<Result<Frame<Bytes>, Infallible>>(FRAME_CHANNEL_CAPACITY);
     let request_body = StreamBody::new(ReceiverStream::new(rx)).boxed();
     let request = client.request("POST", &client.path, request_body)?;
-    let response = sender.send_request(request).await.map_err(map_io_error)?;
-
-    if response.status() != StatusCode::OK {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unexpected xhttp response status: {}", response.status()),
-        ));
-    }
+    let response = validate_response_status(
+        sender.send_request(request).await.map_err(map_io_error)?,
+    )?;
 
     let (app_stream, transport_stream) = tokio::io::duplex(DUPLEX_BUFFER_SIZE);
     let (mut transport_reader, mut transport_writer) =
@@ -178,7 +290,7 @@ async fn proxy_stream_one(
     });
 
     tokio::spawn(async move {
-        forward_response_body(response.into_body(), &mut transport_writer).await;
+        forward_response_body(response, &mut transport_writer).await;
         let _ = transport_writer.shutdown().await;
     });
 
@@ -189,37 +301,9 @@ async fn proxy_stream_up(
     client: &Client,
     stream: AnyStream,
 ) -> io::Result<AnyStream> {
-    let io = TokioIo::new(stream);
-    let (mut sender, conn) = hyper::client::conn::http2::handshake::<
-        _,
-        _,
-        BoxBody<Bytes, Infallible>,
-    >(TokioExecutor::new(), io)
-    .await
-    .map_err(map_io_error)?;
-
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-
+    let mut sender = handshake_http2(stream).await?;
     let session_id = Uuid::new_v4().to_string();
-    let downlink_path = format!("{}{}", client.path, session_id);
-    let get_request = client.request(
-        "GET",
-        &downlink_path,
-        http_body_util::Empty::<Bytes>::new().boxed(),
-    )?;
-    let response = sender
-        .send_request(get_request)
-        .await
-        .map_err(map_io_error)?;
-
-    if response.status() != StatusCode::OK {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unexpected xhttp response status: {}", response.status()),
-        ));
-    }
+    let response = open_downlink_response(client, &mut sender, &session_id).await?;
 
     let (app_stream, transport_stream) = tokio::io::duplex(DUPLEX_BUFFER_SIZE);
     let (mut transport_reader, mut transport_writer) =
@@ -277,7 +361,7 @@ async fn proxy_stream_up(
     });
 
     tokio::spawn(async move {
-        forward_response_body(response.into_body(), &mut transport_writer).await;
+        forward_response_body(response, &mut transport_writer).await;
         let _ = transport_writer.shutdown().await;
     });
 
@@ -288,37 +372,9 @@ async fn proxy_packet_up(
     client: &Client,
     stream: AnyStream,
 ) -> io::Result<AnyStream> {
-    let io = TokioIo::new(stream);
-    let (mut sender, conn) = hyper::client::conn::http2::handshake::<
-        _,
-        _,
-        BoxBody<Bytes, Infallible>,
-    >(TokioExecutor::new(), io)
-    .await
-    .map_err(map_io_error)?;
-
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-
+    let mut sender = handshake_http2(stream).await?;
     let session_id = Uuid::new_v4().to_string();
-    let downlink_path = format!("{}{}", client.path, session_id);
-    let get_request = client.request(
-        "GET",
-        &downlink_path,
-        http_body_util::Empty::<Bytes>::new().boxed(),
-    )?;
-    let response = sender
-        .send_request(get_request)
-        .await
-        .map_err(map_io_error)?;
-
-    if response.status() != StatusCode::OK {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unexpected xhttp response status: {}", response.status()),
-        ));
-    }
+    let response = open_downlink_response(client, &mut sender, &session_id).await?;
 
     let (app_stream, transport_stream) = tokio::io::duplex(DUPLEX_BUFFER_SIZE);
     let (mut transport_reader, mut transport_writer) =
@@ -370,7 +426,7 @@ async fn proxy_packet_up(
     });
 
     tokio::spawn(async move {
-        forward_response_body(response.into_body(), &mut transport_writer).await;
+        forward_response_body(response, &mut transport_writer).await;
         let _ = transport_writer.shutdown().await;
     });
 
@@ -397,7 +453,7 @@ async fn forward_response_body(
 
 #[cfg(test)]
 mod tests {
-    use super::{Client, XhttpMode};
+    use super::{Client, XhttpDownloadConfig, XhttpMode, XhttpSecurity};
     use crate::proxy::transport::Transport;
     use bytes::Bytes;
     use http::{Method, Request, Response, StatusCode};
@@ -447,6 +503,7 @@ mod tests {
             false,
             XhttpMode::StreamOne,
             1_000_000,
+            None,
         );
 
         let mut proxied = client
@@ -507,6 +564,7 @@ mod tests {
             false,
             XhttpMode::StreamUp,
             1_000_000,
+            None,
         );
 
         let mut proxied = client
@@ -567,6 +625,106 @@ mod tests {
             false,
             XhttpMode::PacketUp,
             1_000_000,
+            None,
+        );
+
+        let mut proxied = client
+            .proxy_stream(Box::new(stream))
+            .await
+            .expect("packet-up transport should connect");
+        proxied
+            .write_all(b"ping")
+            .await
+            .expect("write should succeed");
+        proxied.flush().await.expect("flush should succeed");
+
+        let mut buf = [0_u8; 4];
+        timeout(Duration::from_secs(2), proxied.read_exact(&mut buf))
+            .await
+            .expect("read should finish")
+            .expect("read should succeed");
+        assert_eq!(&buf, b"ping");
+    }
+
+    #[tokio::test]
+    async fn xhttp_packet_up_supports_separate_download_settings() {
+        let upload_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upload listener should bind");
+        let upload_addr = upload_listener
+            .local_addr()
+            .expect("upload listener should expose addr");
+        let download_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("download listener should bind");
+        let download_addr = download_listener
+            .local_addr()
+            .expect("download listener should expose addr");
+        let sessions = Arc::new(Mutex::new(HashMap::<
+            String,
+            mpsc::Sender<Result<Frame<Bytes>, Infallible>>,
+        >::new()));
+
+        tokio::spawn({
+            let sessions = sessions.clone();
+            async move {
+                let (tcp, _) = upload_listener
+                    .accept()
+                    .await
+                    .expect("upload accept should succeed");
+                let io = TokioIo::new(tcp);
+                let service = hyper::service::service_fn(move |req| {
+                    handle_split_modes(req, sessions.clone())
+                });
+                let builder = auto::Builder::new(TokioExecutor::new()).http2_only();
+                builder
+                    .serve_connection(io, service)
+                    .await
+                    .expect("upload server connection should succeed");
+            }
+        });
+
+        tokio::spawn({
+            let sessions = sessions.clone();
+            async move {
+                let (tcp, _) = download_listener
+                    .accept()
+                    .await
+                    .expect("download accept should succeed");
+                let io = TokioIo::new(tcp);
+                let service = hyper::service::service_fn(move |req| {
+                    handle_split_modes(req, sessions.clone())
+                });
+                let builder = auto::Builder::new(TokioExecutor::new()).http2_only();
+                builder
+                    .serve_connection(io, service)
+                    .await
+                    .expect("download server connection should succeed");
+            }
+        });
+
+        let stream = TcpStream::connect(upload_addr)
+            .await
+            .expect("client should connect");
+        let client = Client::new(
+            "127.0.0.1".to_owned(),
+            upload_addr.port(),
+            "/xhttp/".to_owned(),
+            None,
+            HashMap::new(),
+            false,
+            XhttpMode::PacketUp,
+            1_000_000,
+            Some(XhttpDownloadConfig {
+                server: "127.0.0.1".to_owned(),
+                port: download_addr.port(),
+                path: "/xhttp/".to_owned(),
+                host: None,
+                headers: HashMap::new(),
+                security: XhttpSecurity::None,
+                server_name: "127.0.0.1".to_owned(),
+                skip_cert_verify: false,
+            }),
         );
 
         let mut proxied = client

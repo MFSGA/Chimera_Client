@@ -9,7 +9,9 @@ mod xhttp;
 pub use tls::Client as TlsClient;
 #[cfg(feature = "ws")]
 pub use ws::Client as WsClient;
-pub use xhttp::{Client as XhttpClient, XhttpMode};
+pub use xhttp::{
+    Client as XhttpClient, XhttpDownloadConfig, XhttpMode, XhttpSecurity,
+};
 
 #[async_trait::async_trait]
 pub trait Transport: Send + Sync {
