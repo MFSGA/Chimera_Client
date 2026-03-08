@@ -179,6 +179,20 @@ pub struct XhttpDownloadXhttpSettings {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
 #[serde(rename_all = "kebab-case")]
+pub struct XhttpExtra {
+    pub headers: Option<HashMap<String, String>>,
+    #[serde(alias = "downloadSettings")]
+    pub download_settings: Option<XhttpDownloadSettings>,
+    #[serde(alias = "noGRPCHeader")]
+    pub no_grpc_header: Option<bool>,
+    #[serde(alias = "scMaxEachPostBytes")]
+    pub sc_max_each_post_bytes: Option<usize>,
+    #[serde(alias = "scMinPostsIntervalMs")]
+    pub sc_min_posts_interval_ms: Option<u64>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+#[serde(rename_all = "kebab-case")]
 pub struct XhttpDownloadSettings {
     pub address: String,
     pub port: u16,
@@ -193,6 +207,8 @@ pub struct XhttpDownloadSettings {
     pub xhttp_settings: Option<XhttpDownloadXhttpSettings>,
 }
 
+pub type XhttpUploadSettings = XhttpDownloadSettings;
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
 #[serde(rename_all = "kebab-case")]
 pub struct XhttpOpt {
@@ -200,6 +216,9 @@ pub struct XhttpOpt {
     pub mode: Option<String>,
     pub host: Option<Vec<String>>,
     pub headers: Option<HashMap<String, String>>,
+    pub extra: Option<XhttpExtra>,
+    #[serde(alias = "uploadSettings")]
+    pub upload_settings: Option<XhttpUploadSettings>,
     #[serde(alias = "downloadSettings")]
     pub download_settings: Option<XhttpDownloadSettings>,
     pub download_mode: Option<String>,
@@ -322,7 +341,7 @@ pub struct OutboundTrojan {
     pub ws_opts: Option<WsOpt>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
 #[serde(rename_all = "kebab-case")]
 pub struct OutboundTrojanRealityOpts {
     #[serde(alias = "publicKey")]
@@ -379,6 +398,25 @@ network: xhttp
 xhttp-opts:
   path: /xhttp/
   mode: split
+  extra:
+    headers:
+      X-Test-Extra: enabled
+    no-grpc-header: true
+    sc-max-each-post-bytes: 2048
+    download-settings:
+      address: extra-download.example.com
+      port: 7443
+      network: xhttp
+      security: tls
+      xhttp-settings:
+        path: /extra-download/
+  upload-settings:
+    address: upload.example.com
+    port: 9443
+    network: xhttp
+    security: tls
+    xhttp-settings:
+      path: /upload/
   download-settings:
     address: download.example.com
     port: 8443
@@ -403,6 +441,37 @@ xhttp-opts:
         assert_eq!(vless.network.as_deref(), Some("xhttp"));
         let opts = vless.xhttp_opts.expect("xhttp_opts should be present");
         assert_eq!(opts.path.as_deref(), Some("/xhttp/"));
+        let extra = opts.extra.expect("xhttp extra should be present");
+        assert_eq!(
+            extra
+                .headers
+                .as_ref()
+                .and_then(|headers| headers.get("X-Test-Extra")),
+            Some(&"enabled".to_owned())
+        );
+        assert_eq!(extra.no_grpc_header, Some(true));
+        assert_eq!(extra.sc_max_each_post_bytes, Some(2048));
+        assert_eq!(
+            extra
+                .download_settings
+                .as_ref()
+                .map(|settings| settings.address.as_str()),
+            Some("extra-download.example.com")
+        );
+        let upload = opts
+            .upload_settings
+            .expect("upload_settings should be present");
+        assert_eq!(upload.address, "upload.example.com");
+        assert_eq!(upload.port, 9443);
+        assert_eq!(upload.network, "xhttp");
+        assert_eq!(upload.security.as_deref(), Some("tls"));
+        assert_eq!(
+            upload
+                .xhttp_settings
+                .and_then(|settings| settings.path)
+                .as_deref(),
+            Some("/upload/")
+        );
         let download = opts
             .download_settings
             .expect("download_settings should be present");

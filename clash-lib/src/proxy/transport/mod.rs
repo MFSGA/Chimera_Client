@@ -10,7 +10,8 @@ pub use tls::Client as TlsClient;
 #[cfg(feature = "ws")]
 pub use ws::Client as WsClient;
 pub use xhttp::{
-    Client as XhttpClient, XhttpDownloadConfig, XhttpMode, XhttpSecurity,
+    Client as XhttpClient, XhttpDownloadConfig, XhttpMode, XhttpRealityConfig,
+    XhttpSecurity,
 };
 
 #[async_trait::async_trait]

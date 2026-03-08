@@ -16,6 +16,8 @@ use uuid::Uuid;
 
 #[cfg(feature = "tls")]
 use super::TlsClient;
+#[cfg(feature = "reality")]
+use super::RealityClient;
 use super::Transport;
 use crate::{common::errors::map_io_error, proxy::AnyStream};
 
@@ -38,6 +40,14 @@ pub enum XhttpMode {
 pub enum XhttpSecurity {
     None,
     Tls,
+    Reality,
+}
+
+#[derive(Clone, Debug)]
+pub struct XhttpRealityConfig {
+    pub public_key: [u8; 32],
+    pub short_id: [u8; 8],
+    pub server_name: String,
 }
 
 #[derive(Clone, Debug)]
@@ -50,6 +60,7 @@ pub struct XhttpDownloadConfig {
     pub security: XhttpSecurity,
     pub server_name: String,
     pub skip_cert_verify: bool,
+    pub reality: Option<XhttpRealityConfig>,
 }
 
 pub struct Client {
@@ -61,6 +72,8 @@ pub struct Client {
     use_tls: bool,
     mode: XhttpMode,
     max_each_post_bytes: usize,
+    no_grpc_header: bool,
+    min_posts_interval_ms: Option<u64>,
     download: Option<XhttpDownloadConfig>,
 }
 
@@ -74,6 +87,8 @@ impl Client {
         use_tls: bool,
         mode: XhttpMode,
         max_each_post_bytes: usize,
+        no_grpc_header: bool,
+        min_posts_interval_ms: Option<u64>,
         download: Option<XhttpDownloadConfig>,
     ) -> Self {
         Self {
@@ -85,6 +100,8 @@ impl Client {
             use_tls,
             mode,
             max_each_post_bytes,
+            no_grpc_header,
+            min_posts_interval_ms,
             download,
         }
     }
@@ -102,9 +119,24 @@ impl Client {
             self.host.as_ref(),
             &self.headers,
             self.use_tls,
+            self.request_content_type(method),
             method,
             body,
         )
+    }
+
+    fn request_content_type(&self, method: &str) -> Option<&'static str> {
+        if method != "POST" {
+            return None;
+        }
+
+        if matches!(self.mode, XhttpMode::StreamOne | XhttpMode::StreamUp)
+            && !self.no_grpc_header
+        {
+            return Some("application/grpc");
+        }
+
+        Some("application/octet-stream")
     }
 }
 
@@ -157,6 +189,30 @@ async fn connect_download_stream(
                 ))
             }
         }
+        XhttpSecurity::Reality => {
+            #[cfg(feature = "reality")]
+            {
+                let reality = config.reality.as_ref().ok_or_else(|| {
+                    io::Error::other(
+                        "xhttp download_settings reality requires reality config",
+                    )
+                })?;
+                let client = RealityClient::new(
+                    reality.public_key,
+                    reality.short_id,
+                    reality.server_name.clone(),
+                    Vec::new(),
+                );
+                client.proxy_stream(stream).await
+            }
+            #[cfg(not(feature = "reality"))]
+            {
+                let _ = stream;
+                Err(io::Error::other(
+                    "xhttp download_settings reality requires reality feature",
+                ))
+            }
+        }
     }
 }
 
@@ -175,7 +231,11 @@ async fn open_downlink_response(
             &path,
             download.host.as_ref(),
             &download.headers,
-            matches!(download.security, XhttpSecurity::Tls),
+            matches!(
+                download.security,
+                XhttpSecurity::Tls | XhttpSecurity::Reality
+            ),
+            None,
             "GET",
             http_body_util::Empty::<Bytes>::new().boxed(),
         )?;
@@ -216,6 +276,7 @@ fn build_request(
     host: Option<&Vec<String>>,
     headers: &HashMap<String, String>,
     use_tls: bool,
+    content_type: Option<&str>,
     method: &'static str,
     body: BoxBody<Bytes, Infallible>,
 ) -> io::Result<Request<BoxBody<Bytes, Infallible>>> {
@@ -226,8 +287,11 @@ fn build_request(
         .method(method)
         .uri(uri)
         .version(Version::HTTP_2)
-        .header("content-type", "application/octet-stream")
         .header("cache-control", "no-store");
+
+    if let Some(content_type) = content_type {
+        request = request.header("content-type", content_type);
+    }
 
     if !headers.keys().any(|key| key.eq_ignore_ascii_case("host"))
         && let Some(host) = host.and_then(|hosts| hosts.first())
@@ -314,6 +378,7 @@ async fn proxy_stream_up(
     let host = client.host.clone();
     let headers = client.headers.clone();
     let use_tls = client.use_tls;
+    let content_type = client.request_content_type("POST");
 
     tokio::spawn(async move {
         let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(
@@ -328,6 +393,7 @@ async fn proxy_stream_up(
             host.as_ref(),
             &headers,
             use_tls,
+            content_type,
             "POST",
             request_body,
         ) {
@@ -386,6 +452,8 @@ async fn proxy_packet_up(
     let host = client.host.clone();
     let headers = client.headers.clone();
     let use_tls = client.use_tls;
+    let content_type = client.request_content_type("POST");
+    let min_posts_interval_ms = client.min_posts_interval_ms;
 
     tokio::spawn(async move {
         let mut seq: u64 = 0;
@@ -405,6 +473,7 @@ async fn proxy_packet_up(
                             host.as_ref(),
                             &headers,
                             use_tls,
+                            content_type,
                             "POST",
                             body,
                         ) {
@@ -415,6 +484,14 @@ async fn proxy_packet_up(
                         match sender.send_request(request).await {
                             Ok(response) if response.status().is_success() => {
                                 seq += 1;
+                                if let Some(interval_ms) = min_posts_interval_ms {
+                                    tokio::time::sleep(
+                                        tokio::time::Duration::from_millis(
+                                            interval_ms,
+                                        ),
+                                    )
+                                    .await;
+                                }
                             }
                             _ => return,
                         }
@@ -503,6 +580,8 @@ mod tests {
             false,
             XhttpMode::StreamOne,
             1_000_000,
+            false,
+            None,
             None,
         );
 
@@ -564,6 +643,8 @@ mod tests {
             false,
             XhttpMode::StreamUp,
             1_000_000,
+            false,
+            None,
             None,
         );
 
@@ -583,6 +664,175 @@ mod tests {
             .expect("read should finish")
             .expect("read should succeed");
         assert_eq!(&buf, b"ping");
+    }
+
+    #[tokio::test]
+    async fn xhttp_stream_up_uses_grpc_content_type_by_default() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should expose addr");
+        let sessions = Arc::new(Mutex::new(HashMap::<
+            String,
+            mpsc::Sender<Result<Frame<Bytes>, Infallible>>,
+        >::new()));
+        let post_content_types = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+
+        tokio::spawn({
+            let sessions = sessions.clone();
+            let post_content_types = post_content_types.clone();
+            async move {
+                let (tcp, _) =
+                    listener.accept().await.expect("accept should succeed");
+                let io = TokioIo::new(tcp);
+                let service = hyper::service::service_fn(move |req| {
+                    handle_split_modes_with_post_content_type(
+                        req,
+                        sessions.clone(),
+                        post_content_types.clone(),
+                    )
+                });
+                let builder = auto::Builder::new(TokioExecutor::new()).http2_only();
+                builder
+                    .serve_connection(io, service)
+                    .await
+                    .expect("server connection should succeed");
+            }
+        });
+
+        let stream = TcpStream::connect(addr)
+            .await
+            .expect("client should connect");
+        let client = Client::new(
+            "127.0.0.1".to_owned(),
+            addr.port(),
+            "/xhttp/".to_owned(),
+            None,
+            HashMap::new(),
+            false,
+            XhttpMode::StreamUp,
+            1_000_000,
+            false,
+            None,
+            None,
+        );
+
+        let mut proxied = client
+            .proxy_stream(Box::new(stream))
+            .await
+            .expect("stream-up transport should connect");
+        proxied
+            .write_all(b"ping")
+            .await
+            .expect("write should succeed");
+        proxied.flush().await.expect("flush should succeed");
+
+        let mut buf = [0_u8; 4];
+        timeout(Duration::from_secs(2), proxied.read_exact(&mut buf))
+            .await
+            .expect("read should finish")
+            .expect("read should succeed");
+        assert_eq!(&buf, b"ping");
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let values = post_content_types.lock().await;
+                if !values.is_empty() {
+                    assert_eq!(values[0].as_deref(), Some("application/grpc"));
+                    break;
+                }
+                drop(values);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("content-type should be recorded");
+    }
+
+    #[tokio::test]
+    async fn xhttp_stream_up_no_grpc_header_uses_octet_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should expose addr");
+        let sessions = Arc::new(Mutex::new(HashMap::<
+            String,
+            mpsc::Sender<Result<Frame<Bytes>, Infallible>>,
+        >::new()));
+        let post_content_types = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+
+        tokio::spawn({
+            let sessions = sessions.clone();
+            let post_content_types = post_content_types.clone();
+            async move {
+                let (tcp, _) =
+                    listener.accept().await.expect("accept should succeed");
+                let io = TokioIo::new(tcp);
+                let service = hyper::service::service_fn(move |req| {
+                    handle_split_modes_with_post_content_type(
+                        req,
+                        sessions.clone(),
+                        post_content_types.clone(),
+                    )
+                });
+                let builder = auto::Builder::new(TokioExecutor::new()).http2_only();
+                builder
+                    .serve_connection(io, service)
+                    .await
+                    .expect("server connection should succeed");
+            }
+        });
+
+        let stream = TcpStream::connect(addr)
+            .await
+            .expect("client should connect");
+        let client = Client::new(
+            "127.0.0.1".to_owned(),
+            addr.port(),
+            "/xhttp/".to_owned(),
+            None,
+            HashMap::new(),
+            false,
+            XhttpMode::StreamUp,
+            1_000_000,
+            true,
+            None,
+            None,
+        );
+
+        let mut proxied = client
+            .proxy_stream(Box::new(stream))
+            .await
+            .expect("stream-up transport should connect");
+        proxied
+            .write_all(b"ping")
+            .await
+            .expect("write should succeed");
+        proxied.flush().await.expect("flush should succeed");
+
+        let mut buf = [0_u8; 4];
+        timeout(Duration::from_secs(2), proxied.read_exact(&mut buf))
+            .await
+            .expect("read should finish")
+            .expect("read should succeed");
+        assert_eq!(&buf, b"ping");
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let values = post_content_types.lock().await;
+                if !values.is_empty() {
+                    assert_eq!(
+                        values[0].as_deref(),
+                        Some("application/octet-stream")
+                    );
+                    break;
+                }
+                drop(values);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("content-type should be recorded");
     }
 
     #[tokio::test]
@@ -625,6 +875,8 @@ mod tests {
             false,
             XhttpMode::PacketUp,
             1_000_000,
+            false,
+            None,
             None,
         );
 
@@ -715,6 +967,8 @@ mod tests {
             false,
             XhttpMode::PacketUp,
             1_000_000,
+            false,
+            None,
             Some(XhttpDownloadConfig {
                 server: "127.0.0.1".to_owned(),
                 port: download_addr.port(),
@@ -724,6 +978,7 @@ mod tests {
                 security: XhttpSecurity::None,
                 server_name: "127.0.0.1".to_owned(),
                 skip_cert_verify: false,
+                reality: None,
             }),
         );
 
@@ -859,5 +1114,24 @@ mod tests {
                 .body(Empty::<Bytes>::new().boxed())
                 .expect("response should build")),
         }
+    }
+
+    async fn handle_split_modes_with_post_content_type(
+        req: Request<Incoming>,
+        sessions: Arc<
+            Mutex<HashMap<String, mpsc::Sender<Result<Frame<Bytes>, Infallible>>>>,
+        >,
+        post_content_types: Arc<Mutex<Vec<Option<String>>>>,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        if req.method() == Method::POST {
+            post_content_types.lock().await.push(
+                req.headers()
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToOwned::to_owned),
+            );
+        }
+
+        handle_split_modes(req, sessions).await
     }
 }
