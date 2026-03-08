@@ -14,10 +14,10 @@ use tokio::{
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
-#[cfg(feature = "tls")]
-use super::TlsClient;
 #[cfg(feature = "reality")]
 use super::RealityClient;
+#[cfg(feature = "tls")]
+use super::TlsClient;
 use super::Transport;
 use crate::{common::errors::map_io_error, proxy::AnyStream};
 

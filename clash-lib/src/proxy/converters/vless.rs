@@ -1,8 +1,8 @@
 use crate::{
     Error,
     config::internal::proxy::{
-        OutboundTrojanRealityOpts, OutboundVless, XhttpDownloadSettings,
-        XhttpOpt, XhttpUploadSettings,
+        OutboundTrojanRealityOpts, OutboundVless, XhttpDownloadSettings, XhttpOpt,
+        XhttpUploadSettings,
     },
     proxy::{
         HandlerCommonOptions,
@@ -346,12 +346,11 @@ fn build_xhttp_download_config(
         .and_then(|settings| settings.insecure)
         .unwrap_or(false);
 
-    let reality =
-        build_xhttp_download_reality_config(
-            s.reality_opts.as_ref(),
-            &security,
-            &server_name,
-        )?;
+    let reality = build_xhttp_download_reality_config(
+        s.reality_opts.as_ref(),
+        &security,
+        &server_name,
+    )?;
 
     Ok(Some(XhttpDownloadConfig {
         server: download_settings.address.clone(),
@@ -1170,7 +1169,10 @@ mod tests {
 
         let transport = build_transport(outbound.network.as_deref(), &outbound)
             .expect("xhttp reality transport should build");
-        assert!(transport.is_some(), "xhttp reality transport should be present");
+        assert!(
+            transport.is_some(),
+            "xhttp reality transport should be present"
+        );
 
         let tls = build_tls_transport(outbound.network.as_deref(), &outbound, false)
             .expect("xhttp reality tls transport should build");
