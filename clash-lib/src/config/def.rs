@@ -111,6 +111,11 @@ pub struct Config {
     /// 10.2 Download URL for country mmdb file
     #[serde(rename = "mmdb-download-url")]
     pub mmdb_download_url: Option<String>,
+    /// Optional ASN database path relative to the working dir
+    pub asn_mmdb: Option<String>,
+    /// Optional ASN database download url
+    #[serde(rename = "asn-mmdb-download-url")]
+    pub asn_mmdb_download_url: Option<String>,
     /// 11.1 The HTTP proxy port
     #[serde(alias = "http_port")]
     pub port: Option<Port>,

@@ -27,20 +27,20 @@ impl RuleMatcher for GeoIP {
     }
 
     fn apply(&self, sess: &Session) -> bool {
-        match &sess.destination {
-            session::SocksAddr::Ip(addr) => {
-                if let Some(mmdb) = &self.mmdb {
-                    mmdb.lookup_country(addr.ip()).is_ok_and(|country| {
-                        country.country_code == self.country_code
-                    })
-                } else {
-                    warn!(
-                        "GeoIP lookup failed: MMDB not available. Maybe config.mmdb is not set?"
-                    );
-                    false
-                }
+        let ip = sess.resolved_ip.or(sess.destination.ip());
+
+        if let Some(ip) = ip {
+            if let Some(mmdb) = &self.mmdb {
+                mmdb.lookup_country(ip)
+                    .is_ok_and(|country| country.country_code == self.country_code)
+            } else {
+                warn!(
+                    "GeoIP lookup failed: MMDB not available. Maybe config.mmdb is not set?"
+                );
+                false
             }
-            session::SocksAddr::Domain(_, _) => false,
+        } else {
+            false
         }
     }
 
@@ -52,8 +52,7 @@ impl RuleMatcher for GeoIP {
         "GeoIP"
     }
 
-    /* todo
     fn should_resolve_ip(&self) -> bool {
         !self.no_resolve
-    } */
+    }
 }

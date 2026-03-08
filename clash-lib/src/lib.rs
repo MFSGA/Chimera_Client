@@ -27,7 +27,10 @@ use crate::{
     common::{
         auth,
         http::new_http_client,
-        mmdb::{self, DEFAULT_COUNTRY_MMDB_DOWNLOAD_URL, MmdbLookup},
+        mmdb::{
+            self, DEFAULT_ASN_MMDB_DOWNLOAD_URL, DEFAULT_COUNTRY_MMDB_DOWNLOAD_URL,
+            MmdbLookup,
+        },
     },
     config::{
         def::{self, LogLevel},
@@ -355,6 +358,24 @@ async fn create_components(
         None
     };
 
+    debug!("initializing country asn mmdb");
+    let asn_mmdb = if let Some(asn_mmdb_name) = config.general.asn_mmdb {
+        Some(Arc::new(
+            mmdb::Mmdb::new(
+                cwd.join(&asn_mmdb_name),
+                config
+                    .general
+                    .asn_mmdb_download_url
+                    .unwrap_or(DEFAULT_ASN_MMDB_DOWNLOAD_URL.to_string()),
+                client.clone(),
+            )
+            .await?,
+        ) as MmdbLookup)
+    } else {
+        debug!("ASN mmdb not found and not configured for download, skipping");
+        None
+    };
+
     let dns_listen = config.dns.listen.clone();
     let plain_outbounds_map = HashMap::<String, Arc<dyn OutboundHandler>>::from_iter(
         plain_outbounds
@@ -398,7 +419,7 @@ async fn create_components(
             // config.rule_providers,
             dns_resolver.clone(),
             country_mmdb,
-            // asn_mmdb,
+            asn_mmdb,
             // geodata,
             cwd.to_string_lossy().to_string(),
         )

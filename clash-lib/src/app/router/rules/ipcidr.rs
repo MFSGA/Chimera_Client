@@ -8,6 +8,7 @@ use super::RuleMatcher;
 pub struct IpCidr {
     pub ipnet: IpNet,
     pub target: String,
+    pub no_resolve: bool,
 }
 
 impl std::fmt::Display for IpCidr {
@@ -22,9 +23,12 @@ impl RuleMatcher for IpCidr {
     }
 
     fn apply(&self, sess: &session::Session) -> bool {
-        match &sess.destination {
-            session::SocksAddr::Ip(addr) => self.ipnet.contains(&addr.ip()),
-            session::SocksAddr::Domain(_, _) => false,
+        let ip = sess.resolved_ip.or(sess.destination.ip());
+
+        if let Some(ip) = ip {
+            self.ipnet.contains(&ip)
+        } else {
+            false
         }
     }
 
@@ -34,5 +38,9 @@ impl RuleMatcher for IpCidr {
 
     fn type_name(&self) -> &str {
         "IPCIDR"
+    }
+
+    fn should_resolve_ip(&self) -> bool {
+        !self.no_resolve
     }
 }

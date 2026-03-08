@@ -71,8 +71,12 @@ pub struct General {
     /// 4
     pub mmdb_download_url: Option<String>,
     /// 5
-    pub mode: RunMode,
+    pub asn_mmdb: Option<String>,
     /// 6
+    pub asn_mmdb_download_url: Option<String>,
+    /// 7
+    pub mode: RunMode,
+    /// 8
     pub routing_mask: Option<u32>,
 }
 

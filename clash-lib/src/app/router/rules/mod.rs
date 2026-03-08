@@ -22,4 +22,8 @@ pub trait RuleMatcher: Send + Sync + Unpin + Display {
 
     /// the type of the rule
     fn type_name(&self) -> &str;
+
+    fn should_resolve_ip(&self) -> bool {
+        false
+    }
 }

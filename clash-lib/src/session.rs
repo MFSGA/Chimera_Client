@@ -1,10 +1,12 @@
 use std::{
+    collections::HashMap,
     fmt::{Display, Formatter},
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
 };
 
 use bytes::BufMut;
+use erased_serde::Serialize as ESerialize;
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -36,6 +38,27 @@ impl Display for SocksAddr {
 impl SocksAddr {
     pub fn any_ipv4() -> Self {
         Self::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0))
+    }
+
+    pub fn is_domain(&self) -> bool {
+        match self {
+            SocksAddr::Ip(_) => false,
+            SocksAddr::Domain(..) => true,
+        }
+    }
+
+    pub fn domain(&self) -> Option<&str> {
+        match self {
+            SocksAddr::Ip(_) => None,
+            SocksAddr::Domain(domain, _) => Some(domain.as_str()),
+        }
+    }
+
+    pub fn ip(&self) -> Option<IpAddr> {
+        match self {
+            SocksAddr::Ip(addr) => Some(addr.ip()),
+            SocksAddr::Domain(host, _) => host.parse().ok(),
+        }
     }
 
     pub(crate) fn write_to_buf_vmess<B: BufMut>(&self, buf: &mut B) {
@@ -143,13 +166,18 @@ impl From<SocketAddr> for SocksAddr {
     }
 }
 
+impl From<(IpAddr, u16)> for SocksAddr {
+    fn from(value: (IpAddr, u16)) -> Self {
+        Self::Ip(value.into())
+    }
+}
+
 impl TryFrom<(String, u16)> for SocksAddr {
     type Error = io::Error;
 
     fn try_from(value: (String, u16)) -> Result<Self, Self::Error> {
         if let Ok(ip) = value.0.parse::<IpAddr>() {
-            todo!()
-            // return Ok(Self::from((ip, value.1)));
+            return Ok(Self::from((ip, value.1)));
         }
         if value.0.len() > 0xff {
             return Err(io::Error::other("domain too long"));
@@ -162,6 +190,15 @@ impl TryFrom<(String, u16)> for SocksAddr {
 pub enum Network {
     Tcp,
     Udp,
+}
+
+impl Display for Network {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Network::Tcp => "TCP",
+            Network::Udp => "UDP",
+        })
+    }
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Debug, Serialize)]
@@ -190,10 +227,48 @@ pub struct Session {
     pub source: SocketAddr,
     /// The proxy target address of a proxy connection.
     pub destination: SocksAddr,
+    /// The locally resolved IP address of the destination domain.
+    pub resolved_ip: Option<IpAddr>,
     /// The packet mark SO_MARK
     pub so_mark: Option<u32>,
     /// The bind interface
     pub iface: Option<OutboundInterface>,
+    /// The ASN of the destination IP address. Only for display.
+    pub asn: Option<String>,
+    /// Traffic statistics for intelligent proxy selection
+    pub traffic_stats: Option<()>,
+}
+
+impl Session {
+    pub fn as_map(&self) -> HashMap<String, Box<dyn ESerialize + Send + Sync>> {
+        let mut rv = HashMap::new();
+        rv.insert("network".to_string(), Box::new(self.network) as _);
+        rv.insert("type".to_string(), Box::new(self.typ) as _);
+        rv.insert("sourceIP".to_string(), Box::new(self.source.ip()) as _);
+        rv.insert("sourcePort".to_string(), Box::new(self.source.port()) as _);
+        rv.insert("destinationIP".to_string(), {
+            let ip = self.resolved_ip.or(self.destination.ip());
+            let asn = self.asn.clone();
+
+            let rv = match (ip, asn) {
+                (Some(ip), Some(asn)) => format!("{ip}({asn})"),
+                (Some(ip), None) => ip.to_string(),
+                (None, _) => "".to_string(),
+            };
+            Box::new(rv) as _
+        });
+        rv.insert(
+            "destinationPort".to_string(),
+            Box::new(self.destination.port()) as _,
+        );
+        rv.insert("host".to_string(), Box::new(self.destination.host()) as _);
+        rv.insert("asn".to_string(), Box::new(self.asn.clone()) as _);
+        rv.insert(
+            "traffic_stats".to_string(),
+            Box::new(self.traffic_stats) as _,
+        );
+        rv
+    }
 }
 
 impl Default for Session {
@@ -203,22 +278,29 @@ impl Default for Session {
             typ: Type::Http,
             source: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0),
             destination: SocksAddr::any_ipv4(),
+            resolved_ip: None,
             so_mark: None,
             iface: None,
+            asn: None,
+            traffic_stats: None,
         }
     }
 }
 
 impl Display for Session {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "[todo] {} -> []",
-            // self.network,
-            self.source,
-            // self.destination,
-            //self.resolved_ip.unwrap_or(IpAddr::V4(Ipv4Addr::from(0)))
-        )
+        match self.resolved_ip {
+            Some(ip) => write!(
+                f,
+                "[{}] {} -> {}[{}]",
+                self.network, self.source, self.destination, ip
+            ),
+            None => write!(
+                f,
+                "[{}] {} -> {}",
+                self.network, self.source, self.destination,
+            ),
+        }
     }
 }
 
@@ -229,12 +311,11 @@ impl Clone for Session {
             typ: self.typ,
             source: self.source,
             destination: self.destination.clone(),
-            // resolved_ip: self.resolved_ip,
+            resolved_ip: self.resolved_ip,
             so_mark: self.so_mark,
             iface: self.iface.as_ref().cloned(),
-            /*
             asn: self.asn.clone(),
-            traffic_stats: self.traffic_stats.clone(), */
+            traffic_stats: self.traffic_stats,
         }
     }
 }
