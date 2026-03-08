@@ -1,0 +1,20 @@
+[package]
+name = "xhttp-h2-phaseb"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+thiserror = "1"
+
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+futures-util = "0.3"
+
+hyper = { version = "1", features = ["full"] }
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["full"] }
+tokio-stream = "0.1"
+
+dashmap = "6"
+uuid = { version = "1", features = ["v4"] }
