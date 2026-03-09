@@ -9,6 +9,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use futures::{FutureExt, future};
 use hickory_resolver::{
     TokioResolver,
     config::{NameServerConfig, ResolverConfig, ResolverOpts},
@@ -16,7 +17,9 @@ use hickory_resolver::{
     name_server::TokioConnectionProvider,
 };
 use hickory_proto::{
+    op::Message,
     op::ResponseCode,
+    rr::{RData, Record},
     rr::RecordType,
     xfer::Protocol,
 };
@@ -105,8 +108,8 @@ impl EnhancedResolver {
 impl ClashResolver for EnhancedResolver {
     async fn exchange(
         &self,
-        message: &hickory_proto::op::Message,
-    ) -> anyhow::Result<hickory_proto::op::Message> {
+        message: &Message,
+    ) -> anyhow::Result<Message> {
         let query = message
             .query()
             .ok_or_else(|| anyhow::anyhow!("invalid query message"))?;
@@ -116,8 +119,7 @@ impl ClashResolver for EnhancedResolver {
             if !message.recursion_desired() {
                 trace!(query = %query.name(), "dns cache hit");
                 if let Ok(cached) = cached {
-                    let mut response =
-                        build_dns_response_message(message, true, false);
+                    let mut response = build_dns_response_message(message, true, false);
                     response.add_answers(cached.records().iter().cloned());
                     return Ok(response);
                 }
@@ -132,7 +134,8 @@ impl ClashResolver for EnhancedResolver {
             ));
         }
 
-        let host = query.name().to_ascii().trim_end_matches('.').to_string();
+        let host = Self::domain_name_of_message(message)
+            .unwrap_or_else(|| query.name().to_ascii().trim_end_matches('.').to_string());
         let ips = match query_type {
             RecordType::A => self.resolve_v4(&host, true).await?.map(|ip| vec![ip.into()]),
             RecordType::AAAA => self.resolve_v6(&host, true).await?.map(|ip| vec![ip.into()]),
@@ -156,8 +159,8 @@ impl ClashResolver for EnhancedResolver {
                     response.answers().iter().cloned(),
                     Instant::now(),
                 );
-                for ip in &ips {
-                    self.save_reverse_lookup(*ip, host.clone()).await;
+                for ip in Self::ip_list_of_message(&response) {
+                    self.save_reverse_lookup(ip, host.clone()).await;
                 }
             }
             _ => {
@@ -198,19 +201,22 @@ impl ClashResolver for EnhancedResolver {
         host: &str,
         enhanced: bool,
     ) -> anyhow::Result<Option<std::net::IpAddr>> {
-        let resolved = match self.ipv6() {
-            true => {
-                self.resolve_with_policy_then_fallback(host, RecordType::AAAA, enhanced)
-                    .await?
-                    .or(
-                        self.resolve_with_policy_then_fallback(host, RecordType::A, enhanced)
-                            .await?,
-                    )
+        let resolved = if self.ipv6() {
+            let v6 = self
+                .resolve_v6(host, enhanced)
+                .map(|result| result.map(|ip| ip.map(IpAddr::from)));
+            let v4 = self
+                .resolve_v4(host, enhanced)
+                .map(|result| result.map(|ip| ip.map(IpAddr::from)));
+
+            let (first, remaining) = future::select_ok(vec![v6.boxed(), v4.boxed()]).await?;
+            if first.is_some() {
+                first
+            } else {
+                future::select_all(remaining).await.0?
             }
-            false => {
-                self.resolve_with_policy_then_fallback(host, RecordType::A, enhanced)
-                    .await?
-            }
+        } else {
+            self.resolve_v4(host, enhanced).await?.map(IpAddr::from)
         };
 
         if let Some(ip) = resolved {
@@ -275,6 +281,27 @@ impl ClashResolver for EnhancedResolver {
 }
 
 impl EnhancedResolver {
+    fn domain_name_of_message(message: &Message) -> Option<String> {
+        message
+            .query()
+            .map(|query| query.name().to_ascii().trim_end_matches('.').to_owned())
+    }
+
+    fn ip_list_of_message(message: &Message) -> Vec<IpAddr> {
+        Self::ip_list_of_records(message.answers())
+    }
+
+    fn ip_list_of_records(records: &[Record]) -> Vec<IpAddr> {
+        records
+            .iter()
+            .filter_map(|record| match record.data() {
+                RData::A(v4) => Some(IpAddr::V4(**v4)),
+                RData::AAAA(v6) => Some(IpAddr::V6(**v6)),
+                _ => None,
+            })
+            .collect()
+    }
+
     async fn resolve_with_policy_then_fallback(
         &self,
         host: &str,
@@ -336,6 +363,7 @@ impl EnhancedResolver {
     }
 
     async fn save_reverse_lookup(&self, ip: IpAddr, host: String) {
+        trace!(%ip, host = %host, "reverse lookup cache insert");
         self.reverse_lookup_cache.write().await.insert(ip, host);
     }
 
