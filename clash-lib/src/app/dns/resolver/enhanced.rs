@@ -113,7 +113,6 @@ impl ClashResolver for EnhancedResolver {
         let query = message
             .query()
             .ok_or_else(|| anyhow::anyhow!("invalid query message"))?;
-        let query_type = query.query_type();
 
         if let Some(cached) = self.lru_cache.read().await.get(query, Instant::now()) {
             if !message.recursion_desired() {
@@ -128,48 +127,7 @@ impl ClashResolver for EnhancedResolver {
             }
         }
 
-        if !matches!(query_type, RecordType::A | RecordType::AAAA) {
-            return Err(anyhow::anyhow!(
-                "unsupported dns query type in migrated path: {query_type:?}"
-            ));
-        }
-
-        let host = Self::domain_name_of_message(message)
-            .unwrap_or_else(|| query.name().to_ascii().trim_end_matches('.').to_string());
-        let ips = match query_type {
-            RecordType::A => self.resolve_v4(&host, true).await?.map(|ip| vec![ip.into()]),
-            RecordType::AAAA => self.resolve_v6(&host, true).await?.map(|ip| vec![ip.into()]),
-            _ => None,
-        };
-
-        let mut response = build_dns_response_message(message, true, false);
-        match ips {
-            Some(ips) if !ips.is_empty() => {
-                let records = ip_records(
-                    query.name().clone(),
-                    crate::app::dns::server::DEFAULT_DNS_SERVER_TTL,
-                    query_type,
-                    &ips,
-                );
-                response.set_response_code(ResponseCode::NoError);
-                response.set_answer_count(records.len() as u16);
-                response.add_answers(records);
-                self.lru_cache.write().await.insert_records(
-                    query.clone(),
-                    response.answers().iter().cloned(),
-                    Instant::now(),
-                );
-                for ip in Self::ip_list_of_message(&response) {
-                    self.save_reverse_lookup(ip, host.clone()).await;
-                }
-            }
-            _ => {
-                warn!(host, ?query_type, "dns query returned no records");
-                response.set_response_code(ResponseCode::NXDomain);
-            }
-        }
-
-        Ok(response)
+        self.exchange_no_cache(message).await
     }
 
     fn ipv6(&self) -> bool {
@@ -230,12 +188,9 @@ impl ClashResolver for EnhancedResolver {
     async fn resolve_v4(
         &self,
         host: &str,
-        enhanced: bool,
+        _enhanced: bool,
     ) -> anyhow::Result<Option<std::net::Ipv4Addr>> {
-        let resolved = self
-            .resolve_with_policy_then_fallback(host, RecordType::A, enhanced)
-            .await?;
-        Ok(resolved.and_then(|ip| match ip {
+        Ok(self.lookup_ip(host, RecordType::A).await?.into_iter().find_map(|ip| match ip {
             std::net::IpAddr::V4(ip) => Some(ip),
             std::net::IpAddr::V6(_) => None,
         }))
@@ -244,16 +199,13 @@ impl ClashResolver for EnhancedResolver {
     async fn resolve_v6(
         &self,
         host: &str,
-        enhanced: bool,
+        _enhanced: bool,
     ) -> anyhow::Result<Option<std::net::Ipv6Addr>> {
         if !self.ipv6() {
             return Ok(None);
         }
 
-        let resolved = self
-            .resolve_with_policy_then_fallback(host, RecordType::AAAA, enhanced)
-            .await?;
-        Ok(resolved.and_then(|ip| match ip {
+        Ok(self.lookup_ip(host, RecordType::AAAA).await?.into_iter().find_map(|ip| match ip {
             std::net::IpAddr::V6(ip) => Some(ip),
             std::net::IpAddr::V4(_) => None,
         }))
@@ -281,6 +233,86 @@ impl ClashResolver for EnhancedResolver {
 }
 
 impl EnhancedResolver {
+    async fn lookup_ip(
+        &self,
+        host: &str,
+        query_type: RecordType,
+    ) -> anyhow::Result<Vec<IpAddr>> {
+        let mut message = Message::new();
+        let mut query = hickory_proto::op::Query::new();
+        let name = hickory_proto::rr::Name::from_str_relaxed(host)
+            .map_err(|_| anyhow::anyhow!("invalid domain: {host}"))?
+            .append_domain(&hickory_proto::rr::Name::root())?;
+        query.set_name(name);
+        query.set_query_type(query_type);
+        message.add_query(query);
+        message.set_recursion_desired(true);
+
+        let response = self.exchange(&message).await?;
+        let ips = Self::ip_list_of_message(&response);
+        if ips.is_empty() {
+            Err(anyhow::anyhow!("no record for hostname: {host}"))
+        } else {
+            Ok(ips)
+        }
+    }
+
+    async fn exchange_no_cache(&self, message: &Message) -> anyhow::Result<Message> {
+        let query = message
+            .query()
+            .ok_or_else(|| anyhow::anyhow!("invalid query message"))?;
+        let query_type = query.query_type();
+
+        if !matches!(query_type, RecordType::A | RecordType::AAAA) {
+            return Err(anyhow::anyhow!(
+                "unsupported dns query type in migrated path: {query_type:?}"
+            ));
+        }
+
+        let host = Self::domain_name_of_message(message)
+            .unwrap_or_else(|| query.name().to_ascii().trim_end_matches('.').to_string());
+        let ips = match query_type {
+            RecordType::A => self
+                .resolve_with_policy_then_fallback(&host, RecordType::A, true)
+                .await?
+                .map(|ip| vec![ip]),
+            RecordType::AAAA => self
+                .resolve_with_policy_then_fallback(&host, RecordType::AAAA, true)
+                .await?
+                .map(|ip| vec![ip]),
+            _ => None,
+        };
+
+        let mut response = build_dns_response_message(message, true, false);
+        match ips {
+            Some(ips) if !ips.is_empty() => {
+                let records = ip_records(
+                    query.name().clone(),
+                    crate::app::dns::server::DEFAULT_DNS_SERVER_TTL,
+                    query_type,
+                    &ips,
+                );
+                response.set_response_code(ResponseCode::NoError);
+                response.set_answer_count(records.len() as u16);
+                response.add_answers(records);
+                self.lru_cache.write().await.insert_records(
+                    query.clone(),
+                    response.answers().iter().cloned(),
+                    Instant::now(),
+                );
+                for ip in Self::ip_list_of_message(&response) {
+                    self.save_reverse_lookup(ip, host.clone()).await;
+                }
+            }
+            _ => {
+                warn!(host, ?query_type, "dns query returned no records");
+                response.set_response_code(ResponseCode::NXDomain);
+            }
+        }
+
+        Ok(response)
+    }
+
     fn domain_name_of_message(message: &Message) -> Option<String> {
         message
             .query()
