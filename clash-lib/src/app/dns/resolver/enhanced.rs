@@ -12,18 +12,23 @@ use hickory_resolver::{
     config::{NameServerConfig, ResolverConfig, ResolverOpts},
     name_server::TokioConnectionProvider,
 };
+use hickory_proto::{
+    op::ResponseCode,
+    rr::RecordType,
+    xfer::Protocol,
+};
 use tracing::debug;
 
 use crate::app::dns::config::DNSNetMode;
 use crate::{
     app::{
         dns::{ClashResolver, DNSConfig},
+        dns::helper::{build_dns_response_message, ip_records},
         profile::ThreadSafeCacheFile,
     },
     common::mmdb::MmdbLookup,
     proxy::OutboundHandler,
 };
-use hickory_proto::xfer::Protocol;
 
 pub struct EnhancedResolver {
     ipv6: AtomicBool,
@@ -70,10 +75,43 @@ impl ClashResolver for EnhancedResolver {
         &self,
         message: &hickory_proto::op::Message,
     ) -> anyhow::Result<hickory_proto::op::Message> {
-        Err(anyhow::anyhow!(
-            "enhanced resolver dns exchange is not migrated yet: {:?}",
-            message.queries()
-        ))
+        let query = message
+            .query()
+            .ok_or_else(|| anyhow::anyhow!("invalid query message"))?;
+        let query_type = query.query_type();
+
+        if !matches!(query_type, RecordType::A | RecordType::AAAA) {
+            return Err(anyhow::anyhow!(
+                "unsupported dns query type in migrated path: {query_type:?}"
+            ));
+        }
+
+        let host = query.name().to_ascii().trim_end_matches('.').to_string();
+        let ips = match query_type {
+            RecordType::A => self.resolve_v4(&host, true).await?.map(|ip| vec![ip.into()]),
+            RecordType::AAAA => self.resolve_v6(&host, true).await?.map(|ip| vec![ip.into()]),
+            _ => None,
+        };
+
+        let mut response = build_dns_response_message(message, true, false);
+        match ips {
+            Some(ips) if !ips.is_empty() => {
+                let records = ip_records(
+                    query.name().clone(),
+                    crate::app::dns::server::DEFAULT_DNS_SERVER_TTL,
+                    query_type,
+                    &ips,
+                );
+                response.set_response_code(ResponseCode::NoError);
+                response.set_answer_count(records.len() as u16);
+                response.add_answers(records);
+            }
+            _ => {
+                response.set_response_code(ResponseCode::NXDomain);
+            }
+        }
+
+        Ok(response)
     }
 
     fn ipv6(&self) -> bool {
@@ -101,7 +139,9 @@ impl ClashResolver for EnhancedResolver {
         host: &str,
         _enhanced: bool,
     ) -> anyhow::Result<Option<std::net::IpAddr>> {
-        let resolved = self.resolve_with_policy_then_fallback(host).await?;
+        let resolved = self
+            .resolve_with_policy_then_fallback(host, RecordType::A)
+            .await?;
 
         if let Some(ip) = resolved {
             let ip = ip.to_string();
@@ -109,6 +149,38 @@ impl ClashResolver for EnhancedResolver {
             self.store.set_ip_to_host(&ip, host).await;
         }
         Ok(resolved)
+    }
+
+    async fn resolve_v4(
+        &self,
+        host: &str,
+        _enhanced: bool,
+    ) -> anyhow::Result<Option<std::net::Ipv4Addr>> {
+        let resolved = self
+            .resolve_with_policy_then_fallback(host, RecordType::A)
+            .await?;
+        Ok(resolved.and_then(|ip| match ip {
+            std::net::IpAddr::V4(ip) => Some(ip),
+            std::net::IpAddr::V6(_) => None,
+        }))
+    }
+
+    async fn resolve_v6(
+        &self,
+        host: &str,
+        _enhanced: bool,
+    ) -> anyhow::Result<Option<std::net::Ipv6Addr>> {
+        if !self.ipv6() {
+            return Ok(None);
+        }
+
+        let resolved = self
+            .resolve_with_policy_then_fallback(host, RecordType::AAAA)
+            .await?;
+        Ok(resolved.and_then(|ip| match ip {
+            std::net::IpAddr::V6(ip) => Some(ip),
+            std::net::IpAddr::V4(_) => None,
+        }))
     }
 
     async fn reverse_lookup(&self, ip: std::net::IpAddr) -> Option<String> {
@@ -124,10 +196,11 @@ impl EnhancedResolver {
     async fn resolve_with_policy_then_fallback(
         &self,
         host: &str,
+        query_type: RecordType,
     ) -> anyhow::Result<Option<std::net::IpAddr>> {
         if let Some(resolver) = self.match_policy_resolver(host) {
             if let Ok(resolved) =
-                lookup_with_resolver(resolver, host, self.ipv6()).await
+                lookup_with_resolver(resolver, host, self.ipv6(), query_type).await
                 && resolved.is_some()
             {
                 return Ok(resolved);
@@ -135,20 +208,22 @@ impl EnhancedResolver {
         }
 
         if let Some(resolver) = &self.resolver {
-            match lookup_with_resolver(resolver, host, self.ipv6()).await {
+            match lookup_with_resolver(resolver, host, self.ipv6(), query_type).await {
                 Ok(Some(ip)) => return Ok(Some(ip)),
                 Ok(None) | Err(_) => {}
             }
         }
 
         if let Some(resolver) = &self.fallback_resolver {
-            return lookup_with_resolver(resolver, host, self.ipv6()).await;
+            return lookup_with_resolver(resolver, host, self.ipv6(), query_type).await;
         }
 
         let response = tokio::net::lookup_host(format!("{host}:0")).await?;
-        Ok(response
-            .map(|addr| addr.ip())
-            .find(|ip| self.ipv6() || ip.is_ipv4()))
+        Ok(response.map(|addr| addr.ip()).find(|ip| match query_type {
+            RecordType::A => ip.is_ipv4(),
+            RecordType::AAAA => self.ipv6() && ip.is_ipv6(),
+            _ => false,
+        }))
     }
 
     fn match_policy_resolver(&self, host: &str) -> Option<&TokioResolver> {
@@ -222,9 +297,14 @@ async fn lookup_with_resolver(
     resolver: &TokioResolver,
     host: &str,
     ipv6: bool,
+    query_type: RecordType,
 ) -> anyhow::Result<Option<std::net::IpAddr>> {
     let response = resolver.lookup_ip(host).await?;
-    Ok(response.into_iter().find(|ip| ipv6 || ip.is_ipv4()))
+    Ok(response.into_iter().find(|ip| match query_type {
+        RecordType::A => ip.is_ipv4(),
+        RecordType::AAAA => ipv6 && ip.is_ipv6(),
+        _ => false,
+    }))
 }
 
 fn domain_matches(host: &str, pattern: &str) -> bool {

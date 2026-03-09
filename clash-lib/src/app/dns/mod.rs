@@ -9,6 +9,7 @@ use std::{
 
 /// 2
 mod config;
+mod helper;
 /// 3
 pub mod resolver;
 /// 1
