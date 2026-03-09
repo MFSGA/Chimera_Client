@@ -16,7 +16,7 @@ use super::SystemResolver;
 
 pub struct EnhancedResolver {
     system: SystemResolver,
-    _store: ThreadSafeCacheFile,
+    store: ThreadSafeCacheFile,
     _mmdb: Option<MmdbLookup>,
     _outbounds: HashMap<String, Arc<dyn OutboundHandler>>,
 }
@@ -32,7 +32,7 @@ impl EnhancedResolver {
         Self {
             system: SystemResolver::new(cfg.ipv6)
                 .expect("failed to create fallback system resolver"),
-            _store: store,
+            store,
             _mmdb: mmdb,
             _outbounds: outbounds,
         }
@@ -52,11 +52,41 @@ impl ClashResolver for EnhancedResolver {
         self.system.ipv6()
     }
 
+    fn set_ipv6(&self, enable: bool) {
+        self.system.set_ipv6(enable);
+    }
+
+    fn kind(&self) -> crate::app::dns::ResolverKind {
+        crate::app::dns::ResolverKind::Clash
+    }
+
+    fn fake_ip_enabled(&self) -> bool {
+        false
+    }
+
+    async fn is_fake_ip(&self, _: std::net::IpAddr) -> bool {
+        false
+    }
+
     async fn resolve(
         &self,
         host: &str,
         enhanced: bool,
     ) -> anyhow::Result<Option<std::net::IpAddr>> {
-        self.system.resolve(host, enhanced).await
+        let resolved = self.system.resolve(host, enhanced).await?;
+        if let Some(ip) = resolved {
+            let ip = ip.to_string();
+            self.store.set_host_to_ip(host, &ip).await;
+            self.store.set_ip_to_host(&ip, host).await;
+        }
+        Ok(resolved)
+    }
+
+    async fn reverse_lookup(&self, ip: std::net::IpAddr) -> Option<String> {
+        self.store.get_fake_ip(&ip.to_string()).await
+    }
+
+    async fn cached_for(&self, ip: std::net::IpAddr) -> Option<String> {
+        self.store.get_fake_ip(&ip.to_string()).await
     }
 }

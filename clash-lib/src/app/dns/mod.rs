@@ -2,7 +2,10 @@ use async_trait::async_trait;
 
 use hickory_proto::op;
 
-use std::sync::Arc;
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    sync::Arc,
+};
 
 /// 2
 mod config;
@@ -35,10 +38,39 @@ pub trait ClashResolver: Sync + Send {
     async fn exchange(&self, message: &op::Message) -> anyhow::Result<op::Message>;
 
     fn ipv6(&self) -> bool;
+    fn set_ipv6(&self, enable: bool);
+    fn kind(&self) -> ResolverKind;
+    fn fake_ip_enabled(&self) -> bool;
+
+    async fn reverse_lookup(&self, ip: IpAddr) -> Option<String>;
+    async fn is_fake_ip(&self, ip: IpAddr) -> bool;
+    async fn cached_for(&self, ip: IpAddr) -> Option<String>;
 
     async fn resolve(
         &self,
         host: &str,
         enhanced: bool,
     ) -> anyhow::Result<Option<std::net::IpAddr>>;
+
+    async fn resolve_v4(
+        &self,
+        host: &str,
+        enhanced: bool,
+    ) -> anyhow::Result<Option<Ipv4Addr>> {
+        Ok(match self.resolve(host, enhanced).await? {
+            Some(IpAddr::V4(ip)) => Some(ip),
+            _ => None,
+        })
+    }
+
+    async fn resolve_v6(
+        &self,
+        host: &str,
+        enhanced: bool,
+    ) -> anyhow::Result<Option<Ipv6Addr>> {
+        Ok(match self.resolve(host, enhanced).await? {
+            Some(IpAddr::V6(ip)) => Some(ip),
+            _ => None,
+        })
+    }
 }

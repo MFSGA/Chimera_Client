@@ -1,7 +1,7 @@
 use std::{fmt, sync::Arc, time::Duration};
 
 use tokio::{io::AsyncWriteExt, sync::RwLock};
-use tracing::{Instrument, debug, info_span, instrument, trace, warn};
+use tracing::{Instrument, debug, error, info_span, instrument, trace, warn};
 use tracing_log::log;
 
 use crate::{
@@ -228,7 +228,31 @@ async fn reverse_lookup(
 ) -> Option<SocksAddr> {
     let dst = match dst {
         crate::session::SocksAddr::Ip(socket_addr) => {
-            todo!()
+            if resolver.fake_ip_enabled() {
+                let ip = socket_addr.ip();
+                if resolver.is_fake_ip(ip).await {
+                    trace!("looking up fake ip: {}", socket_addr.ip());
+                    match resolver.reverse_lookup(ip).await {
+                        Some(host) => (host, socket_addr.port())
+                            .try_into()
+                            .expect("must be valid domain"),
+                        None => {
+                            error!("failed to reverse lookup fake ip: {}", ip);
+                            return None;
+                        }
+                    }
+                } else {
+                    (*socket_addr).into()
+                }
+            } else {
+                trace!("looking up resolve cache ip: {}", socket_addr.ip());
+                match resolver.cached_for(socket_addr.ip()).await {
+                    Some(host) => (host, socket_addr.port())
+                        .try_into()
+                        .expect("must be valid domain"),
+                    None => (*socket_addr).into(),
+                }
+            }
         }
         crate::session::SocksAddr::Domain(host, port) => (host.to_owned(), *port)
             .try_into()
