@@ -6,7 +6,7 @@ use ipnet::IpNet;
 
 use crate::{
     Error,
-    config::def::{DNSListen, DNSMode},
+    config::def::{DNSListen, DNSMode, FallbackFilter as DefFallbackFilter},
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,10 +41,19 @@ impl NameServer {
 }
 
 #[derive(Default)]
+pub struct FallbackFilter {
+    pub geo_ip: bool,
+    pub geo_ip_code: String,
+    pub ip_cidr: Vec<IpNet>,
+    pub domain: Vec<String>,
+}
+
+#[derive(Default)]
 pub struct DNSConfig {
     pub listen: DNSListenAddr,
     pub nameserver: Vec<NameServer>,
     pub fallback: Vec<NameServer>,
+    pub fallback_filter: FallbackFilter,
     pub default_nameserver: Vec<NameServer>,
     pub nameserver_policy: HashMap<String, NameServer>,
     pub hosts: HashMap<String, IpAddr>,
@@ -127,6 +136,22 @@ impl DNSConfig {
 
         Ok(out)
     }
+
+    fn parse_fallback_filter(filter: &DefFallbackFilter) -> Result<FallbackFilter, Error> {
+        let mut ip_cidr = Vec::with_capacity(filter.ip_cidr.len());
+        for cidr in &filter.ip_cidr {
+            ip_cidr.push(cidr.parse::<IpNet>().map_err(|e| {
+                Error::InvalidConfig(format!("invalid fallback ipcidr {cidr}: {e}"))
+            })?);
+        }
+
+        Ok(FallbackFilter {
+            geo_ip: filter.geo_ip,
+            geo_ip_code: filter.geo_ip_code.clone(),
+            ip_cidr,
+            domain: filter.domain.clone(),
+        })
+    }
 }
 
 fn parse_host_port(input: &str, default_port: u16) -> Result<(String, u16), Error> {
@@ -189,6 +214,7 @@ impl TryFrom<&crate::config::def::Config> for DNSConfig {
                 .unwrap_or_default(),
             nameserver: DNSConfig::parse_nameserver(&dc.nameserver)?,
             fallback: DNSConfig::parse_nameserver(&dc.fallback)?,
+            fallback_filter: DNSConfig::parse_fallback_filter(&dc.fallback_filter)?,
             default_nameserver: DNSConfig::parse_nameserver(&dc.default_nameserver)?,
             nameserver_policy: DNSConfig::parse_nameserver_policy(
                 &dc.nameserver_policy,

@@ -33,6 +33,7 @@ use crate::{
             ClashResolver, DNSConfig,
             config::DNSNetMode,
             fakeip::{FakeDns, FileStore, InMemStore, Opts as FakeDnsOpts},
+            filters::{DomainFilter, FallbackDomainFilter, FallbackIpFilter, GeoIpFilter, IpNetFilter},
         },
         dns::helper::{build_dns_response_message, ip_records},
         profile::ThreadSafeCacheFile,
@@ -48,6 +49,8 @@ pub struct EnhancedResolver {
     hosts: HashMap<String, IpAddr>,
     resolver: Option<TokioResolver>,
     fallback_resolver: Option<TokioResolver>,
+    fallback_domain_filters: Vec<Box<dyn FallbackDomainFilter>>,
+    fallback_ip_filters: Vec<Box<dyn FallbackIpFilter>>,
     policy_resolvers: Vec<(String, TokioResolver)>,
     lru_cache: Arc<RwLock<DnsLru>>,
     fake_dns: Option<Arc<RwLock<FakeDns>>>,
@@ -71,6 +74,8 @@ impl EnhancedResolver {
 
         let resolver = build_resolver(&cfg.nameserver, cfg.ipv6).await;
         let fallback_resolver = build_resolver(&cfg.fallback, cfg.ipv6).await;
+        let (fallback_domain_filters, fallback_ip_filters) =
+            build_fallback_filters(&cfg, mmdb.clone());
         let policy_resolvers = build_policy_resolvers(&cfg).await;
         let fake_dns =
             build_fake_dns(&cfg, store.clone()).expect("failed to create fake dns");
@@ -81,6 +86,8 @@ impl EnhancedResolver {
             hosts: cfg.hosts,
             resolver,
             fallback_resolver,
+            fallback_domain_filters,
+            fallback_ip_filters,
             policy_resolvers,
             lru_cache: Arc::new(RwLock::new(DnsLru::new(
                 4096,
@@ -286,6 +293,14 @@ impl EnhancedResolver {
             self.query_resolvers_by_priority([Some(policy), None], &host, query_type)
                 .await?
                 .map(|ip| vec![ip])
+        } else if self.should_only_query_fallback(&host) {
+            self.query_resolvers_by_priority(
+                [self.fallback_resolver.as_ref(), None],
+                &host,
+                query_type,
+            )
+            .await?
+            .map(|ip| vec![ip])
         } else {
             match self.resolve_with_main_then_fallback(&host, query_type, true).await {
                 Ok(ips) => ips.map(|ip| vec![ip]),
@@ -351,6 +366,12 @@ impl EnhancedResolver {
             .collect()
     }
 
+    fn should_only_query_fallback(&self, host: &str) -> bool {
+        self.fallback_domain_filters
+            .iter()
+            .any(|filter| filter.apply(host))
+    }
+
     async fn resolve_with_main_then_fallback(
         &self,
         host: &str,
@@ -389,6 +410,15 @@ impl EnhancedResolver {
             )
             .await?
         {
+            if self.should_ip_fallback(&ip) {
+                if let Some(fallback) = self.fallback_resolver.as_ref()
+                    && let Ok(result) =
+                        lookup_with_resolver(fallback, host, self.ipv6(), query_type).await
+                    && result.is_some()
+                {
+                    return Ok(result);
+                }
+            }
             return Ok(Some(ip));
         }
 
@@ -398,6 +428,12 @@ impl EnhancedResolver {
             RecordType::AAAA => self.ipv6() && ip.is_ipv6(),
             _ => false,
         }))
+    }
+
+    fn should_ip_fallback(&self, ip: &IpAddr) -> bool {
+        self.fallback_ip_filters
+            .iter()
+            .any(|filter| filter.apply(ip))
     }
 
     async fn query_resolvers_by_priority(
@@ -472,6 +508,33 @@ fn build_fake_dns(
         }
         DNSMode::Normal => Ok(None),
     }
+}
+
+fn build_fallback_filters(
+    cfg: &DNSConfig,
+    mmdb: Option<MmdbLookup>,
+) -> (Vec<Box<dyn FallbackDomainFilter>>, Vec<Box<dyn FallbackIpFilter>>) {
+    let mut domain_filters: Vec<Box<dyn FallbackDomainFilter>> = Vec::new();
+    let mut ip_filters: Vec<Box<dyn FallbackIpFilter>> = Vec::new();
+
+    if !cfg.fallback_filter.domain.is_empty() {
+        domain_filters.push(Box::new(DomainFilter::new(&cfg.fallback_filter.domain)));
+    }
+
+    if cfg.fallback_filter.geo_ip || !cfg.fallback_filter.ip_cidr.is_empty() {
+        if cfg.fallback_filter.geo_ip {
+            ip_filters.push(Box::new(GeoIpFilter::new(
+                &cfg.fallback_filter.geo_ip_code,
+                mmdb,
+            )));
+        }
+
+        for cidr in &cfg.fallback_filter.ip_cidr {
+            ip_filters.push(Box::new(IpNetFilter::new(*cidr)));
+        }
+    }
+
+    (domain_filters, ip_filters)
 }
 
 async fn build_resolver(
