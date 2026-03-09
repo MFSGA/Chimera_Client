@@ -35,10 +35,10 @@ use crate::{
             fakeip::{FakeDns, FileStore, InMemStore, Opts as FakeDnsOpts},
             filters::{DomainFilter, FallbackDomainFilter, FallbackIpFilter, GeoIpFilter, IpNetFilter},
         },
-        dns::helper::{build_dns_response_message, ip_records},
+        dns::helper::build_dns_response_message,
         profile::ThreadSafeCacheFile,
     },
-    common::mmdb::MmdbLookup,
+    common::{mmdb::MmdbLookup, trie::StringTrie},
     config::def::DNSMode,
     proxy::OutboundHandler,
 };
@@ -46,12 +46,12 @@ use crate::{
 pub struct EnhancedResolver {
     ipv6: AtomicBool,
     store: ThreadSafeCacheFile,
-    hosts: HashMap<String, IpAddr>,
+    hosts: Option<StringTrie<IpAddr>>,
     resolver: Option<TokioResolver>,
     fallback_resolver: Option<TokioResolver>,
     fallback_domain_filters: Vec<Box<dyn FallbackDomainFilter>>,
     fallback_ip_filters: Vec<Box<dyn FallbackIpFilter>>,
-    policy_resolvers: Vec<(String, TokioResolver)>,
+    policy_resolvers: Option<StringTrie<TokioResolver>>,
     lru_cache: Arc<RwLock<DnsLru>>,
     fake_dns: Option<Arc<RwLock<FakeDns>>>,
     reverse_lookup_cache: Arc<RwLock<LruCache<IpAddr, String>>>,
@@ -77,13 +77,14 @@ impl EnhancedResolver {
         let (fallback_domain_filters, fallback_ip_filters) =
             build_fallback_filters(&cfg, mmdb.clone());
         let policy_resolvers = build_policy_resolvers(&cfg).await;
+        let hosts = build_hosts_trie(&cfg.hosts);
         let fake_dns =
             build_fake_dns(&cfg, store.clone()).expect("failed to create fake dns");
 
         Self {
             ipv6: AtomicBool::new(cfg.ipv6),
             store,
-            hosts: cfg.hosts,
+            hosts,
             resolver,
             fallback_resolver,
             fallback_domain_filters,
@@ -134,7 +135,13 @@ impl ClashResolver for EnhancedResolver {
             }
         }
 
-        self.exchange_no_cache(message).await
+        self.exchange_no_cache(message).await.map(|mut response| {
+            if let Some(edns) = response.extensions_mut() {
+                edns.options_mut()
+                    .remove(hickory_proto::rr::rdata::opt::EdnsCode::Padding);
+            }
+            response
+        })
     }
 
     fn ipv6(&self) -> bool {
@@ -195,27 +202,33 @@ impl ClashResolver for EnhancedResolver {
     async fn resolve_v4(
         &self,
         host: &str,
-        _enhanced: bool,
+        enhanced: bool,
     ) -> anyhow::Result<Option<std::net::Ipv4Addr>> {
-        Ok(self.lookup_ip(host, RecordType::A).await?.into_iter().find_map(|ip| match ip {
-            std::net::IpAddr::V4(ip) => Some(ip),
-            std::net::IpAddr::V6(_) => None,
-        }))
+        Ok(self
+            .resolve_ip_by_type(host, RecordType::A, enhanced)
+            .await?
+            .and_then(|ip| match ip {
+                IpAddr::V4(ip) => Some(ip),
+                IpAddr::V6(_) => None,
+            }))
     }
 
     async fn resolve_v6(
         &self,
         host: &str,
-        _enhanced: bool,
+        enhanced: bool,
     ) -> anyhow::Result<Option<std::net::Ipv6Addr>> {
         if !self.ipv6() {
             return Ok(None);
         }
 
-        Ok(self.lookup_ip(host, RecordType::AAAA).await?.into_iter().find_map(|ip| match ip {
-            std::net::IpAddr::V6(ip) => Some(ip),
-            std::net::IpAddr::V4(_) => None,
-        }))
+        Ok(self
+            .resolve_ip_by_type(host, RecordType::AAAA, enhanced)
+            .await?
+            .and_then(|ip| match ip {
+                IpAddr::V6(ip) => Some(ip),
+                IpAddr::V4(_) => None,
+            }))
     }
 
     async fn reverse_lookup(&self, ip: std::net::IpAddr) -> Option<String> {
@@ -270,11 +283,10 @@ impl EnhancedResolver {
             .ok_or_else(|| anyhow::anyhow!("invalid query message"))?;
         let response = if Self::is_ip_request(query) {
             self.ip_exchange(message).await?
+        } else if let Some(policy) = self.match_policy(message) {
+            self.batch_exchange(vec![policy], message).await?
         } else {
-            return Err(anyhow::anyhow!(
-                "unsupported dns query type in migrated path: {:?}",
-                query.query_type()
-            ));
+            self.exchange_non_ip_query(message).await?
         };
 
         self.maybe_cache_response(query, &response).await;
@@ -282,58 +294,36 @@ impl EnhancedResolver {
     }
 
     async fn ip_exchange(&self, message: &Message) -> anyhow::Result<Message> {
-        let query = message
-            .query()
-            .ok_or_else(|| anyhow::anyhow!("invalid query message"))?;
-        let query_type = query.query_type();
-        let host = Self::domain_name_of_message(message)
-            .unwrap_or_else(|| query.name().to_ascii().trim_end_matches('.').to_string());
+        let host = Self::domain_name_of_message(message).ok_or_else(|| {
+            anyhow::anyhow!("invalid query message")
+        })?;
 
-        let ips = if let Some(policy) = self.match_policy_resolver(&host) {
-            self.query_resolvers_by_priority([Some(policy), None], &host, query_type)
-                .await?
-                .map(|ip| vec![ip])
-        } else if self.should_only_query_fallback(&host) {
-            self.query_resolvers_by_priority(
-                [self.fallback_resolver.as_ref(), None],
-                &host,
-                query_type,
+        let response = if let Some(policy) = self.match_policy(message) {
+            self.batch_exchange(vec![policy], message).await?
+        } else if self.should_only_query_fallback_message(message) {
+            self.batch_exchange(
+                self.fallback_resolver.as_ref().into_iter().collect(),
+                message,
             )
             .await?
-            .map(|ip| vec![ip])
         } else {
-            match self.resolve_with_main_then_fallback(&host, query_type, true).await {
-                Ok(ips) => ips.map(|ip| vec![ip]),
-                Err(err) => return Err(err),
-            }
+            self.exchange_with_main_then_fallback(message).await?
         };
 
-        let mut response = build_dns_response_message(message, true, false);
-        match ips {
-            Some(ips) if !ips.is_empty() => {
-                let records = ip_records(
-                    query.name().clone(),
-                    crate::app::dns::server::DEFAULT_DNS_SERVER_TTL,
-                    query_type,
-                    &ips,
-                );
-                response.set_response_code(ResponseCode::NoError);
-                response.set_answer_count(records.len() as u16);
-                response.add_answers(records);
-                for ip in Self::ip_list_of_message(&response) {
-                    self.save_reverse_lookup(ip, host.clone()).await;
-                }
-            }
-            _ => {
-                warn!(host, ?query_type, "dns query returned no records");
-                response.set_response_code(ResponseCode::NXDomain);
-            }
+        for ip in Self::ip_list_of_message(&response) {
+            self.save_reverse_lookup(ip, host.clone()).await;
         }
 
         Ok(response)
     }
 
     async fn maybe_cache_response(&self, query: &hickory_proto::op::Query, response: &Message) {
+        if query.query_type() == RecordType::TXT
+            && query.name().to_ascii().starts_with("_acme-challenge.")
+        {
+            return;
+        }
+
         self.lru_cache.write().await.insert_records(
             query.clone(),
             response.answers().iter().cloned(),
@@ -372,7 +362,101 @@ impl EnhancedResolver {
             .any(|filter| filter.apply(host))
     }
 
-    async fn resolve_with_main_then_fallback(
+    fn should_only_query_fallback_message(&self, message: &Message) -> bool {
+        let Some(host) = Self::domain_name_of_message(message) else {
+            return false;
+        };
+
+        self.should_only_query_fallback(&host)
+    }
+
+    fn match_policy(&self, message: &Message) -> Option<&TokioResolver> {
+        let host = Self::domain_name_of_message(message)?;
+        self.match_policy_resolver(&host)
+    }
+
+    async fn exchange_with_main_then_fallback(
+        &self,
+        message: &Message,
+    ) -> anyhow::Result<Message> {
+        let main_resolvers: Vec<_> = self.resolver.as_ref().into_iter().collect();
+        let fallback_resolvers: Vec<_> =
+            self.fallback_resolver.as_ref().into_iter().collect();
+
+        if main_resolvers.is_empty() {
+            return self.batch_exchange(fallback_resolvers, message).await;
+        }
+
+        let main_result = self.batch_exchange(main_resolvers, message).await;
+
+        if fallback_resolvers.is_empty() {
+            return main_result;
+        }
+
+        if let Ok(response) = main_result {
+            let ips = Self::ip_list_of_message(&response);
+            if ips.first().is_some_and(|ip| self.should_ip_fallback(ip)) {
+                return self.batch_exchange(fallback_resolvers, message).await;
+            }
+            return Ok(response);
+        }
+
+        self.batch_exchange(fallback_resolvers, message).await
+    }
+
+    async fn exchange_non_ip_query(
+        &self,
+        message: &Message,
+    ) -> anyhow::Result<Message> {
+        let main_resolvers: Vec<_> = self.resolver.as_ref().into_iter().collect();
+        let fallback_resolvers: Vec<_> =
+            self.fallback_resolver.as_ref().into_iter().collect();
+
+        if !main_resolvers.is_empty() {
+            if let Ok(response) = self.batch_exchange(main_resolvers, message).await {
+                return Ok(response);
+            }
+        }
+
+        if !fallback_resolvers.is_empty() {
+            return self.batch_exchange(fallback_resolvers, message).await;
+        }
+
+        Err(anyhow::anyhow!("no resolver available for dns query"))
+    }
+
+    fn should_ip_fallback(&self, ip: &IpAddr) -> bool {
+        self.fallback_ip_filters
+            .iter()
+            .any(|filter| filter.apply(ip))
+    }
+
+    async fn batch_exchange(
+        &self,
+        resolvers: Vec<&TokioResolver>,
+        message: &Message,
+    ) -> anyhow::Result<Message> {
+        if resolvers.is_empty() {
+            return Err(anyhow::anyhow!("no resolver available"));
+        }
+
+        let mut queries = Vec::with_capacity(resolvers.len());
+        for resolver in resolvers {
+            queries.push(exchange_with_resolver(resolver, message).boxed());
+        }
+
+        let timeout = tokio::time::sleep(Duration::from_secs(10));
+        tokio::select! {
+            result = future::select_ok(queries) => match result {
+                Ok((response, _)) => Ok(response),
+                Err(err) => Err(err),
+            },
+            _ = timeout => Err(anyhow::anyhow!("dns query timeout")),
+        }
+    }
+
+
+    async fn resolve_ip_by_type(
         &self,
         host: &str,
         query_type: RecordType,
@@ -380,16 +464,24 @@ impl EnhancedResolver {
     ) -> anyhow::Result<Option<IpAddr>> {
         let normalized_host = host.trim_end_matches('.').to_ascii_lowercase();
 
-        if enhanced && let Some(ip) = self.hosts.get(&normalized_host).copied() {
+        if enhanced
+            && let Some(hosts) = &self.hosts
+            && let Some(node) = hosts.search(&normalized_host)
+            && let Some(ip) = node.get_data()
+        {
             return Ok(match query_type {
-                RecordType::A if ip.is_ipv4() => Some(ip),
-                RecordType::AAAA if ip.is_ipv6() => Some(ip),
+                RecordType::A if ip.is_ipv4() => Some(*ip),
+                RecordType::AAAA if ip.is_ipv6() => Some(*ip),
                 _ => None,
             });
         }
 
         if let Ok(ip) = host.parse::<IpAddr>() {
-            return Ok(Some(ip));
+            return Ok(match query_type {
+                RecordType::A if ip.is_ipv4() => Some(ip),
+                RecordType::AAAA if ip.is_ipv6() => Some(ip),
+                _ => None,
+            });
         }
 
         if enhanced
@@ -402,70 +494,20 @@ impl EnhancedResolver {
             }
         }
 
-        if let Some(ip) = self
-            .query_resolvers_by_priority(
-                [self.resolver.as_ref(), self.fallback_resolver.as_ref()],
-                host,
-                query_type,
-            )
-            .await?
-        {
-            if self.should_ip_fallback(&ip) {
-                if let Some(fallback) = self.fallback_resolver.as_ref()
-                    && let Ok(result) =
-                        lookup_with_resolver(fallback, host, self.ipv6(), query_type).await
-                    && result.is_some()
-                {
-                    return Ok(result);
-                }
+        match self.lookup_ip(host, query_type).await {
+            Ok(ips) => Ok(ips.into_iter().find(|ip| match query_type {
+                RecordType::A => ip.is_ipv4(),
+                RecordType::AAAA => self.ipv6() && ip.is_ipv6(),
+                _ => false,
+            })),
+            Err(_) => {
+                let response = tokio::net::lookup_host(format!("{host}:0")).await?;
+                Ok(response.map(|addr| addr.ip()).find(|ip| match query_type {
+                    RecordType::A => ip.is_ipv4(),
+                    RecordType::AAAA => self.ipv6() && ip.is_ipv6(),
+                    _ => false,
+                }))
             }
-            return Ok(Some(ip));
-        }
-
-        let response = tokio::net::lookup_host(format!("{host}:0")).await?;
-        Ok(response.map(|addr| addr.ip()).find(|ip| match query_type {
-            RecordType::A => ip.is_ipv4(),
-            RecordType::AAAA => self.ipv6() && ip.is_ipv6(),
-            _ => false,
-        }))
-    }
-
-    fn should_ip_fallback(&self, ip: &IpAddr) -> bool {
-        self.fallback_ip_filters
-            .iter()
-            .any(|filter| filter.apply(ip))
-    }
-
-    async fn query_resolvers_by_priority(
-        &self,
-        resolvers: [Option<&TokioResolver>; 2],
-        host: &str,
-        query_type: RecordType,
-    ) -> anyhow::Result<Option<IpAddr>> {
-        match resolvers {
-            [Some(primary), Some(secondary)] => {
-                let primary_query =
-                    lookup_with_resolver(primary, host, self.ipv6(), query_type);
-                let secondary_query =
-                    lookup_with_resolver(secondary, host, self.ipv6(), query_type);
-                let (primary_result, secondary_result) =
-                    tokio::join!(primary_query, secondary_query);
-
-                match primary_result {
-                    Ok(Some(ip)) => Ok(Some(ip)),
-                    Ok(None) | Err(_) => match secondary_result {
-                        Ok(result) => Ok(result),
-                        Err(err) => Err(err),
-                    },
-                }
-            }
-            [Some(primary), None] => {
-                lookup_with_resolver(primary, host, self.ipv6(), query_type).await
-            }
-            [None, Some(secondary)] => {
-                lookup_with_resolver(secondary, host, self.ipv6(), query_type).await
-            }
-            _ => Ok(None),
         }
     }
 
@@ -477,10 +519,9 @@ impl EnhancedResolver {
     fn match_policy_resolver(&self, host: &str) -> Option<&TokioResolver> {
         let host = host.trim_end_matches('.').to_ascii_lowercase();
         self.policy_resolvers
-            .iter()
-            .filter(|(pattern, _)| domain_matches(&host, pattern))
-            .max_by_key(|(pattern, _)| pattern.len())
-            .map(|(_, resolver)| resolver)
+            .as_ref()
+            .and_then(|policy| policy.search(&host))
+            .and_then(|node| node.get_data())
     }
 }
 
@@ -582,36 +623,53 @@ async fn build_resolver(
     )
 }
 
-async fn build_policy_resolvers(cfg: &DNSConfig) -> Vec<(String, TokioResolver)> {
-    let mut out = Vec::new();
+async fn build_policy_resolvers(cfg: &DNSConfig) -> Option<StringTrie<TokioResolver>> {
+    let mut out = StringTrie::new();
+    let mut has_entries = false;
     for (domain, nameserver) in &cfg.nameserver_policy {
         if let Some(resolver) =
             build_resolver(std::slice::from_ref(nameserver), cfg.ipv6).await
         {
-            out.push((domain.clone(), resolver));
+            has_entries = true;
+            out.insert(domain, Arc::new(resolver));
         }
     }
-    out
+    has_entries.then_some(out)
 }
 
-async fn lookup_with_resolver(
+fn build_hosts_trie(hosts: &HashMap<String, IpAddr>) -> Option<StringTrie<IpAddr>> {
+    let mut out = StringTrie::new();
+    let mut has_entries = false;
+
+    for (host, ip) in hosts {
+        has_entries = true;
+        out.insert(host, Arc::new(*ip));
+    }
+
+    has_entries.then_some(out)
+}
+
+async fn exchange_with_resolver(
     resolver: &TokioResolver,
-    host: &str,
-    ipv6: bool,
-    query_type: RecordType,
-) -> anyhow::Result<Option<std::net::IpAddr>> {
-    let response = resolver.lookup_ip(host).await?;
-    Ok(response.into_iter().find(|ip| match query_type {
-        RecordType::A => ip.is_ipv4(),
-        RecordType::AAAA => ipv6 && ip.is_ipv6(),
-        _ => false,
-    }))
-}
+    message: &Message,
+) -> anyhow::Result<Message> {
+    let query = message
+        .query()
+        .ok_or_else(|| anyhow::anyhow!("invalid query message"))?;
+    let lookup = resolver
+        .lookup(query.name().clone(), query.query_type())
+        .await?;
 
-fn domain_matches(host: &str, pattern: &str) -> bool {
-    let pattern = pattern.trim_end_matches('.').to_ascii_lowercase();
-    host == pattern
-        || host
-            .strip_suffix(&pattern)
-            .is_some_and(|rest| rest.ends_with('.'))
+    let records: Vec<_> = lookup.record_iter().cloned().collect();
+    let mut response = build_dns_response_message(message, true, false);
+
+    if records.is_empty() {
+        response.set_response_code(ResponseCode::NXDomain);
+        return Ok(response);
+    }
+
+    response.set_response_code(ResponseCode::NoError);
+    response.set_answer_count(records.len() as u16);
+    response.add_answers(records);
+    Ok(response)
 }
