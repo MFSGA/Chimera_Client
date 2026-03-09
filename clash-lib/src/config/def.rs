@@ -217,6 +217,15 @@ pub enum DNSListen {
     // Multiple(HashMap<String, Value>),
 }
 
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DNSMode {
+    #[default]
+    Normal,
+    FakeIp,
+    RedirHost,
+}
+
 /// DNS client/server settings
 /// This section is optional. When not present, the DNS server will be disabled
 /// and system DNS config will be used # Example
@@ -245,6 +254,8 @@ pub enum DNSListen {
 #[serde(rename_all = "kebab-case", default)]
 #[educe(Default)]
 pub struct DNS {
+    /// Whether to use fake IP addresses
+    pub enhanced_mode: DNSMode,
     /// DNS upstream servers
     pub nameserver: Vec<String>,
     /// Fallback DNS upstream servers
@@ -253,6 +264,11 @@ pub struct DNS {
     pub default_nameserver: Vec<String>,
     /// Lookup domains via specific nameservers
     pub nameserver_policy: HashMap<String, String>,
+    /// Fake IP addresses pool CIDR
+    #[educe(Default = "198.18.0.1/16")]
+    pub fake_ip_range: String,
+    /// Fake IP addresses filter
+    pub fake_ip_filter: Vec<String>,
     /// Enable IPv6 DNS responses (AAAA)
     pub ipv6: bool,
     /// DNS server listening address. If not present, the DNS server will be

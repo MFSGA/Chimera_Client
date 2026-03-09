@@ -1,7 +1,12 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
-use crate::{Error, config::def::DNSListen};
+use ipnet::IpNet;
+
+use crate::{
+    Error,
+    config::def::{DNSListen, DNSMode},
+};
 
 pub use chimera_dns::{DNSListenAddr, DoH3Config, DoHConfig, DoTConfig};
 
@@ -43,6 +48,10 @@ pub struct DNSConfig {
     pub fallback: Vec<NameServer>,
     pub default_nameserver: Vec<NameServer>,
     pub nameserver_policy: HashMap<String, NameServer>,
+    pub enhance_mode: DNSMode,
+    pub fake_ip_range: IpNet,
+    pub fake_ip_filter: Vec<String>,
+    pub store_fake_ip: bool,
     pub ipv6: bool,
     pub enable: bool,
 }
@@ -172,6 +181,12 @@ impl TryFrom<&crate::config::def::Config> for DNSConfig {
             nameserver_policy: DNSConfig::parse_nameserver_policy(
                 &dc.nameserver_policy,
             )?,
+            enhance_mode: dc.enhanced_mode.clone(),
+            fake_ip_range: dc.fake_ip_range.parse::<IpNet>().map_err(|e| {
+                Error::InvalidConfig(format!("invalid fake-ip-range: {e}"))
+            })?,
+            fake_ip_filter: dc.fake_ip_filter.clone(),
+            store_fake_ip: c.profile.store_fake_ip,
             ipv6: dc.ipv6,
             enable: dc.enable,
         })
