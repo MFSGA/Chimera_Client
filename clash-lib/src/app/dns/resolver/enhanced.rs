@@ -20,6 +20,7 @@ use hickory_proto::{
     rr::RecordType,
     xfer::Protocol,
 };
+use lru_time_cache::LruCache;
 use tokio::sync::RwLock;
 use tracing::{debug, trace, warn};
 
@@ -41,11 +42,13 @@ use crate::{
 pub struct EnhancedResolver {
     ipv6: AtomicBool,
     store: ThreadSafeCacheFile,
+    hosts: HashMap<String, IpAddr>,
     resolver: Option<TokioResolver>,
     fallback_resolver: Option<TokioResolver>,
     policy_resolvers: Vec<(String, TokioResolver)>,
     lru_cache: Arc<RwLock<DnsLru>>,
     fake_dns: Option<Arc<RwLock<FakeDns>>>,
+    reverse_lookup_cache: Arc<RwLock<LruCache<IpAddr, String>>>,
     _mmdb: Option<MmdbLookup>,
     _outbounds: HashMap<String, Arc<dyn OutboundHandler>>,
 }
@@ -72,6 +75,7 @@ impl EnhancedResolver {
         Self {
             ipv6: AtomicBool::new(cfg.ipv6),
             store,
+            hosts: cfg.hosts,
             resolver,
             fallback_resolver,
             policy_resolvers,
@@ -85,6 +89,12 @@ impl EnhancedResolver {
                 ),
             ))),
             fake_dns,
+            reverse_lookup_cache: Arc::new(RwLock::new(
+                LruCache::with_expiry_duration_and_capacity(
+                    Duration::from_secs(3),
+                    4096,
+                ),
+            )),
             _mmdb: mmdb,
             _outbounds: outbounds,
         }
@@ -146,6 +156,9 @@ impl ClashResolver for EnhancedResolver {
                     response.answers().iter().cloned(),
                     Instant::now(),
                 );
+                for ip in &ips {
+                    self.save_reverse_lookup(*ip, host.clone()).await;
+                }
             }
             _ => {
                 warn!(host, ?query_type, "dns query returned no records");
@@ -183,11 +196,22 @@ impl ClashResolver for EnhancedResolver {
     async fn resolve(
         &self,
         host: &str,
-        _enhanced: bool,
+        enhanced: bool,
     ) -> anyhow::Result<Option<std::net::IpAddr>> {
-        let resolved = self
-            .resolve_with_policy_then_fallback(host, RecordType::A)
-            .await?;
+        let resolved = match self.ipv6() {
+            true => {
+                self.resolve_with_policy_then_fallback(host, RecordType::AAAA, enhanced)
+                    .await?
+                    .or(
+                        self.resolve_with_policy_then_fallback(host, RecordType::A, enhanced)
+                            .await?,
+                    )
+            }
+            false => {
+                self.resolve_with_policy_then_fallback(host, RecordType::A, enhanced)
+                    .await?
+            }
+        };
 
         if let Some(ip) = resolved {
             let ip = ip.to_string();
@@ -200,10 +224,10 @@ impl ClashResolver for EnhancedResolver {
     async fn resolve_v4(
         &self,
         host: &str,
-        _enhanced: bool,
+        enhanced: bool,
     ) -> anyhow::Result<Option<std::net::Ipv4Addr>> {
         let resolved = self
-            .resolve_with_policy_then_fallback(host, RecordType::A)
+            .resolve_with_policy_then_fallback(host, RecordType::A, enhanced)
             .await?;
         Ok(resolved.and_then(|ip| match ip {
             std::net::IpAddr::V4(ip) => Some(ip),
@@ -214,14 +238,14 @@ impl ClashResolver for EnhancedResolver {
     async fn resolve_v6(
         &self,
         host: &str,
-        _enhanced: bool,
+        enhanced: bool,
     ) -> anyhow::Result<Option<std::net::Ipv6Addr>> {
         if !self.ipv6() {
             return Ok(None);
         }
 
         let resolved = self
-            .resolve_with_policy_then_fallback(host, RecordType::AAAA)
+            .resolve_with_policy_then_fallback(host, RecordType::AAAA, enhanced)
             .await?;
         Ok(resolved.and_then(|ip| match ip {
             std::net::IpAddr::V6(ip) => Some(ip),
@@ -230,6 +254,11 @@ impl ClashResolver for EnhancedResolver {
     }
 
     async fn reverse_lookup(&self, ip: std::net::IpAddr) -> Option<String> {
+        if let Some(cached) = self.reverse_lookup_cache.read().await.peek(&ip).cloned() {
+            trace!(%ip, host = cached, "reverse lookup cache hit");
+            return Some(cached);
+        }
+
         let Some(fake_dns) = &self.fake_dns else {
             return None;
         };
@@ -238,6 +267,9 @@ impl ClashResolver for EnhancedResolver {
     }
 
     async fn cached_for(&self, ip: std::net::IpAddr) -> Option<String> {
+        if let Some(cached) = self.reverse_lookup_cache.read().await.peek(&ip).cloned() {
+            return Some(cached);
+        }
         self.store.get_fake_ip(&ip.to_string()).await
     }
 }
@@ -247,12 +279,24 @@ impl EnhancedResolver {
         &self,
         host: &str,
         query_type: RecordType,
+        enhanced: bool,
     ) -> anyhow::Result<Option<std::net::IpAddr>> {
+        let normalized_host = host.trim_end_matches('.').to_ascii_lowercase();
+
+        if enhanced && let Some(ip) = self.hosts.get(&normalized_host).copied() {
+            return Ok(match query_type {
+                RecordType::A if ip.is_ipv4() => Some(ip),
+                RecordType::AAAA if ip.is_ipv6() => Some(ip),
+                _ => None,
+            });
+        }
+
         if let Ok(ip) = host.parse::<IpAddr>() {
             return Ok(Some(ip));
         }
 
-        if query_type == RecordType::A
+        if enhanced
+            && query_type == RecordType::A
             && let Some(fake_dns) = &self.fake_dns
         {
             let mut fake_dns = fake_dns.write().await;
@@ -289,6 +333,10 @@ impl EnhancedResolver {
             RecordType::AAAA => self.ipv6() && ip.is_ipv6(),
             _ => false,
         }))
+    }
+
+    async fn save_reverse_lookup(&self, ip: IpAddr, host: String) {
+        self.reverse_lookup_cache.write().await.insert(ip, host);
     }
 
     fn match_policy_resolver(&self, host: &str) -> Option<&TokioResolver> {

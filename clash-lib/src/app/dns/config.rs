@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use chimera_dns::DNSListenAddr;
 use ipnet::IpNet;
@@ -47,6 +47,7 @@ pub struct DNSConfig {
     pub fallback: Vec<NameServer>,
     pub default_nameserver: Vec<NameServer>,
     pub nameserver_policy: HashMap<String, NameServer>,
+    pub hosts: HashMap<String, IpAddr>,
     pub enhance_mode: DNSMode,
     pub fake_ip_range: IpNet,
     pub fake_ip_filter: Vec<String>,
@@ -106,6 +107,22 @@ impl DNSConfig {
                 ))
             })?;
             out.insert(domain.to_ascii_lowercase(), ns);
+        }
+
+        Ok(out)
+    }
+
+    fn parse_hosts(hosts: &HashMap<String, String>) -> Result<HashMap<String, IpAddr>, Error> {
+        let mut out = HashMap::from([(
+            "localhost".to_string(),
+            "127.0.0.1".parse::<IpAddr>().expect("localhost ip should be valid"),
+        )]);
+
+        for (host, ip) in hosts {
+            let ip = ip.parse::<IpAddr>().map_err(|e| {
+                Error::InvalidConfig(format!("invalid hosts entry {host}: {e}"))
+            })?;
+            out.insert(host.trim_end_matches('.').to_ascii_lowercase(), ip);
         }
 
         Ok(out)
@@ -176,6 +193,7 @@ impl TryFrom<&crate::config::def::Config> for DNSConfig {
             nameserver_policy: DNSConfig::parse_nameserver_policy(
                 &dc.nameserver_policy,
             )?,
+            hosts: DNSConfig::parse_hosts(&c.hosts)?,
             enhance_mode: dc.enhanced_mode.clone(),
             fake_ip_range: dc
                 .fake_ip_range
