@@ -14,6 +14,7 @@ use hickory_resolver::{
 };
 use tracing::debug;
 
+use crate::app::dns::config::DNSNetMode;
 use crate::{
     app::{
         dns::{ClashResolver, DNSConfig},
@@ -23,12 +24,13 @@ use crate::{
     proxy::OutboundHandler,
 };
 use hickory_proto::xfer::Protocol;
-use crate::app::dns::config::DNSNetMode;
 
 pub struct EnhancedResolver {
     ipv6: AtomicBool,
     store: ThreadSafeCacheFile,
     resolver: Option<TokioResolver>,
+    fallback_resolver: Option<TokioResolver>,
+    policy_resolvers: Vec<(String, TokioResolver)>,
     _mmdb: Option<MmdbLookup>,
     _outbounds: HashMap<String, Arc<dyn OutboundHandler>>,
 }
@@ -46,12 +48,16 @@ impl EnhancedResolver {
             "creating enhanced resolver"
         );
 
-        let resolver = build_resolver(&cfg).await;
+        let resolver = build_resolver(&cfg.nameserver, cfg.ipv6).await;
+        let fallback_resolver = build_resolver(&cfg.fallback, cfg.ipv6).await;
+        let policy_resolvers = build_policy_resolvers(&cfg).await;
 
         Self {
             ipv6: AtomicBool::new(cfg.ipv6),
             store,
             resolver,
+            fallback_resolver,
+            policy_resolvers,
             _mmdb: mmdb,
             _outbounds: outbounds,
         }
@@ -95,13 +101,7 @@ impl ClashResolver for EnhancedResolver {
         host: &str,
         _enhanced: bool,
     ) -> anyhow::Result<Option<std::net::IpAddr>> {
-        let resolved = if let Some(resolver) = &self.resolver {
-            let response = resolver.lookup_ip(host).await?;
-            response.into_iter().find(|ip| self.ipv6() || ip.is_ipv4())
-        } else {
-            let response = tokio::net::lookup_host(format!("{host}:0")).await?;
-            response.map(|addr| addr.ip()).find(|ip| self.ipv6() || ip.is_ipv4())
-        };
+        let resolved = self.resolve_with_policy_then_fallback(host).await?;
 
         if let Some(ip) = resolved {
             let ip = ip.to_string();
@@ -120,13 +120,57 @@ impl ClashResolver for EnhancedResolver {
     }
 }
 
-async fn build_resolver(cfg: &DNSConfig) -> Option<TokioResolver> {
-    if cfg.nameserver.is_empty() {
+impl EnhancedResolver {
+    async fn resolve_with_policy_then_fallback(
+        &self,
+        host: &str,
+    ) -> anyhow::Result<Option<std::net::IpAddr>> {
+        if let Some(resolver) = self.match_policy_resolver(host) {
+            if let Ok(resolved) =
+                lookup_with_resolver(resolver, host, self.ipv6()).await
+                && resolved.is_some()
+            {
+                return Ok(resolved);
+            }
+        }
+
+        if let Some(resolver) = &self.resolver {
+            match lookup_with_resolver(resolver, host, self.ipv6()).await {
+                Ok(Some(ip)) => return Ok(Some(ip)),
+                Ok(None) | Err(_) => {}
+            }
+        }
+
+        if let Some(resolver) = &self.fallback_resolver {
+            return lookup_with_resolver(resolver, host, self.ipv6()).await;
+        }
+
+        let response = tokio::net::lookup_host(format!("{host}:0")).await?;
+        Ok(response
+            .map(|addr| addr.ip())
+            .find(|ip| self.ipv6() || ip.is_ipv4()))
+    }
+
+    fn match_policy_resolver(&self, host: &str) -> Option<&TokioResolver> {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        self.policy_resolvers
+            .iter()
+            .filter(|(pattern, _)| domain_matches(&host, pattern))
+            .max_by_key(|(pattern, _)| pattern.len())
+            .map(|(_, resolver)| resolver)
+    }
+}
+
+async fn build_resolver(
+    nameservers: &[crate::app::dns::config::NameServer],
+    ipv6: bool,
+) -> Option<TokioResolver> {
+    if nameservers.is_empty() {
         return None;
     }
 
     let mut resolver_config = ResolverConfig::new();
-    for server in &cfg.nameserver {
+    for server in nameservers {
         let Ok(socket_addr) = server.to_socket_addr().await else {
             continue;
         };
@@ -137,7 +181,8 @@ async fn build_resolver(cfg: &DNSConfig) -> Option<TokioResolver> {
             DNSNetMode::DoT | DNSNetMode::DoH | DNSNetMode::Dhcp => continue,
         };
 
-        resolver_config.add_name_server(NameServerConfig::new(socket_addr, protocol));
+        resolver_config
+            .add_name_server(NameServerConfig::new(socket_addr, protocol));
     }
 
     if resolver_config.name_servers().is_empty() {
@@ -145,7 +190,7 @@ async fn build_resolver(cfg: &DNSConfig) -> Option<TokioResolver> {
     }
 
     let mut opts = ResolverOpts::default();
-    opts.ip_strategy = if cfg.ipv6 {
+    opts.ip_strategy = if ipv6 {
         hickory_resolver::config::LookupIpStrategy::Ipv4AndIpv6
     } else {
         hickory_resolver::config::LookupIpStrategy::Ipv4Only
@@ -159,4 +204,33 @@ async fn build_resolver(cfg: &DNSConfig) -> Option<TokioResolver> {
         .with_options(opts)
         .build(),
     )
+}
+
+async fn build_policy_resolvers(cfg: &DNSConfig) -> Vec<(String, TokioResolver)> {
+    let mut out = Vec::new();
+    for (domain, nameserver) in &cfg.nameserver_policy {
+        if let Some(resolver) =
+            build_resolver(std::slice::from_ref(nameserver), cfg.ipv6).await
+        {
+            out.push((domain.clone(), resolver));
+        }
+    }
+    out
+}
+
+async fn lookup_with_resolver(
+    resolver: &TokioResolver,
+    host: &str,
+    ipv6: bool,
+) -> anyhow::Result<Option<std::net::IpAddr>> {
+    let response = resolver.lookup_ip(host).await?;
+    Ok(response.into_iter().find(|ip| ipv6 || ip.is_ipv4()))
+}
+
+fn domain_matches(host: &str, pattern: &str) -> bool {
+    let pattern = pattern.trim_end_matches('.').to_ascii_lowercase();
+    host == pattern
+        || host
+            .strip_suffix(&pattern)
+            .is_some_and(|rest| rest.ends_with('.'))
 }
