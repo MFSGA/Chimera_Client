@@ -228,6 +228,22 @@ pub enum DNSMode {
     RedirHost,
 }
 
+#[derive(Serialize, Deserialize, Clone, Educe)]
+#[serde(default)]
+#[serde(rename_all = "kebab-case")]
+#[educe(Default)]
+pub struct FallbackFilter {
+    #[serde(rename = "geoip")]
+    #[educe(Default = true)]
+    pub geo_ip: bool,
+    #[serde(rename = "geoip-code")]
+    #[educe(Default = "CN")]
+    pub geo_ip_code: String,
+    #[serde(rename = "ipcidr")]
+    pub ip_cidr: Vec<String>,
+    pub domain: Vec<String>,
+}
+
 /// DNS client/server settings
 /// This section is optional. When not present, the DNS server will be disabled
 /// and system DNS config will be used # Example
@@ -262,6 +278,8 @@ pub struct DNS {
     pub nameserver: Vec<String>,
     /// Fallback DNS upstream servers
     pub fallback: Vec<String>,
+    /// Fallback DNS filter
+    pub fallback_filter: FallbackFilter,
     /// Default nameservers used for resolving DNS upstream hostnames later
     pub default_nameserver: Vec<String>,
     /// Lookup domains via specific nameservers

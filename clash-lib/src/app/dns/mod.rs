@@ -10,6 +10,7 @@ use std::{
 /// 2
 pub mod config;
 mod fakeip;
+mod filters;
 mod helper;
 /// 3
 pub mod resolver;
