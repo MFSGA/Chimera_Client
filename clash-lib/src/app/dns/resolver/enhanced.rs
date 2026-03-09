@@ -261,26 +261,36 @@ impl EnhancedResolver {
         let query = message
             .query()
             .ok_or_else(|| anyhow::anyhow!("invalid query message"))?;
-        let query_type = query.query_type();
-
-        if !matches!(query_type, RecordType::A | RecordType::AAAA) {
+        let response = if Self::is_ip_request(query) {
+            self.ip_exchange(message).await?
+        } else {
             return Err(anyhow::anyhow!(
-                "unsupported dns query type in migrated path: {query_type:?}"
+                "unsupported dns query type in migrated path: {:?}",
+                query.query_type()
             ));
-        }
+        };
 
+        self.maybe_cache_response(query, &response).await;
+        Ok(response)
+    }
+
+    async fn ip_exchange(&self, message: &Message) -> anyhow::Result<Message> {
+        let query = message
+            .query()
+            .ok_or_else(|| anyhow::anyhow!("invalid query message"))?;
+        let query_type = query.query_type();
         let host = Self::domain_name_of_message(message)
             .unwrap_or_else(|| query.name().to_ascii().trim_end_matches('.').to_string());
-        let ips = match query_type {
-            RecordType::A => self
-                .resolve_with_policy_then_fallback(&host, RecordType::A, true)
+
+        let ips = if let Some(resolver) = self.match_policy_resolver(&host) {
+            lookup_with_resolver(resolver, &host, self.ipv6(), query_type)
                 .await?
-                .map(|ip| vec![ip]),
-            RecordType::AAAA => self
-                .resolve_with_policy_then_fallback(&host, RecordType::AAAA, true)
-                .await?
-                .map(|ip| vec![ip]),
-            _ => None,
+                .map(|ip| vec![ip])
+        } else {
+            match self.resolve_with_main_then_fallback(&host, query_type, true).await {
+                Ok(ips) => ips.map(|ip| vec![ip]),
+                Err(err) => return Err(err),
+            }
         };
 
         let mut response = build_dns_response_message(message, true, false);
@@ -313,10 +323,22 @@ impl EnhancedResolver {
         Ok(response)
     }
 
+    async fn maybe_cache_response(&self, query: &hickory_proto::op::Query, response: &Message) {
+        self.lru_cache.write().await.insert_records(
+            query.clone(),
+            response.answers().iter().cloned(),
+            Instant::now(),
+        );
+    }
+
     fn domain_name_of_message(message: &Message) -> Option<String> {
         message
             .query()
             .map(|query| query.name().to_ascii().trim_end_matches('.').to_owned())
+    }
+
+    fn is_ip_request(query: &hickory_proto::op::Query) -> bool {
+        matches!(query.query_type(), RecordType::A | RecordType::AAAA)
     }
 
     fn ip_list_of_message(message: &Message) -> Vec<IpAddr> {
@@ -340,6 +362,24 @@ impl EnhancedResolver {
         query_type: RecordType,
         enhanced: bool,
     ) -> anyhow::Result<Option<std::net::IpAddr>> {
+        if let Some(resolver) = self.match_policy_resolver(host) {
+            if let Ok(resolved) =
+                lookup_with_resolver(resolver, host, self.ipv6(), query_type).await
+                && resolved.is_some()
+            {
+                return Ok(resolved);
+            }
+        }
+
+        self.resolve_with_main_then_fallback(host, query_type, enhanced).await
+    }
+
+    async fn resolve_with_main_then_fallback(
+        &self,
+        host: &str,
+        query_type: RecordType,
+        enhanced: bool,
+    ) -> anyhow::Result<Option<IpAddr>> {
         let normalized_host = host.trim_end_matches('.').to_ascii_lowercase();
 
         if enhanced && let Some(ip) = self.hosts.get(&normalized_host).copied() {
@@ -360,26 +400,15 @@ impl EnhancedResolver {
         {
             let mut fake_dns = fake_dns.write().await;
             if !fake_dns.should_skip(host) {
-                let ip = fake_dns.lookup(host).await;
-                debug!(host, %ip, "fake dns lookup");
-                return Ok(Some(ip));
+                return Ok(Some(fake_dns.lookup(host).await));
             }
         }
 
-        if let Some(resolver) = self.match_policy_resolver(host) {
-            if let Ok(resolved) =
+        if let Some(resolver) = &self.resolver
+            && let Ok(Some(ip)) =
                 lookup_with_resolver(resolver, host, self.ipv6(), query_type).await
-                && resolved.is_some()
-            {
-                return Ok(resolved);
-            }
-        }
-
-        if let Some(resolver) = &self.resolver {
-            match lookup_with_resolver(resolver, host, self.ipv6(), query_type).await {
-                Ok(Some(ip)) => return Ok(Some(ip)),
-                Ok(None) | Err(_) => {}
-            }
+        {
+            return Ok(Some(ip));
         }
 
         if let Some(resolver) = &self.fallback_resolver {
