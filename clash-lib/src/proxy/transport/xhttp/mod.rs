@@ -25,6 +25,10 @@ const DUPLEX_BUFFER_SIZE: usize = 64 * 1024;
 const FRAME_CHANNEL_CAPACITY: usize = 32;
 const READ_CHUNK_SIZE: usize = 8 * 1024;
 const DEFAULT_XHTTP_ALPN: [&str; 1] = ["h2"];
+const DEFAULT_XHTTP_PADDING_BYTES: usize = 100;
+const DEFAULT_XHTTP_PADDING_QUERY_KEY: &str = "x_padding";
+const DEFAULT_XHTTP_PADDING_HEADER: &str = "Referer";
+const DEFAULT_XHTTP_USER_AGENT: &str = "Mozilla/5.0";
 
 type H2SendRequest =
     hyper::client::conn::http2::SendRequest<BoxBody<Bytes, Infallible>>;
@@ -282,15 +286,24 @@ fn build_request(
 ) -> io::Result<Request<BoxBody<Bytes, Infallible>>> {
     let scheme = if use_tls { "https" } else { "http" };
     let uri = format!("{scheme}://{server}:{port}{path}");
+    let referer = build_xhttp_padding_referer(&uri);
 
     let mut request = Request::builder()
         .method(method)
         .uri(uri)
         .version(Version::HTTP_2)
-        .header("cache-control", "no-store");
+        .header("cache-control", "no-store")
+        .header(DEFAULT_XHTTP_PADDING_HEADER, referer);
 
     if let Some(content_type) = content_type {
         request = request.header("content-type", content_type);
+    }
+
+    if !headers
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case("user-agent"))
+    {
+        request = request.header("user-agent", DEFAULT_XHTTP_USER_AGENT);
     }
 
     if !headers.keys().any(|key| key.eq_ignore_ascii_case("host"))
@@ -304,6 +317,14 @@ fn build_request(
     }
 
     request.body(body).map_err(map_io_error)
+}
+
+fn build_xhttp_padding_referer(uri: &str) -> String {
+    let separator = if uri.contains('?') { '&' } else { '?' };
+    let padding = "X".repeat(DEFAULT_XHTTP_PADDING_BYTES);
+    format!(
+        "{uri}{separator}{DEFAULT_XHTTP_PADDING_QUERY_KEY}={padding}"
+    )
 }
 
 #[async_trait]
@@ -530,7 +551,10 @@ async fn forward_response_body(
 
 #[cfg(test)]
 mod tests {
-    use super::{Client, XhttpDownloadConfig, XhttpMode, XhttpSecurity};
+    use super::{
+        Client, XhttpDownloadConfig, XhttpMode, XhttpSecurity,
+        build_request,
+    };
     use crate::proxy::transport::Transport;
     use bytes::Bytes;
     use http::{Method, Request, Response, StatusCode};
@@ -549,6 +573,40 @@ mod tests {
         time::{Duration, timeout},
     };
     use tokio_stream::wrappers::ReceiverStream;
+
+    #[test]
+    fn xhttp_request_adds_default_padding_referer() {
+        let request = build_request(
+            "127.0.0.1",
+            8080,
+            "/xhttp/",
+            None,
+            &HashMap::new(),
+            false,
+            None,
+            "GET",
+            Empty::<Bytes>::new().boxed(),
+        )
+        .expect("request should build");
+
+        let referer = request
+            .headers()
+            .get("referer")
+            .and_then(|value| value.to_str().ok())
+            .expect("referer should be present");
+        assert!(
+            referer.starts_with("http://127.0.0.1:8080/xhttp/?x_padding="),
+            "unexpected referer: {referer}"
+        );
+        assert_eq!(
+            referer
+                .split("x_padding=")
+                .nth(1)
+                .expect("padding should exist")
+                .len(),
+            100
+        );
+    }
 
     #[tokio::test]
     async fn xhttp_stream_one_echoes_bytes() {
