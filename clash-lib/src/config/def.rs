@@ -245,6 +245,10 @@ pub enum DNSListen {
 #[serde(rename_all = "kebab-case", default)]
 #[educe(Default)]
 pub struct DNS {
+    /// DNS upstream servers
+    pub nameserver: Vec<String>,
+    /// Default nameservers used for resolving DNS upstream hostnames later
+    pub default_nameserver: Vec<String>,
     /// Enable IPv6 DNS responses (AAAA)
     pub ipv6: bool,
     /// DNS server listening address. If not present, the DNS server will be
