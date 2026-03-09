@@ -4,12 +4,14 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
 use hickory_resolver::{
     TokioResolver,
     config::{NameServerConfig, ResolverConfig, ResolverOpts},
+    dns_lru::{DnsLru, TtlConfig},
     name_server::TokioConnectionProvider,
 };
 use hickory_proto::{
@@ -17,7 +19,8 @@ use hickory_proto::{
     rr::RecordType,
     xfer::Protocol,
 };
-use tracing::debug;
+use tokio::sync::RwLock;
+use tracing::{debug, trace, warn};
 
 use crate::app::dns::config::DNSNetMode;
 use crate::{
@@ -36,6 +39,7 @@ pub struct EnhancedResolver {
     resolver: Option<TokioResolver>,
     fallback_resolver: Option<TokioResolver>,
     policy_resolvers: Vec<(String, TokioResolver)>,
+    lru_cache: Arc<RwLock<DnsLru>>,
     _mmdb: Option<MmdbLookup>,
     _outbounds: HashMap<String, Arc<dyn OutboundHandler>>,
 }
@@ -63,6 +67,15 @@ impl EnhancedResolver {
             resolver,
             fallback_resolver,
             policy_resolvers,
+            lru_cache: Arc::new(RwLock::new(DnsLru::new(
+                4096,
+                TtlConfig::new(
+                    Some(Duration::from_secs(1)),
+                    Some(Duration::from_secs(1)),
+                    Some(Duration::from_secs(60)),
+                    Some(Duration::from_secs(10)),
+                ),
+            ))),
             _mmdb: mmdb,
             _outbounds: outbounds,
         }
@@ -79,6 +92,20 @@ impl ClashResolver for EnhancedResolver {
             .query()
             .ok_or_else(|| anyhow::anyhow!("invalid query message"))?;
         let query_type = query.query_type();
+
+        if let Some(cached) = self.lru_cache.read().await.get(query, Instant::now()) {
+            if !message.recursion_desired() {
+                trace!(query = %query.name(), "dns cache hit");
+                if let Ok(cached) = cached {
+                    let mut response =
+                        build_dns_response_message(message, true, false);
+                    response.add_answers(cached.records().iter().cloned());
+                    return Ok(response);
+                }
+            } else {
+                trace!(query = %query.name(), "dns cache present but bypassed");
+            }
+        }
 
         if !matches!(query_type, RecordType::A | RecordType::AAAA) {
             return Err(anyhow::anyhow!(
@@ -105,8 +132,14 @@ impl ClashResolver for EnhancedResolver {
                 response.set_response_code(ResponseCode::NoError);
                 response.set_answer_count(records.len() as u16);
                 response.add_answers(records);
+                self.lru_cache.write().await.insert_records(
+                    query.clone(),
+                    response.answers().iter().cloned(),
+                    Instant::now(),
+                );
             }
             _ => {
+                warn!(host, ?query_type, "dns query returned no records");
                 response.set_response_code(ResponseCode::NXDomain);
             }
         }
