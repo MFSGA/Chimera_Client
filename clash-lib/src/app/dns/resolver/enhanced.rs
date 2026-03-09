@@ -539,7 +539,7 @@ fn build_fake_dns(
 
             Ok(Some(Arc::new(RwLock::new(FakeDns::new(FakeDnsOpts {
                 ipnet: cfg.fake_ip_range,
-                skipped_hostnames: cfg.fake_ip_filter.clone(),
+                skipped_hostnames: build_skipped_hostnames_trie(&cfg.fake_ip_filter),
                 store,
             })?))))
         }
@@ -644,6 +644,19 @@ fn build_hosts_trie(hosts: &HashMap<String, IpAddr>) -> Option<StringTrie<IpAddr
     for (host, ip) in hosts {
         has_entries = true;
         out.insert(host, Arc::new(*ip));
+    }
+
+    has_entries.then_some(out)
+}
+
+fn build_skipped_hostnames_trie(hosts: &[String]) -> Option<StringTrie<bool>> {
+    let mut out = StringTrie::new();
+    let mut has_entries = false;
+
+    for host in hosts {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        has_entries = true;
+        out.insert(&host, Arc::new(true));
     }
 
     has_entries.then_some(out)

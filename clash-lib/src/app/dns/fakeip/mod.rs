@@ -2,7 +2,7 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use async_trait::async_trait;
 
-use crate::Error;
+use crate::{common::trie::StringTrie, Error};
 
 mod file_store;
 mod mem_store;
@@ -12,7 +12,7 @@ pub use mem_store::InMemStore;
 
 pub struct Opts {
     pub ipnet: ipnet::IpNet,
-    pub skipped_hostnames: Vec<String>,
+    pub skipped_hostnames: Option<StringTrie<bool>>,
     pub store: Box<dyn Store>,
 }
 
@@ -30,7 +30,7 @@ pub struct FakeDns {
     max: u32,
     min: u32,
     offset: u32,
-    skipped_hostnames: Vec<String>,
+    skipped_hostnames: Option<StringTrie<bool>>,
     ipnet: ipnet::IpNet,
     store: Box<dyn Store>,
 }
@@ -81,14 +81,11 @@ impl FakeDns {
     }
 
     pub fn should_skip(&self, domain: &str) -> bool {
-        let domain = domain.trim_end_matches('.').to_ascii_lowercase();
-        self.skipped_hostnames.iter().any(|pattern| {
-            let pattern = pattern.trim_end_matches('.').to_ascii_lowercase();
-            domain == pattern
-                || domain
-                    .strip_suffix(&pattern)
-                    .is_some_and(|rest| rest.ends_with('.'))
-        })
+        self.skipped_hostnames
+            .as_ref()
+            .is_some_and(|hostnames| {
+                hostnames.search(&domain.trim_end_matches('.').to_ascii_lowercase()).is_some()
+            })
     }
 
     pub async fn is_fake_ip(&mut self, ip: IpAddr) -> bool {
@@ -121,5 +118,30 @@ impl FakeDns {
 
     fn ip_to_uint(ip: &Ipv4Addr) -> u32 {
         u32::from_be_bytes(ip.octets())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FakeDns, InMemStore, Opts};
+    use crate::common::trie::StringTrie;
+    use std::{net::IpAddr, sync::Arc};
+
+    #[tokio::test]
+    async fn skips_hosts_via_trie() {
+        let mut skipped = StringTrie::new();
+        skipped.insert("*.example.com", Arc::new(true));
+
+        let fake_dns = FakeDns::new(Opts {
+            ipnet: "198.18.0.0/16".parse().expect("valid fake-ip range"),
+            skipped_hostnames: Some(skipped),
+            store: Box::new(InMemStore::new(16)),
+        })
+        .expect("fake dns should build");
+
+        assert!(fake_dns.should_skip("foo.example.com"));
+        assert!(!fake_dns.should_skip("example.com"));
+        assert!(!fake_dns.should_skip("foo.example.net"));
+        assert!(!fake_dns.should_skip(IpAddr::from([127, 0, 0, 1]).to_string().as_str()));
     }
 }
