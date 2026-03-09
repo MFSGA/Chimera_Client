@@ -282,8 +282,8 @@ impl EnhancedResolver {
         let host = Self::domain_name_of_message(message)
             .unwrap_or_else(|| query.name().to_ascii().trim_end_matches('.').to_string());
 
-        let ips = if let Some(resolver) = self.match_policy_resolver(&host) {
-            lookup_with_resolver(resolver, &host, self.ipv6(), query_type)
+        let ips = if let Some(policy) = self.match_policy_resolver(&host) {
+            self.query_resolvers_by_priority([Some(policy), None], &host, query_type)
                 .await?
                 .map(|ip| vec![ip])
         } else {
@@ -305,11 +305,6 @@ impl EnhancedResolver {
                 response.set_response_code(ResponseCode::NoError);
                 response.set_answer_count(records.len() as u16);
                 response.add_answers(records);
-                self.lru_cache.write().await.insert_records(
-                    query.clone(),
-                    response.answers().iter().cloned(),
-                    Instant::now(),
-                );
                 for ip in Self::ip_list_of_message(&response) {
                     self.save_reverse_lookup(ip, host.clone()).await;
                 }
@@ -356,24 +351,6 @@ impl EnhancedResolver {
             .collect()
     }
 
-    async fn resolve_with_policy_then_fallback(
-        &self,
-        host: &str,
-        query_type: RecordType,
-        enhanced: bool,
-    ) -> anyhow::Result<Option<std::net::IpAddr>> {
-        if let Some(resolver) = self.match_policy_resolver(host) {
-            if let Ok(resolved) =
-                lookup_with_resolver(resolver, host, self.ipv6(), query_type).await
-                && resolved.is_some()
-            {
-                return Ok(resolved);
-            }
-        }
-
-        self.resolve_with_main_then_fallback(host, query_type, enhanced).await
-    }
-
     async fn resolve_with_main_then_fallback(
         &self,
         host: &str,
@@ -404,15 +381,15 @@ impl EnhancedResolver {
             }
         }
 
-        if let Some(resolver) = &self.resolver
-            && let Ok(Some(ip)) =
-                lookup_with_resolver(resolver, host, self.ipv6(), query_type).await
+        if let Some(ip) = self
+            .query_resolvers_by_priority(
+                [self.resolver.as_ref(), self.fallback_resolver.as_ref()],
+                host,
+                query_type,
+            )
+            .await?
         {
             return Ok(Some(ip));
-        }
-
-        if let Some(resolver) = &self.fallback_resolver {
-            return lookup_with_resolver(resolver, host, self.ipv6(), query_type).await;
         }
 
         let response = tokio::net::lookup_host(format!("{host}:0")).await?;
@@ -421,6 +398,39 @@ impl EnhancedResolver {
             RecordType::AAAA => self.ipv6() && ip.is_ipv6(),
             _ => false,
         }))
+    }
+
+    async fn query_resolvers_by_priority(
+        &self,
+        resolvers: [Option<&TokioResolver>; 2],
+        host: &str,
+        query_type: RecordType,
+    ) -> anyhow::Result<Option<IpAddr>> {
+        match resolvers {
+            [Some(primary), Some(secondary)] => {
+                let primary_query =
+                    lookup_with_resolver(primary, host, self.ipv6(), query_type);
+                let secondary_query =
+                    lookup_with_resolver(secondary, host, self.ipv6(), query_type);
+                let (primary_result, secondary_result) =
+                    tokio::join!(primary_query, secondary_query);
+
+                match primary_result {
+                    Ok(Some(ip)) => Ok(Some(ip)),
+                    Ok(None) | Err(_) => match secondary_result {
+                        Ok(result) => Ok(result),
+                        Err(err) => Err(err),
+                    },
+                }
+            }
+            [Some(primary), None] => {
+                lookup_with_resolver(primary, host, self.ipv6(), query_type).await
+            }
+            [None, Some(secondary)] => {
+                lookup_with_resolver(secondary, host, self.ipv6(), query_type).await
+            }
+            _ => Ok(None),
+        }
     }
 
     async fn save_reverse_lookup(&self, ip: IpAddr, host: String) {
