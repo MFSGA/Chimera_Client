@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    net::IpAddr,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -22,14 +23,18 @@ use hickory_proto::{
 use tokio::sync::RwLock;
 use tracing::{debug, trace, warn};
 
-use crate::app::dns::config::DNSNetMode;
 use crate::{
     app::{
-        dns::{ClashResolver, DNSConfig},
+        dns::{
+            ClashResolver, DNSConfig,
+            config::DNSNetMode,
+            fakeip::{FakeDns, FileStore, InMemStore, Opts as FakeDnsOpts},
+        },
         dns::helper::{build_dns_response_message, ip_records},
         profile::ThreadSafeCacheFile,
     },
     common::mmdb::MmdbLookup,
+    config::def::DNSMode,
     proxy::OutboundHandler,
 };
 
@@ -40,6 +45,7 @@ pub struct EnhancedResolver {
     fallback_resolver: Option<TokioResolver>,
     policy_resolvers: Vec<(String, TokioResolver)>,
     lru_cache: Arc<RwLock<DnsLru>>,
+    fake_dns: Option<Arc<RwLock<FakeDns>>>,
     _mmdb: Option<MmdbLookup>,
     _outbounds: HashMap<String, Arc<dyn OutboundHandler>>,
 }
@@ -60,6 +66,8 @@ impl EnhancedResolver {
         let resolver = build_resolver(&cfg.nameserver, cfg.ipv6).await;
         let fallback_resolver = build_resolver(&cfg.fallback, cfg.ipv6).await;
         let policy_resolvers = build_policy_resolvers(&cfg).await;
+        let fake_dns =
+            build_fake_dns(&cfg, store.clone()).expect("failed to create fake dns");
 
         Self {
             ipv6: AtomicBool::new(cfg.ipv6),
@@ -76,6 +84,7 @@ impl EnhancedResolver {
                     Some(Duration::from_secs(10)),
                 ),
             ))),
+            fake_dns,
             _mmdb: mmdb,
             _outbounds: outbounds,
         }
@@ -160,11 +169,15 @@ impl ClashResolver for EnhancedResolver {
     }
 
     fn fake_ip_enabled(&self) -> bool {
-        false
+        self.fake_dns.is_some()
     }
 
-    async fn is_fake_ip(&self, _: std::net::IpAddr) -> bool {
-        false
+    async fn is_fake_ip(&self, ip: std::net::IpAddr) -> bool {
+        let Some(fake_dns) = &self.fake_dns else {
+            return false;
+        };
+
+        fake_dns.write().await.is_fake_ip(ip).await
     }
 
     async fn resolve(
@@ -217,7 +230,11 @@ impl ClashResolver for EnhancedResolver {
     }
 
     async fn reverse_lookup(&self, ip: std::net::IpAddr) -> Option<String> {
-        self.store.get_fake_ip(&ip.to_string()).await
+        let Some(fake_dns) = &self.fake_dns else {
+            return None;
+        };
+
+        fake_dns.write().await.reverse_lookup(ip).await
     }
 
     async fn cached_for(&self, ip: std::net::IpAddr) -> Option<String> {
@@ -231,6 +248,21 @@ impl EnhancedResolver {
         host: &str,
         query_type: RecordType,
     ) -> anyhow::Result<Option<std::net::IpAddr>> {
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            return Ok(Some(ip));
+        }
+
+        if query_type == RecordType::A
+            && let Some(fake_dns) = &self.fake_dns
+        {
+            let mut fake_dns = fake_dns.write().await;
+            if !fake_dns.should_skip(host) {
+                let ip = fake_dns.lookup(host).await;
+                debug!(host, %ip, "fake dns lookup");
+                return Ok(Some(ip));
+            }
+        }
+
         if let Some(resolver) = self.match_policy_resolver(host) {
             if let Ok(resolved) =
                 lookup_with_resolver(resolver, host, self.ipv6(), query_type).await
@@ -266,6 +298,32 @@ impl EnhancedResolver {
             .filter(|(pattern, _)| domain_matches(&host, pattern))
             .max_by_key(|(pattern, _)| pattern.len())
             .map(|(_, resolver)| resolver)
+    }
+}
+
+fn build_fake_dns(
+    cfg: &DNSConfig,
+    store: ThreadSafeCacheFile,
+) -> Result<Option<Arc<RwLock<FakeDns>>>, crate::Error> {
+    match cfg.enhance_mode {
+        DNSMode::FakeIp => {
+            let store: Box<dyn crate::app::dns::fakeip::Store> = if cfg.store_fake_ip {
+                Box::new(FileStore::new(store))
+            } else {
+                Box::new(InMemStore::new(1000))
+            };
+
+            Ok(Some(Arc::new(RwLock::new(FakeDns::new(FakeDnsOpts {
+                ipnet: cfg.fake_ip_range,
+                skipped_hostnames: cfg.fake_ip_filter.clone(),
+                store,
+            })?))))
+        }
+        DNSMode::RedirHost => {
+            warn!("dns redir-host is not supported and will not do anything");
+            Ok(None)
+        }
+        DNSMode::Normal => Ok(None),
     }
 }
 
