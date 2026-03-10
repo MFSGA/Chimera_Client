@@ -1,3 +1,4 @@
+pub use super::dns_client::DNSNetMode;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 
@@ -8,15 +9,6 @@ use crate::{
     Error,
     config::def::{DNSListen, DNSMode, FallbackFilter as DefFallbackFilter},
 };
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DNSNetMode {
-    Udp,
-    Tcp,
-    DoT,
-    DoH,
-    Dhcp,
-}
 
 #[derive(Clone, Debug)]
 pub struct NameServer {

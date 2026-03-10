@@ -5,6 +5,7 @@ use crate::common::{mmdb::MmdbLookup, trie::StringTrie};
 pub trait FallbackIpFilter: Sync + Send {
     fn apply(&self, ip: &IpAddr) -> bool;
 }
+pub use FallbackIpFilter as FallbackIPFilter;
 
 pub trait FallbackDomainFilter: Sync + Send {
     fn apply(&self, domain: &str) -> bool;
@@ -14,6 +15,7 @@ pub struct GeoIpFilter {
     code: String,
     mmdb: Option<MmdbLookup>,
 }
+pub use GeoIpFilter as GeoIPFilter;
 
 impl GeoIpFilter {
     pub fn new(code: &str, mmdb: Option<MmdbLookup>) -> Self {
@@ -41,6 +43,7 @@ impl IpNetFilter {
         Self(ipnet)
     }
 }
+pub use IpNetFilter as IPNetFilter;
 
 impl FallbackIpFilter for IpNetFilter {
     fn apply(&self, ip: &IpAddr) -> bool {

@@ -1,3 +1,13 @@
+use std::sync::Arc;
+
+use tracing::{debug, warn};
+
+use crate::app::dns::{
+    ThreadSafeDNSClient,
+    config::NameServer,
+    dns_client::{DnsClient, Opts},
+};
+
 use hickory_proto::{
     op::{Message, MessageType},
     rr::{
@@ -5,6 +15,40 @@ use hickory_proto::{
         rdata::{A, AAAA},
     },
 };
+
+pub async fn make_clients(
+    servers: &[NameServer],
+    ipv6: bool,
+) -> Vec<ThreadSafeDNSClient> {
+    let mut rv = Vec::new();
+
+    for server in servers {
+        debug!(
+            host = %server.host,
+            port = server.port,
+            "building nameserver"
+        );
+
+        match DnsClient::new_client(Opts {
+            host: server.host.clone(),
+            port: server.port,
+            net: server.net.clone(),
+            ipv6,
+        })
+        .await
+        {
+            Ok(client) => rv.push(client),
+            Err(err) => warn!(
+                host = %server.host,
+                port = server.port,
+                err = ?err,
+                "initializing dns client failed"
+            ),
+        }
+    }
+
+    rv
+}
 
 pub fn build_dns_response_message(
     req: &Message,

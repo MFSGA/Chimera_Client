@@ -1,6 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use async_trait::async_trait;
+use tokio::sync::RwLock;
 
 use crate::{common::trie::StringTrie, Error};
 
@@ -9,6 +10,7 @@ mod mem_store;
 
 pub use file_store::FileStore;
 pub use mem_store::InMemStore;
+pub type ThreadSafeFakeDns = std::sync::Arc<RwLock<FakeDns>>;
 
 pub struct Opts {
     pub ipnet: ipnet::IpNet,
@@ -126,6 +128,66 @@ mod tests {
     use super::{FakeDns, InMemStore, Opts};
     use crate::common::trie::StringTrie;
     use std::{net::IpAddr, sync::Arc};
+
+    #[tokio::test]
+    async fn allocates_and_reuses_addresses() {
+        let mut fake_dns = FakeDns::new(Opts {
+            ipnet: "192.168.0.0/29".parse().expect("valid fake-ip range"),
+            skipped_hostnames: None,
+            store: Box::new(InMemStore::new(16)),
+        })
+        .expect("fake dns should build");
+
+        let first = fake_dns.lookup("foo.com").await;
+        let second = fake_dns.lookup("bar.com").await;
+
+        assert_eq!(first, IpAddr::from([192, 168, 0, 2]));
+        assert_eq!(fake_dns.lookup("foo.com").await, first);
+        assert_eq!(second, IpAddr::from([192, 168, 0, 3]));
+        assert_eq!(fake_dns.reverse_lookup(second).await, Some("bar.com".into()));
+        assert!(fake_dns.is_fake_ip(second).await);
+        assert!(!fake_dns.is_fake_ip("::1".parse().expect("valid ipv6")).await);
+    }
+
+    #[tokio::test]
+    async fn cycles_when_pool_is_exhausted() {
+        let mut fake_dns = FakeDns::new(Opts {
+            ipnet: "192.168.0.0/29".parse().expect("valid fake-ip range"),
+            skipped_hostnames: None,
+            store: Box::new(InMemStore::new(16)),
+        })
+        .expect("fake dns should build");
+
+        let first = fake_dns.lookup("foo.com").await;
+        let second = fake_dns.lookup("bar.com").await;
+
+        for index in 0..3 {
+            fake_dns.lookup(&format!("{index}.com")).await;
+        }
+
+        let recycled = fake_dns.lookup("baz.com").await;
+        let next = fake_dns.lookup("foo.com").await;
+
+        assert_eq!(recycled, first);
+        assert_eq!(next, second);
+    }
+
+    #[tokio::test]
+    async fn reassigns_when_store_capacity_evicts_entry() {
+        let mut fake_dns = FakeDns::new(Opts {
+            ipnet: "192.168.0.0/24".parse().expect("valid fake-ip range"),
+            skipped_hostnames: None,
+            store: Box::new(InMemStore::new(2)),
+        })
+        .expect("fake dns should build");
+
+        let first = fake_dns.lookup("foo.com").await;
+        fake_dns.lookup("bar.com").await;
+        fake_dns.lookup("baz.com").await;
+        let next = fake_dns.lookup("foo.com").await;
+
+        assert_ne!(first, next);
+    }
 
     #[tokio::test]
     async fn skips_hosts_via_trie() {

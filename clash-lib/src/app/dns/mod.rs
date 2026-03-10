@@ -3,12 +3,14 @@ use async_trait::async_trait;
 use hickory_proto::op;
 
 use std::{
+    fmt::Debug,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::Arc,
 };
 
 /// 2
 mod config;
+mod dns_client;
 mod fakeip;
 mod filters;
 mod helper;
@@ -18,16 +20,24 @@ pub mod resolver;
 mod server;
 
 pub use config::DNSConfig;
+pub use dns_client::DNSNetMode;
 pub use server::get_dns_listener;
 
 pub use resolver::new as new_resolver;
 
 pub type ThreadSafeDNSResolver = Arc<dyn ClashResolver>;
+pub type ThreadSafeDNSClient = Arc<dyn Client>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResolverKind {
     Clash,
     System,
+}
+
+#[async_trait]
+pub trait Client: Sync + Send + Debug {
+    fn id(&self) -> String;
+    async fn exchange(&self, msg: &op::Message) -> anyhow::Result<op::Message>;
 }
 
 /// A implementation of "anti-poisoning" Resolver
