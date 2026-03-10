@@ -84,7 +84,7 @@ impl EnhancedResolver {
             &cfg.nameserver,
             Some(default_resolver.clone()),
             outbounds.clone(),
-            cfg.edns_client_subnet,
+            cfg.edns_client_subnet.clone(),
             cfg.fw_mark,
             cfg.ipv6,
         )
@@ -97,7 +97,7 @@ impl EnhancedResolver {
                     &cfg.fallback,
                     Some(default_resolver.clone()),
                     outbounds.clone(),
-                    cfg.edns_client_subnet,
+                    cfg.edns_client_subnet.clone(),
                     cfg.fw_mark,
                     cfg.ipv6,
                 )
@@ -660,7 +660,7 @@ async fn build_policy_resolvers(
             std::slice::from_ref(nameserver),
             None,
             HashMap::new(),
-            cfg.edns_client_subnet,
+            cfg.edns_client_subnet.clone(),
             cfg.fw_mark,
             cfg.ipv6,
         )

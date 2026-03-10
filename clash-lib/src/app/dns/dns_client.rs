@@ -5,7 +5,15 @@ use std::{
 };
 
 use async_trait::async_trait;
-use hickory_proto::{op::Message, op::ResponseCode, xfer::Protocol};
+use hickory_proto::{
+    op::Message,
+    op::ResponseCode,
+    rr::{
+        RecordType,
+        rdata::opt::{ClientSubnet, EdnsCode, EdnsOption},
+    },
+    xfer::Protocol,
+};
 use hickory_resolver::{
     TokioResolver,
     config::{NameServerConfig, ResolverConfig, ResolverOpts},
@@ -15,7 +23,7 @@ use tokio::sync::RwLock;
 
 use crate::{
     Error,
-    app::dns::{ClashResolver, helper::build_dns_response_message},
+    app::dns::{ClashResolver, config::EdnsClientSubnet, helper::build_dns_response_message},
     proxy::OutboundHandler,
 };
 
@@ -50,7 +58,7 @@ pub struct Opts {
     pub net: DNSNetMode,
     pub iface: Option<String>,
     pub proxy: Arc<dyn OutboundHandler>,
-    pub ecs: Option<()>,
+    pub ecs: Option<EdnsClientSubnet>,
     pub fw_mark: Option<u32>,
     pub ipv6: bool,
 }
@@ -89,7 +97,7 @@ pub struct DnsClient {
     port: u16,
     net: DNSNetMode,
     iface: Option<String>,
-    ecs: Option<()>,
+    ecs: Option<EdnsClientSubnet>,
     ipv6: bool,
 }
 
@@ -134,7 +142,54 @@ impl DnsClient {
         }))
     }
 
-    fn apply_edns_client_subnet(&self, _message: &mut Message) {}
+    fn apply_edns_client_subnet(&self, message: &mut Message) {
+        let Some(ecs) = &self.ecs else {
+            return;
+        };
+
+        if ecs.ipv4.is_none() && ecs.ipv6.is_none() {
+            return;
+        }
+
+        if message
+            .extensions()
+            .as_ref()
+            .is_some_and(|edns| edns.option(EdnsCode::Subnet).is_some())
+        {
+            return;
+        }
+
+        let prefer_ipv6 = matches!(
+            message.query().map(|q| q.query_type()),
+            Some(RecordType::AAAA)
+        );
+
+        let candidate = if prefer_ipv6 {
+            ecs.ipv6
+                .map(|ipv6| (IpAddr::from(ipv6.network()), ipv6.prefix_len()))
+                .or_else(|| {
+                    ecs.ipv4.map(|ipv4| (IpAddr::from(ipv4.network()), ipv4.prefix_len()))
+                })
+        } else {
+            ecs.ipv4
+                .map(|ipv4| (IpAddr::from(ipv4.network()), ipv4.prefix_len()))
+                .or_else(|| {
+                    ecs.ipv6.map(|ipv6| (IpAddr::from(ipv6.network()), ipv6.prefix_len()))
+                })
+        };
+
+        let Some((addr, prefix)) = candidate else {
+            return;
+        };
+
+        let edns = message
+            .extensions_mut()
+            .get_or_insert_with(hickory_proto::op::Edns::new);
+
+        let options = edns.options_mut();
+        options.remove(EdnsCode::Subnet);
+        options.insert(EdnsOption::Subnet(ClientSubnet::new(addr, prefix, prefix)));
+    }
 
     async fn ensure_resolver(&self) -> anyhow::Result<TokioResolver> {
         if let Some(resolver) = self.inner.read().await.resolver.clone() {

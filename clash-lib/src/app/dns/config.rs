@@ -3,13 +3,16 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 
 use chimera_dns::DNSListenAddr;
-use ipnet::IpNet;
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use std::fmt::Display;
 use url::Url;
 
 use crate::{
     Error,
-    config::def::{DNSListen, DNSMode, FallbackFilter as DefFallbackFilter},
+    config::def::{
+        DNSListen, DNSMode, EdnsClientSubnet as DefEdnsClientSubnet,
+        FallbackFilter as DefFallbackFilter,
+    },
 };
 
 #[derive(Clone, Debug)]
@@ -54,6 +57,12 @@ pub struct FallbackFilter {
     pub domain: Vec<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EdnsClientSubnet {
+    pub ipv4: Option<Ipv4Net>,
+    pub ipv6: Option<Ipv6Net>,
+}
+
 #[derive(Default)]
 pub struct DNSConfig {
     pub listen: DNSListenAddr,
@@ -69,7 +78,7 @@ pub struct DNSConfig {
     pub store_fake_ip: bool,
     pub ipv6: bool,
     pub enable: bool,
-    pub edns_client_subnet: Option<()>,
+    pub edns_client_subnet: Option<EdnsClientSubnet>,
     pub fw_mark: Option<u32>,
 }
 
@@ -181,6 +190,36 @@ impl DNSConfig {
             domain: filter.domain.clone(),
         })
     }
+
+    fn parse_edns_client_subnet(
+        ecs: &DefEdnsClientSubnet,
+    ) -> Result<EdnsClientSubnet, Error> {
+        let ipv4 = ecs
+            .ipv4
+            .as_ref()
+            .map(|value| {
+                value.parse::<Ipv4Net>().map_err(|_| {
+                    Error::InvalidConfig(format!(
+                        "invalid edns-client-subnet ipv4 network: {value}"
+                    ))
+                })
+            })
+            .transpose()?;
+
+        let ipv6 = ecs
+            .ipv6
+            .as_ref()
+            .map(|value| {
+                value.parse::<Ipv6Net>().map_err(|_| {
+                    Error::InvalidConfig(format!(
+                        "invalid edns-client-subnet ipv6 network: {value}"
+                    ))
+                })
+            })
+            .transpose()?;
+
+        Ok(EdnsClientSubnet { ipv4, ipv6 })
+    }
 }
 
 impl TryFrom<crate::config::def::Config> for DNSConfig {
@@ -233,7 +272,11 @@ impl TryFrom<&crate::config::def::Config> for DNSConfig {
             store_fake_ip: c.profile.store_fake_ip,
             ipv6: dc.ipv6,
             enable: dc.enable,
-            edns_client_subnet: None,
+            edns_client_subnet: dc
+                .edns_client_subnet
+                .as_ref()
+                .map(DNSConfig::parse_edns_client_subnet)
+                .transpose()?,
             fw_mark: None,
         })
     }

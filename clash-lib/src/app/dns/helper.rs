@@ -2,8 +2,10 @@ use tracing::{debug, warn};
 
 use crate::{
     app::dns::{
-        ClashResolver, ThreadSafeDNSClient, config::NameServer,
-        dns_client::DnsClient, dns_client::Opts,
+        ClashResolver, ThreadSafeDNSClient,
+        config::{EdnsClientSubnet, NameServer},
+        dns_client::DnsClient,
+        dns_client::Opts,
     },
     proxy,
 };
@@ -23,7 +25,7 @@ pub async fn make_clients(
         String,
         std::sync::Arc<dyn crate::proxy::OutboundHandler>,
     >,
-    edns_client_subnet: Option<()>,
+    edns_client_subnet: Option<EdnsClientSubnet>,
     fw_mark: Option<u32>,
     ipv6: bool,
 ) -> Vec<ThreadSafeDNSClient> {
@@ -48,7 +50,7 @@ pub async fn make_clients(
                 .unwrap_or_else(|| {
                     std::sync::Arc::new(proxy::direct::Handler::new("DIRECT"))
                 }),
-            ecs: edns_client_subnet,
+            ecs: edns_client_subnet.clone(),
             fw_mark,
             ipv6,
         })
