@@ -1,6 +1,6 @@
 use std::{
     fmt::{Debug, Display, Formatter},
-    net::{self, IpAddr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     sync::Arc,
 };
 
@@ -11,6 +11,7 @@ use hickory_resolver::{
     config::{NameServerConfig, ResolverConfig, ResolverOpts},
     name_server::TokioConnectionProvider,
 };
+use tokio::sync::RwLock;
 
 use crate::{
     Error,
@@ -54,10 +55,42 @@ pub struct Opts {
     pub ipv6: bool,
 }
 
-#[derive(Debug)]
+enum DnsConfig {
+    Udp(SocketAddr),
+    Tcp(SocketAddr),
+    Tls(SocketAddr, url::Host<String>),
+    Https(SocketAddr, url::Host<String>),
+}
+
+impl Display for DnsConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DnsConfig::Udp(addr) => write!(f, "UDP: {}:{}", addr.ip(), addr.port()),
+            DnsConfig::Tcp(addr) => write!(f, "TCP: {}:{}", addr.ip(), addr.port()),
+            DnsConfig::Tls(addr, host) => {
+                write!(f, "TLS: {}:{} host: {}", addr.ip(), addr.port(), host)
+            }
+            DnsConfig::Https(addr, host) => {
+                write!(f, "HTTPS: {}:{} host: {}", addr.ip(), addr.port(), host)
+            }
+        }
+    }
+}
+
+struct Inner {
+    resolver: Option<TokioResolver>,
+}
+
 pub struct DnsClient {
-    id: String,
-    resolver: TokioResolver,
+    inner: Arc<RwLock<Inner>>,
+    cfg: DnsConfig,
+    proxy: Arc<dyn OutboundHandler>,
+    host: url::Host<String>,
+    port: u16,
+    net: DNSNetMode,
+    iface: Option<String>,
+    ecs: Option<()>,
+    ipv6: bool,
 }
 
 impl DnsClient {
@@ -78,21 +111,54 @@ impl DnsClient {
         })?;
         let socket_addr = SocketAddr::new(ip, opts.port);
 
-        let protocol = match opts.net {
+        let cfg = match opts.net {
+            DNSNetMode::Udp => DnsConfig::Udp(socket_addr),
+            DNSNetMode::Tcp => DnsConfig::Tcp(socket_addr),
+            DNSNetMode::DoT => DnsConfig::Tls(socket_addr, opts.host.clone()),
+            DNSNetMode::DoH => DnsConfig::Https(socket_addr, opts.host.clone()),
+            DNSNetMode::Dhcp => {
+                return Err(Error::DNSError("unsupported dns protocol".into()).into());
+            }
+        };
+
+        Ok(Arc::new(Self {
+            inner: Arc::new(RwLock::new(Inner { resolver: None })),
+            cfg,
+            proxy: opts.proxy,
+            host: opts.host,
+            port: opts.port,
+            net: opts.net,
+            iface: opts.iface,
+            ecs: opts.ecs,
+            ipv6: opts.ipv6,
+        }))
+    }
+
+    fn apply_edns_client_subnet(&self, _message: &mut Message) {}
+
+    async fn ensure_resolver(&self) -> anyhow::Result<TokioResolver> {
+        if let Some(resolver) = self.inner.read().await.resolver.clone() {
+            return Ok(resolver);
+        }
+
+        let protocol = match self.net {
             DNSNetMode::Udp => Protocol::Udp,
             DNSNetMode::Tcp => Protocol::Tcp,
             DNSNetMode::DoT | DNSNetMode::DoH | DNSNetMode::Dhcp => {
-                return Err(
-                    Error::DNSError("unsupported dns protocol".into()).into()
-                );
+                return Err(Error::DNSError("unsupported dns protocol".into()).into());
             }
+        };
+
+        let socket_addr = match &self.cfg {
+            DnsConfig::Udp(addr) | DnsConfig::Tcp(addr) => *addr,
+            DnsConfig::Tls(addr, _) | DnsConfig::Https(addr, _) => *addr,
         };
 
         let mut config = ResolverConfig::new();
         config.add_name_server(NameServerConfig::new(socket_addr, protocol));
 
         let mut resolver_opts = ResolverOpts::default();
-        resolver_opts.ip_strategy = if opts.ipv6 {
+        resolver_opts.ip_strategy = if self.ipv6 {
             hickory_resolver::config::LookupIpStrategy::Ipv4AndIpv6
         } else {
             hickory_resolver::config::LookupIpStrategy::Ipv4Only
@@ -105,25 +171,40 @@ impl DnsClient {
         .with_options(resolver_opts)
         .build();
 
-        Ok(Arc::new(Self {
-            id: format!("{}://{}:{}", opts.net, opts.host, opts.port),
-            resolver,
-        }))
+        self.inner.write().await.resolver = Some(resolver.clone());
+        Ok(resolver)
+    }
+}
+
+impl Debug for DnsClient {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DnsClient")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("net", &self.net)
+            .field("iface", &self.iface)
+            .field("proxy", &self.proxy.name())
+            .finish()
     }
 }
 
 #[async_trait]
 impl Client for DnsClient {
     fn id(&self) -> String {
-        self.id.clone()
+        format!("{}#{}:{}", &self.net, &self.host, &self.port)
     }
 
     async fn exchange(&self, msg: &Message) -> anyhow::Result<Message> {
         let query = msg
             .query()
             .ok_or_else(|| anyhow::anyhow!("invalid query message"))?;
+
+        let mut outbound = msg.clone();
+        self.apply_edns_client_subnet(&mut outbound);
+
         let lookup = self
-            .resolver
+            .ensure_resolver()
+            .await?
             .lookup(query.name().clone(), query.query_type())
             .await?;
 
