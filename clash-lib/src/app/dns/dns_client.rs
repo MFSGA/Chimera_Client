@@ -1,6 +1,6 @@
 use std::{
     fmt::{Debug, Display, Formatter},
-    net::SocketAddr,
+    net::{self, IpAddr, SocketAddr},
     sync::Arc,
 };
 
@@ -12,7 +12,11 @@ use hickory_resolver::{
     name_server::TokioConnectionProvider,
 };
 
-use crate::{Error, app::dns::helper::build_dns_response_message};
+use crate::{
+    Error,
+    app::dns::{ClashResolver, helper::build_dns_response_message},
+    proxy::OutboundHandler,
+};
 
 use super::{Client, ThreadSafeDNSClient};
 
@@ -37,11 +41,16 @@ impl Display for DNSNetMode {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Opts {
-    pub host: String,
+    pub father: Option<Arc<dyn ClashResolver>>,
+    pub host: url::Host<String>,
     pub port: u16,
     pub net: DNSNetMode,
+    pub iface: Option<String>,
+    pub proxy: Arc<dyn OutboundHandler>,
+    pub ecs: Option<()>,
+    pub fw_mark: Option<u32>,
     pub ipv6: bool,
 }
 
@@ -53,20 +62,29 @@ pub struct DnsClient {
 
 impl DnsClient {
     pub async fn new_client(opts: Opts) -> anyhow::Result<ThreadSafeDNSClient> {
-        let socket_addr = if let Ok(ip) = opts.host.parse() {
-            SocketAddr::new(ip, opts.port)
-        } else {
-            tokio::net::lookup_host((opts.host.as_str(), opts.port))
-                .await?
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("no ip resolved for dns server {}", opts.host))?
+        let resolved_ip = match &opts.host {
+            url::Host::Ipv4(ip) => Some(IpAddr::V4(*ip)),
+            url::Host::Ipv6(ip) => Some(IpAddr::V6(*ip)),
+            url::Host::Domain(domain) => match &opts.father {
+                Some(father) => father.resolve(domain, false).await?,
+                None => tokio::net::lookup_host((domain.as_str(), opts.port))
+                    .await?
+                    .next()
+                    .map(|addr| addr.ip()),
+            },
         };
+        let ip = resolved_ip.ok_or_else(|| {
+            anyhow::anyhow!("no ip resolved for dns server {}", opts.host)
+        })?;
+        let socket_addr = SocketAddr::new(ip, opts.port);
 
         let protocol = match opts.net {
             DNSNetMode::Udp => Protocol::Udp,
             DNSNetMode::Tcp => Protocol::Tcp,
             DNSNetMode::DoT | DNSNetMode::DoH | DNSNetMode::Dhcp => {
-                return Err(Error::DNSError("unsupported dns protocol".into()).into());
+                return Err(
+                    Error::DNSError("unsupported dns protocol".into()).into()
+                );
             }
         };
 

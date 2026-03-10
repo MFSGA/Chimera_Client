@@ -10,18 +10,21 @@ use std::{
 
 use async_trait::async_trait;
 use futures::{FutureExt, TryFutureExt, future};
-use hickory_resolver::dns_lru::{DnsLru, TtlConfig};
 use hickory_proto::{
     op::Message,
-    rr::{RData, Record},
     rr::RecordType,
+    rr::{RData, Record},
 };
+use hickory_resolver::dns_lru::{DnsLru, TtlConfig};
 use lru_time_cache::LruCache;
 use tokio::sync::RwLock;
 use tracing::{debug, error, instrument, trace, warn};
 
+use super::SystemResolver;
+
 use crate::{
     app::{
+        dns::helper::build_dns_response_message,
         dns::{
             ClashResolver, DNSConfig, ThreadSafeDNSClient,
             fakeip::{
@@ -29,12 +32,11 @@ use crate::{
                 ThreadSafeFakeDns,
             },
             filters::{
-                DomainFilter, FallbackDomainFilter, FallbackIPFilter,
-                GeoIPFilter, IPNetFilter,
+                DomainFilter, FallbackDomainFilter, FallbackIPFilter, GeoIPFilter,
+                IPNetFilter,
             },
             helper::make_clients,
         },
-        dns::helper::build_dns_response_message,
         profile::ThreadSafeCacheFile,
     },
     common::{mmdb::MmdbLookup, trie::StringTrie},
@@ -76,11 +78,31 @@ impl EnhancedResolver {
         let hosts = build_hosts_trie(&cfg.hosts);
         let fake_dns =
             build_fake_dns(&cfg, store.clone()).expect("failed to create fake dns");
-        let main = make_clients(&cfg.nameserver, cfg.ipv6).await;
+        let default_resolver =
+            Arc::new(SystemResolver::new(cfg.ipv6).expect("system resolver"));
+        let main = make_clients(
+            &cfg.nameserver,
+            Some(default_resolver.clone()),
+            outbounds.clone(),
+            cfg.edns_client_subnet,
+            cfg.fw_mark,
+            cfg.ipv6,
+        )
+        .await;
         let fallback = if cfg.fallback.is_empty() {
             None
         } else {
-            Some(make_clients(&cfg.fallback, cfg.ipv6).await)
+            Some(
+                make_clients(
+                    &cfg.fallback,
+                    Some(default_resolver.clone()),
+                    outbounds.clone(),
+                    cfg.edns_client_subnet,
+                    cfg.fw_mark,
+                    cfg.ipv6,
+                )
+                .await,
+            )
         };
         let policy = build_policy_resolvers(&cfg).await;
 
@@ -117,10 +139,7 @@ impl EnhancedResolver {
 
 #[async_trait]
 impl ClashResolver for EnhancedResolver {
-    async fn exchange(
-        &self,
-        message: &Message,
-    ) -> anyhow::Result<Message> {
+    async fn exchange(&self, message: &Message) -> anyhow::Result<Message> {
         let query = message
             .query()
             .ok_or_else(|| anyhow::anyhow!("invalid query message"))?;
@@ -131,7 +150,8 @@ impl ClashResolver for EnhancedResolver {
             if !message.recursion_desired() {
                 trace!(query = %query.name(), "dns cache hit");
                 if let Ok(cached) = cached {
-                    let mut response = build_dns_response_message(message, true, false);
+                    let mut response =
+                        build_dns_response_message(message, true, false);
                     response.add_answers(cached.records().iter().cloned());
                     return Ok(response);
                 }
@@ -186,7 +206,8 @@ impl ClashResolver for EnhancedResolver {
                 .resolve_v4(host, enhanced)
                 .map(|result| result.map(|ip| ip.map(IpAddr::from)));
 
-            let (first, remaining) = future::select_ok(vec![v6.boxed(), v4.boxed()]).await?;
+            let (first, remaining) =
+                future::select_ok(vec![v6.boxed(), v4.boxed()]).await?;
             if first.is_some() {
                 first
             } else {
@@ -314,15 +335,16 @@ impl EnhancedResolver {
 
     #[instrument(skip_all, level = "trace")]
     async fn ip_exchange(&self, message: &Message) -> anyhow::Result<Message> {
-        let host = Self::domain_name_of_message(message).ok_or_else(|| {
-            anyhow::anyhow!("invalid query message")
-        })?;
+        let host = Self::domain_name_of_message(message)
+            .ok_or_else(|| anyhow::anyhow!("invalid query message"))?;
 
         let response = if let Some(policy) = self.match_policy(message) {
             Self::batch_exchange(policy, message).await?
         } else if self.should_only_query_fallback(message) {
             Self::batch_exchange(
-                self.fallback.as_ref().ok_or_else(|| anyhow::anyhow!("no fallback resolver available"))?,
+                self.fallback.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("no fallback resolver available")
+                })?,
                 message,
             )
             .await?
@@ -337,7 +359,11 @@ impl EnhancedResolver {
         Ok(response)
     }
 
-    async fn maybe_cache_response(&self, query: &hickory_proto::op::Query, response: &Message) {
+    async fn maybe_cache_response(
+        &self,
+        query: &hickory_proto::op::Query,
+        response: &Message,
+    ) {
         if query.query_type() == RecordType::TXT
             && query.name().to_ascii().starts_with("_acme-challenge.")
         {
@@ -413,10 +439,12 @@ impl EnhancedResolver {
     ) -> anyhow::Result<Message> {
         if self.main.is_empty() {
             return Self::batch_exchange(
-                    self.fallback.as_ref().ok_or_else(|| anyhow::anyhow!("no resolver available"))?,
-                    message,
-                )
-                .await;
+                self.fallback
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("no resolver available"))?,
+                message,
+            )
+            .await;
         }
 
         let main_result = Self::batch_exchange(&self.main, message).await;
@@ -498,7 +526,6 @@ impl EnhancedResolver {
         }
     }
 
-
     async fn resolve_ip_by_type(
         &self,
         host: &str,
@@ -568,7 +595,8 @@ fn build_fake_dns(
 ) -> Result<Option<ThreadSafeFakeDns>, crate::Error> {
     match cfg.enhance_mode {
         DNSMode::FakeIp => {
-            let store: Box<dyn crate::app::dns::fakeip::Store> = if cfg.store_fake_ip {
+            let store: Box<dyn crate::app::dns::fakeip::Store> = if cfg.store_fake_ip
+            {
                 Box::new(FileStore::new(store))
             } else {
                 Box::new(InMemStore::new(1000))
@@ -599,7 +627,8 @@ fn build_fallback_filters(
     let mut ip_filters: Vec<Box<dyn FallbackIPFilter>> = Vec::new();
 
     if !cfg.fallback_filter.domain.is_empty() {
-        domain_filters.push(Box::new(DomainFilter::new(&cfg.fallback_filter.domain)));
+        domain_filters
+            .push(Box::new(DomainFilter::new(&cfg.fallback_filter.domain)));
     }
 
     if cfg.fallback_filter.geo_ip || !cfg.fallback_filter.ip_cidr.is_empty() {
@@ -627,7 +656,15 @@ async fn build_policy_resolvers(
     let mut out = StringTrie::new();
     let mut has_entries = false;
     for (domain, nameserver) in &cfg.nameserver_policy {
-        let resolvers = make_clients(std::slice::from_ref(nameserver), cfg.ipv6).await;
+        let resolvers = make_clients(
+            std::slice::from_ref(nameserver),
+            None,
+            HashMap::new(),
+            cfg.edns_client_subnet,
+            cfg.fw_mark,
+            cfg.ipv6,
+        )
+        .await;
         if !resolvers.is_empty() {
             has_entries = true;
             out.insert(domain, Arc::new(resolvers));

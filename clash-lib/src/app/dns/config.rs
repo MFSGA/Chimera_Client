@@ -4,6 +4,8 @@ use std::net::{IpAddr, SocketAddr};
 
 use chimera_dns::DNSListenAddr;
 use ipnet::IpNet;
+use std::fmt::Display;
+use url::Url;
 
 use crate::{
     Error,
@@ -13,22 +15,34 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct NameServer {
     pub net: DNSNetMode,
-    pub host: String,
+    pub host: url::Host<String>,
     pub port: u16,
+    pub interface: Option<String>,
+    pub proxy: Option<String>,
+}
+
+impl Display for NameServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}://{}:{}#{:?}",
+            self.net, self.host, self.port, self.interface,
+        )
+    }
 }
 
 impl NameServer {
     pub async fn to_socket_addr(&self) -> anyhow::Result<SocketAddr> {
-        if let Ok(addr) = self.host.parse() {
-            return Ok(SocketAddr::new(addr, self.port));
+        match &self.host {
+            url::Host::Ipv4(ip) => return Ok(SocketAddr::new((*ip).into(), self.port)),
+            url::Host::Ipv6(ip) => return Ok(SocketAddr::new((*ip).into(), self.port)),
+            url::Host::Domain(host) => {
+                return tokio::net::lookup_host((host.as_str(), self.port))
+                    .await?
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("no ip resolved for dns server {}", host));
+            }
         }
-
-        tokio::net::lookup_host((self.host.as_str(), self.port))
-            .await?
-            .next()
-            .ok_or_else(|| {
-                anyhow::anyhow!("no ip resolved for dns server {}", self.host)
-            })
     }
 }
 
@@ -55,6 +69,8 @@ pub struct DNSConfig {
     pub store_fake_ip: bool,
     pub ipv6: bool,
     pub enable: bool,
+    pub edns_client_subnet: Option<()>,
+    pub fw_mark: Option<u32>,
 }
 
 impl DNSConfig {
@@ -62,34 +78,55 @@ impl DNSConfig {
         let mut nameservers = Vec::new();
 
         for server in servers {
-            let (scheme, rest) = match server.split_once("://") {
-                Some((scheme, rest)) => (scheme, rest),
-                None => ("udp", server.as_str()),
+            let mut server = server.clone();
+
+            if !server.contains("://") {
+                if server.contains(':') && !server.starts_with('[') {
+                    server = format!("udp://[{server}]");
+                } else {
+                    server = format!("udp://{server}");
+                }
+            }
+
+            let url = Url::parse(&server).map_err(|_| {
+                Error::InvalidConfig(format!("invalid dns server: {}", server))
+            })?;
+
+            let host = url.host().ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "invalid dns server: no host found in {}",
+                    server
+                ))
+            })?;
+
+            let host = match host {
+                url::Host::Domain(value) => match value.parse::<std::net::Ipv4Addr>() {
+                    Ok(ipv4) => url::Host::Ipv4(ipv4),
+                    Err(_) => url::Host::Domain(value.to_string()),
+                },
+                value => value.to_owned(),
             };
 
-            let net = match scheme {
-                "udp" => DNSNetMode::Udp,
-                "tcp" => DNSNetMode::Tcp,
-                "tls" => DNSNetMode::DoT,
-                "https" => DNSNetMode::DoH,
-                "dhcp" => DNSNetMode::Dhcp,
-                _ => {
+            let (net, port) = match url.scheme() {
+                "udp" => (DNSNetMode::Udp, url.port().unwrap_or(53)),
+                "tcp" => (DNSNetMode::Tcp, url.port().unwrap_or(53)),
+                "tls" => (DNSNetMode::DoT, url.port().unwrap_or(853)),
+                "https" => (DNSNetMode::DoH, url.port().unwrap_or(443)),
+                "dhcp" => (DNSNetMode::Dhcp, url.port().unwrap_or(0)),
+                scheme => {
                     return Err(Error::InvalidConfig(format!(
                         "unsupported dns server scheme: {scheme}"
                     )));
                 }
             };
 
-            let host_port = rest.split('#').next().unwrap_or(rest).trim_matches('/');
-            let (host, port) = match net {
-                DNSNetMode::Udp => parse_host_port(host_port, 53)?,
-                DNSNetMode::Tcp => parse_host_port(host_port, 53)?,
-                DNSNetMode::DoT => parse_host_port(host_port, 853)?,
-                DNSNetMode::DoH => parse_host_port(host_port, 443)?,
-                DNSNetMode::Dhcp => parse_host_port(host_port, 0)?,
-            };
-
-            nameservers.push(NameServer { net, host, port });
+            nameservers.push(NameServer {
+                net,
+                host,
+                port,
+                interface: None,
+                proxy: None,
+            });
         }
 
         Ok(nameservers)
@@ -146,31 +183,6 @@ impl DNSConfig {
     }
 }
 
-fn parse_host_port(input: &str, default_port: u16) -> Result<(String, u16), Error> {
-    if input.is_empty() {
-        return Err(Error::InvalidConfig("dns server host is empty".to_string()));
-    }
-
-    if let Some(host) = input.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
-        return Ok((host.to_string(), default_port));
-    }
-
-    if let Ok(addr) = input.parse::<SocketAddr>() {
-        return Ok((addr.ip().to_string(), addr.port()));
-    }
-
-    if let Some((host, port)) = input.rsplit_once(':')
-        && !host.contains(':')
-    {
-        let port = port.parse::<u16>().map_err(|_| {
-            Error::InvalidConfig(format!("invalid dns server port in {input}"))
-        })?;
-        return Ok((host.to_string(), port));
-    }
-
-    Ok((input.to_string(), default_port))
-}
-
 impl TryFrom<crate::config::def::Config> for DNSConfig {
     type Error = Error;
 
@@ -221,6 +233,8 @@ impl TryFrom<&crate::config::def::Config> for DNSConfig {
             store_fake_ip: c.profile.store_fake_ip,
             ipv6: dc.ipv6,
             enable: dc.enable,
+            edns_client_subnet: None,
+            fw_mark: None,
         })
     }
 }
