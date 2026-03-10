@@ -196,21 +196,23 @@ impl DnsClient {
             return Ok(resolver);
         }
 
-        let protocol = match self.net {
-            DNSNetMode::Udp => Protocol::Udp,
-            DNSNetMode::Tcp => Protocol::Tcp,
-            DNSNetMode::DoT | DNSNetMode::DoH | DNSNetMode::Dhcp => {
-                return Err(Error::DNSError("unsupported dns protocol".into()).into());
+        let mut config = ResolverConfig::new();
+        let name_server = match &self.cfg {
+            DnsConfig::Udp(addr) => NameServerConfig::new(*addr, Protocol::Udp),
+            DnsConfig::Tcp(addr) => NameServerConfig::new(*addr, Protocol::Tcp),
+            DnsConfig::Tls(addr, host) => {
+                let mut ns = NameServerConfig::new(*addr, Protocol::Tls);
+                ns.tls_dns_name = Some(host.to_string());
+                ns
+            }
+            DnsConfig::Https(addr, host) => {
+                let mut ns = NameServerConfig::new(*addr, Protocol::Https);
+                ns.tls_dns_name = Some(host.to_string());
+                ns.http_endpoint = Some("/dns-query".to_string());
+                ns
             }
         };
-
-        let socket_addr = match &self.cfg {
-            DnsConfig::Udp(addr) | DnsConfig::Tcp(addr) => *addr,
-            DnsConfig::Tls(addr, _) | DnsConfig::Https(addr, _) => *addr,
-        };
-
-        let mut config = ResolverConfig::new();
-        config.add_name_server(NameServerConfig::new(socket_addr, protocol));
+        config.add_name_server(name_server);
 
         let mut resolver_opts = ResolverOpts::default();
         resolver_opts.ip_strategy = if self.ipv6 {
