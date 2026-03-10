@@ -252,6 +252,54 @@ impl TryFrom<&crate::config::def::Config> for DNSConfig {
                             ..Default::default()
                         })
                     }
+                    DNSListen::Multiple(map) => {
+                        let mut udp = None;
+                        let mut tcp = None;
+
+                        for (key, value) in map {
+                            match key.as_str() {
+                                "udp" => {
+                                    let addr = value
+                                        .as_str()
+                                        .ok_or_else(|| {
+                                            Error::InvalidConfig(format!(
+                                                "invalid udp dns listen address: {value:?}"
+                                            ))
+                                        })?
+                                        .parse::<SocketAddr>()
+                                        .map_err(|_| {
+                                            Error::InvalidConfig(format!(
+                                                "invalid dns udp listen address: {value:?}"
+                                            ))
+                                        })?;
+                                    udp = Some(addr);
+                                }
+                                "tcp" => {
+                                    let addr = value
+                                        .as_str()
+                                        .ok_or_else(|| {
+                                            Error::InvalidConfig(format!(
+                                                "invalid tcp dns listen address: {value:?}"
+                                            ))
+                                        })?
+                                        .parse::<SocketAddr>()
+                                        .map_err(|_| {
+                                            Error::InvalidConfig(format!(
+                                                "invalid dns tcp listen address: {value:?}"
+                                            ))
+                                        })?;
+                                    tcp = Some(addr);
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        Ok::<DNSListenAddr, Error>(DNSListenAddr {
+                            udp,
+                            tcp,
+                            ..Default::default()
+                        })
+                    }
                 })
                 .transpose()?
                 .unwrap_or_default(),

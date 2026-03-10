@@ -215,8 +215,7 @@ impl Display for LogLevel {
 #[serde(untagged)]
 pub enum DNSListen {
     Udp(String),
-    // todo
-    // Multiple(HashMap<String, Value>),
+    Multiple(HashMap<String, Value>),
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
