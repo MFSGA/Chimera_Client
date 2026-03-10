@@ -78,8 +78,29 @@ impl EnhancedResolver {
         let hosts = build_hosts_trie(&cfg.hosts);
         let fake_dns =
             build_fake_dns(&cfg, store.clone()).expect("failed to create fake dns");
-        let default_resolver =
-            Arc::new(SystemResolver::new(cfg.ipv6).expect("system resolver"));
+        let default_resolver = Arc::new(EnhancedResolver {
+            ipv6: AtomicBool::new(false),
+            store: store.clone(),
+            hosts: None,
+            main: make_clients(
+                &cfg.default_nameserver,
+                None,
+                outbounds.clone(),
+                cfg.edns_client_subnet.clone(),
+                cfg.fw_mark,
+                false,
+            )
+            .await,
+            fallback: None,
+            fallback_domain_filters: None,
+            fallback_ip_filters: None,
+            lru_cache: None,
+            policy: None,
+            fake_dns: None,
+            reverse_lookup_cache: None,
+            _mmdb: None,
+            _outbounds: outbounds.clone(),
+        });
         let main = make_clients(
             &cfg.nameserver,
             Some(default_resolver.clone()),
@@ -104,7 +125,9 @@ impl EnhancedResolver {
                 .await,
             )
         };
-        let policy = build_policy_resolvers(&cfg).await;
+        let policy =
+            build_policy_resolvers(&cfg, Some(default_resolver.clone()), outbounds.clone())
+                .await;
 
         Self {
             ipv6: AtomicBool::new(cfg.ipv6),
@@ -652,14 +675,16 @@ fn build_fallback_filters(
 
 async fn build_policy_resolvers(
     cfg: &DNSConfig,
+    resolver: Option<Arc<dyn ClashResolver>>,
+    outbounds: HashMap<String, Arc<dyn OutboundHandler>>,
 ) -> Option<StringTrie<Vec<ThreadSafeDNSClient>>> {
     let mut out = StringTrie::new();
     let mut has_entries = false;
     for (domain, nameserver) in &cfg.nameserver_policy {
         let resolvers = make_clients(
             std::slice::from_ref(nameserver),
-            None,
-            HashMap::new(),
+            resolver.clone(),
+            outbounds.clone(),
             cfg.edns_client_subnet.clone(),
             cfg.fw_mark,
             cfg.ipv6,
