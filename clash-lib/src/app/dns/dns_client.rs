@@ -5,6 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use hickory_proto::{
     op::Message,
     op::ResponseCode,
@@ -12,7 +13,13 @@ use hickory_proto::{
         RecordType,
         rdata::opt::{ClientSubnet, EdnsCode, EdnsOption},
     },
-    xfer::Protocol,
+    runtime::{Time, iocompat::AsyncIoTokioAsStd},
+    rustls::{client_config, tls_client_stream::tls_client_connect_with_future},
+    tcp::{TcpClientStream, TcpStream},
+    xfer::{
+        DnsExchange, DnsHandle, DnsMultiplexer, DnsRequest, DnsRequestOptions,
+        Protocol,
+    },
 };
 use hickory_resolver::{
     TokioResolver,
@@ -24,14 +31,16 @@ use tracing::warn;
 
 use crate::{
     Error,
+    app::dispatcher::BoxedChainedStream,
     app::dns::{
         ClashResolver, config::EdnsClientSubnet, helper::build_dns_response_message,
     },
     app::net::OutboundInterface,
     proxy::OutboundHandler,
+    session::{Network, Session, SocksAddr, Type},
 };
 
-use super::{Client, ThreadSafeDNSClient};
+use super::{Client, ThreadSafeDNSClient, resolver::SystemResolver};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DNSNetMode {
@@ -263,6 +272,221 @@ impl DnsClient {
         self.inner.write().await.resolver = Some(resolver.clone());
         Ok(resolver)
     }
+
+    async fn exchange_via_resolver(
+        &self,
+        message: &Message,
+    ) -> anyhow::Result<Message> {
+        let query = message
+            .query()
+            .ok_or_else(|| anyhow::anyhow!("invalid query message"))?;
+
+        let lookup = self
+            .ensure_resolver()
+            .await?
+            .lookup(query.name().clone(), query.query_type())
+            .await?;
+
+        let records: Vec<_> = lookup.record_iter().cloned().collect();
+        let mut response = build_dns_response_message(message, true, false);
+
+        if records.is_empty() {
+            response.set_response_code(ResponseCode::NXDomain);
+            return Ok(response);
+        }
+
+        response.set_response_code(ResponseCode::NoError);
+        response.set_answer_count(records.len() as u16);
+        response.add_answers(records);
+        Ok(response)
+    }
+
+    async fn exchange_via_proxy(
+        &self,
+        message: &Message,
+    ) -> anyhow::Result<Message> {
+        match &self.cfg {
+            DnsConfig::Udp(_) => {
+                warn!(
+                    proxy = self.proxy.name(),
+                    dns = %self.id(),
+                    "proxied UDP dns upstream is not implemented yet, falling back to direct connect"
+                );
+                self.exchange_via_resolver(message).await
+            }
+            DnsConfig::Tcp(addr) => {
+                self.exchange_via_proxy_tcp(*addr, message).await
+            }
+            DnsConfig::Tls(addr, host) => {
+                self.exchange_via_proxy_tls(*addr, host.to_string(), message)
+                    .await
+            }
+            DnsConfig::Https(addr, host) => {
+                self.exchange_via_proxy_https(*addr, host.to_string(), message)
+                    .await
+            }
+        }
+    }
+
+    async fn exchange_via_proxy_tcp(
+        &self,
+        socket_addr: SocketAddr,
+        message: &Message,
+    ) -> anyhow::Result<Message> {
+        let future = self.connect_proxy_stream(socket_addr);
+        let (stream, handle) = TcpStream::with_future(
+            future,
+            socket_addr,
+            std::time::Duration::from_secs(5),
+        );
+        let stream = Box::pin(async move {
+            let stream = stream.await?;
+            Ok::<_, hickory_proto::ProtoError>(TcpClientStream::from_stream(stream))
+        });
+
+        self.run_multiplexed_exchange(stream, handle, message).await
+    }
+
+    async fn exchange_via_proxy_tls(
+        &self,
+        socket_addr: SocketAddr,
+        dns_name: String,
+        message: &Message,
+    ) -> anyhow::Result<Message> {
+        let mut tls_config = client_config();
+        tls_config.enable_sni = false;
+
+        let (stream, handle) = tls_client_connect_with_future(
+            self.connect_proxy_stream(socket_addr),
+            socket_addr,
+            dns_name,
+            Arc::new(tls_config),
+        );
+
+        self.run_multiplexed_exchange(stream, handle, message).await
+    }
+
+    async fn exchange_via_proxy_https(
+        &self,
+        socket_addr: SocketAddr,
+        dns_name: String,
+        message: &Message,
+    ) -> anyhow::Result<Message> {
+        let exchange: hickory_proto::xfer::DnsExchangeConnect<
+            _,
+            _,
+            hickory_proto::runtime::TokioTime,
+        > = DnsExchange::connect(hickory_proto::h2::HttpsClientConnect::new(
+            self.connect_proxy_stream(socket_addr),
+            Arc::new(client_config()),
+            socket_addr,
+            dns_name,
+            "/dns-query".to_string(),
+        ));
+
+        self.run_exchange_connect(exchange, message).await
+    }
+
+    async fn run_multiplexed_exchange<F, S>(
+        &self,
+        stream: F,
+        handle: hickory_proto::BufDnsStreamHandle,
+        message: &Message,
+    ) -> anyhow::Result<Message>
+    where
+        F: std::future::Future<Output = Result<S, hickory_proto::ProtoError>>
+            + Send
+            + Unpin
+            + 'static,
+        S: hickory_proto::xfer::DnsClientStream + Unpin + 'static,
+    {
+        let exchange: hickory_proto::xfer::DnsExchangeConnect<
+            _,
+            _,
+            hickory_proto::runtime::TokioTime,
+        > = DnsExchange::connect(DnsMultiplexer::with_timeout(
+            stream,
+            handle,
+            std::time::Duration::from_secs(5),
+            None,
+        ));
+
+        self.run_exchange_connect(exchange, message).await
+    }
+
+    async fn run_exchange_connect<F, S, TE>(
+        &self,
+        exchange: hickory_proto::xfer::DnsExchangeConnect<F, S, TE>,
+        message: &Message,
+    ) -> anyhow::Result<Message>
+    where
+        F: std::future::Future<Output = Result<S, hickory_proto::ProtoError>>
+            + Send
+            + Unpin
+            + 'static,
+        S: hickory_proto::xfer::DnsRequestSender,
+        TE: Time + Unpin + Send + 'static,
+    {
+        let (exchange, background) = exchange.await?;
+        tokio::spawn(background);
+
+        let mut options = DnsRequestOptions::default();
+        options.use_edns = true;
+        options.recursion_desired = message.recursion_desired();
+
+        let response = exchange
+            .send(DnsRequest::new(message.clone(), options))
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("dns upstream returned no response"))??;
+
+        Ok(response.into_message())
+    }
+
+    fn connect_proxy_stream(
+        &self,
+        socket_addr: SocketAddr,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = std::io::Result<AsyncIoTokioAsStd<BoxedChainedStream>>,
+                > + Send
+                + 'static,
+        >,
+    > {
+        let proxy = self.proxy.clone();
+        let resolver = Arc::new(
+            SystemResolver::new(self.ipv6)
+                .expect("failed to create system resolver for proxied dns upstream"),
+        );
+        let destination = self.proxy_destination(socket_addr);
+        let iface = resolve_outbound_interface(self.iface.as_deref());
+        let so_mark = self.fw_mark;
+
+        Box::pin(async move {
+            let session = Session {
+                network: Network::Tcp,
+                typ: Type::Ignore,
+                destination,
+                iface,
+                #[cfg(target_os = "linux")]
+                so_mark,
+                ..Default::default()
+            };
+
+            let stream = proxy.connect_stream(&session, resolver).await?;
+            Ok(AsyncIoTokioAsStd(stream))
+        })
+    }
+
+    fn proxy_destination(&self, socket_addr: SocketAddr) -> SocksAddr {
+        match &self.host {
+            url::Host::Domain(domain) => {
+                SocksAddr::Domain(domain.clone(), self.port)
+            }
+            url::Host::Ipv4(_) | url::Host::Ipv6(_) => SocksAddr::Ip(socket_addr),
+        }
+    }
 }
 
 fn interface_bind_addr(
@@ -335,30 +559,27 @@ impl Client for DnsClient {
     }
 
     async fn exchange(&self, msg: &Message) -> anyhow::Result<Message> {
-        let query = msg
-            .query()
-            .ok_or_else(|| anyhow::anyhow!("invalid query message"))?;
-
         let mut outbound = msg.clone();
         self.apply_edns_client_subnet(&mut outbound);
 
-        let lookup = self
-            .ensure_resolver()
-            .await?
-            .lookup(query.name().clone(), query.query_type())
-            .await?;
-
-        let records: Vec<_> = lookup.record_iter().cloned().collect();
-        let mut response = build_dns_response_message(msg, true, false);
-
-        if records.is_empty() {
-            response.set_response_code(ResponseCode::NXDomain);
-            return Ok(response);
+        if self.proxy.name() == "DIRECT" {
+            self.exchange_via_resolver(&outbound).await
+        } else {
+            self.exchange_via_proxy(&outbound).await
         }
-
-        response.set_response_code(ResponseCode::NoError);
-        response.set_answer_count(records.len() as u16);
-        response.add_answers(records);
-        Ok(response)
     }
+}
+
+#[cfg(feature = "tun")]
+fn resolve_outbound_interface(
+    iface_name: Option<&str>,
+) -> Option<OutboundInterface> {
+    iface_name.and_then(crate::app::net::get_interface_by_name)
+}
+
+#[cfg(not(feature = "tun"))]
+fn resolve_outbound_interface(
+    _iface_name: Option<&str>,
+) -> Option<OutboundInterface> {
+    None
 }
