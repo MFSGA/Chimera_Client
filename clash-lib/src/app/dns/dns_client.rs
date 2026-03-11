@@ -36,7 +36,11 @@ use crate::{
         ClashResolver, config::EdnsClientSubnet, helper::build_dns_response_message,
     },
     app::net::OutboundInterface,
-    proxy::{OutboundHandler, datagram::UdpPacket},
+    proxy::{
+        OutboundHandler,
+        datagram::UdpPacket,
+        utils::{new_tcp_stream, new_udp_socket},
+    },
     session::{Network, Session, SocksAddr, Type},
 };
 
@@ -301,6 +305,28 @@ impl DnsClient {
         Ok(response)
     }
 
+    async fn exchange_direct_with_mark(
+        &self,
+        message: &Message,
+    ) -> anyhow::Result<Message> {
+        match &self.cfg {
+            DnsConfig::Udp(addr) => {
+                self.exchange_via_direct_udp(*addr, message).await
+            }
+            DnsConfig::Tcp(addr) => {
+                self.exchange_via_direct_tcp(*addr, message).await
+            }
+            DnsConfig::Tls(addr, host) => {
+                self.exchange_via_direct_tls(*addr, host.to_string(), message)
+                    .await
+            }
+            DnsConfig::Https(addr, host) => {
+                self.exchange_via_direct_https(*addr, host.to_string(), message)
+                    .await
+            }
+        }
+    }
+
     async fn exchange_via_proxy(
         &self,
         message: &Message,
@@ -347,6 +373,31 @@ impl DnsClient {
         Ok(Message::from_vec(&response.data)?)
     }
 
+    async fn exchange_via_direct_udp(
+        &self,
+        socket_addr: SocketAddr,
+        message: &Message,
+    ) -> anyhow::Result<Message> {
+        let socket = new_udp_socket(
+            socket_addr,
+            resolve_outbound_interface(self.iface.as_deref()).as_ref(),
+            #[cfg(target_os = "linux")]
+            self.fw_mark,
+        )?;
+
+        socket.send_to(&message.to_vec()?, socket_addr).await?;
+        let mut buf = vec![0u8; 65535];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            socket.recv_from(&mut buf),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("dns udp upstream timeout"))??;
+
+        buf.truncate(len);
+        Ok(Message::from_vec(&buf)?)
+    }
+
     async fn exchange_via_proxy_tcp(
         &self,
         socket_addr: SocketAddr,
@@ -364,6 +415,100 @@ impl DnsClient {
         });
 
         self.run_multiplexed_exchange(stream, handle, message).await
+    }
+
+    async fn exchange_via_direct_tcp(
+        &self,
+        socket_addr: SocketAddr,
+        message: &Message,
+    ) -> anyhow::Result<Message> {
+        let iface = resolve_outbound_interface(self.iface.as_deref());
+        #[cfg(target_os = "linux")]
+        let so_mark = self.fw_mark;
+        let future = Box::pin(async move {
+            Ok::<_, std::io::Error>(AsyncIoTokioAsStd(
+                new_tcp_stream(
+                    socket_addr,
+                    iface.as_ref(),
+                    #[cfg(target_os = "linux")]
+                    so_mark,
+                )
+                .await?,
+            ))
+        });
+        let (stream, handle) = TcpStream::with_future(
+            future,
+            socket_addr,
+            std::time::Duration::from_secs(5),
+        );
+        let stream = Box::pin(async move {
+            let stream = stream.await?;
+            Ok::<_, hickory_proto::ProtoError>(TcpClientStream::from_stream(stream))
+        });
+        self.run_multiplexed_exchange(stream, handle, message).await
+    }
+
+    async fn exchange_via_direct_tls(
+        &self,
+        socket_addr: SocketAddr,
+        dns_name: String,
+        message: &Message,
+    ) -> anyhow::Result<Message> {
+        let iface = resolve_outbound_interface(self.iface.as_deref());
+        #[cfg(target_os = "linux")]
+        let so_mark = self.fw_mark;
+        let mut tls_config = client_config();
+        tls_config.enable_sni = false;
+        let (stream, handle) = tls_client_connect_with_future(
+            Box::pin(async move {
+                let stream = new_tcp_stream(
+                    socket_addr,
+                    iface.as_ref(),
+                    #[cfg(target_os = "linux")]
+                    so_mark,
+                )
+                .await?;
+                Ok(AsyncIoTokioAsStd(stream))
+            }),
+            socket_addr,
+            dns_name,
+            Arc::new(tls_config),
+        );
+
+        self.run_multiplexed_exchange(stream, handle, message).await
+    }
+
+    async fn exchange_via_direct_https(
+        &self,
+        socket_addr: SocketAddr,
+        dns_name: String,
+        message: &Message,
+    ) -> anyhow::Result<Message> {
+        let iface = resolve_outbound_interface(self.iface.as_deref());
+        #[cfg(target_os = "linux")]
+        let so_mark = self.fw_mark;
+        let exchange: hickory_proto::xfer::DnsExchangeConnect<
+            _,
+            _,
+            hickory_proto::runtime::TokioTime,
+        > = DnsExchange::connect(hickory_proto::h2::HttpsClientConnect::new(
+            Box::pin(async move {
+                let stream = new_tcp_stream(
+                    socket_addr,
+                    iface.as_ref(),
+                    #[cfg(target_os = "linux")]
+                    so_mark,
+                )
+                .await?;
+                Ok(AsyncIoTokioAsStd(stream))
+            }),
+            Arc::new(client_config()),
+            socket_addr,
+            dns_name,
+            "/dns-query".to_string(),
+        ));
+
+        self.run_exchange_connect(exchange, message).await
     }
 
     async fn exchange_via_proxy_tls(
@@ -602,7 +747,9 @@ impl Client for DnsClient {
         let mut outbound = msg.clone();
         self.apply_edns_client_subnet(&mut outbound);
 
-        if self.proxy.name() == "DIRECT" {
+        if self.proxy.name() == "DIRECT" && self.fw_mark.is_some() {
+            self.exchange_direct_with_mark(&outbound).await
+        } else if self.proxy.name() == "DIRECT" {
             self.exchange_via_resolver(&outbound).await
         } else {
             self.exchange_via_proxy(&outbound).await

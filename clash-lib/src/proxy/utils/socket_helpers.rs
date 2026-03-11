@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use socket2::TcpKeepalive;
 
-use tokio::net::{TcpListener, TcpSocket, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
 use tokio::time::timeout;
 use tracing::{debug, trace};
 
@@ -136,4 +136,44 @@ pub async fn new_tcp_stream(
         TcpSocket::from_std_stream(socket.into()).connect(endpoint),
     )
     .await?
+}
+
+pub fn new_udp_socket(
+    endpoint: SocketAddr,
+    iface: Option<&OutboundInterface>,
+    #[cfg(target_os = "linux")] so_mark: Option<u32>,
+) -> std::io::Result<UdpSocket> {
+    let (socket, family) = match endpoint {
+        SocketAddr::V4(_) => (
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?,
+            socket2::Domain::IPV4,
+        ),
+        SocketAddr::V6(_) => (
+            socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::DGRAM, None)?,
+            socket2::Domain::IPV6,
+        ),
+    };
+
+    if !cfg!(target_os = "android")
+        && let Some(iface) = iface
+    {
+        must_bind_socket_on_interface(&socket, iface, family)?;
+        trace!("udp socket bound to interface: {socket:?}");
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[cfg(target_os = "linux")]
+    if let Some(so_mark) = so_mark {
+        socket.set_mark(so_mark)?;
+    }
+
+    socket.set_nonblocking(true)?;
+
+    let bind_addr = match endpoint {
+        SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
+        SocketAddr::V6(_) => SocketAddr::from(([0u16; 8], 0)),
+    };
+    socket.bind(&bind_addr.into())?;
+
+    UdpSocket::from_std(socket.into())
 }
