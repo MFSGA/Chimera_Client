@@ -2,12 +2,13 @@ use std::{collections::HashMap, io, sync::Arc};
 
 use futures::FutureExt;
 use hyper_util::rt::TokioIo;
-use tokio::net::TcpStream;
 use tracing::{trace, warn};
 
 use crate::{
-    app::dns::ThreadSafeDNSResolver, config::internal::proxy::PROXY_DIRECT,
-    proxy::AnyOutboundHandler,
+    app::dns::ThreadSafeDNSResolver,
+    config::internal::proxy::PROXY_DIRECT,
+    proxy::{AnyOutboundHandler, direct},
+    session::Session,
 };
 
 #[cfg(feature = "tls")]
@@ -59,15 +60,6 @@ impl HttpClient {
         })
     }
 
-    async fn connect_tcp(&self, host: &str, port: u16) -> io::Result<TcpStream> {
-        let connect = TcpStream::connect((host, port));
-        tokio::time::timeout(self.timeout, connect)
-            .await
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::TimedOut, "tcp connect timeout")
-            })?
-    }
-
     pub async fn request<T>(
         &self,
         mut req: http::Request<T>,
@@ -112,16 +104,36 @@ impl HttpClient {
         }
 
         let req_ext = req.extensions().get::<ClashHTTPClientExt>();
-        let outbound_name = req_ext
-            .and_then(|ext| ext.outbound.as_deref())
-            .unwrap_or(PROXY_DIRECT);
-        if let Some(outbounds) = self.outbounds.as_ref() {
-            if let Some(outbound) = outbounds.get(outbound_name) {
-                trace!(outbound = %outbound.name(), "using outbound for http client");
-            }
-        }
+        let outbound = req_ext
+            .and_then(|ext| ext.outbound.clone())
+            .as_ref()
+            .and_then(|name| {
+                self.outbounds
+                    .as_ref()
+                    .and_then(|outbounds| outbounds.get(name).cloned())
+            })
+            .unwrap_or_else(|| Arc::new(direct::Handler::new(PROXY_DIRECT)) as _);
 
-        let stream = self.connect_tcp(&host, port).await?;
+        trace!(outbound = %outbound.name(), "using outbound for http client");
+        let session = Session {
+            network: crate::session::Network::Tcp,
+            typ: crate::session::Type::Ignore,
+            destination: crate::session::SocksAddr::Domain(host.clone(), port),
+            ..Default::default()
+        };
+        let stream = tokio::time::timeout(
+            self.timeout,
+            outbound.connect_stream(&session, self.dns_resolver.clone()),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tcp connect timeout"))?
+        .inspect_err(|error| {
+            warn!(
+                outbound = outbound.name(),
+                err = ?error,
+                "http client outbound connect failed"
+            );
+        })?;
 
         #[cfg(not(feature = "tls"))]
         if uri.scheme() == Some(&http::uri::Scheme::HTTPS) {

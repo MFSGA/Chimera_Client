@@ -9,7 +9,9 @@ use tokio::time::timeout;
 use tracing::{debug, trace};
 
 use crate::app::net::OutboundInterface;
-use crate::proxy::utils::platform::must_bind_socket_on_interface;
+use crate::proxy::utils::platform::{
+    maybe_protect_socket, must_bind_socket_on_interface,
+};
 
 pub fn apply_tcp_options(s: &TcpStream) -> std::io::Result<()> {
     #[cfg(not(target_os = "windows"))]
@@ -114,12 +116,11 @@ pub async fn new_tcp_stream(
     };
     debug!("created tcp socket");
 
-    if !cfg!(target_os = "android")
-        && let Some(iface) = iface
-    {
+    if let Some(iface) = iface {
         must_bind_socket_on_interface(&socket, iface, family)?;
-        trace!("tcp socket bound to interface: {socket:?}");
+        trace!(iface = ?iface, "tcp socket prepared for outbound interface");
     }
+    maybe_protect_socket(&socket)?;
 
     #[cfg(not(target_os = "android"))]
     #[cfg(target_os = "linux")]
@@ -153,9 +154,10 @@ pub fn new_udp_socket(
             socket2::Domain::IPV6,
         ),
     };
+    maybe_protect_socket(&socket)?;
 
-    if !cfg!(target_os = "android")
-        && let Some(iface) = iface
+    if let Some(iface) = iface
+        && !cfg!(target_os = "android")
     {
         must_bind_socket_on_interface(&socket, iface, family)?;
         trace!("udp socket bound to interface: {socket:?}");
