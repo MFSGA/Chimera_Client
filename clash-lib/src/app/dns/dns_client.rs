@@ -5,7 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use hickory_proto::{
     op::Message,
     op::ResponseCode,
@@ -31,12 +31,12 @@ use tracing::warn;
 
 use crate::{
     Error,
-    app::dispatcher::BoxedChainedStream,
+    app::dispatcher::{BoxedChainedDatagram, BoxedChainedStream},
     app::dns::{
         ClashResolver, config::EdnsClientSubnet, helper::build_dns_response_message,
     },
     app::net::OutboundInterface,
-    proxy::OutboundHandler,
+    proxy::{OutboundHandler, datagram::UdpPacket},
     session::{Network, Session, SocksAddr, Type},
 };
 
@@ -306,13 +306,8 @@ impl DnsClient {
         message: &Message,
     ) -> anyhow::Result<Message> {
         match &self.cfg {
-            DnsConfig::Udp(_) => {
-                warn!(
-                    proxy = self.proxy.name(),
-                    dns = %self.id(),
-                    "proxied UDP dns upstream is not implemented yet, falling back to direct connect"
-                );
-                self.exchange_via_resolver(message).await
+            DnsConfig::Udp(addr) => {
+                self.exchange_via_proxy_udp(*addr, message).await
             }
             DnsConfig::Tcp(addr) => {
                 self.exchange_via_proxy_tcp(*addr, message).await
@@ -326,6 +321,30 @@ impl DnsClient {
                     .await
             }
         }
+    }
+
+    async fn exchange_via_proxy_udp(
+        &self,
+        socket_addr: SocketAddr,
+        message: &Message,
+    ) -> anyhow::Result<Message> {
+        let mut datagram = self.connect_proxy_datagram(socket_addr).await?;
+        let request = UdpPacket::new(
+            message.to_vec()?,
+            SocksAddr::any_ipv4(),
+            self.proxy_destination(socket_addr),
+        );
+
+        datagram.send(request).await?;
+        let response =
+            tokio::time::timeout(std::time::Duration::from_secs(5), datagram.next())
+                .await
+                .map_err(|_| anyhow::anyhow!("dns udp upstream timeout"))?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("dns udp upstream returned no response")
+                })?;
+
+        Ok(Message::from_vec(&response.data)?)
     }
 
     async fn exchange_via_proxy_tcp(
@@ -477,6 +496,27 @@ impl DnsClient {
             let stream = proxy.connect_stream(&session, resolver).await?;
             Ok(AsyncIoTokioAsStd(stream))
         })
+    }
+
+    async fn connect_proxy_datagram(
+        &self,
+        socket_addr: SocketAddr,
+    ) -> std::io::Result<BoxedChainedDatagram> {
+        let resolver = Arc::new(
+            SystemResolver::new(self.ipv6)
+                .expect("failed to create system resolver for proxied dns upstream"),
+        );
+        let session = Session {
+            network: Network::Udp,
+            typ: Type::Ignore,
+            destination: self.proxy_destination(socket_addr),
+            iface: resolve_outbound_interface(self.iface.as_deref()),
+            #[cfg(target_os = "linux")]
+            so_mark: self.fw_mark,
+            ..Default::default()
+        };
+
+        self.proxy.connect_datagram(&session, resolver).await
     }
 
     fn proxy_destination(&self, socket_addr: SocketAddr) -> SocksAddr {
