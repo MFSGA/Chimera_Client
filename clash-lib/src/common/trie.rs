@@ -120,14 +120,16 @@ impl<T> StringTrie<T> {
         }
 
         if let Some(child) = node.get_child(parts.last().expect("non-empty parts"))
-            && let Some(found) = Self::search_inner(child, parts[..parts.len() - 1].into())
+            && let Some(found) =
+                Self::search_inner(child, parts[..parts.len() - 1].into())
             && found.data.is_some()
         {
             return Some(found);
         }
 
         if let Some(child) = node.get_child(WILDCARD)
-            && let Some(found) = Self::search_inner(child, parts[..parts.len() - 1].into())
+            && let Some(found) =
+                Self::search_inner(child, parts[..parts.len() - 1].into())
             && found.data.is_some()
         {
             return Some(found);
@@ -177,7 +179,9 @@ mod tests {
             assert!(tree.insert(domain, Arc::new(LOCAL_IP)));
         }
 
-        let node = tree.search("example.com").expect("should match example.com");
+        let node = tree
+            .search("example.com")
+            .expect("should match example.com");
         assert_eq!(node.get_data(), Some(&LOCAL_IP));
         assert!(!tree.insert("", Arc::new(LOCAL_IP)));
         assert!(tree.search("").is_none());

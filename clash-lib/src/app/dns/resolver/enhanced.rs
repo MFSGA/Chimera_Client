@@ -125,9 +125,12 @@ impl EnhancedResolver {
                 .await,
             )
         };
-        let policy =
-            build_policy_resolvers(&cfg, Some(default_resolver.clone()), outbounds.clone())
-                .await;
+        let policy = build_policy_resolvers(
+            &cfg,
+            Some(default_resolver.clone()),
+            outbounds.clone(),
+        )
+        .await;
 
         Self {
             ipv6: AtomicBool::new(cfg.ipv6),

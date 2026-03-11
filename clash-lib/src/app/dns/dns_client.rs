@@ -20,10 +20,14 @@ use hickory_resolver::{
     name_server::TokioConnectionProvider,
 };
 use tokio::sync::RwLock;
+use tracing::warn;
 
 use crate::{
     Error,
-    app::dns::{ClashResolver, config::EdnsClientSubnet, helper::build_dns_response_message},
+    app::dns::{
+        ClashResolver, config::EdnsClientSubnet, helper::build_dns_response_message,
+    },
+    app::net::OutboundInterface,
     proxy::OutboundHandler,
 };
 
@@ -98,7 +102,9 @@ pub struct DnsClient {
     net: DNSNetMode,
     iface: Option<String>,
     ecs: Option<EdnsClientSubnet>,
+    fw_mark: Option<u32>,
     ipv6: bool,
+    bind_addr: Option<SocketAddr>,
 }
 
 impl DnsClient {
@@ -118,6 +124,7 @@ impl DnsClient {
             anyhow::anyhow!("no ip resolved for dns server {}", opts.host)
         })?;
         let socket_addr = SocketAddr::new(ip, opts.port);
+        let bind_addr = resolve_bind_addr(opts.iface.as_deref(), socket_addr);
 
         let cfg = match opts.net {
             DNSNetMode::Udp => DnsConfig::Udp(socket_addr),
@@ -125,7 +132,9 @@ impl DnsClient {
             DNSNetMode::DoT => DnsConfig::Tls(socket_addr, opts.host.clone()),
             DNSNetMode::DoH => DnsConfig::Https(socket_addr, opts.host.clone()),
             DNSNetMode::Dhcp => {
-                return Err(Error::DNSError("unsupported dns protocol".into()).into());
+                return Err(
+                    Error::DNSError("unsupported dns protocol".into()).into()
+                );
             }
         };
 
@@ -138,7 +147,9 @@ impl DnsClient {
             net: opts.net,
             iface: opts.iface,
             ecs: opts.ecs,
+            fw_mark: opts.fw_mark,
             ipv6: opts.ipv6,
+            bind_addr,
         }))
     }
 
@@ -168,13 +179,17 @@ impl DnsClient {
             ecs.ipv6
                 .map(|ipv6| (IpAddr::from(ipv6.network()), ipv6.prefix_len()))
                 .or_else(|| {
-                    ecs.ipv4.map(|ipv4| (IpAddr::from(ipv4.network()), ipv4.prefix_len()))
+                    ecs.ipv4.map(|ipv4| {
+                        (IpAddr::from(ipv4.network()), ipv4.prefix_len())
+                    })
                 })
         } else {
             ecs.ipv4
                 .map(|ipv4| (IpAddr::from(ipv4.network()), ipv4.prefix_len()))
                 .or_else(|| {
-                    ecs.ipv6.map(|ipv6| (IpAddr::from(ipv6.network()), ipv6.prefix_len()))
+                    ecs.ipv6.map(|ipv6| {
+                        (IpAddr::from(ipv6.network()), ipv6.prefix_len())
+                    })
                 })
         };
 
@@ -196,8 +211,24 @@ impl DnsClient {
             return Ok(resolver);
         }
 
+        if self.proxy.name() != "DIRECT" {
+            warn!(
+                proxy = self.proxy.name(),
+                dns = %self.id(),
+                "dns upstream proxy dialing is not implemented yet, falling back to direct connect"
+            );
+        }
+
+        if self.fw_mark.is_some() {
+            warn!(
+                fw_mark = self.fw_mark,
+                dns = %self.id(),
+                "dns upstream fw_mark is not implemented yet"
+            );
+        }
+
         let mut config = ResolverConfig::new();
-        let name_server = match &self.cfg {
+        let mut name_server = match &self.cfg {
             DnsConfig::Udp(addr) => NameServerConfig::new(*addr, Protocol::Udp),
             DnsConfig::Tcp(addr) => NameServerConfig::new(*addr, Protocol::Tcp),
             DnsConfig::Tls(addr, host) => {
@@ -212,6 +243,7 @@ impl DnsClient {
                 ns
             }
         };
+        name_server.bind_addr = self.bind_addr;
         config.add_name_server(name_server);
 
         let mut resolver_opts = ResolverOpts::default();
@@ -231,6 +263,57 @@ impl DnsClient {
         self.inner.write().await.resolver = Some(resolver.clone());
         Ok(resolver)
     }
+}
+
+fn interface_bind_addr(
+    iface: &OutboundInterface,
+    remote: SocketAddr,
+) -> Option<SocketAddr> {
+    match remote {
+        SocketAddr::V4(_) => {
+            iface.addr_v4.map(|ip| SocketAddr::new(IpAddr::V4(ip), 0))
+        }
+        SocketAddr::V6(_) => {
+            iface.addr_v6.map(|ip| SocketAddr::new(IpAddr::V6(ip), 0))
+        }
+    }
+}
+
+#[cfg(feature = "tun")]
+fn resolve_bind_addr(
+    iface_name: Option<&str>,
+    remote: SocketAddr,
+) -> Option<SocketAddr> {
+    let iface_name = iface_name?;
+    let iface = crate::app::net::get_interface_by_name(iface_name);
+    let bind_addr = iface
+        .as_ref()
+        .and_then(|iface| interface_bind_addr(iface, remote));
+
+    if bind_addr.is_none() {
+        warn!(
+            iface = iface_name,
+            remote = %remote,
+            "dns upstream interface requested but no compatible address was found"
+        );
+    }
+
+    bind_addr
+}
+
+#[cfg(not(feature = "tun"))]
+fn resolve_bind_addr(
+    iface_name: Option<&str>,
+    _remote: SocketAddr,
+) -> Option<SocketAddr> {
+    if let Some(iface_name) = iface_name {
+        warn!(
+            iface = iface_name,
+            "dns upstream interface binding requires the `tun` feature; ignoring interface"
+        );
+    }
+
+    None
 }
 
 impl Debug for DnsClient {

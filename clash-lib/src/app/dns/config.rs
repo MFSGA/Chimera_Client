@@ -37,13 +37,19 @@ impl Display for NameServer {
 impl NameServer {
     pub async fn to_socket_addr(&self) -> anyhow::Result<SocketAddr> {
         match &self.host {
-            url::Host::Ipv4(ip) => return Ok(SocketAddr::new((*ip).into(), self.port)),
-            url::Host::Ipv6(ip) => return Ok(SocketAddr::new((*ip).into(), self.port)),
+            url::Host::Ipv4(ip) => {
+                return Ok(SocketAddr::new((*ip).into(), self.port));
+            }
+            url::Host::Ipv6(ip) => {
+                return Ok(SocketAddr::new((*ip).into(), self.port));
+            }
             url::Host::Domain(host) => {
                 return tokio::net::lookup_host((host.as_str(), self.port))
                     .await?
                     .next()
-                    .ok_or_else(|| anyhow::anyhow!("no ip resolved for dns server {}", host));
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("no ip resolved for dns server {}", host)
+                    });
             }
         }
     }
@@ -109,10 +115,12 @@ impl DNSConfig {
             })?;
 
             let host = match host {
-                url::Host::Domain(value) => match value.parse::<std::net::Ipv4Addr>() {
-                    Ok(ipv4) => url::Host::Ipv4(ipv4),
-                    Err(_) => url::Host::Domain(value.to_string()),
-                },
+                url::Host::Domain(value) => {
+                    match value.parse::<std::net::Ipv4Addr>() {
+                        Ok(ipv4) => url::Host::Ipv4(ipv4),
+                        Err(_) => url::Host::Domain(value.to_string()),
+                    }
+                }
                 value => value.to_owned(),
             };
 
@@ -159,10 +167,14 @@ impl DNSConfig {
         Ok(out)
     }
 
-    fn parse_hosts(hosts: &HashMap<String, String>) -> Result<HashMap<String, IpAddr>, Error> {
+    fn parse_hosts(
+        hosts: &HashMap<String, String>,
+    ) -> Result<HashMap<String, IpAddr>, Error> {
         let mut out = HashMap::from([(
             "localhost".to_string(),
-            "127.0.0.1".parse::<IpAddr>().expect("localhost ip should be valid"),
+            "127.0.0.1"
+                .parse::<IpAddr>()
+                .expect("localhost ip should be valid"),
         )]);
 
         for (host, ip) in hosts {
@@ -175,7 +187,9 @@ impl DNSConfig {
         Ok(out)
     }
 
-    fn parse_fallback_filter(filter: &DefFallbackFilter) -> Result<FallbackFilter, Error> {
+    fn parse_fallback_filter(
+        filter: &DefFallbackFilter,
+    ) -> Result<FallbackFilter, Error> {
         let mut ip_cidr = Vec::with_capacity(filter.ip_cidr.len());
         for cidr in &filter.ip_cidr {
             ip_cidr.push(cidr.parse::<IpNet>().map_err(|e| {

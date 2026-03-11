@@ -3,7 +3,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use crate::{common::trie::StringTrie, Error};
+use crate::{Error, common::trie::StringTrie};
 
 mod file_store;
 mod mem_store;
@@ -83,11 +83,11 @@ impl FakeDns {
     }
 
     pub fn should_skip(&self, domain: &str) -> bool {
-        self.skipped_hostnames
-            .as_ref()
-            .is_some_and(|hostnames| {
-                hostnames.search(&domain.trim_end_matches('.').to_ascii_lowercase()).is_some()
-            })
+        self.skipped_hostnames.as_ref().is_some_and(|hostnames| {
+            hostnames
+                .search(&domain.trim_end_matches('.').to_ascii_lowercase())
+                .is_some()
+        })
     }
 
     pub async fn is_fake_ip(&mut self, ip: IpAddr) -> bool {
@@ -144,9 +144,16 @@ mod tests {
         assert_eq!(first, IpAddr::from([192, 168, 0, 2]));
         assert_eq!(fake_dns.lookup("foo.com").await, first);
         assert_eq!(second, IpAddr::from([192, 168, 0, 3]));
-        assert_eq!(fake_dns.reverse_lookup(second).await, Some("bar.com".into()));
+        assert_eq!(
+            fake_dns.reverse_lookup(second).await,
+            Some("bar.com".into())
+        );
         assert!(fake_dns.is_fake_ip(second).await);
-        assert!(!fake_dns.is_fake_ip("::1".parse().expect("valid ipv6")).await);
+        assert!(
+            !fake_dns
+                .is_fake_ip("::1".parse().expect("valid ipv6"))
+                .await
+        );
     }
 
     #[tokio::test]
@@ -204,6 +211,8 @@ mod tests {
         assert!(fake_dns.should_skip("foo.example.com"));
         assert!(!fake_dns.should_skip("example.com"));
         assert!(!fake_dns.should_skip("foo.example.net"));
-        assert!(!fake_dns.should_skip(IpAddr::from([127, 0, 0, 1]).to_string().as_str()));
+        assert!(
+            !fake_dns.should_skip(IpAddr::from([127, 0, 0, 1]).to_string().as_str())
+        );
     }
 }
