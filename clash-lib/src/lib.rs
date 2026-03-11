@@ -94,9 +94,7 @@ impl Config {
             Config::File(file) => {
                 TryInto::<def::Config>::try_into(PathBuf::from(file))?.try_into()
             }
-            Config::Str(s) => {
-                todo!()
-            }
+            Config::Str(s) => s.parse::<def::Config>()?.try_into(),
         }
     }
 }
@@ -276,6 +274,69 @@ pub async fn start(
 
     tasks.push(Box::pin(async move {
         futures::future::select_all(runners).await.0
+    }));
+
+    tasks.push(Box::pin(async move {
+        while let Some((config, done)) = reload_rx.recv().await {
+            info!("reloading config");
+            let config = match config.try_parse() {
+                Ok(config) => config,
+                Err(err) => {
+                    error!("failed to reload config: {}", err);
+                    continue;
+                }
+            };
+
+            let controller_cfg = config.general.controller.clone();
+            let new_components = create_components(cwd.clone(), config).await?;
+
+            let _ = done.send(());
+
+            debug!("stopping listeners");
+            inbound_manager.shutdown().await;
+            let mut state = global_state.lock().await;
+
+            #[cfg(feature = "tun")]
+            if let Some(handle) = state.tunnel_listener_handle.take() {
+                handle.abort();
+            }
+            if let Some(handle) = state.dns_listener_handle.take() {
+                handle.abort();
+            }
+            if let Some(handle) = state.api_listener_handle.take() {
+                handle.abort();
+            }
+
+            let inbound_manager = new_components.inbound_manager.clone();
+            debug!("reloading inbound listeners");
+            inbound_manager.restart().await;
+
+            #[cfg(feature = "tun")]
+            let tun_runner_handle = new_components.tun_runner.map(tokio::spawn);
+            let dns_listener_handle = new_components.dns_listener.map(tokio::spawn);
+            let api_listener_handle = app::api::get_api_runner(
+                controller_cfg,
+                log_tx.clone(),
+                new_components.statistics_manager,
+                new_components.inbound_manager,
+                new_components.dispatcher,
+                global_state.clone(),
+                new_components.dns_resolver,
+                new_components.outbound_manager,
+                new_components.router,
+                cwd.to_string_lossy().to_string(),
+            )
+            .map(tokio::spawn);
+
+            #[cfg(feature = "tun")]
+            {
+                state.tunnel_listener_handle = tun_runner_handle;
+            }
+            state.dns_listener_handle = dns_listener_handle;
+            state.api_listener_handle = api_listener_handle;
+        }
+
+        Ok(())
     }));
 
     futures::future::select_all(tasks).await.0.map_err(|x| {
