@@ -1,11 +1,15 @@
-use std::{io::IsTerminal, sync::Once};
+use std::{
+    io::IsTerminal,
+    sync::{Once, OnceLock},
+};
 
 use anyhow::anyhow;
 use serde::Serialize;
 use tokio::sync::broadcast::Sender;
 use tracing_log::LogTracer;
 use tracing_subscriber::{
-    EnvFilter, Layer, filter::filter_fn, fmt::time::LocalTime, prelude::*,
+    EnvFilter, Layer, Registry, filter::filter_fn, fmt::time::LocalTime, prelude::*,
+    reload,
 };
 
 use crate::config::def::LogLevel;
@@ -61,6 +65,8 @@ struct LoggingGuard {
 
 static SETUP_LOGGING: Once = Once::new();
 static mut LOGGING_GUARD: Option<LoggingGuard> = None;
+static LOG_FILTER_RELOAD: OnceLock<reload::Handle<EnvFilter, Registry>> =
+    OnceLock::new();
 
 pub fn setup_logging(
     level: LogLevel,
@@ -76,11 +82,17 @@ pub fn setup_logging(
                      have been initialized"
                 );
             });
-            LOGGING_GUARD = setup_logging_inner(level, collector, cwd, log_file)
-                .unwrap_or_else(|e| {
-                    eprintln!("Failed to setup logging: {e}");
-                    None
-                });
+            let (guard, reload_handle) = setup_logging_inner(
+                level, collector, cwd, log_file,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to setup logging: {e}");
+                (None, None)
+            });
+            LOGGING_GUARD = guard;
+            if let Some(reload_handle) = reload_handle {
+                _ = LOG_FILTER_RELOAD.set(reload_handle);
+            }
         });
     }
 }
@@ -90,7 +102,10 @@ fn setup_logging_inner(
     collector: EventCollector,
     cwd: &str,
     log_file: Option<String>,
-) -> anyhow::Result<Option<LoggingGuard>> {
+) -> anyhow::Result<(
+    Option<LoggingGuard>,
+    Option<reload::Handle<EnvFilter, Registry>>,
+)> {
     let default_log_level = format!("warn,clash={level}");
     let filter = EnvFilter::try_from_default_env()
         .inspect(|f| {
@@ -103,6 +118,7 @@ fn setup_logging_inner(
             }
         })
         .unwrap_or(EnvFilter::new(default_log_level));
+    let (filter_layer, reload_handle) = reload::Layer::new(filter);
 
     let (appender, guard) = if let Some(log_file) = log_file {
         let path_buf = std::path::PathBuf::from(&log_file);
@@ -161,7 +177,7 @@ fn setup_logging_inner(
         #[cfg(feature = "tracing")]
         {
             subscriber
-                .with(filter)
+                .with(filter_layer)
                 .with(collector.with_filter(exclude.clone()))
                 .with(log_to_file_layer)
                 .with(log_stdout_layer)
@@ -169,7 +185,7 @@ fn setup_logging_inner(
         #[cfg(not(feature = "tracing"))]
         {
             subscriber
-                .with(filter) // Global filter
+                .with(filter_layer)
                 .with(collector.with_filter(exclude.clone()))
                 .with(log_to_file_layer)
                 .with(log_stdout_layer)
@@ -179,9 +195,23 @@ fn setup_logging_inner(
     tracing::subscriber::set_global_default(subscriber)
         .map_err(|x| anyhow!("setup logging error: {}", x))?;
 
-    Ok(Some(LoggingGuard {
-        _file_appender: guard,
-    }))
+    Ok((
+        Some(LoggingGuard {
+            _file_appender: guard,
+        }),
+        Some(reload_handle),
+    ))
+}
+
+pub fn set_log_level(level: LogLevel) -> anyhow::Result<()> {
+    let default_log_level = format!("warn,clash={level}");
+    let filter = EnvFilter::new(default_log_level);
+    let handle = LOG_FILTER_RELOAD
+        .get()
+        .ok_or_else(|| anyhow!("logging reload handle not initialized"))?;
+    handle
+        .reload(filter)
+        .map_err(|e| anyhow!("failed to reload log level: {e}"))
 }
 
 struct EventVisitor<'a>(&'a mut Vec<String>);
