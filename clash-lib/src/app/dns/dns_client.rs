@@ -85,6 +85,7 @@ enum DnsConfig {
     Tcp(SocketAddr),
     Tls(SocketAddr, url::Host<String>),
     Https(SocketAddr, url::Host<String>),
+    Dhcp(Option<String>),
 }
 
 impl Display for DnsConfig {
@@ -98,6 +99,7 @@ impl Display for DnsConfig {
             DnsConfig::Https(addr, host) => {
                 write!(f, "HTTPS: {}:{} host: {}", addr.ip(), addr.port(), host)
             }
+            DnsConfig::Dhcp(iface) => write!(f, "DHCP: {:?}", iface),
         }
     }
 }
@@ -122,6 +124,31 @@ pub struct DnsClient {
 
 impl DnsClient {
     pub async fn new_client(opts: Opts) -> anyhow::Result<ThreadSafeDNSClient> {
+        if opts.net == DNSNetMode::Dhcp {
+            let iface = match &opts.host {
+                url::Host::Domain(iface)
+                    if iface != "system" && !iface.is_empty() =>
+                {
+                    Some(iface.clone())
+                }
+                _ => opts.iface.clone(),
+            };
+
+            return Ok(Arc::new(Self {
+                inner: Arc::new(RwLock::new(Inner { resolver: None })),
+                cfg: DnsConfig::Dhcp(iface.clone()),
+                proxy: opts.proxy,
+                host: opts.host,
+                port: opts.port,
+                net: opts.net,
+                iface,
+                ecs: opts.ecs,
+                fw_mark: opts.fw_mark,
+                ipv6: opts.ipv6,
+                bind_addr: None,
+            }));
+        }
+
         let resolved_ip = match &opts.host {
             url::Host::Ipv4(ip) => Some(IpAddr::V4(*ip)),
             url::Host::Ipv6(ip) => Some(IpAddr::V6(*ip)),
@@ -144,11 +171,7 @@ impl DnsClient {
             DNSNetMode::Tcp => DnsConfig::Tcp(socket_addr),
             DNSNetMode::DoT => DnsConfig::Tls(socket_addr, opts.host.clone()),
             DNSNetMode::DoH => DnsConfig::Https(socket_addr, opts.host.clone()),
-            DNSNetMode::Dhcp => {
-                return Err(
-                    Error::DNSError("unsupported dns protocol".into()).into()
-                );
-            }
+            DNSNetMode::Dhcp => unreachable!("dhcp handled before resolving host"),
         };
 
         Ok(Arc::new(Self {
@@ -240,6 +263,38 @@ impl DnsClient {
             );
         }
 
+        if let DnsConfig::Dhcp(iface) = &self.cfg {
+            if iface.is_some() {
+                warn!(
+                    iface = ?iface,
+                    dns = %self.id(),
+                    "dhcp dns interface selection is not implemented yet; using system dns configuration"
+                );
+            }
+
+            let (config, mut resolver_opts) =
+                hickory_resolver::system_conf::read_system_conf().map_err(|e| {
+                    anyhow::anyhow!(
+                        "failed to read system dns config for dhcp upstream: {e}"
+                    )
+                })?;
+            resolver_opts.ip_strategy = if self.ipv6 {
+                hickory_resolver::config::LookupIpStrategy::Ipv4AndIpv6
+            } else {
+                hickory_resolver::config::LookupIpStrategy::Ipv4Only
+            };
+
+            let resolver = TokioResolver::builder_with_config(
+                config,
+                TokioConnectionProvider::default(),
+            )
+            .with_options(resolver_opts)
+            .build();
+
+            self.inner.write().await.resolver = Some(resolver.clone());
+            return Ok(resolver);
+        }
+
         let mut config = ResolverConfig::new();
         let mut name_server = match &self.cfg {
             DnsConfig::Udp(addr) => NameServerConfig::new(*addr, Protocol::Udp),
@@ -255,6 +310,7 @@ impl DnsClient {
                 ns.http_endpoint = Some("/dns-query".to_string());
                 ns
             }
+            DnsConfig::Dhcp(_) => unreachable!("dhcp handled above"),
         };
         name_server.bind_addr = self.bind_addr;
         config.add_name_server(name_server);
@@ -324,6 +380,7 @@ impl DnsClient {
                 self.exchange_via_direct_https(*addr, host.to_string(), message)
                     .await
             }
+            DnsConfig::Dhcp(_) => self.exchange_via_resolver(message).await,
         }
     }
 
@@ -346,6 +403,7 @@ impl DnsClient {
                 self.exchange_via_proxy_https(*addr, host.to_string(), message)
                     .await
             }
+            DnsConfig::Dhcp(_) => self.exchange_via_resolver(message).await,
         }
     }
 
