@@ -87,6 +87,7 @@ pub fn get_api_runner(
         info!("Starting API server");
         let router = Router::new()
             .route("/", get(handlers::hello::handle))
+            .route("/traffic", get(handlers::traffic::handle))
             .route("/version", get(handlers::version::handle))
             .route("/logs", get(handlers::logs::handle))
             .route("/memory", get(handlers::memory::handle))

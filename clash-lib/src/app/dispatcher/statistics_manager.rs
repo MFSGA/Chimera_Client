@@ -147,6 +147,13 @@ impl StatisticsManager {
             .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
+    pub fn now(&self) -> (u64, u64) {
+        (
+            self.upload_blip.load(Ordering::Relaxed),
+            self.download_blip.load(Ordering::Relaxed),
+        )
+    }
+
     pub fn memory_usage(&self) -> usize {
         memory_stats().map(|x| x.physical_mem).unwrap_or(0)
     }
