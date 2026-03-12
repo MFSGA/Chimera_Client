@@ -75,8 +75,12 @@ pub struct General {
     /// 6
     pub asn_mmdb_download_url: Option<String>,
     /// 7
-    pub mode: RunMode,
+    pub geosite: Option<String>,
     /// 8
+    pub geosite_download_url: Option<String>,
+    /// 9
+    pub mode: RunMode,
+    /// 10
     pub routing_mask: Option<u32>,
 }
 

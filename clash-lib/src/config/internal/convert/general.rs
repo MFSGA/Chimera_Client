@@ -22,6 +22,8 @@ pub(super) fn convert(c: &def::Config) -> Result<General, crate::Error> {
         mmdb_download_url: c.mmdb_download_url.clone(),
         asn_mmdb: c.asn_mmdb.clone(),
         asn_mmdb_download_url: c.asn_mmdb_download_url.clone(),
+        geosite: c.geosite.clone(),
+        geosite_download_url: c.geosite_download_url.clone(),
         mode: c.mode,
         routing_mask: c.routing_mark,
     })

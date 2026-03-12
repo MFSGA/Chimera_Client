@@ -38,6 +38,8 @@ quinn-proto = { version = "0.11.13", default-features = false, optional = true }
 maxminddb = "0.27"
 hickory-proto = "0.25"
 hickory-resolver = { version = "0.25", features = ["tokio", "system-config", "webpki-roots", "tls-aws-lc-rs", "https-aws-lc-rs"] }
+prost = "0.14"
+regex = "1"
 url = { version = "2" }
 ipnet = { version = "2" }
 lru_time_cache = "0.11"

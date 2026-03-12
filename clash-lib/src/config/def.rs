@@ -118,6 +118,11 @@ pub struct Config {
     /// Optional ASN database download url
     #[serde(rename = "asn-mmdb-download-url")]
     pub asn_mmdb_download_url: Option<String>,
+    /// Geosite database path relative to the $CWD
+    pub geosite: Option<String>,
+    /// Geosite database download url
+    #[serde(rename = "geosite-download-url")]
+    pub geosite_download_url: Option<String>,
     /// 11.1 The HTTP proxy port
     #[serde(alias = "http_port")]
     pub port: Option<Port>,
