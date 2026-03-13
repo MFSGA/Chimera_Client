@@ -82,7 +82,7 @@ impl StatisticsManager {
         self.connections.lock().await.remove(&id);
     }
 
-    pub async fn snapshot(&self) -> ConnectionsResponse {
+    pub async fn snapshot(&self) -> Snapshot {
         let tracked = {
             let connections = self.connections.lock().await;
             connections
@@ -93,10 +93,25 @@ impl StatisticsManager {
 
         let mut connections = Vec::with_capacity(tracked.len());
         for tracker in tracked {
-            connections.push(Connection::from_tracker(tracker).await);
+            let chain = tracker.proxy_chain_holder.snapshot().await;
+            connections.push(TrackerInfo {
+                uuid: tracker.uuid,
+                session: tracker.session_holder.as_map(),
+                upload_total: AtomicU64::new(
+                    tracker.upload_total.load(Ordering::Acquire),
+                ),
+                download_total: AtomicU64::new(
+                    tracker.download_total.load(Ordering::Acquire),
+                ),
+                start_time: tracker.start_time,
+                proxy_chain: chain,
+                rule: tracker.rule.clone(),
+                rule_payload: tracker.rule_payload.clone(),
+                ..Default::default()
+            });
         }
 
-        ConnectionsResponse {
+        Snapshot {
             download_total: self.download_total.load(Ordering::Relaxed),
             upload_total: self.upload_total.load(Ordering::Relaxed),
             memory: self.memory_usage() as u64,
@@ -159,92 +174,36 @@ impl StatisticsManager {
     }
 }
 
-#[derive(Clone)]
-pub struct TrackerMetadata {
-    pub start: DateTime<Utc>,
-    pub chains: ProxyChain,
-    pub session: Session,
-}
-
-impl Default for TrackerMetadata {
-    fn default() -> Self {
-        Self {
-            start: Utc::now(),
-            chains: ProxyChain::default(),
-            session: Session::default(),
-        }
-    }
-}
-
 #[derive(Serialize, Default)]
 pub struct TrackerInfo {
     #[serde(rename = "id")]
     pub uuid: uuid::Uuid,
-    #[serde(skip)]
-    pub metadata: TrackerMetadata,
+    #[serde(rename = "metadata")]
+    pub session: HashMap<String, Box<dyn erased_serde::Serialize + Send + Sync>>,
 
     #[serde(rename = "upload")]
     pub upload_total: AtomicU64,
     #[serde(rename = "download")]
     pub download_total: AtomicU64,
+    #[serde(rename = "start")]
+    pub start_time: DateTime<Utc>,
+    #[serde(rename = "chains")]
+    pub proxy_chain: Vec<String>,
+    pub rule: String,
+    #[serde(rename = "rulePayload")]
+    pub rule_payload: String,
+
+    #[serde(skip)]
+    pub proxy_chain_holder: ProxyChain,
+    #[serde(skip)]
+    pub session_holder: Session,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ConnectionsResponse {
+pub struct Snapshot {
     pub download_total: u64,
     pub upload_total: u64,
     pub memory: u64,
-    pub connections: Vec<Connection>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Connection {
-    pub id: uuid::Uuid,
-    pub upload: u64,
-    pub download: u64,
-    pub start: DateTime<Utc>,
-    pub chains: Vec<String>,
-    pub metadata: ConnectionMetadata,
-}
-
-impl Connection {
-    async fn from_tracker(tracker: Arc<TrackerInfo>) -> Self {
-        let session = tracker.metadata.session.clone();
-        let destination_ip = match &session.destination {
-            crate::session::SocksAddr::Ip(addr) => Some(addr.ip().to_string()),
-            crate::session::SocksAddr::Domain(_, _) => None,
-        };
-
-        Self {
-            id: tracker.uuid,
-            upload: tracker.upload_total.load(Ordering::Relaxed),
-            download: tracker.download_total.load(Ordering::Relaxed),
-            start: tracker.metadata.start,
-            chains: tracker.metadata.chains.snapshot().await,
-            metadata: ConnectionMetadata {
-                network: format!("{:?}", session.network).to_lowercase(),
-                typ: format!("{:?}", session.typ).to_lowercase(),
-                source_ip: session.source.ip().to_string(),
-                destination_ip,
-                source_port: session.source.port(),
-                destination_port: session.destination.port(),
-                host: session.destination.host(),
-            },
-        }
-    }
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ConnectionMetadata {
-    pub network: String,
-    #[serde(rename = "type")]
-    pub typ: String,
-    pub source_ip: String,
-    pub destination_ip: Option<String>,
-    pub source_port: u16,
-    pub destination_port: u16,
-    pub host: String,
+    pub connections: Vec<TrackerInfo>,
 }

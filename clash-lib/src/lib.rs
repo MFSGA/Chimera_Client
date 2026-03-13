@@ -19,7 +19,7 @@ use crate::{
         dispatcher::{Dispatcher, StatisticsManager},
         dns::{self, ThreadSafeDNSResolver, resolver::SystemResolver},
         inbound::manager::InboundManager,
-        logging::LogEvent,
+        logging::LogEvent as AppLogEvent,
         outbound::manager::OutboundManager,
         profile,
         router::Router,
@@ -34,7 +34,7 @@ use crate::{
         },
     },
     config::{
-        def::{self, LogLevel},
+        def::{self, LogLevel as AppLogLevel},
         internal::{InternalConfig, proxy::OutboundProxy},
     },
     proxy::OutboundHandler,
@@ -51,6 +51,8 @@ mod proxy;
 /// 5
 mod session;
 
+pub use app::logging::LogEvent;
+pub use config::def::LogLevel;
 pub use proxy::utils::{
     SocketProtector, clear_socket_protector, set_socket_protector,
 };
@@ -104,7 +106,7 @@ impl Config {
 }
 
 pub struct GlobalState {
-    log_level: LogLevel,
+    log_level: AppLogLevel,
     #[cfg(feature = "tun")]
     tunnel_listener_handle: Option<JoinHandle<Result<()>>>,
     api_listener_handle: Option<JoinHandle<Result<()>>>,
@@ -114,7 +116,7 @@ pub struct GlobalState {
 }
 
 impl GlobalState {
-    pub(crate) fn log_level(&self) -> LogLevel {
+    pub(crate) fn log_level(&self) -> AppLogLevel {
         self.log_level
     }
 }
@@ -179,6 +181,16 @@ pub fn start_scaffold(opts: Options) -> Result<()> {
     })
 }
 
+pub fn initialize_logging(
+    level: LogLevel,
+    cwd: &str,
+    log_file: Option<String>,
+    log_tx: broadcast::Sender<LogEvent>,
+) {
+    let log_collector = app::logging::EventCollector::new(vec![log_tx]);
+    app::logging::setup_logging(level, log_collector, cwd, log_file);
+}
+
 static CRYPTO_PROVIDER_LOCK: OnceLock<()> = OnceLock::new();
 
 pub fn setup_default_crypto_provider() {
@@ -197,7 +209,7 @@ pub fn setup_default_crypto_provider() {
 pub async fn start(
     config: InternalConfig,
     cwd: String,
-    log_tx: broadcast::Sender<LogEvent>,
+    log_tx: broadcast::Sender<AppLogEvent>,
 ) -> Result<()> {
     setup_default_crypto_provider();
 
