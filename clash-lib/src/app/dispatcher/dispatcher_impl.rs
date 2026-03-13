@@ -97,6 +97,25 @@ impl Dispatcher {
 
         sess.destination = dest.clone();
 
+        if sess.resolved_ip.is_none()
+            && let SocksAddr::Domain(host, _) = &sess.destination
+        {
+            match self.resolver.resolve(host, false).await {
+                Ok(Some(ip)) => {
+                    trace!("resolved destination {} to {}", host, ip);
+                    sess.resolved_ip = Some(ip);
+                }
+                Ok(None) => {
+                    trace!("no ip resolved for destination {}", host);
+                }
+                Err(err) => {
+                    trace!(
+                        "failed to resolve destination {} for tracking: {}",
+                        host, err
+                    );
+                }
+            }
+        }
         let mode = *self.mode.read().await;
         // todo: fix the following code
         let (outbound_name, rule) = match mode {

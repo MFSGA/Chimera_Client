@@ -13,7 +13,7 @@ use crate::{
     app::{
         dispatcher::{
             StatisticsManager,
-            statistics_manager::{ProxyChain, TrackerInfo, TrackerMetadata},
+            statistics_manager::{ProxyChain, TrackerInfo},
         },
         router::RuleMatcher,
     },
@@ -139,11 +139,16 @@ impl TrackedStream {
             manager: manager.clone(),
             tracker: Arc::new(TrackerInfo {
                 uuid,
-                metadata: TrackerMetadata {
-                    chains: chain,
-                    session: sess,
-                    ..Default::default()
-                },
+                session_holder: sess,
+                start_time: chrono::Utc::now(),
+                rule: rule
+                    .as_ref()
+                    .map(|matcher| matcher.type_name().to_owned())
+                    .unwrap_or_default(),
+                rule_payload: rule
+                    .map(|matcher| matcher.payload())
+                    .unwrap_or_default(),
+                proxy_chain_holder: chain.clone(),
                 ..Default::default()
             }),
             close_notify: rx,
@@ -435,18 +440,21 @@ impl TrackedDatagram {
         inner: BoxedChainedDatagram,
         manager: Arc<StatisticsManager>,
         sess: Session,
-        _rule: Option<&Box<dyn RuleMatcher>>,
+        rule: Option<&Box<dyn RuleMatcher>>,
     ) -> Self {
         let uuid = uuid::Uuid::new_v4();
         let chain = inner.chain().clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         let tracker = Arc::new(TrackerInfo {
             uuid,
-            metadata: TrackerMetadata {
-                chains: chain,
-                session: sess,
-                ..Default::default()
-            },
+            session_holder: sess,
+            start_time: chrono::Utc::now(),
+            rule: rule
+                .as_ref()
+                .map(|matcher| matcher.type_name().to_owned())
+                .unwrap_or_default(),
+            rule_payload: rule.map(|matcher| matcher.payload()).unwrap_or_default(),
+            proxy_chain_holder: chain.clone(),
             ..Default::default()
         });
         let s = Self {
