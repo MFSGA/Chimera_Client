@@ -1,3 +1,5 @@
+mod enhanced;
+
 use crate::{
     app::{
         dns::{DNSConfig, ThreadSafeDNSResolver},
@@ -14,6 +16,7 @@ use std::{collections::HashMap, sync::Arc};
 #[path = "system.rs"]
 mod system;
 
+pub use enhanced::EnhancedResolver;
 pub use system::SystemResolver;
 
 pub async fn new(
@@ -25,8 +28,7 @@ pub async fn new(
     if cfg.enable {
         match store {
             Some(store) => {
-                /* Arc::new(EnhancedResolver::new(cfg, store, mmdb, outbounds).await) */
-                todo!()
+                Arc::new(EnhancedResolver::new(cfg, store, mmdb, outbounds).await)
             }
             _ => print_and_exit!("enhanced resolver requires cache store"),
         }

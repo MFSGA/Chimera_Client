@@ -77,6 +77,22 @@ impl ThreadSafeCacheFile {
             None
         }
     }
+
+    pub async fn set_ip_to_host(&self, ip: &str, host: &str) {
+        self.0.write().await.set_ip_to_host(ip, host);
+    }
+
+    pub async fn set_host_to_ip(&self, host: &str, ip: &str) {
+        self.0.write().await.set_host_to_ip(host, ip);
+    }
+
+    pub async fn get_fake_ip(&self, ip_or_host: &str) -> Option<String> {
+        self.0.read().await.get_fake_ip(ip_or_host)
+    }
+
+    pub async fn delete_fake_ip_pair(&self, ip: &str, host: &str) {
+        self.0.write().await.delete_fake_ip_pair(ip, host);
+    }
 }
 
 struct CacheFile {
@@ -127,5 +143,26 @@ impl CacheFile {
         self.db
             .selected
             .insert(group.to_string(), server.to_string());
+    }
+
+    pub fn set_ip_to_host(&mut self, ip: &str, host: &str) {
+        self.db.ip_to_host.insert(ip.to_string(), host.to_string());
+    }
+
+    pub fn set_host_to_ip(&mut self, host: &str, ip: &str) {
+        self.db.host_to_ip.insert(host.to_string(), ip.to_string());
+    }
+
+    pub fn get_fake_ip(&self, ip_or_host: &str) -> Option<String> {
+        self.db
+            .ip_to_host
+            .get(ip_or_host)
+            .or_else(|| self.db.host_to_ip.get(ip_or_host))
+            .cloned()
+    }
+
+    pub fn delete_fake_ip_pair(&mut self, ip: &str, host: &str) {
+        self.db.ip_to_host.remove(ip);
+        self.db.host_to_ip.remove(host);
     }
 }

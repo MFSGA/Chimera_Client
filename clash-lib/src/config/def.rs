@@ -99,6 +99,8 @@ pub struct Config {
     ///   - "https://example.com"
     #[serde(rename = "cors-allow-origins")]
     pub cors_allow_origins: Option<Vec<String>>,
+    #[serde(default)]
+    pub hosts: HashMap<String, String>,
     #[cfg_attr(not(unix), serde(alias = "external-controller-pipe"))]
     #[cfg_attr(unix, serde(alias = "external-controller-unix"))]
     pub external_controller_ipc: Option<String>,
@@ -213,8 +215,32 @@ impl Display for LogLevel {
 #[serde(untagged)]
 pub enum DNSListen {
     Udp(String),
-    // todo
-    // Multiple(HashMap<String, Value>),
+    Multiple(HashMap<String, Value>),
+}
+
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DNSMode {
+    #[default]
+    Normal,
+    FakeIp,
+    RedirHost,
+}
+
+#[derive(Serialize, Deserialize, Clone, Educe)]
+#[serde(default)]
+#[serde(rename_all = "kebab-case")]
+#[educe(Default)]
+pub struct FallbackFilter {
+    #[serde(rename = "geoip")]
+    #[educe(Default = true)]
+    pub geo_ip: bool,
+    #[serde(rename = "geoip-code")]
+    #[educe(Default = "CN")]
+    pub geo_ip_code: String,
+    #[serde(rename = "ipcidr")]
+    pub ip_cidr: Vec<String>,
+    pub domain: Vec<String>,
 }
 
 /// DNS client/server settings
@@ -245,6 +271,24 @@ pub enum DNSListen {
 #[serde(rename_all = "kebab-case", default)]
 #[educe(Default)]
 pub struct DNS {
+    /// Whether to use fake IP addresses
+    pub enhanced_mode: DNSMode,
+    /// DNS upstream servers
+    pub nameserver: Vec<String>,
+    /// Fallback DNS upstream servers
+    pub fallback: Vec<String>,
+    /// Fallback DNS filter
+    pub fallback_filter: FallbackFilter,
+    /// Default nameservers used for resolving DNS upstream hostnames later
+    pub default_nameserver: Vec<String>,
+    pub edns_client_subnet: Option<EdnsClientSubnet>,
+    /// Lookup domains via specific nameservers
+    pub nameserver_policy: HashMap<String, String>,
+    /// Fake IP addresses pool CIDR
+    #[educe(Default = "198.18.0.1/16")]
+    pub fake_ip_range: String,
+    /// Fake IP addresses filter
+    pub fake_ip_filter: Vec<String>,
     /// Enable IPv6 DNS responses (AAAA)
     pub ipv6: bool,
     /// DNS server listening address. If not present, the DNS server will be
@@ -253,6 +297,13 @@ pub struct DNS {
     /// 3. When disabled, system DNS config will be used
     /// All other DNS related options will only be used when this is enabled
     pub enable: bool,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub struct EdnsClientSubnet {
+    pub ipv4: Option<String>,
+    pub ipv6: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]

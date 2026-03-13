@@ -27,6 +27,7 @@ use crate::{
 };
 
 mod handlers;
+mod ipc;
 
 pub struct AppState {
     log_source_tx: Sender<LogEvent>,
@@ -47,8 +48,11 @@ pub fn get_api_runner(
     _cwd: String,
 ) -> Option<Runner> {
     tracing::debug!("API controller configuration: {:?}", controller_cfg);
-    let tcp_addr = controller_cfg.external_controller;
-    let ipc_addr = controller_cfg.external_controller_ipc;
+    let tcp_addr = controller_cfg
+        .external_controller
+        .clone()
+        .filter(|value| !value.is_empty());
+    let ipc_addr = controller_cfg.external_controller_ipc.clone();
 
     if tcp_addr.is_none() && ipc_addr.is_none() {
         return None;
@@ -176,13 +180,19 @@ pub fn get_api_runner(
             None
         };
 
-        if ipc_addr.is_some() {
-            warn!("IPC API listeners are not wired yet");
-        }
+        let ipc_fut = ipc_addr
+            .map(|ipc_path| async move { ipc::serve_ipc(router, &ipc_path).await });
 
-        match tcp_fut {
-            Some(tcp) => tcp.await,
-            None => Ok(()),
+        match (tcp_fut, ipc_fut) {
+            (Some(tcp), Some(ipc)) => {
+                tokio::select! {
+                    result = tcp => result,
+                    result = ipc => result,
+                }
+            }
+            (Some(tcp), None) => tcp.await,
+            (None, Some(ipc)) => ipc.await,
+            (None, None) => Ok(()),
         }
     };
 

@@ -17,8 +17,12 @@ use crate::{
         dispatcher::Dispatcher,
         dns::ThreadSafeDNSResolver,
         inbound::manager::{InboundManager, Ports},
+        logging,
     },
-    config::def::{self, LogLevel, RunMode},
+    config::{
+        def::{self},
+        internal::config::BindAddress,
+    },
 };
 
 #[derive(Clone)]
@@ -36,7 +40,10 @@ pub fn routes(
     dns_resolver: ThreadSafeDNSResolver,
 ) -> Router<Arc<AppState>> {
     Router::new()
-        .route("/", get(get_configs).put(update_configs))
+        .route(
+            "/",
+            get(get_configs).put(update_configs).patch(patch_configs),
+        )
         .with_state(ConfigState {
             inbound_manager,
             dispatcher,
@@ -45,7 +52,7 @@ pub fn routes(
         })
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 struct PatchConfigRequest {
     port: Option<u16>,
@@ -58,6 +65,26 @@ struct PatchConfigRequest {
     log_level: Option<def::LogLevel>,
     ipv6: Option<bool>,
     allow_lan: Option<bool>,
+}
+
+impl PatchConfigRequest {
+    fn rebuild_listeners(&self) -> bool {
+        self.port.is_some()
+            || self.socks_port.is_some()
+            || self.redir_port.is_some()
+            || self.tproxy_port.is_some()
+            || self.mixed_port.is_some()
+            || self.bind_address.is_some()
+    }
+}
+
+fn parse_bind_address(value: &str) -> Result<BindAddress, ()> {
+    match value {
+        "*" => Ok(BindAddress::all_v4()),
+        "localhost" => Ok(BindAddress::local()),
+        "[::]" | "::" => Ok(BindAddress::dual_stack()),
+        _ => value.parse().map(BindAddress).map_err(|_| ()),
+    }
 }
 
 async fn get_configs(State(state): State<ConfigState>) -> impl IntoResponse {
@@ -155,4 +182,74 @@ async fn update_configs(
             (StatusCode::BAD_REQUEST, "no path or payload provided").into_response()
         }
     }
+}
+
+async fn patch_configs(
+    State(state): State<ConfigState>,
+    Json(payload): Json<PatchConfigRequest>,
+) -> impl IntoResponse {
+    let inbound_manager = state.inbound_manager.clone();
+    let mut need_restart = false;
+
+    if let Some(bind_address) = payload.bind_address.clone() {
+        match parse_bind_address(&bind_address) {
+            Ok(bind_address) => {
+                inbound_manager.set_bind_address(bind_address).await;
+                need_restart = true;
+            }
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid bind address: {bind_address}"),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let mut global_state = state.global_state.lock().await;
+
+    if payload.rebuild_listeners() {
+        let ports = Ports {
+            port: payload.port,
+            socks_port: payload.socks_port,
+            redir_port: payload.redir_port,
+            tproxy_port: payload.tproxy_port,
+            mixed_port: payload.mixed_port,
+        };
+        inbound_manager.change_ports(ports).await;
+        need_restart = true;
+    }
+
+    if let Some(allow_lan) = payload.allow_lan
+        && allow_lan != inbound_manager.get_allow_lan().await
+    {
+        inbound_manager.set_allow_lan(allow_lan).await;
+        need_restart = true;
+    }
+
+    if need_restart {
+        inbound_manager.restart().await;
+    }
+
+    if let Some(mode) = payload.mode {
+        state.dispatcher.set_mode(mode).await;
+    }
+
+    if let Some(log_level) = payload.log_level {
+        global_state.log_level = log_level;
+        if let Err(err) = logging::set_log_level(log_level) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to update log level: {err}"),
+            )
+                .into_response();
+        }
+    }
+
+    if let Some(ipv6) = payload.ipv6 {
+        state.dns_resolver.set_ipv6(ipv6);
+    }
+
+    StatusCode::ACCEPTED.into_response()
 }
