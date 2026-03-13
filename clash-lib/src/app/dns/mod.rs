@@ -88,3 +88,4 @@ pub trait ClashResolver: Sync + Send {
         })
     }
 }
+
