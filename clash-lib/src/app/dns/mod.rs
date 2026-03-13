@@ -12,6 +12,7 @@ pub mod resolver;
 mod server;
 
 pub use config::DNSConfig;
+pub use server::exchange_with_resolver;
 pub use server::get_dns_listener;
 
 pub use resolver::new as new_resolver;
@@ -42,3 +43,4 @@ pub trait ClashResolver: Sync + Send {
         enhanced: bool,
     ) -> anyhow::Result<Option<std::net::IpAddr>>;
 }
+

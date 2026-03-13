@@ -8,7 +8,9 @@ use crate::{
     Error, Result, Runner,
     app::{dispatcher::Dispatcher, dns::ThreadSafeDNSResolver},
     config::internal::config::TunConfig,
-    proxy::tun::{routes, stream::handle_inbound_stream},
+    proxy::tun::{
+        datagram::handle_inbound_datagram, routes, stream::handle_inbound_stream,
+    },
 };
 
 #[derive(Default)]
@@ -39,7 +41,7 @@ impl Drop for RouteCleanupGuard {
 pub fn get_runner(
     cfg: TunConfig,
     dispatcher: Arc<Dispatcher>,
-    _resolver: ThreadSafeDNSResolver,
+    resolver: ThreadSafeDNSResolver,
 ) -> Result<Option<Runner>> {
     if !cfg.enable {
         trace!("tun is disabled");
@@ -153,10 +155,11 @@ pub fn get_runner(
         }
     };
 
-    let (stack, mut tcp_listener, _udp_socket) = watfaq_netstack::NetStack::new();
+    let (stack, mut tcp_listener, udp_socket) = watfaq_netstack::NetStack::new();
 
     Ok(Some(Box::pin(async move {
         let so_mark = cfg.so_mark;
+        let dns_hijack = cfg.dns_hijack;
         let _route_cleanup_guard = RouteCleanupGuard::new(cfg);
 
         let framed = tun_rs::async_framed::DeviceFramed::new(
@@ -228,6 +231,12 @@ pub fn get_runner(
             }
 
             Err(Error::Operation("tun stopped unexpectedly 2".to_string()))
+        }));
+
+        futs.push(Box::pin(async move {
+            handle_inbound_datagram(udp_socket, resolver, dns_hijack).await;
+
+            Err(Error::Operation("tun stopped unexpectedly 3".to_string()))
         }));
 
         futures::future::select_all(futs).await.0.map_err(|e| {
