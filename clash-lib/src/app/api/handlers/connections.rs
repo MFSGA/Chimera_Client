@@ -4,7 +4,6 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{FromRequest, Query, Request, State, WebSocketUpgrade, ws::Message},
-    http::StatusCode,
     response::IntoResponse,
     routing::{delete, get},
 };
@@ -77,15 +76,13 @@ async fn close_all_connections(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
     state.statistics_manager.close_all().await;
-    StatusCode::NO_CONTENT
+    "all connections closed".into_response()
 }
 
 async fn close_connection(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
 ) -> impl IntoResponse {
-    match state.statistics_manager.close(id).await {
-        true => StatusCode::NO_CONTENT,
-        false => StatusCode::NOT_FOUND,
-    }
+    state.statistics_manager.close(id).await;
+    format!("connection {id} closed").into_response()
 }

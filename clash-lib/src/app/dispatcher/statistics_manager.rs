@@ -114,7 +114,7 @@ impl StatisticsManager {
         Snapshot {
             download_total: self.download_total.load(Ordering::Relaxed),
             upload_total: self.upload_total.load(Ordering::Relaxed),
-            memory: self.memory_usage() as u64,
+            memory: self.memory_usage(),
             connections,
         }
     }
@@ -169,6 +169,16 @@ impl StatisticsManager {
         )
     }
 
+    #[allow(dead_code)]
+    pub fn reset_statistic(&self) {
+        self.upload_temp.store(0, Ordering::Relaxed);
+        self.upload_blip.store(0, Ordering::Relaxed);
+        self.upload_total.store(0, Ordering::Relaxed);
+        self.download_temp.store(0, Ordering::Relaxed);
+        self.download_blip.store(0, Ordering::Relaxed);
+        self.download_total.store(0, Ordering::Relaxed);
+    }
+
     pub fn memory_usage(&self) -> usize {
         memory_stats().map(|x| x.physical_mem).unwrap_or(0)
     }
@@ -204,6 +214,6 @@ pub struct TrackerInfo {
 pub struct Snapshot {
     pub download_total: u64,
     pub upload_total: u64,
-    pub memory: u64,
+    pub memory: usize,
     pub connections: Vec<TrackerInfo>,
 }
