@@ -118,7 +118,6 @@ pub struct TrackedStream {
     inner: BoxedChainedStream,
     manager: Arc<StatisticsManager>,
     tracker: Arc<TrackerInfo>,
-    /// 4
     close_notify: Receiver<()>,
 }
 
@@ -453,9 +452,7 @@ impl TrackedDatagram {
                 .as_ref()
                 .map(|matcher| matcher.type_name().to_owned())
                 .unwrap_or_default(),
-            rule_payload: rule
-                .map(|matcher| matcher.payload())
-                .unwrap_or_default(),
+            rule_payload: rule.map(|matcher| matcher.payload()).unwrap_or_default(),
             proxy_chain_holder: chain.clone(),
             ..Default::default()
         });
@@ -587,6 +584,7 @@ impl Drop for TrackedStream {
     fn drop(&mut self) {
         let manager = self.manager.clone();
         let id = self.id();
+        debug!("untrack connection: {}", id);
         tokio::spawn(async move {
             manager.untrack(id).await;
         });
@@ -597,6 +595,7 @@ impl Drop for TrackedDatagram {
     fn drop(&mut self) {
         let manager = self.manager.clone();
         let id = self.id();
+        debug!("untrack connection: {}", id);
         tokio::spawn(async move {
             manager.untrack(id).await;
         });
