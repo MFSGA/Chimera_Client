@@ -52,6 +52,10 @@ mod session;
 
 pub use session::Session;
 
+pub use proxy::utils::{
+    SocketProtector, clear_socket_protector, set_socket_protector,
+};
+
 #[derive(Error, Debug)]
 pub enum Error {
     #[error(transparent)]
