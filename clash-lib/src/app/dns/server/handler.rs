@@ -8,13 +8,14 @@ pub async fn exchange_with_resolver(
     req: &Message,
     _enhanced: bool,
 ) -> Result<Message, chimera_dns::DNSError> {
-    tracing::debug!("todo: enhanced dns resolve: {}", _enhanced);
+    tracing::debug!("dns resolve request, enhanced={}", _enhanced);
     match resolver.exchange(req).await {
         Ok(m) => Ok(m),
         Err(e) => {
             debug!("dns resolve error: {}", e);
-            todo!()
-            // Err(chimera_dns::DNSError::QueryFailed(e.to_string()))
+            Err(chimera_dns::DNSError::Io(std::io::Error::other(
+                e.to_string(),
+            )))
         }
     }
 }

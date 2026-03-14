@@ -483,6 +483,7 @@ version = "0.8.0"
 dependencies = [
  "async-trait",
  "futures",
+ "hickory-proto",
  "hickory-server",
  "thiserror 2.0.18",
  "tokio",

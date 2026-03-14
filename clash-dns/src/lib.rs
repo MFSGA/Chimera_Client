@@ -1,5 +1,8 @@
 use std::{net::SocketAddr, path::Path};
 
+use async_trait::async_trait;
+use hickory_proto::op::Message;
+
 mod handler;
 
 mod utils;
@@ -26,7 +29,8 @@ pub struct DNSListenAddr {
     pub doh3: Option<DoH3Config>,
 }
 
+#[async_trait]
 pub trait DnsMessageExchanger: Send + Sync {
     fn ipv6(&self) -> bool;
-    // async fn exchange(&self, message: &Message) -> Result<Message, DNSError>;
+    async fn exchange(&self, message: &Message) -> Result<Message, DNSError>;
 }

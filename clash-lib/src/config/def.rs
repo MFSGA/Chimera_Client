@@ -247,8 +247,12 @@ pub enum DNSListen {
 pub struct DNS {
     /// DNS upstream servers
     pub nameserver: Vec<String>,
+    /// Fallback DNS upstream servers
+    pub fallback: Vec<String>,
     /// Default nameservers used for resolving DNS upstream hostnames later
     pub default_nameserver: Vec<String>,
+    /// Lookup domains via specific nameservers
+    pub nameserver_policy: HashMap<String, String>,
     /// Enable IPv6 DNS responses (AAAA)
     pub ipv6: bool,
     /// DNS server listening address. If not present, the DNS server will be

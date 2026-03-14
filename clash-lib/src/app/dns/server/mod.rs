@@ -8,7 +8,7 @@ use crate::{Runner, app::dns::ThreadSafeDNSResolver};
 mod handler;
 pub use handler::exchange_with_resolver;
 
-static DEFAULT_DNS_SERVER_TTL: u32 = 60;
+pub(crate) static DEFAULT_DNS_SERVER_TTL: u32 = 60;
 
 struct DnsMessageExchanger {
     resolver: ThreadSafeDNSResolver,
@@ -20,9 +20,9 @@ impl chimera_dns::DnsMessageExchanger for DnsMessageExchanger {
         self.resolver.ipv6()
     }
 
-    /* async fn exchange(&self, message: &Message) -> Result<Message, chimera_dns::DNSError> {
+    async fn exchange(&self, message: &Message) -> Result<Message, chimera_dns::DNSError> {
         exchange_with_resolver(&self.resolver, message, true).await
-    } */
+    }
 }
 
 pub async fn get_dns_listener(
@@ -38,8 +38,7 @@ pub async fn get_dns_listener(
                 Ok(()) => Ok(()),
                 Err(err) => {
                     error!("dns listener error: {}", err);
-                    todo!()
-                    // Err(err.into())
+                    Err(crate::Error::Io(std::io::Error::other(err.to_string())))
                 }
             }
         })),

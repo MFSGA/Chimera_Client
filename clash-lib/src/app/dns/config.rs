@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use crate::{Error, config::def::DNSListen};
@@ -39,7 +40,9 @@ impl NameServer {
 pub struct DNSConfig {
     pub listen: DNSListenAddr,
     pub nameserver: Vec<NameServer>,
+    pub fallback: Vec<NameServer>,
     pub default_nameserver: Vec<NameServer>,
+    pub nameserver_policy: HashMap<String, NameServer>,
     pub ipv6: bool,
     pub enable: bool,
 }
@@ -80,6 +83,24 @@ impl DNSConfig {
         }
 
         Ok(nameservers)
+    }
+
+    fn parse_nameserver_policy(
+        policy: &HashMap<String, String>,
+    ) -> Result<HashMap<String, NameServer>, Error> {
+        let mut out = HashMap::new();
+
+        for (domain, server) in policy {
+            let parsed = DNSConfig::parse_nameserver(std::slice::from_ref(server))?;
+            let ns = parsed.into_iter().next().ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "invalid dns nameserver policy for domain {domain}"
+                ))
+            })?;
+            out.insert(domain.to_ascii_lowercase(), ns);
+        }
+
+        Ok(out)
     }
 }
 
@@ -146,7 +167,11 @@ impl TryFrom<&crate::config::def::Config> for DNSConfig {
                 .transpose()?
                 .unwrap_or_default(),
             nameserver: DNSConfig::parse_nameserver(&dc.nameserver)?,
+            fallback: DNSConfig::parse_nameserver(&dc.fallback)?,
             default_nameserver: DNSConfig::parse_nameserver(&dc.default_nameserver)?,
+            nameserver_policy: DNSConfig::parse_nameserver_policy(
+                &dc.nameserver_policy,
+            )?,
             ipv6: dc.ipv6,
             enable: dc.enable,
         })
