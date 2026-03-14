@@ -322,9 +322,7 @@ fn build_request(
 fn build_xhttp_padding_referer(uri: &str) -> String {
     let separator = if uri.contains('?') { '&' } else { '?' };
     let padding = "X".repeat(DEFAULT_XHTTP_PADDING_BYTES);
-    format!(
-        "{uri}{separator}{DEFAULT_XHTTP_PADDING_QUERY_KEY}={padding}"
-    )
+    format!("{uri}{separator}{DEFAULT_XHTTP_PADDING_QUERY_KEY}={padding}")
 }
 
 #[async_trait]
@@ -552,8 +550,7 @@ async fn forward_response_body(
 #[cfg(test)]
 mod tests {
     use super::{
-        Client, XhttpDownloadConfig, XhttpMode, XhttpSecurity,
-        build_request,
+        Client, XhttpDownloadConfig, XhttpMode, XhttpSecurity, build_request,
     };
     use crate::proxy::transport::Transport;
     use bytes::Bytes;

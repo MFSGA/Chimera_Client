@@ -108,12 +108,16 @@ impl DNSConfig {
                 Error::InvalidConfig(format!("invalid dns server: {}", server))
             })?;
 
-            let host = url.host().ok_or_else(|| {
-                Error::InvalidConfig(format!(
-                    "invalid dns server: no host found in {}",
-                    server
-                ))
-            })?;
+            let host = match url.host() {
+                Some(host) => host,
+                None if url.scheme() == "dhcp" => url::Host::Domain("system"),
+                None => {
+                    return Err(Error::InvalidConfig(format!(
+                        "invalid dns server: no host found in {}",
+                        server
+                    )));
+                }
+            };
 
             let host = match host {
                 url::Host::Domain(value) => {

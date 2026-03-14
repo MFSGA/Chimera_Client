@@ -20,7 +20,10 @@ impl chimera_dns::DnsMessageExchanger for DnsMessageExchanger {
         self.resolver.ipv6()
     }
 
-    async fn exchange(&self, message: &Message) -> Result<Message, chimera_dns::DNSError> {
+    async fn exchange(
+        &self,
+        message: &Message,
+    ) -> Result<Message, chimera_dns::DNSError> {
         exchange_with_resolver(&self.resolver, message, true).await
     }
 }

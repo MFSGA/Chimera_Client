@@ -154,10 +154,9 @@ pub fn new_udp_socket(
             socket2::Domain::IPV6,
         ),
     };
-    maybe_protect_socket(&socket)?;
 
-    if let Some(iface) = iface
-        && !cfg!(target_os = "android")
+    if !cfg!(target_os = "android")
+        && let Some(iface) = iface
     {
         must_bind_socket_on_interface(&socket, iface, family)?;
         trace!("udp socket bound to interface: {socket:?}");
