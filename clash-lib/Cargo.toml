@@ -34,7 +34,7 @@ quinn = { version = "0.11", default-features = false, features = [
 ], optional = true }
 h3 = { version = "0.0.8", optional = true }
 h3-quinn = { version = "0.0.10", optional = true }
-quinn-proto = { version = "0.11.13", default-features = false, optional = true }
+quinn-proto = { version = "0.11.14", default-features = false, optional = true }
 maxminddb = "0.27"
 hickory-proto = "0.25"
 hickory-resolver = { version = "0.25", features = ["tokio", "system-config", "webpki-roots", "tls-aws-lc-rs", "https-aws-lc-rs"] }
@@ -84,7 +84,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 sha2 = "0.10"
 blake2 = { version = "0.10.6", optional = true }
-digest = { version = "0.10.7", optional = true }
+digest = { version = "0.11.2", optional = true }
 
 tokio-tungstenite = { version = "0.28.0", optional = true }
 tun-rs = { version = "2", features = [
@@ -118,7 +118,7 @@ log = { version = "0.4", optional = true }
 memchr = { version = "2", optional = true }
 subtle = { version = "2", optional = true }
 ring-compat = { version = "0.8", features = ["aead"] }
-x509-parser = { version = "0.16", default-features = false, optional = true }
+x509-parser = { version = "0.18", default-features = false, optional = true }
 
 [features]
 default = ["zero_copy", "tls", "aws-lc-rs", "tun", "port", "reality"]
