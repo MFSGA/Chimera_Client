@@ -1,7 +1,4 @@
-use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    sync::atomic::{AtomicBool, Ordering},
-};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use rand::seq::IteratorRandom;
@@ -36,10 +33,6 @@ impl ClashResolver for SystemResolver {
         ))
     }
 
-    fn ipv6(&self) -> bool {
-        self.ipv6.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
     async fn resolve(
         &self,
         host: &str,
@@ -62,5 +55,33 @@ impl ClashResolver for SystemResolver {
             .collect::<Vec<_>>();
         // todo: use the first address for now, we may want to randomize it later
         Ok(response.into_iter().choose(&mut rand::rng()))
+    }
+
+    fn ipv6(&self) -> bool {
+        self.ipv6.load(Ordering::Relaxed)
+    }
+
+    fn set_ipv6(&self, enable: bool) {
+        self.ipv6.store(enable, Ordering::Relaxed);
+    }
+
+    fn kind(&self) -> ResolverKind {
+        ResolverKind::System
+    }
+
+    fn fake_ip_enabled(&self) -> bool {
+        false
+    }
+
+    async fn reverse_lookup(&self, _: std::net::IpAddr) -> Option<String> {
+        None
+    }
+
+    async fn is_fake_ip(&self, _: std::net::IpAddr) -> bool {
+        false
+    }
+
+    async fn cached_for(&self, _: std::net::IpAddr) -> Option<String> {
+        None
     }
 }
