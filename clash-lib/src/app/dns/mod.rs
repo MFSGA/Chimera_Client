@@ -5,7 +5,7 @@ use hickory_proto::op;
 use std::sync::Arc;
 
 /// 2
-mod config;
+pub mod config;
 /// 3
 pub mod resolver;
 /// 1
@@ -43,4 +43,3 @@ pub trait ClashResolver: Sync + Send {
         enhanced: bool,
     ) -> anyhow::Result<Option<std::net::IpAddr>>;
 }
-

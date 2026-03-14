@@ -17,7 +17,10 @@ use crate::{app::net::init_net_config, proxy::tun::get_tun_runner};
 use crate::{
     app::{
         dispatcher::{Dispatcher, StatisticsManager},
-        dns::{self, ThreadSafeDNSResolver, resolver::SystemResolver},
+        dns::{
+            self, ThreadSafeDNSResolver, config::DNSListenAddr,
+            resolver::SystemResolver,
+        },
         inbound::manager::InboundManager,
         logging::LogEvent,
         outbound::manager::OutboundManager,
@@ -40,7 +43,7 @@ use crate::{
 };
 
 /// 2
-mod app;
+pub mod app;
 /// 4
 mod common;
 /// todo: #[cfg(not(feature = "internal"))]
@@ -256,6 +259,8 @@ pub async fn start(
         components.cache_store,
         components.router, */
         cwd.to_string_lossy().to_string(),
+        components.dns_listen.clone(),
+        components.dns_enabled,
     );
 
     if let Some(r) = api_runner {
@@ -329,6 +334,8 @@ pub async fn start(
                 new_components.outbound_manager,
                 new_components.router,
                 cwd.to_string_lossy().to_string(),
+                new_components.dns_listen.clone(),
+                new_components.dns_enabled,
             )
             .map(tokio::spawn);
 
@@ -362,6 +369,8 @@ struct RuntimeComponents {
     inbound_manager: Arc<InboundManager>,
     #[cfg(feature = "tun")]
     tun_runner: Option<Runner>,
+    dns_listen: DNSListenAddr,
+    dns_enabled: bool,
 }
 
 async fn create_components(
@@ -441,7 +450,9 @@ async fn create_components(
         None
     };
 
+    debug!("initializing dns resolver");
     let dns_listen = config.dns.listen.clone();
+    let dns_enable = config.dns.enable;
     let plain_outbounds_map = HashMap::<String, Arc<dyn OutboundHandler>>::from_iter(
         plain_outbounds
             .iter()
@@ -520,7 +531,7 @@ async fn create_components(
 
     debug!("initializing dns listener");
     let dns_listener =
-        dns::get_dns_listener(dns_listen, dns_resolver.clone(), &cwd).await;
+        dns::get_dns_listener(dns_listen.clone(), dns_resolver.clone(), &cwd).await;
 
     Ok(RuntimeComponents {
         statistics_manager,
@@ -533,5 +544,7 @@ async fn create_components(
         inbound_manager,
         #[cfg(feature = "tun")]
         tun_runner,
+        dns_listen,
+        dns_enabled: dns_enable,
     })
 }

@@ -50,6 +50,16 @@ impl InboundOpts {
             InboundOpts::Mixed { common_opts, .. } => common_opts,
         }
     }
+
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            #[cfg(feature = "http_port")]
+            InboundOpts::Http { .. } => "http",
+            InboundOpts::Socks { .. } => "socks",
+            #[cfg(feature = "mixed_port")]
+            InboundOpts::Mixed { .. } => "mixed",
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, Eq, PartialEq)]

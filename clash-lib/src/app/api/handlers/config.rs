@@ -6,82 +6,135 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
+
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tracing::debug;
 
 use crate::{
     GlobalState,
     app::{
         api::AppState,
-        dispatcher::Dispatcher,
-        dns::ThreadSafeDNSResolver,
-        inbound::manager::{InboundManager, Ports},
+        dispatcher,
+        dns::{ThreadSafeDNSResolver, config::DNSListenAddr},
+        inbound::manager::{InboundEndpoint, InboundManager, Ports},
     },
-    config::def::{self, LogLevel, RunMode},
+    config::{def, internal::config::BindAddress},
 };
+
+#[derive(Serialize)]
+struct DnsListenInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    udp: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tcp: Option<String>,
+    // #[serde(skip_serializing_if = "Option::is_none")]
+    // doh: Option<String>,
+    // #[serde(skip_serializing_if = "Option::is_none")]
+    // dot: Option<String>,
+    // #[serde(skip_serializing_if = "Option::is_none")]
+    // doh3: Option<String>,
+}
 
 #[derive(Clone)]
 struct ConfigState {
     inbound_manager: Arc<InboundManager>,
-    dispatcher: Arc<Dispatcher>,
+    dispatcher: Arc<dispatcher::Dispatcher>,
     global_state: Arc<Mutex<GlobalState>>,
     dns_resolver: ThreadSafeDNSResolver,
+    dns_listen_addr: DNSListenAddr,
+    dns_enabled: bool,
 }
 
 pub fn routes(
     inbound_manager: Arc<InboundManager>,
-    dispatcher: Arc<Dispatcher>,
+    dispatcher: Arc<dispatcher::Dispatcher>,
     global_state: Arc<Mutex<GlobalState>>,
     dns_resolver: ThreadSafeDNSResolver,
+    dns_listen_addr: DNSListenAddr,
+    dns_enabled: bool,
 ) -> Router<Arc<AppState>> {
     Router::new()
-        .route("/", get(get_configs).put(update_configs))
+        .route(
+            "/",
+            get(get_configs).put(update_configs).patch(patch_configs),
+        )
         .with_state(ConfigState {
             inbound_manager,
             dispatcher,
             global_state,
             dns_resolver,
+            dns_listen_addr,
+            dns_enabled,
         })
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "kebab-case")]
-struct PatchConfigRequest {
-    port: Option<u16>,
-    socks_port: Option<u16>,
-    redir_port: Option<u16>,
-    tproxy_port: Option<u16>,
-    mixed_port: Option<u16>,
-    bind_address: Option<String>,
-    mode: Option<def::RunMode>,
-    log_level: Option<def::LogLevel>,
-    ipv6: Option<bool>,
-    allow_lan: Option<bool>,
 }
 
 async fn get_configs(State(state): State<ConfigState>) -> impl IntoResponse {
     let run_mode = state.dispatcher.get_mode().await;
-    let global_state = state.global_state.lock().await;
-    let dns_resolver = state.dns_resolver;
+    let log_level = {
+        let global_state = state.global_state.lock().await;
+        global_state.log_level
+    };
     let inbound_manager = state.inbound_manager.clone();
 
-    let ports = state.inbound_manager.get_ports().await;
+    let ports = inbound_manager.get_ports().await;
+    let allow_lan = inbound_manager.get_allow_lan().await;
+    let listeners = inbound_manager.get_listeners().await;
+    let bind_address = inbound_manager.get_bind_address().await.0.to_string();
 
-    axum::response::Json(PatchConfigRequest {
+    let lan_ips = if allow_lan {
+        use network_interface::{NetworkInterface, NetworkInterfaceConfig};
+        Some({
+            let mut ips = NetworkInterface::show()
+                .unwrap_or_default()
+                .into_iter()
+                .flat_map(|iface| {
+                    iface.addr.into_iter().filter_map(|addr| match addr {
+                        network_interface::Addr::V4(v4)
+                            if !v4.ip.is_loopback() && !v4.ip.is_link_local() =>
+                        {
+                            Some(v4.ip.to_string())
+                        }
+                        _ => None,
+                    })
+                })
+                .collect::<Vec<_>>();
+            ips.sort();
+            ips.dedup();
+            ips
+        })
+    } else {
+        None
+    };
+
+    let dns_listen = if state.dns_enabled {
+        let addr = &state.dns_listen_addr;
+        Some(DnsListenInfo {
+            udp: addr.udp.map(|a| a.to_string()),
+            tcp: addr.tcp.map(|a| a.to_string()),
+            /* doh: addr.doh.as_ref().map(|c| c.addr.to_string()),
+            dot: addr.dot.as_ref().map(|c| c.addr.to_string()),
+            doh3: addr.doh3.as_ref().map(|c| c.addr.to_string()), */
+        })
+    } else {
+        None
+    };
+
+    axum::response::Json(GetConfigResponse {
         port: ports.port,
         socks_port: ports.socks_port,
         redir_port: ports.redir_port,
         tproxy_port: ports.tproxy_port,
         mixed_port: ports.mixed_port,
-        bind_address: Some(
-            state.inbound_manager.get_bind_address().await.0.to_string(),
-        ),
-
+        bind_address: Some(bind_address),
         mode: Some(run_mode),
-        log_level: Some(global_state.log_level),
-        ipv6: Some(dns_resolver.ipv6()),
-        allow_lan: Some(inbound_manager.get_allow_lan().await),
+        log_level: Some(log_level),
+        ipv6: Some(state.dns_resolver.ipv6()),
+        allow_lan: Some(allow_lan),
+        listeners: Some(listeners),
+        lan_ips,
+        dns_listen,
     })
 }
 
@@ -92,9 +145,8 @@ struct UpdateConfigRequest {
     payload: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct UploadConfigQuery {
-    #[allow(dead_code)]
     force: Option<bool>,
 }
 
@@ -155,4 +207,115 @@ async fn update_configs(
             (StatusCode::BAD_REQUEST, "no path or payload provided").into_response()
         }
     }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct GetConfigResponse {
+    port: Option<u16>,
+    socks_port: Option<u16>,
+    redir_port: Option<u16>,
+    tproxy_port: Option<u16>,
+    mixed_port: Option<u16>,
+    bind_address: Option<String>,
+    mode: Option<def::RunMode>,
+    log_level: Option<def::LogLevel>,
+    ipv6: Option<bool>,
+    allow_lan: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    listeners: Option<Vec<InboundEndpoint>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lan_ips: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dns_listen: Option<DnsListenInfo>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct PatchConfigRequest {
+    port: Option<u16>,
+    socks_port: Option<u16>,
+    redir_port: Option<u16>,
+    tproxy_port: Option<u16>,
+    mixed_port: Option<u16>,
+    bind_address: Option<String>,
+    mode: Option<def::RunMode>,
+    log_level: Option<def::LogLevel>,
+    ipv6: Option<bool>,
+    allow_lan: Option<bool>,
+}
+
+impl PatchConfigRequest {
+    fn rebuild_listeners(&self) -> bool {
+        self.port.is_some()
+            || self.socks_port.is_some()
+            || self.redir_port.is_some()
+            || self.tproxy_port.is_some()
+            || self.mixed_port.is_some()
+            || self.bind_address.is_some()
+    }
+}
+
+async fn patch_configs(
+    State(state): State<ConfigState>,
+    Json(payload): Json<PatchConfigRequest>,
+) -> impl IntoResponse {
+    let inbound_manager = state.inbound_manager.clone();
+    let mut need_restart = false;
+    if let Some(bind_address) = payload.bind_address.clone() {
+        match bind_address.parse::<BindAddress>() {
+            Ok(bind_address) => {
+                inbound_manager.set_bind_address(bind_address).await;
+                need_restart = true;
+            }
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid bind address: {bind_address}"),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let mut global_state = state.global_state.lock().await;
+
+    if payload.rebuild_listeners() {
+        let ports = Ports {
+            port: payload.port,
+            socks_port: payload.socks_port,
+            redir_port: payload.redir_port,
+            tproxy_port: payload.tproxy_port,
+            mixed_port: payload.mixed_port,
+        };
+        inbound_manager.change_ports(ports).await;
+        need_restart = true;
+    }
+
+    if let Some(allow_lan) = payload.allow_lan
+        && allow_lan != inbound_manager.get_allow_lan().await
+    {
+        inbound_manager.set_allow_lan(allow_lan).await;
+        // TODO: can be done with AtomicBool, but requires more changes
+        need_restart = true;
+    }
+
+    if need_restart {
+        let _ = inbound_manager.restart().await;
+    }
+
+    if let Some(mode) = payload.mode {
+        state.dispatcher.set_mode(mode).await;
+    }
+
+    if let Some(log_level) = payload.log_level {
+        global_state.log_level = log_level;
+    }
+
+    debug!("todo ipv6 setting");
+    /* if let Some(ipv6) = payload.ipv6 {
+        state.dns_resolver.set_ipv6(ipv6);
+    } */
+
+    StatusCode::ACCEPTED.into_response()
 }

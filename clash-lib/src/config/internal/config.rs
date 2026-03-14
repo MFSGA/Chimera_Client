@@ -1,8 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    str::FromStr,
 };
 
+use anyhow::anyhow;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde::{Deserialize, Serialize};
 
@@ -127,6 +129,25 @@ impl<'de> Deserialize<'de> for BindAddress {
                     Err(serde::de::Error::custom(format!(
                         "Invalid BindAddress value {str}"
                     )))
+                }
+            }
+        }
+    }
+}
+
+impl FromStr for BindAddress {
+    type Err = anyhow::Error;
+
+    fn from_str(str: &str) -> Result<Self, Self::Err> {
+        match str {
+            "*" => Ok(Self(IpAddr::V4(Ipv4Addr::UNSPECIFIED))),
+            "localhost" => Ok(Self(IpAddr::from([127, 0, 0, 1]))),
+            "[::]" | "::" => Ok(Self(IpAddr::V6(Ipv6Addr::UNSPECIFIED))),
+            _ => {
+                if let Ok(ip) = str.parse::<IpAddr>() {
+                    Ok(Self(ip))
+                } else {
+                    Err(anyhow!("Invalid BindAddress value {str}"))
                 }
             }
         }

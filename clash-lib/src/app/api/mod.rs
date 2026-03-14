@@ -17,7 +17,7 @@ use crate::{
     GlobalState, Runner,
     app::{
         dispatcher::{Dispatcher, StatisticsManager},
-        dns::ThreadSafeDNSResolver,
+        dns::{ThreadSafeDNSResolver, config::DNSListenAddr},
         inbound::manager::InboundManager,
         logging::LogEvent,
         outbound::manager::ThreadSafeOutboundManager,
@@ -46,6 +46,8 @@ pub fn get_api_runner(
     outbound_manager: ThreadSafeOutboundManager,
     router_state: ThreadSafeRouter,
     _cwd: String,
+    dns_listen_addr: DNSListenAddr,
+    dns_enabled: bool,
 ) -> Option<Runner> {
     tracing::debug!("API controller configuration: {:?}", controller_cfg);
     let tcp_addr = controller_cfg
@@ -104,6 +106,8 @@ pub fn get_api_runner(
                     dispatcher.clone(),
                     global_state.clone(),
                     dns_resolver.clone(),
+                    dns_listen_addr,
+                    dns_enabled,
                 ),
             )
             .nest(

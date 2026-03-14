@@ -202,4 +202,30 @@ impl InboundManager {
             guard.insert(opts, handle);
         }
     }
+
+    pub async fn get_listeners(&self) -> Vec<InboundEndpoint> {
+        let guard = self.inbound_handlers.read().await;
+        guard
+            .iter()
+            .map(|(opts, handler)| {
+                let common = opts.common_opts();
+                let active = handler.as_ref().is_some_and(|h| !h.is_finished());
+                InboundEndpoint {
+                    name: common.name.clone(),
+                    inbound_type: opts.type_name().to_string(),
+                    port: common.port,
+                    active,
+                }
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboundEndpoint {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub inbound_type: String,
+    pub port: u16,
+    pub active: bool,
 }
