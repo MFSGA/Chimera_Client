@@ -215,8 +215,7 @@ impl Display for LogLevel {
 #[serde(untagged)]
 pub enum DNSListen {
     Udp(String),
-    // todo
-    // Multiple(HashMap<String, Value>),
+    Multiple(HashMap<String, Value>),
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
@@ -282,6 +281,7 @@ pub struct DNS {
     pub fallback_filter: FallbackFilter,
     /// Default nameservers used for resolving DNS upstream hostnames later
     pub default_nameserver: Vec<String>,
+    pub edns_client_subnet: Option<EdnsClientSubnet>,
     /// Lookup domains via specific nameservers
     pub nameserver_policy: HashMap<String, String>,
     /// Fake IP addresses pool CIDR
@@ -297,6 +297,13 @@ pub struct DNS {
     /// 3. When disabled, system DNS config will be used
     /// All other DNS related options will only be used when this is enabled
     pub enable: bool,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub struct EdnsClientSubnet {
+    pub ipv4: Option<String>,
+    pub ipv6: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
