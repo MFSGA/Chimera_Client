@@ -99,6 +99,8 @@ pub struct Config {
     ///   - "https://example.com"
     #[serde(rename = "cors-allow-origins")]
     pub cors_allow_origins: Option<Vec<String>>,
+    #[serde(default)]
+    pub hosts: HashMap<String, String>,
     #[cfg_attr(not(unix), serde(alias = "external-controller-pipe"))]
     #[cfg_attr(unix, serde(alias = "external-controller-unix"))]
     pub external_controller_ipc: Option<String>,

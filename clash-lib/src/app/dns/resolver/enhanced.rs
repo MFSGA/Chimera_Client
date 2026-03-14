@@ -9,6 +9,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use futures::{FutureExt, future};
 use hickory_resolver::{
     TokioResolver,
     config::{NameServerConfig, ResolverConfig, ResolverOpts},
@@ -16,10 +17,13 @@ use hickory_resolver::{
     name_server::TokioConnectionProvider,
 };
 use hickory_proto::{
+    op::Message,
     op::ResponseCode,
+    rr::{RData, Record},
     rr::RecordType,
     xfer::Protocol,
 };
+use lru_time_cache::LruCache;
 use tokio::sync::RwLock;
 use tracing::{debug, trace, warn};
 
@@ -41,11 +45,13 @@ use crate::{
 pub struct EnhancedResolver {
     ipv6: AtomicBool,
     store: ThreadSafeCacheFile,
+    hosts: HashMap<String, IpAddr>,
     resolver: Option<TokioResolver>,
     fallback_resolver: Option<TokioResolver>,
     policy_resolvers: Vec<(String, TokioResolver)>,
     lru_cache: Arc<RwLock<DnsLru>>,
     fake_dns: Option<Arc<RwLock<FakeDns>>>,
+    reverse_lookup_cache: Arc<RwLock<LruCache<IpAddr, String>>>,
     _mmdb: Option<MmdbLookup>,
     _outbounds: HashMap<String, Arc<dyn OutboundHandler>>,
 }
@@ -72,6 +78,7 @@ impl EnhancedResolver {
         Self {
             ipv6: AtomicBool::new(cfg.ipv6),
             store,
+            hosts: cfg.hosts,
             resolver,
             fallback_resolver,
             policy_resolvers,
@@ -85,6 +92,12 @@ impl EnhancedResolver {
                 ),
             ))),
             fake_dns,
+            reverse_lookup_cache: Arc::new(RwLock::new(
+                LruCache::with_expiry_duration_and_capacity(
+                    Duration::from_secs(3),
+                    4096,
+                ),
+            )),
             _mmdb: mmdb,
             _outbounds: outbounds,
         }
@@ -95,19 +108,17 @@ impl EnhancedResolver {
 impl ClashResolver for EnhancedResolver {
     async fn exchange(
         &self,
-        message: &hickory_proto::op::Message,
-    ) -> anyhow::Result<hickory_proto::op::Message> {
+        message: &Message,
+    ) -> anyhow::Result<Message> {
         let query = message
             .query()
             .ok_or_else(|| anyhow::anyhow!("invalid query message"))?;
-        let query_type = query.query_type();
 
         if let Some(cached) = self.lru_cache.read().await.get(query, Instant::now()) {
             if !message.recursion_desired() {
                 trace!(query = %query.name(), "dns cache hit");
                 if let Ok(cached) = cached {
-                    let mut response =
-                        build_dns_response_message(message, true, false);
+                    let mut response = build_dns_response_message(message, true, false);
                     response.add_answers(cached.records().iter().cloned());
                     return Ok(response);
                 }
@@ -116,44 +127,7 @@ impl ClashResolver for EnhancedResolver {
             }
         }
 
-        if !matches!(query_type, RecordType::A | RecordType::AAAA) {
-            return Err(anyhow::anyhow!(
-                "unsupported dns query type in migrated path: {query_type:?}"
-            ));
-        }
-
-        let host = query.name().to_ascii().trim_end_matches('.').to_string();
-        let ips = match query_type {
-            RecordType::A => self.resolve_v4(&host, true).await?.map(|ip| vec![ip.into()]),
-            RecordType::AAAA => self.resolve_v6(&host, true).await?.map(|ip| vec![ip.into()]),
-            _ => None,
-        };
-
-        let mut response = build_dns_response_message(message, true, false);
-        match ips {
-            Some(ips) if !ips.is_empty() => {
-                let records = ip_records(
-                    query.name().clone(),
-                    crate::app::dns::server::DEFAULT_DNS_SERVER_TTL,
-                    query_type,
-                    &ips,
-                );
-                response.set_response_code(ResponseCode::NoError);
-                response.set_answer_count(records.len() as u16);
-                response.add_answers(records);
-                self.lru_cache.write().await.insert_records(
-                    query.clone(),
-                    response.answers().iter().cloned(),
-                    Instant::now(),
-                );
-            }
-            _ => {
-                warn!(host, ?query_type, "dns query returned no records");
-                response.set_response_code(ResponseCode::NXDomain);
-            }
-        }
-
-        Ok(response)
+        self.exchange_no_cache(message).await
     }
 
     fn ipv6(&self) -> bool {
@@ -183,11 +157,25 @@ impl ClashResolver for EnhancedResolver {
     async fn resolve(
         &self,
         host: &str,
-        _enhanced: bool,
+        enhanced: bool,
     ) -> anyhow::Result<Option<std::net::IpAddr>> {
-        let resolved = self
-            .resolve_with_policy_then_fallback(host, RecordType::A)
-            .await?;
+        let resolved = if self.ipv6() {
+            let v6 = self
+                .resolve_v6(host, enhanced)
+                .map(|result| result.map(|ip| ip.map(IpAddr::from)));
+            let v4 = self
+                .resolve_v4(host, enhanced)
+                .map(|result| result.map(|ip| ip.map(IpAddr::from)));
+
+            let (first, remaining) = future::select_ok(vec![v6.boxed(), v4.boxed()]).await?;
+            if first.is_some() {
+                first
+            } else {
+                future::select_all(remaining).await.0?
+            }
+        } else {
+            self.resolve_v4(host, enhanced).await?.map(IpAddr::from)
+        };
 
         if let Some(ip) = resolved {
             let ip = ip.to_string();
@@ -202,10 +190,7 @@ impl ClashResolver for EnhancedResolver {
         host: &str,
         _enhanced: bool,
     ) -> anyhow::Result<Option<std::net::Ipv4Addr>> {
-        let resolved = self
-            .resolve_with_policy_then_fallback(host, RecordType::A)
-            .await?;
-        Ok(resolved.and_then(|ip| match ip {
+        Ok(self.lookup_ip(host, RecordType::A).await?.into_iter().find_map(|ip| match ip {
             std::net::IpAddr::V4(ip) => Some(ip),
             std::net::IpAddr::V6(_) => None,
         }))
@@ -220,16 +205,18 @@ impl ClashResolver for EnhancedResolver {
             return Ok(None);
         }
 
-        let resolved = self
-            .resolve_with_policy_then_fallback(host, RecordType::AAAA)
-            .await?;
-        Ok(resolved.and_then(|ip| match ip {
+        Ok(self.lookup_ip(host, RecordType::AAAA).await?.into_iter().find_map(|ip| match ip {
             std::net::IpAddr::V6(ip) => Some(ip),
             std::net::IpAddr::V4(_) => None,
         }))
     }
 
     async fn reverse_lookup(&self, ip: std::net::IpAddr) -> Option<String> {
+        if let Some(cached) = self.reverse_lookup_cache.read().await.peek(&ip).cloned() {
+            trace!(%ip, host = cached, "reverse lookup cache hit");
+            return Some(cached);
+        }
+
         let Some(fake_dns) = &self.fake_dns else {
             return None;
         };
@@ -238,49 +225,171 @@ impl ClashResolver for EnhancedResolver {
     }
 
     async fn cached_for(&self, ip: std::net::IpAddr) -> Option<String> {
+        if let Some(cached) = self.reverse_lookup_cache.read().await.peek(&ip).cloned() {
+            return Some(cached);
+        }
         self.store.get_fake_ip(&ip.to_string()).await
     }
 }
 
 impl EnhancedResolver {
-    async fn resolve_with_policy_then_fallback(
+    async fn lookup_ip(
         &self,
         host: &str,
         query_type: RecordType,
-    ) -> anyhow::Result<Option<std::net::IpAddr>> {
+    ) -> anyhow::Result<Vec<IpAddr>> {
+        let mut message = Message::new();
+        let mut query = hickory_proto::op::Query::new();
+        let name = hickory_proto::rr::Name::from_str_relaxed(host)
+            .map_err(|_| anyhow::anyhow!("invalid domain: {host}"))?
+            .append_domain(&hickory_proto::rr::Name::root())?;
+        query.set_name(name);
+        query.set_query_type(query_type);
+        message.add_query(query);
+        message.set_recursion_desired(true);
+
+        let response = self.exchange(&message).await?;
+        let ips = Self::ip_list_of_message(&response);
+        if ips.is_empty() {
+            Err(anyhow::anyhow!("no record for hostname: {host}"))
+        } else {
+            Ok(ips)
+        }
+    }
+
+    async fn exchange_no_cache(&self, message: &Message) -> anyhow::Result<Message> {
+        let query = message
+            .query()
+            .ok_or_else(|| anyhow::anyhow!("invalid query message"))?;
+        let response = if Self::is_ip_request(query) {
+            self.ip_exchange(message).await?
+        } else {
+            return Err(anyhow::anyhow!(
+                "unsupported dns query type in migrated path: {:?}",
+                query.query_type()
+            ));
+        };
+
+        self.maybe_cache_response(query, &response).await;
+        Ok(response)
+    }
+
+    async fn ip_exchange(&self, message: &Message) -> anyhow::Result<Message> {
+        let query = message
+            .query()
+            .ok_or_else(|| anyhow::anyhow!("invalid query message"))?;
+        let query_type = query.query_type();
+        let host = Self::domain_name_of_message(message)
+            .unwrap_or_else(|| query.name().to_ascii().trim_end_matches('.').to_string());
+
+        let ips = if let Some(policy) = self.match_policy_resolver(&host) {
+            self.query_resolvers_by_priority([Some(policy), None], &host, query_type)
+                .await?
+                .map(|ip| vec![ip])
+        } else {
+            match self.resolve_with_main_then_fallback(&host, query_type, true).await {
+                Ok(ips) => ips.map(|ip| vec![ip]),
+                Err(err) => return Err(err),
+            }
+        };
+
+        let mut response = build_dns_response_message(message, true, false);
+        match ips {
+            Some(ips) if !ips.is_empty() => {
+                let records = ip_records(
+                    query.name().clone(),
+                    crate::app::dns::server::DEFAULT_DNS_SERVER_TTL,
+                    query_type,
+                    &ips,
+                );
+                response.set_response_code(ResponseCode::NoError);
+                response.set_answer_count(records.len() as u16);
+                response.add_answers(records);
+                for ip in Self::ip_list_of_message(&response) {
+                    self.save_reverse_lookup(ip, host.clone()).await;
+                }
+            }
+            _ => {
+                warn!(host, ?query_type, "dns query returned no records");
+                response.set_response_code(ResponseCode::NXDomain);
+            }
+        }
+
+        Ok(response)
+    }
+
+    async fn maybe_cache_response(&self, query: &hickory_proto::op::Query, response: &Message) {
+        self.lru_cache.write().await.insert_records(
+            query.clone(),
+            response.answers().iter().cloned(),
+            Instant::now(),
+        );
+    }
+
+    fn domain_name_of_message(message: &Message) -> Option<String> {
+        message
+            .query()
+            .map(|query| query.name().to_ascii().trim_end_matches('.').to_owned())
+    }
+
+    fn is_ip_request(query: &hickory_proto::op::Query) -> bool {
+        matches!(query.query_type(), RecordType::A | RecordType::AAAA)
+    }
+
+    fn ip_list_of_message(message: &Message) -> Vec<IpAddr> {
+        Self::ip_list_of_records(message.answers())
+    }
+
+    fn ip_list_of_records(records: &[Record]) -> Vec<IpAddr> {
+        records
+            .iter()
+            .filter_map(|record| match record.data() {
+                RData::A(v4) => Some(IpAddr::V4(**v4)),
+                RData::AAAA(v6) => Some(IpAddr::V6(**v6)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn resolve_with_main_then_fallback(
+        &self,
+        host: &str,
+        query_type: RecordType,
+        enhanced: bool,
+    ) -> anyhow::Result<Option<IpAddr>> {
+        let normalized_host = host.trim_end_matches('.').to_ascii_lowercase();
+
+        if enhanced && let Some(ip) = self.hosts.get(&normalized_host).copied() {
+            return Ok(match query_type {
+                RecordType::A if ip.is_ipv4() => Some(ip),
+                RecordType::AAAA if ip.is_ipv6() => Some(ip),
+                _ => None,
+            });
+        }
+
         if let Ok(ip) = host.parse::<IpAddr>() {
             return Ok(Some(ip));
         }
 
-        if query_type == RecordType::A
+        if enhanced
+            && query_type == RecordType::A
             && let Some(fake_dns) = &self.fake_dns
         {
             let mut fake_dns = fake_dns.write().await;
             if !fake_dns.should_skip(host) {
-                let ip = fake_dns.lookup(host).await;
-                debug!(host, %ip, "fake dns lookup");
-                return Ok(Some(ip));
+                return Ok(Some(fake_dns.lookup(host).await));
             }
         }
 
-        if let Some(resolver) = self.match_policy_resolver(host) {
-            if let Ok(resolved) =
-                lookup_with_resolver(resolver, host, self.ipv6(), query_type).await
-                && resolved.is_some()
-            {
-                return Ok(resolved);
-            }
-        }
-
-        if let Some(resolver) = &self.resolver {
-            match lookup_with_resolver(resolver, host, self.ipv6(), query_type).await {
-                Ok(Some(ip)) => return Ok(Some(ip)),
-                Ok(None) | Err(_) => {}
-            }
-        }
-
-        if let Some(resolver) = &self.fallback_resolver {
-            return lookup_with_resolver(resolver, host, self.ipv6(), query_type).await;
+        if let Some(ip) = self
+            .query_resolvers_by_priority(
+                [self.resolver.as_ref(), self.fallback_resolver.as_ref()],
+                host,
+                query_type,
+            )
+            .await?
+        {
+            return Ok(Some(ip));
         }
 
         let response = tokio::net::lookup_host(format!("{host}:0")).await?;
@@ -289,6 +398,44 @@ impl EnhancedResolver {
             RecordType::AAAA => self.ipv6() && ip.is_ipv6(),
             _ => false,
         }))
+    }
+
+    async fn query_resolvers_by_priority(
+        &self,
+        resolvers: [Option<&TokioResolver>; 2],
+        host: &str,
+        query_type: RecordType,
+    ) -> anyhow::Result<Option<IpAddr>> {
+        match resolvers {
+            [Some(primary), Some(secondary)] => {
+                let primary_query =
+                    lookup_with_resolver(primary, host, self.ipv6(), query_type);
+                let secondary_query =
+                    lookup_with_resolver(secondary, host, self.ipv6(), query_type);
+                let (primary_result, secondary_result) =
+                    tokio::join!(primary_query, secondary_query);
+
+                match primary_result {
+                    Ok(Some(ip)) => Ok(Some(ip)),
+                    Ok(None) | Err(_) => match secondary_result {
+                        Ok(result) => Ok(result),
+                        Err(err) => Err(err),
+                    },
+                }
+            }
+            [Some(primary), None] => {
+                lookup_with_resolver(primary, host, self.ipv6(), query_type).await
+            }
+            [None, Some(secondary)] => {
+                lookup_with_resolver(secondary, host, self.ipv6(), query_type).await
+            }
+            _ => Ok(None),
+        }
+    }
+
+    async fn save_reverse_lookup(&self, ip: IpAddr, host: String) {
+        trace!(%ip, host = %host, "reverse lookup cache insert");
+        self.reverse_lookup_cache.write().await.insert(ip, host);
     }
 
     fn match_policy_resolver(&self, host: &str) -> Option<&TokioResolver> {
