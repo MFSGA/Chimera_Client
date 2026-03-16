@@ -79,7 +79,14 @@ pub fn get_api_runner(
         .unwrap_or_else(|| Any.into());
 
     let cors = CorsLayer::new()
-        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::PATCH])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            // todo: decide if we want to allow DELETE method
+            Method::DELETE,
+        ])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
         .allow_private_network(true)
         .allow_origin(origins);
