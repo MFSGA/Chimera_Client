@@ -1,5 +1,5 @@
 pub mod config;
-pub mod connections;
+pub mod connection;
 pub mod hello;
 pub mod logs;
 pub mod memory;
