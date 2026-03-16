@@ -24,6 +24,8 @@ pub use dns_client::DNSNetMode;
 pub use server::get_dns_listener;
 
 pub use resolver::new as new_resolver;
+#[cfg(feature = "tun")]
+pub use server::exchange_with_resolver;
 
 pub type ThreadSafeDNSResolver = Arc<dyn ClashResolver>;
 pub type ThreadSafeDNSClient = Arc<dyn Client>;
