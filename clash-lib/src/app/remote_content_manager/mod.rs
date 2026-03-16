@@ -84,13 +84,15 @@ impl ProxyManager {
             .into()
     }
 
-    // pub async fn last_delay(&self, name: &str) -> Option<Duration> {
-    //     self.proxy_state
-    //         .read()
-    //         .await
-    //         .get(name)
-    //         .and_then(|state| state.delay_history.back().map(|x| x.delay))
-    // }
+    pub async fn last_delay(&self, name: &str) -> Option<Duration> {
+        if !self.alive(name).await {
+            return None;
+        }
+        self.delay_history(name)
+            .await
+            .last()
+            .map(|x| x.delay.to_owned())
+    }
 
     pub async fn report_delay(
         &self,

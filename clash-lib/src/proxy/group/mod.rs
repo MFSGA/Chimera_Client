@@ -7,6 +7,8 @@ use erased_serde::Serialize;
 
 pub mod selector;
 
+pub mod urltest;
+
 /// Convenience trait for group proxy serializing API responses.
 #[async_trait]
 pub trait GroupProxyAPIResponse: OutboundHandler {

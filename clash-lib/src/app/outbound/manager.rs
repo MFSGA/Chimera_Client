@@ -27,7 +27,10 @@ use crate::{
     },
     proxy::{
         AnyOutboundHandler, direct,
-        group::selector::{self, ThreadSafeSelectorControl},
+        group::{
+            selector::{self, ThreadSafeSelectorControl},
+            urltest,
+        },
         reject,
         utils::{DirectConnector, ProxyConnector},
         vless,
@@ -414,6 +417,51 @@ impl OutboundManager {
         // Initialize handlers for each outbound group protocol
         for outbound_group in outbound_groups.iter() {
             match outbound_group {
+                OutboundGroupProtocol::UrlTest(proto) => {
+                    if check_group_empty(&proto.proxies, &proto.use_provider) {
+                        return Err(Error::InvalidConfig(format!(
+                            "proxy group {} has no proxies",
+                            proto.name
+                        )));
+                    }
+                    let mut providers: Vec<ThreadSafeProxyProvider> = vec![];
+
+                    if let Some(proxies) = &proto.proxies {
+                        providers.push(make_provider_from_proxies(
+                            &proto.name,
+                            proxies,
+                            proto.interval,
+                            proto.lazy.unwrap_or_default(),
+                            handlers,
+                            proxy_manager.clone(),
+                            provider_registry,
+                        )?);
+                    }
+
+                    maybe_append_use_providers(
+                        &proto.use_provider,
+                        provider_registry,
+                        &mut providers,
+                    );
+
+                    let url_test = urltest::Handler::new(
+                        urltest::HandlerOptions {
+                            name: proto.name.clone(),
+                            common_opts: crate::proxy::HandlerCommonOptions {
+                                icon: proto.icon.clone(),
+                                url: Some(proto.url.clone()),
+                                connector: None,
+                            },
+                            ..Default::default()
+                        },
+                        proto.tolerance.unwrap_or_default(),
+                        providers,
+                        proxy_manager.clone(),
+                    );
+
+                    handlers.insert(proto.name.clone(), Arc::new(url_test));
+                }
+
                 OutboundGroupProtocol::Select(proto) => {
                     if check_group_empty(&proto.proxies, &proto.use_provider) {
                         return Err(Error::InvalidConfig(format!(

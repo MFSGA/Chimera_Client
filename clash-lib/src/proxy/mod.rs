@@ -172,6 +172,9 @@ pub enum OutboundType {
     Trojan,
     Hysteria2,
     Vless,
+
+    #[serde(rename = "URLTest")]
+    UrlTest,
 }
 
 impl Display for OutboundType {
@@ -188,7 +191,7 @@ impl Display for OutboundType {
             OutboundType::Ssh => write!(f, "ssh"),
             OutboundType::ShadowQuic => write!(f, "ShadowQuic"),
 
-            OutboundType::UrlTest => write!(f, "URLTest"),
+
             OutboundType::Selector => write!(f, "Selector"),
             OutboundType::Relay => write!(f, "Relay"),
             OutboundType::LoadBalance => write!(f, "LoadBalance"),
@@ -200,6 +203,8 @@ impl Display for OutboundType {
             OutboundType::Selector => write!(f, "Selector"),
             OutboundType::Direct => write!(f, "Direct"),
             OutboundType::Reject => write!(f, "Reject"),
+
+            OutboundType::UrlTest => write!(f, "URLTest"),
         }
     }
 }
