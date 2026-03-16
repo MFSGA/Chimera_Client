@@ -13,8 +13,9 @@ use crate::{
     },
     proxy::{
         AnyOutboundHandler, ConnectorType, DialWithConnector, HandlerCommonOptions,
-        OutboundHandler, OutboundType, group::GroupProxyAPIResponse,
-        utils::RemoteConnector,
+        OutboundHandler, OutboundType,
+        group::GroupProxyAPIResponse,
+        utils::{RemoteConnector, provider_helper::get_proxies_from_providers},
     },
     session::Session,
 };
@@ -54,8 +55,7 @@ impl Handler {
     }
 
     async fn get_proxies(&self, touch: bool) -> Vec<AnyOutboundHandler> {
-        todo!()
-        // get_proxies_from_providers(&self.providers, touch).await
+        get_proxies_from_providers(&self.providers, touch).await
     }
 
     async fn find_alive_proxy(&self, touch: bool) -> AnyOutboundHandler {

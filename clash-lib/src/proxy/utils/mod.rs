@@ -9,4 +9,6 @@ mod platform;
 
 mod proxy_connector;
 
+pub mod provider_helper;
+
 pub use proxy_connector::*;
