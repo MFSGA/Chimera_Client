@@ -9,6 +9,8 @@ pub mod selector;
 
 pub mod urltest;
 
+pub mod fallback;
+
 /// Convenience trait for group proxy serializing API responses.
 #[async_trait]
 pub trait GroupProxyAPIResponse: OutboundHandler {

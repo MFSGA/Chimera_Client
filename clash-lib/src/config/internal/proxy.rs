@@ -256,6 +256,8 @@ pub struct OutboundVless {
 pub enum OutboundGroupProtocol {
     #[serde(rename = "url-test")]
     UrlTest(OutboundGroupUrlTest),
+    #[serde(rename = "fallback")]
+    Fallback(OutboundGroupFallback),
     #[serde(rename = "select")]
     Select(OutboundGroupSelect),
 }
@@ -267,8 +269,8 @@ impl OutboundGroupProtocol {
     pub fn name(&self) -> &str {
         match &self {
             OutboundGroupProtocol::UrlTest(g) => &g.name,
-            /* OutboundGroupProtocol::Relay(g) => &g.name,
             OutboundGroupProtocol::Fallback(g) => &g.name,
+            /* OutboundGroupProtocol::Relay(g) => &g.name,
             OutboundGroupProtocol::LoadBalance(g) => &g.name,
             OutboundGroupProtocol::Smart(g) => &g.name, */
             OutboundGroupProtocol::Select(g) => &g.name,
@@ -280,6 +282,7 @@ impl OutboundGroupProtocol {
         match &self {
             OutboundGroupProtocol::Select(g) => g.proxies.as_ref(),
             OutboundGroupProtocol::UrlTest(g) => g.proxies.as_ref(),
+            OutboundGroupProtocol::Fallback(g) => g.proxies.as_ref(),
         }
     }
 }
@@ -297,6 +300,21 @@ pub struct OutboundGroupUrlTest {
     pub interval: u64,
     pub lazy: Option<bool>,
     pub tolerance: Option<u16>,
+    pub icon: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+pub struct OutboundGroupFallback {
+    pub name: String,
+
+    pub proxies: Option<Vec<String>>,
+    #[serde(rename = "use")]
+    pub use_provider: Option<Vec<String>>,
+
+    pub url: String,
+    #[serde(deserialize_with = "utils::deserialize_u64")]
+    pub interval: u64,
+    pub lazy: Option<bool>,
     pub icon: Option<String>,
 }
 

@@ -175,6 +175,7 @@ pub enum OutboundType {
 
     #[serde(rename = "URLTest")]
     UrlTest,
+    Fallback,
 }
 
 impl Display for OutboundType {
@@ -196,7 +197,7 @@ impl Display for OutboundType {
             OutboundType::Relay => write!(f, "Relay"),
             OutboundType::LoadBalance => write!(f, "LoadBalance"),
             OutboundType::Smart => write!(f, "Smart"),
-            OutboundType::Fallback => write!(f, "Fallback"), */
+             */
             OutboundType::Vless => write!(f, "Vless"),
             OutboundType::Trojan => write!(f, "Trojan"),
             OutboundType::Hysteria2 => write!(f, "Hysteria2"),
@@ -205,6 +206,7 @@ impl Display for OutboundType {
             OutboundType::Reject => write!(f, "Reject"),
 
             OutboundType::UrlTest => write!(f, "URLTest"),
+            OutboundType::Fallback => write!(f, "Fallback"),
         }
     }
 }
