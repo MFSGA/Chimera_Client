@@ -1,8 +1,9 @@
 pub use super::dns_client::DNSNetMode;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
-use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+use ipnet::{AddrParseError, IpNet, Ipv4Net, Ipv6Net};
 use serde::Deserialize;
 use std::fmt::Display;
 use tracing::warn;
@@ -39,7 +40,7 @@ impl Display for NameServer {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub struct FallbackFilter {
     pub geo_ip: bool,
     pub geo_ip_code: String,
@@ -74,7 +75,7 @@ pub struct DNSConfig {
 }
 
 impl DNSConfig {
-    fn parse_nameserver(servers: &[String]) -> Result<Vec<NameServer>, Error> {
+    pub fn parse_nameserver(servers: &[String]) -> Result<Vec<NameServer>, Error> {
         let mut nameservers = Vec::new();
 
         for (index, server) in servers.iter().enumerate() {
@@ -179,7 +180,7 @@ impl DNSConfig {
         Ok(None)
     }
 
-    fn parse_nameserver_policy(
+    pub fn parse_nameserver_policy(
         policy: &HashMap<String, String>,
     ) -> Result<HashMap<String, NameServer>, Error> {
         let mut out = HashMap::new();
@@ -205,18 +206,11 @@ impl DNSConfig {
         Ok(out)
     }
 
-    fn parse_hosts(
+    pub fn parse_hosts(
         hosts: &HashMap<String, String>,
     ) -> Result<trie::StringTrie<IpAddr>, Error> {
         let mut out = trie::StringTrie::new();
-        out.insert(
-            "localhost",
-            std::sync::Arc::new(
-                "127.0.0.1"
-                    .parse::<IpAddr>()
-                    .expect("localhost ip should be valid"),
-            ),
-        );
+        out.insert("localhost", Arc::new("127.0.0.1".parse::<IpAddr>().unwrap()));
 
         for (host, ip) in hosts {
             let ip = ip.parse::<IpAddr>().map_err(|e| {
@@ -224,29 +218,24 @@ impl DNSConfig {
             })?;
             out.insert(
                 &host.trim_end_matches('.').to_ascii_lowercase(),
-                std::sync::Arc::new(ip),
+                Arc::new(ip),
             );
         }
 
         Ok(out)
     }
 
-    fn parse_fallback_filter(
-        filter: &DefFallbackFilter,
-    ) -> Result<FallbackFilter, Error> {
-        let mut ip_cidr = Vec::with_capacity(filter.ip_cidr.len());
-        for cidr in &filter.ip_cidr {
-            ip_cidr.push(cidr.parse::<IpNet>().map_err(|e| {
-                Error::InvalidConfig(format!("invalid fallback ipcidr {cidr}: {e}"))
-            })?);
+    pub fn parse_fallback_ip_cidr(ipcidr: &[String]) -> anyhow::Result<Vec<IpNet>> {
+        let mut output = vec![];
+
+        for ip in ipcidr {
+            let net: IpNet = ip
+                .parse()
+                .map_err(|x: AddrParseError| Error::InvalidConfig(x.to_string()))?;
+            output.push(net);
         }
 
-        Ok(FallbackFilter {
-            geo_ip: filter.geo_ip,
-            geo_ip_code: filter.geo_ip_code.to_uppercase(),
-            ip_cidr: (!ip_cidr.is_empty()).then_some(ip_cidr),
-            domain: filter.domain.clone(),
-        })
+        Ok(output)
     }
 
     fn parse_edns_client_subnet(
@@ -447,7 +436,7 @@ impl TryFrom<&crate::config::def::Config> for DNSConfig {
                 .unwrap_or_default(),
             nameserver,
             fallback,
-            fallback_filter: DNSConfig::parse_fallback_filter(&dc.fallback_filter)?,
+            fallback_filter: dc.fallback_filter.clone().into(),
             default_nameserver,
             nameserver_policy: DNSConfig::parse_nameserver_policy(
                 &dc.nameserver_policy,
@@ -469,6 +458,18 @@ impl TryFrom<&crate::config::def::Config> for DNSConfig {
                 .transpose()?,
             fw_mark: c.routing_mark,
         })
+    }
+}
+
+impl From<DefFallbackFilter> for FallbackFilter {
+    fn from(filter: DefFallbackFilter) -> Self {
+        let ip_cidr = DNSConfig::parse_fallback_ip_cidr(&filter.ip_cidr);
+        Self {
+            geo_ip: filter.geo_ip,
+            geo_ip_code: filter.geo_ip_code.to_uppercase(),
+            ip_cidr: ip_cidr.ok(),
+            domain: filter.domain,
+        }
     }
 }
 

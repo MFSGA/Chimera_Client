@@ -1,6 +1,7 @@
 use std::{
     fmt::{Debug, Display, Formatter},
     net::{IpAddr, SocketAddr},
+    str::FromStr,
     sync::Arc,
 };
 
@@ -10,6 +11,7 @@ use hickory_proto::{
     op::Message,
     op::ResponseCode,
     rr::{
+        Record,
         RecordType,
         rdata::opt::{ClientSubnet, EdnsCode, EdnsOption},
     },
@@ -27,7 +29,7 @@ use hickory_resolver::{
     name_server::TokioConnectionProvider,
 };
 use tokio::sync::RwLock;
-use tracing::warn;
+use tracing::{info, instrument, trace, warn};
 
 use crate::{
     Error,
@@ -67,6 +69,21 @@ impl Display for DNSNetMode {
     }
 }
 
+impl FromStr for DNSNetMode {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "UDP" => Ok(Self::Udp),
+            "TCP" => Ok(Self::Tcp),
+            "DoH" => Ok(Self::DoH),
+            "DoT" => Ok(Self::DoT),
+            "DHCP" => Ok(Self::Dhcp),
+            _ => Err(Error::DNSError("unsupported protocol".into())),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Opts {
     pub father: Option<Arc<dyn ClashResolver>>,
@@ -80,56 +97,144 @@ pub struct Opts {
     pub ipv6: bool,
 }
 
+type FwMark = Option<u32>;
+
 enum DnsConfig {
-    Udp(SocketAddr),
-    Tcp(SocketAddr),
-    Tls(SocketAddr, url::Host<String>),
-    Https(SocketAddr, url::Host<String>, String),
+    Udp(
+        SocketAddr,
+        Option<OutboundInterface>,
+        Arc<dyn OutboundHandler>,
+        FwMark,
+    ),
+    Tcp(
+        SocketAddr,
+        Option<OutboundInterface>,
+        Arc<dyn OutboundHandler>,
+        FwMark,
+    ),
+    Tls(
+        SocketAddr,
+        url::Host<String>,
+        Option<OutboundInterface>,
+        Arc<dyn OutboundHandler>,
+        FwMark,
+    ),
+    Https(
+        SocketAddr,
+        url::Host<String>,
+        Option<OutboundInterface>,
+        Arc<dyn OutboundHandler>,
+        FwMark,
+    ),
     Dhcp(Option<String>),
 }
 
 impl Display for DnsConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            DnsConfig::Udp(addr) => write!(f, "UDP: {}:{}", addr.ip(), addr.port()),
-            DnsConfig::Tcp(addr) => write!(f, "TCP: {}:{}", addr.ip(), addr.port()),
-            DnsConfig::Tls(addr, host) => {
-                write!(f, "TLS: {}:{} host: {}", addr.ip(), addr.port(), host)
+            DnsConfig::Udp(addr, iface, proxy, _) => {
+                write!(f, "UDP: {}:{} ", addr.ip(), addr.port())?;
+                if let Some(iface) = iface {
+                    write!(f, "bind: {} ", iface.name)?;
+                }
+                write!(f, "via proxy: {}", proxy.name())
             }
-            DnsConfig::Https(addr, host, endpoint) => {
-                write!(
-                    f,
-                    "HTTPS: {}:{} host: {} endpoint: {}",
-                    addr.ip(),
-                    addr.port(),
-                    host,
-                    endpoint
-                )
+            DnsConfig::Tcp(addr, iface, proxy, _) => {
+                write!(f, "TCP: {}:{} ", addr.ip(), addr.port())?;
+                if let Some(iface) = iface {
+                    write!(f, "bind: {} ", iface.name)?;
+                }
+                write!(f, "via proxy: {}", proxy.name())
+            }
+            DnsConfig::Tls(addr, host, iface, proxy, _) => {
+                write!(f, "TLS: {}:{} ", addr.ip(), addr.port())?;
+                if let Some(iface) = iface {
+                    write!(f, "bind: {} ", iface.name)?;
+                }
+                write!(f, "host: {host}")?;
+                write!(f, "via proxy: {}", proxy.name())
+            }
+            DnsConfig::Https(addr, host, iface, proxy, _) => {
+                write!(f, "HTTPS: {}:{} ", addr.ip(), addr.port())?;
+                if let Some(iface) = iface {
+                    write!(f, "bind: {} ", iface.name)?;
+                }
+                write!(f, "host: {host}")?;
+                write!(f, "via proxy: {}", proxy.name())
             }
             DnsConfig::Dhcp(iface) => write!(f, "DHCP: {:?}", iface),
         }
     }
 }
 
+impl DnsConfig {
+    fn addr(&self) -> Option<SocketAddr> {
+        match self {
+            DnsConfig::Udp(addr, ..)
+            | DnsConfig::Tcp(addr, ..)
+            | DnsConfig::Tls(addr, ..)
+            | DnsConfig::Https(addr, ..) => Some(*addr),
+            DnsConfig::Dhcp(_) => None,
+        }
+    }
+
+    fn iface(&self) -> Option<&OutboundInterface> {
+        match self {
+            DnsConfig::Udp(_, iface, ..)
+            | DnsConfig::Tcp(_, iface, ..)
+            | DnsConfig::Tls(_, _, iface, ..)
+            | DnsConfig::Https(_, _, iface, ..) => iface.as_ref(),
+            DnsConfig::Dhcp(_) => None,
+        }
+    }
+
+    fn fw_mark(&self) -> Option<u32> {
+        match self {
+            DnsConfig::Udp(_, _, _, fw_mark)
+            | DnsConfig::Tcp(_, _, _, fw_mark)
+            | DnsConfig::Tls(_, _, _, _, fw_mark)
+            | DnsConfig::Https(_, _, _, _, fw_mark) => *fw_mark,
+            DnsConfig::Dhcp(_) => None,
+        }
+    }
+
+    fn proxy(&self) -> Option<&Arc<dyn OutboundHandler>> {
+        match self {
+            DnsConfig::Udp(_, _, proxy, _)
+            | DnsConfig::Tcp(_, _, proxy, _)
+            | DnsConfig::Tls(_, _, _, proxy, _)
+            | DnsConfig::Https(_, _, _, proxy, _) => Some(proxy),
+            DnsConfig::Dhcp(_) => None,
+        }
+    }
+}
+
+#[derive(Default)]
 struct Inner {
     resolver: Option<TokioResolver>,
 }
 
 pub struct DnsClient {
     inner: Arc<RwLock<Inner>>,
+
     cfg: DnsConfig,
-    proxy: Arc<dyn OutboundHandler>,
+
     host: url::Host<String>,
     port: u16,
     net: DNSNetMode,
-    iface: Option<OutboundInterface>,
     ecs: Option<EdnsClientSubnet>,
-    fw_mark: Option<u32>,
     ipv6: bool,
-    bind_addr: Option<SocketAddr>,
 }
 
 impl DnsClient {
+    fn upstream_timeout() -> std::time::Duration {
+        std::time::Duration::from_secs(5)
+    }
+
+    fn doh_endpoint() -> String {
+        "/dns-query".to_string()
+    }
+
     pub async fn new_client(opts: Opts) -> anyhow::Result<ThreadSafeDNSClient> {
         if opts.net == DNSNetMode::Dhcp {
             let iface_name = match &opts.host {
@@ -142,61 +247,97 @@ impl DnsClient {
             };
 
             return Ok(Arc::new(Self {
-                inner: Arc::new(RwLock::new(Inner { resolver: None })),
+                inner: Arc::new(RwLock::new(Inner::default())),
                 cfg: DnsConfig::Dhcp(iface_name),
-                proxy: opts.proxy,
                 host: opts.host,
                 port: opts.port,
                 net: opts.net,
-                iface: opts.iface,
                 ecs: opts.ecs,
-                fw_mark: opts.fw_mark,
                 ipv6: opts.ipv6,
-                bind_addr: None,
             }));
         }
 
-        let resolved_ip = match &opts.host {
-            url::Host::Ipv4(ip) => Some(IpAddr::V4(*ip)),
-            url::Host::Ipv6(ip) => Some(IpAddr::V6(*ip)),
-            url::Host::Domain(domain) => match &opts.father {
-                Some(father) => father.resolve(domain, false).await?,
-                None => tokio::net::lookup_host((domain.as_str(), opts.port))
-                    .await?
-                    .next()
-                    .map(|addr| addr.ip()),
-            },
+        let mut ip: Option<IpAddr> = None;
+        let need_resolve = match &opts.host {
+            url::Host::Domain(domain) => Some(domain),
+            url::Host::Ipv4(addr) => {
+                ip = Some(IpAddr::V4(*addr));
+                None
+            }
+            url::Host::Ipv6(addr) => {
+                ip = Some(IpAddr::V6(*addr));
+                None
+            }
         };
-        let ip = resolved_ip.ok_or_else(|| {
-            anyhow::anyhow!("no ip resolved for dns server {}", opts.host)
+
+        let resolved_ip = match need_resolve {
+            Some(domain) => match &opts.father {
+                Some(father) => match father.resolve(domain, false).await? {
+                    Some(ip) => Some(ip),
+                    None => {
+                        return Err(Error::InvalidConfig(format!(
+                            "can't resolve default DNS: {}",
+                            domain
+                        ))
+                        .into());
+                    }
+                },
+                None => {
+                    return Err(Error::DNSError(format!(
+                        "unable to resolve DNS hostname {} without a default resolver",
+                        domain
+                    ))
+                    .into());
+                }
+            },
+            None => None,
+        };
+        let ip = ip.or(resolved_ip).ok_or_else(|| {
+            anyhow::anyhow!(
+                "invalid DNS host: {}, unable to parse as IP and no default resolver",
+                opts.host
+            )
         })?;
         let socket_addr = SocketAddr::new(ip, opts.port);
-        let bind_addr = resolve_bind_addr(opts.iface.as_ref(), socket_addr);
 
         let cfg = match opts.net {
-            DNSNetMode::Udp => DnsConfig::Udp(socket_addr),
-            DNSNetMode::Tcp => DnsConfig::Tcp(socket_addr),
-            DNSNetMode::DoT => DnsConfig::Tls(socket_addr, opts.host.clone()),
+            DNSNetMode::Udp => DnsConfig::Udp(
+                socket_addr,
+                opts.iface.clone(),
+                opts.proxy.clone(),
+                opts.fw_mark,
+            ),
+            DNSNetMode::Tcp => DnsConfig::Tcp(
+                socket_addr,
+                opts.iface.clone(),
+                opts.proxy.clone(),
+                opts.fw_mark,
+            ),
+            DNSNetMode::DoT => DnsConfig::Tls(
+                socket_addr,
+                opts.host.clone(),
+                opts.iface.clone(),
+                opts.proxy.clone(),
+                opts.fw_mark,
+            ),
             DNSNetMode::DoH => DnsConfig::Https(
                 socket_addr,
                 opts.host.clone(),
-                "/dns-query".to_string(),
+                opts.iface.clone(),
+                opts.proxy.clone(),
+                opts.fw_mark,
             ),
             DNSNetMode::Dhcp => unreachable!("dhcp handled before resolving host"),
         };
 
         Ok(Arc::new(Self {
-            inner: Arc::new(RwLock::new(Inner { resolver: None })),
+            inner: Arc::new(RwLock::new(Inner::default())),
             cfg,
-            proxy: opts.proxy,
             host: opts.host,
             port: opts.port,
             net: opts.net,
-            iface: opts.iface,
             ecs: opts.ecs,
-            fw_mark: opts.fw_mark,
             ipv6: opts.ipv6,
-            bind_addr,
         }))
     }
 
@@ -253,27 +394,44 @@ impl DnsClient {
         options.insert(EdnsOption::Subnet(ClientSubnet::new(addr, prefix, prefix)));
     }
 
-    async fn ensure_resolver(&self) -> anyhow::Result<TokioResolver> {
-        if let Some(resolver) = self.inner.read().await.resolver.clone() {
-            return Ok(resolver);
-        }
+    fn resolver_opts(&self) -> ResolverOpts {
+        let mut resolver_opts = ResolverOpts::default();
+        resolver_opts.ip_strategy = if self.ipv6 {
+            hickory_resolver::config::LookupIpStrategy::Ipv4AndIpv6
+        } else {
+            hickory_resolver::config::LookupIpStrategy::Ipv4Only
+        };
+        resolver_opts
+    }
 
-        if self.proxy.name() != "DIRECT" {
-            warn!(
-                proxy = self.proxy.name(),
-                dns = %self.id(),
-                "dns upstream proxy dialing is not implemented yet, falling back to direct connect"
-            );
-        }
+    fn name_server_config(&self) -> anyhow::Result<Option<NameServerConfig>> {
+        let Some(addr) = self.cfg.addr() else {
+            return Ok(None);
+        };
 
-        if self.fw_mark.is_some() {
-            warn!(
-                fw_mark = self.fw_mark,
-                dns = %self.id(),
-                "dns upstream fw_mark is not implemented yet"
-            );
-        }
+        let mut name_server = match &self.cfg {
+            DnsConfig::Udp(..) => NameServerConfig::new(addr, Protocol::Udp),
+            DnsConfig::Tcp(..) => NameServerConfig::new(addr, Protocol::Tcp),
+            DnsConfig::Tls(_, host, ..) => {
+                let mut ns = NameServerConfig::new(addr, Protocol::Tls);
+                ns.tls_dns_name = Some(host.to_string());
+                ns
+            }
+            DnsConfig::Https(_, host, ..) => {
+                let mut ns = NameServerConfig::new(addr, Protocol::Https);
+                ns.tls_dns_name = Some(host.to_string());
+                ns.http_endpoint = Some(Self::doh_endpoint());
+                ns
+            }
+            DnsConfig::Dhcp(_) => return Ok(None),
+        };
+        name_server.bind_addr =
+            Some(addr).and_then(|addr| resolve_bind_addr(self.cfg.iface(), addr));
 
+        Ok(Some(name_server))
+    }
+
+    async fn build_resolver(&self) -> anyhow::Result<TokioResolver> {
         if let DnsConfig::Dhcp(iface) = &self.cfg {
             if iface.is_some() {
                 warn!(
@@ -289,57 +447,54 @@ impl DnsClient {
                         "failed to read system dns config for dhcp upstream: {e}"
                     )
                 })?;
-            resolver_opts.ip_strategy = if self.ipv6 {
-                hickory_resolver::config::LookupIpStrategy::Ipv4AndIpv6
-            } else {
-                hickory_resolver::config::LookupIpStrategy::Ipv4Only
-            };
+            resolver_opts.ip_strategy = self.resolver_opts().ip_strategy;
 
-            let resolver = TokioResolver::builder_with_config(
+            return Ok(TokioResolver::builder_with_config(
                 config,
                 TokioConnectionProvider::default(),
             )
             .with_options(resolver_opts)
-            .build();
-
-            self.inner.write().await.resolver = Some(resolver.clone());
-            return Ok(resolver);
+            .build());
         }
 
         let mut config = ResolverConfig::new();
-        let mut name_server = match &self.cfg {
-            DnsConfig::Udp(addr) => NameServerConfig::new(*addr, Protocol::Udp),
-            DnsConfig::Tcp(addr) => NameServerConfig::new(*addr, Protocol::Tcp),
-            DnsConfig::Tls(addr, host) => {
-                let mut ns = NameServerConfig::new(*addr, Protocol::Tls);
-                ns.tls_dns_name = Some(host.to_string());
-                ns
-            }
-            DnsConfig::Https(addr, host, endpoint) => {
-                let mut ns = NameServerConfig::new(*addr, Protocol::Https);
-                ns.tls_dns_name = Some(host.to_string());
-                ns.http_endpoint = Some(endpoint.clone());
-                ns
-            }
-            DnsConfig::Dhcp(_) => unreachable!("dhcp handled above"),
-        };
-        name_server.bind_addr = self.bind_addr;
-        config.add_name_server(name_server);
+        if let Some(name_server) = self.name_server_config()? {
+            config.add_name_server(name_server);
+        }
 
-        let mut resolver_opts = ResolverOpts::default();
-        resolver_opts.ip_strategy = if self.ipv6 {
-            hickory_resolver::config::LookupIpStrategy::Ipv4AndIpv6
-        } else {
-            hickory_resolver::config::LookupIpStrategy::Ipv4Only
-        };
-
-        let resolver = TokioResolver::builder_with_config(
+        Ok(TokioResolver::builder_with_config(
             config,
             TokioConnectionProvider::default(),
         )
-        .with_options(resolver_opts)
-        .build();
+        .with_options(self.resolver_opts())
+        .build())
+    }
 
+    async fn ensure_resolver(&self) -> anyhow::Result<TokioResolver> {
+        if let Some(resolver) = self.inner.read().await.resolver.clone() {
+            trace!("dns client resolver is initialized, reusing existing resolver");
+            return Ok(resolver);
+        }
+
+        info!("initializing dns client: {}", &self.cfg);
+
+        if self.cfg.proxy().map(|proxy| proxy.name()) != Some("DIRECT") {
+            warn!(
+                proxy = self.cfg.proxy().map(|proxy| proxy.name()).unwrap_or("DIRECT"),
+                dns = %self.id(),
+                "dns upstream proxy dialing is not implemented yet, falling back to direct connect"
+            );
+        }
+
+        if self.cfg.fw_mark().is_some() {
+            warn!(
+                fw_mark = self.cfg.fw_mark(),
+                dns = %self.id(),
+                "dns upstream fw_mark is not implemented yet"
+            );
+        }
+
+        let resolver = self.build_resolver().await?;
         self.inner.write().await.resolver = Some(resolver.clone());
         Ok(resolver)
     }
@@ -358,18 +513,10 @@ impl DnsClient {
             .lookup(query.name().clone(), query.query_type())
             .await?;
 
-        let records: Vec<_> = lookup.record_iter().cloned().collect();
-        let mut response = build_dns_response_message(message, true, false);
-
-        if records.is_empty() {
-            response.set_response_code(ResponseCode::NXDomain);
-            return Ok(response);
-        }
-
-        response.set_response_code(ResponseCode::NoError);
-        response.set_answer_count(records.len() as u16);
-        response.add_answers(records);
-        Ok(response)
+        Ok(self.lookup_response(
+            message,
+            lookup.record_iter().cloned().collect(),
+        ))
     }
 
     async fn exchange_via_direct(
@@ -377,21 +524,21 @@ impl DnsClient {
         message: &Message,
     ) -> anyhow::Result<Message> {
         match &self.cfg {
-            DnsConfig::Udp(addr) => {
+            DnsConfig::Udp(addr, ..) => {
                 self.exchange_via_direct_udp(*addr, message).await
             }
-            DnsConfig::Tcp(addr) => {
+            DnsConfig::Tcp(addr, ..) => {
                 self.exchange_via_direct_tcp(*addr, message).await
             }
-            DnsConfig::Tls(addr, host) => {
+            DnsConfig::Tls(addr, host, ..) => {
                 self.exchange_via_direct_tls(*addr, host.to_string(), message)
                     .await
             }
-            DnsConfig::Https(addr, host, endpoint) => {
+            DnsConfig::Https(addr, host, ..) => {
                 self.exchange_via_direct_https(
                     *addr,
                     host.to_string(),
-                    endpoint.clone(),
+                    Self::doh_endpoint(),
                     message,
                 )
                 .await
@@ -405,27 +552,49 @@ impl DnsClient {
         message: &Message,
     ) -> anyhow::Result<Message> {
         match &self.cfg {
-            DnsConfig::Udp(addr) => {
+            DnsConfig::Udp(addr, ..) => {
                 self.exchange_via_proxy_udp(*addr, message).await
             }
-            DnsConfig::Tcp(addr) => {
+            DnsConfig::Tcp(addr, ..) => {
                 self.exchange_via_proxy_tcp(*addr, message).await
             }
-            DnsConfig::Tls(addr, host) => {
+            DnsConfig::Tls(addr, host, ..) => {
                 self.exchange_via_proxy_tls(*addr, host.to_string(), message)
                     .await
             }
-            DnsConfig::Https(addr, host, endpoint) => {
+            DnsConfig::Https(addr, host, ..) => {
                 self.exchange_via_proxy_https(
                     *addr,
                     host.to_string(),
-                    endpoint.clone(),
+                    Self::doh_endpoint(),
                     message,
                 )
                 .await
             }
             DnsConfig::Dhcp(_) => self.exchange_via_resolver(message).await,
         }
+    }
+
+    fn is_direct(&self) -> bool {
+        self.cfg.proxy().map(|proxy| proxy.name()) == Some("DIRECT")
+    }
+
+    fn should_use_direct_exchange(&self) -> bool {
+        self.is_direct() && (self.cfg.fw_mark().is_some() || self.ecs.is_some())
+    }
+
+    fn lookup_response(&self, message: &Message, records: Vec<Record>) -> Message {
+        let mut response = build_dns_response_message(message, true, false);
+
+        if records.is_empty() {
+            response.set_response_code(ResponseCode::NXDomain);
+            return response;
+        }
+
+        response.set_response_code(ResponseCode::NoError);
+        response.set_answer_count(records.len() as u16);
+        response.add_answers(records);
+        response
     }
 
     async fn exchange_via_proxy_udp(
@@ -441,13 +610,10 @@ impl DnsClient {
         );
 
         datagram.send(request).await?;
-        let response =
-            tokio::time::timeout(std::time::Duration::from_secs(5), datagram.next())
-                .await
-                .map_err(|_| anyhow::anyhow!("dns udp upstream timeout"))?
-                .ok_or_else(|| {
-                    anyhow::anyhow!("dns udp upstream returned no response")
-                })?;
+        let response = tokio::time::timeout(Self::upstream_timeout(), datagram.next())
+            .await
+            .map_err(|_| anyhow::anyhow!("dns udp upstream timeout"))?
+            .ok_or_else(|| anyhow::anyhow!("dns udp upstream returned no response"))?;
 
         Ok(Message::from_vec(&response.data)?)
     }
@@ -459,15 +625,15 @@ impl DnsClient {
     ) -> anyhow::Result<Message> {
         let socket = new_udp_socket(
             socket_addr,
-            self.iface.as_ref(),
+            self.cfg.iface(),
             #[cfg(target_os = "linux")]
-            self.fw_mark,
+            self.cfg.fw_mark(),
         )?;
 
         socket.send_to(&message.to_vec()?, socket_addr).await?;
         let mut buf = vec![0u8; 65535];
         let (len, _) = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            Self::upstream_timeout(),
             socket.recv_from(&mut buf),
         )
         .await
@@ -486,7 +652,7 @@ impl DnsClient {
         let (stream, handle) = TcpStream::with_future(
             future,
             socket_addr,
-            std::time::Duration::from_secs(5),
+            Self::upstream_timeout(),
         );
         let stream = Box::pin(async move {
             let stream = stream.await?;
@@ -501,24 +667,11 @@ impl DnsClient {
         socket_addr: SocketAddr,
         message: &Message,
     ) -> anyhow::Result<Message> {
-        let iface = self.iface.clone();
-        #[cfg(target_os = "linux")]
-        let so_mark = self.fw_mark;
-        let future = Box::pin(async move {
-            Ok::<_, std::io::Error>(AsyncIoTokioAsStd(
-                new_tcp_stream(
-                    socket_addr,
-                    iface.as_ref(),
-                    #[cfg(target_os = "linux")]
-                    so_mark,
-                )
-                .await?,
-            ))
-        });
+        let future = self.connect_direct_stream(socket_addr);
         let (stream, handle) = TcpStream::with_future(
             future,
             socket_addr,
-            std::time::Duration::from_secs(5),
+            Self::upstream_timeout(),
         );
         let stream = Box::pin(async move {
             let stream = stream.await?;
@@ -533,22 +686,10 @@ impl DnsClient {
         dns_name: String,
         message: &Message,
     ) -> anyhow::Result<Message> {
-        let iface = self.iface.clone();
-        #[cfg(target_os = "linux")]
-        let so_mark = self.fw_mark;
         let mut tls_config = client_config();
         tls_config.enable_sni = false;
         let (stream, handle) = tls_client_connect_with_future(
-            Box::pin(async move {
-                let stream = new_tcp_stream(
-                    socket_addr,
-                    iface.as_ref(),
-                    #[cfg(target_os = "linux")]
-                    so_mark,
-                )
-                .await?;
-                Ok(AsyncIoTokioAsStd(stream))
-            }),
+            self.connect_direct_stream(socket_addr),
             socket_addr,
             dns_name,
             Arc::new(tls_config),
@@ -564,24 +705,12 @@ impl DnsClient {
         endpoint: String,
         message: &Message,
     ) -> anyhow::Result<Message> {
-        let iface = self.iface.clone();
-        #[cfg(target_os = "linux")]
-        let so_mark = self.fw_mark;
         let exchange: hickory_proto::xfer::DnsExchangeConnect<
             _,
             _,
             hickory_proto::runtime::TokioTime,
         > = DnsExchange::connect(hickory_proto::h2::HttpsClientConnect::new(
-            Box::pin(async move {
-                let stream = new_tcp_stream(
-                    socket_addr,
-                    iface.as_ref(),
-                    #[cfg(target_os = "linux")]
-                    so_mark,
-                )
-                .await?;
-                Ok(AsyncIoTokioAsStd(stream))
-            }),
+            self.connect_direct_stream(socket_addr),
             Arc::new(client_config()),
             socket_addr,
             dns_name,
@@ -652,7 +781,7 @@ impl DnsClient {
         > = DnsExchange::connect(DnsMultiplexer::with_timeout(
             stream,
             handle,
-            std::time::Duration::from_secs(5),
+            Self::upstream_timeout(),
             None,
         ));
 
@@ -699,14 +828,18 @@ impl DnsClient {
                 + 'static,
         >,
     > {
-        let proxy = self.proxy.clone();
+        let proxy = self
+            .cfg
+            .proxy()
+            .expect("proxy-backed dns config should carry outbound handler")
+            .clone();
         let resolver = Arc::new(
             SystemResolver::new(self.ipv6)
                 .expect("failed to create system resolver for proxied dns upstream"),
         );
         let destination = self.proxy_destination(socket_addr);
-        let iface = self.iface.clone();
-        let so_mark = self.fw_mark;
+        let iface = self.cfg.iface().cloned();
+        let so_mark = self.cfg.fw_mark();
 
         Box::pin(async move {
             let session = Session {
@@ -724,6 +857,35 @@ impl DnsClient {
         })
     }
 
+    fn connect_direct_stream(
+        &self,
+        socket_addr: SocketAddr,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = std::io::Result<
+                        AsyncIoTokioAsStd<tokio::net::TcpStream>,
+                    >,
+                > + Send
+                + 'static,
+        >,
+    > {
+        let iface = self.cfg.iface().cloned();
+        #[cfg(target_os = "linux")]
+        let so_mark = self.cfg.fw_mark();
+
+        Box::pin(async move {
+            let stream = new_tcp_stream(
+                socket_addr,
+                iface.as_ref(),
+                #[cfg(target_os = "linux")]
+                so_mark,
+            )
+            .await?;
+            Ok(AsyncIoTokioAsStd(stream))
+        })
+    }
+
     async fn connect_proxy_datagram(
         &self,
         socket_addr: SocketAddr,
@@ -736,13 +898,17 @@ impl DnsClient {
             network: Network::Udp,
             typ: Type::Ignore,
             destination: self.proxy_destination(socket_addr),
-            iface: self.iface.clone(),
+            iface: self.cfg.iface().cloned(),
             #[cfg(target_os = "linux")]
-            so_mark: self.fw_mark,
+            so_mark: self.cfg.fw_mark(),
             ..Default::default()
         };
 
-        self.proxy.connect_datagram(&session, resolver).await
+        self.cfg
+            .proxy()
+            .expect("proxy-backed dns config should carry outbound handler")
+            .connect_datagram(&session, resolver)
+            .await
     }
 
     fn proxy_destination(&self, socket_addr: SocketAddr) -> SocksAddr {
@@ -809,8 +975,8 @@ impl Debug for DnsClient {
             .field("host", &self.host)
             .field("port", &self.port)
             .field("net", &self.net)
-            .field("iface", &self.iface)
-            .field("proxy", &self.proxy.name())
+            .field("iface", &self.cfg.iface())
+            .field("proxy", &self.cfg.proxy().map(|proxy| proxy.name()))
             .finish()
     }
 }
@@ -821,15 +987,14 @@ impl Client for DnsClient {
         format!("{}#{}:{}", &self.net, &self.host, &self.port)
     }
 
+    #[instrument(skip(msg), level = "trace")]
     async fn exchange(&self, msg: &Message) -> anyhow::Result<Message> {
         let mut outbound = msg.clone();
         self.apply_edns_client_subnet(&mut outbound);
 
-        if self.proxy.name() == "DIRECT"
-            && (self.fw_mark.is_some() || self.ecs.is_some())
-        {
+        if self.should_use_direct_exchange() {
             self.exchange_via_direct(&outbound).await
-        } else if self.proxy.name() == "DIRECT" {
+        } else if self.is_direct() {
             self.exchange_via_resolver(&outbound).await
         } else {
             self.exchange_via_proxy(&outbound).await
