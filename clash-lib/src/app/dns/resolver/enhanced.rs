@@ -75,7 +75,6 @@ impl EnhancedResolver {
 
         let (fallback_domain_filters, fallback_ip_filters) =
             build_fallback_filters(&cfg, mmdb.clone());
-        let hosts = build_hosts_trie(&cfg.hosts);
         let fake_dns =
             build_fake_dns(&cfg, store.clone()).expect("failed to create fake dns");
         let default_resolver = Arc::new(EnhancedResolver {
@@ -135,7 +134,7 @@ impl EnhancedResolver {
         Self {
             ipv6: AtomicBool::new(cfg.ipv6),
             store,
-            hosts,
+            hosts: cfg.hosts,
             main,
             fallback,
             fallback_domain_filters,
@@ -657,7 +656,13 @@ fn build_fallback_filters(
             .push(Box::new(DomainFilter::new(&cfg.fallback_filter.domain)));
     }
 
-    if cfg.fallback_filter.geo_ip || !cfg.fallback_filter.ip_cidr.is_empty() {
+    if cfg.fallback_filter.geo_ip
+        || cfg
+            .fallback_filter
+            .ip_cidr
+            .as_ref()
+            .is_some_and(|ip_cidr| !ip_cidr.is_empty())
+    {
         if cfg.fallback_filter.geo_ip {
             ip_filters.push(Box::new(GeoIPFilter::new(
                 &cfg.fallback_filter.geo_ip_code,
@@ -665,8 +670,10 @@ fn build_fallback_filters(
             )));
         }
 
-        for cidr in &cfg.fallback_filter.ip_cidr {
-            ip_filters.push(Box::new(IPNetFilter::new(*cidr)));
+        if let Some(ip_cidr) = &cfg.fallback_filter.ip_cidr {
+            for cidr in ip_cidr {
+                ip_filters.push(Box::new(IPNetFilter::new(*cidr)));
+            }
         }
     }
 
@@ -698,18 +705,6 @@ async fn build_policy_resolvers(
             out.insert(domain, Arc::new(resolvers));
         }
     }
-    has_entries.then_some(out)
-}
-
-fn build_hosts_trie(hosts: &HashMap<String, IpAddr>) -> Option<StringTrie<IpAddr>> {
-    let mut out = StringTrie::new();
-    let mut has_entries = false;
-
-    for (host, ip) in hosts {
-        has_entries = true;
-        out.insert(host, Arc::new(*ip));
-    }
-
     has_entries.then_some(out)
 }
 

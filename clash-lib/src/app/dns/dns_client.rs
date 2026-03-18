@@ -73,7 +73,7 @@ pub struct Opts {
     pub host: url::Host<String>,
     pub port: u16,
     pub net: DNSNetMode,
-    pub iface: Option<String>,
+    pub iface: Option<OutboundInterface>,
     pub proxy: Arc<dyn OutboundHandler>,
     pub ecs: Option<EdnsClientSubnet>,
     pub fw_mark: Option<u32>,
@@ -84,7 +84,7 @@ enum DnsConfig {
     Udp(SocketAddr),
     Tcp(SocketAddr),
     Tls(SocketAddr, url::Host<String>),
-    Https(SocketAddr, url::Host<String>),
+    Https(SocketAddr, url::Host<String>, String),
     Dhcp(Option<String>),
 }
 
@@ -96,8 +96,15 @@ impl Display for DnsConfig {
             DnsConfig::Tls(addr, host) => {
                 write!(f, "TLS: {}:{} host: {}", addr.ip(), addr.port(), host)
             }
-            DnsConfig::Https(addr, host) => {
-                write!(f, "HTTPS: {}:{} host: {}", addr.ip(), addr.port(), host)
+            DnsConfig::Https(addr, host, endpoint) => {
+                write!(
+                    f,
+                    "HTTPS: {}:{} host: {} endpoint: {}",
+                    addr.ip(),
+                    addr.port(),
+                    host,
+                    endpoint
+                )
             }
             DnsConfig::Dhcp(iface) => write!(f, "DHCP: {:?}", iface),
         }
@@ -115,7 +122,7 @@ pub struct DnsClient {
     host: url::Host<String>,
     port: u16,
     net: DNSNetMode,
-    iface: Option<String>,
+    iface: Option<OutboundInterface>,
     ecs: Option<EdnsClientSubnet>,
     fw_mark: Option<u32>,
     ipv6: bool,
@@ -125,23 +132,23 @@ pub struct DnsClient {
 impl DnsClient {
     pub async fn new_client(opts: Opts) -> anyhow::Result<ThreadSafeDNSClient> {
         if opts.net == DNSNetMode::Dhcp {
-            let iface = match &opts.host {
+            let iface_name = match &opts.host {
                 url::Host::Domain(iface)
                     if iface != "system" && !iface.is_empty() =>
                 {
                     Some(iface.clone())
                 }
-                _ => opts.iface.clone(),
+                _ => opts.iface.as_ref().map(|iface| iface.name.clone()),
             };
 
             return Ok(Arc::new(Self {
                 inner: Arc::new(RwLock::new(Inner { resolver: None })),
-                cfg: DnsConfig::Dhcp(iface.clone()),
+                cfg: DnsConfig::Dhcp(iface_name),
                 proxy: opts.proxy,
                 host: opts.host,
                 port: opts.port,
                 net: opts.net,
-                iface,
+                iface: opts.iface,
                 ecs: opts.ecs,
                 fw_mark: opts.fw_mark,
                 ipv6: opts.ipv6,
@@ -164,13 +171,17 @@ impl DnsClient {
             anyhow::anyhow!("no ip resolved for dns server {}", opts.host)
         })?;
         let socket_addr = SocketAddr::new(ip, opts.port);
-        let bind_addr = resolve_bind_addr(opts.iface.as_deref(), socket_addr);
+        let bind_addr = resolve_bind_addr(opts.iface.as_ref(), socket_addr);
 
         let cfg = match opts.net {
             DNSNetMode::Udp => DnsConfig::Udp(socket_addr),
             DNSNetMode::Tcp => DnsConfig::Tcp(socket_addr),
             DNSNetMode::DoT => DnsConfig::Tls(socket_addr, opts.host.clone()),
-            DNSNetMode::DoH => DnsConfig::Https(socket_addr, opts.host.clone()),
+            DNSNetMode::DoH => DnsConfig::Https(
+                socket_addr,
+                opts.host.clone(),
+                "/dns-query".to_string(),
+            ),
             DNSNetMode::Dhcp => unreachable!("dhcp handled before resolving host"),
         };
 
@@ -304,10 +315,10 @@ impl DnsClient {
                 ns.tls_dns_name = Some(host.to_string());
                 ns
             }
-            DnsConfig::Https(addr, host) => {
+            DnsConfig::Https(addr, host, endpoint) => {
                 let mut ns = NameServerConfig::new(*addr, Protocol::Https);
                 ns.tls_dns_name = Some(host.to_string());
-                ns.http_endpoint = Some("/dns-query".to_string());
+                ns.http_endpoint = Some(endpoint.clone());
                 ns
             }
             DnsConfig::Dhcp(_) => unreachable!("dhcp handled above"),
@@ -361,7 +372,7 @@ impl DnsClient {
         Ok(response)
     }
 
-    async fn exchange_direct_with_mark(
+    async fn exchange_via_direct(
         &self,
         message: &Message,
     ) -> anyhow::Result<Message> {
@@ -376,9 +387,14 @@ impl DnsClient {
                 self.exchange_via_direct_tls(*addr, host.to_string(), message)
                     .await
             }
-            DnsConfig::Https(addr, host) => {
-                self.exchange_via_direct_https(*addr, host.to_string(), message)
-                    .await
+            DnsConfig::Https(addr, host, endpoint) => {
+                self.exchange_via_direct_https(
+                    *addr,
+                    host.to_string(),
+                    endpoint.clone(),
+                    message,
+                )
+                .await
             }
             DnsConfig::Dhcp(_) => self.exchange_via_resolver(message).await,
         }
@@ -399,9 +415,14 @@ impl DnsClient {
                 self.exchange_via_proxy_tls(*addr, host.to_string(), message)
                     .await
             }
-            DnsConfig::Https(addr, host) => {
-                self.exchange_via_proxy_https(*addr, host.to_string(), message)
-                    .await
+            DnsConfig::Https(addr, host, endpoint) => {
+                self.exchange_via_proxy_https(
+                    *addr,
+                    host.to_string(),
+                    endpoint.clone(),
+                    message,
+                )
+                .await
             }
             DnsConfig::Dhcp(_) => self.exchange_via_resolver(message).await,
         }
@@ -438,7 +459,7 @@ impl DnsClient {
     ) -> anyhow::Result<Message> {
         let socket = new_udp_socket(
             socket_addr,
-            resolve_outbound_interface(self.iface.as_deref()).as_ref(),
+            self.iface.as_ref(),
             #[cfg(target_os = "linux")]
             self.fw_mark,
         )?;
@@ -480,7 +501,7 @@ impl DnsClient {
         socket_addr: SocketAddr,
         message: &Message,
     ) -> anyhow::Result<Message> {
-        let iface = resolve_outbound_interface(self.iface.as_deref());
+        let iface = self.iface.clone();
         #[cfg(target_os = "linux")]
         let so_mark = self.fw_mark;
         let future = Box::pin(async move {
@@ -512,7 +533,7 @@ impl DnsClient {
         dns_name: String,
         message: &Message,
     ) -> anyhow::Result<Message> {
-        let iface = resolve_outbound_interface(self.iface.as_deref());
+        let iface = self.iface.clone();
         #[cfg(target_os = "linux")]
         let so_mark = self.fw_mark;
         let mut tls_config = client_config();
@@ -540,9 +561,10 @@ impl DnsClient {
         &self,
         socket_addr: SocketAddr,
         dns_name: String,
+        endpoint: String,
         message: &Message,
     ) -> anyhow::Result<Message> {
-        let iface = resolve_outbound_interface(self.iface.as_deref());
+        let iface = self.iface.clone();
         #[cfg(target_os = "linux")]
         let so_mark = self.fw_mark;
         let exchange: hickory_proto::xfer::DnsExchangeConnect<
@@ -563,7 +585,7 @@ impl DnsClient {
             Arc::new(client_config()),
             socket_addr,
             dns_name,
-            "/dns-query".to_string(),
+            endpoint,
         ));
 
         self.run_exchange_connect(exchange, message).await
@@ -592,6 +614,7 @@ impl DnsClient {
         &self,
         socket_addr: SocketAddr,
         dns_name: String,
+        endpoint: String,
         message: &Message,
     ) -> anyhow::Result<Message> {
         let exchange: hickory_proto::xfer::DnsExchangeConnect<
@@ -603,7 +626,7 @@ impl DnsClient {
             Arc::new(client_config()),
             socket_addr,
             dns_name,
-            "/dns-query".to_string(),
+            endpoint,
         ));
 
         self.run_exchange_connect(exchange, message).await
@@ -682,7 +705,7 @@ impl DnsClient {
                 .expect("failed to create system resolver for proxied dns upstream"),
         );
         let destination = self.proxy_destination(socket_addr);
-        let iface = resolve_outbound_interface(self.iface.as_deref());
+        let iface = self.iface.clone();
         let so_mark = self.fw_mark;
 
         Box::pin(async move {
@@ -713,7 +736,7 @@ impl DnsClient {
             network: Network::Udp,
             typ: Type::Ignore,
             destination: self.proxy_destination(socket_addr),
-            iface: resolve_outbound_interface(self.iface.as_deref()),
+            iface: self.iface.clone(),
             #[cfg(target_os = "linux")]
             so_mark: self.fw_mark,
             ..Default::default()
@@ -748,18 +771,15 @@ fn interface_bind_addr(
 
 #[cfg(feature = "tun")]
 fn resolve_bind_addr(
-    iface_name: Option<&str>,
+    iface: Option<&OutboundInterface>,
     remote: SocketAddr,
 ) -> Option<SocketAddr> {
-    let iface_name = iface_name?;
-    let iface = crate::app::net::get_interface_by_name(iface_name);
-    let bind_addr = iface
-        .as_ref()
-        .and_then(|iface| interface_bind_addr(iface, remote));
+    let iface = iface?;
+    let bind_addr = interface_bind_addr(iface, remote);
 
     if bind_addr.is_none() {
         warn!(
-            iface = iface_name,
+            iface = %iface.name,
             remote = %remote,
             "dns upstream interface requested but no compatible address was found"
         );
@@ -770,12 +790,12 @@ fn resolve_bind_addr(
 
 #[cfg(not(feature = "tun"))]
 fn resolve_bind_addr(
-    iface_name: Option<&str>,
+    iface: Option<&OutboundInterface>,
     _remote: SocketAddr,
 ) -> Option<SocketAddr> {
-    if let Some(iface_name) = iface_name {
+    if let Some(iface) = iface {
         warn!(
-            iface = iface_name,
+            iface = %iface.name,
             "dns upstream interface binding requires the `tun` feature; ignoring interface"
         );
     }
@@ -805,26 +825,14 @@ impl Client for DnsClient {
         let mut outbound = msg.clone();
         self.apply_edns_client_subnet(&mut outbound);
 
-        if self.proxy.name() == "DIRECT" && self.fw_mark.is_some() {
-            self.exchange_direct_with_mark(&outbound).await
+        if self.proxy.name() == "DIRECT"
+            && (self.fw_mark.is_some() || self.ecs.is_some())
+        {
+            self.exchange_via_direct(&outbound).await
         } else if self.proxy.name() == "DIRECT" {
             self.exchange_via_resolver(&outbound).await
         } else {
             self.exchange_via_proxy(&outbound).await
         }
     }
-}
-
-#[cfg(feature = "tun")]
-fn resolve_outbound_interface(
-    iface_name: Option<&str>,
-) -> Option<OutboundInterface> {
-    iface_name.and_then(crate::app::net::get_interface_by_name)
-}
-
-#[cfg(not(feature = "tun"))]
-fn resolve_outbound_interface(
-    _iface_name: Option<&str>,
-) -> Option<OutboundInterface> {
-    None
 }

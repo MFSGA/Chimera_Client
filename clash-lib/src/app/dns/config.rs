@@ -3,11 +3,15 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+use serde::Deserialize;
 use std::fmt::Display;
+use tracing::warn;
 use url::Url;
 
 use crate::{
     Error,
+    app::net::OutboundInterface,
+    common::trie,
     config::def::{
         DNSListen, DNSMode, EdnsClientSubnet as DefEdnsClientSubnet,
         FallbackFilter as DefFallbackFilter,
@@ -21,7 +25,7 @@ pub struct NameServer {
     pub net: DNSNetMode,
     pub host: url::Host<String>,
     pub port: u16,
-    pub interface: Option<String>,
+    pub interface: Option<OutboundInterface>,
     pub proxy: Option<String>,
 }
 
@@ -35,32 +39,11 @@ impl Display for NameServer {
     }
 }
 
-impl NameServer {
-    pub async fn to_socket_addr(&self) -> anyhow::Result<SocketAddr> {
-        match &self.host {
-            url::Host::Ipv4(ip) => {
-                return Ok(SocketAddr::new((*ip).into(), self.port));
-            }
-            url::Host::Ipv6(ip) => {
-                return Ok(SocketAddr::new((*ip).into(), self.port));
-            }
-            url::Host::Domain(host) => {
-                return tokio::net::lookup_host((host.as_str(), self.port))
-                    .await?
-                    .next()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("no ip resolved for dns server {}", host)
-                    });
-            }
-        }
-    }
-}
-
 #[derive(Default)]
 pub struct FallbackFilter {
     pub geo_ip: bool,
     pub geo_ip_code: String,
-    pub ip_cidr: Vec<IpNet>,
+    pub ip_cidr: Option<Vec<IpNet>>,
     pub domain: Vec<String>,
 }
 
@@ -78,11 +61,12 @@ pub struct DNSConfig {
     pub fallback_filter: FallbackFilter,
     pub default_nameserver: Vec<NameServer>,
     pub nameserver_policy: HashMap<String, NameServer>,
-    pub hosts: HashMap<String, IpAddr>,
+    pub hosts: Option<trie::StringTrie<IpAddr>>,
     pub enhance_mode: DNSMode,
     pub fake_ip_range: IpNet,
     pub fake_ip_filter: Vec<String>,
     pub store_fake_ip: bool,
+    pub store_smart_stats: bool,
     pub ipv6: bool,
     pub enable: bool,
     pub edns_client_subnet: Option<EdnsClientSubnet>,
@@ -93,8 +77,13 @@ impl DNSConfig {
     fn parse_nameserver(servers: &[String]) -> Result<Vec<NameServer>, Error> {
         let mut nameservers = Vec::new();
 
-        for server in servers {
+        for (index, server) in servers.iter().enumerate() {
             let mut server = server.clone();
+
+            if server == "system" {
+                warn!("'system' is not supported as dns nameserver, skipping");
+                continue;
+            }
 
             if !server.contains("://") {
                 if server.contains(':') && !server.starts_with('[') {
@@ -137,7 +126,7 @@ impl DNSConfig {
                 "dhcp" => (DNSNetMode::Dhcp, url.port().unwrap_or(0)),
                 scheme => {
                     return Err(Error::InvalidConfig(format!(
-                        "unsupported dns server scheme: {scheme}"
+                        "DNS nameserver [{index}] unsupported scheme: {scheme}"
                     )));
                 }
             };
@@ -146,12 +135,48 @@ impl DNSConfig {
                 net,
                 host,
                 port,
-                interface: None,
-                proxy: None,
+                interface: DNSConfig::parse_outbound_interface(&url, index)?,
+                proxy: DNSConfig::parse_outbound_proxy(&url),
             });
         }
 
         Ok(nameservers)
+    }
+
+    fn parse_outbound_proxy(url: &Url) -> Option<String> {
+        let fragment = url.fragment()?;
+        for pair in fragment.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+            if let Some(value) = pair.strip_prefix("proxy=") {
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+                continue;
+            }
+            if !pair.contains('=') {
+                return Some(pair.to_string());
+            }
+        }
+        None
+    }
+
+    fn parse_outbound_interface(
+        url: &Url,
+        index: usize,
+    ) -> Result<Option<OutboundInterface>, Error> {
+        let Some(fragment) = url.fragment() else {
+            return Ok(None);
+        };
+        for pair in fragment.split('&') {
+            if let Some(value) = pair.strip_prefix("interface=") {
+                if !value.is_empty() {
+                    return Ok(Some(resolve_outbound_interface(value, index)?));
+                }
+            }
+        }
+        Ok(None)
     }
 
     fn parse_nameserver_policy(
@@ -166,6 +191,14 @@ impl DNSConfig {
                     "invalid dns nameserver policy for domain {domain}"
                 ))
             })?;
+
+            let (_, valid) = trie::valid_and_split_domain(domain);
+            if !valid {
+                return Err(Error::InvalidConfig(format!(
+                    "DNS ResolverRule invalid domain: {domain}"
+                )));
+            }
+
             out.insert(domain.to_ascii_lowercase(), ns);
         }
 
@@ -174,19 +207,25 @@ impl DNSConfig {
 
     fn parse_hosts(
         hosts: &HashMap<String, String>,
-    ) -> Result<HashMap<String, IpAddr>, Error> {
-        let mut out = HashMap::from([(
-            "localhost".to_string(),
-            "127.0.0.1"
-                .parse::<IpAddr>()
-                .expect("localhost ip should be valid"),
-        )]);
+    ) -> Result<trie::StringTrie<IpAddr>, Error> {
+        let mut out = trie::StringTrie::new();
+        out.insert(
+            "localhost",
+            std::sync::Arc::new(
+                "127.0.0.1"
+                    .parse::<IpAddr>()
+                    .expect("localhost ip should be valid"),
+            ),
+        );
 
         for (host, ip) in hosts {
             let ip = ip.parse::<IpAddr>().map_err(|e| {
                 Error::InvalidConfig(format!("invalid hosts entry {host}: {e}"))
             })?;
-            out.insert(host.trim_end_matches('.').to_ascii_lowercase(), ip);
+            out.insert(
+                &host.trim_end_matches('.').to_ascii_lowercase(),
+                std::sync::Arc::new(ip),
+            );
         }
 
         Ok(out)
@@ -204,8 +243,8 @@ impl DNSConfig {
 
         Ok(FallbackFilter {
             geo_ip: filter.geo_ip,
-            geo_ip_code: filter.geo_ip_code.clone(),
-            ip_cidr,
+            geo_ip_code: filter.geo_ip_code.to_uppercase(),
+            ip_cidr: (!ip_cidr.is_empty()).then_some(ip_cidr),
             domain: filter.domain.clone(),
         })
     }
@@ -237,8 +276,45 @@ impl DNSConfig {
             })
             .transpose()?;
 
+        if ipv4.is_none() && ipv6.is_none() {
+            return Err(Error::InvalidConfig(
+                "edns-client-subnet requires at least one of ipv4/ipv6"
+                    .to_string(),
+            ));
+        }
+
         Ok(EdnsClientSubnet { ipv4, ipv6 })
     }
+}
+
+#[cfg(feature = "tun")]
+fn resolve_outbound_interface(
+    iface_name: &str,
+    index: usize,
+) -> Result<OutboundInterface, Error> {
+    match iface_name {
+        "auto" => crate::app::net::get_outbound_interface().ok_or_else(|| {
+            Error::InvalidConfig(
+                "DNS nameserver [auto] no outbound interface found".into(),
+            )
+        }),
+        name => crate::app::net::get_interface_by_name(name).ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "DNS nameserver [{index}] invalid interface: {name}"
+            ))
+        }),
+    }
+}
+
+#[cfg(not(feature = "tun"))]
+fn resolve_outbound_interface(
+    iface_name: &str,
+    index: usize,
+) -> Result<OutboundInterface, Error> {
+    let _ = index;
+    Err(Error::InvalidConfig(format!(
+        "DNS nameserver interface requires the `tun` feature: {iface_name}"
+    )))
 }
 
 impl TryFrom<crate::config::def::Config> for DNSConfig {
@@ -255,17 +331,38 @@ impl TryFrom<&crate::config::def::Config> for DNSConfig {
     fn try_from(c: &crate::config::def::Config) -> Result<Self, Self::Error> {
         let dc = &c.dns;
 
+        if dc.enable && dc.nameserver.is_empty() {
+            return Err(Error::InvalidConfig(
+                "dns enabled, no nameserver specified".to_string(),
+            ));
+        }
+
+        if dc.default_nameserver.is_empty() {
+            return Err(Error::InvalidConfig(
+                "default nameserver empty".to_string(),
+            ));
+        }
+
+        let nameserver = DNSConfig::parse_nameserver(&dc.nameserver)?;
+        let fallback = DNSConfig::parse_nameserver(&dc.fallback)?;
+        let default_nameserver =
+            DNSConfig::parse_nameserver(&dc.default_nameserver)?;
+
+        for ns in &default_nameserver {
+            if matches!(ns.host, url::Host::Domain(_)) {
+                return Err(Error::InvalidConfig(
+                    "default dns must be ip address".to_string(),
+                ));
+            }
+        }
+
         Ok(Self {
             listen: dc
                 .listen
                 .clone()
                 .map(|l| match l {
                     DNSListen::Udp(u) => {
-                        let addr = u.parse::<SocketAddr>().map_err(|_| {
-                            Error::InvalidConfig(format!(
-                                "invalid dns udp listen address: {u}"
-                            ))
-                        })?;
+                        let addr = parse_listen_addr(&u)?;
                         Ok::<DNSListenAddr, Error>(DNSListenAddr {
                             udp: Some(addr),
                             ..Default::default()
@@ -278,76 +375,99 @@ impl TryFrom<&crate::config::def::Config> for DNSConfig {
                     DNSListen::Multiple(map) => {
                         let mut udp = None;
                         let mut tcp = None;
+                        let mut doh = None;
+                        let mut dot = None;
+                        let mut doh3 = None;
 
                         for (key, value) in map {
                             match key.as_str() {
                                 "udp" => {
-                                    let addr = value
-                                        .as_str()
-                                        .ok_or_else(|| {
-                                            Error::InvalidConfig(format!(
-                                                "invalid udp dns listen address: {value:?}"
-                                            ))
-                                        })?
-                                        .parse::<SocketAddr>()
-                                        .map_err(|_| {
-                                            Error::InvalidConfig(format!(
-                                                "invalid dns udp listen address: {value:?}"
-                                            ))
-                                        })?;
+                                    let raw = value.as_str().ok_or_else(|| {
+                                        Error::InvalidConfig(format!(
+                                            "invalid udp dns listen address: {value:?}"
+                                        ))
+                                    })?;
+                                    let addr = parse_listen_addr(raw)?;
                                     udp = Some(addr);
                                 }
                                 "tcp" => {
-                                    let addr = value
-                                        .as_str()
-                                        .ok_or_else(|| {
-                                            Error::InvalidConfig(format!(
-                                                "invalid tcp dns listen address: {value:?}"
-                                            ))
-                                        })?
-                                        .parse::<SocketAddr>()
-                                        .map_err(|_| {
-                                            Error::InvalidConfig(format!(
-                                                "invalid dns tcp listen address: {value:?}"
-                                            ))
-                                        })?;
+                                    let raw = value.as_str().ok_or_else(|| {
+                                        Error::InvalidConfig(format!(
+                                            "invalid tcp dns listen address: {value:?}"
+                                        ))
+                                    })?;
+                                    let addr = parse_listen_addr(raw)?;
                                     tcp = Some(addr);
                                 }
-                                _ => {}
+                                "doh" => {
+                                    doh = Some(DoHConfig::deserialize(value).map_err(
+                                        |err| {
+                                            Error::InvalidConfig(format!(
+                                                "invalid doh dns listen config: {err:?}"
+                                            ))
+                                        },
+                                    )?);
+                                }
+                                "dot" => {
+                                    dot = Some(DoTConfig::deserialize(value).map_err(
+                                        |err| {
+                                            Error::InvalidConfig(format!(
+                                                "invalid dot dns listen config: {err:?}"
+                                            ))
+                                        },
+                                    )?);
+                                }
+                                "doh3" => {
+                                    doh3 = Some(DoH3Config::deserialize(value).map_err(
+                                        |err| {
+                                            Error::InvalidConfig(format!(
+                                                "invalid doh3 dns listen config: {err:?}"
+                                            ))
+                                        },
+                                    )?);
+                                }
+                                _ => {
+                                    return Err(Error::InvalidConfig(format!(
+                                        "invalid dns listen address: {key}"
+                                    )));
+                                }
                             }
                         }
 
                         Ok::<DNSListenAddr, Error>(DNSListenAddr {
                             udp,
                             tcp,
-                            ..Default::default()
+                            doh,
+                            dot,
+                            doh3,
                         })
                     }
                 })
                 .transpose()?
                 .unwrap_or_default(),
-            nameserver: DNSConfig::parse_nameserver(&dc.nameserver)?,
-            fallback: DNSConfig::parse_nameserver(&dc.fallback)?,
+            nameserver,
+            fallback,
             fallback_filter: DNSConfig::parse_fallback_filter(&dc.fallback_filter)?,
-            default_nameserver: DNSConfig::parse_nameserver(&dc.default_nameserver)?,
+            default_nameserver,
             nameserver_policy: DNSConfig::parse_nameserver_policy(
                 &dc.nameserver_policy,
             )?,
-            hosts: DNSConfig::parse_hosts(&c.hosts)?,
+            hosts: Some(DNSConfig::parse_hosts(&c.hosts)?),
             enhance_mode: dc.enhanced_mode.clone(),
             fake_ip_range: dc.fake_ip_range.parse::<IpNet>().map_err(|e| {
                 Error::InvalidConfig(format!("invalid fake-ip-range: {e}"))
             })?,
             fake_ip_filter: dc.fake_ip_filter.clone(),
             store_fake_ip: c.profile.store_fake_ip,
-            ipv6: dc.ipv6,
+            store_smart_stats: c.profile.store_smart_stats,
+            ipv6: c.ipv6 && dc.ipv6,
             enable: dc.enable,
             edns_client_subnet: dc
                 .edns_client_subnet
                 .as_ref()
                 .map(DNSConfig::parse_edns_client_subnet)
                 .transpose()?,
-            fw_mark: None,
+            fw_mark: c.routing_mark,
         })
     }
 }

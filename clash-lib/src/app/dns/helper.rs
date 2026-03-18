@@ -7,6 +7,7 @@ use crate::{
         dns_client::DnsClient,
         dns_client::Opts,
     },
+    app::net::OutboundInterface,
     proxy,
 };
 
@@ -43,7 +44,7 @@ pub async fn make_clients(
             host: server.host.clone(),
             port: server.port,
             net: server.net.clone(),
-            iface: server.interface.clone(),
+            iface: server.interface.clone().map(|iface: OutboundInterface| iface),
             proxy: outbounds
                 .get(server.proxy.as_deref().unwrap_or("DIRECT"))
                 .cloned()
