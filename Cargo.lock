@@ -485,6 +485,7 @@ dependencies = [
  "futures",
  "hickory-proto",
  "hickory-server",
+ "serde",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
