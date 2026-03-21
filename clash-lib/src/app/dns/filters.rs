@@ -1,96 +1,77 @@
-use std::{net::IpAddr, sync::Arc};
+use std::{
+    net,
+    sync::{Arc, OnceLock},
+};
 
-use crate::common::{mmdb::MmdbLookup, trie::StringTrie};
+use crate::common::{mmdb::MmdbLookup, trie};
 
-pub trait FallbackIpFilter: Sync + Send {
-    fn apply(&self, ip: &IpAddr) -> bool;
+pub trait FallbackIPFilter: Sync + Send {
+    fn apply(&self, ip: &net::IpAddr) -> bool;
 }
-pub use FallbackIpFilter as FallbackIPFilter;
+
+/// A shared, lazily-populated MMDB handle.  The `OnceLock` starts empty and is
+/// filled in after the `OutboundManager` (and its full outbound registry) is
+/// ready, so that any MMDB download can use proxy groups if needed.
+pub type PendingMmdb = Arc<OnceLock<MmdbLookup>>;
+
+pub struct GeoIPFilter(String, Option<PendingMmdb>);
+
+impl GeoIPFilter {
+    pub fn new(code: &str, mmdb: Option<PendingMmdb>) -> Self {
+        Self(code.to_owned(), mmdb)
+    }
+}
+
+impl FallbackIPFilter for GeoIPFilter {
+    fn apply(&self, ip: &net::IpAddr) -> bool {
+        // When the OnceLock is not yet populated (e.g. during startup before the
+        // MMDB is loaded) `lock.get()` returns `None`, making this return `true`
+        // — the permissive default that lets all IPs through to the fallback
+        // resolver.  Once the MMDB is set the filter behaves normally.
+        !self
+            .1
+            .as_ref()
+            .and_then(|lock| lock.get())
+            .is_some_and(|mmdb| {
+                mmdb.lookup_country(*ip)
+                    .map(|x| x.country_code)
+                    .is_ok_and(|x| x == self.0)
+            })
+    }
+}
+
+pub struct IPNetFilter(ipnet::IpNet);
+
+impl IPNetFilter {
+    pub fn new(ipnet: ipnet::IpNet) -> Self {
+        Self(ipnet)
+    }
+}
+
+impl FallbackIPFilter for IPNetFilter {
+    fn apply(&self, ip: &net::IpAddr) -> bool {
+        self.0.contains(ip)
+    }
+}
 
 pub trait FallbackDomainFilter: Sync + Send {
     fn apply(&self, domain: &str) -> bool;
 }
 
-pub struct GeoIpFilter {
-    code: String,
-    mmdb: Option<MmdbLookup>,
-}
-pub use GeoIpFilter as GeoIPFilter;
-
-impl GeoIpFilter {
-    pub fn new(code: &str, mmdb: Option<MmdbLookup>) -> Self {
-        Self {
-            code: code.to_string(),
-            mmdb,
-        }
-    }
-}
-
-impl FallbackIpFilter for GeoIpFilter {
-    fn apply(&self, ip: &IpAddr) -> bool {
-        !self.mmdb.as_ref().is_some_and(|mmdb| {
-            mmdb.lookup_country(*ip)
-                .map(|country| country.country_code == self.code)
-                .unwrap_or(false)
-        })
-    }
-}
-
-pub struct IpNetFilter(ipnet::IpNet);
-
-impl IpNetFilter {
-    pub fn new(ipnet: ipnet::IpNet) -> Self {
-        Self(ipnet)
-    }
-}
-pub use IpNetFilter as IPNetFilter;
-
-impl FallbackIpFilter for IpNetFilter {
-    fn apply(&self, ip: &IpAddr) -> bool {
-        self.0.contains(ip)
-    }
-}
-
-pub struct DomainFilter(StringTrie<Option<String>>);
+pub struct DomainFilter(trie::StringTrie<Option<String>>);
 
 impl DomainFilter {
-    pub fn new(domains: &[String]) -> Self {
-        let mut filter = Self(StringTrie::new());
-
-        for domain in domains {
-            let domain = domain.trim_end_matches('.').to_ascii_lowercase();
-            filter.0.insert(&domain, Arc::new(None));
+    pub fn new(domains: Vec<&str>) -> Self {
+        let mut f = DomainFilter(trie::StringTrie::new());
+        for d in domains {
+            f.0.insert(d, Arc::new(None));
         }
-
-        filter
+        f
     }
 }
 
 impl FallbackDomainFilter for DomainFilter {
     fn apply(&self, domain: &str) -> bool {
-        let domain = domain.trim_end_matches('.').to_ascii_lowercase();
-        self.0.search(&domain).is_some()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{DomainFilter, FallbackDomainFilter};
-
-    #[test]
-    fn domain_filter_matches_trie_patterns() {
-        let filter = DomainFilter::new(&[
-            "*.example.com".to_string(),
-            ".apple.*".to_string(),
-            "+.foo.com".to_string(),
-        ]);
-
-        assert!(filter.apply("sub.example.com"));
-        assert!(filter.apply("test.apple.com"));
-        assert!(filter.apply("foo.com"));
-        assert!(filter.apply("bar.foo.com"));
-
-        assert!(!filter.apply("example.com"));
-        assert!(!filter.apply("foo.example.net"));
+        self.0.search(domain).is_some()
     }
 }

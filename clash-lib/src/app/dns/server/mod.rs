@@ -1,25 +1,27 @@
 use hickory_proto::op::Message;
-use tracing::{error, info, instrument};
 
+use tracing::{error, info, instrument};
 use chimera_dns::DNSListenAddr;
 
-use crate::{Runner, app::dns::ThreadSafeDNSResolver};
+use crate::runner::Runner;
+
+use super::ThreadSafeDNSResolver;
 
 mod handler;
 pub use handler::exchange_with_resolver;
 
-pub(crate) static DEFAULT_DNS_SERVER_TTL: u32 = 60;
+static DEFAULT_DNS_SERVER_TTL: u32 = 60;
 
 struct DnsMessageExchanger {
     resolver: ThreadSafeDNSResolver,
 }
 
-#[async_trait::async_trait]
 impl chimera_dns::DnsMessageExchanger for DnsMessageExchanger {
     fn ipv6(&self) -> bool {
         self.resolver.ipv6()
     }
 
+    #[instrument(skip(self))]
     async fn exchange(
         &self,
         message: &Message,
@@ -100,25 +102,3 @@ impl Runner for DnsRunner {
         Box::pin(async move { Ok(()) })
     }
 }
-/*
-pub async fn get_dns_listener(
-    listen: DNSListenAddr,
-    resolver: ThreadSafeDNSResolver,
-    cwd: &std::path::Path,
-) -> Option<Runner> {
-    let h = DnsMessageExchanger { resolver };
-    let r = chimera_dns::get_dns_listener(listen, h, cwd).await;
-    match r {
-        Some(r) => Some(Box::pin(async move {
-            match r.await {
-                Ok(()) => Ok(()),
-                Err(err) => {
-                    error!("dns listener error: {}", err);
-                    Err(crate::Error::Io(std::io::Error::other(err.to_string())))
-                }
-            }
-        })),
-        _ => None,
-    }
-}
- */

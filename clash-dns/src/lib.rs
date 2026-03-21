@@ -48,8 +48,11 @@ pub struct DNSListenAddr {
     pub doh3: Option<DoH3Config>,
 }
 
-#[async_trait]
-pub trait DnsMessageExchanger: Send + Sync {
+#[cfg_attr(test, mockall::automock)]
+pub trait DnsMessageExchanger {
     fn ipv6(&self) -> bool;
-    async fn exchange(&self, message: &Message) -> Result<Message, DNSError>;
+    fn exchange(
+        &self,
+        message: &Message,
+    ) -> impl Future<Output = Result<Message, DNSError>> + Send;
 }

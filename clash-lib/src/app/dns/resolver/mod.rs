@@ -1,29 +1,29 @@
 mod enhanced;
 
-use crate::{
-    app::{
-        dns::{DNSConfig, ThreadSafeDNSResolver},
-        profile::ThreadSafeCacheFile,
-    },
-    common::mmdb::MmdbLookup,
-    print_and_exit,
-    proxy::OutboundHandler,
-};
-
-use std::{collections::HashMap, sync::Arc};
+#[cfg(all(target_feature = "crt-static", target_env = "gnu"))]
+#[path = "system_static_crt.rs"]
+mod system;
 
 #[cfg(not(all(target_feature = "crt-static", target_env = "gnu")))]
 #[path = "system.rs"]
 mod system;
 
+use std::sync::Arc;
+
 pub use enhanced::EnhancedResolver;
 pub use system::SystemResolver;
+
+use super::{DNSConfig, ThreadSafeDNSResolver};
+use crate::{
+    app::profile::ThreadSafeCacheFile, dns::filters::PendingMmdb, print_and_exit,
+    proxy::utils::OutboundHandlerRegistry,
+};
 
 pub async fn new(
     cfg: DNSConfig,
     store: Option<ThreadSafeCacheFile>,
-    mmdb: Option<MmdbLookup>,
-    outbounds: HashMap<String, Arc<dyn OutboundHandler>>,
+    mmdb: Option<PendingMmdb>,
+    outbounds: OutboundHandlerRegistry,
 ) -> ThreadSafeDNSResolver {
     if cfg.enable {
         match store {

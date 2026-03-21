@@ -13,5 +13,10 @@ mod platform;
 mod proxy_connector;
 
 pub mod provider_helper;
+mod shared_handler;
 
 pub use proxy_connector::*;
+
+pub use shared_handler::{
+    OutboundHandlerRegistry, SharedOutboundHandler, direct_only_registry,
+};

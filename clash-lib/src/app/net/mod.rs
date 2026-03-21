@@ -116,6 +116,24 @@ impl From<NetworkInterface> for OutboundInterface {
     }
 }
 
+impl std::fmt::Display for OutboundInterface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} (v4: {}, v6: {}, index: {}, mac: {})",
+            self.name,
+            self.addr_v4
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "None".to_string()),
+            self.addr_v6
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "None".to_string()),
+            self.index,
+            self.mac_addr.clone().unwrap_or_else(|| "None".to_string())
+        )
+    }
+}
+
 #[cfg(feature = "tun")]
 pub fn get_interface_by_name(name: &str) -> Option<OutboundInterface> {
     let now = std::time::Instant::now();

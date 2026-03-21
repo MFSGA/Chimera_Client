@@ -1,23 +1,21 @@
 use std::sync::atomic::AtomicBool;
 
-use crate::{
-    Error,
-    app::dns::{ClashResolver, ResolverKind, parse_ip_literal},
-};
 use async_trait::async_trait;
+use hickory_resolver::TokioResolver;
 use rand::seq::IteratorRandom;
-use tracing::{debug, warn};
+
+use crate::app::dns::{ClashResolver, ResolverKind, parse_ip_literal};
 
 pub struct SystemResolver {
+    inner: TokioResolver,
     ipv6: AtomicBool,
 }
 
-/// SystemResolver is a resolver that uses libc getaddrinfo to resolve
-/// hostnames.
+/// Bug in libc, use tokio impl instead: https://sourceware.org/bugzilla/show_bug.cgi?id=10652
 impl SystemResolver {
     pub fn new(ipv6: bool) -> anyhow::Result<Self> {
-        debug!("creating system resolver with ipv6={}", ipv6);
         Ok(Self {
+            inner: TokioResolver::builder_tokio()?.build(),
             ipv6: AtomicBool::new(ipv6),
         })
     }
@@ -34,22 +32,11 @@ impl ClashResolver for SystemResolver {
             return Ok(Some(ip));
         }
 
-        let response = tokio::net::lookup_host(format!("{host}:0"))
-            .await?
-            .filter_map(|x| {
-                if self.ipv6() || x.is_ipv4() {
-                    Some(x.ip())
-                } else {
-                    warn!(
-                        "resolved v6 address {} for {} but ipv6 is disabled",
-                        x.ip(),
-                        host
-                    );
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        Ok(response.into_iter().choose(&mut rand::rng()))
+        let response = self.inner.lookup_ip(host).await?;
+        Ok(response
+            .iter()
+            .filter(|x| self.ipv6() || x.is_ipv4())
+            .choose(&mut rand::rng()))
     }
 
     async fn resolve_v4(
@@ -57,14 +44,8 @@ impl ClashResolver for SystemResolver {
         host: &str,
         _: bool,
     ) -> anyhow::Result<Option<std::net::Ipv4Addr>> {
-        let response = tokio::net::lookup_host(format!("{host}:0"))
-            .await?
-            .filter_map(|ip| match ip.ip() {
-                std::net::IpAddr::V4(ip) => Some(ip),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        Ok(response.into_iter().choose(&mut rand::rng()))
+        let response = self.inner.ipv4_lookup(host).await?;
+        Ok(response.iter().map(|x| x.0).choose(&mut rand::rng()))
     }
 
     async fn resolve_v6(
@@ -72,17 +53,8 @@ impl ClashResolver for SystemResolver {
         host: &str,
         _: bool,
     ) -> anyhow::Result<Option<std::net::Ipv6Addr>> {
-        if !self.ipv6() {
-            return Err(Error::DNSError("ipv6 disabled".into()).into());
-        }
-        let response = tokio::net::lookup_host(format!("{host}:0"))
-            .await?
-            .filter_map(|x| match x.ip() {
-                std::net::IpAddr::V6(ip) => Some(ip),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        Ok(response.into_iter().choose(&mut rand::rng()))
+        let response = self.inner.ipv6_lookup(host).await?;
+        Ok(response.iter().map(|x| x.0).choose(&mut rand::rng()))
     }
 
     async fn cached_for(&self, _: std::net::IpAddr) -> Option<String> {
@@ -93,10 +65,7 @@ impl ClashResolver for SystemResolver {
         &self,
         _: &hickory_proto::op::Message,
     ) -> anyhow::Result<hickory_proto::op::Message> {
-        Err(anyhow::anyhow!(
-            "system resolver does not support advanced dns features, please enable \
-             the dns server in your config"
-        ))
+        Err(anyhow::anyhow!("unsupported"))
     }
 
     fn ipv6(&self) -> bool {
@@ -126,7 +95,7 @@ impl ClashResolver for SystemResolver {
 
 #[cfg(test)]
 mod tests {
-    use crate::app::dns::{ClashResolver, resolver::SystemResolver};
+    use crate::app::dns::{ClashResolver, SystemResolver};
 
     #[tokio::test]
     async fn test_system_resolver_default_config() {

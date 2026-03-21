@@ -6,7 +6,7 @@ use socket2::TcpKeepalive;
 
 use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
 use tokio::time::timeout;
-use tracing::{debug, trace};
+use tracing::{debug, error, instrument, trace};
 
 use crate::app::net::OutboundInterface;
 use crate::proxy::utils::platform::{
@@ -139,42 +139,97 @@ pub async fn new_tcp_stream(
     .await?
 }
 
-pub fn new_udp_socket(
-    endpoint: SocketAddr,
+#[instrument(skip(so_mark))]
+pub async fn new_udp_socket(
+    src: Option<SocketAddr>,
     iface: Option<&OutboundInterface>,
     #[cfg(target_os = "linux")] so_mark: Option<u32>,
+    // Optional family hint for the socket.
+    // If not provided, the family will be determined based on the source
+    // address or interface.
+    family_hint: Option<std::net::SocketAddr>,
 ) -> std::io::Result<UdpSocket> {
-    let (socket, family) = match endpoint {
-        SocketAddr::V4(_) => (
-            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?,
-            socket2::Domain::IPV4,
+    // Determine the socket family based on the source address or interface
+    // logic:
+    // - If family_hint is provided, use it.
+    // - If src is provided and is IPv6, use IPv6.
+    // - If iface is provided and is IPv6, use IPv6.
+    // - Otherwise, default to IPv4.
+    let (socket, family) = match (family_hint, src, iface) {
+        (Some(family_hint), ..) => {
+            let domain = socket2::Domain::for_address(family_hint);
+            (
+                socket2::Socket::new(domain, socket2::Type::DGRAM, None)?,
+                domain,
+            )
+        }
+        (None, Some(src), _) if src.is_ipv6() => (
+            try_create_dualstack_socket(src, socket2::Type::DGRAM)?.0,
+            socket2::Domain::IPV6,
         ),
-        SocketAddr::V6(_) => (
+        (None, _, Some(iface)) if iface.addr_v6.is_some() => (
             socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::DGRAM, None)?,
             socket2::Domain::IPV6,
         ),
+        _ => (
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?,
+            socket2::Domain::IPV4,
+        ),
     };
+    debug!("created udp socket");
 
-    if !cfg!(target_os = "android")
-        && let Some(iface) = iface
-    {
-        must_bind_socket_on_interface(&socket, iface, family)?;
-        trace!("udp socket bound to interface: {socket:?}");
+    if !cfg!(target_os = "android") {
+        match (src, iface) {
+            (_, Some(iface)) => {
+                must_bind_socket_on_interface(&socket, iface, family).inspect_err(
+                    |x| {
+                        error!("failed to bind socket to interface: {}", x);
+                    },
+                )?;
+                // binding is not necessary for linux but is required on windows
+                // Without binding local_addr can't be obtained by system call
+                // which is required on quinn.
+                #[cfg(target_os = "windows")]
+                if let Some(addr) = src {
+                    socket.bind(&socket2::SockAddr::from(addr))?;
+                }
+
+                trace!(iface = ?iface, "udp socket bound: {socket:?}");
+            }
+            (Some(src), None) => {
+                socket.bind(&src.into())?;
+                trace!(src = ?src, "udp socket bound: {socket:?}");
+            }
+            (None, None) => {
+                // On Windows, UDP sockets must be bound to get a valid local_addr
+                // which is required for some operations (e.g., quinn/QUIC)
+                #[cfg(target_os = "windows")]
+                {
+                    let bind_addr = match family {
+                        socket2::Domain::IPV4 => {
+                            "0.0.0.0:0".parse::<SocketAddr>().unwrap()
+                        }
+                        socket2::Domain::IPV6 => {
+                            "[::]:0".parse::<SocketAddr>().unwrap()
+                        }
+                        _ => "0.0.0.0:0".parse::<SocketAddr>().unwrap(),
+                    };
+                    socket.bind(&socket2::SockAddr::from(bind_addr))?;
+                    trace!(addr = ?bind_addr, "udp socket bound to default address on Windows: {socket:?}");
+                }
+                #[cfg(not(target_os = "windows"))]
+                trace!("udp socket not bound to any specific address: {socket:?}");
+            }
+        }
     }
 
-    #[cfg(not(target_os = "android"))]
     #[cfg(target_os = "linux")]
     if let Some(so_mark) = so_mark {
         socket.set_mark(so_mark)?;
     }
 
+    socket.set_broadcast(true)?;
     socket.set_nonblocking(true)?;
-
-    let bind_addr = match endpoint {
-        SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
-        SocketAddr::V6(_) => SocketAddr::from(([0u16; 8], 0)),
-    };
-    socket.bind(&bind_addr.into())?;
 
     UdpSocket::from_std(socket.into())
 }

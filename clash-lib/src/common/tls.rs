@@ -1,9 +1,11 @@
-use std::sync::{Arc, LazyLock};
-
 use rustls::{
     RootCertStore,
     client::{WebPkiServerVerifier, danger::ServerCertVerifier},
+    pki_types::{CertificateDer, ServerName, UnixTime},
 };
+use tracing::warn;
+
+use std::sync::{Arc, LazyLock};
 
 pub static GLOBAL_ROOT_STORE: LazyLock<Arc<RootCertStore>> = LazyLock::new(|| {
     let store = webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
@@ -93,5 +95,68 @@ impl ServerCertVerifier for DefaultTlsVerifier {
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.pki.supported_verify_schemes()
+    }
+}
+
+#[derive(Debug)]
+pub struct NoHostnameTlsVerifier(Arc<WebPkiServerVerifier>);
+
+impl NoHostnameTlsVerifier {
+    pub fn new() -> Self {
+        Self(
+            WebPkiServerVerifier::builder(GLOBAL_ROOT_STORE.clone())
+                .build()
+                .unwrap(),
+        )
+    }
+}
+
+impl ServerCertVerifier for NoHostnameTlsVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        match self.0.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        ) {
+            Err(rustls::Error::UnsupportedNameType) => {
+                warn!(
+                    "skipping TLS cert name verification for server name: {:?}",
+                    server_name
+                );
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            }
+            other => other,
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.0.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.0.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.supported_verify_schemes()
     }
 }

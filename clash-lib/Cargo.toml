@@ -36,6 +36,8 @@ h3 = { version = "0.0.8", optional = true }
 h3-quinn = { version = "0.0.10", optional = true }
 quinn-proto = { version = "0.11.13", default-features = false, optional = true }
 maxminddb = "0.27"
+
+hickory-client = { version = "0.25", default-features = false }
 hickory-proto = "0.25"
 hickory-resolver = { version = "0.25", features = ["tokio", "system-config", "webpki-roots", "tls-aws-lc-rs", "https-aws-lc-rs"] }
 url = { version = "2" }
@@ -121,6 +123,8 @@ subtle = { version = "2", optional = true }
 ring-compat = { version = "0.8", features = ["aead"] }
 x509-parser = { version = "0.16", default-features = false, optional = true }
 
+byteorder = "1"
+
 [features]
 default = ["zero_copy", "tls", "aws-lc-rs", "tun", "port", "reality"]
 
@@ -180,3 +184,4 @@ windows = { version = "0.62", features = [
 [dev-dependencies]
 rcgen = "0.14"
 tempfile = "3.27"
+mockall = "0.14.0"

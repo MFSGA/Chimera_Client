@@ -18,7 +18,7 @@ impl Store for FileStore {
         self.0
             .get_fake_ip(host)
             .await
-            .and_then(|ip| ip.parse::<std::net::IpAddr>().ok())
+            .and_then(|ip| ip.parse().ok())
     }
 
     async fn pub_by_host(&mut self, host: &str, ip: std::net::IpAddr) {
@@ -40,5 +40,9 @@ impl Store for FileStore {
 
     async fn exist(&mut self, ip: std::net::IpAddr) -> bool {
         self.0.get_fake_ip(&ip.to_string()).await.is_some()
+    }
+
+    async fn copy_to(&self, #[allow(unused)] store: &mut Box<dyn Store>) {
+        // NO-OP
     }
 }

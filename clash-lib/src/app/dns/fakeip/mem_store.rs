@@ -1,4 +1,3 @@
-use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 
 use async_trait::async_trait;
@@ -6,80 +5,55 @@ use async_trait::async_trait;
 use super::Store;
 
 pub struct InMemStore {
-    capacity: usize,
-    ip_to_host: HashMap<IpAddr, String>,
-    host_to_ip: HashMap<String, IpAddr>,
-    order: VecDeque<String>,
+    itoh: lru_time_cache::LruCache<IpAddr, String>,
+    htoi: lru_time_cache::LruCache<String, IpAddr>,
 }
 
 impl InMemStore {
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(size: usize) -> Self {
         Self {
-            capacity,
-            ip_to_host: HashMap::new(),
-            host_to_ip: HashMap::new(),
-            order: VecDeque::new(),
-        }
-    }
-
-    fn touch(&mut self, host: &str) {
-        if let Some(index) = self.order.iter().position(|item| item == host) {
-            self.order.remove(index);
-        }
-        self.order.push_back(host.to_string());
-        self.evict_if_needed();
-    }
-
-    fn evict_if_needed(&mut self) {
-        while self.host_to_ip.len() > self.capacity {
-            let Some(host) = self.order.pop_front() else {
-                break;
-            };
-            if let Some(ip) = self.host_to_ip.remove(&host) {
-                self.ip_to_host.remove(&ip);
-            }
+            itoh: lru_time_cache::LruCache::with_capacity(size),
+            htoi: lru_time_cache::LruCache::with_capacity(size),
         }
     }
 }
 
 #[async_trait]
 impl Store for InMemStore {
-    async fn get_by_host(&mut self, host: &str) -> Option<IpAddr> {
-        let ip = self.host_to_ip.get(host).copied();
-        if ip.is_some() {
-            self.touch(host);
-        }
-        ip
+    async fn get_by_host(&mut self, host: &str) -> Option<std::net::IpAddr> {
+        self.htoi.get_mut(host).map(|ip| {
+            self.itoh.get_mut(ip);
+            *ip
+        })
     }
 
-    async fn pub_by_host(&mut self, host: &str, ip: IpAddr) {
-        self.host_to_ip.insert(host.to_string(), ip);
-        self.touch(host);
+    async fn pub_by_host(&mut self, host: &str, ip: std::net::IpAddr) {
+        self.htoi.insert(host.into(), ip);
     }
 
-    async fn get_by_ip(&mut self, ip: IpAddr) -> Option<String> {
-        let host = self.ip_to_host.get(&ip).cloned();
-        if let Some(host) = &host {
-            self.touch(host);
-        }
-        host
+    async fn get_by_ip(&mut self, ip: std::net::IpAddr) -> Option<String> {
+        self.itoh.get_mut(&ip).map(|h| {
+            self.htoi.get_mut(h);
+            h.to_string()
+        })
     }
 
-    async fn put_by_ip(&mut self, ip: IpAddr, host: &str) {
-        self.ip_to_host.insert(ip, host.to_string());
-        self.touch(host);
+    async fn put_by_ip(&mut self, ip: std::net::IpAddr, host: &str) {
+        self.itoh.insert(ip, host.into());
     }
 
-    async fn del_by_ip(&mut self, ip: IpAddr) {
-        if let Some(host) = self.ip_to_host.remove(&ip) {
-            self.host_to_ip.remove(&host);
-            if let Some(index) = self.order.iter().position(|item| item == &host) {
-                self.order.remove(index);
-            }
+    async fn del_by_ip(&mut self, ip: std::net::IpAddr) {
+        if let Some(host) = self.itoh.remove(&ip) {
+            self.htoi.remove(&host);
         }
     }
 
-    async fn exist(&mut self, ip: IpAddr) -> bool {
-        self.ip_to_host.contains_key(&ip)
+    async fn exist(&mut self, ip: std::net::IpAddr) -> bool {
+        self.itoh.contains_key(&ip)
+    }
+
+    async fn copy_to(&self, #[allow(unused)] store: &mut Box<dyn Store>) {
+        // TODO: copy
+        // NOTE: use file based persistence store
     }
 }

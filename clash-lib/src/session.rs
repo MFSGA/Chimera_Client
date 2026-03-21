@@ -2,9 +2,10 @@ use std::{
     collections::HashMap,
     fmt::{Debug, Display, Formatter},
     io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr}, str::FromStr,
 };
 
+use anyhow::anyhow;
 use bytes::BufMut;
 use erased_serde::Serialize as ESerialize;
 use serde::Serialize;
@@ -24,6 +25,29 @@ impl SocksAddrType {
 pub enum SocksAddr {
     Ip(SocketAddr),
     Domain(String, u16),
+}
+
+impl FromStr for SocksAddr {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut s = s.to_string();
+        if !s.contains(':') {
+            s = format!("{s}:80");
+        }
+        match SocketAddr::from_str(&s) {
+            Ok(v) => Ok(Self::Ip(v)),
+            Err(_) => {
+                let tokens: Vec<_> = s.split(':').collect();
+                if tokens.len() == 2 {
+                    let port: u16 = tokens.get(1).unwrap().parse()?;
+                    Ok(Self::Domain(tokens.first().unwrap().to_string(), port))
+                } else {
+                    Err(anyhow!("SocksAddr parse error, value: {s}"))
+                }
+            }
+        }
+    }
 }
 
 impl Display for SocksAddr {

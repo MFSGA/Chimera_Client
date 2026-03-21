@@ -1,69 +1,58 @@
+use crate::{
+    app::net::DEFAULT_OUTBOUND_INTERFACE,
+    config::internal::proxy::PROXY_DIRECT,
+    dns::{
+        ClashResolver, EdnsClientSubnet, ThreadSafeDNSClient,
+        dns_client::{DNSNetMode, DnsClient, Opts},
+    },
+    proxy::{
+        self,
+        utils::{OutboundHandlerRegistry, SharedOutboundHandler},
+    },
+};
+use hickory_proto::rr::rdata::opt::EdnsCode;
+use std::sync::Arc;
 use tracing::{debug, warn};
 
-use crate::{
-    app::dns::{
-        ClashResolver, ThreadSafeDNSClient,
-        config::{EdnsClientSubnet, NameServer},
-        dns_client::DnsClient,
-        dns_client::Opts,
-    },
-    app::net::OutboundInterface,
-    proxy,
-};
-
-use hickory_proto::{
-    op::{Message, MessageType},
-    rr::{
-        RData, Record, RecordType,
-        rdata::{A, AAAA},
-    },
-};
+use super::config::NameServer;
 
 pub async fn make_clients(
-    servers: &[NameServer],
-    resolver: Option<std::sync::Arc<dyn ClashResolver>>,
-    outbounds: std::collections::HashMap<
-        String,
-        std::sync::Arc<dyn crate::proxy::OutboundHandler>,
-    >,
+    servers: Vec<NameServer>,
+    resolver: Option<Arc<dyn ClashResolver>>,
+    outbounds: OutboundHandlerRegistry,
     edns_client_subnet: Option<EdnsClientSubnet>,
     fw_mark: Option<u32>,
-    ipv6: bool,
 ) -> Vec<ThreadSafeDNSClient> {
     let mut rv = Vec::new();
 
-    for server in servers {
-        debug!(
-            host = %server.host,
-            port = server.port,
-            "building nameserver"
-        );
+    for s in servers {
+        debug!("building nameserver: {}", s);
+
+        let proxy_name = s.proxy.clone().unwrap_or(PROXY_DIRECT.to_string());
+        let proxy: Arc<dyn proxy::OutboundHandler> =
+            Arc::new(SharedOutboundHandler::new(proxy_name, outbounds.clone()));
+
+        let port = if s.net == DNSNetMode::Dhcp { 0 } else { s.port };
 
         match DnsClient::new_client(Opts {
             father: resolver.as_ref().cloned(),
-            host: server.host.clone(),
-            port: server.port,
-            net: server.net.clone(),
-            iface: server.interface.clone().map(|iface: OutboundInterface| iface),
-            proxy: outbounds
-                .get(server.proxy.as_deref().unwrap_or("DIRECT"))
-                .cloned()
-                .unwrap_or_else(|| {
-                    std::sync::Arc::new(proxy::direct::Handler::new("DIRECT"))
-                }),
+            host: s.host.clone(),
+            port,
+            net: s.net.to_owned(),
+            iface: s
+                .interface
+                .as_ref()
+                .or(DEFAULT_OUTBOUND_INTERFACE.read().await.as_ref())
+                .inspect(|x| debug!("DNS client interface: {:?}", x))
+                .cloned(),
+            proxy,
             ecs: edns_client_subnet.clone(),
             fw_mark,
-            ipv6,
         })
         .await
         {
-            Ok(client) => rv.push(client),
-            Err(err) => warn!(
-                host = %server.host,
-                port = server.port,
-                err = ?err,
-                "initializing dns client failed"
-            ),
+            Ok(c) => rv.push(c),
+            Err(e) => warn!("initializing DNS client {} with error {}", &s, e),
         }
     }
 
@@ -71,15 +60,15 @@ pub async fn make_clients(
 }
 
 pub fn build_dns_response_message(
-    req: &Message,
+    req: &hickory_proto::op::Message,
     recursive_available: bool,
     authoritative: bool,
-) -> Message {
-    let mut res = Message::new();
+) -> hickory_proto::op::Message {
+    let mut res = hickory_proto::op::Message::new();
 
     res.set_id(req.id());
     res.set_op_code(req.op_code());
-    res.set_message_type(MessageType::Response);
+    res.set_message_type(hickory_proto::op::MessageType::Response);
     res.add_queries(req.queries().iter().cloned());
     res.set_recursion_available(recursive_available);
     res.set_authoritative(authoritative);
@@ -90,28 +79,9 @@ pub fn build_dns_response_message(
     }
 
     if let Some(edns) = res.extensions_mut() {
-        edns.options_mut()
-            .remove(hickory_proto::rr::rdata::opt::EdnsCode::Padding);
+        // Remove only padding options, keep everything else
+        edns.options_mut().remove(EdnsCode::Padding);
     }
 
     res
-}
-
-pub fn ip_records(
-    name: hickory_proto::rr::Name,
-    ttl: u32,
-    query_type: RecordType,
-    ips: &[std::net::IpAddr],
-) -> Vec<Record> {
-    ips.iter()
-        .filter_map(|ip| match (query_type, ip) {
-            (RecordType::A, std::net::IpAddr::V4(ip)) => {
-                Some(Record::from_rdata(name.clone(), ttl, RData::A(A(*ip))))
-            }
-            (RecordType::AAAA, std::net::IpAddr::V6(ip)) => Some(
-                Record::from_rdata(name.clone(), ttl, RData::AAAA(AAAA(*ip))),
-            ),
-            _ => None,
-        })
-        .collect()
 }

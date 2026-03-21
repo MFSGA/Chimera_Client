@@ -77,6 +77,8 @@ pub enum Error {
     DNSError(String),
     #[error("operation error: {0}")]
     Operation(String),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
 }
 
 pub enum TokioRuntime {
@@ -370,7 +372,6 @@ async fn create_components(
     cwd: PathBuf,
     config: InternalConfig,
 ) -> Result<RuntimeComponents> {
-    #[cfg(feature = "tun")]
     if config.tun.enable {
         debug!("tun enabled, initializing default outbound interface");
         init_net_config(config.tun.so_mark).await;
@@ -401,61 +402,46 @@ async fn create_components(
             .collect(),
     );
 
-    debug!("todo del the line outbounds {}", plain_outbounds.len());
+    // Create a shared outbound registry seeded with plain outbounds.
+    // After OutboundManager is initialized it will be extended with all
+    // handlers (plain + proxy groups + provider proxies), so DNS clients
+    // and the HTTP client can use any of them for bootstrap traffic.
+    let outbound_registry: crate::proxy::utils::OutboundHandlerRegistry =
+        Arc::new(tokio::sync::RwLock::new(
+            plain_outbounds
+                .iter()
+                .map(|x| (x.name().to_string(), x.clone()))
+                .collect(),
+        ));
 
     let client =
-        new_http_client(system_resolver.clone(), Some(plain_outbounds.clone()))
+        new_http_client(system_resolver.clone(), Some(outbound_registry.clone()))
             .map_err(|x| Error::DNSError(x.to_string()))?;
 
-    debug!("initializing mmdb");
-    let country_mmdb = if let Some(country_mmdb_file) = config.general.mmdb {
-        Some(Arc::new(
-            mmdb::Mmdb::new(
-                cwd.join(&country_mmdb_file),
-                config
-                    .general
-                    .mmdb_download_url
-                    .unwrap_or(DEFAULT_COUNTRY_MMDB_DOWNLOAD_URL.to_string()),
-                client.clone(),
-            )
-            .await?,
-        ) as MmdbLookup)
-    } else {
-        debug!("country mmdb not set, skipping");
-        None
-    };
-
-    debug!("initializing country asn mmdb");
-    let asn_mmdb = if let Some(asn_mmdb_name) = config.general.asn_mmdb {
-        Some(Arc::new(
-            mmdb::Mmdb::new(
-                cwd.join(&asn_mmdb_name),
-                config
-                    .general
-                    .asn_mmdb_download_url
-                    .unwrap_or(DEFAULT_ASN_MMDB_DOWNLOAD_URL.to_string()),
-                client.clone(),
-            )
-            .await?,
-        ) as MmdbLookup)
-    } else {
-        debug!("ASN mmdb not found and not configured for download, skipping");
-        None
-    };
-
     debug!("initializing dns resolver");
+    // Clone the dns.listen for the DNS Server later before we consume the config
+    // TODO: we should separate the DNS resolver and DNS server config here
     let dns_listen = config.dns.listen.clone();
     let dns_enable = config.dns.enable;
-    let plain_outbounds_map = HashMap::<String, Arc<dyn OutboundHandler>>::from_iter(
-        plain_outbounds
-            .iter()
-            .map(|x| (x.name().to_string(), x.clone())),
-    );
+
+    // Extract the country MMDB file/url config early so they can be consumed
+    // here, while the actual MMDB loading happens after OutboundManager (like
+    // geodata and asn_mmdb) so it benefits from the fully-populated outbound
+    // registry when downloading the file.
+    let country_mmdb_file = config.general.mmdb;
+    let country_mmdb_download_url = config.general.mmdb_download_url;
+
+    // Create a shared pending handle that the DNS resolver's GeoIPFilter holds.
+    // It starts empty and is populated once the MMDB is loaded below.
+    let pending_country_mmdb: Option<dns::PendingMmdb> = country_mmdb_file
+        .as_ref()
+        .map(|_| Arc::new(OnceLock::new()));
+
     let dns_resolver = dns::new_resolver(
         config.dns,
         Some(cache_store.clone()),
-        country_mmdb.clone(),
-        plain_outbounds_map,
+        pending_country_mmdb.clone(),
+        outbound_registry.clone(),
     )
     .await;
 
@@ -481,6 +467,71 @@ async fn create_components(
         .await?,
     );
 
+    debug!("initializing mmdb");
+    let country_mmdb = if let Some(ref mmdb_file) = country_mmdb_file {
+        let mmdb = Arc::new(
+            mmdb::Mmdb::new(
+                cwd.join(mmdb_file),
+                country_mmdb_download_url
+                    .unwrap_or(DEFAULT_COUNTRY_MMDB_DOWNLOAD_URL.to_string()),
+                client.clone(),
+            )
+            .await?,
+        ) as MmdbLookup;
+        // Populate the shared handle so the DNS resolver's GeoIPFilter can use
+        // it. Any inflight DNS fallback-IP filtering that ran before this point
+        // will have been permissive (MMDB absent = pass-through), which is the
+        // safe default during startup.
+        if let Some(pending) = &pending_country_mmdb
+            && pending.set(mmdb.clone()).is_err()
+        {
+            warn!(
+                "country MMDB OnceLock was already set — this is unexpected and \
+                 indicates a double-initialization bug"
+            );
+        }
+        Some(mmdb)
+    } else {
+        debug!("country mmdb not set, skipping");
+        None
+    };
+
+    /* debug!("initializing geosite");
+    let geodata = if let Some(geosite_file) = config.general.geosite {
+        Some(Arc::new(
+            geodata::GeoData::new(
+                cwd.join(&geosite_file),
+                config
+                    .general
+                    .geosite_download_url
+                    .unwrap_or(DEFAULT_GEOSITE_DOWNLOAD_URL.to_string()),
+                client.clone(),
+            )
+            .await?,
+        ) as GeoDataLookup)
+    } else {
+        debug!("geosite not set, skipping");
+        None
+    }; */
+
+    debug!("initializing country asn mmdb");
+    let asn_mmdb = if let Some(asn_mmdb_name) = config.general.asn_mmdb {
+        Some(Arc::new(
+            mmdb::Mmdb::new(
+                cwd.join(&asn_mmdb_name),
+                config
+                    .general
+                    .asn_mmdb_download_url
+                    .unwrap_or(DEFAULT_ASN_MMDB_DOWNLOAD_URL.to_string()),
+                client.clone(),
+            )
+            .await?,
+        ) as MmdbLookup)
+    } else {
+        debug!("ASN mmdb not found and not configured for download, skipping");
+        None
+    };
+
     debug!("initializing router");
     let router = Arc::new(
         Router::new(
@@ -504,7 +555,7 @@ async fn create_components(
         dns_resolver.clone(),
         config.general.mode,
         statistics_manager.clone(),
-        None,
+        None, // config.experimental.and_then(|e| e.tcp_buffer_size),
     ));
 
     debug!("initializing authenticator");
@@ -520,6 +571,16 @@ async fn create_components(
         )
         .await,
     );
+    /* if !config.inbound_providers.is_empty() {
+        debug!("loading inbound providers");
+        inbound_manager
+            .load_inbound_providers(
+                cwd.to_string_lossy().to_string(),
+                config.inbound_providers,
+                dns_resolver.clone(),
+            )
+            .await;
+    } */
 
     #[cfg(feature = "tun")]
     debug!("initializing tun runner");
@@ -540,17 +601,18 @@ async fn create_components(
         Some(cancellation_token.child_token()),
     ));
 
+    info!("all components initialized");
     Ok(RuntimeComponents {
-        statistics_manager,
-        dns_listener,
         cache_store,
         dns_resolver,
         outbound_manager,
-        dispatcher,
         router,
+        dispatcher,
+        statistics_manager,
         inbound_manager,
         #[cfg(feature = "tun")]
         tun_runner,
+        dns_listener,
         dns_listen,
         dns_enabled: dns_enable,
     })

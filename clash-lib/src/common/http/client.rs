@@ -7,7 +7,7 @@ use tracing::{trace, warn};
 use crate::{
     app::dns::ThreadSafeDNSResolver,
     config::internal::proxy::PROXY_DIRECT,
-    proxy::{AnyOutboundHandler, direct},
+    proxy::{AnyOutboundHandler, direct, utils::OutboundHandlerRegistry},
     session::Session,
 };
 
@@ -24,7 +24,7 @@ pub struct ClashHTTPClientExt {
 #[derive(Clone)]
 pub struct HttpClient {
     dns_resolver: ThreadSafeDNSResolver,
-    outbounds: Option<HashMap<String, AnyOutboundHandler>>,
+    outbounds: Option<OutboundHandlerRegistry>,
     #[cfg(feature = "tls")]
     tls_config: Arc<rustls::ClientConfig>,
     timeout: tokio::time::Duration,
@@ -33,28 +33,19 @@ pub struct HttpClient {
 impl HttpClient {
     pub fn new(
         dns_resolver: ThreadSafeDNSResolver,
-        bootstrap_outbounds: Option<Vec<AnyOutboundHandler>>,
+        bootstrap_outbounds: Option<OutboundHandlerRegistry>,
         timeout: Option<tokio::time::Duration>,
     ) -> io::Result<HttpClient> {
-        #[cfg(feature = "tls")]
         let mut tls_config = rustls::ClientConfig::builder()
             .with_root_certificates(GLOBAL_ROOT_STORE.clone())
             .with_no_client_auth();
-        #[cfg(feature = "tls")]
         if std::env::var("SSLKEYLOGFILE").is_ok() {
             tls_config.key_log = Arc::new(rustls::KeyLogFile::new());
         }
 
         Ok(HttpClient {
             dns_resolver,
-            outbounds: bootstrap_outbounds.map(|obs| {
-                let mut map = HashMap::new();
-                for handler in obs {
-                    map.insert(handler.name().to_owned(), handler);
-                }
-                map
-            }),
-            #[cfg(feature = "tls")]
+            outbounds: bootstrap_outbounds,
             tls_config: Arc::new(tls_config),
             timeout: timeout.unwrap_or(tokio::time::Duration::from_secs(10)),
         })
@@ -63,7 +54,7 @@ impl HttpClient {
     pub async fn request<T>(
         &self,
         mut req: http::Request<T>,
-    ) -> Result<http::Response<hyper::body::Incoming>, io::Error>
+    ) -> Result<http::Response<hyper::body::Incoming>, std::io::Error>
     where
         T: hyper::body::Body + Send + 'static,
         <T as hyper::body::Body>::Data: Send,
@@ -73,29 +64,31 @@ impl HttpClient {
 
         let host = uri
             .host()
-            .ok_or(io::Error::new(
-                io::ErrorKind::InvalidInput,
+            .ok_or(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
                 format!("uri must have a host: {uri}"),
             ))?
             .to_owned();
         let port = uri.port_u16().unwrap_or(match uri.scheme_str() {
             None => 80,
-            Some("http") => 80,
-            Some("https") => 443,
-            Some(s) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unsupported scheme: {s}"),
-                ));
-            }
+            Some(s) => match s {
+                "http" => 80,
+                "https" => 443,
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("unsupported scheme: {s}"),
+                    ));
+                }
+            },
         });
 
         if req.headers_mut().get(http::header::HOST).is_none() {
             req.headers_mut().insert(
                 http::header::HOST,
                 uri.host()
-                    .ok_or(io::Error::new(
-                        io::ErrorKind::InvalidInput,
+                    .ok_or(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
                         "uri must have a host",
                     ))?
                     .parse()
@@ -103,19 +96,29 @@ impl HttpClient {
             );
         }
 
-        let req_ext = req.extensions().get::<ClashHTTPClientExt>();
-        let outbound = req_ext
-            .and_then(|ext| ext.outbound.clone())
-            .as_ref()
-            .and_then(|name| {
-                self.outbounds
-                    .as_ref()
-                    .and_then(|outbounds| outbounds.get(name).cloned())
-            })
-            .unwrap_or_else(|| Arc::new(direct::Handler::new(PROXY_DIRECT)) as _);
+        let outbound_name = req
+            .extensions()
+            .get::<ClashHTTPClientExt>()
+            .and_then(|ext| ext.outbound.clone());
+        let make_direct =
+            || Arc::new(direct::Handler::new(PROXY_DIRECT)) as AnyOutboundHandler;
+        let outbound: AnyOutboundHandler = if let Some(name) = outbound_name {
+            if let Some(registry) = &self.outbounds {
+                registry
+                    .read()
+                    .await
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_else(make_direct)
+            } else {
+                make_direct()
+            }
+        } else {
+            make_direct()
+        };
 
-        trace!(outbound = %outbound.name(), "using outbound for http client");
-        let session = Session {
+        trace!(outbound = %outbound.name(), "using outbound");
+        let sess = Session {
             network: crate::session::Network::Tcp,
             typ: crate::session::Type::Ignore,
             destination: crate::session::SocksAddr::Domain(host.clone(), port),
@@ -123,32 +126,19 @@ impl HttpClient {
         };
         let stream = tokio::time::timeout(
             self.timeout,
-            outbound.connect_stream(&session, self.dns_resolver.clone()),
+            outbound.connect_stream(&sess, self.dns_resolver.clone()),
         )
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tcp connect timeout"))?
-        .inspect_err(|error| {
-            warn!(
-                outbound = outbound.name(),
-                err = ?error,
-                "http client outbound connect failed"
-            );
+        .await?
+        .inspect_err(|e| {
+            warn!(outbound = outbound.name(), err = ?e, "download via proxy");
         })?;
-
-        #[cfg(not(feature = "tls"))]
-        if uri.scheme() == Some(&http::uri::Scheme::HTTPS) {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "https requires the tls feature",
-            ));
-        }
 
         let resp = match uri.scheme() {
             Some(scheme) if scheme == &http::uri::Scheme::HTTP => {
                 let io = TokioIo::new(stream);
                 let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
                     .await
-                    .map_err(io::Error::other)?;
+                    .map_err(std::io::Error::other)?;
 
                 tokio::task::spawn(async move {
                     if let Err(err) = conn.await {
@@ -158,7 +148,6 @@ impl HttpClient {
 
                 sender.send_request(req).boxed()
             }
-            #[cfg(feature = "tls")]
             Some(scheme) if scheme == &http::uri::Scheme::HTTPS => {
                 let connector =
                     tokio_rustls::TlsConnector::from(self.tls_config.clone());
@@ -166,22 +155,17 @@ impl HttpClient {
                 let stream = tokio::time::timeout(
                     self.timeout,
                     connector.connect(
-                        host.try_into().map_err(|_| {
-                            io::Error::new(io::ErrorKind::InvalidInput, "bad SNI")
-                        })?,
+                        host.try_into().expect("must be valid SNI"),
                         stream,
                     ),
                 )
-                .await
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::TimedOut, "tls connect timeout")
-                })?
-                .map_err(io::Error::other)?;
+                .await??;
 
                 let io = TokioIo::new(stream);
+
                 let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
                     .await
-                    .map_err(io::Error::other)?;
+                    .map_err(std::io::Error::other)?;
 
                 tokio::task::spawn(async move {
                     if let Err(err) = conn.await {
@@ -192,15 +176,15 @@ impl HttpClient {
                 sender.send_request(req).boxed()
             }
             _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
                     format!("invalid url: {uri}: unsupported scheme"),
                 ));
             }
         };
 
         resp.await
-            .map_err(|e| io::Error::other(format!("HTTP request failed: {e}")))
+            .map_err(|e| std::io::Error::other(format!("HTTP request failed: {e}")))
     }
 }
 
@@ -208,7 +192,7 @@ impl HttpClient {
 /// outbounds, that is used by clash to send outgoing HTTP requests.
 pub fn new_http_client(
     dns_resolver: ThreadSafeDNSResolver,
-    bootstrap_outbounds: Option<Vec<AnyOutboundHandler>>,
+    bootstrap_outbounds: Option<OutboundHandlerRegistry>,
 ) -> io::Result<HttpClient> {
     HttpClient::new(dns_resolver, bootstrap_outbounds, None)
 }

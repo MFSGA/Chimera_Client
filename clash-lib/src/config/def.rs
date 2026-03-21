@@ -297,6 +297,9 @@ pub struct DNS {
     /// 3. When disabled, system DNS config will be used
     /// All other DNS related options will only be used when this is enabled
     pub enable: bool,
+    /// Whether to `Config::hosts` as when resolving hostnames
+    #[educe(Default = true)]
+    pub user_hosts: bool,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
