@@ -22,7 +22,10 @@ mod server;
 
 pub use config::DNSConfig;
 pub use dns_client::DNSNetMode;
-pub use server::get_dns_listener;
+
+// pub use server::get_dns_listener;
+pub use server::DnsRunner;
+
 
 pub use resolver::new as new_resolver;
 #[cfg(feature = "tun")]

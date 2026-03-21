@@ -6,6 +6,7 @@ use crate::{
     config::internal::config::TunConfig,
 };
 
+/// TODO: get rid of command execution
 pub fn check_ip_command_installed() -> std::io::Result<()> {
     std::process::Command::new("ip")
         .arg("route")
@@ -38,6 +39,7 @@ pub fn add_route(via: &OutboundInterface, dest: &IpNet) -> std::io::Result<()> {
 }
 
 fn run_ip_cmd(args: &[&str], enable_v6: bool) -> std::io::Result<()> {
+    // IPv4
     let cmd_str = format!("ip {}", args.join(" "));
     let cmd = std::process::Command::new("ip").args(args).output()?;
     warn!("executing: {}", cmd_str);
@@ -49,6 +51,7 @@ fn run_ip_cmd(args: &[&str], enable_v6: bool) -> std::io::Result<()> {
         )));
     }
 
+    // IPv6
     if enable_v6 {
         let mut v6_args = vec!["-6"];
         v6_args.extend_from_slice(args);
@@ -67,6 +70,12 @@ fn run_ip_cmd(args: &[&str], enable_v6: bool) -> std::io::Result<()> {
     Ok(())
 }
 
+/// three rules are added:
+/// # ip route add default dev wg0 table 2468
+/// # ip rule add not fwmark 1234 table 2468
+/// # ip rule add table main suppress_prefixlength 0
+/// for ipv6
+/// # ip -6 ...
 pub fn setup_policy_routing(
     tun_cfg: &TunConfig,
     via: &OutboundInterface,
@@ -107,6 +116,12 @@ pub fn setup_policy_routing(
     Ok(())
 }
 
+/// three rules to clean up:
+/// # ip rule del not fwmark $SO_MARK table $TABLE
+/// # ip rule del table main suppress_prefixlength 0
+/// # ip rule del dport 53 table $TABLE
+/// for v6
+/// # ip -6 ...
 pub fn maybe_routes_clean_up(tun_cfg: &TunConfig) -> std::io::Result<()> {
     if !(tun_cfg.enable && tun_cfg.route_all) {
         return Ok(());

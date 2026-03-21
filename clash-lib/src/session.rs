@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    fmt::{Display, Formatter},
+    fmt::{Debug, Display, Formatter},
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
 };
@@ -145,6 +145,19 @@ impl SocksAddr {
         match self {
             SocksAddr::Ip(ip) => ip.port(),
             SocksAddr::Domain(_, port) => *port,
+        }
+    }
+
+    pub fn must_into_socket_addr(self) -> SocketAddr {
+        let self_clone = self.clone();
+        self.try_into_socket_addr()
+            .unwrap_or_else(|| panic!("not a socket address: {self_clone:?}"))
+    }
+
+    pub fn try_into_socket_addr(self) -> Option<SocketAddr> {
+        match self {
+            SocksAddr::Ip(addr) => Some(addr),
+            SocksAddr::Domain(..) => None,
         }
     }
 }
@@ -301,6 +314,19 @@ impl Display for Session {
                 self.network, self.source, self.destination,
             ),
         }
+    }
+}
+
+impl Debug for Session {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("network", &self.network)
+            .field("source", &self.source)
+            .field("destination", &self.destination)
+            .field("packet_mark", &self.so_mark)
+            .field("iface", &self.iface)
+            .field("asn", &self.asn)
+            .finish()
     }
 }
 

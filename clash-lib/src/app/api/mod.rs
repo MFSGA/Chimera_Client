@@ -28,13 +28,16 @@ use crate::{
 
 mod handlers;
 mod ipc;
+mod runner;
+
+pub use runner::ApiRunner;
 
 pub struct AppState {
     log_source_tx: Sender<LogEvent>,
     statistics_manager: Arc<StatisticsManager>,
 }
 
-#[allow(clippy::too_many_arguments)]
+/* #[allow(clippy::too_many_arguments)]
 pub fn get_api_runner(
     controller_cfg: Controller,
     log_source: Sender<LogEvent>,
@@ -212,3 +215,4 @@ pub fn get_api_runner(
 
     Some(Box::pin(runner))
 }
+ */

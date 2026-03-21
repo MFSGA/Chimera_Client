@@ -1,3 +1,4 @@
+use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use tokio::{sync::RwLock, task::JoinHandle};
 
@@ -7,12 +8,13 @@ use crate::{
     },
     common::auth::ThreadSafeAuthenticator,
     config::internal::{config::BindAddress, listener::InboundOpts},
+    runner::Runner,
 };
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
 };
-use tracing::{trace, warn};
+use tracing::{debug, trace, warn};
 
 /// Legacy ports configuration for inbounds.
 /// Newer inbounds have their own port configuration.
@@ -34,7 +36,36 @@ pub struct InboundManager {
     authenticator: ThreadSafeAuthenticator,
 
     /// Inbound options for each inbound type -> listening Task
-    inbound_handlers: RwLock<HashMap<InboundOpts, Option<JoinHandle<()>>>>,
+    inbound_handlers: Arc<RwLock<HashMap<InboundOpts, Option<JoinHandle<()>>>>>,
+
+    cancellation_token: tokio_util::sync::CancellationToken,
+}
+
+impl Runner for InboundManager {
+    fn run_async(&self) {
+        let inbound_handlers = self.inbound_handlers.clone();
+        let dispatcher = self.dispatcher.clone();
+        let authenticator = self.authenticator.clone();
+        let cancellation_token = self.cancellation_token.clone();
+
+        tokio::spawn(async move {
+            Self::start_all_listeners(
+                dispatcher,
+                authenticator,
+                inbound_handlers,
+                cancellation_token,
+            )
+            .await;
+        });
+    }
+
+    fn shutdown(&self) {
+        self.cancellation_token.cancel();
+    }
+
+    fn join(&self) -> BoxFuture<'_, Result<(), crate::Error>> {
+        Box::pin(async move { self.join_all_listeners().await })
+    }
 }
 
 impl InboundManager {
@@ -42,20 +73,27 @@ impl InboundManager {
         dispatcher: Arc<Dispatcher>,
         authenticator: ThreadSafeAuthenticator,
         inbounds_opt: HashSet<InboundOpts>,
+        cancellation_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Self {
         Self {
-            inbound_handlers: RwLock::new(
+            inbound_handlers: Arc::new(RwLock::new(
                 inbounds_opt.into_iter().map(|opts| (opts, None)).collect(),
-            ),
+            )),
             dispatcher,
             authenticator,
+            cancellation_token: cancellation_token.unwrap_or_default(),
         }
     }
 
     /// Starts all inbounds listeners based on the provided options.
     /// If a listener is already running, it will be restarted.
-    pub async fn start_all_listeners(&self) {
-        for (opts, handler) in self.inbound_handlers.write().await.iter_mut() {
+    async fn start_all_listeners(
+        dispatcher: Arc<Dispatcher>,
+        authenticator: ThreadSafeAuthenticator,
+        inbound_handlers: Arc<RwLock<HashMap<InboundOpts, Option<JoinHandle<()>>>>>,
+        cancellation_token: tokio_util::sync::CancellationToken,
+    ) {
+        for (opts, handler) in inbound_handlers.write().await.iter_mut() {
             if let Some(handler) = handler.take() {
                 warn!(
                     "Restarting inbound handler for: {}",
@@ -73,11 +111,11 @@ impl InboundManager {
             *handler = None;
         }
 
-        for (opts, handler) in self.inbound_handlers.write().await.iter_mut() {
+        for (opts, handler) in inbound_handlers.write().await.iter_mut() {
             *handler = build_network_listeners(
                 opts,
-                self.dispatcher.clone(),
-                self.authenticator.clone(),
+                dispatcher.clone(),
+                authenticator.clone(),
             )
             .map(|r| {
                 tokio::spawn(async move {
@@ -96,8 +134,21 @@ impl InboundManager {
         }
     }
 
-    pub async fn restart(&self) {
-        self.start_all_listeners().await;
+    pub async fn restart(&self) -> Result<(), crate::Error> {
+        self.stop_all_listeners().await;
+
+        let inbound_handlers = self.inbound_handlers.clone();
+        let dispatcher = self.dispatcher.clone();
+        let authenticator = self.authenticator.clone();
+        let cancellation_token = self.cancellation_token.clone();
+        Self::start_all_listeners(
+            dispatcher,
+            authenticator,
+            inbound_handlers,
+            cancellation_token,
+        )
+        .await;
+        Ok(())
     }
 
     // RESTFUL API handlers below
@@ -218,6 +269,68 @@ impl InboundManager {
                 }
             })
             .collect()
+    }
+
+    async fn stop_all_listeners(&self) {
+        for (opt, l) in self.inbound_handlers.write().await.iter_mut() {
+            if let Some(handler) = l.take() {
+                warn!("Shutting down inbound handler: {}", opt.common_opts().name);
+                handler.abort();
+            }
+            *l = None;
+        }
+        debug!("todo for provider");
+        /* for handles in self.provider_handles.write().await.values_mut() {
+            for (opt, handle) in handles.iter_mut() {
+                if let Some(h) = handle.take() {
+                    warn!(
+                        "Shutting down provider inbound handler: {}",
+                        opt.common_opts().name
+                    );
+                    h.abort();
+                }
+            }
+        } */
+    }
+
+    #[allow(dead_code)]
+    async fn join_all_listeners(&self) -> Result<(), crate::Error> {
+        let mut last_join_error = None;
+        for (opt, l) in self.inbound_handlers.write().await.iter_mut() {
+            if let Some(handler) = l.take() {
+                warn!("Shutting down inbound handler: {}", opt.common_opts().name);
+                handler.await.unwrap_or_else(|e| {
+                    warn!(
+                        "Inbound handler {} shutdown with error: {}",
+                        opt.common_opts().name,
+                        e
+                    );
+                    last_join_error = Some(e);
+                });
+            }
+        }
+        debug!("todo join_all_listeners for provider");
+        /* for handles in self.provider_handles.write().await.values_mut() {
+            for (opt, handle) in handles.iter_mut() {
+                if let Some(h) = handle.take() {
+                    warn!(
+                        "Shutting down provider inbound handler: {}",
+                        opt.common_opts().name
+                    );
+                    h.await.unwrap_or_else(|e| {
+                        warn!(
+                            "Provider inbound handler {} shutdown with error: {}",
+                            opt.common_opts().name,
+                            e
+                        );
+                        last_join_error = Some(e);
+                    });
+                }
+            }
+        } */
+        last_join_error
+            .map(|e| Err(std::io::Error::other(e).into()))
+            .unwrap_or(Ok(()))
     }
 }
 

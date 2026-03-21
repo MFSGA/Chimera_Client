@@ -170,7 +170,7 @@ pub struct Profile {
     // store_fake_ip: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct TunConfig {
     pub enable: bool,
     pub device_id: String,

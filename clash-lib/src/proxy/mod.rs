@@ -5,6 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use futures::{Sink, Stream};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::error;
@@ -14,7 +15,9 @@ use crate::{
         dispatcher::{BoxedChainedDatagram, BoxedChainedStream},
         dns::ThreadSafeDNSResolver,
     },
-    proxy::{group::GroupProxyAPIResponse, utils::RemoteConnector},
+    proxy::{
+        datagram::UdpPacket, group::GroupProxyAPIResponse, utils::RemoteConnector,
+    },
     session::Session,
 };
 
@@ -210,3 +213,16 @@ impl Display for OutboundType {
         }
     }
 }
+
+pub trait InboundDatagram<Item>:
+    Stream<Item = Item> + Sink<Item, Error = io::Error> + Send + Sync + Unpin + Debug
+{
+}
+
+impl<T, U> InboundDatagram<U> for T where
+    T: Stream<Item = U> + Sink<U, Error = io::Error> + Send + Sync + Unpin + Debug
+{
+}
+
+pub type AnyInboundDatagram =
+    Box<dyn InboundDatagram<UdpPacket, Error = io::Error, Item = UdpPacket>>;

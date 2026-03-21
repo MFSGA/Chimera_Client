@@ -1,3 +1,6 @@
+// todo
+#![feature(sync_unsafe_cell)]
+
 use std::{
     collections::HashMap,
     io,
@@ -10,10 +13,10 @@ use tokio::{
     sync::{Mutex, broadcast, mpsc, oneshot},
     task::JoinHandle,
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "tun")]
-use crate::{app::net::init_net_config, proxy::tun::get_tun_runner};
+use crate::{app::net::init_net_config, proxy::tun};
 use crate::{
     app::{
         dispatcher::{Dispatcher, StatisticsManager},
@@ -40,6 +43,7 @@ use crate::{
         internal::{InternalConfig, proxy::OutboundProxy},
     },
     proxy::OutboundHandler,
+    runner::Runner,
 };
 
 /// 2
@@ -52,6 +56,8 @@ mod config;
 mod proxy;
 /// 5
 mod session;
+
+mod runner;
 
 pub use session::Session;
 
@@ -77,6 +83,8 @@ pub enum TokioRuntime {
     MultiThread,
     SingleThread,
 }
+
+type ArcRunner = Arc<dyn Runner>;
 
 pub struct Options {
     pub config: Config,
@@ -109,9 +117,8 @@ impl Config {
 pub struct GlobalState {
     log_level: LogLevel,
     #[cfg(feature = "tun")]
-    tunnel_listener_handle: Option<JoinHandle<Result<()>>>,
-    api_listener_handle: Option<JoinHandle<Result<()>>>,
-    dns_listener_handle: Option<JoinHandle<Result<()>>>,
+    tunnel_runner: ArcRunner,
+    dns_listener: ArcRunner,
     reload_tx: mpsc::Sender<(Config, oneshot::Sender<()>)>,
     cwd: String,
 }
@@ -123,7 +130,6 @@ impl GlobalState {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
-pub type Runner = futures::future::BoxFuture<'static, Result<()>>;
 
 #[derive(Default)]
 pub struct RuntimeController {
@@ -204,15 +210,12 @@ pub async fn start(
 ) -> Result<()> {
     setup_default_crypto_provider();
 
-    let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
+    let shutdown_token = tokio_util::sync::CancellationToken::new();
 
     {
-        let mut rt_ctrl = RUNTIME_CONTROLLER.lock().unwrap();
-        rt_ctrl.register_runtime(shutdown_tx);
+        let mut token_guard = SHUTDOWN_TOKEN.lock().unwrap();
+        token_guard.push(shutdown_token.clone());
     }
-
-    let mut tasks = Vec::<Runner>::new();
-    let mut runners = Vec::new();
 
     let cwd = PathBuf::from(cwd);
 
@@ -221,156 +224,146 @@ pub async fn start(
     let log_level = config.general.log_level;
 
     let components = create_components(cwd.clone(), config).await?;
-    let inbound_manager = components.inbound_manager.clone();
-    inbound_manager.start_all_listeners().await;
-
-    #[cfg(feature = "tun")]
-    let tun_runner_handle = components.tun_runner.map(tokio::spawn);
-    let dns_listener_handle = components.dns_listener.map(tokio::spawn);
 
     let (reload_tx, mut reload_rx) = mpsc::channel(1);
 
     let global_state = Arc::new(Mutex::new(GlobalState {
         log_level,
         #[cfg(feature = "tun")]
-        tunnel_listener_handle: tun_runner_handle,
-        dns_listener_handle,
+        tunnel_runner: components.tun_runner.clone(),
+        dns_listener: components.dns_listener.clone(),
         reload_tx,
-        api_listener_handle: None,
         cwd: cwd.to_string_lossy().to_string(),
     }));
 
-    let api_runner = app::api::get_api_runner(
-        controller_cfg,
+    let api_listener: ArcRunner = Arc::new(app::api::ApiRunner::new(
+        controller_cfg.clone(),
         log_tx.clone(),
-        components.statistics_manager,
         components.inbound_manager.clone(),
         components.dispatcher.clone(),
         global_state.clone(),
         components.dns_resolver.clone(),
-        components.outbound_manager,
+        components.outbound_manager.clone(),
+        components.statistics_manager.clone(),
+        components.cache_store.clone(),
         components.router.clone(),
-        /* components.inbound_manager,
-
-        components.dispatcher,
-        global_state.clone(),
-        components.dns_resolver,
-
-        components.cache_store,
-        components.router, */
         cwd.to_string_lossy().to_string(),
+        Some(shutdown_token.child_token()),
         components.dns_listen.clone(),
         components.dns_enabled,
-    );
+    ));
 
-    if let Some(r) = api_runner {
-        let api_listener_handle = tokio::spawn(r);
-        global_state.lock().await.api_listener_handle = Some(api_listener_handle);
+    // api_listener is not part of components because it requires components to be
+    // initialized before it can be initialized. start it manually.
+    api_listener.run_async();
+
+    {
+        let mut g = global_state.lock().await;
+        #[cfg(feature = "tun")]
+        {
+            g.tunnel_runner = components.tun_runner.clone();
+        }
+        g.dns_listener = components.dns_listener.clone();
     }
 
-    runners.push(Box::pin(async move {
-        match shutdown_rx.recv().await {
-            Some(_) => {
-                info!("received shutdown signal");
-                Ok(())
-            }
-            None => {
-                info!("runtime controller shutdown");
-                Ok(())
-            }
-        }
-    }));
+    components.start_all();
 
-    tasks.push(Box::pin(async move {
-        futures::future::select_all(runners).await.0
-    }));
+    let cwd_clone = cwd.clone();
 
-    tasks.push(Box::pin(async move {
+    let reload_token = shutdown_token.child_token();
+    tokio::spawn(async move {
+        // Listen for config reload signal and reload config
         while let Some((config, done)) = reload_rx.recv().await {
             info!("reloading config");
             let config = match config.try_parse() {
-                Ok(config) => config,
-                Err(err) => {
-                    error!("failed to reload config: {}", err);
+                Ok(c) => c,
+                Err(e) => {
+                    error!("failed to reload config: {}", e);
                     continue;
                 }
             };
 
             let controller_cfg = config.general.controller.clone();
-            let new_components = create_components(cwd.clone(), config).await?;
+            let new_components =
+                create_components(cwd_clone.clone(), config).await?;
 
-            let _ = done.send(());
+            done.send(()).unwrap();
 
-            debug!("stopping listeners");
-            inbound_manager.shutdown().await;
-            let mut state = global_state.lock().await;
+            components.stop_all();
+            new_components.start_all();
 
-            #[cfg(feature = "tun")]
-            if let Some(handle) = state.tunnel_listener_handle.take() {
-                handle.abort();
-            }
-            if let Some(handle) = state.dns_listener_handle.take() {
-                handle.abort();
-            }
-            if let Some(handle) = state.api_listener_handle.take() {
-                handle.abort();
-            }
-
-            let inbound_manager = new_components.inbound_manager.clone();
-            debug!("reloading inbound listeners");
-            inbound_manager.restart().await;
-
-            #[cfg(feature = "tun")]
-            let tun_runner_handle = new_components.tun_runner.map(tokio::spawn);
-            let dns_listener_handle = new_components.dns_listener.map(tokio::spawn);
-            let api_listener_handle = app::api::get_api_runner(
+            // TODO: every reload is causing the API server to restart, we should
+            // make the API server reloadable instead of restarting it.
+            // maybe adding APIs to replace components
+            // and only recreate the listeners when necessary (e.g. when the listen
+            // address or port is changed)
+            let new_api_listener: ArcRunner = Arc::new(app::api::ApiRunner::new(
                 controller_cfg,
                 log_tx.clone(),
-                new_components.statistics_manager,
-                new_components.inbound_manager,
-                new_components.dispatcher,
+                new_components.inbound_manager.clone(),
+                new_components.dispatcher.clone(),
                 global_state.clone(),
-                new_components.dns_resolver,
-                new_components.outbound_manager,
-                new_components.router,
-                cwd.to_string_lossy().to_string(),
+                new_components.dns_resolver.clone(),
+                new_components.outbound_manager.clone(),
+                new_components.statistics_manager.clone(),
+                new_components.cache_store.clone(),
+                new_components.router.clone(),
+                cwd_clone.to_string_lossy().to_string(),
+                Some(reload_token.clone()),
                 new_components.dns_listen.clone(),
                 new_components.dns_enabled,
-            )
-            .map(tokio::spawn);
+            ));
+            let mut g = global_state.lock().await;
 
             #[cfg(feature = "tun")]
             {
-                state.tunnel_listener_handle = tun_runner_handle;
+                g.tunnel_runner = new_components.tun_runner.clone();
             }
-            state.dns_listener_handle = dns_listener_handle;
-            state.api_listener_handle = api_listener_handle;
+            g.dns_listener = new_components.dns_listener.clone();
+
+            api_listener.shutdown();
+            new_api_listener.run_async();
         }
+        Ok::<(), Error>(())
+    });
 
-        Ok(())
-    }));
-
-    futures::future::select_all(tasks).await.0.map_err(|x| {
-        error!("runtime error: {}, shutting down", x);
-        x
-    })
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => { result.map_err(Error::Io)?; }
+        _ = shutdown_token.cancelled() => {}
+    }
+    Ok(())
 }
 
 struct RuntimeComponents {
-    /// 1
-    statistics_manager: Arc<StatisticsManager>,
-    /// 2
-    dns_listener: Option<Runner>,
     cache_store: profile::ThreadSafeCacheFile,
     dns_resolver: ThreadSafeDNSResolver,
     outbound_manager: Arc<OutboundManager>,
-    dispatcher: Arc<Dispatcher>,
     router: Arc<Router>,
-    inbound_manager: Arc<InboundManager>,
+    dispatcher: Arc<Dispatcher>,
+    statistics_manager: Arc<StatisticsManager>,
+
     #[cfg(feature = "tun")]
-    tun_runner: Option<Runner>,
+    tun_runner: ArcRunner,
+    dns_listener: ArcRunner,
+    inbound_manager: Arc<InboundManager>,
     dns_listen: DNSListenAddr,
     dns_enabled: bool,
+}
+
+impl RuntimeComponents {
+    fn start_all(&self) {
+        #[cfg(feature = "tun")]
+        self.tun_runner.run_async();
+        self.dns_listener.run_async();
+        self.inbound_manager.run_async();
+    }
+
+    fn stop_all(&self) {
+        #[cfg(feature = "tun")]
+        self.tun_runner.shutdown();
+        self.dns_listener.shutdown();
+        self.inbound_manager.shutdown();
+    }
 }
 
 async fn create_components(
@@ -383,7 +376,7 @@ async fn create_components(
         init_net_config(config.tun.so_mark).await;
     }
 
-    info!("all components initialized");
+    let cancellation_token = tokio_util::sync::CancellationToken::new();
 
     debug!("initializing cache store");
     let cache_store = profile::ThreadSafeCacheFile::new(
@@ -519,19 +512,33 @@ async fn create_components(
 
     debug!("initializing inbound manager");
     let inbound_manager = Arc::new(
-        InboundManager::new(dispatcher.clone(), authenticator, config.listeners)
-            .await,
+        InboundManager::new(
+            dispatcher.clone(),
+            authenticator,
+            config.listeners,
+            Some(cancellation_token.child_token()),
+        )
+        .await,
     );
 
     #[cfg(feature = "tun")]
     debug!("initializing tun runner");
     #[cfg(feature = "tun")]
-    let tun_runner =
-        get_tun_runner(config.tun, dispatcher.clone(), dns_resolver.clone())?;
+    let tun_runner: ArcRunner = Arc::new(tun::TunRunner::new(
+        config.tun,
+        dispatcher.clone(),
+        dns_resolver.clone(),
+        Some(cancellation_token.child_token()),
+    )?);
 
     debug!("initializing dns listener");
-    let dns_listener =
-        dns::get_dns_listener(dns_listen.clone(), dns_resolver.clone(), &cwd).await;
+    let dns_listener: ArcRunner = Arc::new(dns::DnsRunner::new(
+        dns_enable,
+        dns_listen.clone(),
+        dns_resolver.clone(),
+        &cwd,
+        Some(cancellation_token.child_token()),
+    ));
 
     Ok(RuntimeComponents {
         statistics_manager,
@@ -547,4 +554,21 @@ async fn create_components(
         dns_listen,
         dns_enabled: dns_enable,
     })
+}
+
+static SHUTDOWN_TOKEN: std::sync::Mutex<Vec<tokio_util::sync::CancellationToken>> =
+    std::sync::Mutex::new(Vec::new());
+
+pub fn shutdown() -> bool {
+    let mut token_guard = SHUTDOWN_TOKEN.lock().unwrap();
+    if !token_guard.is_empty() {
+        for token in token_guard.drain(..) {
+            token.cancel();
+        }
+        warn!("Shutdown signal sent, waiting for shutdown to complete...");
+        true
+    } else {
+        warn!("Shutdown token not initialized, cannot shutdown");
+        false
+    }
 }

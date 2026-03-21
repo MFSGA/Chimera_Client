@@ -8,7 +8,7 @@ edition = { workspace = true }
 
 [features]
 default = ["standard", "aws-lc-rs"]
-standard = ["trojan", "ws", "tls", "hysteria", "reality", "port"]
+standard = ["trojan", "ws", "tls", "hysteria", "reality", "port", "tun"]
 
 plus = ["standard", "onion"]
 onion = []

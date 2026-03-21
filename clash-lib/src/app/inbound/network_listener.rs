@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use futures::future::BoxFuture;
 use tracing::{error, info, warn};
 
 #[cfg(feature = "http_port")]
@@ -7,7 +8,6 @@ use crate::proxy::http::HttpInbound;
 #[cfg(feature = "mixed_port")]
 use crate::proxy::mixed::MixedInbound;
 use crate::{
-    Runner,
     app::dispatcher::Dispatcher,
     common::auth::ThreadSafeAuthenticator,
     config::internal::listener::InboundOpts,
@@ -18,13 +18,14 @@ pub(crate) fn build_network_listeners(
     inbound_opts: &InboundOpts,
     dispatcher: Arc<Dispatcher>,
     authenticator: ThreadSafeAuthenticator,
-) -> Option<Vec<Runner>> {
+) -> Option<Vec<BoxFuture<'static, Result<(), crate::Error>>>> {
     let name = &inbound_opts.common_opts().name;
     let addr = inbound_opts.common_opts().listen.0;
     let port = inbound_opts.common_opts().port;
 
     if let Some(handler) = build_handler(inbound_opts, dispatcher, authenticator) {
-        let mut runners: Vec<Runner> = Vec::new();
+        let mut runners: Vec<BoxFuture<'static, Result<(), crate::Error>>> =
+            Vec::new();
 
         if handler.handle_tcp() {
             let tcp_listener = handler.clone();
