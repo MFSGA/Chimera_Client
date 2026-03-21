@@ -243,8 +243,34 @@ where
     }
 
     if let Some(c) = listen.doh3 {
-        let _ = c;
-        warn!("DoH3 listener is not implemented yet");
+        has_server |= match UdpSocket::bind(c.addr).await {
+            Ok(socket) => match load_server_cert_resolver(cwd, &c.ca_cert, &c.ca_key)
+            {
+                Ok(cert_resolver) => s
+                    .register_h3_listener(
+                        socket,
+                        DEFAULT_DNS_SERVER_TIMEOUT,
+                        cert_resolver,
+                        c.hostname.clone(),
+                    )
+                    .map(|_| {
+                        info!("DoH3 dns server listening on: {}", c.addr);
+                        true
+                    })
+                    .inspect_err(|x| {
+                        error!("failed to register DoH3 DNS server on {}: {}", c.addr, x);
+                    })
+                    .unwrap_or(false),
+                Err(err) => {
+                    error!("failed to load DoH3 certificate material: {}", err);
+                    false
+                }
+            },
+            Err(err) => {
+                error!("failed to listen DoH3 DNS server on {}: {}", c.addr, err);
+                false
+            }
+        };
     }
 
     if !has_server {
