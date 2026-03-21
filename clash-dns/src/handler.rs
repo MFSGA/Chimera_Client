@@ -1,7 +1,7 @@
-use std::time::Duration;
+use std::{path::{Path, PathBuf}, sync::Arc, time::Duration};
 
 use crate::utils::new_io_error;
-use crate::{DNSListenAddr, DnsMessageExchanger};
+use crate::{DNSListenAddr, DnsMessageExchanger, DnsServerCert, DnsServerKey};
 use async_trait::async_trait;
 use hickory_proto::op::{Header, Message, ResponseCode};
 use hickory_server::server::Request;
@@ -9,6 +9,12 @@ use hickory_server::{
     ServerFuture,
     authority::MessageResponseBuilder,
     server::{RequestHandler, ResponseHandler, ResponseInfo},
+};
+use rustls::{
+    crypto::ring::default_provider,
+    pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
+    server::ResolvesServerCert,
+    sign::{CertifiedKey, SingleCertAndKey},
 };
 use thiserror::Error;
 use tokio::net::{TcpListener, UdpSocket};
@@ -83,6 +89,60 @@ where
 
 static DEFAULT_DNS_SERVER_TIMEOUT: Duration = Duration::from_secs(5);
 
+fn resolve_cert_path(cwd: &Path, path: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() { path } else { cwd.join(path) }
+}
+
+fn load_server_cert_resolver(
+    cwd: &Path,
+    cert: &DnsServerCert,
+    key: &DnsServerKey,
+) -> Result<Arc<dyn ResolvesServerCert>, DNSError> {
+    let cert = cert.as_ref().ok_or_else(|| {
+        DNSError::Io(new_io_error("missing dns server certificate path"))
+    })?;
+    let key = key.as_ref().ok_or_else(|| {
+        DNSError::Io(new_io_error("missing dns server private key path"))
+    })?;
+
+    let cert_path = resolve_cert_path(cwd, cert);
+    let key_path = resolve_cert_path(cwd, key);
+
+    let cert_chain = CertificateDer::pem_file_iter(&cert_path)
+        .map_err(|err| {
+            DNSError::Io(new_io_error(format!(
+                "failed to open dns cert {}: {err}",
+                cert_path.display()
+            )))
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| {
+            DNSError::Io(new_io_error(format!(
+                "failed to parse dns cert {}: {err}",
+                cert_path.display()
+            )))
+        })?;
+
+    let key = PrivateKeyDer::from_pem_file(&key_path).map_err(|err| {
+        DNSError::Io(new_io_error(format!(
+            "failed to parse dns key {}: {err}",
+            key_path.display()
+        )))
+    })?;
+
+    let certified_key =
+        CertifiedKey::from_der(cert_chain, key, &default_provider()).map_err(
+            |err| {
+                DNSError::Io(new_io_error(format!(
+                    "failed to build dns tls identity: {err}"
+                )))
+            },
+        )?;
+
+    Ok(Arc::new(SingleCertAndKey::from(certified_key)))
+}
+
 pub async fn get_dns_listener<X>(
     listen: DNSListenAddr,
     exchanger: X,
@@ -121,13 +181,65 @@ where
             .is_ok();
     }
     if let Some(c) = listen.doh {
-        let _ = c;
-        warn!("DoH listener is not implemented yet");
+        has_server |= match TcpListener::bind(c.addr).await {
+            Ok(listener) => match load_server_cert_resolver(cwd, &c.ca_cert, &c.ca_key)
+            {
+                Ok(cert_resolver) => s
+                    .register_https_listener(
+                        listener,
+                        DEFAULT_DNS_SERVER_TIMEOUT,
+                        cert_resolver,
+                        c.hostname.clone(),
+                        "/dns-query".to_string(),
+                    )
+                    .map(|_| {
+                        info!("DoH dns server listening on: {}", c.addr);
+                        true
+                    })
+                    .inspect_err(|x| {
+                        error!("failed to register DoH DNS server on {}: {}", c.addr, x);
+                    })
+                    .unwrap_or(false),
+                Err(err) => {
+                    error!("failed to load DoH certificate material: {}", err);
+                    false
+                }
+            },
+            Err(err) => {
+                error!("failed to listen DoH DNS server on {}: {}", c.addr, err);
+                false
+            }
+        };
     }
 
     if let Some(c) = listen.dot {
-        let _ = c;
-        warn!("DoT listener is not implemented yet");
+        has_server |= match TcpListener::bind(c.addr).await {
+            Ok(listener) => match load_server_cert_resolver(cwd, &c.ca_cert, &c.ca_key)
+            {
+                Ok(cert_resolver) => s
+                    .register_tls_listener(
+                        listener,
+                        DEFAULT_DNS_SERVER_TIMEOUT,
+                        cert_resolver,
+                    )
+                    .map(|_| {
+                        info!("DoT dns server listening on: {}", c.addr);
+                        true
+                    })
+                    .inspect_err(|x| {
+                        error!("failed to register DoT DNS server on {}: {}", c.addr, x);
+                    })
+                    .unwrap_or(false),
+                Err(err) => {
+                    error!("failed to load DoT certificate material: {}", err);
+                    false
+                }
+            },
+            Err(err) => {
+                error!("failed to listen DoT DNS server on {}: {}", c.addr, err);
+                false
+            }
+        };
     }
 
     if let Some(c) = listen.doh3 {

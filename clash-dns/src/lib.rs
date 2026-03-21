@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::Path};
+use std::net::SocketAddr;
 
 use async_trait::async_trait;
 use hickory_proto::op::Message;
