@@ -68,6 +68,7 @@ uuid = { version = "1", features = [
 
 # dns
 chimera-dns = { path = "../clash-dns", default-features = false }
+dhcproto = "0.14"
 
 # Macro Magic
 educe = "0.6"

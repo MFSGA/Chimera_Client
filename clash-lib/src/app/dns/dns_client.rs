@@ -46,7 +46,9 @@ use crate::{
     session::{Network, Session, SocksAddr, Type},
 };
 
-use super::{Client, ThreadSafeDNSClient, resolver::SystemResolver};
+use super::{
+    Client, ThreadSafeDNSClient, dhcp::DhcpClient, resolver::SystemResolver,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DNSNetMode {
@@ -126,7 +128,6 @@ enum DnsConfig {
         Arc<dyn OutboundHandler>,
         FwMark,
     ),
-    Dhcp(Option<String>),
 }
 
 impl Display for DnsConfig {
@@ -162,7 +163,6 @@ impl Display for DnsConfig {
                 write!(f, "host: {host}")?;
                 write!(f, "via proxy: {}", proxy.name())
             }
-            DnsConfig::Dhcp(iface) => write!(f, "DHCP: {:?}", iface),
         }
     }
 }
@@ -174,7 +174,6 @@ impl DnsConfig {
             | DnsConfig::Tcp(addr, ..)
             | DnsConfig::Tls(addr, ..)
             | DnsConfig::Https(addr, ..) => Some(*addr),
-            DnsConfig::Dhcp(_) => None,
         }
     }
 
@@ -184,7 +183,6 @@ impl DnsConfig {
             | DnsConfig::Tcp(_, iface, ..)
             | DnsConfig::Tls(_, _, iface, ..)
             | DnsConfig::Https(_, _, iface, ..) => iface.as_ref(),
-            DnsConfig::Dhcp(_) => None,
         }
     }
 
@@ -194,7 +192,6 @@ impl DnsConfig {
             | DnsConfig::Tcp(_, _, _, fw_mark)
             | DnsConfig::Tls(_, _, _, _, fw_mark)
             | DnsConfig::Https(_, _, _, _, fw_mark) => *fw_mark,
-            DnsConfig::Dhcp(_) => None,
         }
     }
 
@@ -204,7 +201,6 @@ impl DnsConfig {
             | DnsConfig::Tcp(_, _, proxy, _)
             | DnsConfig::Tls(_, _, _, proxy, _)
             | DnsConfig::Https(_, _, _, proxy, _) => Some(proxy),
-            DnsConfig::Dhcp(_) => None,
         }
     }
 }
@@ -246,15 +242,13 @@ impl DnsClient {
                 _ => opts.iface.as_ref().map(|iface| iface.name.clone()),
             };
 
-            return Ok(Arc::new(Self {
-                inner: Arc::new(RwLock::new(Inner::default())),
-                cfg: DnsConfig::Dhcp(iface_name),
-                host: opts.host,
-                port: opts.port,
-                net: opts.net,
-                ecs: opts.ecs,
-                ipv6: opts.ipv6,
-            }));
+            return Ok(Arc::new(
+                DhcpClient::new(
+                    iface_name.as_deref().unwrap_or("system"),
+                    opts.fw_mark,
+                )
+                .await,
+            ));
         }
 
         let mut ip: Option<IpAddr> = None;
@@ -405,9 +399,7 @@ impl DnsClient {
     }
 
     fn name_server_config(&self) -> anyhow::Result<Option<NameServerConfig>> {
-        let Some(addr) = self.cfg.addr() else {
-            return Ok(None);
-        };
+        let addr = self.cfg.addr().expect("dns config must have upstream addr");
 
         let mut name_server = match &self.cfg {
             DnsConfig::Udp(..) => NameServerConfig::new(addr, Protocol::Udp),
@@ -423,7 +415,6 @@ impl DnsClient {
                 ns.http_endpoint = Some(Self::doh_endpoint());
                 ns
             }
-            DnsConfig::Dhcp(_) => return Ok(None),
         };
         name_server.bind_addr =
             Some(addr).and_then(|addr| resolve_bind_addr(self.cfg.iface(), addr));
@@ -432,31 +423,6 @@ impl DnsClient {
     }
 
     async fn build_resolver(&self) -> anyhow::Result<TokioResolver> {
-        if let DnsConfig::Dhcp(iface) = &self.cfg {
-            if iface.is_some() {
-                warn!(
-                    iface = ?iface,
-                    dns = %self.id(),
-                    "dhcp dns interface selection is not implemented yet; using system dns configuration"
-                );
-            }
-
-            let (config, mut resolver_opts) =
-                hickory_resolver::system_conf::read_system_conf().map_err(|e| {
-                    anyhow::anyhow!(
-                        "failed to read system dns config for dhcp upstream: {e}"
-                    )
-                })?;
-            resolver_opts.ip_strategy = self.resolver_opts().ip_strategy;
-
-            return Ok(TokioResolver::builder_with_config(
-                config,
-                TokioConnectionProvider::default(),
-            )
-            .with_options(resolver_opts)
-            .build());
-        }
-
         let mut config = ResolverConfig::new();
         if let Some(name_server) = self.name_server_config()? {
             config.add_name_server(name_server);
@@ -543,7 +509,6 @@ impl DnsClient {
                 )
                 .await
             }
-            DnsConfig::Dhcp(_) => self.exchange_via_resolver(message).await,
         }
     }
 
@@ -571,7 +536,6 @@ impl DnsClient {
                 )
                 .await
             }
-            DnsConfig::Dhcp(_) => self.exchange_via_resolver(message).await,
         }
     }
 

@@ -518,7 +518,7 @@ impl EnhancedResolver {
     }
 
     #[instrument(skip(message), level = "trace")]
-    async fn batch_exchange(
+    pub(crate) async fn batch_exchange(
         resolvers: &Vec<ThreadSafeDNSClient>,
         message: &Message,
     ) -> anyhow::Result<Message> {

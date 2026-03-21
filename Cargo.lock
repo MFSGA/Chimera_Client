@@ -578,6 +578,7 @@ dependencies = [
  "bytes",
  "chimera-dns",
  "chrono",
+ "dhcproto",
  "digest",
  "downcast-rs",
  "educe",
@@ -868,6 +869,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ececcb659e7ba858fb4f10388c250a7252eb0a27373f1a72b8748afdd248e587"
 dependencies = [
  "powerfmt",
+]
+
+[[package]]
+name = "dhcproto"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "425ab19f6a915beac79cac8ec2810c1311b502ae14d7f294682081cf5ae4c5bb"
+dependencies = [
+ "dhcproto-macros",
+ "hickory-proto",
+ "ipnet",
+ "rand 0.9.2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "dhcproto-macros"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3944d18b1889ce23702b0ea0230e87033cf5b4659e233419b5c00da3983a387b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

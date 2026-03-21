@@ -10,6 +10,7 @@ use std::{
 
 /// 2
 pub mod config;
+mod dhcp;
 mod dns_client;
 mod fakeip;
 mod filters;
