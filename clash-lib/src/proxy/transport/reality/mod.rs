@@ -1,8 +1,9 @@
 use async_trait::async_trait;
-use std::io;
+use std::{io, sync::{Arc, atomic::AtomicBool}};
 
 use super::Transport;
-use crate::proxy::AnyStream;
+use crate::proxy::{AnyStream, transport::VisionOptions};
+use crate::proxy::transport::splice_tls::SplicableTlsStream;
 
 mod buf_reader;
 mod common;
@@ -90,5 +91,65 @@ impl Transport for Client {
         );
         let tls_stream = self.handshake_stream(stream).await?;
         Ok(Box::new(tls_stream))
+    }
+
+    /// Establish a Reality TLS connection and return the stream together with
+    /// `VisionOptions` (a pair of `Arc<AtomicBool>` splice flags) that allow
+    /// the upper `VisionStream` to signal this layer when XTLS-splice mode is
+    /// triggered.
+    ///
+    /// ## Layer stack
+    ///
+    /// ```text
+    ///  VisionStream          (owns VisionOptions – writes the flags)
+    ///    └─ VlessStream      (VLESS framing)
+    ///        └─ SplicableTlsStream  (reads the flags; bypasses TLS when set)
+    ///            └─ Reality TLS
+    ///                └─ TCP
+    /// ```
+    ///
+    /// ## Handshake / splice sequence
+    ///
+    /// ```text
+    ///  Client                                  Xray server
+    ///    |                                          |
+    ///    |---------- Reality TLS handshake -------->|
+    ///    |<--------- Reality TLS handshake ---------|
+    ///    |   (all traffic above is Reality-TLS encrypted)
+    ///    |                                          |
+    ///    |========== Vision framing mode ===========|
+    ///    |--[UUID][CMD=0x00][inner TLS ClientHello]->|  Vision-framed inner TLS
+    ///    |<-[UUID][CMD=0x00][inner TLS ServerHello]--|
+    ///    |<-[CMD=0x02][inner TLS AppData]------------|  server triggers splice
+    ///    |--[CMD=0x02][inner TLS AppData]----------->|  client triggers splice
+    ///    |                                          |
+    ///    |  (both sides received CMD_DIRECT)        |
+    ///    |                                          |
+    ///    |========== Splice mode (raw TCP) ==========|
+    ///    |--[raw inner-TLS AppData]----------------->|  no outer TLS encryption
+    ///    |<-[raw inner-TLS AppData]------------------|
+    /// ```
+    ///
+    /// On `CMD_PADDING_DIRECT` (0x02):
+    /// - `VisionStream` sets `read_flag` / `write_flag` to `true`.
+    /// - `SplicableTlsStream` detects the flags and bypasses Reality TLS,
+    ///   reading/writing raw bytes directly on the TCP socket.
+    async fn proxy_stream_spliced(
+        &self,
+        stream: AnyStream,
+    ) -> io::Result<(AnyStream, Option<VisionOptions>)> {
+        let read_flag = Arc::new(AtomicBool::new(false));
+        let write_flag = Arc::new(AtomicBool::new(false));
+        let tls_stream = self.handshake_stream(stream).await?;
+        let splittable = SplicableTlsStream::new(
+            tls_stream,
+            Arc::clone(&read_flag),
+            Arc::clone(&write_flag),
+        );
+        let opts = VisionOptions {
+            read_flag,
+            write_flag,
+        };
+        Ok((Box::new(splittable), Some(opts)))
     }
 }

@@ -64,6 +64,7 @@ impl TryFrom<&OutboundVless> for Handler {
             udp: s.udp.unwrap_or(true),
             transport,
             tls: build_tls_transport(network, s, skip_cert_verify)?,
+            flow: s.flow.clone(),
         }))
     }
 }

@@ -110,6 +110,14 @@ where
         (self.io, self.session)
     }
 
+    /// Borrow the underlying transport and crypto session.
+    ///
+    /// This is used by the Vision/Reality splice wrapper to drain any
+    /// remaining decrypted bytes before bypassing the outer REALITY layer.
+    pub fn get_mut(&mut self) -> (&mut IO, &mut CryptoConnection) {
+        (&mut self.io, &mut self.session)
+    }
+
     /// Get the negotiated ALPN protocol, if any
     ///
     /// Returns the ALPN protocol that was negotiated during the TLS handshake.

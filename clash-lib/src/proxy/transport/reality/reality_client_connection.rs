@@ -995,6 +995,18 @@ impl RealityClientConnection {
         self.plaintext_read_buf.is_empty()
     }
 
+    /// Drain unread bytes still buffered as would-be ciphertext.
+    ///
+    /// After the VISION `CMD_PADDING_DIRECT` transition, post-splice raw TCP
+    /// bytes may already have been read from the socket and end up parked in
+    /// `ciphertext_read_buf`. They are no longer REALITY records and must be
+    /// passed back to the raw transport path.
+    pub fn take_remaining_ciphertext(&mut self) -> Vec<u8> {
+        let pending = self.ciphertext_read_buf.as_slice().to_vec();
+        self.ciphertext_read_buf.consume(pending.len());
+        pending
+    }
+
     /// Queue a close notification alert
     pub fn send_close_notify(&mut self) {
         // In TLS 1.3, alerts must be encrypted like application data

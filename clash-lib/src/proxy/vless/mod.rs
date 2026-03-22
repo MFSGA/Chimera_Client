@@ -14,7 +14,7 @@ use crate::{
         dns::ThreadSafeDNSResolver,
     },
     impl_default_connector,
-    proxy::vless::datagram::OutboundDatagramVless,
+    proxy::vless::{datagram::OutboundDatagramVless, vision::VisionStream},
     session::Session,
 };
 use async_trait::async_trait;
@@ -23,6 +23,7 @@ use tracing::debug;
 
 mod datagram;
 mod stream;
+mod vision;
 
 pub struct HandlerOptions {
     pub name: String,
@@ -33,6 +34,7 @@ pub struct HandlerOptions {
     pub udp: bool,
     pub transport: Option<Box<dyn Transport>>,
     pub tls: Option<Box<dyn Transport>>,
+    pub flow: Option<String>,
 }
 
 pub struct Handler {
@@ -64,22 +66,51 @@ impl Handler {
         sess: &Session,
         is_udp: bool,
     ) -> io::Result<AnyStream> {
+        let wants_vision_splice =
+            self.opts.flow.as_deref() == Some("xtls-rprx-vision");
+        let mut vision_opts = None;
+
         let s = if let Some(tls) = self.opts.tls.as_ref() {
-            tls.proxy_stream(s).await?
+            if wants_vision_splice {
+                let (stream, opts) = tls.proxy_stream_spliced(s).await?;
+                vision_opts = opts;
+                stream
+            } else {
+                tls.proxy_stream(s).await?
+            }
         } else {
             s
         };
 
         let s = if let Some(transport) = self.opts.transport.as_ref() {
-            transport.proxy_stream(s).await?
+            if wants_vision_splice && vision_opts.is_none() {
+                let (stream, opts) = transport.proxy_stream_spliced(s).await?;
+                vision_opts = opts;
+                stream
+            } else {
+                transport.proxy_stream(s).await?
+            }
         } else {
             s
         };
 
-        let vless_stream =
-            VlessStream::new(s, &self.opts.uuid, &sess.destination, is_udp)?;
+        let vless_stream = VlessStream::new(
+            s,
+            &self.opts.uuid,
+            &sess.destination,
+            is_udp,
+            self.opts.flow.clone(),
+        )?;
 
-        Ok(Box::new(vless_stream))
+        if self.opts.flow.as_deref() == Some("xtls-rprx-vision") {
+            Ok(Box::new(VisionStream::new(
+                Box::new(vless_stream),
+                self.opts.uuid.clone(),
+                vision_opts,
+            )?))
+        } else {
+            Ok(Box::new(vless_stream))
+        }
     }
 }
 

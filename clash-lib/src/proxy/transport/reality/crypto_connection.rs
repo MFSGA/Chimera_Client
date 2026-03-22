@@ -68,6 +68,10 @@ impl CryptoConnection {
     pub fn send_close_notify(&mut self) {
         self.inner.send_close_notify();
     }
+
+    pub fn take_remaining_ciphertext(&mut self) -> Vec<u8> {
+        self.inner.take_remaining_ciphertext()
+    }
 }
 
 #[inline]

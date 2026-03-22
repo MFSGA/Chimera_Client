@@ -13,6 +13,7 @@ use crate::{proxy::AnyStream, session::SocksAddr};
 const VLESS_VERSION: u8 = 0;
 const VLESS_COMMAND_TCP: u8 = 1;
 const VLESS_COMMAND_UDP: u8 = 2;
+const XTLS_VISION_FLOW: &str = "xtls-rprx-vision";
 
 pub struct VlessStream {
     inner: AnyStream,
@@ -22,6 +23,7 @@ pub struct VlessStream {
     uuid: uuid::Uuid,
     destination: SocksAddr,
     is_udp: bool,
+    flow: Option<String>,
 }
 
 impl VlessStream {
@@ -30,6 +32,7 @@ impl VlessStream {
         uuid: &str,
         destination: &SocksAddr,
         is_udp: bool,
+        flow: Option<String>,
     ) -> io::Result<Self> {
         let uuid = uuid::Uuid::parse_str(uuid).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "invalid UUID format")
@@ -45,11 +48,13 @@ impl VlessStream {
             uuid,
             destination: destination.clone(),
             is_udp,
+            flow,
         })
     }
 
     fn build_handshake_header(&self) -> BytesMut {
         let mut buf = BytesMut::new();
+        let addons = self.encode_request_addons();
 
         // VLESS request header:
         // Version (1 byte) + UUID (16 bytes) + Additional info length (1 byte)
@@ -57,7 +62,8 @@ impl VlessStream {
         //   info
         buf.put_u8(VLESS_VERSION);
         buf.put_slice(self.uuid.as_bytes());
-        buf.put_u8(0); // Additional info length (0 for simplicity)
+        buf.put_u8(addons.len() as u8);
+        buf.put_slice(&addons);
 
         if self.is_udp {
             buf.put_u8(VLESS_COMMAND_UDP);
@@ -67,6 +73,13 @@ impl VlessStream {
 
         self.destination.write_to_buf_vmess(&mut buf);
         buf
+    }
+
+    fn encode_request_addons(&self) -> Vec<u8> {
+        match self.flow.as_deref() {
+            Some(XTLS_VISION_FLOW) => encode_flow_addon(XTLS_VISION_FLOW),
+            _ => Vec::new(),
+        }
     }
 
     async fn send_handshake_with_data(&mut self, data: &[u8]) -> io::Result<usize> {
@@ -148,14 +161,33 @@ impl VlessStream {
     }
 }
 
+fn encode_flow_addon(flow: &str) -> Vec<u8> {
+    let flow_bytes = flow.as_bytes();
+    let flow_len = flow_bytes.len();
+    assert!(
+        flow_len < 128,
+        "xtls vision flow string must fit in a single-byte protobuf varint"
+    );
+
+    let mut result = Vec::with_capacity(2 + flow_len);
+    result.push(0x0a);
+    result.push(flow_len as u8);
+    result.extend_from_slice(flow_bytes);
+    result
+}
+
 impl AsyncRead for VlessStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        // Must receive response before reading
-        if self.handshake_sent && !self.response_received {
+        // Vision handles the response header itself because the first response
+        // bytes are followed by Vision-framed body data in the same stream.
+        let vision_flow = self.flow.as_deref() == Some(XTLS_VISION_FLOW);
+
+        // Must receive response before reading for non-Vision flows.
+        if self.handshake_sent && !self.response_received && !vision_flow {
             let fut = self.receive_response();
             tokio::pin!(fut);
             match fut.poll(cx) {
@@ -201,5 +233,30 @@ impl AsyncWrite for VlessStream {
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), io::Error>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VlessStream, XTLS_VISION_FLOW};
+    use crate::session::SocksAddr;
+
+    #[test]
+    fn vless_vision_flow_addon_is_encoded_into_request_header() {
+        let (io, _) = tokio::io::duplex(1);
+        let stream = VlessStream::new(
+            Box::new(io),
+            "5415d8e0-df92-3655-afa4-b79de66413f5",
+            &SocksAddr::Domain("example.com".to_owned(), 443),
+            false,
+            Some(XTLS_VISION_FLOW.to_owned()),
+        )
+        .expect("stream should build");
+
+        let header = stream.build_handshake_header();
+
+        assert_eq!(header[17], 18, "vision flow protobuf should be 18 bytes");
+        assert_eq!(&header[18..20], &[0x0a, 16]);
+        assert_eq!(&header[20..36], XTLS_VISION_FLOW.as_bytes());
     }
 }

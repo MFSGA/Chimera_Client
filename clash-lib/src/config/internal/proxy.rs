@@ -240,8 +240,6 @@ pub struct OutboundVless {
     #[serde(alias = "servername", alias = "serverName")]
     pub server_name: Option<String>,
     pub sni: Option<String>,
-    #[serde(alias = "fingerprint")]
-    pub client_fingerprint: Option<String>,
     pub network: Option<String>,
     #[serde(alias = "xhttpOpts")]
     pub xhttp_opts: Option<XhttpOpt>,
@@ -249,6 +247,9 @@ pub struct OutboundVless {
     pub ws_opts: Option<WsOpt>,
     #[serde(alias = "realityOpts")]
     pub reality_opts: Option<OutboundTrojanRealityOpts>,
+    pub flow: Option<String>,
+    #[serde(alias = "fingerprint")]
+    pub client_fingerprint: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
