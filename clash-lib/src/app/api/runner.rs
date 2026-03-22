@@ -101,6 +101,7 @@ impl Runner for ApiRunner {
         let cwd = self.cwd.clone();
         let dns_listen_addr = self.dns_listen_addr.clone();
         let dns_enabled = self.dns_enabled;
+        let cancellation_token = self.cancellation_token.clone();
 
         tracing::debug!("API controller configuration: {:?}", controller_cfg);
         let ipc_addr = controller_cfg.external_controller_ipc;
@@ -253,13 +254,37 @@ impl Runner for ApiRunner {
             match (tcp_fut, ipc_fut) {
                 (Some(tcp), Some(ipc)) => {
                     tokio::select! {
+                        _ = cancellation_token.cancelled() => {
+                            debug!("API server shutdown signal received");
+                            Ok(())
+                        }
                         result = tcp => result,
                         result = ipc => result,
                     }
                 }
-                (Some(tcp), None) => tcp.await,
-                (None, Some(ipc)) => ipc.await,
-                (None, None) => Ok(()),
+                (Some(tcp), None) => {
+                    tokio::select! {
+                        _ = cancellation_token.cancelled() => {
+                            debug!("API server shutdown signal received");
+                            Ok(())
+                        }
+                        result = tcp => result,
+                    }
+                }
+                (None, Some(ipc)) => {
+                    tokio::select! {
+                        _ = cancellation_token.cancelled() => {
+                            debug!("API server shutdown signal received");
+                            Ok(())
+                        }
+                        result = ipc => result,
+                    }
+                }
+                (None, None) => {
+                    cancellation_token.cancelled().await;
+                    debug!("API server shutdown signal received");
+                    Ok(())
+                }
             }
         });
     }

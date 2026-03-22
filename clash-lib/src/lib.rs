@@ -274,6 +274,9 @@ pub async fn start(
 
     let reload_token = shutdown_token.child_token();
     tokio::spawn(async move {
+        let mut active_components = components;
+        let mut active_api_listener = api_listener;
+
         // Listen for config reload signal and reload config
         while let Some((config, done)) = reload_rx.recv().await {
             info!("reloading config");
@@ -291,7 +294,7 @@ pub async fn start(
 
             done.send(()).unwrap();
 
-            components.stop_all();
+            active_components.stop_all();
             new_components.start_all();
 
             // TODO: every reload is causing the API server to restart, we should
@@ -323,8 +326,11 @@ pub async fn start(
             }
             g.dns_listener = new_components.dns_listener.clone();
 
-            api_listener.shutdown();
+            active_api_listener.shutdown();
             new_api_listener.run_async();
+
+            active_components = new_components;
+            active_api_listener = new_api_listener;
         }
         Ok::<(), Error>(())
     });
@@ -364,7 +370,7 @@ impl RuntimeComponents {
         #[cfg(feature = "tun")]
         self.tun_runner.shutdown();
         self.dns_listener.shutdown();
-        self.inbound_manager.shutdown();
+        Runner::shutdown(self.inbound_manager.as_ref());
     }
 }
 

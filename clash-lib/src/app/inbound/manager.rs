@@ -61,6 +61,10 @@ impl Runner for InboundManager {
 
     fn shutdown(&self) {
         self.cancellation_token.cancel();
+        let inbound_handlers = self.inbound_handlers.clone();
+        tokio::spawn(async move {
+            InboundManager::stop_all_listener_handles(inbound_handlers).await;
+        });
     }
 
     fn join(&self) -> BoxFuture<'_, Result<(), crate::Error>> {
@@ -69,6 +73,18 @@ impl Runner for InboundManager {
 }
 
 impl InboundManager {
+    async fn stop_all_listener_handles(
+        inbound_handlers: Arc<RwLock<HashMap<InboundOpts, Option<JoinHandle<()>>>>>,
+    ) {
+        for (opt, l) in inbound_handlers.write().await.iter_mut() {
+            if let Some(handler) = l.take() {
+                warn!("Shutting down inbound handler: {}", opt.common_opts().name);
+                handler.abort();
+            }
+            *l = None;
+        }
+    }
+
     pub async fn new(
         dispatcher: Arc<Dispatcher>,
         authenticator: ThreadSafeAuthenticator,
@@ -126,12 +142,8 @@ impl InboundManager {
     }
 
     pub async fn shutdown(&self) {
-        for (opt, l) in self.inbound_handlers.write().await.iter_mut() {
-            if let Some(handler) = l.take() {
-                warn!("Shutting down inbound handler: {}", opt.common_opts().name);
-                handler.abort();
-            }
-        }
+        self.cancellation_token.cancel();
+        Self::stop_all_listener_handles(self.inbound_handlers.clone()).await;
     }
 
     pub async fn restart(&self) -> Result<(), crate::Error> {
@@ -272,13 +284,7 @@ impl InboundManager {
     }
 
     async fn stop_all_listeners(&self) {
-        for (opt, l) in self.inbound_handlers.write().await.iter_mut() {
-            if let Some(handler) = l.take() {
-                warn!("Shutting down inbound handler: {}", opt.common_opts().name);
-                handler.abort();
-            }
-            *l = None;
-        }
+        Self::stop_all_listener_handles(self.inbound_handlers.clone()).await;
         debug!("todo for provider");
         /* for handles in self.provider_handles.write().await.values_mut() {
             for (opt, handle) in handles.iter_mut() {
