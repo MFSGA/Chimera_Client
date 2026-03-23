@@ -8,3 +8,5 @@ pub mod mmdb;
 pub mod tls;
 pub mod trie;
 pub mod utils;
+
+pub mod defer;
