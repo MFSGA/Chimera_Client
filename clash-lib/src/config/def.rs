@@ -280,6 +280,10 @@ pub struct DNS {
     /// Fallback DNS filter
     pub fallback_filter: FallbackFilter,
     /// Default nameservers used for resolving DNS upstream hostnames later
+    #[educe(Default = vec![
+      String::from("114.114.114.114"),
+      String::from("8.8.8.8")]
+    )]
     pub default_nameserver: Vec<String>,
     pub edns_client_subnet: Option<EdnsClientSubnet>,
     /// Lookup domains via specific nameservers
