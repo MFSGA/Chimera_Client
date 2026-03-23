@@ -6,9 +6,13 @@ use tracing::{debug, error, info};
 use url::Url;
 
 use crate::{
-    Error, app::{dispatcher::Dispatcher, dns::ThreadSafeDNSResolver}, config::internal::config::TunConfig, proxy::tun::{
+    Error,
+    app::{dispatcher::Dispatcher, dns::ThreadSafeDNSResolver},
+    config::internal::config::TunConfig,
+    proxy::tun::{
         datagram::handle_inbound_datagram, routes, stream::handle_inbound_stream,
-    }, runner::Runner
+    },
+    runner::Runner,
 };
 
 /// Maximum number of attempts to wait for a newly created TUN interface to

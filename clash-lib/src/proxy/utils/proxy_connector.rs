@@ -9,12 +9,18 @@ use tracing::trace;
 use super::new_tcp_stream;
 use crate::{
     app::{
-        dispatcher::{ChainedStream, ChainedStreamWrapper},
+        dispatcher::{
+            ChainedDatagram, ChainedDatagramWrapper, ChainedStream,
+            ChainedStreamWrapper,
+        },
         dns::ThreadSafeDNSResolver,
         net::OutboundInterface,
     },
     common::errors::new_io_error,
-    proxy::{AnyOutboundHandler, AnyStream},
+    proxy::{
+        AnyOutboundDatagram, AnyOutboundHandler, AnyStream,
+        datagram::OutboundDatagramImpl, utils::new_udp_socket,
+    },
     session::{Network, Session, SocksAddr, Type},
 };
 
@@ -29,6 +35,15 @@ pub trait RemoteConnector: Send + Sync + Debug {
         iface: Option<&OutboundInterface>,
         #[cfg(target_os = "linux")] packet_mark: Option<u32>,
     ) -> std::io::Result<AnyStream>;
+
+    async fn connect_datagram(
+        &self,
+        resolver: ThreadSafeDNSResolver,
+        src: Option<SocketAddr>,
+        destination: SocksAddr,
+        iface: Option<&OutboundInterface>,
+        #[cfg(target_os = "linux")] packet_mark: Option<u32>,
+    ) -> std::io::Result<AnyOutboundDatagram>;
 }
 
 #[derive(Debug)]
@@ -71,6 +86,30 @@ impl RemoteConnector for DirectConnector {
         )
         .await
         .map(|x| Box::new(x) as _)
+    }
+
+    async fn connect_datagram(
+        &self,
+        resolver: ThreadSafeDNSResolver,
+        src: Option<SocketAddr>,
+        destination: SocksAddr,
+        iface: Option<&OutboundInterface>,
+        #[cfg(target_os = "linux")] so_mark: Option<u32>,
+    ) -> std::io::Result<AnyOutboundDatagram> {
+        let dgram = new_udp_socket(
+            src,
+            iface,
+            #[cfg(target_os = "linux")]
+            so_mark,
+            destination
+                .ip()
+                .map(|ip| SocketAddr::new(ip, destination.port())),
+        )
+        .await
+        .map(|x| OutboundDatagramImpl::new(x, resolver))?;
+
+        let dgram = ChainedDatagramWrapper::new(dgram);
+        Ok(Box::new(dgram))
     }
 }
 
@@ -130,6 +169,37 @@ impl RemoteConnector for ProxyConnector {
             .await?;
 
         let stream = ChainedStreamWrapper::new(s);
+        stream.append_to_chain(self.proxy.name()).await;
+        Ok(Box::new(stream))
+    }
+
+    async fn connect_datagram(
+        &self,
+        resolver: ThreadSafeDNSResolver,
+        _src: Option<SocketAddr>,
+        destination: SocksAddr,
+        iface: Option<&OutboundInterface>,
+        #[cfg(target_os = "linux")] so_mark: Option<u32>,
+    ) -> std::io::Result<AnyOutboundDatagram> {
+        let sess = Session {
+            network: Network::Udp,
+            typ: Type::Ignore,
+            iface: iface.cloned(),
+            destination: destination.clone(),
+            #[cfg(target_os = "linux")]
+            so_mark,
+            ..Default::default()
+        };
+        let s = self
+            .proxy
+            .connect_datagram_with_connector(
+                &sess,
+                resolver,
+                self.connector.as_ref(),
+            )
+            .await?;
+
+        let stream = ChainedDatagramWrapper::new(s);
         stream.append_to_chain(self.proxy.name()).await;
         Ok(Box::new(stream))
     }

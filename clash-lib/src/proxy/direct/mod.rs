@@ -3,16 +3,21 @@ use std::fmt::Debug;
 use async_trait::async_trait;
 use futures::TryFutureExt;
 
+use crate::app::dispatcher::ChainedDatagram;
 use crate::{
     Session,
     app::{
-        dispatcher::{BoxedChainedStream, ChainedStream, ChainedStreamWrapper},
+        dispatcher::{
+            BoxedChainedDatagram, BoxedChainedStream, ChainedDatagramWrapper,
+            ChainedStream, ChainedStreamWrapper,
+        },
         dns::ThreadSafeDNSResolver,
     },
     common::errors::map_io_error,
     config::internal::proxy::PROXY_DIRECT,
     proxy::{
-        DialWithConnector, OutboundHandler, OutboundType, utils::new_tcp_stream,
+        DialWithConnector, OutboundHandler, OutboundType,
+        utils::{RemoteConnector, new_tcp_stream},
     },
 };
 
@@ -69,5 +74,26 @@ impl OutboundHandler for Handler {
         let s = ChainedStreamWrapper::new(s);
         s.append_to_chain(self.name()).await;
         Ok(Box::new(s))
+    }
+
+    async fn connect_datagram_with_connector(
+        &self,
+        sess: &Session,
+        resolver: ThreadSafeDNSResolver,
+        connector: &dyn RemoteConnector,
+    ) -> std::io::Result<BoxedChainedDatagram> {
+        let d = connector
+            .connect_datagram(
+                resolver,
+                None,
+                sess.destination.clone(),
+                sess.iface.as_ref(),
+                #[cfg(target_os = "linux")]
+                sess.so_mark,
+            )
+            .await?;
+        let d = ChainedDatagramWrapper::new(d);
+        d.append_to_chain(self.name()).await;
+        Ok(Box::new(d))
     }
 }
