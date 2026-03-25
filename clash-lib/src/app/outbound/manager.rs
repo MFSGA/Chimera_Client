@@ -16,8 +16,11 @@ use crate::{
         remote_content_manager::{
             ProxyManager,
             healthcheck::HealthCheck,
-            providers::proxy_provider::{
-                ThreadSafeProxyProvider, plain_provider::PlainProvider,
+            providers::{
+                ProviderVehicleType,
+                proxy_provider::{
+                    ThreadSafeProxyProvider, plain_provider::PlainProvider,
+                },
             },
         },
     },
@@ -33,10 +36,12 @@ use crate::{
             urltest,
         },
         reject,
-        utils::{DirectConnector, ProxyConnector},
+        utils::{DirectConnector, OutboundHandlerRegistry, ProxyConnector},
         vless,
     },
 };
+
+static RESERVED_PROVIDER_NAME: &str = "default";
 
 #[cfg(feature = "hysteria")]
 use crate::proxy::hysteria2;
@@ -45,13 +50,17 @@ use crate::proxy::trojan;
 
 pub struct OutboundManager {
     /// name -> handler
-    handlers: HashMap<String, AnyOutboundHandler>,
-    proxy_names: Vec<String>,
+    /// handlers: HashMap<String, AnyOutboundHandler>,
+    /// proxy_names: Vec<String>,
     /// name -> provider
     proxy_providers: HashMap<String, ThreadSafeProxyProvider>,
     proxy_manager: ProxyManager,
     selector_control: HashMap<String, ThreadSafeSelectorControl>,
     cache_store: ThreadSafeCacheFile,
+    /// Shared registry used by both OutboundManager lookups and the DNS /
+    /// HTTP bootstrap clients.  Populated at the end of `new()` and is the
+    /// single source of truth for all handlers after initialization.
+    registry: OutboundHandlerRegistry,
 }
 
 pub type ThreadSafeOutboundManager = Arc<OutboundManager>;
@@ -89,16 +98,20 @@ impl OutboundManager {
         cache_store: ThreadSafeCacheFile,
         cwd: String,
         fw_mark: Option<u32>,
+        registry: OutboundHandlerRegistry,
     ) -> Result<Self, Error> {
-        let handlers = HashMap::new();
-        let proxy_names_ref = proxy_names;
+        // Build all handlers in a plain HashMap during initialization.
+        // Once fully assembled it is written into the shared registry so that
+        // DNS clients and the HTTP client can look up any handler by name.
+        let mut handlers: HashMap<String, AnyOutboundHandler> = HashMap::new();
+        // let proxy_names_ref = proxy_names;
         let provider_registry = HashMap::new();
         let selector_control = HashMap::new();
         let proxy_manager = ProxyManager::new(dns_resolver.clone(), fw_mark);
 
         let mut m = Self {
-            handlers,
-            proxy_names: proxy_names_ref,
+            registry,
+            // proxy_names: proxy_names_ref,
             proxy_manager,
             selector_control,
             proxy_providers: provider_registry,
@@ -109,23 +122,46 @@ impl OutboundManager {
         m.load_proxy_providers(cwd, proxy_providers, dns_resolver)
             .await?;
 
-        debug!("todo initializing handlers");
-        m.load_handlers(outbounds, outbound_groups, cache_store)
-            .await?;
+        debug!("initializing handlers");
+        m.load_handlers(
+            &mut handlers,
+            outbounds,
+            outbound_groups,
+            proxy_names,
+            cache_store,
+        )
+        .await?;
 
         debug!("initializing connectors");
-        m.init_handler_connectors().await?;
+        m.init_handler_connectors(&handlers).await?;
+
+        // Replace the shared registry with the freshly assembled handler map.
+        // Using `clone()` + `*reg = ...` ensures stale entries from previous
+        // initialisation rounds (e.g. across hot reloads) are removed.
+        {
+            let mut reg = m.registry.write().await;
+            *reg = handlers
+                .iter()
+                .map(|(k, v)| {
+                    debug!("registering outbound '{}' in bootstrap registry", k);
+                    (k.clone(), v.clone())
+                })
+                .collect();
+        }
 
         Ok(m)
     }
 
-    pub fn get_outbound(&self, name: &str) -> Option<AnyOutboundHandler> {
-        self.handlers.get(name).cloned()
+    /// Look up a handler by name. Returns `None` when the name is not
+    /// registered.  The registry is read under a shared lock, so this method
+    /// is `async` — callers must `.await` the result.
+    pub async fn get_outbound(&self, name: &str) -> Option<AnyOutboundHandler> {
+        self.registry.read().await.get(name).cloned()
     }
 
-    pub fn proxy_names(&self) -> &[String] {
+    /* pub fn proxy_names(&self) -> &[String] {
         &self.proxy_names
-    }
+    } */
 
     pub async fn select(&self, group: &str, proxy: &str) -> Result<(), Error> {
         let selector = self.selector_control.get(group).ok_or_else(|| {
@@ -142,23 +178,31 @@ impl OutboundManager {
 
         let proxy_manager = &self.proxy_manager;
 
-        for (k, v) in self.handlers.iter() {
+        // Snapshot the registry without holding the lock across async calls.
+        let handlers: Vec<(String, AnyOutboundHandler)> = self
+            .registry
+            .read()
+            .await
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        for (k, v) in handlers {
             let mut m = if let Some(g) = v.try_as_group_handler() {
                 g.as_map().await
+            } else if let Some(p) = v.try_as_plain_handler() {
+                p.as_map().await
             } else {
                 let mut m = HashMap::new();
                 m.insert("type".to_string(), Box::new(v.proto()) as _);
                 m
             };
 
-            let alive = proxy_manager.alive(k).await;
-            let history = proxy_manager.delay_history(k).await;
-            let support_udp = v.support_udp().await;
+            let alive = proxy_manager.alive(&k).await;
+            let history = proxy_manager.delay_history(&k).await;
 
             m.insert("history".to_string(), Box::new(history));
             m.insert("alive".to_string(), Box::new(alive));
-            m.insert("name".to_string(), Box::new(k.to_owned()));
-            m.insert("udp".to_string(), Box::new(support_udp));
 
             r.insert(k.clone(), Box::new(m) as _);
         }
@@ -178,68 +222,82 @@ impl OutboundManager {
             .await
     }
 
+    /// Load handlers from the provided outbound protocols and groups.
+    /// handlers in proxy_providers are not loaded here as they are stored in
+    /// the provider separately.
     async fn load_handlers(
         &mut self,
+        handlers: &mut HashMap<String, AnyOutboundHandler>,
         outbounds: Vec<AnyOutboundHandler>,
         outbound_groups: Vec<OutboundGroupProtocol>,
+        proxy_names: Vec<String>,
         cache_store: ThreadSafeCacheFile,
     ) -> Result<(), Error> {
-        self.handlers.extend(outbounds.into_iter().map(|h| {
+        handlers.extend(outbounds.into_iter().map(|h| {
             let name = h.name().to_owned();
             (name, h)
         }));
 
-        self.load_group_outbounds(outbound_groups, cache_store.clone())
+        self.load_group_outbounds(handlers, outbound_groups, cache_store.clone())
             .await?;
 
-        // insert GLOBAL selector to keep behavior aligned with clash-rs bootstrap
-        let mut all = vec![];
-        let mut keys = self.handlers.keys().collect::<Vec<_>>();
+        // insert GLOBAL
+        let mut g = vec![];
+        let mut keys = handlers.keys().collect::<Vec<_>>();
         keys.sort_by(|a, b| {
-            self.proxy_names
+            proxy_names
                 .iter()
-                .position(|x| x == *a)
-                .cmp(&self.proxy_names.iter().position(|x| x == *b))
+                .position(|x| &x == a)
+                .cmp(&proxy_names.iter().position(|x| &x == b))
         });
         for name in keys {
-            if let Some(handler) = self.handlers.get(name) {
-                all.push(handler.clone());
+            g.push(handlers.get(name).unwrap().clone());
+        }
+        let hc = HealthCheck::new(
+            g.clone(),
+            DEFAULT_LATENCY_TEST_URL.to_owned(),
+            0, // this is a manual HC
+            true,
+            self.proxy_manager.clone(),
+        );
+
+        let pd = Arc::new(RwLock::new(PlainProvider::new(
+            PROXY_GLOBAL.to_owned(),
+            g,
+            hc,
+        )?));
+
+        let stored_selection = cache_store.get_selected(PROXY_GLOBAL).await;
+        let mut providers: Vec<ThreadSafeProxyProvider> = vec![pd.clone()];
+        for p in self.proxy_providers.values() {
+            let vehicle_type = p.read().await.vehicle_type();
+            if matches!(
+                vehicle_type,
+                ProviderVehicleType::Http | ProviderVehicleType::File
+            ) {
+                providers.push(p.clone());
             }
         }
 
-        if !all.is_empty() {
-            let hc = HealthCheck::new(
-                all.clone(),
-                DEFAULT_LATENCY_TEST_URL.to_owned(),
-                0,
-                true,
-                self.proxy_manager.clone(),
-            );
-            let pd = Arc::new(RwLock::new(
-                PlainProvider::new(PROXY_GLOBAL.to_owned(), all, hc).map_err(
-                    |x| {
-                        Error::InvalidConfig(format!("invalid provider config: {x}"))
-                    },
-                )?,
-            ));
-            let stored_selection = cache_store.get_selected(PROXY_GLOBAL).await;
-            let selector = selector::Handler::new(
-                selector::HandlerOptions {
-                    name: PROXY_GLOBAL.to_owned(),
-                    udp: true,
-                    common_opts: crate::proxy::HandlerCommonOptions::default(),
+        let h = selector::Handler::new(
+            selector::HandlerOptions {
+                name: PROXY_GLOBAL.to_owned(),
+                udp: true,
+                common_opts: crate::proxy::HandlerCommonOptions {
+                    icon: None,
+                    ..Default::default()
                 },
-                vec![pd.clone()],
-                stored_selection,
-            )
-            .await;
+            },
+            providers,
+            stored_selection,
+        )
+        .await;
 
-            self.handlers
-                .insert(PROXY_GLOBAL.to_owned(), Arc::new(selector.clone()));
-            self.selector_control
-                .insert(PROXY_GLOBAL.to_owned(), Arc::new(selector));
-            self.proxy_providers.insert(PROXY_GLOBAL.to_owned(), pd);
-        }
+        self.proxy_providers
+            .insert(RESERVED_PROVIDER_NAME.to_owned(), pd);
+        handlers.insert(PROXY_GLOBAL.to_owned(), Arc::new(h.clone()));
+        self.selector_control
+            .insert(PROXY_GLOBAL.to_owned(), Arc::new(h));
 
         Ok(())
     }
@@ -300,15 +358,19 @@ impl OutboundManager {
     }
 
     /// Lazy initialization of connectors for each handler.
-    async fn init_handler_connectors(&self) -> Result<(), Error> {
+    async fn init_handler_connectors(
+        &self,
+        handlers: &HashMap<String, AnyOutboundHandler>,
+    ) -> Result<(), Error> {
         let mut connectors = HashMap::new();
-        for handler in self.handlers.values() {
+        for handler in handlers.values() {
             if let Some(connector_name) = handler.support_dialer() {
-                let outbound = self.get_outbound(connector_name).ok_or(
-                    Error::InvalidConfig(format!(
+                let outbound = handlers
+                    .get(connector_name)
+                    .ok_or(Error::InvalidConfig(format!(
                         "connector {connector_name} not found"
-                    )),
-                )?;
+                    )))?
+                    .clone();
                 let connector =
                     connectors.entry(connector_name).or_insert_with(|| {
                         Arc::new(ProxyConnector::new(
@@ -325,6 +387,7 @@ impl OutboundManager {
 
     async fn load_group_outbounds(
         &mut self,
+        handlers: &mut HashMap<String, AnyOutboundHandler>,
         outbound_groups: Vec<OutboundGroupProtocol>,
         cache_store: ThreadSafeCacheFile,
     ) -> Result<(), Error> {
@@ -332,7 +395,7 @@ impl OutboundManager {
         let mut outbound_groups = outbound_groups;
         proxy_groups_dag_sort(&mut outbound_groups)?;
 
-        let handlers = &mut self.handlers;
+        // let handlers = &mut self.handlers;
         let proxy_manager = &self.proxy_manager;
         let provider_registry = &mut self.proxy_providers;
         let selector_control = &mut self.selector_control;

@@ -11,7 +11,10 @@ use tracing::{Instrument, debug, error, info, info_span, instrument, trace, warn
 
 use crate::{
     app::{
-        dispatcher::{TrackedStream, statistics_manager::StatisticsManager, tracked::TrackedDatagram},
+        dispatcher::{
+            TrackedStream, statistics_manager::StatisticsManager,
+            tracked::TrackedDatagram,
+        },
         dns::{ClashResolver, ThreadSafeDNSResolver},
         outbound::manager::ThreadSafeOutboundManager,
         router::ThreadSafeRouter,
@@ -21,7 +24,9 @@ use crate::{
         def::RunMode,
         internal::proxy::{PROXY_DIRECT, PROXY_GLOBAL},
     },
-    proxy::{AnyInboundDatagram, AnyOutboundHandler, ClientStream, datagram::UdpPacket},
+    proxy::{
+        AnyInboundDatagram, AnyOutboundHandler, ClientStream, datagram::UdpPacket,
+    },
     session::{Session, SocksAddr},
 };
 
@@ -61,10 +66,6 @@ impl Dispatcher {
         }
     }
 
-    pub fn get_outbound(&self, name: &str) -> Option<AnyOutboundHandler> {
-        self.outbound_manager.get_outbound(name)
-    }
-
     pub fn tcp_buffer_size(&self) -> usize {
         self.tcp_buffer_size
     }
@@ -102,27 +103,7 @@ impl Dispatcher {
 
         sess.destination = dest.clone();
 
-        if sess.resolved_ip.is_none()
-            && let SocksAddr::Domain(host, _) = &sess.destination
-        {
-            match self.resolver.resolve(host, false).await {
-                Ok(Some(ip)) => {
-                    trace!("resolved destination {} to {}", host, ip);
-                    sess.resolved_ip = Some(ip);
-                }
-                Ok(None) => {
-                    trace!("no ip resolved for destination {}", host);
-                }
-                Err(err) => {
-                    trace!(
-                        "failed to resolve destination {} for tracking: {}",
-                        host, err
-                    );
-                }
-            }
-        }
         let mode = *self.mode.read().await;
-        // todo: fix the following code
         let (outbound_name, rule) = match mode {
             RunMode::Global => (PROXY_GLOBAL, None),
             RunMode::Rule => self.router.match_route(&mut sess).await,
@@ -132,10 +113,13 @@ impl Dispatcher {
         debug!("dispatching {} to {}[{}]", sess, outbound_name, mode);
 
         let mgr = self.outbound_manager.clone();
-        let handler = mgr.get_outbound(outbound_name).unwrap_or_else(|| {
-            debug!("unknown rule: {}, fallback to direct", outbound_name);
-            mgr.get_outbound(PROXY_DIRECT).unwrap()
-        });
+        let handler = match mgr.get_outbound(outbound_name).await {
+            Some(h) => h,
+            None => {
+                debug!("unknown rule: {}, fallback to direct", outbound_name);
+                mgr.get_outbound(PROXY_DIRECT).await.unwrap()
+            }
+        };
 
         match handler
             .connect_stream(&sess, self.resolver.clone())
@@ -151,7 +135,6 @@ impl Dispatcher {
                     rule,
                 )
                 .await;
-                log::debug!("todo use custom error");
                 match copy_bidirectional(
                     lhs,
                     rhs,
@@ -320,15 +303,14 @@ impl Dispatcher {
                 let remote_receiver_w = remote_receiver_w.clone();
 
                 let mgr = outbound_manager.clone();
-                // todo: use new handler
-                let handler = match mgr.get_outbound(&outbound_name){
+                let handler = match mgr.get_outbound(&outbound_name).await {
                     Some(h) => h,
                     None => {
                         debug!(
                             "unknown rule: {}, fallback to direct",
                             outbound_name
                         );
-                        mgr.get_outbound(PROXY_DIRECT).unwrap()
+                        mgr.get_outbound(PROXY_DIRECT).await.unwrap()
                     }
                 };
 

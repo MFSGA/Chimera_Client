@@ -4,7 +4,11 @@ use async_trait::async_trait;
 use tracing::debug;
 
 use crate::{
-    Error, app::remote_content_manager::healthcheck::HealthCheck,
+    Error,
+    app::remote_content_manager::{
+        healthcheck::HealthCheck,
+        providers::{Provider, ProviderVehicleType},
+    },
     proxy::AnyOutboundHandler,
 };
 
@@ -14,6 +18,7 @@ use super::ProxyProvider;
 /// No vehicle no background update.
 /// Used in GroupOutbounds to manage proxy health checks.
 pub struct PlainProvider {
+    name: String,
     proxies: Vec<AnyOutboundHandler>,
     hc: Arc<HealthCheck>,
 }
@@ -40,8 +45,44 @@ impl PlainProvider {
             });
         }
 
-        Ok(Self { proxies, hc })
+        Ok(Self { name, proxies, hc })
     }
+}
+
+#[async_trait]
+impl Provider for PlainProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn vehicle_type(&self) -> ProviderVehicleType {
+        ProviderVehicleType::Compatible
+    }
+
+    /*  fn typ(&self) -> ProviderType {
+        ProviderType::Proxy
+    }
+
+    async fn initialize(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    async fn update(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    async fn as_map(&self) -> HashMap<String, Box<dyn Serialize + Send>> {
+        let mut m: HashMap<String, Box<dyn Serialize + Send>> = HashMap::new();
+
+        m.insert("name".to_owned(), Box::new(self.name().to_string()));
+        m.insert("type".to_owned(), Box::new(self.typ().to_string()));
+        m.insert(
+            "vehicleType".to_owned(),
+            Box::new(self.vehicle_type().to_string()),
+        );
+
+        m
+    } */
 }
 
 #[async_trait]

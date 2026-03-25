@@ -508,6 +508,7 @@ async fn create_components(
             cache_store.clone(),
             cwd.to_string_lossy().to_string(),
             config.general.routing_mask,
+            outbound_registry.clone(),
         )
         .await?,
     );

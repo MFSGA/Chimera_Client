@@ -1,12 +1,42 @@
 use async_trait::async_trait;
+use erased_serde::Serialize;
+use serde::Deserialize;
+use std::{
+    collections::HashMap,
+    fmt::{Display, Formatter},
+    io,
+    sync::Arc,
+};
 
 pub mod proxy_provider;
+
+#[derive(Deserialize, PartialEq, Clone, Copy, Debug)]
+pub enum ProviderVehicleType {
+    File,
+    Http,
+    Compatible,
+    Inline, /* InlineRuleProvider doesn't have a vehicle type, but we use it for
+             * compatibility */
+}
+
+impl Display for ProviderVehicleType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProviderVehicleType::File => write!(f, "File"),
+            ProviderVehicleType::Http => write!(f, "HTTP"),
+            ProviderVehicleType::Compatible => write!(f, "Compatible"),
+            ProviderVehicleType::Inline => write!(f, "Inline"),
+        }
+    }
+}
+
+// pub type ThreadSafeProviderVehicle = Arc<dyn ProviderVehicle + Send + Sync>;
 
 /// either Proxy or Rule provider
 #[async_trait]
 pub trait Provider {
     fn name(&self) -> &str;
-    // fn vehicle_type(&self) -> ProviderVehicleType;
+    fn vehicle_type(&self) -> ProviderVehicleType;
     // fn typ(&self) -> ProviderType;
     // async fn initialize(&self) -> io::Result<()>;
     // async fn update(&self) -> io::Result<()>;

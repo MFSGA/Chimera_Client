@@ -1,10 +1,12 @@
 use std::{
+    collections::HashMap,
     fmt::{Debug, Display},
     io,
     sync::Arc,
 };
 
 use async_trait::async_trait;
+use erased_serde::Serialize as ErasedSerialize;
 use futures::{Sink, Stream};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -138,6 +140,10 @@ pub trait OutboundHandler: Sync + Send + Unpin + DialWithConnector + Debug {
     fn try_as_group_handler(&self) -> Option<&dyn GroupProxyAPIResponse> {
         None
     }
+
+    fn try_as_plain_handler(&self) -> Option<&dyn PlainProxyAPIResponse> {
+        None
+    }
 }
 
 #[async_trait]
@@ -239,3 +245,11 @@ impl<T, U> OutboundDatagram<U> for T where
 
 pub type AnyOutboundDatagram =
     Box<dyn OutboundDatagram<UdpPacket, Item = UdpPacket, Error = io::Error>>;
+
+/// Plain outbound implements this trait to serialize itself for rest API
+/// response.
+#[async_trait]
+pub trait PlainProxyAPIResponse: OutboundHandler {
+    /// used in the API responses.
+    async fn as_map(&self) -> HashMap<String, Box<dyn ErasedSerialize + Send>>;
+}
