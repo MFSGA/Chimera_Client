@@ -187,4 +187,18 @@ tun:
         let converted = convert(cfg).expect("internal convert should succeed");
         assert_eq!(converted.tun.so_mark, Some(7777));
     }
+
+    #[test]
+    fn parse_tun_auto_route_alias() {
+        let cfg = parse_config(
+            r#"
+tun:
+  enable: true
+  auto-route: true
+"#,
+        );
+
+        let converted = convert(cfg).expect("internal convert should succeed");
+        assert!(converted.tun.route_all);
+    }
 }
