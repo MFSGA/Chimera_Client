@@ -34,6 +34,7 @@ pub struct TunRunner {
     dispatcher: Arc<Dispatcher>,
     resolver: ThreadSafeDNSResolver,
     cancellation_token: CancellationToken,
+    task: std::sync::Mutex<Option<tokio::task::JoinHandle<Result<(), Error>>>>,
 }
 
 impl TunRunner {
@@ -48,6 +49,7 @@ impl TunRunner {
             dispatcher,
             resolver,
             cancellation_token: cancellation_token.unwrap_or_default(),
+            task: std::sync::Mutex::new(None),
         })
     }
 
@@ -142,6 +144,12 @@ impl TunRunner {
 
                     if tun_exist {
                         info!("tun device {} already exists, using it.", &tun_name);
+                        if let Err(err) = routes::maybe_routes_clean_up(cfg) {
+                            error!(
+                                "failed to clean up existing tun routes for {}: {}",
+                                tun_name, err
+                            );
+                        }
                     } else {
                         info!("tun device {} does not exist, creating.", &tun_name);
                     }
@@ -221,10 +229,11 @@ impl TunRunner {
                         }
 
                         info!("setting up routes for tun {}", &tun_name);
-                        maybe_add_routes(cfg, &tun_name)?;
                     } else {
-                        info!("skipping route setup for existing tun {}", &tun_name);
+                        info!("reconciling routes for existing tun {}", &tun_name);
                     }
+
+                    maybe_add_routes(cfg, &tun_name)?;
 
                     dev
                 }
@@ -255,7 +264,7 @@ impl Runner for TunRunner {
         let dns_hijack = self.cfg.dns_hijack;
         let cancellation_token = self.cancellation_token.clone();
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let (tun, stack, mut tcp_listener, udp_socket) =
                 TunRunner::new_internal(&cfg).await?;
 
@@ -352,6 +361,9 @@ impl Runner for TunRunner {
                 },
             }
         });
+
+        let mut task = self.task.lock().unwrap();
+        *task = Some(handle);
     }
 
     fn shutdown(&self) {
@@ -366,6 +378,15 @@ impl Runner for TunRunner {
     }
 
     fn join(&self) -> BoxFuture<'_, Result<(), Error>> {
-        async move { Ok(()) }.boxed()
+        let handle = self.task.lock().unwrap().take();
+        async move {
+            match handle {
+                Some(handle) => handle.await.map_err(|err| {
+                    Error::Operation(format!("tun runner join error: {err}"))
+                })?,
+                None => Ok(()),
+            }
+        }
+        .boxed()
     }
 }

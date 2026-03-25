@@ -43,12 +43,17 @@ fn is_candidate_outbound_v6(addr: Ipv6Addr) -> bool {
 pub async fn init_net_config(tun_somark: Option<u32>) {
     *DEFAULT_OUTBOUND_INTERFACE.write().await = get_outbound_interface();
     *TUN_SOMARK.write().await = tun_somark;
-
     trace!(
         "default outbound interface: {:?}, tun somark: {:?}",
         *DEFAULT_OUTBOUND_INTERFACE.read().await,
         *TUN_SOMARK.read().await
     );
+}
+
+#[cfg(feature = "tun")]
+pub async fn clear_net_config() {
+    *DEFAULT_OUTBOUND_INTERFACE.write().await = None;
+    *TUN_SOMARK.write().await = None;
 }
 
 /// Represents a parsed outbound interface for use in runtime.

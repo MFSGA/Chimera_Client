@@ -16,7 +16,10 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "tun")]
-use crate::{app::net::init_net_config, proxy::tun};
+use crate::{
+    app::net::{clear_net_config, init_net_config},
+    proxy::tun,
+};
 use crate::{
     app::{
         dispatcher::{Dispatcher, StatisticsManager},
@@ -121,7 +124,7 @@ pub struct GlobalState {
     #[cfg(feature = "tun")]
     tunnel_runner: ArcRunner,
     dns_listener: ArcRunner,
-    reload_tx: mpsc::Sender<(Config, oneshot::Sender<()>)>,
+    reload_tx: mpsc::Sender<(Config, oneshot::Sender<Result<()>>)>,
     cwd: String,
 }
 
@@ -272,7 +275,7 @@ pub async fn start(
 
     let cwd_clone = cwd.clone();
 
-    let reload_token = shutdown_token.child_token();
+    let reload_token = shutdown_token.clone();
     tokio::spawn(async move {
         let mut active_components = components;
         let mut active_api_listener = api_listener;
@@ -284,17 +287,29 @@ pub async fn start(
                 Ok(c) => c,
                 Err(e) => {
                     error!("failed to reload config: {}", e);
+                    let _ = done.send(Err(e));
                     continue;
                 }
             };
-
+            info!("reloading get config 2");
             let controller_cfg = config.general.controller.clone();
+
+            active_components.stop_all_and_join().await;
+
             let new_components =
-                create_components(cwd_clone.clone(), config).await?;
-
-            done.send(()).unwrap();
-
-            active_components.stop_all();
+                match create_components(cwd_clone.clone(), config).await {
+                    Ok(components) => components,
+                    Err(e) => {
+                        error!("failed to create components during reload: {}", e);
+                        let _ = done.send(Err(e));
+                        continue;
+                    }
+                };
+            info!("reloading get components 3333");
+            if done.send(Ok(())).is_err() {
+                warn!("config reload response channel dropped before completion");
+            }
+            info!("reloading send 444");
             new_components.start_all();
 
             // TODO: every reload is causing the API server to restart, we should
@@ -314,7 +329,7 @@ pub async fn start(
                 new_components.cache_store.clone(),
                 new_components.router.clone(),
                 cwd_clone.to_string_lossy().to_string(),
-                Some(reload_token.clone()),
+                Some(reload_token.child_token()),
                 new_components.dns_listen.clone(),
                 new_components.dns_enabled,
             ));
@@ -327,6 +342,9 @@ pub async fn start(
             g.dns_listener = new_components.dns_listener.clone();
 
             active_api_listener.shutdown();
+            if let Err(err) = active_api_listener.join().await {
+                warn!("failed waiting for api listener shutdown: {}", err);
+            }
             new_api_listener.run_async();
 
             active_components = new_components;
@@ -371,6 +389,27 @@ impl RuntimeComponents {
         self.tun_runner.shutdown();
         self.dns_listener.shutdown();
         Runner::shutdown(self.inbound_manager.as_ref());
+    }
+
+    async fn stop_all_and_join(&self) {
+        self.stop_all();
+
+        #[cfg(feature = "tun")]
+        {
+            if let Err(err) = self.tun_runner.join().await {
+                warn!("failed waiting for tun runner shutdown: {}", err);
+            }
+            clear_net_config().await;
+        }
+
+        tracing::debug!("todo: validate");
+        /* if let Err(err) = self.dns_listener.join().await {
+            warn!("failed waiting for dns listener shutdown: {}", err);
+        } */
+
+        /*  if let Err(err) = self.inbound_manager.join().await {
+            warn!("failed waiting for inbound manager shutdown: {}", err);
+        } */
     }
 }
 

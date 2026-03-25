@@ -48,6 +48,8 @@ pub struct ApiRunner {
     cancellation_token: tokio_util::sync::CancellationToken,
     dns_listen_addr: DNSListenAddr,
     dns_enabled: bool,
+    task:
+        std::sync::Mutex<Option<tokio::task::JoinHandle<Result<(), crate::Error>>>>,
 }
 
 impl ApiRunner {
@@ -83,6 +85,7 @@ impl ApiRunner {
             cancellation_token: cancellation_token.unwrap_or_default(),
             dns_listen_addr,
             dns_enabled,
+            task: std::sync::Mutex::new(None),
         }
     }
 }
@@ -146,7 +149,7 @@ impl Runner for ApiRunner {
             statistics_manager: statistics_manager.clone(),
         });
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             info!("Starting API server");
             let router = Router::new()
                 .route("/", get(handlers::hello::handle))
@@ -251,7 +254,7 @@ impl Runner for ApiRunner {
                 async move { ipc::serve_ipc(router, &ipc_path).await }
             });
 
-            match (tcp_fut, ipc_fut) {
+            let result = match (tcp_fut, ipc_fut) {
                 (Some(tcp), Some(ipc)) => {
                     tokio::select! {
                         _ = cancellation_token.cancelled() => {
@@ -285,8 +288,17 @@ impl Runner for ApiRunner {
                     debug!("API server shutdown signal received");
                     Ok(())
                 }
+            };
+
+            if let Err(err) = &result {
+                error!("API server task exited with error: {}", err);
             }
+
+            result
         });
+
+        let mut task = self.task.lock().unwrap();
+        *task = Some(handle);
     }
 
     fn shutdown(&self) {
@@ -295,6 +307,14 @@ impl Runner for ApiRunner {
     }
 
     fn join(&self) -> futures::future::BoxFuture<'_, Result<(), crate::Error>> {
-        Box::pin(async move { Ok(()) })
+        let handle = self.task.lock().unwrap().take();
+        Box::pin(async move {
+            match handle {
+                Some(handle) => handle.await.map_err(|err| {
+                    crate::Error::Operation(format!("api runner join error: {err}"))
+                })?,
+                None => Ok(()),
+            }
+        })
     }
 }

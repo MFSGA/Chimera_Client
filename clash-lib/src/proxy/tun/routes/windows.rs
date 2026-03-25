@@ -10,6 +10,7 @@ use std::{
     ptr::null_mut,
 };
 use tracing::{error, info, warn};
+use url::Url;
 use windows::{
     Win32::{
         Foundation::{ERROR_SUCCESS, GetLastError},
@@ -17,9 +18,9 @@ use windows::{
             IpHelper::{
                 CreateIpForwardEntry2, CreateUnicastIpAddressEntry,
                 DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1,
-                DNS_SETTING_IPV6, DNS_SETTING_NAMESERVER, GetIfEntry2,
-                IP_ADDRESS_PREFIX, InitializeIpForwardEntry, MIB_IF_ROW2,
-                MIB_IPFORWARD_ROW2, MIB_UNICASTIPADDRESS_ROW,
+                DNS_SETTING_IPV6, DNS_SETTING_NAMESERVER, DeleteIpForwardEntry2,
+                GetIfEntry2, IP_ADDRESS_PREFIX, InitializeIpForwardEntry,
+                MIB_IF_ROW2, MIB_IPFORWARD_ROW2, MIB_UNICASTIPADDRESS_ROW,
                 SetInterfaceDnsSettings,
             },
             Rras::{
@@ -96,6 +97,67 @@ pub fn add_route(via: &OutboundInterface, dest: &IpNet) -> io::Result<()> {
         .inspect_err(|e| {
             error!(
                 "failed to add route to destination {} via {}: {}",
+                dest, via.name, e
+            );
+        })
+        .map_err(new_io_error)
+}
+
+fn build_route_row(
+    via: &OutboundInterface,
+    dest: &IpNet,
+) -> io::Result<MIB_IPFORWARD_ROW2> {
+    let mut row = MIB_IPFORWARD_ROW2::default();
+    unsafe {
+        InitializeIpForwardEntry(&mut row);
+    }
+
+    row.InterfaceIndex = via.index;
+    row.DestinationPrefix = IP_ADDRESS_PREFIX {
+        Prefix: match dest {
+            IpNet::V4(ipv4) => {
+                let mut s = SOCKADDR_INET::default();
+                s.Ipv4.sin_family = AF_INET;
+                s.Ipv4.sin_addr = ipv4.addr().into();
+                s
+            }
+            IpNet::V6(ipv6) => {
+                let mut s = SOCKADDR_INET::default();
+                s.Ipv6.sin6_family = AF_INET6;
+                s.Ipv6.sin6_addr = ipv6.addr().into();
+                s
+            }
+        },
+        PrefixLength: dest.prefix_len(),
+    };
+    row.Metric = 0;
+    let next_hop: SocketAddr = if dest.addr().is_ipv4() {
+        (
+            via.addr_v4
+                .ok_or(std::io::Error::other("tun interface has no ipv4 address"))?,
+            0,
+        )
+            .into()
+    } else {
+        (
+            via.addr_v6
+                .ok_or(std::io::Error::other("tun interface has no ipv6 address"))?,
+            0,
+        )
+            .into()
+    };
+    row.NextHop = next_hop.into();
+    Ok(row)
+}
+
+fn delete_route(via: &OutboundInterface, dest: &IpNet) -> io::Result<()> {
+    let row = build_route_row(via, dest)?;
+    unsafe { DeleteIpForwardEntry2(&row) }
+        .to_hresult()
+        .ok()
+        .inspect_err(|e| {
+            error!(
+                "failed to delete route to destination {} via {}: {}",
                 dest, via.name, e
             );
         })
@@ -181,6 +243,42 @@ pub fn set_dns_v6(
         .map_err(|e| anyhow::anyhow!(e))
 }
 
+fn clear_dns_v4(iface: &OutboundInterface) -> anyhow::Result<()> {
+    let mut dns_wstr = vec![0u16];
+    let dns_settings = DNS_INTERFACE_SETTINGS {
+        Version: DNS_INTERFACE_SETTINGS_VERSION1,
+        Flags: DNS_SETTING_NAMESERVER as u64,
+        NameServer: PWSTR::from_raw(dns_wstr.as_mut_ptr()),
+        ..Default::default()
+    };
+
+    let guid =
+        get_guid(iface).ok_or(anyhow!("interface {} not found", iface.name))?;
+
+    unsafe { SetInterfaceDnsSettings(guid, &dns_settings) }
+        .to_hresult()
+        .ok()
+        .map_err(|e| anyhow::anyhow!(e))
+}
+
+fn clear_dns_v6(iface: &OutboundInterface) -> anyhow::Result<()> {
+    let mut dns_wstr = vec![0u16];
+    let dns_settings = DNS_INTERFACE_SETTINGS {
+        Version: DNS_INTERFACE_SETTINGS_VERSION1,
+        Flags: (DNS_SETTING_NAMESERVER | DNS_SETTING_IPV6) as u64,
+        NameServer: PWSTR::from_raw(dns_wstr.as_mut_ptr()),
+        ..Default::default()
+    };
+
+    let guid =
+        get_guid(iface).ok_or(anyhow!("interface {} not found", iface.name))?;
+
+    unsafe { SetInterfaceDnsSettings(guid, &dns_settings) }
+        .to_hresult()
+        .ok()
+        .map_err(|e| anyhow::anyhow!(e))
+}
+
 /// Adding ipv4/v6 address to the interface.
 /// See https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-createunicastipaddressentry
 #[allow(dead_code)]
@@ -238,7 +336,63 @@ pub fn add_address(
             })
     }
 }
-pub fn maybe_routes_clean_up(_: &TunConfig) -> std::io::Result<()> {
+fn tun_name_from_device_id(device_id: &str) -> Option<String> {
+    match Url::parse(device_id) {
+        Ok(url) => match url.scheme() {
+            "dev" => url.host_str().map(|v| v.to_string()),
+            "fd" => None,
+            _ => Some(device_id.to_string()),
+        },
+        Err(_) => Some(device_id.to_string()),
+    }
+}
+
+pub fn maybe_routes_clean_up(cfg: &TunConfig) -> std::io::Result<()> {
+    let Some(tun_name) = tun_name_from_device_id(&cfg.device_id) else {
+        return Ok(());
+    };
+    let Some(tun_iface) = crate::app::net::get_interface_by_name(&tun_name) else {
+        return Ok(());
+    };
+
+    if cfg.route_all {
+        let mut routes = vec![
+            IpNet::new(std::net::IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 1).unwrap(),
+            IpNet::new(std::net::IpAddr::V4(Ipv4Addr::new(128, 0, 0, 0)), 1)
+                .unwrap(),
+        ];
+
+        if tun_iface.addr_v6.is_some() {
+            routes.push(
+                IpNet::new(std::net::IpAddr::V6(Ipv6Addr::UNSPECIFIED), 1).unwrap(),
+            );
+            routes.push(
+                IpNet::new(
+                    std::net::IpAddr::V6(Ipv6Addr::new(0x8000, 0, 0, 0, 0, 0, 0, 0)),
+                    1,
+                )
+                .unwrap(),
+            );
+        }
+
+        for route in routes {
+            let _ = delete_route(&tun_iface, &route);
+        }
+    } else {
+        for route in &cfg.routes {
+            let _ = delete_route(&tun_iface, route);
+        }
+    }
+
+    if cfg.dns_hijack {
+        if let Err(err) = clear_dns_v4(&tun_iface) {
+            warn!("failed to clear IPv4 DNS on {}: {}", tun_iface.name, err);
+        }
+        if let Err(err) = clear_dns_v6(&tun_iface) {
+            warn!("failed to clear IPv6 DNS on {}: {}", tun_iface.name, err);
+        }
+    }
+
     Ok(())
 }
 

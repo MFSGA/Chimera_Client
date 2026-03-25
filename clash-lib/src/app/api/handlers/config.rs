@@ -10,7 +10,6 @@ use axum::{
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tracing::debug;
 
 use crate::{
     GlobalState,
@@ -29,12 +28,12 @@ struct DnsListenInfo {
     udp: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tcp: Option<String>,
-    // #[serde(skip_serializing_if = "Option::is_none")]
-    // doh: Option<String>,
-    // #[serde(skip_serializing_if = "Option::is_none")]
-    // dot: Option<String>,
-    // #[serde(skip_serializing_if = "Option::is_none")]
-    // doh3: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    doh: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dot: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    doh3: Option<String>,
 }
 
 #[derive(Clone)]
@@ -113,9 +112,9 @@ async fn get_configs(State(state): State<ConfigState>) -> impl IntoResponse {
         Some(DnsListenInfo {
             udp: addr.udp.map(|a| a.to_string()),
             tcp: addr.tcp.map(|a| a.to_string()),
-            /* doh: addr.doh.as_ref().map(|c| c.addr.to_string()),
+            doh: addr.doh.as_ref().map(|c| c.addr.to_string()),
             dot: addr.dot.as_ref().map(|c| c.addr.to_string()),
-            doh3: addr.doh3.as_ref().map(|c| c.addr.to_string()), */
+            doh3: addr.doh3.as_ref().map(|c| c.addr.to_string()),
         })
     } else {
         None
@@ -156,16 +155,27 @@ async fn update_configs(
     Json(req): Json<UpdateConfigRequest>,
 ) -> impl IntoResponse {
     let (done, wait) = tokio::sync::oneshot::channel();
-    let g = state.global_state.lock().await;
+    let (reload_tx, cwd) = {
+        let g = state.global_state.lock().await;
+        (g.reload_tx.clone(), g.cwd.clone())
+    };
     match (req.path, req.payload) {
         (_, Some(payload)) => {
             let msg = "config reloading from payload".to_string();
             let cfg = crate::Config::Str(payload);
-            match g.reload_tx.send((cfg, done)).await {
-                Ok(_) => {
-                    wait.await.unwrap();
-                    (StatusCode::NO_CONTENT, msg).into_response()
-                }
+            match reload_tx.send((cfg, done)).await {
+                Ok(_) => match wait.await {
+                    Ok(Ok(())) => (StatusCode::NO_CONTENT, msg).into_response(),
+                    Ok(Err(err)) => {
+                        (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+                            .into_response()
+                    }
+                    Err(_) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "config reload task terminated unexpectedly",
+                    )
+                        .into_response(),
+                },
                 Err(_) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "could not signal config reload",
@@ -175,10 +185,7 @@ async fn update_configs(
         }
         (Some(mut path), None) => {
             if !PathBuf::from(&path).is_absolute() {
-                path = PathBuf::from(g.cwd.clone())
-                    .join(path)
-                    .to_string_lossy()
-                    .to_string();
+                path = PathBuf::from(cwd).join(path).to_string_lossy().to_string();
             }
             if !PathBuf::from(&path).exists() {
                 return (
@@ -190,11 +197,19 @@ async fn update_configs(
 
             let msg = format!("config reloading from file {path}");
             let cfg: crate::Config = crate::Config::File(path);
-            match g.reload_tx.send((cfg, done)).await {
-                Ok(_) => {
-                    wait.await.unwrap();
-                    (StatusCode::NO_CONTENT, msg).into_response()
-                }
+            match reload_tx.send((cfg, done)).await {
+                Ok(_) => match wait.await {
+                    Ok(Ok(())) => (StatusCode::NO_CONTENT, msg).into_response(),
+                    Ok(Err(err)) => {
+                        (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+                            .into_response()
+                    }
+                    Err(_) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "config reload task terminated unexpectedly",
+                    )
+                        .into_response(),
+                },
 
                 Err(_) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -312,10 +327,9 @@ async fn patch_configs(
         global_state.log_level = log_level;
     }
 
-    debug!("todo ipv6 setting");
-    /* if let Some(ipv6) = payload.ipv6 {
+    if let Some(ipv6) = payload.ipv6 {
         state.dns_resolver.set_ipv6(ipv6);
-    } */
+    }
 
     StatusCode::ACCEPTED.into_response()
 }
