@@ -23,3 +23,10 @@ lto = "thin"
 strip = true
 debug = 2
 panic = "abort"
+
+[workspace.lints.rust]
+warnings = "deny"
+
+[workspace.lints.clippy]
+redundant_clone = "deny"
+needless_collect = "deny"
