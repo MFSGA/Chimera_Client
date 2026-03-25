@@ -192,24 +192,21 @@ pub fn get_outbound_interface() -> Option<OutboundInterface> {
             (Some(_), None) => return std::cmp::Ordering::Less,
             (None, Some(_)) => return std::cmp::Ordering::Greater,
             (Some(left), Some(right)) => {
-                if is_global_unicast_like(left) && !is_global_unicast_like(right) {
+                if left.is_unicast_global() && !right.is_unicast_global() {
                     return std::cmp::Ordering::Less;
-                } else if !is_global_unicast_like(left)
-                    && is_global_unicast_like(right)
-                {
+                } else if !left.is_unicast_global() && right.is_unicast_global() {
                     return std::cmp::Ordering::Greater;
                 }
             }
             _ => {}
         }
-
         let left = priority
             .iter()
-            .position(|x| left.name.contains(x))
+            .position(|x| left.name.contains(x) && left.name.starts_with(x))
             .unwrap_or(usize::MAX);
         let right = priority
             .iter()
-            .position(|x| right.name.contains(x))
+            .position(|x| right.name.contains(x) && right.name.starts_with(x))
             .unwrap_or(usize::MAX);
 
         left.cmp(&right)
