@@ -17,7 +17,8 @@ use crate::{
     config::internal::proxy::PROXY_DIRECT,
     proxy::{
         DialWithConnector, OutboundHandler, OutboundType,
-        utils::{RemoteConnector, new_tcp_stream},
+        datagram::OutboundDatagramImpl,
+        utils::{RemoteConnector, new_tcp_stream, new_udp_socket},
     },
 };
 
@@ -52,6 +53,10 @@ impl OutboundHandler for Handler {
         OutboundType::Direct
     }
 
+    async fn support_udp(&self) -> bool {
+        true
+    }
+
     async fn connect_stream(
         &self,
         sess: &Session,
@@ -74,6 +79,33 @@ impl OutboundHandler for Handler {
         let s = ChainedStreamWrapper::new(s);
         s.append_to_chain(self.name()).await;
         Ok(Box::new(s))
+    }
+
+    async fn connect_datagram(
+        &self,
+        sess: &Session,
+        resolver: ThreadSafeDNSResolver,
+    ) -> std::io::Result<BoxedChainedDatagram> {
+        let bind_addr: std::net::IpAddr = if sess.source.is_ipv4() {
+            std::net::Ipv4Addr::UNSPECIFIED.into()
+        } else {
+            std::net::Ipv6Addr::UNSPECIFIED.into()
+        };
+        let d = new_udp_socket(
+            Some((bind_addr, 0).into()),
+            sess.iface.as_ref(),
+            #[cfg(target_os = "linux")]
+            sess.so_mark,
+            sess.destination
+                .ip()
+                .map(|ip| std::net::SocketAddr::new(ip, sess.destination.port())),
+        )
+        .await
+        .map(|x| OutboundDatagramImpl::new(x, resolver))?;
+
+        let d = ChainedDatagramWrapper::new(d);
+        d.append_to_chain(self.name()).await;
+        Ok(Box::new(d))
     }
 
     async fn connect_datagram_with_connector(
