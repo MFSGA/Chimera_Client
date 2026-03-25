@@ -1,8 +1,7 @@
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use axum::{
-    Router, middleware,
-    response::Redirect,
+    Router,
     routing::{get, post},
 };
 
@@ -175,7 +174,7 @@ impl Runner for ApiRunner {
                 )
                 .nest(
                     "/proxies",
-                    handlers::proxy::routes(outbound_manager.clone()),
+                    handlers::proxy::routes(outbound_manager.clone(), cache_store),
                 )
                 .nest("/rules", handlers::rule::routes(router))
                 .layer(cors)

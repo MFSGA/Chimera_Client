@@ -2,31 +2,50 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use axum::{
     Extension, Json, Router,
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     http::{StatusCode, header},
-    response::IntoResponse,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, put},
 };
 use http::HeaderMap;
 use serde::Deserialize;
 
 use crate::{
-    app::{api::AppState, outbound::manager::ThreadSafeOutboundManager},
+    app::{
+        api::AppState, outbound::manager::ThreadSafeOutboundManager,
+        profile::ThreadSafeCacheFile,
+    },
     proxy::AnyOutboundHandler,
 };
 
 #[derive(Clone)]
 struct ProxyState {
     outbound_manager: ThreadSafeOutboundManager,
+    cache_store: ThreadSafeCacheFile,
 }
 
-pub fn routes(outbound_manager: ThreadSafeOutboundManager) -> Router<Arc<AppState>> {
-    let state = ProxyState { outbound_manager };
-
+pub fn routes(
+    outbound_manager: ThreadSafeOutboundManager,
+    cache_store: ThreadSafeCacheFile,
+) -> Router<Arc<AppState>> {
+    let state = ProxyState {
+        outbound_manager,
+        cache_store,
+    };
     Router::new()
         .route("/", get(get_proxies))
-        .route("/{group}", put(update_proxy))
-        .route("/{name}/delay", get(get_proxy_delay))
+        .nest(
+            "/{name}",
+            Router::new()
+                .route("/", get(get_proxy).put(update_proxy))
+                .route("/delay", get(get_proxy_delay))
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    find_proxy_by_name,
+                ))
+                .with_state(state.clone()),
+        )
         .with_state(state)
 }
 
@@ -38,6 +57,31 @@ async fn get_proxies(State(state): State<ProxyState>) -> impl IntoResponse {
     axum::response::Json(res)
 }
 
+async fn find_proxy_by_name(
+    State(state): State<ProxyState>,
+    Path(name): Path<String>,
+    mut req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let outbound_manager = state.outbound_manager.clone();
+    match outbound_manager.get_outbound(&name).await {
+        Some(proxy) => {
+            req.extensions_mut().insert(proxy);
+            next.run(req).await
+        }
+        _ => (StatusCode::NOT_FOUND, format!("proxy {name} not found"))
+            .into_response(),
+    }
+}
+
+async fn get_proxy(
+    Extension(proxy): Extension<AnyOutboundHandler>,
+    State(state): State<ProxyState>,
+) -> impl IntoResponse {
+    let outbound_manager = state.outbound_manager.clone();
+    axum::response::Json(outbound_manager.get_proxy(&proxy).await)
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case")]
 struct UpdateProxyRequest {
@@ -46,16 +90,34 @@ struct UpdateProxyRequest {
 
 async fn update_proxy(
     State(state): State<ProxyState>,
-    Path(group): Path<String>,
+    Extension(proxy): Extension<AnyOutboundHandler>,
     Json(payload): Json<UpdateProxyRequest>,
 ) -> impl IntoResponse {
     let outbound_manager = state.outbound_manager.clone();
-    match outbound_manager.select(&group, &payload.name).await {
-        Ok(_) => (
-            StatusCode::ACCEPTED,
-            format!("selected proxy {} for {}", payload.name, group),
+    match outbound_manager.get_selector_control(proxy.name()) {
+        Some(ctrl) => match ctrl.select(&payload.name).await {
+            Ok(_) => {
+                let cache_store = state.cache_store;
+                cache_store.set_selected(proxy.name(), &payload.name).await;
+                (
+                    StatusCode::ACCEPTED,
+                    format!("selected proxy {} for {}", payload.name, proxy.name()),
+                )
+            }
+            Err(err) => (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "select {} for {} failed with error: {}",
+                    payload.name,
+                    proxy.name(),
+                    err
+                ),
+            ),
+        },
+        _ => (
+            StatusCode::NOT_FOUND,
+            format!("proxy {} is not a Select", proxy.name()),
         ),
-        Err(err) => (StatusCode::BAD_REQUEST, err.to_string()),
     }
 }
 
@@ -64,7 +126,6 @@ struct DelayRequest {
     url: String,
     timeout: u16,
 }
-
 async fn get_proxy_delay(
     State(state): State<ProxyState>,
     Extension(proxy): Extension<AnyOutboundHandler>,

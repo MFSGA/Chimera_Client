@@ -159,6 +159,14 @@ impl OutboundManager {
         self.registry.read().await.get(name).cloned()
     }
 
+    // API handles start
+    pub fn get_selector_control(
+        &self,
+        name: &str,
+    ) -> Option<ThreadSafeSelectorControl> {
+        self.selector_control.get(name).cloned()
+    }
+
     /* pub fn proxy_names(&self) -> &[String] {
         &self.proxy_names
     } */
@@ -203,9 +211,37 @@ impl OutboundManager {
 
             m.insert("history".to_string(), Box::new(history));
             m.insert("alive".to_string(), Box::new(alive));
+            // todo: use another way
+            m.insert("name".to_string(), Box::new(k.to_owned()));
+            m.insert("udp".to_string(), Box::new(false));
 
             r.insert(k.clone(), Box::new(m) as _);
         }
+
+        r
+    }
+
+    pub async fn get_proxy(
+        &self,
+        proxy: &AnyOutboundHandler,
+    ) -> HashMap<String, Box<dyn Serialize + Send>> {
+        let mut r = if let Some(g) = proxy.try_as_group_handler() {
+            g.as_map().await
+        } else if let Some(p) = proxy.try_as_plain_handler() {
+            p.as_map().await
+        } else {
+            let mut m = HashMap::new();
+            m.insert("type".to_string(), Box::new(proxy.proto()) as _);
+            m
+        };
+
+        let proxy_manager = self.proxy_manager.clone();
+
+        let alive = proxy_manager.alive(proxy.name()).await;
+        let history = proxy_manager.delay_history(proxy.name()).await;
+
+        r.insert("history".to_string(), Box::new(history));
+        r.insert("alive".to_string(), Box::new(alive));
 
         r
     }
