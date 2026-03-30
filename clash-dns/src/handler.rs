@@ -1,4 +1,8 @@
-use std::{path::{Path, PathBuf}, sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use crate::utils::new_io_error;
 use crate::{DNSListenAddr, DnsMessageExchanger, DnsServerCert, DnsServerKey};
@@ -91,7 +95,11 @@ static DEFAULT_DNS_SERVER_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn resolve_cert_path(cwd: &Path, path: &str) -> PathBuf {
     let path = PathBuf::from(path);
-    if path.is_absolute() { path } else { cwd.join(path) }
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
 }
 
 fn load_server_cert_resolver(
@@ -131,14 +139,12 @@ fn load_server_cert_resolver(
         )))
     })?;
 
-    let certified_key =
-        CertifiedKey::from_der(cert_chain, key, &default_provider()).map_err(
-            |err| {
-                DNSError::Io(new_io_error(format!(
-                    "failed to build dns tls identity: {err}"
-                )))
-            },
-        )?;
+    let certified_key = CertifiedKey::from_der(cert_chain, key, &default_provider())
+        .map_err(|err| {
+            DNSError::Io(new_io_error(format!(
+                "failed to build dns tls identity: {err}"
+            )))
+        })?;
 
     Ok(Arc::new(SingleCertAndKey::from(certified_key)))
 }
@@ -182,29 +188,33 @@ where
     }
     if let Some(c) = listen.doh {
         has_server |= match TcpListener::bind(c.addr).await {
-            Ok(listener) => match load_server_cert_resolver(cwd, &c.ca_cert, &c.ca_key)
-            {
-                Ok(cert_resolver) => s
-                    .register_https_listener(
-                        listener,
-                        DEFAULT_DNS_SERVER_TIMEOUT,
-                        cert_resolver,
-                        c.hostname.clone(),
-                        "/dns-query".to_string(),
-                    )
-                    .map(|_| {
-                        info!("DoH dns server listening on: {}", c.addr);
-                        true
-                    })
-                    .inspect_err(|x| {
-                        error!("failed to register DoH DNS server on {}: {}", c.addr, x);
-                    })
-                    .unwrap_or(false),
-                Err(err) => {
-                    error!("failed to load DoH certificate material: {}", err);
-                    false
+            Ok(listener) => {
+                match load_server_cert_resolver(cwd, &c.ca_cert, &c.ca_key) {
+                    Ok(cert_resolver) => s
+                        .register_https_listener(
+                            listener,
+                            DEFAULT_DNS_SERVER_TIMEOUT,
+                            cert_resolver,
+                            c.hostname.clone(),
+                            "/dns-query".to_string(),
+                        )
+                        .map(|_| {
+                            info!("DoH dns server listening on: {}", c.addr);
+                            true
+                        })
+                        .inspect_err(|x| {
+                            error!(
+                                "failed to register DoH DNS server on {}: {}",
+                                c.addr, x
+                            );
+                        })
+                        .unwrap_or(false),
+                    Err(err) => {
+                        error!("failed to load DoH certificate material: {}", err);
+                        false
+                    }
                 }
-            },
+            }
             Err(err) => {
                 error!("failed to listen DoH DNS server on {}: {}", c.addr, err);
                 false
@@ -214,27 +224,31 @@ where
 
     if let Some(c) = listen.dot {
         has_server |= match TcpListener::bind(c.addr).await {
-            Ok(listener) => match load_server_cert_resolver(cwd, &c.ca_cert, &c.ca_key)
-            {
-                Ok(cert_resolver) => s
-                    .register_tls_listener(
-                        listener,
-                        DEFAULT_DNS_SERVER_TIMEOUT,
-                        cert_resolver,
-                    )
-                    .map(|_| {
-                        info!("DoT dns server listening on: {}", c.addr);
-                        true
-                    })
-                    .inspect_err(|x| {
-                        error!("failed to register DoT DNS server on {}: {}", c.addr, x);
-                    })
-                    .unwrap_or(false),
-                Err(err) => {
-                    error!("failed to load DoT certificate material: {}", err);
-                    false
+            Ok(listener) => {
+                match load_server_cert_resolver(cwd, &c.ca_cert, &c.ca_key) {
+                    Ok(cert_resolver) => s
+                        .register_tls_listener(
+                            listener,
+                            DEFAULT_DNS_SERVER_TIMEOUT,
+                            cert_resolver,
+                        )
+                        .map(|_| {
+                            info!("DoT dns server listening on: {}", c.addr);
+                            true
+                        })
+                        .inspect_err(|x| {
+                            error!(
+                                "failed to register DoT DNS server on {}: {}",
+                                c.addr, x
+                            );
+                        })
+                        .unwrap_or(false),
+                    Err(err) => {
+                        error!("failed to load DoT certificate material: {}", err);
+                        false
+                    }
                 }
-            },
+            }
             Err(err) => {
                 error!("failed to listen DoT DNS server on {}: {}", c.addr, err);
                 false
@@ -244,28 +258,32 @@ where
 
     if let Some(c) = listen.doh3 {
         has_server |= match UdpSocket::bind(c.addr).await {
-            Ok(socket) => match load_server_cert_resolver(cwd, &c.ca_cert, &c.ca_key)
-            {
-                Ok(cert_resolver) => s
-                    .register_h3_listener(
-                        socket,
-                        DEFAULT_DNS_SERVER_TIMEOUT,
-                        cert_resolver,
-                        c.hostname.clone(),
-                    )
-                    .map(|_| {
-                        info!("DoH3 dns server listening on: {}", c.addr);
-                        true
-                    })
-                    .inspect_err(|x| {
-                        error!("failed to register DoH3 DNS server on {}: {}", c.addr, x);
-                    })
-                    .unwrap_or(false),
-                Err(err) => {
-                    error!("failed to load DoH3 certificate material: {}", err);
-                    false
+            Ok(socket) => {
+                match load_server_cert_resolver(cwd, &c.ca_cert, &c.ca_key) {
+                    Ok(cert_resolver) => s
+                        .register_h3_listener(
+                            socket,
+                            DEFAULT_DNS_SERVER_TIMEOUT,
+                            cert_resolver,
+                            c.hostname.clone(),
+                        )
+                        .map(|_| {
+                            info!("DoH3 dns server listening on: {}", c.addr);
+                            true
+                        })
+                        .inspect_err(|x| {
+                            error!(
+                                "failed to register DoH3 DNS server on {}: {}",
+                                c.addr, x
+                            );
+                        })
+                        .unwrap_or(false),
+                    Err(err) => {
+                        error!("failed to load DoH3 certificate material: {}", err);
+                        false
+                    }
                 }
-            },
+            }
             Err(err) => {
                 error!("failed to listen DoH3 DNS server on {}: {}", c.addr, err);
                 false
