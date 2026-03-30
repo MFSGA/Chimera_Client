@@ -180,7 +180,8 @@ impl AsyncRead for VisionStream {
             // 2. Consume the initial VLESS response header before decoding any
             // Vision-framed payload bytes.
             if this.vless_response_pending {
-                if let Some(consumed) = consume_vless_response_header(&mut this.raw)? {
+                if let Some(consumed) = consume_vless_response_header(&mut this.raw)?
+                {
                     debug!(
                         "VISION READ: consumed {} bytes of VLESS response header",
                         consumed
@@ -209,7 +210,9 @@ impl AsyncRead for VisionStream {
             if this.read_direct
                 && let Some(flag) = &this.read_splice_flag
             {
-                debug!("VISION READ: signalling underlying transport to enter splice");
+                debug!(
+                    "VISION READ: signalling underlying transport to enter splice"
+                );
                 flag.store(true, Ordering::Release);
             }
 
@@ -648,7 +651,12 @@ mod tests {
         let part2 = b"chunk2";
 
         let mut msg = vec![0, 0];
-        msg.extend(server_first_frame(&TEST_UUID, CMD_PADDING_CONTINUE, part1, 0));
+        msg.extend(server_first_frame(
+            &TEST_UUID,
+            CMD_PADDING_CONTINUE,
+            part1,
+            0,
+        ));
         msg.extend(server_frame(CMD_PADDING_DIRECT, part2));
         server.write_all(&msg).await.unwrap();
         drop(server);

@@ -1,9 +1,12 @@
 use async_trait::async_trait;
-use std::{io, sync::{Arc, atomic::AtomicBool}};
+use std::{
+    io,
+    sync::{Arc, atomic::AtomicBool},
+};
 
 use super::Transport;
-use crate::proxy::{AnyStream, transport::VisionOptions};
 use crate::proxy::transport::splice_tls::SplicableTlsStream;
+use crate::proxy::{AnyStream, transport::VisionOptions};
 
 mod buf_reader;
 mod common;
