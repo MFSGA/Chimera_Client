@@ -207,6 +207,14 @@ pub struct TrackerInfo {
     pub proxy_chain_holder: ProxyChain,
     #[serde(skip)]
     pub session_holder: Session,
+
+    /// Per-user byte counters, separate from `upload_total`/`download_total`.
+    /// Only incremented when `session_holder.inbound_user` is set.
+    /// Swapped to 0 on drain — never touched by `snapshot()`.
+    #[serde(skip)]
+    pub user_upload: AtomicU64,
+    #[serde(skip)]
+    pub user_download: AtomicU64,
 }
 
 #[derive(Serialize)]

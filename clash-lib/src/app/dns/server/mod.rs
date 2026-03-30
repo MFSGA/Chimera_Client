@@ -1,7 +1,7 @@
 use hickory_proto::op::Message;
 
-use tracing::{error, info, instrument};
 use chimera_dns::DNSListenAddr;
+use tracing::{error, info, instrument};
 
 use crate::runner::Runner;
 

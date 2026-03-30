@@ -16,6 +16,10 @@ pub struct UdpPacket {
     pub data: Vec<u8>,
     pub src_addr: SocksAddr,
     pub dst_addr: SocksAddr,
+    /// Authenticated user name from SS2022 EIH, propagated to the dispatcher
+    /// session for per-user traffic attribution. `None` for all other
+    /// protocols.
+    pub inbound_user: Option<String>,
 }
 
 impl Default for UdpPacket {
@@ -24,6 +28,7 @@ impl Default for UdpPacket {
             data: Vec::new(),
             src_addr: SocksAddr::any_ipv4(),
             dst_addr: SocksAddr::any_ipv4(),
+            inbound_user: None,
         }
     }
 }
@@ -55,11 +60,14 @@ impl UdpPacket {
             data,
             src_addr,
             dst_addr,
+            inbound_user: None,
         }
     }
 }
 
 #[must_use = "sinks do nothing unless polled"]
+// TODO: maybe we should use abstract datagram IO interface instead of the
+// Stream + Sink trait
 pub struct OutboundDatagramImpl {
     inner: UdpSocket,
     resolver: ThreadSafeDNSResolver,
@@ -125,7 +133,16 @@ impl Sink<UdpPacket> for OutboundDatagramImpl {
                 SocksAddr::Domain(domain, port) => {
                     let domain = domain.to_string();
                     let port = *port;
-                    let mut fut = resolver.resolve(domain.as_str(), false).boxed();
+                    let mut fut = {
+                        if inner.local_addr()?.is_ipv6() {
+                            resolver.resolve(domain.as_str(), false)
+                        } else {
+                            resolver
+                                .resolve_v4(domain.as_str(), false)
+                                .map(|x| x.map(|ip| ip.map(Into::into)))
+                                .boxed()
+                        }
+                    };
                     let ip = ready!(fut.as_mut().poll(cx).map_err(|_| {
                         io::Error::other("resolve domain failed")
                     }))?;
@@ -166,7 +183,6 @@ impl Sink<UdpPacket> for OutboundDatagramImpl {
         Poll::Ready(Ok(()))
     }
 }
-
 impl Stream for OutboundDatagramImpl {
     type Item = UdpPacket;
 
@@ -184,6 +200,7 @@ impl Stream for OutboundDatagramImpl {
                     data,
                     src_addr: src.into(),
                     dst_addr: SocksAddr::any_ipv4(),
+                    inbound_user: None,
                 }))
             }
             Err(_) => Poll::Ready(None),

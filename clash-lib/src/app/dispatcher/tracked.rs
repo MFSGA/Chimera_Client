@@ -272,6 +272,11 @@ impl AsyncRead for TrackedStream {
         self.tracker
             .download_total
             .fetch_add(download as u64, std::sync::atomic::Ordering::Release);
+        if self.tracker.session_holder.inbound_user.is_some() {
+            self.tracker
+                .user_download
+                .fetch_add(download as u64, std::sync::atomic::Ordering::Relaxed);
+        }
 
         v
     }
@@ -302,6 +307,11 @@ impl AsyncWrite for TrackedStream {
         self.tracker
             .upload_total
             .fetch_add(upload as u64, std::sync::atomic::Ordering::Release);
+        if self.tracker.session_holder.inbound_user.is_some() {
+            self.tracker
+                .user_upload
+                .fetch_add(upload as u64, std::sync::atomic::Ordering::Relaxed);
+        }
 
         v
     }
@@ -493,30 +503,35 @@ impl Stream for TrackedDatagram {
         }
 
         let r = Pin::new(self.inner.as_mut()).poll_next(cx);
-        if let Poll::Ready(Some(pkt)) = &r {
-            self.manager.push_downloaded(pkt.data.len());
-            self.tracker.download_total.fetch_add(
-                pkt.data.len() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+        if let Poll::Ready(Some(ref pkt)) = r {
+            let n = pkt.data.len();
+            self.manager.push_downloaded(n);
+            self.tracker
+                .download_total
+                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            if self.tracker.session_holder.inbound_user.is_some() {
+                self.tracker
+                    .user_download
+                    .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         r
     }
 }
 
 impl Sink<UdpPacket> for TrackedDatagram {
-    type Error = io::Error;
+    type Error = std::io::Error;
 
     fn poll_ready(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
         match self.close_notify.try_recv() {
-            Ok(_) => return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
+            Ok(_) => return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into())),
             Err(e) => match e {
                 TryRecvError::Empty => {}
                 TryRecvError::Closed => {
-                    return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+                    return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
                 }
             },
         }
@@ -528,11 +543,11 @@ impl Sink<UdpPacket> for TrackedDatagram {
         item: UdpPacket,
     ) -> Result<(), Self::Error> {
         match self.close_notify.try_recv() {
-            Ok(_) => return Err(io::ErrorKind::BrokenPipe.into()),
+            Ok(_) => return Err(std::io::ErrorKind::BrokenPipe.into()),
             Err(e) => match e {
                 TryRecvError::Empty => {}
                 TryRecvError::Closed => {
-                    return Err(io::ErrorKind::BrokenPipe.into());
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
                 }
             },
         }
@@ -542,6 +557,11 @@ impl Sink<UdpPacket> for TrackedDatagram {
         self.tracker
             .upload_total
             .fetch_add(upload as u64, std::sync::atomic::Ordering::Relaxed);
+        if self.tracker.session_holder.inbound_user.is_some() {
+            self.tracker
+                .user_upload
+                .fetch_add(upload as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         Pin::new(self.inner.as_mut()).start_send(item)
     }
 
@@ -550,11 +570,11 @@ impl Sink<UdpPacket> for TrackedDatagram {
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
         match self.close_notify.try_recv() {
-            Ok(_) => return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
+            Ok(_) => return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into())),
             Err(e) => match e {
                 TryRecvError::Empty => {}
                 TryRecvError::Closed => {
-                    return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+                    return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
                 }
             },
         }
@@ -567,11 +587,11 @@ impl Sink<UdpPacket> for TrackedDatagram {
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
         match self.close_notify.try_recv() {
-            Ok(_) => return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
+            Ok(_) => return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into())),
             Err(e) => match e {
                 TryRecvError::Empty => {}
                 TryRecvError::Closed => {
-                    return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+                    return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
                 }
             },
         }

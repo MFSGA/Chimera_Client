@@ -2,7 +2,8 @@ use std::{
     collections::HashMap,
     fmt::{Debug, Display, Formatter},
     io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr}, str::FromStr,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    str::FromStr,
 };
 
 use anyhow::anyhow;
@@ -274,6 +275,10 @@ pub struct Session {
     pub asn: Option<String>,
     /// Traffic statistics for intelligent proxy selection
     pub traffic_stats: Option<()>,
+    /// Authenticated user name from SS2022 EIH (FAC user_id as string).
+    /// Set by the Shadowsocks inbound before dispatch; used for per-user
+    /// traffic attribution.
+    pub inbound_user: Option<String>,
 }
 
 impl Session {
@@ -304,6 +309,9 @@ impl Session {
             "traffic_stats".to_string(),
             Box::new(self.traffic_stats) as _,
         );
+        if let Some(ref user) = self.inbound_user {
+            rv.insert("inboundUser".to_string(), Box::new(user.clone()) as _);
+        }
         rv
     }
 }
@@ -320,6 +328,7 @@ impl Default for Session {
             iface: None,
             asn: None,
             traffic_stats: None,
+            inbound_user: None,
         }
     }
 }
@@ -366,6 +375,7 @@ impl Clone for Session {
             iface: self.iface.as_ref().cloned(),
             asn: self.asn.clone(),
             traffic_stats: self.traffic_stats,
+            inbound_user: self.inbound_user.clone(),
         }
     }
 }

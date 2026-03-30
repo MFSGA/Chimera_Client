@@ -5,6 +5,7 @@ use crate::{
     common::trie,
     config::def::{DNSListen, DNSMode, EdnsClientSubnet as DefEdnsClientSubnet},
 };
+pub use chimera_dns::{DNSListenAddr, DoH3Config, DoHConfig, DoTConfig};
 use ipnet::{AddrParseError, Ipv4Net, Ipv6Net};
 use serde::Deserialize;
 use std::{
@@ -15,7 +16,6 @@ use std::{
 };
 use tracing::warn;
 use url::Url;
-pub use chimera_dns::{DNSListenAddr, DoH3Config, DoHConfig, DoTConfig};
 
 #[derive(Clone, Debug)]
 pub struct NameServer {
@@ -303,7 +303,8 @@ impl TryFrom<&crate::config::def::Config> for DNSConfig {
             )));
         }
 
-        let default_nameserver = DNSConfig::parse_nameserver(&dc.default_nameserver)?;
+        let default_nameserver =
+            DNSConfig::parse_nameserver(&dc.default_nameserver)?;
 
         for ns in &default_nameserver {
             if let url::Host::Domain(_) = ns.host {

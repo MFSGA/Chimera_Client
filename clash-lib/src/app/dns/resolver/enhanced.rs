@@ -95,8 +95,7 @@ impl EnhancedResolver {
         mmdb: Option<PendingMmdb>,
         outbounds: crate::proxy::utils::OutboundHandlerRegistry,
     ) -> Self {
-        let edns_client_subnet: Option<crate::app::dns::EdnsClientSubnet> =
-            cfg.edns_client_subnet.clone();
+        let edns_client_subnet = cfg.edns_client_subnet.clone();
         let default_resolver = Arc::new(EnhancedResolver {
             ipv6: AtomicBool::new(false),
             hosts: None,
