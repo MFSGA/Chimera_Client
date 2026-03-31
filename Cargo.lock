@@ -479,7 +479,7 @@ dependencies = [
 
 [[package]]
 name = "chimera-dns"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -560,15 +560,15 @@ checksum = "3a822ea5bc7590f9d40f1ba12c0dc3c2760f3482c6984db1573ad11031420831"
 
 [[package]]
 name = "clash-doc"
-version = "0.11.0"
+version = "0.11.1"
 
 [[package]]
 name = "clash-ffi"
-version = "0.11.0"
+version = "0.11.1"
 
 [[package]]
 name = "clash-lib"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -644,7 +644,7 @@ dependencies = [
 
 [[package]]
 name = "clash-rs"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "aws-lc-rs",
  "clap",
@@ -3935,7 +3935,7 @@ dependencies = [
 
 [[package]]
 name = "watfaq-netstack"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "bytes",
  "env_logger",
@@ -4609,7 +4609,7 @@ dependencies = [
 
 [[package]]
 name = "xhttp-h2-phaseb"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "anyhow",
  "bytes",
