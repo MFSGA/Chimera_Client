@@ -5,7 +5,10 @@ use serde::Serialize;
 
 use crate::{
     Session,
-    app::{dispatcher::BoxedChainedStream, dns::ThreadSafeDNSResolver},
+    app::{
+        dispatcher::{BoxedChainedDatagram, BoxedChainedStream},
+        dns::ThreadSafeDNSResolver,
+    },
     config::internal::proxy::PROXY_REJECT,
     proxy::{DialWithConnector, OutboundHandler, OutboundType},
 };
@@ -46,6 +49,14 @@ impl OutboundHandler for Handler {
         #[allow(unused_variables)] sess: &Session,
         #[allow(unused_variables)] _resolver: ThreadSafeDNSResolver,
     ) -> io::Result<BoxedChainedStream> {
+        Err(io::Error::other("REJECT"))
+    }
+
+    async fn connect_datagram(
+        &self,
+        #[allow(unused_variables)] sess: &Session,
+        #[allow(unused_variables)] _resolver: ThreadSafeDNSResolver,
+    ) -> io::Result<BoxedChainedDatagram> {
         Err(io::Error::other("REJECT"))
     }
 }

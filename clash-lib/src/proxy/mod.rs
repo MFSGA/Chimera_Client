@@ -109,16 +109,12 @@ pub trait OutboundHandler: Sync + Send + Unpin + DialWithConnector + Debug {
         )))
     }
 
+    /// connect to remote target via UDP
     async fn connect_datagram(
         &self,
-        _sess: &Session,
-        _resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedChainedDatagram> {
-        Err(io::Error::other(format!(
-            "udp relay not supported for {}",
-            self.proto()
-        )))
-    }
+        sess: &Session,
+        resolver: ThreadSafeDNSResolver,
+    ) -> io::Result<BoxedChainedDatagram>;
 
     /// relay related
     async fn support_connector(&self) -> ConnectorType {

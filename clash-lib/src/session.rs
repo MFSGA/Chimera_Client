@@ -210,6 +210,18 @@ impl From<(IpAddr, u16)> for SocksAddr {
     }
 }
 
+impl From<(Ipv4Addr, u16)> for SocksAddr {
+    fn from(value: (Ipv4Addr, u16)) -> Self {
+        Self::Ip(value.into())
+    }
+}
+
+impl From<(Ipv6Addr, u16)> for SocksAddr {
+    fn from(value: (Ipv6Addr, u16)) -> Self {
+        Self::Ip(value.into())
+    }
+}
+
 impl TryFrom<(String, u16)> for SocksAddr {
     type Error = io::Error;
 

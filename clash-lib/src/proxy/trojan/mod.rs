@@ -8,7 +8,10 @@ use tracing::debug;
 
 use crate::{
     app::{
-        dispatcher::{BoxedChainedStream, ChainedStream, ChainedStreamWrapper},
+        dispatcher::{
+            BoxedChainedDatagram, BoxedChainedStream, ChainedDatagram,
+            ChainedDatagramWrapper, ChainedStream, ChainedStreamWrapper,
+        },
         dns::ThreadSafeDNSResolver,
     },
     common::utils,
@@ -21,6 +24,10 @@ use super::{
     AnyStream, DialWithConnector, OutboundHandler, OutboundType,
     utils::{GLOBAL_DIRECT_CONNECTOR, RemoteConnector},
 };
+
+use self::datagram::OutboundDatagramTrojan;
+
+mod datagram;
 
 pub struct HandlerOptions {
     pub name: String,
@@ -143,6 +150,54 @@ impl OutboundHandler for Handler {
 
         let s = self.inner_proxy_stream(stream, sess, false).await?;
         let chained = ChainedStreamWrapper::new(s);
+        chained.append_to_chain(self.name()).await;
+        Ok(Box::new(chained))
+    }
+
+    async fn connect_datagram(
+        &self,
+        sess: &Session,
+        resolver: ThreadSafeDNSResolver,
+    ) -> io::Result<BoxedChainedDatagram> {
+        let dialer = self.connector.read().await;
+
+        if let Some(dialer) = dialer.as_ref() {
+            debug!("{:?} is connecting via {:?}", self, dialer);
+        }
+
+        self.connect_datagram_with_connector(
+            sess,
+            resolver,
+            dialer
+                .as_ref()
+                .unwrap_or(&GLOBAL_DIRECT_CONNECTOR.clone())
+                .as_ref(),
+        )
+        .await
+    }
+
+    async fn connect_datagram_with_connector(
+        &self,
+        sess: &Session,
+        resolver: ThreadSafeDNSResolver,
+        connector: &dyn RemoteConnector,
+    ) -> io::Result<BoxedChainedDatagram> {
+        let stream = connector
+            .connect_stream(
+                resolver,
+                self.opts.server.as_str(),
+                self.opts.port,
+                sess.iface.as_ref(),
+                #[cfg(target_os = "linux")]
+                sess.so_mark,
+            )
+            .await?;
+
+        let stream = self.inner_proxy_stream(stream, sess, true).await?;
+
+        let d = OutboundDatagramTrojan::new(stream, sess.destination.clone());
+
+        let chained = ChainedDatagramWrapper::new(d);
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
     }

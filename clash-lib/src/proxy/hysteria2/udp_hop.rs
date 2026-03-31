@@ -2,201 +2,241 @@ use std::{
     fmt::Debug,
     io,
     net::SocketAddr,
-    ops::Sub,
+    ops::{Deref, DerefMut, Sub},
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
     time::{Duration, Instant},
 };
 
-use quinn::{
-    AsyncUdpSocket, Runtime, TokioRuntime, UdpPoller,
-    udp::{RecvMeta, Transmit},
-};
+use quinn::{AsyncUdpSocket, Runtime, TokioRuntime, UdpPoller, udp::Transmit};
 
 use crate::proxy::converters::hysteria2::PortGenerator;
 
 struct HopState {
     prev_conn: Option<Arc<dyn AsyncUdpSocket>>,
     cur_conn: Arc<dyn AsyncUdpSocket>,
-    last_hop: Instant,
-    next_port: u16,
+    last: Instant,
+    new_hop_port: u16,
 }
 
+/// A udp socket hopper, it can hop to a new port when the time interval is
+/// greater than interval
+///
+/// https://v2.hysteria.network/docs/advanced/Port-Hopping/
 pub struct UdpHop {
+    /// (prev_conn, cur_conn, last, new_hop_port), here maybe we can use struct
     state: Mutex<HopState>,
-    initial_port: u16,
-    port_generator: PortGenerator,
+    /// The default port is the initial port when this quic connect connects to
+    /// the server. Every time we call poll_recv, we must rewrite the source
+    /// of the data packet inside to this port, because quic will check the
+    /// source of the data packet and discard the unknown source data.
+    init_port: u16,
+    /// generate new port used to hop
+    port_range: PortGenerator,
+    /// interval to hop
     interval: Duration,
-    bind_addr: SocketAddr,
-    #[cfg(target_os = "linux")]
-    so_mark: Option<u32>,
 }
 
 impl UdpHop {
     const DEFAULT_INTERVAL: Duration = Duration::from_secs(30);
 
-    fn build_socket(
-        bind_addr: SocketAddr,
-        #[cfg(target_os = "linux")] so_mark: Option<u32>,
-    ) -> io::Result<std::net::UdpSocket> {
-        let domain = match bind_addr {
-            SocketAddr::V4(_) => socket2::Domain::IPV4,
-            SocketAddr::V6(_) => socket2::Domain::IPV6,
-        };
-        let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
-        #[cfg(target_os = "linux")]
-        if let Some(so_mark) = so_mark {
-            socket.set_mark(so_mark)?;
-        }
-        socket.set_nonblocking(true)?;
-        socket.bind(&bind_addr.into())?;
-        Ok(socket.into())
-    }
-
     pub fn new(
-        initial_port: u16,
-        port_generator: PortGenerator,
+        port: u16,
+        port_range: PortGenerator,
         interval: Option<Duration>,
-        bind_addr: SocketAddr,
-        #[cfg(target_os = "linux")] so_mark: Option<u32>,
     ) -> io::Result<Self> {
-        let socket = Self::build_socket(
-            bind_addr,
-            #[cfg(target_os = "linux")]
-            so_mark,
-        )?;
+        let socket =
+            std::net::UdpSocket::bind(SocketAddr::new([0, 0, 0, 0].into(), 0))?;
+
         let state = HopState {
             prev_conn: None,
             cur_conn: TokioRuntime.wrap_udp_socket(socket)?,
-            last_hop: Instant::now(),
-            next_port: initial_port,
-        };
+            last: Instant::now(),
+            new_hop_port: port,
+        }
+        .into();
 
-        Ok(Self {
-            state: Mutex::new(state),
-            initial_port,
-            port_generator,
+        Ok(UdpHop {
+            state,
+            init_port: port,
+            port_range,
             interval: interval.unwrap_or(Self::DEFAULT_INTERVAL),
-            bind_addr,
-            #[cfg(target_os = "linux")]
-            so_mark,
         })
     }
 
-    fn maybe_hop(&self) -> u16 {
-        let mut lock = self.state.lock().expect("udp hop lock poisoned");
-        if Instant::now().sub(lock.last_hop) > self.interval
-            && lock.prev_conn.is_none()
-        {
-            match Self::build_socket(
-                self.bind_addr,
-                #[cfg(target_os = "linux")]
-                self.so_mark,
-            )
-            .and_then(|socket| TokioRuntime.wrap_udp_socket(socket))
-            {
-                Ok(new_conn) => {
-                    lock.last_hop = Instant::now();
-                    lock.next_port = self.port_generator.get();
-                    lock.prev_conn =
-                        Some(std::mem::replace(&mut lock.cur_conn, new_conn));
-                }
-                Err(err) => {
-                    tracing::error!("hysteria2 port hopping failed: {err}");
-                }
-            }
+    fn hop(&self) -> u16 {
+        let mut lock = self.state.lock().unwrap();
+        let HopState {
+            prev_conn,
+            cur_conn,
+            last,
+            new_hop_port,
+        } = lock.deref_mut();
+
+        let now = Instant::now();
+        let to_hop = now.sub(*last) > self.interval;
+
+        if to_hop && prev_conn.is_none() {
+            *last = now;
+            tracing::trace!("port hopping");
+
+            std::net::UdpSocket::bind(SocketAddr::new([0, 0, 0, 0].into(), 0))
+                .and_then(|udp| TokioRuntime.wrap_udp_socket(udp))
+                .map(|new_conn| {
+                    *new_hop_port = self.port_range.get();
+                    *prev_conn = Some(std::mem::replace(cur_conn, new_conn));
+                })
+                .unwrap_or_else(|e| {
+                    tracing::error!("port hopping err {}", e);
+                });
         }
-        lock.next_port
+        *new_hop_port
     }
 
-    fn get_connections(
+    fn get_conn(
         &self,
     ) -> (Option<Arc<dyn AsyncUdpSocket>>, Arc<dyn AsyncUdpSocket>) {
-        let lock = self.state.lock().expect("udp hop lock poisoned");
-        (lock.prev_conn.clone(), lock.cur_conn.clone())
+        let lock = self.state.lock().unwrap();
+        let HopState {
+            prev_conn,
+            cur_conn,
+            ..
+        } = lock.deref();
+        (prev_conn.clone(), cur_conn.clone())
     }
 
-    fn drop_previous_connection(&self) {
-        let mut lock = self.state.lock().expect("udp hop lock poisoned");
-        lock.prev_conn.take();
+    fn drop_prcv_conn(&self) {
+        let mut lock = self.state.lock().unwrap();
+        lock.deref_mut().prev_conn.take();
     }
 }
 
 impl Debug for UdpHop {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UdpHop").finish()
+        f.debug_struct("UdpHop")
+            // .field("cur_conn", &self.state)
+            .finish()
     }
 }
 
 impl AsyncUdpSocket for UdpHop {
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
-        self.get_connections().1.create_io_poller()
+        let cur = self.get_conn().1;
+        cur.create_io_poller()
     }
 
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
-        let hop_port = self.maybe_hop();
-        let (_, current_conn) = self.get_connections();
+        let port = self.hop();
 
+        let cur = self.get_conn().1;
+
+        // here just need change send addr, it is not necessary to change send
+        // contents, so we can use unsafe
         unsafe {
-            let ptr = transmit as *const Transmit as *mut Transmit;
-            (*ptr).destination.set_port(hop_port);
+            let prt = transmit as *const Transmit as *mut Transmit;
+            (*prt).destination.set_port(port);
         }
 
-        current_conn.try_send(transmit)
+        cur.try_send(transmit)
     }
+
+    // fn poll_send(
+    //     &self,
+    //     state: &UdpState,
+    //     cx: &mut Context,
+    //     transmits: &[Transmit],
+    // ) -> Poll<Result<usize, io::Error>> {
+    //     // try to hop when we send data
+    //     let port = self.hop();
+
+    //     let (_pre_conn, io) = self.get_conn();
+
+    //     // here just need change send addr, it is not necessary to change send
+    //     // contents, so we can use unsafe
+    //     unsafe {
+    //         let prt = transmits.as_ptr() as *mut Transmit;
+    //         let slice_mut: &mut [Transmit] =
+    //             std::slice::from_raw_parts_mut(prt, transmits.len());
+    //         slice_mut.iter_mut().for_each(|v| {
+    //             v.destination.set_port(port);
+    //         })
+    //     }
+
+    //     loop {
+    //         ready!(io.poll_send_ready(cx))?;
+    //         if let Ok(res) = io.try_io(Interest::WRITABLE, || {
+    //             self.socket_rw.send((&io).into(), state, &transmits)
+    //         }) {
+    //             return Poll::Ready(Ok(res));
+    //         }
+    //     }
+    // }
 
     fn poll_recv(
         &self,
-        cx: &mut Context<'_>,
+        cx: &mut Context,
         bufs: &mut [io::IoSliceMut<'_>],
-        meta: &mut [RecvMeta],
+        meta: &mut [quinn::udp::RecvMeta],
     ) -> Poll<io::Result<usize>> {
-        let (prev_conn, current_conn) = self.get_connections();
+        let (prev_io, io) = self.get_conn();
 
-        let (prev_len, should_drop_prev) = match prev_conn {
-            Some(ref prev_conn) => match prev_conn.poll_recv(cx, bufs, meta) {
+        // read prev conn
+        let (len, should_drop) = match prev_io {
+            Some(ref prev_io) => match prev_io.poll_recv(cx, bufs, meta) {
+                // can readable, it is represent that the prev conn is not
+                // closed, and we recv the data from prev conn
                 Poll::Ready(Ok(len)) => (len, false),
-                Poll::Ready(Err(err)) => {
-                    tracing::trace!("hysteria2 previous conn recv error: {err}");
-                    (0, true)
+                Poll::Ready(Err(e)) => {
+                    tracing::trace!("poll prev conn err {}", e);
+                    match e.kind() {
+                        // io::ErrorKind::WouldBlock => {}
+                        io::ErrorKind::TimedOut => return Poll::Ready(Err(e)),
+                        _ => (0, true),
+                    }
                 }
-                Poll::Pending => (0, false),
+                Poll::Pending => {
+                    tracing::trace!("poll prev conn pending");
+                    (0, false)
+                }
             },
-            None => (0, false),
+            None => (0, true),
         };
 
-        if should_drop_prev {
-            self.drop_previous_connection();
+        if should_drop {
+            self.drop_prcv_conn();
         }
-
         meta.iter_mut()
-            .take(prev_len)
-            .for_each(|recv_meta| recv_meta.addr.set_port(self.initial_port));
+            .take(len)
+            .for_each(|m| m.addr.set_port(self.init_port));
 
-        match current_conn.poll_recv(cx, bufs, &mut meta[prev_len..]) {
+        match io.poll_recv(cx, bufs, &mut meta[len..]) {
             Poll::Pending => {
-                if prev_len > 0 {
-                    Poll::Ready(Ok(prev_len))
+                if len > 0 {
+                    Poll::Ready(Ok(len))
                 } else {
                     Poll::Pending
                 }
             }
-            Poll::Ready(Ok(current_len)) => {
-                meta.iter_mut().skip(prev_len).take(current_len).for_each(
-                    |recv_meta| recv_meta.addr.set_port(self.initial_port),
-                );
-                Poll::Ready(Ok(prev_len + current_len))
+            Poll::Ready(Ok(res)) => {
+                meta.iter_mut()
+                    .skip(len)
+                    .take(res)
+                    .for_each(|m| m.addr.set_port(self.init_port));
+                Poll::Ready(Ok(len + res))
             }
-            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Ready(Err(e)) => {
+                tracing::trace!("poll cur conn err {}", e);
+                Poll::Ready(Err(e))
+            }
         }
     }
 
     fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
-        self.get_connections().1.local_addr()
+        self.get_conn().1.local_addr()
     }
 
     fn may_fragment(&self) -> bool {
-        self.get_connections().1.may_fragment()
+        self.get_conn().1.may_fragment()
     }
 }

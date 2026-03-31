@@ -364,8 +364,8 @@ pub type BoxedChainedDatagram = Box<dyn ChainedDatagram + Send + Sync>;
 #[async_trait]
 impl<T> ChainedDatagram for ChainedDatagramWrapper<T>
 where
-    T: Stream<Item = UdpPacket> + Unpin + Send + Sync + 'static,
-    T: Sink<UdpPacket, Error = io::Error>,
+    T: Sink<UdpPacket, Error = std::io::Error> + Unpin + Send + Sync + 'static,
+    T: Stream<Item = UdpPacket>,
 {
     fn chain(&self) -> &ProxyChain {
         &self.chain

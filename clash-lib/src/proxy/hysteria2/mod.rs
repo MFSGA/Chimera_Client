@@ -3,7 +3,10 @@ mod congestion;
 mod salamander;
 mod udp_hop;
 
+mod datagram;
+
 use std::{
+    collections::HashMap,
     fmt::{Debug, Formatter},
     fs,
     io::{self, BufReader},
@@ -11,14 +14,14 @@ use std::{
     num::ParseIntError,
     path::Path,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, RwLock, atomic::AtomicU32},
     task::{Context, Poll},
 };
 
 use anyhow::anyhow;
-use bytes::Bytes;
-use codec::Hy2TcpCodec;
-use congestion::{Brutal, DynCongestion, DynController};
+use bytes::{Bytes, BytesMut};
+use codec::{Fragments, Hy2TcpCodec};
+use congestion::{Brutal, DynController};
 use futures::{SinkExt, StreamExt};
 use h3::client::SendRequest;
 use h3_quinn::OpenStreams;
@@ -36,13 +39,19 @@ use tracing::{debug, warn};
 
 use crate::{
     app::{
-        dispatcher::{BoxedChainedStream, ChainedStream, ChainedStreamWrapper},
+        dispatcher::{
+            BoxedChainedDatagram, BoxedChainedStream, ChainedDatagram,
+            ChainedDatagramWrapper, ChainedStream, ChainedStreamWrapper,
+        },
         dns::ThreadSafeDNSResolver,
     },
     common::tls::{DefaultTlsVerifier, GLOBAL_ROOT_STORE},
     proxy::{
         DialWithConnector, OutboundHandler, OutboundType,
         converters::hysteria2::PortGenerator,
+        datagram::UdpPacket,
+        hysteria2::datagram::{HysteriaDatagramOutbound, UdpSession},
+        utils::new_udp_socket,
     },
     session::{Session, SocksAddr},
 };
@@ -98,8 +107,12 @@ pub struct Handler {
     opts: HystOption,
     ep_config: EndpointConfig,
     client_config: ClientConfig,
-    conn: Mutex<Option<Arc<Connection>>>,
+    conn: Mutex<Option<Arc<HysteriaConnection>>>,
+    next_session_id: AtomicU32,
+    /// a send request guard to keep the connection alive
     guard: Mutex<Option<SendRequest<OpenStreams, Bytes>>>,
+    /// support udp is decided by server
+    support_udp: RwLock<bool>,
 }
 
 impl Debug for Handler {
@@ -250,74 +263,48 @@ impl Handler {
     }
 
     pub fn new(opts: HystOption) -> Self {
-        if opts.udp_mtu.is_some() {
-            warn!("hysteria2 `udp-mtu` is ignored in TCP-only implementation");
+        if opts.ca.is_some() {
+            warn!("hysteria2 does not support ca yet");
         }
-        if matches!(opts.cwnd, Some(0)) {
-            warn!(
-                "hysteria2 `cwnd` must be greater than 0, falling back to default window"
-            );
-        }
-
-        let custom_root_store = Self::load_custom_root_store(&opts);
-        let verifier = match custom_root_store {
-            Some(root_store) => DefaultTlsVerifier::with_root_store(
-                opts.fingerprint.clone(),
-                opts.skip_cert_verify,
-                root_store,
-            ),
-            None => DefaultTlsVerifier::new(
-                opts.fingerprint.clone(),
-                opts.skip_cert_verify,
-            ),
-        };
+        let verify =
+            DefaultTlsVerifier::new(opts.fingerprint.clone(), opts.skip_cert_verify);
         let mut tls_config = RustlsClientConfig::builder()
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(verifier))
+            .with_custom_certificate_verifier(Arc::new(verify))
             .with_no_client_auth();
 
+        // should set alpn_protocol `h3` default
         tls_config.alpn_protocols = if opts.alpn.is_empty() {
             vec![b"h3".to_vec()]
         } else {
-            opts.alpn
-                .iter()
-                .map(|item| item.as_bytes().to_vec())
-                .collect()
+            opts.alpn.iter().map(|x| x.as_bytes().to_vec()).collect()
         };
 
         let mut transport = TransportConfig::default();
         if opts.disable_mtu_discovery {
+            tracing::debug!("disable mtu discovery");
             transport.mtu_discovery_config(None);
         }
-        let cwnd_packets = opts
-            .cwnd
-            .filter(|value| *value >= Self::MIN_INITIAL_CWND_PACKETS);
-        if opts.cwnd.is_some() && cwnd_packets.is_none() {
-            warn!(
-                min = Self::MIN_INITIAL_CWND_PACKETS,
-                "hysteria2 `cwnd` is too small, falling back to default window"
-            );
-        }
-
-        transport.congestion_controller_factory(Arc::new(DynCongestion::new(
-            cwnd_packets,
-        )));
+        // TODO
+        // transport.congestion_controller_factory(DynCongestion);
         transport.max_idle_timeout(Some(
             Self::DEFAULT_MAX_IDLE_TIMEOUT.try_into().unwrap(),
         ));
         transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
 
-        let quic_config: QuicClientConfig =
-            tls_config.try_into().expect("valid quic config");
+        let quic_config: QuicClientConfig = tls_config.try_into().unwrap();
         let mut client_config = ClientConfig::new(Arc::new(quic_config));
         client_config.transport_config(Arc::new(transport));
+        let ep_config = quinn::EndpointConfig::default();
 
         Self {
             opts,
-            ep_config: EndpointConfig::default(),
+            ep_config,
             client_config,
+            next_session_id: AtomicU32::new(0),
             conn: Mutex::new(None),
             guard: Mutex::new(None),
+            support_udp: RwLock::new(true),
         }
     }
 
@@ -408,153 +395,139 @@ impl Handler {
         }
     }
 
+    // connect and auth
     async fn new_authed_connection_inner(
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> anyhow::Result<(Arc<Connection>, SendRequest<OpenStreams, Bytes>)> {
-        let server_addr = self.resolve_server_addr(resolver).await?;
-        let socket_factory = || Self::create_udp_socket(server_addr, sess);
-        let bind_addr = Self::select_bind_addr(server_addr, sess);
+    ) -> anyhow::Result<(Connection, SendRequest<OpenStreams, Bytes>)> {
+        tracing::trace!(
+            "hysteria2 new_authed_connection_inner: starting connection to {:?}",
+            self.opts.addr
+        );
+        // Everytime we enstablish a new session, we should lookup the server
+        // address. maybe it changed since it use ddns
+        let server_socket_addr = match self.opts.addr.clone() {
+            SocksAddr::Ip(ip) => ip,
+            SocksAddr::Domain(d, port) => {
+                let ip = resolver
+                    .resolve(d.as_str(), true)
+                    .await?
+                    .ok_or_else(|| anyhow!("resolve domain {} failed", d))?;
+                SocketAddr::new(ip, port)
+            }
+        };
 
-        let mut endpoint = if let Some(obfs) = self.opts.obfs.as_ref() {
+        // todo: Here maybe we should use a AsyncUdpSocket which implement salamander obfs
+        // and port hopping
+        let create_socket = || async {
+            new_udp_socket(
+                None,
+                sess.iface.as_ref(),
+                #[cfg(target_os = "linux")]
+                sess.so_mark,
+                Some(server_socket_addr),
+            )
+            .await
+        };
+
+        let mut ep = if let Some(obfs) = self.opts.obfs.as_ref() {
             match obfs {
                 Obfs::Salamander(salamander_obfs) => {
-                    let socket = socket_factory()?;
-                    let obfs_socket = salamander::Salamander::new(
-                        socket,
-                        salamander_obfs.key.clone(),
+                    let socket = create_socket().await?;
+                    let obfs = salamander::Salamander::new(
+                        socket.into_std()?,
+                        salamander_obfs.key.to_vec(),
                     )?;
+
                     quinn::Endpoint::new_with_abstract_socket(
                         self.ep_config.clone(),
                         None,
-                        Arc::new(obfs_socket),
+                        Arc::new(obfs),
                         Arc::new(TokioRuntime),
                     )?
                 }
             }
-        } else if let Some(port_generator) = self.opts.ports.as_ref() {
-            let socket = udp_hop::UdpHop::new(
-                server_addr.port(),
-                port_generator.clone(),
+        } else if let Some(port_gen) = self.opts.ports.as_ref() {
+            let udp_hop = udp_hop::UdpHop::new(
+                server_socket_addr.port(),
+                port_gen.clone(),
                 None,
-                bind_addr,
-                #[cfg(target_os = "linux")]
-                sess.so_mark,
             )?;
             quinn::Endpoint::new_with_abstract_socket(
                 self.ep_config.clone(),
                 None,
-                Arc::new(socket),
+                Arc::new(udp_hop),
                 Arc::new(TokioRuntime),
             )?
         } else {
-            let socket = socket_factory()?;
+            let socket = create_socket().await?;
+
             quinn::Endpoint::new(
                 self.ep_config.clone(),
                 None,
-                socket,
+                socket.into_std()?,
                 Arc::new(TokioRuntime),
             )?
         };
 
-        endpoint.set_default_client_config(self.client_config.clone());
+        ep.set_default_client_config(self.client_config.clone());
 
-        let server_name = self.tls_server_name(server_addr);
-        let conn = endpoint.connect(server_addr, &server_name)?.await?;
-        let cc_rx_header = self.client_cc_rx_header();
-        let (guard, cc_rx, _udp_supported) =
-            Self::auth(&conn, &self.opts.password, cc_rx_header.as_str()).await?;
-        Self::configure_brutal_cc(&conn, self.select_brutal_bps(cc_rx));
+        tracing::trace!("hysteria2 connecting to server: {:?}", server_socket_addr);
+        let session = ep
+            .connect(server_socket_addr, self.opts.sni.as_deref().unwrap_or(""))?
+            .await?;
+        tracing::trace!("hysteria2 QUIC connection established");
+        let (guard, cc_rx, udp) = Self::auth(&session, &self.opts.password).await?;
+        tracing::trace!("hysteria2 authentication successful, udp={}", udp);
+        *self.support_udp.write().unwrap() = udp;
+        Self::configure_brutal_cc(&session, self.select_brutal_bps(cc_rx));
 
-        Ok((Arc::new(conn), guard))
+        Ok((session, guard))
     }
 
     async fn auth(
-        conn: &Connection,
-        password: &str,
-        cc_rx_header: &str,
+        conn: &quinn::Connection,
+        passwd: &str,
     ) -> anyhow::Result<(SendRequest<OpenStreams, Bytes>, CcRx, bool)> {
         let h3_conn = h3_quinn::Connection::new(conn.clone());
+
         let (_, mut sender) =
             h3::client::builder().build::<_, _, Bytes>(h3_conn).await?;
 
-        let request = http::Request::post("https://hysteria/auth")
-            .header("Hysteria-Auth", password)
-            .header("Hysteria-CC-RX", cc_rx_header)
+        let req = http::Request::post("https://hysteria/auth")
+            .header("Hysteria-Auth", passwd)
+            .header("Hysteria-CC-RX", "0")
             .header("Hysteria-Padding", codec::padding(64..=512))
             .body(())
-            .expect("request builder should be valid");
+            .unwrap();
+        let mut r = sender.send_request(req).await?;
+        r.finish().await?;
 
-        let mut req = sender.send_request(request).await?;
-        req.finish().await?;
-        let response = req.recv_response().await?;
+        let r = r.recv_response().await?;
 
         const HYSTERIA_STATUS_OK: u16 = 233;
-        if response.status() != HYSTERIA_STATUS_OK {
-            return Err(anyhow!(
-                "hysteria2 auth failed: unexpected status {}",
-                response.status()
-            ));
+        if r.status() != HYSTERIA_STATUS_OK {
+            return Err(anyhow!("auth failed: response status code {}", r.status()));
         }
 
-        let cc_rx = match response.headers().get("Hysteria-CC-RX") {
-            Some(header) => match header.to_str() {
-                Ok(value) => match value.parse::<CcRx>() {
-                    Ok(parsed) => parsed,
-                    Err(err) => {
-                        warn!(
-                            "hysteria2 invalid Hysteria-CC-RX value `{value}`: {err}, fallback to auto"
-                        );
-                        CcRx::Auto
-                    }
-                },
-                Err(err) => {
-                    warn!(
-                        "hysteria2 invalid Hysteria-CC-RX header: {err}, fallback to auto"
-                    );
-                    CcRx::Auto
-                }
-            },
-            None => CcRx::Auto,
-        };
+        // MUST have Hysteria-CC-RX and Hysteria-UDP headers according to hysteria2
+        // document
+        let cc_rx = r
+            .headers()
+            .get("Hysteria-CC-RX")
+            .ok_or_else(|| anyhow!("auth failed: missing Hysteria-CC-RX header"))?
+            .to_str()?
+            .parse()?;
 
-        let udp_supported = response
+        let support_udp = r
             .headers()
             .get("Hysteria-UDP")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<bool>().ok())
-            .unwrap_or(false);
+            .ok_or_else(|| anyhow!("auth failed: missing Hysteria-UDP header"))?
+            .to_str()?
+            .parse()?;
 
-        Ok((sender, cc_rx, udp_supported))
-    }
-
-    async fn new_authed_connection(
-        &self,
-        sess: &Session,
-        resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<Arc<Connection>> {
-        let mut lock = self.conn.lock().await;
-        if let Some(conn) = lock.as_ref() {
-            if conn.close_reason().is_none() {
-                return Ok(conn.clone());
-            }
-            debug!("hysteria2 cached connection closed, reconnecting");
-        }
-
-        let (conn, guard) = self
-            .new_authed_connection_inner(sess, resolver)
-            .await
-            .map_err(|err| {
-            io::Error::other(format!(
-                "connect to {} failed: {err}",
-                self.server_label()
-            ))
-        })?;
-
-        *lock = Some(conn.clone());
-        *self.guard.lock().await = Some(guard);
-        Ok(conn)
+        Ok((sender, cc_rx, support_udp))
     }
 
     async fn connect_tcp(
@@ -588,6 +561,170 @@ impl Handler {
 
         Ok(HystStream { send, recv })
     }
+
+    pub async fn new_authed_connection(
+        &self,
+        sess: &Session,
+        resolver: ThreadSafeDNSResolver,
+    ) -> std::io::Result<Arc<HysteriaConnection>> {
+        let mut quinn_conn_lock = self.conn.lock().await;
+
+        match (*quinn_conn_lock).as_ref().filter(|s| {
+            match s.conn.close_reason() {
+                // rust should have inspect method on Option and Result!
+                Some(reason) => {
+                    tracing::debug!("old connection closed: {:?}", reason);
+                    false
+                }
+                None => true,
+            }
+        }) {
+            Some(s) => Ok(s.clone()),
+            None => {
+                let (session, guard) = self
+                    .new_authed_connection_inner(sess, resolver)
+                    .await
+                    .map_err(|e| {
+                        std::io::Error::other(format!(
+                            "connect to {} failed: {}",
+                            self.opts.addr, e
+                        ))
+                    })?;
+
+                let session = Arc::new(session);
+                let hyst_conn = HysteriaConnection::new_with_task_loop(
+                    session,
+                    self.opts.udp_mtu,
+                );
+                *quinn_conn_lock = Some(hyst_conn.clone());
+                *self.guard.lock().await = Some(guard);
+                Ok(hyst_conn)
+            }
+        }
+    }
+}
+
+pub struct HysteriaConnection {
+    pub conn: Arc<quinn::Connection>,
+    pub udp_sessions: Arc<tokio::sync::Mutex<HashMap<u32, UdpSession>>>,
+
+    // config
+    pub udp_mtu: Option<usize>,
+}
+
+impl HysteriaConnection {
+    pub fn new_with_task_loop(
+        conn: Arc<quinn::Connection>,
+        udp_mtu: Option<u32>,
+    ) -> Arc<Self> {
+        let s = Arc::new(Self {
+            conn,
+            udp_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            udp_mtu: udp_mtu.map(|x| x as usize),
+        });
+        tokio::spawn(Self::spawn_tasks(s.clone()));
+
+        s
+    }
+
+    async fn spawn_tasks(self: Arc<Self>) {
+        tracing::trace!("hysteria2 spawn_tasks: starting datagram receive loop");
+        let err = loop {
+            tokio::select! {
+                res = self.conn.read_datagram() => {
+                    match res {
+                        Ok(pkt) => {
+                            tracing::trace!("hysteria2 received datagram: {} bytes", pkt.len());
+                            self.clone().recv_packet(pkt).await
+                        },
+                        Err(e) => {
+                            tracing::error!("hysteria2 read datagram error: {}", e);
+                            break e;
+                        }
+                    }
+                }
+            }
+        };
+        tracing::warn!("hysteria2 connection error: {:?}", err);
+    }
+
+    pub async fn connect_udp(
+        self: Arc<Self>,
+        sess: &Session,
+        session_id: u32,
+    ) -> HysteriaDatagramOutbound {
+        HysteriaDatagramOutbound::new(
+            session_id,
+            self.clone(),
+            sess.destination.clone(),
+        )
+        .await
+    }
+
+    pub fn send_packet(
+        &self,
+        pkt: Bytes,
+        addr: SocksAddr,
+        session_id: u32,
+        pkt_id: u16,
+    ) -> io::Result<()> {
+        let max_frag_size = match self.udp_mtu.or(self.conn.max_datagram_size()) {
+            Some(value) => value,
+            None => {
+                return Err(io::Error::other(
+                    "hysteria2 udp mtu not set, please check disable_mtu_discovery and udp_mtu",
+                ));
+            }
+        };
+
+        for frag in Fragments::new(session_id, pkt_id, addr, max_frag_size, pkt) {
+            self.conn.send_datagram(frag).map_err(io::Error::other)?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn recv_packet(self: Arc<Self>, pkt: Bytes) {
+        tracing::trace!("hysteria2 recv_packet: {} bytes", pkt.len());
+        let mut buf: BytesMut = pkt.into();
+        let pkt = codec::HysUdpPacket::decode(&mut buf).unwrap();
+        let session_id = pkt.session_id;
+        let mut udp_sessions = self.udp_sessions.lock().await;
+        match udp_sessions.get_mut(&session_id) {
+            Some(session) => {
+                tracing::trace!(
+                    "hysteria2 found session {}, feeding packet",
+                    session_id
+                );
+                if let Some(pkt) = session.feed(pkt) {
+                    tracing::trace!(
+                        "hysteria2 complete packet received for session {}: {} \
+                         bytes to {:?}",
+                        session_id,
+                        pkt.data.len(),
+                        session.local_addr
+                    );
+                    let _ = session
+                        .incoming
+                        .send(UdpPacket {
+                            data: pkt.data,
+                            src_addr: pkt.addr,
+                            dst_addr: session.local_addr.clone(),
+                            inbound_user: None,
+                        })
+                        .await;
+                } else {
+                    tracing::trace!(
+                        "hysteria2 packet fragment buffered for session {}",
+                        session_id
+                    );
+                }
+            }
+            _ => {
+                tracing::warn!("hysteria2 udp session not found: {}", session_id);
+            }
+        }
+    }
 }
 
 impl DialWithConnector for Handler {}
@@ -608,10 +745,26 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
     ) -> io::Result<BoxedChainedStream> {
         let conn = self.new_authed_connection(sess, resolver).await?;
-        let stream = Self::connect_tcp(&conn, sess).await?;
+        let stream = Self::connect_tcp(&conn.conn, sess).await?;
         let chained = ChainedStreamWrapper::new(Box::new(stream));
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
+    }
+
+    /// connect to remote target via UDP
+    async fn connect_datagram(
+        &self,
+        sess: &Session,
+        resolver: ThreadSafeDNSResolver,
+    ) -> std::io::Result<BoxedChainedDatagram> {
+        let authed_conn = self.new_authed_connection(sess, resolver.clone()).await?;
+        let next_session_id = self
+            .next_session_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let hy_datagram = authed_conn.connect_udp(sess, next_session_id).await;
+        let s = ChainedDatagramWrapper::new(hy_datagram);
+        s.append_to_chain(self.name()).await;
+        Ok(Box::new(s))
     }
 }
 
