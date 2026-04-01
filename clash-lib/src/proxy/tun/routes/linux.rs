@@ -6,6 +6,14 @@ use crate::{
     config::internal::config::TunConfig,
 };
 
+fn is_missing_ip_state(stderr: &str) -> bool {
+    matches!(
+        stderr.trim(),
+        msg if msg.contains("No such file or directory")
+            || msg.contains("No such process")
+    )
+}
+
 /// TODO: get rid of command execution
 pub fn check_ip_command_installed() -> std::io::Result<()> {
     std::process::Command::new("ip")
@@ -38,35 +46,60 @@ pub fn add_route(via: &OutboundInterface, dest: &IpNet) -> std::io::Result<()> {
     Ok(())
 }
 
-fn run_ip_cmd(args: &[&str], enable_v6: bool) -> std::io::Result<()> {
-    // IPv4
-    let cmd_str = format!("ip {}", args.join(" "));
+pub fn delete_interface(name: &str) -> std::io::Result<()> {
+    let cmd_str = format!("ip link del dev {name}");
+    let args = ["link", "del", "dev", name];
+    let deleted = run_ip_cmd_single(&cmd_str, &args, true)?;
+    if deleted {
+        warn!("deleted stale tun interface {}", name);
+    }
+    Ok(())
+}
+
+fn run_ip_cmd_single(
+    cmd_str: &str,
+    args: &[&str],
+    allow_missing: bool,
+) -> std::io::Result<bool> {
     let cmd = std::process::Command::new("ip").args(args).output()?;
     warn!("executing: {}", cmd_str);
-    if !cmd.status.success() {
-        return Err(new_io_error(format!(
-            "{} failed: {}",
-            cmd_str,
-            String::from_utf8_lossy(&cmd.stderr)
-        )));
+    if cmd.status.success() {
+        return Ok(true);
     }
 
-    // IPv6
+    let stderr = String::from_utf8_lossy(&cmd.stderr);
+    if allow_missing && is_missing_ip_state(&stderr) {
+        warn!("{} already absent: {}", cmd_str, stderr.trim());
+        return Ok(false);
+    }
+
+    Err(new_io_error(format!("{} failed: {}", cmd_str, stderr)))
+}
+
+fn run_ip_cmd_with_mode(
+    args: &[&str],
+    enable_v6: bool,
+    allow_missing: bool,
+) -> std::io::Result<bool> {
+    let cmd_str = format!("ip {}", args.join(" "));
+    let mut changed = run_ip_cmd_single(&cmd_str, args, allow_missing)?;
+
     if enable_v6 {
         let mut v6_args = vec!["-6"];
         v6_args.extend_from_slice(args);
         let v6_cmd_str = format!("ip -6 {}", args.join(" "));
-        let v6_cmd = std::process::Command::new("ip").args(&v6_args).output()?;
-        warn!("executing: {}", v6_cmd_str);
-        if !v6_cmd.status.success() {
-            return Err(new_io_error(format!(
-                "{} failed: {}",
-                v6_cmd_str,
-                String::from_utf8_lossy(&v6_cmd.stderr)
-            )));
-        }
+        changed |= run_ip_cmd_single(&v6_cmd_str, &v6_args, allow_missing)?;
     }
 
+    Ok(changed)
+}
+
+fn run_ip_cmd(args: &[&str], enable_v6: bool) -> std::io::Result<()> {
+    run_ip_cmd_with_mode(args, enable_v6, false).map(|_| ())
+}
+
+fn delete_ip_cmd_all(args: &[&str], enable_v6: bool) -> std::io::Result<()> {
+    while run_ip_cmd_with_mode(args, enable_v6, true)? {}
     Ok(())
 }
 
@@ -130,8 +163,10 @@ pub fn maybe_routes_clean_up(tun_cfg: &TunConfig) -> std::io::Result<()> {
     let table = tun_cfg.route_table.to_string();
     let enable_v6 = tun_cfg.gateway_v6.is_some();
 
+    delete_ip_cmd_all(&["route", "del", "default", "table", &table], enable_v6)?;
+
     if let Some(so_mark) = tun_cfg.so_mark {
-        run_ip_cmd(
+        delete_ip_cmd_all(
             &[
                 "rule",
                 "del",
@@ -144,14 +179,27 @@ pub fn maybe_routes_clean_up(tun_cfg: &TunConfig) -> std::io::Result<()> {
             enable_v6,
         )?;
     }
-    run_ip_cmd(
+    delete_ip_cmd_all(
         &["rule", "del", "table", "main", "suppress_prefixlength", "0"],
         enable_v6,
     )?;
 
-    if tun_cfg.dns_hijack {
-        run_ip_cmd(&["rule", "del", "dport", "53", "table", &table], enable_v6)?;
-    }
+    delete_ip_cmd_all(
+        &["rule", "del", "dport", "53", "table", &table],
+        enable_v6,
+    )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_missing_ip_state;
+
+    #[test]
+    fn detect_missing_ip_rule_errors() {
+        assert!(is_missing_ip_state("RTNETLINK answers: No such file or directory"));
+        assert!(is_missing_ip_state("RTNETLINK answers: No such process"));
+        assert!(!is_missing_ip_state("RTNETLINK answers: File exists"));
+    }
 }

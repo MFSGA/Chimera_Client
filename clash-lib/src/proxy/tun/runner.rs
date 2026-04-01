@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use futures::{FutureExt, SinkExt, StreamExt, future::BoxFuture};
+use network_interface::NetworkInterfaceConfig;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 use url::Url;
@@ -20,6 +21,58 @@ use crate::{
 const TUN_VISIBILITY_MAX_ATTEMPTS: u32 = 40;
 /// Interval in milliseconds between each visibility poll attempt.
 const TUN_VISIBILITY_POLL_INTERVAL_MS: u64 = 50;
+
+fn tun_exists(name: &str) -> bool {
+    use network_interface::NetworkInterfaceConfig;
+
+    network_interface::NetworkInterface::show()
+        .map(|ifs| ifs.into_iter().any(|x| x.name == name))
+        .unwrap_or_default()
+}
+
+async fn wait_for_tun_state(name: &str, should_exist: bool) -> Result<(), Error> {
+    let mut last_show_err: Option<String> = None;
+    let mut attempt = 0u32;
+
+    loop {
+        match network_interface::NetworkInterface::show() {
+            Ok(ifs) => {
+                if ifs.into_iter().any(|x| x.name == name) == should_exist {
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                last_show_err = Some(e.to_string());
+            }
+        }
+
+        attempt += 1;
+        if attempt >= TUN_VISIBILITY_MAX_ATTEMPTS {
+            break;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(
+            TUN_VISIBILITY_POLL_INTERVAL_MS,
+        ))
+        .await;
+    }
+
+    let total_ms = TUN_VISIBILITY_MAX_ATTEMPTS as u64
+        * TUN_VISIBILITY_POLL_INTERVAL_MS;
+    let state = if should_exist { "visible" } else { "removed" };
+    let err_msg = match last_show_err {
+        Some(e) => format!(
+            "tun device {} not {} after waiting {}ms (last error: {})",
+            name, state, total_ms, e
+        ),
+        None => format!(
+            "tun device {} not {} after waiting {}ms",
+            name, state, total_ms
+        ),
+    };
+
+    Err(Error::Operation(err_msg))
+}
 
 #[derive(Default)]
 struct TunInitializationConfig {
@@ -133,23 +186,40 @@ impl TunRunner {
                 #[cfg(not(any(target_os = "ios", target_os = "android")))]
                 {
                     use crate::proxy::tun::routes::maybe_add_routes;
-                    use network_interface::NetworkInterfaceConfig;
                     use tun_rs::DeviceBuilder;
 
                     let tun_name =
                         tun_init_config.tun_name.expect("tun name must be provided");
-                    let tun_exist = network_interface::NetworkInterface::show()
-                        .map(|ifs| ifs.into_iter().any(|x| x.name == tun_name))
-                        .unwrap_or_default();
+                    let mut tun_exist = tun_exists(&tun_name);
+                    #[cfg(target_os = "linux")]
+                    let mut removed_existing_tun = false;
 
+                    #[cfg(target_os = "linux")]
                     if tun_exist {
-                        info!("tun device {} already exists, using it.", &tun_name);
                         if let Err(err) = routes::maybe_routes_clean_up(cfg) {
                             error!(
-                                "failed to clean up existing tun routes for {}: {}",
+                                "failed to clean up stale tun routes for {}: {}",
                                 tun_name, err
                             );
                         }
+                        routes::delete_interface(&tun_name)?;
+                        wait_for_tun_state(&tun_name, false).await?;
+                        tun_exist = false;
+                        removed_existing_tun = true;
+                    }
+
+                    #[cfg(target_os = "linux")]
+                    if cfg.route_all && !removed_existing_tun {
+                        if let Err(err) = routes::maybe_routes_clean_up(cfg) {
+                            error!(
+                                "failed to clean up stale tun routes for {}: {}",
+                                tun_name, err
+                            );
+                        }
+                    }
+
+                    if tun_exist {
+                        info!("tun device {} already exists, using it.", &tun_name);
                     } else {
                         info!("tun device {} does not exist, creating.", &tun_name);
                     }
@@ -182,52 +252,7 @@ impl TunRunner {
                     let dev = tun_builder.build_async()?;
 
                     if !tun_exist {
-                        // After build_async(), the new TUN interface may not be
-                        // immediately visible via NetworkInterface::show(). Poll up
-                        // to TUN_VISIBILITY_MAX_ATTEMPTS times (≈2 s) before
-                        // setting up routes, but never sleep after the final check.
-                        let mut tun_visible = false;
-                        let mut last_show_err: Option<String> = None;
-                        let mut attempt = 0u32;
-                        loop {
-                            match network_interface::NetworkInterface::show() {
-                                Ok(ifs) => {
-                                    if ifs.into_iter().any(|x| x.name == tun_name) {
-                                        tun_visible = true;
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    last_show_err = Some(e.to_string());
-                                }
-                            }
-                            attempt += 1;
-                            if attempt >= TUN_VISIBILITY_MAX_ATTEMPTS {
-                                break;
-                            }
-                            tokio::time::sleep(std::time::Duration::from_millis(
-                                TUN_VISIBILITY_POLL_INTERVAL_MS,
-                            ))
-                            .await;
-                        }
-
-                        if !tun_visible {
-                            let total_ms = TUN_VISIBILITY_MAX_ATTEMPTS as u64
-                                * TUN_VISIBILITY_POLL_INTERVAL_MS;
-                            let err_msg = match last_show_err {
-                                Some(e) => format!(
-                                    "tun device {} not visible after waiting {}ms \
-                                     (last error: {})",
-                                    tun_name, total_ms, e
-                                ),
-                                None => format!(
-                                    "tun device {} not visible after waiting {}ms",
-                                    tun_name, total_ms
-                                ),
-                            };
-                            return Err(Error::Operation(err_msg));
-                        }
-
+                        wait_for_tun_state(&tun_name, true).await?;
                         info!("setting up routes for tun {}", &tun_name);
                     } else {
                         info!("reconciling routes for existing tun {}", &tun_name);
