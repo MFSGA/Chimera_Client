@@ -21,6 +21,10 @@ pub enum RuleType {
         country_code: String,
         no_resolve: bool,
     },
+    GeoSite {
+        target: String,
+        country_code: String,
+    },
     Match {
         target: String,
     },
@@ -60,6 +64,10 @@ impl RuleType {
                     false
                 },
             }),
+            "GEOSITE" => Ok(RuleType::GeoSite {
+                target: target.to_string(),
+                country_code: payload.to_string(),
+            }),
             "IP-CIDR" | "IP-CIDR6" => Ok(RuleType::IpCidr {
                 ipnet: payload.parse()?,
                 target: target.to_string(),
@@ -84,6 +92,7 @@ impl RuleType {
             RuleType::DomainSuffix { target, .. } => target,
             RuleType::DomainKeyword { target, .. } => target,
             RuleType::GeoIP { target, .. } => target,
+            RuleType::GeoSite { target, .. } => target,
             RuleType::Match { target } => target,
             RuleType::IpCidr { target, .. } => target,
         }
@@ -164,5 +173,20 @@ mod tests {
     fn invalid_rule_line_still_errors() {
         let rule = RuleType::try_from("DOMAIN-SUFFIX".to_string());
         assert!(rule.is_err());
+    }
+
+    #[test]
+    fn parse_geosite_rule() {
+        let rule = RuleType::try_from("GEOSITE,cn,PROXY".to_string()).unwrap();
+        match rule {
+            RuleType::GeoSite {
+                country_code,
+                target,
+            } => {
+                assert_eq!(country_code, "cn");
+                assert_eq!(target, "PROXY");
+            }
+            _ => panic!("Expected GeoSite rule"),
+        }
     }
 }

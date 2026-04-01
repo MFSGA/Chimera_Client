@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod errors;
+pub mod geodata;
 pub mod http;
 /// note
 pub mod io;

@@ -14,8 +14,9 @@ use crate::{
             domain_suffix::DomainSuffix, final_::Final, ipcidr::IpCidr,
         },
     },
-    common::mmdb::MmdbLookup,
+    common::{geodata::GeoDataLookup, mmdb::MmdbLookup},
     config::internal::rule::RuleType,
+    print_and_exit,
 };
 
 const MATCH: &str = "MATCH";
@@ -43,13 +44,13 @@ impl Router {
         dns_resolver: ThreadSafeDNSResolver,
         country_mmdb: Option<MmdbLookup>,
         asn_mmdb: Option<MmdbLookup>,
-        // geodata: Option<GeoDataLookup>,
+        geodata: Option<GeoDataLookup>,
         cwd: String,
     ) -> Self {
         Self {
             rules: rules
                 .into_iter()
-                .map(|r| map_rule_type(r, country_mmdb.clone()))
+                .map(|r| map_rule_type(r, country_mmdb.clone(), geodata.clone()))
                 .collect(),
             dns_resolver,
             asn_mmdb,
@@ -125,6 +126,7 @@ impl Router {
 pub fn map_rule_type(
     rule_type: RuleType,
     mmdb: Option<MmdbLookup>,
+    geodata: Option<GeoDataLookup>,
 ) -> Box<dyn RuleMatcher> {
     match rule_type {
         RuleType::Domain { domain, target } => {
@@ -154,6 +156,19 @@ pub fn map_rule_type(
             no_resolve,
             mmdb: mmdb.clone(),
         }),
+        RuleType::GeoSite {
+            target,
+            country_code,
+        } => Box::new(
+            rules::geodata::GeoSiteMatcher::new(
+                country_code,
+                target,
+                geodata.as_ref(),
+            )
+            .unwrap_or_else(|err| {
+                print_and_exit!("failed to initialize GEOSITE rule: {err}")
+            }),
+        ),
         RuleType::IpCidr {
             ipnet,
             target,
