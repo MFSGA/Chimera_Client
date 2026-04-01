@@ -11,7 +11,7 @@ use serde::Serialize;
 #[cfg(feature = "tun")]
 use std::sync::{Arc, LazyLock};
 #[cfg(feature = "tun")]
-use tracing::trace;
+use tracing::{trace, warn};
 
 #[cfg(feature = "tun")]
 pub static DEFAULT_OUTBOUND_INTERFACE: LazyLock<
@@ -43,8 +43,12 @@ fn is_candidate_outbound_v6(addr: Ipv6Addr) -> bool {
 }
 
 #[cfg(feature = "tun")]
-pub async fn init_net_config(tun_somark: Option<u32>) {
-    *DEFAULT_OUTBOUND_INTERFACE.write().await = get_outbound_interface();
+pub async fn init_net_config(
+    tun_somark: Option<u32>,
+    interface: Option<&Interface>,
+) {
+    *DEFAULT_OUTBOUND_INTERFACE.write().await =
+        resolve_outbound_interface(interface);
     *TUN_SOMARK.write().await = tun_somark;
     trace!(
         "default outbound interface: {:?}, tun somark: {:?}",
@@ -159,6 +163,54 @@ pub fn get_interface_by_name(name: &str) -> Option<OutboundInterface> {
     );
 
     Some(outbound)
+}
+
+#[cfg(feature = "tun")]
+pub fn get_interface_by_ip(ip: IpAddr) -> Option<OutboundInterface> {
+    let now = std::time::Instant::now();
+
+    let outbound = network_interface::NetworkInterface::show()
+        .ok()?
+        .into_iter()
+        .find(|iface| {
+            iface.addr.iter().any(|addr| match (ip, addr) {
+                (IpAddr::V4(target), network_interface::Addr::V4(addr)) => {
+                    addr.ip == target
+                }
+                (IpAddr::V6(target), network_interface::Addr::V6(addr)) => {
+                    addr.ip == target
+                }
+                _ => false,
+            })
+        })?
+        .into();
+
+    trace!(
+        "found interface by ip: {:?}, took: {}ms",
+        outbound,
+        now.elapsed().as_millis()
+    );
+
+    Some(outbound)
+}
+
+#[cfg(feature = "tun")]
+pub fn resolve_outbound_interface(
+    interface: Option<&Interface>,
+) -> Option<OutboundInterface> {
+    let configured = interface.and_then(|interface| match interface {
+        Interface::IpAddr(ip) => get_interface_by_ip(*ip),
+        Interface::Name(name) => get_interface_by_name(name),
+    });
+
+    if interface.is_some() && configured.is_none() {
+        warn!(
+            "configured outbound interface {} not found, falling back to auto-detect",
+            interface.expect("checked is_some")
+        );
+    }
+
+    configured.or_else(get_outbound_interface)
 }
 
 #[cfg(feature = "tun")]

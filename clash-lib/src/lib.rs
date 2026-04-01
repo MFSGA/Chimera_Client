@@ -415,9 +415,15 @@ async fn create_components(
     cwd: PathBuf,
     config: InternalConfig,
 ) -> Result<RuntimeComponents> {
-    if config.tun.enable {
-        debug!("tun enabled, initializing default outbound interface");
-        init_net_config(config.tun.so_mark).await;
+    #[cfg(feature = "tun")]
+    {
+        if config.tun.enable {
+            debug!("tun enabled, initializing default outbound interface");
+        } else if config.general.interface.is_some() {
+            debug!("general interface configured, initializing default outbound interface");
+        }
+        init_net_config(config.tun.so_mark, config.general.interface.as_ref())
+            .await;
     }
 
     let cancellation_token = tokio_util::sync::CancellationToken::new();

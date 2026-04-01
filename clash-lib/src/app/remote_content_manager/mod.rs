@@ -20,6 +20,8 @@ use tracing::warn;
 #[cfg(feature = "tls")]
 use crate::common::tls::GLOBAL_ROOT_STORE;
 use crate::common::utils::serialize_duration;
+#[cfg(feature = "tun")]
+use crate::app::net::DEFAULT_OUTBOUND_INTERFACE;
 use crate::{
     app::dns::ThreadSafeDNSResolver,
     proxy::AnyOutboundHandler,
@@ -158,6 +160,10 @@ impl ProxyManager {
     ) -> std::io::Result<(Duration, Duration)> {
         let name = outbound.name().to_owned();
         let timeout = timeout.unwrap_or(Duration::from_secs(5));
+        #[cfg(feature = "tun")]
+        let default_outbound_interface = DEFAULT_OUTBOUND_INTERFACE.read().await.clone();
+        #[cfg(not(feature = "tun"))]
+        let default_outbound_interface = None;
 
         let uri: http::Uri = url.parse().map_err(std::io::Error::other)?;
         let host = uri
@@ -177,6 +183,7 @@ impl ProxyManager {
             typ: Type::Tunnel,
             destination: SocksAddr::Domain(host.clone(), port),
             so_mark: self.fw_mark,
+            iface: default_outbound_interface,
             ..Default::default()
         };
 
