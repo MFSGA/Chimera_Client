@@ -10,10 +10,7 @@ use std::{
 };
 
 use thiserror::Error;
-use tokio::{
-    sync::{Mutex, broadcast, mpsc, oneshot},
-    task::JoinHandle,
-};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "tun")]

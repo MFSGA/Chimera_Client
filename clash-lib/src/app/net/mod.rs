@@ -1,4 +1,7 @@
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::{
+    fmt::Display,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+};
 
 #[cfg(feature = "tun")]
 use network_interface::{
@@ -219,4 +222,55 @@ pub fn get_outbound_interface() -> Option<OutboundInterface> {
     );
 
     all_outbounds.into_iter().next()
+}
+
+/// Represents a network interface in configuration.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub enum Interface {
+    IpAddr(IpAddr),
+    Name(String),
+}
+
+impl From<&str> for Interface {
+    fn from(s: &str) -> Self {
+        Self::Name(s.to_owned())
+    }
+}
+
+impl From<IpAddr> for Interface {
+    fn from(ip: IpAddr) -> Self {
+        Self::IpAddr(ip)
+    }
+}
+
+impl Display for Interface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Interface::IpAddr(ip) => write!(f, "{ip}"),
+            Interface::Name(name) => write!(f, "{name}"),
+        }
+    }
+}
+
+impl Interface {
+    pub fn into_ip_addr(self) -> Option<IpAddr> {
+        match self {
+            Interface::IpAddr(ip) => Some(ip),
+            _ => None,
+        }
+    }
+
+    pub fn into_socket_addr(self) -> Option<SocketAddr> {
+        match self {
+            Interface::IpAddr(ip) => Some(SocketAddr::new(ip, 0)),
+            _ => None,
+        }
+    }
+
+    pub fn into_iface_name(self) -> Option<String> {
+        match self {
+            Interface::IpAddr(_) => None,
+            Interface::Name(name) => Some(name),
+        }
+    }
 }

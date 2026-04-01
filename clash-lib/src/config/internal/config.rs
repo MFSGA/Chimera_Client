@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Error,
-    app::dns,
+    app::{dns, net::Interface},
     common::auth,
     config::{
         def::{LogLevel, RunMode},
@@ -64,22 +64,20 @@ impl Config {
 }
 
 pub struct General {
-    /// 1
-    pub log_level: LogLevel,
-    /// 2
+    pub authentication: Vec<String>,
+    pub bind_address: BindAddress,
     pub(crate) controller: Controller,
-    /// 3
-    pub mmdb: Option<String>,
-    /// 4
-    pub mmdb_download_url: Option<String>,
-    /// 5
-    pub asn_mmdb: Option<String>,
-    /// 6
-    pub asn_mmdb_download_url: Option<String>,
-    /// 7
     pub mode: RunMode,
-    /// 8
+    pub log_level: LogLevel,
+    pub ipv6: bool,
+    pub interface: Option<Interface>,
     pub routing_mask: Option<u32>,
+    pub mmdb: Option<String>,
+    pub mmdb_download_url: Option<String>,
+    pub asn_mmdb: Option<String>,
+    pub asn_mmdb_download_url: Option<String>,
+    pub geosite: Option<String>,
+    pub geosite_download_url: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug, Copy, PartialEq, Hash, Eq)]
@@ -159,6 +157,7 @@ pub struct Controller {
     pub external_controller: Option<String>,
     pub external_controller_ipc: Option<String>,
     pub external_ui: Option<String>,
+    pub external_ui_download_url: Option<String>,
     pub secret: Option<String>,
     pub cors_allow_origins: Option<Vec<String>>,
 }

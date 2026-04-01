@@ -90,6 +90,8 @@ pub struct Config {
     pub external_controller: Option<String>,
     /// dashboard folder path relative to the $CWD
     pub external_ui: Option<String>,
+    /// dashboard download URL for bootstrapping external UI assets
+    pub external_ui_url: Option<String>,
     /// external controller secret
     pub secret: Option<String>,
     /// CORS allowed origins
@@ -118,6 +120,11 @@ pub struct Config {
     /// Optional ASN database download url
     #[serde(rename = "asn-mmdb-download-url")]
     pub asn_mmdb_download_url: Option<String>,
+    /// Geosite database path relative to the working dir
+    pub geosite: Option<String>,
+    /// Geosite database download url
+    #[serde(rename = "geosite-download-url")]
+    pub geosite_download_url: Option<String>,
     /// 11.1 The HTTP proxy port
     #[serde(alias = "http_port")]
     pub port: Option<Port>,
@@ -143,6 +150,9 @@ pub struct Config {
     /// this will affect the DNS server response to AAAA questions
     /// default is `false`
     pub ipv6: bool,
+    /// outbound interface name
+    #[serde(rename = "interface-name")]
+    pub interface: Option<String>,
     /// 14. fwmark on Linux only
     /// # Note
     /// - traffics originated from clash will be marked with this value
