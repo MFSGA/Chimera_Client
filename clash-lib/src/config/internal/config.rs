@@ -183,6 +183,20 @@ pub struct TunConfig {
     pub dns_hijack: bool,
 }
 
+impl TunConfig {
+    pub fn dedicated_dns_ipv4(&self) -> Option<Ipv4Addr> {
+        let network = u32::from(self.gateway.network());
+        let broadcast = u32::from(self.gateway.broadcast());
+        let candidate = network.checked_add(2)?;
+
+        if candidate >= broadcast {
+            return None;
+        }
+
+        Some(Ipv4Addr::from(candidate))
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "kebab-case")]

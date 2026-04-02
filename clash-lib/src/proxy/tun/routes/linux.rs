@@ -1,4 +1,4 @@
-use ipnet::IpNet;
+use ipnet::{IpNet, Ipv4Net};
 use tracing::warn;
 
 use crate::{
@@ -54,6 +54,35 @@ pub fn delete_interface(name: &str) -> std::io::Result<()> {
         warn!("deleted stale tun interface {}", name);
     }
     Ok(())
+}
+
+pub fn ensure_interface_address(
+    name: &str,
+    addr: Ipv4Net,
+) -> std::io::Result<()> {
+    let cidr = addr.to_string();
+    let cmd = std::process::Command::new("ip")
+        .args(["addr", "add", &cidr, "dev", name])
+        .output()?;
+    warn!("executing: ip addr add {} dev {}", cidr, name);
+
+    if cmd.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&cmd.stderr);
+    if stderr.contains("File exists") {
+        warn!(
+            "address {} already configured on {}, continuing",
+            cidr, name
+        );
+        return Ok(());
+    }
+
+    Err(new_io_error(format!(
+        "ip addr add {} dev {} failed: {}",
+        cidr, name, stderr
+    )))
 }
 
 fn run_ip_cmd_single(

@@ -61,6 +61,7 @@ pub struct DNSConfig {
     pub default_nameserver: Vec<NameServer>,
     pub fake_ip_range: ipnet::IpNet,
     pub fake_ip_filter: Vec<String>,
+    pub reserved_ip_addrs: Vec<std::net::Ipv4Addr>,
     pub store_fake_ip: bool,
     pub store_smart_stats: bool,
     pub hosts: Option<trie::StringTrie<IpAddr>>,
@@ -424,6 +425,7 @@ impl TryFrom<&crate::config::def::Config> for DNSConfig {
                 |_| Error::InvalidConfig(String::from("invalid fake ip range")),
             )?,
             fake_ip_filter: dc.fake_ip_filter.clone(),
+            reserved_ip_addrs: Vec::new(),
             store_fake_ip: c.profile.store_fake_ip,
             store_smart_stats: c.profile.store_smart_stats,
             hosts: if dc.user_hosts && !c.hosts.is_empty() {

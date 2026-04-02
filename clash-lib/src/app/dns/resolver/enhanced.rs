@@ -211,6 +211,7 @@ impl EnhancedResolver {
                 DNSMode::FakeIp => Some(Arc::new(RwLock::new(
                     fakeip::FakeDns::new(fakeip::Opts {
                         ipnet: cfg.fake_ip_range,
+                        reserved_ips: cfg.reserved_ip_addrs.clone(),
                         skipped_hostnames: if !cfg.fake_ip_filter.is_empty() {
                             let mut host = trie::StringTrie::new();
                             for domain in cfg.fake_ip_filter.iter() {

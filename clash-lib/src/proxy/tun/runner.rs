@@ -258,6 +258,24 @@ impl TunRunner {
                         info!("reconciling routes for existing tun {}", &tun_name);
                     }
 
+                    #[cfg(target_os = "linux")]
+                    if cfg.dns_hijack
+                        && let Some(dedicated_dns_ip) = cfg.dedicated_dns_ipv4()
+                    {
+                        routes::ensure_interface_address(
+                            &tun_name,
+                            ipnet::Ipv4Net::new(
+                                dedicated_dns_ip,
+                                cfg.gateway.prefix_len(),
+                            )
+                            .map_err(|err| {
+                                Error::Operation(format!(
+                                    "failed to build dedicated tun dns cidr: {err}"
+                                ))
+                            })?,
+                        )?;
+                    }
+
                     maybe_add_routes(cfg, &tun_name)?;
 
                     dev

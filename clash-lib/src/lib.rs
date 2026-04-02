@@ -402,21 +402,26 @@ struct RuntimeComponents {
 
 impl RuntimeComponents {
     fn start_all(&self) {
-        self.dns_listener.run_async();
         #[cfg(feature = "tun")]
         self.tun_runner.run_async();
+        self.dns_listener.run_async();
         self.inbound_manager.run_async();
     }
 
     fn stop_all(&self) {
+        self.dns_listener.shutdown();
         #[cfg(feature = "tun")]
         self.tun_runner.shutdown();
-        self.dns_listener.shutdown();
         Runner::shutdown(self.inbound_manager.as_ref());
     }
 
     async fn stop_all_and_join(&self) {
         self.stop_all();
+
+        tracing::debug!("todo: validate");
+        if let Err(err) = self.dns_listener.join().await {
+            warn!("failed waiting for dns listener shutdown: {}", err);
+        }
 
         #[cfg(feature = "tun")]
         {
@@ -424,11 +429,6 @@ impl RuntimeComponents {
                 warn!("failed waiting for tun runner shutdown: {}", err);
             }
             clear_net_config().await;
-        }
-
-        tracing::debug!("todo: validate");
-        if let Err(err) = self.dns_listener.join().await {
-            warn!("failed waiting for dns listener shutdown: {}", err);
         }
 
         if let Err(err) = self.inbound_manager.join().await {
@@ -447,7 +447,7 @@ fn dns_listener_is_empty(listen: &DNSListenAddr) -> bool {
 
 async fn create_components(
     cwd: PathBuf,
-    config: InternalConfig,
+    mut config: InternalConfig,
 ) -> Result<RuntimeComponents> {
     #[cfg(feature = "tun")]
     {
@@ -517,15 +517,22 @@ async fn create_components(
 
     #[cfg(feature = "tun")]
     if auto_manage_linux_dns {
-        let localhost_dns = std::net::SocketAddr::from((
-            std::net::Ipv4Addr::LOCALHOST,
+        let dedicated_dns_ip = config.tun.dedicated_dns_ipv4().ok_or_else(|| {
+            Error::InvalidConfig(
+                "tun dns-hijack requires a subnet with room for a dedicated DNS address"
+                    .to_string(),
+            )
+        })?;
+        let tun_dns_addr = std::net::SocketAddr::from((
+            dedicated_dns_ip,
             53,
         ));
-        dns_listen.udp = Some(localhost_dns);
-        dns_listen.tcp = Some(localhost_dns);
+        dns_listen.udp = Some(tun_dns_addr);
+        dns_listen.tcp = Some(tun_dns_addr);
+        config.dns.reserved_ip_addrs.push(dedicated_dns_ip);
         info!(
-            "auto-enabling local DNS listener on {} to avoid Linux stub-resolver bypass",
-            localhost_dns
+            "auto-enabling linux tun DNS listener on {} for systemd-resolved per-link takeover",
+            tun_dns_addr
         );
     }
 
