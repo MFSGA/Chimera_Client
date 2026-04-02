@@ -275,87 +275,112 @@ pub async fn start(
     let cwd_clone = cwd.clone();
 
     let reload_token = shutdown_token.clone();
-    tokio::spawn(async move {
+    let reload_handle = tokio::spawn(async move {
         let mut active_components = components;
         let mut active_api_listener = api_listener;
 
         // Listen for config reload signal and reload config
-        while let Some((config, done)) = reload_rx.recv().await {
-            info!("reloading config");
-            let config = match config.try_parse() {
-                Ok(c) => c,
-                Err(e) => {
-                    error!("failed to reload config: {}", e);
-                    let _ = done.send(Err(e));
-                    continue;
-                }
-            };
-            info!("reloading get config 2");
-            let controller_cfg = config.general.controller.clone();
+        loop {
+            tokio::select! {
+                maybe_reload = reload_rx.recv() => {
+                    let Some((config, done)) = maybe_reload else {
+                        break;
+                    };
 
-            active_components.stop_all_and_join().await;
+                    info!("reloading config");
+                    let config = match config.try_parse() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            error!("failed to reload config: {}", e);
+                            let _ = done.send(Err(e));
+                            continue;
+                        }
+                    };
+                    info!("reloading get config 2");
+                    let controller_cfg = config.general.controller.clone();
 
-            let new_components =
-                match create_components(cwd_clone.clone(), config).await {
-                    Ok(components) => components,
-                    Err(e) => {
-                        error!("failed to create components during reload: {}", e);
-                        let _ = done.send(Err(e));
-                        continue;
+                    active_components.stop_all_and_join().await;
+
+                    let new_components =
+                        match create_components(cwd_clone.clone(), config).await {
+                            Ok(components) => components,
+                            Err(e) => {
+                                error!("failed to create components during reload: {}", e);
+                                let _ = done.send(Err(e));
+                                continue;
+                            }
+                        };
+                    info!("reloading get components 3333");
+                    if done.send(Ok(())).is_err() {
+                        warn!("config reload response channel dropped before completion");
                     }
-                };
-            info!("reloading get components 3333");
-            if done.send(Ok(())).is_err() {
-                warn!("config reload response channel dropped before completion");
+                    info!("reloading send 444");
+                    new_components.start_all();
+
+                    // TODO: every reload is causing the API server to restart, we should
+                    // make the API server reloadable instead of restarting it.
+                    // maybe adding APIs to replace components
+                    // and only recreate the listeners when necessary (e.g. when the listen
+                    // address or port is changed)
+                    let new_api_listener: ArcRunner = Arc::new(app::api::ApiRunner::new(
+                        controller_cfg,
+                        log_tx.clone(),
+                        new_components.inbound_manager.clone(),
+                        new_components.dispatcher.clone(),
+                        global_state.clone(),
+                        new_components.dns_resolver.clone(),
+                        new_components.outbound_manager.clone(),
+                        new_components.statistics_manager.clone(),
+                        new_components.cache_store.clone(),
+                        new_components.router.clone(),
+                        cwd_clone.to_string_lossy().to_string(),
+                        Some(reload_token.child_token()),
+                        new_components.dns_listen.clone(),
+                        new_components.dns_enabled,
+                    ));
+                    let mut g = global_state.lock().await;
+
+                    #[cfg(feature = "tun")]
+                    {
+                        g.tunnel_runner = new_components.tun_runner.clone();
+                    }
+                    g.dns_listener = new_components.dns_listener.clone();
+
+                    active_api_listener.shutdown();
+                    if let Err(err) = active_api_listener.join().await {
+                        warn!("failed waiting for api listener shutdown: {}", err);
+                    }
+                    new_api_listener.run_async();
+
+                    active_components = new_components;
+                    active_api_listener = new_api_listener;
+                }
+                _ = reload_token.cancelled() => {
+                    info!("runtime shutdown requested");
+                    active_api_listener.shutdown();
+                    if let Err(err) = active_api_listener.join().await {
+                        warn!("failed waiting for api listener shutdown: {}", err);
+                    }
+                    active_components.stop_all_and_join().await;
+                    break;
+                }
             }
-            info!("reloading send 444");
-            new_components.start_all();
-
-            // TODO: every reload is causing the API server to restart, we should
-            // make the API server reloadable instead of restarting it.
-            // maybe adding APIs to replace components
-            // and only recreate the listeners when necessary (e.g. when the listen
-            // address or port is changed)
-            let new_api_listener: ArcRunner = Arc::new(app::api::ApiRunner::new(
-                controller_cfg,
-                log_tx.clone(),
-                new_components.inbound_manager.clone(),
-                new_components.dispatcher.clone(),
-                global_state.clone(),
-                new_components.dns_resolver.clone(),
-                new_components.outbound_manager.clone(),
-                new_components.statistics_manager.clone(),
-                new_components.cache_store.clone(),
-                new_components.router.clone(),
-                cwd_clone.to_string_lossy().to_string(),
-                Some(reload_token.child_token()),
-                new_components.dns_listen.clone(),
-                new_components.dns_enabled,
-            ));
-            let mut g = global_state.lock().await;
-
-            #[cfg(feature = "tun")]
-            {
-                g.tunnel_runner = new_components.tun_runner.clone();
-            }
-            g.dns_listener = new_components.dns_listener.clone();
-
-            active_api_listener.shutdown();
-            if let Err(err) = active_api_listener.join().await {
-                warn!("failed waiting for api listener shutdown: {}", err);
-            }
-            new_api_listener.run_async();
-
-            active_components = new_components;
-            active_api_listener = new_api_listener;
         }
         Ok::<(), Error>(())
     });
 
     tokio::select! {
-        result = tokio::signal::ctrl_c() => { result.map_err(Error::Io)?; }
+        result = tokio::signal::ctrl_c() => {
+            result.map_err(Error::Io)?;
+            shutdown_token.cancel();
+        }
         _ = shutdown_token.cancelled() => {}
     }
+
+    reload_handle.await.map_err(|err| {
+        Error::Operation(format!("runtime reload task join error: {err}"))
+    })??;
+
     Ok(())
 }
 
@@ -402,13 +427,13 @@ impl RuntimeComponents {
         }
 
         tracing::debug!("todo: validate");
-        // if let Err(err) = self.dns_listener.join().await {
-        // warn!("failed waiting for dns listener shutdown: {}", err);
-        // }
+        if let Err(err) = self.dns_listener.join().await {
+            warn!("failed waiting for dns listener shutdown: {}", err);
+        }
 
-        //  if let Err(err) = self.inbound_manager.join().await {
-        // warn!("failed waiting for inbound manager shutdown: {}", err);
-        // }
+        if let Err(err) = self.inbound_manager.join().await {
+            warn!("failed waiting for inbound manager shutdown: {}", err);
+        }
     }
 }
 

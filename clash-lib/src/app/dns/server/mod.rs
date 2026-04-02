@@ -1,3 +1,4 @@
+use futures::FutureExt;
 use hickory_proto::op::Message;
 
 use chimera_dns::DNSListenAddr;
@@ -40,6 +41,7 @@ pub struct DnsRunner {
     managed_resolv_conf_backup: Arc<Mutex<Option<String>>>,
 
     cancellation_token: tokio_util::sync::CancellationToken,
+    task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl DnsRunner {
@@ -59,6 +61,7 @@ impl DnsRunner {
             manage_system_resolver,
             managed_resolv_conf_backup: Arc::new(Mutex::new(None)),
             cancellation_token: cancellation_token.unwrap_or_default(),
+            task: std::sync::Mutex::new(None),
         }
     }
 }
@@ -179,7 +182,7 @@ impl Runner for DnsRunner {
         let managed_resolv_conf_backup = self.managed_resolv_conf_backup.clone();
         let cancellation_token = self.cancellation_token.clone();
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let h = DnsMessageExchanger { resolver };
             let r = chimera_dns::get_dns_listener(listen_for_server, h, &cwd).await;
             if let Some(r) = r {
@@ -208,6 +211,9 @@ impl Runner for DnsRunner {
                 info!("dns listener: no listen addresses configured, skipping");
             }
         });
+
+        let mut task = self.task.lock().unwrap();
+        *task = Some(handle);
     }
 
     fn shutdown(&self) {
@@ -216,6 +222,19 @@ impl Runner for DnsRunner {
     }
 
     fn join(&self) -> futures::future::BoxFuture<'_, Result<(), crate::Error>> {
-        Box::pin(async move { Ok(()) })
+        let handle = self.task.lock().unwrap().take();
+        async move {
+            match handle {
+                Some(handle) => handle.await.map_err(|err| {
+                    crate::Error::Operation(format!(
+                        "dns listener join error: {err}"
+                    ))
+                })?,
+                None => {}
+            }
+
+            Ok(())
+        }
+        .boxed()
     }
 }
