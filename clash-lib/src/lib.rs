@@ -377,9 +377,9 @@ struct RuntimeComponents {
 
 impl RuntimeComponents {
     fn start_all(&self) {
+        self.dns_listener.run_async();
         #[cfg(feature = "tun")]
         self.tun_runner.run_async();
-        self.dns_listener.run_async();
         self.inbound_manager.run_async();
     }
 
@@ -402,14 +402,22 @@ impl RuntimeComponents {
         }
 
         tracing::debug!("todo: validate");
-        /* if let Err(err) = self.dns_listener.join().await {
-            warn!("failed waiting for dns listener shutdown: {}", err);
-        } */
+        // if let Err(err) = self.dns_listener.join().await {
+        // warn!("failed waiting for dns listener shutdown: {}", err);
+        // }
 
-        /*  if let Err(err) = self.inbound_manager.join().await {
-            warn!("failed waiting for inbound manager shutdown: {}", err);
-        } */
+        //  if let Err(err) = self.inbound_manager.join().await {
+        // warn!("failed waiting for inbound manager shutdown: {}", err);
+        // }
     }
+}
+
+fn dns_listener_is_empty(listen: &DNSListenAddr) -> bool {
+    listen.udp.is_none()
+        && listen.tcp.is_none()
+        && listen.doh.is_none()
+        && listen.dot.is_none()
+        && listen.doh3.is_none()
 }
 
 async fn create_components(
@@ -421,10 +429,12 @@ async fn create_components(
         if config.tun.enable {
             debug!("tun enabled, initializing default outbound interface");
         } else if config.general.interface.is_some() {
-            debug!("general interface configured, initializing default outbound interface");
+            debug!(
+                "general interface configured, initializing default outbound \
+                 interface"
+            );
         }
-        init_net_config(config.tun.so_mark, config.general.interface.as_ref())
-            .await;
+        init_net_config(config.tun.so_mark, config.general.interface.as_ref()).await;
     }
 
     let cancellation_token = tokio_util::sync::CancellationToken::new();
@@ -471,8 +481,28 @@ async fn create_components(
     debug!("initializing dns resolver");
     // Clone the dns.listen for the DNS Server later before we consume the config
     // TODO: we should separate the DNS resolver and DNS server config here
-    let dns_listen = config.dns.listen.clone();
+    let mut dns_listen = config.dns.listen.clone();
     let dns_enable = config.dns.enable;
+    #[cfg(feature = "tun")]
+    let auto_manage_linux_dns = cfg!(target_os = "linux")
+        && config.tun.enable
+        && config.tun.dns_hijack
+        && dns_enable
+        && dns_listener_is_empty(&dns_listen);
+
+    #[cfg(feature = "tun")]
+    if auto_manage_linux_dns {
+        let localhost_dns = std::net::SocketAddr::from((
+            std::net::Ipv4Addr::LOCALHOST,
+            53,
+        ));
+        dns_listen.udp = Some(localhost_dns);
+        dns_listen.tcp = Some(localhost_dns);
+        info!(
+            "auto-enabling local DNS listener on {} to avoid Linux stub-resolver bypass",
+            localhost_dns
+        );
+    }
 
     // Extract the country MMDB file/url config early so they can be consumed
     // here, while the actual MMDB loading happens after OutboundManager (like
@@ -621,16 +651,16 @@ async fn create_components(
         )
         .await,
     );
-    /* if !config.inbound_providers.is_empty() {
-        debug!("loading inbound providers");
-        inbound_manager
-            .load_inbound_providers(
-                cwd.to_string_lossy().to_string(),
-                config.inbound_providers,
-                dns_resolver.clone(),
-            )
-            .await;
-    } */
+    // if !config.inbound_providers.is_empty() {
+    // debug!("loading inbound providers");
+    // inbound_manager
+    // .load_inbound_providers(
+    // cwd.to_string_lossy().to_string(),
+    // config.inbound_providers,
+    // dns_resolver.clone(),
+    // )
+    // .await;
+    // }
 
     #[cfg(feature = "tun")]
     debug!("initializing tun runner");
@@ -648,6 +678,10 @@ async fn create_components(
         dns_listen.clone(),
         dns_resolver.clone(),
         &cwd,
+        #[cfg(feature = "tun")]
+        auto_manage_linux_dns,
+        #[cfg(not(feature = "tun"))]
+        false,
         Some(cancellation_token.child_token()),
     ));
 
