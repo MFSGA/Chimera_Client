@@ -20,6 +20,11 @@ fn default_route_table() -> u32 {
     DEFAULT_ROUTE_TABLE
 }
 
+/// todo: will support only in gui
+fn default_country_mmdb() -> Option<String> {
+    Some("Country.mmdb".to_string())
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum DnsHijack {
@@ -111,6 +116,7 @@ pub struct Config {
     /// 9 Profile settings
     pub profile: Profile,
     /// 10.1 Path to country mmdb file (GeoIP)
+    #[serde(default = "default_country_mmdb")]
     pub mmdb: Option<String>,
     /// 10.2 Download URL for country mmdb file
     #[serde(rename = "mmdb-download-url")]
@@ -406,5 +412,26 @@ impl Display for RunMode {
             RunMode::Rule => write!(f, "rule"),
             RunMode::Direct => write!(f, "direct"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn missing_mmdb_defaults_to_country_mmdb() {
+        let cfg: Config = "port: 7890".parse().expect("config should parse");
+
+        assert_eq!(cfg.mmdb.as_deref(), Some("Country.mmdb"));
+    }
+
+    #[test]
+    fn explicit_null_mmdb_stays_disabled() {
+        let cfg: Config = "port: 7890\nmmdb: null"
+            .parse()
+            .expect("config should parse");
+
+        assert_eq!(cfg.mmdb, None);
     }
 }
