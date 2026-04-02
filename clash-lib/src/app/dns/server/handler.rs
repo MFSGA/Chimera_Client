@@ -6,6 +6,26 @@ use hickory_proto::{
 };
 use tracing::debug;
 
+fn normalize_upstream_response(
+    req: &Message,
+    mut res: Message,
+) -> Message {
+    if res.id() != req.id() {
+        debug!(
+            request_id = req.id(),
+            upstream_response_id = res.id(),
+            "normalizing upstream dns response id to match request"
+        );
+        res.set_id(req.id());
+    }
+
+    if res.queries().is_empty() {
+        res.add_queries(req.queries().iter().cloned());
+    }
+
+    res
+}
+
 pub async fn exchange_with_resolver<'a>(
     resolver: &'a ThreadSafeDNSResolver,
     req: &'a Message,
@@ -16,7 +36,7 @@ pub async fn exchange_with_resolver<'a>(
         || !resolver.fake_ip_enabled()
     {
         return match resolver.exchange(req).await {
-            Ok(m) => Ok(m),
+            Ok(m) => Ok(normalize_upstream_response(req, m)),
             Err(e) => {
                 debug!("dns resolve error: {}", e);
                 Err(chimera_dns::DNSError::QueryFailed(e.to_string()))
