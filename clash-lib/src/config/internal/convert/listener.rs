@@ -73,7 +73,6 @@ pub(super) fn convert(
         warn!("ignoring top-level `port` because `http_port` feature is disabled");
     }
 
-    warn!("support socks5 udp later");
     if let Some(Port(socks_port)) = socks_port
         && !all_inbounds.insert(InboundOpts::Socks {
             common_opts: CommonInboundOpts {
@@ -83,8 +82,7 @@ pub(super) fn convert(
                 allow_lan: c.allow_lan.unwrap_or_default(),
                 fw_mark: c.routing_mark,
             },
-            // todo
-            udp: false,
+            udp: true,
         })
     {
         warn!("Duplicate SOCKS inbound listener found: {}", socks_port);

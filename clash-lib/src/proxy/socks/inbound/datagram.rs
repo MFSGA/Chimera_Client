@@ -105,9 +105,10 @@ impl Stream for InboundUdp<UdpFramed<Socks5UDPCodec>> {
                 None => Poll::Ready(None),
                 Some(item) => match item {
                     Ok(((dst, pkt), src)) => Poll::Ready(Some(UdpPacket {
-                        data: pkt.to_vec(),
+                        data: pkt.freeze().to_vec(),
                         src_addr: SocksAddr::Ip(src),
                         dst_addr: dst,
+                        inbound_user: None,
                     })),
                     Err(_) => Poll::Ready(None),
                 },

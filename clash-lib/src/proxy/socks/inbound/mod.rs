@@ -1,30 +1,22 @@
-use std::{
-    io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::Arc,
-};
+use std::{io, net::SocketAddr, sync::Arc};
 
 use async_trait::async_trait;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
-};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::{
     app::dispatcher::Dispatcher,
-    common::auth::ThreadSafeAuthenticator,
-    config::internal::listener::CommonInboundOpts,
+    common::{auth::ThreadSafeAuthenticator, errors::new_io_error},
     proxy::{
         inbound::InboundHandlerTrait,
-        socks::SOCKS5_VERSION,
         utils::{ToCanonical, apply_tcp_options, try_create_dualstack_tcplistener},
     },
     session::{Network, Session, Type},
 };
 
+mod datagram;
 mod stream;
 
+pub use datagram::Socks5UDPCodec;
 pub use stream::handle_tcp;
 
 pub struct SocksInbound {
@@ -107,6 +99,6 @@ impl InboundHandlerTrait for SocksInbound {
     }
 
     async fn listen_udp(&self) -> io::Result<()> {
-        Ok(())
+        Err(new_io_error("UDP is not supported"))
     }
 }

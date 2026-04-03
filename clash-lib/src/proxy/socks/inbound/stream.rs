@@ -1,20 +1,25 @@
-use std::{io, sync::Arc};
+use std::{io, net::SocketAddr, str, sync::Arc};
 
 use bytes::{BufMut, BytesMut};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
 };
-use tracing::{instrument, trace};
+use tokio_util::udp::UdpFramed;
+use tracing::{instrument, trace, warn};
 
 use crate::{
     app::dispatcher::Dispatcher,
     common::{auth::ThreadSafeAuthenticator, errors::new_io_error},
-    proxy::socks::{
-        SOCKS5_VERSION,
-        socks5::{auth_methods, response_code, socks_command},
+    proxy::{
+        socks::{
+            SOCKS5_VERSION,
+            inbound::{Socks5UDPCodec, datagram::InboundUdp},
+            socks5::{auth_methods, response_code, socks_command},
+        },
+        utils::new_udp_socket,
     },
-    session::{Session, SocksAddr},
+    session::{Network, Session, SocksAddr, Type},
 };
 
 #[instrument(skip(sess, s, dispatcher, authenticator))]
@@ -135,7 +140,61 @@ pub async fn handle_tcp(
             Ok(())
         }
         socks_command::UDP_ASSOCIATE => {
-            todo!()
+            let udp_addr = SocketAddr::new(s.local_addr()?.ip(), 0);
+            let udp_inbound = new_udp_socket(
+                Some(udp_addr),
+                None,
+                #[cfg(target_os = "linux")]
+                None,
+                None,
+            )
+            .await?;
+
+            trace!(
+                "Got a UDP_ASSOCIATE request from {}, UDP assigned at {}",
+                s.peer_addr()?,
+                udp_inbound.local_addr()?
+            );
+
+            buf.clear();
+            buf.put_u8(SOCKS5_VERSION);
+            buf.put_u8(response_code::SUCCEEDED);
+            buf.put_u8(0x0);
+            SocksAddr::from(udp_inbound.local_addr()?).write_buf(&mut buf);
+
+            let (close_handle, close_listener) = tokio::sync::oneshot::channel();
+            let framed = UdpFramed::new(udp_inbound, Socks5UDPCodec);
+
+            let sess = Session {
+                network: Network::Udp,
+                typ: Type::Socks5,
+                so_mark: sess.so_mark,
+                iface: sess.iface.clone(),
+                ..Default::default()
+            };
+
+            let dispatcher_cloned = dispatcher.clone();
+            tokio::spawn(async move {
+                let handle = dispatcher_cloned
+                    .dispatch_datagram(sess, Box::new(InboundUdp::new(framed)))
+                    .await;
+                close_listener.await.ok();
+                handle.send(0).ok();
+            });
+
+            s.write_all(&buf[..]).await?;
+
+            // SOCKS5 keeps the TCP control channel alive for the lifetime of
+            // the UDP association; once it closes we should tear down the UDP
+            // relay as well.
+            buf.resize(1, 0);
+            match s.read(&mut buf[..]).await {
+                Ok(_) => trace!("UDP association finished, closing"),
+                Err(e) => warn!("SOCKS client closed connection: {}", e),
+            }
+
+            let _ = close_handle.send(1);
+            Ok(())
         }
         _ => {
             buf.clear();

@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::anyhow;
-use bytes::BufMut;
+use bytes::{Buf, BufMut};
 use erased_serde::Serialize as ESerialize;
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -183,6 +183,54 @@ impl SocksAddr {
         match self {
             SocksAddr::Ip(addr) => Some(addr),
             SocksAddr::Domain(..) => None,
+        }
+    }
+
+    pub fn size(&self) -> usize {
+        match self {
+            Self::Ip(SocketAddr::V4(_)) => 1 + 4 + 2,
+            Self::Ip(SocketAddr::V6(_)) => 1 + 16 + 2,
+            Self::Domain(domain, _) => 1 + 1 + domain.len() + 2,
+        }
+    }
+
+    pub fn peek_read(buf: &[u8]) -> io::Result<Self> {
+        let mut cur = io::Cursor::new(buf);
+        Self::peek_cursor(&mut cur)
+    }
+
+    // The SOCKS5 UDP codec needs to parse the target address without taking
+    // ownership of the payload buffer so it can forward the remaining bytes.
+    fn peek_cursor<T: AsRef<[u8]>>(cur: &mut io::Cursor<T>) -> io::Result<Self> {
+        if cur.remaining() < 2 {
+            return Err(io::Error::other("invalid buf"));
+        }
+
+        match cur.get_u8() {
+            SocksAddrType::V4 => {
+                if cur.remaining() < 4 + 2 {
+                    return Err(io::Error::other("invalid buf"));
+                }
+                Ok(Self::Ip((Ipv4Addr::from(cur.get_u32()), cur.get_u16()).into()))
+            }
+            SocksAddrType::V6 => {
+                if cur.remaining() < 16 + 2 {
+                    return Err(io::Error::other("invalid buf"));
+                }
+                Ok(Self::Ip((Ipv6Addr::from(cur.get_u128()), cur.get_u16()).into()))
+            }
+            SocksAddrType::DOMAIN => {
+                let domain_len = cur.get_u8() as usize;
+                if cur.remaining() < domain_len + 2 {
+                    return Err(io::Error::other("invalid buf"));
+                }
+                let mut buf = vec![0u8; domain_len];
+                cur.copy_to_slice(&mut buf);
+                let port = cur.get_u16();
+                let domain = String::from_utf8(buf).map_err(|_| invalid_domain())?;
+                Ok(Self::Domain(domain, port))
+            }
+            _ => Err(invalid_atyp()),
         }
     }
 }
@@ -398,4 +446,21 @@ fn invalid_domain() -> io::Error {
 
 fn invalid_atyp() -> io::Error {
     io::Error::other("invalid address type")
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::BytesMut;
+
+    use super::SocksAddr;
+
+    #[test]
+    fn socks_addr_peek_read_matches_encoded_domain() {
+        let addr = SocksAddr::Domain("example.com".into(), 443);
+        let mut buf = BytesMut::new();
+        addr.write_buf(&mut buf);
+
+        assert_eq!(addr.size(), buf.len());
+        assert_eq!(SocksAddr::peek_read(&buf).unwrap(), addr);
+    }
 }
