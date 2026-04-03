@@ -35,7 +35,7 @@ use crate::{
             selector::{self, ThreadSafeSelectorControl},
             urltest,
         },
-        reject,
+        reject, socks,
         utils::{DirectConnector, OutboundHandlerRegistry, ProxyConnector},
         vless,
     },
@@ -350,6 +350,15 @@ impl OutboundManager {
                 OutboundProxyProtocol::Reject(r) => {
                     Some(Arc::new(reject::Handler::new(&r.name)) as _)
                 }
+                OutboundProxyProtocol::Socks5(v) => {
+                    let name = v.common_opts.name.clone();
+                    v.try_into()
+                        .map(|x: socks::outbound::Handler| Arc::new(x) as _)
+                        .inspect_err(|e| {
+                            error!("failed to load socks5 outbound {}: {}", name, e);
+                        })
+                        .ok()
+                }
                 #[cfg(feature = "trojan")]
                 OutboundProxyProtocol::Trojan(v) => {
                     let name = v.common_opts.name.clone();
@@ -381,13 +390,6 @@ impl OutboundManager {
                             error!("failed to load vless outbound {}: {}", name, e);
                         })
                         .ok()
-                }
-                // todo: support more outbound protocols
-                _ => {
-                    todo!(
-                        "unsupported outbound protocol in plain outbound: {:?}",
-                        outbound
-                    )
                 }
             })
             .collect()

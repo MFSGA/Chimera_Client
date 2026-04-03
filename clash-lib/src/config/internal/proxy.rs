@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, de::value::MapDeserializer};
 use serde_yaml::Value;
 
-use crate::{Error, config::utils};
+use crate::{Error, common::utils::default_bool_true, config::utils};
 
 pub const PROXY_DIRECT: &str = "DIRECT";
 pub const PROXY_REJECT: &str = "REJECT";
@@ -49,9 +49,7 @@ impl OutboundProxyProtocol {
         match &self {
             OutboundProxyProtocol::Direct(direct) => &direct.name,
             OutboundProxyProtocol::Reject(reject) => &reject.name,
-            OutboundProxyProtocol::Socks5(socks5) => {
-                todo!()
-            }
+            OutboundProxyProtocol::Socks5(socks5) => &socks5.common_opts.name,
             OutboundProxyProtocol::Vless(vless) => &vless.common_opts.name,
             #[cfg(feature = "trojan")]
             OutboundProxyProtocol::Trojan(trojan) => &trojan.common_opts.name,
@@ -93,6 +91,8 @@ pub struct OutboundReject {
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct OutboundSocks5 {
+    #[serde(flatten)]
+    pub common_opts: CommonConfigOptions,
     pub username: Option<String>,
     pub password: Option<String>,
     #[cfg(feature = "tls")]
@@ -103,6 +103,8 @@ pub struct OutboundSocks5 {
     #[cfg(feature = "tls")]
     #[serde(default = "Default::default")]
     pub skip_cert_verify: bool,
+    #[serde(default = "default_bool_true")]
+    pub udp: bool,
 }
 
 pub fn map_serde_error(

@@ -65,6 +65,13 @@ impl SocksAddr {
         Self::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0))
     }
 
+    pub fn any_ipv6() -> Self {
+        Self::Ip(SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0)),
+            0,
+        ))
+    }
+
     pub fn is_domain(&self) -> bool {
         match self {
             SocksAddr::Ip(_) => false,

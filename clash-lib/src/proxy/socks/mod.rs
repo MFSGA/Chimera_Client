@@ -1,4 +1,5 @@
 pub mod inbound;
+pub mod outbound;
 
 mod socks5;
 
