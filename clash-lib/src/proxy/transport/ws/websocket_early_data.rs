@@ -99,6 +99,9 @@ impl WebsocketEarlyDataConn {
                     "msg: websocket early data handshake failed",
                 ));
             }
+            // After the handshake finishes, all read/write/close edge cases are
+            // delegated to `WebsocketConn` so early-data and regular WS share
+            // the same teardown behavior.
             let rv = Box::new(WebsocketConn::from_websocket(stream));
             Ok(rv)
         }

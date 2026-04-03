@@ -1,4 +1,5 @@
-use std::{io, sync::Arc};
+use erased_serde::Serialize as ErasedSerialize;
+use std::{collections::HashMap, io, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::{BufMut, BytesMut};
@@ -16,16 +17,17 @@ use crate::{
     },
     common::utils,
     impl_default_connector,
-    proxy::{HandlerCommonOptions, transport::Transport},
     session::Session,
 };
 
+use self::datagram::OutboundDatagramTrojan;
+
 use super::{
-    AnyStream, DialWithConnector, OutboundHandler, OutboundType,
+    AnyStream, ConnectorType, DialWithConnector, HandlerCommonOptions,
+    OutboundHandler, OutboundType, PlainProxyAPIResponse,
+    transport::Transport,
     utils::{GLOBAL_DIRECT_CONNECTOR, RemoteConnector},
 };
-
-use self::datagram::OutboundDatagramTrojan;
 
 mod datagram;
 
@@ -109,6 +111,10 @@ impl OutboundHandler for Handler {
         OutboundType::Trojan
     }
 
+    async fn support_udp(&self) -> bool {
+        self.opts.udp
+    }
+
     async fn connect_stream(
         &self,
         sess: &Session,
@@ -129,6 +135,32 @@ impl OutboundHandler for Handler {
                 .as_ref(),
         )
         .await
+    }
+
+    async fn connect_datagram(
+        &self,
+        sess: &Session,
+        resolver: ThreadSafeDNSResolver,
+    ) -> io::Result<BoxedChainedDatagram> {
+        let dialer = self.connector.read().await;
+
+        if let Some(dialer) = dialer.as_ref() {
+            debug!("{:?} is connecting via {:?}", self, dialer);
+        }
+
+        self.connect_datagram_with_connector(
+            sess,
+            resolver,
+            dialer
+                .as_ref()
+                .unwrap_or(&GLOBAL_DIRECT_CONNECTOR.clone())
+                .as_ref(),
+        )
+        .await
+    }
+
+    async fn support_connector(&self) -> ConnectorType {
+        ConnectorType::All
     }
 
     async fn connect_stream_with_connector(
@@ -152,28 +184,6 @@ impl OutboundHandler for Handler {
         let chained = ChainedStreamWrapper::new(s);
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
-    }
-
-    async fn connect_datagram(
-        &self,
-        sess: &Session,
-        resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedChainedDatagram> {
-        let dialer = self.connector.read().await;
-
-        if let Some(dialer) = dialer.as_ref() {
-            debug!("{:?} is connecting via {:?}", self, dialer);
-        }
-
-        self.connect_datagram_with_connector(
-            sess,
-            resolver,
-            dialer
-                .as_ref()
-                .unwrap_or(&GLOBAL_DIRECT_CONNECTOR.clone())
-                .as_ref(),
-        )
-        .await
     }
 
     async fn connect_datagram_with_connector(
@@ -200,5 +210,162 @@ impl OutboundHandler for Handler {
         let chained = ChainedDatagramWrapper::new(d);
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
+    }
+
+    fn try_as_plain_handler(&self) -> Option<&dyn PlainProxyAPIResponse> {
+        Some(self as _)
+    }
+}
+
+#[async_trait]
+impl PlainProxyAPIResponse for Handler {
+    async fn as_map(&self) -> HashMap<String, Box<dyn ErasedSerialize + Send>> {
+        let mut m = HashMap::new();
+        m.insert("name".to_owned(), Box::new(self.opts.name.clone()) as _);
+        m.insert("type".to_owned(), Box::new(self.proto().to_string()) as _);
+        m.insert("server".to_owned(), Box::new(self.opts.server.clone()) as _);
+        m.insert("port".to_owned(), Box::new(self.opts.port) as _);
+        m.insert(
+            "password".to_owned(),
+            Box::new(self.opts.password.clone()) as _,
+        );
+        if self.opts.udp {
+            m.insert("udp".to_owned(), Box::new(true) as _);
+        }
+        if self.opts.tls.is_some() {
+            m.insert("tls".to_owned(), Box::new(true) as _);
+        }
+        m
+    }
+}
+
+#[cfg(all(test, docker_test))]
+mod tests {
+
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::{
+        proxy::{
+            transport,
+            utils::test_utils::{
+                Suite,
+                config_helper::test_config_base_dir,
+                consts::*,
+                docker_runner::{DockerTestRunner, DockerTestRunnerBuilder},
+                run_test_suites_and_cleanup,
+            },
+        },
+        tests::initialize,
+    };
+
+    async fn get_ws_runner() -> anyhow::Result<DockerTestRunner> {
+        let test_config_dir = test_config_base_dir();
+        let trojan_conf = test_config_dir.join("trojan-ws.json");
+        let trojan_cert = test_config_dir.join("example.org.pem");
+        let trojan_key = test_config_dir.join("example.org-key.pem");
+
+        DockerTestRunnerBuilder::new()
+            .image(IMAGE_TROJAN_GO)
+            .mounts(&[
+                (trojan_conf.to_str().unwrap(), "/etc/trojan-go/config.json"),
+                (trojan_cert.to_str().unwrap(), "/fullchain.pem"),
+                (trojan_key.to_str().unwrap(), "/privkey.pem"),
+            ])
+            .build()
+            .await
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_trojan_ws() -> anyhow::Result<()> {
+        let span = tracing::info_span!("test_trojan_ws");
+        let _enter = span.enter();
+        let transport = transport::WsClient::new(
+            "".to_owned(),
+            10002,
+            "/".to_owned(),
+            [("Host".to_owned(), "example.org".to_owned())]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            None,
+            0,
+            "".to_owned(),
+        );
+        let tls =
+            transport::TlsClient::new(true, "example.org".to_owned(), None, None);
+
+        let container = get_ws_runner().await?;
+
+        let opts = HandlerOptions {
+            name: "test-trojan-ws".to_owned(),
+            common_opts: Default::default(),
+            server: container.container_ip().unwrap_or(LOCAL_ADDR.to_owned()),
+            port: 10002,
+            password: "example".to_owned(),
+            udp: true,
+            tls: Some(Box::new(tls)),
+            transport: Some(Box::new(transport)),
+        };
+        let handler = Arc::new(Handler::new(opts));
+        handler
+            .register_connector(GLOBAL_DIRECT_CONNECTOR.clone())
+            .await;
+        // ignore the udp test
+        run_test_suites_and_cleanup(handler, container, Suite::all()).await
+    }
+
+    async fn get_grpc_runner() -> anyhow::Result<DockerTestRunner> {
+        let test_config_dir = test_config_base_dir();
+        let conf = test_config_dir.join("trojan-grpc.json");
+        let cert = test_config_dir.join("example.org.pem");
+        let key = test_config_dir.join("example.org-key.pem");
+
+        DockerTestRunnerBuilder::new()
+            .image(IMAGE_XRAY)
+            .mounts(&[
+                (conf.to_str().unwrap(), "/etc/xray/config.json"),
+                (cert.to_str().unwrap(), "/etc/ssl/v2ray/fullchain.pem"),
+                (key.to_str().unwrap(), "/etc/ssl/v2ray/privkey.pem"),
+            ])
+            .build()
+            .await
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_trojan_grpc() -> anyhow::Result<()> {
+        initialize();
+        let transport = transport::GrpcClient::new(
+            "example.org".to_owned(),
+            "example"
+                .to_owned()
+                .try_into()
+                .expect("invalid grpc service name"),
+        );
+        let tls = transport::TlsClient::new(
+            true,
+            "example.org".to_owned(),
+            Some(vec!["http/1.1".to_owned(), "h2".to_owned()]),
+            None,
+        );
+
+        let runner = get_grpc_runner().await?;
+
+        let opts = HandlerOptions {
+            name: "test-trojan-grpc".to_owned(),
+            common_opts: Default::default(),
+            server: runner.container_ip().unwrap_or(LOCAL_ADDR.to_owned()),
+            port: 10002,
+            password: "example".to_owned(),
+            udp: true,
+            tls: Some(Box::new(tls)),
+            transport: Some(Box::new(transport)),
+        };
+        let handler = Arc::new(Handler::new(opts));
+        handler
+            .register_connector(GLOBAL_DIRECT_CONNECTOR.clone())
+            .await;
+        run_test_suites_and_cleanup(handler, runner, Suite::all()).await
     }
 }
