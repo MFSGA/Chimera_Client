@@ -57,8 +57,8 @@ async fn wait_for_tun_state(name: &str, should_exist: bool) -> Result<(), Error>
         .await;
     }
 
-    let total_ms = TUN_VISIBILITY_MAX_ATTEMPTS as u64
-        * TUN_VISIBILITY_POLL_INTERVAL_MS;
+    let total_ms =
+        TUN_VISIBILITY_MAX_ATTEMPTS as u64 * TUN_VISIBILITY_POLL_INTERVAL_MS;
     let state = if should_exist { "visible" } else { "removed" };
     let err_msg = match last_show_err {
         Some(e) => format!(

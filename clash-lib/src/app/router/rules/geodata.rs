@@ -4,8 +4,7 @@ use std::{
 };
 
 use crate::{
-    Error,
-    Session,
+    Error, Session,
     app::router::RuleMatcher,
     common::{
         geodata::{
@@ -116,7 +115,9 @@ impl Display for GeoSiteMatcher {
     }
 }
 
-fn parse_country_code(country_code: &str) -> Result<(bool, String, Vec<String>), Error> {
+fn parse_country_code(
+    country_code: &str,
+) -> Result<(bool, String, Vec<String>), Error> {
     let country_code = country_code.trim().to_lowercase();
     if country_code.is_empty() {
         return Err(Error::InvalidConfig(

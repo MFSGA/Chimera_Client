@@ -523,10 +523,7 @@ async fn create_components(
                     .to_string(),
             )
         })?;
-        let tun_dns_addr = std::net::SocketAddr::from((
-            dedicated_dns_ip,
-            53,
-        ));
+        let tun_dns_addr = std::net::SocketAddr::from((dedicated_dns_ip, 53));
         dns_listen.udp = Some(tun_dns_addr);
         dns_listen.tcp = Some(tun_dns_addr);
         config.dns.reserved_ip_addrs.push(dedicated_dns_ip);

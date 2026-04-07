@@ -194,7 +194,9 @@ async fn wait_for_linux_dns_listener_targets(
 
 #[cfg(target_os = "linux")]
 fn run_resolvectl(args: &[&str]) -> Result<(), std::io::Error> {
-    let output = std::process::Command::new("resolvectl").args(args).output()?;
+    let output = std::process::Command::new("resolvectl")
+        .args(args)
+        .output()?;
 
     if output.status.success() {
         return Ok(());
@@ -202,11 +204,7 @@ fn run_resolvectl(args: &[&str]) -> Result<(), std::io::Error> {
 
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    let details = if stderr.is_empty() {
-        stdout
-    } else {
-        stderr
-    };
+    let details = if stderr.is_empty() { stdout } else { stderr };
 
     Err(std::io::Error::other(format!(
         "resolvectl {} failed: {}",
@@ -334,7 +332,9 @@ async fn maybe_take_over_linux_stub_resolver(
     if !current.contains("127.0.0.53")
         && !current.contains("managed by man:systemd-resolved")
     {
-        info!("linux stub resolver takeover skipped because /etc/resolv.conf is not using systemd-resolved stub");
+        info!(
+            "linux stub resolver takeover skipped because /etc/resolv.conf is not using systemd-resolved stub"
+        );
         return;
     }
 
@@ -441,7 +441,8 @@ impl Runner for DnsRunner {
         let cancellation_token = self.cancellation_token.clone();
 
         let handle = tokio::spawn(async move {
-            if !wait_for_linux_dns_listener_targets(&listen, &cancellation_token).await
+            if !wait_for_linux_dns_listener_targets(&listen, &cancellation_token)
+                .await
             {
                 return;
             }

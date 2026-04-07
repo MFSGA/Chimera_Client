@@ -3,11 +3,7 @@ use std::net::SocketAddr;
 use bytes::{BufMut, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::{
-    common::errors::new_io_error,
-    proxy::AnyStream,
-    session::SocksAddr,
-};
+use crate::{common::errors::new_io_error, proxy::AnyStream, session::SocksAddr};
 
 pub const SOCKS5_VERSION: u8 = 0x05;
 
@@ -127,7 +123,9 @@ pub(crate) async fn client_handshake(
         } else {
             "unknown error"
         };
-        return Err(new_io_error(format!("SOCKS5 request failed with {message}")));
+        return Err(new_io_error(format!(
+            "SOCKS5 request failed with {message}"
+        )));
     }
 
     SocksAddr::read_from(s).await

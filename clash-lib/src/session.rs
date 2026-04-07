@@ -218,13 +218,17 @@ impl SocksAddr {
                 if cur.remaining() < 4 + 2 {
                     return Err(io::Error::other("invalid buf"));
                 }
-                Ok(Self::Ip((Ipv4Addr::from(cur.get_u32()), cur.get_u16()).into()))
+                Ok(Self::Ip(
+                    (Ipv4Addr::from(cur.get_u32()), cur.get_u16()).into(),
+                ))
             }
             SocksAddrType::V6 => {
                 if cur.remaining() < 16 + 2 {
                     return Err(io::Error::other("invalid buf"));
                 }
-                Ok(Self::Ip((Ipv6Addr::from(cur.get_u128()), cur.get_u16()).into()))
+                Ok(Self::Ip(
+                    (Ipv6Addr::from(cur.get_u128()), cur.get_u16()).into(),
+                ))
             }
             SocksAddrType::DOMAIN => {
                 let domain_len = cur.get_u8() as usize;

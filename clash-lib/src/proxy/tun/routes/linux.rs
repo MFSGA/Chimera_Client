@@ -56,10 +56,7 @@ pub fn delete_interface(name: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-pub fn ensure_interface_address(
-    name: &str,
-    addr: Ipv4Net,
-) -> std::io::Result<()> {
+pub fn ensure_interface_address(name: &str, addr: Ipv4Net) -> std::io::Result<()> {
     let cidr = addr.to_string();
     let cmd = std::process::Command::new("ip")
         .args(["addr", "add", &cidr, "dev", name])
@@ -213,10 +210,7 @@ pub fn maybe_routes_clean_up(tun_cfg: &TunConfig) -> std::io::Result<()> {
         enable_v6,
     )?;
 
-    delete_ip_cmd_all(
-        &["rule", "del", "dport", "53", "table", &table],
-        enable_v6,
-    )?;
+    delete_ip_cmd_all(&["rule", "del", "dport", "53", "table", &table], enable_v6)?;
 
     Ok(())
 }
@@ -227,7 +221,9 @@ mod tests {
 
     #[test]
     fn detect_missing_ip_rule_errors() {
-        assert!(is_missing_ip_state("RTNETLINK answers: No such file or directory"));
+        assert!(is_missing_ip_state(
+            "RTNETLINK answers: No such file or directory"
+        ));
         assert!(is_missing_ip_state("RTNETLINK answers: No such process"));
         assert!(!is_missing_ip_state("RTNETLINK answers: File exists"));
     }

@@ -17,9 +17,7 @@ mod linux;
 #[cfg(target_os = "linux")]
 use linux::add_route;
 #[cfg(target_os = "linux")]
-pub use linux::{
-    delete_interface, ensure_interface_address, maybe_routes_clean_up,
-};
+pub use linux::{delete_interface, ensure_interface_address, maybe_routes_clean_up};
 
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 mod other;

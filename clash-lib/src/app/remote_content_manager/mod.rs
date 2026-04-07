@@ -17,11 +17,11 @@ use serde::Serialize;
 use tokio::sync::RwLock;
 use tracing::warn;
 
+#[cfg(feature = "tun")]
+use crate::app::net::DEFAULT_OUTBOUND_INTERFACE;
 #[cfg(feature = "tls")]
 use crate::common::tls::GLOBAL_ROOT_STORE;
 use crate::common::utils::serialize_duration;
-#[cfg(feature = "tun")]
-use crate::app::net::DEFAULT_OUTBOUND_INTERFACE;
 use crate::{
     app::dns::ThreadSafeDNSResolver,
     proxy::AnyOutboundHandler,
@@ -161,7 +161,8 @@ impl ProxyManager {
         let name = outbound.name().to_owned();
         let timeout = timeout.unwrap_or(Duration::from_secs(5));
         #[cfg(feature = "tun")]
-        let default_outbound_interface = DEFAULT_OUTBOUND_INTERFACE.read().await.clone();
+        let default_outbound_interface =
+            DEFAULT_OUTBOUND_INTERFACE.read().await.clone();
         #[cfg(not(feature = "tun"))]
         let default_outbound_interface = None;
 

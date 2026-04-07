@@ -28,7 +28,17 @@ pub mod geodata_proto {
             pub key: ::prost::alloc::string::String,
         }
 
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+        #[derive(
+            Clone,
+            Copy,
+            Debug,
+            PartialEq,
+            Eq,
+            Hash,
+            PartialOrd,
+            Ord,
+            ::prost::Enumeration,
+        )]
         #[repr(i32)]
         pub enum Type {
             Plain = 0,
@@ -86,15 +96,13 @@ impl GeoData {
             download(&download_url, path.as_ref(), &http_client)
                 .await
                 .map_err(|err| {
-                    Error::InvalidConfig(format!(
-                        "geosite download failed: {err}"
-                    ))
+                    Error::InvalidConfig(format!("geosite download failed: {err}"))
                 })?;
         }
 
         let bytes = tokio::fs::read(path).await?;
-        let cache = geodata_proto::GeoSiteList::decode(bytes.as_slice())
-            .map_err(|err| {
+        let cache =
+            geodata_proto::GeoSiteList::decode(bytes.as_slice()).map_err(|err| {
                 Error::InvalidConfig(format!("geosite decode failed: {err}"))
             })?;
 

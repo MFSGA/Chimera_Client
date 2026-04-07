@@ -6,10 +6,7 @@ use hickory_proto::{
 };
 use tracing::debug;
 
-fn normalize_upstream_response(
-    req: &Message,
-    mut res: Message,
-) -> Message {
+fn normalize_upstream_response(req: &Message, mut res: Message) -> Message {
     if res.id() != req.id() {
         debug!(
             request_id = req.id(),
