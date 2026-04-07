@@ -32,14 +32,28 @@ impl Display for ProviderVehicleType {
 
 // pub type ThreadSafeProviderVehicle = Arc<dyn ProviderVehicle + Send + Sync>;
 
+pub enum ProviderType {
+    Proxy,
+    Rule,
+}
+
+impl Display for ProviderType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProviderType::Proxy => write!(f, "Proxy"),
+            ProviderType::Rule => write!(f, "Rule"),
+        }
+    }
+}
+
 /// either Proxy or Rule provider
 #[async_trait]
 pub trait Provider {
     fn name(&self) -> &str;
     fn vehicle_type(&self) -> ProviderVehicleType;
-    // fn typ(&self) -> ProviderType;
-    // async fn initialize(&self) -> io::Result<()>;
-    // async fn update(&self) -> io::Result<()>;
+    fn typ(&self) -> ProviderType;
+    async fn initialize(&self) -> io::Result<()>;
+    async fn update(&self) -> io::Result<()>;
 
-    // async fn as_map(&self) -> HashMap<String, Box<dyn Serialize + Send>>;
+    async fn as_map(&self) -> HashMap<String, Box<dyn Serialize + Send>>;
 }

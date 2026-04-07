@@ -159,6 +159,11 @@ impl OutboundManager {
         self.registry.read().await.get(name).cloned()
     }
 
+    /// This does not populate history/liveness information.
+    pub fn get_proxy_provider(&self, name: &str) -> Option<ThreadSafeProxyProvider> {
+        self.proxy_providers.get(name).cloned()
+    }
+
     // API handles start
     pub fn get_selector_control(
         &self,
@@ -256,6 +261,10 @@ impl OutboundManager {
         self.proxy_manager
             .check(outbounds, url, Some(timeout))
             .await
+    }
+
+    pub fn get_proxy_providers(&self) -> HashMap<String, ThreadSafeProxyProvider> {
+        self.proxy_providers.clone()
     }
 
     /// Load handlers from the provided outbound protocols and groups.

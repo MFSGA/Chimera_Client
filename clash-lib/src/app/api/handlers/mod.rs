@@ -5,6 +5,7 @@ pub mod group;
 pub mod hello;
 pub mod logs;
 pub mod memory;
+pub mod provider;
 pub mod proxy;
 pub mod restart;
 pub mod rule;

@@ -1,13 +1,14 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
+use erased_serde::Serialize;
 use tracing::debug;
 
 use crate::{
     Error,
     app::remote_content_manager::{
         healthcheck::HealthCheck,
-        providers::{Provider, ProviderVehicleType},
+        providers::{Provider, ProviderType, ProviderVehicleType},
     },
     proxy::AnyOutboundHandler,
 };
@@ -59,7 +60,7 @@ impl Provider for PlainProvider {
         ProviderVehicleType::Compatible
     }
 
-    /*  fn typ(&self) -> ProviderType {
+    fn typ(&self) -> ProviderType {
         ProviderType::Proxy
     }
 
@@ -82,7 +83,7 @@ impl Provider for PlainProvider {
         );
 
         m
-    } */
+    }
 }
 
 #[async_trait]
@@ -94,7 +95,8 @@ impl ProxyProvider for PlainProvider {
     async fn touch(&self) {
         self.hc.touch().await;
     }
-    // async fn healthcheck(&self) {
-    //     self.hc.check().await;
-    // }
+
+    async fn healthcheck(&self) {
+        self.hc.check().await;
+    }
 }

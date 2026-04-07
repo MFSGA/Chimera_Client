@@ -85,10 +85,10 @@ impl HealthCheck {
         self.inner.write().await.last_check = tokio::time::Instant::now();
     }
 
-    // pub async fn check(&self) {
-    //     let proxies = self.inner.read().await.proxies.clone();
-    //     self.proxy_manager.check(&proxies, &self.url, None).await;
-    // }
+    pub async fn check(&self) {
+        let proxies = self.inner.read().await.proxies.clone();
+        self.proxy_manager.check(&proxies, &self.url, None).await;
+    }
 
     // pub async fn update(&self, proxies: Vec<AnyOutboundHandler>) {
     //     self.inner.write().await.proxies = proxies;

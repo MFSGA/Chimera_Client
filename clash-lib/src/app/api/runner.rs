@@ -176,6 +176,10 @@ impl Runner for ApiRunner {
                     "/proxies",
                     handlers::proxy::routes(outbound_manager.clone(), cache_store),
                 )
+                .nest(
+                    "/providers/proxies",
+                    handlers::provider::routes(outbound_manager.clone()),
+                )
                 .nest("/group", handlers::group::routes(outbound_manager.clone()))
                 .nest("/dns", handlers::dns::routes(dns_resolver.clone()))
                 .nest("/rules", handlers::rule::routes(router))
