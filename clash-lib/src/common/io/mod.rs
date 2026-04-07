@@ -196,6 +196,15 @@ struct CopyBidirectional<'a, A: ?Sized, B: ?Sized> {
     b_to_a_timeout_duration: Duration,
 }
 
+fn reset_idle_timeout(
+    delay: &mut Option<Pin<Box<tokio::time::Sleep>>>,
+    duration: Duration,
+) {
+    if let Some(delay) = delay {
+        delay.as_mut().reset(tokio::time::Instant::now() + duration);
+    }
+}
+
 impl<A, B> Future for CopyBidirectional<'_, A, B>
 where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
@@ -224,7 +233,11 @@ where
         loop {
             match a_to_b {
                 TransferState::Running(buf) => {
+                    let transferred_before = buf.amount_transferred();
                     let res = buf.poll_copy(cx, a.as_mut(), b.as_mut());
+                    if buf.amount_transferred() != transferred_before {
+                        reset_idle_timeout(a_to_b_delay, *a_to_b_timeout_duration);
+                    }
                     match res {
                         Poll::Ready(Ok(count)) => {
                             *a_to_b = TransferState::ShuttingDown(count);
@@ -239,6 +252,12 @@ where
                             if let Some(delay) = a_to_b_delay {
                                 match delay.as_mut().poll(cx) {
                                     Poll::Ready(()) => {
+                                        // After the opposite direction has fully
+                                        // shut down, this timeout is an
+                                        // inactivity guard for the remaining
+                                        // half-open stream, not an absolute
+                                        // lifetime cap. Progress above refreshes
+                                        // the timer.
                                         *a_to_b = TransferState::ShuttingDown(
                                             buf.amount_transferred(),
                                         );
@@ -274,7 +293,11 @@ where
 
             match b_to_a {
                 TransferState::Running(buf) => {
+                    let transferred_before = buf.amount_transferred();
                     let res = buf.poll_copy(cx, b.as_mut(), a.as_mut());
+                    if buf.amount_transferred() != transferred_before {
+                        reset_idle_timeout(b_to_a_delay, *b_to_a_timeout_duration);
+                    }
                     match res {
                         Poll::Ready(Ok(count)) => {
                             *b_to_a = TransferState::ShuttingDown(count);
@@ -416,6 +439,77 @@ where
         b_to_a_timeout_duration,
     }
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt, duplex},
+        time::timeout,
+    };
+
+    use super::copy_buf_bidirectional_with_timeout;
+
+    #[tokio::test]
+    async fn half_closed_stream_keeps_running_while_peer_makes_progress() {
+        let (mut proxy_local, mut local) = duplex(1024);
+        let (mut proxy_remote, mut remote) = duplex(1024);
+
+        let relay = tokio::spawn(async move {
+            copy_buf_bidirectional_with_timeout(
+                &mut proxy_local,
+                &mut proxy_remote,
+                256,
+                Duration::from_millis(100),
+                Duration::from_millis(100),
+            )
+            .await
+        });
+
+        let local_task = tokio::spawn(async move {
+            local.write_all(b"req").await?;
+            local.shutdown().await?;
+
+            let mut response = Vec::new();
+            local.read_to_end(&mut response).await?;
+
+            Ok::<Vec<u8>, std::io::Error>(response)
+        });
+
+        let remote_task = tokio::spawn(async move {
+            let mut req = [0u8; 3];
+            remote.read_exact(&mut req).await?;
+            assert_eq!(&req, b"req");
+
+            remote.write_all(b"chunk-1").await?;
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            remote.write_all(b"chunk-2").await?;
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            remote.write_all(b"chunk-3").await?;
+            remote.shutdown().await?;
+
+            Ok::<(), std::io::Error>(())
+        });
+
+        remote_task
+            .await
+            .expect("remote task join")
+            .expect("remote io");
+
+        let response = timeout(Duration::from_secs(2), local_task)
+            .await
+            .expect("local task timeout")
+            .expect("local task join")
+            .expect("local io");
+        assert_eq!(response, b"chunk-1chunk-2chunk-3");
+
+        relay
+            .await
+            .expect("relay task join")
+            .expect("relay should finish cleanly");
+    }
 }
 
 pub trait ReadExactBase {

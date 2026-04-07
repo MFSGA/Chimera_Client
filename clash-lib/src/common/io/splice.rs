@@ -438,6 +438,15 @@ struct CopyBidirectional<'a, A, B> {
     read_tracker: std::sync::Arc<dyn TrackCopy + Send + Sync>,
 }
 
+fn reset_idle_timeout(
+    delay: &mut Option<Pin<Box<tokio::time::Sleep>>>,
+    duration: Duration,
+) {
+    if let Some(delay) = delay {
+        delay.as_mut().reset(tokio::time::Instant::now() + duration);
+    }
+}
+
 impl<'a, A, B> CopyBidirectional<'a, A, B> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -497,7 +506,11 @@ where
         loop {
             match a_to_b {
                 TransferState::Running(buf) => {
+                    let transferred_before = buf.amount_transferred();
                     let res = buf.poll_copy(cx, *a, *b);
+                    if buf.amount_transferred() != transferred_before {
+                        reset_idle_timeout(a_to_b_delay, *a_to_b_timeout_duration);
+                    }
                     match res {
                         Poll::Ready(Ok(count)) => {
                             *a_to_b = TransferState::ShuttingDown(count);
@@ -511,6 +524,11 @@ where
                             if let Some(delay) = a_to_b_delay {
                                 match delay.as_mut().poll(cx) {
                                     Poll::Ready(()) => {
+                                        // Mirror the buffered implementation:
+                                        // this timeout only fires after the
+                                        // remaining direction has gone idle
+                                        // after the opposite half already
+                                        // completed.
                                         *a_to_b = TransferState::ShuttingDown(
                                             buf.amount_transferred(),
                                         );
@@ -547,7 +565,11 @@ where
 
             match b_to_a {
                 TransferState::Running(buf) => {
+                    let transferred_before = buf.amount_transferred();
                     let res = buf.poll_copy(cx, *b, *a);
+                    if buf.amount_transferred() != transferred_before {
+                        reset_idle_timeout(b_to_a_delay, *b_to_a_timeout_duration);
+                    }
                     match res {
                         Poll::Ready(Ok(count)) => {
                             *b_to_a = TransferState::ShuttingDown(count);
