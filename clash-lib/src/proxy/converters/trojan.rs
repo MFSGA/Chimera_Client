@@ -14,6 +14,8 @@ use crate::{
 };
 
 #[cfg(feature = "ws")]
+use super::utils::build_ws_client;
+#[cfg(feature = "ws")]
 use crate::proxy::transport::WsClient;
 
 impl TryFrom<OutboundTrojan> for Handler {
@@ -80,9 +82,11 @@ impl TryFrom<&OutboundTrojan> for Handler {
                             s.ws_opts
                                 .as_ref()
                                 .map(|x| {
-                                    let client: WsClient = (x, &s.common_opts)
-                                        .try_into()
-                                        .expect("invalid ws_opts");
+                                    let client: WsClient = build_ws_client(
+                                        x,
+                                        &s.common_opts,
+                                        s.sni.as_deref(),
+                                    );
                                     Box::new(client) as _
                                 })
                                 .ok_or(Error::InvalidConfig(

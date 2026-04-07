@@ -18,6 +18,8 @@ use base64::{Engine as _, engine::general_purpose};
 use tracing::warn;
 
 #[cfg(feature = "ws")]
+use super::utils::build_ws_client;
+#[cfg(feature = "ws")]
 use crate::proxy::transport::WsClient;
 
 const DEFAULT_WS_ALPN: [&str; 1] = ["http/1.1"];
@@ -224,13 +226,11 @@ fn build_ws_transport(
         s.ws_opts
             .as_ref()
             .map(|opts| {
-                let client: WsClient =
-                    (opts, &s.common_opts).try_into().map_err(|err| {
-                        Error::InvalidConfig(format!(
-                            "invalid ws_opts for {}: {err}",
-                            s.common_opts.name
-                        ))
-                    })?;
+                let client: WsClient = build_ws_client(
+                    opts,
+                    &s.common_opts,
+                    s.sni.as_deref().or(s.server_name.as_deref()),
+                );
                 Ok(Box::new(client) as Box<dyn Transport>)
             })
             .transpose()
