@@ -18,7 +18,7 @@ use crate::proxy::{AnyStream, transport::VisionOptions};
 ///
 /// Source: Xray-core `proxy/proxy.go` (`CommandPadding*` constants).
 const CMD_PADDING_CONTINUE: u8 = 0x00; // more Vision frames coming
-const CMD_PADDING_END: u8 = 0x01; // last Vision frame, do not splice yet
+const CMD_PADDING_END: u8 = 0x01; // last Vision frame, stay on Reality TLS
 const CMD_PADDING_DIRECT: u8 = 0x02; // last Vision frame, enter splice mode
 
 /// TLS ApplicationData record type; triggers the direct-mode transition.
@@ -39,7 +39,8 @@ const TLS_APPLICATION_DATA: u8 = 0x17;
 ///
 /// ## Commands
 /// - `0x00` `PaddingContinue`: more Vision frames follow.
-/// - `0x01` `PaddingEnd`:      last Vision frame; stay in framed mode.
+/// - `0x01` `PaddingEnd`:      last Vision frame; bypass Vision framing but
+///                             keep using the outer Reality TLS tunnel.
 /// - `0x02` `PaddingDirect`:   last Vision frame; enter XTLS-splice (raw) mode.
 ///
 /// ## XTLS-splice mode
@@ -47,6 +48,18 @@ const TLS_APPLICATION_DATA: u8 = 0x17;
 /// the outer Reality TLS layer and communicate over raw TCP.  VisionStream
 /// signals this via optional `Arc<AtomicBool>` flags shared with the
 /// `SplicableTlsStream` that sits below VlessStream in the stack.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReadMode {
+    /// Parse incoming bytes as Vision frames.
+    Framed,
+    /// Vision framing is finished, but bytes still come from the outer
+    /// Reality TLS tunnel and must continue through `VlessStream`.
+    DirectTls,
+    /// Vision framing is finished and both peers switched to XTLS-splice, so
+    /// reads can bypass the outer Reality TLS layer entirely.
+    DirectRaw,
+}
+
 pub struct VisionStream {
     inner: AnyStream,
 
@@ -71,8 +84,10 @@ pub struct VisionStream {
     raw: BytesMut,
     /// True until the initial VLESS response header is consumed.
     vless_response_pending: bool,
-    /// True once the server has switched to XTLS-splice (raw) mode.
-    read_direct: bool,
+    /// Current read mode for server traffic. Xray-core can end Vision framing
+    /// without immediately enabling splice, so we need to distinguish
+    /// "bypass Vision only" from "bypass Vision and Reality TLS".
+    read_mode: ReadMode,
 
     // --- XTLS-splice signals (optional, only used with Reality transport) ---
     /// Set when CMD_DIRECT received from server → underlying TLS must switch
@@ -113,7 +128,7 @@ impl VisionStream {
             decoded: BytesMut::new(),
             raw: BytesMut::new(),
             vless_response_pending: true,
-            read_direct: false,
+            read_mode: ReadMode::Framed,
             read_splice_flag,
             write_splice_flag,
         })
@@ -194,7 +209,7 @@ impl AsyncRead for VisionStream {
             }
 
             // 2. Direct/splice mode: raw passthrough.
-            if this.read_direct {
+            if this.read_mode != ReadMode::Framed {
                 return Pin::new(&mut this.inner).poll_read(cx, buf);
             }
 
@@ -202,12 +217,12 @@ impl AsyncRead for VisionStream {
             let changed = decode_vision_frames(
                 &mut this.raw,
                 &mut this.decoded,
-                &mut this.read_direct,
+                &mut this.read_mode,
                 &mut this.server_uuid_consumed,
             );
 
             // Signal the underlying SplicableTlsStream to bypass TLS.
-            if this.read_direct
+            if this.read_mode == ReadMode::DirectRaw
                 && let Some(flag) = &this.read_splice_flag
             {
                 debug!(
@@ -216,7 +231,7 @@ impl AsyncRead for VisionStream {
                 flag.store(true, Ordering::Release);
             }
 
-            if changed || this.read_direct {
+            if changed || this.read_mode != ReadMode::Framed {
                 continue;
             }
 
@@ -271,11 +286,12 @@ fn consume_vless_response_header(raw: &mut BytesMut) -> io::Result<Option<usize>
 
 /// Drain Vision frames from `raw` into `decoded`.
 ///
-/// Returns `true` if any content bytes were produced or `read_direct` was set.
+/// Returns `true` if any content bytes were produced or the stream left framed
+/// Vision mode.
 fn decode_vision_frames(
     raw: &mut BytesMut,
     decoded: &mut BytesMut,
-    read_direct: &mut bool,
+    read_mode: &mut ReadMode,
     server_uuid_consumed: &mut bool,
 ) -> bool {
     let before = decoded.len();
@@ -314,10 +330,13 @@ fn decode_vision_frames(
         raw.advance(content_len);
         raw.advance(padding_len);
 
-        // CMD_PADDING_END (0x01) or CMD_PADDING_DIRECT (0x02): server has
-        // finished sending Vision frames.  Remaining raw bytes are direct.
-        if command == CMD_PADDING_DIRECT || command == CMD_PADDING_END {
-            *read_direct = true;
+        // Xray-core distinguishes "stop Vision framing" from "enter splice".
+        // `CMD_PADDING_END` means subsequent bytes are no longer Vision frames,
+        // but they still travel through the outer Reality TLS tunnel.
+        // `CMD_PADDING_DIRECT` is the stronger transition that also enables
+        // XTLS-splice, so the transport can bypass Reality TLS entirely.
+        if command == CMD_PADDING_DIRECT {
+            *read_mode = ReadMode::DirectRaw;
             debug!(
                 "VISION READ: switching to direct mode with {} buffered raw bytes",
                 raw.len()
@@ -326,9 +345,20 @@ fn decode_vision_frames(
             raw.clear();
             break;
         }
+
+        if command == CMD_PADDING_END {
+            *read_mode = ReadMode::DirectTls;
+            debug!(
+                "VISION READ: leaving framed mode but staying on Reality TLS with {} buffered bytes",
+                raw.len()
+            );
+            decoded.extend_from_slice(raw);
+            raw.clear();
+            break;
+        }
     }
 
-    *read_direct || decoded.len() > before
+    *read_mode != ReadMode::Framed || decoded.len() > before
 }
 
 // ---------------------------------------------------------------------------
@@ -623,11 +653,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_switches_to_direct_on_cmd_end() {
+    async fn test_read_cmd_end_switches_to_direct_tls_mode() {
         let (mut vs, mut server) = make_vision_pair();
 
         let content = b"end-frame-content";
-        let raw_after = b"direct-data";
+        let raw_after = b"\x17\x03\x03\x00\x05hello";
 
         let mut msg = vec![0, 0];
         msg.extend(server_first_frame(&TEST_UUID, CMD_PADDING_END, content, 0));
