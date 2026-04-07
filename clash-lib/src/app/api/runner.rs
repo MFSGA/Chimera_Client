@@ -2,6 +2,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use axum::{
     Router, middleware,
+    response::Redirect,
     routing::{get, post},
 };
 
@@ -108,6 +109,7 @@ impl Runner for ApiRunner {
         tracing::debug!("API controller configuration: {:?}", controller_cfg);
         let ipc_addr = controller_cfg.external_controller_ipc;
         let tcp_addr = controller_cfg.external_controller;
+        let external_ui = controller_cfg.external_ui.clone();
 
         let origins: AllowOrigin = controller_cfg
             .cors_allow_origins
@@ -150,7 +152,7 @@ impl Runner for ApiRunner {
 
         let handle = tokio::spawn(async move {
             info!("Starting API server");
-            let router = Router::new()
+            let mut router = Router::new()
                 .route("/", get(handlers::hello::handle))
                 .route("/traffic", get(handlers::traffic::handle))
                 .route("/version", get(handlers::version::handle))
@@ -192,6 +194,15 @@ impl Runner for ApiRunner {
                 .layer(cors)
                 .with_state(app_state.clone())
                 .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()));
+
+            if let Some(external_ui) = external_ui {
+                router = router
+                    .route("/ui", get(|| async { Redirect::to("/ui/") }))
+                    .nest_service(
+                        "/ui/",
+                        ServeDir::new(PathBuf::from(&cwd).join(external_ui)),
+                    );
+            }
 
             // Handle TCP listening
             let tcp_fut = if let Some(bind_addr) = tcp_addr {
