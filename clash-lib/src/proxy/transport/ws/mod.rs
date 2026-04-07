@@ -1,14 +1,14 @@
 use async_trait::async_trait;
-use http::{Request, StatusCode};
+use http::Request;
 use std::collections::HashMap;
-use tokio_tungstenite::{
-    client_async_with_config,
-    tungstenite::{handshake::client::generate_key, protocol::WebSocketConfig},
+use tokio_tungstenite::tungstenite::{
+    handshake::client::generate_key, protocol::WebSocketConfig,
 };
 
 use super::Transport;
-use crate::{common::errors::map_io_error, proxy::AnyStream};
+use crate::proxy::AnyStream;
 
+mod handshake;
 mod websocket;
 mod websocket_early_data;
 
@@ -16,7 +16,7 @@ pub use websocket::WebsocketConn;
 pub use websocket_early_data::WebsocketEarlyDataConn;
 
 pub struct Client {
-    server: String,
+    host: String,
     port: u16,
     path: String,
     headers: HashMap<String, String>,
@@ -27,7 +27,7 @@ pub struct Client {
 
 impl Client {
     pub fn new(
-        server: String,
+        host: String,
         port: u16,
         path: String,
         headers: HashMap<String, String>,
@@ -36,7 +36,7 @@ impl Client {
         early_data_header_name: String,
     ) -> Self {
         Self {
-            server,
+            host,
             port,
             path,
             headers,
@@ -53,15 +53,75 @@ impl Client {
             .header("Upgrade", "websocket")
             .header("Sec-WebSocket-Version", "13")
             .header("Sec-WebSocket-Key", generate_key())
-            .uri(format!("ws://{}:{}{}", self.server, self.port, self.path));
+            .uri(format!("ws://{}:{}{}", self.host, self.port, self.path));
         for (k, v) in self.headers.iter() {
             request = request.header(k.as_str(), v.as_str());
+        }
+        if !self
+            .headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("host"))
+        {
+            request = request.header("Host", self.host.as_str());
         }
         if self.max_early_data > 0 {
             // we will replace this field later
             request = request.header(self.early_data_header_name.as_str(), "xxoo");
         }
         request.body(()).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::Client;
+
+    #[test]
+    fn req_adds_default_host_header_when_missing() {
+        let request = Client::new(
+            "sni.example.com".to_owned(),
+            443,
+            "/ws".to_owned(),
+            HashMap::new(),
+            None,
+            0,
+            String::new(),
+        )
+        .req();
+
+        assert_eq!(
+            request
+                .headers()
+                .get("Host")
+                .and_then(|value| value.to_str().ok()),
+            Some("sni.example.com")
+        );
+    }
+
+    #[test]
+    fn req_preserves_explicit_host_header() {
+        let headers =
+            HashMap::from([("Host".to_owned(), "cdn.example.com".to_owned())]);
+        let request = Client::new(
+            "sni.example.com".to_owned(),
+            443,
+            "/ws".to_owned(),
+            headers,
+            None,
+            0,
+            String::new(),
+        )
+        .req();
+
+        assert_eq!(
+            request
+                .headers()
+                .get("Host")
+                .and_then(|value| value.to_str().ok()),
+            Some("cdn.example.com")
+        );
     }
 }
 
@@ -79,17 +139,8 @@ impl Transport for Client {
             );
             Ok(Box::new(early_data_conn))
         } else {
-            let (stream, resp) =
-                client_async_with_config(req, stream, self.ws_config)
-                    .await
-                    .map_err(map_io_error)?;
-
-            if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "invalid response",
-                ));
-            }
+            let stream =
+                handshake::client_upgrade(stream, req, self.ws_config).await?;
             Ok(Box::new(WebsocketConn::from_websocket(stream)))
         }
     }

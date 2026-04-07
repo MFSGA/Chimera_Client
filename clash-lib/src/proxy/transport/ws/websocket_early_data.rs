@@ -7,18 +7,13 @@ use std::{
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures::{Future, ready};
-use http::{HeaderValue, Request, StatusCode};
+use http::{HeaderValue, Request};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_tungstenite::{
-    client_async_with_config, tungstenite::protocol::WebSocketConfig,
-};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
-use crate::{
-    common::errors::{map_io_error, new_io_error},
-    proxy::AnyStream,
-};
+use crate::proxy::AnyStream;
 
-use super::websocket::WebsocketConn;
+use super::{handshake, websocket::WebsocketConn};
 
 pub struct WebsocketEarlyDataConn {
     stream: Option<AnyStream>,
@@ -91,14 +86,7 @@ impl WebsocketEarlyDataConn {
             req: Request<()>,
             config: Option<WebSocketConfig>,
         ) -> std::io::Result<AnyStream> {
-            let (stream, resp) = client_async_with_config(req, stream, config)
-                .await
-                .map_err(map_io_error)?;
-            if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
-                return Err(new_io_error(
-                    "msg: websocket early data handshake failed",
-                ));
-            }
+            let stream = handshake::client_upgrade(stream, req, config).await?;
             // After the handshake finishes, all read/write/close edge cases are
             // delegated to `WebsocketConn` so early-data and regular WS share
             // the same teardown behavior.
