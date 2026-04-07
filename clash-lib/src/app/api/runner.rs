@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use axum::{
-    Router,
+    Router, middleware,
     routing::{get, post},
 };
 
@@ -18,7 +18,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     GlobalState,
     app::{
-        api::{AppState, handlers, ipc},
+        api::{AppState, handlers, ipc, middlewares},
         dispatcher::{self, StatisticsManager},
         dns::{ThreadSafeDNSResolver, config::DNSListenAddr},
         inbound::manager::InboundManager,
@@ -183,6 +183,12 @@ impl Runner for ApiRunner {
                 .nest("/group", handlers::group::routes(outbound_manager.clone()))
                 .nest("/dns", handlers::dns::routes(dns_resolver.clone()))
                 .nest("/rules", handlers::rule::routes(router))
+                .route_layer(middlewares::auth::AuthMiddlewareLayer::new(
+                    controller_cfg.secret.clone().unwrap_or_default(),
+                ))
+                .layer(middleware::from_fn(
+                    middlewares::fix_json_content_type::fix_content_type,
+                ))
                 .layer(cors)
                 .with_state(app_state.clone())
                 .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()));

@@ -28,6 +28,7 @@ use crate::{
 
 mod handlers;
 mod ipc;
+mod middlewares;
 mod runner;
 
 pub use runner::ApiRunner;
