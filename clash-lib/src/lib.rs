@@ -431,11 +431,9 @@ impl RuntimeComponents {
             clear_net_config().await;
         }
 
-        /* todo: we should make the inbound manager shutdown gracefully instead of forcefully killing it,
-         because some inbound handlers (e.g. SOCKS5) may have long-lived connections that need to be closed gracefully.
         if let Err(err) = self.inbound_manager.join().await {
             warn!("failed waiting for inbound manager shutdown: {}", err);
-        } */
+        }
     }
 }
 
