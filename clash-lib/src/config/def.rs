@@ -50,6 +50,12 @@ pub struct TunConfig {
     #[serde(alias = "gateway_v6", alias = "gateway-v6")]
     pub gateway_v6: Option<String>,
     pub routes: Option<Vec<String>>,
+    #[serde(default, alias = "route_exclude_address")]
+    pub route_exclude_address: Option<Vec<String>>,
+    #[serde(default, alias = "inet4_route_exclude_address")]
+    pub inet4_route_exclude_address: Option<Vec<String>>,
+    #[serde(default, alias = "inet6_route_exclude_address")]
+    pub inet6_route_exclude_address: Option<Vec<String>>,
     #[serde(default, alias = "route_all", alias = "auto-route")]
     pub route_all: bool,
     pub mtu: Option<u16>,

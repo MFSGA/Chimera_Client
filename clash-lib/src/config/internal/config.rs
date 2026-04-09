@@ -175,6 +175,7 @@ pub struct TunConfig {
     pub device_id: String,
     pub route_all: bool,
     pub routes: Vec<IpNet>,
+    pub route_exclude_address: Vec<IpNet>,
     pub gateway: Ipv4Net,
     pub gateway_v6: Option<Ipv6Net>,
     pub mtu: Option<u16>,

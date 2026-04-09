@@ -1,9 +1,9 @@
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-use windows::add_route;
-#[cfg(windows)]
 pub use windows::maybe_routes_clean_up;
+#[cfg(windows)]
+use windows::{add_excluded_route, add_route, best_route_for_destination};
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -51,11 +51,34 @@ pub fn maybe_add_routes(cfg: &TunConfig, tun_name: &str) -> std::io::Result<()> 
                  interface"
             );
 
+            #[cfg(not(windows))]
+            if !cfg.route_exclude_address.is_empty() {
+                warn!(
+                    "tun route-exclude-address is currently only implemented on Windows; \
+                     ignoring {} prefixes",
+                    cfg.route_exclude_address.len()
+                );
+            }
+
             #[cfg(not(target_os = "linux"))]
             {
                 use ipnet::IpNet;
 
                 use std::net::Ipv4Addr;
+
+                #[cfg(windows)]
+                let exclude_routes = cfg
+                    .route_exclude_address
+                    .iter()
+                    .filter_map(|route| {
+                        best_route_for_destination(route).transpose().map(
+                            |best_route| {
+                                best_route
+                                    .map(|best_route| (route.clone(), best_route))
+                            },
+                        )
+                    })
+                    .collect::<std::io::Result<Vec<_>>>()?;
 
                 let mut default_routes = vec![
                     IpNet::new(std::net::IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 1)
@@ -86,6 +109,11 @@ pub fn maybe_add_routes(cfg: &TunConfig, tun_name: &str) -> std::io::Result<()> 
 
                 for r in default_routes {
                     add_route(&tun_iface, &r)?;
+                }
+
+                #[cfg(windows)]
+                for (route, best_route) in exclude_routes {
+                    add_excluded_route(&route, &best_route)?;
                 }
 
                 #[cfg(target_os = "windows")]

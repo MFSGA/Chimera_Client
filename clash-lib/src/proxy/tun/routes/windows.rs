@@ -3,24 +3,28 @@ use crate::{
     config::internal::config::TunConfig, defer,
 };
 use anyhow::anyhow;
-use ipnet::IpNet;
+use ipnet::{IpNet, Ipv4Net};
 use std::{
     io,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     ptr::null_mut,
+    sync::{LazyLock, Mutex},
 };
 use tracing::{error, info, warn};
 use windows::{
     Win32::{
-        Foundation::{ERROR_SUCCESS, GetLastError},
+        Foundation::{
+            ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_NOT_FOUND,
+            ERROR_OBJECT_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError,
+        },
         NetworkManagement::{
             IpHelper::{
                 CreateIpForwardEntry2, CreateUnicastIpAddressEntry,
                 DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1,
-                DNS_SETTING_IPV6, DNS_SETTING_NAMESERVER, GetIfEntry2,
-                IP_ADDRESS_PREFIX, InitializeIpForwardEntry, MIB_IF_ROW2,
-                MIB_IPFORWARD_ROW2, MIB_UNICASTIPADDRESS_ROW,
-                SetInterfaceDnsSettings,
+                DNS_SETTING_IPV6, DNS_SETTING_NAMESERVER, DeleteIpForwardEntry2,
+                GetBestRoute2, GetIfEntry2, IP_ADDRESS_PREFIX,
+                InitializeIpForwardEntry, MIB_IF_ROW2, MIB_IPFORWARD_ROW2,
+                MIB_UNICASTIPADDRESS_ROW, SetInterfaceDnsSettings,
             },
             Rras::{
                 RTM_ENTITY_ID, RTM_ENTITY_ID_0, RTM_ENTITY_ID_0_0, RTM_ENTITY_INFO,
@@ -40,20 +44,18 @@ use windows::{
 
 const PROTO_TYPE_UCAST: u32 = 0;
 const PROTO_VENDOR_ID: u32 = 0xFFFF;
+static EXCLUDED_ROUTES: LazyLock<Mutex<Vec<MIB_IPFORWARD_ROW2>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+static IPV4_LINK_LOCAL_NET: LazyLock<Ipv4Net> =
+    LazyLock::new(|| Ipv4Net::new(Ipv4Addr::new(169, 254, 0, 0), 16).unwrap());
+
 #[inline]
 fn protocol_id(typ: u32, vendor_id: u32, protocol_id: u32) -> u32 {
     ((typ & 0x03) << 30) | ((vendor_id & 0x3FFF) << 16) | (protocol_id & 0xFFFF)
 }
 
-pub fn add_route(via: &OutboundInterface, dest: &IpNet) -> io::Result<()> {
-    warn!("adding route to destination {} via {}", dest, via.name);
-    let mut row = MIB_IPFORWARD_ROW2::default();
-    unsafe {
-        InitializeIpForwardEntry(&mut row);
-    }
-
-    row.InterfaceIndex = via.index;
-    row.DestinationPrefix = IP_ADDRESS_PREFIX {
+fn prefix_from_ipnet(dest: &IpNet) -> IP_ADDRESS_PREFIX {
+    IP_ADDRESS_PREFIX {
         Prefix: match dest {
             IpNet::V4(ipv4) => {
                 let mut s = SOCKADDR_INET::default();
@@ -69,7 +71,61 @@ pub fn add_route(via: &OutboundInterface, dest: &IpNet) -> io::Result<()> {
             }
         },
         PrefixLength: dest.prefix_len(),
-    };
+    }
+}
+
+fn probe_addr(dest: &IpNet) -> IpAddr {
+    match dest {
+        IpNet::V4(ipv4) => {
+            let mut probe = u32::from(ipv4.network());
+            if ipv4.prefix_len() < 32 && probe < u32::MAX {
+                probe += 1;
+            }
+            IpAddr::V4(Ipv4Addr::from(probe))
+        }
+        IpNet::V6(ipv6) => {
+            let mut probe = u128::from(ipv6.network());
+            if ipv6.prefix_len() < 128 && probe < u128::MAX {
+                probe += 1;
+            }
+            IpAddr::V6(Ipv6Addr::from(probe))
+        }
+    }
+}
+
+fn sockaddr_from_ip(ip: IpAddr) -> SOCKADDR_INET {
+    match ip {
+        IpAddr::V4(ipv4) => {
+            let mut s = SOCKADDR_INET::default();
+            s.Ipv4.sin_family = AF_INET;
+            s.Ipv4.sin_addr = ipv4.into();
+            s
+        }
+        IpAddr::V6(ipv6) => {
+            let mut s = SOCKADDR_INET::default();
+            s.Ipv6.sin6_family = AF_INET6;
+            s.Ipv6.sin6_addr = ipv6.into();
+            s
+        }
+    }
+}
+
+fn should_skip_best_route_lookup(dest: &IpNet) -> bool {
+    match dest {
+        IpNet::V4(ipv4) => IPV4_LINK_LOCAL_NET.contains(&ipv4.network()),
+        IpNet::V6(_) => false,
+    }
+}
+
+pub fn add_route(via: &OutboundInterface, dest: &IpNet) -> io::Result<()> {
+    warn!("adding route to destination {} via {}", dest, via.name);
+    let mut row = MIB_IPFORWARD_ROW2::default();
+    unsafe {
+        InitializeIpForwardEntry(&mut row);
+    }
+
+    row.InterfaceIndex = via.index;
+    row.DestinationPrefix = prefix_from_ipnet(dest);
     // May be too harsh to set zero
     let metric = 0;
     let next_hop: SocketAddr = if dest.addr().is_ipv4() {
@@ -100,6 +156,90 @@ pub fn add_route(via: &OutboundInterface, dest: &IpNet) -> io::Result<()> {
             );
         })
         .map_err(new_io_error)
+}
+
+pub fn best_route_for_destination(
+    dest: &IpNet,
+) -> io::Result<Option<MIB_IPFORWARD_ROW2>> {
+    if should_skip_best_route_lookup(dest) {
+        error!(
+            "skipping best-route lookup for {}: IPv4 link-local prefixes are not \
+             stable route-exclude candidates on Windows; keep rule-level DIRECT \
+             handling instead",
+            dest
+        );
+        return Ok(None);
+    }
+
+    let mut row = MIB_IPFORWARD_ROW2::default();
+    let mut best_source_address = SOCKADDR_INET::default();
+    let destination = sockaddr_from_ip(probe_addr(dest));
+
+    unsafe {
+        GetBestRoute2(
+            None,
+            0,
+            None,
+            &destination,
+            0,
+            &mut row,
+            &mut best_source_address,
+        )
+    }
+    .to_hresult()
+    .ok()
+    .inspect_err(|e| {
+        error!("failed to resolve best route for {}: {}", dest, e);
+    })
+    .map_err(new_io_error)?;
+
+    Ok(Some(row))
+}
+
+pub fn add_excluded_route(
+    dest: &IpNet,
+    best_route: &MIB_IPFORWARD_ROW2,
+) -> io::Result<()> {
+    warn!(
+        "adding excluded route {} via interface index {}",
+        dest, best_route.InterfaceIndex
+    );
+
+    let mut row = MIB_IPFORWARD_ROW2::default();
+    unsafe {
+        InitializeIpForwardEntry(&mut row);
+    }
+
+    row.InterfaceLuid = best_route.InterfaceLuid;
+    row.InterfaceIndex = best_route.InterfaceIndex;
+    row.DestinationPrefix = prefix_from_ipnet(dest);
+    row.NextHop = best_route.NextHop;
+    row.Metric = best_route.Metric;
+
+    let result = unsafe { CreateIpForwardEntry2(&row) };
+    if result == ERROR_SUCCESS {
+        EXCLUDED_ROUTES.lock().unwrap().push(row);
+        info!(
+            "excluded route {} now bypasses tun via interface index {}",
+            dest, best_route.InterfaceIndex
+        );
+        return Ok(());
+    }
+
+    if result == ERROR_ALREADY_EXISTS || result == ERROR_OBJECT_ALREADY_EXISTS {
+        warn!(
+            "excluded route {} already exists on interface index {}, leaving it unchanged",
+            dest, best_route.InterfaceIndex
+        );
+        return Ok(());
+    }
+
+    let err = result.to_hresult();
+    error!(
+        "failed to add excluded route {} via interface index {}: {}",
+        dest, best_route.InterfaceIndex, err
+    );
+    Err(std::io::Error::other(err.message().to_string()))
 }
 
 fn get_guid(iface: &OutboundInterface) -> Option<GUID> {
@@ -239,7 +379,43 @@ pub fn add_address(
     }
 }
 pub fn maybe_routes_clean_up(_: &TunConfig) -> std::io::Result<()> {
+    let routes = {
+        let mut guard = EXCLUDED_ROUTES.lock().unwrap();
+        std::mem::take(&mut *guard)
+    };
+
+    for route in routes.into_iter().rev() {
+        let result = unsafe { DeleteIpForwardEntry2(&route) };
+        if result == ERROR_SUCCESS
+            || result == ERROR_NOT_FOUND
+            || result == ERROR_FILE_NOT_FOUND
+        {
+            continue;
+        }
+
+        error!(
+            "failed to remove excluded route on interface index {}: {}",
+            route.InterfaceIndex,
+            result.to_hresult()
+        );
+    }
+
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_skip_best_route_lookup;
+    use ipnet::IpNet;
+
+    #[test]
+    fn skip_ipv4_link_local_prefix_from_best_route_lookup() {
+        let link_local: IpNet = "169.254.0.0/16".parse().unwrap();
+        let lan: IpNet = "192.168.0.0/16".parse().unwrap();
+
+        assert!(should_skip_best_route_lookup(&link_local));
+        assert!(!should_skip_best_route_lookup(&lan));
+    }
 }
 
 /// Add a route to the routing table.
