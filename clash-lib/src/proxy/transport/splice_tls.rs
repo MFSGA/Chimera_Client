@@ -98,6 +98,15 @@ impl SplicableTlsStream {
         );
         self.write_spliced = true;
     }
+
+    fn should_recover_from_reality_read_error(&self, err: &io::Error) -> bool {
+        should_recover_from_reality_read_error(
+            err.kind(),
+            self.tls.is_reality(),
+            self.write_spliced,
+            self.read_spliced,
+        )
+    }
 }
 
 impl AsyncRead for SplicableTlsStream {
@@ -126,7 +135,28 @@ impl AsyncRead for SplicableTlsStream {
             let (io, _) = this.tls.get_mut();
             Pin::new(io).poll_read(cx, buf)
         } else {
-            Pin::new(&mut this.tls).poll_read(cx, buf)
+            match Pin::new(&mut this.tls).poll_read(cx, buf) {
+                Poll::Ready(Err(err))
+                    if this.should_recover_from_reality_read_error(&err) =>
+                {
+                    debug!(
+                        "SplicableTlsStream: recovering from REALITY read error after write splice: {}",
+                        err
+                    );
+                    this.activate_read_splice();
+
+                    if !this.leftover.is_empty() {
+                        let amt = this.leftover.len().min(buf.remaining());
+                        buf.put_slice(&this.leftover[..amt]);
+                        this.leftover.advance(amt);
+                        Poll::Ready(Ok(()))
+                    } else {
+                        let (io, _) = this.tls.get_mut();
+                        Pin::new(io).poll_read(cx, buf)
+                    }
+                }
+                other => other,
+            }
         }
     }
 }
@@ -196,5 +226,63 @@ impl AsyncWrite for SplicableTlsStream {
         } else {
             Pin::new(&mut this.tls).poll_shutdown(cx)
         }
+    }
+}
+
+fn should_recover_from_reality_read_error(
+    err_kind: io::ErrorKind,
+    is_reality: bool,
+    write_spliced: bool,
+    read_spliced: bool,
+) -> bool {
+    is_reality
+        && write_spliced
+        && !read_spliced
+        && err_kind == io::ErrorKind::InvalidData
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_recover_from_reality_read_error;
+    use std::io;
+
+    #[test]
+    fn recovers_only_for_reality_invalid_data_after_write_splice() {
+        assert!(should_recover_from_reality_read_error(
+            io::ErrorKind::InvalidData,
+            true,
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn does_not_recover_before_write_splice() {
+        assert!(!should_recover_from_reality_read_error(
+            io::ErrorKind::InvalidData,
+            true,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn does_not_recover_after_read_splice_is_active() {
+        assert!(!should_recover_from_reality_read_error(
+            io::ErrorKind::InvalidData,
+            true,
+            true,
+            true,
+        ));
+    }
+
+    #[test]
+    fn does_not_recover_non_invalid_data_errors() {
+        assert!(!should_recover_from_reality_read_error(
+            io::ErrorKind::ConnectionReset,
+            true,
+            true,
+            false,
+        ));
     }
 }
