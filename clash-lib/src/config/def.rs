@@ -297,6 +297,8 @@ pub struct DNS {
     pub enhanced_mode: DNSMode,
     /// DNS upstream servers
     pub nameserver: Vec<String>,
+    /// DNS upstreams dedicated to resolving proxy node hostnames
+    pub proxy_server_nameserver: Vec<String>,
     /// Fallback DNS upstream servers
     pub fallback: Vec<String>,
     /// Fallback DNS filter

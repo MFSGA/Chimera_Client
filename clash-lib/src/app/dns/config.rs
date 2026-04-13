@@ -54,6 +54,7 @@ pub struct DNSConfig {
     pub enable: bool,
     pub ipv6: bool,
     pub nameserver: Vec<NameServer>,
+    pub proxy_server_nameserver: Vec<NameServer>,
     pub fallback: Vec<NameServer>,
     pub fallback_filter: FallbackFilter,
     pub listen: DNSListenAddr,
@@ -294,6 +295,8 @@ impl TryFrom<&crate::config::def::Config> for DNSConfig {
         }
 
         let nameservers = DNSConfig::parse_nameserver(&dc.nameserver)?;
+        let proxy_server_nameserver =
+            DNSConfig::parse_nameserver(&dc.proxy_server_nameserver)?;
         let fallback = DNSConfig::parse_nameserver(&dc.fallback)?;
         let nameserver_policy =
             DNSConfig::parse_nameserver_policy(&dc.nameserver_policy)?;
@@ -326,6 +329,7 @@ impl TryFrom<&crate::config::def::Config> for DNSConfig {
             ipv6: c.ipv6 && dc.ipv6,
             fw_mark: c.routing_mark,
             nameserver: nameservers,
+            proxy_server_nameserver,
             fallback,
             fallback_filter: dc.fallback_filter.clone().into(),
             listen: dc
