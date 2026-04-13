@@ -11,7 +11,7 @@ use crate::{
             BoxedChainedDatagram, BoxedChainedStream, ChainedDatagram,
             ChainedDatagramWrapper, ChainedStream, ChainedStreamWrapper,
         },
-        dns::ThreadSafeDNSResolver,
+        dns::{self, ThreadSafeDNSResolver},
     },
     config::internal::proxy::OutboundSocks5,
     impl_default_connector,
@@ -90,6 +90,7 @@ impl Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> std::io::Result<Socks5Datagram> {
+        let resolver = dns::get_control_plane_resolver().await.unwrap_or(resolver);
         let mut stream = if let Some(tls_client) = self.opts.tls_client.as_ref() {
             tls_client.proxy_stream(stream).await?
         } else {

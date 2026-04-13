@@ -10,7 +10,7 @@ use serde_yaml::Value;
 use crate::{
     Error,
     app::{
-        dns::ThreadSafeDNSResolver,
+        dns::{self, ThreadSafeDNSResolver},
         outbound::utils::proxy_groups_dag_sort,
         profile::ThreadSafeCacheFile,
         remote_content_manager::{
@@ -107,7 +107,12 @@ impl OutboundManager {
         // let proxy_names_ref = proxy_names;
         let provider_registry = HashMap::new();
         let selector_control = HashMap::new();
-        let proxy_manager = ProxyManager::new(dns_resolver.clone(), fw_mark);
+        let proxy_manager = ProxyManager::new(
+            dns::get_control_plane_resolver()
+                .await
+                .unwrap_or(dns_resolver.clone()),
+            fw_mark,
+        );
 
         let mut m = Self {
             registry,

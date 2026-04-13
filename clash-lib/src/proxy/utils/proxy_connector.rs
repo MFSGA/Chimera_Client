@@ -13,7 +13,7 @@ use crate::{
             ChainedDatagram, ChainedDatagramWrapper, ChainedStream,
             ChainedStreamWrapper,
         },
-        dns::ThreadSafeDNSResolver,
+        dns::{self, ThreadSafeDNSResolver},
         net::OutboundInterface,
     },
     common::errors::new_io_error,
@@ -72,6 +72,7 @@ impl RemoteConnector for DirectConnector {
         iface: Option<&OutboundInterface>,
         #[cfg(target_os = "linux")] so_mark: Option<u32>,
     ) -> std::io::Result<AnyStream> {
+        let resolver = dns::get_control_plane_resolver().await.unwrap_or(resolver);
         let dial_addr = resolver
             .resolve(address, false)
             .await
@@ -96,6 +97,7 @@ impl RemoteConnector for DirectConnector {
         iface: Option<&OutboundInterface>,
         #[cfg(target_os = "linux")] so_mark: Option<u32>,
     ) -> std::io::Result<AnyOutboundDatagram> {
+        let resolver = dns::get_control_plane_resolver().await.unwrap_or(resolver);
         let dgram = new_udp_socket(
             src,
             iface,

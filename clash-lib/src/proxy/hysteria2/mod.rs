@@ -43,7 +43,7 @@ use crate::{
             BoxedChainedDatagram, BoxedChainedStream, ChainedDatagram,
             ChainedDatagramWrapper, ChainedStream, ChainedStreamWrapper,
         },
-        dns::ThreadSafeDNSResolver,
+        dns::{self, ThreadSafeDNSResolver},
     },
     common::tls::{DefaultTlsVerifier, GLOBAL_ROOT_STORE},
     proxy::{
@@ -449,11 +449,8 @@ impl Handler {
                 }
             }
         } else if let Some(port_gen) = self.opts.ports.as_ref() {
-            let udp_hop = udp_hop::UdpHop::new(
-                server_socket_addr.port(),
-                port_gen.clone(),
-                None,
-            )?;
+            let udp_hop =
+                udp_hop::UdpHop::new(server_socket_addr.port(), port_gen.clone(), None)?;
             quinn::Endpoint::new_with_abstract_socket(
                 self.ep_config.clone(),
                 None,
@@ -567,6 +564,7 @@ impl Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> std::io::Result<Arc<HysteriaConnection>> {
+        let resolver = dns::get_control_plane_resolver().await.unwrap_or(resolver);
         let mut quinn_conn_lock = self.conn.lock().await;
 
         match (*quinn_conn_lock).as_ref().filter(|s| {
