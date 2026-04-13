@@ -1,4 +1,5 @@
 use crate::{Packet, stack::IfaceEvent};
+use log::trace;
 use smoltcp::{
     phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
     time::Instant,
@@ -53,9 +54,9 @@ impl Device for NetstackDevice {
         {
             let rx_token = RxTokenImpl { packet };
             let tx_token = TxTokenImpl { tx_sender: permit };
-            self.iface_notifier
-                .send(IfaceEvent::DeviceReady)
-                .expect("Failed to notify iface event");
+            if let Err(e) = self.iface_notifier.send(IfaceEvent::DeviceReady) {
+                trace!("device ready notifier dropped: {e}");
+            }
             return Some((rx_token, tx_token));
         }
 

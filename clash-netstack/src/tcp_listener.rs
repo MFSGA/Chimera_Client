@@ -12,11 +12,12 @@ use smoltcp::{
 use std::{
     collections::HashMap,
     net::SocketAddr,
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant as StdInstant},
 };
 use tokio::sync::mpsc;
 
@@ -34,6 +35,85 @@ const SYN_TRACK_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 /// so 10 000 entries ≈ 1 MiB — negligible compared to the per-connection
 /// socket buffers that are only allocated once the SYN is accepted.
 const SYN_TRACK_MAX: usize = 10_000;
+
+#[derive(Clone, Debug)]
+struct LastTcpPacketMeta {
+    src_addr: SocketAddr,
+    dst_addr: SocketAddr,
+    seq: u32,
+    ack: Option<u32>,
+    syn: bool,
+    ack_flag: bool,
+    fin: bool,
+    rst: bool,
+    psh: bool,
+    payload_len: usize,
+    window_len: u16,
+}
+
+impl std::fmt::Display for LastTcpPacketMeta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} -> {} seq={} ack={:?} flags={}{}{}{}{} payload_len={} window={}",
+            self.src_addr,
+            self.dst_addr,
+            self.seq,
+            self.ack,
+            if self.syn { "S" } else { "-" },
+            if self.ack_flag { "A" } else { "-" },
+            if self.fin { "F" } else { "-" },
+            if self.rst { "R" } else { "-" },
+            if self.psh { "P" } else { "-" },
+            self.payload_len,
+            self.window_len
+        )
+    }
+}
+
+fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(msg) => *msg,
+        Err(payload) => match payload.downcast::<&'static str>() {
+            Ok(msg) => (*msg).to_string(),
+            Err(_) => "unknown panic payload".to_string(),
+        },
+    }
+}
+
+fn mark_all_streams_closed(
+    socket_maps: &HashMap<smoltcp::iface::SocketHandle, Arc<TcpStreamHandle>>,
+) {
+    for socket_control in socket_maps.values() {
+        socket_control.read_closed.store(true, Ordering::Release);
+        socket_control.write_closed.store(true, Ordering::Release);
+        socket_control.recv_waker.wake();
+        socket_control.send_waker.wake();
+    }
+}
+
+fn record_last_tcp_packet(
+    sink: &Arc<Mutex<Option<LastTcpPacketMeta>>>,
+    packet: &TcpPacket<&[u8]>,
+    src_addr: SocketAddr,
+    dst_addr: SocketAddr,
+) {
+    if let Ok(mut guard) = sink.lock() {
+        *guard = Some(LastTcpPacketMeta {
+            src_addr,
+            dst_addr,
+            seq: packet.seq_number().0 as u32,
+            ack: packet.ack().then(|| packet.ack_number().0 as u32),
+            syn: packet.syn(),
+            ack_flag: packet.ack(),
+            fin: packet.fin(),
+            rst: packet.rst(),
+            psh: packet.psh(),
+            payload_len: packet.payload().len(),
+            window_len: packet.window_len(),
+        });
+    }
+}
 
 pub(crate) struct TcpStreamHandle {
     pub(crate) recv_buffer: LockFreeRingBuffer,
@@ -87,20 +167,13 @@ impl Drop for TcpListener {
 }
 
 impl TcpListener {
-    pub fn new(
-        inbound: mpsc::UnboundedReceiver<Packet>,
-        outbound: mpsc::Sender<Packet>,
-    ) -> Self {
-        // the global bus that drives the iface polling
-        let (iface_notifier, iface_notifier_rx) = mpsc::unbounded_channel();
-
+    fn build_interface(device: &mut NetstackDevice) -> Interface {
         let mut config =
             smoltcp::iface::Config::new(smoltcp::wire::HardwareAddress::Ip);
         config.random_seed = rand::random();
-        let mut device = NetstackDevice::new(outbound, iface_notifier.clone());
         let mut iface = smoltcp::iface::Interface::new(
             config,
-            &mut device,
+            device,
             smoltcp::time::Instant::now(),
         );
         iface.set_any_ip(true);
@@ -115,28 +188,44 @@ impl TcpListener {
             ));
         });
 
-        iface
+        if let Err(err) = iface
             .routes_mut()
             .add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 0, 1))
-            .expect("Failed to add default IPv4 route");
+        {
+            warn!("failed to add default IPv4 route to smoltcp interface: {err}");
+        }
+        if let Err(err) = iface.routes_mut().add_default_ipv6_route(
+            smoltcp::wire::Ipv6Address::new(0x0, 0xfac, 0, 0, 0, 0, 0, 1),
+        ) {
+            warn!("failed to add default IPv6 route to smoltcp interface: {err}");
+        }
+
         iface
-            .routes_mut()
-            .add_default_ipv6_route(smoltcp::wire::Ipv6Address::new(
-                0x0, 0xfac, 0, 0, 0, 0, 0, 1,
-            ))
-            .expect("Failed to add default IPv6 route");
+    }
+
+    pub fn new(
+        inbound: mpsc::UnboundedReceiver<Packet>,
+        outbound: mpsc::Sender<Packet>,
+    ) -> Self {
+        // the global bus that drives the iface polling
+        let (iface_notifier, iface_notifier_rx) = mpsc::unbounded_channel();
+        let mut device = NetstackDevice::new(outbound, iface_notifier.clone());
+        let mut iface = Self::build_interface(&mut device);
 
         let (socket_stream_emitter, socket_stream) =
             mpsc::unbounded_channel::<TcpStream>();
 
         let socket_stream_waker = Arc::new(AtomicWaker::new());
+        let last_tcp_packet = Arc::new(Mutex::new(None));
 
         let waker = socket_stream_waker.clone();
+        let poll_packet_last_tcp_packet = last_tcp_packet.clone();
+        let poll_socket_last_tcp_packet = last_tcp_packet.clone();
         let task_handle = tokio::spawn(async move {
             let rv = tokio::select! {
                 biased;
-                rv = Self::poll_packets(inbound, device.create_injector(), iface_notifier, socket_stream_emitter, waker) => rv,
-                rv = Self::poll_sockets(&mut iface, &mut device, iface_notifier_rx) => rv,
+                rv = Self::poll_packets(inbound, device.create_injector(), iface_notifier, socket_stream_emitter, waker, poll_packet_last_tcp_packet) => rv,
+                rv = Self::poll_sockets(&mut iface, &mut device, iface_notifier_rx, poll_socket_last_tcp_packet) => rv,
             };
             if let Err(e) = rv {
                 error!("Error in TCP listener: {e}");
@@ -156,6 +245,7 @@ impl TcpListener {
         iface_notifier: mpsc::UnboundedSender<IfaceEvent<'static>>,
         tcp_stream_emitter: mpsc::UnboundedSender<TcpStream>,
         tcp_stream_waker: Arc<AtomicWaker>,
+        last_tcp_packet: Arc<Mutex<Option<LastTcpPacketMeta>>>,
     ) -> std::io::Result<()> {
         let mut packet_buf = Vec::with_capacity(32);
         let mut syn_tracker: HashMap<(SocketAddr, SocketAddr), std::time::Instant> =
@@ -222,6 +312,12 @@ impl TcpListener {
 
                 let src_addr = SocketAddr::new(src_ip, src_port);
                 let dst_addr = SocketAddr::new(dst_ip, dst_port);
+                record_last_tcp_packet(
+                    &last_tcp_packet,
+                    &packet,
+                    src_addr,
+                    dst_addr,
+                );
 
                 if packet.syn() && !packet.ack() {
                     let conn_tuple = (src_addr, dst_addr);
@@ -339,6 +435,7 @@ impl TcpListener {
         iface: &mut Interface,
         device: &mut NetstackDevice,
         mut notifier_rx: mpsc::UnboundedReceiver<IfaceEvent<'_>>,
+        last_tcp_packet: Arc<Mutex<Option<LastTcpPacketMeta>>>,
     ) -> std::io::Result<()> {
         // Create a socket set for TCP sockets
         let mut sockets = smoltcp::iface::SocketSet::new(vec![]);
@@ -347,6 +444,8 @@ impl TcpListener {
             Arc<TcpStreamHandle>,
         > = HashMap::new();
         let mut next_poll = None;
+        let mut panic_window_start = StdInstant::now();
+        let mut panic_count = 0usize;
 
         loop {
             trace!(
@@ -374,7 +473,42 @@ impl TcpListener {
             if should_poll_now {
                 trace!("Woke up to poll sockets");
 
-                iface.poll(now, device, &mut sockets);
+                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
+                    iface.poll(now, device, &mut sockets);
+                })) {
+                    let panic_message = panic_payload_to_string(payload);
+                    let active_socket_count = socket_maps.len();
+                    let last_packet =
+                        last_tcp_packet.lock().ok().and_then(|guard| guard.clone());
+                    mark_all_streams_closed(&socket_maps);
+                    socket_maps.clear();
+                    sockets = smoltcp::iface::SocketSet::new(vec![]);
+                    *iface = Self::build_interface(device);
+                    next_poll = None;
+
+                    let now = StdInstant::now();
+                    if now.duration_since(panic_window_start)
+                        > Duration::from_secs(10)
+                    {
+                        panic_window_start = now;
+                        panic_count = 0;
+                    }
+                    panic_count += 1;
+                    let last_packet_log = last_packet
+                        .as_ref()
+                        .map(std::string::ToString::to_string)
+                        .unwrap_or_else(|| "<none>".to_string());
+                    error!(
+                        "smoltcp iface.poll panicked: {panic_message}; active sockets: {}; last tcp packet: {}",
+                        active_socket_count, last_packet_log
+                    );
+                    if panic_count >= 5 {
+                        return Err(std::io::Error::other(format!(
+                            "smoltcp iface.poll panicked repeatedly ({panic_count} times in 10s): {panic_message}"
+                        )));
+                    }
+                    continue;
+                }
 
                 // Poll the sockets for new connections or data
                 for (socket_handle, socket_control) in socket_maps.iter() {

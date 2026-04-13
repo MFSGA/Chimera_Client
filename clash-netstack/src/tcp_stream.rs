@@ -48,6 +48,25 @@ impl TcpStream {
         let (r, w) = tokio::io::split(self);
         (r, w)
     }
+
+    fn mark_stack_closed(&self) {
+        self.handle.read_closed.store(true, Ordering::Release);
+        self.handle.write_closed.store(true, Ordering::Release);
+        self.handle.recv_waker.wake();
+        self.handle.send_waker.wake();
+    }
+
+    fn notify_stack_ready(&self) -> std::io::Result<()> {
+        self.stack_notifier
+            .send(IfaceEvent::TcpSocketReady)
+            .map_err(|e| {
+                self.mark_stack_closed();
+                Error::new(
+                    ErrorKind::BrokenPipe,
+                    format!("failed to notify TCP socket ready: {e}"),
+                )
+            })
+    }
 }
 
 impl std::fmt::Debug for TcpStream {
@@ -100,9 +119,11 @@ impl tokio::io::AsyncRead for TcpStream {
         let n = read_buf.dequeue_slice(recv_buf);
         buf.advance(n);
 
-        self.stack_notifier
-            .send(IfaceEvent::TcpSocketReady)
-            .expect("Failed to notify TCP socket ready");
+        if let Err(e) = self.notify_stack_ready() {
+            trace!(
+                "TcpStream::poll_read: stack notifier unavailable after read: {e}"
+            );
+        }
         trace!("TcpStream::poll_read: (proxy)read {n} bytes from recv buffer");
 
         Poll::Ready(Ok(()))
@@ -129,9 +150,9 @@ impl tokio::io::AsyncWrite for TcpStream {
         if send_buf.is_full() {
             trace!("TcpStream::poll_write: send buffer is full, waiting for space");
             self.handle.send_waker.register(cx.waker());
-            self.stack_notifier
-                .send(IfaceEvent::TcpSocketReady)
-                .expect("Failed to notify TCP socket ready");
+            if let Err(e) = self.notify_stack_ready() {
+                return Poll::Ready(Err(e));
+            }
 
             if self.handle.write_closed.load(Ordering::Acquire)
                 || self.handle.write_shutdown.load(Ordering::Acquire)
@@ -150,9 +171,11 @@ impl tokio::io::AsyncWrite for TcpStream {
 
         let n = send_buf.enqueue_slice(buf);
 
-        self.stack_notifier
-            .send(IfaceEvent::TcpSocketReady)
-            .expect("Failed to notify TCP socket ready");
+        if let Err(e) = self.notify_stack_ready() {
+            trace!(
+                "TcpStream::poll_write: stack notifier unavailable after enqueue: {e}"
+            );
+        }
         trace!("TcpStream::poll_write: (proxy)write {n} bytes to send buffer");
 
         Poll::Ready(Ok(n))
@@ -162,10 +185,10 @@ impl tokio::io::AsyncWrite for TcpStream {
         self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<()>> {
-        self.stack_notifier
-            .send(IfaceEvent::TcpSocketReady)
-            .expect("Failed to notify TCP socket ready");
-        Poll::Ready(Ok(()))
+        match self.notify_stack_ready() {
+            Ok(()) => Poll::Ready(Ok(())),
+            Err(e) => Poll::Ready(Err(e)),
+        }
     }
 
     fn poll_shutdown(
@@ -245,5 +268,37 @@ mod tests {
         assert!(
             matches!(result, Poll::Ready(Err(err)) if err.kind() == ErrorKind::BrokenPipe)
         );
+    }
+
+    #[test]
+    fn poll_flush_returns_broken_pipe_when_notifier_closed() {
+        let (mut stream, rx) = build_stream();
+        drop(rx);
+        let mut cx = noop_cx();
+
+        let result = Pin::new(&mut stream).poll_flush(&mut cx);
+
+        assert!(
+            matches!(result, Poll::Ready(Err(err)) if err.kind() == ErrorKind::BrokenPipe)
+        );
+        assert!(stream.handle.read_closed.load(Ordering::Acquire));
+        assert!(stream.handle.write_closed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn poll_read_returns_buffered_data_when_notifier_closed() {
+        let (mut stream, rx) = build_stream();
+        drop(rx);
+        stream.handle.recv_buffer.enqueue_slice(b"ok");
+        let mut cx = noop_cx();
+        let mut bytes = [0u8; 8];
+        let mut buf = tokio::io::ReadBuf::new(&mut bytes);
+
+        let result = Pin::new(&mut stream).poll_read(&mut cx, &mut buf);
+
+        assert!(matches!(result, Poll::Ready(Ok(()))));
+        assert_eq!(buf.filled(), b"ok");
+        assert!(stream.handle.read_closed.load(Ordering::Acquire));
+        assert!(stream.handle.write_closed.load(Ordering::Acquire));
     }
 }
