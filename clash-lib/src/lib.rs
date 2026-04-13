@@ -41,10 +41,9 @@ use crate::{
         },
     },
     config::{
-        def::{self, LogLevel},
+        def::{self, DNSMode, LogLevel},
         internal::{InternalConfig, proxy::OutboundProxy},
     },
-    proxy::OutboundHandler,
     runner::Runner,
 };
 
@@ -499,9 +498,27 @@ async fn create_components(
                 .collect(),
         ));
 
-    let client =
-        new_http_client(system_resolver.clone(), Some(outbound_registry.clone()))
-            .map_err(|x| Error::DNSError(x.to_string()))?;
+    let control_plane_dns_resolver = build_auxiliary_dns_resolver(
+        if config.dns.proxy_server_nameserver.is_empty() {
+            config.dns.nameserver.clone()
+        } else {
+            config.dns.proxy_server_nameserver.clone()
+        },
+        config.dns.default_nameserver.clone(),
+        config.general.ipv6,
+        config.general.routing_mask,
+        cache_store.clone(),
+        outbound_registry.clone(),
+        system_resolver.clone(),
+    )
+    .await;
+    dns::set_control_plane_resolver(control_plane_dns_resolver.clone()).await;
+
+    let client = new_http_client(
+        control_plane_dns_resolver.clone(),
+        Some(outbound_registry.clone()),
+    )
+    .map_err(|x| Error::DNSError(x.to_string()))?;
 
     debug!("initializing dns resolver");
     // Clone the dns.listen for the DNS Server later before we consume the config
@@ -746,4 +763,49 @@ pub fn shutdown() -> bool {
         warn!("Shutdown token not initialized, cannot shutdown");
         false
     }
+}
+
+async fn build_auxiliary_dns_resolver(
+    nameserver: Vec<dns::config::NameServer>,
+    default_nameserver: Vec<dns::config::NameServer>,
+    ipv6: bool,
+    fw_mark: Option<u32>,
+    cache_store: profile::ThreadSafeCacheFile,
+    outbounds: crate::proxy::utils::OutboundHandlerRegistry,
+    system_resolver: Arc<SystemResolver>,
+) -> ThreadSafeDNSResolver {
+    let effective_nameserver = if nameserver.is_empty() {
+        default_nameserver.clone()
+    } else {
+        nameserver
+    };
+
+    if effective_nameserver.is_empty() {
+        return system_resolver;
+    }
+
+    let cfg = dns::DNSConfig {
+        enable: true,
+        ipv6,
+        nameserver: effective_nameserver,
+        proxy_server_nameserver: Vec::new(),
+        fallback: Vec::new(),
+        fallback_filter: Default::default(),
+        listen: DNSListenAddr::default(),
+        enhance_mode: DNSMode::Normal,
+        default_nameserver,
+        fake_ip_range: "198.18.0.1/16"
+            .parse()
+            .expect("static fake-ip-range must parse"),
+        fake_ip_filter: Vec::new(),
+        reserved_ip_addrs: Vec::new(),
+        store_fake_ip: false,
+        store_smart_stats: false,
+        hosts: None,
+        nameserver_policy: HashMap::new(),
+        edns_client_subnet: None,
+        fw_mark,
+    };
+
+    dns::new_resolver(cfg, Some(cache_store), None, outbounds).await
 }
