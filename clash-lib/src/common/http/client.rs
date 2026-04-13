@@ -4,6 +4,8 @@ use futures::FutureExt;
 use hyper_util::rt::TokioIo;
 use tracing::{trace, warn};
 
+#[cfg(feature = "tun")]
+use crate::app::net::DEFAULT_OUTBOUND_INTERFACE;
 use crate::{
     app::dns::ThreadSafeDNSResolver,
     config::internal::proxy::PROXY_DIRECT,
@@ -118,10 +120,16 @@ impl HttpClient {
         };
 
         trace!(outbound = %outbound.name(), "using outbound");
+        #[cfg(feature = "tun")]
+        let default_outbound_interface =
+            DEFAULT_OUTBOUND_INTERFACE.read().await.clone();
+        #[cfg(not(feature = "tun"))]
+        let default_outbound_interface = None;
         let sess = Session {
             network: crate::session::Network::Tcp,
             typ: crate::session::Type::Ignore,
             destination: crate::session::SocksAddr::Domain(host.clone(), port),
+            iface: default_outbound_interface,
             ..Default::default()
         };
         let stream = tokio::time::timeout(
