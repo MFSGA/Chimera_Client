@@ -120,7 +120,12 @@ pub async fn new_tcp_stream(
         must_bind_socket_on_interface(&socket, iface, family)?;
         trace!(iface = ?iface, "tcp socket prepared for outbound interface");
     }
+    #[cfg(target_os = "android")]
     maybe_protect_socket(&socket)?;
+    #[cfg(not(target_os = "android"))]
+    if iface.is_none() {
+        maybe_protect_socket(&socket)?;
+    }
 
     #[cfg(not(target_os = "android"))]
     #[cfg(target_os = "linux")]
@@ -228,8 +233,62 @@ pub async fn new_udp_socket(
         socket.set_mark(so_mark)?;
     }
 
+    #[cfg(target_os = "android")]
+    maybe_protect_socket(&socket)?;
+    #[cfg(not(target_os = "android"))]
+    if iface.is_none() {
+        maybe_protect_socket(&socket)?;
+    }
+
     socket.set_broadcast(true)?;
     socket.set_nonblocking(true)?;
 
     UdpSocket::from_std(socket.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::new_udp_socket;
+    use crate::proxy::utils::{
+        SocketProtector, clear_socket_protector, set_socket_protector,
+    };
+
+    struct CountingProtector {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl SocketProtector for CountingProtector {
+        fn protect_socket_handle(&self, _handle: usize) -> std::io::Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_socket_invokes_socket_protector() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        set_socket_protector(Arc::new(CountingProtector {
+            calls: calls.clone(),
+        }));
+
+        let family_hint = Some("127.0.0.1:0".parse().expect("valid socket addr"));
+
+        #[cfg(target_os = "linux")]
+        let _socket = new_udp_socket(None, None, None, family_hint)
+            .await
+            .expect("udp socket should be created");
+
+        #[cfg(not(target_os = "linux"))]
+        let _socket = new_udp_socket(None, None, family_hint)
+            .await
+            .expect("udp socket should be created");
+
+        clear_socket_protector();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 }

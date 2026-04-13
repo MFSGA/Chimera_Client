@@ -9,7 +9,7 @@ use tracing::trace;
 use crate::app::net::OutboundInterface;
 
 pub trait SocketProtector: Send + Sync {
-    fn protect_socket_fd(&self, fd: i32) -> io::Result<()>;
+    fn protect_socket_handle(&self, handle: usize) -> io::Result<()>;
 }
 
 static SOCKET_PROTECTOR: LazyLock<RwLock<Option<Arc<dyn SocketProtector>>>> =
@@ -37,9 +37,9 @@ pub(crate) fn maybe_protect_socket(socket: &socket2::Socket) -> io::Result<()> {
         return Ok(());
     };
 
-    let fd = socket.as_raw_fd();
-    trace!(fd, "protecting android socket before connect");
-    protector.protect_socket_fd(fd)
+    let handle = socket.as_raw_fd() as usize;
+    trace!(handle, "protecting android socket before connect");
+    protector.protect_socket_handle(handle)
 }
 
 pub(crate) fn must_bind_socket_on_interface(
