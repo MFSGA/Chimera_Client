@@ -8,9 +8,23 @@ use crate::{
     proxy::datagram::UdpPacket,
     session::{Network, Session, Type},
 };
-use futures::{Sink, Stream, ready};
-use std::{sync::Arc, task::Poll};
+use futures::{Sink, Stream, future::BoxFuture, ready};
+use std::{fmt, sync::Arc, task::Poll};
 use tracing::{debug, trace, warn};
+
+type PendingPermitFuture = BoxFuture<
+    'static,
+    Result<
+        tokio::sync::mpsc::OwnedPermit<UdpPacket>,
+        tokio::sync::mpsc::error::SendError<()>,
+    >,
+>;
+
+enum FlushState {
+    Pending,
+    Ready(tokio::sync::mpsc::OwnedPermit<UdpPacket>),
+    Disconnected,
+}
 
 pub(crate) async fn handle_inbound_datagram(
     socket: watfaq_netstack::UdpSocket,
@@ -183,12 +197,12 @@ pub(crate) async fn handle_inbound_datagram(
     let _ = futures::future::join(fut1, fut2).await;
 }
 
-#[derive(Debug)]
 pub struct TunDatagram {
     rx: tokio::sync::mpsc::Receiver<UdpPacket>,
     tx: tokio::sync::mpsc::Sender<UdpPacket>,
 
     pkt: Option<UdpPacket>,
+    pending_permit: std::sync::Mutex<Option<PendingPermitFuture>>,
     flushed: bool,
 }
 
@@ -203,8 +217,17 @@ impl TunDatagram {
             rx,
             tx,
             pkt: None,
+            pending_permit: std::sync::Mutex::new(None),
             flushed: true,
         }
+    }
+}
+
+impl fmt::Debug for TunDatagram {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TunDatagram")
+            .field("flushed", &self.flushed)
+            .finish_non_exhaustive()
     }
 }
 
@@ -248,32 +271,61 @@ impl Sink<UdpPacket> for TunDatagram {
 
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
-        _: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
         if self.flushed {
             return Poll::Ready(Ok(()));
         }
 
-        let Self {
-            ref mut tx,
-            ref mut pkt,
-            ref mut flushed,
-            ..
-        } = *self;
+        if self.pkt.is_none() {
+            return Poll::Ready(Err(new_io_error(
+                "no packet to send, call start_send first",
+            )));
+        }
 
-        let pkt = pkt
-            .take()
-            .ok_or(new_io_error("no packet to send, call start_send first"))?;
+        let flush_state = {
+            let mut pending_permit = self
+                .pending_permit
+                .lock()
+                .expect("pending_permit mutex poisoned");
 
-        match tx.try_send(pkt) {
-            Ok(_) => {
-                *flushed = true;
+            if pending_permit.is_none() {
+                *pending_permit = Some(Box::pin(self.tx.clone().reserve_owned()));
+            }
+
+            match pending_permit
+                .as_mut()
+                .expect("pending_permit must exist")
+                .as_mut()
+                .poll(cx)
+            {
+                Poll::Pending => FlushState::Pending,
+                Poll::Ready(Ok(permit)) => {
+                    *pending_permit = None;
+                    FlushState::Ready(permit)
+                }
+                Poll::Ready(Err(_)) => {
+                    *pending_permit = None;
+                    FlushState::Disconnected
+                }
+            }
+        };
+
+        match flush_state {
+            FlushState::Pending => Poll::Pending,
+            FlushState::Ready(permit) => {
+                let pkt = self.pkt.take().ok_or(new_io_error(
+                    "no packet to send, call start_send first",
+                ))?;
+                let _ = permit.send(pkt);
+                self.flushed = true;
                 Poll::Ready(Ok(()))
             }
-            Err(err) => {
-                self.pkt = Some(err.into_inner());
+            FlushState::Disconnected => {
+                self.pkt = None;
+                self.flushed = true;
                 Poll::Ready(Err(new_io_error(
-                    "could not send packet, queue full or disconnected",
+                    "could not send packet, local UDP sink disconnected",
                 )))
             }
         }
@@ -285,5 +337,99 @@ impl Sink<UdpPacket> for TunDatagram {
     ) -> Poll<Result<(), Self::Error>> {
         ready!(self.poll_flush(cx))?;
         Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TunDatagram;
+    use crate::{proxy::datagram::UdpPacket, session::SocksAddr};
+    use futures::{Sink, task::noop_waker_ref};
+    use std::{
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    fn sample_packet(port: u16) -> UdpPacket {
+        UdpPacket::new(
+            vec![1, 2, 3],
+            SocksAddr::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)),
+            SocksAddr::Ip(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+                53,
+            )),
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tun_datagram_flush_waits_for_capacity_instead_of_failing() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let (_dummy_tx, dummy_rx) = tokio::sync::mpsc::channel(1);
+        tx.send(sample_packet(10000))
+            .await
+            .expect("failed to fill channel");
+
+        let mut datagram = TunDatagram::new(tx, dummy_rx);
+        let waker = noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+
+        assert!(matches!(
+            Pin::new(&mut datagram).poll_ready(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        Pin::new(&mut datagram)
+            .start_send(sample_packet(10001))
+            .expect("start_send should succeed");
+
+        assert!(matches!(
+            Pin::new(&mut datagram).poll_flush(&mut cx),
+            Poll::Pending
+        ));
+
+        let drained = rx.recv().await.expect("expected queued packet");
+        assert_eq!(
+            drained.src_addr,
+            SocksAddr::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10000,))
+        );
+
+        assert!(matches!(
+            Pin::new(&mut datagram).poll_flush(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+
+        let forwarded = rx.recv().await.expect("expected forwarded packet");
+        assert_eq!(
+            forwarded.src_addr,
+            SocksAddr::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10001,))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tun_datagram_flush_reports_disconnected_sink() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let (_dummy_tx, dummy_rx) = tokio::sync::mpsc::channel(1);
+
+        let mut datagram = TunDatagram::new(tx, dummy_rx);
+        let waker = noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+
+        assert!(matches!(
+            Pin::new(&mut datagram).poll_ready(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        Pin::new(&mut datagram)
+            .start_send(sample_packet(10002))
+            .expect("start_send should succeed");
+
+        let err = match Pin::new(&mut datagram).poll_flush(&mut cx) {
+            Poll::Ready(Err(err)) => err,
+            other => panic!("expected disconnected error, got {other:?}"),
+        };
+        assert!(
+            err.to_string().contains("local UDP sink disconnected"),
+            "unexpected error: {err}"
+        );
     }
 }

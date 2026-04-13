@@ -382,6 +382,7 @@ impl Dispatcher {
                                             "failed to send packet to local: {}",
                                             err
                                         );
+                                        break;
                                     }
                                 }
                             }
@@ -396,6 +397,7 @@ impl Dispatcher {
                                             "failed to send packet to remote: \
                                              {err:?}"
                                         );
+                                        break;
                                     }
                                 }
                             }
@@ -439,7 +441,8 @@ impl Dispatcher {
                 match local_w.send(packet).await {
                     Ok(_) => {}
                     Err(err) => {
-                        error!("failed to send packet to local: {}", err);
+                        warn!("failed to send packet to local: {}", err);
+                        break;
                     }
                 }
             }
