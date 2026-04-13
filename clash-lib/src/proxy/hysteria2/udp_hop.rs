@@ -11,7 +11,10 @@ use std::{
 
 use quinn::{AsyncUdpSocket, Runtime, TokioRuntime, UdpPoller, udp::Transmit};
 
-use crate::proxy::converters::hysteria2::PortGenerator;
+use crate::{
+    app::net::OutboundInterface,
+    proxy::{converters::hysteria2::PortGenerator, utils::new_udp_socket},
+};
 
 struct HopState {
     prev_conn: Option<Arc<dyn AsyncUdpSocket>>,
@@ -36,32 +39,49 @@ pub struct UdpHop {
     port_range: PortGenerator,
     /// interval to hop
     interval: Duration,
+    family_hint: SocketAddr,
+    iface: Option<OutboundInterface>,
+    #[cfg(target_os = "linux")]
+    so_mark: Option<u32>,
 }
 
 impl UdpHop {
     const DEFAULT_INTERVAL: Duration = Duration::from_secs(30);
 
-    pub fn new(
-        port: u16,
+    pub async fn new(
+        server_addr: SocketAddr,
         port_range: PortGenerator,
+        iface: Option<OutboundInterface>,
+        #[cfg(target_os = "linux")] so_mark: Option<u32>,
         interval: Option<Duration>,
     ) -> io::Result<Self> {
-        let socket =
-            std::net::UdpSocket::bind(SocketAddr::new([0, 0, 0, 0].into(), 0))?;
+        let socket = new_udp_socket(
+            None,
+            iface.as_ref(),
+            #[cfg(target_os = "linux")]
+            so_mark,
+            Some(server_addr),
+        )
+        .await?
+        .into_std()?;
 
         let state = HopState {
             prev_conn: None,
             cur_conn: TokioRuntime.wrap_udp_socket(socket)?,
             last: Instant::now(),
-            new_hop_port: port,
+            new_hop_port: server_addr.port(),
         }
         .into();
 
         Ok(UdpHop {
             state,
-            init_port: port,
+            init_port: server_addr.port(),
             port_range,
             interval: interval.unwrap_or(Self::DEFAULT_INTERVAL),
+            family_hint: server_addr,
+            iface,
+            #[cfg(target_os = "linux")]
+            so_mark,
         })
     }
 
@@ -81,15 +101,22 @@ impl UdpHop {
             *last = now;
             tracing::trace!("port hopping");
 
-            std::net::UdpSocket::bind(SocketAddr::new([0, 0, 0, 0].into(), 0))
-                .and_then(|udp| TokioRuntime.wrap_udp_socket(udp))
-                .map(|new_conn| {
-                    *new_hop_port = self.port_range.get();
-                    *prev_conn = Some(std::mem::replace(cur_conn, new_conn));
-                })
-                .unwrap_or_else(|e| {
-                    tracing::error!("port hopping err {}", e);
-                });
+            futures::executor::block_on(new_udp_socket(
+                None,
+                self.iface.as_ref(),
+                #[cfg(target_os = "linux")]
+                self.so_mark,
+                Some(self.family_hint),
+            ))
+            .and_then(|udp| udp.into_std())
+            .and_then(|udp| TokioRuntime.wrap_udp_socket(udp))
+            .map(|new_conn| {
+                *new_hop_port = self.port_range.get();
+                *prev_conn = Some(std::mem::replace(cur_conn, new_conn));
+            })
+            .unwrap_or_else(|e| {
+                tracing::error!("port hopping err {}", e);
+            });
         }
         *new_hop_port
     }

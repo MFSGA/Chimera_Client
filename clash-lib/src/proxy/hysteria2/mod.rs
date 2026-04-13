@@ -449,8 +449,15 @@ impl Handler {
                 }
             }
         } else if let Some(port_gen) = self.opts.ports.as_ref() {
-            let udp_hop =
-                udp_hop::UdpHop::new(server_socket_addr.port(), port_gen.clone(), None)?;
+            let udp_hop = udp_hop::UdpHop::new(
+                server_socket_addr,
+                port_gen.clone(),
+                sess.iface.clone(),
+                #[cfg(target_os = "linux")]
+                sess.so_mark,
+                None,
+            )
+            .await?;
             quinn::Endpoint::new_with_abstract_socket(
                 self.ep_config.clone(),
                 None,
