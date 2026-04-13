@@ -63,7 +63,8 @@ mod runner;
 pub use session::Session;
 
 pub use proxy::utils::{
-    SocketProtector, clear_socket_protector, set_socket_protector,
+    SocketProtector, clear_socket_protector, install_default_socket_protector,
+    set_socket_protector,
 };
 
 #[derive(Error, Debug)]
@@ -459,6 +460,7 @@ async fn create_components(
             );
         }
         init_net_config(config.tun.so_mark, config.general.interface.as_ref()).await;
+        install_default_socket_protector();
     }
 
     let cancellation_token = tokio_util::sync::CancellationToken::new();

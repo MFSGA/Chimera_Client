@@ -16,6 +16,8 @@ pub(crate) use unix::must_bind_socket_on_interface;
 #[cfg(windows)]
 pub(crate) mod win;
 #[cfg(windows)]
+use win::default_socket_protector;
+#[cfg(windows)]
 pub(crate) use win::must_bind_socket_on_interface;
 
 #[cfg(not(target_os = "android"))]
@@ -84,3 +86,11 @@ pub(crate) fn maybe_protect_socket(socket: &socket2::Socket) -> io::Result<()> {
     protector.protect_socket_handle(handle)?;
     Ok(())
 }
+
+#[cfg(all(not(target_os = "android"), windows))]
+pub fn install_default_socket_protector() {
+    set_socket_protector(default_socket_protector());
+}
+
+#[cfg(any(target_os = "android", not(windows)))]
+pub fn install_default_socket_protector() {}
