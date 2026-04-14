@@ -5,8 +5,8 @@ use std::time::Duration;
 use socket2::TcpKeepalive;
 
 use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
-use tokio::time::timeout;
-use tracing::{debug, error, instrument, trace};
+use tokio::time::{sleep, timeout};
+use tracing::{debug, error, instrument, trace, warn};
 
 use crate::app::net::OutboundInterface;
 use crate::proxy::utils::platform::{
@@ -96,6 +96,76 @@ pub async fn new_tcp_stream(
     iface: Option<&OutboundInterface>,
     #[cfg(target_os = "linux")] so_mark: Option<u32>,
 ) -> std::io::Result<TcpStream> {
+    const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+    #[cfg(target_os = "windows")]
+    const MAX_RETRY_ATTEMPTS: usize = 3;
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let socket = prepare_outbound_tcp_socket(
+            endpoint,
+            iface,
+            #[cfg(target_os = "linux")]
+            so_mark,
+        )?;
+        return timeout(
+            TCP_CONNECT_TIMEOUT,
+            TcpSocket::from_std_stream(socket.into()).connect(endpoint),
+        )
+        .await?;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut last_err = None;
+
+        for attempt in 0..MAX_RETRY_ATTEMPTS {
+            let socket = prepare_outbound_tcp_socket(
+                endpoint,
+                iface,
+                #[cfg(target_os = "linux")]
+                so_mark,
+            )?;
+
+            match timeout(
+                TCP_CONNECT_TIMEOUT,
+                TcpSocket::from_std_stream(socket.into()).connect(endpoint),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => return Ok(stream),
+                Ok(Err(err))
+                    if should_retry_tcp_connect(&err)
+                        && attempt + 1 < MAX_RETRY_ATTEMPTS =>
+                {
+                    warn!(
+                        endpoint = %endpoint,
+                        attempt = attempt + 1,
+                        max_attempts = MAX_RETRY_ATTEMPTS,
+                        err = ?err,
+                        "tcp connect hit a transient local address conflict; recreating socket and retrying"
+                    );
+                    last_err = Some(err);
+                    sleep(Duration::from_millis(25 * (attempt as u64 + 1))).await;
+                }
+                Ok(Err(err)) => return Err(err),
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        return Err(last_err.unwrap_or_else(|| {
+            io::Error::other(
+                "tcp connect retry loop exited without a captured error",
+            )
+        }));
+    }
+}
+
+fn prepare_outbound_tcp_socket(
+    endpoint: SocketAddr,
+    iface: Option<&OutboundInterface>,
+    #[cfg(target_os = "linux")] so_mark: Option<u32>,
+) -> std::io::Result<socket2::Socket> {
     let (socket, family) = match endpoint {
         SocketAddr::V4(_) => (
             socket2::Socket::new(
@@ -137,11 +207,12 @@ pub async fn new_tcp_stream(
     socket.set_tcp_nodelay(true)?;
     socket.set_nonblocking(true)?;
 
-    timeout(
-        Duration::from_secs(10),
-        TcpSocket::from_std_stream(socket.into()).connect(endpoint),
-    )
-    .await?
+    Ok(socket)
+}
+
+#[cfg(target_os = "windows")]
+fn should_retry_tcp_connect(err: &io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(10048))
 }
 
 #[instrument(skip(so_mark))]
