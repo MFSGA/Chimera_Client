@@ -333,6 +333,7 @@ impl Dispatcher {
                                                                           * socket addr as it's
                                                                           * from local
                                                                           * udp */
+                        &orig_dest,
                     )
                     .await
                 {
@@ -362,13 +363,14 @@ impl Dispatcher {
                         let (mut remote_w, mut remote_r) = outbound_datagram.split();
                         let (remote_sender, mut remote_forwarder) =
                             tokio::sync::mpsc::channel::<UdpPacket>(32);
+                        let orig_dest_for_nat = orig_dest.clone();
 
                         // remote -> local
                         let r_handle = tokio::spawn(async move {
                             while let Some(packet) = remote_r.next().await {
                                 // NAT
                                 let mut packet = packet;
-                                packet.src_addr = orig_dest.clone();
+                                packet.src_addr = orig_dest_for_nat.clone();
                                 packet.dst_addr = sess.source.into();
 
                                 debug!(
@@ -407,6 +409,7 @@ impl Dispatcher {
                             .insert(
                                 &outbound_name,
                                 packet.src_addr.clone().must_into_socket_addr(),
+                                &orig_dest,
                                 r_handle,
                                 w_handle,
                                 remote_sender.clone(),
@@ -575,25 +578,34 @@ impl TimeoutUdpSessionManager {
         &self,
         outbound_name: &str,
         src_addr: SocketAddr,
+        orig_dest: &SocksAddr,
         recv_handle: JoinHandle<()>,
         send_handle: JoinHandle<()>,
         sender: OutboundPacketSender,
     ) {
         let mut map = self.map.write().await;
-        map.insert(outbound_name, src_addr, recv_handle, send_handle, sender);
+        map.insert(
+            outbound_name,
+            src_addr,
+            orig_dest,
+            recv_handle,
+            send_handle,
+            sender,
+        );
     }
 
     async fn get_outbound_sender_mut(
         &self,
         outbound_name: &str,
         src_addr: SocketAddr,
+        orig_dest: &SocksAddr,
     ) -> Option<OutboundPacketSender> {
         let mut map = self.map.write().await;
-        map.get_outbound_sender_mut(outbound_name, src_addr)
+        map.get_outbound_sender_mut(outbound_name, src_addr, orig_dest)
     }
 }
 
-type OutboundHandleKey = (String, SocketAddr);
+type OutboundHandleKey = (String, SocketAddr, String);
 type OutboundHandleVal = (
     JoinHandle<()>,
     JoinHandle<()>,
@@ -612,12 +624,13 @@ impl OutboundHandleMap {
         &mut self,
         outbound_name: &str,
         src_addr: SocketAddr,
+        orig_dest: &SocksAddr,
         recv_handle: JoinHandle<()>,
         send_handle: JoinHandle<()>,
         sender: OutboundPacketSender,
     ) {
         self.0.insert(
-            (outbound_name.to_string(), src_addr),
+            (outbound_name.to_string(), src_addr, orig_dest.to_string()),
             (recv_handle, send_handle, sender, Instant::now()),
         );
     }
@@ -626,17 +639,69 @@ impl OutboundHandleMap {
         &mut self,
         outbound_name: &str,
         src_addr: SocketAddr,
+        orig_dest: &SocksAddr,
     ) -> Option<OutboundPacketSender> {
-        self.0.get_mut(&(outbound_name.to_owned(), src_addr)).map(
-            |(_, _, sender, last)| {
+        self.0
+            .get_mut(&(outbound_name.to_owned(), src_addr, orig_dest.to_string()))
+            .map(|(_, _, sender, last)| {
                 trace!(
                     "updating last access time for outbound {:?}",
-                    (outbound_name, src_addr)
+                    (outbound_name, src_addr, orig_dest)
                 );
                 *last = Instant::now();
                 sender.clone()
-            },
-        )
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OutboundHandleMap;
+    use crate::session::SocksAddr;
+    use std::{future::pending, net::SocketAddr, str::FromStr};
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn outbound_handle_map_distinguishes_sessions_by_original_destination() {
+        let mut map = OutboundHandleMap::new();
+        let src_addr = SocketAddr::from_str("127.0.0.1:53000").unwrap();
+        let dest_a = SocksAddr::from_str("8.8.8.8:53").unwrap();
+        let dest_b = SocksAddr::from_str("1.1.1.1:53").unwrap();
+
+        let (sender_a, mut receiver_a) = mpsc::channel(1);
+        let (sender_b, mut receiver_b) = mpsc::channel(1);
+
+        map.insert(
+            "DIRECT",
+            src_addr,
+            &dest_a,
+            tokio::spawn(pending()),
+            tokio::spawn(pending()),
+            sender_a,
+        );
+        map.insert(
+            "DIRECT",
+            src_addr,
+            &dest_b,
+            tokio::spawn(pending()),
+            tokio::spawn(pending()),
+            sender_b,
+        );
+
+        let handle_a = map
+            .get_outbound_sender_mut("DIRECT", src_addr, &dest_a)
+            .expect("session for first destination should exist");
+        let handle_b = map
+            .get_outbound_sender_mut("DIRECT", src_addr, &dest_b)
+            .expect("session for second destination should exist");
+
+        handle_a.send(Default::default()).await.unwrap();
+        handle_b.send(Default::default()).await.unwrap();
+
+        assert!(receiver_a.recv().await.is_some());
+        assert!(receiver_b.recv().await.is_some());
+        assert!(receiver_a.try_recv().is_err());
+        assert!(receiver_b.try_recv().is_err());
     }
 }
 
