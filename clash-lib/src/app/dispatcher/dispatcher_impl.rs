@@ -364,6 +364,7 @@ impl Dispatcher {
                         let (remote_sender, mut remote_forwarder) =
                             tokio::sync::mpsc::channel::<UdpPacket>(32);
                         let orig_dest_for_nat = orig_dest.clone();
+                        let sess_for_nat = sess.clone();
 
                         // remote -> local
                         let r_handle = tokio::spawn(async move {
@@ -375,7 +376,7 @@ impl Dispatcher {
 
                                 debug!(
                                     "UDP NAT for packet: {:?}, session: {}",
-                                    packet, sess
+                                    packet, sess_for_nat
                                 );
                                 match remote_receiver_w.send(packet).await {
                                     Ok(_) => {}
@@ -416,22 +417,13 @@ impl Dispatcher {
                             )
                             .await;
 
-                        match remote_sender.send(packet).await {
-                            Ok(_) => {}
-                            Err(err) => {
-                                error!("failed to send packet to remote: {}", err);
-                            }
-                        };
+                        try_queue_outbound_packet(&remote_sender, packet, &sess);
                     }
-                    Some(handle) => match handle.send(packet).await {
+                    Some(handle) => {
                         // TODO: need to reset when GLOBAL select is changed
-                        Ok(_) => {
-                            debug!("reusing {} sent to remote", sess);
-                        }
-                        Err(err) => {
-                            error!("failed to send packet to remote: {}", err);
-                        }
-                    },
+                        try_queue_outbound_packet(&handle, packet, &sess);
+                        debug!("reusing {} sent to remote", sess);
+                    }
                 };
             }
 
@@ -455,13 +447,20 @@ impl Dispatcher {
         let (close_sender, close_receiver) = tokio::sync::oneshot::channel::<u8>();
 
         tokio::spawn(async move {
-            if close_receiver.await.is_ok() {
-                trace!("UDP close signal for {} received", s);
-                t1.abort();
-                t2.abort();
-            } else {
-                error!("UDP close signal dropped!");
+            match close_receiver.await {
+                Ok(_) => {
+                    trace!("UDP close signal for {} received", s);
+                }
+                Err(_) => {
+                    trace!(
+                        "UDP close sender for {} dropped before explicit close; treating as normal shutdown",
+                        s
+                    );
+                }
             }
+
+            t1.abort();
+            t2.abort();
         });
 
         close_sender
@@ -512,6 +511,25 @@ async fn reverse_lookup(
 }
 
 type OutboundPacketSender = tokio::sync::mpsc::Sender<UdpPacket>; // outbound packet sender
+
+fn try_queue_outbound_packet(
+    sender: &OutboundPacketSender,
+    packet: UdpPacket,
+    sess: &Session,
+) {
+    match sender.try_send(packet) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            warn!(
+                "dropping UDP packet for {} because outbound session queue is full",
+                sess
+            );
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            error!("failed to send packet to remote: outbound session is closed");
+        }
+    }
+}
 
 struct TimeoutUdpSessionManager {
     map: Arc<RwLock<OutboundHandleMap>>,
@@ -656,8 +674,8 @@ impl OutboundHandleMap {
 
 #[cfg(test)]
 mod tests {
-    use super::OutboundHandleMap;
-    use crate::session::SocksAddr;
+    use super::{OutboundHandleMap, try_queue_outbound_packet};
+    use crate::session::{Network, Session, SocksAddr, Type};
     use std::{future::pending, net::SocketAddr, str::FromStr};
     use tokio::sync::mpsc;
 
@@ -702,6 +720,29 @@ mod tests {
         assert!(receiver_b.recv().await.is_some());
         assert!(receiver_a.try_recv().is_err());
         assert!(receiver_b.try_recv().is_err());
+    }
+
+    #[test]
+    fn try_queue_outbound_packet_drops_when_session_queue_is_full() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let sess = Session {
+            network: Network::Udp,
+            typ: Type::Ignore,
+            source: SocketAddr::from_str("127.0.0.1:53000").unwrap(),
+            destination: SocksAddr::from_str("8.8.8.8:53").unwrap(),
+            resolved_ip: None,
+            so_mark: None,
+            iface: None,
+            asn: None,
+            traffic_stats: None,
+            inbound_user: None,
+        };
+
+        sender.try_send(Default::default()).unwrap();
+        try_queue_outbound_packet(&sender, Default::default(), &sess);
+
+        assert!(receiver.try_recv().is_ok());
+        assert!(receiver.try_recv().is_err());
     }
 }
 
