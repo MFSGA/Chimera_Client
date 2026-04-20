@@ -58,6 +58,12 @@ impl From<std::io::Error> for CopyBidirectionalError {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShutdownMode {
+    HalfClose,
+    FlushOnly,
+}
+
 #[derive(Debug)]
 pub struct CopyBuffer {
     read_done: bool,
@@ -194,6 +200,7 @@ struct CopyBidirectional<'a, A: ?Sized, B: ?Sized> {
     b_to_a_delay: Option<Pin<Box<tokio::time::Sleep>>>,
     a_to_b_timeout_duration: Duration,
     b_to_a_timeout_duration: Duration,
+    shutdown_mode: ShutdownMode,
 }
 
 fn reset_idle_timeout(
@@ -225,6 +232,7 @@ where
             b_to_a_delay,
             a_to_b_timeout_duration,
             b_to_a_timeout_duration,
+            shutdown_mode,
         } = &mut *self;
 
         let mut a = Pin::new(a);
@@ -240,7 +248,17 @@ where
                     }
                     match res {
                         Poll::Ready(Ok(count)) => {
-                            *a_to_b = TransferState::ShuttingDown(count);
+                            if *shutdown_mode == ShutdownMode::FlushOnly {
+                                *a_to_b_count += count;
+                                *a_to_b = TransferState::Done;
+                                b_to_a_delay.replace(Box::pin(
+                                    tokio::time::sleep(
+                                        *b_to_a_timeout_duration,
+                                    ),
+                                ));
+                            } else {
+                                *a_to_b = TransferState::ShuttingDown(count);
+                            }
                             continue;
                         }
                         Poll::Ready(Err(err)) => {
@@ -300,7 +318,17 @@ where
                     }
                     match res {
                         Poll::Ready(Ok(count)) => {
-                            *b_to_a = TransferState::ShuttingDown(count);
+                            if *shutdown_mode == ShutdownMode::FlushOnly {
+                                *b_to_a_count += count;
+                                *b_to_a = TransferState::Done;
+                                a_to_b_delay.replace(Box::pin(
+                                    tokio::time::sleep(
+                                        *a_to_b_timeout_duration,
+                                    ),
+                                ));
+                            } else {
+                                *b_to_a = TransferState::ShuttingDown(count);
+                            }
                             continue;
                         }
                         Poll::Ready(Err(err)) => {
@@ -361,6 +389,7 @@ pub async fn copy_bidirectional(
     size: usize,
     a_to_b_timeout_duration: Duration,
     b_to_a_timeout_duration: Duration,
+    shutdown_mode: ShutdownMode,
 ) -> Result<(u64, u64), CopyBidirectionalError> {
     // zero copy is only available on linux
     #[cfg(all(target_os = "linux", feature = "zero_copy"))]
@@ -397,6 +426,7 @@ pub async fn copy_bidirectional(
                     size,
                     a_to_b_timeout_duration,
                     b_to_a_timeout_duration,
+                    shutdown_mode,
                 )
                 .await
             }
@@ -410,6 +440,7 @@ pub async fn copy_bidirectional(
             size,
             a_to_b_timeout_duration,
             b_to_a_timeout_duration,
+            shutdown_mode,
         )
         .await
     }
@@ -421,6 +452,7 @@ pub async fn copy_buf_bidirectional_with_timeout<A, B>(
     size: usize,
     a_to_b_timeout_duration: Duration,
     b_to_a_timeout_duration: Duration,
+    shutdown_mode: ShutdownMode,
 ) -> Result<(u64, u64), CopyBidirectionalError>
 where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
@@ -437,20 +469,26 @@ where
         b_to_a_delay: None,
         a_to_b_timeout_duration,
         b_to_a_timeout_duration,
+        shutdown_mode,
     }
     .await
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+        time::Duration,
+    };
 
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt, duplex},
         time::timeout,
     };
 
-    use super::copy_buf_bidirectional_with_timeout;
+    use super::{ShutdownMode, copy_buf_bidirectional_with_timeout};
 
     #[tokio::test]
     async fn half_closed_stream_keeps_running_while_peer_makes_progress() {
@@ -464,6 +502,7 @@ mod tests {
                 256,
                 Duration::from_millis(100),
                 Duration::from_millis(100),
+                ShutdownMode::HalfClose,
             )
             .await
         });
@@ -509,6 +548,108 @@ mod tests {
             .await
             .expect("relay task join")
             .expect("relay should finish cleanly");
+    }
+
+    struct NoHalfClose<T> {
+        inner: T,
+        shutdown_called: bool,
+    }
+
+    impl<T> NoHalfClose<T> {
+        fn new(inner: T) -> Self {
+            Self {
+                inner,
+                shutdown_called: false,
+            }
+        }
+    }
+
+    impl<T: AsyncRead + Unpin> AsyncRead for NoHalfClose<T> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<T: AsyncWrite + Unpin> AsyncWrite for NoHalfClose<T> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            self.shutdown_called = true;
+            Poll::Ready(Err(std::io::Error::other(
+                "half-close should not be propagated",
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn flush_only_mode_skips_half_close_propagation() {
+        let (client, mut observer) = duplex(1024);
+        let (mut upstream, relay_peer) = duplex(1024);
+
+        let relay = tokio::spawn(async move {
+            let mut lhs = NoHalfClose::new(client);
+            copy_buf_bidirectional_with_timeout(
+                &mut lhs,
+                &mut upstream,
+                256,
+                Duration::from_millis(100),
+                Duration::from_millis(100),
+                ShutdownMode::FlushOnly,
+            )
+            .await
+            .map(|result| (result, lhs.shutdown_called))
+        });
+
+        let peer = tokio::spawn(async move {
+            let mut relay_peer = relay_peer;
+            relay_peer.write_all(b"req").await?;
+            relay_peer.shutdown().await?;
+            let mut response = Vec::new();
+            relay_peer.read_to_end(&mut response).await?;
+            Ok::<Vec<u8>, std::io::Error>(response)
+        });
+
+        let mut req = [0u8; 3];
+        observer.read_exact(&mut req).await.expect("observer read");
+        assert_eq!(&req, b"req");
+
+        observer
+            .write_all(b"resp")
+            .await
+            .expect("observer writes after flush-only transition");
+        observer.shutdown().await.expect("observer shutdown");
+
+        let ((up, down), shutdown_called) = relay
+            .await
+            .expect("relay join")
+            .expect("relay io");
+        assert_eq!((up, down), (4, 3));
+        let response = peer.await.expect("peer join").expect("peer io");
+        assert_eq!(response, b"resp");
+        assert!(
+            !shutdown_called,
+            "flush-only mode should not call poll_shutdown on peer"
+        );
     }
 }
 

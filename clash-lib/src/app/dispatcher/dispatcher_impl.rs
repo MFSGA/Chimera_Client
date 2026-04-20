@@ -19,7 +19,7 @@ use crate::{
         outbound::manager::ThreadSafeOutboundManager,
         router::ThreadSafeRouter,
     },
-    common::io::copy_bidirectional,
+    common::io::{ShutdownMode, copy_bidirectional},
     config::{
         def::RunMode,
         internal::proxy::{PROXY_DIRECT, PROXY_GLOBAL},
@@ -135,12 +135,18 @@ impl Dispatcher {
                     rule,
                 )
                 .await;
+                let shutdown_mode = if sess.typ == crate::session::Type::HttpConnect {
+                    ShutdownMode::FlushOnly
+                } else {
+                    ShutdownMode::HalfClose
+                };
                 match copy_bidirectional(
                     lhs,
                     rhs,
                     self.tcp_buffer_size,
                     Duration::from_secs(10),
                     Duration::from_secs(10),
+                    shutdown_mode,
                 )
                 .instrument(info_span!(
                     "copy_bidirectional",
