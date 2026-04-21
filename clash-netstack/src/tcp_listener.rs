@@ -473,6 +473,29 @@ impl TcpListener {
             if should_poll_now {
                 trace!("Woke up to poll sockets");
 
+                // Drain pending notifier events before polling smoltcp.
+                // The critical race is IfaceEvent::TcpStream: poll_packets
+                // creates the listening socket and queues it here before the
+                // raw SYN is injected into the device buffer. If iface.poll()
+                // runs first, smoltcp can observe the SYN without a matching
+                // listener and immediately reply with RST.
+                loop {
+                    match notifier_rx.try_recv() {
+                        Ok(IfaceEvent::TcpStream(stream)) => {
+                            let socket_handle = sockets.add(stream.0);
+                            socket_maps.insert(socket_handle, stream.1);
+                            trace!(
+                                "Added pending TCP socket before iface poll: {socket_handle:?}"
+                            );
+                        }
+                        Ok(_) => {
+                            // Other events only mean "poll soon", which is
+                            // already what this branch is about to do.
+                        }
+                        Err(_) => break,
+                    }
+                }
+
                 if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
                     iface.poll(now, device, &mut sockets);
                 })) {
