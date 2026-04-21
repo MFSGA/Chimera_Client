@@ -667,7 +667,15 @@ impl futures::Stream for TcpListener {
             Err(e) => match e {
                 mpsc::error::TryRecvError::Empty => {
                     self.socket_stream_waker.register(cx.waker());
-                    std::task::Poll::Pending
+                    match self.socket_stream.try_recv() {
+                        Ok(stream) => std::task::Poll::Ready(Some(stream)),
+                        Err(mpsc::error::TryRecvError::Empty) => {
+                            std::task::Poll::Pending
+                        }
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            std::task::Poll::Ready(None)
+                        }
+                    }
                 }
                 mpsc::error::TryRecvError::Disconnected => {
                     std::task::Poll::Ready(None)
