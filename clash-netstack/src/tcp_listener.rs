@@ -122,6 +122,7 @@ pub(crate) struct TcpStreamHandle {
     pub(crate) send_waker: AtomicWaker,
 
     pub(crate) socket_dropped: AtomicBool,
+    pub(crate) socket_closed: AtomicBool,
     pub(crate) read_closed: AtomicBool,
     pub(crate) write_closed: AtomicBool,
     pub(crate) write_shutdown: AtomicBool,
@@ -139,6 +140,7 @@ impl TcpStreamHandle {
             ),
             send_waker: AtomicWaker::new(),
             socket_dropped: AtomicBool::new(false),
+            socket_closed: AtomicBool::new(false),
             read_closed: AtomicBool::new(false),
             write_closed: AtomicBool::new(false),
             write_shutdown: AtomicBool::new(false),
@@ -611,22 +613,28 @@ impl TcpListener {
                 }
 
                 socket_maps.retain(|handle, socket_control| {
+                    let socket = sockets.get_mut::<tcp::Socket>(*handle);
+
                     if socket_control.socket_dropped.load(Ordering::Acquire) {
-                        trace!("Removing dropped TCP socket");
-                        socket_control.read_closed.store(true, Ordering::Release);
-                        socket_control.write_closed.store(true, Ordering::Release);
-                        socket_control.recv_waker.wake();
-                        socket_control.send_waker.wake();
-                        sockets.remove(*handle);
-                        return false;
+                        let buf = &socket_control.send_buffer;
+                        while socket.can_send() && !buf.is_empty() {
+                            if let Ok(n) = socket.send(|buffer| {
+                                let n = buf.dequeue_slice(buffer);
+                                (n, n)
+                            }) {
+                                trace!("Flushing {n} bytes to closing TCP socket");
+                            }
+                        }
+                        if buf.is_empty() {
+                            socket.close();
+                        }
                     }
 
-                    let socket = sockets.get_mut::<tcp::Socket>(*handle);
                     if socket.is_active() {
                         true
                     } else {
                         trace!("Removing inactive TCP socket");
-                        socket_control.read_closed.store(true, Ordering::Release);
+                        socket_control.socket_closed.store(true, Ordering::Release);
                         socket_control.write_closed.store(true, Ordering::Release);
                         socket_control.recv_waker.wake();
                         socket_control.send_waker.wake();
@@ -643,6 +651,8 @@ impl TcpListener {
                     }
                     None => None,
                 };
+
+                tokio::task::yield_now().await;
             } else {
                 tokio::select! {
                     Some(event) = notifier_rx.recv() => {

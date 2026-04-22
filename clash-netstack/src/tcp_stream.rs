@@ -50,6 +50,7 @@ impl TcpStream {
     }
 
     fn mark_stack_closed(&self) {
+        self.handle.socket_closed.store(true, Ordering::Release);
         self.handle.read_closed.store(true, Ordering::Release);
         self.handle.write_closed.store(true, Ordering::Release);
         self.handle.recv_waker.wake();
@@ -91,21 +92,17 @@ impl tokio::io::AsyncRead for TcpStream {
         let read_buf = &self.handle.recv_buffer;
 
         if read_buf.is_empty() {
-            if self.handle.read_closed.load(Ordering::Acquire) {
-                trace!("TcpStream::poll_read: returning EOF");
-                return Poll::Ready(Ok(()));
-            }
-
-            trace!("TcpStream::poll_read: recv buffer is empty, waiting for data");
             self.handle.recv_waker.register(cx.waker());
-
-            if self.handle.read_closed.load(Ordering::Acquire) {
-                trace!("TcpStream::poll_read: peer closed while registering waker");
-                return Poll::Ready(Ok(()));
-            }
-
-            // Re-check buffer after registering waker to avoid missed wakeups.
             if read_buf.is_empty() {
+                if self.handle.socket_closed.load(Ordering::Acquire)
+                    || self.handle.read_closed.load(Ordering::Acquire)
+                {
+                    trace!("TcpStream::poll_read: socket closed, returning EOF");
+                    return Poll::Ready(Ok(()));
+                }
+                trace!(
+                    "TcpStream::poll_read: recv buffer is empty, waiting for data"
+                );
                 return Poll::Pending;
             }
         }

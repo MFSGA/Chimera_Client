@@ -1,7 +1,13 @@
 use crate::{Packet, packet::IpPacket};
 use etherparse::PacketBuilder;
-use log::{error, trace};
-use std::net::SocketAddr;
+use log::{error, trace, warn};
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 use tokio::sync::mpsc;
 
 pub struct UdpPacket {
@@ -57,6 +63,7 @@ impl UdpSocket {
         let read = SplitRead { recv: self.inbound };
         let write = SplitWrite {
             send: self.outbound,
+            dropped_on_full: Arc::new(AtomicU64::new(0)),
         };
         (read, write)
     }
@@ -111,6 +118,7 @@ impl SplitRead {
 #[derive(Clone)]
 pub struct SplitWrite {
     send: mpsc::Sender<Packet>,
+    dropped_on_full: Arc<AtomicU64>,
 }
 
 impl SplitWrite {
@@ -142,9 +150,21 @@ impl SplitWrite {
             .write(&mut ip_packet_writer, packet.data.data())
             .map_err(std::io::Error::other)?;
 
-        match self.send.send(Packet::new(ip_packet_writer)).await {
+        match self.send.try_send(Packet::new(ip_packet_writer)) {
             Ok(()) => Ok(()),
-            Err(err) => Err(std::io::Error::other(format!("send error: {err}"))),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let dropped =
+                    self.dropped_on_full.fetch_add(1, Ordering::Relaxed) + 1;
+                if dropped == 1 || dropped.is_power_of_two() {
+                    warn!(
+                        "dropping UDP packet because outbound queue is full; total dropped on this split writer: {dropped}"
+                    );
+                }
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(std::io::Error::other("packet outbound channel closed"))
+            }
         }
     }
 }

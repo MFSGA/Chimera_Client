@@ -49,18 +49,15 @@ impl Device for NetstackDevice {
         &mut self,
         _timestamp: Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        if let (Ok(packet), Ok(permit)) =
-            (self.rx_queue.try_recv(), self.tx_sender.try_reserve())
-        {
-            let rx_token = RxTokenImpl { packet };
-            let tx_token = TxTokenImpl { tx_sender: permit };
-            if let Err(e) = self.iface_notifier.send(IfaceEvent::DeviceReady) {
-                trace!("device ready notifier dropped: {e}");
-            }
-            return Some((rx_token, tx_token));
-        }
+        let permit = self.tx_sender.try_reserve().ok()?;
+        let packet = self.rx_queue.try_recv().ok()?;
 
-        None
+        let rx_token = RxTokenImpl { packet };
+        let tx_token = TxTokenImpl { tx_sender: permit };
+        if let Err(e) = self.iface_notifier.send(IfaceEvent::DeviceReady) {
+            trace!("device ready notifier dropped: {e}");
+        }
+        Some((rx_token, tx_token))
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
