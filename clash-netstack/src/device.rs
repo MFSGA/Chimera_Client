@@ -1,5 +1,5 @@
 use crate::{Packet, stack::IfaceEvent};
-use log::trace;
+use log::error;
 use smoltcp::{
     phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
     time::Instant,
@@ -55,7 +55,7 @@ impl Device for NetstackDevice {
         let rx_token = RxTokenImpl { packet };
         let tx_token = TxTokenImpl { tx_sender: permit };
         if let Err(e) = self.iface_notifier.send(IfaceEvent::DeviceReady) {
-            trace!("device ready notifier dropped: {e}");
+            error!("device ready notifier dropped: {e}");
         }
         Some((rx_token, tx_token))
     }
@@ -69,6 +69,46 @@ impl Device for NetstackDevice {
 
     fn capabilities(&self) -> DeviceCapabilities {
         self.capabilities.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smoltcp::phy::Device;
+
+    #[tokio::test]
+    async fn test_receive_drops_inbound_packet_when_tx_channel_full() {
+        let (tx_sender, mut tx_receiver) = tokio::sync::mpsc::channel::<Packet>(1);
+        let (iface_notifier, _iface_rx) =
+            tokio::sync::mpsc::unbounded_channel::<IfaceEvent<'static>>();
+        let mut device = NetstackDevice::new(tx_sender, iface_notifier);
+        let injector = device.create_injector();
+
+        device
+            .tx_sender
+            .try_send(Packet::new(vec![0u8; 60]))
+            .expect("should fit in empty channel");
+
+        injector
+            .send(Packet::new(vec![0u8; 60]))
+            .expect("unbounded, should not fail");
+
+        {
+            let result = device.receive(smoltcp::time::Instant::now());
+            assert!(
+                result.is_none(),
+                "receive() must return None when tx channel is full"
+            );
+        }
+
+        tx_receiver.recv().await.expect("should have a packet");
+
+        let result = device.receive(smoltcp::time::Instant::now());
+        assert!(
+            result.is_some(),
+            "inbound ACK was dropped when tx channel was full"
+        );
     }
 }
 

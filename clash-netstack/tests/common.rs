@@ -114,6 +114,112 @@ pub fn build_udp_packet() -> Bytes {
     buf.freeze()
 }
 
+pub fn parse_server_isn(syn_ack: &[u8]) -> u32 {
+    let ihl = (syn_ack[0] & 0x0F) as usize * 4;
+    u32::from_be_bytes(syn_ack[ihl + 4..ihl + 8].try_into().unwrap())
+}
+
+pub fn parse_tcp_data(pkt: &[u8]) -> Option<(u32, usize)> {
+    if pkt.len() < 40 || pkt[9] != 0x06 {
+        return None;
+    }
+    let ihl = (pkt[0] & 0x0f) as usize * 4;
+    if pkt.len() < ihl + 20 {
+        return None;
+    }
+    let tcp = &pkt[ihl..];
+    let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
+    let data_offset = ((tcp[12] >> 4) as usize) * 4;
+    let payload_len = pkt.len().saturating_sub(ihl + data_offset);
+    Some((seq, payload_len))
+}
+
+pub fn build_tcp_ack(seq: u32, ack: u32, window: u16) -> Bytes {
+    let src_ip = [1u8, 1, 1, 1];
+    let dst_ip = [2u8, 2, 2, 2];
+    let mut buf = BytesMut::with_capacity(40);
+    buf.put_u8(0x45);
+    buf.put_u8(0x00);
+    buf.put_u16(40);
+    buf.put_u16(0x0001);
+    buf.put_u16(0x4000);
+    buf.put_u8(0x40);
+    buf.put_u8(0x06);
+    buf.put_u16(0x0000);
+    buf.put_slice(&src_ip);
+    buf.put_slice(&dst_ip);
+    let tcp_start = buf.len();
+    buf.put_u16(1024);
+    buf.put_u16(80);
+    buf.put_u32(seq);
+    buf.put_u32(ack);
+    buf.put_u8(0x50);
+    buf.put_u8(0x10);
+    buf.put_u16(window);
+    buf.put_u16(0x0000);
+    buf.put_u16(0x0000);
+    let tcp_sum = tcp_udp_checksum(src_ip, dst_ip, 6, &buf[tcp_start..].to_vec());
+    let chk_pos = tcp_start + 16;
+    buf[chk_pos..chk_pos + 2].copy_from_slice(&tcp_sum.to_be_bytes());
+    let ip_sum = ipv4_checksum(&buf[..20].to_vec());
+    buf[10..12].copy_from_slice(&ip_sum.to_be_bytes());
+    buf.freeze()
+}
+
+pub fn build_tcp_syn_packet_with_port(src_port: u16) -> Bytes {
+    let src_ip = [1u8, 1, 1, 1];
+    let dst_ip = [2u8, 2, 2, 2];
+    let mut buf = BytesMut::with_capacity(40);
+    buf.put_u8(0x45);
+    buf.put_u8(0x00);
+    buf.put_u16(40);
+    buf.put_u16(0x0000);
+    buf.put_u16(0x4000);
+    buf.put_u8(0x40);
+    buf.put_u8(0x06);
+    buf.put_u16(0x0000);
+    buf.put_slice(&src_ip);
+    buf.put_slice(&dst_ip);
+    let tcp_start = buf.len();
+    buf.put_u16(src_port);
+    buf.put_u16(80);
+    buf.put_u32(0);
+    buf.put_u32(0);
+    buf.put_u8(0x50);
+    buf.put_u8(0x02);
+    buf.put_u16(0x7210);
+    buf.put_u16(0x0000);
+    buf.put_u16(0x0000);
+    let tcp_sum = tcp_udp_checksum(src_ip, dst_ip, 6, &buf[tcp_start..].to_vec());
+    let chk_pos = tcp_start + 16;
+    buf[chk_pos..chk_pos + 2].copy_from_slice(&tcp_sum.to_be_bytes());
+    let ip_sum = ipv4_checksum(&buf[..20].to_vec());
+    buf[10..12].copy_from_slice(&ip_sum.to_be_bytes());
+    buf.freeze()
+}
+
+pub fn tcp_dst_port(packet: &[u8]) -> Option<u16> {
+    if packet.len() < 24 || packet[9] != 0x06 {
+        return None;
+    }
+    let ihl = (packet[0] & 0x0F) as usize * 4;
+    if packet.len() < ihl + 4 {
+        return None;
+    }
+    Some(u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]))
+}
+
+pub fn is_rst(packet: &[u8]) -> bool {
+    if packet.len() < 20 || packet[9] != 0x06 {
+        return false;
+    }
+    let ihl = (packet[0] & 0x0F) as usize * 4;
+    if packet.len() < ihl + 14 {
+        return false;
+    }
+    (packet[ihl + 13] & 0x04) != 0
+}
+
 pub fn is_syn_ack(packet: &[u8]) -> bool {
     // IPv4 header: minimum 20 bytes
     if packet.len() < 20 {
