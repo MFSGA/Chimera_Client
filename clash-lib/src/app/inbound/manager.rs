@@ -259,7 +259,7 @@ impl InboundManager {
         *guard = new_map;
     }
 
-    pub async fn change_ports(&self, ports: Ports) {
+    pub async fn change_ports(&self, ports: Ports) -> bool {
         let mut guard = self.inbound_handlers.write().await;
 
         let listeners: HashMap<InboundOpts, Option<_>> = guard
@@ -280,22 +280,28 @@ impl InboundManager {
             })
             .collect();
 
+        let changed = !listeners.is_empty();
+
         for (mut opts, handle) in listeners {
-            opts.common_opts_mut().port = match &opts {
+            let new_port = match &opts {
                 #[cfg(feature = "http_port")]
-                InboundOpts::Http { common_opts } => {
-                    ports.port.unwrap_or(common_opts.port)
-                }
-                InboundOpts::Socks { common_opts, .. } => {
-                    ports.socks_port.unwrap_or(common_opts.port)
-                }
+                InboundOpts::Http { .. } => ports.port,
+                InboundOpts::Socks { .. } => ports.socks_port,
                 #[cfg(feature = "mixed_port")]
-                InboundOpts::Mixed { common_opts, .. } => {
-                    ports.mixed_port.unwrap_or(common_opts.port)
-                }
+                InboundOpts::Mixed { .. } => ports.mixed_port,
             };
+            let Some(port) = new_port else {
+                warn!(
+                    "Port for listener '{}' is not changed",
+                    opts.common_opts().name
+                );
+                continue;
+            };
+            opts.common_opts_mut().port = port;
             guard.insert(opts, handle);
         }
+
+        changed
     }
 
     pub async fn get_listeners(&self) -> Vec<InboundEndpoint> {

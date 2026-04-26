@@ -192,8 +192,8 @@ async fn get_proxy_delay(
     match result.first().expect("url_test always returns one result") {
         Ok((actual, overall)) => {
             let mut res = HashMap::new();
-            res.insert("delay".to_owned(), actual);
-            res.insert("overall".to_owned(), overall);
+            res.insert("delay".to_owned(), actual.as_millis());
+            res.insert("overall".to_owned(), overall.as_millis());
             axum::response::Json(res).into_response()
         }
         Err(err) => (
