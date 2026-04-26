@@ -9,7 +9,7 @@ use std::{
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
+use futures::{FutureExt, StreamExt, stream::FuturesOrdered};
 use http_body_util::Empty;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
@@ -139,7 +139,7 @@ impl ProxyManager {
             }));
         }
 
-        let futs: FuturesUnordered<_> = futs.into_iter().collect();
+        let futs: FuturesOrdered<_> = futs.into_iter().collect();
         let joined: Vec<_> = futs.collect().await;
 
         let mut results = vec![];
