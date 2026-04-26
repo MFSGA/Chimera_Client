@@ -30,7 +30,10 @@ use crate::{
     session::{Session, SocksAddr},
 };
 
-const DEFAULT_BUFFER_SIZE: usize = 16 * 1024;
+// SS2022 (AEAD-2022) MAX_PACKET_SIZE is 0xFFFF (65535 bytes). A smaller
+// relay buffer forces full packets into multiple encrypted chunks and increases
+// encrypt/decrypt overhead.
+const DEFAULT_BUFFER_SIZE: usize = 64 * 1024;
 
 pub struct Dispatcher {
     outbound_manager: ThreadSafeOutboundManager,
@@ -267,7 +270,7 @@ impl Dispatcher {
          */
         let (mut local_w, mut local_r) = udp_inbound.split();
         let (remote_receiver_w, mut remote_receiver_r) =
-            tokio::sync::mpsc::channel(32);
+            tokio::sync::mpsc::channel(256);
 
         let s = sess.clone();
         let ss = sess.clone();
@@ -368,7 +371,7 @@ impl Dispatcher {
 
                         let (mut remote_w, mut remote_r) = outbound_datagram.split();
                         let (remote_sender, mut remote_forwarder) =
-                            tokio::sync::mpsc::channel::<UdpPacket>(32);
+                            tokio::sync::mpsc::channel::<UdpPacket>(256);
                         let orig_dest_for_nat = orig_dest.clone();
                         let sess_for_nat = sess.clone();
 
