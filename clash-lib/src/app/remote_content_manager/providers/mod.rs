@@ -5,7 +5,6 @@ use std::{
     collections::HashMap,
     fmt::{Display, Formatter},
     io,
-    sync::Arc,
 };
 
 pub mod proxy_provider;

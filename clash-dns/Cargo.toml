@@ -21,3 +21,6 @@ tracing = "0.1"
 
 [dev-dependencies]
 mockall = "0.14.0"
+
+[lints]
+workspace = true

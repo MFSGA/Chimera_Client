@@ -251,11 +251,9 @@ where
                             if *shutdown_mode == ShutdownMode::FlushOnly {
                                 *a_to_b_count += count;
                                 *a_to_b = TransferState::Done;
-                                b_to_a_delay.replace(Box::pin(
-                                    tokio::time::sleep(
-                                        *b_to_a_timeout_duration,
-                                    ),
-                                ));
+                                b_to_a_delay.replace(Box::pin(tokio::time::sleep(
+                                    *b_to_a_timeout_duration,
+                                )));
                             } else {
                                 *a_to_b = TransferState::ShuttingDown(count);
                             }
@@ -321,11 +319,9 @@ where
                             if *shutdown_mode == ShutdownMode::FlushOnly {
                                 *b_to_a_count += count;
                                 *b_to_a = TransferState::Done;
-                                a_to_b_delay.replace(Box::pin(
-                                    tokio::time::sleep(
-                                        *a_to_b_timeout_duration,
-                                    ),
-                                ));
+                                a_to_b_delay.replace(Box::pin(tokio::time::sleep(
+                                    *a_to_b_timeout_duration,
+                                )));
                             } else {
                                 *b_to_a = TransferState::ShuttingDown(count);
                             }
@@ -639,10 +635,8 @@ mod tests {
             .expect("observer writes after flush-only transition");
         observer.shutdown().await.expect("observer shutdown");
 
-        let ((up, down), shutdown_called) = relay
-            .await
-            .expect("relay join")
-            .expect("relay io");
+        let ((up, down), shutdown_called) =
+            relay.await.expect("relay join").expect("relay io");
         assert_eq!((up, down), (4, 3));
         let response = peer.await.expect("peer join").expect("peer io");
         assert_eq!(response, b"resp");
@@ -653,6 +647,7 @@ mod tests {
     }
 }
 
+#[allow(dead_code)]
 pub trait ReadExactBase {
     /// inner stream to be polled
     type I: AsyncRead + Unpin;
@@ -660,6 +655,7 @@ pub trait ReadExactBase {
     fn decompose(&mut self) -> (&mut Self::I, &mut BytesMut, &mut usize);
 }
 
+#[allow(dead_code)]
 pub trait ReadExt: ReadExactBase {
     fn poll_read_exact(
         &mut self,

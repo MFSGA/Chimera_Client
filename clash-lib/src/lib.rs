@@ -6,7 +6,7 @@ use std::{
     collections::HashMap,
     io,
     path::PathBuf,
-    sync::{Arc, LazyLock, OnceLock, atomic::AtomicUsize},
+    sync::{Arc, OnceLock, atomic::AtomicUsize},
 };
 
 use thiserror::Error;
@@ -128,6 +128,7 @@ pub struct GlobalState {
 }
 
 impl GlobalState {
+    #[allow(dead_code)]
     pub(crate) fn log_level(&self) -> LogLevel {
         self.log_level
     }
@@ -154,9 +155,6 @@ impl RuntimeController {
         id
     }
 }
-
-static RUNTIME_CONTROLLER: LazyLock<std::sync::Mutex<RuntimeController>> =
-    LazyLock::new(|| std::sync::Mutex::new(RuntimeController::new()));
 
 pub fn start_scaffold(opts: Options) -> Result<()> {
     let rt = match opts.rt.as_ref().unwrap_or(&TokioRuntime::MultiThread) {

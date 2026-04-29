@@ -22,6 +22,7 @@ macro_rules! print_and_exit {
     }};
 }
 
+#[allow(dead_code)]
 pub trait IntoIoResultExt<T> {
     fn into_io(self) -> std::io::Result<T>;
 }

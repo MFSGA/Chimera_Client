@@ -1,6 +1,5 @@
 use std::net::SocketAddr;
 
-use async_trait::async_trait;
 use hickory_proto::op::Message;
 use serde::Deserialize;
 

@@ -45,7 +45,7 @@ impl Router {
         country_mmdb: Option<MmdbLookup>,
         asn_mmdb: Option<MmdbLookup>,
         geodata: Option<GeoDataLookup>,
-        cwd: String,
+        _cwd: String,
     ) -> Self {
         Self {
             rules: rules

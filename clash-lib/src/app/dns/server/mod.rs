@@ -4,11 +4,7 @@ use hickory_proto::op::Message;
 use network_interface::NetworkInterfaceConfig;
 
 use chimera_dns::DNSListenAddr;
-use std::{
-    net::IpAddr,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::sync::{Arc, Mutex};
 use tracing::{error, info, instrument};
 
 use crate::runner::Runner;
@@ -281,15 +277,6 @@ async fn maybe_take_over_linux_resolved_link(
         link_name, addr
     );
     true
-}
-
-#[cfg(not(target_os = "linux"))]
-async fn maybe_take_over_linux_resolved_link(
-    _: &DNSListenAddr,
-    _: &Arc<Mutex<Option<String>>>,
-    _: bool,
-) -> bool {
-    false
 }
 
 #[cfg(target_os = "linux")]

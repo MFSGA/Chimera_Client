@@ -6,7 +6,7 @@ use axum::{
     http::{StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, put},
+    routing::get,
 };
 use http::HeaderMap;
 use serde::Deserialize;

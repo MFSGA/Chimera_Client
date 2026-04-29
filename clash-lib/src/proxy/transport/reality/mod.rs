@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use async_trait::async_trait;
 use std::{
     io,
@@ -28,14 +30,12 @@ mod slide_buffer;
 mod sync_adapter;
 mod util;
 
-pub use reality_cipher_suite::{CipherSuite, DEFAULT_CIPHER_SUITES};
+pub use reality_cipher_suite::CipherSuite;
 pub use reality_util::{decode_public_key, decode_short_id};
 
-pub(crate) use crypto_connection::{CryptoConnection, feed_crypto_connection};
+pub(crate) use crypto_connection::CryptoConnection;
 pub(crate) use crypto_handshake::perform_crypto_handshake;
 pub(crate) use crypto_tls_stream::CryptoTlsStream;
-pub(crate) use sync_adapter::{SyncReadAdapter, SyncWriteAdapter};
-pub(crate) use util::allocate_vec;
 
 pub const DEFAULT_REALITY_SHORT_ID: &str = "0000000000000000";
 

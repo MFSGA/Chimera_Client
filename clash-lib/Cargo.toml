@@ -187,3 +187,6 @@ rcgen = "0.14"
 tempfile = "3.27"
 mockall = "0.14.0"
 serial_test = "3.4"
+
+[lints]
+workspace = true

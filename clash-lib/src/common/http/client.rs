@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io, sync::Arc};
+use std::{io, sync::Arc};
 
 use futures::FutureExt;
 use hyper_util::rt::TokioIo;

@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
     Router,
@@ -10,7 +10,6 @@ use tokio::sync::{Mutex, broadcast::Sender};
 use tower::ServiceBuilder;
 use tower_http::{
     cors::{AllowOrigin, Any, CorsLayer},
-    services::ServeDir,
     trace::TraceLayer,
 };
 use tracing::{debug, error, info, warn};
@@ -42,7 +41,6 @@ pub struct ApiRunner {
     statistics_manager: Arc<StatisticsManager>,
     cache_store: ThreadSafeCacheFile,
     router: ThreadSafeRouter,
-    cwd: String,
 
     cancellation_token: tokio_util::sync::CancellationToken,
     dns_listen_addr: DNSListenAddr,
@@ -64,7 +62,7 @@ impl ApiRunner {
         statistics_manager: Arc<StatisticsManager>,
         cache_store: ThreadSafeCacheFile,
         router: ThreadSafeRouter,
-        cwd: String,
+        _cwd: String,
         cancellation_token: Option<tokio_util::sync::CancellationToken>,
         dns_listen_addr: DNSListenAddr,
         dns_enabled: bool,
@@ -80,7 +78,6 @@ impl ApiRunner {
             statistics_manager,
             cache_store,
             router,
-            cwd,
             cancellation_token: cancellation_token.unwrap_or_default(),
             dns_listen_addr,
             dns_enabled,
@@ -100,7 +97,6 @@ impl Runner for ApiRunner {
         let cache_store = self.cache_store.clone();
         let controller_cfg = self.controller_cfg.clone();
         let router = self.router.clone();
-        let cwd = self.cwd.clone();
         let dns_listen_addr = self.dns_listen_addr.clone();
         let dns_enabled = self.dns_enabled;
         let cancellation_token = self.cancellation_token.clone();

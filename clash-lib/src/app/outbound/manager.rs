@@ -558,7 +558,7 @@ impl OutboundManager {
                         &proto.use_provider,
                         provider_registry,
                         &mut providers,
-                    );
+                    )?;
 
                     let url_test = urltest::Handler::new(
                         urltest::HandlerOptions {
@@ -603,7 +603,7 @@ impl OutboundManager {
                         &proto.use_provider,
                         provider_registry,
                         &mut providers,
-                    );
+                    )?;
 
                     let fallback = fallback::Handler::new(
                         fallback::HandlerOptions {

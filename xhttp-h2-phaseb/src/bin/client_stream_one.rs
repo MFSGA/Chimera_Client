@@ -2,7 +2,7 @@ use std::convert::Infallible;
 
 use anyhow::Result;
 use bytes::Bytes;
-use http_body_util::{combinators::BoxBody, BodyExt, Empty, StreamBody};
+use http_body_util::{combinators::BoxBody, BodyExt, StreamBody};
 use hyper::body::Incoming;
 use hyper::{body::Frame, Request, Version};
 use hyper_util::rt::{TokioExecutor, TokioIo};

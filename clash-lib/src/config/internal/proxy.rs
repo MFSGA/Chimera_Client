@@ -141,6 +141,7 @@ pub struct CommonConfigOptions {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
+#[allow(dead_code)]
 pub struct WsOpt {
     pub path: Option<String>,
     pub headers: Option<HashMap<String, String>>,
@@ -150,6 +151,7 @@ pub struct WsOpt {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
+#[allow(dead_code)]
 pub struct H2Opt {
     pub host: Option<Vec<String>>,
     pub path: Option<String>,
@@ -157,6 +159,7 @@ pub struct H2Opt {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
+#[allow(dead_code)]
 pub struct GrpcOpt {
     pub grpc_service_name: Option<String>,
 }

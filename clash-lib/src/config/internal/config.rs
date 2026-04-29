@@ -201,6 +201,7 @@ impl TunConfig {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "kebab-case")]
+#[allow(dead_code)]
 pub enum RuleProviderDef {
     // Http(HttpRuleProvider),
     File(FileRuleProvider),
@@ -208,6 +209,7 @@ pub enum RuleProviderDef {
 }
 
 #[derive(Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct FileRuleProvider {
     pub path: String,
     // todo

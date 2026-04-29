@@ -1,13 +1,13 @@
 use futures::{SinkExt, StreamExt};
 use std::{
     collections::HashMap,
-    fmt::{self, Debug, Formatter},
+    fmt::{Debug, Formatter},
     net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{io::AsyncWriteExt, sync::RwLock, task::JoinHandle};
-use tracing::{Instrument, debug, error, info, info_span, instrument, trace, warn};
+use tracing::{Instrument, debug, error, info_span, instrument, trace, warn};
 
 use crate::{
     app::{
@@ -24,9 +24,7 @@ use crate::{
         def::RunMode,
         internal::proxy::{PROXY_DIRECT, PROXY_GLOBAL},
     },
-    proxy::{
-        AnyInboundDatagram, AnyOutboundHandler, ClientStream, datagram::UdpPacket,
-    },
+    proxy::{AnyInboundDatagram, ClientStream, datagram::UdpPacket},
     session::{Session, SocksAddr},
 };
 
@@ -138,7 +136,8 @@ impl Dispatcher {
                     rule,
                 )
                 .await;
-                let shutdown_mode = if sess.typ == crate::session::Type::HttpConnect {
+                let shutdown_mode = if sess.typ == crate::session::Type::HttpConnect
+                {
                     ShutdownMode::FlushOnly
                 } else {
                     ShutdownMode::HalfClose

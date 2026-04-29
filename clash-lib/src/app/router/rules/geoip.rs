@@ -1,9 +1,6 @@
 use tracing::warn;
 
-use crate::{
-    common::mmdb::MmdbLookup,
-    session::{self, Session},
-};
+use crate::{common::mmdb::MmdbLookup, session::Session};
 
 use super::RuleMatcher;
 
