@@ -74,7 +74,7 @@ where
         }
 
         let response = builder.build(
-            resp.header().clone(),
+            *resp.header(),
             resp.answers(),
             resp.name_servers(),
             std::iter::empty::<&hickory_proto::rr::Record>(),

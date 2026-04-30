@@ -3,8 +3,8 @@ use std::{io, net::SocketAddr, time::Duration};
 use socket2::TcpKeepalive;
 
 use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
-use tokio::time::{sleep, timeout};
-use tracing::{debug, error, instrument, trace, warn};
+use tokio::time::timeout;
+use tracing::{debug, error, instrument, trace};
 
 use crate::app::net::OutboundInterface;
 use crate::proxy::utils::platform::{
@@ -157,7 +157,7 @@ pub async fn new_tcp_stream(
                     if should_retry_tcp_connect(&err)
                         && attempt + 1 < MAX_RETRY_ATTEMPTS =>
                 {
-                    warn!(
+                    tracing::warn!(
                         endpoint = %endpoint,
                         attempt = attempt + 1,
                         max_attempts = MAX_RETRY_ATTEMPTS,
@@ -165,7 +165,10 @@ pub async fn new_tcp_stream(
                         "tcp connect hit a transient local address conflict; recreating socket and retrying"
                     );
                     last_err = Some(err);
-                    sleep(Duration::from_millis(25 * (attempt as u64 + 1))).await;
+                    tokio::time::sleep(Duration::from_millis(
+                        25 * (attempt as u64 + 1),
+                    ))
+                    .await;
                 }
                 Ok(Err(err)) => return Err(err),
                 Err(err) => return Err(err.into()),

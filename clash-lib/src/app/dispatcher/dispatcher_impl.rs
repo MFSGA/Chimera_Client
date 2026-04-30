@@ -785,7 +785,10 @@ impl OutboundHandleMap {
 #[cfg(test)]
 mod tests {
     use super::{OutboundHandleMap, try_queue_outbound_packet};
-    use crate::session::{Network, Session, SocksAddr, Type};
+    use crate::{
+        proxy::datagram::UdpPacket,
+        session::{Network, Session, SocksAddr, Type},
+    };
     use std::{future::pending, net::SocketAddr, str::FromStr};
     use tokio::sync::mpsc;
 
@@ -833,7 +836,9 @@ mod tests {
             inbound_user: None,
         };
 
-        sender.try_send(Default::default()).unwrap();
+        sender
+            .try_send((UdpPacket::default(), sess.destination.clone()))
+            .unwrap();
         try_queue_outbound_packet(
             &sender,
             Default::default(),

@@ -26,11 +26,6 @@ pub(super) fn convert(
     let socks_port = c.socks_port;
     #[cfg(feature = "mixed_port")]
     let mixed_port = c.mixed_port;
-    #[cfg(feature = "tproxy")]
-    let tproxy_port = c.tproxy_port;
-    #[cfg(feature = "redir")]
-    let redir_port = c.redir_port;
-
     let bind_address = if c.bind_address == BindAddress::default() && c.ipv6 {
         BindAddress::dual_stack()
     } else {
@@ -108,6 +103,16 @@ pub(super) fn convert(
     if c.mixed_port.is_some() {
         warn!(
             "ignoring top-level `mixed-port` because `mixed_port` feature is disabled"
+        );
+    }
+    if c.redir_port.is_some() {
+        warn!(
+            "ignoring top-level `redir-port` because redir inbound is not implemented"
+        );
+    }
+    if c.tproxy_port.is_some() {
+        warn!(
+            "ignoring top-level `tproxy-port` because tproxy inbound is not implemented"
         );
     }
     Ok(all_inbounds)

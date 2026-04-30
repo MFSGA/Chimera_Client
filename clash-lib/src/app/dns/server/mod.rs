@@ -4,7 +4,11 @@ use hickory_proto::op::Message;
 use network_interface::NetworkInterfaceConfig;
 
 use chimera_dns::DNSListenAddr;
-use std::sync::{Arc, Mutex};
+use std::{
+    net::IpAddr,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tracing::{error, info, instrument};
 
 use crate::runner::Runner;

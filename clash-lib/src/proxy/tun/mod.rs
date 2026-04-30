@@ -5,6 +5,7 @@ pub use runner::TunRunner;
 mod stream;
 
 #[cfg(target_os = "linux")] // for tproxy
+#[allow(unused_imports)]
 pub use datagram::TunDatagram;
 
 #[cfg(test)]

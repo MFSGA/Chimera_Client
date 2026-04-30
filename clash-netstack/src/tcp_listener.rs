@@ -222,7 +222,7 @@ impl TcpListener {
 
         let waker = socket_stream_waker.clone();
         let poll_packet_last_tcp_packet = last_tcp_packet.clone();
-        let poll_socket_last_tcp_packet = last_tcp_packet.clone();
+        let poll_socket_last_tcp_packet = last_tcp_packet;
         let task_handle = tokio::spawn(async move {
             let rv = tokio::select! {
                 biased;
