@@ -24,7 +24,9 @@ use crate::{
         def::RunMode,
         internal::proxy::{PROXY_DIRECT, PROXY_GLOBAL},
     },
-    proxy::{AnyInboundDatagram, ClientStream, datagram::UdpPacket},
+    proxy::{
+        AnyInboundDatagram, ClientStream, datagram::UdpPacket, utils::ToCanonical,
+    },
     session::{Session, SocksAddr},
 };
 
@@ -112,6 +114,7 @@ impl Dispatcher {
         };
 
         debug!("dispatching {} to {}[{}]", sess, outbound_name, mode);
+        let rule_summary = rule_summary(rule);
 
         let mgr = self.outbound_manager.clone();
         let handler = match mgr.get_outbound(outbound_name).await {
@@ -128,7 +131,14 @@ impl Dispatcher {
             .await
         {
             Ok(rhs) => {
-                debug!("remote connection established {}", sess);
+                debug!(
+                    outbound_name,
+                    rule = %rule_summary,
+                    mode = %mode,
+                    source = %sess.source,
+                    destination = %sess.destination,
+                    "remote connection established"
+                );
                 let rhs = TrackedStream::new(
                     rhs,
                     self.manager.clone(),
@@ -222,8 +232,13 @@ impl Dispatcher {
             }
             Err(err) => {
                 warn!(
-                    "failed to establish remote connection {}, error: {}",
-                    sess, err
+                    outbound_name,
+                    rule = %rule_summary,
+                    mode = %mode,
+                    source = %sess.source,
+                    destination = %sess.destination,
+                    error = %err,
+                    "failed to establish remote connection"
                 );
                 if let Err(e) = lhs.shutdown().await {
                     warn!("error closing local connection {}: {}", sess, e)
@@ -277,6 +292,14 @@ impl Dispatcher {
             while let Some(mut packet) = local_r.next().await {
                 let mut sess = sess.clone();
 
+                // SS2022 and dual-stack UDP inbounds can surface IPv4 targets as
+                // IPv4-mapped IPv6. Keep the canonical IP before fake-IP reverse
+                // lookup may replace the destination with a domain.
+                if let SocksAddr::Ip(addr) = &mut packet.dst_addr {
+                    *addr = addr.to_canonical();
+                    sess.resolved_ip = Some(addr.ip());
+                }
+
                 let dest = match reverse_lookup(&resolver, &packet.dst_addr).await {
                     Some(dest) => dest,
                     None => {
@@ -289,6 +312,7 @@ impl Dispatcher {
                 let orig_dest = packet.dst_addr.clone();
                 sess.source = packet.src_addr.clone().must_into_socket_addr();
                 sess.destination = dest.clone();
+                sess.inbound_user = packet.inbound_user.clone();
 
                 // mutate packet for fake ip
                 // resolve is done in OutboundDatagramImpl so it's fine to have
@@ -305,8 +329,6 @@ impl Dispatcher {
                 };
 
                 let outbound_name = outbound_name.to_string();
-
-                debug!("dispatching {} to {}[{}]", sess, outbound_name, mode);
 
                 let remote_receiver_w = remote_receiver_w.clone();
 
@@ -333,6 +355,17 @@ impl Dispatcher {
                         outbound_name
                     };
 
+                let rule_summary = rule_summary(rule);
+                debug!(
+                    outbound_name = %outbound_name,
+                    rule = %rule_summary,
+                    mode = %mode,
+                    source = %sess.source,
+                    orig_dest = %orig_dest,
+                    resolved_dest = %sess.destination,
+                    "dispatching udp packet"
+                );
+
                 match outbound_handle_guard
                     .get_outbound_sender_mut(
                         &outbound_name,
@@ -346,19 +379,41 @@ impl Dispatcher {
                     .await
                 {
                     None => {
-                        debug!("building {} outbound datagram connecting", sess);
+                        debug!(
+                            outbound_name = %outbound_name,
+                            rule = %rule_summary,
+                            source = %sess.source,
+                            orig_dest = %orig_dest,
+                            resolved_dest = %sess.destination,
+                            "building outbound datagram"
+                        );
                         let outbound_datagram = match handler
                             .connect_datagram(&sess, resolver.clone())
                             .await
                         {
                             Ok(v) => v,
                             Err(err) => {
-                                error!("failed to connect outbound: {}", err);
+                                error!(
+                                    outbound_name = %outbound_name,
+                                    rule = %rule_summary,
+                                    source = %sess.source,
+                                    orig_dest = %orig_dest,
+                                    resolved_dest = %sess.destination,
+                                    error = %err,
+                                    "failed to connect outbound datagram"
+                                );
                                 continue;
                             }
                         };
 
-                        debug!("{} outbound datagram connected", sess);
+                        debug!(
+                            outbound_name = %outbound_name,
+                            rule = %rule_summary,
+                            source = %sess.source,
+                            orig_dest = %orig_dest,
+                            resolved_dest = %sess.destination,
+                            "outbound datagram connected"
+                        );
 
                         let outbound_datagram = TrackedDatagram::new(
                             outbound_datagram,
@@ -373,6 +428,7 @@ impl Dispatcher {
                             tokio::sync::mpsc::channel::<UdpPacket>(256);
                         let orig_dest_for_nat = orig_dest.clone();
                         let sess_for_nat = sess.clone();
+                        let outbound_name_for_nat = outbound_name.clone();
 
                         // remote -> local
                         let r_handle = tokio::spawn(async move {
@@ -383,15 +439,21 @@ impl Dispatcher {
                                 packet.dst_addr = sess.source.into();
 
                                 debug!(
-                                    "UDP NAT for packet: {:?}, session: {}",
-                                    packet, sess_for_nat
+                                    outbound_name = %outbound_name_for_nat,
+                                    session = %sess_for_nat,
+                                    orig_dest = %orig_dest_for_nat,
+                                    packet = ?packet,
+                                    "udp nat remote packet"
                                 );
                                 match remote_receiver_w.send(packet).await {
                                     Ok(_) => {}
                                     Err(err) => {
                                         warn!(
-                                            "failed to send packet to local: {}",
-                                            err
+                                            outbound_name = %outbound_name_for_nat,
+                                            session = %sess_for_nat,
+                                            orig_dest = %orig_dest_for_nat,
+                                            error = %err,
+                                            "failed to send packet to local"
                                         );
                                         break;
                                     }
@@ -399,14 +461,20 @@ impl Dispatcher {
                             }
                         });
                         // local -> remote
+                        let outbound_name_for_send = outbound_name.clone();
+                        let sess_for_send = sess.clone();
+                        let orig_dest_for_send = orig_dest.clone();
                         let w_handle = tokio::spawn(async move {
                             while let Some(packet) = remote_forwarder.recv().await {
                                 match remote_w.send(packet).await {
                                     Ok(_) => {}
                                     Err(err) => {
                                         warn!(
-                                            "failed to send packet to remote: \
-                                             {err:?}"
+                                            outbound_name = %outbound_name_for_send,
+                                            session = %sess_for_send,
+                                            orig_dest = %orig_dest_for_send,
+                                            error = ?err,
+                                            "failed to send packet to remote"
                                         );
                                         break;
                                     }
@@ -425,12 +493,31 @@ impl Dispatcher {
                             )
                             .await;
 
-                        try_queue_outbound_packet(&remote_sender, packet, &sess);
+                        try_queue_outbound_packet(
+                            &remote_sender,
+                            packet,
+                            &sess,
+                            &outbound_name,
+                            &orig_dest,
+                        );
                     }
                     Some(handle) => {
                         // TODO: need to reset when GLOBAL select is changed
-                        try_queue_outbound_packet(&handle, packet, &sess);
-                        debug!("reusing {} sent to remote", sess);
+                        try_queue_outbound_packet(
+                            &handle,
+                            packet,
+                            &sess,
+                            &outbound_name,
+                            &orig_dest,
+                        );
+                        debug!(
+                            outbound_name = %outbound_name,
+                            rule = %rule_summary,
+                            source = %sess.source,
+                            orig_dest = %orig_dest,
+                            resolved_dest = %sess.destination,
+                            "reusing outbound datagram"
+                        );
                     }
                 };
             }
@@ -518,23 +605,46 @@ async fn reverse_lookup(
     Some(dst)
 }
 
+fn rule_summary(rule: Option<&Box<dyn crate::app::router::RuleMatcher>>) -> String {
+    rule.map(|rule| {
+        let payload = rule.payload();
+        if payload.is_empty() {
+            rule.type_name().to_string()
+        } else {
+            format!("{} {}", rule.type_name(), payload)
+        }
+    })
+    .unwrap_or_else(|| "implicit MATCH".to_string())
+}
+
 type OutboundPacketSender = tokio::sync::mpsc::Sender<UdpPacket>; // outbound packet sender
 
 fn try_queue_outbound_packet(
     sender: &OutboundPacketSender,
     packet: UdpPacket,
     sess: &Session,
+    outbound_name: &str,
+    orig_dest: &SocksAddr,
 ) {
     match sender.try_send(packet) {
         Ok(()) => {}
         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
             warn!(
-                "dropping UDP packet for {} because outbound session queue is full",
-                sess
+                outbound_name,
+                source = %sess.source,
+                orig_dest = %orig_dest,
+                resolved_dest = %sess.destination,
+                "dropping UDP packet because outbound session queue is full"
             );
         }
         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-            error!("failed to send packet to remote: outbound session is closed");
+            warn!(
+                outbound_name,
+                source = %sess.source,
+                orig_dest = %orig_dest,
+                resolved_dest = %sess.destination,
+                "failed to send packet to remote: outbound session is closed"
+            );
         }
     }
 }
@@ -747,7 +857,13 @@ mod tests {
         };
 
         sender.try_send(Default::default()).unwrap();
-        try_queue_outbound_packet(&sender, Default::default(), &sess);
+        try_queue_outbound_packet(
+            &sender,
+            Default::default(),
+            &sess,
+            "DIRECT",
+            &sess.destination,
+        );
 
         assert!(receiver.try_recv().is_ok());
         assert!(receiver.try_recv().is_err());

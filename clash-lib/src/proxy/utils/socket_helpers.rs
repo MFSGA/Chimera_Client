@@ -1,6 +1,4 @@
-use std::{io, net::SocketAddr};
-
-use std::time::Duration;
+use std::{io, net::SocketAddr, time::Duration};
 
 use socket2::TcpKeepalive;
 
@@ -12,6 +10,7 @@ use crate::app::net::OutboundInterface;
 use crate::proxy::utils::platform::{
     maybe_protect_socket, must_bind_socket_on_interface,
 };
+use crate::{app::dns::ThreadSafeDNSResolver, session::Session};
 
 pub fn apply_tcp_options(s: &TcpStream) -> std::io::Result<()> {
     #[cfg(not(target_os = "windows"))]
@@ -87,6 +86,26 @@ impl ToCanonical for SocketAddr {
     fn to_canonical(mut self) -> SocketAddr {
         self.set_ip(self.ip().to_canonical());
         self
+    }
+}
+
+pub async fn family_hint_for_session(
+    sess: &Session,
+    resolver: &ThreadSafeDNSResolver,
+) -> Option<SocketAddr> {
+    if let Some(resolved_ip) = sess.resolved_ip {
+        Some(SocketAddr::new(resolved_ip, sess.destination.port()))
+    } else if let Some(host) = sess.destination.ip() {
+        Some(SocketAddr::new(host, sess.destination.port()))
+    } else {
+        let host = sess.destination.host();
+        resolver
+            .resolve_v6(&host, false)
+            .await
+            .map(|ip| {
+                ip.map(|ip| SocketAddr::new(ip.into(), sess.destination.port()))
+            })
+            .ok()?
     }
 }
 

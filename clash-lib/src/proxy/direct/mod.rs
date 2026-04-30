@@ -16,9 +16,11 @@ use crate::{
     common::errors::map_io_error,
     config::internal::proxy::PROXY_DIRECT,
     proxy::{
-        DialWithConnector, OutboundHandler, OutboundType,
+        ConnectorType, DialWithConnector, OutboundHandler, OutboundType,
         datagram::OutboundDatagramImpl,
-        utils::{RemoteConnector, new_tcp_stream, new_udp_socket},
+        utils::{
+            RemoteConnector, family_hint_for_session, new_tcp_stream, new_udp_socket,
+        },
     },
 };
 
@@ -86,19 +88,14 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> std::io::Result<BoxedChainedDatagram> {
-        let bind_addr: std::net::IpAddr = if sess.source.is_ipv4() {
-            std::net::Ipv4Addr::UNSPECIFIED.into()
-        } else {
-            std::net::Ipv6Addr::UNSPECIFIED.into()
-        };
+        let family_hint = family_hint_for_session(sess, &resolver).await;
+        let bind_addr = udp_bind_addr_for_session(sess, family_hint);
         let d = new_udp_socket(
             Some((bind_addr, 0).into()),
             sess.iface.as_ref(),
             #[cfg(target_os = "linux")]
             sess.so_mark,
-            sess.destination
-                .ip()
-                .map(|ip| std::net::SocketAddr::new(ip, sess.destination.port())),
+            family_hint,
         )
         .await
         .map(|x| OutboundDatagramImpl::new(x, resolver))?;
@@ -106,6 +103,31 @@ impl OutboundHandler for Handler {
         let d = ChainedDatagramWrapper::new(d);
         d.append_to_chain(self.name()).await;
         Ok(Box::new(d))
+    }
+
+    async fn support_connector(&self) -> ConnectorType {
+        ConnectorType::Tcp
+    }
+
+    async fn connect_stream_with_connector(
+        &self,
+        sess: &Session,
+        resolver: ThreadSafeDNSResolver,
+        connector: &dyn RemoteConnector,
+    ) -> std::io::Result<BoxedChainedStream> {
+        let s = connector
+            .connect_stream(
+                resolver,
+                sess.destination.host().as_str(),
+                sess.destination.port(),
+                sess.iface.as_ref(),
+                #[cfg(target_os = "linux")]
+                sess.so_mark,
+            )
+            .await?;
+        let s = ChainedStreamWrapper::new(s);
+        s.append_to_chain(self.name()).await;
+        Ok(Box::new(s))
     }
 
     async fn connect_datagram_with_connector(
@@ -127,5 +149,46 @@ impl OutboundHandler for Handler {
         let d = ChainedDatagramWrapper::new(d);
         d.append_to_chain(self.name()).await;
         Ok(Box::new(d))
+    }
+}
+
+fn udp_bind_addr_for_session(
+    sess: &Session,
+    family_hint: Option<std::net::SocketAddr>,
+) -> std::net::IpAddr {
+    match family_hint {
+        Some(addr) if addr.is_ipv6() => std::net::Ipv6Addr::UNSPECIFIED.into(),
+        Some(_) => std::net::Ipv4Addr::UNSPECIFIED.into(),
+        None if sess.source.is_ipv6() => std::net::Ipv6Addr::UNSPECIFIED.into(),
+        None => std::net::Ipv4Addr::UNSPECIFIED.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use super::udp_bind_addr_for_session;
+    use crate::Session;
+
+    #[test]
+    fn udp_bind_addr_follows_family_hint_before_source_family() {
+        let sess = Session {
+            source: "127.0.0.1:12345".parse().unwrap(),
+            ..Default::default()
+        };
+        let family_hint: SocketAddr = "[::1]:443".parse().unwrap();
+
+        assert!(udp_bind_addr_for_session(&sess, Some(family_hint)).is_ipv6());
+    }
+
+    #[test]
+    fn udp_bind_addr_uses_source_family_without_hint() {
+        let sess = Session {
+            source: "[::1]:12345".parse().unwrap(),
+            ..Default::default()
+        };
+
+        assert!(udp_bind_addr_for_session(&sess, None).is_ipv6());
     }
 }
