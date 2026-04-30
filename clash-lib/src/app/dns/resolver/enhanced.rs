@@ -256,16 +256,43 @@ impl EnhancedResolver {
         clients: &Vec<ThreadSafeDNSClient>,
         message: &op::Message,
     ) -> anyhow::Result<op::Message> {
+        let query_name = Self::domain_name_of_message(message)
+            .unwrap_or_else(|| "<invalid-query>".to_string());
+        let query_type = message
+            .query()
+            .map(|query| query.query_type().to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+
         let mut queries = Vec::new();
         for c in clients {
+            let query_name = query_name.clone();
+            let query_type = query_type.clone();
             queries.push(
                 async move {
+                    let client_id = c.id();
                     c.exchange(message)
                         .inspect_err(|x| {
                             error!(
-                                client = c.id(),
+                                client = %client_id,
+                                query = %query_name,
+                                record_type = %query_type,
                                 err = ?x,
                                 "resolve error");
+                        })
+                        .inspect_ok(|response| {
+                            let ips = Self::ip_list_of_message(response)
+                                .into_iter()
+                                .map(|ip| ip.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            debug!(
+                                client = %client_id,
+                                query = %query_name,
+                                record_type = %query_type,
+                                answers = %ips,
+                                answer_count = response.answer_count(),
+                                "dns upstream query succeeded"
+                            );
                         })
                         .await
                 }
