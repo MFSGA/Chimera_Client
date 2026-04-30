@@ -190,6 +190,7 @@ impl TunRunner {
 
                     let tun_name =
                         tun_init_config.tun_name.expect("tun name must be provided");
+                    #[allow(unused_mut)]
                     let mut tun_exist = tun_exists(&tun_name);
                     #[cfg(target_os = "linux")]
                     let mut removed_existing_tun = false;
