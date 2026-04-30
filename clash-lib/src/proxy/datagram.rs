@@ -7,12 +7,12 @@ use std::{
     collections::HashMap,
     fmt::{Debug, Display, Formatter},
     io,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     pin::Pin,
     task::{Context, Poll},
     time::{Duration, Instant},
 };
-use tokio::{io::ReadBuf, net::UdpSocket};
+use tokio::{io::ReadBuf, net::UdpSocket, task::JoinHandle};
 
 const UDP_DOMAIN_MAP_TTL: Duration = Duration::from_secs(60);
 
@@ -81,6 +81,8 @@ pub struct OutboundDatagramImpl {
     // Avoid allocating a full UDP packet buffer on every poll_next call.
     recv_buf: Vec<u8>,
     ip_to_logical: HashMap<SocketAddr, (SocksAddr, Instant)>,
+    pending_dns: Option<JoinHandle<io::Result<SocketAddr>>>,
+    resolved_dst: Option<SocketAddr>,
 }
 
 impl OutboundDatagramImpl {
@@ -92,6 +94,8 @@ impl OutboundDatagramImpl {
             pkt: None,
             recv_buf: vec![0u8; 65535],
             ip_to_logical: HashMap::new(),
+            pending_dns: None,
+            resolved_dst: None,
         }
     }
 }
@@ -115,8 +119,12 @@ impl Sink<UdpPacket> for OutboundDatagramImpl {
 
     fn start_send(self: Pin<&mut Self>, item: UdpPacket) -> Result<(), Self::Error> {
         let pin = self.get_mut();
+        if let Some(handle) = pin.pending_dns.take() {
+            handle.abort();
+        }
         pin.pkt = Some(item);
         pin.flushed = false;
+        pin.resolved_dst = None;
         Ok(())
     }
 
@@ -133,6 +141,8 @@ impl Sink<UdpPacket> for OutboundDatagramImpl {
             ref mut pkt,
             ref resolver,
             ref mut ip_to_logical,
+            ref mut pending_dns,
+            ref mut resolved_dst,
             ..
         } = *self;
 
@@ -140,29 +150,55 @@ impl Sink<UdpPacket> for OutboundDatagramImpl {
             .as_ref()
             .ok_or_else(|| io::Error::other("no packet to send"))?;
         let dst = match &p.dst_addr {
-            SocksAddr::Ip(addr) => *addr,
+            SocksAddr::Ip(addr) => {
+                *pending_dns = None;
+                *resolved_dst = None;
+                *addr
+            }
             SocksAddr::Domain(domain, port) => {
-                let domain = domain.to_string();
-                let port = *port;
-                let mut fut = if inner.local_addr()?.is_ipv6() {
-                    resolver.resolve(domain.as_str(), false)
+                if let Some(addr) = *resolved_dst {
+                    addr
                 } else {
-                    Box::pin(async {
-                        resolver
-                            .resolve_v4(domain.as_str(), false)
-                            .await
-                            .map(|x| x.map(Into::into))
-                    })
-                };
-                ready!(
-                    fut.as_mut()
-                        .poll(cx)
-                        .map_err(|_| { io::Error::other("resolve domain failed") })
-                )?
-                .map(|ip| SocketAddr::from((ip, port)))
-                .ok_or_else(|| {
-                    io::Error::other(format!("resolve domain failed: {domain}"))
-                })?
+                    let is_ipv6 = inner.local_addr()?.is_ipv6();
+                    let handle = pending_dns.get_or_insert_with(|| {
+                        let resolver = resolver.clone();
+                        let domain = domain.clone();
+                        let port = *port;
+                        tokio::spawn(async move {
+                            let ip = if is_ipv6 {
+                                resolver.resolve(&domain, false).await.map_err(
+                                    |_| io::Error::other("resolve domain failed"),
+                                )?
+                            } else {
+                                resolver
+                                    .resolve_v4(&domain, false)
+                                    .await
+                                    .map_err(|_| {
+                                        io::Error::other("resolve domain failed")
+                                    })?
+                                    .map(IpAddr::V4)
+                            };
+                            ip.map(|ip| SocketAddr::from((ip, port))).ok_or_else(
+                                || {
+                                    io::Error::other(format!(
+                                        "resolve domain failed: {domain}"
+                                    ))
+                                },
+                            )
+                        })
+                    });
+                    let addr = match ready!(Pin::new(handle).poll(cx)) {
+                        Ok(result) => result?,
+                        Err(err) => {
+                            return Poll::Ready(Err(io::Error::other(format!(
+                                "DNS task panicked: {err}"
+                            ))));
+                        }
+                    };
+                    *pending_dns = None;
+                    *resolved_dst = Some(addr);
+                    addr
+                }
             }
         };
 
