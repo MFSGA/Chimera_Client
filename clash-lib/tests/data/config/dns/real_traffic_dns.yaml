@@ -1,0 +1,29 @@
+mixed-port: 0
+bind-address: '*'
+allow-lan: false
+mode: rule
+log-level: info
+ipv6: true
+mmdb: null
+
+dns:
+  enable: true
+  ipv6: true
+  listen:
+    udp: 127.0.0.1:55353
+    tcp: 127.0.0.1:55354
+  enhanced-mode: normal
+  nameserver:
+    - 1.1.1.1
+  default-nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
+
+profile:
+  store-selected: false
+  store-fake-ip: false
+
+proxies: []
+
+rules:
+  - MATCH,DIRECT

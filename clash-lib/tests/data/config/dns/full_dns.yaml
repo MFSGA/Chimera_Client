@@ -1,0 +1,51 @@
+mixed-port: 0
+bind-address: '*'
+allow-lan: false
+mode: rule
+log-level: info
+ipv6: true
+
+dns:
+  enable: true
+  ipv6: true
+  listen:
+    udp: 127.0.0.1:0
+    tcp: 127.0.0.1:0
+  enhanced-mode: fake-ip
+  nameserver:
+    - 1.1.1.1
+    - tcp://8.8.8.8:5353
+    - tls://1.0.0.1
+    - https://cloudflare-dns.com/dns-query#DIRECT
+  proxy-server-nameserver:
+    - 9.9.9.9
+  default-nameserver:
+    - 223.5.5.5
+    - 8.8.4.4
+  fallback:
+    - tls://8.8.8.8
+  fallback-filter:
+    geoip: true
+    geoip-code: cn
+    ipcidr:
+      - 240.0.0.0/4
+    domain:
+      - '+.google.com'
+  nameserver-policy:
+    example.com: tls://1.1.1.1
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - '*.lan'
+    - '+.local'
+  edns-client-subnet:
+    ipv4: 1.2.3.0/24
+    ipv6: 2001:db8::/56
+
+profile:
+  store-selected: false
+  store-fake-ip: false
+
+proxies: []
+
+rules:
+  - MATCH,DIRECT
