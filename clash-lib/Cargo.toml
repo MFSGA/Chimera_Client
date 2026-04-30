@@ -65,6 +65,7 @@ rustls-pemfile = "2"
 
 uuid = { version = "1", features = [
     "v4",
+    "v5",
     "fast-rng",
     "macro-diagnostics",
     "serde",

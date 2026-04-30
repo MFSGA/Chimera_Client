@@ -2,6 +2,7 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use tokio::sync::RwLock;
 use tracing::{debug, error};
+use uuid::Uuid;
 
 use erased_serde::Serialize;
 use serde::Deserialize;
@@ -194,8 +195,6 @@ impl OutboundManager {
     pub async fn get_proxies(&self) -> HashMap<String, Box<dyn Serialize + Send>> {
         let mut r = HashMap::new();
 
-        let proxy_manager = &self.proxy_manager;
-
         // Snapshot the registry without holding the lock across async calls.
         let handlers: Vec<(String, AnyOutboundHandler)> = self
             .registry
@@ -211,19 +210,10 @@ impl OutboundManager {
             } else if let Some(p) = v.try_as_plain_handler() {
                 p.as_map().await
             } else {
-                let mut m = HashMap::new();
-                m.insert("type".to_string(), Box::new(v.proto()) as _);
-                m
+                HashMap::new()
             };
 
-            let alive = proxy_manager.alive(&k).await;
-            let history = proxy_manager.delay_history(&k).await;
-
-            m.insert("history".to_string(), Box::new(history));
-            m.insert("alive".to_string(), Box::new(alive));
-            // todo: use another way
-            m.insert("name".to_string(), Box::new(k.to_owned()));
-            m.insert("udp".to_string(), Box::new(false));
+            self.apply_common_proxy_fields(&mut m, &v, &k).await;
 
             r.insert(k.clone(), Box::new(m) as _);
         }
@@ -240,20 +230,45 @@ impl OutboundManager {
         } else if let Some(p) = proxy.try_as_plain_handler() {
             p.as_map().await
         } else {
-            let mut m = HashMap::new();
-            m.insert("type".to_string(), Box::new(proxy.proto()) as _);
-            m
+            HashMap::new()
         };
 
-        let proxy_manager = self.proxy_manager.clone();
-
-        let alive = proxy_manager.alive(proxy.name()).await;
-        let history = proxy_manager.delay_history(proxy.name()).await;
-
-        r.insert("history".to_string(), Box::new(history));
-        r.insert("alive".to_string(), Box::new(alive));
+        self.apply_common_proxy_fields(&mut r, proxy, proxy.name())
+            .await;
 
         r
+    }
+
+    async fn apply_common_proxy_fields(
+        &self,
+        m: &mut HashMap<String, Box<dyn Serialize + Send>>,
+        proxy: &AnyOutboundHandler,
+        name: &str,
+    ) {
+        let alive = self.proxy_manager.alive(name).await;
+        let history = self.proxy_manager.delay_history(name).await;
+        let support_udp = proxy.support_udp().await;
+
+        let id = Uuid::new_v5(&Uuid::NAMESPACE_OID, name.as_bytes());
+        m.insert("id".to_string(), Box::new(id.to_string()));
+        m.insert("history".to_string(), Box::new(history));
+        m.insert("alive".to_string(), Box::new(alive));
+        m.insert("name".to_string(), Box::new(name.to_owned()));
+        m.insert("type".to_string(), Box::new(proxy.proto().to_string()));
+        m.insert("udp".to_string(), Box::new(support_udp));
+        m.insert("uot".to_string(), Box::new(false));
+        m.insert("xudp".to_string(), Box::new(false));
+        m.insert("tfo".to_string(), Box::new(false));
+        m.insert("mptcp".to_string(), Box::new(false));
+        m.insert("smux".to_string(), Box::new(false));
+        m.insert("interface".to_string(), Box::new(""));
+        m.insert("dialer-proxy".to_string(), Box::new(""));
+        m.insert("routing-mark".to_string(), Box::new(0));
+        m.insert("provider-name".to_string(), Box::new(""));
+        m.insert(
+            "extra".to_string(),
+            Box::new(HashMap::<String, String>::new()),
+        );
     }
 
     /// A thin wrapper so the API layer does not access proxy_manager directly.
