@@ -22,7 +22,7 @@ impl SocksAddrType {
     pub const V6: u8 = 0x4;
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, PartialEq, Eq, Hash, Serialize)]
 pub enum SocksAddr {
     Ip(SocketAddr),
     Domain(String, u16),

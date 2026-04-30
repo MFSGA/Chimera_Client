@@ -314,12 +314,6 @@ impl Dispatcher {
                 sess.destination = dest.clone();
                 sess.inbound_user = packet.inbound_user.clone();
 
-                // mutate packet for fake ip
-                // resolve is done in OutboundDatagramImpl so it's fine to have
-                // (Domain, port) here. ideally the OutboundDatagramImpl should only
-                // do Ip though?
-                packet.dst_addr = dest;
-
                 let mode = *mode.read().await;
 
                 let (outbound_name, rule) = match mode {
@@ -374,7 +368,6 @@ impl Dispatcher {
                                                                           * socket addr as it's
                                                                           * from local
                                                                           * udp */
-                        &orig_dest,
                     )
                     .await
                 {
@@ -425,58 +418,75 @@ impl Dispatcher {
 
                         let (mut remote_w, mut remote_r) = outbound_datagram.split();
                         let (remote_sender, mut remote_forwarder) =
-                            tokio::sync::mpsc::channel::<UdpPacket>(256);
-                        let orig_dest_for_nat = orig_dest.clone();
-                        let sess_for_nat = sess.clone();
-                        let outbound_name_for_nat = outbound_name.clone();
+                            tokio::sync::mpsc::channel::<(UdpPacket, SocksAddr)>(
+                                256,
+                            );
+                        let sess_for_rw = sess.clone();
+                        let outbound_name_for_rw = outbound_name.clone();
 
-                        // remote -> local
-                        let r_handle = tokio::spawn(async move {
-                            while let Some(packet) = remote_r.next().await {
-                                // NAT
-                                let mut packet = packet;
-                                packet.src_addr = orig_dest_for_nat.clone();
-                                packet.dst_addr = sess.source.into();
+                        let rw_handle = tokio::spawn(async move {
+                            const ORIG_MAP_MAX: usize = 256;
+                            let mut orig_map: HashMap<SocksAddr, SocksAddr> =
+                                HashMap::new();
+                            let mut last_orig_addr: Option<SocksAddr> = None;
 
-                                debug!(
-                                    outbound_name = %outbound_name_for_nat,
-                                    session = %sess_for_nat,
-                                    orig_dest = %orig_dest_for_nat,
-                                    packet = ?packet,
-                                    "udp nat remote packet"
-                                );
-                                match remote_receiver_w.send(packet).await {
-                                    Ok(_) => {}
-                                    Err(err) => {
-                                        warn!(
-                                            outbound_name = %outbound_name_for_nat,
-                                            session = %sess_for_nat,
-                                            orig_dest = %orig_dest_for_nat,
-                                            error = %err,
-                                            "failed to send packet to local"
-                                        );
-                                        break;
+                            loop {
+                                tokio::select! {
+                                    packet = remote_forwarder.recv() => {
+                                        let Some((mut packet, dest)) = packet else { break };
+                                        let orig = packet.dst_addr.clone();
+                                        packet.dst_addr = dest;
+                                        if orig != packet.dst_addr {
+                                            if orig_map.len() >= ORIG_MAP_MAX
+                                                && let Some(key) =
+                                                    orig_map.keys().next().cloned()
+                                            {
+                                                orig_map.remove(&key);
+                                            }
+                                            orig_map.insert(packet.dst_addr.clone(), orig.clone());
+                                        }
+                                        last_orig_addr = Some(orig.clone());
+
+                                        if let Err(err) = remote_w.send(packet).await {
+                                            warn!(
+                                                outbound_name = %outbound_name_for_rw,
+                                                session = %sess_for_rw,
+                                                orig_dest = %orig,
+                                                error = ?err,
+                                                "failed to send packet to remote"
+                                            );
+                                            break;
+                                        }
                                     }
-                                }
-                            }
-                        });
-                        // local -> remote
-                        let outbound_name_for_send = outbound_name.clone();
-                        let sess_for_send = sess.clone();
-                        let orig_dest_for_send = orig_dest.clone();
-                        let w_handle = tokio::spawn(async move {
-                            while let Some(packet) = remote_forwarder.recv().await {
-                                match remote_w.send(packet).await {
-                                    Ok(_) => {}
-                                    Err(err) => {
-                                        warn!(
-                                            outbound_name = %outbound_name_for_send,
-                                            session = %sess_for_send,
-                                            orig_dest = %orig_dest_for_send,
-                                            error = ?err,
-                                            "failed to send packet to remote"
+
+                                    packet = remote_r.next() => {
+                                        let Some(mut packet) = packet else { break };
+                                        if let Some(orig) =
+                                            orig_map.get(&packet.src_addr).cloned()
+                                        {
+                                            packet.src_addr = orig;
+                                        } else if !orig_map.is_empty()
+                                            && let Some(ref fallback) = last_orig_addr
+                                        {
+                                            packet.src_addr = fallback.clone();
+                                        }
+                                        packet.dst_addr = sess.source.into();
+
+                                        debug!(
+                                            outbound_name = %outbound_name_for_rw,
+                                            session = %sess_for_rw,
+                                            packet = ?packet,
+                                            "udp nat remote packet"
                                         );
-                                        break;
+                                        if let Err(err) = remote_receiver_w.send(packet).await {
+                                            warn!(
+                                                outbound_name = %outbound_name_for_rw,
+                                                session = %sess_for_rw,
+                                                error = %err,
+                                                "failed to send packet to local"
+                                            );
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -486,9 +496,7 @@ impl Dispatcher {
                             .insert(
                                 &outbound_name,
                                 packet.src_addr.clone().must_into_socket_addr(),
-                                &orig_dest,
-                                r_handle,
-                                w_handle,
+                                rw_handle,
                                 remote_sender.clone(),
                             )
                             .await;
@@ -496,6 +504,7 @@ impl Dispatcher {
                         try_queue_outbound_packet(
                             &remote_sender,
                             packet,
+                            dest,
                             &sess,
                             &outbound_name,
                             &orig_dest,
@@ -506,6 +515,7 @@ impl Dispatcher {
                         try_queue_outbound_packet(
                             &handle,
                             packet,
+                            dest,
                             &sess,
                             &outbound_name,
                             &orig_dest,
@@ -617,16 +627,17 @@ fn rule_summary(rule: Option<&Box<dyn crate::app::router::RuleMatcher>>) -> Stri
     .unwrap_or_else(|| "implicit MATCH".to_string())
 }
 
-type OutboundPacketSender = tokio::sync::mpsc::Sender<UdpPacket>; // outbound packet sender
+type OutboundPacketSender = tokio::sync::mpsc::Sender<(UdpPacket, SocksAddr)>;
 
 fn try_queue_outbound_packet(
     sender: &OutboundPacketSender,
     packet: UdpPacket,
+    dest: SocksAddr,
     sess: &Session,
     outbound_name: &str,
     orig_dest: &SocksAddr,
 ) {
-    match sender.try_send(packet) {
+    match sender.try_send((packet, dest)) {
         Ok(()) => {}
         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
             warn!(
@@ -683,14 +694,13 @@ impl TimeoutUdpSessionManager {
                 let mut alived = 0;
                 let mut expired = 0;
                 g.0.retain(|k, x| {
-                    let (h1, h2, _, last) = x;
+                    let (handle, _, last) = x;
                     let now = Instant::now();
                     let alive = now.duration_since(*last) < timeout;
                     if !alive {
                         expired += 1;
                         trace!("udp session expired: {:?}", k);
-                        h1.abort();
-                        h2.abort();
+                        handle.abort();
                     } else {
                         alived += 1;
                     }
@@ -714,40 +724,25 @@ impl TimeoutUdpSessionManager {
         &self,
         outbound_name: &str,
         src_addr: SocketAddr,
-        orig_dest: &SocksAddr,
-        recv_handle: JoinHandle<()>,
-        send_handle: JoinHandle<()>,
+        handle: JoinHandle<()>,
         sender: OutboundPacketSender,
     ) {
         let mut map = self.map.write().await;
-        map.insert(
-            outbound_name,
-            src_addr,
-            orig_dest,
-            recv_handle,
-            send_handle,
-            sender,
-        );
+        map.insert(outbound_name, src_addr, handle, sender);
     }
 
     async fn get_outbound_sender_mut(
         &self,
         outbound_name: &str,
         src_addr: SocketAddr,
-        orig_dest: &SocksAddr,
     ) -> Option<OutboundPacketSender> {
         let mut map = self.map.write().await;
-        map.get_outbound_sender_mut(outbound_name, src_addr, orig_dest)
+        map.get_outbound_sender_mut(outbound_name, src_addr)
     }
 }
 
-type OutboundHandleKey = (String, SocketAddr, String);
-type OutboundHandleVal = (
-    JoinHandle<()>,
-    JoinHandle<()>,
-    OutboundPacketSender,
-    Instant,
-);
+type OutboundHandleKey = (String, SocketAddr);
+type OutboundHandleVal = (JoinHandle<()>, OutboundPacketSender, Instant);
 
 struct OutboundHandleMap(HashMap<OutboundHandleKey, OutboundHandleVal>);
 
@@ -760,14 +755,12 @@ impl OutboundHandleMap {
         &mut self,
         outbound_name: &str,
         src_addr: SocketAddr,
-        orig_dest: &SocksAddr,
-        recv_handle: JoinHandle<()>,
-        send_handle: JoinHandle<()>,
+        handle: JoinHandle<()>,
         sender: OutboundPacketSender,
     ) {
         self.0.insert(
-            (outbound_name.to_string(), src_addr, orig_dest.to_string()),
-            (recv_handle, send_handle, sender, Instant::now()),
+            (outbound_name.to_string(), src_addr),
+            (handle, sender, Instant::now()),
         );
     }
 
@@ -775,18 +768,17 @@ impl OutboundHandleMap {
         &mut self,
         outbound_name: &str,
         src_addr: SocketAddr,
-        orig_dest: &SocksAddr,
     ) -> Option<OutboundPacketSender> {
-        self.0
-            .get_mut(&(outbound_name.to_owned(), src_addr, orig_dest.to_string()))
-            .map(|(_, _, sender, last)| {
+        self.0.get_mut(&(outbound_name.to_owned(), src_addr)).map(
+            |(_, sender, last)| {
                 trace!(
                     "updating last access time for outbound {:?}",
-                    (outbound_name, src_addr, orig_dest)
+                    (outbound_name, src_addr)
                 );
                 *last = Instant::now();
                 sender.clone()
-            })
+            },
+        )
     }
 }
 
@@ -798,7 +790,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     #[tokio::test]
-    async fn outbound_handle_map_distinguishes_sessions_by_original_destination() {
+    async fn outbound_handle_map_reuses_session_by_source_for_full_cone_nat() {
         let mut map = OutboundHandleMap::new();
         let src_addr = SocketAddr::from_str("127.0.0.1:53000").unwrap();
         let dest_a = SocksAddr::from_str("8.8.8.8:53").unwrap();
@@ -807,37 +799,22 @@ mod tests {
         let (sender_a, mut receiver_a) = mpsc::channel(1);
         let (sender_b, mut receiver_b) = mpsc::channel(1);
 
-        map.insert(
-            "DIRECT",
-            src_addr,
-            &dest_a,
-            tokio::spawn(pending()),
-            tokio::spawn(pending()),
-            sender_a,
-        );
-        map.insert(
-            "DIRECT",
-            src_addr,
-            &dest_b,
-            tokio::spawn(pending()),
-            tokio::spawn(pending()),
-            sender_b,
-        );
+        map.insert("DIRECT", src_addr, tokio::spawn(pending()), sender_a);
+        map.insert("DIRECT", src_addr, tokio::spawn(pending()), sender_b);
 
         let handle_a = map
-            .get_outbound_sender_mut("DIRECT", src_addr, &dest_a)
-            .expect("session for first destination should exist");
+            .get_outbound_sender_mut("DIRECT", src_addr)
+            .expect("session should exist");
         let handle_b = map
-            .get_outbound_sender_mut("DIRECT", src_addr, &dest_b)
-            .expect("session for second destination should exist");
+            .get_outbound_sender_mut("DIRECT", src_addr)
+            .expect("session should still exist");
 
-        handle_a.send(Default::default()).await.unwrap();
-        handle_b.send(Default::default()).await.unwrap();
+        handle_a.send((Default::default(), dest_a)).await.unwrap();
+        handle_b.send((Default::default(), dest_b)).await.unwrap();
 
-        assert!(receiver_a.recv().await.is_some());
-        assert!(receiver_b.recv().await.is_some());
         assert!(receiver_a.try_recv().is_err());
-        assert!(receiver_b.try_recv().is_err());
+        assert!(receiver_b.recv().await.is_some());
+        assert!(receiver_b.recv().await.is_some());
     }
 
     #[test]
@@ -860,6 +837,7 @@ mod tests {
         try_queue_outbound_packet(
             &sender,
             Default::default(),
+            sess.destination.clone(),
             &sess,
             "DIRECT",
             &sess.destination,
@@ -876,9 +854,8 @@ impl Drop for OutboundHandleMap {
             "dropping inner outbound handle map that has {} sessions",
             self.0.len()
         );
-        for (_, (recv_handle, send_handle, ..)) in self.0.drain() {
-            recv_handle.abort();
-            send_handle.abort();
+        for (_, (handle, ..)) in self.0.drain() {
+            handle.abort();
         }
     }
 }
