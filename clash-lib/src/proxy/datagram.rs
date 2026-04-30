@@ -2,14 +2,19 @@ use crate::{
     app::dns::ThreadSafeDNSResolver, common::errors::new_io_error,
     session::SocksAddr,
 };
-use futures::{FutureExt, Sink, Stream, ready};
+use futures::{Sink, Stream, ready};
 use std::{
+    collections::HashMap,
     fmt::{Debug, Display, Formatter},
     io,
+    net::SocketAddr,
     pin::Pin,
     task::{Context, Poll},
+    time::{Duration, Instant},
 };
 use tokio::{io::ReadBuf, net::UdpSocket};
+
+const UDP_DOMAIN_MAP_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct UdpPacket {
@@ -75,6 +80,7 @@ pub struct OutboundDatagramImpl {
     pkt: Option<UdpPacket>,
     // Avoid allocating a full UDP packet buffer on every poll_next call.
     recv_buf: Vec<u8>,
+    ip_to_logical: HashMap<SocketAddr, (SocksAddr, Instant)>,
 }
 
 impl OutboundDatagramImpl {
@@ -85,6 +91,7 @@ impl OutboundDatagramImpl {
             flushed: true,
             pkt: None,
             recv_buf: vec![0u8; 65535],
+            ip_to_logical: HashMap::new(),
         }
     }
 }
@@ -125,56 +132,56 @@ impl Sink<UdpPacket> for OutboundDatagramImpl {
             ref mut inner,
             ref mut pkt,
             ref resolver,
+            ref mut ip_to_logical,
             ..
         } = *self;
 
-        if pkt.is_some() {
-            let p = pkt.as_ref().unwrap();
-            let dst = &p.dst_addr;
-            let data = &p.data;
-            let dst = match dst {
-                SocksAddr::Domain(domain, port) => {
-                    let domain = domain.to_string();
-                    let port = *port;
-                    let mut fut = {
-                        if inner.local_addr()?.is_ipv6() {
-                            resolver.resolve(domain.as_str(), false)
-                        } else {
-                            resolver
-                                .resolve_v4(domain.as_str(), false)
-                                .map(|x| x.map(|ip| ip.map(Into::into)))
-                                .boxed()
-                        }
-                    };
-                    let ip = ready!(fut.as_mut().poll(cx).map_err(|_| {
-                        io::Error::other("resolve domain failed")
-                    }))?;
-                    if let Some(ip) = ip {
-                        (ip, port).into()
-                    } else {
-                        return Poll::Ready(Err(io::Error::other(format!(
-                            "resolve domain failed: {domain}"
-                        ))));
-                    }
-                }
-                SocksAddr::Ip(addr) => *addr,
-            };
+        let p = pkt
+            .as_ref()
+            .ok_or_else(|| io::Error::other("no packet to send"))?;
+        let dst = match &p.dst_addr {
+            SocksAddr::Ip(addr) => *addr,
+            SocksAddr::Domain(domain, port) => {
+                let domain = domain.to_string();
+                let port = *port;
+                let mut fut = if inner.local_addr()?.is_ipv6() {
+                    resolver.resolve(domain.as_str(), false)
+                } else {
+                    Box::pin(async {
+                        resolver
+                            .resolve_v4(domain.as_str(), false)
+                            .await
+                            .map(|x| x.map(Into::into))
+                    })
+                };
+                ready!(
+                    fut.as_mut()
+                        .poll(cx)
+                        .map_err(|_| { io::Error::other("resolve domain failed") })
+                )?
+                .map(|ip| SocketAddr::from((ip, port)))
+                .ok_or_else(|| {
+                    io::Error::other(format!("resolve domain failed: {domain}"))
+                })?
+            }
+        };
 
-            let n = ready!(inner.poll_send_to(cx, data.as_slice(), dst))?;
-            let wrote_all = n == data.len();
-            self.pkt = None;
-            self.flushed = true;
+        let n = ready!(inner.poll_send_to(cx, p.data.as_slice(), dst))?;
+        let now = Instant::now();
+        ip_to_logical
+            .retain(|_, (_, ts)| now.duration_since(*ts) < UDP_DOMAIN_MAP_TTL);
+        ip_to_logical.insert(dst, (p.dst_addr.clone(), now));
+        let data_len = p.data.len();
 
-            let res = if wrote_all {
-                Ok(())
-            } else {
-                Err(new_io_error(format!(
-                    "failed to send all data, only sent {n} bytes"
-                )))
-            };
-            Poll::Ready(res)
+        *pkt = None;
+        self.flushed = true;
+
+        if n == data_len {
+            Poll::Ready(Ok(()))
         } else {
-            Poll::Ready(Err(io::Error::other("no packet to send")))
+            Poll::Ready(Err(new_io_error(format!(
+                "failed to send all data, only sent {n} bytes"
+            ))))
         }
     }
 
@@ -196,15 +203,20 @@ impl Stream for OutboundDatagramImpl {
         let Self {
             ref mut inner,
             ref mut recv_buf,
+            ref ip_to_logical,
             ..
         } = *self;
         let mut buf = ReadBuf::new(recv_buf.as_mut_slice());
         match ready!(inner.poll_recv_from(cx, &mut buf)) {
             Ok(src) => {
                 let data = buf.filled().to_vec();
+                let src_addr = ip_to_logical
+                    .get(&src)
+                    .map(|(logical, _)| logical.clone())
+                    .unwrap_or_else(|| src.into());
                 Poll::Ready(Some(UdpPacket {
                     data,
-                    src_addr: src.into(),
+                    src_addr,
                     dst_addr: SocksAddr::any_ipv4(),
                     inbound_user: None,
                 }))
