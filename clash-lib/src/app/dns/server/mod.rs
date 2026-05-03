@@ -6,6 +6,7 @@ use network_interface::NetworkInterfaceConfig;
 use chimera_dns::DNSListenAddr;
 use std::sync::{Arc, Mutex};
 #[allow(unused_mut)]
+#[cfg(target_os = "linux")]
 use std::{net::IpAddr, time::Duration};
 
 use tracing::{error, info, instrument};
