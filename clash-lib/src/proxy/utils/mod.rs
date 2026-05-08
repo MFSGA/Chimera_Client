@@ -1,3 +1,6 @@
+#[cfg(test)]
+pub mod test_utils;
+
 pub mod socket_helpers;
 
 #[allow(unused_imports)]
