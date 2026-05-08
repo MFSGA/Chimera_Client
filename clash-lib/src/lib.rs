@@ -809,3 +809,14 @@ async fn build_auxiliary_dns_resolver(
 
     dns::new_resolver(cfg, Some(cache_store), None, outbounds).await
 }
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::sync::Once;
+
+    static INIT: Once = Once::new();
+
+    pub fn initialize() {
+        INIT.call_once(crate::setup_default_crypto_provider);
+    }
+}

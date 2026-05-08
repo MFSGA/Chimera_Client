@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 pub const LOCAL_ADDR: &str = "127.0.0.1";
 
 pub const IMAGE_TROJAN_GO: &str = "p4gefau1t/trojan-go:latest";

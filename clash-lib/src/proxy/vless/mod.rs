@@ -296,6 +296,7 @@ mod tests {
             server: LOCAL_ADDR.into(),
             port: 8443,
             uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".into(),
+            flow: None,
             udp: true,
             tls: tls_client(None),
             transport: Some(Box::new(ws_client)),

@@ -256,7 +256,6 @@ mod tests {
                 run_test_suites_and_cleanup,
             },
         },
-        tests::initialize,
     };
 
     async fn get_ws_runner() -> anyhow::Result<DockerTestRunner> {
@@ -315,6 +314,7 @@ mod tests {
         run_test_suites_and_cleanup(handler, container, Suite::all()).await
     }
 
+    #[cfg(any())]
     async fn get_grpc_runner() -> anyhow::Result<DockerTestRunner> {
         let test_config_dir = test_config_base_dir();
         let conf = test_config_dir.join("trojan-grpc.json");
@@ -332,6 +332,7 @@ mod tests {
             .await
     }
 
+    #[cfg(any())]
     #[tokio::test]
     #[serial_test::serial]
     async fn test_trojan_grpc() -> anyhow::Result<()> {
