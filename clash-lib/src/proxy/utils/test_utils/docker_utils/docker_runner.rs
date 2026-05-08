@@ -1,31 +1,115 @@
 #![allow(dead_code)]
 
 use std::{
+    collections::HashMap,
     future::Future,
     sync::atomic::{AtomicU16, Ordering},
 };
 
+use bollard::{
+    API_DEFAULT_VERSION, Docker,
+    config::ContainerInspectResponse,
+    models::{ContainerCreateBody, HostConfig, Mount, MountTypeEnum, PortBinding},
+    query_parameters::{
+        CreateContainerOptions, CreateImageOptionsBuilder, RemoveContainerOptions,
+        StartContainerOptions,
+    },
+};
+use futures::TryStreamExt;
+
 const FIRST_DOCKER_TEST_PORT: u16 = 30001;
+const PORT: u16 = 10002;
+const EXPOSED_PORTS: &[&str] = &["10002/tcp", "10002/udp"];
 
 static PORT_COUNTER: AtomicU16 = AtomicU16::new(FIRST_DOCKER_TEST_PORT);
 
 pub struct DockerTestRunner {
-    image: String,
-    gateway_ip: Option<String>,
-    container_ip: Option<String>,
+    instance: Docker,
+    id: String,
+    inspect: ContainerInspectResponse,
 }
 
 impl DockerTestRunner {
+    pub async fn try_new(body: ContainerCreateBody) -> anyhow::Result<Self> {
+        let docker = connect_docker()?;
+
+        if let Some(image) = body.image.as_deref() {
+            docker
+                .create_image(
+                    Some(CreateImageOptionsBuilder::new().from_image(image).build()),
+                    None,
+                    None,
+                )
+                .try_collect::<Vec<_>>()
+                .await?;
+        }
+
+        let container = docker
+            .create_container(Some(CreateContainerOptions::default()), body)
+            .await?;
+        let id = container.id;
+
+        if let Err(err) = docker
+            .start_container(&id, Some(StartContainerOptions::default()))
+            .await
+        {
+            let _ = docker
+                .remove_container(
+                    &id,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            return Err(err.into());
+        }
+
+        let inspect = docker.inspect_container(&id, None).await?;
+        Ok(Self {
+            instance: docker,
+            id,
+            inspect,
+        })
+    }
+
     pub fn container_ip(&self) -> Option<String> {
-        self.container_ip.clone()
+        self.inspect
+            .network_settings
+            .as_ref()
+            .and_then(|settings| settings.networks.as_ref())
+            .and_then(|networks| {
+                networks
+                    .values()
+                    .find_map(|network| network.ip_address.clone())
+                    .filter(|ip| !ip.is_empty())
+            })
     }
 
     pub fn gateway_ip(&self) -> Option<String> {
-        self.gateway_ip.clone()
+        self.inspect
+            .network_settings
+            .as_ref()
+            .and_then(|settings| settings.networks.as_ref())
+            .and_then(|networks| {
+                networks
+                    .values()
+                    .find_map(|network| network.gateway.clone())
+                    .filter(|ip| !ip.is_empty())
+            })
     }
 
-    pub fn image(&self) -> &str {
-        &self.image
+    pub async fn cleanup(self) -> anyhow::Result<()> {
+        self.instance
+            .remove_container(
+                &self.id,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        Ok(())
     }
 }
 
@@ -64,20 +148,26 @@ impl RunAndCleanup for MultiDockerTestRunner {
     }
 }
 
+#[derive(Debug)]
 pub struct DockerTestRunnerBuilder {
     image: String,
-    env: Vec<String>,
-    cmd: Vec<String>,
-    mounts: Vec<(String, String)>,
+    host_config: HostConfig,
+    exposed_ports: Vec<String>,
+    cmd: Option<Vec<String>>,
+    env: Option<Vec<String>>,
 }
 
 impl Default for DockerTestRunnerBuilder {
     fn default() -> Self {
         Self {
-            image: String::new(),
-            env: Vec::new(),
-            cmd: Vec::new(),
-            mounts: Vec::new(),
+            image: "hello-world".to_owned(),
+            host_config: get_host_config(PORT),
+            exposed_ports: EXPOSED_PORTS
+                .iter()
+                .map(|port| (*port).to_owned())
+                .collect(),
+            cmd: None,
+            env: None,
         }
     }
 }
@@ -93,32 +183,88 @@ impl DockerTestRunnerBuilder {
     }
 
     pub fn env(mut self, env: &[&str]) -> Self {
-        self.env = env.iter().map(|value| (*value).to_owned()).collect();
+        self.env = Some(env.iter().map(|value| (*value).to_owned()).collect());
         self
     }
 
     pub fn cmd(mut self, cmd: &[&str]) -> Self {
-        self.cmd = cmd.iter().map(|value| (*value).to_owned()).collect();
+        self.cmd = Some(cmd.iter().map(|value| (*value).to_owned()).collect());
         self
     }
 
     pub fn mounts(mut self, pairs: &[(&str, &str)]) -> Self {
-        self.mounts = pairs
-            .iter()
-            .map(|(source, target)| ((*source).to_owned(), (*target).to_owned()))
-            .collect();
+        self.host_config.mounts = Some(
+            pairs
+                .iter()
+                .map(|(source, target)| Mount {
+                    target: Some((*target).to_owned()),
+                    source: Some((*source).to_owned()),
+                    typ: Some(MountTypeEnum::BIND),
+                    read_only: Some(false),
+                    ..Default::default()
+                })
+                .collect(),
+        );
         self
     }
 
     pub async fn build(self) -> anyhow::Result<DockerTestRunner> {
-        let _ = (self.env, self.cmd, self.mounts);
-        Err(anyhow::anyhow!(
-            "docker runner container lifecycle is not migrated yet for image {}",
-            self.image
-        ))
+        DockerTestRunner::try_new(ContainerCreateBody {
+            image: Some(self.image),
+            tty: Some(true),
+            cmd: self.cmd,
+            env: self.env,
+            exposed_ports: Some(self.exposed_ports),
+            host_config: Some(self.host_config),
+            ..Default::default()
+        })
+        .await
     }
 }
 
 pub fn alloc_docker_port() -> u16 {
     PORT_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+pub fn get_host_config(port: u16) -> HostConfig {
+    HostConfig {
+        port_bindings: Some(
+            [
+                (
+                    format!("{}/tcp", port),
+                    Some(vec![PortBinding {
+                        host_ip: Some("0.0.0.0".to_owned()),
+                        host_port: Some(port.to_string()),
+                    }]),
+                ),
+                (
+                    format!("{}/udp", port),
+                    Some(vec![PortBinding {
+                        host_ip: Some("0.0.0.0".to_owned()),
+                        host_port: Some(port.to_string()),
+                    }]),
+                ),
+            ]
+            .into_iter()
+            .collect::<HashMap<_, _>>(),
+        ),
+        ..Default::default()
+    }
+}
+
+fn connect_docker() -> anyhow::Result<Docker> {
+    match std::env::var("DOCKER_HOST").ok() {
+        Some(url)
+            if url.starts_with("http://")
+                || url.starts_with("https://")
+                || url.starts_with("tcp://") =>
+        {
+            Ok(Docker::connect_with_http(&url, 60, API_DEFAULT_VERSION)?)
+        }
+        Some(url) if url.starts_with("unix://") || url.starts_with("npipe://") => {
+            Ok(Docker::connect_with_socket(&url, 60, API_DEFAULT_VERSION)?)
+        }
+        Some(url) => anyhow::bail!("invalid DOCKER_HOST url: {}", url),
+        None => Ok(Docker::connect_with_socket_defaults()?),
+    }
 }

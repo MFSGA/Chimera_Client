@@ -184,6 +184,7 @@ windows = { version = "0.62", features = [
 ] }
 
 [dev-dependencies]
+bollard = "0.20"
 rcgen = "0.14"
 tempfile = "3.27"
 mockall = "0.14.0"

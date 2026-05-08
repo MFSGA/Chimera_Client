@@ -245,16 +245,14 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::{
-        proxy::{
-            transport,
-            utils::test_utils::{
-                Suite,
-                config_helper::test_config_base_dir,
-                consts::*,
-                docker_runner::{DockerTestRunner, DockerTestRunnerBuilder},
-                run_test_suites_and_cleanup,
-            },
+    use crate::proxy::{
+        transport,
+        utils::test_utils::{
+            Suite,
+            config_helper::test_config_base_dir,
+            consts::*,
+            docker_runner::{DockerTestRunner, DockerTestRunnerBuilder},
+            run_test_suites_and_cleanup,
         },
     };
 
