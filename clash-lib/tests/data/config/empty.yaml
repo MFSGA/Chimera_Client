@@ -1,0 +1,28 @@
+# Purpose: Minimal base config used by docker integration test helpers.
+# Referenced by: clash-lib/src/proxy/utils/test_utils/docker_utils/config_helper.rs
+
+port: 8888
+socks-port: 8889
+mixed-port: 8899
+
+dns:
+  enable: true
+  listen: 127.0.0.1:53533
+  default-nameserver:
+    - 114.114.114.114
+    - 8.8.8.8
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  nameserver:
+    - 114.114.114.114
+    - 8.8.8.8
+    - tls://dns.google:853
+    - https://1.1.1.1/dns-query
+
+allow-lan: true
+mode: rule
+log-level: debug
+external-controller: 127.0.0.1:6170
+
+rules:
+  - MATCH, DIRECT
