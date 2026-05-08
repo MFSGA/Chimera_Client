@@ -36,10 +36,14 @@ impl Suite {
 
 pub async fn run_test_suites_and_cleanup(
     _handler: Arc<dyn OutboundHandler>,
-    _docker_test_runner: impl RunAndCleanup,
+    docker_test_runner: impl RunAndCleanup,
     _suites: &[Suite],
 ) -> anyhow::Result<()> {
-    Err(anyhow::anyhow!(
-        "docker test suite execution is not migrated yet"
-    ))
+    docker_test_runner
+        .run_and_cleanup(async {
+            Err(anyhow::anyhow!(
+                "docker test suite execution is not migrated yet"
+            ))
+        })
+        .await
 }

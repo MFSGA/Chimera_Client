@@ -20,6 +20,7 @@ use futures::TryStreamExt;
 const FIRST_DOCKER_TEST_PORT: u16 = 30001;
 const PORT: u16 = 10002;
 const EXPOSED_PORTS: &[&str] = &["10002/tcp", "10002/udp"];
+const TIMEOUT_DURATION: u64 = 120;
 
 static PORT_COUNTER: AtomicU16 = AtomicU16::new(FIRST_DOCKER_TEST_PORT);
 
@@ -123,8 +124,22 @@ impl MultiDockerTestRunner {
         &mut self,
         creator: impl Future<Output = anyhow::Result<DockerTestRunner>>,
     ) -> anyhow::Result<()> {
-        self.runners.push(creator.await?);
-        Ok(())
+        match creator.await {
+            Ok(runner) => {
+                self.runners.push(runner);
+                Ok(())
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "cannot start container, please check the docker environment, error: {:?}",
+                    err
+                );
+                for runner in std::mem::take(&mut self.runners) {
+                    let _ = runner.cleanup().await;
+                }
+                Err(err)
+            }
+        }
     }
 
     pub fn add_with_runner(&mut self, runner: DockerTestRunner) {
@@ -132,19 +147,59 @@ impl MultiDockerTestRunner {
     }
 }
 
+#[async_trait::async_trait]
 pub trait RunAndCleanup {
     fn docker_gateway_ip(&self) -> Option<String>;
+
+    async fn run_and_cleanup(
+        self,
+        f: impl Future<Output = anyhow::Result<()>> + Send + 'static,
+    ) -> anyhow::Result<()>;
 }
 
+#[async_trait::async_trait]
 impl RunAndCleanup for DockerTestRunner {
     fn docker_gateway_ip(&self) -> Option<String> {
         self.gateway_ip()
     }
+
+    async fn run_and_cleanup(
+        self,
+        f: impl Future<Output = anyhow::Result<()>> + Send + 'static,
+    ) -> anyhow::Result<()> {
+        let result = run_with_timeout(f).await;
+        self.cleanup().await?;
+        result
+    }
 }
 
+#[async_trait::async_trait]
 impl RunAndCleanup for MultiDockerTestRunner {
     fn docker_gateway_ip(&self) -> Option<String> {
         self.runners.iter().find_map(DockerTestRunner::gateway_ip)
+    }
+
+    async fn run_and_cleanup(
+        self,
+        f: impl Future<Output = anyhow::Result<()>> + Send + 'static,
+    ) -> anyhow::Result<()> {
+        let result = run_with_timeout(f).await;
+        for runner in self.runners {
+            runner.cleanup().await?;
+        }
+        result
+    }
+}
+
+async fn run_with_timeout(
+    f: impl Future<Output = anyhow::Result<()>> + Send + 'static,
+) -> anyhow::Result<()> {
+    tokio::select! {
+        result = f => result,
+        _ = tokio::time::sleep(std::time::Duration::from_secs(TIMEOUT_DURATION)) => {
+            tracing::warn!("docker test runner timed out");
+            Err(anyhow::anyhow!("timeout"))
+        }
     }
 }
 
