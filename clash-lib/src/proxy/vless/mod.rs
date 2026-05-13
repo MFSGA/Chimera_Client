@@ -258,8 +258,8 @@ mod tests {
     async fn get_ws_runner() -> anyhow::Result<DockerTestRunner> {
         let test_config_dir = test_config_base_dir();
         let conf = test_config_dir.join("vless-ws-tls.json");
-        let cert = test_config_dir.join("example.org.pem");
-        let key = test_config_dir.join("example.org-key.pem");
+        let cert = test_config_dir.join("certs/example.org.pem");
+        let key = test_config_dir.join("certs/example.org-key.pem");
 
         DockerTestRunnerBuilder::new()
             .image(IMAGE_VLESS)
