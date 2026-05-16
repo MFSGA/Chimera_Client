@@ -42,6 +42,9 @@ pub struct EnhancedResolver {
     lru_cache: Option<Arc<RwLock<hickory_resolver::dns_lru::DnsLru>>>,
     policy: Option<trie::StringTrie<Vec<ThreadSafeDNSClient>>>,
 
+    proxy_resolver: Option<Vec<ThreadSafeDNSClient>>,
+    proxy_server_domains: Option<trie::StringTrie<bool>>,
+
     fake_dns: Option<ThreadSafeFakeDns>,
 
     reverse_lookup_cache:
@@ -83,6 +86,9 @@ impl EnhancedResolver {
             lru_cache: None,
             policy: None,
 
+            proxy_resolver: None,
+            proxy_server_domains: None,
+
             fake_dns: None,
 
             reverse_lookup_cache: None,
@@ -113,10 +119,55 @@ impl EnhancedResolver {
             lru_cache: None,
             policy: None,
 
+            proxy_resolver: None,
+            proxy_server_domains: None,
+
             fake_dns: None,
 
             reverse_lookup_cache: None,
         });
+
+        let proxy_resolver = if !cfg.proxy_server_nameserver.is_empty() {
+            let clients = make_clients(
+                cfg.proxy_server_nameserver.clone(),
+                Some(default_resolver.clone()),
+                Arc::new(RwLock::new(std::collections::HashMap::new())),
+                edns_client_subnet.clone(),
+                cfg.fw_mark,
+            )
+            .await;
+            if clients.is_empty() {
+                warn!(
+                    "no usable proxy-server-nameserver clients were initialized; \
+                     proxy server domain resolution will fall back to the main \
+                     nameservers"
+                );
+                None
+            } else {
+                Some(clients)
+            }
+        } else {
+            None
+        };
+
+        let plain_outbounds = outbounds.read().await;
+        let proxy_server_domains = plain_outbounds
+            .values()
+            .filter_map(|x| x.server_name())
+            .collect::<Vec<_>>();
+
+        let proxy_server_domains_trie =
+            if proxy_resolver.is_some() && !proxy_server_domains.is_empty() {
+                let mut domains = trie::StringTrie::new();
+                for server in proxy_server_domains {
+                    domains.insert(server, Arc::new(true));
+                    debug!("added proxy server domain: {}", server);
+                }
+                Some(domains)
+            } else {
+                None
+            };
+        drop(plain_outbounds);
 
         Self {
             ipv6: AtomicBool::new(cfg.ipv6),
@@ -238,6 +289,9 @@ impl EnhancedResolver {
                 _ => None,
             },
 
+            proxy_resolver,
+            proxy_server_domains: proxy_server_domains_trie,
+
             reverse_lookup_cache: Some(Arc::new(RwLock::new(
                 lru_time_cache::LruCache::with_expiry_duration_and_capacity(
                     Duration::from_secs(3), /* should be shorter than TTL so
@@ -256,6 +310,13 @@ impl EnhancedResolver {
         clients: &Vec<ThreadSafeDNSClient>,
         message: &op::Message,
     ) -> anyhow::Result<op::Message> {
+        if clients.is_empty() {
+            return Err(Error::DNSError(
+                "no DNS clients available for query".into(),
+            )
+            .into());
+        }
+
         let query_name = Self::domain_name_of_message(message)
             .unwrap_or_else(|| "<invalid-query>".to_string());
         let query_type = message
@@ -384,6 +445,16 @@ impl EnhancedResolver {
         let query = async move {
             if EnhancedResolver::is_ip_request(q) {
                 return self.ip_exchange(message).await;
+            }
+
+            if let (Some(proxy_resolver), Some(proxy_domains)) =
+                (&self.proxy_resolver, &self.proxy_server_domains)
+                && let Some(domain) =
+                    EnhancedResolver::domain_name_of_message(message)
+                && proxy_domains.search(&domain).is_some()
+            {
+                return EnhancedResolver::batch_exchange(proxy_resolver, message)
+                    .await;
             }
 
             if let Some(matched) = self.match_policy(message) {
@@ -719,7 +790,8 @@ mod tests {
 
     use crate::{
         app::dns::{
-            ClashResolver, ThreadSafeDNSClient,
+            ClashResolver, DNSConfig, ThreadSafeDNSClient,
+            config::NameServer,
             dns_client::{DNSNetMode, DnsClient, Opts},
             resolver::enhanced::EnhancedResolver,
             runtime::DnsRuntimeProvider,
@@ -1042,5 +1114,94 @@ mod tests {
     }
     fn get_default_outbound() -> Arc<dyn crate::proxy::OutboundHandler> {
         Arc::new(proxy::direct::Handler::new("default_direct"))
+    }
+
+    fn make_outbound_registry(
+        entries: &[(&str, &str)],
+    ) -> crate::proxy::utils::OutboundHandlerRegistry {
+        use crate::proxy::{
+            HandlerCommonOptions,
+            socks::outbound::{
+                Handler as SocksHandler, HandlerOptions as SocksHandlerOptions,
+            },
+        };
+
+        let mut map = std::collections::HashMap::new();
+        for (name, server) in entries {
+            let handler: Arc<dyn crate::proxy::OutboundHandler> =
+                Arc::new(SocksHandler::new(SocksHandlerOptions {
+                    name: name.to_string(),
+                    common_opts: HandlerCommonOptions::default(),
+                    server: server.to_string(),
+                    port: 1080,
+                    user: None,
+                    password: None,
+                    udp: false,
+                    tls_client: None,
+                }));
+            map.insert(name.to_string(), handler);
+        }
+        Arc::new(RwLock::new(map))
+    }
+
+    fn make_proxy_nameserver_config() -> DNSConfig {
+        let proxy_ns = NameServer {
+            net: DNSNetMode::Udp,
+            host: url::Host::Ipv4("8.8.8.8".parse().unwrap()),
+            port: 53,
+            interface: None,
+            proxy: None,
+        };
+        DNSConfig {
+            enable: true,
+            ipv6: false,
+            proxy_server_nameserver: vec![proxy_ns],
+            default_nameserver: vec![NameServer {
+                net: DNSNetMode::Udp,
+                host: url::Host::Ipv4("114.114.114.114".parse().unwrap()),
+                port: 53,
+                interface: None,
+                proxy: None,
+            }],
+            nameserver: vec![NameServer {
+                net: DNSNetMode::Udp,
+                host: url::Host::Ipv4("223.5.5.5".parse().unwrap()),
+                port: 53,
+                interface: None,
+                proxy: None,
+            }],
+            ..DNSConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_proxy_server_domains_populated_from_outbounds() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_store = crate::app::profile::ThreadSafeCacheFile::new(
+            temp_dir.path().join("cache.db").to_str().unwrap(),
+            false,
+        );
+        let outbounds = make_outbound_registry(&[
+            ("proxy-a", "proxy.example.com"),
+            ("proxy-b", "vpn.example.net"),
+            ("proxy-ip", "1.2.3.4"),
+        ]);
+
+        let resolver = EnhancedResolver::new(
+            make_proxy_nameserver_config(),
+            cache_store,
+            None,
+            outbounds,
+        )
+        .await;
+
+        assert!(resolver.proxy_resolver.is_some());
+        let domains = resolver
+            .proxy_server_domains
+            .as_ref()
+            .expect("proxy_server_domains should be populated");
+        assert!(domains.search("proxy.example.com").is_some());
+        assert!(domains.search("vpn.example.net").is_some());
+        assert!(domains.search("1.2.3.4").is_some());
     }
 }
