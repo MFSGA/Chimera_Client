@@ -308,6 +308,53 @@ pub struct DnsClient {
 }
 
 impl DnsClient {
+    /// Rebuild the DNS stream with retries, waiting between attempts.
+    /// Network transitions can briefly make outbound sockets unavailable; a
+    /// short retry loop avoids permanently failing the resolver on a transient
+    /// rebuild error.
+    async fn rebuild_with_retries(
+        &self,
+    ) -> anyhow::Result<(client::Client, JoinHandle<Result<(), ProtoError>>)> {
+        const MAX_RETRIES: u32 = 3;
+        const RETRY_DELAY: Duration = Duration::from_millis(200);
+
+        for attempt in 0..=MAX_RETRIES {
+            match dns_stream_builder(&self.cfg).await {
+                Ok(result) => {
+                    if attempt > 0 {
+                        info!(
+                            "{}: dns client rebuild succeeded on attempt {}/{}",
+                            self.id(),
+                            attempt + 1,
+                            MAX_RETRIES + 1
+                        );
+                    }
+                    return Ok(result);
+                }
+                Err(err) if attempt < MAX_RETRIES => {
+                    warn!(
+                        "{}: dns client rebuild attempt {}/{} failed: {err:#}, retrying in {}ms",
+                        self.id(),
+                        attempt + 1,
+                        MAX_RETRIES + 1,
+                        RETRY_DELAY.as_millis()
+                    );
+                    tokio::time::sleep(RETRY_DELAY).await;
+                }
+                Err(err) => {
+                    warn!(
+                        "{}: dns client rebuild failed after {} attempts: {err:#}",
+                        self.id(),
+                        MAX_RETRIES + 1
+                    );
+                    return Err(err.into());
+                }
+            }
+        }
+
+        unreachable!()
+    }
+
     pub async fn new_client(opts: Opts) -> anyhow::Result<ThreadSafeDNSClient> {
         // TODO: use proxy to connect?
 
@@ -541,7 +588,7 @@ impl Client for DnsClient {
                             "dns client background task is finished, likely \
                              connection closed, restarting a new one"
                         );
-                        let (client, bg) = dns_stream_builder(&self.cfg).await?;
+                        let (client, bg) = self.rebuild_with_retries().await?;
                         inner.c.replace(client);
                         inner.bg_handle.replace(bg);
                     } else {
@@ -554,7 +601,7 @@ impl Client for DnsClient {
                 _ => {
                     // initializing client
                     info!("initializing dns client: {}", &self.cfg);
-                    let (client, bg) = dns_stream_builder(&self.cfg).await?;
+                    let (client, bg) = self.rebuild_with_retries().await?;
                     inner.c.replace(client);
                     inner.bg_handle.replace(bg);
                 }

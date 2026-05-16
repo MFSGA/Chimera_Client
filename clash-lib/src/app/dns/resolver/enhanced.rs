@@ -345,28 +345,20 @@ impl EnhancedResolver {
         if let Some(q) = message.query() {
             trace!(q = q.to_string(), "start");
             if let Some(lru) = &self.lru_cache
-                && let Some(cached) = lru.read().await.get(q, Instant::now())
+                && let Some(Ok(cached)) =
+                    lru.read().await.get(q, Instant::now()).map(|c| {
+                        c.inspect_err(|x| {
+                            warn!("failed to get cached message: {}", x)
+                        })
+                    })
             {
-                if !message.recursion_desired() {
-                    trace!(q = q.to_string(), "cache hit, RA not desired");
-                    if let Ok(cached) = cached.inspect_err(|x| {
-                        warn!("failed to get cached message: {}", x);
-                    }) {
-                        trace!(
-                            q = q.to_string(),
-                            "cache hit for DNS query, returning cached response",
-                        );
-                        let mut reply =
-                            build_dns_response_message(message, true, false);
-                        reply.add_answers(cached.records().iter().cloned());
-                        return Ok(reply);
-                    }
-                } else {
-                    trace!(
-                        q = q.to_string(),
-                        "cache hit, RA desired, bypassing cache",
-                    );
-                }
+                trace!(
+                    q = q.to_string(),
+                    "cache hit for DNS query, returning cached response",
+                );
+                let mut reply = build_dns_response_message(message, true, false);
+                reply.add_answers(cached.records().iter().cloned());
+                return Ok(reply);
             }
             trace!(q = q.to_string(), "querying resolver");
             let res = self.exchange_no_cache(message).await.map(|mut r| {
@@ -407,6 +399,14 @@ impl EnhancedResolver {
             && let Some(lru) = &self.lru_cache
             && !(q.query_type() == rr::RecordType::TXT
                 && q.name().to_ascii().starts_with("_acme-challenge."))
+            && !matches!(
+                msg.response_code(),
+                op::ResponseCode::NXDomain | op::ResponseCode::ServFail
+            )
+            && {
+                let ips = EnhancedResolver::ip_list_of_message(msg);
+                ips.is_empty() || ips.iter().any(|ip| !ip.is_unspecified())
+            }
         {
             lru.write().await.insert_records(
                 q.clone(),
@@ -707,13 +707,15 @@ impl ClashResolver for EnhancedResolver {
 #[cfg(test)]
 mod tests {
 
+    use async_trait::async_trait;
     use hickory_client::client;
     use hickory_proto::{
         op, rr,
         udp::UdpClientStream,
         xfer::{DnsHandle, DnsRequest, DnsRequestOptions, FirstAnswer},
     };
-    use std::{net::Ipv4Addr, sync::Arc};
+    use std::{net::Ipv4Addr, sync::Arc, time::Instant};
+    use tokio::sync::RwLock;
 
     use crate::{
         app::dns::{
@@ -724,6 +726,36 @@ mod tests {
         },
         proxy,
     };
+
+    #[derive(Debug)]
+    struct FixedClient {
+        response: op::Message,
+    }
+
+    #[async_trait]
+    impl crate::app::dns::Client for FixedClient {
+        fn id(&self) -> String {
+            "fixed-client".to_owned()
+        }
+
+        async fn exchange(&self, _msg: &op::Message) -> anyhow::Result<op::Message> {
+            Ok(self.response.clone())
+        }
+    }
+
+    fn test_query() -> (op::Message, op::Query) {
+        let mut request = op::Message::new();
+        let mut query = op::Query::new();
+        query.set_name(
+            rr::Name::from_str_relaxed("example.com")
+                .unwrap()
+                .append_domain(&rr::Name::root())
+                .unwrap(),
+        );
+        query.set_query_type(rr::RecordType::A);
+        request.add_query(query.clone());
+        (request, query)
+    }
 
     /// Regression test for https://github.com/Watfaq/clash-rs/issues/976
     /// IPv6 literal addresses must be returned directly even when dns.ipv6 is
@@ -778,6 +810,72 @@ mod tests {
             result,
             Some("::1".parse::<std::net::Ipv6Addr>().unwrap()),
             "IPv6 literal should be returned directly"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lru_cache_hit_with_recursion_desired() {
+        let mut resolver = EnhancedResolver::new_default().await;
+        resolver.main.clear();
+        resolver.lru_cache = Some(Arc::new(RwLock::new(
+            hickory_resolver::dns_lru::DnsLru::new(
+                16,
+                hickory_resolver::dns_lru::TtlConfig::default(),
+            ),
+        )));
+
+        let (mut request, query) = test_query();
+        request.set_recursion_desired(true);
+
+        let record = rr::Record::from_rdata(
+            query.name().clone(),
+            300,
+            rr::RData::A(rr::rdata::A(Ipv4Addr::new(127, 0, 0, 1))),
+        );
+        resolver
+            .lru_cache
+            .as_ref()
+            .unwrap()
+            .write()
+            .await
+            .insert_records(query, vec![record].into_iter(), Instant::now());
+
+        let response = resolver
+            .exchange(&request)
+            .await
+            .expect("should be served from cache");
+        assert_eq!(response.message_type(), op::MessageType::Response);
+    }
+
+    #[tokio::test]
+    async fn test_lru_skips_nxdomain_response() {
+        let mut resolver = EnhancedResolver::new_default().await;
+        resolver.lru_cache = Some(Arc::new(RwLock::new(
+            hickory_resolver::dns_lru::DnsLru::new(
+                16,
+                hickory_resolver::dns_lru::TtlConfig::default(),
+            ),
+        )));
+
+        let (request, query) = test_query();
+        let mut response = op::Message::new();
+        response.set_response_code(op::ResponseCode::NXDomain);
+        resolver.main = vec![Arc::new(FixedClient { response })];
+
+        resolver
+            .exchange_no_cache(&request)
+            .await
+            .expect("fixed client returns a response");
+
+        assert!(
+            resolver
+                .lru_cache
+                .as_ref()
+                .unwrap()
+                .read()
+                .await
+                .get(&query, Instant::now())
+                .is_none()
         );
     }
 
