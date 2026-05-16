@@ -202,7 +202,19 @@ impl Sink<UdpPacket> for OutboundDatagramImpl {
             }
         };
 
-        let n = ready!(inner.poll_send_to(cx, p.data.as_slice(), dst))?;
+        let send_dst = match (inner.local_addr()?.is_ipv6(), dst) {
+            (true, SocketAddr::V4(v4)) => {
+                SocketAddr::V6(std::net::SocketAddrV6::new(
+                    v4.ip().to_ipv6_mapped(),
+                    v4.port(),
+                    0,
+                    0,
+                ))
+            }
+            _ => dst,
+        };
+
+        let n = ready!(inner.poll_send_to(cx, p.data.as_slice(), send_dst))?;
         let now = Instant::now();
         ip_to_logical
             .retain(|_, (_, ts)| now.duration_since(*ts) < UDP_DOMAIN_MAP_TTL);
@@ -246,6 +258,16 @@ impl Stream for OutboundDatagramImpl {
         match ready!(inner.poll_recv_from(cx, &mut buf)) {
             Ok(src) => {
                 let data = buf.filled().to_vec();
+                let src = match src {
+                    SocketAddr::V6(v6) => {
+                        if let Some(v4) = v6.ip().to_ipv4_mapped() {
+                            SocketAddr::from((v4, v6.port()))
+                        } else {
+                            src
+                        }
+                    }
+                    _ => src,
+                };
                 let src_addr = ip_to_logical
                     .get(&src)
                     .map(|(logical, _)| logical.clone())

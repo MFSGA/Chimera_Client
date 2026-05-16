@@ -1,4 +1,8 @@
-use std::{io, net::SocketAddr, time::Duration};
+use std::{
+    io,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    time::Duration,
+};
 
 use socket2::TcpKeepalive;
 
@@ -10,7 +14,6 @@ use crate::app::net::OutboundInterface;
 use crate::proxy::utils::platform::{
     maybe_protect_socket, must_bind_socket_on_interface,
 };
-use crate::{app::dns::ThreadSafeDNSResolver, session::Session};
 
 pub fn apply_tcp_options(s: &TcpStream) -> std::io::Result<()> {
     #[cfg(not(target_os = "windows"))]
@@ -76,6 +79,56 @@ pub fn try_create_dualstack_tcplistener(
     Ok(listener)
 }
 
+/// Create a dual-stack UDP socket bound to `[::]`, falling back to an IPv4
+/// socket bound to `0.0.0.0` if IPv6 is unavailable. The socket can be reused
+/// for destinations from different address families.
+pub fn new_dual_stack_udp_socket(
+    iface: Option<&OutboundInterface>,
+    #[cfg(target_os = "linux")] so_mark: Option<u32>,
+) -> std::io::Result<UdpSocket> {
+    let dual_stack = SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0));
+    let ipv4_only = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0));
+
+    let (socket, bind_addr) =
+        match try_create_dualstack_socket(dual_stack, socket2::Type::DGRAM) {
+            Ok((socket, true)) => (socket, dual_stack),
+            Ok((_, false)) | Err(_) => (
+                socket2::Socket::new(
+                    socket2::Domain::IPV4,
+                    socket2::Type::DGRAM,
+                    None,
+                )?,
+                ipv4_only,
+            ),
+        };
+
+    if let Some(iface) = iface {
+        let family = socket2::Domain::for_address(bind_addr);
+        must_bind_socket_on_interface(&socket, iface, family).inspect_err(|x| {
+            error!("failed to bind socket to interface: {}", x);
+        })?;
+    }
+
+    socket.bind(&bind_addr.into())?;
+
+    #[cfg(target_os = "linux")]
+    if let Some(so_mark) = so_mark {
+        socket.set_mark(so_mark)?;
+    }
+
+    #[cfg(target_os = "android")]
+    maybe_protect_socket(&socket)?;
+    #[cfg(not(target_os = "android"))]
+    if iface.is_none() {
+        maybe_protect_socket(&socket)?;
+    }
+
+    socket.set_broadcast(true)?;
+    socket.set_nonblocking(true)?;
+
+    UdpSocket::from_std(socket.into())
+}
+
 /// Convert ipv6 mapped ipv4 address back to ipv4. Other address remain
 /// unchanged. e.g. ::ffff:127.0.0.1 -> 127.0.0.1
 pub trait ToCanonical {
@@ -86,26 +139,6 @@ impl ToCanonical for SocketAddr {
     fn to_canonical(mut self) -> SocketAddr {
         self.set_ip(self.ip().to_canonical());
         self
-    }
-}
-
-pub async fn family_hint_for_session(
-    sess: &Session,
-    resolver: &ThreadSafeDNSResolver,
-) -> Option<SocketAddr> {
-    if let Some(resolved_ip) = sess.resolved_ip {
-        Some(SocketAddr::new(resolved_ip, sess.destination.port()))
-    } else if let Some(host) = sess.destination.ip() {
-        Some(SocketAddr::new(host, sess.destination.port()))
-    } else {
-        let host = sess.destination.host();
-        resolver
-            .resolve_v6(&host, false)
-            .await
-            .map(|ip| {
-                ip.map(|ip| SocketAddr::new(ip.into(), sess.destination.port()))
-            })
-            .ok()?
     }
 }
 
