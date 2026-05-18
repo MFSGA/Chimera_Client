@@ -187,7 +187,12 @@ impl Sink<UdpPacket> for OutboundDatagramImpl {
                             )
                         })
                     });
-                    let addr = match ready!(Pin::new(handle).poll(cx)) {
+                    let join_result = ready!(Pin::new(handle).poll(cx));
+                    // Clear the completed task before propagating errors. If a
+                    // DNS error returns early with the handle still stored, the
+                    // next poll would panic by polling a completed JoinHandle.
+                    *pending_dns = None;
+                    let addr = match join_result {
                         Ok(result) => result?,
                         Err(err) => {
                             return Poll::Ready(Err(io::Error::other(format!(
@@ -195,7 +200,6 @@ impl Sink<UdpPacket> for OutboundDatagramImpl {
                             ))));
                         }
                     };
-                    *pending_dns = None;
                     *resolved_dst = Some(addr);
                     addr
                 }
@@ -281,5 +285,141 @@ impl Stream for OutboundDatagramImpl {
             }
             Err(_) => Poll::Ready(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::dns::MockClashResolver;
+    use futures::{SinkExt, StreamExt};
+    use std::{collections::HashSet, net::Ipv4Addr, sync::Arc, time::Duration};
+    use tokio::net::UdpSocket;
+
+    async fn spawn_echo_server() -> u16 {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = sock.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let Ok((n, peer)) = sock.recv_from(&mut buf).await else {
+                    break;
+                };
+                let _ = sock.send_to(&buf[..n], peer).await;
+            }
+        });
+        port
+    }
+
+    async fn make_datagram() -> OutboundDatagramImpl {
+        let mut resolver = MockClashResolver::new();
+        resolver
+            .expect_resolve_v4()
+            .returning(|_, _| Ok(Some(Ipv4Addr::LOCALHOST)));
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        OutboundDatagramImpl::new(udp, Arc::new(resolver))
+    }
+
+    #[tokio::test]
+    async fn single_dest_domain_src_addr_restored() {
+        let echo_port = spawn_echo_server().await;
+        let mut datagram = make_datagram().await;
+
+        let dst = SocksAddr::Domain("echo.test".to_owned(), echo_port);
+        datagram
+            .send(UdpPacket {
+                data: b"hello".to_vec(),
+                dst_addr: dst.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let pkt = tokio::time::timeout(Duration::from_secs(2), datagram.next())
+            .await
+            .expect("timed out")
+            .expect("stream ended");
+
+        assert_eq!(pkt.src_addr, dst);
+        assert_eq!(pkt.data, b"hello");
+    }
+
+    #[tokio::test]
+    async fn multi_dest_1_to_n_src_addr_restored() {
+        let port_a = spawn_echo_server().await;
+        let port_b = spawn_echo_server().await;
+        let mut datagram = make_datagram().await;
+
+        let dst_a = SocksAddr::Domain("echo1.test".to_owned(), port_a);
+        let dst_b = SocksAddr::Domain("echo2.test".to_owned(), port_b);
+
+        datagram
+            .send(UdpPacket {
+                data: b"to-a".to_vec(),
+                dst_addr: dst_a.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        datagram
+            .send(UdpPacket {
+                data: b"to-b".to_vec(),
+                dst_addr: dst_b.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let timeout = Duration::from_secs(2);
+        let pkt1 = tokio::time::timeout(timeout, datagram.next())
+            .await
+            .expect("timed out waiting for first response")
+            .expect("stream ended");
+        let pkt2 = tokio::time::timeout(timeout, datagram.next())
+            .await
+            .expect("timed out waiting for second response")
+            .expect("stream ended");
+
+        let got: HashSet<SocksAddr> =
+            [pkt1.src_addr, pkt2.src_addr].into_iter().collect();
+        assert!(got.contains(&dst_a), "missing echo1.test src_addr");
+        assert!(got.contains(&dst_b), "missing echo2.test src_addr");
+    }
+
+    #[tokio::test]
+    async fn dns_failure_does_not_panic_on_retry() {
+        let mut resolver = MockClashResolver::new();
+        let mut call_count = 0u8;
+        resolver.expect_resolve_v4().returning(move |_, _| {
+            call_count += 1;
+            if call_count == 1 {
+                Err(anyhow::anyhow!("simulated DNS failure"))
+            } else {
+                Ok(Some(Ipv4Addr::LOCALHOST))
+            }
+        });
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut datagram = OutboundDatagramImpl::new(udp, Arc::new(resolver));
+
+        let echo_port = spawn_echo_server().await;
+        let dst = SocksAddr::Domain("fail.test".to_owned(), echo_port);
+
+        let result = datagram
+            .send(UdpPacket {
+                data: b"hello".to_vec(),
+                dst_addr: dst.clone(),
+                ..Default::default()
+            })
+            .await;
+        assert!(result.is_err(), "expected error on DNS failure");
+
+        datagram
+            .send(UdpPacket {
+                data: b"hello again".to_vec(),
+                dst_addr: dst,
+                ..Default::default()
+            })
+            .await
+            .expect("second send must succeed after DNS recovers");
     }
 }
