@@ -102,6 +102,10 @@ fn run_ip_cmd_single(
     Err(new_io_error(format!("{} failed: {}", cmd_str, stderr)))
 }
 
+/// Run an ip command for IPv4 and optionally IPv6.
+///
+/// When allow_missing is true this returns Ok(false) for already-absent rules
+/// or routes, allowing cleanup to be idempotent across restarts.
 fn run_ip_cmd_with_mode(
     args: &[&str],
     enable_v6: bool,

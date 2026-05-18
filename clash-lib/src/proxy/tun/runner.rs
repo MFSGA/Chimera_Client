@@ -3,7 +3,7 @@ use std::sync::Arc;
 use futures::{FutureExt, SinkExt, StreamExt, future::BoxFuture};
 use network_interface::NetworkInterfaceConfig;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use url::Url;
 
 use crate::{
@@ -246,7 +246,17 @@ impl TunRunner {
                         }
                     }
                     #[cfg(target_os = "windows")]
-                    if let Some(guid) = tun_init_config.guid {
+                    {
+                        // Use an explicit GUID when configured, otherwise derive
+                        // a deterministic one from the device name so restarts
+                        // reuse the same adapter instead of creating a new one.
+                        let guid = tun_init_config.guid.unwrap_or_else(|| {
+                            uuid::Uuid::new_v5(
+                                &uuid::Uuid::NAMESPACE_DNS,
+                                tun_name.as_bytes(),
+                            )
+                            .as_u128()
+                        });
                         tun_builder = tun_builder.device_guid(guid);
                     }
 
@@ -310,7 +320,25 @@ impl Runner for TunRunner {
 
         let handle = tokio::spawn(async move {
             let (tun, stack, mut tcp_listener, udp_socket) =
-                TunRunner::new_internal(&cfg).await?;
+                TunRunner::new_internal(&cfg)
+                    .await
+                    .inspect_err(|e| match e {
+                        Error::Io(e) => {
+                            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                                error!(
+                                    "tun initialization failed: permission denied. \
+                                     Please make sure the program has the \
+                                     necessary permissions to create and manage \
+                                     TUN interfaces."
+                                );
+                            } else {
+                                error!("tun initialization I/O error: {}", e);
+                            }
+                        }
+                        _ => {
+                            error!("tun initialization error: {}", e);
+                        }
+                    })?;
 
             let framed = tun_rs::async_framed::DeviceFramed::new(
                 tun,
@@ -327,6 +355,15 @@ impl Runner for TunRunner {
                     match pkt {
                         Ok(pkt) => {
                             if let Err(e) = tun_sink.send(pkt.into_bytes()).await {
+                                if e.kind() == std::io::ErrorKind::TimedOut
+                                    || e.kind() == std::io::ErrorKind::WouldBlock
+                                {
+                                    warn!(
+                                        "tun send buffer full, dropping packet: {}",
+                                        e
+                                    );
+                                    continue;
+                                }
                                 error!("failed to send pkt to tun: {}", e);
                                 break;
                             }
@@ -394,15 +431,24 @@ impl Runner for TunRunner {
                 Err(Error::Operation("tun stopped unexpectedly 3".to_string()))
             };
 
-            tokio::select! {
+            match tokio::select! {
                 res = fut_dispatcher_tun() => res,
                 res = fut_tun_dispatcher() => res,
                 res = fut_tcp_dispatch() => res,
                 res = fut_udp_dispatch() => res,
                 _ = cancellation_token.cancelled() => {
-                    info!("tun runner is closed");
+                    info!("tun stop signal received");
                     Ok(())
                 },
+            } {
+                Ok(_) => {
+                    info!("tun runner exited");
+                    Ok(())
+                }
+                Err(e) => {
+                    error!("tun runner error: {}", e);
+                    Err(e)
+                }
             }
         });
 

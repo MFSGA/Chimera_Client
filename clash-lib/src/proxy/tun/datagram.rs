@@ -20,6 +20,12 @@ type PendingPermitFuture = BoxFuture<
     >,
 >;
 
+/// Flush state for a pending dispatcher-to-TUN UDP packet.
+///
+/// This intentionally waits for mpsc capacity instead of using try_send: TUN UDP
+/// may be lossy at the network layer, but dropping locally just because the
+/// small handoff queue is temporarily full causes avoidable stalls under bursty
+/// DNS/UDP traffic.
 enum FlushState {
     Pending,
     Ready(tokio::sync::mpsc::OwnedPermit<UdpPacket>),
@@ -290,6 +296,9 @@ impl Sink<UdpPacket> for TunDatagram {
                 .expect("pending_permit mutex poisoned");
 
             if pending_permit.is_none() {
+                // Reserve capacity asynchronously and keep the same future
+                // across polls so the packet is sent exactly once when capacity
+                // becomes available.
                 *pending_permit = Some(Box::pin(self.tx.clone().reserve_owned()));
             }
 
@@ -430,6 +439,40 @@ mod tests {
         assert!(
             err.to_string().contains("local UDP sink disconnected"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tun_datagram_poll_ready_waits_for_pending_flush_capacity() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let (_dummy_tx, dummy_rx) = tokio::sync::mpsc::channel(1);
+        tx.send(sample_packet(10010))
+            .await
+            .expect("failed to fill channel");
+
+        let mut datagram = TunDatagram::new(tx, dummy_rx);
+        let waker = noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+
+        Pin::new(&mut datagram)
+            .start_send(sample_packet(10011))
+            .expect("start_send should succeed");
+
+        assert!(matches!(
+            Pin::new(&mut datagram).poll_ready(&mut cx),
+            Poll::Pending
+        ));
+
+        let _ = rx.recv().await.expect("expected queued packet");
+
+        assert!(matches!(
+            Pin::new(&mut datagram).poll_ready(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        let forwarded = rx.recv().await.expect("expected forwarded packet");
+        assert_eq!(
+            forwarded.src_addr,
+            SocksAddr::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10011,))
         );
     }
 }

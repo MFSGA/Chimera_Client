@@ -74,6 +74,10 @@ fn prefix_from_ipnet(dest: &IpNet) -> IP_ADDRESS_PREFIX {
     }
 }
 
+/// Pick an address inside the excluded prefix for GetBestRoute2 probing.
+///
+/// Using the network address itself can be ambiguous for non-host prefixes, so
+/// prefer the next address when the prefix has host space.
 fn probe_addr(dest: &IpNet) -> IpAddr {
     match dest {
         IpNet::V4(ipv4) => {
@@ -110,6 +114,9 @@ fn sockaddr_from_ip(ip: IpAddr) -> SOCKADDR_INET {
     }
 }
 
+/// IPv4 link-local routes are unstable best-route candidates on Windows.
+/// Keep those addresses out of route-exclude-address and handle them with
+/// rule-level DIRECT behavior instead.
 fn should_skip_best_route_lookup(dest: &IpNet) -> bool {
     match dest {
         IpNet::V4(ipv4) => IPV4_LINK_LOCAL_NET.contains(&ipv4.network()),
@@ -196,6 +203,8 @@ pub fn best_route_for_destination(
     Ok(Some(row))
 }
 
+/// Add a more specific route that bypasses the TUN interface through the
+/// original best route. Created rows are tracked for cleanup on shutdown.
 pub fn add_excluded_route(
     dest: &IpNet,
     best_route: &MIB_IPFORWARD_ROW2,
