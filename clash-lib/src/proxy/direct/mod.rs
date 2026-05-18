@@ -3,6 +3,8 @@ use std::fmt::Debug;
 use async_trait::async_trait;
 use futures::TryFutureExt;
 
+pub(crate) mod datagram;
+
 use crate::app::dispatcher::ChainedDatagram;
 use crate::{
     Session,
@@ -17,10 +19,11 @@ use crate::{
     config::internal::proxy::PROXY_DIRECT,
     proxy::{
         ConnectorType, DialWithConnector, OutboundHandler, OutboundType,
-        datagram::OutboundDatagramImpl,
         utils::{RemoteConnector, new_dual_stack_udp_socket, new_tcp_stream},
     },
 };
+
+use datagram::OutboundDatagramImpl;
 
 #[derive(Clone)]
 pub struct Handler {
