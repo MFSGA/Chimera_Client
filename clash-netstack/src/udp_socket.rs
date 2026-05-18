@@ -150,6 +150,8 @@ impl SplitWrite {
             .write(&mut ip_packet_writer, packet.data.data())
             .map_err(std::io::Error::other)?;
 
+        // UDP is inherently unreliable; drop the packet if the outbound
+        // channel is full rather than blocking the UDP handler task.
         match self.send.try_send(Packet::new(ip_packet_writer)) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {

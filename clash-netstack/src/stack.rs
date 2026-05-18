@@ -101,12 +101,11 @@ impl NetStack {
         crate::tcp_listener::TcpListener,
         crate::udp_socket::UdpSocket,
     ) {
-        let (tcp_packet_sender, tcp_packet_receiver) =
-            mpsc::channel::<Packet>(4096);
-        // UDP is lossy by design, so a dedicated bounded queue prevents it
-        // from crowding out TCP replies when the consumer falls behind.
-        let (udp_packet_sender, udp_packet_receiver) =
-            mpsc::channel::<Packet>(4096);
+        let (tcp_packet_sender, tcp_packet_receiver) = mpsc::channel::<Packet>(4096);
+        // UDP uses a separate bounded channel. UDP is inherently lossy, so
+        // drop-on-full is correct; the bound prevents unbounded memory growth
+        // if a remote floods responses faster than the consumer can drain them.
+        let (udp_packet_sender, udp_packet_receiver) = mpsc::channel::<Packet>(4096);
 
         let (udp_inbound_app, udp_outbound_stack) =
             mpsc::unbounded_channel::<Packet>();
@@ -116,8 +115,7 @@ impl NetStack {
         let udp_socket = UdpSocket::new(udp_outbound_stack, udp_packet_sender);
         let (tcp_inbound_app, tcp_outbound_stack) =
             mpsc::unbounded_channel::<Packet>();
-        let tcp_listener =
-            TcpListener::new(tcp_outbound_stack, tcp_packet_sender);
+        let tcp_listener = TcpListener::new(tcp_outbound_stack, tcp_packet_sender);
 
         let stack = NetStack {
             udp_inbound: udp_inbound_app,

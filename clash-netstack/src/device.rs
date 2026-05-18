@@ -49,6 +49,9 @@ impl Device for NetstackDevice {
         &mut self,
         _timestamp: Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        // Reserve a tx slot first before touching rx_queue. If rx_queue were
+        // consumed first, try_reserve() failure would silently drop inbound ACKs
+        // and prevent smoltcp from advancing its send window.
         let permit = self.tx_sender.try_reserve().ok()?;
         let packet = self.rx_queue.try_recv().ok()?;
 
@@ -109,6 +112,10 @@ mod tests {
     use super::*;
     use smoltcp::phy::Device;
 
+    /// Reproduces the ACK-drop bug when the outbound tx channel is full.
+    ///
+    /// Without the receive() ordering fix, the inbound ACK is consumed from
+    /// rx_queue before a tx slot is reserved and disappears forever.
     #[tokio::test]
     async fn test_receive_drops_inbound_packet_when_tx_channel_full() {
         let (tx_sender, mut tx_receiver) = tokio::sync::mpsc::channel::<Packet>(1);
@@ -117,15 +124,18 @@ mod tests {
         let mut device = NetstackDevice::new(tx_sender, iface_notifier);
         let injector = device.create_injector();
 
+        // Fill the tx channel to its capacity of 1.
         device
             .tx_sender
             .try_send(Packet::new(vec![0u8; 60]))
             .expect("should fit in empty channel");
 
+        // Simulate an inbound ACK entering rx_queue.
         injector
             .send(Packet::new(vec![0u8; 60]))
             .expect("unbounded, should not fail");
 
+        // receive() must not consume the ACK while there is no tx slot.
         {
             let result = device.receive(smoltcp::time::Instant::now());
             assert!(
@@ -134,12 +144,14 @@ mod tests {
             );
         }
 
+        // Drain the tx channel to make space, then verify the ACK is still
+        // available for smoltcp to process.
         tx_receiver.recv().await.expect("should have a packet");
 
         let result = device.receive(smoltcp::time::Instant::now());
         assert!(
             result.is_some(),
-            "inbound ACK was dropped when tx channel was full"
+            "inbound ACK was dropped when tx channel was full; smoltcp will stall"
         );
     }
 }

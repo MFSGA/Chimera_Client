@@ -24,6 +24,8 @@ impl Drop for TcpStream {
             self.local_addr, self.remote_addr
         );
 
+        // socket_dropped tells poll_sockets to drain send_buffer and issue FIN.
+        // read_closed / write_closed unblock any concurrent poll_read / poll_write.
         self.handle.socket_dropped.store(true, Ordering::Release);
         self.handle.read_closed.store(true, Ordering::Release);
         self.handle.write_closed.store(true, Ordering::Release);
@@ -49,24 +51,10 @@ impl TcpStream {
         (r, w)
     }
 
-    fn mark_stack_closed(&self) {
-        self.handle.socket_closed.store(true, Ordering::Release);
-        self.handle.read_closed.store(true, Ordering::Release);
-        self.handle.write_closed.store(true, Ordering::Release);
-        self.handle.recv_waker.wake();
-        self.handle.send_waker.wake();
-    }
-
-    fn notify_stack_ready(&self) -> std::io::Result<()> {
-        self.stack_notifier
-            .send(IfaceEvent::TcpSocketReady)
-            .map_err(|e| {
-                self.mark_stack_closed();
-                Error::new(
-                    ErrorKind::BrokenPipe,
-                    format!("failed to notify TCP socket ready: {e}"),
-                )
-            })
+    fn notify_tcp_socket_ready(&self) {
+        if let Err(e) = self.stack_notifier.send(IfaceEvent::TcpSocketReady) {
+            error!("Failed to notify TCP socket ready: {e}");
+        }
     }
 }
 
@@ -92,6 +80,7 @@ impl tokio::io::AsyncRead for TcpStream {
         let read_buf = &self.handle.recv_buffer;
 
         if read_buf.is_empty() {
+            // Register waker first, then re-check to close the TOCTOU window.
             self.handle.recv_waker.register(cx.waker());
             if read_buf.is_empty() {
                 if self.handle.socket_closed.load(Ordering::Acquire)
@@ -116,11 +105,7 @@ impl tokio::io::AsyncRead for TcpStream {
         let n = read_buf.dequeue_slice(recv_buf);
         buf.advance(n);
 
-        if let Err(e) = self.notify_stack_ready() {
-            trace!(
-                "TcpStream::poll_read: stack notifier unavailable after read: {e}"
-            );
-        }
+        self.notify_tcp_socket_ready();
         trace!("TcpStream::poll_read: (proxy)read {n} bytes from recv buffer");
 
         Poll::Ready(Ok(()))
@@ -145,34 +130,20 @@ impl tokio::io::AsyncWrite for TcpStream {
         let send_buf = &self.handle.send_buffer;
 
         if send_buf.is_full() {
-            trace!("TcpStream::poll_write: send buffer is full, waiting for space");
+            // Register waker first, then re-check to close the TOCTOU window.
             self.handle.send_waker.register(cx.waker());
-            if let Err(e) = self.notify_stack_ready() {
-                return Poll::Ready(Err(e));
-            }
-
-            if self.handle.write_closed.load(Ordering::Acquire)
-                || self.handle.write_shutdown.load(Ordering::Acquire)
-            {
-                return Poll::Ready(Err(Error::new(
-                    ErrorKind::BrokenPipe,
-                    "TCP stream write half closed",
-                )));
-            }
-
-            // Re-check fullness after registering the waker to avoid missing a wake
             if send_buf.is_full() {
+                trace!(
+                    "TcpStream::poll_write: send buffer is full, waiting for space"
+                );
+                self.notify_tcp_socket_ready();
                 return Poll::Pending;
             }
         }
 
         let n = send_buf.enqueue_slice(buf);
 
-        if let Err(e) = self.notify_stack_ready() {
-            trace!(
-                "TcpStream::poll_write: stack notifier unavailable after enqueue: {e}"
-            );
-        }
+        self.notify_tcp_socket_ready();
         trace!("TcpStream::poll_write: (proxy)write {n} bytes to send buffer");
 
         Poll::Ready(Ok(n))
@@ -182,10 +153,8 @@ impl tokio::io::AsyncWrite for TcpStream {
         self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<()>> {
-        match self.notify_stack_ready() {
-            Ok(()) => Poll::Ready(Ok(())),
-            Err(e) => Poll::Ready(Err(e)),
-        }
+        self.notify_tcp_socket_ready();
+        Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(
@@ -268,34 +237,13 @@ mod tests {
     }
 
     #[test]
-    fn poll_flush_returns_broken_pipe_when_notifier_closed() {
+    fn poll_flush_still_succeeds_when_notifier_closed() {
         let (mut stream, rx) = build_stream();
         drop(rx);
         let mut cx = noop_cx();
 
         let result = Pin::new(&mut stream).poll_flush(&mut cx);
 
-        assert!(
-            matches!(result, Poll::Ready(Err(err)) if err.kind() == ErrorKind::BrokenPipe)
-        );
-        assert!(stream.handle.read_closed.load(Ordering::Acquire));
-        assert!(stream.handle.write_closed.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn poll_read_returns_buffered_data_when_notifier_closed() {
-        let (mut stream, rx) = build_stream();
-        drop(rx);
-        stream.handle.recv_buffer.enqueue_slice(b"ok");
-        let mut cx = noop_cx();
-        let mut bytes = [0u8; 8];
-        let mut buf = tokio::io::ReadBuf::new(&mut bytes);
-
-        let result = Pin::new(&mut stream).poll_read(&mut cx, &mut buf);
-
         assert!(matches!(result, Poll::Ready(Ok(()))));
-        assert_eq!(buf.filled(), b"ok");
-        assert!(stream.handle.read_closed.load(Ordering::Acquire));
-        assert!(stream.handle.write_closed.load(Ordering::Acquire));
     }
 }

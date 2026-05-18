@@ -24,16 +24,11 @@ use tokio::sync::mpsc;
 const DEFAULT_TCP_SEND_BUFFER_SIZE: u32 = 256 * 1024; // 256 KiB
 const DEFAULT_TCP_RECV_BUFFER_SIZE: u32 = 256 * 1024; // 256 KiB
 
-/// Time-to-live for SYN tracker entries. Long enough to cover typical TCP SYN
-/// retransmission windows so duplicates within ~60s are suppressed, while still
-/// bounding memory use for stale half-open connections.
+/// Time-to-live for SYN tracker entries. Duplicates within this window are
+/// suppressed to prevent the same SYN from creating multiple smoltcp sockets.
 const SYN_TRACK_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Maximum number of concurrent half-open SYN entries tracked.
-/// Caps the SYN tracker to prevent OOM under SYN flood attacks.
-/// Each entry is a (SocketAddr, SocketAddr) -> Instant mapping (~100 bytes),
-/// so 10 000 entries ≈ 1 MiB — negligible compared to the per-connection
-/// socket buffers that are only allocated once the SYN is accepted.
+/// Maximum tracked half-open SYN entries. Bounds memory under a SYN flood.
 const SYN_TRACK_MAX: usize = 10_000;
 
 #[derive(Clone, Debug)]
@@ -121,10 +116,20 @@ pub(crate) struct TcpStreamHandle {
     pub(crate) send_buffer: LockFreeRingBuffer,
     pub(crate) send_waker: AtomicWaker,
 
+    /// Set by the relay task through TcpStream::drop when the app-side stream
+    /// is dropped. poll_sockets drains send_buffer, then calls socket.close()
+    /// to start the FIN handshake.
     pub(crate) socket_dropped: AtomicBool,
+    /// Set by poll_sockets when the smoltcp socket becomes inactive. poll_read
+    /// returns EOF once recv_buffer is drained.
     pub(crate) socket_closed: AtomicBool,
+    /// Set when smoltcp reports the receive side is closed, and defensively in
+    /// TcpStream::drop().
     pub(crate) read_closed: AtomicBool,
+    /// Set when smoltcp reports the send side is closed, and defensively in
+    /// TcpStream::drop().
     pub(crate) write_closed: AtomicBool,
+    /// Set by poll_shutdown(); poll_sockets closes once send_buffer is drained.
     pub(crate) write_shutdown: AtomicBool,
 }
 
@@ -476,11 +481,16 @@ impl TcpListener {
                 trace!("Woke up to poll sockets");
 
                 // Drain pending notifier events before polling smoltcp.
+                //
                 // The critical race is IfaceEvent::TcpStream: poll_packets
                 // creates the listening socket and queues it here before the
                 // raw SYN is injected into the device buffer. If iface.poll()
                 // runs first, smoltcp can observe the SYN without a matching
                 // listener and immediately reply with RST.
+                //
+                // During active downloads poll_delay often returns 0/None, keeping
+                // should_poll_now=true and never entering the else branch below.
+                // Draining here ensures sockets are always registered in time.
                 loop {
                     match notifier_rx.try_recv() {
                         Ok(IfaceEvent::TcpStream(stream)) => {
@@ -616,6 +626,10 @@ impl TcpListener {
                     let socket = sockets.get_mut::<tcp::Socket>(*handle);
 
                     if socket_control.socket_dropped.load(Ordering::Acquire) {
+                        // The app-side TcpStream was dropped. Flush remaining
+                        // data from send_buffer into smoltcp's TX buffer, then
+                        // initiate a graceful FIN. Do not remove immediately,
+                        // otherwise smoltcp may discard queued TX data.
                         let buf = &socket_control.send_buffer;
                         while socket.can_send() && !buf.is_empty() {
                             if let Ok(n) = socket.send(|buffer| {
@@ -628,12 +642,17 @@ impl TcpListener {
                         if buf.is_empty() {
                             socket.close();
                         }
+                        // Keep the socket until smoltcp finishes the close
+                        // handshake and reports is_active() == false.
                     }
 
                     if socket.is_active() {
                         true
                     } else {
                         trace!("Removing inactive TCP socket");
+                        // Unblock any in-flight poll_read / poll_write on this
+                        // stream. socket_closed covers RST/timeout paths where
+                        // read_closed may not have been set by the data path.
                         socket_control.socket_closed.store(true, Ordering::Release);
                         socket_control.write_closed.store(true, Ordering::Release);
                         socket_control.recv_waker.wake();
@@ -652,6 +671,9 @@ impl TcpListener {
                     None => None,
                 };
 
+                // Yield to the tokio scheduler so StackSplitStream can drain
+                // outbound packets and send ACKs back. Without this, sustained
+                // zero poll_delay can create a tight loop that starves readers.
                 tokio::task::yield_now().await;
             } else {
                 tokio::select! {
@@ -699,6 +721,8 @@ impl futures::Stream for TcpListener {
             Ok(stream) => std::task::Poll::Ready(Some(stream)),
             Err(e) => match e {
                 mpsc::error::TryRecvError::Empty => {
+                    // Register waker first, then re-check to close the TOCTOU
+                    // window if poll_packets wakes between try_recv and register.
                     self.socket_stream_waker.register(cx.waker());
                     match self.socket_stream.try_recv() {
                         Ok(stream) => std::task::Poll::Ready(Some(stream)),
