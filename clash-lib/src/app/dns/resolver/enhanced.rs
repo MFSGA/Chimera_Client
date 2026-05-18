@@ -110,7 +110,7 @@ impl EnhancedResolver {
             main: make_clients(
                 cfg.default_nameserver.clone(),
                 None,
-                outbounds.clone(),
+                Arc::new(RwLock::new(std::collections::HashMap::new())),
                 edns_client_subnet.clone(),
                 cfg.fw_mark,
                 None,
@@ -447,16 +447,6 @@ impl EnhancedResolver {
                 return self.ip_exchange(message).await;
             }
 
-            if let (Some(proxy_resolver), Some(proxy_domains)) =
-                (&self.proxy_resolver, &self.proxy_server_domains)
-                && let Some(domain) =
-                    EnhancedResolver::domain_name_of_message(message)
-                && proxy_domains.search(&domain).is_some()
-            {
-                return EnhancedResolver::batch_exchange(proxy_resolver, message)
-                    .await;
-            }
-
             if let Some(matched) = self.match_policy(message) {
                 return EnhancedResolver::batch_exchange(matched, message).await;
             }
@@ -500,6 +490,18 @@ impl EnhancedResolver {
         &self,
         message: &op::Message,
     ) -> anyhow::Result<op::Message> {
+        if let (Some(proxy_resolver), Some(proxy_domains)) =
+            (&self.proxy_resolver, &self.proxy_server_domains)
+            && let Some(domain) = EnhancedResolver::domain_name_of_message(message)
+            && proxy_domains.search(&domain).is_some()
+        {
+            debug!(
+                "using proxy-server-nameserver for proxy server domain: {}",
+                domain
+            );
+            return EnhancedResolver::batch_exchange(proxy_resolver, message).await;
+        }
+
         if let Some(matched) = self.match_policy(message) {
             return EnhancedResolver::batch_exchange(matched, message).await;
         }
@@ -783,7 +785,14 @@ mod tests {
         rr,
     };
     use hickory_resolver::{ResponseCache, TtlConfig};
-    use std::{net::Ipv4Addr, sync::Arc, time::Instant};
+    use std::{
+        net::Ipv4Addr,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Instant,
+    };
     use tokio::sync::RwLock;
 
     use crate::{
@@ -813,6 +822,25 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct CountingClient {
+        response: op::Message,
+        hits: Arc<AtomicUsize>,
+        id: &'static str,
+    }
+
+    #[async_trait]
+    impl crate::app::dns::Client for CountingClient {
+        fn id(&self) -> String {
+            self.id.to_owned()
+        }
+
+        async fn exchange(&self, _msg: &op::Message) -> anyhow::Result<op::Message> {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            Ok(self.response.clone())
+        }
+    }
+
     fn test_query() -> (op::Message, op::Query) {
         let mut request = op::Message::query();
         let mut query = op::Query::new();
@@ -825,6 +853,33 @@ mod tests {
         query.set_query_type(rr::RecordType::A);
         request.add_query(query.clone());
         (request, query)
+    }
+
+    fn test_query_with_type(record_type: rr::RecordType) -> op::Message {
+        let mut request = op::Message::query();
+        let mut query = op::Query::new();
+        query.set_name(
+            rr::Name::from_str_relaxed("proxy.example.com")
+                .unwrap()
+                .append_domain(&rr::Name::root())
+                .unwrap(),
+        );
+        query.set_query_type(record_type);
+        request.add_query(query);
+        request
+    }
+
+    fn response_with_a(ip: Ipv4Addr) -> op::Message {
+        let mut response = op::Message::response(0, op::OpCode::Query);
+        response.add_answer(rr::Record::from_rdata(
+            rr::Name::from_str_relaxed("proxy.example.com")
+                .unwrap()
+                .append_domain(&rr::Name::root())
+                .unwrap(),
+            300,
+            rr::RData::A(rr::rdata::A(ip)),
+        ));
+        response
     }
 
     /// Regression test for https://github.com/Watfaq/clash-rs/issues/976
@@ -937,6 +992,50 @@ mod tests {
                 .get(&query, Instant::now())
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_server_nameserver_only_handles_ip_queries() {
+        let mut resolver = EnhancedResolver::new_default().await;
+        resolver.lru_cache = None;
+
+        let proxy_hits = Arc::new(AtomicUsize::new(0));
+        let main_hits = Arc::new(AtomicUsize::new(0));
+
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(203, 0, 113, 10)),
+            hits: proxy_hits.clone(),
+            id: "proxy-ns",
+        })]);
+        resolver.main = vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(198, 51, 100, 20)),
+            hits: main_hits.clone(),
+            id: "main-ns",
+        })];
+
+        let mut domains = crate::common::trie::StringTrie::new();
+        domains.insert("proxy.example.com", Arc::new(true));
+        resolver.proxy_server_domains = Some(domains);
+
+        let a_request = test_query_with_type(rr::RecordType::A);
+        let a_response = resolver
+            .exchange_no_cache(&a_request)
+            .await
+            .expect("A query should resolve");
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&a_response),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))]
+        );
+        assert_eq!(proxy_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(main_hits.load(Ordering::SeqCst), 0);
+
+        let txt_request = test_query_with_type(rr::RecordType::TXT);
+        resolver
+            .exchange_no_cache(&txt_request)
+            .await
+            .expect("TXT query should resolve through main nameserver");
+        assert_eq!(proxy_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(main_hits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
