@@ -50,7 +50,6 @@ pub async fn exchange_with_resolver<'a>(
                     vec![Record::from_rdata(name, DEFAULT_DNS_SERVER_TTL, rdata)];
 
                 res.metadata.response_code = ResponseCode::NoError;
-
                 res.add_answers(records);
 
                 Ok(res)

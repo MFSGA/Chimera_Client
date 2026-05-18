@@ -390,17 +390,12 @@ impl EnhancedResolver {
         m.add_query(q);
         m.metadata.recursion_desired = true;
 
-        match self.exchange(&m).await {
-            Ok(result) => {
-                let ip_list = EnhancedResolver::ip_list_of_message(&result);
-                if !ip_list.is_empty() {
-                    Ok(ip_list)
-                } else {
-                    Err(anyhow!("no record for hostname: {}", host))
-                }
-            }
-            Err(e) => Err(e),
+        let result = self.exchange(&m).await?;
+        let ip_list = EnhancedResolver::ip_list_of_message(&result);
+        if ip_list.is_empty() {
+            return Err(anyhow!("no record for hostname: {}", host));
         }
+        Ok(ip_list)
     }
 
     #[instrument(skip_all, level = "trace")]
@@ -1341,5 +1336,47 @@ mod tests {
         assert!(domains.search("proxy.example.com").is_some());
         assert!(domains.search("vpn.example.net").is_some());
         assert!(domains.search("1.2.3.4").is_some());
+    }
+
+    #[tokio::test]
+    #[ignore = "network unstable on CI"]
+    async fn test_proxy_server_domain_resolved_via_proxy_nameserver() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_store = crate::app::profile::ThreadSafeCacheFile::new(
+            temp_dir.path().join("cache.db").to_str().unwrap(),
+            false,
+        );
+
+        let outbounds = make_outbound_registry(&[("cf-proxy", "one.one.one.one")]);
+
+        let resolver = EnhancedResolver::new(
+            make_proxy_nameserver_config(),
+            cache_store,
+            None,
+            outbounds,
+            None,
+        )
+        .await;
+
+        assert!(resolver.proxy_server_domains.is_some());
+        assert!(
+            resolver
+                .proxy_server_domains
+                .as_ref()
+                .unwrap()
+                .search("one.one.one.one")
+                .is_some()
+        );
+
+        let ip = resolver
+            .resolve("one.one.one.one", false)
+            .await
+            .expect("should resolve one.one.one.one")
+            .expect("should return an IP for one.one.one.one");
+        assert!(
+            ip.to_string() == "1.1.1.1" || ip.to_string() == "1.0.0.1",
+            "unexpected IP: {}",
+            ip
+        );
     }
 }

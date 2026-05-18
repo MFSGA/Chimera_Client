@@ -33,6 +33,8 @@ pub async fn make_clients(
         let proxy: Arc<dyn proxy::OutboundHandler> =
             Arc::new(SharedOutboundHandler::new(proxy_name, outbounds.clone()));
 
+        // An explicit `#proxy=...` always wins; rule-engine routing is only
+        // applied to nameservers that use the default DIRECT path.
         let rd = if s.proxy.is_none() {
             rule_dispatch.clone()
         } else {

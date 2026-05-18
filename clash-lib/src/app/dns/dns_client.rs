@@ -217,6 +217,10 @@ pub struct Opts {
     pub proxy: Arc<dyn OutboundHandler>,
     pub ecs: Option<EdnsClientSubnet>,
     pub fw_mark: Option<u32>,
+    /// When set, upstream dials consult the rule engine. Only populated for
+    /// `nameserver`, `fallback`, and `nameserver-policy` clients when
+    /// `dns.respect-rules` is true; bootstrap clients (`default-nameserver`,
+    /// `proxy-server-nameserver`) leave this `None`.
     pub rule_dispatch: Option<Arc<RuleDispatch>>,
 }
 
