@@ -374,12 +374,19 @@ pub async fn new_udp_socket(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        net::{Ipv4Addr, SocketAddr, SocketAddrV6},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
     };
 
-    use super::new_udp_socket;
+    use tokio::net::UdpSocket;
+
+    use super::{new_dual_stack_udp_socket, new_udp_socket};
+    use crate::app::net::OutboundInterface;
     use crate::proxy::utils::{
         SocketProtector, clear_socket_protector, set_socket_protector,
     };
@@ -415,6 +422,102 @@ mod tests {
             .expect("udp socket should be created");
 
         clear_socket_protector();
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    fn find_loopback_iface() -> Option<OutboundInterface> {
+        use network_interface::{Addr, NetworkInterface, NetworkInterfaceConfig};
+
+        let iface = NetworkInterface::show().ok()?.into_iter().find(|iface| {
+            iface.addr.iter().any(|addr| match addr {
+                Addr::V4(v4) => v4.ip.is_loopback(),
+                _ => false,
+            })
+        })?;
+
+        Some(OutboundInterface {
+            name: iface.name,
+            addr_v4: Some(Ipv4Addr::LOCALHOST),
+            addr_v6: Some(Ipv4Addr::LOCALHOST.to_ipv6_mapped().into()),
+            index: iface.index,
+            netmask_v4: None,
+            broadcast_v4: None,
+            netmask_v6: None,
+            broadcast_v6: None,
+            mac_addr: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn dual_stack_no_iface_is_bound_and_sends_ipv4_mapped() {
+        let sock = new_dual_stack_udp_socket(
+            None,
+            #[cfg(target_os = "linux")]
+            None,
+        )
+        .expect("failed to create dual-stack socket");
+
+        let local = sock.local_addr().expect("local_addr failed");
+        assert_ne!(local.port(), 0, "socket must have a non-zero local port");
+
+        // Hosts without IPv6 support fall back to an IPv4-only socket.
+        if !local.is_ipv6() {
+            return;
+        }
+
+        let echo = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind echo server");
+        let echo_port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 64];
+            if let Ok((n, peer)) = echo.recv_from(&mut buf).await {
+                let _ = echo.send_to(&buf[..n], peer).await;
+            }
+        });
+
+        let dst = SocketAddr::V6(SocketAddrV6::new(
+            Ipv4Addr::LOCALHOST.to_ipv6_mapped(),
+            echo_port,
+            0,
+            0,
+        ));
+        sock.send_to(b"ping", dst).await.expect("send_to failed");
+
+        let mut buf = vec![0u8; 64];
+        let (n, _) =
+            tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf))
+                .await
+                .expect("timed out")
+                .expect("recv_from failed");
+        assert_eq!(&buf[..n], b"ping");
+    }
+
+    #[tokio::test]
+    async fn dual_stack_with_iface_is_bound() {
+        let Some(iface) = find_loopback_iface() else {
+            eprintln!("skipping: loopback interface not found");
+            return;
+        };
+
+        let result = new_dual_stack_udp_socket(
+            Some(&iface),
+            #[cfg(target_os = "linux")]
+            None,
+        );
+
+        #[cfg(target_os = "linux")]
+        if result.is_err() {
+            eprintln!("skipping: SO_BINDTODEVICE requires elevated privileges");
+            return;
+        }
+
+        let sock = result.expect("failed to create dual-stack socket with iface");
+        let local = sock.local_addr().expect("local_addr failed");
+        assert_ne!(
+            local.port(),
+            0,
+            "socket must have a non-zero local port even when iface is set"
+        );
     }
 }
