@@ -693,14 +693,13 @@ impl TimeoutUdpSessionManager {
                 let mut g = map_cloned.write().await;
                 let mut alived = 0;
                 let mut expired = 0;
-                g.0.retain(|k, x| {
-                    let (handle, _, last) = x;
+                g.0.retain(|k, val| {
                     let now = Instant::now();
-                    let alive = now.duration_since(*last) < timeout;
+                    let alive = now.duration_since(val.last_active) < timeout;
                     if !alive {
                         expired += 1;
                         trace!("udp session expired: {:?}", k);
-                        handle.abort();
+                        val.rw_handle.abort();
                     } else {
                         alived += 1;
                     }
@@ -724,11 +723,11 @@ impl TimeoutUdpSessionManager {
         &self,
         outbound_name: &str,
         src_addr: SocketAddr,
-        handle: JoinHandle<()>,
+        rw_handle: JoinHandle<()>,
         sender: OutboundPacketSender,
     ) {
         let mut map = self.map.write().await;
-        map.insert(outbound_name, src_addr, handle, sender);
+        map.insert(outbound_name, src_addr, rw_handle, sender);
     }
 
     async fn get_outbound_sender_mut(
@@ -741,8 +740,20 @@ impl TimeoutUdpSessionManager {
     }
 }
 
-type OutboundHandleKey = (String, SocketAddr);
-type OutboundHandleVal = (JoinHandle<()>, OutboundPacketSender, Instant);
+/// Key identifying a unique UDP NAT session.
+/// Scoped to outbound plus client source, one socket per client for full-cone NAT.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct OutboundHandleKey {
+    outbound_name: String,
+    src_addr: SocketAddr,
+}
+
+struct OutboundHandleVal {
+    /// Handles both local-to-remote and remote-to-local packet forwarding.
+    rw_handle: JoinHandle<()>,
+    sender: OutboundPacketSender,
+    last_active: Instant,
+}
 
 struct OutboundHandleMap(HashMap<OutboundHandleKey, OutboundHandleVal>);
 
@@ -755,12 +766,19 @@ impl OutboundHandleMap {
         &mut self,
         outbound_name: &str,
         src_addr: SocketAddr,
-        handle: JoinHandle<()>,
+        rw_handle: JoinHandle<()>,
         sender: OutboundPacketSender,
     ) {
         self.0.insert(
-            (outbound_name.to_string(), src_addr),
-            (handle, sender, Instant::now()),
+            OutboundHandleKey {
+                outbound_name: outbound_name.to_string(),
+                src_addr,
+            },
+            OutboundHandleVal {
+                rw_handle,
+                sender,
+                last_active: Instant::now(),
+            },
         );
     }
 
@@ -769,16 +787,18 @@ impl OutboundHandleMap {
         outbound_name: &str,
         src_addr: SocketAddr,
     ) -> Option<OutboundPacketSender> {
-        self.0.get_mut(&(outbound_name.to_owned(), src_addr)).map(
-            |(_, sender, last)| {
-                trace!(
-                    "updating last access time for outbound {:?}",
-                    (outbound_name, src_addr)
-                );
-                *last = Instant::now();
-                sender.clone()
-            },
-        )
+        let key = OutboundHandleKey {
+            outbound_name: outbound_name.to_owned(),
+            src_addr,
+        };
+        self.0.get_mut(&key).map(|val| {
+            trace!(
+                "updating last access time for outbound {:?}",
+                (outbound_name, src_addr)
+            );
+            val.last_active = Instant::now();
+            val.sender.clone()
+        })
     }
 }
 
@@ -812,11 +832,12 @@ mod tests {
             .get_outbound_sender_mut("DIRECT", src_addr)
             .expect("session should still exist");
 
-        handle_a.send((Default::default(), dest_a)).await.unwrap();
-        handle_b.send((Default::default(), dest_b)).await.unwrap();
-
         assert!(receiver_a.try_recv().is_err());
+
+        handle_a.send((Default::default(), dest_a)).await.unwrap();
         assert!(receiver_b.recv().await.is_some());
+
+        handle_b.send((Default::default(), dest_b)).await.unwrap();
         assert!(receiver_b.recv().await.is_some());
     }
 
@@ -859,8 +880,8 @@ impl Drop for OutboundHandleMap {
             "dropping inner outbound handle map that has {} sessions",
             self.0.len()
         );
-        for (_, (handle, ..)) in self.0.drain() {
-            handle.abort();
+        for (_, val) in self.0.drain() {
+            val.rw_handle.abort();
         }
     }
 }
