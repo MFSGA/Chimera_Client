@@ -67,6 +67,10 @@ impl DnsRuntimeProvider {
         Self::new(proxy, dns_resolver, iface, so_mark, None)
     }
 
+    /// Pick the outbound handler for an upstream DNS dial. When
+    /// `rule_dispatch` is ready, DNS dials can follow the rule engine; until
+    /// startup finishes, or if a routed outbound cannot be found, this falls
+    /// back to the static DNS outbound.
     async fn pick_outbound(&self, sess: &Session) -> AnyOutboundHandler {
         let Some(rd) = &self.rule_dispatch else {
             return self.outbound.clone();

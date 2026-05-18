@@ -4,15 +4,21 @@ use crate::app::{
     outbound::manager::ThreadSafeOutboundManager, router::ThreadSafeRouter,
 };
 
-/// Late-bound reference to `Router`. Populated after the DNS resolver is built.
+/// Late-bound reference to `Router`. Populated by `lib.rs` after the router
+/// is constructed; the DNS resolver itself is built earlier.
 pub type PendingRouter = Arc<OnceLock<ThreadSafeRouter>>;
 
-/// Late-bound reference to `OutboundManager`. Populated after outbound manager
-/// construction.
+/// Late-bound reference to `OutboundManager`. Populated by `lib.rs` after the
+/// outbound manager is constructed.
 pub type PendingOutboundManager = Arc<OnceLock<ThreadSafeOutboundManager>>;
 
-/// Handles used by `DnsRuntimeProvider` when `dns.respect-rules` is enabled.
-/// They start empty and fall back to the static DNS outbound until populated.
+/// Bundle of late-bound handles consulted by `DnsRuntimeProvider` when
+/// `dns.respect-rules` is enabled, allowing upstream DNS dials to be routed
+/// through the rule engine.
+///
+/// Both `OnceLock`s start empty and are filled exactly once during startup.
+/// Until both are set, callers fall back to the static `outbound` handler;
+/// this keeps early DNS lookups working before the rule engine exists.
 pub struct RuleDispatch {
     pub router: PendingRouter,
     pub outbound_manager: PendingOutboundManager,

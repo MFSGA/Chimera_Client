@@ -1268,6 +1268,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_proxy_server_nameserver_initialization() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_store = crate::app::profile::ThreadSafeCacheFile::new(
+            temp_dir.path().join("cache.db").to_str().unwrap(),
+            false,
+        );
+
+        let resolver = EnhancedResolver::new(
+            make_proxy_nameserver_config(),
+            cache_store,
+            None,
+            Arc::new(RwLock::new(std::collections::HashMap::new())),
+            None,
+        )
+        .await;
+
+        assert!(resolver.proxy_resolver.is_some());
+        assert!(resolver.proxy_server_domains.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_proxy_server_nameserver_without_config() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_store = crate::app::profile::ThreadSafeCacheFile::new(
+            temp_dir.path().join("cache.db").to_str().unwrap(),
+            false,
+        );
+        let mut config = make_proxy_nameserver_config();
+        config.proxy_server_nameserver = None;
+
+        let resolver = EnhancedResolver::new(
+            config,
+            cache_store,
+            None,
+            Arc::new(RwLock::new(std::collections::HashMap::new())),
+            None,
+        )
+        .await;
+
+        assert!(resolver.proxy_resolver.is_none());
+        assert!(resolver.proxy_server_domains.is_none());
+    }
+
+    #[tokio::test]
     async fn test_proxy_server_domains_populated_from_outbounds() {
         let temp_dir = tempfile::tempdir().unwrap();
         let cache_store = crate::app::profile::ThreadSafeCacheFile::new(
