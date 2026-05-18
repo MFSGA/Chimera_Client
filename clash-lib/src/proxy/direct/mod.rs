@@ -167,21 +167,28 @@ mod tests {
     };
 
     async fn spawn_udp_echo(bind: &str) -> SocketAddr {
-        let socket = UdpSocket::bind(bind).await.unwrap();
-        let addr = socket.local_addr().unwrap();
+        let sock = UdpSocket::bind(bind).await.unwrap();
+        let addr = sock.local_addr().unwrap();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
-            while let Ok((n, peer)) = socket.recv_from(&mut buf).await {
-                let _ = socket.send_to(&buf[..n], peer).await;
+            loop {
+                let Ok((n, peer)) = sock.recv_from(&mut buf).await else {
+                    break;
+                };
+                let _ = sock.send_to(&buf[..n], peer).await;
             }
         });
         addr
     }
 
     fn make_resolver() -> ThreadSafeDNSResolver {
+        // IP destinations never touch the resolver; an empty mock is enough.
         Arc::new(MockClashResolver::new())
     }
 
+    /// Full round-trip through Handler::connect_datagram ->
+    /// new_dual_stack_udp_socket -> IPv4 echo server. This exercises the real
+    /// socket-creation path, including the Windows WSAEINVAL regression.
     #[tokio::test]
     async fn test_connect_datagram_ipv4_roundtrip() {
         let echo = spawn_udp_echo("127.0.0.1:0").await;
@@ -193,27 +200,68 @@ mod tests {
             ..Default::default()
         };
 
-        let mut datagram = handler
+        let mut d = handler
             .connect_datagram(&sess, make_resolver())
             .await
             .expect("connect_datagram failed");
 
-        datagram
-            .send(UdpPacket {
-                data: b"hello-v4".to_vec(),
-                dst_addr: SocksAddr::Ip(echo),
-                ..Default::default()
-            })
-            .await
-            .expect("send failed");
+        d.send(UdpPacket {
+            data: b"hello-v4".to_vec(),
+            dst_addr: SocksAddr::Ip(echo),
+            ..Default::default()
+        })
+        .await
+        .expect("send failed");
 
-        let pkt = tokio::time::timeout(Duration::from_secs(2), datagram.next())
+        let pkt = tokio::time::timeout(Duration::from_secs(2), d.next())
             .await
             .expect("timed out")
             .expect("stream ended");
         assert_eq!(pkt.data, b"hello-v4");
     }
 
+    /// Same direct UDP socket, two different IPv4 destinations. This validates
+    /// the 1-to-N multiplexing that requires a dual-stack socket.
+    #[tokio::test]
+    async fn test_connect_datagram_ipv4_multi_dest() {
+        let echo_a = spawn_udp_echo("127.0.0.1:0").await;
+        let echo_b = spawn_udp_echo("127.0.0.1:0").await;
+        let handler = Handler::new("DIRECT");
+        let sess = Session {
+            network: Network::Udp,
+            typ: Type::Socks5,
+            destination: SocksAddr::Ip(echo_a),
+            ..Default::default()
+        };
+
+        let mut d = handler
+            .connect_datagram(&sess, make_resolver())
+            .await
+            .expect("connect_datagram failed");
+
+        for (dst, payload) in [(echo_a, b"to-a" as &[u8]), (echo_b, b"to-b")] {
+            d.send(UdpPacket {
+                data: payload.to_vec(),
+                dst_addr: SocksAddr::Ip(dst),
+                ..Default::default()
+            })
+            .await
+            .expect("send failed");
+        }
+
+        let mut received = std::collections::HashSet::new();
+        for _ in 0..2 {
+            let pkt = tokio::time::timeout(Duration::from_secs(2), d.next())
+                .await
+                .expect("timed out")
+                .expect("stream ended");
+            received.insert(pkt.data);
+        }
+        assert!(received.contains(b"to-a".as_ref()));
+        assert!(received.contains(b"to-b".as_ref()));
+    }
+
+    /// IPv6 round-trip. Skipped when the host has no IPv6 loopback.
     #[tokio::test]
     async fn test_connect_datagram_ipv6_roundtrip() {
         if UdpSocket::bind("[::1]:0").await.is_err() {
@@ -231,21 +279,20 @@ mod tests {
             ..Default::default()
         };
 
-        let mut datagram = handler
+        let mut d = handler
             .connect_datagram(&sess, make_resolver())
             .await
             .expect("connect_datagram failed");
 
-        datagram
-            .send(UdpPacket {
-                data: b"hello-v6".to_vec(),
-                dst_addr: SocksAddr::Ip(echo),
-                ..Default::default()
-            })
-            .await
-            .expect("send failed");
+        d.send(UdpPacket {
+            data: b"hello-v6".to_vec(),
+            dst_addr: SocksAddr::Ip(echo),
+            ..Default::default()
+        })
+        .await
+        .expect("send failed");
 
-        let pkt = tokio::time::timeout(Duration::from_secs(2), datagram.next())
+        let pkt = tokio::time::timeout(Duration::from_secs(2), d.next())
             .await
             .expect("timed out")
             .expect("stream ended");
