@@ -1,8 +1,9 @@
-use std::net::SocketAddr;
+use std::{future::Future, net::SocketAddr};
 
 use hickory_proto::op::Message;
 use serde::Deserialize;
 
+mod dummy_keys;
 mod handler;
 
 mod utils;

@@ -1,31 +1,51 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
+use crate::{
+    DNSListenAddr, DnsMessageExchanger,
+    utils::{
+        load_cert_chain, load_default_cert, load_default_key, load_priv_key,
+        new_io_error,
+    },
 };
-
-use crate::utils::new_io_error;
-use crate::{DNSListenAddr, DnsMessageExchanger, DnsServerCert, DnsServerKey};
 use async_trait::async_trait;
-use hickory_proto::op::{Header, Message, ResponseCode};
-use hickory_server::server::Request;
+use hickory_proto::{
+    op::{
+        Header, HeaderCounts, Message, MessageType, Metadata, OpCode, ResponseCode,
+    },
+    rr::RecordType,
+};
 use hickory_server::{
-    ServerFuture,
-    authority::MessageResponseBuilder,
-    server::{RequestHandler, ResponseHandler, ResponseInfo},
+    Server,
+    net::runtime::Time,
+    server::{Request, RequestHandler, ResponseHandler, ResponseInfo},
+    zone_handler::MessageResponseBuilder,
 };
-use rustls::{
-    crypto::ring::default_provider,
-    pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
-    server::ResolvesServerCert,
-    sign::{CertifiedKey, SingleCertAndKey},
-};
+use rustls::{server::AlwaysResolvesServerRawPublicKeys, sign::CertifiedKey};
+use std::{sync::Arc, time::Duration};
 use thiserror::Error;
 use tokio::net::{TcpListener, UdpSocket};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
+
+struct CertificateKeyPair {
+    certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
+}
+
+impl From<CertificateKeyPair> for Arc<dyn rustls::server::ResolvesServerCert> {
+    fn from(pair: CertificateKeyPair) -> Self {
+        Arc::new(AlwaysResolvesServerRawPublicKeys::new(Arc::new(
+            CertifiedKey::new(
+                pair.certs,
+                rustls::crypto::CryptoProvider::get_default()
+                    .expect("no default crypto provider installed")
+                    .key_provider
+                    .load_private_key(pair.key)
+                    .expect("unsupported private key type"),
+            ),
+        )))
+    }
+}
 
 struct DnsListener<H: RequestHandler> {
-    server: ServerFuture<H>,
+    server: Server<H>,
 }
 
 struct DnsHandler<X> {
@@ -36,10 +56,112 @@ struct DnsHandler<X> {
 pub enum DNSError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    #[error("invalid OP query: {0}")]
+    #[error("invalid OP code: {0}")]
     InvalidOpQuery(String),
     #[error("query failed: {0}")]
     QueryFailed(String),
+}
+
+impl<X> DnsHandler<X>
+where
+    X: DnsMessageExchanger,
+{
+    async fn handle<H: ResponseHandler>(
+        &self,
+        request: &Request,
+        mut response_handle: H,
+    ) -> Result<ResponseInfo, DNSError> {
+        if request.metadata.op_code != OpCode::Query {
+            return Err(DNSError::InvalidOpQuery(format!(
+                "invalid OP code: {}",
+                request.metadata.op_code
+            )));
+        }
+
+        if request.metadata.message_type != MessageType::Query {
+            return Err(DNSError::InvalidOpQuery(format!(
+                "invalid message type: {}",
+                request.metadata.message_type
+            )));
+        }
+
+        let mut metadata = Metadata::response_from_request(&request.metadata);
+
+        let query = request
+            .queries
+            .queries()
+            .first()
+            .ok_or(DNSError::QueryFailed("no query".to_string()))?;
+
+        if query.query_type() == RecordType::AAAA && !self.exchanger.ipv6() {
+            metadata.authoritative = true;
+
+            let resp = MessageResponseBuilder::from_message_request(request)
+                .build_no_records(metadata);
+            return response_handle
+                .send_response(resp)
+                .await
+                .map_err(|e| DNSError::QueryFailed(e.to_string()));
+        }
+
+        let mut m = Message::new(
+            request.metadata.id,
+            request.metadata.message_type,
+            request.metadata.op_code,
+        );
+        m.metadata.recursion_desired = request.metadata.recursion_desired;
+        m.metadata.checking_disabled = request.metadata.checking_disabled;
+        m.add_query(query.original().clone());
+        m.add_additionals(request.additionals.iter().cloned());
+        m.add_authorities(request.authorities.iter().cloned());
+        if let Some(edns) = &request.edns {
+            m.set_edns(edns.clone());
+        }
+
+        match self.exchanger.exchange(&m).await {
+            Ok(m) => {
+                metadata.recursion_available = m.metadata.recursion_available;
+                metadata.response_code = m.metadata.response_code;
+                metadata.authoritative = m.metadata.authoritative;
+                metadata.truncation = m.metadata.truncation;
+                metadata.authentic_data = m.metadata.authentic_data;
+                metadata.checking_disabled = m.metadata.checking_disabled;
+
+                let resp_edns = if request.edns.is_some() {
+                    m.edns.clone()
+                } else {
+                    None
+                };
+
+                let rv = MessageResponseBuilder::new(
+                    &request.queries,
+                    resp_edns.as_ref(),
+                )
+                .build(
+                    metadata,
+                    m.answers.iter(),
+                    m.authorities.iter(),
+                    std::iter::empty(),
+                    m.additionals.iter(),
+                );
+
+                debug!(
+                    "answering dns query {} with answer {:?}",
+                    query.name(),
+                    &m.answers,
+                );
+
+                Ok(response_handle
+                    .send_response(rv)
+                    .await
+                    .map_err(|e| DNSError::QueryFailed(e.to_string()))?)
+            }
+            Err(e) => {
+                debug!("dns resolve error: {}", e);
+                Err(DNSError::QueryFailed(e.to_string()))
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -47,107 +169,36 @@ impl<X> RequestHandler for DnsHandler<X>
 where
     X: DnsMessageExchanger + Unpin + Send + Sync + 'static,
 {
-    async fn handle_request<H: ResponseHandler>(
+    async fn handle_request<R: ResponseHandler, T: Time>(
         &self,
         request: &Request,
-        mut response_handle: H,
+        response_handle: R,
     ) -> ResponseInfo {
-        let req = match to_dns_message(request) {
-            Ok(req) => req,
-            Err(err) => {
-                error!("failed to parse dns request: {}", err);
-                return servfail_info();
-            }
-        };
-
-        let resp = match self.exchanger.exchange(&req).await {
-            Ok(resp) => resp,
-            Err(err) => {
-                warn!("dns exchange failed: {}", err);
-                build_servfail_message(&req)
-            }
-        };
-
-        let mut builder = MessageResponseBuilder::from_message_request(request);
-        if let Some(edns) = resp.extensions().clone() {
-            builder.edns(edns);
-        }
-
-        let response = builder.build(
-            *resp.header(),
-            resp.answers(),
-            resp.name_servers(),
-            std::iter::empty::<&hickory_proto::rr::Record>(),
-            resp.additionals(),
+        debug!(
+            "got dns request [{}][{:?}][{:?}] from {}",
+            request.protocol(),
+            request.queries.queries().first().map(|x| x.query_type()),
+            request.queries.queries().first().map(|x| x.name()),
+            request.src()
         );
 
-        match response_handle.send_response(response).await {
-            Ok(info) => info,
-            Err(err) => {
-                error!("failed to send dns response: {}", err);
-                servfail_info()
-            }
-        }
+        self.handle(request, response_handle)
+            .await
+            .unwrap_or_else(|e| {
+                debug!("dns request error: {}", e);
+                let mut metadata =
+                    Metadata::response_from_request(&request.metadata);
+                metadata.response_code = ResponseCode::ServFail;
+                Header {
+                    metadata,
+                    counts: HeaderCounts::default(),
+                }
+                .into()
+            })
     }
 }
 
 static DEFAULT_DNS_SERVER_TIMEOUT: Duration = Duration::from_secs(5);
-
-fn resolve_cert_path(cwd: &Path, path: &str) -> PathBuf {
-    let path = PathBuf::from(path);
-    if path.is_absolute() {
-        path
-    } else {
-        cwd.join(path)
-    }
-}
-
-fn load_server_cert_resolver(
-    cwd: &Path,
-    cert: &DnsServerCert,
-    key: &DnsServerKey,
-) -> Result<Arc<dyn ResolvesServerCert>, DNSError> {
-    let cert = cert.as_ref().ok_or_else(|| {
-        DNSError::Io(new_io_error("missing dns server certificate path"))
-    })?;
-    let key = key.as_ref().ok_or_else(|| {
-        DNSError::Io(new_io_error("missing dns server private key path"))
-    })?;
-
-    let cert_path = resolve_cert_path(cwd, cert);
-    let key_path = resolve_cert_path(cwd, key);
-
-    let cert_chain = CertificateDer::pem_file_iter(&cert_path)
-        .map_err(|err| {
-            DNSError::Io(new_io_error(format!(
-                "failed to open dns cert {}: {err}",
-                cert_path.display()
-            )))
-        })?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| {
-            DNSError::Io(new_io_error(format!(
-                "failed to parse dns cert {}: {err}",
-                cert_path.display()
-            )))
-        })?;
-
-    let key = PrivateKeyDer::from_pem_file(&key_path).map_err(|err| {
-        DNSError::Io(new_io_error(format!(
-            "failed to parse dns key {}: {err}",
-            key_path.display()
-        )))
-    })?;
-
-    let certified_key = CertifiedKey::from_der(cert_chain, key, &default_provider())
-        .map_err(|err| {
-            DNSError::Io(new_io_error(format!(
-                "failed to build dns tls identity: {err}"
-            )))
-        })?;
-
-    Ok(Arc::new(SingleCertAndKey::from(certified_key)))
-}
 
 pub async fn get_dns_listener<X>(
     listen: DNSListenAddr,
@@ -158,7 +209,7 @@ where
     X: DnsMessageExchanger + Sync + Send + Unpin + 'static,
 {
     let handler = DnsHandler { exchanger };
-    let mut s = ServerFuture::new(handler);
+    let mut s = Server::new(handler);
 
     let mut has_server = false;
 
@@ -179,7 +230,7 @@ where
             .await
             .map(|x| {
                 info!("TCP dns server listening on: {}", addr);
-                s.register_listener(x, DEFAULT_DNS_SERVER_TIMEOUT);
+                s.register_listener(x, DEFAULT_DNS_SERVER_TIMEOUT, 4096);
             })
             .inspect_err(|x| {
                 error!("failed to listen TCP DNS server on {}: {}", addr, x);
@@ -187,108 +238,125 @@ where
             .is_ok();
     }
     if let Some(c) = listen.doh {
-        has_server |= match TcpListener::bind(c.addr).await {
-            Ok(listener) => {
-                match load_server_cert_resolver(cwd, &c.ca_cert, &c.ca_key) {
-                    Ok(cert_resolver) => s
-                        .register_https_listener(
-                            listener,
-                            DEFAULT_DNS_SERVER_TIMEOUT,
-                            cert_resolver,
-                            c.hostname.clone(),
-                            "/dns-query".to_string(),
-                        )
-                        .map(|_| {
-                            info!("DoH dns server listening on: {}", c.addr);
-                            true
-                        })
-                        .inspect_err(|x| {
-                            error!(
-                                "failed to register DoH DNS server on {}: {}",
-                                c.addr, x
-                            );
-                        })
-                        .unwrap_or(false),
-                    Err(err) => {
-                        error!("failed to load DoH certificate material: {}", err);
-                        false
-                    }
+        has_server |= TcpListener::bind(c.addr)
+            .await
+            .and_then(|x| {
+                if let (Some(k), Some(c)) = (&c.ca_key, &c.ca_cert) {
+                    debug!(
+                        "using custom key and cert for DoH: {:?}/{:?}",
+                        cwd.join(k),
+                        cwd.join(c)
+                    );
                 }
-            }
-            Err(err) => {
-                error!("failed to listen DoH DNS server on {}: {}", c.addr, err);
-                false
-            }
-        };
-    }
 
-    if let Some(c) = listen.dot {
-        has_server |= match TcpListener::bind(c.addr).await {
-            Ok(listener) => {
-                match load_server_cert_resolver(cwd, &c.ca_cert, &c.ca_key) {
-                    Ok(cert_resolver) => s
-                        .register_tls_listener(
-                            listener,
-                            DEFAULT_DNS_SERVER_TIMEOUT,
-                            cert_resolver,
-                        )
-                        .map(|_| {
-                            info!("DoT dns server listening on: {}", c.addr);
-                            true
-                        })
-                        .inspect_err(|x| {
-                            error!(
-                                "failed to register DoT DNS server on {}: {}",
-                                c.addr, x
-                            );
-                        })
-                        .unwrap_or(false),
-                    Err(err) => {
-                        error!("failed to load DoT certificate material: {}", err);
-                        false
+                let server_key = c
+                    .ca_key
+                    .map(|x| load_priv_key(&cwd.join(x)))
+                    .transpose()?
+                    .unwrap_or(load_default_key());
+                let server_cert = c
+                    .ca_cert
+                    .map(|x| load_cert_chain(&cwd.join(x)))
+                    .transpose()?
+                    .unwrap_or(load_default_cert());
+                s.register_https_listener(
+                    x,
+                    DEFAULT_DNS_SERVER_TIMEOUT,
+                    CertificateKeyPair {
+                        certs: server_cert,
+                        key: server_key,
                     }
+                    .into(),
+                    c.hostname,
+                    "/dns-query".to_string(),
+                )?;
+                info!("DoH server listening on: {}", c.addr);
+                Ok(())
+            })
+            .inspect_err(|x| {
+                error!("failed to listen DoH server on {}: {}", c.addr, x);
+            })
+            .is_ok();
+    }
+    if let Some(c) = listen.dot {
+        has_server |= TcpListener::bind(c.addr)
+            .await
+            .and_then(|x| {
+                if let (Some(k), Some(c)) = (&c.ca_key, &c.ca_cert) {
+                    debug!(
+                        "using custom key and cert for DoT: {:?}/{:?}",
+                        cwd.join(k),
+                        cwd.join(c)
+                    );
                 }
-            }
-            Err(err) => {
-                error!("failed to listen DoT DNS server on {}: {}", c.addr, err);
-                false
-            }
-        };
+
+                let server_key = c
+                    .ca_key
+                    .map(|x| load_priv_key(&cwd.join(x)))
+                    .transpose()?
+                    .unwrap_or(load_default_key());
+                let server_cert = c
+                    .ca_cert
+                    .map(|x| load_cert_chain(&cwd.join(x)))
+                    .transpose()?
+                    .unwrap_or(load_default_cert());
+                s.register_tls_listener(
+                    x,
+                    DEFAULT_DNS_SERVER_TIMEOUT,
+                    CertificateKeyPair {
+                        certs: server_cert,
+                        key: server_key,
+                    }
+                    .into(),
+                )?;
+                info!("DoT dns server listening on: {}", c.addr);
+                Ok(())
+            })
+            .inspect_err(|x| {
+                error!("failed to listen DoT DNS server on {}: {}", c.addr, x);
+            })
+            .is_ok();
     }
 
     if let Some(c) = listen.doh3 {
-        has_server |= match UdpSocket::bind(c.addr).await {
-            Ok(socket) => {
-                match load_server_cert_resolver(cwd, &c.ca_cert, &c.ca_key) {
-                    Ok(cert_resolver) => s
-                        .register_h3_listener(
-                            socket,
-                            DEFAULT_DNS_SERVER_TIMEOUT,
-                            cert_resolver,
-                            c.hostname.clone(),
-                        )
-                        .map(|_| {
-                            info!("DoH3 dns server listening on: {}", c.addr);
-                            true
-                        })
-                        .inspect_err(|x| {
-                            error!(
-                                "failed to register DoH3 DNS server on {}: {}",
-                                c.addr, x
-                            );
-                        })
-                        .unwrap_or(false),
-                    Err(err) => {
-                        error!("failed to load DoH3 certificate material: {}", err);
-                        false
-                    }
+        has_server |= UdpSocket::bind(c.addr)
+            .await
+            .and_then(|x| {
+                if let (Some(k), Some(c)) = (&c.ca_key, &c.ca_cert) {
+                    debug!(
+                        "using custom key and cert for DoH3: {:?}/{:?}",
+                        cwd.join(k),
+                        cwd.join(c)
+                    );
                 }
-            }
-            Err(err) => {
-                error!("failed to listen DoH3 DNS server on {}: {}", c.addr, err);
-                false
-            }
-        };
+
+                let server_key = c
+                    .ca_key
+                    .map(|x| load_priv_key(&cwd.join(x)))
+                    .transpose()?
+                    .unwrap_or(load_default_key());
+                let server_cert = c
+                    .ca_cert
+                    .map(|x| load_cert_chain(&cwd.join(x)))
+                    .transpose()?
+                    .unwrap_or(load_default_cert());
+                s.register_h3_listener(
+                    x,
+                    DEFAULT_DNS_SERVER_TIMEOUT,
+                    CertificateKeyPair {
+                        certs: server_cert,
+                        key: server_key,
+                    }
+                    .into(),
+                    c.hostname,
+                )?;
+                info!("DoT3 dns server listening on: {}", c.addr);
+                Ok(())
+            })
+            .inspect_err(|x| {
+                error!("failed to listen DoH3 DNS server on {}: {}", c.addr, x);
+            })
+            .is_ok();
     }
 
     if !has_server {
@@ -304,54 +372,4 @@ where
             DNSError::Io(new_io_error(format!("dns server error: {x}")))
         })
     }))
-}
-
-fn to_dns_message(request: &Request) -> Result<Message, DNSError> {
-    let mut message = Message::new();
-    message.set_id(request.id());
-    message.set_op_code(request.op_code());
-    message.set_message_type(request.message_type());
-    message.set_authoritative(request.authoritative());
-    message.set_truncated(request.truncated());
-    message.set_recursion_desired(request.recursion_desired());
-    message.set_recursion_available(request.recursion_available());
-    message.set_authentic_data(request.authentic_data());
-    message.set_checking_disabled(request.checking_disabled());
-    message.set_response_code(request.response_code());
-    message.add_queries(request.queries().iter().map(|q| q.original().clone()));
-    message.add_answers(request.answers().iter().cloned());
-    message.add_name_servers(request.name_servers().iter().cloned());
-    message.add_additionals(request.additionals().iter().cloned());
-    if let Some(edns) = request.edns().cloned() {
-        message.set_edns(edns);
-    }
-    Ok(message)
-}
-
-fn build_servfail_message(req: &Message) -> Message {
-    let mut header = Header::response_from_request(req.header());
-    header.set_response_code(ResponseCode::ServFail);
-
-    let mut message = Message::new();
-    message.set_id(header.id());
-    message.set_message_type(header.message_type());
-    message.set_op_code(header.op_code());
-    message.set_authoritative(header.authoritative());
-    message.set_truncated(header.truncated());
-    message.set_recursion_desired(header.recursion_desired());
-    message.set_recursion_available(header.recursion_available());
-    message.set_authentic_data(header.authentic_data());
-    message.set_checking_disabled(header.checking_disabled());
-    message.set_response_code(header.response_code());
-    message.add_queries(req.queries().iter().cloned());
-    if let Some(edns) = req.extensions().clone() {
-        message.set_edns(edns);
-    }
-    message
-}
-
-fn servfail_info() -> ResponseInfo {
-    let mut header = Header::new();
-    header.set_response_code(ResponseCode::ServFail);
-    header.into()
 }
