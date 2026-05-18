@@ -222,6 +222,7 @@ checksum = "6a88aab2464f1f25453baa7a07c84c5b7684e274054ba06817f382357f77a288"
 dependencies = [
  "aws-lc-fips-sys",
  "aws-lc-sys",
+ "untrusted 0.7.1",
  "zeroize",
 ]
 
@@ -524,7 +525,9 @@ dependencies = [
 name = "chimera-dns"
 version = "0.16.4"
 dependencies = [
+ "anyhow",
  "async-trait",
+ "env_logger",
  "futures",
  "hickory-net",
  "hickory-proto 0.26.1",
@@ -536,6 +539,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -1595,6 +1599,8 @@ version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bab31817bfb44672a252e97fe81cd0c18d1b2cf892108922f6818820df8c643"
 dependencies = [
+ "aws-lc-rs",
+ "bitflags 2.10.0",
  "data-encoding",
  "idna",
  "ipnet",
@@ -1603,8 +1609,10 @@ dependencies = [
  "prefix-trie",
  "rand 0.10.0",
  "ring",
+ "rustls-pki-types",
  "serde",
  "thiserror 2.0.18",
+ "time",
  "tinyvec",
  "tracing",
  "url",
@@ -3029,7 +3037,7 @@ dependencies = [
  "cfg-if",
  "getrandom 0.2.16",
  "libc",
- "untrusted",
+ "untrusted 0.9.0",
  "windows-sys 0.52.0",
 ]
 
@@ -3153,7 +3161,7 @@ dependencies = [
  "aws-lc-rs",
  "ring",
  "rustls-pki-types",
- "untrusted",
+ "untrusted 0.9.0",
 ]
 
 [[package]]
@@ -3996,6 +4004,12 @@ name = "unsafe-libyaml"
 version = "0.2.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
+
+[[package]]
+name = "untrusted"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a156c684c91ea7d62626509bce3cb4e1d9ed5c4d978f7b4352658f96a4c26b4a"
 
 [[package]]
 name = "untrusted"

@@ -6,6 +6,8 @@ use serde::Deserialize;
 mod dummy_keys;
 mod handler;
 
+#[cfg(test)]
+mod tls;
 mod utils;
 
 pub use handler::{DNSError, get_dns_listener};
@@ -55,4 +57,25 @@ pub trait DnsMessageExchanger {
         &self,
         message: &Message,
     ) -> impl Future<Output = Result<Message, DNSError>> + Send;
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::sync::OnceLock;
+
+    static CRYPTO_PROVIDER_LOCK: OnceLock<()> = OnceLock::new();
+
+    pub(crate) fn setup_default_crypto_provider() {
+        CRYPTO_PROVIDER_LOCK.get_or_init(|| {
+            #[cfg(feature = "aws-lc-rs")]
+            {
+                let _ =
+                    rustls::crypto::aws_lc_rs::default_provider().install_default();
+            }
+            #[cfg(feature = "ring")]
+            {
+                let _ = rustls::crypto::ring::default_provider().install_default();
+            }
+        });
+    }
 }

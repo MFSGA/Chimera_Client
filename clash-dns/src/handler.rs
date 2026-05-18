@@ -373,3 +373,212 @@ where
         })
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        DNSListenAddr, DoH3Config, DoHConfig, DoTConfig, MockDnsMessageExchanger,
+        tests::setup_default_crypto_provider,
+        tls::{self, global_root_store},
+    };
+    use futures::FutureExt;
+    use hickory_net::{
+        client::{Client, ClientHandle},
+        h2::HttpsClientStream,
+        h3::H3ClientStream,
+        runtime::TokioRuntimeProvider,
+        tcp::TcpClientStream,
+        tls::tls_client_connect,
+        udp::UdpClientStream,
+    };
+    use hickory_proto::rr::{DNSClass, Name, RData, RecordType};
+    use rustls::{ClientConfig, pki_types::ServerName};
+    use std::{sync::Arc, time::Duration};
+    use tokio::{
+        net::{TcpListener, UdpSocket},
+        task::JoinHandle,
+    };
+
+    async fn send_query(
+        client: &mut Client<TokioRuntimeProvider>,
+    ) -> anyhow::Result<()> {
+        let name = Name::from_ascii("www.example.com.").unwrap();
+
+        let mut retries = 3;
+        let response = loop {
+            match client
+                .query(name.clone(), DNSClass::IN, RecordType::A)
+                .await
+            {
+                Ok(v) => break v,
+                Err(e) => {
+                    retries -= 1;
+                    if retries == 0 {
+                        anyhow::bail!(e)
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        };
+
+        let answers = &response.answers;
+        if let RData::A(ip) = &answers[0].data {
+            assert_eq!(ip.0, std::net::Ipv4Addr::new(93, 184, 215, 14));
+        } else {
+            unreachable!("unexpected result")
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_multiple_dns_server() -> anyhow::Result<()> {
+        setup_default_crypto_provider();
+        let _ = env_logger::try_init();
+
+        let mut mock_exchanger = MockDnsMessageExchanger::new();
+        mock_exchanger.expect_ipv6().returning(|| false);
+        mock_exchanger.expect_exchange().returning(|_| {
+            async {
+                let mut m = hickory_proto::op::Message::response(
+                    0,
+                    hickory_proto::op::OpCode::Query,
+                );
+                m.add_answer(hickory_proto::rr::Record::from_rdata(
+                    "www.example.com".parse().unwrap(),
+                    60,
+                    hickory_proto::rr::RData::A(hickory_proto::rr::rdata::A(
+                        std::net::Ipv4Addr::new(93, 184, 215, 14),
+                    )),
+                ));
+                Ok(m)
+            }
+            .boxed()
+        });
+
+        let udp_sock = UdpSocket::bind("127.0.0.1:0").await?;
+        let udp_addr = udp_sock.local_addr()?;
+        drop(udp_sock);
+
+        let tcp_sock = TcpListener::bind("127.0.0.1:0").await?;
+        let tcp_addr = tcp_sock.local_addr()?;
+        drop(tcp_sock);
+
+        let dot_sock = TcpListener::bind("127.0.0.1:0").await?;
+        let dot_addr = dot_sock.local_addr()?;
+        drop(dot_sock);
+
+        let doh_sock = TcpListener::bind("127.0.0.1:0").await?;
+        let doh_addr = doh_sock.local_addr()?;
+        drop(doh_sock);
+
+        let doh3_sock = UdpSocket::bind("127.0.0.1:0").await?;
+        let doh3_addr = doh3_sock.local_addr()?;
+        drop(doh3_sock);
+
+        let cfg = DNSListenAddr {
+            udp: Some(udp_addr),
+            tcp: Some(tcp_addr),
+            dot: Some(DoTConfig {
+                addr: dot_addr,
+                ca_key: None,
+                ca_cert: None,
+            }),
+            doh: Some(DoHConfig {
+                addr: doh_addr,
+                hostname: Some("dns.example.com".to_string()),
+                ca_key: None,
+                ca_cert: None,
+            }),
+            doh3: Some(DoH3Config {
+                addr: doh3_addr,
+                hostname: Some("dns.example.com".to_string()),
+                ca_key: None,
+                ca_cert: None,
+            }),
+        };
+
+        let listener =
+            super::get_dns_listener(cfg, mock_exchanger, std::path::Path::new("."))
+                .await;
+        assert!(listener.is_some());
+        let _: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+            listener.unwrap().await?;
+            Ok(())
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let stream =
+            UdpClientStream::builder(udp_addr, TokioRuntimeProvider::new()).build();
+        let (mut client, bg) = Client::<TokioRuntimeProvider>::from_sender(stream);
+        tokio::spawn(bg);
+        send_query(&mut client).await?;
+
+        let (stream_future, sender) =
+            TcpClientStream::new(tcp_addr, None, None, TokioRuntimeProvider::new());
+        let stream = stream_future.await?;
+        let (mut client, bg) = Client::<TokioRuntimeProvider>::new(stream, sender);
+        tokio::spawn(bg);
+        send_query(&mut client).await?;
+
+        let mut tls_config = ClientConfig::builder()
+            .with_root_certificates(global_root_store())
+            .with_no_client_auth();
+        tls_config.alpn_protocols = vec!["dot".into()];
+        tls_config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(tls::DummyTlsVerifier::new()));
+
+        let server_name = ServerName::try_from("dns.example.com").unwrap();
+        let (stream_future, sender) = tls_client_connect(
+            dot_addr,
+            server_name,
+            Arc::new(tls_config),
+            TokioRuntimeProvider::new(),
+        );
+        let stream = stream_future.await?;
+        let (mut client, bg) = Client::<TokioRuntimeProvider>::with_timeout(
+            stream,
+            sender,
+            Duration::from_secs(5),
+        );
+        tokio::spawn(bg);
+        send_query(&mut client).await?;
+
+        let mut tls_config = ClientConfig::builder()
+            .with_root_certificates(global_root_store())
+            .with_no_client_auth();
+        tls_config.alpn_protocols = vec!["h2".into()];
+        tls_config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(tls::DummyTlsVerifier::new()));
+
+        let stream = HttpsClientStream::builder(
+            Arc::new(tls_config),
+            TokioRuntimeProvider::new(),
+        )
+        .build(doh_addr, "dns.example.com".into(), "/dns-query".into())
+        .await?;
+        let (mut client, bg) = Client::<TokioRuntimeProvider>::from_sender(stream);
+        tokio::spawn(bg);
+        send_query(&mut client).await?;
+
+        let mut tls_config = ClientConfig::builder()
+            .with_root_certificates(global_root_store())
+            .with_no_client_auth();
+        tls_config.alpn_protocols = vec!["h3".into()];
+        tls_config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(tls::DummyTlsVerifier::new()));
+
+        let stream = H3ClientStream::builder()
+            .crypto_config(tls_config)
+            .build(doh3_addr, "dns.example.com".into(), "/dns-query".into())
+            .await?;
+        let (mut client, bg) = Client::<TokioRuntimeProvider>::from_sender(stream);
+        tokio::spawn(bg);
+        send_query(&mut client).await?;
+
+        Ok(())
+    }
+}

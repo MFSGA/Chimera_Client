@@ -139,12 +139,13 @@ aws-lc-rs = [
     "dep:aws-lc-rs",
     "rustls/aws-lc-rs",
     "quinn-proto?/rustls-aws-lc-rs",
+    "chimera-dns/aws-lc-rs",
     "dep:log",
     "dep:memchr",
     "dep:subtle",
     "dep:x509-parser",
 ]
-ring = ["tls", "rustls/ring", "quinn-proto?/ring"]
+ring = ["tls", "rustls/ring", "quinn-proto?/ring", "chimera-dns/ring"]
 
 ws = ["tokio-tungstenite"]
 
