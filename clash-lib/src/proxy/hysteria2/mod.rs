@@ -45,7 +45,7 @@ use crate::{
             BoxedChainedDatagram, BoxedChainedStream, ChainedDatagram,
             ChainedDatagramWrapper, ChainedStream, ChainedStreamWrapper,
         },
-        dns::{self, ThreadSafeDNSResolver},
+        dns::ThreadSafeDNSResolver,
     },
     common::tls::{DefaultTlsVerifier, GLOBAL_ROOT_STORE},
     proxy::{
@@ -573,7 +573,6 @@ impl Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> std::io::Result<Arc<HysteriaConnection>> {
-        let resolver = dns::get_control_plane_resolver().await.unwrap_or(resolver);
         let mut quinn_conn_lock = self.conn.lock().await;
 
         match (*quinn_conn_lock).as_ref().filter(|s| {

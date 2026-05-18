@@ -445,7 +445,7 @@ fn dns_listener_is_empty(listen: &DNSListenAddr) -> bool {
 
 async fn create_components(
     cwd: PathBuf,
-    mut config: InternalConfig,
+    config: InternalConfig,
 ) -> Result<RuntimeComponents> {
     #[cfg(feature = "tun")]
     {
@@ -499,11 +499,11 @@ async fn create_components(
         ));
 
     let control_plane_dns_resolver = build_auxiliary_dns_resolver(
-        if config.dns.proxy_server_nameserver.is_empty() {
-            config.dns.nameserver.clone()
-        } else {
-            config.dns.proxy_server_nameserver.clone()
-        },
+        config
+            .dns
+            .proxy_server_nameserver
+            .clone()
+            .unwrap_or_else(|| config.dns.nameserver.clone()),
         config.dns.default_nameserver.clone(),
         config.general.ipv6,
         config.general.routing_mask,
@@ -512,8 +512,6 @@ async fn create_components(
         system_resolver.clone(),
     )
     .await;
-    dns::set_control_plane_resolver(control_plane_dns_resolver.clone()).await;
-
     let client = new_http_client(
         control_plane_dns_resolver.clone(),
         Some(outbound_registry.clone()),
@@ -543,7 +541,6 @@ async fn create_components(
         let tun_dns_addr = std::net::SocketAddr::from((dedicated_dns_ip, 53));
         dns_listen.udp = Some(tun_dns_addr);
         dns_listen.tcp = Some(tun_dns_addr);
-        config.dns.reserved_ip_addrs.push(dedicated_dns_ip);
         info!(
             "auto-enabling linux tun DNS listener on {} for systemd-resolved per-link takeover",
             tun_dns_addr
@@ -784,11 +781,11 @@ async fn build_auxiliary_dns_resolver(
         return system_resolver;
     }
 
-    let cfg = dns::DNSConfig {
+    let cfg = dns::Config {
         enable: true,
         ipv6,
         nameserver: effective_nameserver,
-        proxy_server_nameserver: Vec::new(),
+        proxy_server_nameserver: None,
         fallback: Vec::new(),
         fallback_filter: Default::default(),
         listen: DNSListenAddr::default(),
@@ -798,7 +795,6 @@ async fn build_auxiliary_dns_resolver(
             .parse()
             .expect("static fake-ip-range must parse"),
         fake_ip_filter: Vec::new(),
-        reserved_ip_addrs: Vec::new(),
         store_fake_ip: false,
         store_smart_stats: false,
         hosts: None,

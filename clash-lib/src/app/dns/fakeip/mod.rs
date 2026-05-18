@@ -14,7 +14,6 @@ pub use mem_store::InMemStore;
 
 pub struct Opts {
     pub ipnet: ipnet::IpNet,
-    pub reserved_ips: Vec<net::Ipv4Addr>,
     pub skipped_hostnames: Option<trie::StringTrie<bool>>,
     pub store: Box<dyn Store>,
 }
@@ -40,7 +39,6 @@ pub struct FakeDns {
     offset: u32,
     skipped_hostnames: Option<trie::StringTrie<bool>>,
     ipnet: ipnet::IpNet,
-    reserved_ips: Vec<u32>,
     store: Box<dyn Store>,
 }
 
@@ -65,11 +63,6 @@ impl FakeDns {
             offset: 0,
             skipped_hostnames: opt.skipped_hostnames,
             ipnet: opt.ipnet,
-            reserved_ips: opt
-                .reserved_ips
-                .into_iter()
-                .map(|ip| Self::ip_to_uint(&ip))
-                .collect(),
             store: opt.store,
         })
     }
@@ -153,9 +146,7 @@ impl FakeDns {
             }
 
             let ip = net::Ipv4Addr::from(self.min + self.offset - 1);
-            if !self.reserved_ips.contains(&Self::ip_to_uint(&ip))
-                && !self.store.exist(std::net::IpAddr::V4(ip)).await
-            {
+            if !self.store.exist(std::net::IpAddr::V4(ip)).await {
                 break;
             }
         }
@@ -184,7 +175,6 @@ mod tests {
         let store = Box::new(InMemStore::new(10));
         let mut pool = FakeDns::new(Opts {
             ipnet,
-            reserved_ips: Vec::new(),
             skipped_hostnames: None,
             store,
         })
@@ -217,7 +207,6 @@ mod tests {
         let ipnet = "192.168.0.0/29".parse::<ipnet::IpNet>().unwrap();
         let mut pool = FakeDns::new(Opts {
             ipnet,
-            reserved_ips: Vec::new(),
             skipped_hostnames: None,
             store,
         })
@@ -246,7 +235,6 @@ mod tests {
 
         let pool = FakeDns::new(Opts {
             ipnet,
-            reserved_ips: Vec::new(),
             skipped_hostnames: Some(tree),
             store,
         })
@@ -263,7 +251,6 @@ mod tests {
         let ipnet = "192.168.0.0/24".parse::<ipnet::IpNet>().unwrap();
         let mut pool = FakeDns::new(Opts {
             ipnet,
-            reserved_ips: Vec::new(),
             skipped_hostnames: None,
             store,
         })
@@ -286,7 +273,6 @@ mod tests {
         let ipnet = "192.168.0.0/24".parse::<ipnet::IpNet>().unwrap();
         let mut pool = FakeDns::new(Opts {
             ipnet,
-            reserved_ips: Vec::new(),
             skipped_hostnames: None,
             store,
         })
@@ -301,7 +287,6 @@ mod tests {
 
         let mut new_pool = FakeDns::new(Opts {
             ipnet,
-            reserved_ips: Vec::new(),
             skipped_hostnames: None,
             store,
         })
@@ -324,7 +309,6 @@ mod tests {
         let ipnet = "198.18.0.0/16".parse::<ipnet::IpNet>().unwrap();
         let mut pool = FakeDns::new(Opts {
             ipnet,
-            reserved_ips: Vec::new(),
             skipped_hostnames: None,
             store,
         })
@@ -365,21 +349,5 @@ mod tests {
             !pool.is_fake_ip(unallocated).await,
             "unallocated in-range IP must not be treated as a fake IP"
         );
-    }
-
-    #[tokio::test]
-    async fn test_reserved_ip_is_not_allocated() {
-        let store = Box::new(InMemStore::new(10));
-        let ipnet = "192.168.0.0/24".parse::<ipnet::IpNet>().unwrap();
-        let mut pool = FakeDns::new(Opts {
-            ipnet,
-            reserved_ips: vec!["192.168.0.2".parse().unwrap()],
-            skipped_hostnames: None,
-            store,
-        })
-        .unwrap();
-
-        let first = pool.lookup("foo.com").await;
-        assert_eq!(first, net::IpAddr::from([192, 168, 0, 3]));
     }
 }

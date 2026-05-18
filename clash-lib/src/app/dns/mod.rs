@@ -3,8 +3,7 @@ use async_trait::async_trait;
 use std::fmt::Debug;
 
 use hickory_proto::op;
-use std::sync::{Arc, LazyLock};
-use tokio::sync::RwLock;
+use std::sync::Arc;
 
 #[cfg(test)]
 use mockall::automock;
@@ -19,7 +18,7 @@ pub mod resolver;
 mod runtime;
 mod server;
 
-pub use config::{DNSConfig, EdnsClientSubnet};
+pub use config::{Config, EdnsClientSubnet};
 
 pub use filters::PendingMmdb;
 
@@ -44,10 +43,6 @@ pub enum ResolverKind {
 }
 
 pub type ThreadSafeDNSResolver = Arc<dyn ClashResolver>;
-
-static CONTROL_PLANE_DNS_RESOLVER: LazyLock<
-    Arc<RwLock<Option<ThreadSafeDNSResolver>>>,
-> = LazyLock::new(Default::default);
 
 /// A implementation of "anti-poisoning" Resolver
 /// it can hold multiple clients in different protocols
@@ -92,12 +87,4 @@ pub trait ClashResolver: Sync + Send {
 /// Used by resolvers to short-circuit DNS resolution for IP literals.
 pub(crate) fn parse_ip_literal(host: &str) -> Option<std::net::IpAddr> {
     host.parse().ok()
-}
-
-pub async fn set_control_plane_resolver(resolver: ThreadSafeDNSResolver) {
-    *CONTROL_PLANE_DNS_RESOLVER.write().await = Some(resolver);
-}
-
-pub async fn get_control_plane_resolver() -> Option<ThreadSafeDNSResolver> {
-    CONTROL_PLANE_DNS_RESOLVER.read().await.clone()
 }

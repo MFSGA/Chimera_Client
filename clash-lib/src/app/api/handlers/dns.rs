@@ -46,17 +46,20 @@ async fn query_dns(
         return (StatusCode::BAD_REQUEST, "Invalid name").into_response();
     };
 
-    let mut message = Message::new();
+    let mut message = Message::query();
     message.add_query(hickory_proto::op::Query::query(name, typ));
 
     match state.resolver.exchange(&message).await {
         Ok(response) => {
             let mut resp = Map::new();
-            resp.insert("Status".to_owned(), response.response_code().low().into());
+            resp.insert(
+                "Status".to_owned(),
+                response.metadata.response_code.low().into(),
+            );
             resp.insert(
                 "Question".to_owned(),
                 response
-                    .queries()
+                    .queries
                     .iter()
                     .map(|query| {
                         let mut data = Map::new();
@@ -77,39 +80,42 @@ async fn query_dns(
                     .collect::<Vec<Value>>()
                     .into(),
             );
-            resp.insert("TC".to_owned(), response.truncated().into());
-            resp.insert("RD".to_owned(), response.recursion_desired().into());
-            resp.insert("RA".to_owned(), response.recursion_available().into());
-            resp.insert("AD".to_owned(), response.authentic_data().into());
-            resp.insert("CD".to_owned(), response.checking_disabled().into());
+            resp.insert("TC".to_owned(), response.metadata.truncation.into());
+            resp.insert("RD".to_owned(), response.metadata.recursion_desired.into());
+            resp.insert(
+                "RA".to_owned(),
+                response.metadata.recursion_available.into(),
+            );
+            resp.insert("AD".to_owned(), response.metadata.authentic_data.into());
+            resp.insert("CD".to_owned(), response.metadata.checking_disabled.into());
 
             let rr_to_json = |rr: &hickory_proto::rr::Record| -> Value {
                 let mut data = Map::new();
-                data.insert("name".to_owned(), rr.name().to_string().into());
+                data.insert("name".to_owned(), rr.name.to_string().into());
                 data.insert("type".to_owned(), u16::from(rr.record_type()).into());
-                data.insert("ttl".to_owned(), rr.ttl().into());
-                data.insert("data".to_owned(), rr.data().to_string().into());
+                data.insert("ttl".to_owned(), rr.ttl.into());
+                data.insert("data".to_owned(), rr.data.to_string().into());
                 data.into()
             };
 
-            if response.answer_count() > 0 {
+            if !response.answers.is_empty() {
                 resp.insert(
                     "Answer".to_owned(),
-                    response.answers().iter().map(rr_to_json).collect(),
+                    response.answers.iter().map(rr_to_json).collect(),
                 );
             }
 
-            if response.name_server_count() > 0 {
+            if !response.authorities.is_empty() {
                 resp.insert(
                     "Authority".to_owned(),
-                    response.name_servers().iter().map(rr_to_json).collect(),
+                    response.authorities.iter().map(rr_to_json).collect(),
                 );
             }
 
-            if response.additional_count() > 0 {
+            if !response.additionals.is_empty() {
                 resp.insert(
                     "Additional".to_owned(),
-                    response.additionals().iter().map(rr_to_json).collect(),
+                    response.additionals.iter().map(rr_to_json).collect(),
                 );
             }
 

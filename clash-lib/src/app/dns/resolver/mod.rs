@@ -13,14 +13,14 @@ use std::sync::Arc;
 pub use enhanced::EnhancedResolver;
 pub use system::SystemResolver;
 
-use super::{DNSConfig, ThreadSafeDNSResolver};
+use super::{Config, ThreadSafeDNSResolver};
 use crate::{
     app::profile::ThreadSafeCacheFile, dns::filters::PendingMmdb, print_and_exit,
     proxy::utils::OutboundHandlerRegistry,
 };
 
 pub async fn new(
-    cfg: DNSConfig,
+    cfg: Config,
     store: Option<ThreadSafeCacheFile>,
     mmdb: Option<PendingMmdb>,
     outbounds: OutboundHandlerRegistry,

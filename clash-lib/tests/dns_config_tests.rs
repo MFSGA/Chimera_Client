@@ -1,9 +1,9 @@
 use clash_lib::{
     Config,
-    app::dns::{DNSConfig, config::DNSNetMode},
+    app::dns::{Config as DnsConfig, config::DNSNetMode},
 };
 
-fn parse_dns(yaml: &str) -> DNSConfig {
+fn parse_dns(yaml: &str) -> DnsConfig {
     Config::Str(yaml.to_owned())
         .try_parse()
         .expect("config should parse")
@@ -63,7 +63,7 @@ fn full_dns_fixture_parses_expected_runtime_shape() {
     assert_eq!(dns.nameserver[3].port, 443);
     assert_eq!(dns.nameserver[3].proxy.as_deref(), Some("DIRECT"));
     assert_eq!(dns.default_nameserver.len(), 2);
-    assert_eq!(dns.proxy_server_nameserver.len(), 1);
+    assert_eq!(dns.proxy_server_nameserver.as_ref().unwrap().len(), 1);
     assert_eq!(dns.fallback.len(), 1);
     assert!(dns.nameserver_policy.contains_key("example.com"));
     assert_eq!(dns.fallback_filter.geo_ip_code, "CN");

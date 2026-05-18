@@ -245,9 +245,9 @@ async fn query_tcp(
 }
 
 fn build_query(host: &str, record_type: RecordType) -> anyhow::Result<Message> {
-    let mut message = Message::new();
-    message.set_id(rand::random::<u16>());
-    message.set_recursion_desired(true);
+    let mut message = Message::query();
+    message.metadata.id = rand::random::<u16>();
+    message.metadata.recursion_desired = true;
 
     let mut query = Query::new();
     query.set_name(Name::from_ascii(host)?);
@@ -259,9 +259,9 @@ fn build_query(host: &str, record_type: RecordType) -> anyhow::Result<Message> {
 
 fn answer_ips(message: &Message) -> Vec<IpAddr> {
     message
-        .answers()
+        .answers
         .iter()
-        .filter_map(|record| match record.data() {
+        .filter_map(|record| match &record.data {
             RData::A(ip) => Some(IpAddr::V4(**ip)),
             RData::AAAA(ip) => Some(IpAddr::V6(**ip)),
             _ => None,

@@ -40,7 +40,7 @@ pub struct Config {
     /// 4
     pub general: General,
     /// 5
-    pub dns: dns::DNSConfig,
+    pub dns: dns::Config,
     /// 6
     pub tun: TunConfig,
     /// 7

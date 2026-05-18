@@ -50,11 +50,11 @@ pub struct EdnsClientSubnet {
 }
 
 #[derive(Default)]
-pub struct DNSConfig {
+pub struct Config {
     pub enable: bool,
     pub ipv6: bool,
     pub nameserver: Vec<NameServer>,
-    pub proxy_server_nameserver: Vec<NameServer>,
+    pub proxy_server_nameserver: Option<Vec<NameServer>>,
     pub fallback: Vec<NameServer>,
     pub fallback_filter: FallbackFilter,
     pub listen: DNSListenAddr,
@@ -62,7 +62,6 @@ pub struct DNSConfig {
     pub default_nameserver: Vec<NameServer>,
     pub fake_ip_range: ipnet::IpNet,
     pub fake_ip_filter: Vec<String>,
-    pub reserved_ip_addrs: Vec<std::net::Ipv4Addr>,
     pub store_fake_ip: bool,
     pub store_smart_stats: bool,
     pub hosts: Option<trie::StringTrie<IpAddr>>,
@@ -71,7 +70,7 @@ pub struct DNSConfig {
     pub fw_mark: Option<u32>,
 }
 
-impl DNSConfig {
+impl Config {
     pub fn parse_nameserver(servers: &[String]) -> Result<Vec<NameServer>, Error> {
         let mut nameservers = vec![];
 
@@ -186,7 +185,7 @@ impl DNSConfig {
         let mut policy = HashMap::new();
 
         for (domain, server) in policy_map {
-            let nameservers = DNSConfig::parse_nameserver(&[server.to_owned()])?;
+            let nameservers = Config::parse_nameserver(&[server.to_owned()])?;
 
             let (_, valid) = trie::valid_and_split_domain(domain);
             if !valid {
@@ -245,7 +244,7 @@ fn parse_listen_addr(addr: &str) -> Result<SocketAddr, Error> {
     }
 }
 
-impl DNSConfig {
+impl Config {
     pub fn parse_outbound_proxy(url: &Url) -> Option<String> {
         let frag = url.fragment()?;
         let pairs = frag.split("&");
@@ -275,7 +274,7 @@ impl DNSConfig {
     }
 }
 
-impl TryFrom<crate::config::def::Config> for DNSConfig {
+impl TryFrom<crate::config::def::Config> for Config {
     type Error = Error;
 
     fn try_from(value: crate::def::Config) -> Result<Self, Self::Error> {
@@ -283,7 +282,7 @@ impl TryFrom<crate::config::def::Config> for DNSConfig {
     }
 }
 
-impl TryFrom<&crate::config::def::Config> for DNSConfig {
+impl TryFrom<&crate::config::def::Config> for Config {
     type Error = Error;
 
     fn try_from(c: &crate::config::def::Config) -> Result<Self, Self::Error> {
@@ -294,12 +293,10 @@ impl TryFrom<&crate::config::def::Config> for DNSConfig {
             )));
         }
 
-        let nameservers = DNSConfig::parse_nameserver(&dc.nameserver)?;
-        let proxy_server_nameserver =
-            DNSConfig::parse_nameserver(&dc.proxy_server_nameserver)?;
-        let fallback = DNSConfig::parse_nameserver(&dc.fallback)?;
+        let nameservers = Config::parse_nameserver(&dc.nameserver)?;
+        let fallback = Config::parse_nameserver(&dc.fallback)?;
         let nameserver_policy =
-            DNSConfig::parse_nameserver_policy(&dc.nameserver_policy)?;
+            Config::parse_nameserver_policy(&dc.nameserver_policy)?;
 
         if dc.default_nameserver.is_empty() {
             return Err(Error::InvalidConfig(String::from(
@@ -307,8 +304,7 @@ impl TryFrom<&crate::config::def::Config> for DNSConfig {
             )));
         }
 
-        let default_nameserver =
-            DNSConfig::parse_nameserver(&dc.default_nameserver)?;
+        let default_nameserver = Config::parse_nameserver(&dc.default_nameserver)?;
 
         for ns in &default_nameserver {
             if let url::Host::Domain(_) = ns.host {
@@ -317,6 +313,21 @@ impl TryFrom<&crate::config::def::Config> for DNSConfig {
                 )));
             }
         }
+
+        // Domain hostnames are allowed here: they are bootstrapped through
+        // `default-nameserver` at client-construction time, mirroring how
+        // `nameserver` resolves its own DoH/DoT hosts.
+        let proxy_server_nameserver = if !dc.proxy_server_nameserver.is_empty() {
+            let ns = Config::parse_nameserver(&dc.proxy_server_nameserver)?;
+            if ns.is_empty() {
+                return Err(Error::InvalidConfig(String::from(
+                    "proxy-server-nameserver has no usable entries (all skipped)",
+                )));
+            }
+            Some(ns)
+        } else {
+            None
+        };
 
         let edns_client_subnet = dc
             .edns_client_subnet
@@ -429,11 +440,10 @@ impl TryFrom<&crate::config::def::Config> for DNSConfig {
                 |_| Error::InvalidConfig(String::from("invalid fake ip range")),
             )?,
             fake_ip_filter: dc.fake_ip_filter.clone(),
-            reserved_ip_addrs: Vec::new(),
             store_fake_ip: c.profile.store_fake_ip,
             store_smart_stats: c.profile.store_smart_stats,
             hosts: if dc.use_hosts && !c.hosts.is_empty() {
-                DNSConfig::parse_hosts(&c.hosts).ok()
+                Config::parse_hosts(&c.hosts).ok()
             } else {
                 let mut tree = trie::StringTrie::new();
                 tree.insert(
@@ -486,7 +496,7 @@ fn parse_edns_client_subnet(
 
 impl From<crate::config::def::FallbackFilter> for FallbackFilter {
     fn from(c: crate::config::def::FallbackFilter) -> Self {
-        let ipcidr = DNSConfig::parse_fallback_ip_cidr(&c.ip_cidr);
+        let ipcidr = Config::parse_fallback_ip_cidr(&c.ip_cidr);
         Self {
             geo_ip: c.geo_ip,
             geo_ip_code: c.geo_ip_code.to_uppercase(),
@@ -503,7 +513,7 @@ mod tests {
     #[test]
     fn parse_nameserver_ipv6_without_scheme() {
         let servers = vec!["2400:3200::1".to_string()];
-        let ns = DNSConfig::parse_nameserver(&servers).expect("parse failed");
+        let ns = Config::parse_nameserver(&servers).expect("parse failed");
         assert_eq!(ns.len(), 1);
         assert_eq!(ns[0].host.to_string(), "[2400:3200::1]");
         assert_eq!(ns[0].port, 53);
@@ -516,7 +526,7 @@ mod tests {
     #[test]
     fn parse_nameserver_ipv6_with_brackets_and_port() {
         let servers = vec!["[2400:3200::1]:5353".to_string()];
-        let ns = DNSConfig::parse_nameserver(&servers).expect("parse failed");
+        let ns = Config::parse_nameserver(&servers).expect("parse failed");
         assert_eq!(ns.len(), 1);
         assert_eq!(ns[0].host.to_string(), "[2400:3200::1]");
         assert_eq!(ns[0].port, 5353);
