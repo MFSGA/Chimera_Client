@@ -15,6 +15,7 @@ mod fakeip;
 mod filters;
 mod helper;
 pub mod resolver;
+mod rule_dispatch;
 mod runtime;
 mod server;
 
@@ -23,6 +24,7 @@ pub use config::{Config, EdnsClientSubnet};
 pub use filters::PendingMmdb;
 
 pub use resolver::{EnhancedResolver, SystemResolver, new as new_resolver};
+pub use rule_dispatch::{PendingOutboundManager, PendingRouter, RuleDispatch};
 
 pub use server::DnsRunner;
 #[cfg(feature = "tun")]

@@ -2,7 +2,7 @@ use crate::{
     app::net::DEFAULT_OUTBOUND_INTERFACE,
     config::internal::proxy::PROXY_DIRECT,
     dns::{
-        ClashResolver, EdnsClientSubnet, ThreadSafeDNSClient,
+        ClashResolver, EdnsClientSubnet, RuleDispatch, ThreadSafeDNSClient,
         dns_client::{DNSNetMode, DnsClient, Opts},
     },
     proxy::{
@@ -22,6 +22,7 @@ pub async fn make_clients(
     outbounds: OutboundHandlerRegistry,
     edns_client_subnet: Option<EdnsClientSubnet>,
     fw_mark: Option<u32>,
+    rule_dispatch: Option<Arc<RuleDispatch>>,
 ) -> Vec<ThreadSafeDNSClient> {
     let mut rv = Vec::new();
 
@@ -31,6 +32,12 @@ pub async fn make_clients(
         let proxy_name = s.proxy.clone().unwrap_or(PROXY_DIRECT.to_string());
         let proxy: Arc<dyn proxy::OutboundHandler> =
             Arc::new(SharedOutboundHandler::new(proxy_name, outbounds.clone()));
+
+        let rd = if s.proxy.is_none() {
+            rule_dispatch.clone()
+        } else {
+            None
+        };
 
         let port = if s.net == DNSNetMode::Dhcp { 0 } else { s.port };
 
@@ -48,6 +55,7 @@ pub async fn make_clients(
             proxy,
             ecs: edns_client_subnet.clone(),
             fw_mark,
+            rule_dispatch: rd,
         })
         .await
         {

@@ -328,6 +328,8 @@ pub struct DNS {
     /// Whether to use `Config::hosts` when resolving hostnames
     #[educe(Default = true)]
     pub use_hosts: bool,
+    /// Route upstream DNS queries from nameserver/fallback/policy through rules.
+    pub respect_rules: bool,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]

@@ -4,7 +4,7 @@ use crate::{
     common::trie,
     config::def::DNSMode,
     dns::{
-        ClashResolver, Config, ResolverKind, ThreadSafeDNSClient,
+        ClashResolver, Config, ResolverKind, RuleDispatch, ThreadSafeDNSClient,
         fakeip::{self, FileStore, InMemStore, ThreadSafeFakeDns},
         filters::{
             DomainFilter, FallbackDomainFilter, FallbackIPFilter, GeoIPFilter,
@@ -78,6 +78,7 @@ impl EnhancedResolver {
                 )),
                 None,
                 None,
+                None,
             )
             .await,
             fallback: None,
@@ -100,6 +101,7 @@ impl EnhancedResolver {
         store: ThreadSafeCacheFile,
         mmdb: Option<PendingMmdb>,
         outbounds: crate::proxy::utils::OutboundHandlerRegistry,
+        rule_dispatch: Option<Arc<RuleDispatch>>,
     ) -> Self {
         let edns_client_subnet = cfg.edns_client_subnet.clone();
         let default_resolver = Arc::new(EnhancedResolver {
@@ -111,6 +113,7 @@ impl EnhancedResolver {
                 outbounds.clone(),
                 edns_client_subnet.clone(),
                 cfg.fw_mark,
+                None,
             )
             .await,
             fallback: None,
@@ -136,6 +139,7 @@ impl EnhancedResolver {
                 Arc::new(RwLock::new(std::collections::HashMap::new())),
                 edns_client_subnet.clone(),
                 cfg.fw_mark,
+                None,
             )
             .await;
             if clients.is_empty() {
@@ -179,6 +183,7 @@ impl EnhancedResolver {
                 outbounds.clone(),
                 edns_client_subnet.clone(),
                 cfg.fw_mark,
+                rule_dispatch.clone(),
             )
             .await,
             hosts: cfg.hosts,
@@ -190,6 +195,7 @@ impl EnhancedResolver {
                         outbounds.clone(),
                         edns_client_subnet.clone(),
                         cfg.fw_mark,
+                        rule_dispatch.clone(),
                     )
                     .await,
                 )
@@ -244,6 +250,7 @@ impl EnhancedResolver {
                                 outbounds.clone(),
                                 edns_client_subnet.clone(),
                                 cfg.fw_mark,
+                                rule_dispatch.clone(),
                             )
                             .await,
                         ),
@@ -976,6 +983,7 @@ mod tests {
             proxy: get_default_outbound(),
             ecs: None,
             fw_mark: None,
+            rule_dispatch: None,
         })
         .await
         .expect("build client");
@@ -995,6 +1003,7 @@ mod tests {
             proxy: get_default_outbound(),
             ecs: None,
             fw_mark: None,
+            rule_dispatch: None,
         })
         .await
         .expect("build client");
@@ -1014,6 +1023,7 @@ mod tests {
             proxy: get_default_outbound(),
             ecs: None,
             fw_mark: None,
+            rule_dispatch: None,
         })
         .await
         .expect("build client");
@@ -1035,6 +1045,7 @@ mod tests {
             proxy: get_default_outbound(),
             ecs: None,
             fw_mark: None,
+            rule_dispatch: None,
         })
         .await
         .expect("build client");
@@ -1054,6 +1065,7 @@ mod tests {
             proxy: get_default_outbound(),
             ecs: None,
             fw_mark: None,
+            rule_dispatch: None,
         })
         .await
         .expect("build client");
@@ -1174,6 +1186,7 @@ mod tests {
             cache_store,
             None,
             outbounds,
+            None,
         )
         .await;
 

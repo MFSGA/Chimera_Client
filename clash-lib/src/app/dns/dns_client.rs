@@ -1,4 +1,7 @@
-use super::{ClashResolver, Client, EdnsClientSubnet, runtime::DnsRuntimeProvider};
+use super::{
+    ClashResolver, Client, EdnsClientSubnet, RuleDispatch,
+    runtime::DnsRuntimeProvider,
+};
 use std::{
     fmt::{Debug, Display, Formatter},
     net::{self, IpAddr},
@@ -82,6 +85,7 @@ mod tests {
             net: DNSNetMode::Udp,
             iface: None,
             ecs,
+            rule_dispatch: None,
         }
     }
 
@@ -213,6 +217,7 @@ pub struct Opts {
     pub proxy: Arc<dyn OutboundHandler>,
     pub ecs: Option<EdnsClientSubnet>,
     pub fw_mark: Option<u32>,
+    pub rule_dispatch: Option<Arc<RuleDispatch>>,
 }
 
 type FwMark = Option<u32>;
@@ -303,6 +308,7 @@ pub struct DnsClient {
     net: DNSNetMode,
     iface: Option<OutboundInterface>,
     ecs: Option<EdnsClientSubnet>,
+    rule_dispatch: Option<Arc<RuleDispatch>>,
 }
 
 impl DnsClient {
@@ -317,7 +323,7 @@ impl DnsClient {
         const RETRY_DELAY: Duration = Duration::from_millis(200);
 
         for attempt in 0..=MAX_RETRIES {
-            match dns_stream_builder(&self.cfg).await {
+            match dns_stream_builder(&self.cfg, self.rule_dispatch.clone()).await {
                 Ok(result) => {
                     if attempt > 0 {
                         info!(
@@ -424,6 +430,7 @@ impl DnsClient {
                     net: opts.net,
                     iface: opts.iface,
                     ecs: opts.ecs.clone(),
+                    rule_dispatch: opts.rule_dispatch.clone(),
                 }))
             }
             DNSNetMode::Tcp => {
@@ -446,6 +453,7 @@ impl DnsClient {
                     net: opts.net,
                     iface: opts.iface,
                     ecs: opts.ecs.clone(),
+                    rule_dispatch: opts.rule_dispatch.clone(),
                 }))
             }
             DNSNetMode::DoT => {
@@ -468,6 +476,7 @@ impl DnsClient {
                     net: opts.net,
                     iface: opts.iface,
                     ecs: opts.ecs.clone(),
+                    rule_dispatch: opts.rule_dispatch.clone(),
                 }))
             }
             DNSNetMode::DoH => {
@@ -491,6 +500,7 @@ impl DnsClient {
                     net: opts.net,
                     iface: opts.iface,
                     ecs: opts.ecs.clone(),
+                    rule_dispatch: opts.rule_dispatch.clone(),
                 }))
             }
             DNSNetMode::Dhcp => unreachable!("."),
@@ -629,6 +639,7 @@ impl Client for DnsClient {
 
 async fn dns_stream_builder(
     cfg: &DnsConfig,
+    rule_dispatch: Option<Arc<RuleDispatch>>,
 ) -> Result<(client::Client<DnsRuntimeProvider>, JoinHandle<()>), Error> {
     let dns_resolver = Arc::new(dns::SystemResolver::new(false)?);
     match cfg {
@@ -640,6 +651,7 @@ async fn dns_stream_builder(
                     dns_resolver,
                     iface.clone(),
                     *fw_mark,
+                    rule_dispatch.clone(),
                 ),
             )
             .with_timeout(Some(Duration::from_secs(5)))
@@ -658,6 +670,7 @@ async fn dns_stream_builder(
                     dns_resolver,
                     iface.clone(),
                     *fw_mark,
+                    rule_dispatch.clone(),
                 ),
             );
 
@@ -687,6 +700,7 @@ async fn dns_stream_builder(
                     dns_resolver,
                     iface.clone(),
                     *fw_mark,
+                    rule_dispatch.clone(),
                 ),
             );
 
@@ -723,6 +737,7 @@ async fn dns_stream_builder(
                     dns_resolver,
                     iface.clone(),
                     *fw_mark,
+                    rule_dispatch.clone(),
                 ),
             )
             .build(*addr, host.to_string().into(), "/dns-query".into())
