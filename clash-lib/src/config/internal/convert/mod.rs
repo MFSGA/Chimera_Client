@@ -163,7 +163,7 @@ profile: {{}}
     fn fill_tun_so_mark_from_routing_mark() {
         let cfg = parse_config(
             r#"
-routing_mark: 6666
+routing-mark: 6666
 tun:
   enable: true
 "#,
@@ -177,7 +177,7 @@ tun:
     fn keep_tun_so_mark_if_explicitly_set() {
         let cfg = parse_config(
             r#"
-routing_mark: 6666
+routing-mark: 6666
 tun:
   enable: true
   so-mark: 7777
@@ -200,5 +200,100 @@ tun:
 
         let converted = convert(cfg).expect("internal convert should succeed");
         assert!(converted.tun.route_all);
+    }
+
+    #[test]
+    fn parse_relay_group_with_proxies() {
+        let cfg = parse_config(
+            r#"
+proxies:
+  - name: "proxy-a"
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+  - name: "proxy-b"
+    type: socks5
+    server: 127.0.0.1
+    port: 1081
+
+proxy-groups:
+  - name: "relay-chain"
+    type: relay
+    proxies:
+      - "proxy-a"
+      - "proxy-b"
+    url: "http://www.gstatic.com/generate_204"
+    icon: "relay.svg"
+"#,
+        );
+
+        let converted = convert(cfg).expect("internal convert should succeed");
+        let group = converted
+            .proxy_groups
+            .get("relay-chain")
+            .expect("relay-chain group should exist");
+
+        use crate::config::internal::proxy::OutboundGroupProtocol;
+        match &group {
+            crate::config::internal::proxy::OutboundProxy::ProxyGroup(protocol) => {
+                match protocol {
+                    OutboundGroupProtocol::Relay(relay) => {
+                        assert_eq!(relay.name, "relay-chain");
+                        assert_eq!(
+                            relay.proxies,
+                            Some(vec!["proxy-a".to_string(), "proxy-b".to_string()])
+                        );
+                        assert_eq!(
+                            relay.url,
+                            Some("http://www.gstatic.com/generate_204".to_string())
+                        );
+                        assert_eq!(relay.icon, Some("relay.svg".to_string()));
+                    }
+                    _ => panic!("expected Relay group, got {protocol:?}"),
+                }
+            }
+            _ => panic!("expected ProxyGroup"),
+        }
+    }
+
+    #[test]
+    fn parse_relay_group_minimal() {
+        let cfg = parse_config(
+            r#"
+proxies:
+  - name: "proxy-a"
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+
+proxy-groups:
+  - name: "minimal-relay"
+    type: relay
+    proxies:
+      - "proxy-a"
+"#,
+        );
+
+        let converted = convert(cfg).expect("internal convert should succeed");
+        let group = converted
+            .proxy_groups
+            .get("minimal-relay")
+            .expect("minimal-relay group should exist");
+
+        use crate::config::internal::proxy::OutboundGroupProtocol;
+        match &group {
+            crate::config::internal::proxy::OutboundProxy::ProxyGroup(protocol) => {
+                match protocol {
+                    OutboundGroupProtocol::Relay(relay) => {
+                        assert_eq!(relay.name, "minimal-relay");
+                        assert_eq!(relay.proxies, Some(vec!["proxy-a".to_string()]));
+                        assert!(relay.url.is_none());
+                        assert!(relay.icon.is_none());
+                    }
+                    _ => panic!("expected Relay group, got {protocol:?}"),
+                }
+            }
+            _ => panic!("expected ProxyGroup"),
+        }
     }
 }

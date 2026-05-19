@@ -32,7 +32,7 @@ use crate::{
     proxy::{
         AnyOutboundHandler, direct,
         group::{
-            fallback,
+            fallback, relay,
             selector::{self, ThreadSafeSelectorControl},
             urltest,
         },
@@ -630,6 +630,49 @@ impl OutboundManager {
                     );
 
                     handlers.insert(proto.name.clone(), Arc::new(fallback));
+                }
+
+                OutboundGroupProtocol::Relay(proto) => {
+                    if check_group_empty(&proto.proxies, &proto.use_provider) {
+                        return Err(Error::InvalidConfig(format!(
+                            "proxy group {} has no proxies",
+                            proto.name
+                        )));
+                    }
+
+                    let mut providers: Vec<ThreadSafeProxyProvider> = vec![];
+
+                    if let Some(proxies) = &proto.proxies {
+                        providers.push(make_provider_from_proxies(
+                            &proto.name,
+                            proxies,
+                            0,
+                            true,
+                            handlers,
+                            proxy_manager.clone(),
+                            provider_registry,
+                        )?);
+                    }
+
+                    maybe_append_use_providers(
+                        &proto.use_provider,
+                        provider_registry,
+                        &mut providers,
+                    )?;
+
+                    let relay = relay::Handler::new(
+                        relay::HandlerOptions {
+                            name: proto.name.clone(),
+                            common_opts: crate::proxy::HandlerCommonOptions {
+                                icon: proto.icon.clone(),
+                                url: proto.url.clone(),
+                                connector: None,
+                            },
+                        },
+                        providers,
+                    );
+
+                    handlers.insert(proto.name.clone(), relay);
                 }
 
                 OutboundGroupProtocol::Select(proto) => {
