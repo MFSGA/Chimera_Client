@@ -94,12 +94,22 @@ After matching `ref`:
 3. Convert missing features into new iteration tasks.
 4. Implement, test, and commit one task at a time.
 5. Continue until the current project fully aligns with mihomo features.
-
 ## Model Constraint
 
-- Use only free models when model selection is required.
-- Do not intentionally configure or invoke paid models.
-- If the execution environment externally fixes the active model, do not attempt paid-model-specific configuration.
+- Use only free models when model selection is required, **except** for Plan Builder/Prometheus planning roles which may use GPT.
+- All exploration, librarian, implementation, QA, review, and automation roles must use free models when model choice is available.
+- If a non-plan-builder role cannot be executed with a free model, it must stop and record a blocker/skip rather than using GPT or paid models.
+## Non-Free-Model Blocker Rule
+
+If a non-plan-builder role (explore, librarian, implementation, QA, review, automation) cannot be executed with a free model, it must stop and record a blocker/skip instead of silently using GPT or paid models.
+
+This rule connects to the existing Skip Record Format: record the task as skipped with reason "non-free-model unavailability" and follow-up "resolve model availability or escalate".
+
+## Status and Evidence Rule
+
+Future executors should track task status (completed/in-progress/skipped) in the plan file and capture verification evidence (command output, diffs, test results) in .omo/evidence/ without requiring human confirmation.
+
+This rule preserves the existing one-task-one-commit discipline and does not change backlog task meanings.
 
 ## Completion Definition
 
