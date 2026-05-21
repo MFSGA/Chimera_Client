@@ -14,7 +14,7 @@ use crate::{
     },
     common::errors::new_io_error,
     proxy::{AnyOutboundHandler, datagram::UdpPacket},
-    session::{Network, Session, Type},
+    session::{InternalMetadata, Network, Session, Type},
 };
 use futures::{SinkExt, StreamExt};
 use hickory_net::runtime::{
@@ -31,6 +31,7 @@ pub struct DnsRuntimeProvider {
     iface: Option<OutboundInterface>,
     so_mark: Option<u32>,
     rule_dispatch: Option<Arc<RuleDispatch>>,
+    upstream: InternalMetadata,
 }
 
 impl DnsRuntimeProvider {
@@ -40,6 +41,7 @@ impl DnsRuntimeProvider {
         iface: Option<OutboundInterface>,
         so_mark: Option<u32>,
         rule_dispatch: Option<Arc<RuleDispatch>>,
+        upstream: InternalMetadata,
     ) -> Self {
         Self {
             handle: TokioHandle::default(),
@@ -48,6 +50,7 @@ impl DnsRuntimeProvider {
             iface,
             so_mark,
             rule_dispatch,
+            upstream,
         }
     }
 
@@ -64,7 +67,18 @@ impl DnsRuntimeProvider {
         let proxy = Arc::new(direct::Handler::new(PROXY_DIRECT));
         // SystemResolver::new us trivial,it always return Ok
         let dns_resolver = Arc::new(dns::SystemResolver::new(false).unwrap());
-        Self::new(proxy, dns_resolver, iface, so_mark, None)
+        Self::new(
+            proxy,
+            dns_resolver,
+            iface,
+            so_mark,
+            None,
+            InternalMetadata {
+                typ: "dns-upstream",
+                host: "direct".to_owned(),
+                network: "UDP".to_owned(),
+            },
+        )
     }
 
     /// Pick the outbound handler for an upstream DNS dial. When
@@ -116,14 +130,22 @@ impl RuntimeProvider for DnsRuntimeProvider {
         let sess = Session {
             source: src,
             network: Network::Tcp,
-            typ: Type::Ignore,
+            typ: Type::Dns,
             destination: server_addr.into(),
             so_mark: self.so_mark,
             iface: self.iface.clone(),
+            internal: Some(self.upstream.clone()),
             ..Default::default()
         };
         Box::pin(async move {
             let outbound = provider.pick_outbound(&sess).await;
+            tracing::debug!(
+                upstream_host = %provider.upstream.host,
+                upstream_network = %provider.upstream.network,
+                destination = %server_addr,
+                outbound = %outbound.name(),
+                "internal dns upstream tcp dial"
+            );
             let stream = outbound.connect_stream(&sess, dns);
             stream.await.map(AsyncIoTokioAsStd)
         })
@@ -146,15 +168,23 @@ impl RuntimeProvider for DnsRuntimeProvider {
         let sess = Session {
             source: src,
             network: Network::Udp,
-            typ: Type::Ignore,
+            typ: Type::Dns,
             destination: server_addr.into(),
             so_mark: self.so_mark,
             iface: self.iface.clone(),
+            internal: Some(self.upstream.clone()),
             ..Default::default()
         };
 
         Box::pin(async move {
             let outbound = provider.pick_outbound(&sess).await;
+            tracing::debug!(
+                upstream_host = %provider.upstream.host,
+                upstream_network = %provider.upstream.network,
+                destination = %server_addr,
+                outbound = %outbound.name(),
+                "internal dns upstream udp dial"
+            );
             outbound
                 .connect_datagram(&sess, dns)
                 .await

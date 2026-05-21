@@ -323,7 +323,16 @@ pub enum Type {
     Redir,
     Tunnel,
     Shadowsocks,
+    Dns,
     Ignore,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct InternalMetadata {
+    #[serde(rename = "type")]
+    pub typ: &'static str,
+    pub host: String,
+    pub network: String,
 }
 
 #[derive(Serialize)]
@@ -350,6 +359,9 @@ pub struct Session {
     /// Set by the Shadowsocks inbound before dispatch; used for per-user
     /// traffic attribution.
     pub inbound_user: Option<String>,
+    /// Metadata for runtime/control-plane traffic that is tracked but should not
+    /// be mistaken for user initiated traffic.
+    pub internal: Option<InternalMetadata>,
 }
 
 impl Session {
@@ -383,6 +395,18 @@ impl Session {
         if let Some(ref user) = self.inbound_user {
             rv.insert("inboundUser".to_string(), Box::new(user.clone()) as _);
         }
+        if let Some(ref internal) = self.internal {
+            rv.insert("internal".to_string(), Box::new(true) as _);
+            rv.insert("internalType".to_string(), Box::new(internal.typ) as _);
+            rv.insert(
+                "dnsUpstreamHost".to_string(),
+                Box::new(internal.host.clone()) as _,
+            );
+            rv.insert(
+                "dnsUpstreamNetwork".to_string(),
+                Box::new(internal.network.clone()) as _,
+            );
+        }
         rv
     }
 }
@@ -400,6 +424,7 @@ impl Default for Session {
             asn: None,
             traffic_stats: None,
             inbound_user: None,
+            internal: None,
         }
     }
 }
@@ -430,6 +455,7 @@ impl Debug for Session {
             .field("packet_mark", &self.so_mark)
             .field("iface", &self.iface)
             .field("asn", &self.asn)
+            .field("internal", &self.internal)
             .finish()
     }
 }
@@ -447,6 +473,7 @@ impl Clone for Session {
             asn: self.asn.clone(),
             traffic_stats: self.traffic_stats,
             inbound_user: self.inbound_user.clone(),
+            internal: self.internal.clone(),
         }
     }
 }
@@ -463,7 +490,7 @@ fn invalid_atyp() -> io::Error {
 mod tests {
     use bytes::BytesMut;
 
-    use super::SocksAddr;
+    use super::{InternalMetadata, Network, Session, SocksAddr, Type};
 
     #[test]
     fn socks_addr_peek_read_matches_encoded_domain() {
@@ -473,5 +500,27 @@ mod tests {
 
         assert_eq!(addr.size(), buf.len());
         assert_eq!(SocksAddr::peek_read(&buf).unwrap(), addr);
+    }
+
+    #[test]
+    fn dns_upstream_session_exports_internal_metadata() {
+        let sess = Session {
+            network: Network::Tcp,
+            typ: Type::Dns,
+            destination: "1.1.1.1:443".parse().unwrap(),
+            internal: Some(InternalMetadata {
+                typ: "dns-upstream",
+                host: "dns.cloudflare.com".to_owned(),
+                network: "DoH".to_owned(),
+            }),
+            ..Default::default()
+        };
+
+        let metadata = sess.as_map();
+
+        assert!(metadata.contains_key("internal"));
+        assert!(metadata.contains_key("internalType"));
+        assert!(metadata.contains_key("dnsUpstreamHost"));
+        assert!(metadata.contains_key("dnsUpstreamNetwork"));
     }
 }

@@ -537,4 +537,25 @@ mod tests {
             .parse()
             .expect("address should parse to SocketAddr");
     }
+
+    #[test]
+    fn parse_nameserver_proxy_fragment_for_dns_upstream() {
+        let servers =
+            vec!["https://dns.cloudflare.com/dns-query#proxy=TESTED".to_string()];
+        let ns = Config::parse_nameserver(&servers).expect("parse failed");
+
+        assert_eq!(ns.len(), 1);
+        assert_eq!(ns[0].net, DNSNetMode::DoH);
+        assert_eq!(ns[0].proxy.as_deref(), Some("TESTED"));
+    }
+
+    #[test]
+    fn parse_nameserver_proxy_fragment_shorthand() {
+        let servers = vec!["tls://8.8.4.4:853#TESTED".to_string()];
+        let ns = Config::parse_nameserver(&servers).expect("parse failed");
+
+        assert_eq!(ns.len(), 1);
+        assert_eq!(ns[0].net, DNSNetMode::DoT);
+        assert_eq!(ns[0].proxy.as_deref(), Some("TESTED"));
+    }
 }

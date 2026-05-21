@@ -113,8 +113,21 @@ impl Dispatcher {
             RunMode::Direct => (PROXY_DIRECT, None),
         };
 
-        debug!("dispatching {} to {}[{}]", sess, outbound_name, mode);
         let rule_summary = rule_summary(rule);
+        if let Some(internal) = &sess.internal {
+            debug!(
+                upstream_type = internal.typ,
+                upstream_host = %internal.host,
+                upstream_network = %internal.network,
+                destination = %sess.destination,
+                outbound_name,
+                rule = %rule_summary,
+                mode = %mode,
+                "dispatching internal dns upstream stream"
+            );
+        } else {
+            debug!("dispatching {} to {}[{}]", sess, outbound_name, mode);
+        }
 
         let mgr = self.outbound_manager.clone();
         let handler = match mgr.get_outbound(outbound_name).await {
@@ -131,14 +144,28 @@ impl Dispatcher {
             .await
         {
             Ok(rhs) => {
-                debug!(
-                    outbound_name,
-                    rule = %rule_summary,
-                    mode = %mode,
-                    source = %sess.source,
-                    destination = %sess.destination,
-                    "remote connection established"
-                );
+                if let Some(internal) = &sess.internal {
+                    debug!(
+                        outbound_name,
+                        rule = %rule_summary,
+                        mode = %mode,
+                        upstream_type = internal.typ,
+                        upstream_host = %internal.host,
+                        upstream_network = %internal.network,
+                        source = %sess.source,
+                        destination = %sess.destination,
+                        "internal dns upstream connection established"
+                    );
+                } else {
+                    debug!(
+                        outbound_name,
+                        rule = %rule_summary,
+                        mode = %mode,
+                        source = %sess.source,
+                        destination = %sess.destination,
+                        "remote connection established"
+                    );
+                }
                 let rhs = TrackedStream::new(
                     rhs,
                     self.manager.clone(),
@@ -350,15 +377,30 @@ impl Dispatcher {
                     };
 
                 let rule_summary = rule_summary(rule);
-                debug!(
-                    outbound_name = %outbound_name,
-                    rule = %rule_summary,
-                    mode = %mode,
-                    source = %sess.source,
-                    orig_dest = %orig_dest,
-                    resolved_dest = %sess.destination,
-                    "dispatching udp packet"
-                );
+                if let Some(internal) = &sess.internal {
+                    debug!(
+                        outbound_name = %outbound_name,
+                        rule = %rule_summary,
+                        mode = %mode,
+                        upstream_type = internal.typ,
+                        upstream_host = %internal.host,
+                        upstream_network = %internal.network,
+                        source = %sess.source,
+                        orig_dest = %orig_dest,
+                        resolved_dest = %sess.destination,
+                        "dispatching internal dns upstream datagram"
+                    );
+                } else {
+                    debug!(
+                        outbound_name = %outbound_name,
+                        rule = %rule_summary,
+                        mode = %mode,
+                        source = %sess.source,
+                        orig_dest = %orig_dest,
+                        resolved_dest = %sess.destination,
+                        "dispatching udp packet"
+                    );
+                }
 
                 match outbound_handle_guard
                     .get_outbound_sender_mut(
@@ -399,14 +441,28 @@ impl Dispatcher {
                             }
                         };
 
-                        debug!(
-                            outbound_name = %outbound_name,
-                            rule = %rule_summary,
-                            source = %sess.source,
-                            orig_dest = %orig_dest,
-                            resolved_dest = %sess.destination,
-                            "outbound datagram connected"
-                        );
+                        if let Some(internal) = &sess.internal {
+                            debug!(
+                                outbound_name = %outbound_name,
+                                rule = %rule_summary,
+                                upstream_type = internal.typ,
+                                upstream_host = %internal.host,
+                                upstream_network = %internal.network,
+                                source = %sess.source,
+                                orig_dest = %orig_dest,
+                                resolved_dest = %sess.destination,
+                                "internal dns upstream datagram connected"
+                            );
+                        } else {
+                            debug!(
+                                outbound_name = %outbound_name,
+                                rule = %rule_summary,
+                                source = %sess.source,
+                                orig_dest = %orig_dest,
+                                resolved_dest = %sess.destination,
+                                "outbound datagram connected"
+                            );
+                        }
 
                         let outbound_datagram = TrackedDatagram::new(
                             outbound_datagram,
@@ -855,6 +911,7 @@ mod tests {
             asn: None,
             traffic_stats: None,
             inbound_user: None,
+            internal: None,
         };
 
         sender
