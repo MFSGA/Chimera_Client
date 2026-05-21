@@ -9,7 +9,7 @@ use crate::{
     session::{Network, Session, Type},
 };
 use futures::{Sink, Stream, future::BoxFuture, ready};
-use std::{fmt, sync::Arc, task::Poll};
+use std::{fmt, net::IpAddr, sync::Arc, task::Poll};
 use tracing::{debug, trace, warn};
 
 type PendingPermitFuture = BoxFuture<
@@ -102,7 +102,16 @@ pub(crate) async fn handle_inbound_datagram(
             remote_addr,
         }) = lr.recv().await
         {
-            if remote_addr.ip().is_multicast() {
+            if is_noise_datagram(
+                local_addr.ip(),
+                remote_addr.ip(),
+                remote_addr.port(),
+            ) {
+                trace!(
+                    source = %local_addr,
+                    destination = %remote_addr,
+                    "dropping tun UDP system noise"
+                );
                 continue;
             }
             let pkt = UdpPacket {
@@ -201,6 +210,18 @@ pub(crate) async fn handle_inbound_datagram(
     debug!("tun UDP ready");
 
     let _ = futures::future::join(fut1, fut2).await;
+}
+
+fn is_noise_datagram(src: IpAddr, dst: IpAddr, dst_port: u16) -> bool {
+    if dst.is_multicast() || dst.is_unspecified() || src.is_unspecified() {
+        return true;
+    }
+
+    if matches!(dst, IpAddr::V4(ip) if ip.is_broadcast()) {
+        return true;
+    }
+
+    matches!(dst_port, 67 | 68 | 137 | 138 | 1900 | 3702 | 5353 | 5355)
 }
 
 pub struct TunDatagram {
@@ -351,7 +372,7 @@ impl Sink<UdpPacket> for TunDatagram {
 
 #[cfg(test)]
 mod tests {
-    use super::TunDatagram;
+    use super::{TunDatagram, is_noise_datagram};
     use crate::{proxy::datagram::UdpPacket, session::SocksAddr};
     use futures::{Sink, task::noop_waker_ref};
     use std::{
@@ -474,5 +495,26 @@ mod tests {
             forwarded.src_addr,
             SocksAddr::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10011,))
         );
+    }
+
+    #[test]
+    fn drops_windows_udp_discovery_noise() {
+        let src = IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1));
+
+        assert!(is_noise_datagram(
+            src,
+            IpAddr::V4(Ipv4Addr::new(198, 18, 0, 255)),
+            137
+        ));
+        assert!(is_noise_datagram(
+            src,
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            137
+        ));
+        assert!(!is_noise_datagram(
+            src,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            443
+        ));
     }
 }
