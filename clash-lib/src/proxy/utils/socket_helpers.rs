@@ -17,6 +17,7 @@ use crate::proxy::utils::platform::{
     maybe_protect_socket, must_bind_socket_on_interface,
 };
 
+#[allow(unused)]
 fn bind_addr_for_iface(
     iface: &OutboundInterface,
     family: socket2::Domain,
