@@ -19,7 +19,10 @@ use crate::{
     config::internal::proxy::PROXY_DIRECT,
     proxy::{
         ConnectorType, DialWithConnector, OutboundHandler, OutboundType,
-        utils::{RemoteConnector, new_dual_stack_udp_socket, new_tcp_stream},
+        utils::{
+            RemoteConnector, new_protected_dual_stack_udp_socket,
+            new_protected_tcp_stream,
+        },
     },
 };
 
@@ -71,7 +74,7 @@ impl OutboundHandler for Handler {
             .await?
             .ok_or_else(|| std::io::Error::other("no dns result"))?;
 
-        let s = new_tcp_stream(
+        let s = new_protected_tcp_stream(
             (remote_ip, sess.destination.port()).into(),
             sess.iface.as_ref(),
             #[cfg(target_os = "linux")]
@@ -92,11 +95,12 @@ impl OutboundHandler for Handler {
         // The outbound socket is shared across all destinations from the same
         // client. Use a dual-stack socket so one socket can send to both IPv4
         // and IPv6 destinations without EAFNOSUPPORT.
-        let udp = new_dual_stack_udp_socket(
+        let udp = new_protected_dual_stack_udp_socket(
             sess.iface.as_ref(),
             #[cfg(target_os = "linux")]
             sess.so_mark,
-        )?;
+        )
+        .await?;
 
         let d =
             ChainedDatagramWrapper::new(OutboundDatagramImpl::new(udp, resolver));

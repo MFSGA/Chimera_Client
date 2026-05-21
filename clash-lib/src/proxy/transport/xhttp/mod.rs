@@ -8,7 +8,6 @@ use hyper::body::{Frame, Incoming};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
     sync::mpsc,
 };
 use tokio_stream::wrappers::ReceiverStream;
@@ -19,7 +18,11 @@ use super::RealityClient;
 #[cfg(feature = "tls")]
 use super::TlsClient;
 use super::Transport;
-use crate::{common::errors::map_io_error, proxy::AnyStream};
+use crate::{
+    app::net::DEFAULT_OUTBOUND_INTERFACE,
+    common::errors::map_io_error,
+    proxy::{AnyStream, utils::new_tcp_stream},
+};
 
 const DUPLEX_BUFFER_SIZE: usize = 64 * 1024;
 const FRAME_CHANNEL_CAPACITY: usize = 32;
@@ -164,7 +167,20 @@ async fn handshake_http2(stream: AnyStream) -> io::Result<H2SendRequest> {
 async fn connect_download_stream(
     config: &XhttpDownloadConfig,
 ) -> io::Result<AnyStream> {
-    let tcp = TcpStream::connect((config.server.as_str(), config.port)).await?;
+    let endpoint = tokio::net::lookup_host((config.server.as_str(), config.port))
+        .await?
+        .next()
+        .ok_or_else(|| {
+            io::Error::other("xhttp download server resolved no addresses")
+        })?;
+    let iface = DEFAULT_OUTBOUND_INTERFACE.read().await.clone();
+    let tcp = new_tcp_stream(
+        endpoint,
+        iface.as_ref(),
+        #[cfg(target_os = "linux")]
+        None,
+    )
+    .await?;
     let stream: AnyStream = Box::new(tcp);
 
     match config.security {

@@ -10,10 +10,23 @@ use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
 use tokio::time::timeout;
 use tracing::{debug, error, instrument, trace};
 
+#[cfg(feature = "tun")]
+use crate::app::net::DEFAULT_OUTBOUND_INTERFACE;
 use crate::app::net::OutboundInterface;
 use crate::proxy::utils::platform::{
     maybe_protect_socket, must_bind_socket_on_interface,
 };
+
+fn bind_addr_for_iface(
+    iface: &OutboundInterface,
+    family: socket2::Domain,
+) -> Option<SocketAddr> {
+    match family {
+        socket2::Domain::IPV4 => iface.addr_v4.map(|ip| SocketAddr::from((ip, 0))),
+        socket2::Domain::IPV6 => iface.addr_v6.map(|ip| SocketAddr::from((ip, 0))),
+        _ => None,
+    }
+}
 
 pub fn apply_tcp_options(s: &TcpStream) -> std::io::Result<()> {
     #[cfg(not(target_os = "windows"))]
@@ -127,6 +140,79 @@ pub fn new_dual_stack_udp_socket(
     socket.set_nonblocking(true)?;
 
     UdpSocket::from_std(socket.into())
+}
+
+#[cfg(feature = "tun")]
+fn select_effective_iface<'a>(
+    explicit: Option<&'a OutboundInterface>,
+    default: &'a Option<OutboundInterface>,
+) -> Option<&'a OutboundInterface> {
+    explicit.or(default.as_ref())
+}
+
+#[cfg(feature = "tun")]
+async fn default_outbound_interface() -> Option<OutboundInterface> {
+    DEFAULT_OUTBOUND_INTERFACE.read().await.clone()
+}
+
+/// Create an outbound TCP socket protected from being routed back into TUN.
+///
+/// This mirrors mihomo's dialer behavior: a per-session explicit interface
+/// wins, otherwise the detected default outbound interface is applied.
+pub async fn new_protected_tcp_stream(
+    endpoint: SocketAddr,
+    iface: Option<&OutboundInterface>,
+    #[cfg(target_os = "linux")] so_mark: Option<u32>,
+) -> std::io::Result<TcpStream> {
+    #[cfg(feature = "tun")]
+    {
+        let default_iface = default_outbound_interface().await;
+        let effective_iface = select_effective_iface(iface, &default_iface);
+        return new_tcp_stream(
+            endpoint,
+            effective_iface,
+            #[cfg(target_os = "linux")]
+            so_mark,
+        )
+        .await;
+    }
+
+    #[cfg(not(feature = "tun"))]
+    {
+        new_tcp_stream(
+            endpoint,
+            iface,
+            #[cfg(target_os = "linux")]
+            so_mark,
+        )
+        .await
+    }
+}
+
+/// Create an outbound dual-stack UDP socket protected from TUN re-entry.
+pub async fn new_protected_dual_stack_udp_socket(
+    iface: Option<&OutboundInterface>,
+    #[cfg(target_os = "linux")] so_mark: Option<u32>,
+) -> std::io::Result<UdpSocket> {
+    #[cfg(feature = "tun")]
+    {
+        let default_iface = default_outbound_interface().await;
+        let effective_iface = select_effective_iface(iface, &default_iface);
+        return new_dual_stack_udp_socket(
+            effective_iface,
+            #[cfg(target_os = "linux")]
+            so_mark,
+        );
+    }
+
+    #[cfg(not(feature = "tun"))]
+    {
+        new_dual_stack_udp_socket(
+            iface,
+            #[cfg(target_os = "linux")]
+            so_mark,
+        )
+    }
 }
 
 /// Convert ipv6 mapped ipv4 address back to ipv4. Other address remain
@@ -243,6 +329,10 @@ fn prepare_outbound_tcp_socket(
 
     if let Some(iface) = iface {
         must_bind_socket_on_interface(&socket, iface, family)?;
+        #[cfg(target_os = "windows")]
+        if let Some(addr) = bind_addr_for_iface(iface, family) {
+            socket.bind(&addr.into())?;
+        }
         trace!(iface = ?iface, "tcp socket prepared for outbound interface");
     }
     #[cfg(target_os = "android")]
@@ -321,8 +411,12 @@ pub async fn new_udp_socket(
                 // Without binding local_addr can't be obtained by system call
                 // which is required on quinn.
                 #[cfg(target_os = "windows")]
-                if let Some(addr) = src {
-                    socket.bind(&socket2::SockAddr::from(addr))?;
+                {
+                    let bind_addr =
+                        src.or_else(|| bind_addr_for_iface(iface, family));
+                    if let Some(addr) = bind_addr {
+                        socket.bind(&socket2::SockAddr::from(addr))?;
+                    }
                 }
 
                 trace!(iface = ?iface, "udp socket bound: {socket:?}");
@@ -372,6 +466,40 @@ pub async fn new_udp_socket(
     UdpSocket::from_std(socket.into())
 }
 
+/// Create an outbound UDP socket protected from being routed back into TUN.
+pub async fn new_protected_udp_socket(
+    src: Option<SocketAddr>,
+    iface: Option<&OutboundInterface>,
+    #[cfg(target_os = "linux")] so_mark: Option<u32>,
+    family_hint: Option<std::net::SocketAddr>,
+) -> std::io::Result<UdpSocket> {
+    #[cfg(feature = "tun")]
+    {
+        let default_iface = default_outbound_interface().await;
+        let effective_iface = select_effective_iface(iface, &default_iface);
+        return new_udp_socket(
+            src,
+            effective_iface,
+            #[cfg(target_os = "linux")]
+            so_mark,
+            family_hint,
+        )
+        .await;
+    }
+
+    #[cfg(not(feature = "tun"))]
+    {
+        new_udp_socket(
+            src,
+            iface,
+            #[cfg(target_os = "linux")]
+            so_mark,
+            family_hint,
+        )
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -385,6 +513,8 @@ mod tests {
 
     use tokio::net::UdpSocket;
 
+    #[cfg(feature = "tun")]
+    use super::select_effective_iface;
     use super::{new_dual_stack_udp_socket, new_udp_socket};
     use crate::app::net::OutboundInterface;
     use crate::proxy::utils::{
@@ -393,6 +523,59 @@ mod tests {
 
     struct CountingProtector {
         calls: Arc<AtomicUsize>,
+    }
+
+    #[cfg(feature = "tun")]
+    #[test]
+    fn protected_socket_prefers_explicit_interface_over_default() {
+        let explicit = OutboundInterface {
+            name: "explicit".to_owned(),
+            addr_v4: Some(Ipv4Addr::LOCALHOST),
+            addr_v6: None,
+            index: 1,
+            netmask_v4: None,
+            broadcast_v4: None,
+            netmask_v6: None,
+            broadcast_v6: None,
+            mac_addr: None,
+        };
+        let default = Some(OutboundInterface {
+            name: "default".to_owned(),
+            addr_v4: Some(Ipv4Addr::new(192, 0, 2, 1)),
+            addr_v6: None,
+            index: 2,
+            netmask_v4: None,
+            broadcast_v4: None,
+            netmask_v6: None,
+            broadcast_v6: None,
+            mac_addr: None,
+        });
+
+        let effective = select_effective_iface(Some(&explicit), &default)
+            .expect("explicit interface should win");
+
+        assert_eq!(effective.name, "explicit");
+    }
+
+    #[cfg(feature = "tun")]
+    #[test]
+    fn protected_socket_uses_default_interface_without_explicit_iface() {
+        let default = Some(OutboundInterface {
+            name: "default".to_owned(),
+            addr_v4: Some(Ipv4Addr::new(192, 0, 2, 1)),
+            addr_v6: None,
+            index: 2,
+            netmask_v4: None,
+            broadcast_v4: None,
+            netmask_v6: None,
+            broadcast_v6: None,
+            mac_addr: None,
+        });
+
+        let effective = select_effective_iface(None, &default)
+            .expect("default interface should be used");
+
+        assert_eq!(effective.name, "default");
     }
 
     impl SocketProtector for CountingProtector {

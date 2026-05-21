@@ -6,7 +6,7 @@ use std::{
 };
 use tracing::trace;
 
-use super::new_tcp_stream;
+use super::new_protected_tcp_stream;
 use crate::{
     app::{
         dispatcher::{
@@ -19,7 +19,7 @@ use crate::{
     common::errors::new_io_error,
     proxy::{
         AnyOutboundDatagram, AnyOutboundHandler, AnyStream,
-        direct::datagram::OutboundDatagramImpl, utils::new_udp_socket,
+        direct::datagram::OutboundDatagramImpl, utils::new_protected_udp_socket,
     },
     session::{Network, Session, SocksAddr, Type},
 };
@@ -78,7 +78,7 @@ impl RemoteConnector for DirectConnector {
             .map_err(|v| new_io_error(format!("can't resolve dns: {v}")))?
             .ok_or(new_io_error("no dns result"))?;
 
-        new_tcp_stream(
+        new_protected_tcp_stream(
             (dial_addr, port).into(),
             iface,
             #[cfg(target_os = "linux")]
@@ -96,7 +96,7 @@ impl RemoteConnector for DirectConnector {
         iface: Option<&OutboundInterface>,
         #[cfg(target_os = "linux")] so_mark: Option<u32>,
     ) -> std::io::Result<AnyOutboundDatagram> {
-        let dgram = new_udp_socket(
+        let dgram = new_protected_udp_socket(
             src,
             iface,
             #[cfg(target_os = "linux")]
