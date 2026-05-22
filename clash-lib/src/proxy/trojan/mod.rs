@@ -249,18 +249,25 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::proxy::{
-        transport,
-        utils::test_utils::{
-            Suite,
-            config_helper::test_config_base_dir,
-            consts::*,
-            docker_runner::{DockerTestRunner, DockerTestRunnerBuilder},
-            run_test_suites_and_cleanup,
+    use crate::{
+        proxy::{
+            transport,
+            utils::test_utils::{
+                Suite,
+                docker_utils::{
+                    config_helper::test_config_base_dir,
+                    consts::*,
+                    docker_runner::{
+                        DockerTestRunner, DockerTestRunnerBuilder, alloc_docker_port,
+                    },
+                },
+                run_test_suites_and_cleanup,
+            },
         },
+        tests::initialize,
     };
 
-    async fn get_ws_runner() -> anyhow::Result<DockerTestRunner> {
+    async fn get_ws_runner(host_port: u16) -> anyhow::Result<DockerTestRunner> {
         let test_config_dir = test_config_base_dir();
         let trojan_conf = test_config_dir.join("trojan-ws.json");
         let trojan_cert = test_config_dir.join("certs/example.org.pem");
@@ -268,6 +275,7 @@ mod tests {
 
         DockerTestRunnerBuilder::new()
             .image(IMAGE_TROJAN_GO)
+            .host_port(host_port, 10002)
             .mounts(&[
                 (trojan_conf.to_str().unwrap(), "/etc/trojan-go/config.json"),
                 (trojan_cert.to_str().unwrap(), "/fullchain.pem"),
@@ -280,8 +288,10 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_trojan_ws() -> anyhow::Result<()> {
+        initialize();
         let span = tracing::info_span!("test_trojan_ws");
         let _enter = span.enter();
+        let host_port = alloc_docker_port();
         let transport = transport::WsClient::new(
             "".to_owned(),
             10002,
@@ -296,7 +306,7 @@ mod tests {
         let tls =
             transport::TlsClient::new(true, "example.org".to_owned(), None, None);
 
-        let container = get_ws_runner().await?;
+        let container = get_ws_runner(host_port).await?;
 
         let opts = HandlerOptions {
             name: "test-trojan-ws".to_owned(),
