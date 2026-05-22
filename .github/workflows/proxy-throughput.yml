@@ -9,6 +9,9 @@ on:
       - "bench/**"
       - ".github/workflows/proxy-throughput.yml"
   workflow_dispatch:
+  push:
+    tags: ["v*"]
+    branches: ["master"]
 
 permissions:
   contents: read
