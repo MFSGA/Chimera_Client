@@ -13,7 +13,8 @@ fn default_tun_device_id() -> String {
 }
 
 fn default_tun_address() -> String {
-    "198.18.0.1/24".to_string()
+    // reference: mihomo
+    "198.18.0.1/30".to_string()
 }
 
 fn default_route_table() -> u32 {
@@ -313,7 +314,7 @@ pub struct DNS {
     /// Lookup domains via specific nameservers
     pub nameserver_policy: HashMap<String, String>,
     /// Fake IP addresses pool CIDR
-    #[educe(Default = "198.18.0.1/16")]
+    #[educe(Default = "198.19.0.1/16")]
     pub fake_ip_range: String,
     /// Fake IP addresses filter
     pub fake_ip_filter: Vec<String>,
