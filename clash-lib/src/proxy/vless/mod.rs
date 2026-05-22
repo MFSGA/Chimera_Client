@@ -294,10 +294,11 @@ mod tests {
             "".to_owned(),
         );
 
+        let runner = get_ws_runner().await?;
         let opts = HandlerOptions {
             name: "test-vless-ws".into(),
             common_opts: Default::default(),
-            server: LOCAL_ADDR.into(),
+            server: runner.container_ip().unwrap_or(LOCAL_ADDR.to_owned()),
             port: 8443,
             uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".into(),
             flow: None,
@@ -306,7 +307,6 @@ mod tests {
             transport: Some(Box::new(ws_client)),
         };
         let handler = Arc::new(Handler::new(opts));
-        let runner = get_ws_runner().await?;
         run_test_suites_and_cleanup(handler, runner, Suite::all()).await
     }
 }

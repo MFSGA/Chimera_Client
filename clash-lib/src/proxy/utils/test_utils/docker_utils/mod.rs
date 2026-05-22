@@ -51,8 +51,8 @@ pub fn write_throughput_result(result: &ThroughputResult) {
         .append(true)
         .open(&path)
         .expect("THROUGHPUT_RESULTS_FILE: cannot open for append");
-    let mut line =
-        serde_json::to_string(result).expect("ThroughputResult serialization failed");
+    let mut line = serde_json::to_string(result)
+        .expect("ThroughputResult serialization failed");
     line.push('\n');
     file.write_all(line.as_bytes())
         .expect("THROUGHPUT_RESULTS_FILE: write failed");
