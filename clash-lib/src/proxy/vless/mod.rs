@@ -242,7 +242,9 @@ mod tests {
                 docker_utils::{
                     config_helper::test_config_base_dir,
                     consts::*,
-                    docker_runner::{DockerTestRunner, DockerTestRunnerBuilder},
+                    docker_runner::{
+                        DockerTestRunner, DockerTestRunnerBuilder, alloc_docker_port,
+                    },
                 },
                 run_test_suites_and_cleanup,
             },
@@ -259,7 +261,7 @@ mod tests {
         )))
     }
 
-    async fn get_ws_runner() -> anyhow::Result<DockerTestRunner> {
+    async fn get_ws_runner(host_port: u16) -> anyhow::Result<DockerTestRunner> {
         let test_config_dir = test_config_base_dir();
         let conf = test_config_dir.join("vless-ws-tls.json");
         let cert = test_config_dir.join("certs/example.org.pem");
@@ -267,6 +269,7 @@ mod tests {
 
         DockerTestRunnerBuilder::new()
             .image(IMAGE_VLESS)
+            .host_port(host_port, 8443)
             .mounts(&[
                 (conf.to_str().unwrap(), "/etc/v2ray/config.json"),
                 (cert.to_str().unwrap(), "/etc/ssl/v2ray/fullchain.pem"),
@@ -282,6 +285,7 @@ mod tests {
         initialize();
         let span = tracing::info_span!("test_vless_ws");
         let _enter = span.enter();
+        let host_port = alloc_docker_port();
         let ws_client = WsClient::new(
             "".to_owned(),
             8443,
@@ -294,7 +298,7 @@ mod tests {
             "".to_owned(),
         );
 
-        let runner = get_ws_runner().await?;
+        let runner = get_ws_runner(host_port).await?;
         let opts = HandlerOptions {
             name: "test-vless-ws".into(),
             common_opts: Default::default(),

@@ -247,6 +247,34 @@ impl DockerTestRunnerBuilder {
         self
     }
 
+    pub fn host_port(mut self, host_port: u16, container_port: u16) -> Self {
+        self.exposed_ports = vec![
+            format!("{}/tcp", container_port),
+            format!("{}/udp", container_port),
+        ];
+        self.host_config.port_bindings = Some(
+            [
+                (
+                    format!("{}/tcp", container_port),
+                    Some(vec![PortBinding {
+                        host_ip: Some("0.0.0.0".to_owned()),
+                        host_port: Some(host_port.to_string()),
+                    }]),
+                ),
+                (
+                    format!("{}/udp", container_port),
+                    Some(vec![PortBinding {
+                        host_ip: Some("0.0.0.0".to_owned()),
+                        host_port: Some(host_port.to_string()),
+                    }]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        self
+    }
+
     pub fn mounts(mut self, pairs: &[(&str, &str)]) -> Self {
         self.host_config.mounts = Some(
             pairs
