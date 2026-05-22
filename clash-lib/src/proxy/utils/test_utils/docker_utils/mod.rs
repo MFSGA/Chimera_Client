@@ -20,6 +20,64 @@ use crate::{
 #[allow(unused_imports)]
 pub use docker_runner::{RunAndCleanup, alloc_docker_port};
 
+#[cfg(throughput_test)]
+pub fn alloc_port() -> u16 {
+    alloc_docker_port()
+}
+
+#[cfg(throughput_test)]
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ThroughputResult {
+    pub label: String,
+    pub upload_mbps: f64,
+    pub download_mbps: f64,
+    pub upload_stdev_mbps: f64,
+    pub download_stdev_mbps: f64,
+    pub runs: usize,
+    pub total_bytes: usize,
+    pub netem: Option<String>,
+}
+
+#[cfg(all(docker_test, throughput_test))]
+pub fn write_throughput_result(result: &ThroughputResult) {
+    let Some(path) = std::env::var_os("THROUGHPUT_RESULTS_FILE") else {
+        return;
+    };
+
+    use std::io::Write as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .expect("THROUGHPUT_RESULTS_FILE: cannot open for append");
+    let mut line =
+        serde_json::to_string(result).expect("ThroughputResult serialization failed");
+    line.push('\n');
+    file.write_all(line.as_bytes())
+        .expect("THROUGHPUT_RESULTS_FILE: write failed");
+}
+
+#[cfg(throughput_test)]
+pub fn find_clash_rs_binary() -> std::path::PathBuf {
+    let root = config_helper::root_dir();
+    let binary_name = if cfg!(windows) {
+        "clash-rs.exe"
+    } else {
+        "clash-rs"
+    };
+    let debug = root.join("target").join("debug").join(binary_name);
+    let release = root.join("target").join("release").join(binary_name);
+
+    if debug.exists() {
+        debug
+    } else if release.exists() {
+        release
+    } else {
+        panic!("clash-rs binary not found; run `cargo build -p clash-rs` first")
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum Suite {
     PingPongTcp,
