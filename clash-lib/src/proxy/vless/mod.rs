@@ -267,7 +267,7 @@ mod tests {
         let cert = test_config_dir.join("certs/example.org.pem");
         let key = test_config_dir.join("certs/example.org-key.pem");
 
-        DockerTestRunnerBuilder::new()
+        let runner = DockerTestRunnerBuilder::new()
             .image(IMAGE_VLESS)
             .host_port(host_port, 8443)
             .mounts(&[
@@ -276,7 +276,13 @@ mod tests {
                 (key.to_str().unwrap(), "/etc/ssl/v2ray/privkey.pem"),
             ])
             .build()
-            .await
+            .await?;
+
+        runner
+            .wait_tcp_ready(8443, std::time::Duration::from_secs(15))
+            .await?;
+
+        Ok(runner)
     }
 
     #[tokio::test]

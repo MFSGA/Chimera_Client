@@ -3,6 +3,7 @@
 use std::{
     collections::HashMap,
     future::Future,
+    net::SocketAddr,
     sync::atomic::{AtomicU16, Ordering},
 };
 
@@ -16,6 +17,7 @@ use bollard::{
     },
 };
 use futures::TryStreamExt;
+use tokio::net::TcpStream;
 
 const FIRST_DOCKER_TEST_PORT: u16 = 30001;
 const PORT: u16 = 10002;
@@ -100,6 +102,38 @@ impl DockerTestRunner {
             })
     }
 
+    pub async fn wait_tcp_ready(
+        &self,
+        port: u16,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        let ip = self
+            .container_ip()
+            .ok_or_else(|| anyhow::anyhow!("container ip is unavailable"))?;
+        let addr: SocketAddr = format!("{ip}:{port}").parse()?;
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            match TcpStream::connect(addr).await {
+                Ok(stream) => {
+                    drop(stream);
+                    return Ok(());
+                }
+                Err(err) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        anyhow::bail!(
+                            "docker service {} was not ready in {:?}: {}",
+                            addr,
+                            timeout,
+                            err
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
     pub async fn cleanup(self) -> anyhow::Result<()> {
         self.instance
             .remove_container(
@@ -131,7 +165,8 @@ impl MultiDockerTestRunner {
             }
             Err(err) => {
                 tracing::warn!(
-                    "cannot start container, please check the docker environment, error: {:?}",
+                    "cannot start container, please check the docker environment, \
+                     error: {:?}",
                     err
                 );
                 for runner in std::mem::take(&mut self.runners) {
