@@ -246,42 +246,63 @@ impl PlainProxyAPIResponse for Handler {
 #[cfg(all(test, docker_test))]
 mod tests {
 
-    use std::collections::HashMap;
+    use std::{collections::HashMap, time::Duration};
 
     use super::*;
-    use crate::proxy::{
-        transport,
-        utils::test_utils::{
-            Suite,
-            config_helper::test_config_base_dir,
-            consts::*,
-            docker_runner::{DockerTestRunner, DockerTestRunnerBuilder},
-            run_test_suites_and_cleanup,
+    use crate::{
+        proxy::{
+            transport,
+            utils::test_utils::{
+                Suite,
+                docker_utils::{
+                    config_helper::test_config_base_dir,
+                    consts::*,
+                    docker_runner::{
+                        DockerTestRunner, DockerTestRunnerBuilder, alloc_docker_port,
+                    },
+                },
+                run_test_suites_and_cleanup,
+            },
         },
+        tests::initialize,
     };
-
-    async fn get_ws_runner() -> anyhow::Result<DockerTestRunner> {
+    async fn get_ws_runner(host_port: u16) -> anyhow::Result<DockerTestRunner> {
         let test_config_dir = test_config_base_dir();
         let trojan_conf = test_config_dir.join("trojan-ws.json");
         let trojan_cert = test_config_dir.join("certs/example.org.pem");
         let trojan_key = test_config_dir.join("certs/example.org-key.pem");
 
-        DockerTestRunnerBuilder::new()
+        let runner = DockerTestRunnerBuilder::new()
             .image(IMAGE_TROJAN_GO)
+            .host_port(host_port, 10002)
             .mounts(&[
                 (trojan_conf.to_str().unwrap(), "/etc/trojan-go/config.json"),
                 (trojan_cert.to_str().unwrap(), "/fullchain.pem"),
                 (trojan_key.to_str().unwrap(), "/privkey.pem"),
             ])
             .build()
-            .await
+            .await?;
+
+        DockerTestRunner::wait_host_tcp_ready(
+            LOCAL_ADDR,
+            host_port,
+            Duration::from_secs(20),
+        )
+        .await?;
+        // trojan-go may bind the port before TLS listener state is fully
+        // initialized, which can produce transient `tls handshake eof` in CI.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        Ok(runner)
     }
 
     #[tokio::test]
     #[serial_test::serial]
     async fn test_trojan_ws() -> anyhow::Result<()> {
+        initialize();
         let span = tracing::info_span!("test_trojan_ws");
         let _enter = span.enter();
+        let host_port = alloc_docker_port();
         let transport = transport::WsClient::new(
             "".to_owned(),
             10002,
@@ -296,13 +317,13 @@ mod tests {
         let tls =
             transport::TlsClient::new(true, "example.org".to_owned(), None, None);
 
-        let container = get_ws_runner().await?;
+        let container = get_ws_runner(host_port).await?;
 
         let opts = HandlerOptions {
             name: "test-trojan-ws".to_owned(),
             common_opts: Default::default(),
-            server: container.container_ip().unwrap_or(LOCAL_ADDR.to_owned()),
-            port: 10002,
+            server: LOCAL_ADDR.to_owned(),
+            port: host_port,
             password: "example".to_owned(),
             udp: true,
             tls: Some(Box::new(tls)),
