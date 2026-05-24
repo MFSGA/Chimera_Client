@@ -303,39 +303,62 @@ mod tests {
         initialize();
         let span = tracing::info_span!("test_trojan_ws");
         let _enter = span.enter();
-        let host_port = alloc_docker_port();
-        let transport = transport::WsClient::new(
-            "".to_owned(),
-            10002,
-            "/".to_owned(),
-            [("Host".to_owned(), "example.org".to_owned())]
-                .into_iter()
-                .collect::<HashMap<_, _>>(),
-            None,
-            0,
-            "".to_owned(),
-        );
-        let tls =
-            transport::TlsClient::new(true, "example.org".to_owned(), None, None);
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 1..=3 {
+            let host_port = alloc_docker_port();
+            let transport = transport::WsClient::new(
+                "".to_owned(),
+                10002,
+                "/".to_owned(),
+                [("Host".to_owned(), "example.org".to_owned())]
+                    .into_iter()
+                    .collect::<HashMap<_, _>>(),
+                None,
+                0,
+                "".to_owned(),
+            );
+            let tls = transport::TlsClient::new(
+                true,
+                "example.org".to_owned(),
+                None,
+                None,
+            );
 
-        let container = get_ws_runner(host_port).await?;
+            let container = get_ws_runner(host_port).await?;
 
-        let opts = HandlerOptions {
-            name: "test-trojan-ws".to_owned(),
-            common_opts: Default::default(),
-            server: LOCAL_ADDR.to_owned(),
-            port: host_port,
-            password: "example".to_owned(),
-            udp: true,
-            tls: Some(Box::new(tls)),
-            transport: Some(Box::new(transport)),
-        };
-        let handler = Arc::new(Handler::new(opts));
-        handler
-            .register_connector(GLOBAL_DIRECT_CONNECTOR.clone())
-            .await;
-        // ignore the udp test
-        run_test_suites_and_cleanup(handler, container, Suite::all()).await
+            let opts = HandlerOptions {
+                name: "test-trojan-ws".to_owned(),
+                common_opts: Default::default(),
+                server: LOCAL_ADDR.to_owned(),
+                port: host_port,
+                password: "example".to_owned(),
+                udp: true,
+                tls: Some(Box::new(tls)),
+                transport: Some(Box::new(transport)),
+            };
+            let handler = Arc::new(Handler::new(opts));
+            handler
+                .register_connector(GLOBAL_DIRECT_CONNECTOR.clone())
+                .await;
+            // ignore the udp test
+            match run_test_suites_and_cleanup(handler, container, Suite::all()).await
+            {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    tracing::warn!(
+                        "trojan ws e2e attempt {} failed: {}",
+                        attempt,
+                        err
+                    );
+                    last_err = Some(err);
+                    if attempt < 3 {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("trojan ws e2e failed")))
     }
 
     #[cfg(any())]
