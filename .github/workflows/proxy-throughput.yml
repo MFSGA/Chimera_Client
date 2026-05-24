@@ -80,20 +80,21 @@ jobs:
           curl -fL https://github.com/Loyalsoldier/geoip/releases/latest/download/Country.mmdb \
             -o "$mmdb_path"
 
-      - name: Run existing proxy Docker E2E tests
+      - name: Run throughput tests
         env:
+          # Absolute path: cargo test -p clash-lib sets the test binary's CWD
+          # to clash-lib/, so a relative path would land there instead of the
+          # workspace root.  The workflow-level env sets an absolute path.
           THROUGHPUT_RESULTS_FILE: ${{ env.THROUGHPUT_RESULTS_FILE }}
           RUST_LOG: ${{ env.RUST_LOG }}
           CLASH_RS_CI: "true"
         run: |
           set -o pipefail
           echo "Results will be written to: ${THROUGHPUT_RESULTS_FILE}"
-          {
-            echo "Running trimmed proxy E2E set."
-            echo "Full throughput tests are pending migration of throughput helpers and e2e_throughput_* tests."
-            RUSTFLAGS="--cfg docker_test" cargo test -p clash-lib --all-features test_vless_ws -- --nocapture
-            RUSTFLAGS="--cfg docker_test" cargo test -p clash-lib --all-features test_trojan_ws -- --nocapture
-          } 2>&1 | tee throughput-test.log
+          RUSTFLAGS="--cfg docker_test --cfg throughput_test" \
+          cargo test -p clash-lib --all-features \
+            e2e_throughput \
+            -- --test-threads=4 --nocapture 2>&1 | tee throughput-test.log
 
       - name: Format results as Markdown
         if: always()

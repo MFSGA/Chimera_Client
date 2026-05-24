@@ -350,11 +350,12 @@ mod tests {
         let gateway_ip = container.docker_gateway_ip();
         let binary =
             crate::proxy::utils::test_utils::docker_utils::find_clash_rs_binary();
-        let mmdb = test_config_base_dir()
-            .join("Country.mmdb")
-            .to_str()
-            .unwrap()
-            .to_owned();
+        let mmdb =
+            crate::proxy::utils::test_utils::docker_utils::config_helper::root_dir()
+                .join("clash-bin/tests/data/config/Country.mmdb")
+                .to_str()
+                .unwrap()
+                .to_owned();
 
         let config = format!(
             r#"
