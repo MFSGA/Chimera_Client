@@ -243,7 +243,8 @@ mod tests {
                     config_helper::test_config_base_dir,
                     consts::*,
                     docker_runner::{
-                        DockerTestRunner, DockerTestRunnerBuilder, alloc_docker_port,
+                        DockerTestRunner, DockerTestRunnerBuilder, RunAndCleanup,
+                        alloc_docker_port,
                     },
                 },
                 run_test_suites_and_cleanup,
@@ -324,5 +325,71 @@ mod tests {
         };
         let handler = Arc::new(Handler::new(opts));
         run_test_suites_and_cleanup(handler, runner, Suite::all()).await
+    }
+
+    #[cfg(throughput_test)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn e2e_throughput_vless_ws() -> anyhow::Result<()> {
+        initialize();
+        let host_port = alloc_docker_port();
+        let socks_port = alloc_docker_port();
+        let echo_port = alloc_docker_port();
+        let container = get_ws_runner(host_port).await?;
+        let gateway_ip = container.docker_gateway_ip();
+        let binary =
+            crate::proxy::utils::test_utils::docker_utils::find_clash_rs_binary();
+        let mmdb =
+            crate::proxy::utils::test_utils::docker_utils::config_helper::root_dir()
+                .join("clash-bin/tests/data/config/Country.mmdb")
+                .to_str()
+                .unwrap()
+                .to_owned();
+
+        let config = format!(
+            r#"
+socks-port: {socks_port}
+bind-address: 127.0.0.1
+mmdb: "{mmdb}"
+mode: global
+log-level: error
+proxies:
+  - name: proxy
+    type: vless
+    server: {server}
+    port: {port}
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    udp: false
+    tls: true
+    skip-cert-verify: true
+    network: ws
+    ws-opts:
+      path: /websocket
+      headers:
+        Host: example.org
+rules:
+  - MATCH,proxy
+"#,
+            socks_port = socks_port,
+            mmdb = mmdb,
+            server = LOCAL_ADDR,
+            port = host_port,
+        );
+
+        container
+            .run_and_cleanup(async move {
+                crate::proxy::utils::test_utils::docker_utils::clash_process_e2e_throughput(
+                    &binary,
+                    &config,
+                    "vless-ws",
+                    socks_port,
+                    echo_port,
+                    gateway_ip,
+                    32 * 1024 * 1024,
+                )
+                .await
+                .map(|_| ())
+            })
+            .await
     }
 }
