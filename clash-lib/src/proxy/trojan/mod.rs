@@ -290,6 +290,9 @@ mod tests {
             std::time::Duration::from_secs(20),
         )
         .await?;
+        // trojan-go may bind the port before TLS listener state is fully
+        // initialized, which can produce transient `tls handshake eof` in CI.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         Ok(runner)
     }
