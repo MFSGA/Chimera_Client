@@ -649,8 +649,12 @@ async fn reverse_lookup(
                             .try_into()
                             .expect("must be valid domain"),
                         None => {
-                            error!("failed to reverse lookup fake ip: {}", ip);
-                            return None;
+                            warn!(
+                                "failed to reverse lookup fake ip {}, fallback to \
+                                 raw destination",
+                                ip
+                            );
+                            (*socket_addr).into()
                         }
                     }
                 } else {
@@ -863,12 +867,13 @@ impl OutboundHandleMap {
 
 #[cfg(test)]
 mod tests {
-    use super::{OutboundHandleMap, try_queue_outbound_packet};
+    use super::{OutboundHandleMap, reverse_lookup, try_queue_outbound_packet};
     use crate::{
+        app::dns::{ClashResolver, MockClashResolver},
         proxy::datagram::UdpPacket,
         session::{Network, Session, SocksAddr, Type},
     };
-    use std::{future::pending, net::SocketAddr, str::FromStr};
+    use std::{future::pending, net::SocketAddr, str::FromStr, sync::Arc};
     use tokio::sync::mpsc;
 
     #[tokio::test]
@@ -931,6 +936,28 @@ mod tests {
 
         assert!(receiver.try_recv().is_ok());
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn reverse_lookup_falls_back_to_ip_when_fake_ip_record_is_missing() {
+        let fake_ip: std::net::IpAddr = "198.18.0.10".parse().unwrap();
+        let destination = SocksAddr::from_str("198.18.0.10:443").unwrap();
+
+        let mut resolver = MockClashResolver::new();
+        resolver.expect_fake_ip_enabled().return_const(true);
+        resolver
+            .expect_is_fake_ip()
+            .returning(move |ip| ip == fake_ip);
+        resolver.expect_reverse_lookup().returning(|_| None);
+
+        let resolved = reverse_lookup(
+            &(Arc::new(resolver) as Arc<dyn ClashResolver>),
+            &destination,
+        )
+        .await
+        .expect("reverse lookup should return fallback destination");
+
+        assert_eq!(resolved, destination);
     }
 }
 
