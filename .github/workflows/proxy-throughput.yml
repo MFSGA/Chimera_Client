@@ -24,11 +24,11 @@ concurrency:
 env:
   RUST_LOG: "clash_lib=info"
   RUST_TOOLCHAIN: "stable"
-  THROUGHPUT_RESULTS_FILE: ${{ github.workspace }}/throughput-results.jsonl
+  THROUGHPUT_RESULTS_FILE: ${{ github.workspace }}/throughput-results.json
 
 jobs:
   throughput:
-    name: Proxy E2E Smoke
+    name: Proxy E2E Throughput
     runs-on: ubuntu-latest
 
     steps:
@@ -43,7 +43,7 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          key: proxy-e2e-${{ runner.os }}
+          key: throughput-${{ runner.os }}
 
       - name: Install system dependencies
         run: |
@@ -73,18 +73,21 @@ jobs:
           docker pull v2fly/v2fly-core:v4.45.2
           docker pull p4gefau1t/trojan-go:latest
 
-      - name: Prepare test assets
+      - name: Download Country.mmdb
         run: |
-          mkdir -p clash-bin/tests/data/config
+          mmdb_path="clash-bin/tests/data/config/Country.mmdb"
+          mkdir -p "$(dirname "$mmdb_path")"
           curl -fL https://github.com/Loyalsoldier/geoip/releases/latest/download/Country.mmdb \
-            -o clash-bin/tests/data/config/Country.mmdb
+            -o "$mmdb_path"
 
       - name: Run existing proxy Docker E2E tests
         env:
+          THROUGHPUT_RESULTS_FILE: ${{ env.THROUGHPUT_RESULTS_FILE }}
           RUST_LOG: ${{ env.RUST_LOG }}
           CLASH_RS_CI: "true"
         run: |
           set -o pipefail
+          echo "Results will be written to: ${THROUGHPUT_RESULTS_FILE}"
           {
             echo "Running trimmed proxy E2E set."
             echo "Full throughput tests are pending migration of throughput helpers and e2e_throughput_* tests."
@@ -97,9 +100,10 @@ jobs:
         env:
           WORKFLOW_RUN_URL: "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         run: |
+          results_file="${{ env.THROUGHPUT_RESULTS_FILE }}"
           ENV_JSON=$(python3 bench/collect_env.py)
           python3 bench/format_throughput.py \
-            "${{ env.THROUGHPUT_RESULTS_FILE }}" \
+            "$results_file" \
             --output throughput-comment.md \
             --run-url "${WORKFLOW_RUN_URL}" \
             --env-json "$ENV_JSON"
