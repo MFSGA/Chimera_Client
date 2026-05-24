@@ -278,9 +278,12 @@ mod tests {
             .build()
             .await?;
 
-        runner
-            .wait_tcp_ready(8443, std::time::Duration::from_secs(15))
-            .await?;
+        DockerTestRunner::wait_host_tcp_ready(
+            LOCAL_ADDR,
+            host_port,
+            std::time::Duration::from_secs(20),
+        )
+        .await?;
 
         Ok(runner)
     }
@@ -308,8 +311,8 @@ mod tests {
         let opts = HandlerOptions {
             name: "test-vless-ws".into(),
             common_opts: Default::default(),
-            server: runner.container_ip().unwrap_or(LOCAL_ADDR.to_owned()),
-            port: 8443,
+            server: LOCAL_ADDR.to_owned(),
+            port: host_port,
             uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".into(),
             flow: None,
             udp: true,

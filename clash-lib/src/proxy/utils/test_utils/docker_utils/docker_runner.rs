@@ -134,6 +134,34 @@ impl DockerTestRunner {
         }
     }
 
+    pub async fn wait_host_tcp_ready(
+        host: &str,
+        port: u16,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        let addr: SocketAddr = format!("{host}:{port}").parse()?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            match TcpStream::connect(addr).await {
+                Ok(stream) => {
+                    drop(stream);
+                    return Ok(());
+                }
+                Err(err) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        anyhow::bail!(
+                            "host service {} was not ready in {:?}: {}",
+                            addr,
+                            timeout,
+                            err
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
     pub async fn cleanup(self) -> anyhow::Result<()> {
         self.instance
             .remove_container(

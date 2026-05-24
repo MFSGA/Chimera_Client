@@ -284,9 +284,12 @@ mod tests {
             .build()
             .await?;
 
-        runner
-            .wait_tcp_ready(10002, std::time::Duration::from_secs(15))
-            .await?;
+        DockerTestRunner::wait_host_tcp_ready(
+            LOCAL_ADDR,
+            host_port,
+            std::time::Duration::from_secs(20),
+        )
+        .await?;
 
         Ok(runner)
     }
@@ -317,8 +320,8 @@ mod tests {
         let opts = HandlerOptions {
             name: "test-trojan-ws".to_owned(),
             common_opts: Default::default(),
-            server: container.container_ip().unwrap_or(LOCAL_ADDR.to_owned()),
-            port: 10002,
+            server: LOCAL_ADDR.to_owned(),
+            port: host_port,
             password: "example".to_owned(),
             udp: true,
             tls: Some(Box::new(tls)),
