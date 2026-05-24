@@ -20,26 +20,26 @@ pub struct NoopResolver;
 impl ClashResolver for NoopResolver {
     async fn resolve(
         &self,
-        _host: &str,
+        host: &str,
         _enhanced: bool,
     ) -> anyhow::Result<Option<std::net::IpAddr>> {
-        Ok(None)
+        Ok(host.parse().ok())
     }
 
     async fn resolve_v4(
         &self,
-        _host: &str,
+        host: &str,
         _enhanced: bool,
     ) -> anyhow::Result<Option<std::net::Ipv4Addr>> {
-        Ok(None)
+        Ok(host.parse().ok())
     }
 
     async fn resolve_v6(
         &self,
-        _host: &str,
+        host: &str,
         _enhanced: bool,
     ) -> anyhow::Result<Option<std::net::Ipv6Addr>> {
-        Ok(None)
+        Ok(host.parse().ok())
     }
 
     async fn cached_for(&self, _ip: std::net::IpAddr) -> Option<String> {

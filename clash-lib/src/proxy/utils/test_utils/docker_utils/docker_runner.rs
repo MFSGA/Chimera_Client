@@ -3,6 +3,7 @@
 use std::{
     collections::HashMap,
     future::Future,
+    net::SocketAddr,
     sync::atomic::{AtomicU16, Ordering},
 };
 
@@ -16,6 +17,7 @@ use bollard::{
     },
 };
 use futures::TryStreamExt;
+use tokio::net::TcpStream;
 
 const FIRST_DOCKER_TEST_PORT: u16 = 30001;
 const PORT: u16 = 10002;
@@ -100,6 +102,34 @@ impl DockerTestRunner {
             })
     }
 
+    pub async fn wait_host_tcp_ready(
+        host: &str,
+        port: u16,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        let addr: SocketAddr = format!("{host}:{port}").parse()?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            match TcpStream::connect(addr).await {
+                Ok(stream) => {
+                    drop(stream);
+                    return Ok(());
+                }
+                Err(err) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        anyhow::bail!(
+                            "host service {} was not ready in {:?}: {}",
+                            addr,
+                            timeout,
+                            err
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
     pub async fn cleanup(self) -> anyhow::Result<()> {
         self.instance
             .remove_container(
@@ -131,7 +161,8 @@ impl MultiDockerTestRunner {
             }
             Err(err) => {
                 tracing::warn!(
-                    "cannot start container, please check the docker environment, error: {:?}",
+                    "cannot start container, please check the docker environment, \
+                     error: {:?}",
                     err
                 );
                 for runner in std::mem::take(&mut self.runners) {
@@ -244,6 +275,34 @@ impl DockerTestRunnerBuilder {
 
     pub fn cmd(mut self, cmd: &[&str]) -> Self {
         self.cmd = Some(cmd.iter().map(|value| (*value).to_owned()).collect());
+        self
+    }
+
+    pub fn host_port(mut self, host_port: u16, container_port: u16) -> Self {
+        self.exposed_ports = vec![
+            format!("{}/tcp", container_port),
+            format!("{}/udp", container_port),
+        ];
+        self.host_config.port_bindings = Some(
+            [
+                (
+                    format!("{}/tcp", container_port),
+                    Some(vec![PortBinding {
+                        host_ip: Some("0.0.0.0".to_owned()),
+                        host_port: Some(host_port.to_string()),
+                    }]),
+                ),
+                (
+                    format!("{}/udp", container_port),
+                    Some(vec![PortBinding {
+                        host_ip: Some("0.0.0.0".to_owned()),
+                        host_port: Some(host_port.to_string()),
+                    }]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
         self
     }
 
