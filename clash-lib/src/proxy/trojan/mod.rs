@@ -258,7 +258,8 @@ mod tests {
                     config_helper::test_config_base_dir,
                     consts::*,
                     docker_runner::{
-                        DockerTestRunner, DockerTestRunnerBuilder, alloc_docker_port,
+                        DockerTestRunner, DockerTestRunnerBuilder, RunAndCleanup,
+                        alloc_docker_port,
                     },
                 },
                 run_test_suites_and_cleanup,
@@ -335,6 +336,71 @@ mod tests {
             .await;
         // ignore the udp test
         run_test_suites_and_cleanup(handler, container, Suite::all()).await
+    }
+
+    #[cfg(throughput_test)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn e2e_throughput_trojan_ws() -> anyhow::Result<()> {
+        initialize();
+        let host_port = alloc_docker_port();
+        let socks_port = alloc_docker_port();
+        let echo_port = alloc_docker_port();
+        let container = get_ws_runner(host_port).await?;
+        let gateway_ip = container.docker_gateway_ip();
+        let binary =
+            crate::proxy::utils::test_utils::docker_utils::find_clash_rs_binary();
+        let mmdb = test_config_base_dir()
+            .join("Country.mmdb")
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        let config = format!(
+            r#"
+socks-port: {socks_port}
+bind-address: 127.0.0.1
+mmdb: "{mmdb}"
+mode: global
+log-level: error
+proxies:
+  - name: proxy
+    type: trojan
+    server: {server}
+    port: {port}
+    password: example
+    skip-cert-verify: true
+    udp: false
+    tls: true
+    network: ws
+    ws-opts:
+      path: /
+      headers:
+        Host: example.org
+rules:
+  - MATCH,proxy
+"#,
+            socks_port = socks_port,
+            mmdb = mmdb,
+            server = LOCAL_ADDR,
+            port = host_port,
+        );
+
+        container
+            .run_and_cleanup(async move {
+                crate::proxy::utils::test_utils::docker_utils::clash_process_e2e_throughput(
+                    &binary,
+                    &config,
+                    "trojan-ws",
+                    socks_port,
+                    echo_port,
+                    gateway_ip,
+                    32 * 1024 * 1024,
+                )
+                .await
+                .map(|_| ())
+            })
+            .await
     }
 
     #[cfg(any())]

@@ -60,12 +60,22 @@ pub fn write_throughput_result(result: &ThroughputResult) {
 
 #[cfg(throughput_test)]
 pub fn find_clash_rs_binary() -> std::path::PathBuf {
-    let root = config_helper::root_dir();
     let binary_name = if cfg!(windows) {
         "clash-rs.exe"
     } else {
         "clash-rs"
     };
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(profile_dir) =
+            current_exe.parent().and_then(|deps| deps.parent())
+    {
+        let sibling = profile_dir.join(binary_name);
+        if sibling.exists() {
+            return sibling;
+        }
+    }
+
+    let root = config_helper::root_dir();
     let debug = root.join("target").join("debug").join(binary_name);
     let release = root.join("target").join("release").join(binary_name);
 
@@ -192,7 +202,6 @@ pub async fn clash_process_e2e_throughput(
     let mut child = tokio::process::Command::new(binary)
         .arg("-c")
         .arg(&cfg_path)
-        .arg("--compatibility=false")
         .kill_on_drop(true)
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
