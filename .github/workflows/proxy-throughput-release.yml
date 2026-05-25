@@ -74,7 +74,6 @@ jobs:
       - name: Download Country.mmdb
         run: |
           mmdb_path="clash-bin/tests/data/config/Country.mmdb"
-          mkdir -p "$(dirname "$mmdb_path")"
           curl -fL https://github.com/Loyalsoldier/geoip/releases/latest/download/Country.mmdb \
             -o "$mmdb_path"
 
