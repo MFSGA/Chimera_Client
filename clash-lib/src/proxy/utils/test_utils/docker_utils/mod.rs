@@ -213,6 +213,7 @@ pub async fn clash_process_e2e_throughput(
     let mut child = tokio::process::Command::new(binary)
         .arg("-c")
         .arg(&cfg_path)
+        .arg("--compatibility=false")
         .kill_on_drop(true)
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
