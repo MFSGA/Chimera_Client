@@ -313,6 +313,13 @@ impl DockerTestRunnerBuilder {
         self
     }
 
+    #[allow(dead_code)]
+    pub fn no_port(mut self) -> Self {
+        self.exposed_ports = vec![];
+        self.host_config.port_bindings = Some(HashMap::new());
+        self
+    }
+
     pub fn mounts(mut self, pairs: &[(&str, &str)]) -> Self {
         self.host_config.mounts = Some(
             pairs
