@@ -436,8 +436,8 @@ mod e2e {
             .ok_or_else(|| anyhow::anyhow!("vless container has no IP"))?;
         let gateway_ip = container.docker_gateway_ip();
 
-        let mmdb = config_helper::root_dir()
-            .join("clash-bin/tests/data/config/Country.mmdb")
+        let mmdb = config_helper::test_config_base_dir()
+            .join("Country.mmdb")
             .to_str()
             .unwrap()
             .to_owned();
@@ -502,8 +502,8 @@ rules:
             .ok_or_else(|| anyhow::anyhow!("vless container has no IP"))?;
         let gateway_ip = container.docker_gateway_ip();
 
-        let mmdb = config_helper::root_dir()
-            .join("clash-bin/tests/data/config/Country.mmdb")
+        let mmdb = config_helper::test_config_base_dir()
+            .join("Country.mmdb")
             .to_str()
             .unwrap()
             .to_owned();

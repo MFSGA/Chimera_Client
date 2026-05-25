@@ -1,0 +1,21 @@
+{
+  "run_type": "server",
+  "local_addr": "0.0.0.0",
+  "local_port": 10002,
+  "disable_http_check": true,
+  "remote_addr": "127.0.0.1",
+  "remote_port": 80,
+  "password": [
+    "example"
+  ],
+  "ssl": {
+    "cert": "/fullchain.pem",
+    "key": "/privkey.pem",
+    "sni": "example.org"
+  },
+  "websocket": {
+    "enabled": true,
+    "path": "/",
+    "host": "example.org"
+  }
+}

@@ -13,7 +13,7 @@ pub fn root_dir() -> PathBuf {
 }
 
 pub fn test_config_base_dir() -> PathBuf {
-    root_dir().join("clash-lib/tests/data/config")
+    root_dir().join("clash-bin/tests/data/config")
 }
 
 pub async fn build_dns_resolver() -> anyhow::Result<ThreadSafeDNSResolver> {
