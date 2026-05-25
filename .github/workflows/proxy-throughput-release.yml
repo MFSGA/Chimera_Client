@@ -1,0 +1,167 @@
+name: Proxy Throughput Tests Release
+
+on:
+  pull_request:
+    branches: ["master"]
+    paths:
+      - "clash-lib/src/proxy/**"
+      - "clash-lib/src/app/**"
+      - ".github/workflows/proxy-throughput-release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_LOG: "clash_lib=info"
+  RUST_TOOLCHAIN: "stable"
+  THROUGHPUT_RESULTS_FILE: ${{ github.workspace }}/throughput-results.json
+
+jobs:
+  throughput:
+    name: Proxy E2E Throughput
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache Rust dependencies
+        uses: Itsusinn/rust-cache@92e40e4e88556b42f44b1a0c0e417d27f4e30f90
+        with:
+          key: throughput-${{ runner.os }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libclang-dev protobuf-compiler
+
+      - name: Build clash-rs binary (release)
+        # todo run: cargo build --release --bin clash-rs and the following two lines
+        run: cargo build --release --bin clash-rs
+
+      - name: Print environment info
+        run: |
+          echo "=== Runner environment ==="
+          echo "OS:     $(uname -a)"
+          echo "CPUs:   $(nproc) logical, $(lscpu | awk '/^Model name/{sub(/.*: */,""); print}')"
+          echo "Memory: $(free -h | awk '/^Mem/{print $2, "total,", $7, "available"}')"
+          echo "Disk:   $(df -h / | awk 'NR==2{print $4, "free on /"}')"
+          echo "=== Docker ==="
+          docker version --format 'Client: {{.Client.Version}}  Server: {{.Server.Version}}'
+          echo "=== Rust ==="
+          rustc --version
+          cargo --version
+          echo "=== Results file will be written to ==="
+          echo "  ${{ env.THROUGHPUT_RESULTS_FILE }}"
+
+      - name: Pull docker images
+        run: |
+          docker pull v2fly/v2fly-core:v4.45.2
+          docker pull p4gefau1t/trojan-go:latest
+          docker pull nicolaka/netshoot:latest
+
+      - name: Download Country.mmdb
+        run: |
+          mmdb_path="clash-bin/tests/data/config/Country.mmdb"
+          mkdir -p "$(dirname "$mmdb_path")"
+          curl -fL https://github.com/Loyalsoldier/geoip/releases/latest/download/Country.mmdb \
+            -o "$mmdb_path"
+
+      - name: Run throughput tests
+        env:
+          # Absolute path: cargo test -p clash-lib sets the test binary's CWD
+          # to clash-lib/, so a relative path would land there instead of the
+          # workspace root.  The workflow-level env sets an absolute path.
+          THROUGHPUT_RESULTS_FILE: ${{ env.THROUGHPUT_RESULTS_FILE }}
+          RUST_LOG: ${{ env.RUST_LOG }}
+          CLASH_RS_CI: "true"
+        run: |
+          set -o pipefail
+          echo "Results will be written to: ${THROUGHPUT_RESULTS_FILE}"
+          RUSTFLAGS="--cfg docker_test --cfg throughput_test" \
+          cargo test -p clash-lib --release --all-features \
+            e2e_throughput \
+            -- --test-threads=4 --nocapture 2>&1 | tee throughput-test.log
+
+      - name: Format results as Markdown
+        if: always()
+        env:
+          WORKFLOW_RUN_URL: "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          results_file="${{ env.THROUGHPUT_RESULTS_FILE }}"
+          ENV_JSON=$(python3 bench/collect_env.py)
+          python3 bench/format_throughput.py \
+            "$results_file" \
+            --output throughput-comment.md \
+            --run-url "${WORKFLOW_RUN_URL}" \
+            --env-json "$ENV_JSON"
+          cat throughput-comment.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload result artifacts
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: throughput-results
+          path: |
+            ${{ env.THROUGHPUT_RESULTS_FILE }}
+            throughput-comment.md
+            throughput-test.log
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - name: Post PR comment
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+
+            let body;
+            if (fs.existsSync('throughput-comment.md')) {
+              body = fs.readFileSync('throughput-comment.md', 'utf8');
+            } else {
+              body = '## Proxy E2E Results\n\nNo results produced; check workflow logs.';
+            }
+
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            body += '\n\n<details><summary>Full test log</summary>\n\n';
+            body += `Download the \`throughput-results\` artifact from the [workflow run](${runUrl}) for the full log.\n\n</details>`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' &&
+              (c.body.includes('Proxy Throughput Results') || c.body.includes('Proxy E2E Results'))
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
