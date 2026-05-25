@@ -72,6 +72,7 @@ jobs:
         run: |
           docker pull v2fly/v2fly-core:v4.45.2
           docker pull p4gefau1t/trojan-go:latest
+          docker pull nicolaka/netshoot:latest
 
       - name: Download Country.mmdb
         run: |
