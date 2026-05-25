@@ -50,7 +50,8 @@ jobs:
           sudo apt-get install -y cmake libclang-dev protobuf-compiler
 
       - name: Build clash-rs binary (release)
-        run: cargo build --release --bin clash-rs
+        # todo run: cargo build --release --bin clash-rs and the following two lines
+        run: cargo build --bin clash-rs
 
       - name: Print environment info
         run: |
@@ -90,8 +91,8 @@ jobs:
           {
             echo "Running trimmed proxy E2E set."
             echo "Full throughput tests are pending migration of throughput helpers and e2e_throughput_* tests."
-            RUSTFLAGS="--cfg docker_test" cargo test -p clash-lib --release --all-features test_vless_ws -- --nocapture
-            RUSTFLAGS="--cfg docker_test" cargo test -p clash-lib --release --all-features test_trojan_ws -- --nocapture
+            RUSTFLAGS="--cfg docker_test" cargo test -p clash-lib --all-features test_vless_ws -- --nocapture
+            RUSTFLAGS="--cfg docker_test" cargo test -p clash-lib --all-features test_trojan_ws -- --nocapture
           } 2>&1 | tee throughput-test.log
 
       - name: Format results as Markdown
