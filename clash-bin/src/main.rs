@@ -8,7 +8,7 @@ use std::{
 
 extern crate clash_lib as clash;
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[clap(author, about, long_about = None)]
 struct Cli {
     #[clap(short, long, value_parser, value_name = "DIRECTORY")]
@@ -51,10 +51,35 @@ struct Cli {
         help = "Enable crash report to help improve clash"
     )]
     help_improve: bool,
+    #[clap(
+        long,
+        visible_aliases = ["ext-ctl-pipe", "ext-ctl-unix"],
+        value_parser,
+        value_name = "IPC_PATH",
+        help = "Specify the IPC path for the controller"
+    )]
+    controller_ipc: Option<String>,
+    #[clap(
+        long,
+        value_parser,
+        action = clap::ArgAction::Set,
+        default_value_t = true,
+        help = "Enable compatibility mode, which make behaviors more consistent \
+                with mihomo but may cause some issues. It is recommended to enable \
+                this if you are using clash verge."
+    )]
+    compatibility: bool,
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let args: Vec<String> = std::env::args()
+        .map(|arg| match arg.as_str() {
+            "-ext-ctl-unix" => "--ext-ctl-unix".to_string(),
+            "-ext-ctl-pipe" => "--ext-ctl-pipe".to_string(),
+            _ => arg,
+        })
+        .collect();
+    let cli = Cli::parse_from(args);
 
     if cli.version {
         println!(
@@ -107,13 +132,60 @@ fn main() {
         }
     }
 
-    // todo: NOTE: set this up before Sentry
+    let mut config = match clash::Config::File(file.clone()).try_parse() {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("Failed to parse config: {e}");
+            exit(1);
+        }
+    };
+
+    if cli.compatibility {
+        println!(
+            "Compatibility mode enabled. This may cause some issues, but it is \
+             recommended to enable this if you are using clash verge."
+        );
+        if let Some(dir) = &cli.directory {
+            match std::fs::canonicalize(dir) {
+                Ok(abs) => {
+                    if let Err(e) = std::env::set_current_dir(&abs) {
+                        eprintln!(
+                            "Failed to set current directory to {}: {e}",
+                            abs.to_string_lossy()
+                        );
+                        exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Failed to canonicalize directory {}: {e}",
+                        dir.to_string_lossy()
+                    );
+                    exit(1);
+                }
+            }
+        }
+        if config.general.mmdb.is_none() {
+            config.general.mmdb = Some("Country.mmdb".to_string());
+        }
+        if config.general.geosite.is_none() {
+            config.general.geosite = Some("geosite.dat".to_string());
+        }
+    }
+    config.general.controller.external_controller_ipc = cli.controller_ipc;
+
+    let cwd = if cli.compatibility && cli.directory.is_some() {
+        None
+    } else {
+        cli.directory.map(|x| x.to_string_lossy().to_string())
+    };
 
     match clash::start_scaffold(clash::Options {
-        config: clash::Config::File(file),
-        cwd: cli.directory.map(|x| x.to_string_lossy().to_string()),
+        config: clash::Config::Internal(config),
+        cwd,
         rt: Some(TokioRuntime::MultiThread),
         log_file: cli.log_file,
+        config_path: Some(file),
     }) {
         Ok(_) => {}
         Err(e) => {
