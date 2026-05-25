@@ -258,8 +258,7 @@ mod tests {
                     config_helper::test_config_base_dir,
                     consts::*,
                     docker_runner::{
-                        DockerTestRunner, DockerTestRunnerBuilder, RunAndCleanup,
-                        alloc_docker_port,
+                        DockerTestRunner, DockerTestRunnerBuilder, alloc_docker_port,
                     },
                 },
                 run_test_suites_and_cleanup,
@@ -354,77 +353,6 @@ mod tests {
         run_test_suites_and_cleanup(handler, container, Suite::all()).await
     }
 
-    #[cfg(throughput_test)]
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn e2e_throughput_trojan_ws() -> anyhow::Result<()> {
-        initialize();
-        let host_port = alloc_docker_port();
-        let socks_port = alloc_docker_port();
-        let echo_port = alloc_docker_port();
-        let container = get_ws_runner(host_port).await?;
-        let target_ip =
-            if crate::proxy::utils::test_utils::docker_utils::use_ci_host_network() {
-                Some(LOCAL_ADDR.to_owned())
-            } else {
-                container.docker_gateway_ip()
-            };
-        let binary =
-            crate::proxy::utils::test_utils::docker_utils::find_clash_rs_binary();
-        let mmdb =
-            crate::proxy::utils::test_utils::docker_utils::config_helper::root_dir()
-                .join("clash-bin/tests/data/config/Country.mmdb")
-                .to_str()
-                .unwrap()
-                .to_owned();
-
-        let config = format!(
-            r#"
-socks-port: {socks_port}
-bind-address: 127.0.0.1
-mmdb: "{mmdb}"
-mode: global
-log-level: error
-proxies:
-  - name: proxy
-    type: trojan
-    server: {server}
-    port: {port}
-    password: example
-    skip-cert-verify: true
-    udp: false
-    tls: true
-    network: ws
-    ws-opts:
-      path: /
-      headers:
-        Host: example.org
-rules:
-  - MATCH,proxy
-"#,
-            socks_port = socks_port,
-            mmdb = mmdb,
-            server = LOCAL_ADDR,
-            port = ws_server_port(host_port),
-        );
-
-        container
-            .run_and_cleanup(async move {
-                crate::proxy::utils::test_utils::docker_utils::clash_process_e2e_throughput(
-                    &binary,
-                    &config,
-                    "trojan-ws",
-                    socks_port,
-                    echo_port,
-                    target_ip,
-                    32 * 1024 * 1024,
-                )
-                .await
-                .map(|_| ())
-            })
-            .await
-    }
-
     #[cfg(any())]
     async fn get_grpc_runner() -> anyhow::Result<DockerTestRunner> {
         let test_config_dir = test_config_base_dir();
@@ -479,5 +407,135 @@ rules:
             .register_connector(GLOBAL_DIRECT_CONNECTOR.clone())
             .await;
         run_test_suites_and_cleanup(handler, runner, Suite::all()).await
+    }
+}
+
+#[cfg(all(test, docker_test, throughput_test))]
+mod e2e {
+    use crate::{
+        proxy::utils::test_utils::{
+            consts::*,
+            docker_runner::{
+                DockerTestRunner, DockerTestRunnerBuilder, RunAndCleanup,
+            },
+            docker_utils::{
+                alloc_port, clash_process_e2e_throughput, config_helper,
+                find_clash_rs_binary,
+            },
+        },
+        tests::initialize,
+    };
+
+    const WS_CONTAINER_PORT: u16 = 10002;
+    const E2E_PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
+
+    fn ws_server_port(host_port: u16) -> u16 {
+        if crate::proxy::utils::test_utils::docker_utils::use_ci_host_network() {
+            WS_CONTAINER_PORT
+        } else {
+            host_port
+        }
+    }
+
+    async fn get_ws_runner(host_port: u16) -> anyhow::Result<DockerTestRunner> {
+        let test_config_dir = config_helper::test_config_base_dir();
+        let trojan_conf = test_config_dir.join("trojan-ws.json");
+        let trojan_cert = test_config_dir.join("certs/example.org.pem");
+        let trojan_key = test_config_dir.join("certs/example.org-key.pem");
+
+        let mut builder = DockerTestRunnerBuilder::new().image(IMAGE_TROJAN_GO);
+        builder =
+            if crate::proxy::utils::test_utils::docker_utils::use_ci_host_network() {
+                builder.host_network()
+            } else {
+                builder.host_port(host_port, WS_CONTAINER_PORT)
+            };
+
+        let runner = builder
+            .mounts(&[
+                (trojan_conf.to_str().unwrap(), "/etc/trojan-go/config.json"),
+                (trojan_cert.to_str().unwrap(), "/fullchain.pem"),
+                (trojan_key.to_str().unwrap(), "/privkey.pem"),
+            ])
+            .build()
+            .await?;
+
+        DockerTestRunner::wait_host_tcp_ready(
+            LOCAL_ADDR,
+            ws_server_port(host_port),
+            std::time::Duration::from_secs(20),
+        )
+        .await?;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        Ok(runner)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn e2e_throughput_trojan_ws() -> anyhow::Result<()> {
+        initialize();
+        let host_port = alloc_port();
+        let socks_port = alloc_port();
+        let echo_port = alloc_port();
+        let container = get_ws_runner(host_port).await?;
+        let target_ip =
+            if crate::proxy::utils::test_utils::docker_utils::use_ci_host_network() {
+                Some(LOCAL_ADDR.to_owned())
+            } else {
+                container.docker_gateway_ip()
+            };
+        let binary = find_clash_rs_binary();
+        let mmdb = config_helper::root_dir()
+            .join("clash-bin/tests/data/config/Country.mmdb")
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        let config = format!(
+            r#"
+socks-port: {socks_port}
+bind-address: 127.0.0.1
+mmdb: "{mmdb}"
+mode: global
+log-level: error
+proxies:
+  - name: proxy
+    type: trojan
+    server: {server}
+    port: {port}
+    password: example
+    skip-cert-verify: true
+    udp: false
+    tls: true
+    network: ws
+    ws-opts:
+      path: /
+      headers:
+        Host: example.org
+rules:
+  - MATCH,proxy
+"#,
+            socks_port = socks_port,
+            mmdb = mmdb,
+            server = LOCAL_ADDR,
+            port = ws_server_port(host_port),
+        );
+
+        container
+            .run_and_cleanup(async move {
+                clash_process_e2e_throughput(
+                    &binary,
+                    &config,
+                    "trojan-ws",
+                    socks_port,
+                    echo_port,
+                    target_ip,
+                    E2E_PAYLOAD_BYTES,
+                )
+                .await
+                .map(|_| ())
+            })
+            .await
     }
 }

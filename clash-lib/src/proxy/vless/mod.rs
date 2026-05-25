@@ -243,8 +243,7 @@ mod tests {
                     config_helper::test_config_base_dir,
                     consts::*,
                     docker_runner::{
-                        DockerTestRunner, DockerTestRunnerBuilder, RunAndCleanup,
-                        alloc_docker_port,
+                        DockerTestRunner, DockerTestRunnerBuilder, alloc_docker_port,
                     },
                 },
                 run_test_suites_and_cleanup,
@@ -342,15 +341,76 @@ mod tests {
         let handler = Arc::new(Handler::new(opts));
         run_test_suites_and_cleanup(handler, runner, Suite::all()).await
     }
+}
 
-    #[cfg(throughput_test)]
+#[cfg(all(test, docker_test, throughput_test))]
+mod e2e {
+    use crate::{
+        proxy::utils::test_utils::{
+            consts::*,
+            docker_runner::{
+                DockerTestRunner, DockerTestRunnerBuilder, RunAndCleanup,
+            },
+            docker_utils::{
+                alloc_port, clash_process_e2e_throughput, config_helper,
+                find_clash_rs_binary,
+            },
+        },
+        tests::initialize,
+    };
+
+    const WS_CONTAINER_PORT: u16 = 8443;
+    const E2E_PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
+
+    fn ws_server_port(host_port: u16) -> u16 {
+        if crate::proxy::utils::test_utils::docker_utils::use_ci_host_network() {
+            WS_CONTAINER_PORT
+        } else {
+            host_port
+        }
+    }
+
+    async fn get_ws_runner(host_port: u16) -> anyhow::Result<DockerTestRunner> {
+        let test_config_dir = config_helper::test_config_base_dir();
+        let conf = test_config_dir.join("vless-ws-tls.json");
+        let cert = test_config_dir.join("certs/example.org.pem");
+        let key = test_config_dir.join("certs/example.org-key.pem");
+
+        let mut builder = DockerTestRunnerBuilder::new().image(IMAGE_VLESS);
+        builder =
+            if crate::proxy::utils::test_utils::docker_utils::use_ci_host_network() {
+                builder.host_network()
+            } else {
+                builder.host_port(host_port, WS_CONTAINER_PORT)
+            };
+
+        let runner = builder
+            .mounts(&[
+                (conf.to_str().unwrap(), "/etc/v2ray/config.json"),
+                (cert.to_str().unwrap(), "/etc/ssl/v2ray/fullchain.pem"),
+                (key.to_str().unwrap(), "/etc/ssl/v2ray/privkey.pem"),
+            ])
+            .build()
+            .await?;
+
+        DockerTestRunner::wait_host_tcp_ready(
+            LOCAL_ADDR,
+            ws_server_port(host_port),
+            std::time::Duration::from_secs(20),
+        )
+        .await?;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        Ok(runner)
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn e2e_throughput_vless_ws() -> anyhow::Result<()> {
         initialize();
-        let host_port = alloc_docker_port();
-        let socks_port = alloc_docker_port();
-        let echo_port = alloc_docker_port();
+        let host_port = alloc_port();
+        let socks_port = alloc_port();
+        let echo_port = alloc_port();
         let container = get_ws_runner(host_port).await?;
         let target_ip =
             if crate::proxy::utils::test_utils::docker_utils::use_ci_host_network() {
@@ -358,14 +418,12 @@ mod tests {
             } else {
                 container.docker_gateway_ip()
             };
-        let binary =
-            crate::proxy::utils::test_utils::docker_utils::find_clash_rs_binary();
-        let mmdb =
-            crate::proxy::utils::test_utils::docker_utils::config_helper::root_dir()
-                .join("clash-bin/tests/data/config/Country.mmdb")
-                .to_str()
-                .unwrap()
-                .to_owned();
+        let binary = find_clash_rs_binary();
+        let mmdb = config_helper::root_dir()
+            .join("clash-bin/tests/data/config/Country.mmdb")
+            .to_str()
+            .unwrap()
+            .to_owned();
 
         let config = format!(
             r#"
@@ -399,14 +457,14 @@ rules:
 
         container
             .run_and_cleanup(async move {
-                crate::proxy::utils::test_utils::docker_utils::clash_process_e2e_throughput(
+                clash_process_e2e_throughput(
                     &binary,
                     &config,
                     "vless-ws",
                     socks_port,
                     echo_port,
                     target_ip,
-                    32 * 1024 * 1024,
+                    E2E_PAYLOAD_BYTES,
                 )
                 .await
                 .map(|_| ())
