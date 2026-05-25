@@ -34,8 +34,8 @@ quinn = { version = "0.11", default-features = false, features = [
 ], optional = true }
 h3 = { version = "0.0.8", optional = true }
 h3-quinn = { version = "0.0.10", optional = true }
-quinn-proto = { version = "0.11.13", default-features = false, optional = true }
-maxminddb = "0.27"
+quinn-proto = { version = "0.11.14", default-features = false, optional = true }
+maxminddb = "0.28"
 
 hickory-net = { version = "0.26", default-features = false, features = ["https-aws-lc-rs"] }
 hickory-proto = { version = "0.26", default-features = false }
@@ -89,17 +89,17 @@ memory-stats = "1"
 
 chrono = { version = "0.4", features = ["serde"] }
 
-sha2 = "0.10"
+sha2 = "0.11"
 blake2 = { version = "0.10.6", optional = true }
-digest = { version = "0.10.7", optional = true }
+digest = { version = "0.11.3", optional = true }
 
-tokio-tungstenite = { version = "0.28.0", optional = true }
+tokio-tungstenite = { version = "0.29.0", optional = true }
 tun-rs = { version = "2", features = [
     "async",
     "async_framed",
 ], optional = true }
 watfaq-netstack = { path = "../clash-netstack", optional = true }
-smoltcp = { version = "0.12", default-features = false, features = [
+smoltcp = { version = "0.13", default-features = false, features = [
     "std",
     "log",
     "medium-ip",
@@ -108,7 +108,7 @@ smoltcp = { version = "0.12", default-features = false, features = [
     "socket-udp",
     "socket-tcp",
 ], optional = true }
-etherparse = { version = "0.19", optional = true }
+etherparse = { version = "0.20", optional = true }
 
 base64 = "0.22"
 
@@ -125,7 +125,7 @@ log = { version = "0.4", optional = true }
 memchr = { version = "2", optional = true }
 subtle = { version = "2", optional = true }
 ring-compat = { version = "0.8", features = ["aead"] }
-x509-parser = { version = "0.16", default-features = false, optional = true }
+x509-parser = { version = "0.18", default-features = false, optional = true }
 
 byteorder = "1"
 
@@ -186,7 +186,7 @@ windows = { version = "0.62", features = [
 ] }
 
 [dev-dependencies]
-bollard = "0.20"
+bollard = "0.21"
 rcgen = "0.14"
 tempfile = "3.27"
 mockall = "0.14.0"
