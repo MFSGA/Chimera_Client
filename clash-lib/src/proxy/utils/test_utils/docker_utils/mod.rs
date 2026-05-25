@@ -6,6 +6,7 @@ pub mod docker_runner;
 
 use std::{sync::Arc, time::Duration};
 
+use sysinfo::Networks;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, split},
     net::TcpListener,
@@ -16,6 +17,8 @@ use crate::{
     proxy::OutboundHandler,
     session::{Session, SocksAddr},
 };
+
+use tracing::{debug, trace};
 
 #[allow(unused_imports)]
 pub use docker_runner::{RunAndCleanup, alloc_docker_port};
@@ -482,17 +485,53 @@ pub async fn run_test_suites_and_cleanup(
 }
 
 fn destination_list(gateway_ip: Option<String>) -> Vec<String> {
-    let mut destinations = vec!["host.docker.internal".to_owned()];
-
+    let mut destination_list = vec!["host.docker.internal".to_owned()];
     if let Some(ip) = gateway_ip {
-        destinations.push(ip);
+        debug!("gateway_ip Ip: {}", ip);
+        destination_list.push(ip);
     }
+    if let Some(ip) = std::env::var("CLIENT_IP").ok() {
+        debug!("client Ip: {}", &ip);
+        destination_list.insert(0, ip);
+    } else {
+        debug!("CLIENT_IP env not set, ");
+        let mut networks = Networks::new_with_refreshed_list();
+        networks.refresh(true);
 
-    if let Ok(ip) = std::env::var("CLIENT_IP") {
-        destinations.insert(0, ip);
+        trace!("networks: {:?}", networks);
+        // 收集所有有流量的网卡的 IPv4 地址
+        let mut active_interfaces = networks
+            .iter()
+            .filter(|(_, data)| {
+                data.mac_address().to_string() != "00:00:00:00:00:00"
+            })
+            .collect::<Vec<_>>();
+
+        // 按流量排序：优先按发送流量降序，其次按接收流量降序
+        active_interfaces.sort_by(|a, b| {
+            b.1.total_transmitted()
+                .cmp(&a.1.total_transmitted())
+                .then_with(|| b.1.total_received().cmp(&a.1.total_received()))
+        });
+        for (iface_name, data) in active_interfaces {
+            trace!("Processing interface: {}, {:#?}", iface_name, data);
+
+            // 获取该网卡的所有 IP 地址
+            for ip_network in data.ip_networks() {
+                let addr = ip_network.addr;
+                // 只添加 IPv4 地址，排除 loopback
+                if addr.is_ipv4() && !addr.is_loopback() {
+                    let ip_str = addr.to_string();
+                    // 跳过已存在的 IP
+                    if !destination_list.contains(&ip_str) {
+                        debug!("Found IPv4 address on {}: {}", iface_name, ip_str);
+                        destination_list.push(ip_str);
+                    }
+                }
+            }
+        }
     }
-
-    destinations
+    destination_list
 }
 
 async fn ping_pong_tcp_test(
