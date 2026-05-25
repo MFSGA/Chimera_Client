@@ -62,6 +62,7 @@ mod tests {
                 cwd: Some(cwd_clone),
                 rt: None,
                 log_file: Some(log_file_clone),
+                config_path: None,
             })
             .unwrap()
         });
@@ -133,6 +134,7 @@ mod tests {
                 cwd: Some(cwd_clone),
                 rt: None,
                 log_file: Some(log_file_clone),
+                config_path: None,
             })
             .unwrap()
         });

@@ -51,6 +51,7 @@ async fn test_config_reload_via_payload() {
             cwd: Some(wd.to_string_lossy().to_string()),
             rt: None,
             log_file: None,
+            config_path: Some(config_path.to_string_lossy().to_string()),
         },
         vec![9090, 8888, 8889, 8899, 53553, 53554, 53555],
     )
@@ -121,6 +122,7 @@ async fn test_get_set_allow_lan() {
             cwd: Some(wd.to_string_lossy().to_string()),
             rt: None,
             log_file: None,
+            config_path: Some(config_path.to_string_lossy().to_string()),
         },
         vec![9090, 8888, 8889, 8899, 53553, 53554, 53555],
     )

@@ -101,6 +101,7 @@ rules:
             cwd: Some(cwd),
             rt: None,
             log_file: Some(log_file),
+            config_path: None,
         })
         .expect("start clash with tun")
     });

@@ -95,6 +95,10 @@ pub struct Options {
     pub cwd: Option<String>,
     pub rt: Option<TokioRuntime>,
     pub log_file: Option<String>,
+    /// The original config file path, used to support "reload current config"
+    /// from the dashboard. Set this when starting from a file; leave `None`
+    /// for string/inline configs.
+    pub config_path: Option<String>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -125,6 +129,9 @@ pub struct GlobalState {
     dns_listener: ArcRunner,
     reload_tx: mpsc::Sender<(Config, oneshot::Sender<Result<()>>)>,
     cwd: String,
+    /// Path to the config file used at startup. Used by the dashboard "Reload"
+    /// button which sends an empty path to mean "reload current config".
+    config_path: Option<String>,
 }
 
 impl GlobalState {
@@ -166,6 +173,13 @@ pub fn start_scaffold(opts: Options) -> Result<()> {
             .build()?,
     };
 
+    let config_path = opts.config_path.or_else(|| {
+        if let Config::File(ref path) = opts.config {
+            Some(path.clone())
+        } else {
+            None
+        }
+    });
     let config: InternalConfig = opts.config.try_parse()?;
     let cwd = opts.cwd.unwrap_or_else(|| ".".to_string());
     let (log_tx, _) = broadcast::channel(100);
@@ -180,7 +194,7 @@ pub fn start_scaffold(opts: Options) -> Result<()> {
     );
 
     rt.block_on(async {
-        match start(config, cwd, log_tx).await {
+        match start(config, cwd, config_path, log_tx).await {
             Err(e) => {
                 eprintln!("start error: {e}");
                 Err(e)
@@ -208,6 +222,7 @@ pub fn setup_default_crypto_provider() {
 pub async fn start(
     config: InternalConfig,
     cwd: String,
+    config_path: Option<String>,
     log_tx: broadcast::Sender<LogEvent>,
 ) -> Result<()> {
     setup_default_crypto_provider();
@@ -236,6 +251,7 @@ pub async fn start(
         dns_listener: components.dns_listener.clone(),
         reload_tx,
         cwd: cwd.to_string_lossy().to_string(),
+        config_path,
     }));
 
     let api_listener: ArcRunner = Arc::new(app::api::ApiRunner::new(

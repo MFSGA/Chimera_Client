@@ -100,6 +100,7 @@ async fn put_configs_reloads_runtime_from_file() {
             cwd: Some(cwd.to_string_lossy().to_string()),
             rt: None,
             log_file: None,
+            config_path: Some(initial_config.to_string_lossy().to_string()),
         })
         .expect("failed to start clash");
     });

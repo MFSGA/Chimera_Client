@@ -36,6 +36,7 @@ fn local_dns_listener_resolves_real_udp_and_tcp_traffic() {
             cwd: Some(cwd),
             rt: Some(TokioRuntime::MultiThread),
             log_file: None,
+            config_path: None,
         })
     });
 
@@ -76,6 +77,7 @@ fn local_dns_listener_handles_concurrent_real_udp_queries() {
             cwd: Some(cwd),
             rt: Some(TokioRuntime::MultiThread),
             log_file: None,
+            config_path: None,
         })
     });
 
