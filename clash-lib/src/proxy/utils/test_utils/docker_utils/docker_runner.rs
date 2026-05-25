@@ -130,6 +130,93 @@ impl DockerTestRunner {
         }
     }
 
+    #[cfg(all(docker_test, throughput_test))]
+    pub async fn apply_netem(
+        &self,
+        delay_ms: u32,
+        loss_pct: f32,
+    ) -> anyhow::Result<()> {
+        use super::consts::IMAGE_NETEM;
+        use bollard::query_parameters::WaitContainerOptionsBuilder;
+        use futures::StreamExt as _;
+
+        let tc_cmd = format!(
+            "tc qdisc add dev eth0 root netem delay {}ms loss {}%",
+            delay_ms, loss_pct
+        );
+        let network_mode = format!("container:{}", self.id);
+
+        let body = ContainerCreateBody {
+            image: Some(IMAGE_NETEM.to_owned()),
+            cmd: Some(vec!["sh".to_owned(), "-c".to_owned(), tc_cmd]),
+            host_config: Some(HostConfig {
+                network_mode: Some(network_mode),
+                cap_add: Some(vec!["NET_ADMIN".to_owned()]),
+                auto_remove: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let sidecar = self
+            .instance
+            .create_container(Some(CreateContainerOptions::default()), body)
+            .await?;
+
+        self.instance
+            .start_container(
+                &sidecar.id,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await?;
+
+        let mut wait_stream = self.instance.wait_container(
+            &sidecar.id,
+            Some(
+                WaitContainerOptionsBuilder::new()
+                    .condition("not-running")
+                    .build(),
+            ),
+        );
+        while let Some(result) = wait_stream.next().await {
+            match result {
+                Ok(status) => {
+                    if status.status_code != 0 {
+                        self.instance
+                            .remove_container(
+                                &sidecar.id,
+                                Some(RemoveContainerOptions {
+                                    force: true,
+                                    ..Default::default()
+                                }),
+                            )
+                            .await
+                            .ok();
+                        anyhow::bail!(
+                            "netem sidecar exited with code {}: {:?}",
+                            status.status_code,
+                            status.error
+                        );
+                    }
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        self.instance
+            .remove_container(
+                &sidecar.id,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .ok();
+
+        Ok(())
+    }
+
     pub async fn cleanup(self) -> anyhow::Result<()> {
         self.instance
             .remove_container(

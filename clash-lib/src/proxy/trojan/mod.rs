@@ -414,85 +414,28 @@ mod tests {
 mod e2e {
     use crate::{
         proxy::utils::test_utils::{
+            config_helper,
             consts::*,
             docker_runner::{
                 DockerTestRunner, DockerTestRunnerBuilder, RunAndCleanup,
             },
             docker_utils::{
-                alloc_port, clash_process_e2e_throughput, config_helper,
-                find_clash_rs_binary,
+                alloc_port, clash_process_e2e_throughput, find_clash_rs_binary,
             },
         },
         tests::initialize,
     };
 
-    const WS_CONTAINER_PORT: u16 = 10002;
-    const E2E_PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
+    const CONTAINER_PORT: u16 = 10002;
+    const E2E_PAYLOAD_BYTES: usize = 32 * 1024 * 1024; // 32 MB
 
-    fn ws_server_port(host_port: u16) -> u16 {
-        if crate::proxy::utils::test_utils::docker_utils::use_ci_host_network() {
-            WS_CONTAINER_PORT
-        } else {
-            host_port
-        }
-    }
-
-    async fn get_ws_runner(host_port: u16) -> anyhow::Result<DockerTestRunner> {
-        let test_config_dir = config_helper::test_config_base_dir();
-        let trojan_conf = test_config_dir.join("trojan-ws.json");
-        let trojan_cert = test_config_dir.join("certs/example.org.pem");
-        let trojan_key = test_config_dir.join("certs/example.org-key.pem");
-
-        let mut builder = DockerTestRunnerBuilder::new().image(IMAGE_TROJAN_GO);
-        builder =
-            if crate::proxy::utils::test_utils::docker_utils::use_ci_host_network() {
-                builder.host_network()
-            } else {
-                builder.host_port(host_port, WS_CONTAINER_PORT)
-            };
-
-        let runner = builder
-            .mounts(&[
-                (trojan_conf.to_str().unwrap(), "/etc/trojan-go/config.json"),
-                (trojan_cert.to_str().unwrap(), "/fullchain.pem"),
-                (trojan_key.to_str().unwrap(), "/privkey.pem"),
-            ])
-            .build()
-            .await?;
-
-        DockerTestRunner::wait_host_tcp_ready(
-            LOCAL_ADDR,
-            ws_server_port(host_port),
-            std::time::Duration::from_secs(20),
-        )
-        .await?;
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
-        Ok(runner)
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn e2e_throughput_trojan_ws() -> anyhow::Result<()> {
-        initialize();
-        let host_port = alloc_port();
-        let socks_port = alloc_port();
-        let echo_port = alloc_port();
-        let container = get_ws_runner(host_port).await?;
-        let target_ip =
-            if crate::proxy::utils::test_utils::docker_utils::use_ci_host_network() {
-                Some(LOCAL_ADDR.to_owned())
-            } else {
-                container.docker_gateway_ip()
-            };
-        let binary = find_clash_rs_binary();
-        let mmdb = config_helper::root_dir()
-            .join("clash-bin/tests/data/config/Country.mmdb")
+    fn base_config(server: &str, port: u16, socks_port: u16, extra: &str) -> String {
+        let mmdb = config_helper::test_config_base_dir()
+            .join("Country.mmdb")
             .to_str()
             .unwrap()
             .to_owned();
-
-        let config = format!(
+        format!(
             r#"
 socks-port: {socks_port}
 bind-address: 127.0.0.1
@@ -507,20 +450,165 @@ proxies:
     password: example
     skip-cert-verify: true
     udp: false
-    tls: true
-    network: ws
-    ws-opts:
-      path: /
-      headers:
-        Host: example.org
+{extra}
 rules:
   - MATCH,proxy
 "#,
             socks_port = socks_port,
             mmdb = mmdb,
-            server = LOCAL_ADDR,
-            port = ws_server_port(host_port),
-        );
+            server = server,
+            port = port,
+            extra = extra,
+        )
+    }
+
+    const TROJAN_WS_SERVER_CONFIG: &str = r#"{
+    "run_type": "server",
+    "local_addr": "0.0.0.0",
+    "local_port": 10002,
+    "disable_http_check": true,
+    "password": ["example"],
+    "websocket": {"enabled": true, "path": "/", "host": "example.org"},
+    "ssl": {"verify": true, "cert": "/fullchain.pem", "key": "/privkey.pem", "sni": "example.org"}
+}"#;
+
+    const TROJAN_TCP_SERVER_CONFIG: &str = r#"{
+    "run_type": "server",
+    "local_addr": "0.0.0.0",
+    "local_port": 10002,
+    "disable_http_check": true,
+    "password": ["example"],
+    "ssl": {
+        "verify": true,
+        "cert": "/fullchain.pem",
+        "key": "/privkey.pem",
+        "sni": "example.org"
+    }
+}"#;
+
+    async fn get_tcp_runner() -> anyhow::Result<DockerTestRunner> {
+        let test_config_dir = config_helper::test_config_base_dir();
+        let cert = test_config_dir.join("certs/example.org.pem");
+        let key = test_config_dir.join("certs/example.org-key.pem");
+        let mut tmp = tempfile::NamedTempFile::new_in(&test_config_dir)?;
+        use std::io::Write as _;
+        tmp.write_all(TROJAN_TCP_SERVER_CONFIG.as_bytes())?;
+        let result = DockerTestRunnerBuilder::new()
+            .image(IMAGE_TROJAN_GO)
+            .no_port()
+            .mounts(&[
+                (tmp.path().to_str().unwrap(), "/etc/trojan-go/config.json"),
+                (cert.to_str().unwrap(), "/fullchain.pem"),
+                (key.to_str().unwrap(), "/privkey.pem"),
+            ])
+            .build()
+            .await;
+        drop(tmp);
+        result
+    }
+
+    async fn get_ws_runner() -> anyhow::Result<DockerTestRunner> {
+        let test_config_dir = config_helper::test_config_base_dir();
+        let cert = test_config_dir.join("certs/example.org.pem");
+        let key = test_config_dir.join("certs/example.org-key.pem");
+        let mut tmp = tempfile::NamedTempFile::new_in(&test_config_dir)?;
+        use std::io::Write as _;
+        tmp.write_all(TROJAN_WS_SERVER_CONFIG.as_bytes())?;
+        let result = DockerTestRunnerBuilder::new()
+            .image(IMAGE_TROJAN_GO)
+            .no_port()
+            .mounts(&[
+                (tmp.path().to_str().unwrap(), "/etc/trojan-go/config.json"),
+                (cert.to_str().unwrap(), "/fullchain.pem"),
+                (key.to_str().unwrap(), "/privkey.pem"),
+            ])
+            .build()
+            .await;
+        drop(tmp);
+        result
+    }
+
+    #[tokio::test]
+    async fn e2e_throughput_trojan_tcp() -> anyhow::Result<()> {
+        initialize();
+        let socks_port = alloc_port();
+        let echo_port = alloc_port();
+
+        let container = get_tcp_runner().await?;
+        let server = container.container_ip().unwrap_or(LOCAL_ADDR.to_owned());
+        let gateway_ip = container.docker_gateway_ip();
+
+        let extra = r#"    tls: true"#;
+        let config = base_config(&server, CONTAINER_PORT, socks_port, extra);
+        let binary = find_clash_rs_binary();
+
+        container
+            .run_and_cleanup(async move {
+                clash_process_e2e_throughput(
+                    &binary,
+                    &config,
+                    "trojan-tcp",
+                    socks_port,
+                    echo_port,
+                    gateway_ip,
+                    E2E_PAYLOAD_BYTES,
+                )
+                .await
+                .map(|_| ())
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn e2e_throughput_trojan_tcp_netem() -> anyhow::Result<()> {
+        initialize();
+        let socks_port = alloc_port();
+        let echo_port = alloc_port();
+
+        let container = get_tcp_runner().await?;
+        container.apply_netem(50, 1.0).await?;
+        let server = container.container_ip().unwrap_or(LOCAL_ADDR.to_owned());
+        let gateway_ip = container.docker_gateway_ip();
+
+        let extra = r#"    tls: true"#;
+        let config = base_config(&server, CONTAINER_PORT, socks_port, extra);
+        let binary = find_clash_rs_binary();
+
+        container
+            .run_and_cleanup(async move {
+                clash_process_e2e_throughput(
+                    &binary,
+                    &config,
+                    "trojan-tcp-netem",
+                    socks_port,
+                    echo_port,
+                    gateway_ip,
+                    E2E_PAYLOAD_BYTES,
+                )
+                .await
+                .map(|_| ())
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn e2e_throughput_trojan_ws() -> anyhow::Result<()> {
+        initialize();
+        let socks_port = alloc_port();
+        let echo_port = alloc_port();
+
+        let container = get_ws_runner().await?;
+        let server = container.container_ip().unwrap_or(LOCAL_ADDR.to_owned());
+        let gateway_ip = container.docker_gateway_ip();
+
+        let extra = r#"    tls: true
+    network: ws
+    ws-opts:
+      path: /
+      headers:
+        Host: example.org"#;
+        let config = base_config(&server, CONTAINER_PORT, socks_port, extra);
+        let binary = find_clash_rs_binary();
 
         container
             .run_and_cleanup(async move {
@@ -530,7 +618,7 @@ rules:
                     "trojan-ws",
                     socks_port,
                     echo_port,
-                    target_ip,
+                    gateway_ip,
                     E2E_PAYLOAD_BYTES,
                 )
                 .await
