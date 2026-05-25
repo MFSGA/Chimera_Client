@@ -6,6 +6,7 @@ pub mod docker_runner;
 
 use std::{sync::Arc, time::Duration};
 
+use network_interface::NetworkInterfaceConfig as _;
 use sysinfo::Networks;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, split},
@@ -526,6 +527,26 @@ fn destination_list(gateway_ip: Option<String>) -> Vec<String> {
                     if !destination_list.contains(&ip_str) {
                         debug!("Found IPv4 address on {}: {}", iface_name, ip_str);
                         destination_list.push(ip_str);
+                    }
+                }
+            }
+        }
+
+        if let Ok(interfaces) = network_interface::NetworkInterface::show() {
+            for iface in interfaces {
+                for addr in iface.addr {
+                    if let network_interface::Addr::V4(v4) = addr
+                        && !v4.ip.is_loopback()
+                        && !v4.ip.is_link_local()
+                    {
+                        let ip_str = v4.ip.to_string();
+                        if !destination_list.contains(&ip_str) {
+                            debug!(
+                                "Found IPv4 address via network-interface on {}: {}",
+                                iface.name, ip_str
+                            );
+                            destination_list.push(ip_str);
+                        }
                     }
                 }
             }
