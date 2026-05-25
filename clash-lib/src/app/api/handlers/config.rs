@@ -154,38 +154,17 @@ async fn update_configs(
     State(state): State<ConfigState>,
     Json(req): Json<UpdateConfigRequest>,
 ) -> impl IntoResponse {
-    let (done, wait) = tokio::sync::oneshot::channel();
-    let (reload_tx, cwd) = {
+    let (reload_tx, cwd, config_path) = {
         let g = state.global_state.lock().await;
-        (g.reload_tx.clone(), g.cwd.clone())
+        (g.reload_tx.clone(), g.cwd.clone(), g.config_path.clone())
     };
-    match (req.path, req.payload) {
-        (_, Some(payload)) => {
-            let msg = "config reloading from payload".to_string();
-            let cfg = crate::Config::Str(payload);
-            match reload_tx.send((cfg, done)).await {
-                Ok(_) => match wait.await {
-                    Ok(Ok(())) => (StatusCode::NO_CONTENT, msg).into_response(),
-                    Ok(Err(err)) => {
-                        (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-                            .into_response()
-                    }
-                    Err(_) => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "config reload task terminated unexpectedly",
-                    )
-                        .into_response(),
-                },
-                Err(_) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "could not signal config reload",
-                )
-                    .into_response(),
-            }
-        }
-        (Some(mut path), None) => {
+
+    let cfg = match (req.path.as_deref(), req.payload) {
+        (_, Some(payload)) => crate::Config::Str(payload),
+        (Some(path), None) if !path.is_empty() => {
+            let mut path = path.to_string();
             if !PathBuf::from(&path).is_absolute() {
-                path = PathBuf::from(cwd).join(path).to_string_lossy().to_string();
+                path = PathBuf::from(&cwd).join(path).to_string_lossy().to_string();
             }
             if !PathBuf::from(&path).exists() {
                 return (
@@ -194,33 +173,42 @@ async fn update_configs(
                 )
                     .into_response();
             }
-
-            let msg = format!("config reloading from file {path}");
-            let cfg: crate::Config = crate::Config::File(path);
-            match reload_tx.send((cfg, done)).await {
-                Ok(_) => match wait.await {
-                    Ok(Ok(())) => (StatusCode::NO_CONTENT, msg).into_response(),
-                    Ok(Err(err)) => {
-                        (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-                            .into_response()
-                    }
-                    Err(_) => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "config reload task terminated unexpectedly",
-                    )
-                        .into_response(),
-                },
-
-                Err(_) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "could not signal config reload",
+            if PathBuf::from(&path).is_dir() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("config path {path} is a directory"),
                 )
-                    .into_response(),
+                    .into_response();
             }
+            crate::Config::File(path)
         }
-        (None, None) => {
-            (StatusCode::BAD_REQUEST, "no path or payload provided").into_response()
-        }
+        _ => match config_path {
+            Some(path) => crate::Config::File(path),
+            None => {
+                return (StatusCode::BAD_REQUEST, "no path or payload provided")
+                    .into_response();
+            }
+        },
+    };
+
+    let (done, wait) = tokio::sync::oneshot::channel();
+    match reload_tx.send((cfg, done)).await {
+        Ok(_) => match wait.await {
+            Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+            Ok(Err(err)) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
+            }
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "config reload task terminated unexpectedly",
+            )
+                .into_response(),
+        },
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not signal config reload",
+        )
+            .into_response(),
     }
 }
 
