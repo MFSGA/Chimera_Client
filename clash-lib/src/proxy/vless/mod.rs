@@ -253,6 +253,16 @@ mod tests {
         tests::initialize,
     };
 
+    const WS_CONTAINER_PORT: u16 = 8443;
+
+    fn ws_server_port(host_port: u16) -> u16 {
+        if crate::proxy::utils::test_utils::docker_utils::use_ci_host_network() {
+            WS_CONTAINER_PORT
+        } else {
+            host_port
+        }
+    }
+
     fn tls_client(alpn: Option<Vec<String>>) -> Option<Box<dyn Transport>> {
         Some(Box::new(TlsClient::new(
             true,
@@ -268,9 +278,15 @@ mod tests {
         let cert = test_config_dir.join("certs/example.org.pem");
         let key = test_config_dir.join("certs/example.org-key.pem");
 
-        let runner = DockerTestRunnerBuilder::new()
-            .image(IMAGE_VLESS)
-            .host_port(host_port, 8443)
+        let mut builder = DockerTestRunnerBuilder::new().image(IMAGE_VLESS);
+        builder =
+            if crate::proxy::utils::test_utils::docker_utils::use_ci_host_network() {
+                builder.host_network()
+            } else {
+                builder.host_port(host_port, WS_CONTAINER_PORT)
+            };
+
+        let runner = builder
             .mounts(&[
                 (conf.to_str().unwrap(), "/etc/v2ray/config.json"),
                 (cert.to_str().unwrap(), "/etc/ssl/v2ray/fullchain.pem"),
@@ -281,7 +297,7 @@ mod tests {
 
         DockerTestRunner::wait_host_tcp_ready(
             LOCAL_ADDR,
-            host_port,
+            ws_server_port(host_port),
             std::time::Duration::from_secs(20),
         )
         .await?;
@@ -316,7 +332,7 @@ mod tests {
             name: "test-vless-ws".into(),
             common_opts: Default::default(),
             server: LOCAL_ADDR.to_owned(),
-            port: host_port,
+            port: ws_server_port(host_port),
             uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".into(),
             flow: None,
             udp: true,
@@ -336,7 +352,12 @@ mod tests {
         let socks_port = alloc_docker_port();
         let echo_port = alloc_docker_port();
         let container = get_ws_runner(host_port).await?;
-        let gateway_ip = container.docker_gateway_ip();
+        let target_ip =
+            if crate::proxy::utils::test_utils::docker_utils::use_ci_host_network() {
+                Some(LOCAL_ADDR.to_owned())
+            } else {
+                container.docker_gateway_ip()
+            };
         let binary =
             crate::proxy::utils::test_utils::docker_utils::find_clash_rs_binary();
         let mmdb =
@@ -373,7 +394,7 @@ rules:
             socks_port = socks_port,
             mmdb = mmdb,
             server = LOCAL_ADDR,
-            port = host_port,
+            port = ws_server_port(host_port),
         );
 
         container
@@ -384,7 +405,7 @@ rules:
                     "vless-ws",
                     socks_port,
                     echo_port,
-                    gateway_ip,
+                    target_ip,
                     32 * 1024 * 1024,
                 )
                 .await

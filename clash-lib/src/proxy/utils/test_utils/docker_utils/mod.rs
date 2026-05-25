@@ -25,6 +25,13 @@ pub fn alloc_port() -> u16 {
     alloc_docker_port()
 }
 
+#[cfg(docker_test)]
+pub fn use_ci_host_network() -> bool {
+    cfg!(target_os = "linux")
+        && std::env::var("CLASH_RS_CI")
+            .is_ok_and(|value| value.eq_ignore_ascii_case("true"))
+}
+
 #[cfg(throughput_test)]
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ThroughputResult {

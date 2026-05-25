@@ -306,6 +306,13 @@ impl DockerTestRunnerBuilder {
         self
     }
 
+    pub fn host_network(mut self) -> Self {
+        self.exposed_ports = Vec::new();
+        self.host_config.network_mode = Some("host".to_owned());
+        self.host_config.port_bindings = None;
+        self
+    }
+
     pub fn mounts(mut self, pairs: &[(&str, &str)]) -> Self {
         self.host_config.mounts = Some(
             pairs

@@ -267,15 +267,31 @@ mod tests {
         },
         tests::initialize,
     };
+    const WS_CONTAINER_PORT: u16 = 10002;
+
+    fn ws_server_port(host_port: u16) -> u16 {
+        if crate::proxy::utils::test_utils::docker_utils::use_ci_host_network() {
+            WS_CONTAINER_PORT
+        } else {
+            host_port
+        }
+    }
+
     async fn get_ws_runner(host_port: u16) -> anyhow::Result<DockerTestRunner> {
         let test_config_dir = test_config_base_dir();
         let trojan_conf = test_config_dir.join("trojan-ws.json");
         let trojan_cert = test_config_dir.join("certs/example.org.pem");
         let trojan_key = test_config_dir.join("certs/example.org-key.pem");
 
-        let runner = DockerTestRunnerBuilder::new()
-            .image(IMAGE_TROJAN_GO)
-            .host_port(host_port, 10002)
+        let mut builder = DockerTestRunnerBuilder::new().image(IMAGE_TROJAN_GO);
+        builder =
+            if crate::proxy::utils::test_utils::docker_utils::use_ci_host_network() {
+                builder.host_network()
+            } else {
+                builder.host_port(host_port, WS_CONTAINER_PORT)
+            };
+
+        let runner = builder
             .mounts(&[
                 (trojan_conf.to_str().unwrap(), "/etc/trojan-go/config.json"),
                 (trojan_cert.to_str().unwrap(), "/fullchain.pem"),
@@ -286,7 +302,7 @@ mod tests {
 
         DockerTestRunner::wait_host_tcp_ready(
             LOCAL_ADDR,
-            host_port,
+            ws_server_port(host_port),
             Duration::from_secs(20),
         )
         .await?;
@@ -324,7 +340,7 @@ mod tests {
             name: "test-trojan-ws".to_owned(),
             common_opts: Default::default(),
             server: LOCAL_ADDR.to_owned(),
-            port: host_port,
+            port: ws_server_port(host_port),
             password: "example".to_owned(),
             udp: true,
             tls: Some(Box::new(tls)),
@@ -347,7 +363,12 @@ mod tests {
         let socks_port = alloc_docker_port();
         let echo_port = alloc_docker_port();
         let container = get_ws_runner(host_port).await?;
-        let gateway_ip = container.docker_gateway_ip();
+        let target_ip =
+            if crate::proxy::utils::test_utils::docker_utils::use_ci_host_network() {
+                Some(LOCAL_ADDR.to_owned())
+            } else {
+                container.docker_gateway_ip()
+            };
         let binary =
             crate::proxy::utils::test_utils::docker_utils::find_clash_rs_binary();
         let mmdb =
@@ -384,7 +405,7 @@ rules:
             socks_port = socks_port,
             mmdb = mmdb,
             server = LOCAL_ADDR,
-            port = host_port,
+            port = ws_server_port(host_port),
         );
 
         container
@@ -395,7 +416,7 @@ rules:
                     "trojan-ws",
                     socks_port,
                     echo_port,
-                    gateway_ip,
+                    target_ip,
                     32 * 1024 * 1024,
                 )
                 .await
