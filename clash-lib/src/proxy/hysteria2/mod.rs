@@ -824,3 +824,212 @@ impl AsyncWrite for HystStream {
         Pin::new(&mut self.get_mut().send).poll_shutdown(cx)
     }
 }
+
+#[cfg(all(test, docker_test, throughput_test))]
+mod e2e {
+    use std::io::Write as _;
+
+    use crate::{
+        proxy::utils::test_utils::{
+            config_helper,
+            consts::*,
+            docker_runner::{
+                DockerTestRunner, DockerTestRunnerBuilder, RunAndCleanup,
+            },
+            docker_utils::{
+                alloc_port, clash_process_e2e_throughput, find_clash_rs_binary,
+            },
+        },
+        tests::initialize,
+    };
+
+    const CONTAINER_PORT: u16 = 10002;
+    const E2E_PAYLOAD_BYTES: usize = 32 * 1024 * 1024; // 32 MB
+
+    const HYSTERIA2_SERVER_CONFIG: &str = r#"{
+    "listen": ":10002",
+    "tls": {
+        "cert": "/home/ubuntu/my.crt",
+        "key": "/home/ubuntu/my.key"
+    },
+    "up_mbps": 100,
+    "down_mbps": 100,
+    "auth": {
+        "type": "password",
+        "password": "passwd"
+    }
+}"#;
+
+    const HYSTERIA_SALAMANDER_SERVER_CONFIG: &str = r#"{
+    "listen": ":10002",
+    "tls": {
+        "cert": "/home/ubuntu/my.crt",
+        "key": "/home/ubuntu/my.key"
+    },
+    "obfs": {
+        "type": "salamander",
+        "salamander": {
+            "password": "salamander-password"
+        }
+    },
+    "up_mbps": 100,
+    "down_mbps": 100,
+    "auth": {
+        "type": "password",
+        "password": "passwd"
+    }
+}"#;
+
+    async fn build_hysteria2_runner(
+        server_config: &str,
+    ) -> anyhow::Result<DockerTestRunner> {
+        let test_config_dir = config_helper::test_config_base_dir();
+        let cert = test_config_dir.join("certs/example.org.pem");
+        let key = test_config_dir.join("certs/example.org-key.pem");
+
+        let mut tmp = tempfile::NamedTempFile::new_in(&test_config_dir)?;
+        tmp.write_all(server_config.as_bytes())?;
+
+        let runner = DockerTestRunnerBuilder::new()
+            .image(IMAGE_HYSTERIA)
+            .cmd(&["server"])
+            .no_port()
+            .mounts(&[
+                (tmp.path().to_str().unwrap(), "/config.json"),
+                (cert.to_str().unwrap(), "/home/ubuntu/my.crt"),
+                (key.to_str().unwrap(), "/home/ubuntu/my.key"),
+            ])
+            .build()
+            .await?;
+        drop(tmp);
+        Ok(runner)
+    }
+
+    fn base_config(server: &str, socks_port: u16, extra: &str) -> String {
+        let mmdb = config_helper::test_config_base_dir()
+            .join("Country.mmdb")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        format!(
+            r#"
+socks-port: {socks_port}
+bind-address: 127.0.0.1
+mmdb: "{mmdb}"
+mode: global
+log-level: error
+proxies:
+  - name: proxy
+    type: hysteria2
+    server: {server}
+    port: {port}
+    password: passwd
+{extra}
+    sni: example.org
+    skip-cert-verify: true
+rules:
+  - MATCH,proxy
+"#,
+            socks_port = socks_port,
+            mmdb = mmdb,
+            server = server,
+            port = CONTAINER_PORT,
+            extra = extra,
+        )
+    }
+
+    #[tokio::test]
+    async fn e2e_throughput_hysteria2_plain() -> anyhow::Result<()> {
+        initialize();
+        let socks_port = alloc_port();
+        let echo_port = alloc_port();
+
+        let container = build_hysteria2_runner(HYSTERIA2_SERVER_CONFIG).await?;
+        let server = container.container_ip().unwrap_or(LOCAL_ADDR.to_owned());
+        let gateway_ip = container.docker_gateway_ip();
+
+        let config = base_config(&server, socks_port, "");
+        let binary = find_clash_rs_binary();
+
+        container
+            .run_and_cleanup(async move {
+                clash_process_e2e_throughput(
+                    &binary,
+                    &config,
+                    "hysteria2-plain",
+                    socks_port,
+                    echo_port,
+                    gateway_ip,
+                    E2E_PAYLOAD_BYTES,
+                )
+                .await
+                .map(|_| ())
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn e2e_throughput_hysteria2_plain_netem() -> anyhow::Result<()> {
+        initialize();
+        let socks_port = alloc_port();
+        let echo_port = alloc_port();
+
+        let container = build_hysteria2_runner(HYSTERIA2_SERVER_CONFIG).await?;
+        container.apply_netem(50, 1.0).await?;
+        let server = container.container_ip().unwrap_or(LOCAL_ADDR.to_owned());
+        let gateway_ip = container.docker_gateway_ip();
+
+        let config = base_config(&server, socks_port, "");
+        let binary = find_clash_rs_binary();
+
+        container
+            .run_and_cleanup(async move {
+                clash_process_e2e_throughput(
+                    &binary,
+                    &config,
+                    "hysteria2-plain-netem",
+                    socks_port,
+                    echo_port,
+                    gateway_ip,
+                    E2E_PAYLOAD_BYTES,
+                )
+                .await
+                .map(|_| ())
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn e2e_throughput_hysteria2_salamander() -> anyhow::Result<()> {
+        initialize();
+        let socks_port = alloc_port();
+        let echo_port = alloc_port();
+
+        let container =
+            build_hysteria2_runner(HYSTERIA_SALAMANDER_SERVER_CONFIG).await?;
+        let server = container.container_ip().unwrap_or(LOCAL_ADDR.to_owned());
+        let gateway_ip = container.docker_gateway_ip();
+
+        let extra = r#"    obfs: salamander
+    obfs-password: salamander-password
+"#;
+        let config = base_config(&server, socks_port, extra);
+        let binary = find_clash_rs_binary();
+
+        container
+            .run_and_cleanup(async move {
+                clash_process_e2e_throughput(
+                    &binary,
+                    &config,
+                    "hysteria2-salamander",
+                    socks_port,
+                    echo_port,
+                    gateway_ip,
+                    E2E_PAYLOAD_BYTES,
+                )
+                .await
+                .map(|_| ())
+            })
+            .await
+    }
+}
