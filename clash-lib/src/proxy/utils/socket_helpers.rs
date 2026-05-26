@@ -17,6 +17,7 @@ use crate::proxy::utils::platform::{
     maybe_protect_socket, must_bind_socket_on_interface,
 };
 
+// todo: support in linux to protect dataflow.
 #[allow(unused)]
 fn bind_addr_for_iface(
     iface: &OutboundInterface,
@@ -328,7 +329,7 @@ fn prepare_outbound_tcp_socket(
     };
     debug!("created tcp socket");
 
-    if let Some(iface) = iface {
+    if let Some(iface) = iface.filter(|_| !endpoint.ip().is_loopback()) {
         must_bind_socket_on_interface(&socket, iface, family)?;
         #[cfg(target_os = "windows")]
         if let Some(addr) = bind_addr_for_iface(iface, family) {
@@ -401,8 +402,13 @@ pub async fn new_udp_socket(
     debug!("created udp socket");
 
     if !cfg!(target_os = "android") {
+        // Skip interface binding for loopback destinations; binding to a
+        // physical outbound interface prevents localhost routes from working.
+        let dst_is_loopback = family_hint
+            .map(|addr| addr.ip().is_loopback())
+            .unwrap_or(false);
         match (src, iface) {
-            (_, Some(iface)) => {
+            (_, Some(iface)) if !dst_is_loopback => {
                 must_bind_socket_on_interface(&socket, iface, family).inspect_err(
                     |x| {
                         error!("failed to bind socket to interface: {}", x);
@@ -422,11 +428,11 @@ pub async fn new_udp_socket(
 
                 trace!(iface = ?iface, "udp socket bound: {socket:?}");
             }
-            (Some(src), None) => {
+            (Some(src), _) => {
                 socket.bind(&src.into())?;
                 trace!(src = ?src, "udp socket bound: {socket:?}");
             }
-            (None, None) => {
+            (None, _) => {
                 // On Windows, UDP sockets must be bound to get a valid local_addr
                 // which is required for some operations (e.g., quinn/QUIC)
                 #[cfg(target_os = "windows")]
