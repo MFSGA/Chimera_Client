@@ -53,7 +53,7 @@ pub enum XhttpSecurity {
 #[derive(Clone, Debug)]
 pub struct XhttpRealityConfig {
     pub public_key: [u8; 32],
-    pub short_id: [u8; 8],
+    pub short_id: Vec<u8>,
     pub server_name: String,
 }
 
@@ -219,7 +219,7 @@ async fn connect_download_stream(
                 })?;
                 let client = RealityClient::new(
                     reality.public_key,
-                    reality.short_id,
+                    reality.short_id.clone(),
                     reality.server_name.clone(),
                     Vec::new(),
                 );

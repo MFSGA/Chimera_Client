@@ -53,8 +53,8 @@ pub fn decode_private_key(encoded: &str) -> Result<[u8; 32], std::io::Error> {
 /// Decodes a hex-encoded short ID with zero-padding
 ///
 /// Short IDs can be 0-16 hex characters (0-8 bytes).
-/// If shorter than 16 characters, they are left-padded with zeros.
-pub fn decode_short_id(hex: &str) -> Result<[u8; 8], std::io::Error> {
+/// Shorter IDs remain variable-length to match Xray REALITY shortIds.
+pub fn decode_short_id(hex: &str) -> Result<Vec<u8>, std::io::Error> {
     if hex.len() > 16 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -62,11 +62,15 @@ pub fn decode_short_id(hex: &str) -> Result<[u8; 8], std::io::Error> {
         ));
     }
 
-    // Left-pad with zeros to make 16 chars
-    let padded = format!("{:0>16}", hex);
+    if !hex.len().is_multiple_of(2) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Short ID hex length must be even: {}", hex.len()),
+        ));
+    }
 
-    let mut short_id = [0u8; 8];
-    decode_hex_to_slice(&padded, &mut short_id).map_err(|e| {
+    let mut short_id = vec![0u8; hex.len() / 2];
+    decode_hex_to_slice(hex, &mut short_id).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("Invalid hex: {}", e),
@@ -504,15 +508,21 @@ mod tests {
     fn test_decode_short_id() {
         // Full 16-char hex
         let short_id = decode_short_id("0123456789abcdef").unwrap();
-        assert_eq!(short_id, [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
+        assert_eq!(
+            short_id,
+            vec![0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]
+        );
 
-        // Partial hex (should be zero-padded on left)
-        let short_id2 = decode_short_id("abcdef").unwrap();
-        assert_eq!(short_id2, [0x00, 0x00, 0x00, 0x00, 0x00, 0xab, 0xcd, 0xef]);
+        // Partial hex remains variable-length, matching Xray REALITY shortIds.
+        let short_id2 = decode_short_id("85144f63").unwrap();
+        assert_eq!(short_id2, vec![0x85, 0x14, 0x4f, 0x63]);
 
-        // Empty (all zeros)
+        // Empty short ID is valid and remains empty.
         let short_id3 = decode_short_id("").unwrap();
-        assert_eq!(short_id3, [0; 8]);
+        assert!(short_id3.is_empty());
+
+        let odd_len = decode_short_id("abc");
+        assert!(odd_len.is_err());
 
         // Too long should error
         let result = decode_short_id("0123456789abcdef0");

@@ -42,8 +42,8 @@ use super::util::allocate_vec;
 pub struct RealityClientConfig {
     /// Server's X25519 public key (32 bytes)
     pub public_key: [u8; 32],
-    /// Short ID for authentication (8 bytes)
-    pub short_id: [u8; 8],
+    /// Short ID for authentication (0-8 bytes)
+    pub short_id: Vec<u8>,
     /// Server name for SNI
     pub server_name: String,
     /// Supported TLS 1.3 cipher suites (empty = use defaults)
@@ -187,8 +187,18 @@ impl RealityClientConnection {
         // Timestamp (4 bytes as uint32, in seconds)
         session_id_plaintext[4..8]
             .copy_from_slice(&(timestamp as u32).to_be_bytes());
-        // Short ID (8 bytes)
-        session_id_plaintext[8..16].copy_from_slice(&self.config.short_id);
+        // Short ID (0-8 bytes), followed by zero padding.
+        if self.config.short_id.len() > 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "REALITY short-id too long: {} bytes (max 8)",
+                    self.config.short_id.len()
+                ),
+            ));
+        }
+        session_id_plaintext[8..8 + self.config.short_id.len()]
+            .copy_from_slice(&self.config.short_id);
 
         // Create a 32-byte SessionId (16 bytes plaintext + 16 bytes zeros for padding)
         let mut session_id_for_hello = [0u8; 32];

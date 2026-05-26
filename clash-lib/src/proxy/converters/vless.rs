@@ -724,7 +724,7 @@ fn decode_reality_public_key(input: &str) -> Result<[u8; 32], Error> {
 }
 
 #[cfg(feature = "reality")]
-fn decode_reality_short_id(short_id: Option<&str>) -> Result<[u8; 8], Error> {
+fn decode_reality_short_id(short_id: Option<&str>) -> Result<Vec<u8>, Error> {
     let candidate = short_id.map(str::trim).unwrap_or(DEFAULT_REALITY_SHORT_ID);
     let normalized = if candidate.is_empty() {
         DEFAULT_REALITY_SHORT_ID
@@ -765,10 +765,18 @@ mod tests {
 
     #[cfg(feature = "reality")]
     #[test]
-    fn reality_short_id_accepts_empty_as_zero_short_id() {
+    fn reality_short_id_accepts_empty_as_empty_short_id() {
         let decoded =
             decode_reality_short_id(Some("")).expect("empty short-id should decode");
-        assert_eq!(decoded, [0; 8]);
+        assert!(decoded.is_empty());
+    }
+
+    #[cfg(feature = "reality")]
+    #[test]
+    fn reality_short_id_preserves_variable_length_bytes() {
+        let decoded = decode_reality_short_id(Some("85144f63"))
+            .expect("short-id should decode");
+        assert_eq!(decoded, vec![0x85, 0x14, 0x4f, 0x63]);
     }
 
     #[cfg(feature = "ws")]

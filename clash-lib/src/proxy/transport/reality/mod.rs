@@ -37,12 +37,12 @@ pub(crate) use crypto_connection::CryptoConnection;
 pub(crate) use crypto_handshake::perform_crypto_handshake;
 pub(crate) use crypto_tls_stream::CryptoTlsStream;
 
-pub const DEFAULT_REALITY_SHORT_ID: &str = "0000000000000000";
+pub const DEFAULT_REALITY_SHORT_ID: &str = "";
 
 #[derive(Clone, Debug)]
 pub struct Client {
     public_key: [u8; 32],
-    short_id: [u8; 8],
+    short_id: Vec<u8>,
     server_name: String,
     cipher_suites: Vec<CipherSuite>,
 }
@@ -50,7 +50,7 @@ pub struct Client {
 impl Client {
     pub fn new(
         public_key: [u8; 32],
-        short_id: [u8; 8],
+        short_id: Vec<u8>,
         server_name: String,
         cipher_suites: Vec<CipherSuite>,
     ) -> Self {
@@ -68,7 +68,7 @@ impl Client {
     ) -> io::Result<CryptoTlsStream<AnyStream>> {
         let config = reality_client_connection::RealityClientConfig {
             public_key: self.public_key,
-            short_id: self.short_id,
+            short_id: self.short_id.clone(),
             server_name: self.server_name.clone(),
             cipher_suites: self.cipher_suites.clone(),
         };
