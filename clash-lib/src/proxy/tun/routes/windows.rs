@@ -21,10 +21,10 @@ use windows::{
             IpHelper::{
                 CreateIpForwardEntry2, CreateUnicastIpAddressEntry,
                 DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1,
-                DNS_SETTING_IPV6, DNS_SETTING_NAMESERVER, DeleteIpForwardEntry2,
-                GetBestRoute2, GetIfEntry2, IP_ADDRESS_PREFIX,
-                InitializeIpForwardEntry, MIB_IF_ROW2, MIB_IPFORWARD_ROW2,
-                MIB_UNICASTIPADDRESS_ROW, SetInterfaceDnsSettings,
+                DNS_SETTING_NAMESERVER, DeleteIpForwardEntry2, GetBestRoute2,
+                GetIfEntry2, IP_ADDRESS_PREFIX, InitializeIpForwardEntry,
+                MIB_IF_ROW2, MIB_IPFORWARD_ROW2, MIB_UNICASTIPADDRESS_ROW,
+                SetInterfaceDnsSettings,
             },
             Rras::{
                 RTM_ENTITY_ID, RTM_ENTITY_ID_0, RTM_ENTITY_ID_0_0, RTM_ENTITY_INFO,
@@ -286,37 +286,6 @@ pub fn set_dns_v4(
     let dns_settings = DNS_INTERFACE_SETTINGS {
         Version: DNS_INTERFACE_SETTINGS_VERSION1,
         Flags: DNS_SETTING_NAMESERVER as u64,
-        NameServer: PWSTR::from_raw(dns_wstr.as_mut_ptr()),
-        ..Default::default()
-    };
-
-    let guid =
-        get_guid(iface).ok_or(anyhow!("interface {} not found", iface.name))?;
-
-    unsafe { SetInterfaceDnsSettings(guid, &dns_settings) }
-        .to_hresult()
-        .ok()
-        .map_err(|e| anyhow::anyhow!(e))
-}
-
-// SetInterfaceDnsSettings()
-// See https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-setinterfacednssettings
-pub fn set_dns_v6(
-    iface: &OutboundInterface,
-    name_servers: &[Ipv6Addr],
-) -> anyhow::Result<()> {
-    let mut dns_wstr = name_servers
-        .iter()
-        .map(|x| x.to_string())
-        .collect::<Vec<String>>()
-        .join(",")
-        .encode_utf16()
-        .collect::<Vec<u16>>();
-    dns_wstr.push(0); // ensure ending with null
-
-    let dns_settings = DNS_INTERFACE_SETTINGS {
-        Version: DNS_INTERFACE_SETTINGS_VERSION1,
-        Flags: (DNS_SETTING_NAMESERVER | DNS_SETTING_IPV6) as u64,
         NameServer: PWSTR::from_raw(dns_wstr.as_mut_ptr()),
         ..Default::default()
     };
