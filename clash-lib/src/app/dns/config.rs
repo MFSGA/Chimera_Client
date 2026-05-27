@@ -3,11 +3,13 @@ use crate::{
     Error,
     app::net::{OutboundInterface, get_interface_by_name, get_outbound_interface},
     common::trie,
-    config::def::{DNSListen, DNSMode, EdnsClientSubnet as DefEdnsClientSubnet},
+    config::def::{
+        DNSListen, DNSMode, DohListenDef, DotListenDef,
+        EdnsClientSubnet as DefEdnsClientSubnet,
+    },
 };
 pub use chimera_dns::{DNSListenAddr, DoH3Config, DoHConfig, DoTConfig};
 use ipnet::{AddrParseError, Ipv4Net, Ipv6Net};
-use serde::Deserialize;
 use std::{
     collections::HashMap,
     fmt::Display,
@@ -245,6 +247,23 @@ fn parse_listen_addr(addr: &str) -> Result<SocketAddr, Error> {
     }
 }
 
+fn parse_doh_config(cfg: DohListenDef) -> Result<DoHConfig, Error> {
+    Ok(DoHConfig {
+        addr: parse_listen_addr(&cfg.addr)?,
+        ca_cert: cfg.ca_cert,
+        ca_key: cfg.ca_key,
+        hostname: cfg.hostname,
+    })
+}
+
+fn parse_dot_config(cfg: DotListenDef) -> Result<DoTConfig, Error> {
+    Ok(DoTConfig {
+        addr: parse_listen_addr(&cfg.addr)?,
+        ca_cert: cfg.ca_cert,
+        ca_key: cfg.ca_key,
+    })
+}
+
 impl Config {
     pub fn parse_outbound_proxy(url: &Url) -> Option<String> {
         let frag = url.fragment()?;
@@ -349,88 +368,33 @@ impl TryFrom<&crate::config::def::Config> for Config {
                 .map(|l| match l {
                     DNSListen::Udp(u) => {
                         let addr = parse_listen_addr(&u)?;
-                        Ok(DNSListenAddr {
+                        Ok::<DNSListenAddr, Error>(DNSListenAddr {
                             udp: Some(addr),
                             ..Default::default()
                         })
                     }
-                    DNSListen::Multiple(map) => {
-                        let mut udp = None;
-                        let mut tcp = None;
-                        let mut doh = None;
-                        let mut doh3 = None;
-                        let mut dot = None;
-
-                        for (k, v) in map {
-                            match k.as_str() {
-                                "udp" => {
-                                    let addr = v
-                                        .as_str()
-                                        .ok_or(Error::InvalidConfig(format!(
-                                            "invalid udp dns listen address - must \
-                                             be string: {v:?}"
-                                        )))
-                                        .and_then(parse_listen_addr)?;
-                                    udp = Some(addr)
-                                }
-                                "tcp" => {
-                                    let addr = v
-                                        .as_str()
-                                        .ok_or(Error::InvalidConfig(format!(
-                                            "invalid tcp dns listen address - must \
-                                             be string: {v:?}"
-                                        )))
-                                        .and_then(parse_listen_addr)?;
-                                    tcp = Some(addr)
-                                }
-                                "doh" => {
-                                    let c =
-                                        DoHConfig::deserialize(v).map_err(|x| {
-                                            Error::InvalidConfig(format!(
-                                                "invalid doh dns listen config: \
-                                                 {x:?}"
-                                            ))
-                                        })?;
-
-                                    doh = Some(c)
-                                }
-                                "dot" => {
-                                    let c =
-                                        DoTConfig::deserialize(v).map_err(|x| {
-                                            Error::InvalidConfig(format!(
-                                                "invalid dot dns listen config: \
-                                                 {x:?}"
-                                            ))
-                                        })?;
-                                    dot = Some(c)
-                                }
-                                "doh3" => {
-                                    let c =
-                                        DoH3Config::deserialize(v).map_err(|x| {
-                                            Error::InvalidConfig(format!(
-                                                "invalid doh3 dns listen config: \
-                                                 {x:?}"
-                                            ))
-                                        })?;
-
-                                    doh3 = Some(c)
-                                }
-                                _ => {
-                                    return Err(Error::InvalidConfig(format!(
-                                        "invalid dns listen address: {k}"
-                                    )));
-                                }
-                            }
-                        }
-
-                        Ok(DNSListenAddr {
-                            udp,
-                            tcp,
-                            doh,
-                            dot,
-                            doh3,
-                        })
-                    }
+                    DNSListen::Multiple(cfg) => Ok(DNSListenAddr {
+                        udp: cfg
+                            .udp
+                            .as_deref()
+                            .map(parse_listen_addr)
+                            .transpose()?,
+                        tcp: cfg
+                            .tcp
+                            .as_deref()
+                            .map(parse_listen_addr)
+                            .transpose()?,
+                        doh: cfg.doh.map(parse_doh_config).transpose()?,
+                        dot: cfg.dot.map(parse_dot_config).transpose()?,
+                        doh3: cfg.doh3.map(parse_doh_config).transpose()?.map(
+                            |cfg| DoH3Config {
+                                addr: cfg.addr,
+                                ca_cert: cfg.ca_cert,
+                                ca_key: cfg.ca_key,
+                                hostname: cfg.hostname,
+                            },
+                        ),
+                    }),
                 })
                 .transpose()?
                 .unwrap_or_default(),

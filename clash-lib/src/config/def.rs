@@ -242,10 +242,37 @@ impl Display for LogLevel {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub struct DohListenDef {
+    pub addr: String,
+    pub ca_cert: Option<String>,
+    pub ca_key: Option<String>,
+    pub hostname: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub struct DotListenDef {
+    pub addr: String,
+    pub ca_cert: Option<String>,
+    pub ca_key: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct DnsMultipleListenDef {
+    pub udp: Option<String>,
+    pub tcp: Option<String>,
+    pub doh: Option<DohListenDef>,
+    pub dot: Option<DotListenDef>,
+    pub doh3: Option<DohListenDef>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(untagged)]
 pub enum DNSListen {
     Udp(String),
-    Multiple(HashMap<String, Value>),
+    Multiple(Box<DnsMultipleListenDef>),
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
