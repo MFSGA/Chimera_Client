@@ -4,7 +4,14 @@ use serde_yaml::Value;
 
 use std::{collections::HashMap, fmt::Display, path::PathBuf, str::FromStr};
 
-use crate::{Error, config::internal::config::BindAddress};
+use crate::{
+    Error,
+    config::internal::{
+        config::BindAddress,
+        listener::InboundOpts,
+        proxy::{OutboundGroupProtocol, OutboundProxyProtocol},
+    },
+};
 
 const DEFAULT_ROUTE_TABLE: u32 = 2468;
 
@@ -84,13 +91,13 @@ pub struct Config {
     pub bind_address: BindAddress,
     /// 3. Proxy settings
     #[serde(rename = "proxies")]
-    pub proxy: Option<Vec<HashMap<String, Value>>>,
+    pub proxy: Option<Vec<OutboundProxyProtocol>>,
     /// 11. HTTP and SOCKS5 proxy authentication
     #[serde(default)]
     pub authentication: Vec<String>,
     #[serde(rename = "proxy-groups")]
     /// 4. Proxy group settings
-    pub proxy_group: Option<Vec<HashMap<String, Value>>>,
+    pub proxy_group: Option<Vec<OutboundGroupProtocol>>,
     #[serde(rename = "rules")]
     /// 5. Rule settings
     pub rule: Option<Vec<String>>,
@@ -156,7 +163,7 @@ pub struct Config {
     /// TUN settings
     pub tun: Option<TunConfig>,
     /// 12
-    pub listeners: Option<Vec<HashMap<String, Value>>>,
+    pub listeners: Option<Vec<InboundOpts>>,
     // 13. these options has default vals,
     // and needs extra processing
     /// whether your network environment supports IPv6

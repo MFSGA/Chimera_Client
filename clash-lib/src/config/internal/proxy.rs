@@ -45,7 +45,7 @@ pub enum OutboundProxyProtocol {
 }
 
 impl OutboundProxyProtocol {
-    fn name(&self) -> &str {
+    pub(crate) fn name(&self) -> &str {
         match &self {
             OutboundProxyProtocol::Direct(direct) => &direct.name,
             OutboundProxyProtocol::Reject(reject) => &reject.name,
@@ -70,7 +70,6 @@ impl TryFrom<HashMap<String, Value>> for OutboundProxyProtocol {
                 "missing field `name` in outbound proxy protocol".to_owned(),
             ))?
             .to_owned();
-        println!("parsing proxy protocol for {name}");
         OutboundProxyProtocol::deserialize(MapDeserializer::new(mapping.into_iter()))
             .map_err(map_serde_error(name))
     }

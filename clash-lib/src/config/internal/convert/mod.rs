@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 
-use serde::{Deserialize, de::value::MapDeserializer};
-use serde_yaml::Value;
 use tracing::warn;
 
 use crate::{
@@ -12,9 +10,8 @@ use crate::{
         internal::{
             config::{self, Profile},
             proxy::{
-                OutboundDirect, OutboundGroupProtocol, OutboundProxy,
-                OutboundProxyProtocol, OutboundReject, PROXY_DIRECT, PROXY_REJECT,
-                map_serde_error,
+                OutboundDirect, OutboundProxy, OutboundProxyProtocol,
+                OutboundReject, PROXY_DIRECT, PROXY_REJECT,
             },
             rule::RuleType,
         },
@@ -71,9 +68,8 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
                     )),
                 ),
             ]),
-            |mut rv, x| {
-                let proxy =
-                    OutboundProxy::ProxyServer(OutboundProxyProtocol::try_from(x)?);
+            |mut rv, protocol| {
+                let proxy = OutboundProxy::ProxyServer(protocol);
                 let name = proxy.name();
                 if rv.contains_key(name.as_str()) {
                     return Err(Error::InvalidConfig(format!(
@@ -120,22 +116,6 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
         },
     }
     .validate()
-}
-
-impl TryFrom<HashMap<String, Value>> for OutboundGroupProtocol {
-    type Error = Error;
-
-    fn try_from(mapping: HashMap<String, Value>) -> Result<Self, Self::Error> {
-        let name = mapping
-            .get("name")
-            .and_then(|x| x.as_str())
-            .ok_or(Error::InvalidConfig(
-                "missing field `name` in outbound proxy grouop".to_owned(),
-            ))?
-            .to_owned();
-        OutboundGroupProtocol::deserialize(MapDeserializer::new(mapping.into_iter()))
-            .map_err(map_serde_error(name))
-    }
 }
 
 #[cfg(test)]
