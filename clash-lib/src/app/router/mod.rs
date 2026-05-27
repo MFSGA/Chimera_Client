@@ -101,24 +101,12 @@ impl Router {
             }
 
             if r.apply(sess) {
-                if let Some(internal) = &sess.internal {
-                    info!(
-                        upstream_type = internal.typ,
-                        upstream_host = %internal.host,
-                        upstream_network = %internal.network,
-                        destination = %sess.destination,
-                        target = r.target(),
-                        rule = r.type_name(),
-                        "matched internal dns upstream"
-                    );
-                } else {
-                    info!(
-                        "matched {} to target {}[{}]",
-                        &sess,
-                        r.target(),
-                        r.type_name()
-                    );
-                }
+                info!(
+                    "matched {} to target {}[{}]",
+                    &sess,
+                    r.target(),
+                    r.type_name()
+                );
                 return (r.target(), Some(r));
             }
         }

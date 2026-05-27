@@ -36,7 +36,6 @@ use crate::{
     common::tls::{self, GLOBAL_ROOT_STORE},
     dns::{ThreadSafeDNSClient, dhcp::DhcpClient},
     proxy::OutboundHandler,
-    session::InternalMetadata,
 };
 use anyhow::anyhow;
 
@@ -291,22 +290,6 @@ impl Display for DnsConfig {
                 write!(f, "host: {host}")?;
                 write!(f, "via proxy: {}", proxy.name())
             }
-        }
-    }
-}
-
-impl DnsConfig {
-    fn upstream_metadata(&self) -> InternalMetadata {
-        let (host, network) = match self {
-            DnsConfig::Udp(addr, _, _, _) => (addr.ip().to_string(), "UDP"),
-            DnsConfig::Tcp(addr, _, _, _) => (addr.ip().to_string(), "TCP"),
-            DnsConfig::Tls(_, host, _, _, _) => (host.to_string(), "DoT"),
-            DnsConfig::Https(_, host, _, _, _) => (host.to_string(), "DoH"),
-        };
-        InternalMetadata {
-            typ: "dns-upstream",
-            host,
-            network: network.to_owned(),
         }
     }
 }
@@ -663,7 +646,6 @@ async fn dns_stream_builder(
     rule_dispatch: Option<Arc<RuleDispatch>>,
 ) -> Result<(client::Client<DnsRuntimeProvider>, JoinHandle<()>), Error> {
     let dns_resolver = Arc::new(dns::SystemResolver::new(false)?);
-    let upstream = cfg.upstream_metadata();
     match cfg {
         DnsConfig::Udp(addr, iface, proxy, fw_mark) => {
             let stream = UdpClientStream::builder(
@@ -674,7 +656,6 @@ async fn dns_stream_builder(
                     iface.clone(),
                     *fw_mark,
                     rule_dispatch.clone(),
-                    upstream.clone(),
                 ),
             )
             .with_timeout(Some(Duration::from_secs(5)))
@@ -694,7 +675,6 @@ async fn dns_stream_builder(
                     iface.clone(),
                     *fw_mark,
                     rule_dispatch.clone(),
-                    upstream.clone(),
                 ),
             );
 
@@ -725,7 +705,6 @@ async fn dns_stream_builder(
                     iface.clone(),
                     *fw_mark,
                     rule_dispatch.clone(),
-                    upstream.clone(),
                 ),
             );
 
@@ -763,7 +742,6 @@ async fn dns_stream_builder(
                     iface.clone(),
                     *fw_mark,
                     rule_dispatch.clone(),
-                    upstream.clone(),
                 ),
             )
             .build(*addr, host.to_string().into(), "/dns-query".into())
