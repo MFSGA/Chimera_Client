@@ -127,6 +127,9 @@ subtle = { version = "2", optional = true }
 ring-compat = { version = "0.8", features = ["aead"] }
 x509-parser = { version = "0.16", default-features = false, optional = true }
 
+blake3 = { version = "1", optional = true }
+shadowsocks = { version = "1.24", optional = true, features = ["aead-cipher-2022", "stream-cipher", "aead-cipher-extra"], git = "https://github.com/shadowsocks/shadowsocks-rust.git", rev = "c4d8d18527289d12470cad1ce718754c908a75fe" }
+
 byteorder = "1"
 
 [features]
@@ -150,6 +153,7 @@ ring = ["tls", "rustls/ring", "quinn-proto?/ring", "chimera-dns/ring"]
 
 ws = ["tokio-tungstenite"]
 
+shadowsocks = ["dep:shadowsocks", "dep:blake3"]
 trojan = []
 hysteria = [
     "tls",
