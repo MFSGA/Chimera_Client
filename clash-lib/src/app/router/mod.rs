@@ -25,6 +25,7 @@ pub struct Router {
     rules: Vec<Box<dyn RuleMatcher>>,
     dns_resolver: ThreadSafeDNSResolver,
     // kept aligned with clash-rs matcher flow
+    country_mmdb: Option<MmdbLookup>,
     asn_mmdb: Option<MmdbLookup>,
 }
 
@@ -53,6 +54,7 @@ impl Router {
                 .map(|r| map_rule_type(r, country_mmdb.clone(), geodata.clone()))
                 .collect(),
             dns_resolver,
+            country_mmdb,
             asn_mmdb,
         }
     }
@@ -89,23 +91,13 @@ impl Router {
                 }
             }
 
-            let maybe_ip = sess.resolved_ip.or(sess.destination.ip());
-            if let (Some(ip), Some(asn_mmdb)) = (maybe_ip, &self.asn_mmdb) {
-                let rv = asn_mmdb.lookup_country(ip);
-                if let Ok(country) = rv {
-                    sess.asn = Some(country.country_code);
-                }
-                if sess.asn.is_none() {
-                    match asn_mmdb.lookup_asn(ip) {
-                        Ok(asn) => {
-                            trace!("asn for {} is {:?}", ip, asn);
-                            sess.asn = Some(asn.asn_name);
-                        }
-                        Err(e) => {
-                            trace!("failed to lookup ASN for {}: {}", ip, e);
-                        }
-                    }
-                }
+            if let Some(ip) = sess.resolved_ip.or(sess.destination.ip()) {
+                Self::populate_geo_for_ip(
+                    ip,
+                    &self.country_mmdb,
+                    &self.asn_mmdb,
+                    sess,
+                );
             }
 
             if r.apply(sess) {
@@ -132,6 +124,51 @@ impl Router {
         }
 
         (MATCH, None)
+    }
+
+    /// Look up country code and ASN for an IP address.
+    fn populate_geo_for_ip(
+        ip: std::net::IpAddr,
+        country_mmdb: &Option<MmdbLookup>,
+        asn_mmdb: &Option<MmdbLookup>,
+        sess: &mut Session,
+    ) {
+        if sess.country.is_some() && sess.asn.is_some() {
+            return;
+        }
+
+        if sess.country.is_none()
+            && let Some(country_mmdb) = country_mmdb
+        {
+            match country_mmdb.lookup_country(ip) {
+                Ok(country) => {
+                    trace!("country for {} is {:?}", ip, country.country_code);
+                    sess.country = Some(country.country_code);
+                }
+                Err(e) => {
+                    trace!("failed to lookup country for {}: {}", ip, e);
+                }
+            }
+        }
+
+        if sess.asn.is_none()
+            && let Some(asn_mmdb) = asn_mmdb
+        {
+            if let Ok(country) = asn_mmdb.lookup_country(ip) {
+                sess.asn = Some(country.country_code);
+                return;
+            }
+
+            match asn_mmdb.lookup_asn(ip) {
+                Ok(asn) => {
+                    trace!("asn for {} is {:?}", ip, asn);
+                    sess.asn = Some(asn.asn_name);
+                }
+                Err(e) => {
+                    trace!("failed to lookup ASN for {}: {}", ip, e);
+                }
+            }
+        }
     }
 }
 

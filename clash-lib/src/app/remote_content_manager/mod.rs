@@ -31,6 +31,24 @@ use crate::{
 pub mod healthcheck;
 pub mod providers;
 
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct TrafficStats {
+    /// Total bytes uploaded in this session
+    pub bytes_uploaded: u64,
+    /// Total bytes downloaded in this session
+    pub bytes_downloaded: u64,
+    /// Duration of the connection
+    pub connection_duration: Duration,
+    /// Average throughput in bytes per second
+    pub average_throughput: f64,
+    /// Peak throughput observed
+    pub peak_throughput: f64,
+    /// Frequency of requests per second
+    pub request_frequency: f64,
+    /// Whether traffic flows both ways significantly
+    pub is_bidirectional: bool,
+}
+
 #[derive(Default)]
 struct ProxyState {
     alive: AtomicBool,

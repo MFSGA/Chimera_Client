@@ -908,6 +908,7 @@ mod tests {
             resolved_ip: None,
             so_mark: None,
             iface: None,
+            country: None,
             asn: None,
             traffic_stats: None,
             inbound_user: None,
