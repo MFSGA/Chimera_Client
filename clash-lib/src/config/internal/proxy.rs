@@ -31,6 +31,9 @@ pub enum OutboundProxyProtocol {
     Direct(OutboundDirect),
     #[serde(rename = "reject")]
     Reject(OutboundReject),
+    #[cfg(feature = "shadowsocks")]
+    #[serde(rename = "ss")]
+    Ss(OutboundShadowsocks),
     #[serde(rename = "socks5")]
     Socks5(OutboundSocks5),
 
@@ -49,6 +52,8 @@ impl OutboundProxyProtocol {
         match &self {
             OutboundProxyProtocol::Direct(direct) => &direct.name,
             OutboundProxyProtocol::Reject(reject) => &reject.name,
+            #[cfg(feature = "shadowsocks")]
+            OutboundProxyProtocol::Ss(ss) => &ss.common_opts.name,
             OutboundProxyProtocol::Socks5(socks5) => &socks5.common_opts.name,
             OutboundProxyProtocol::Vless(vless) => &vless.common_opts.name,
             #[cfg(feature = "trojan")]
@@ -85,6 +90,20 @@ pub struct OutboundDirect {
 #[serde(rename_all = "kebab-case")]
 pub struct OutboundReject {
     pub name: String,
+}
+
+#[cfg(feature = "shadowsocks")]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct OutboundShadowsocks {
+    #[serde(flatten)]
+    pub common_opts: CommonConfigOptions,
+    pub cipher: String,
+    pub password: String,
+    #[serde(default = "default_bool_true")]
+    pub udp: bool,
+    pub plugin: Option<String>,
+    pub plugin_opts: Option<HashMap<String, serde_yaml::Value>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
