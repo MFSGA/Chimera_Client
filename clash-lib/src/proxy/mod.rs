@@ -49,6 +49,9 @@ mod transport;
 pub mod trojan;
 pub mod utils;
 
+#[cfg(feature = "shadowsocks")]
+pub mod shadowsocks;
+
 pub mod converters;
 
 pub mod group;
@@ -184,6 +187,8 @@ pub enum OutboundType {
     Trojan,
     Hysteria2,
     Vless,
+    #[cfg(feature = "shadowsocks")]
+    Shadowsocks,
 
     #[serde(rename = "URLTest")]
     UrlTest,
@@ -194,8 +199,9 @@ pub enum OutboundType {
 impl Display for OutboundType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            /* OutboundType::Shadowsocks => write!(f, "Shadowsocks"),
-            OutboundType::Vmess => write!(f, "Vmess"),
+            #[cfg(feature = "shadowsocks")]
+            OutboundType::Shadowsocks => write!(f, "Shadowsocks"),
+            /* OutboundType::Vmess => write!(f, "Vmess"),
 
             OutboundType::WireGuard => write!(f, "WireGuard"),
             OutboundType::Tor => write!(f, "Tor"),
