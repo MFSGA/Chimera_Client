@@ -13,7 +13,7 @@ use crate::{
     app::{dns, net::Interface},
     common::auth,
     config::{
-        def::{LogLevel, RunMode},
+        def::{self, LogLevel, RunMode},
         internal::{
             listener::InboundOpts,
             proxy::{OutboundProxy, OutboundProxyProviderDef},
@@ -44,6 +44,8 @@ pub struct Config {
     /// 6
     pub tun: TunConfig,
     /// 7
+    pub experimental: Option<def::Experimental>,
+    /// 8
     pub profile: Profile,
 }
 

@@ -179,6 +179,8 @@ pub struct Config {
     /// - so you can use this value to match the traffic in iptables to avoid
     ///   traffic loops
     pub routing_mark: Option<u32>,
+    /// experimental settings, if any
+    pub experimental: Option<Experimental>,
     /// 15. Clash router working mode
     /// Either `rule`, `global` or `direct`
     #[serde(default)]
@@ -372,6 +374,13 @@ pub struct DNS {
 pub struct EdnsClientSubnet {
     pub ipv4: Option<String>,
     pub ipv6: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct Experimental {
+    /// buffer size for tcp stream bidirectional copy
+    pub tcp_buffer_size: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize)]

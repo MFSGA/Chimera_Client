@@ -110,6 +110,7 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
         // relate to dns::Config
         dns: (&c).try_into()?,
         tun: tun::convert(c.tun.take())?,
+        experimental: c.experimental.take(),
         profile: Profile {
             store_selected: c.profile.store_selected,
             store_smart_stats: c.profile.store_smart_stats,
