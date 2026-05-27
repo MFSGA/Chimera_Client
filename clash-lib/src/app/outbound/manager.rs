@@ -374,6 +374,21 @@ impl OutboundManager {
                 OutboundProxyProtocol::Reject(r) => {
                     Some(Arc::new(reject::Handler::new(&r.name)) as _)
                 }
+                #[cfg(feature = "shadowsocks")]
+                OutboundProxyProtocol::Ss(s) => {
+                    let name = s.common_opts.name.clone();
+                    s.try_into()
+                        .map(|x: crate::proxy::shadowsocks::outbound::Handler| {
+                            Arc::new(x) as AnyOutboundHandler
+                        })
+                        .inspect_err(|e| {
+                            error!(
+                                "failed to load shadowsocks outbound {}: {}",
+                                name, e
+                            );
+                        })
+                        .ok()
+                }
                 OutboundProxyProtocol::Socks5(v) => {
                     let name = v.common_opts.name.clone();
                     v.try_into()
