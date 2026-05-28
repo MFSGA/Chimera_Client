@@ -5,6 +5,7 @@ use crate::{Error, common::trie};
 use async_trait::async_trait;
 use byteorder::{BigEndian, ByteOrder};
 use tokio::sync::RwLock;
+use tracing::info;
 
 mod file_store;
 mod mem_store;
@@ -69,12 +70,30 @@ impl FakeDns {
 
     pub async fn lookup(&mut self, host: &str) -> net::IpAddr {
         if let Some(ip) = self.store.get_by_host(host).await {
+            info!(
+                host = %host,
+                fake_ip = %ip,
+                range = %self.ipnet,
+                reused = true,
+                "fake-ip mapping reused"
+            );
             return ip;
         }
 
         let ip = self.get(host).await;
         self.store.pub_by_host(host, ip).await;
+        info!(
+            host = %host,
+            fake_ip = %ip,
+            range = %self.ipnet,
+            reused = false,
+            "fake-ip mapping allocated"
+        );
         ip
+    }
+
+    pub async fn lookup_existing(&mut self, host: &str) -> Option<net::IpAddr> {
+        self.store.get_by_host(host).await
     }
 
     pub async fn reverse_lookup(&mut self, ip: net::IpAddr) -> Option<String> {
@@ -141,6 +160,11 @@ impl FakeDns {
             if self.offset == current {
                 self.offset = (self.offset + 1) % (self.max - self.min);
                 let ip = net::Ipv4Addr::from(self.min + self.offset - 1);
+                info!(
+                    fake_ip = %ip,
+                    range = %self.ipnet,
+                    "fake-ip pool full, evicting previous mapping"
+                );
                 self.store.del_by_ip(std::net::IpAddr::V4(ip)).await;
                 break;
             }

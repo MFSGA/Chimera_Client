@@ -185,6 +185,9 @@ windows = { version = "0.62", features = [
     "Win32_NetworkManagement_Ndis",
 ] }
 
+[target.'cfg(any(target_os="linux", target_os="macos", target_os="windows"))'.dependencies]
+sock2proc = { git = "https://github.com/Watfaq/sock2proc.git", rev = "9f9e630" }
+
 [dev-dependencies]
 bollard = "0.20"
 rcgen = "0.14"

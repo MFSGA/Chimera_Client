@@ -101,12 +101,36 @@ impl Router {
             }
 
             if r.apply(sess) {
-                info!(
-                    "matched {} to target {}[{}]",
-                    &sess,
-                    r.target(),
-                    r.type_name()
-                );
+                let process = sess.process_name.as_deref().unwrap_or("<unknown>");
+                if let Some(host) = sess.destination.domain()
+                    && self.dns_resolver.fake_ip_enabled()
+                {
+                    match self.dns_resolver.fake_ip_for_host(host).await {
+                        Some(fake_ip) => info!(
+                            "matched {} process={} fake_ip={} reused=true to target {}[{}]",
+                            &sess,
+                            process,
+                            fake_ip,
+                            r.target(),
+                            r.type_name()
+                        ),
+                        None => info!(
+                            "matched {} process={} fake_ip=<none> reused=false to target {}[{}]",
+                            &sess,
+                            process,
+                            r.target(),
+                            r.type_name()
+                        ),
+                    }
+                } else {
+                    info!(
+                        "matched {} process={} to target {}[{}]",
+                        &sess,
+                        process,
+                        r.target(),
+                        r.type_name()
+                    );
+                }
                 return (r.target(), Some(r));
             }
         }

@@ -58,6 +58,10 @@ impl ClashResolver for NoopResolver {
         false
     }
 
+    async fn fake_ip_for_host(&self, _host: &str) -> Option<std::net::IpAddr> {
+        None
+    }
+
     fn fake_ip_enabled(&self) -> bool {
         false
     }

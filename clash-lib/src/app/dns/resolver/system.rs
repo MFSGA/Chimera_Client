@@ -122,6 +122,10 @@ impl ClashResolver for SystemResolver {
     async fn reverse_lookup(&self, _: std::net::IpAddr) -> Option<String> {
         None
     }
+
+    async fn fake_ip_for_host(&self, _: &str) -> Option<std::net::IpAddr> {
+        None
+    }
 }
 
 #[cfg(test)]

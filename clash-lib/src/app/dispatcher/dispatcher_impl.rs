@@ -27,7 +27,7 @@ use crate::{
     proxy::{
         AnyInboundDatagram, ClientStream, datagram::UdpPacket, utils::ToCanonical,
     },
-    session::{Session, SocksAddr},
+    session::{Session, SocksAddr, find_process_name},
 };
 
 // SS2022 (AEAD-2022) MAX_PACKET_SIZE is 0xFFFF (65535 bytes). A smaller
@@ -313,6 +313,11 @@ impl Dispatcher {
                 sess.source = packet.src_addr.clone().must_into_socket_addr();
                 sess.destination = dest.clone();
                 sess.inbound_user = packet.inbound_user.clone();
+                sess.process_name = find_process_name(
+                    sess.source,
+                    orig_dest.clone().try_into_socket_addr(),
+                    sess.network,
+                );
 
                 let mode = *mode.read().await;
 
@@ -855,6 +860,7 @@ mod tests {
             country: None,
             asn: None,
             traffic_stats: None,
+            process_name: None,
             inbound_user: None,
         };
 

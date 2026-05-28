@@ -768,6 +768,15 @@ impl ClashResolver for EnhancedResolver {
         let mut fake_dns = self.fake_dns.as_ref().unwrap().write().await;
         fake_dns.reverse_lookup(ip).await
     }
+
+    async fn fake_ip_for_host(&self, host: &str) -> Option<net::IpAddr> {
+        if !self.fake_ip_enabled() {
+            return None;
+        }
+
+        let mut fake_dns = self.fake_dns.as_ref().unwrap().write().await;
+        fake_dns.lookup_existing(host).await
+    }
 }
 
 #[cfg(test)]

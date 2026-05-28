@@ -349,6 +349,8 @@ pub struct Session {
     pub asn: Option<String>,
     /// Traffic statistics for intelligent proxy selection
     pub traffic_stats: Option<crate::app::remote_content_manager::TrafficStats>,
+    /// Process name that owns the socket, when available from the OS.
+    pub process_name: Option<String>,
     /// Authenticated user name from SS2022 EIH (FAC user_id as string).
     /// Set by the Shadowsocks inbound before dispatch; used for per-user
     /// traffic attribution.
@@ -384,10 +386,42 @@ impl Session {
             "traffic_stats".to_string(),
             Box::new(self.traffic_stats.clone()) as _,
         );
+        rv.insert(
+            "processName".to_string(),
+            Box::new(self.process_name.clone()) as _,
+        );
         if let Some(ref user) = self.inbound_user {
             rv.insert("inboundUser".to_string(), Box::new(user.clone()) as _);
         }
         rv
+    }
+}
+
+pub fn find_process_name(
+    source: SocketAddr,
+    destination: Option<SocketAddr>,
+    network: Network,
+) -> Option<String> {
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    {
+        sock2proc::find_process_name(
+            Some(source),
+            destination,
+            match network {
+                Network::Tcp => sock2proc::NetworkProtocol::TCP,
+                Network::Udp => sock2proc::NetworkProtocol::UDP,
+            },
+        )
+    }
+
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows"
+    )))]
+    {
+        let _ = (source, destination, network);
+        None
     }
 }
 
@@ -404,6 +438,7 @@ impl Default for Session {
             country: None,
             asn: None,
             traffic_stats: None,
+            process_name: None,
             inbound_user: None,
         }
     }
@@ -436,6 +471,7 @@ impl Debug for Session {
             .field("iface", &self.iface)
             .field("country", &self.country)
             .field("asn", &self.asn)
+            .field("process_name", &self.process_name)
             .finish()
     }
 }
@@ -453,6 +489,7 @@ impl Clone for Session {
             country: self.country.clone(),
             asn: self.asn.clone(),
             traffic_stats: self.traffic_stats.clone(),
+            process_name: self.process_name.clone(),
             inbound_user: self.inbound_user.clone(),
         }
     }
