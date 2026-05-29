@@ -1,6 +1,6 @@
 // todo
 #![feature(ip)]
-#![feature(sync_unsafe_cell)]
+// #![feature(sync_unsafe_cell)]
 
 use std::{
     collections::HashMap,
