@@ -132,14 +132,22 @@ pub fn new_dual_stack_udp_socket(
         }
     };
 
+    #[cfg(target_os = "windows")]
+    let mut bind_addr = bind_addr;
+
     if let Some(iface) = iface {
         let family = socket2::Domain::for_address(bind_addr);
         must_bind_socket_on_interface(&socket, iface, family).inspect_err(|x| {
             error!("failed to bind socket to interface: {}", x);
         })?;
+        #[cfg(target_os = "windows")]
+        if let Some(addr) = bind_addr_for_iface(iface, family) {
+            bind_addr = addr;
+        }
     }
 
     socket.bind(&bind_addr.into())?;
+    trace!(addr = ?bind_addr, iface = ?iface, "dual-stack udp socket bound");
 
     #[cfg(target_os = "linux")]
     if let Some(so_mark) = so_mark {
