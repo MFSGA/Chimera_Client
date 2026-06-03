@@ -318,7 +318,7 @@ impl Handler {
             SocksAddr::Ip(ip) => Ok(ip),
             SocksAddr::Domain(domain, port) => {
                 let ip = resolver
-                    .resolve(domain.as_str(), true)
+                    .resolve(domain.as_str(), false)
                     .await?
                     .ok_or_else(|| anyhow!("resolve domain {domain} failed"))?;
                 Ok(SocketAddr::new(ip, port))
@@ -412,8 +412,11 @@ impl Handler {
         let server_socket_addr = match self.opts.addr.clone() {
             SocksAddr::Ip(ip) => ip,
             SocksAddr::Domain(d, port) => {
+                // Proxy server domains must resolve to real endpoint IPs. Using
+                // enhanced DNS here may return a fake-ip address and make QUIC
+                // connect to the virtual pool instead of the Hysteria2 server.
                 let ip = resolver
-                    .resolve(d.as_str(), true)
+                    .resolve(d.as_str(), false)
                     .await?
                     .ok_or_else(|| anyhow!("resolve domain {} failed", d))?;
                 SocketAddr::new(ip, port)
