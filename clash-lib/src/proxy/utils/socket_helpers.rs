@@ -30,6 +30,12 @@ fn bind_addr_for_iface(
     }
 }
 
+fn should_prefer_ipv4_udp_socket(iface: Option<&OutboundInterface>) -> bool {
+    iface
+        .map(|iface| iface.addr_v4.is_some() && iface.addr_v6.is_none())
+        .unwrap_or(false)
+}
+
 pub fn apply_tcp_options(s: &TcpStream) -> std::io::Result<()> {
     #[cfg(not(target_os = "windows"))]
     {
@@ -105,7 +111,14 @@ pub fn new_dual_stack_udp_socket(
     let dual_stack = SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0));
     let ipv4_only = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0));
 
-    let (socket, bind_addr) =
+    let prefer_ipv4 = should_prefer_ipv4_udp_socket(iface);
+
+    let (socket, bind_addr) = if prefer_ipv4 {
+        (
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?,
+            ipv4_only,
+        )
+    } else {
         match try_create_dualstack_socket(dual_stack, socket2::Type::DGRAM) {
             Ok((socket, true)) => (socket, dual_stack),
             Ok((_, false)) | Err(_) => (
@@ -116,7 +129,8 @@ pub fn new_dual_stack_udp_socket(
                 )?,
                 ipv4_only,
             ),
-        };
+        }
+    };
 
     if let Some(iface) = iface {
         let family = socket2::Domain::for_address(bind_addr);
@@ -523,7 +537,9 @@ mod tests {
 
     #[cfg(feature = "tun")]
     use super::select_effective_iface;
-    use super::{new_dual_stack_udp_socket, new_udp_socket};
+    use super::{
+        new_dual_stack_udp_socket, new_udp_socket, should_prefer_ipv4_udp_socket,
+    };
     use crate::app::net::OutboundInterface;
     use crate::proxy::utils::{
         SocketProtector, clear_socket_protector, set_socket_protector,
@@ -584,6 +600,24 @@ mod tests {
             .expect("default interface should be used");
 
         assert_eq!(effective.name, "default");
+    }
+
+    #[test]
+    fn dual_stack_udp_prefers_ipv4_for_ipv4_only_interface() {
+        let iface = OutboundInterface {
+            name: "ipv4-only".to_owned(),
+            addr_v4: Some(Ipv4Addr::new(192, 0, 2, 1)),
+            addr_v6: None,
+            index: 2,
+            netmask_v4: None,
+            broadcast_v4: None,
+            netmask_v6: None,
+            broadcast_v6: None,
+            mac_addr: None,
+        };
+
+        assert!(should_prefer_ipv4_udp_socket(Some(&iface)));
+        assert!(!should_prefer_ipv4_udp_socket(None));
     }
 
     impl SocketProtector for CountingProtector {
