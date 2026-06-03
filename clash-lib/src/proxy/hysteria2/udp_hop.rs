@@ -13,7 +13,7 @@ use quinn::{AsyncUdpSocket, Runtime, TokioRuntime, UdpPoller, udp::Transmit};
 
 use crate::{
     app::net::OutboundInterface,
-    proxy::{converters::hysteria2::PortGenerator, utils::new_udp_socket},
+    proxy::{converters::hysteria2::PortGenerator, utils::new_protected_udp_socket},
 };
 
 struct HopState {
@@ -55,7 +55,7 @@ impl UdpHop {
         #[cfg(target_os = "linux")] so_mark: Option<u32>,
         interval: Option<Duration>,
     ) -> io::Result<Self> {
-        let socket = new_udp_socket(
+        let socket = new_protected_udp_socket(
             None,
             iface.as_ref(),
             #[cfg(target_os = "linux")]
@@ -101,7 +101,7 @@ impl UdpHop {
             *last = now;
             tracing::trace!("port hopping");
 
-            futures::executor::block_on(new_udp_socket(
+            futures::executor::block_on(new_protected_udp_socket(
                 None,
                 self.iface.as_ref(),
                 #[cfg(target_os = "linux")]
