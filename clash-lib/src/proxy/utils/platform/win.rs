@@ -179,5 +179,14 @@ fn bind_socket_to_interface(
         }
     }
 
+    if family == socket2::Domain::IPV6
+        && let Err(err) =
+            bind_socket_to_interface(handle, iface, socket2::Domain::IPV4)
+    {
+        tracing::warn!(
+            "try bind dual-stack socket on IPv4 interface failed, it may be IPv6-only: {err}"
+        );
+    }
+
     Ok(())
 }
