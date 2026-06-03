@@ -33,23 +33,24 @@ fn bind_addr_for_iface(
 pub fn apply_tcp_options(s: &TcpStream) -> std::io::Result<()> {
     #[cfg(not(target_os = "windows"))]
     {
-        let s = socket2::SockRef::from(s);
-        s.set_tcp_keepalive(
+        let sock_ref = socket2::SockRef::from(s);
+        sock_ref.set_tcp_keepalive(
             &TcpKeepalive::new()
                 .with_time(Duration::from_secs(10))
                 .with_interval(Duration::from_secs(1))
                 .with_retries(3),
-        )
+        )?;
     }
     #[cfg(target_os = "windows")]
     {
-        let s = socket2::SockRef::from(s);
-        s.set_tcp_keepalive(
+        let sock_ref = socket2::SockRef::from(s);
+        sock_ref.set_tcp_keepalive(
             &TcpKeepalive::new()
                 .with_time(Duration::from_secs(10))
                 .with_interval(Duration::from_secs(1)),
-        )
+        )?;
     }
+    s.set_nodelay(true)
 }
 
 /// Create dualstack socket if it can
