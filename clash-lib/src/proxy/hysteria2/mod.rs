@@ -53,7 +53,7 @@ use crate::{
         converters::hysteria2::PortGenerator,
         datagram::UdpPacket,
         hysteria2::datagram::{HysteriaDatagramOutbound, UdpSession},
-        utils::new_udp_socket,
+        utils::new_protected_udp_socket,
     },
     session::{Session, SocksAddr},
 };
@@ -426,7 +426,7 @@ impl Handler {
         // todo: Here maybe we should use a AsyncUdpSocket which implement salamander obfs
         // and port hopping
         let create_socket = || async {
-            new_udp_socket(
+            new_protected_udp_socket(
                 None,
                 sess.iface.as_ref(),
                 #[cfg(target_os = "linux")]
