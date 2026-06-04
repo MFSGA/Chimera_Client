@@ -49,11 +49,14 @@ impl FakeDns {
             net::IpAddr::V4(ip) => ip,
             _ => unreachable!("fakeip range must be valid ipv4 subnet"),
         };
-        let min = Self::ip_to_uint(&ip) + 2;
+        // avoid tun gateway and its subnet broadcast
+        let min = Self::ip_to_uint(&ip) + 8;
         let prefix_len = opt.ipnet.prefix_len();
         let max_prefix_len = opt.ipnet.max_prefix_len();
         debug_assert_eq!(max_prefix_len, 32, "v4 subnet");
-        let total = (1 << (max_prefix_len - prefix_len)) - 2;
+
+        // do not allocate the last 16 IPs in the range, to avoid broadcast and multicast addresses.
+        let total = (1 << (max_prefix_len - prefix_len)) - 16;
 
         let max = min + total - 1;
 
