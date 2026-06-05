@@ -12,7 +12,9 @@ pub enum SimpleOBFSMode {
     Tls,
 }
 
+#[derive(Debug)]
 pub struct SimpleOBFSOption {
+    /// currently only http and tls are supported
     pub mode: SimpleOBFSMode,
     pub host: String,
 }

@@ -20,6 +20,7 @@ use crate::{
         AnyStream, ConnectorType, DialWithConnector, HandlerCommonOptions,
         OutboundHandler, OutboundType, PlainProxyAPIResponse,
         shadowsocks::map_cipher,
+        transport::Sip003Plugin,
         utils::{GLOBAL_DIRECT_CONNECTOR, RemoteConnector},
     },
     session::Session,
@@ -41,6 +42,14 @@ pub struct HandlerOptions {
     pub password: String,
     pub cipher: String,
     pub udp: bool,
+    #[cfg_attr(
+        not(any(feature = "ws", feature = "tls")),
+        expect(
+            dead_code,
+            reason = "plugin field is unused when no plugin transports are compiled in"
+        )
+    )]
+    pub plugin: Option<Box<dyn Sip003Plugin>>,
 }
 
 pub struct Handler {
@@ -74,11 +83,16 @@ impl Handler {
         sess: &Session,
         _resolver: ThreadSafeDNSResolver,
     ) -> std::io::Result<AnyStream> {
+        let stream: AnyStream = match &self.opts.plugin {
+            Some(plugin) => plugin.proxy_stream(s).await?,
+            None => s,
+        };
+
         let cfg = self.server_config()?;
 
         let stream = ProxyClientStream::from_stream(
             self.ctx.clone(),
-            s,
+            stream,
             &cfg,
             (sess.destination.host(), sess.destination.port()),
         );

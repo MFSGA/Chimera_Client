@@ -25,6 +25,7 @@ use prelude::*;
 /// indistinguishable from a normal TLS handshake on the wire. The actual
 /// application data is XORed / authenticated with an HMAC keyed with
 /// `password` and the server random — see the shadow-tls V3 spec.
+#[derive(Debug)]
 pub struct Shadowtls {
     host: String,
     password: String,

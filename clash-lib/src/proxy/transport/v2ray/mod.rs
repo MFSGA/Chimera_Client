@@ -4,6 +4,7 @@ mod websocket;
 
 pub use websocket::V2rayWsClient;
 
+#[derive(Debug)]
 pub struct V2RayOBFSOption {
     /// currently only websocket is supported
     pub mode: String,
