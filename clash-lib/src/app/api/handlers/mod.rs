@@ -1,6 +1,7 @@
 pub mod config;
 pub mod connection;
 pub mod dns;
+pub mod flows;
 pub mod group;
 pub mod hello;
 pub mod logs;
@@ -10,5 +11,6 @@ pub mod proxy;
 pub mod restart;
 pub mod rule;
 pub mod traffic;
+pub mod user_stats;
 pub mod utils;
 pub mod version;
