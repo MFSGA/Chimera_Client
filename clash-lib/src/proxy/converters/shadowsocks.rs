@@ -10,7 +10,7 @@ use crate::{
     proxy::{
         HandlerCommonOptions,
         shadowsocks::outbound::{Handler, HandlerOptions},
-        transport::{Sip003Plugin, SimpleOBFSOption, SimpleObfsHttp, SimpleObfsTLS},
+        transport::{SimpleOBFSOption, SimpleObfsHttp, SimpleObfsTLS, Sip003Plugin},
     },
 };
 
@@ -110,9 +110,7 @@ fn build_simple_obfs_plugin(
     port: u16,
 ) -> Result<Option<Box<dyn Sip003Plugin>>, Error> {
     let plugin: Box<dyn Sip003Plugin> = match opt.mode {
-        SimpleOBFSMode::Http => {
-            Box::new(SimpleObfsHttp::new(opt.host, port))
-        }
+        SimpleOBFSMode::Http => Box::new(SimpleObfsHttp::new(opt.host, port)),
         SimpleOBFSMode::Tls => Box::new(SimpleObfsTLS::new(opt.host)),
     };
     Ok(Some(plugin))

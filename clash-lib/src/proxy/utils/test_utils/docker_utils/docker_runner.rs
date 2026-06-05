@@ -328,6 +328,7 @@ pub struct DockerTestRunnerBuilder {
     exposed_ports: Vec<String>,
     cmd: Option<Vec<String>>,
     env: Option<Vec<String>>,
+    entrypoint: Option<Vec<String>>,
 }
 
 impl Default for DockerTestRunnerBuilder {
@@ -341,6 +342,7 @@ impl Default for DockerTestRunnerBuilder {
                 .collect(),
             cmd: None,
             env: None,
+            entrypoint: None,
         }
     }
 }
@@ -362,6 +364,12 @@ impl DockerTestRunnerBuilder {
 
     pub fn cmd(mut self, cmd: &[&str]) -> Self {
         self.cmd = Some(cmd.iter().map(|value| (*value).to_owned()).collect());
+        self
+    }
+
+    pub fn entrypoint(mut self, entrypoint: &[&str]) -> Self {
+        self.entrypoint =
+            Some(entrypoint.iter().map(|value| (*value).to_owned()).collect());
         self
     }
 
@@ -429,6 +437,7 @@ impl DockerTestRunnerBuilder {
             tty: Some(true),
             cmd: self.cmd,
             env: self.env,
+            entrypoint: self.entrypoint,
             exposed_ports: Some(self.exposed_ports),
             host_config: Some(self.host_config),
             ..Default::default()

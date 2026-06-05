@@ -25,7 +25,9 @@ pub use xhttp::{
 #[allow(unused_imports)]
 pub use shadow_tls::Shadowtls;
 #[allow(unused_imports)]
-pub use simple_obfs::{SimpleOBFSMode, SimpleOBFSOption, SimpleObfsHttp, SimpleObfsTLS};
+pub use simple_obfs::{
+    SimpleOBFSMode, SimpleOBFSOption, SimpleObfsHttp, SimpleObfsTLS,
+};
 pub use sip003::Sip003Plugin;
 pub use splice_tls::VisionOptions;
 #[cfg(feature = "ws")]
