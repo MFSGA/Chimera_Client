@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -12,6 +12,12 @@ use serde::Serialize;
 use tokio::sync::{Mutex, RwLock, oneshot::Sender};
 
 use crate::{app::dispatcher::tracked::Tracked, session::Session};
+
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct UserTraffic {
+    pub upload: u64,
+    pub download: u64,
+}
 
 #[derive(Default, Clone, Debug)]
 pub struct ProxyChain(Arc<RwLock<Vec<String>>>);
@@ -31,24 +37,28 @@ type ConnectionMap = HashMap<uuid::Uuid, (Tracked, Sender<()>)>;
 
 pub struct StatisticsManager {
     connections: Arc<Mutex<ConnectionMap>>,
+    closed_flows: Arc<Mutex<VecDeque<Arc<TrackerInfo>>>>,
     upload_temp: AtomicU64,
     download_temp: AtomicU64,
     upload_blip: AtomicU64,
     download_blip: AtomicU64,
     upload_total: AtomicU64,
     download_total: AtomicU64,
+    user_period_stats: Arc<Mutex<HashMap<String, UserTraffic>>>,
 }
 
 impl StatisticsManager {
     pub fn new() -> Arc<Self> {
         let v = Arc::new(Self {
             connections: Arc::new(Mutex::new(HashMap::new())),
+            closed_flows: Arc::new(Mutex::new(VecDeque::new())),
             upload_temp: AtomicU64::new(0),
             download_temp: AtomicU64::new(0),
             upload_blip: AtomicU64::new(0),
             download_blip: AtomicU64::new(0),
             upload_total: AtomicU64::new(0),
             download_total: AtomicU64::new(0),
+            user_period_stats: Arc::new(Mutex::new(HashMap::new())),
         });
         let c = v.clone();
         tokio::spawn(async move {
@@ -79,7 +89,63 @@ impl StatisticsManager {
     }
 
     pub async fn untrack(&self, id: uuid::Uuid) {
-        self.connections.lock().await.remove(&id);
+        let Some((tracked, _)) = self.connections.lock().await.remove(&id) else {
+            return;
+        };
+
+        let info = tracked.tracker_info();
+        let upload = info.user_upload.swap(0, Ordering::AcqRel);
+        let download = info.user_download.swap(0, Ordering::AcqRel);
+        if let Some(user) = &info.session_holder.inbound_user
+            && (upload > 0 || download > 0)
+        {
+            let mut stats = self.user_period_stats.lock().await;
+            let entry = stats.entry(user.clone()).or_default();
+            entry.upload += upload;
+            entry.download += download;
+        }
+
+        let mut closed_flows = self.closed_flows.lock().await;
+        closed_flows.push_back(info);
+        if closed_flows.len() > 1000 {
+            closed_flows.pop_front();
+        }
+    }
+
+    pub async fn active_connections_snapshot(&self) -> Vec<Arc<TrackerInfo>> {
+        let connections = self.connections.lock().await;
+        connections
+            .values()
+            .map(|(tracked, _)| tracked.tracker_info())
+            .collect()
+    }
+
+    pub async fn closed_flows_snapshot(&self) -> Vec<Arc<TrackerInfo>> {
+        let closed_flows = self.closed_flows.lock().await;
+        closed_flows.iter().cloned().collect()
+    }
+
+    pub async fn drain_user_stats(&self) -> HashMap<String, UserTraffic> {
+        let mut result = {
+            let mut stats = self.user_period_stats.lock().await;
+            std::mem::take(&mut *stats)
+        };
+
+        let connections = self.connections.lock().await;
+        for (tracked, _) in connections.values() {
+            let info = tracked.tracker_info();
+            if let Some(user) = &info.session_holder.inbound_user {
+                let upload = info.user_upload.swap(0, Ordering::AcqRel);
+                let download = info.user_download.swap(0, Ordering::AcqRel);
+                if upload > 0 || download > 0 {
+                    let entry = result.entry(user.clone()).or_default();
+                    entry.upload += upload;
+                    entry.download += download;
+                }
+            }
+        }
+
+        result
     }
 
     pub async fn snapshot(&self) -> Snapshot {
