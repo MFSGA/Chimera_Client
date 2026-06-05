@@ -7,6 +7,8 @@ mod xhttp;
 
 pub mod simple_obfs;
 pub mod sip003;
+#[cfg(feature = "ws")]
+pub mod v2ray;
 
 pub mod splice_tls;
 
@@ -22,6 +24,9 @@ pub use xhttp::{
 #[allow(unused_imports)]
 pub use simple_obfs::{SimpleOBFSMode, SimpleOBFSOption, SimpleObfsHttp, SimpleObfsTLS};
 pub use splice_tls::VisionOptions;
+#[cfg(feature = "ws")]
+#[allow(unused_imports)]
+pub use v2ray::{V2RayOBFSOption, V2rayWsClient};
 
 #[async_trait::async_trait]
 pub trait Transport: Send + Sync {
