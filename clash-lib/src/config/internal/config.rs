@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Error,
+    app::remote_content_manager::providers::rule_provider::{
+        RuleSetBehavior, RuleSetFormat,
+    },
     app::{dns, net::Interface},
     common::auth,
     config::{
@@ -31,6 +34,7 @@ pub struct Config {
     pub proxy_groups: HashMap<String, OutboundProxy>,
     /// 3.1
     pub proxy_providers: HashMap<String, OutboundProxyProviderDef>,
+    pub rule_providers: HashMap<String, RuleProviderDef>,
     /// 3.2
     pub proxy_names: Vec<String>,
     /// 3.3
@@ -205,16 +209,39 @@ impl TunConfig {
 #[serde(rename_all = "kebab-case")]
 #[allow(dead_code)]
 pub enum RuleProviderDef {
-    // Http(HttpRuleProvider),
+    Http(HttpRuleProvider),
     File(FileRuleProvider),
-    // Inline(InlineRuleProvider),
+    Inline(InlineRuleProvider),
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct HttpRuleProvider {
+    pub url: String,
+    pub interval: u64,
+    pub behavior: RuleSetBehavior,
+    pub path: String,
+    pub format: Option<RuleSetFormat>,
+    #[serde(alias = "payload")]
+    pub inline_rules: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct FileRuleProvider {
     pub path: String,
-    // todo
+    pub interval: Option<u64>,
+    pub behavior: RuleSetBehavior,
+    pub format: Option<RuleSetFormat>,
+    #[serde(alias = "payload")]
+    pub inline_rules: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct InlineRuleProvider {
+    pub path: String,
+    pub behavior: RuleSetBehavior,
+    #[serde(alias = "payload")]
+    pub inline_rules: Vec<String>,
 }
 
 #[cfg(test)]
