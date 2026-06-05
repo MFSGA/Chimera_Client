@@ -32,8 +32,7 @@ pub struct MmdbLookupAsn {
     pub asn_name: String,
 }
 
-// todo
-// #[cfg_attr(test, mockall::automock)]
+#[cfg_attr(test, mockall::automock)]
 pub trait MmdbLookupTrait {
     fn lookup_country(&self, ip: IpAddr) -> std::io::Result<MmdbLookupCountry>;
     fn lookup_asn(&self, ip: IpAddr) -> std::io::Result<MmdbLookupAsn>;

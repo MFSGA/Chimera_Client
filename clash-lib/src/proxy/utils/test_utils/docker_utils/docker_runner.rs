@@ -10,7 +10,7 @@ use std::{
 use bollard::{
     API_DEFAULT_VERSION, Docker,
     config::ContainerInspectResponse,
-    models::{ContainerCreateBody, HostConfig, Mount, MountTypeEnum, PortBinding},
+    models::{ContainerCreateBody, HostConfig, Mount, MountType, PortBinding},
     query_parameters::{
         CreateContainerOptions, CreateImageOptionsBuilder, RemoveContainerOptions,
         StartContainerOptions,
@@ -422,7 +422,7 @@ impl DockerTestRunnerBuilder {
                 .map(|(source, target)| Mount {
                     target: Some((*target).to_owned()),
                     source: Some((*source).to_owned()),
-                    typ: Some(MountTypeEnum::BIND),
+                    typ: Some(MountType::BIND),
                     read_only: Some(false),
                     ..Default::default()
                 })

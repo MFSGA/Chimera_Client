@@ -14,6 +14,9 @@ pub mod http_vehicle;
 pub mod proxy_provider;
 pub mod rule_provider;
 
+#[cfg(test)]
+use mockall::automock;
+
 #[derive(Deserialize, PartialEq, Clone, Copy, Debug)]
 pub enum ProviderVehicleType {
     File,
@@ -36,6 +39,7 @@ impl Display for ProviderVehicleType {
 
 pub type ThreadSafeProviderVehicle = Arc<dyn ProviderVehicle + Send + Sync>;
 
+#[cfg_attr(test, automock)]
 #[async_trait]
 pub trait ProviderVehicle {
     async fn read(&self) -> io::Result<Vec<u8>>;

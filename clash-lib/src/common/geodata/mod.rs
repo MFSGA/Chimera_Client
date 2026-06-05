@@ -69,6 +69,7 @@ pub struct GeoData {
 
 pub type GeoDataLookup = Arc<dyn GeoDataLookupTrait + Send + Sync>;
 
+#[cfg_attr(test, mockall::automock)]
 pub trait GeoDataLookupTrait {
     fn get(&self, list: &str) -> Option<geodata_proto::GeoSite>;
 }

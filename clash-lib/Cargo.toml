@@ -202,7 +202,9 @@ bollard = "0.21"
 rcgen = "0.14"
 tempfile = "3.27"
 mockall = "0.14.0"
-serial_test = "3.4"
+tokio-test = "0.4.5"
+serial_test = "3.5"
+httpmock = "0.8.3"
 
 [lints]
 workspace = true
