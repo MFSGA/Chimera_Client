@@ -6,6 +6,7 @@ use crate::app::{dispatcher::StatisticsManager, logging::LogEvent};
 
 mod handlers;
 mod ipc;
+mod middlewares;
 mod runner;
 mod websocket;
 
