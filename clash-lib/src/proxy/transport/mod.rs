@@ -5,6 +5,9 @@ mod tls;
 mod ws;
 mod xhttp;
 
+pub mod simple_obfs;
+pub mod sip003;
+
 pub mod splice_tls;
 
 #[cfg(feature = "tls")]
@@ -16,6 +19,8 @@ pub use xhttp::{
     XhttpSecurity,
 };
 
+#[allow(unused_imports)]
+pub use simple_obfs::{SimpleOBFSMode, SimpleOBFSOption, SimpleObfsHttp, SimpleObfsTLS};
 pub use splice_tls::VisionOptions;
 
 #[async_trait::async_trait]
