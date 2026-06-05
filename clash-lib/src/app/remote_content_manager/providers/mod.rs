@@ -12,6 +12,7 @@ pub mod fetcher;
 pub mod file_vehicle;
 pub mod http_vehicle;
 pub mod proxy_provider;
+pub mod rule_provider;
 
 #[derive(Deserialize, PartialEq, Clone, Copy, Debug)]
 pub enum ProviderVehicleType {
