@@ -8,7 +8,7 @@ edition = { workspace = true }
 
 [features]
 default = ["standard", "aws-lc-rs"]
-standard = ["trojan", "ws", "tls", "hysteria", "reality", "port", "tun"]
+standard = ["shadowsocks", "trojan", "ws", "tls", "hysteria", "reality", "port", "tun"]
 
 plus = ["standard", "onion"]
 onion = []
@@ -20,6 +20,7 @@ tls = ["clash-lib/tls"]
 trojan = ["clash-lib/trojan"]
 reality = ["clash-lib/reality"]
 hysteria = ["clash-lib/hysteria"]
+shadowsocks = ["clash-lib/shadowsocks"]
 tun = ["clash-lib/tun"]
 
 port = ["clash-lib/port"]

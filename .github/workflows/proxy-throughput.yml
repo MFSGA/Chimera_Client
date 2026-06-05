@@ -50,11 +50,15 @@ jobs:
           sudo apt-get install -y cmake libclang-dev protobuf-compiler
 
       # Build the binary that the tests will spawn as a subprocess.
-      # Do NOT use --all-features here: the `telemetry` feature enables
-      # console_subscriber and OpenTelemetry threads that deadlock with the
-      # main thread during crypto initialization when multiple instances start
-      # concurrently.  Default features already include shadowsocks, tuic,
-      # wireguard, and everything else needed for these tests.
+      # clash-bin's `standard` feature (enabled by default) governs which
+      # protocol features are compiled into the binary.  Add new protocol
+      # features to `standard` in clash-bin/Cargo.toml when they are needed
+      # for e2e tests.
+      #
+      # The test step below uses `--all-features` to build clash-lib's test
+      # binary.  Our clash-lib does NOT define a `telemetry` feature (see
+      # the ref repo for the upstream version that has one), so there is no
+      # risk of deadlock from OpenTelemetry/console_subscriber threads here.
       - name: Build clash-rs binary (release)
         run: cargo build --bin clash-rs
 
