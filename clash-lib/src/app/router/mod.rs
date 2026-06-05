@@ -1,21 +1,26 @@
 mod rules;
 
-use std::sync::Arc;
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 pub use rules::RuleMatcher;
-use tracing::{info, trace};
+use tracing::{error, info, trace};
 
 use crate::{
     Session,
     app::{
         dns::ThreadSafeDNSResolver,
+        remote_content_manager::providers::{
+            file_vehicle, http_vehicle,
+            rule_provider::{RuleProviderImpl, ThreadSafeRuleProvider},
+        },
         router::rules::{
             domain::Domain, domain_keyword::DomainKeyword,
             domain_suffix::DomainSuffix, final_::Final, ipcidr::IpCidr,
+            ruleset::RuleSet,
         },
     },
     common::{geodata::GeoDataLookup, mmdb::MmdbLookup},
-    config::internal::rule::RuleType,
+    config::internal::{config::RuleProviderDef, rule::RuleType},
     print_and_exit,
 };
 
@@ -27,6 +32,7 @@ pub struct Router {
     // kept aligned with clash-rs matcher flow
     country_mmdb: Option<MmdbLookup>,
     asn_mmdb: Option<MmdbLookup>,
+    rule_providers: HashMap<String, ThreadSafeRuleProvider>,
 }
 
 pub type ThreadSafeRouter = Arc<Router>;
@@ -42,21 +48,46 @@ pub struct RuleSnapshot {
 impl Router {
     pub async fn new(
         rules: Vec<RuleType>,
+        rule_providers: HashMap<String, RuleProviderDef>,
         dns_resolver: ThreadSafeDNSResolver,
         country_mmdb: Option<MmdbLookup>,
         asn_mmdb: Option<MmdbLookup>,
         geodata: Option<GeoDataLookup>,
-        _cwd: String,
+        cwd: String,
     ) -> Self {
+        let mut rule_provider_registry = HashMap::new();
+        Self::load_rule_providers(
+            rule_providers,
+            &mut rule_provider_registry,
+            dns_resolver.clone(),
+            country_mmdb.clone(),
+            geodata.clone(),
+            cwd,
+        )
+        .await
+        .ok();
+
         Self {
             rules: rules
                 .into_iter()
-                .map(|r| map_rule_type(r, country_mmdb.clone(), geodata.clone()))
+                .map(|r| {
+                    map_rule_type(
+                        r,
+                        country_mmdb.clone(),
+                        geodata.clone(),
+                        Some(&rule_provider_registry),
+                    )
+                })
                 .collect(),
             dns_resolver,
             country_mmdb,
             asn_mmdb,
+            rule_providers: rule_provider_registry,
         }
+    }
+
+    pub fn get_rule_providers(&self) -> &HashMap<String, ThreadSafeRuleProvider> {
+        &self.rule_providers
     }
 
     pub fn get_all_rules(&self) -> Vec<RuleSnapshot> {
@@ -182,12 +213,97 @@ impl Router {
             }
         }
     }
+
+    async fn load_rule_providers(
+        rule_providers: HashMap<String, RuleProviderDef>,
+        rule_provider_registry: &mut HashMap<String, ThreadSafeRuleProvider>,
+        resolver: ThreadSafeDNSResolver,
+        mmdb: Option<MmdbLookup>,
+        geodata: Option<GeoDataLookup>,
+        cwd: String,
+    ) -> Result<(), crate::Error> {
+        for (name, provider) in rule_providers.into_iter() {
+            match provider {
+                RuleProviderDef::Http(http) => {
+                    let vehicle = http_vehicle::Vehicle::new(
+                        http.url.parse::<hyper::Uri>().unwrap_or_else(|_| {
+                            print_and_exit!("invalid provider url: {}", http.url)
+                        }),
+                        http.path,
+                        Some(cwd.clone()),
+                        resolver.clone(),
+                    );
+                    let provider = RuleProviderImpl::new(
+                        name.clone(),
+                        http.behavior,
+                        http.format.unwrap_or_default(),
+                        Some(Duration::from_secs(http.interval)),
+                        Some(Arc::new(vehicle)),
+                        mmdb.clone(),
+                        geodata.clone(),
+                        http.inline_rules,
+                    );
+                    rule_provider_registry.insert(name, Arc::new(provider));
+                }
+                RuleProviderDef::File(file) => {
+                    let vehicle = file_vehicle::Vehicle::new(
+                        PathBuf::from(cwd.clone())
+                            .join(&file.path)
+                            .to_str()
+                            .unwrap(),
+                    );
+                    let provider = RuleProviderImpl::new(
+                        name.clone(),
+                        file.behavior,
+                        file.format.unwrap_or_default(),
+                        Some(Duration::from_secs(file.interval.unwrap_or_default())),
+                        Some(Arc::new(vehicle)),
+                        mmdb.clone(),
+                        geodata.clone(),
+                        file.inline_rules,
+                    );
+                    rule_provider_registry.insert(name, Arc::new(provider));
+                }
+                RuleProviderDef::Inline(inline) => {
+                    let provider = RuleProviderImpl::new(
+                        name.clone(),
+                        inline.behavior,
+                        Default::default(),
+                        None,
+                        None,
+                        mmdb.clone(),
+                        geodata.clone(),
+                        Some(inline.inline_rules),
+                    );
+                    rule_provider_registry.insert(name, Arc::new(provider));
+                }
+            }
+        }
+
+        for provider in rule_provider_registry.values() {
+            let provider = provider.clone();
+            tokio::spawn(async move {
+                info!("initializing rule provider {}", provider.name());
+                match provider.initialize().await {
+                    Ok(()) => info!("rule provider {} initialized", provider.name()),
+                    Err(err) => error!(
+                        "failed to initialize rule provider {}: {}",
+                        provider.name(),
+                        err
+                    ),
+                }
+            });
+        }
+
+        Ok(())
+    }
 }
 
 pub fn map_rule_type(
     rule_type: RuleType,
     mmdb: Option<MmdbLookup>,
     geodata: Option<GeoDataLookup>,
+    rule_provider_registry: Option<&HashMap<String, ThreadSafeRuleProvider>>,
 ) -> Box<dyn RuleMatcher> {
     match rule_type {
         RuleType::Domain { domain, target } => {
@@ -240,6 +356,21 @@ pub fn map_rule_type(
             target,
             no_resolve,
         }),
+        RuleType::RuleSet { rule_set, target } => match rule_provider_registry {
+            Some(rule_provider_registry) => Box::new(RuleSet::new(
+                rule_set.clone(),
+                target,
+                rule_provider_registry
+                    .get(&rule_set)
+                    .unwrap_or_else(|| {
+                        print_and_exit!("rule provider {} not found", rule_set)
+                    })
+                    .clone(),
+            )),
+            None => {
+                unreachable!("rule-set cannot be nested inside another rule-set")
+            }
+        },
 
         RuleType::Match { target } => Box::new(Final { target }),
     }

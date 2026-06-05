@@ -8,6 +8,7 @@ pub mod domain_suffix;
 pub mod geodata;
 pub mod geoip;
 pub mod ipcidr;
+pub mod ruleset;
 
 pub mod final_;
 

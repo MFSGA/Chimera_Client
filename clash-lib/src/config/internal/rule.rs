@@ -33,6 +33,10 @@ pub enum RuleType {
         target: String,
         no_resolve: bool,
     },
+    RuleSet {
+        rule_set: String,
+        target: String,
+    },
 }
 
 impl RuleType {
@@ -77,6 +81,10 @@ impl RuleType {
                     false
                 },
             }),
+            "RULE-SET" => Ok(RuleType::RuleSet {
+                rule_set: payload.to_string(),
+                target: target.to_string(),
+            }),
             "MATCH" => Ok(RuleType::Match {
                 target: target.to_string(),
             }),
@@ -95,6 +103,7 @@ impl RuleType {
             RuleType::GeoSite { target, .. } => target,
             RuleType::Match { target } => target,
             RuleType::IpCidr { target, .. } => target,
+            RuleType::RuleSet { target, .. } => target,
         }
     }
 }
