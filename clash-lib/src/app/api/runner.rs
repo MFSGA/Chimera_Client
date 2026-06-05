@@ -1,7 +1,8 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use axum::{
-    Router,
+    Router, middleware,
+    response::Redirect,
     routing::{get, post},
 };
 
@@ -10,6 +11,7 @@ use tokio::sync::{Mutex, broadcast::Sender};
 use tower::ServiceBuilder;
 use tower_http::{
     cors::{AllowOrigin, Any, CorsLayer},
+    services::ServeDir,
     trace::TraceLayer,
 };
 use tracing::{debug, error, info, warn};
@@ -17,7 +19,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     GlobalState,
     app::{
-        api::{AppState, handlers, ipc},
+        api::{AppState, handlers, ipc, middlewares, websocket},
         dispatcher::{self, StatisticsManager},
         dns::{ThreadSafeDNSResolver, config::DNSListenAddr},
         inbound::manager::InboundManager,
@@ -41,6 +43,7 @@ pub struct ApiRunner {
     statistics_manager: Arc<StatisticsManager>,
     cache_store: ThreadSafeCacheFile,
     router: ThreadSafeRouter,
+    cwd: String,
 
     cancellation_token: tokio_util::sync::CancellationToken,
     dns_listen_addr: DNSListenAddr,
@@ -62,7 +65,7 @@ impl ApiRunner {
         statistics_manager: Arc<StatisticsManager>,
         cache_store: ThreadSafeCacheFile,
         router: ThreadSafeRouter,
-        _cwd: String,
+        cwd: String,
         cancellation_token: Option<tokio_util::sync::CancellationToken>,
         dns_listen_addr: DNSListenAddr,
         dns_enabled: bool,
@@ -78,6 +81,7 @@ impl ApiRunner {
             statistics_manager,
             cache_store,
             router,
+            cwd,
             cancellation_token: cancellation_token.unwrap_or_default(),
             dns_listen_addr,
             dns_enabled,
@@ -97,6 +101,7 @@ impl Runner for ApiRunner {
         let cache_store = self.cache_store.clone();
         let controller_cfg = self.controller_cfg.clone();
         let router = self.router.clone();
+        let cwd = self.cwd.clone();
         let dns_listen_addr = self.dns_listen_addr.clone();
         let dns_enabled = self.dns_enabled;
         let cancellation_token = self.cancellation_token.clone();
@@ -146,16 +151,18 @@ impl Runner for ApiRunner {
 
         let handle = tokio::spawn(async move {
             info!("Starting API server");
-            let router = Router::new()
+            let mut router = Router::new()
                 .route("/", get(handlers::hello::handle))
                 .route("/traffic", get(handlers::traffic::handle))
+                .route("/user-stats", get(handlers::user_stats::handle))
                 .route("/version", get(handlers::version::handle))
                 .route("/logs", get(handlers::logs::handle))
                 .route("/memory", get(handlers::memory::handle))
                 .route("/restart", post(handlers::restart::handle))
+                .nest("/ws", websocket::routes(app_state.clone()))
                 .nest(
                     "/connections",
-                    handlers::connection::routes(statistics_manager),
+                    handlers::connection::routes(statistics_manager.clone()),
                 )
                 .nest(
                     "/configs",
@@ -177,11 +184,24 @@ impl Runner for ApiRunner {
                     handlers::provider::routes(outbound_manager.clone()),
                 )
                 .nest("/group", handlers::group::routes(outbound_manager.clone()))
+                .nest("/flows", handlers::flows::routes(statistics_manager))
                 .nest("/dns", handlers::dns::routes(dns_resolver.clone()))
                 .nest("/rules", handlers::rule::routes(router))
-                .layer(cors)
+                .layer(middleware::from_fn(
+                    middlewares::fix_json_content_type::fix_content_type,
+                ))
+                .route_layer(cors)
                 .with_state(app_state.clone())
                 .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()));
+
+            if let Some(external_ui) = controller_cfg.external_ui.clone() {
+                router = router
+                    .route("/ui", get(|| async { Redirect::to("/ui/") }))
+                    .nest_service(
+                        "/ui/",
+                        ServeDir::new(PathBuf::from(cwd).join(external_ui)),
+                    );
+            }
 
             // Handle TCP listening
             let tcp_fut = if let Some(bind_addr) = tcp_addr {
@@ -193,7 +213,10 @@ impl Runner for ApiRunner {
                 } else {
                     bind_addr
                 };
-                let router_clone = router.clone();
+                let auth_secret = controller_cfg.secret.clone().unwrap_or_default();
+                let router_clone = router.clone().route_layer(
+                    middlewares::auth::AuthMiddlewareLayer::new(auth_secret),
+                );
                 Some(async move {
                     info!("Starting API server on TCP address {bind_addr}");
                     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
