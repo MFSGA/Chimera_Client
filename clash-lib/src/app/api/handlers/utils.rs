@@ -56,7 +56,7 @@ pub async fn group_url_test(
     }
 }
 
-pub fn is_request_websocket(header: HeaderMap) -> bool {
+pub fn is_request_websocket(header: &HeaderMap) -> bool {
     header
         .get(header::CONNECTION)
         .and_then(|x| x.to_str().ok().map(|x| x.to_ascii_lowercase()))
