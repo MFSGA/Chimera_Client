@@ -6,6 +6,9 @@ use std::{collections::HashMap, fmt::Display, path::PathBuf, str::FromStr};
 
 use crate::{
     Error,
+    app::remote_content_manager::providers::rule_provider::{
+        RuleSetBehavior, RuleSetFormat,
+    },
     config::internal::{
         config::BindAddress,
         listener::InboundOpts,
@@ -160,6 +163,8 @@ pub struct Config {
     /// mixed-port: 7892
     /// ```
     pub mixed_port: Option<Port>,
+    #[serde(rename = "rule-providers")]
+    pub rule_provider: Option<HashMap<String, RuleProviderDef>>,
     /// TUN settings
     pub tun: Option<TunConfig>,
     /// 12
@@ -258,6 +263,48 @@ pub struct DotListenDef {
     pub addr: String,
     pub ca_cert: Option<String>,
     pub ca_key: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type")]
+#[serde(rename_all = "kebab-case")]
+pub enum RuleProviderDef {
+    Http(HttpRuleProviderDef),
+    File(FileRuleProviderDef),
+    Inline(InlineRuleProviderDef),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct HttpRuleProviderDef {
+    pub url: String,
+    #[serde(default)]
+    pub interval: u64,
+    pub behavior: RuleSetBehavior,
+    pub path: Option<String>,
+    pub format: Option<RuleSetFormat>,
+    #[serde(alias = "payload")]
+    pub inline_rules: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct FileRuleProviderDef {
+    pub path: String,
+    pub interval: Option<u64>,
+    pub behavior: RuleSetBehavior,
+    pub format: Option<RuleSetFormat>,
+    #[serde(alias = "payload")]
+    pub inline_rules: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct InlineRuleProviderDef {
+    pub path: Option<String>,
+    pub behavior: RuleSetBehavior,
+    #[serde(alias = "payload")]
+    pub inline_rules: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]

@@ -43,6 +43,7 @@ hickory-resolver = { version = "0.26", default-features = false, features = ["to
 url = { version = "2" }
 ipnet = { version = "2" }
 lru_time_cache = "0.11"
+ip_network_table-deps-treebitmap = "0.5"
 network-interface = { version = "2" }
 sysinfo = { version = "0.39", features = ["network"] }
 
@@ -51,6 +52,8 @@ serde_yaml = "0.9"
 serde_json = "1"
 prost = "0.14"
 regex = "1"
+zstd = "0.13"
+filetime = "0.2"
 
 tracing = "0.1"
 tracing-log = "0.2"

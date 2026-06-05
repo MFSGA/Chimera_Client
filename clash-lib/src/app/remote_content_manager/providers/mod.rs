@@ -5,9 +5,14 @@ use std::{
     collections::HashMap,
     fmt::{Display, Formatter},
     io,
+    sync::Arc,
 };
 
+pub mod fetcher;
+pub mod file_vehicle;
+pub mod http_vehicle;
 pub mod proxy_provider;
+pub mod rule_provider;
 
 #[derive(Deserialize, PartialEq, Clone, Copy, Debug)]
 pub enum ProviderVehicleType {
@@ -29,7 +34,14 @@ impl Display for ProviderVehicleType {
     }
 }
 
-// pub type ThreadSafeProviderVehicle = Arc<dyn ProviderVehicle + Send + Sync>;
+pub type ThreadSafeProviderVehicle = Arc<dyn ProviderVehicle + Send + Sync>;
+
+#[async_trait]
+pub trait ProviderVehicle {
+    async fn read(&self) -> io::Result<Vec<u8>>;
+    fn path(&self) -> &str;
+    fn typ(&self) -> ProviderVehicleType;
+}
 
 pub enum ProviderType {
     Proxy,

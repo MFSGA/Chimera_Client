@@ -692,6 +692,7 @@ async fn create_components(
     let router = Arc::new(
         Router::new(
             config.rules,
+            config.rule_providers,
             dns_resolver.clone(),
             country_mmdb,
             asn_mmdb,

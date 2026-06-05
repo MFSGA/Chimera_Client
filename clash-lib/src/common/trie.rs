@@ -43,6 +43,28 @@ impl<T> Node<T> {
     pub fn add_child(&mut self, key: &str, child: Node<T>) {
         self.children.insert(key.to_string(), child);
     }
+
+    fn traverse<F>(&self, prefix: &mut Vec<String>, f: &mut F) -> bool
+    where
+        F: FnMut(&str, &T) -> bool,
+    {
+        if let Some(data) = self.data.as_deref() {
+            let domain = prefix.iter().rev().cloned().collect::<Vec<_>>().join(".");
+            if !f(&domain, data) {
+                return false;
+            }
+        }
+
+        for (label, child) in &self.children {
+            prefix.push(label.clone());
+            if !child.traverse(prefix, f) {
+                return false;
+            }
+            prefix.pop();
+        }
+
+        true
+    }
 }
 
 pub struct StringTrie<T> {
@@ -97,6 +119,14 @@ impl<T> StringTrie<T> {
         }
 
         None
+    }
+
+    pub fn traverse<F>(&self, mut f: F)
+    where
+        F: FnMut(&str, &T) -> bool,
+    {
+        let mut prefix = Vec::new();
+        self.root.traverse(&mut prefix, &mut f);
     }
 
     fn insert_inner(&mut self, parts: &[&str], data: Arc<T>) {

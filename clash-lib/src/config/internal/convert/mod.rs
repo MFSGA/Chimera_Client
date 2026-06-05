@@ -22,6 +22,7 @@ mod general;
 /// 3
 mod listener;
 mod proxy_group;
+mod rule_provider;
 mod tun;
 
 impl TryFrom<def::Config> for config::Config {
@@ -83,6 +84,7 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
         )?,
         proxy_groups: proxy_group::convert(c.proxy_group.take(), &mut proxy_names)?,
         proxy_providers: HashMap::new(),
+        rule_providers: rule_provider::convert(c.rule_provider.take()),
         proxy_names,
         users: c
             .authentication
