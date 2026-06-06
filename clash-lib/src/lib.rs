@@ -41,7 +41,7 @@ use crate::{
         },
     },
     config::{
-        def::{self, DNSMode, LogLevel},
+        def::{self, LogLevel},
         internal::{InternalConfig, proxy::OutboundProxy},
     },
     runner::Runner,
@@ -52,7 +52,7 @@ pub mod app;
 /// 4
 mod common;
 /// todo: #[cfg(not(feature = "internal"))]
-mod config;
+pub mod config;
 /// 3
 mod proxy;
 /// 5
@@ -65,6 +65,11 @@ pub use session::Session;
 pub use proxy::utils::{
     SocketProtector, clear_socket_protector, install_default_socket_protector,
     set_socket_protector,
+};
+
+pub use config::{
+    DNSListen as ClashDNSListen, RuntimeConfig as ClashRuntimeConfig,
+    def::{Config as ClashConfigDef, DNS as ClashDNSConfigDef},
 };
 
 #[derive(Error, Debug)]
@@ -831,7 +836,7 @@ async fn build_auxiliary_dns_resolver(
         fallback: Vec::new(),
         fallback_filter: Default::default(),
         listen: DNSListenAddr::default(),
-        enhance_mode: DNSMode::Normal,
+        enhance_mode: def::DNSMode::Normal,
         default_nameserver,
         fake_ip_range: "198.18.0.1/16"
             .parse()
