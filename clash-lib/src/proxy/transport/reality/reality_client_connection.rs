@@ -253,6 +253,8 @@ impl RealityClientConnection {
             &encrypted_session_id
         );
 
+        // Restore the encrypted SessionId before writing or storing ClientHello.
+        // REALITY transcripts use the wire ClientHello, not the zeroed AAD form.
         client_hello[39..71].copy_from_slice(&encrypted_session_id);
 
         let mut record =
@@ -260,8 +262,8 @@ impl RealityClientConnection {
         record.extend_from_slice(&client_hello);
         self.ciphertext_write_buf.extend_from_slice(&record);
 
-        // Update state - store raw ClientHello bytes for transcript hash computation
-        // after we learn the cipher suite from ServerHello
+        // Store the wire ClientHello bytes for transcript hashing after ServerHello.
+        // At this point client_hello contains the encrypted SessionId.
         self.handshake_state = HandshakeState::AwaitingServerHello {
             client_hello_bytes: client_hello, // Save the actual ClientHello bytes
             client_private_key: our_private_bytes,
@@ -1072,4 +1074,50 @@ pub fn feed_reality_client_connection(
         i += n;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_hello_transcript_bytes_use_encrypted_session_id() {
+        let server_private = [0x42u8; 32];
+        let server_private_key = agreement::PrivateKey::from_private_key(
+            &agreement::X25519,
+            &server_private,
+        )
+        .unwrap();
+        let server_public_key = server_private_key.compute_public_key().unwrap();
+        let mut server_public = [0u8; 32];
+        server_public.copy_from_slice(server_public_key.as_ref());
+
+        let config = RealityClientConfig {
+            public_key: server_public,
+            short_id: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            server_name: "example.com".to_string(),
+            cipher_suites: vec![],
+        };
+
+        let mut conn = RealityClientConnection::new(config).unwrap();
+        let stored_client_hello = match &conn.handshake_state {
+            HandshakeState::AwaitingServerHello {
+                client_hello_bytes, ..
+            } => client_hello_bytes.clone(),
+            _ => panic!("new client must be awaiting ServerHello"),
+        };
+
+        let mut wire = Vec::new();
+        conn.write_tls(&mut wire).unwrap();
+
+        assert_eq!(
+            &wire[TLS_RECORD_HEADER_SIZE..],
+            stored_client_hello.as_slice()
+        );
+        assert_ne!(
+            &stored_client_hello[39..71],
+            &[0u8; 32],
+            "transcript ClientHello must retain encrypted wire SessionId"
+        );
+    }
 }
