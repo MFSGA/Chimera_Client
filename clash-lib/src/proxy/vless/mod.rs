@@ -23,7 +23,13 @@ use tracing::debug;
 
 mod datagram;
 mod stream;
+mod tls_deframer;
+mod tls_fuzzy_deframer;
+mod tls_handshake_util;
 mod vision;
+mod vision_filter;
+mod vision_pad;
+mod vision_unpad;
 
 pub struct HandlerOptions {
     pub name: String,
