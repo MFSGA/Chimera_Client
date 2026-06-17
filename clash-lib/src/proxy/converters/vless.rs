@@ -688,14 +688,19 @@ fn build_tcp_transport(
         ));
     }
 
-    let server_name = s
-        .server_name
-        .clone()
-        .unwrap_or("wwww.apple.com".to_string());
+    let server_name = resolve_reality_server_name(s);
     let reality_opts = s.reality_opts.as_ref().expect("checked is_some above");
     let client = build_reality_transport_from_opts(reality_opts, server_name)?;
 
     Ok(Some(Box::new(client)))
+}
+
+#[cfg(feature = "reality")]
+fn resolve_reality_server_name(s: &OutboundVless) -> String {
+    s.sni
+        .clone()
+        .or_else(|| s.server_name.clone())
+        .unwrap_or_else(|| s.common_opts.server.clone())
 }
 
 #[cfg(feature = "reality")]
@@ -757,7 +762,7 @@ mod tests {
     use super::build_transport;
 
     #[cfg(feature = "reality")]
-    use super::decode_reality_short_id;
+    use super::{decode_reality_short_id, resolve_reality_server_name};
 
     #[cfg(feature = "reality")]
     const TEST_REALITY_PUBLIC_KEY: &str =
@@ -777,6 +782,29 @@ mod tests {
         let decoded = decode_reality_short_id(Some("85144f63"))
             .expect("short-id should decode");
         assert_eq!(decoded, vec![0x85, 0x14, 0x4f, 0x63]);
+    }
+
+    #[cfg(feature = "reality")]
+    #[test]
+    fn vless_reality_prefers_sni_for_server_name() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "reality".to_owned(),
+                server: "edge.example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            server_name: Some("www.apple.com".to_owned()),
+            sni: Some("www.amd.com".to_owned()),
+            reality_opts: Some(OutboundTrojanRealityOpts {
+                public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
+                short_id: Some("85144f63".to_owned()),
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(resolve_reality_server_name(&outbound), "www.amd.com");
     }
 
     #[cfg(feature = "ws")]
