@@ -6,7 +6,7 @@
 - When in doubt, read this file first, then consult a crate README or the `docs/` folder for deeper context.
 
 ## Workspace at a glance
-- **Rust workspace** defined in `Cargo.toml` with pinned toolchain `nightly-2025-09-15` (see `rust-toolchain.toml`).
+- **Rust workspace** defined in `Cargo.toml` with pinned toolchain `stable` (see `rust-toolchain.toml`; a `nightly-2025-09-15` channel is also listed but commented out).
 - **Crates:**
   - `clash-bin` (`clash-rs` CLI entrypoint with `clap` parsing and `start_scaffold`).
   - `clash-lib` core runtime scaffolding; contains `app/`, `common/`, `config/`, `proxy/`, and `session/` modules.
@@ -15,7 +15,7 @@
 - **Scripting helpers:** `start.sh`/`start.ps1` wrap `cargo watch` for quick iteration, `make` recipes live at the repo root.
 
 ## Toolchain & dependencies
-- **Rust:** Always use `nightly-2025-09-15` (managed via `rust-toolchain.toml`).
+- **Rust:** Use the channel specified in `rust-toolchain.toml` (currently `stable`).
 - **Required native tools:** CMake ≥3.29, LLVM/libclang, nasm (Windows), protoc for proto generation; install via your platform package manager.
 - **Notifications:** `cargo fmt`, `cargo clippy --all-targets --all-features`, and `cargo test --all` are treated as basic hygiene before any PR.
 
@@ -45,6 +45,25 @@
 - `cargo run -p clash-rs -- -c config.yaml` – mimics the user experience: loads `config.yaml`, sets up logging, starts the async runtime.
 - `./start.sh` (or `start.ps1` on Windows) – wraps `cargo watch -x "run -p clash-rs -- -c config.yaml"` for live reload.
 - Pass `-t` to test config, `--help-improve` to toggle telemetry, `--directory` to point to a profile folder, or `--config` for alternate files.
+
+### External Controller API
+
+The API server is configured via `external-controller` + `secret` in the YAML config:
+
+| Field | Example | Notes |
+|---|---|---|
+| `external-controller` | `127.0.0.1:13456` | REST + WebSocket API address |
+| `secret` | `chimera` | Auth token |
+| `cors-allow-origins` | `["http://localhost:3000"]` | CORS origins; default `Any` if absent |
+
+**Auth mechanisms:**
+- **HTTP REST**: `Authorization: Bearer <secret>` header
+- **WebSocket**: `?token=<secret>` query parameter
+
+**Key API paths:**
+- `/configs`, `/proxies`, `/rules`, `/group`, `/version`, `/logs`, `/traffic`, `/memory`, `/connections`, `/dns`, `/flows`
+- WebSocket variants live under `/ws/*` (`/ws/memory`, `/ws/connections`, `/ws/traffic`, `/ws/logs`, `/ws/flows`)
+- The `websocket_uri_rewrite` middleware auto-redirects WS upgrade requests from `/memory` → `/ws/memory` (etc.), so clients connecting to the plain path work transparently.
 
 ### Documentation
 - `make docs` – rebuilds documentation for `docs/` pages and other static assets.
@@ -121,6 +140,7 @@
 - When experimenting, run the multi-crate build (`cargo check --all`) before pushing to catch cross-crate integration issues early.
 - Use `cargo fmt && cargo clippy` immediately after refactoring modules or changing public APIs; these are fast enough to run before each push.
 - After you edit `config.yaml`, rerun the CLI once (`cargo run -p clash-rs -- -c config.yaml`) to ensure the generated `cache.db` paths and watchers stay aligned.
+- The `ref/` directory mirrors the upstream [`clash-rs`](https://github.com/Watfaq/clash-rs) reference implementation. When unsure about behavior or fix approach, check `ref/` first—it often has the canonical solution.
 
 ## Observability & debugging
 - Wire every long-lived component through `tracing` so you can lower the log level to debug or trace when investigating issues.
