@@ -67,6 +67,11 @@ where
             return Box::pin(self.inner.call(req));
         }
 
+        // CORS preflight requests don't carry auth credentials
+        if req.method() == http::Method::OPTIONS {
+            return Box::pin(self.inner.call(req));
+        }
+
         let path = req.uri().path();
         if path == "/ui" || path.starts_with("/ui/") {
             return Box::pin(self.inner.call(req));
