@@ -1,0 +1,23 @@
+{
+  "nodes": {
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1,
+        "narHash": "sha256-NHnKNOJEfmf3kih5NNDH13bECInFDgUiFDFqlZsBf5k=",
+        "path": "/nix/store/pzxxxg9vvzk63122vj38lcmqg9dl6qxk-nixos-26.05.1947.a0374025a863/nixos",
+        "type": "path"
+      },
+      "original": {
+        "path": "/nix/store/pzxxxg9vvzk63122vj38lcmqg9dl6qxk-nixos-26.05.1947.a0374025a863/nixos",
+        "type": "path"
+      }
+    },
+    "root": {
+      "inputs": {
+        "nixpkgs": "nixpkgs"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
