@@ -43,10 +43,14 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
              will not allow any connections from the local network."
         );
     }
-    if let Some(tun) = &mut c.tun
-        && tun.so_mark.is_none()
-    {
-        tun.so_mark = c.routing_mark;
+    if let Some(tun) = &mut c.tun {
+        match (c.routing_mark, tun.so_mark) {
+            (Some(routing_mark), None) => tun.so_mark = Some(routing_mark),
+            (None, Some(tun_so_mark)) if tun.enable => {
+                c.routing_mark = Some(tun_so_mark);
+            }
+            _ => {}
+        }
     }
 
     config::Config {
@@ -168,6 +172,22 @@ tun:
         );
 
         let converted = convert(cfg).expect("internal convert should succeed");
+        assert_eq!(converted.tun.so_mark, Some(7777));
+    }
+
+    #[test]
+    fn fill_routing_mark_from_enabled_tun_so_mark() {
+        let cfg = parse_config(
+            r#"
+tun:
+  enable: true
+  so-mark: 7777
+"#,
+        );
+
+        let converted = convert(cfg).expect("internal convert should succeed");
+        assert_eq!(converted.general.routing_mask, Some(7777));
+        assert_eq!(converted.dns.fw_mark, Some(7777));
         assert_eq!(converted.tun.so_mark, Some(7777));
     }
 

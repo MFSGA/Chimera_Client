@@ -1,3 +1,5 @@
+use std::net::{IpAddr, Ipv4Addr};
+
 use ipnet::{IpNet, Ipv4Net};
 use tracing::warn;
 
@@ -6,11 +8,18 @@ use crate::{
     config::internal::config::TunConfig,
 };
 
+const FWMARK_MAIN_RULE_PREF: &str = "100";
+const DNS_HIJACK_RULE_PREF: &str = "101";
+const ROUTE_ALL_RULE_PREF: &str = "102";
+const MAIN_SUPPRESS_RULE_PREF: &str = "103";
+const NIXOS_SOURCE_MAIN_RULE_PREF: &str = "90";
+
 fn is_missing_ip_state(stderr: &str) -> bool {
     matches!(
         stderr.trim(),
         msg if msg.contains("No such file or directory")
             || msg.contains("No such process")
+            || msg.contains("FIB table does not exist")
     )
 }
 
@@ -44,6 +53,89 @@ pub fn add_route(via: &OutboundInterface, dest: &IpNet) -> std::io::Result<()> {
         )));
     }
     Ok(())
+}
+
+fn best_route_for(dest: IpAddr) -> std::io::Result<(Option<IpAddr>, String)> {
+    let output = std::process::Command::new("ip")
+        .args(["route", "get", &dest.to_string()])
+        .output()?;
+    warn!("executing: ip route get {}", dest);
+    if !output.status.success() {
+        return Err(new_io_error(format!(
+            "query best route for {} failed: {}",
+            dest,
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let Some(line) = stdout.lines().next() else {
+        return Err(new_io_error(format!("no best route found for {dest}")));
+    };
+
+    let mut gateway = None;
+    let mut dev = None;
+    let mut parts = line.split_whitespace();
+    while let Some(part) = parts.next() {
+        match part {
+            "via" => gateway = parts.next().and_then(|gateway| gateway.parse().ok()),
+            "dev" => {
+                dev = parts.next().map(ToOwned::to_owned);
+            }
+            _ => {}
+        }
+    }
+
+    let dev = dev
+        .ok_or_else(|| new_io_error(format!("no route device found for {dest}")))?;
+    Ok((gateway, dev))
+}
+
+fn add_excluded_route(table: &str, dest: &IpNet) -> std::io::Result<()> {
+    let cidr = dest.to_string();
+    let (gateway, dev) = best_route_for(dest.addr())?;
+
+    let mut args = vec!["route", "add", &cidr];
+    if let Some(gateway) = gateway {
+        let gateway = gateway.to_string();
+        args.extend(["via", &gateway, "dev", &dev, "table", table]);
+        run_ip_cmd(&args, false)
+    } else {
+        args.extend(["dev", &dev, "table", table]);
+        run_ip_cmd(&args, false)
+    }
+}
+
+fn is_nixos() -> bool {
+    std::path::Path::new("/etc/NIXOS").exists()
+        || std::path::Path::new("/run/current-system/sw/bin").exists()
+}
+
+fn main_route_source_v4() -> std::io::Result<Option<Ipv4Addr>> {
+    let output = std::process::Command::new("ip")
+        .args(["-4", "route", "get", "1.1.1.1"])
+        .output()?;
+    warn!("executing: ip -4 route get 1.1.1.1");
+    if !output.status.success() {
+        return Err(new_io_error(format!(
+            "query default IPv4 source failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let Some(line) = stdout.lines().next() else {
+        return Ok(None);
+    };
+
+    let mut parts = line.split_whitespace();
+    while let Some(part) = parts.next() {
+        if part == "src" {
+            return Ok(parts.next().and_then(|src| src.parse().ok()));
+        }
+    }
+
+    Ok(None)
 }
 
 pub fn delete_interface(name: &str) -> std::io::Result<()> {
@@ -135,8 +227,10 @@ fn delete_ip_cmd_all(args: &[&str], enable_v6: bool) -> std::io::Result<()> {
 
 /// three rules are added:
 /// # ip route add default dev wg0 table 2468
-/// # ip rule add not fwmark 1234 table 2468
-/// # ip rule add table main suppress_prefixlength 0
+/// # ip rule add pref 90 from $OUTBOUND_IPV4 table main (NixOS only)
+/// # ip rule add pref 100 fwmark 1234 table main
+/// # ip rule add pref 102 not fwmark 1234 table 2468
+/// # ip rule add pref 103 table main suppress_prefixlength 0
 /// for ipv6
 /// # ip -6 ...
 pub fn setup_policy_routing(
@@ -152,11 +246,54 @@ pub fn setup_policy_routing(
         enable_v6,
     )?;
 
+    for route in &tun_cfg.route_exclude_address {
+        add_excluded_route(&table, route)?;
+    }
+
+    if is_nixos() {
+        match main_route_source_v4()? {
+            Some(addr_v4) => {
+                run_ip_cmd(
+                    &[
+                        "rule",
+                        "add",
+                        "pref",
+                        NIXOS_SOURCE_MAIN_RULE_PREF,
+                        "from",
+                        &format!("{addr_v4}/32"),
+                        "table",
+                        "main",
+                    ],
+                    false,
+                )?;
+            }
+            None => {
+                warn!("NixOS source-main rule skipped: no default IPv4 source found")
+            }
+        }
+    }
+
     if let Some(so_mark) = tun_cfg.so_mark {
         run_ip_cmd(
             &[
                 "rule",
                 "add",
+                "pref",
+                FWMARK_MAIN_RULE_PREF,
+                "fwmark",
+                &so_mark.to_string(),
+                "table",
+                "main",
+            ],
+            enable_v6,
+        )?;
+
+        run_ip_cmd(
+            &[
+                "rule",
+                "add",
+                "pref",
+                ROUTE_ALL_RULE_PREF,
                 "not",
                 "fwmark",
                 &so_mark.to_string(),
@@ -168,21 +305,27 @@ pub fn setup_policy_routing(
     }
 
     run_ip_cmd(
-        &["rule", "add", "table", "main", "suppress_prefixlength", "0"],
+        &[
+            "rule",
+            "add",
+            "pref",
+            MAIN_SUPPRESS_RULE_PREF,
+            "table",
+            "main",
+            "suppress_prefixlength",
+            "0",
+        ],
         enable_v6,
     )?;
-
-    if tun_cfg.dns_hijack {
-        run_ip_cmd(&["rule", "add", "dport", "53", "table", &table], enable_v6)?;
-    }
 
     Ok(())
 }
 
-/// three rules to clean up:
-/// # ip rule del not fwmark $SO_MARK table $TABLE
-/// # ip rule del table main suppress_prefixlength 0
-/// # ip rule del dport 53 table $TABLE
+/// policy rules to clean up:
+/// # ip rule del pref 90 from $OUTBOUND_IPV4 table main (NixOS only)
+/// # ip rule del pref 100 fwmark $SO_MARK table main
+/// # ip rule del pref 102 not fwmark $SO_MARK table $TABLE
+/// # ip rule del pref 103 table main suppress_prefixlength 0
 /// for v6
 /// # ip -6 ...
 pub fn maybe_routes_clean_up(tun_cfg: &TunConfig) -> std::io::Result<()> {
@@ -195,7 +338,69 @@ pub fn maybe_routes_clean_up(tun_cfg: &TunConfig) -> std::io::Result<()> {
 
     delete_ip_cmd_all(&["route", "del", "default", "table", &table], enable_v6)?;
 
+    for route in &tun_cfg.route_exclude_address {
+        delete_ip_cmd_all(
+            &["route", "del", &route.to_string(), "table", &table],
+            enable_v6,
+        )?;
+    }
+
+    if is_nixos() {
+        delete_ip_cmd_all(
+            &[
+                "rule",
+                "del",
+                "pref",
+                NIXOS_SOURCE_MAIN_RULE_PREF,
+                "table",
+                "main",
+            ],
+            false,
+        )?;
+    }
+
     if let Some(so_mark) = tun_cfg.so_mark {
+        delete_ip_cmd_all(
+            &[
+                "rule",
+                "del",
+                "pref",
+                FWMARK_MAIN_RULE_PREF,
+                "fwmark",
+                &so_mark.to_string(),
+                "table",
+                "main",
+            ],
+            enable_v6,
+        )?;
+
+        delete_ip_cmd_all(
+            &[
+                "rule",
+                "del",
+                "pref",
+                ROUTE_ALL_RULE_PREF,
+                "not",
+                "fwmark",
+                &so_mark.to_string(),
+                "table",
+                &table,
+            ],
+            enable_v6,
+        )?;
+
+        delete_ip_cmd_all(
+            &[
+                "rule",
+                "del",
+                "fwmark",
+                &so_mark.to_string(),
+                "table",
+                "main",
+            ],
+            enable_v6,
+        )?;
+
         delete_ip_cmd_all(
             &[
                 "rule",
@@ -210,10 +415,70 @@ pub fn maybe_routes_clean_up(tun_cfg: &TunConfig) -> std::io::Result<()> {
         )?;
     }
     delete_ip_cmd_all(
+        &[
+            "rule",
+            "del",
+            "pref",
+            MAIN_SUPPRESS_RULE_PREF,
+            "table",
+            "main",
+            "suppress_prefixlength",
+            "0",
+        ],
+        enable_v6,
+    )?;
+    delete_ip_cmd_all(
         &["rule", "del", "table", "main", "suppress_prefixlength", "0"],
         enable_v6,
     )?;
 
+    if let Some(so_mark) = tun_cfg.so_mark {
+        delete_ip_cmd_all(
+            &[
+                "rule",
+                "del",
+                "pref",
+                DNS_HIJACK_RULE_PREF,
+                "not",
+                "fwmark",
+                &so_mark.to_string(),
+                "dport",
+                "53",
+                "table",
+                &table,
+            ],
+            enable_v6,
+        )?;
+
+        delete_ip_cmd_all(
+            &[
+                "rule",
+                "del",
+                "not",
+                "fwmark",
+                &so_mark.to_string(),
+                "dport",
+                "53",
+                "table",
+                &table,
+            ],
+            enable_v6,
+        )?;
+    }
+
+    delete_ip_cmd_all(
+        &[
+            "rule",
+            "del",
+            "pref",
+            DNS_HIJACK_RULE_PREF,
+            "dport",
+            "53",
+            "table",
+            &table,
+        ],
+        enable_v6,
+    )?;
     delete_ip_cmd_all(&["rule", "del", "dport", "53", "table", &table], enable_v6)?;
 
     Ok(())
@@ -229,6 +494,7 @@ mod tests {
             "RTNETLINK answers: No such file or directory"
         ));
         assert!(is_missing_ip_state("RTNETLINK answers: No such process"));
+        assert!(is_missing_ip_state("Error: FIB table does not exist."));
         assert!(!is_missing_ip_state("RTNETLINK answers: File exists"));
     }
 }

@@ -54,7 +54,7 @@ pub fn maybe_add_routes(cfg: &TunConfig, tun_name: &str) -> std::io::Result<()> 
             // route-exclude-address is a local Windows extension: before adding
             // the default split routes, capture the current best route and then
             // add a more specific bypass route through the original interface.
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, target_os = "linux")))]
             if !cfg.route_exclude_address.is_empty() {
                 warn!(
                     "tun route-exclude-address is currently only implemented on Windows; \
