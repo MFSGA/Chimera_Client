@@ -1,14 +1,14 @@
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use axum::{
-    Router, middleware,
+    Router, ServiceExt, middleware,
     response::Redirect,
     routing::{get, post},
 };
 
 use http::{Method, header};
 use tokio::sync::{Mutex, broadcast::Sender};
-use tower::ServiceBuilder;
+use tower::{Layer, ServiceBuilder, util::MapRequestLayer};
 use tower_http::{
     cors::{AllowOrigin, Any, CorsLayer},
     services::ServeDir,
@@ -221,6 +221,10 @@ impl Runner for ApiRunner {
                 let router_clone = router.clone().route_layer(
                     middlewares::auth::AuthMiddlewareLayer::new(auth_secret),
                 );
+                let router_clone = MapRequestLayer::new(
+                    middlewares::websocket_uri_rewrite::rewrite_websocket_uri,
+                )
+                .layer(router_clone);
                 Some(async move {
                     info!("Starting API server on TCP address {bind_addr}");
                     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
