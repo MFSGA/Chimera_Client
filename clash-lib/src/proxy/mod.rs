@@ -32,6 +32,8 @@ pub mod inbound;
 
 pub mod reject;
 
+#[cfg(feature = "anytls")]
+pub mod anytls;
 pub mod socks;
 #[cfg(feature = "tun")]
 pub mod tun;
@@ -184,6 +186,8 @@ pub enum OutboundType {
     Reject,
     Socks5,
     Selector,
+    #[cfg(feature = "anytls")]
+    Anytls,
     Trojan,
     Hysteria2,
     Vless,
@@ -218,6 +222,8 @@ impl Display for OutboundType {
             OutboundType::Smart => write!(f, "Smart"),
              */
             OutboundType::Vless => write!(f, "Vless"),
+            #[cfg(feature = "anytls")]
+            OutboundType::Anytls => write!(f, "AnyTLS"),
             OutboundType::Trojan => write!(f, "Trojan"),
             OutboundType::Hysteria2 => write!(f, "Hysteria2"),
             OutboundType::Socks5 => write!(f, "Socks5"),

@@ -323,6 +323,8 @@ pub enum Type {
     Redir,
     Tunnel,
     Shadowsocks,
+    #[cfg(feature = "anytls")]
+    Anytls,
     Dns,
     Ignore,
 }

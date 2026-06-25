@@ -66,6 +66,7 @@ time = { version = "=0.3", features = ["macros", "local-offset"] }
 
 rustls = { version = "0.23", default-features = false, optional = true }
 rustls-pemfile = "2"
+rcgen = { version = "0.14", optional = true }
 
 uuid = { version = "1", features = [
     "v4",
@@ -158,6 +159,7 @@ ring = ["tls", "rustls/ring", "quinn-proto?/ring", "chimera-dns/ring"]
 
 ws = ["tokio-tungstenite"]
 
+anytls = ["tls", "dep:rcgen"]
 shadowsocks = ["dep:shadowsocks", "dep:blake3"]
 trojan = []
 hysteria = [
