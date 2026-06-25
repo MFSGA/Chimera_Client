@@ -36,6 +36,9 @@ pub enum OutboundProxyProtocol {
     Ss(OutboundShadowsocks),
     #[serde(rename = "socks5")]
     Socks5(OutboundSocks5),
+    #[cfg(feature = "anytls")]
+    #[serde(rename = "anytls")]
+    Anytls(OutboundAnytls),
 
     #[serde(rename = "vless")]
     Vless(OutboundVless),
@@ -55,6 +58,8 @@ impl OutboundProxyProtocol {
             #[cfg(feature = "shadowsocks")]
             OutboundProxyProtocol::Ss(ss) => &ss.common_opts.name,
             OutboundProxyProtocol::Socks5(socks5) => &socks5.common_opts.name,
+            #[cfg(feature = "anytls")]
+            OutboundProxyProtocol::Anytls(anytls) => &anytls.common_opts.name,
             OutboundProxyProtocol::Vless(vless) => &vless.common_opts.name,
             #[cfg(feature = "trojan")]
             OutboundProxyProtocol::Trojan(trojan) => &trojan.common_opts.name,
@@ -123,6 +128,35 @@ pub struct OutboundSocks5 {
     pub skip_cert_verify: bool,
     #[serde(default = "default_bool_true")]
     pub udp: bool,
+}
+
+#[cfg(feature = "anytls")]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct OutboundAnytls {
+    #[serde(flatten)]
+    pub common_opts: CommonConfigOptions,
+    pub password: String,
+    pub alpn: Option<Vec<String>>,
+    pub sni: Option<String>,
+    pub skip_cert_verify: Option<bool>,
+    /// Parsed for config compatibility; currently not applied by the runtime.
+    pub fingerprint: Option<String>,
+    /// Parsed for config compatibility; currently not applied by the runtime.
+    pub client_fingerprint: Option<String>,
+    pub udp: Option<bool>,
+    /// Parsed for config compatibility; currently not applied by the runtime.
+    pub idle_session_check_interval: Option<u64>,
+    /// Parsed for config compatibility; currently not applied by the runtime.
+    pub idle_session_timeout: Option<u64>,
+    /// Parsed for config compatibility; currently not applied by the runtime.
+    pub min_idle_session: Option<u64>,
+    /// File path or inline PEM client certificate for mTLS.
+    /// Must be set together with `tls-key`.
+    pub tls_cert: Option<String>,
+    /// File path or inline PEM client private key for mTLS.
+    /// Must be set together with `tls-cert`.
+    pub tls_key: Option<String>,
 }
 
 pub fn map_serde_error(
@@ -569,5 +603,45 @@ xhttp-opts:
         assert_eq!(opts.max_each_post_bytes, Some(1_000_000));
         assert_eq!(opts.max_buffered_posts, Some(30));
         assert_eq!(opts.session_ttl, Some(30));
+    }
+}
+
+#[cfg(all(test, feature = "anytls"))]
+mod anytls_tests {
+    use super::{OutboundProxyProtocol, OutboundProxyProtocol::Anytls};
+
+    #[test]
+    fn test_anytls_deserialize() {
+        let yaml = r#"
+            name: anytls-test
+            type: anytls
+            server: example.com
+            port: 443
+            password: example-password
+            sni: sni.example.com
+            skip-cert-verify: true
+            udp: true
+            idle-session-check-interval: 30
+            idle-session-timeout: 300
+            min-idle-session: 2
+        "#;
+
+        let config: OutboundProxyProtocol =
+            serde_yaml::from_str(yaml).expect("should parse anytls");
+
+        let Anytls(config) = config else {
+            panic!("expected anytls config");
+        };
+
+        assert_eq!(config.common_opts.name, "anytls-test");
+        assert_eq!(config.common_opts.server, "example.com");
+        assert_eq!(config.common_opts.port, 443);
+        assert_eq!(config.password, "example-password");
+        assert_eq!(config.sni.as_deref(), Some("sni.example.com"));
+        assert_eq!(config.skip_cert_verify, Some(true));
+        assert_eq!(config.udp, Some(true));
+        assert_eq!(config.idle_session_check_interval, Some(30));
+        assert_eq!(config.idle_session_timeout, Some(300));
+        assert_eq!(config.min_idle_session, Some(2));
     }
 }

@@ -65,6 +65,23 @@ impl Config {
                 )));
             }
         }
+        #[cfg(feature = "anytls")]
+        for opts in &self.listeners {
+            if let InboundOpts::Anytls {
+                common_opts, users, ..
+            } = opts
+            {
+                let mut seen = std::collections::HashSet::new();
+                for user in users {
+                    if !seen.insert(user.password.as_str()) {
+                        return Err(Error::InvalidConfig(format!(
+                            "anytls inbound '{}': duplicate user password",
+                            common_opts.name
+                        )));
+                    }
+                }
+            }
+        }
         Ok(self)
     }
 }

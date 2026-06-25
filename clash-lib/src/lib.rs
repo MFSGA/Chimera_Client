@@ -854,7 +854,7 @@ async fn build_auxiliary_dns_resolver(
     dns::new_resolver(cfg, Some(cache_store), None, outbounds, None).await
 }
 
-#[cfg(all(test, docker_test))]
+#[cfg(test)]
 pub(crate) mod tests {
     use std::sync::Once;
 

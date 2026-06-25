@@ -3,6 +3,13 @@ use serde::{Deserialize, Serialize};
 
 use super::config::BindAddress;
 
+#[cfg(feature = "anytls")]
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, Eq, PartialEq)]
+pub struct InboundUser {
+    pub name: String,
+    pub password: String,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, Eq, PartialEq)]
 #[serde(tag = "type")]
 #[serde(rename_all = "kebab-case")]
@@ -28,6 +35,21 @@ pub enum InboundOpts {
         #[serde(default = "default_bool_true")]
         udp: bool,
     },
+    #[cfg(feature = "anytls")]
+    #[serde(alias = "anytls")]
+    Anytls {
+        #[serde(flatten)]
+        common_opts: CommonInboundOpts,
+        password: String,
+        #[serde(default)]
+        certificate: Option<String>,
+        #[serde(rename = "private-key", default)]
+        private_key: Option<String>,
+        #[serde(default)]
+        users: Vec<InboundUser>,
+        #[serde(default)]
+        fallback: Option<String>,
+    },
 }
 
 impl InboundOpts {
@@ -38,6 +60,8 @@ impl InboundOpts {
             InboundOpts::Http { common_opts, .. } => common_opts,
             #[cfg(feature = "mixed_port")]
             InboundOpts::Mixed { common_opts, .. } => common_opts,
+            #[cfg(feature = "anytls")]
+            InboundOpts::Anytls { common_opts, .. } => common_opts,
         }
     }
 
@@ -48,6 +72,8 @@ impl InboundOpts {
             InboundOpts::Http { common_opts, .. } => common_opts,
             #[cfg(feature = "mixed_port")]
             InboundOpts::Mixed { common_opts, .. } => common_opts,
+            #[cfg(feature = "anytls")]
+            InboundOpts::Anytls { common_opts, .. } => common_opts,
         }
     }
 
@@ -58,6 +84,8 @@ impl InboundOpts {
             InboundOpts::Socks { .. } => "socks",
             #[cfg(feature = "mixed_port")]
             InboundOpts::Mixed { .. } => "mixed",
+            #[cfg(feature = "anytls")]
+            InboundOpts::Anytls { .. } => "anytls",
         }
     }
 }

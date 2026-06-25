@@ -3,6 +3,10 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use tracing::{error, info, warn};
 
+#[cfg(feature = "anytls")]
+use crate::proxy::anytls::inbound::{
+    AnytlsInbound, InboundOptions as AnytlsInboundOptions,
+};
 #[cfg(feature = "http_port")]
 use crate::proxy::http::HttpInbound;
 #[cfg(feature = "mixed_port")]
@@ -99,5 +103,33 @@ fn build_handler(
             authenticator,
             fw_mark,
         ))),
+        #[cfg(feature = "anytls")]
+        InboundOpts::Anytls {
+            common_opts,
+            password,
+            certificate,
+            private_key,
+            fallback,
+            users,
+        } => {
+            let (_, users_rx) = tokio::sync::watch::channel(users.clone());
+            match AnytlsInbound::new(AnytlsInboundOptions {
+                addr: (common_opts.listen.0, common_opts.port).into(),
+                password: password.clone(),
+                certificate: certificate.clone(),
+                private_key: private_key.clone(),
+                fallback: fallback.clone(),
+                allow_lan: common_opts.allow_lan,
+                dispatcher,
+                fw_mark: common_opts.fw_mark,
+                users_rx,
+            }) {
+                Ok(handler) => Some(Arc::new(handler)),
+                Err(err) => {
+                    warn!("anytls inbound failed to init: {err}");
+                    None
+                }
+            }
+        }
     }
 }

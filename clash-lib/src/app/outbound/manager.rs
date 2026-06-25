@@ -44,6 +44,8 @@ use crate::{
 
 static RESERVED_PROVIDER_NAME: &str = "default";
 
+#[cfg(feature = "anytls")]
+use crate::proxy::anytls;
 #[cfg(feature = "hysteria")]
 use crate::proxy::hysteria2;
 #[cfg(feature = "trojan")]
@@ -395,6 +397,16 @@ impl OutboundManager {
                         .map(|x: socks::outbound::Handler| Arc::new(x) as _)
                         .inspect_err(|e| {
                             error!("failed to load socks5 outbound {}: {}", name, e);
+                        })
+                        .ok()
+                }
+                #[cfg(feature = "anytls")]
+                OutboundProxyProtocol::Anytls(v) => {
+                    let name = v.common_opts.name.clone();
+                    v.try_into()
+                        .map(|x: anytls::Handler| Arc::new(x) as _)
+                        .inspect_err(|e| {
+                            error!("failed to load anytls outbound {}: {}", name, e);
                         })
                         .ok()
                 }
