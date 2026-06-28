@@ -10,3 +10,11 @@ cache.db
 scripts/
 
 *.tmp*/
+
+.direnv/*
+
+Country.mmdb
+
+geosite.dat
+
+xray*
