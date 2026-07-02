@@ -259,9 +259,7 @@ mod tests {
 
     use serde_yaml::Value;
 
-    use super::{
-        SimpleOBFSMode, SimpleOBFSOption, SimpleObfsHttp, SimpleObfsTLS,
-    };
+    use super::{SimpleOBFSMode, SimpleOBFSOption, SimpleObfsHttp, SimpleObfsTLS};
     use crate::{
         config::internal::proxy::{CommonConfigOptions, OutboundShadowsocks},
         proxy::shadowsocks::outbound::Handler,

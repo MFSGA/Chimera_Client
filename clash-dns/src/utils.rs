@@ -1,6 +1,10 @@
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use std::{fs, io, path::Path};
+use std::io;
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+use std::{fs, path::Path};
 
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use super::dummy_keys::{TEST_CERT, TEST_KEY};
 
 pub fn new_io_error<T>(msg: T) -> io::Error
@@ -10,6 +14,7 @@ where
     io::Error::other(msg.into())
 }
 
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 pub fn load_cert_chain(
     cert_path: &Path,
 ) -> std::io::Result<Vec<CertificateDer<'static>>> {
@@ -27,6 +32,7 @@ pub fn load_cert_chain(
     }
 }
 
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 pub fn load_priv_key(key_path: &Path) -> std::io::Result<PrivateKeyDer<'static>> {
     let key = fs::read(key_path).map_err(|e| {
         new_io_error(format!(
@@ -43,12 +49,14 @@ pub fn load_priv_key(key_path: &Path) -> std::io::Result<PrivateKeyDer<'static>>
     }
 }
 
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 pub fn load_default_cert() -> Vec<CertificateDer<'static>> {
     rustls_pemfile::certs(&mut TEST_CERT.as_bytes())
         .collect::<Result<_, _>>()
         .unwrap()
 }
 
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 pub fn load_default_key() -> PrivateKeyDer<'static> {
     rustls_pemfile::private_key(&mut TEST_KEY.as_bytes())
         .unwrap()

@@ -1,10 +1,8 @@
-use crate::{
-    DNSListenAddr, DnsMessageExchanger,
-    utils::{
-        load_cert_chain, load_default_cert, load_default_key, load_priv_key,
-        new_io_error,
-    },
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+use crate::utils::{
+    load_cert_chain, load_default_cert, load_default_key, load_priv_key,
 };
+use crate::{DNSListenAddr, DnsMessageExchanger, utils::new_io_error};
 use async_trait::async_trait;
 use hickory_proto::{
     op::{
@@ -18,17 +16,22 @@ use hickory_server::{
     server::{Request, RequestHandler, ResponseHandler, ResponseInfo},
     zone_handler::MessageResponseBuilder,
 };
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use rustls::{server::AlwaysResolvesServerRawPublicKeys, sign::CertifiedKey};
-use std::{sync::Arc, time::Duration};
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::net::{TcpListener, UdpSocket};
 use tracing::{debug, error, info, warn};
 
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 struct CertificateKeyPair {
     certs: Vec<rustls::pki_types::CertificateDer<'static>>,
     key: rustls::pki_types::PrivateKeyDer<'static>,
 }
 
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 impl From<CertificateKeyPair> for Arc<dyn rustls::server::ResolvesServerCert> {
     fn from(pair: CertificateKeyPair) -> Self {
         Arc::new(AlwaysResolvesServerRawPublicKeys::new(Arc::new(
@@ -203,6 +206,10 @@ static DEFAULT_DNS_SERVER_TIMEOUT: Duration = Duration::from_secs(5);
 pub async fn get_dns_listener<X>(
     listen: DNSListenAddr,
     exchanger: X,
+    #[cfg_attr(
+        not(any(feature = "aws-lc-rs", feature = "ring")),
+        allow(unused_variables)
+    )]
     cwd: &std::path::Path,
 ) -> Option<futures::future::BoxFuture<'static, Result<(), DNSError>>>
 where
@@ -238,125 +245,155 @@ where
             .is_ok();
     }
     if let Some(c) = listen.doh {
-        has_server |= TcpListener::bind(c.addr)
-            .await
-            .and_then(|x| {
-                if let (Some(k), Some(c)) = (&c.ca_key, &c.ca_cert) {
-                    debug!(
-                        "using custom key and cert for DoH: {:?}/{:?}",
-                        cwd.join(k),
-                        cwd.join(c)
-                    );
-                }
-
-                let server_key = c
-                    .ca_key
-                    .map(|x| load_priv_key(&cwd.join(x)))
-                    .transpose()?
-                    .unwrap_or(load_default_key());
-                let server_cert = c
-                    .ca_cert
-                    .map(|x| load_cert_chain(&cwd.join(x)))
-                    .transpose()?
-                    .unwrap_or(load_default_cert());
-                s.register_https_listener(
-                    x,
-                    DEFAULT_DNS_SERVER_TIMEOUT,
-                    CertificateKeyPair {
-                        certs: server_cert,
-                        key: server_key,
+        #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+        {
+            has_server |= TcpListener::bind(c.addr)
+                .await
+                .and_then(|x| {
+                    if let (Some(k), Some(c)) = (&c.ca_key, &c.ca_cert) {
+                        debug!(
+                            "using custom key and cert for DoH: {:?}/{:?}",
+                            cwd.join(k),
+                            cwd.join(c)
+                        );
                     }
-                    .into(),
-                    c.hostname,
-                    "/dns-query".to_string(),
-                )?;
-                info!("DoH server listening on: {}", c.addr);
-                Ok(())
-            })
-            .inspect_err(|x| {
-                error!("failed to listen DoH server on {}: {}", c.addr, x);
-            })
-            .is_ok();
+
+                    let server_key = c
+                        .ca_key
+                        .map(|x| load_priv_key(&cwd.join(x)))
+                        .transpose()?
+                        .unwrap_or(load_default_key());
+                    let server_cert = c
+                        .ca_cert
+                        .map(|x| load_cert_chain(&cwd.join(x)))
+                        .transpose()?
+                        .unwrap_or(load_default_cert());
+                    s.register_https_listener(
+                        x,
+                        DEFAULT_DNS_SERVER_TIMEOUT,
+                        CertificateKeyPair {
+                            certs: server_cert,
+                            key: server_key,
+                        }
+                        .into(),
+                        c.hostname,
+                        "/dns-query".to_string(),
+                    )?;
+                    info!("DoH server listening on: {}", c.addr);
+                    Ok(())
+                })
+                .inspect_err(|x| {
+                    error!("failed to listen DoH server on {}: {}", c.addr, x);
+                })
+                .is_ok();
+        }
+        #[cfg(not(any(feature = "aws-lc-rs", feature = "ring")))]
+        {
+            warn!(
+                "DoH listener {} ignored because chimera-dns was built without aws-lc-rs or ring",
+                c.addr
+            );
+        }
     }
     if let Some(c) = listen.dot {
-        has_server |= TcpListener::bind(c.addr)
-            .await
-            .and_then(|x| {
-                if let (Some(k), Some(c)) = (&c.ca_key, &c.ca_cert) {
-                    debug!(
-                        "using custom key and cert for DoT: {:?}/{:?}",
-                        cwd.join(k),
-                        cwd.join(c)
-                    );
-                }
-
-                let server_key = c
-                    .ca_key
-                    .map(|x| load_priv_key(&cwd.join(x)))
-                    .transpose()?
-                    .unwrap_or(load_default_key());
-                let server_cert = c
-                    .ca_cert
-                    .map(|x| load_cert_chain(&cwd.join(x)))
-                    .transpose()?
-                    .unwrap_or(load_default_cert());
-                s.register_tls_listener(
-                    x,
-                    DEFAULT_DNS_SERVER_TIMEOUT,
-                    CertificateKeyPair {
-                        certs: server_cert,
-                        key: server_key,
+        #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+        {
+            has_server |= TcpListener::bind(c.addr)
+                .await
+                .and_then(|x| {
+                    if let (Some(k), Some(c)) = (&c.ca_key, &c.ca_cert) {
+                        debug!(
+                            "using custom key and cert for DoT: {:?}/{:?}",
+                            cwd.join(k),
+                            cwd.join(c)
+                        );
                     }
-                    .into(),
-                )?;
-                info!("DoT dns server listening on: {}", c.addr);
-                Ok(())
-            })
-            .inspect_err(|x| {
-                error!("failed to listen DoT DNS server on {}: {}", c.addr, x);
-            })
-            .is_ok();
+
+                    let server_key = c
+                        .ca_key
+                        .map(|x| load_priv_key(&cwd.join(x)))
+                        .transpose()?
+                        .unwrap_or(load_default_key());
+                    let server_cert = c
+                        .ca_cert
+                        .map(|x| load_cert_chain(&cwd.join(x)))
+                        .transpose()?
+                        .unwrap_or(load_default_cert());
+                    s.register_tls_listener(
+                        x,
+                        DEFAULT_DNS_SERVER_TIMEOUT,
+                        CertificateKeyPair {
+                            certs: server_cert,
+                            key: server_key,
+                        }
+                        .into(),
+                    )?;
+                    info!("DoT dns server listening on: {}", c.addr);
+                    Ok(())
+                })
+                .inspect_err(|x| {
+                    error!("failed to listen DoT DNS server on {}: {}", c.addr, x);
+                })
+                .is_ok();
+        }
+        #[cfg(not(any(feature = "aws-lc-rs", feature = "ring")))]
+        {
+            warn!(
+                "DoT listener {} ignored because chimera-dns was built without aws-lc-rs or ring",
+                c.addr
+            );
+        }
     }
 
     if let Some(c) = listen.doh3 {
-        has_server |= UdpSocket::bind(c.addr)
-            .await
-            .and_then(|x| {
-                if let (Some(k), Some(c)) = (&c.ca_key, &c.ca_cert) {
-                    debug!(
-                        "using custom key and cert for DoH3: {:?}/{:?}",
-                        cwd.join(k),
-                        cwd.join(c)
-                    );
-                }
-
-                let server_key = c
-                    .ca_key
-                    .map(|x| load_priv_key(&cwd.join(x)))
-                    .transpose()?
-                    .unwrap_or(load_default_key());
-                let server_cert = c
-                    .ca_cert
-                    .map(|x| load_cert_chain(&cwd.join(x)))
-                    .transpose()?
-                    .unwrap_or(load_default_cert());
-                s.register_h3_listener(
-                    x,
-                    DEFAULT_DNS_SERVER_TIMEOUT,
-                    CertificateKeyPair {
-                        certs: server_cert,
-                        key: server_key,
+        #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+        {
+            has_server |= UdpSocket::bind(c.addr)
+                .await
+                .and_then(|x| {
+                    if let (Some(k), Some(c)) = (&c.ca_key, &c.ca_cert) {
+                        debug!(
+                            "using custom key and cert for DoH3: {:?}/{:?}",
+                            cwd.join(k),
+                            cwd.join(c)
+                        );
                     }
-                    .into(),
-                    c.hostname,
-                )?;
-                info!("DoT3 dns server listening on: {}", c.addr);
-                Ok(())
-            })
-            .inspect_err(|x| {
-                error!("failed to listen DoH3 DNS server on {}: {}", c.addr, x);
-            })
-            .is_ok();
+
+                    let server_key = c
+                        .ca_key
+                        .map(|x| load_priv_key(&cwd.join(x)))
+                        .transpose()?
+                        .unwrap_or(load_default_key());
+                    let server_cert = c
+                        .ca_cert
+                        .map(|x| load_cert_chain(&cwd.join(x)))
+                        .transpose()?
+                        .unwrap_or(load_default_cert());
+                    s.register_h3_listener(
+                        x,
+                        DEFAULT_DNS_SERVER_TIMEOUT,
+                        CertificateKeyPair {
+                            certs: server_cert,
+                            key: server_key,
+                        }
+                        .into(),
+                        c.hostname,
+                    )?;
+                    info!("DoH3 dns server listening on: {}", c.addr);
+                    Ok(())
+                })
+                .inspect_err(|x| {
+                    error!("failed to listen DoH3 DNS server on {}: {}", c.addr, x);
+                })
+                .is_ok();
+        }
+        #[cfg(not(any(feature = "aws-lc-rs", feature = "ring")))]
+        {
+            warn!(
+                "DoH3 listener {} ignored because chimera-dns was built without aws-lc-rs or ring",
+                c.addr
+            );
+        }
     }
 
     if !has_server {
@@ -374,7 +411,7 @@ where
     }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "aws-lc-rs", feature = "ring")))]
 mod tests {
     use crate::{
         DNSListenAddr, DoH3Config, DoHConfig, DoTConfig, MockDnsMessageExchanger,
