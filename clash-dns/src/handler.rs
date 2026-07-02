@@ -411,6 +411,103 @@ where
     }))
 }
 
+#[cfg(test)]
+mod plain_tests {
+    use crate::{DNSListenAddr, MockDnsMessageExchanger};
+    use futures::FutureExt;
+    use hickory_net::{
+        client::{Client, ClientHandle},
+        runtime::TokioRuntimeProvider,
+        tcp::TcpClientStream,
+        udp::UdpClientStream,
+    };
+    use hickory_proto::rr::{DNSClass, Name, RData, RecordType};
+    use std::time::Duration;
+    use tokio::{
+        net::{TcpListener, UdpSocket},
+        task::JoinHandle,
+    };
+
+    async fn send_query(
+        client: &mut Client<TokioRuntimeProvider>,
+    ) -> anyhow::Result<()> {
+        let name = Name::from_ascii("www.example.com.").unwrap();
+        let response = client.query(name, DNSClass::IN, RecordType::A).await?;
+        let answers = &response.answers;
+        if let RData::A(ip) = &answers[0].data {
+            assert_eq!(ip.0, std::net::Ipv4Addr::new(93, 184, 215, 14));
+        } else {
+            unreachable!("unexpected result")
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_and_tcp_listeners_work_without_crypto_features()
+    -> anyhow::Result<()> {
+        let mut mock_exchanger = MockDnsMessageExchanger::new();
+        mock_exchanger.expect_ipv6().returning(|| false);
+        mock_exchanger.expect_exchange().returning(|_| {
+            async {
+                let mut message = hickory_proto::op::Message::response(
+                    0,
+                    hickory_proto::op::OpCode::Query,
+                );
+                message.add_answer(hickory_proto::rr::Record::from_rdata(
+                    "www.example.com".parse().unwrap(),
+                    60,
+                    hickory_proto::rr::RData::A(hickory_proto::rr::rdata::A(
+                        std::net::Ipv4Addr::new(93, 184, 215, 14),
+                    )),
+                ));
+                Ok(message)
+            }
+            .boxed()
+        });
+
+        let udp_sock = UdpSocket::bind("127.0.0.1:0").await?;
+        let udp_addr = udp_sock.local_addr()?;
+        drop(udp_sock);
+
+        let tcp_sock = TcpListener::bind("127.0.0.1:0").await?;
+        let tcp_addr = tcp_sock.local_addr()?;
+        drop(tcp_sock);
+
+        let cfg = DNSListenAddr {
+            udp: Some(udp_addr),
+            tcp: Some(tcp_addr),
+            ..Default::default()
+        };
+
+        let listener =
+            super::get_dns_listener(cfg, mock_exchanger, std::path::Path::new("."))
+                .await;
+        assert!(listener.is_some());
+        let handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+            listener.unwrap().await?;
+            Ok(())
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let stream =
+            UdpClientStream::builder(udp_addr, TokioRuntimeProvider::new()).build();
+        let (mut client, bg) = Client::<TokioRuntimeProvider>::from_sender(stream);
+        tokio::spawn(bg);
+        send_query(&mut client).await?;
+
+        let (stream_future, sender) =
+            TcpClientStream::new(tcp_addr, None, None, TokioRuntimeProvider::new());
+        let stream = stream_future.await?;
+        let (mut client, bg) = Client::<TokioRuntimeProvider>::new(stream, sender);
+        tokio::spawn(bg);
+        send_query(&mut client).await?;
+
+        handle.abort();
+        Ok(())
+    }
+}
+
 #[cfg(all(test, any(feature = "aws-lc-rs", feature = "ring")))]
 mod tests {
     use crate::{
