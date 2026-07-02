@@ -1,5 +1,10 @@
 // todo
+#![allow(unused_features)]
 #![feature(ip)]
+#![cfg_attr(
+    not(any(feature = "reality", feature = "tls", feature = "tun")),
+    allow(dead_code)
+)]
 // #![feature(sync_unsafe_cell)]
 
 use std::{
@@ -456,6 +461,7 @@ impl RuntimeComponents {
     }
 }
 
+#[cfg(feature = "tun")]
 fn dns_listener_is_empty(listen: &DNSListenAddr) -> bool {
     listen.udp.is_none()
         && listen.tcp.is_none()
@@ -542,6 +548,7 @@ async fn create_components(
     debug!("initializing dns resolver");
     // Clone the dns.listen for the DNS Server later before we consume the config
     // TODO: we should separate the DNS resolver and DNS server config here
+    #[allow(unused_mut)]
     let mut dns_listen = config.dns.listen.clone();
     let dns_enable = config.dns.enable;
     #[cfg(feature = "tun")]

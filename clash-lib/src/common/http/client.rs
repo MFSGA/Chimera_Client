@@ -13,7 +13,6 @@ use crate::{
     session::Session,
 };
 
-#[cfg(feature = "tls")]
 use crate::common::tls::GLOBAL_ROOT_STORE;
 
 #[derive(Clone, Debug)]
@@ -27,7 +26,6 @@ pub struct ClashHTTPClientExt {
 pub struct HttpClient {
     dns_resolver: ThreadSafeDNSResolver,
     outbounds: Option<OutboundHandlerRegistry>,
-    #[cfg(feature = "tls")]
     tls_config: Arc<rustls::ClientConfig>,
     timeout: tokio::time::Duration,
 }

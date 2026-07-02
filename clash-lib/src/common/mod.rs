@@ -6,7 +6,6 @@ pub mod http;
 pub mod io;
 pub mod mmdb;
 pub mod succinct_set;
-#[cfg(feature = "tls")]
 pub mod tls;
 pub mod trie;
 pub mod utils;

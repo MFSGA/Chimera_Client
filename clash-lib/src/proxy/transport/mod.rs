@@ -1,4 +1,3 @@
-#[cfg(feature = "tls")]
 mod tls;
 
 #[cfg(feature = "ws")]
@@ -11,9 +10,9 @@ pub mod sip003;
 #[cfg(feature = "ws")]
 pub mod v2ray;
 
+#[cfg(feature = "reality")]
 pub mod splice_tls;
 
-#[cfg(feature = "tls")]
 pub use tls::Client as TlsClient;
 #[cfg(feature = "ws")]
 pub use ws::Client as WsClient;
@@ -29,7 +28,14 @@ pub use simple_obfs::{
     SimpleOBFSMode, SimpleOBFSOption, SimpleObfsHttp, SimpleObfsTLS,
 };
 pub use sip003::Sip003Plugin;
+#[cfg(feature = "reality")]
 pub use splice_tls::VisionOptions;
+#[cfg(not(feature = "reality"))]
+#[derive(Clone, Debug, Default)]
+pub struct VisionOptions {
+    pub read_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub write_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
 #[cfg(feature = "ws")]
 #[allow(unused_imports)]
 pub use v2ray::{V2RayOBFSOption, V2rayWsClient};

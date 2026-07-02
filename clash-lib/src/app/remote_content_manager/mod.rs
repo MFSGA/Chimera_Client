@@ -224,6 +224,7 @@ impl ProxyManager {
             .body(Empty::<Bytes>::new())
             .map_err(std::io::Error::other)?;
 
+        #[allow(unused_mut)]
         let mut tls_handshake_delay = Duration::default();
 
         let request_started = tokio::time::Instant::now();

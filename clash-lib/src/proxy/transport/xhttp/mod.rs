@@ -27,6 +27,7 @@ use crate::{
 const DUPLEX_BUFFER_SIZE: usize = 64 * 1024;
 const FRAME_CHANNEL_CAPACITY: usize = 32;
 const READ_CHUNK_SIZE: usize = 8 * 1024;
+#[allow(dead_code)]
 const DEFAULT_XHTTP_ALPN: [&str; 1] = ["h2"];
 const DEFAULT_XHTTP_PADDING_BYTES: usize = 100;
 const DEFAULT_XHTTP_PADDING_QUERY_KEY: &str = "x_padding";
@@ -50,6 +51,7 @@ pub enum XhttpSecurity {
     Reality,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct XhttpRealityConfig {
     pub public_key: [u8; 32],
@@ -57,6 +59,7 @@ pub struct XhttpRealityConfig {
     pub server_name: String,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct XhttpDownloadConfig {
     pub server: String,

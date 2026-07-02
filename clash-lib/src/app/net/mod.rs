@@ -8,18 +8,26 @@ use network_interface::{
     NetworkInterface, NetworkInterfaceConfig, V4IfAddr, V6IfAddr,
 };
 use serde::Serialize;
-#[cfg(feature = "tun")]
 use std::sync::{Arc, LazyLock};
 #[cfg(feature = "tun")]
 use tracing::{trace, warn};
 
-#[cfg(feature = "tun")]
 pub static DEFAULT_OUTBOUND_INTERFACE: LazyLock<
     Arc<tokio::sync::RwLock<Option<OutboundInterface>>>,
 > = LazyLock::new(Default::default);
 #[cfg(feature = "tun")]
 pub static TUN_SOMARK: LazyLock<tokio::sync::RwLock<Option<u32>>> =
     LazyLock::new(Default::default);
+
+#[cfg(not(feature = "tun"))]
+pub fn get_interface_by_name(_name: &str) -> Option<OutboundInterface> {
+    None
+}
+
+#[cfg(not(feature = "tun"))]
+pub fn get_outbound_interface() -> Option<OutboundInterface> {
+    None
+}
 
 #[cfg(feature = "tun")]
 fn is_documentation_v6(addr: Ipv6Addr) -> bool {
