@@ -34,13 +34,9 @@ aws-lc-rs = ["dep:aws-lc-rs", "clash-lib/aws-lc-rs"]
 ring = ["clash-lib/ring"]
 tracing = ["clash-lib/tracing"]
 
-perf = ["plus", "jemallocator"]
-# for ci
-jemallocator = ["dep:tikv-jemallocator"]
+perf = ["plus"]
 
 [dependencies]
-tikv-jemallocator = { version = "0.7", optional = true }
-
 clap = { version = "4", features = ["derive"] }
 
 clash-lib = { path = "../clash-lib", default-features = false }
