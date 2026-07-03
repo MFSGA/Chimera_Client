@@ -17,56 +17,47 @@ use crate::{
         dispatcher::{BoxedChainedDatagram, BoxedChainedStream},
         dns::ThreadSafeDNSResolver,
     },
-    proxy::{
-        datagram::UdpPacket, group::GroupProxyAPIResponse, utils::RemoteConnector,
-    },
+    proxy::datagram::UdpPacket,
     session::Session,
 };
 
 use downcast_rs::{Downcast, impl_downcast};
 
-pub mod datagram;
 pub mod direct;
-
-pub mod inbound;
-
 pub mod reject;
 
 #[cfg(feature = "anytls")]
 pub mod anytls;
-pub mod socks;
-#[cfg(feature = "tun")]
-pub mod tun;
-
-/// 9
-mod common;
-#[cfg(feature = "hysteria")]
-pub mod hysteria2;
-/// 7
-mod options;
-/// 8
-mod transport;
-/// 6
-#[cfg(feature = "trojan")]
-pub mod trojan;
-pub mod utils;
-
-#[cfg(feature = "shadowsocks")]
-pub mod shadowsocks;
-
 pub mod converters;
-
+pub mod datagram;
 pub mod group;
-
-pub use options::HandlerCommonOptions;
-
 #[cfg(feature = "http_port")]
 pub mod http;
+#[cfg(feature = "hysteria")]
+pub mod hysteria2;
+pub mod inbound;
 #[cfg(feature = "mixed_port")]
 pub mod mixed;
+#[cfg(feature = "shadowsocks")]
+pub mod shadowsocks;
+pub mod socks;
+#[cfg(feature = "trojan")]
+pub mod trojan;
+#[cfg(feature = "tun")]
+pub mod tun;
+pub mod utils;
 pub mod vless;
 
-#[cfg(feature = "http_port")]
+mod common;
+mod options;
+mod transport;
+
+use self::{group::GroupProxyAPIResponse, utils::RemoteConnector};
+
+#[allow(unused_imports)]
+pub use group::{fallback, relay, selector, urltest};
+pub use options::HandlerCommonOptions;
+
 #[derive(thiserror::Error, Debug)]
 pub enum ProxyError {
     #[error(transparent)]
@@ -180,60 +171,60 @@ pub trait ClientStream: Downcast + AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T> ClientStream for T where T: Downcast + AsyncRead + AsyncWrite + Send + Unpin {}
 impl_downcast!(ClientStream);
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub enum OutboundType {
-    Direct,
-    Reject,
-    Socks5,
-    Selector,
-    #[cfg(feature = "anytls")]
-    Anytls,
-    Trojan,
-    Hysteria2,
-    Vless,
-    #[cfg(feature = "shadowsocks")]
     Shadowsocks,
+    Vmess,
+    Vless,
+    Trojan,
+    Anytls,
+    WireGuard,
+    Tor,
+    Tuic,
+    Socks5,
+    Hysteria2,
+    Ssh,
+    Tailscale,
+    ShadowQuic,
 
     #[serde(rename = "URLTest")]
     UrlTest,
-    Fallback,
+    Selector,
     Relay,
+    LoadBalance,
+    Smart,
+    Fallback,
+
+    Direct,
+    Reject,
 }
 
 impl Display for OutboundType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            #[cfg(feature = "shadowsocks")]
             OutboundType::Shadowsocks => write!(f, "Shadowsocks"),
-            /* OutboundType::Vmess => write!(f, "Vmess"),
-
+            OutboundType::Vmess => write!(f, "Vmess"),
+            OutboundType::Vless => write!(f, "Vless"),
+            OutboundType::Trojan => write!(f, "Trojan"),
+            OutboundType::Anytls => write!(f, "AnyTLS"),
             OutboundType::WireGuard => write!(f, "WireGuard"),
             OutboundType::Tor => write!(f, "Tor"),
             OutboundType::Tuic => write!(f, "Tuic"),
-            OutboundType::Socks5 => write!(f, "Socks5"),
             OutboundType::Hysteria2 => write!(f, "Hysteria2"),
             OutboundType::Ssh => write!(f, "ssh"),
+            OutboundType::Tailscale => write!(f, "Tailscale"),
             OutboundType::ShadowQuic => write!(f, "ShadowQuic"),
+            OutboundType::Socks5 => write!(f, "Socks5"),
 
-
+            OutboundType::UrlTest => write!(f, "URLTest"),
             OutboundType::Selector => write!(f, "Selector"),
             OutboundType::Relay => write!(f, "Relay"),
             OutboundType::LoadBalance => write!(f, "LoadBalance"),
             OutboundType::Smart => write!(f, "Smart"),
-             */
-            OutboundType::Vless => write!(f, "Vless"),
-            #[cfg(feature = "anytls")]
-            OutboundType::Anytls => write!(f, "AnyTLS"),
-            OutboundType::Trojan => write!(f, "Trojan"),
-            OutboundType::Hysteria2 => write!(f, "Hysteria2"),
-            OutboundType::Socks5 => write!(f, "Socks5"),
-            OutboundType::Selector => write!(f, "Selector"),
+            OutboundType::Fallback => write!(f, "Fallback"),
+
             OutboundType::Direct => write!(f, "Direct"),
             OutboundType::Reject => write!(f, "Reject"),
-
-            OutboundType::UrlTest => write!(f, "URLTest"),
-            OutboundType::Fallback => write!(f, "Fallback"),
-            OutboundType::Relay => write!(f, "Relay"),
         }
     }
 }

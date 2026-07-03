@@ -1,17 +1,14 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-
-use crate::proxy::{AnyOutboundHandler, OutboundHandler};
 use erased_serde::Serialize;
 
-pub mod selector;
-
-pub mod urltest;
+use crate::proxy::{AnyOutboundHandler, OutboundHandler};
 
 pub mod fallback;
-
 pub mod relay;
+pub mod selector;
+pub mod urltest;
 
 /// Convenience trait for group proxy serializing API responses.
 #[async_trait]
@@ -25,10 +22,8 @@ pub trait GroupProxyAPIResponse: OutboundHandler {
     /// urltest, it returns the fastest proxy, etc.
     async fn get_active_proxy(&self) -> Option<AnyOutboundHandler>;
 
-    /// Returns the preferred latency test URL for the group, if configured.
-    fn get_latency_test_url(&self) -> Option<String> {
-        None
-    }
+    /// Returns the latency test URL for the group.
+    fn get_latency_test_url(&self) -> Option<String>;
 
     /// used in the API responses.
     async fn as_map(&self) -> HashMap<String, Box<dyn Serialize + Send>> {
