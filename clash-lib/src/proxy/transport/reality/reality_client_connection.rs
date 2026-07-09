@@ -596,7 +596,10 @@ impl RealityClientConnection {
             record_len
         );
 
-        // Decrypt using current sequence number
+        // Decrypt using current sequence number.  When this fails at record 0,
+        // the peer most commonly forwarded camouflage/fallback TLS records
+        // because REALITY auth did not match; another possibility is a
+        // transcript/key-schedule mismatch between client and server.
         let plaintext = decrypt_handshake_message(
             cipher_suite,
             &server_hs_key,
@@ -604,7 +607,17 @@ impl RealityClientConnection {
             handshake_seq,
             &ciphertext,
             record_len as u16,
-        )?;
+        )
+        .map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "REALITY server handshake decryption failed at record #{handshake_seq} \
+                     (record_len={record_len}, cipher_suite={cipher_suite:?}); \
+                     possible fallback TLS data or mismatched public-key/short-id/servername: {err}"
+                ),
+            )
+        })?;
 
         log::debug!(
             "REALITY CLIENT: Decrypted record #{} ({} bytes plaintext)",
