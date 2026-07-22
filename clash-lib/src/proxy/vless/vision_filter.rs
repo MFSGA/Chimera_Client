@@ -3,7 +3,10 @@ use std::io;
 const TLS_CONTENT_TYPE_HANDSHAKE: u8 = 0x16;
 const TLS_HANDSHAKE_TYPE_CLIENT_HELLO: u8 = 0x01;
 const TLS_HANDSHAKE_TYPE_SERVER_HELLO: u8 = 0x02;
-const TLS13_CIPHER_AES_128_CCM_8_SHA256: u16 = 0x1305;
+const TLS13_CIPHER_AES_128_GCM_SHA256: u16 = 0x1301;
+const TLS13_CIPHER_AES_256_GCM_SHA384: u16 = 0x1302;
+const TLS13_CIPHER_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
+const TLS13_CIPHER_AES_128_CCM_SHA256: u16 = 0x1304;
 
 #[derive(Debug)]
 pub struct VisionFilter {
@@ -88,9 +91,7 @@ impl VisionFilter {
 
             match parse_server_hello(data) {
                 Ok(parsed) => {
-                    if parsed.is_tls13
-                        && parsed.cipher_suite != TLS13_CIPHER_AES_128_CCM_8_SHA256
-                    {
+                    if parsed.is_tls13 && supports_xtls_cipher(parsed.cipher_suite) {
                         self.supports_xtls = true;
                     }
                     if parsed.is_tls13 {
@@ -103,6 +104,16 @@ impl VisionFilter {
             }
         }
     }
+}
+
+fn supports_xtls_cipher(cipher_suite: u16) -> bool {
+    matches!(
+        cipher_suite,
+        TLS13_CIPHER_AES_128_GCM_SHA256
+            | TLS13_CIPHER_AES_256_GCM_SHA384
+            | TLS13_CIPHER_CHACHA20_POLY1305_SHA256
+            | TLS13_CIPHER_AES_128_CCM_SHA256
+    )
 }
 
 fn parse_server_hello(record: &[u8]) -> io::Result<ParsedServerHello> {
@@ -189,4 +200,61 @@ fn parse_server_hello(record: &[u8]) -> io::Result<ParsedServerHello> {
         cipher_suite,
         is_tls13,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VisionFilter;
+
+    fn server_hello(cipher: u16, tls13: bool) -> Vec<u8> {
+        let mut message = Vec::new();
+        message.extend_from_slice(&[0x03, 0x03]);
+        message.extend_from_slice(&[0x11; 32]);
+        message.push(0);
+        message.extend_from_slice(&cipher.to_be_bytes());
+        message.push(0);
+        if tls13 {
+            message.extend_from_slice(&6u16.to_be_bytes());
+            message.extend_from_slice(&[0x00, 0x2b, 0x00, 0x02, 0x03, 0x04]);
+        } else {
+            message.extend_from_slice(&0u16.to_be_bytes());
+        }
+
+        let mut handshake = vec![0x02];
+        handshake.extend_from_slice(&(message.len() as u32).to_be_bytes()[1..]);
+        handshake.extend_from_slice(&message);
+
+        let mut record = vec![0x16, 0x03, 0x03];
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    #[test]
+    fn xray_tls13_cipher_matrix() {
+        for cipher in [0x1301, 0x1302, 0x1303, 0x1304] {
+            let mut filter = VisionFilter::new();
+            filter.filter_record(&server_hello(cipher, true));
+            assert!(filter.supports_xtls(), "cipher {cipher:#06x}");
+        }
+
+        for cipher in [0x1305, 0x0a0a, 0xc02f] {
+            let mut filter = VisionFilter::new();
+            filter.filter_record(&server_hello(cipher, true));
+            assert!(!filter.supports_xtls(), "cipher {cipher:#06x}");
+        }
+    }
+
+    #[test]
+    fn tls12_and_non_tls_never_enable_direct() {
+        let mut tls12 = VisionFilter::new();
+        tls12.filter_record(&server_hello(0xc02f, false));
+        assert!(tls12.is_tls12_or_above());
+        assert!(!tls12.supports_xtls());
+
+        let mut plaintext = VisionFilter::new();
+        plaintext.filter_record(b"GET / HTTP/1.1\r\n");
+        assert!(!plaintext.is_tls());
+        assert!(!plaintext.supports_xtls());
+    }
 }

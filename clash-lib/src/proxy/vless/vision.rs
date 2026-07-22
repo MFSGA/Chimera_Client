@@ -54,7 +54,8 @@ pub struct VisionStream {
     write_shutdown_queued: bool,
     write_buf: BytesMut,
     write_deframer: FuzzyTlsDeframer,
-    write_filter: VisionFilter,
+    read_deframer: FuzzyTlsDeframer,
+    traffic_filter: VisionFilter,
     read_mode: ReadMode,
     decoded: BytesMut,
     raw: BytesMut,
@@ -87,7 +88,8 @@ impl VisionStream {
             write_shutdown_queued: false,
             write_buf: BytesMut::new(),
             write_deframer: FuzzyTlsDeframer::new(),
-            write_filter: VisionFilter::new(),
+            read_deframer: FuzzyTlsDeframer::new(),
+            traffic_filter: VisionFilter::new(),
             read_mode: ReadMode::Framed,
             decoded: BytesMut::new(),
             raw: BytesMut::new(),
@@ -118,24 +120,24 @@ impl VisionStream {
             match self.write_deframer.next_record()? {
                 DeframeResult::TlsRecord(record) => {
                     processed_len += record.len();
-                    self.write_filter.filter_record(&record);
+                    self.traffic_filter.filter_record(&record);
 
-                    let is_app_data = self.write_filter.is_tls()
+                    let is_app_data = self.traffic_filter.is_tls()
                         && record.len() >= 3
                         && record[0] == TLS_APPLICATION_DATA
                         && record[1] == 0x03;
                     let non_tls_filtering_ended = !is_app_data
-                        && !self.write_filter.is_filtering()
-                        && !self.write_filter.is_tls12_or_above();
+                        && !self.traffic_filter.is_filtering()
+                        && !self.traffic_filter.is_tls12_or_above();
                     let finish_padding_for_legacy_compat =
-                        !self.write_filter.is_tls12_or_above()
-                            && self.write_filter.remaining_filter_count() <= 1;
+                        !self.traffic_filter.is_tls12_or_above()
+                            && self.traffic_filter.remaining_filter_count() <= 1;
 
                     if is_app_data
                         || non_tls_filtering_ended
                         || finish_padding_for_legacy_compat
                     {
-                        let command = if self.write_filter.supports_xtls() {
+                        let command = if self.traffic_filter.supports_xtls() {
                             self.pending_write_switch = PendingWriteSwitch::Raw;
                             CMD_PADDING_DIRECT
                         } else {
@@ -150,21 +152,21 @@ impl VisionStream {
                     self.pad_frame(
                         &record,
                         CMD_PADDING_CONTINUE,
-                        self.write_filter.is_tls(),
+                        self.traffic_filter.is_tls(),
                     );
                 }
                 DeframeResult::UnknownPrefix(prefix) => {
                     processed_len += prefix.len();
-                    self.write_filter.decrement_filter_count();
+                    self.traffic_filter.decrement_filter_count();
 
-                    if !self.write_filter.is_tls()
-                        || self.write_filter.remaining_filter_count() <= 1
+                    if !self.traffic_filter.is_tls()
+                        || self.traffic_filter.remaining_filter_count() <= 1
                     {
                         self.pending_write_switch = PendingWriteSwitch::Tls;
                         self.pad_frame(
                             &prefix,
                             CMD_PADDING_END,
-                            self.write_filter.is_tls(),
+                            self.traffic_filter.is_tls(),
                         );
                         self.write_deframer.clear();
                         return Ok(processed_len.saturating_sub(existing_inner_len));
@@ -173,7 +175,7 @@ impl VisionStream {
                     self.pad_frame(
                         &prefix,
                         CMD_PADDING_CONTINUE,
-                        self.write_filter.is_tls(),
+                        self.traffic_filter.is_tls(),
                     );
                 }
                 DeframeResult::NeedData => break,
@@ -220,7 +222,7 @@ impl VisionStream {
 
         let remaining = self.write_deframer.remaining_data().to_vec();
         self.write_deframer.clear();
-        self.pad_frame(&remaining, CMD_PADDING_END, self.write_filter.is_tls());
+        self.pad_frame(&remaining, CMD_PADDING_END, self.traffic_filter.is_tls());
         self.write_shutdown_queued = true;
         self.pending_write_switch = PendingWriteSwitch::Tls;
     }
@@ -234,6 +236,7 @@ impl VisionStream {
         let changed = !result.content.is_empty() || result.command.is_some();
 
         self.raw.clear();
+        self.observe_read_content(&result.content)?;
         self.decoded.extend_from_slice(&result.content);
 
         match result.command {
@@ -252,6 +255,29 @@ impl VisionStream {
         }
 
         Ok(changed)
+    }
+
+    /// Feed downlink TLS records into the same traffic filter used by the
+    /// uplink writer. xray-core shares one TrafficState between VisionReader
+    /// and VisionWriter; without this, the client never learns the negotiated
+    /// TLS version/cipher from ServerHello and cannot select Direct upstream.
+    fn observe_read_content(&mut self, content: &[u8]) -> io::Result<()> {
+        if content.is_empty() || !self.traffic_filter.is_filtering() {
+            return Ok(());
+        }
+
+        self.read_deframer.feed(content);
+        loop {
+            match self.read_deframer.next_record()? {
+                DeframeResult::TlsRecord(record) => {
+                    self.traffic_filter.filter_record(&record);
+                }
+                DeframeResult::UnknownPrefix(_) => {
+                    self.traffic_filter.decrement_filter_count();
+                }
+                DeframeResult::NeedData => return Ok(()),
+            }
+        }
     }
 }
 
@@ -362,14 +388,14 @@ impl AsyncWrite for VisionStream {
                 error!(
                     "VISION WRITE: TLS deframing failed, ending Vision framing: {err}"
                 );
-                this.write_filter.stop_filtering("write invalid TLS data");
+                this.traffic_filter.stop_filtering("write invalid TLS data");
                 let remaining = this.write_deframer.remaining_data().to_vec();
                 this.write_deframer.clear();
                 this.pending_write_switch = PendingWriteSwitch::Tls;
                 this.pad_frame(
                     &remaining,
                     CMD_PADDING_END,
-                    this.write_filter.is_tls(),
+                    this.traffic_filter.is_tls(),
                 );
                 buf.len()
             }
@@ -542,6 +568,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_downlink_server_hello_enables_uplink_direct() {
+        let (mut vs, mut server) = make_vision_pair();
+        let client_hello = tls_record(0x16, Some(0x01), &[0; 32]);
+        let server_hello = tls13_server_hello();
+        let app_data = tls_record(TLS_APPLICATION_DATA, None, b"request");
+
+        vs.write_all(&client_hello).await.unwrap();
+        vs.flush().await.unwrap();
+
+        let mut uplink = vec![0u8; 65536];
+        let _ = server.read(&mut uplink).await.unwrap();
+
+        let mut downlink = vec![0, 0];
+        downlink.extend(server_first_frame(
+            &TEST_UUID,
+            CMD_PADDING_CONTINUE,
+            &server_hello,
+            0,
+        ));
+        server.write_all(&downlink).await.unwrap();
+
+        let mut observed_server_hello = vec![0u8; server_hello.len()];
+        vs.read_exact(&mut observed_server_hello).await.unwrap();
+        assert_eq!(observed_server_hello, server_hello);
+
+        vs.write_all(&app_data).await.unwrap();
+        vs.flush().await.unwrap();
+
+        let n = server.read(&mut uplink).await.unwrap();
+        let (cmd, content, _, _) = parse_frame(&uplink[..n], 0);
+        assert_eq!(cmd, CMD_PADDING_DIRECT);
+        assert_eq!(content, app_data);
+    }
+
+    #[tokio::test]
     async fn test_read_switches_to_direct_on_cmd_direct() {
         let (mut vs, mut server) = make_vision_pair();
         let raw_after = b"\x17\x03\x03\x00\x05hello";
@@ -600,6 +661,28 @@ mod tests {
 
         assert!(!vs.process_raw_read().unwrap());
         assert_eq!(vs.read_mode, ReadMode::Framed);
+    }
+
+    #[test]
+    fn test_fragmented_downlink_server_hello_enables_direct() {
+        let (mut vs, _) = make_vision_pair();
+        let server_hello = tls13_server_hello();
+        let split = server_hello.len() / 2;
+
+        vs.raw.extend(server_first_frame(
+            &TEST_UUID,
+            CMD_PADDING_CONTINUE,
+            &server_hello[..split],
+            0,
+        ));
+        assert!(vs.process_raw_read().unwrap());
+        assert!(!vs.traffic_filter.supports_xtls());
+        vs.decoded.clear();
+
+        vs.raw
+            .extend(server_frame(CMD_PADDING_CONTINUE, &server_hello[split..]));
+        assert!(vs.process_raw_read().unwrap());
+        assert!(vs.traffic_filter.supports_xtls());
     }
 
     #[tokio::test]

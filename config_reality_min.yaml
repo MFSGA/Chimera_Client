@@ -1,9 +1,10 @@
 socks-port: 17890
-bind-address: '*'
+bind-address: 127.0.0.1
 allow-lan: false
 mode: rule
 log-level: debug
 ipv6: false
+mmdb: null
 dns:
   enable: false
 
@@ -12,14 +13,14 @@ proxies:
   type: vless
   server: 127.0.0.1
   port: 39444
-  uuid: 114cb5a6-3787-4357-a5da-69b5782cb74f
+  uuid: 3ac9b383-75a1-431c-8184-106c80eb2273
   network: tcp
   tls: true
-  servername: 
-  client-fingerprint: 
+  servername: www.apple.com
+  client-fingerprint: chrome
   reality-opts:
-    public-key: 
-    short-id: 
+    public-key: lpaMu0U01fKbRO9mgkSiOArWZz4V0TRW7pR543Pm9Xg
+    short-id: 4ac97aaf8b9b0356
   skip-cert-verify: true
 
 rules:
