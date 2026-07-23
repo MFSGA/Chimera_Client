@@ -25,7 +25,7 @@ use hickory_proto::{
 };
 use rustls::{ClientConfig, pki_types::ServerName};
 use tokio::{sync::RwLock, task::JoinHandle};
-use tracing::{info, instrument, trace, warn};
+use tracing::{debug, info, instrument, trace, warn};
 
 use crate::{
     Error,
@@ -63,7 +63,7 @@ impl Display for DNSNetMode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proxy;
+    use crate::{app::dns::MockClashResolver, proxy};
     use hickory_proto::{
         op,
         rr::{Name, rdata::opt::EdnsOption},
@@ -78,8 +78,9 @@ mod tests {
                 c: None,
                 bg_handle: None,
             })),
-            cfg: DnsConfig::Udp(addr, None, proxy.clone(), None),
+            cfg: RwLock::new(DnsConfig::Udp(addr, None, proxy.clone(), None)),
             proxy,
+            bootstrap_resolver: None,
             host: url::Host::Domain("example.org".to_string()),
             port: 53,
             net: DNSNetMode::Udp,
@@ -87,6 +88,28 @@ mod tests {
             ecs,
             rule_dispatch: None,
         }
+    }
+
+    #[tokio::test]
+    async fn refresh_upstream_address_uses_bootstrap_resolver() {
+        let mut resolver = MockClashResolver::new();
+        resolver
+            .expect_resolve()
+            .with(
+                mockall::predicate::eq("example.org"),
+                mockall::predicate::eq(false),
+            )
+            .once()
+            .returning(|_, _| Ok(Some(net::IpAddr::from([203, 0, 113, 10]))));
+
+        let mut client = client_with_ecs(None);
+        client.bootstrap_resolver = Some(Arc::new(resolver));
+
+        assert!(client.refresh_upstream_address().await.unwrap());
+        assert_eq!(
+            client.cfg.read().await.addr(),
+            net::SocketAddr::from(([203, 0, 113, 10], 53))
+        );
     }
 
     fn build_message(record_type: RecordType) -> Message {
@@ -226,6 +249,7 @@ pub struct Opts {
 
 type FwMark = Option<u32>;
 
+#[derive(Clone)]
 enum DnsConfig {
     Udp(
         net::SocketAddr,
@@ -253,6 +277,26 @@ enum DnsConfig {
         Arc<dyn OutboundHandler>,
         FwMark,
     ),
+}
+
+impl DnsConfig {
+    fn addr(&self) -> net::SocketAddr {
+        match self {
+            Self::Udp(addr, ..)
+            | Self::Tcp(addr, ..)
+            | Self::Tls(addr, ..)
+            | Self::Https(addr, ..) => *addr,
+        }
+    }
+
+    fn set_ip(&mut self, ip: IpAddr) {
+        match self {
+            Self::Udp(addr, ..)
+            | Self::Tcp(addr, ..)
+            | Self::Tls(addr, ..)
+            | Self::Https(addr, ..) => addr.set_ip(ip),
+        }
+    }
 }
 
 impl Display for DnsConfig {
@@ -303,8 +347,9 @@ struct Inner {
 pub struct DnsClient {
     inner: Arc<RwLock<Inner>>,
 
-    cfg: DnsConfig,
+    cfg: RwLock<DnsConfig>,
     proxy: Arc<dyn OutboundHandler>,
+    bootstrap_resolver: Option<Arc<dyn ClashResolver>>,
 
     // debug purpose
     host: url::Host<String>,
@@ -316,6 +361,88 @@ pub struct DnsClient {
 }
 
 impl DnsClient {
+    async fn build_stream(
+        &self,
+    ) -> Result<(client::Client<DnsRuntimeProvider>, JoinHandle<()>), Error> {
+        let cfg = self.cfg.read().await.clone();
+        dns_stream_builder(&cfg, self.rule_dispatch.clone()).await
+    }
+
+    async fn refresh_upstream_address(&self) -> anyhow::Result<bool> {
+        let url::Host::Domain(domain) = &self.host else {
+            return Ok(false);
+        };
+        let Some(resolver) = &self.bootstrap_resolver else {
+            return Ok(false);
+        };
+        let Some(ip) = resolver.resolve(domain, false).await? else {
+            return Err(Error::DNSError(format!(
+                "unable to refresh DNS upstream address for {domain}"
+            ))
+            .into());
+        };
+
+        let mut cfg = self.cfg.write().await;
+        let old_addr = cfg.addr();
+        if old_addr.ip() == ip {
+            debug!(
+                upstream = %self.id(),
+                address = %old_addr,
+                "DNS upstream address refresh returned the current address"
+            );
+            return Ok(false);
+        }
+
+        cfg.set_ip(ip);
+        info!(
+            upstream = %self.id(),
+            old_address = %old_addr,
+            new_address = %cfg.addr(),
+            "refreshed DNS upstream address after connection failures"
+        );
+        Ok(true)
+    }
+
+    async fn rebuild_current_address(
+        &self,
+        address_refreshed: bool,
+    ) -> Result<(client::Client<DnsRuntimeProvider>, JoinHandle<()>), Error> {
+        const MAX_RETRIES: u32 = 3;
+        const RETRY_DELAY: Duration = Duration::from_millis(200);
+
+        for attempt in 0..=MAX_RETRIES {
+            match self.build_stream().await {
+                Ok(result) => {
+                    if attempt > 0 {
+                        info!(
+                            upstream = %self.id(),
+                            address_refreshed,
+                            attempt = attempt + 1,
+                            max_attempts = MAX_RETRIES + 1,
+                            "dns client rebuild succeeded"
+                        );
+                    }
+                    return Ok(result);
+                }
+                Err(err) if attempt < MAX_RETRIES => {
+                    warn!(
+                        upstream = %self.id(),
+                        address_refreshed,
+                        attempt = attempt + 1,
+                        max_attempts = MAX_RETRIES + 1,
+                        retry_delay_ms = RETRY_DELAY.as_millis(),
+                        error = %err,
+                        "dns client rebuild failed, retrying"
+                    );
+                    tokio::time::sleep(RETRY_DELAY).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        unreachable!()
+    }
+
     /// Rebuild the DNS stream with retries, waiting between attempts.
     /// Network transitions can briefly make outbound sockets unavailable; a
     /// short retry loop avoids permanently failing the resolver on a transient
@@ -323,44 +450,20 @@ impl DnsClient {
     async fn rebuild_with_retries(
         &self,
     ) -> anyhow::Result<(client::Client<DnsRuntimeProvider>, JoinHandle<()>)> {
-        const MAX_RETRIES: u32 = 3;
-        const RETRY_DELAY: Duration = Duration::from_millis(200);
-
-        for attempt in 0..=MAX_RETRIES {
-            match dns_stream_builder(&self.cfg, self.rule_dispatch.clone()).await {
-                Ok(result) => {
-                    if attempt > 0 {
-                        info!(
-                            "{}: dns client rebuild succeeded on attempt {}/{}",
-                            self.id(),
-                            attempt + 1,
-                            MAX_RETRIES + 1
-                        );
-                    }
-                    return Ok(result);
-                }
-                Err(err) if attempt < MAX_RETRIES => {
-                    warn!(
-                        "{}: dns client rebuild attempt {}/{} failed: {err:#}, retrying in {}ms",
-                        self.id(),
-                        attempt + 1,
-                        MAX_RETRIES + 1,
-                        RETRY_DELAY.as_millis()
-                    );
-                    tokio::time::sleep(RETRY_DELAY).await;
-                }
-                Err(err) => {
-                    warn!(
-                        "{}: dns client rebuild failed after {} attempts: {err:#}",
-                        self.id(),
-                        MAX_RETRIES + 1
-                    );
-                    return Err(err.into());
-                }
-            }
+        let err = match self.rebuild_current_address(false).await {
+            Ok(result) => return Ok(result),
+            Err(err) => err,
+        };
+        warn!(
+            upstream = %self.id(),
+            error = %err,
+            "dns client rebuild attempts exhausted, refreshing upstream address"
+        );
+        if !self.refresh_upstream_address().await? {
+            return Err(err.into());
         }
 
-        unreachable!()
+        self.rebuild_current_address(true).await.map_err(Into::into)
     }
 
     pub async fn new_client(opts: Opts) -> anyhow::Result<ThreadSafeDNSClient> {
@@ -385,7 +488,7 @@ impl DnsClient {
         };
 
         let resolved_ip = match need_resolve {
-            Some(domain) => match opts.father {
+            Some(domain) => match opts.father.as_ref() {
                 Some(father) => match father.resolve(domain, false).await? {
                     Some(ip) => Some(ip),
                     _ => {
@@ -427,8 +530,9 @@ impl DnsClient {
                         c: None,
                         bg_handle: None,
                     })),
-                    cfg,
+                    cfg: RwLock::new(cfg),
                     proxy: opts.proxy,
+                    bootstrap_resolver: opts.father,
                     host: opts.host,
                     port: opts.port,
                     net: opts.net,
@@ -450,8 +554,9 @@ impl DnsClient {
                         bg_handle: None,
                     })),
 
-                    cfg,
+                    cfg: RwLock::new(cfg),
                     proxy: opts.proxy,
+                    bootstrap_resolver: opts.father,
                     host: opts.host,
                     port: opts.port,
                     net: opts.net,
@@ -473,8 +578,9 @@ impl DnsClient {
                         c: None,
                         bg_handle: None,
                     })),
-                    cfg,
+                    cfg: RwLock::new(cfg),
                     proxy: opts.proxy,
+                    bootstrap_resolver: opts.father,
                     host: opts.host,
                     port: opts.port,
                     net: opts.net,
@@ -497,8 +603,9 @@ impl DnsClient {
                         bg_handle: None,
                     })),
 
-                    cfg,
+                    cfg: RwLock::new(cfg),
                     proxy: opts.proxy,
+                    bootstrap_resolver: opts.father,
                     host: opts.host,
                     port: opts.port,
                     net: opts.net,
@@ -612,7 +719,7 @@ impl Client for DnsClient {
                 }
                 _ => {
                     // initializing client
-                    info!("initializing dns client: {}", &self.cfg);
+                    info!("initializing dns client: {}", self.cfg.read().await);
                     let (client, bg) = self.rebuild_with_retries().await?;
                     inner.c.replace(client);
                     inner.bg_handle.replace(bg);
