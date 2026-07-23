@@ -251,6 +251,13 @@ pub fn setup_policy_routing(
     }
 
     if is_nixos() {
+        // TODO: This is a NixOS-specific fallback for the TUN loopback issue. It
+        // snapshots the current default-route source address at startup, so it
+        // can become stale when the host switches Wi-Fi/hotspots or DHCP assigns
+        // a new LAN address while Chimera is still running. A more robust Linux
+        // design should bind outbound proxy sockets to the current physical
+        // egress interface/source and refresh that state from netlink
+        // route/address changes instead of relying on this fixed source rule.
         match main_route_source_v4()? {
             Some(addr_v4) => {
                 run_ip_cmd(
