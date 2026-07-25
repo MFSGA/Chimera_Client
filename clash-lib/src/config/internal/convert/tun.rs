@@ -1,7 +1,87 @@
 use crate::{
     Error,
-    config::{def, internal::config},
+    config::{
+        def,
+        internal::config::{
+            self, DnsHijackAddress, DnsHijackProtocol, DnsHijackRule,
+        },
+    },
 };
+
+fn parse_dns_hijack_rule(value: &str) -> Result<DnsHijackRule, crate::Error> {
+    let (protocol, address) = match value.split_once("://") {
+        Some(("udp", address)) => (DnsHijackProtocol::Udp, address),
+        Some(("tcp", address)) => (DnsHijackProtocol::Tcp, address),
+        Some((protocol, _)) => {
+            return Err(Error::InvalidConfig(format!(
+                "parse tun dns-hijack: unsupported protocol {protocol}"
+            )));
+        }
+        None => (DnsHijackProtocol::Udp, value),
+    };
+
+    let (address, port) = address.rsplit_once(':').ok_or_else(|| {
+        Error::InvalidConfig(format!(
+            "parse tun dns-hijack: missing port in {value}"
+        ))
+    })?;
+    let port = port.parse::<u16>().map_err(|e| {
+        Error::InvalidConfig(format!("parse tun dns-hijack port in {value}: {e}"))
+    })?;
+    if port == 0 {
+        return Err(Error::InvalidConfig(format!(
+            "parse tun dns-hijack: port must not be zero in {value}"
+        )));
+    }
+
+    let address = if address == "any" {
+        DnsHijackAddress::Any
+    } else {
+        if address.contains(':')
+            && !(address.starts_with('[') && address.ends_with(']'))
+        {
+            return Err(Error::InvalidConfig(format!(
+                "parse tun dns-hijack: IPv6 address must be bracketed in {value}"
+            )));
+        }
+        let address = address
+            .strip_prefix('[')
+            .and_then(|address| address.strip_suffix(']'))
+            .unwrap_or(address);
+        DnsHijackAddress::Ip(address.parse().map_err(|e| {
+            Error::InvalidConfig(format!(
+                "parse tun dns-hijack address in {value}: {e}"
+            ))
+        })?)
+    };
+
+    Ok(DnsHijackRule {
+        protocol,
+        address,
+        port,
+    })
+}
+
+fn parse_dns_hijack(
+    value: def::DnsHijack,
+) -> Result<(bool, Vec<DnsHijackRule>), crate::Error> {
+    let (enabled, values) = match value {
+        def::DnsHijack::Switch(false) => return Ok((false, Vec::new())),
+        def::DnsHijack::Switch(true) => {
+            (true, vec!["any:53".to_string(), "tcp://any:53".to_string()])
+        }
+        def::DnsHijack::List(values) => (true, values),
+    };
+
+    let mut rules = Vec::with_capacity(values.len());
+    for value in values {
+        let rule = parse_dns_hijack_rule(&value)?;
+        if !rules.contains(&rule) {
+            rules.push(rule);
+        }
+    }
+    Ok((enabled, rules))
+}
 
 pub(super) fn convert(
     before: Option<def::TunConfig>,
@@ -24,6 +104,7 @@ pub(super) fn convert(
 
     match before {
         Some(t) => {
+            let (dns_hijack, dns_hijack_rules) = parse_dns_hijack(t.dns_hijack)?;
             let mut route_exclude_address =
                 parse_routes(t.route_exclude_address, "route-exclude-address")?;
 
@@ -79,10 +160,8 @@ pub(super) fn convert(
                 mtu: t.mtu,
                 so_mark: t.so_mark,
                 route_table: t.route_table,
-                dns_hijack: match t.dns_hijack {
-                    def::DnsHijack::Switch(v) => v,
-                    def::DnsHijack::List(_) => true,
-                },
+                dns_hijack,
+                dns_hijack_rules,
             })
         }
         None => Ok(config::TunConfig::default()),
@@ -91,7 +170,10 @@ pub(super) fn convert(
 
 #[cfg(test)]
 mod tests {
-    use crate::config::def;
+    use crate::config::{
+        def,
+        internal::config::{DnsHijackAddress, DnsHijackProtocol, DnsHijackRule},
+    };
 
     use super::convert;
 
@@ -130,6 +212,84 @@ dns-hijack:
         );
         let converted = convert(Some(tun)).expect("tun convert should succeed");
         assert!(converted.dns_hijack);
+        assert_eq!(
+            converted.dns_hijack_rules,
+            vec![DnsHijackRule {
+                protocol: DnsHijackProtocol::Udp,
+                address: DnsHijackAddress::Any,
+                port: 53,
+            }]
+        );
+    }
+
+    #[test]
+    fn expand_dns_hijack_true_to_udp_and_tcp() {
+        let converted = convert(Some(parse_tun("enable: true\ndns-hijack: true")))
+            .expect("valid rule");
+
+        assert_eq!(converted.dns_hijack_rules.len(), 2);
+        assert_eq!(
+            converted.dns_hijack_rules[0].protocol,
+            DnsHijackProtocol::Udp
+        );
+        assert_eq!(
+            converted.dns_hijack_rules[1].protocol,
+            DnsHijackProtocol::Tcp
+        );
+    }
+
+    #[test]
+    fn preserve_empty_dns_hijack_list_as_enabled() {
+        let converted = convert(Some(parse_tun("enable: true\ndns-hijack: []")))
+            .expect("empty list remains compatible");
+
+        assert!(converted.dns_hijack);
+        assert!(converted.dns_hijack_rules.is_empty());
+    }
+
+    #[test]
+    fn parse_dns_hijack_addresses_and_remove_duplicates() {
+        let tun = parse_tun(
+            r#"
+enable: true
+dns-hijack:
+  - 1.1.1.1:53
+  - tcp://[::1]:53
+  - 1.1.1.1:53
+"#,
+        );
+        let converted = convert(Some(tun)).expect("valid rules");
+
+        assert_eq!(converted.dns_hijack_rules.len(), 2);
+        assert_eq!(
+            converted.dns_hijack_rules[0].address,
+            DnsHijackAddress::Ip("1.1.1.1".parse().unwrap())
+        );
+        assert_eq!(
+            converted.dns_hijack_rules[1].address,
+            DnsHijackAddress::Ip("::1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn reject_invalid_dns_hijack_rules() {
+        for rule in [
+            "quic://any:53",
+            "any",
+            "any:0",
+            "any:65536",
+            "not-an-ip:53",
+            "::1:53",
+        ] {
+            let tun = parse_tun(&format!("enable: true\ndns-hijack: [\"{rule}\"]"));
+            match convert(Some(tun)) {
+                Err(crate::Error::InvalidConfig(message)) => {
+                    assert!(message.contains("parse tun dns-hijack"))
+                }
+                Err(other) => panic!("unexpected error for {rule}: {other}"),
+                Ok(_) => panic!("invalid rule should fail: {rule}"),
+            }
+        }
     }
 
     #[test]

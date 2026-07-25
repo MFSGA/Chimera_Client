@@ -298,6 +298,7 @@ impl Runner for TunRunner {
         let dispatcher = self.dispatcher.clone();
         let resolver = self.resolver.clone();
         let dns_hijack = self.cfg.dns_hijack;
+        let dns_hijack_rules = self.cfg.dns_hijack_rules.clone();
         let cancellation_token = self.cancellation_token.clone();
 
         let handle = tokio::spawn(async move {
@@ -408,6 +409,7 @@ impl Runner for TunRunner {
                     resolver.clone(),
                     so_mark,
                     dns_hijack,
+                    dns_hijack_rules.clone(),
                 )
                 .await;
                 Err(Error::Operation("tun stopped unexpectedly 3".to_string()))
