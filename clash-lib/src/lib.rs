@@ -461,15 +461,6 @@ impl RuntimeComponents {
     }
 }
 
-#[cfg(feature = "tun")]
-fn dns_listener_is_empty(listen: &DNSListenAddr) -> bool {
-    listen.udp.is_none()
-        && listen.tcp.is_none()
-        && listen.doh.is_none()
-        && listen.dot.is_none()
-        && listen.doh3.is_none()
-}
-
 async fn create_components(
     cwd: PathBuf,
     config: InternalConfig,
@@ -548,32 +539,8 @@ async fn create_components(
     debug!("initializing dns resolver");
     // Clone the dns.listen for the DNS Server later before we consume the config
     // TODO: we should separate the DNS resolver and DNS server config here
-    #[allow(unused_mut)]
-    let mut dns_listen = config.dns.listen.clone();
+    let dns_listen = config.dns.listen.clone();
     let dns_enable = config.dns.enable;
-    #[cfg(feature = "tun")]
-    let auto_manage_linux_dns = cfg!(target_os = "linux")
-        && config.tun.enable
-        && config.tun.dns_hijack
-        && dns_enable
-        && dns_listener_is_empty(&dns_listen);
-
-    #[cfg(feature = "tun")]
-    if auto_manage_linux_dns {
-        let dedicated_dns_ip = config.tun.dedicated_dns_ipv4().ok_or_else(|| {
-            Error::InvalidConfig(
-                "tun dns-hijack requires a subnet with room for a dedicated DNS address"
-                    .to_string(),
-            )
-        })?;
-        let tun_dns_addr = std::net::SocketAddr::from((dedicated_dns_ip, 53));
-        dns_listen.udp = Some(tun_dns_addr);
-        dns_listen.tcp = Some(tun_dns_addr);
-        info!(
-            "auto-enabling linux tun DNS listener on {} for systemd-resolved per-link takeover",
-            tun_dns_addr
-        );
-    }
 
     // Extract the country MMDB file/url config early so they can be consumed
     // here, while the actual MMDB loading happens after OutboundManager (like
@@ -775,10 +742,6 @@ async fn create_components(
         dns_listen.clone(),
         dns_resolver.clone(),
         &cwd,
-        #[cfg(feature = "tun")]
-        auto_manage_linux_dns,
-        #[cfg(not(feature = "tun"))]
-        false,
         Some(cancellation_token.child_token()),
     ));
 
