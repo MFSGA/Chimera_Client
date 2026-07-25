@@ -6,12 +6,28 @@
   inputs.nixpkgs.url =
     "path:/nix/store/pzxxxg9vvzk63122vj38lcmqg9dl6qxk-nixos-26.05.1947.a0374025a863/nixos";
 
-  outputs = { nixpkgs, ... }:
+  outputs = { self, nixpkgs, ... }:
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
+      chimeraClient = pkgs.callPackage ./nix/package.nix { };
     in
     {
+      packages.${system} = {
+        chimera-client = chimeraClient;
+        default = chimeraClient;
+      };
+
+      nixosModules.chimera-client =
+        { lib, pkgs, ... }:
+        {
+          imports = [ ./nix/module.nix ];
+          services.chimera-client.package =
+            lib.mkDefault self.packages.${pkgs.system}.default;
+        };
+
+      nixosModules.default = self.nixosModules.chimera-client;
+
       devShells.${system}.default = pkgs.mkShell {
         nativeBuildInputs = with pkgs; [
           cargo
