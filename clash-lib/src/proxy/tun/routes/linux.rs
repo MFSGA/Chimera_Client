@@ -299,6 +299,24 @@ pub fn setup_policy_routing(
         enable_v6,
     )?;
 
+    for port in tun_cfg.dns_hijack_udp_ports() {
+        run_ip_cmd(
+            &[
+                "rule",
+                "add",
+                "pref",
+                DNS_HIJACK_RULE_PREF,
+                "ipproto",
+                "udp",
+                "dport",
+                &port.to_string(),
+                "table",
+                &table,
+            ],
+            enable_v6,
+        )?;
+    }
+
     Ok(())
 }
 
@@ -413,33 +431,17 @@ pub fn maybe_routes_clean_up(tun_cfg: &TunConfig) -> std::io::Result<()> {
         enable_v6,
     )?;
 
-    if let Some(so_mark) = tun_cfg.so_mark {
+    for port in tun_cfg.dns_hijack_udp_ports() {
         delete_ip_cmd_all(
             &[
                 "rule",
                 "del",
                 "pref",
                 DNS_HIJACK_RULE_PREF,
-                "not",
-                "fwmark",
-                &so_mark.to_string(),
+                "ipproto",
+                "udp",
                 "dport",
-                "53",
-                "table",
-                &table,
-            ],
-            enable_v6,
-        )?;
-
-        delete_ip_cmd_all(
-            &[
-                "rule",
-                "del",
-                "not",
-                "fwmark",
-                &so_mark.to_string(),
-                "dport",
-                "53",
+                &port.to_string(),
                 "table",
                 &table,
             ],
@@ -447,6 +449,7 @@ pub fn maybe_routes_clean_up(tun_cfg: &TunConfig) -> std::io::Result<()> {
         )?;
     }
 
+    // Remove rules left by older builds that did not include ipproto.
     delete_ip_cmd_all(
         &[
             "rule",
