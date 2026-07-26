@@ -33,6 +33,21 @@ let
     args:
     lib.replaceStrings [ "%%d" ] [ "%d" ]
       (utils.escapeSystemdExecArgs args);
+
+  tunReadinessCheck = pkgs.writeShellScript "chimera-client-tun-ready" ''
+    attempt=0
+    while [ "$attempt" -lt 300 ]; do
+      if ${pkgs.iproute2}/bin/ip -4 route show table 2468 \
+        | ${pkgs.gnugrep}/bin/grep -q '^default dev '; then
+        exit 0
+      fi
+      attempt=$((attempt + 1))
+      ${pkgs.coreutils}/bin/sleep 0.1
+    done
+
+    echo "Chimera Client did not install its TUN route within 30 seconds" >&2
+    exit 1
+  '';
 in
 {
   options.services.chimera-client = {
@@ -118,6 +133,7 @@ in
           escapeExecArgs (commonArgs ++ [ "--test-config" ])
         );
         ExecStart = escapeExecArgs (commonArgs ++ cfg.extraArgs);
+        ExecStartPost = lib.optional cfg.tun.enable tunReadinessCheck;
 
         Restart = "on-failure";
         RestartSec = "3s";
