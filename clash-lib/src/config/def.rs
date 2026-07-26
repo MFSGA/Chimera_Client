@@ -29,6 +29,10 @@ fn default_tun_address() -> String {
     "198.18.0.1/30".to_string()
 }
 
+pub(crate) fn default_tun_address_v6() -> String {
+    "fd00:198:18::1/126".to_string()
+}
+
 fn default_route_table() -> u32 {
     DEFAULT_ROUTE_TABLE
 }
@@ -64,6 +68,7 @@ pub struct TunConfig {
     pub device_id: String,
     #[serde(default = "default_tun_address")]
     pub gateway: String,
+    pub ipv6: Option<bool>,
     #[serde(alias = "gateway_v6", alias = "gateway-v6")]
     pub gateway_v6: Option<String>,
     pub routes: Option<Vec<String>>,
