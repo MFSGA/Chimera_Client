@@ -135,7 +135,7 @@ mod tests {
     #[tokio::test]
     async fn test_system_resolver_default_config() {
         let resolver = SystemResolver::new(false).unwrap();
-        let response = resolver.resolve("www.google.com", false).await.unwrap();
-        assert!(response.is_some());
+        let response = resolver.resolve("localhost", false).await.unwrap();
+        assert!(response.is_some_and(|ip| ip.is_ipv4()));
     }
 }
