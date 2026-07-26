@@ -23,7 +23,8 @@ fn default_tun_device_id() -> String {
 }
 
 fn default_tun_address() -> String {
-    // reference: mihomo
+    // Keep the TUN link subnet separate from the default 198.19.0.0/16
+    // fake-IP pool. Fake-IP traffic is routed to TUN explicitly.
     "198.18.0.1/30".to_string()
 }
 
@@ -106,6 +107,7 @@ pub struct Config {
     pub rule: Option<Vec<String>>,
 
     /// 6. Log level
+    ///
     /// Either `debug`, `info`, `warning`, `error` or `off`
     pub log_level: LogLevel,
     /// external controller address
@@ -187,6 +189,7 @@ pub struct Config {
     /// experimental settings, if any
     pub experimental: Option<Experimental>,
     /// 15. Clash router working mode
+    ///
     /// Either `rule`, `global` or `direct`
     #[serde(default)]
     pub mode: RunMode,
@@ -407,6 +410,7 @@ pub struct DNS {
     /// disabled.
     pub listen: Option<DNSListen>,
     /// 3. When disabled, system DNS config will be used
+    ///
     /// All other DNS related options will only be used when this is enabled
     pub enable: bool,
     /// Whether to use `Config::hosts` when resolving hostnames

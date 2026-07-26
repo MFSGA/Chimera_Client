@@ -197,7 +197,7 @@ mod tests {
 
         assert_eq!(converted.device_id, "utun1989");
         assert_eq!(converted.route_table, 2468);
-        assert_eq!(converted.gateway.to_string(), "198.18.0.1/24");
+        assert_eq!(converted.gateway.to_string(), "198.18.0.1/30");
         assert!(!converted.dns_hijack);
     }
 

@@ -59,9 +59,7 @@ tun:
   enable: true
   device-id: "dev://chimera-test-tun"
   route-all: false
-  routes:
-    - 198.18.0.0/16
-  gateway: "198.18.0.1/24"
+  gateway: "198.19.0.1/30"
   dns-hijack: false
 
 dns:
