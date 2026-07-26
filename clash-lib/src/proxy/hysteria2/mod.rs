@@ -12,7 +12,7 @@ use std::{
     fmt::{Debug, Formatter},
     fs,
     io::{self, BufReader},
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::SocketAddr,
     num::ParseIntError,
     path::Path,
     pin::Pin,
@@ -129,64 +129,6 @@ impl Handler {
     const DEFAULT_MAX_IDLE_TIMEOUT: std::time::Duration =
         std::time::Duration::from_secs(300);
     const MIN_INITIAL_CWND_PACKETS: u64 = 2;
-
-    fn default_bind_addr(server_addr: SocketAddr) -> SocketAddr {
-        match server_addr {
-            SocketAddr::V4(_) => SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
-            SocketAddr::V6(_) => SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0),
-        }
-    }
-
-    fn select_bind_addr(server_addr: SocketAddr, sess: &Session) -> SocketAddr {
-        let default_bind_addr = Self::default_bind_addr(server_addr);
-
-        let Some(iface) = sess.iface.as_ref() else {
-            return default_bind_addr;
-        };
-
-        match server_addr {
-            SocketAddr::V4(_) => match iface.addr_v4 {
-                Some(bind_ip) => {
-                    let bind_addr = SocketAddr::new(bind_ip.into(), 0);
-                    debug!(
-                        server_addr = %server_addr,
-                        iface = %iface.name,
-                        bind_addr = %bind_addr,
-                        "hysteria2 socket bound to interface address"
-                    );
-                    bind_addr
-                }
-                None => {
-                    warn!(
-                        server_addr = %server_addr,
-                        iface = %iface.name,
-                        "hysteria2 connect-via has no IPv4 address on selected interface, using wildcard bind"
-                    );
-                    default_bind_addr
-                }
-            },
-            SocketAddr::V6(_) => match iface.addr_v6 {
-                Some(bind_ip) => {
-                    let bind_addr = SocketAddr::new(bind_ip.into(), 0);
-                    debug!(
-                        server_addr = %server_addr,
-                        iface = %iface.name,
-                        bind_addr = %bind_addr,
-                        "hysteria2 socket bound to interface address"
-                    );
-                    bind_addr
-                }
-                None => {
-                    warn!(
-                        server_addr = %server_addr,
-                        iface = %iface.name,
-                        "hysteria2 connect-via has no IPv6 address on selected interface, using wildcard bind"
-                    );
-                    default_bind_addr
-                }
-            },
-        }
-    }
 
     fn append_custom_ca(
         root_store: &mut RootCertStore,
@@ -310,41 +252,6 @@ impl Handler {
         }
     }
 
-    async fn resolve_server_addr(
-        &self,
-        resolver: ThreadSafeDNSResolver,
-    ) -> anyhow::Result<SocketAddr> {
-        match self.opts.addr.clone() {
-            SocksAddr::Ip(ip) => Ok(ip),
-            SocksAddr::Domain(domain, port) => {
-                let ip = resolver
-                    .resolve(domain.as_str(), false)
-                    .await?
-                    .ok_or_else(|| anyhow!("resolve domain {domain} failed"))?;
-                Ok(SocketAddr::new(ip, port))
-            }
-        }
-    }
-
-    fn create_udp_socket(
-        server_addr: SocketAddr,
-        sess: &Session,
-    ) -> io::Result<std::net::UdpSocket> {
-        let domain = match server_addr {
-            SocketAddr::V4(_) => socket2::Domain::IPV4,
-            SocketAddr::V6(_) => socket2::Domain::IPV6,
-        };
-        let bind_addr = Self::select_bind_addr(server_addr, sess);
-        let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
-        #[cfg(target_os = "linux")]
-        if let Some(so_mark) = sess.so_mark {
-            socket.set_mark(so_mark)?;
-        }
-        socket.set_nonblocking(true)?;
-        socket.bind(&bind_addr.into())?;
-        Ok(socket.into())
-    }
-
     fn tls_server_name(&self, server_addr: SocketAddr) -> String {
         self.opts
             .sni
@@ -409,20 +316,52 @@ impl Handler {
         );
         // Everytime we enstablish a new session, we should lookup the server
         // address. maybe it changed since it use ddns
-        let server_socket_addr = match self.opts.addr.clone() {
-            SocksAddr::Ip(ip) => ip,
+        let server_socket_addrs = match self.opts.addr.clone() {
+            SocksAddr::Ip(ip) => vec![ip],
             SocksAddr::Domain(d, port) => {
                 // Proxy server domains must resolve to real endpoint IPs. Using
                 // enhanced DNS here may return a fake-ip address and make QUIC
                 // connect to the virtual pool instead of the Hysteria2 server.
-                let ip = resolver
-                    .resolve(d.as_str(), false)
+                resolver
+                    .resolve_all(d.as_str(), false)
                     .await?
-                    .ok_or_else(|| anyhow!("resolve domain {} failed", d))?;
-                SocketAddr::new(ip, port)
+                    .into_iter()
+                    .map(|ip| SocketAddr::new(ip, port))
+                    .collect()
             }
         };
+        if server_socket_addrs.is_empty() {
+            return Err(anyhow!("resolve domain {} failed", self.opts.addr));
+        }
 
+        let mut last_error = None;
+        for server_socket_addr in server_socket_addrs {
+            match self
+                .new_authed_connection_to(sess, server_socket_addr)
+                .await
+            {
+                Ok(connection) => return Ok(connection),
+                Err(error) => {
+                    warn!(
+                        server = %server_socket_addr,
+                        error = %error,
+                        "hysteria2 connection attempt failed"
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            anyhow!("no address available for {}", self.opts.addr)
+        }))
+    }
+
+    async fn new_authed_connection_to(
+        &self,
+        sess: &Session,
+        server_socket_addr: SocketAddr,
+    ) -> anyhow::Result<(Connection, SendRequest<OpenStreams, Bytes>)> {
         // todo: Here maybe we should use a AsyncUdpSocket which implement salamander obfs
         // and port hopping
         let create_socket = || async {
