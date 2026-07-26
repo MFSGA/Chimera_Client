@@ -9,6 +9,8 @@ use std::{
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+#[cfg(all(feature = "extended-health-check", feature = "ws"))]
+use futures::SinkExt;
 use futures::{FutureExt, StreamExt, stream::FuturesOrdered};
 #[cfg(feature = "extended-health-check")]
 use http_body_util::BodyExt;
@@ -18,6 +20,11 @@ use hyper_util::rt::TokioIo;
 use serde::Serialize;
 use tokio::sync::RwLock;
 use tracing::warn;
+
+#[cfg(all(feature = "extended-health-check", feature = "ws"))]
+use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(all(feature = "extended-health-check", feature = "ws"))]
+use tokio_tungstenite::{client_async, tungstenite::Message};
 
 #[cfg(feature = "tun")]
 use crate::app::net::DEFAULT_OUTBOUND_INTERFACE;
@@ -253,6 +260,127 @@ impl ProxyManager {
             Some((minimum_events, maximum_first_byte)),
         )
         .await
+    }
+
+    #[cfg(all(feature = "extended-health-check", feature = "ws"))]
+    pub async fn websocket_test(
+        &self,
+        outbound: AnyOutboundHandler,
+        url: &str,
+        timeout: Option<Duration>,
+        expected_echo: &str,
+    ) -> std::io::Result<(Duration, Duration)> {
+        let name = outbound.name().to_owned();
+        let timeout = timeout.unwrap_or(Duration::from_secs(5));
+        let uri: http::Uri = url.parse().map_err(std::io::Error::other)?;
+        let host = uri
+            .host()
+            .ok_or_else(|| std::io::Error::other("url has no host"))?
+            .to_owned();
+        let port = uri.port_u16().unwrap_or_else(|| {
+            if uri.scheme_str() == Some("wss") {
+                443
+            } else {
+                80
+            }
+        });
+
+        #[cfg(feature = "tun")]
+        let iface = DEFAULT_OUTBOUND_INTERFACE.read().await.clone();
+        #[cfg(not(feature = "tun"))]
+        let iface = None;
+        let sess = Session {
+            network: Network::Tcp,
+            typ: Type::Tunnel,
+            destination: SocksAddr::Domain(host.clone(), port),
+            so_mark: self.fw_mark,
+            iface,
+            ..Default::default()
+        };
+
+        let connect_started = tokio::time::Instant::now();
+        let stream = tokio::time::timeout(
+            timeout,
+            outbound.connect_stream(&sess, self.dns_resolver.clone()),
+        )
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "websocket healthcheck connect timeout",
+            )
+        })??;
+        let connect_delay = connect_started.elapsed();
+        let probe_started = tokio::time::Instant::now();
+
+        let result = match uri.scheme_str() {
+            Some("ws") => tokio::time::timeout(
+                timeout,
+                websocket_echo(stream, url, expected_echo),
+            )
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "websocket healthcheck echo timeout",
+                )
+            })?,
+            #[cfg(feature = "tls")]
+            Some("wss") => {
+                let tls_config = rustls::ClientConfig::builder()
+                    .with_root_certificates(GLOBAL_ROOT_STORE.clone())
+                    .with_no_client_auth();
+                let connector =
+                    tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+                let tls_stream = tokio::time::timeout(
+                    timeout,
+                    connector.connect(
+                        host.try_into().map_err(|_| {
+                            std::io::Error::other("invalid WebSocket SNI host")
+                        })?,
+                        stream,
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "websocket healthcheck TLS timeout",
+                    )
+                })?
+                .map_err(std::io::Error::other)?;
+                tokio::time::timeout(
+                    timeout,
+                    websocket_echo(tls_stream, url, expected_echo),
+                )
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "websocket healthcheck echo timeout",
+                    )
+                })?
+            }
+            #[cfg(not(feature = "tls"))]
+            Some("wss") => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "wss healthcheck requires tls feature",
+            )),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "websocket healthcheck requires ws or wss URL",
+            )),
+        };
+
+        let probe_delay = probe_started.elapsed();
+        let ok = result.is_ok();
+        self.report_delay(
+            &name,
+            ok,
+            Some(if ok { probe_delay } else { Duration::default() }),
+        )
+        .await;
+        result.map(|_| (probe_delay, connect_delay + probe_delay))
     }
 
     async fn url_test_inner(
@@ -539,6 +667,48 @@ fn drain_sse_events(buffer: &mut Vec<u8>) -> usize {
     count
 }
 
+#[cfg(all(feature = "extended-health-check", feature = "ws"))]
+async fn websocket_echo<S>(
+    stream: S,
+    url: &str,
+    expected_echo: &str,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut websocket, response) = client_async(url, stream)
+        .await
+        .map_err(std::io::Error::other)?;
+    if response.status() != http::StatusCode::SWITCHING_PROTOCOLS {
+        return Err(std::io::Error::other(format!(
+            "websocket healthcheck returned HTTP {}",
+            response.status()
+        )));
+    }
+
+    websocket
+        .send(Message::Text(expected_echo.to_owned().into()))
+        .await
+        .map_err(std::io::Error::other)?;
+    while let Some(message) = websocket.next().await {
+        match message.map_err(std::io::Error::other)? {
+            Message::Text(text) if text.as_str() == expected_echo => return Ok(()),
+            Message::Binary(data) if data.as_ref() == expected_echo.as_bytes() => {
+                return Ok(());
+            }
+            Message::Close(_) => {
+                return Err(std::io::Error::other(
+                    "websocket healthcheck closed before echo",
+                ));
+            }
+            _ => {}
+        }
+    }
+    Err(std::io::Error::other(
+        "websocket healthcheck ended before echo",
+    ))
+}
+
 #[cfg(all(test, feature = "extended-health-check"))]
 mod tests {
     use std::{sync::Arc, time::Duration};
@@ -632,5 +802,37 @@ mod tests {
         let mut buffer = b"data: one\r\n\r\ndata: two\n\npartial".to_vec();
         assert_eq!(super::drain_sse_events(&mut buffer), 2);
         assert_eq!(buffer, b"partial");
+    }
+
+    #[cfg(feature = "ws")]
+    #[tokio::test]
+    async fn websocket_probe_requires_matching_echo() {
+        use futures::{SinkExt, StreamExt};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(stream).await.unwrap();
+            if let Some(message) = websocket.next().await {
+                websocket.send(message.unwrap()).await.unwrap();
+            }
+        });
+        let (manager, outbound) = direct_manager();
+
+        manager
+            .websocket_test(
+                outbound,
+                &format!("ws://{address}/echo"),
+                Some(Duration::from_secs(2)),
+                "chimera-health",
+            )
+            .await
+            .unwrap();
+
+        server.await.unwrap();
+        assert!(manager.alive(PROXY_DIRECT).await);
     }
 }
