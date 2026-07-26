@@ -79,10 +79,10 @@ async fn handle(
             }
         }
         Method::POST => {
-            if sid.is_none() {
-                Ok(handle_stream_one(req).await)
+            if let Some(sid) = sid {
+                Ok(handle_packet_up(req, state, sid, seq).await)
             } else {
-                Ok(handle_packet_up(req, state, sid.unwrap(), seq).await)
+                Ok(handle_stream_one(req).await)
             }
         }
         _ => Ok(simple(StatusCode::METHOD_NOT_ALLOWED)),
@@ -133,21 +133,15 @@ async fn handle_stream_down(
     let (tx, rx) =
         mpsc::channel::<std::result::Result<Frame<Bytes>, Infallible>>(32);
     let store = state.sessions.clone();
-    let sid2 = sid.clone();
     let queue = session.queue.clone();
 
     tokio::spawn(async move {
-        loop {
-            match queue.read_chunk().await {
-                Some(bytes) => {
-                    if tx.send(Ok(Frame::data(bytes))).await.is_err() {
-                        break;
-                    }
-                }
-                None => break,
+        while let Some(bytes) = queue.read_chunk().await {
+            if tx.send(Ok(Frame::data(bytes))).await.is_err() {
+                break;
             }
         }
-        let _ = store.remove(&sid2).await;
+        let _ = store.remove(&sid).await;
     });
 
     Response::builder()

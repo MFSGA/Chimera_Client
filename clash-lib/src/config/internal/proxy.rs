@@ -26,6 +26,7 @@ impl OutboundProxy {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 #[serde(tag = "type")]
+#[allow(clippy::large_enum_variant)]
 pub enum OutboundProxyProtocol {
     #[serde(rename = "direct")]
     Direct(OutboundDirect),
