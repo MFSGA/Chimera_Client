@@ -114,6 +114,9 @@ pub async fn maybe_add_routes(
                 }
 
                 for r in default_routes {
+                    #[cfg(target_os = "linux")]
+                    add_route(&tun_iface, &r).await?;
+                    #[cfg(not(target_os = "linux"))]
                     add_route(&tun_iface, &r)?;
                 }
 
@@ -151,6 +154,9 @@ pub async fn maybe_add_routes(
             }
         } else {
             for r in &cfg.routes {
+                #[cfg(target_os = "linux")]
+                add_route(&tun_iface, r).await?;
+                #[cfg(not(target_os = "linux"))]
                 add_route(&tun_iface, r)?;
             }
         }

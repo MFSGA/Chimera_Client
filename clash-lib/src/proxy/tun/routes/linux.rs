@@ -4,7 +4,7 @@ use ipnet::IpNet;
 use tracing::{debug, info, warn};
 
 use crate::{
-    app::net::{OutboundInterface, route_for_destination},
+    app::net::{OutboundInterface, add_route_to_interface, route_for_destination},
     common::errors::new_io_error,
     config::internal::config::TunConfig,
 };
@@ -42,13 +42,13 @@ pub fn check_ip_command_installed() -> std::io::Result<()> {
         })
 }
 
-pub fn add_route(via: &OutboundInterface, dest: &IpNet) -> std::io::Result<()> {
-    run_ip_cmd_for_family(
-        &["route", "add", &dest.to_string(), "dev", &via.name],
-        dest.addr().is_ipv6(),
-        false,
-    )
-    .map(|_| ())
+pub async fn add_route(
+    via: &OutboundInterface,
+    dest: &IpNet,
+) -> std::io::Result<()> {
+    add_route_to_interface(*dest, via.index)
+        .await
+        .map_err(|error| new_io_error(error.to_string()))
 }
 
 async fn best_route_for(dest: IpAddr) -> std::io::Result<(Option<IpAddr>, String)> {
