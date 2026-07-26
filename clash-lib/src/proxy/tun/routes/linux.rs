@@ -42,28 +42,23 @@ pub fn check_ip_command_installed() -> std::io::Result<()> {
 }
 
 pub fn add_route(via: &OutboundInterface, dest: &IpNet) -> std::io::Result<()> {
-    let cmd = std::process::Command::new("ip")
-        .arg("route")
-        .arg("add")
-        .arg(dest.to_string())
-        .arg("dev")
-        .arg(&via.name)
-        .output()?;
-    warn!("executing: ip route add {} dev {}", dest, via.name);
-    if !cmd.status.success() {
-        return Err(new_io_error(format!(
-            "add route failed: {}",
-            String::from_utf8_lossy(&cmd.stderr)
-        )));
-    }
-    Ok(())
+    run_ip_cmd_for_family(
+        &["route", "add", &dest.to_string(), "dev", &via.name],
+        dest.addr().is_ipv6(),
+        false,
+    )
+    .map(|_| ())
 }
 
 fn best_route_for(dest: IpAddr) -> std::io::Result<(Option<IpAddr>, String)> {
-    let output = std::process::Command::new("ip")
-        .args(["route", "get", &dest.to_string()])
-        .output()?;
-    warn!("executing: ip route get {}", dest);
+    let destination = dest.to_string();
+    let mut args = Vec::new();
+    if dest.is_ipv6() {
+        args.push("-6");
+    }
+    args.extend(["route", "get", &destination]);
+    let output = std::process::Command::new("ip").args(&args).output()?;
+    warn!("executing: ip {}", args.join(" "));
     if !output.status.success() {
         return Err(new_io_error(format!(
             "query best route for {} failed: {}",
@@ -100,6 +95,7 @@ fn add_excluded_route(
     dest: &IpNet,
     transaction: &mut RouteTransaction,
 ) -> std::io::Result<()> {
+    let ipv6 = dest.addr().is_ipv6();
     let cidr = dest.to_string();
     let (gateway, dev) = best_route_for(dest.addr())?;
 
@@ -112,14 +108,14 @@ fn add_excluded_route(
             &[
                 "route", "del", &cidr, "via", &gateway, "dev", &dev, "table", table,
             ],
-            false,
+            ipv6,
         )
     } else {
         args.extend(["dev", &dev, "table", table]);
         transaction.apply(
             &args,
             &["route", "del", &cidr, "dev", &dev, "table", table],
-            false,
+            ipv6,
         )
     }
 }
@@ -154,26 +150,22 @@ fn run_ip_cmd_single(
     Err(new_io_error(format!("{} failed: {}", cmd_str, stderr)))
 }
 
-/// Run an ip command for IPv4 and optionally IPv6.
-///
-/// When allow_missing is true this returns Ok(false) for already-absent rules
-/// or routes, allowing cleanup to be idempotent across restarts.
-fn run_ip_cmd_with_mode(
+fn run_ip_cmd_for_family(
     args: &[&str],
-    enable_v6: bool,
+    ipv6: bool,
     allow_missing: bool,
 ) -> std::io::Result<bool> {
-    let cmd_str = format!("ip {}", args.join(" "));
-    let mut changed = run_ip_cmd_single(&cmd_str, args, allow_missing)?;
-
-    if enable_v6 {
-        let mut v6_args = vec!["-6"];
-        v6_args.extend_from_slice(args);
-        let v6_cmd_str = format!("ip -6 {}", args.join(" "));
-        changed |= run_ip_cmd_single(&v6_cmd_str, &v6_args, allow_missing)?;
+    if ipv6 {
+        let mut family_args = vec!["-6"];
+        family_args.extend_from_slice(args);
+        run_ip_cmd_single(
+            &format!("ip {}", family_args.join(" ")),
+            &family_args,
+            allow_missing,
+        )
+    } else {
+        run_ip_cmd_single(&format!("ip {}", args.join(" ")), args, allow_missing)
     }
-
-    Ok(changed)
 }
 
 #[derive(Default)]
@@ -186,31 +178,15 @@ impl RouteTransaction {
         &mut self,
         add_args: &[&str],
         delete_args: &[&str],
-        enable_v6: bool,
+        ipv6: bool,
     ) -> std::io::Result<()> {
-        self.apply_family(add_args, delete_args)?;
-
-        if enable_v6 {
-            let add_v6 = std::iter::once("-6")
-                .chain(add_args.iter().copied())
-                .collect::<Vec<_>>();
-            let delete_v6 = std::iter::once("-6")
-                .chain(delete_args.iter().copied())
-                .collect::<Vec<_>>();
-            self.apply_family(&add_v6, &delete_v6)?;
+        run_ip_cmd_for_family(add_args, ipv6, false)?;
+        let mut inverse = Vec::new();
+        if ipv6 {
+            inverse.push("-6".to_owned());
         }
-
-        Ok(())
-    }
-
-    fn apply_family(
-        &mut self,
-        add_args: &[&str],
-        delete_args: &[&str],
-    ) -> std::io::Result<()> {
-        run_ip_cmd_single(&format!("ip {}", add_args.join(" ")), add_args, false)?;
-        self.applied
-            .push(delete_args.iter().map(|arg| (*arg).to_owned()).collect());
+        inverse.extend(delete_args.iter().map(|arg| (*arg).to_owned()));
+        self.applied.push(inverse);
         Ok(())
     }
 
@@ -225,8 +201,8 @@ impl RouteTransaction {
     }
 }
 
-fn delete_ip_cmd_all(args: &[&str], enable_v6: bool) -> std::io::Result<()> {
-    while run_ip_cmd_with_mode(args, enable_v6, true)? {}
+fn delete_ip_cmd_all(args: &[&str], ipv6: bool) -> std::io::Result<()> {
+    while run_ip_cmd_for_family(args, ipv6, true)? {}
     Ok(())
 }
 
@@ -254,18 +230,46 @@ fn setup_policy_routing_inner(
     via: &OutboundInterface,
     transaction: &mut RouteTransaction,
 ) -> std::io::Result<()> {
-    let table = tun_cfg.route_table.to_string();
+    setup_policy_family(
+        tun_cfg,
+        via,
+        &tun_cfg.route_table.to_string(),
+        false,
+        transaction,
+    )?;
+    if tun_cfg.gateway_v6.is_some() {
+        setup_policy_family(
+            tun_cfg,
+            via,
+            &tun_cfg.route_table_v6.to_string(),
+            true,
+            transaction,
+        )?;
+    }
+    Ok(())
+}
+
+fn setup_policy_family(
+    tun_cfg: &TunConfig,
+    via: &OutboundInterface,
+    table: &str,
+    ipv6: bool,
+    transaction: &mut RouteTransaction,
+) -> std::io::Result<()> {
     let dev = via.name.as_str();
-    let enable_v6 = tun_cfg.gateway_v6.is_some();
 
     transaction.apply(
-        &["route", "add", "default", "dev", dev, "table", &table],
-        &["route", "del", "default", "dev", dev, "table", &table],
-        enable_v6,
+        &["route", "add", "default", "dev", dev, "table", table],
+        &["route", "del", "default", "dev", dev, "table", table],
+        ipv6,
     )?;
 
-    for route in &tun_cfg.route_exclude_address {
-        add_excluded_route(&table, route, transaction)?;
+    for route in tun_cfg
+        .route_exclude_address
+        .iter()
+        .filter(|route| route.addr().is_ipv6() == ipv6)
+    {
+        add_excluded_route(table, route, transaction)?;
     }
 
     if let Some(so_mark) = tun_cfg.so_mark {
@@ -290,7 +294,7 @@ fn setup_policy_routing_inner(
                 "table",
                 "main",
             ],
-            enable_v6,
+            ipv6,
         )?;
 
         transaction.apply(
@@ -303,7 +307,7 @@ fn setup_policy_routing_inner(
                 "fwmark",
                 &so_mark.to_string(),
                 "table",
-                &table,
+                table,
             ],
             &[
                 "rule",
@@ -314,9 +318,9 @@ fn setup_policy_routing_inner(
                 "fwmark",
                 &so_mark.to_string(),
                 "table",
-                &table,
+                table,
             ],
-            enable_v6,
+            ipv6,
         )?;
     }
 
@@ -341,7 +345,7 @@ fn setup_policy_routing_inner(
             "suppress_prefixlength",
             "0",
         ],
-        enable_v6,
+        ipv6,
     )?;
 
     for port in tun_cfg.dns_hijack_udp_ports() {
@@ -356,7 +360,7 @@ fn setup_policy_routing_inner(
                 "dport",
                 &port.to_string(),
                 "table",
-                &table,
+                table,
             ],
             &[
                 "rule",
@@ -368,9 +372,9 @@ fn setup_policy_routing_inner(
                 "dport",
                 &port.to_string(),
                 "table",
-                &table,
+                table,
             ],
-            enable_v6,
+            ipv6,
         )?;
     }
 
@@ -388,15 +392,28 @@ pub fn maybe_routes_clean_up(tun_cfg: &TunConfig) -> std::io::Result<()> {
         return Ok(());
     }
 
-    let table = tun_cfg.route_table.to_string();
-    let enable_v6 = tun_cfg.gateway_v6.is_some();
+    clean_up_policy_family(tun_cfg, &tun_cfg.route_table.to_string(), false)?;
+    if tun_cfg.gateway_v6.is_some() {
+        clean_up_policy_family(tun_cfg, &tun_cfg.route_table_v6.to_string(), true)?;
+    }
+    Ok(())
+}
 
-    delete_ip_cmd_all(&["route", "del", "default", "table", &table], enable_v6)?;
+fn clean_up_policy_family(
+    tun_cfg: &TunConfig,
+    table: &str,
+    ipv6: bool,
+) -> std::io::Result<()> {
+    delete_ip_cmd_all(&["route", "del", "default", "table", table], ipv6)?;
 
-    for route in &tun_cfg.route_exclude_address {
+    for route in tun_cfg
+        .route_exclude_address
+        .iter()
+        .filter(|route| route.addr().is_ipv6() == ipv6)
+    {
         delete_ip_cmd_all(
-            &["route", "del", &route.to_string(), "table", &table],
-            enable_v6,
+            &["route", "del", &route.to_string(), "table", table],
+            ipv6,
         )?;
     }
 
@@ -412,7 +429,7 @@ pub fn maybe_routes_clean_up(tun_cfg: &TunConfig) -> std::io::Result<()> {
                 "table",
                 "main",
             ],
-            enable_v6,
+            ipv6,
         )?;
 
         delete_ip_cmd_all(
@@ -425,9 +442,9 @@ pub fn maybe_routes_clean_up(tun_cfg: &TunConfig) -> std::io::Result<()> {
                 "fwmark",
                 &so_mark.to_string(),
                 "table",
-                &table,
+                table,
             ],
-            enable_v6,
+            ipv6,
         )?;
     }
     delete_ip_cmd_all(
@@ -441,7 +458,7 @@ pub fn maybe_routes_clean_up(tun_cfg: &TunConfig) -> std::io::Result<()> {
             "suppress_prefixlength",
             "0",
         ],
-        enable_v6,
+        ipv6,
     )?;
 
     for port in tun_cfg.dns_hijack_udp_ports() {
@@ -456,9 +473,9 @@ pub fn maybe_routes_clean_up(tun_cfg: &TunConfig) -> std::io::Result<()> {
                 "dport",
                 &port.to_string(),
                 "table",
-                &table,
+                table,
             ],
-            enable_v6,
+            ipv6,
         )?;
     }
 

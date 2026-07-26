@@ -105,6 +105,12 @@ pub(super) fn convert(
     match before {
         Some(t) => {
             let (dns_hijack, dns_hijack_rules) = parse_dns_hijack(t.dns_hijack)?;
+            if t.gateway_v6.is_some() && t.route_table == t.route_table_v6 {
+                return Err(Error::InvalidConfig(
+                    "tun route-table-v6 must differ from route-table when IPv6 is enabled"
+                        .to_owned(),
+                ));
+            }
             let mut route_exclude_address =
                 parse_routes(t.route_exclude_address, "route-exclude-address")?;
 
@@ -210,6 +216,23 @@ mod tests {
 
         assert_eq!(converted.route_table, 100);
         assert_eq!(converted.route_table_v6, 101);
+    }
+
+    #[test]
+    fn reject_shared_route_table_when_ipv6_is_enabled() {
+        let tun = parse_tun(
+            "enable: true\ngateway-v6: fd00:198:18::1/126\nroute-table: 100\nroute-table-v6: 100",
+        );
+        let error = match convert(Some(tun)) {
+            Ok(_) => panic!("shared table should fail"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            crate::Error::InvalidConfig(message)
+                if message.contains("route-table-v6 must differ")
+        ));
     }
 
     #[test]
