@@ -95,7 +95,11 @@ fn best_route_for(dest: IpAddr) -> std::io::Result<(Option<IpAddr>, String)> {
     Ok((gateway, dev))
 }
 
-fn add_excluded_route(table: &str, dest: &IpNet) -> std::io::Result<()> {
+fn add_excluded_route(
+    table: &str,
+    dest: &IpNet,
+    transaction: &mut RouteTransaction,
+) -> std::io::Result<()> {
     let cidr = dest.to_string();
     let (gateway, dev) = best_route_for(dest.addr())?;
 
@@ -103,10 +107,20 @@ fn add_excluded_route(table: &str, dest: &IpNet) -> std::io::Result<()> {
     if let Some(gateway) = gateway {
         let gateway = gateway.to_string();
         args.extend(["via", &gateway, "dev", &dev, "table", table]);
-        run_ip_cmd(&args, false)
+        transaction.apply(
+            &args,
+            &[
+                "route", "del", &cidr, "via", &gateway, "dev", &dev, "table", table,
+            ],
+            false,
+        )
     } else {
         args.extend(["dev", &dev, "table", table]);
-        run_ip_cmd(&args, false)
+        transaction.apply(
+            &args,
+            &["route", "del", &cidr, "dev", &dev, "table", table],
+            false,
+        )
     }
 }
 
@@ -162,8 +176,53 @@ fn run_ip_cmd_with_mode(
     Ok(changed)
 }
 
-fn run_ip_cmd(args: &[&str], enable_v6: bool) -> std::io::Result<()> {
-    run_ip_cmd_with_mode(args, enable_v6, false).map(|_| ())
+#[derive(Default)]
+struct RouteTransaction {
+    applied: Vec<Vec<String>>,
+}
+
+impl RouteTransaction {
+    fn apply(
+        &mut self,
+        add_args: &[&str],
+        delete_args: &[&str],
+        enable_v6: bool,
+    ) -> std::io::Result<()> {
+        self.apply_family(add_args, delete_args)?;
+
+        if enable_v6 {
+            let add_v6 = std::iter::once("-6")
+                .chain(add_args.iter().copied())
+                .collect::<Vec<_>>();
+            let delete_v6 = std::iter::once("-6")
+                .chain(delete_args.iter().copied())
+                .collect::<Vec<_>>();
+            self.apply_family(&add_v6, &delete_v6)?;
+        }
+
+        Ok(())
+    }
+
+    fn apply_family(
+        &mut self,
+        add_args: &[&str],
+        delete_args: &[&str],
+    ) -> std::io::Result<()> {
+        run_ip_cmd_single(&format!("ip {}", add_args.join(" ")), add_args, false)?;
+        self.applied
+            .push(delete_args.iter().map(|arg| (*arg).to_owned()).collect());
+        Ok(())
+    }
+
+    fn rollback(&mut self) {
+        while let Some(args) = self.applied.pop() {
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let cmd = format!("ip {}", args.join(" "));
+            if let Err(error) = run_ip_cmd_single(&cmd, &args, true) {
+                warn!(command = %cmd, %error, "failed to roll back TUN route operation");
+            }
+        }
+    }
 }
 
 fn delete_ip_cmd_all(args: &[&str], enable_v6: bool) -> std::io::Result<()> {
@@ -182,21 +241,35 @@ pub fn setup_policy_routing(
     tun_cfg: &TunConfig,
     via: &OutboundInterface,
 ) -> std::io::Result<()> {
+    let mut transaction = RouteTransaction::default();
+    let result = setup_policy_routing_inner(tun_cfg, via, &mut transaction);
+    if result.is_err() {
+        transaction.rollback();
+    }
+    result
+}
+
+fn setup_policy_routing_inner(
+    tun_cfg: &TunConfig,
+    via: &OutboundInterface,
+    transaction: &mut RouteTransaction,
+) -> std::io::Result<()> {
     let table = tun_cfg.route_table.to_string();
     let dev = via.name.as_str();
     let enable_v6 = tun_cfg.gateway_v6.is_some();
 
-    run_ip_cmd(
+    transaction.apply(
         &["route", "add", "default", "dev", dev, "table", &table],
+        &["route", "del", "default", "dev", dev, "table", &table],
         enable_v6,
     )?;
 
     for route in &tun_cfg.route_exclude_address {
-        add_excluded_route(&table, route)?;
+        add_excluded_route(&table, route, transaction)?;
     }
 
     if let Some(so_mark) = tun_cfg.so_mark {
-        run_ip_cmd(
+        transaction.apply(
             &[
                 "rule",
                 "add",
@@ -207,13 +280,34 @@ pub fn setup_policy_routing(
                 "table",
                 "main",
             ],
+            &[
+                "rule",
+                "del",
+                "pref",
+                FWMARK_MAIN_RULE_PREF,
+                "fwmark",
+                &so_mark.to_string(),
+                "table",
+                "main",
+            ],
             enable_v6,
         )?;
 
-        run_ip_cmd(
+        transaction.apply(
             &[
                 "rule",
                 "add",
+                "pref",
+                ROUTE_ALL_RULE_PREF,
+                "not",
+                "fwmark",
+                &so_mark.to_string(),
+                "table",
+                &table,
+            ],
+            &[
+                "rule",
+                "del",
                 "pref",
                 ROUTE_ALL_RULE_PREF,
                 "not",
@@ -226,10 +320,20 @@ pub fn setup_policy_routing(
         )?;
     }
 
-    run_ip_cmd(
+    transaction.apply(
         &[
             "rule",
             "add",
+            "pref",
+            MAIN_SUPPRESS_RULE_PREF,
+            "table",
+            "main",
+            "suppress_prefixlength",
+            "0",
+        ],
+        &[
+            "rule",
+            "del",
             "pref",
             MAIN_SUPPRESS_RULE_PREF,
             "table",
@@ -241,10 +345,22 @@ pub fn setup_policy_routing(
     )?;
 
     for port in tun_cfg.dns_hijack_udp_ports() {
-        run_ip_cmd(
+        transaction.apply(
             &[
                 "rule",
                 "add",
+                "pref",
+                DNS_HIJACK_RULE_PREF,
+                "ipproto",
+                "udp",
+                "dport",
+                &port.to_string(),
+                "table",
+                &table,
+            ],
+            &[
+                "rule",
+                "del",
                 "pref",
                 DNS_HIJACK_RULE_PREF,
                 "ipproto",
