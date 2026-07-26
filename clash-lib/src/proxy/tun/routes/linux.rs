@@ -1,7 +1,7 @@
 use std::net::IpAddr;
 
 use ipnet::IpNet;
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 use crate::{
     app::net::OutboundInterface, common::errors::new_io_error,
@@ -58,7 +58,7 @@ fn best_route_for(dest: IpAddr) -> std::io::Result<(Option<IpAddr>, String)> {
     }
     args.extend(["route", "get", &destination]);
     let output = std::process::Command::new("ip").args(&args).output()?;
-    warn!("executing: ip {}", args.join(" "));
+    debug!("executing: ip {}", args.join(" "));
     if !output.status.success() {
         return Err(new_io_error(format!(
             "query best route for {} failed: {}",
@@ -125,7 +125,7 @@ pub fn delete_interface(name: &str) -> std::io::Result<()> {
     let args = ["link", "del", "dev", name];
     let deleted = run_ip_cmd_single(&cmd_str, &args, true)?;
     if deleted {
-        warn!("deleted stale tun interface {}", name);
+        info!("deleted stale tun interface {}", name);
     }
     Ok(())
 }
@@ -136,14 +136,14 @@ fn run_ip_cmd_single(
     allow_missing: bool,
 ) -> std::io::Result<bool> {
     let cmd = std::process::Command::new("ip").args(args).output()?;
-    warn!("executing: {}", cmd_str);
+    debug!("executing: {}", cmd_str);
     if cmd.status.success() {
         return Ok(true);
     }
 
     let stderr = String::from_utf8_lossy(&cmd.stderr);
     if allow_missing && is_missing_ip_state(&stderr) {
-        warn!("{} already absent: {}", cmd_str, stderr.trim());
+        debug!("{} already absent: {}", cmd_str, stderr.trim());
         return Ok(false);
     }
 
