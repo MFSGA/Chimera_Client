@@ -160,6 +160,7 @@ pub(super) fn convert(
                 mtu: t.mtu,
                 so_mark: t.so_mark,
                 route_table: t.route_table,
+                route_table_v6: t.route_table_v6,
                 dns_hijack,
                 dns_hijack_rules,
             })
@@ -197,8 +198,18 @@ mod tests {
 
         assert_eq!(converted.device_id, "utun1989");
         assert_eq!(converted.route_table, 2468);
+        assert_eq!(converted.route_table_v6, 2469);
         assert_eq!(converted.gateway.to_string(), "198.18.0.1/30");
         assert!(!converted.dns_hijack);
+    }
+
+    #[test]
+    fn parse_separate_ipv6_route_table() {
+        let tun = parse_tun("enable: true\nroute-table: 100\nroute-table-v6: 101");
+        let converted = convert(Some(tun)).expect("tun convert should succeed");
+
+        assert_eq!(converted.route_table, 100);
+        assert_eq!(converted.route_table_v6, 101);
     }
 
     #[test]
