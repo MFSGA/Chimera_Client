@@ -4,7 +4,8 @@ use ipnet::IpNet;
 use tracing::{debug, info, warn};
 
 use crate::{
-    app::net::OutboundInterface, common::errors::new_io_error,
+    app::net::{OutboundInterface, route_for_destination},
+    common::errors::new_io_error,
     config::internal::config::TunConfig,
 };
 
@@ -50,54 +51,21 @@ pub fn add_route(via: &OutboundInterface, dest: &IpNet) -> std::io::Result<()> {
     .map(|_| ())
 }
 
-fn best_route_for(dest: IpAddr) -> std::io::Result<(Option<IpAddr>, String)> {
-    let destination = dest.to_string();
-    let mut args = Vec::new();
-    if dest.is_ipv6() {
-        args.push("-6");
-    }
-    args.extend(["route", "get", &destination]);
-    let output = std::process::Command::new("ip").args(&args).output()?;
-    debug!("executing: ip {}", args.join(" "));
-    if !output.status.success() {
-        return Err(new_io_error(format!(
-            "query best route for {} failed: {}",
-            dest,
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let Some(line) = stdout.lines().next() else {
-        return Err(new_io_error(format!("no best route found for {dest}")));
-    };
-
-    let mut gateway = None;
-    let mut dev = None;
-    let mut parts = line.split_whitespace();
-    while let Some(part) = parts.next() {
-        match part {
-            "via" => gateway = parts.next().and_then(|gateway| gateway.parse().ok()),
-            "dev" => {
-                dev = parts.next().map(ToOwned::to_owned);
-            }
-            _ => {}
-        }
-    }
-
-    let dev = dev
-        .ok_or_else(|| new_io_error(format!("no route device found for {dest}")))?;
-    Ok((gateway, dev))
+async fn best_route_for(dest: IpAddr) -> std::io::Result<(Option<IpAddr>, String)> {
+    let route = route_for_destination(dest, None)
+        .await
+        .map_err(|error| new_io_error(error.to_string()))?;
+    Ok((route.gateway, route.interface_name))
 }
 
-fn add_excluded_route(
+async fn add_excluded_route(
     table: &str,
     dest: &IpNet,
     transaction: &mut RouteTransaction<'_>,
 ) -> std::io::Result<()> {
     let ipv6 = dest.addr().is_ipv6();
     let cidr = dest.to_string();
-    let (gateway, dev) = best_route_for(dest.addr())?;
+    let (gateway, dev) = best_route_for(dest.addr()).await?;
 
     let mut args = vec!["route", "add", &cidr];
     if let Some(gateway) = gateway {
@@ -168,7 +136,7 @@ fn run_ip_cmd_for_family(
     }
 }
 
-trait IpCommandExecutor {
+trait IpCommandExecutor: Send {
     fn execute(
         &mut self,
         args: &[&str],
@@ -244,20 +212,20 @@ fn delete_ip_cmd_all(args: &[&str], ipv6: bool) -> std::io::Result<()> {
 /// # ip rule add pref 102 not fwmark 1234 table 2468
 /// for ipv6
 /// # ip -6 ...
-pub fn setup_policy_routing(
+pub async fn setup_policy_routing(
     tun_cfg: &TunConfig,
     via: &OutboundInterface,
 ) -> std::io::Result<()> {
     let mut executor = SystemIpCommandExecutor;
     let mut transaction = RouteTransaction::new(&mut executor);
-    let result = setup_policy_routing_inner(tun_cfg, via, &mut transaction);
+    let result = setup_policy_routing_inner(tun_cfg, via, &mut transaction).await;
     if result.is_err() {
         transaction.rollback();
     }
     result
 }
 
-fn setup_policy_routing_inner(
+async fn setup_policy_routing_inner(
     tun_cfg: &TunConfig,
     via: &OutboundInterface,
     transaction: &mut RouteTransaction<'_>,
@@ -268,7 +236,8 @@ fn setup_policy_routing_inner(
         &tun_cfg.route_table.to_string(),
         false,
         transaction,
-    )?;
+    )
+    .await?;
     if tun_cfg.gateway_v6.is_some() {
         setup_policy_family(
             tun_cfg,
@@ -276,12 +245,13 @@ fn setup_policy_routing_inner(
             &tun_cfg.route_table_v6.to_string(),
             true,
             transaction,
-        )?;
+        )
+        .await?;
     }
     Ok(())
 }
 
-fn setup_policy_family(
+async fn setup_policy_family(
     tun_cfg: &TunConfig,
     via: &OutboundInterface,
     table: &str,
@@ -301,7 +271,7 @@ fn setup_policy_family(
         .iter()
         .filter(|route| route.addr().is_ipv6() == ipv6)
     {
-        add_excluded_route(table, route, transaction)?;
+        add_excluded_route(table, route, transaction).await?;
     }
 
     if let Some(so_mark) = tun_cfg.so_mark {
