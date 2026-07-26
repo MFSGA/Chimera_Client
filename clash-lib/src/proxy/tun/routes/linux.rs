@@ -284,9 +284,6 @@ pub fn maybe_routes_clean_up(tun_cfg: &TunConfig) -> std::io::Result<()> {
         )?;
     }
 
-    // Also removes the broad source-address bypass emitted by older builds.
-    delete_ip_cmd_all(&["rule", "del", "pref", "90", "table", "main"], false)?;
-
     if let Some(so_mark) = tun_cfg.so_mark {
         delete_ip_cmd_all(
             &[
@@ -316,31 +313,6 @@ pub fn maybe_routes_clean_up(tun_cfg: &TunConfig) -> std::io::Result<()> {
             ],
             enable_v6,
         )?;
-
-        delete_ip_cmd_all(
-            &[
-                "rule",
-                "del",
-                "fwmark",
-                &so_mark.to_string(),
-                "table",
-                "main",
-            ],
-            enable_v6,
-        )?;
-
-        delete_ip_cmd_all(
-            &[
-                "rule",
-                "del",
-                "not",
-                "fwmark",
-                &so_mark.to_string(),
-                "table",
-                &table,
-            ],
-            enable_v6,
-        )?;
     }
     delete_ip_cmd_all(
         &[
@@ -353,10 +325,6 @@ pub fn maybe_routes_clean_up(tun_cfg: &TunConfig) -> std::io::Result<()> {
             "suppress_prefixlength",
             "0",
         ],
-        enable_v6,
-    )?;
-    delete_ip_cmd_all(
-        &["rule", "del", "table", "main", "suppress_prefixlength", "0"],
         enable_v6,
     )?;
 
@@ -377,30 +345,6 @@ pub fn maybe_routes_clean_up(tun_cfg: &TunConfig) -> std::io::Result<()> {
             enable_v6,
         )?;
     }
-
-    // Remove rules left by older builds that did not include ipproto.
-    delete_ip_cmd_all(
-        &[
-            "rule",
-            "del",
-            "pref",
-            DNS_HIJACK_RULE_PREF,
-            "dport",
-            "53",
-            "table",
-            &table,
-        ],
-        enable_v6,
-    )?;
-    // Remove the rule emitted by transparent-dns step 1.
-    delete_ip_cmd_all(
-        &[
-            "rule", "del", "pref", "101", "ipproto", "udp", "dport", "53", "table",
-            &table,
-        ],
-        enable_v6,
-    )?;
-    delete_ip_cmd_all(&["rule", "del", "dport", "53", "table", &table], enable_v6)?;
 
     Ok(())
 }
