@@ -58,6 +58,7 @@ fn write_config(path: &PathBuf, api_port: u16, socks_port: u16, mode: &str) {
             "ipv6: false\n\
 log_level: info\n\
 mode: {mode}\n\
+mmdb: null\n\
 external-controller: 127.0.0.1:{api_port}\n\
 socks-port: {socks_port}\n\
 dns:\n\
