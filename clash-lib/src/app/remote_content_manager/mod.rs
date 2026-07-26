@@ -220,7 +220,8 @@ impl ProxyManager {
         url: &str,
         timeout: Option<Duration>,
     ) -> std::io::Result<(Duration, Duration)> {
-        self.url_test_inner(outbound, url, timeout, None).await
+        self.url_test_inner(outbound, url, timeout, None, None)
+            .await
     }
 
     #[cfg(feature = "extended-health-check")]
@@ -231,8 +232,27 @@ impl ProxyManager {
         timeout: Option<Duration>,
         minimum_bytes: usize,
     ) -> std::io::Result<(Duration, Duration)> {
-        self.url_test_inner(outbound, url, timeout, Some(minimum_bytes))
+        self.url_test_inner(outbound, url, timeout, Some(minimum_bytes), None)
             .await
+    }
+
+    #[cfg(feature = "extended-health-check")]
+    pub async fn sse_test(
+        &self,
+        outbound: AnyOutboundHandler,
+        url: &str,
+        timeout: Option<Duration>,
+        minimum_events: usize,
+        maximum_first_byte: Duration,
+    ) -> std::io::Result<(Duration, Duration)> {
+        self.url_test_inner(
+            outbound,
+            url,
+            timeout,
+            None,
+            Some((minimum_events, maximum_first_byte)),
+        )
+        .await
     }
 
     async fn url_test_inner(
@@ -241,9 +261,10 @@ impl ProxyManager {
         url: &str,
         timeout: Option<Duration>,
         minimum_bytes: Option<usize>,
+        sse: Option<(usize, Duration)>,
     ) -> std::io::Result<(Duration, Duration)> {
         #[cfg(not(feature = "extended-health-check"))]
-        let _ = minimum_bytes;
+        let _ = (minimum_bytes, sse);
 
         let name = outbound.name().to_owned();
         let timeout = timeout.unwrap_or(Duration::from_secs(5));
@@ -381,6 +402,55 @@ impl ProxyManager {
                 )))
             }
             #[cfg(feature = "extended-health-check")]
+            Ok(mut response) if sse.is_some() => {
+                let (minimum_events, maximum_first_byte) = sse.unwrap();
+                tokio::time::timeout(timeout, async {
+                    let first = tokio::time::timeout(
+                        maximum_first_byte,
+                        response.body_mut().frame(),
+                    )
+                    .await
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "healthcheck SSE first byte timeout",
+                        )
+                    })?;
+
+                    let mut buffer = Vec::new();
+                    let mut events = 0usize;
+                    let mut frame = first;
+                    loop {
+                        match frame {
+                            Some(frame) => {
+                                let frame = frame.map_err(std::io::Error::other)?;
+                                if let Some(data) = frame.data_ref() {
+                                    buffer.extend_from_slice(data);
+                                    events += drain_sse_events(&mut buffer);
+                                    if events >= minimum_events {
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                            None => {
+                                return Err(std::io::Error::other(format!(
+                                    "healthcheck SSE ended after {events} events; \
+                                     expected at least {minimum_events}"
+                                )));
+                            }
+                        }
+                        frame = response.body_mut().frame().await;
+                    }
+                })
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "healthcheck SSE timeout",
+                    )
+                })?
+            }
+            #[cfg(feature = "extended-health-check")]
             Ok(mut response) if minimum_bytes.is_some() => {
                 let minimum_bytes = minimum_bytes.unwrap_or_default();
                 tokio::time::timeout(timeout, async {
@@ -440,6 +510,33 @@ impl ProxyManager {
     // pub fn fw_mark(&self) -> Option<u32> {
     //     self.fw_mark
     // }
+}
+
+#[cfg(feature = "extended-health-check")]
+fn drain_sse_events(buffer: &mut Vec<u8>) -> usize {
+    let mut count = 0;
+    loop {
+        let lf = buffer
+            .windows(2)
+            .position(|window| window == b"\n\n")
+            .map(|position| (position, 2));
+        let crlf = buffer
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|position| (position, 4));
+        let delimiter = match (lf, crlf) {
+            (Some(left), Some(right)) => {
+                Some(if left.0 < right.0 { left } else { right })
+            }
+            (left, right) => left.or(right),
+        };
+        let Some((position, length)) = delimiter else {
+            break;
+        };
+        buffer.drain(..position + length);
+        count += 1;
+    }
+    count
 }
 
 #[cfg(all(test, feature = "extended-health-check"))]
@@ -505,5 +602,35 @@ mod tests {
 
         assert!(error.to_string().contains("expected at least 64"));
         assert!(!manager.alive(PROXY_DIRECT).await);
+    }
+
+    #[tokio::test]
+    async fn sse_probe_requires_complete_events() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/events");
+            then.status(200).body("data: first\n\ndata: second\n\n");
+        });
+        let (manager, outbound) = direct_manager();
+
+        manager
+            .sse_test(
+                outbound,
+                &server.url("/events"),
+                Some(Duration::from_secs(2)),
+                2,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+
+        assert!(manager.alive(PROXY_DIRECT).await);
+    }
+
+    #[test]
+    fn parses_lf_and_crlf_sse_event_boundaries() {
+        let mut buffer = b"data: one\r\n\r\ndata: two\n\npartial".to_vec();
+        assert_eq!(super::drain_sse_events(&mut buffer), 2);
+        assert_eq!(buffer, b"partial");
     }
 }
