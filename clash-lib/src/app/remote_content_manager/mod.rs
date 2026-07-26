@@ -10,6 +10,8 @@ use std::{
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::{FutureExt, StreamExt, stream::FuturesOrdered};
+#[cfg(feature = "extended-health-check")]
+use http_body_util::BodyExt;
 use http_body_util::Empty;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
@@ -176,6 +178,31 @@ impl ProxyManager {
         url: &str,
         timeout: Option<Duration>,
     ) -> std::io::Result<(Duration, Duration)> {
+        self.url_test_inner(outbound, url, timeout, None).await
+    }
+
+    #[cfg(feature = "extended-health-check")]
+    pub async fn download_test(
+        &self,
+        outbound: AnyOutboundHandler,
+        url: &str,
+        timeout: Option<Duration>,
+        minimum_bytes: usize,
+    ) -> std::io::Result<(Duration, Duration)> {
+        self.url_test_inner(outbound, url, timeout, Some(minimum_bytes))
+            .await
+    }
+
+    async fn url_test_inner(
+        &self,
+        outbound: AnyOutboundHandler,
+        url: &str,
+        timeout: Option<Duration>,
+        minimum_bytes: Option<usize>,
+    ) -> std::io::Result<(Duration, Duration)> {
+        #[cfg(not(feature = "extended-health-check"))]
+        let _ = minimum_bytes;
+
         let name = outbound.name().to_owned();
         let timeout = timeout.unwrap_or(Duration::from_secs(5));
         #[cfg(feature = "tun")]
@@ -304,9 +331,46 @@ impl ProxyManager {
                 "unsupported scheme",
             )),
         };
+        let probe_result = match request_result {
+            Ok(response) if !response.status().is_success() => {
+                Err(std::io::Error::other(format!(
+                    "healthcheck returned HTTP {}",
+                    response.status()
+                )))
+            }
+            #[cfg(feature = "extended-health-check")]
+            Ok(mut response) if minimum_bytes.is_some() => {
+                let minimum_bytes = minimum_bytes.unwrap_or_default();
+                tokio::time::timeout(timeout, async {
+                    let mut received = 0usize;
+                    while let Some(frame) = response.body_mut().frame().await {
+                        let frame = frame.map_err(std::io::Error::other)?;
+                        if let Some(data) = frame.data_ref() {
+                            received = received.saturating_add(data.len());
+                            if received >= minimum_bytes {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Err(std::io::Error::other(format!(
+                        "healthcheck download ended after {received} bytes; \
+                         expected at least {minimum_bytes}"
+                    )))
+                })
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "healthcheck download timeout",
+                    )
+                })?
+            }
+            Ok(_) => Ok(()),
+            Err(error) => Err(error),
+        };
         let request_delay = request_started.elapsed();
 
-        let ok = request_result.is_ok();
+        let ok = probe_result.is_ok();
         self.report_alive(&name, ok).await;
         self.report_delay(
             &name,
@@ -319,7 +383,7 @@ impl ProxyManager {
         )
         .await;
 
-        request_result.map(|_| {
+        probe_result.map(|_| {
             (
                 request_delay,
                 connect_delay + tls_handshake_delay + request_delay,
@@ -334,4 +398,70 @@ impl ProxyManager {
     // pub fn fw_mark(&self) -> Option<u32> {
     //     self.fw_mark
     // }
+}
+
+#[cfg(all(test, feature = "extended-health-check"))]
+mod tests {
+    use std::{sync::Arc, time::Duration};
+
+    use httpmock::{Method::GET, MockServer};
+
+    use super::ProxyManager;
+    use crate::{
+        app::dns::SystemResolver,
+        config::internal::proxy::PROXY_DIRECT,
+        proxy::{AnyOutboundHandler, direct},
+    };
+
+    fn direct_manager() -> (ProxyManager, AnyOutboundHandler) {
+        let resolver = Arc::new(SystemResolver::new(false).unwrap());
+        let manager = ProxyManager::new(resolver, None);
+        let outbound = Arc::new(direct::Handler::new(PROXY_DIRECT));
+        (manager, outbound)
+    }
+
+    #[tokio::test]
+    async fn download_probe_requires_minimum_response_bytes() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/download");
+            then.status(200).body(vec![b'x'; 64]);
+        });
+        let (manager, outbound) = direct_manager();
+
+        manager
+            .download_test(
+                outbound,
+                &server.url("/download"),
+                Some(Duration::from_secs(2)),
+                64,
+            )
+            .await
+            .unwrap();
+
+        assert!(manager.alive(PROXY_DIRECT).await);
+    }
+
+    #[tokio::test]
+    async fn short_download_marks_proxy_unhealthy() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/short");
+            then.status(200).body(vec![b'x'; 16]);
+        });
+        let (manager, outbound) = direct_manager();
+
+        let error = manager
+            .download_test(
+                outbound,
+                &server.url("/short"),
+                Some(Duration::from_secs(2)),
+                64,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("expected at least 64"));
+        assert!(!manager.alive(PROXY_DIRECT).await);
+    }
 }
