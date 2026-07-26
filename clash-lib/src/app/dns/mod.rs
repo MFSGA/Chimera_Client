@@ -58,6 +58,13 @@ pub trait ClashResolver: Sync + Send {
         host: &str,
         enhanced: bool,
     ) -> anyhow::Result<Option<std::net::IpAddr>>;
+    async fn resolve_all(
+        &self,
+        host: &str,
+        enhanced: bool,
+    ) -> anyhow::Result<Vec<std::net::IpAddr>> {
+        Ok(self.resolve(host, enhanced).await?.into_iter().collect())
+    }
     async fn resolve_v4(
         &self,
         host: &str,

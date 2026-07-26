@@ -18,10 +18,11 @@ use super::RealityClient;
 #[cfg(feature = "tls")]
 use super::TlsClient;
 use super::Transport;
+#[cfg(all(feature = "tun", target_os = "linux"))]
+use crate::app::net::TUN_SOMARK;
 use crate::{
-    app::net::DEFAULT_OUTBOUND_INTERFACE,
     common::errors::map_io_error,
-    proxy::{AnyStream, utils::new_tcp_stream},
+    proxy::{AnyStream, utils::new_protected_tcp_stream},
 };
 
 const DUPLEX_BUFFER_SIZE: usize = 64 * 1024;
@@ -176,12 +177,15 @@ async fn connect_download_stream(
         .ok_or_else(|| {
             io::Error::other("xhttp download server resolved no addresses")
         })?;
-    let iface = DEFAULT_OUTBOUND_INTERFACE.read().await.clone();
-    let tcp = new_tcp_stream(
+    #[cfg(all(feature = "tun", target_os = "linux"))]
+    let so_mark = *TUN_SOMARK.read().await;
+    #[cfg(all(not(feature = "tun"), target_os = "linux"))]
+    let so_mark = None;
+    let tcp = new_protected_tcp_stream(
         endpoint,
-        iface.as_ref(),
-        #[cfg(target_os = "linux")]
         None,
+        #[cfg(target_os = "linux")]
+        so_mark,
     )
     .await?;
     let stream: AnyStream = Box::new(tcp);

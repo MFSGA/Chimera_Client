@@ -39,6 +39,25 @@ impl ClashResolver for SystemResolver {
             .choose(&mut rand::rng()))
     }
 
+    async fn resolve_all(
+        &self,
+        host: &str,
+        _: bool,
+    ) -> anyhow::Result<Vec<std::net::IpAddr>> {
+        if let Some(ip) = parse_ip_literal(host) {
+            return Ok(vec![ip]);
+        }
+
+        let response = self.inner.lookup_ip(host).await?;
+        let mut addresses = response
+            .iter()
+            .filter(|address| self.ipv6() || address.is_ipv4())
+            .collect::<Vec<_>>();
+        addresses.sort_unstable();
+        addresses.dedup();
+        Ok(addresses)
+    }
+
     async fn resolve_v4(
         &self,
         host: &str,

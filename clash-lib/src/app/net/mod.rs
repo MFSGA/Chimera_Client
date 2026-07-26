@@ -471,7 +471,7 @@ pub fn resolve_outbound_interface(
     interface: Option<&Interface>,
 ) -> Result<Option<OutboundInterface>> {
     let Some(interface) = interface else {
-        return Ok(get_outbound_interface());
+        return Ok(None);
     };
 
     let configured = match interface {
@@ -643,6 +643,11 @@ mod tests {
                     == "configured outbound interface \
                        \"__chimera_missing_interface__\" does not exist"
         ));
+    }
+
+    #[test]
+    fn unconfigured_interface_does_not_guess_an_outbound() {
+        assert!(resolve_outbound_interface(None).unwrap().is_none());
     }
 
     #[cfg(target_os = "linux")]
