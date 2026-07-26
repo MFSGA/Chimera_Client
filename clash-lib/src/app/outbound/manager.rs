@@ -26,8 +26,8 @@ use crate::{
         },
     },
     config::internal::proxy::{
-        OutboundGroupProtocol, OutboundProxyProtocol, OutboundProxyProviderDef,
-        PROXY_DIRECT, PROXY_GLOBAL, PROXY_REJECT,
+        HealthCheckProbe, OutboundGroupProtocol, OutboundProxyProtocol,
+        OutboundProxyProviderDef, PROXY_DIRECT, PROXY_GLOBAL, PROXY_REJECT,
     },
     proxy::{
         AnyOutboundHandler, direct,
@@ -809,17 +809,49 @@ impl OutboundManager {
                         }
                     }
 
+                    let health = file.health_check;
+                    if health.probe == HealthCheckProbe::Download
+                        && !cfg!(feature = "extended-health-check")
+                    {
+                        return Err(Error::InvalidConfig(format!(
+                            "file provider `{name}` uses download health probe, \
+                             but extended-health-check is disabled"
+                        )));
+                    }
+                    let minimum_bytes = health.minimum_bytes.unwrap_or(65_536);
+                    if health.probe == HealthCheckProbe::Download
+                        && minimum_bytes == 0
+                    {
+                        return Err(Error::InvalidConfig(format!(
+                            "file provider `{name}` download health probe requires \
+                             minimum-bytes greater than zero"
+                        )));
+                    }
+                    let interval = if health.enable == Some(false) {
+                        0
+                    } else {
+                        health.interval.or(file.interval).unwrap_or_default()
+                    };
+                    let health_check = HealthCheck::new(
+                        proxies.clone(),
+                        health
+                            .url
+                            .unwrap_or_else(|| DEFAULT_LATENCY_TEST_URL.to_owned()),
+                        interval,
+                        health.lazy.unwrap_or(true),
+                        self.proxy_manager.clone(),
+                    )
+                    .with_probe(
+                        health.probe,
+                        minimum_bytes,
+                        health.timeout.map(Duration::from_secs),
+                    );
+
                     let provider = Arc::new(RwLock::new(
                         PlainProvider::new(
                             name.clone(),
                             proxies.clone(),
-                            HealthCheck::new(
-                                proxies,
-                                DEFAULT_LATENCY_TEST_URL.to_owned(),
-                                file.interval.unwrap_or_default(),
-                                true,
-                                self.proxy_manager.clone(),
-                            ),
+                            health_check,
                         )
                         .map_err(|x| {
                             Error::InvalidConfig(format!(

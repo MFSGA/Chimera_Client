@@ -172,6 +172,48 @@ impl ProxyManager {
         results
     }
 
+    #[cfg(feature = "extended-health-check")]
+    pub async fn check_download(
+        &self,
+        outbounds: &Vec<AnyOutboundHandler>,
+        url: &str,
+        timeout: Option<Duration>,
+        minimum_bytes: usize,
+    ) -> Vec<std::io::Result<(Duration, Duration)>> {
+        let mut tasks = Vec::new();
+        for outbound in outbounds {
+            let outbound = outbound.clone();
+            let url = url.to_owned();
+            let manager = self.clone();
+            tasks.push(tokio::spawn(async move {
+                let proxy_name = outbound.name().to_owned();
+                manager
+                    .download_test(outbound, &url, timeout, minimum_bytes)
+                    .await
+                    .inspect_err(|error| {
+                        warn!(
+                            "download healthcheck {} -> {} failed: {}",
+                            proxy_name, url, error
+                        );
+                    })
+            }));
+        }
+
+        let joined: Vec<_> = tasks
+            .into_iter()
+            .collect::<FuturesOrdered<_>>()
+            .collect()
+            .await;
+        joined
+            .into_iter()
+            .map(|result| {
+                result.unwrap_or_else(|error| {
+                    Err(std::io::Error::other(error.to_string()))
+                })
+            })
+            .collect()
+    }
+
     pub async fn url_test(
         &self,
         outbound: AnyOutboundHandler,

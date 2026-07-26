@@ -434,6 +434,20 @@ pub struct HealthCheck {
     pub url: Option<String>,
     pub interval: Option<u64>,
     pub lazy: Option<bool>,
+    #[serde(rename = "type", default)]
+    pub probe: HealthCheckProbe,
+    pub minimum_bytes: Option<usize>,
+    pub timeout: Option<u64>,
+}
+
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum HealthCheckProbe {
+    #[default]
+    Http,
+    Download,
 }
 
 #[cfg(feature = "trojan")]
@@ -496,7 +510,26 @@ pub enum Hysteria2Obfs {
 
 #[cfg(test)]
 mod tests {
-    use super::OutboundProxyProtocol;
+    use super::{HealthCheck, HealthCheckProbe, OutboundProxyProtocol};
+
+    #[test]
+    fn download_health_check_config_parses() {
+        let health: HealthCheck = serde_yaml::from_str(
+            r#"
+enable: true
+url: https://probe.example/64k.bin
+interval: 300
+timeout: 10
+type: download
+minimum-bytes: 65536
+"#,
+        )
+        .expect("health check config should parse");
+
+        assert_eq!(health.probe, HealthCheckProbe::Download);
+        assert_eq!(health.minimum_bytes, Some(65_536));
+        assert_eq!(health.timeout, Some(10));
+    }
 
     #[test]
     fn outbound_vless_parses_xhttp_opts() {
