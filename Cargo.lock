@@ -807,6 +807,7 @@ dependencies = [
  "rcgen",
  "regex",
  "ring-compat",
+ "rtnetlink 0.21.0",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -2850,6 +2851,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "netlink-packet-route"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be8919612f6028ab4eacbbfe1234a9a43e3722c6e0915e7ff519066991905092"
+dependencies = [
+ "bitflags 2.12.1",
+ "libc",
+ "log",
+ "netlink-packet-core 0.8.1",
+]
+
+[[package]]
 name = "netlink-packet-sock-diag"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2886,6 +2899,21 @@ dependencies = [
  "futures",
  "log",
  "netlink-packet-core 0.7.0",
+ "netlink-sys",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "netlink-proto"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6f7398dddf5f152d2a91a2921a134c6097056e292c0d4b9906007855e7cece6"
+dependencies = [
+ "bytes",
+ "futures-channel",
+ "futures-util",
+ "log",
+ "netlink-packet-core 0.8.1",
  "netlink-sys",
  "thiserror 2.0.18",
 ]
@@ -3745,9 +3773,27 @@ dependencies = [
  "netlink-packet-core 0.7.0",
  "netlink-packet-route 0.19.0",
  "netlink-packet-utils",
- "netlink-proto",
+ "netlink-proto 0.11.5",
  "netlink-sys",
  "nix 0.27.1",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "rtnetlink"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc19f84f710fa2f337617f9bc0400260a94224bde7bae28fd8879f3771ca5784"
+dependencies = [
+ "futures-channel",
+ "futures-util",
+ "log",
+ "netlink-packet-core 0.8.1",
+ "netlink-packet-route 0.30.0",
+ "netlink-proto 0.12.1",
+ "netlink-sys",
+ "nix 0.30.1",
  "thiserror 1.0.69",
  "tokio",
 ]
@@ -4262,7 +4308,7 @@ dependencies = [
  "netlink-packet-core 0.7.0",
  "netlink-packet-sock-diag",
  "netlink-sys",
- "rtnetlink",
+ "rtnetlink 0.14.1",
  "sysctl",
  "tracing",
  "windows-sys 0.52.0",

@@ -10,7 +10,10 @@ use network_interface::{
 use serde::Serialize;
 use std::sync::{Arc, LazyLock};
 #[cfg(feature = "tun")]
-use tracing::{trace, warn};
+use tracing::trace;
+
+#[cfg(feature = "tun")]
+use crate::{Error, Result};
 
 pub static DEFAULT_OUTBOUND_INTERFACE: LazyLock<
     Arc<tokio::sync::RwLock<Option<OutboundInterface>>>,
@@ -18,6 +21,200 @@ pub static DEFAULT_OUTBOUND_INTERFACE: LazyLock<
 #[cfg(feature = "tun")]
 pub static TUN_SOMARK: LazyLock<tokio::sync::RwLock<Option<u32>>> =
     LazyLock::new(Default::default);
+#[cfg(all(feature = "tun", target_os = "linux"))]
+static ROUTE_NETLINK_HANDLE: tokio::sync::OnceCell<rtnetlink::Handle> =
+    tokio::sync::OnceCell::const_new();
+
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressFamily {
+    Ipv4,
+    Ipv6,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct RouteDecision {
+    pub family: AddressFamily,
+    pub destination: IpAddr,
+    pub interface_index: u32,
+    pub interface_name: String,
+    pub gateway: Option<IpAddr>,
+    pub preferred_source: Option<IpAddr>,
+    pub table: u32,
+    pub metric: Option<u32>,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum RouteSelectionError {
+    #[error("failed to initialize route netlink connection: {0}")]
+    Connection(#[source] std::io::Error),
+    #[error("netlink route query for {destination} failed: {message}")]
+    Netlink {
+        destination: IpAddr,
+        message: String,
+    },
+    #[error("route query for {destination} failed: {message}")]
+    QueryFailed {
+        destination: IpAddr,
+        message: String,
+    },
+    #[error("invalid route query output for {destination}: {message}")]
+    InvalidOutput {
+        destination: IpAddr,
+        message: String,
+    },
+    #[error("route to {destination} uses unknown interface index {interface_index}")]
+    InterfaceNotFound {
+        destination: IpAddr,
+        interface_index: u32,
+    },
+    #[error("route lookup is unsupported on this platform")]
+    Unsupported,
+}
+
+#[cfg(all(feature = "tun", target_os = "linux"))]
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedRoute {
+    interface_index: u32,
+    gateway: Option<IpAddr>,
+    preferred_source: Option<IpAddr>,
+    table: u32,
+    metric: Option<u32>,
+}
+
+#[cfg(all(feature = "tun", target_os = "linux"))]
+async fn route_netlink_handle()
+-> std::result::Result<&'static rtnetlink::Handle, RouteSelectionError> {
+    ROUTE_NETLINK_HANDLE
+        .get_or_try_init(|| async {
+            let (connection, handle, _) = rtnetlink::new_connection()
+                .map_err(RouteSelectionError::Connection)?;
+            tokio::spawn(connection);
+            Ok(handle)
+        })
+        .await
+}
+
+#[cfg(all(feature = "tun", target_os = "linux"))]
+fn route_address_to_ip(
+    address: &rtnetlink::packet_route::route::RouteAddress,
+) -> Option<IpAddr> {
+    use rtnetlink::packet_route::route::RouteAddress;
+
+    match address {
+        RouteAddress::Inet(address) => Some(IpAddr::V4(*address)),
+        RouteAddress::Inet6(address) => Some(IpAddr::V6(*address)),
+        _ => None,
+    }
+}
+
+#[cfg(all(feature = "tun", target_os = "linux"))]
+fn parse_netlink_route(
+    destination: IpAddr,
+    message: &rtnetlink::packet_route::route::RouteMessage,
+) -> std::result::Result<ParsedRoute, RouteSelectionError> {
+    use rtnetlink::packet_route::route::RouteAttribute;
+
+    let mut interface_index = None;
+    let mut gateway = None;
+    let mut preferred_source = None;
+    let mut table = message.header.table as u32;
+    let mut metric = None;
+
+    for attribute in &message.attributes {
+        match attribute {
+            RouteAttribute::Oif(index) => interface_index = Some(*index),
+            RouteAttribute::Gateway(address) => {
+                gateway = route_address_to_ip(address);
+            }
+            RouteAttribute::PrefSource(address) => {
+                preferred_source = route_address_to_ip(address);
+            }
+            RouteAttribute::Table(value) => table = *value,
+            RouteAttribute::Priority(value) => metric = Some(*value),
+            _ => {}
+        }
+    }
+
+    let interface_index =
+        interface_index.ok_or_else(|| RouteSelectionError::InvalidOutput {
+            destination,
+            message: "missing output interface index".to_owned(),
+        })?;
+
+    Ok(ParsedRoute {
+        interface_index,
+        gateway,
+        preferred_source,
+        table,
+        metric,
+    })
+}
+
+#[cfg(all(feature = "tun", target_os = "linux"))]
+pub async fn route_for_destination(
+    destination: IpAddr,
+    fwmark: Option<u32>,
+) -> std::result::Result<RouteDecision, RouteSelectionError> {
+    use futures::TryStreamExt;
+    use rtnetlink::RouteMessageBuilder;
+
+    let prefix_length = if destination.is_ipv4() { 32 } else { 128 };
+    let mut request = RouteMessageBuilder::<IpAddr>::new()
+        .destination_prefix(destination, prefix_length)
+        .map_err(|error| RouteSelectionError::InvalidOutput {
+            destination,
+            message: error.to_string(),
+        })?;
+    if let Some(fwmark) = fwmark {
+        request = request.mark(fwmark);
+    }
+
+    let handle = route_netlink_handle().await?;
+    let mut routes = handle.route().get(request.build()).execute();
+    let message = routes
+        .try_next()
+        .await
+        .map_err(|error| RouteSelectionError::Netlink {
+            destination,
+            message: error.to_string(),
+        })?
+        .ok_or_else(|| RouteSelectionError::QueryFailed {
+            destination,
+            message: "kernel returned no matching route".to_owned(),
+        })?;
+
+    let parsed = parse_netlink_route(destination, &message)?;
+    let interface =
+        get_interface_by_index(parsed.interface_index).ok_or_else(|| {
+            RouteSelectionError::InterfaceNotFound {
+                destination,
+                interface_index: parsed.interface_index,
+            }
+        })?;
+
+    Ok(RouteDecision {
+        family: if destination.is_ipv4() {
+            AddressFamily::Ipv4
+        } else {
+            AddressFamily::Ipv6
+        },
+        destination,
+        interface_index: parsed.interface_index,
+        interface_name: interface.name,
+        gateway: parsed.gateway,
+        preferred_source: parsed.preferred_source,
+        table: parsed.table,
+        metric: parsed.metric,
+    })
+}
+
+#[cfg(any(not(feature = "tun"), not(target_os = "linux")))]
+pub async fn route_for_destination(
+    _destination: IpAddr,
+    _fwmark: Option<u32>,
+) -> std::result::Result<RouteDecision, RouteSelectionError> {
+    Err(RouteSelectionError::Unsupported)
+}
 
 #[cfg(not(feature = "tun"))]
 pub fn get_interface_by_name(_name: &str) -> Option<OutboundInterface> {
@@ -54,15 +251,16 @@ fn is_candidate_outbound_v6(addr: Ipv6Addr) -> bool {
 pub async fn init_net_config(
     tun_somark: Option<u32>,
     interface: Option<&Interface>,
-) {
+) -> Result<()> {
     *DEFAULT_OUTBOUND_INTERFACE.write().await =
-        resolve_outbound_interface(interface);
+        resolve_outbound_interface(interface)?;
     *TUN_SOMARK.write().await = tun_somark;
     trace!(
         "default outbound interface: {:?}, tun somark: {:?}",
         *DEFAULT_OUTBOUND_INTERFACE.read().await,
         *TUN_SOMARK.read().await
     );
+    Ok(())
 }
 
 #[cfg(feature = "tun")]
@@ -174,6 +372,15 @@ pub fn get_interface_by_name(name: &str) -> Option<OutboundInterface> {
 }
 
 #[cfg(feature = "tun")]
+fn get_interface_by_index(index: u32) -> Option<OutboundInterface> {
+    network_interface::NetworkInterface::show()
+        .ok()?
+        .into_iter()
+        .find(|interface| interface.index == index)
+        .map(Into::into)
+}
+
+#[cfg(feature = "tun")]
 pub fn get_interface_by_ip(ip: IpAddr) -> Option<OutboundInterface> {
     let now = std::time::Instant::now();
 
@@ -202,25 +409,91 @@ pub fn get_interface_by_ip(ip: IpAddr) -> Option<OutboundInterface> {
     Some(outbound)
 }
 
+#[cfg(all(feature = "tun", target_os = "linux"))]
+fn validate_linux_interface_flags(
+    interface: &OutboundInterface,
+    flags: u32,
+) -> Result<()> {
+    let families = match (interface.addr_v4.is_some(), interface.addr_v6.is_some()) {
+        (true, true) => "IPv4/IPv6",
+        (true, false) => "IPv4",
+        (false, true) => "IPv6",
+        (false, false) => "none",
+    };
+
+    for (flag, state) in [
+        (libc::IFF_UP as u32, "UP"),
+        (libc::IFF_RUNNING as u32, "RUNNING"),
+    ] {
+        if flags & flag == 0 {
+            return Err(Error::InvalidConfig(format!(
+                "configured outbound interface \"{}\" is not {state}: \
+                 index={}, family={families}",
+                interface.name, interface.index
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(all(feature = "tun", target_os = "linux"))]
+fn validate_configured_interface_state(interface: &OutboundInterface) -> Result<()> {
+    let flags_path = format!("/sys/class/net/{}/flags", interface.name);
+    let raw_flags = std::fs::read_to_string(&flags_path).map_err(|error| {
+        Error::InvalidConfig(format!(
+            "failed to inspect configured outbound interface \"{}\": \
+             index={}, error={error}",
+            interface.name, interface.index
+        ))
+    })?;
+    let flags = u32::from_str_radix(raw_flags.trim().trim_start_matches("0x"), 16)
+        .map_err(|error| {
+        Error::InvalidConfig(format!(
+            "failed to parse state for configured outbound interface \"{}\": \
+             index={}, error={error}",
+            interface.name, interface.index
+        ))
+    })?;
+
+    validate_linux_interface_flags(interface, flags)
+}
+
+#[cfg(all(feature = "tun", not(target_os = "linux")))]
+fn validate_configured_interface_state(
+    _interface: &OutboundInterface,
+) -> Result<()> {
+    Ok(())
+}
+
 #[cfg(feature = "tun")]
 pub fn resolve_outbound_interface(
     interface: Option<&Interface>,
-) -> Option<OutboundInterface> {
-    let configured = interface.and_then(|interface| match interface {
+) -> Result<Option<OutboundInterface>> {
+    let Some(interface) = interface else {
+        return Ok(get_outbound_interface());
+    };
+
+    let configured = match interface {
         Interface::IpAddr(ip) => get_interface_by_ip(*ip),
         Interface::Name(name) => get_interface_by_name(name),
-    });
+    }
+    .ok_or_else(|| {
+        Error::InvalidConfig(format!(
+            "configured outbound interface \"{interface}\" does not exist"
+        ))
+    })?;
 
-    if let Some(interface) = interface
-        && configured.is_none()
-    {
-        warn!(
-            "configured outbound interface {} not found, falling back to auto-detect",
-            interface
-        );
+    if configured.addr_v4.is_none() && configured.addr_v6.is_none() {
+        return Err(Error::InvalidConfig(format!(
+            "configured outbound interface \"{}\" has no usable IP address",
+            configured.name
+        )));
     }
 
-    configured.or_else(get_outbound_interface)
+    validate_configured_interface_state(&configured)?;
+
+    Ok(Some(configured))
 }
 
 #[cfg(feature = "tun")]
@@ -334,5 +607,122 @@ impl Interface {
             Interface::IpAddr(_) => None,
             Interface::Name(name) => Some(name),
         }
+    }
+}
+
+#[cfg(all(test, feature = "tun"))]
+mod tests {
+    use super::{Interface, OutboundInterface, resolve_outbound_interface};
+    use crate::Error;
+
+    #[cfg(target_os = "linux")]
+    fn test_interface() -> OutboundInterface {
+        OutboundInterface {
+            name: "test0".to_owned(),
+            addr_v4: Some(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+            netmask_v4: None,
+            broadcast_v4: None,
+            addr_v6: None,
+            netmask_v6: None,
+            broadcast_v6: None,
+            index: 42,
+            mac_addr: None,
+        }
+    }
+
+    #[test]
+    fn configured_interface_does_not_fall_back_when_missing() {
+        let interface = Interface::Name("__chimera_missing_interface__".to_owned());
+
+        let error = resolve_outbound_interface(Some(&interface)).unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::InvalidConfig(message)
+                if message
+                    == "configured outbound interface \
+                       \"__chimera_missing_interface__\" does not exist"
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn configured_interface_must_be_up_and_running() {
+        let interface = test_interface();
+
+        let down = super::validate_linux_interface_flags(&interface, 0).unwrap_err();
+        assert!(matches!(
+            down,
+            Error::InvalidConfig(message)
+                if message.contains("is not UP")
+                    && message.contains("index=42")
+                    && message.contains("family=IPv4")
+        ));
+
+        let not_running =
+            super::validate_linux_interface_flags(&interface, libc::IFF_UP as u32)
+                .unwrap_err();
+        assert!(matches!(
+            not_running,
+            Error::InvalidConfig(message)
+                if message.contains("is not RUNNING")
+        ));
+
+        super::validate_linux_interface_flags(
+            &interface,
+            (libc::IFF_UP | libc::IFF_RUNNING) as u32,
+        )
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_linux_route_decision_fields() {
+        use std::net::IpAddr;
+
+        use rtnetlink::RouteMessageBuilder;
+
+        let destination = "185.148.13.16".parse().unwrap();
+        let message = RouteMessageBuilder::<IpAddr>::new()
+            .destination_prefix(destination, 32)
+            .unwrap()
+            .output_interface(42)
+            .gateway("192.168.1.1".parse().unwrap())
+            .unwrap()
+            .pref_source("192.168.1.9".parse().unwrap())
+            .unwrap()
+            .table_id(100)
+            .priority(20)
+            .build();
+        let route = super::parse_netlink_route(destination, &message).unwrap();
+
+        assert_eq!(route.interface_index, 42);
+        assert_eq!(route.gateway, Some("192.168.1.1".parse().unwrap()));
+        assert_eq!(route.preferred_source, Some("192.168.1.9".parse().unwrap()));
+        assert_eq!(route.table, 100);
+        assert_eq!(route.metric, Some(20));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn route_parser_defaults_to_main_table() {
+        use std::net::IpAddr;
+
+        use rtnetlink::RouteMessageBuilder;
+
+        let destination = "2606:4700::1111".parse().unwrap();
+        let message = RouteMessageBuilder::<IpAddr>::new()
+            .destination_prefix(destination, 128)
+            .unwrap()
+            .output_interface(7)
+            .pref_source("fd00::2".parse().unwrap())
+            .unwrap()
+            .priority(5)
+            .build();
+        let route = super::parse_netlink_route(destination, &message).unwrap();
+
+        assert_eq!(route.interface_index, 7);
+        assert_eq!(route.gateway, None);
+        assert_eq!(route.table, 254);
     }
 }
