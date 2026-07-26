@@ -8,7 +8,18 @@ edition = { workspace = true }
 
 [features]
 default = ["standard", "aws-lc-rs"]
-standard = ["shadowsocks", "trojan", "anytls", "ws", "tls", "hysteria", "reality", "port", "tun"]
+standard = [
+    "shadowsocks",
+    "trojan",
+    "anytls",
+    "ws",
+    "tls",
+    "hysteria",
+    "reality",
+    "port",
+    "tun",
+    "extended-health-check",
+]
 
 plus = ["standard", "onion"]
 onion = []
@@ -33,6 +44,7 @@ mixed_port = ["clash-lib/mixed_port"]
 aws-lc-rs = ["dep:aws-lc-rs", "clash-lib/aws-lc-rs"]
 ring = ["clash-lib/ring"]
 tracing = ["clash-lib/tracing"]
+extended-health-check = ["clash-lib/extended-health-check"]
 
 perf = ["plus"]
 

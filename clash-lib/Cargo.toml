@@ -139,11 +139,21 @@ sha1 = "0.11"
 byteorder = "1"
 
 [features]
-default = ["zero_copy", "tls", "aws-lc-rs", "tun", "port", "reality"]
+default = [
+    "zero_copy",
+    "tls",
+    "aws-lc-rs",
+    "tun",
+    "port",
+    "reality",
+    "extended-health-check",
+]
 
 zero_copy = []
 
 tls = []
+
+extended-health-check = []
 
 aws-lc-rs = [
     "dep:aws-lc-rs",
