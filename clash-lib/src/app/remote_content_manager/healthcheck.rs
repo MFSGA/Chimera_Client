@@ -20,6 +20,9 @@ pub struct HealthCheck {
     lazy: bool,
     probe: HealthCheckProbe,
     minimum_bytes: usize,
+    minimum_events: usize,
+    maximum_first_byte: std::time::Duration,
+    expected_echo: String,
     timeout: Option<std::time::Duration>,
     proxy_manager: ProxyManager,
     inner: Arc<tokio::sync::RwLock<HealCheckInner>>,
@@ -39,6 +42,9 @@ impl HealthCheck {
             lazy,
             probe: HealthCheckProbe::Http,
             minimum_bytes: 0,
+            minimum_events: 0,
+            maximum_first_byte: std::time::Duration::ZERO,
+            expected_echo: String::new(),
             timeout: None,
             proxy_manager,
             inner: Arc::new(tokio::sync::RwLock::new(HealCheckInner {
@@ -53,10 +59,16 @@ impl HealthCheck {
         mut self,
         probe: HealthCheckProbe,
         minimum_bytes: usize,
+        minimum_events: usize,
+        maximum_first_byte: std::time::Duration,
+        expected_echo: String,
         timeout: Option<std::time::Duration>,
     ) -> Self {
         self.probe = probe;
         self.minimum_bytes = minimum_bytes;
+        self.minimum_events = minimum_events;
+        self.maximum_first_byte = maximum_first_byte;
+        self.expected_echo = expected_echo;
         self.timeout = timeout;
         self
     }
@@ -67,10 +79,20 @@ impl HealthCheck {
         url: &str,
         probe: HealthCheckProbe,
         minimum_bytes: usize,
+        minimum_events: usize,
+        maximum_first_byte: std::time::Duration,
+        expected_echo: &str,
         timeout: Option<std::time::Duration>,
     ) {
         #[cfg(not(feature = "extended-health-check"))]
-        let _ = minimum_bytes;
+        let _ = (
+            minimum_bytes,
+            minimum_events,
+            maximum_first_byte,
+            expected_echo,
+        );
+        #[cfg(all(feature = "extended-health-check", not(feature = "ws")))]
+        let _ = expected_echo;
 
         match probe {
             HealthCheckProbe::Http => {
@@ -81,6 +103,56 @@ impl HealthCheck {
                 proxy_manager
                     .check_download(proxies, url, timeout, minimum_bytes)
                     .await;
+            }
+            #[cfg(feature = "extended-health-check")]
+            HealthCheckProbe::Sse => {
+                for proxy in proxies {
+                    if let Err(error) = proxy_manager
+                        .sse_test(
+                            proxy.clone(),
+                            url,
+                            timeout,
+                            minimum_events,
+                            maximum_first_byte,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            "SSE healthcheck {} -> {} failed: {}",
+                            proxy.name(),
+                            url,
+                            error
+                        );
+                    }
+                }
+            }
+            #[cfg(not(feature = "extended-health-check"))]
+            HealthCheckProbe::Sse => {
+                tracing::warn!(
+                    "SSE health probe requires extended-health-check feature"
+                );
+            }
+            #[cfg(all(feature = "extended-health-check", feature = "ws"))]
+            HealthCheckProbe::Websocket => {
+                for proxy in proxies {
+                    if let Err(error) = proxy_manager
+                        .websocket_test(proxy.clone(), url, timeout, expected_echo)
+                        .await
+                    {
+                        tracing::warn!(
+                            "WebSocket healthcheck {} -> {} failed: {}",
+                            proxy.name(),
+                            url,
+                            error
+                        );
+                    }
+                }
+            }
+            #[cfg(not(all(feature = "extended-health-check", feature = "ws")))]
+            HealthCheckProbe::Websocket => {
+                tracing::warn!(
+                    "WebSocket health probe requires extended-health-check and ws features"
+                );
             }
             #[cfg(not(feature = "extended-health-check"))]
             HealthCheckProbe::Download => {
@@ -98,6 +170,9 @@ impl HealthCheck {
         let probe = self.probe;
         let minimum_bytes = self.minimum_bytes;
         let timeout = self.timeout;
+        let minimum_events = self.minimum_events;
+        let maximum_first_byte = self.maximum_first_byte;
+        let expected_echo = self.expected_echo.clone();
         let proxies = self.inner.read().await.proxies.clone();
 
         {
@@ -110,6 +185,9 @@ impl HealthCheck {
                     &url,
                     probe,
                     minimum_bytes,
+                    minimum_events,
+                    maximum_first_byte,
+                    &expected_echo,
                     timeout,
                 )
                 .await;
@@ -122,6 +200,9 @@ impl HealthCheck {
         let probe = self.probe;
         let minimum_bytes = self.minimum_bytes;
         let timeout = self.timeout;
+        let minimum_events = self.minimum_events;
+        let maximum_first_byte = self.maximum_first_byte;
+        let expected_echo = self.expected_echo.clone();
         let task_handle = tokio::spawn(async move {
             let mut ticker =
                 tokio::time::interval(tokio::time::Duration::from_secs(interval));
@@ -138,6 +219,9 @@ impl HealthCheck {
                                 &url,
                                 probe,
                                 minimum_bytes,
+                                minimum_events,
+                                maximum_first_byte,
+                                &expected_echo,
                                 timeout,
                             ).await;
                             let mut w = inner.write().await;
@@ -163,6 +247,9 @@ impl HealthCheck {
             &self.url,
             self.probe,
             self.minimum_bytes,
+            self.minimum_events,
+            self.maximum_first_byte,
+            &self.expected_echo,
             self.timeout,
         )
         .await;

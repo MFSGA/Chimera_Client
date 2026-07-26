@@ -810,12 +810,25 @@ impl OutboundManager {
                     }
 
                     let health = file.health_check;
-                    if health.probe == HealthCheckProbe::Download
-                        && !cfg!(feature = "extended-health-check")
+                    if matches!(
+                        health.probe,
+                        HealthCheckProbe::Download | HealthCheckProbe::Sse
+                    ) && !cfg!(feature = "extended-health-check")
                     {
                         return Err(Error::InvalidConfig(format!(
                             "file provider `{name}` uses download health probe, \
                              but extended-health-check is disabled"
+                        )));
+                    }
+                    if health.probe == HealthCheckProbe::Websocket
+                        && !cfg!(all(
+                            feature = "extended-health-check",
+                            feature = "ws"
+                        ))
+                    {
+                        return Err(Error::InvalidConfig(format!(
+                            "file provider `{name}` uses WebSocket health probe, \
+                             but extended-health-check or ws is disabled"
                         )));
                     }
                     let minimum_bytes = health.minimum_bytes.unwrap_or(65_536);
@@ -825,6 +838,35 @@ impl OutboundManager {
                         return Err(Error::InvalidConfig(format!(
                             "file provider `{name}` download health probe requires \
                              minimum-bytes greater than zero"
+                        )));
+                    }
+                    let minimum_events = health.minimum_events.unwrap_or(3);
+                    if health.probe == HealthCheckProbe::Sse && minimum_events == 0 {
+                        return Err(Error::InvalidConfig(format!(
+                            "file provider `{name}` SSE health probe requires \
+                             minimum-events greater than zero"
+                        )));
+                    }
+                    let maximum_first_byte = Duration::from_millis(
+                        health.maximum_first_byte_ms.unwrap_or(3_000),
+                    );
+                    if health.probe == HealthCheckProbe::Sse
+                        && maximum_first_byte.is_zero()
+                    {
+                        return Err(Error::InvalidConfig(format!(
+                            "file provider `{name}` SSE health probe requires \
+                             maximum-first-byte-ms greater than zero"
+                        )));
+                    }
+                    let expected_echo = health
+                        .expect_echo
+                        .unwrap_or_else(|| "chimera-health".to_owned());
+                    if health.probe == HealthCheckProbe::Websocket
+                        && expected_echo.is_empty()
+                    {
+                        return Err(Error::InvalidConfig(format!(
+                            "file provider `{name}` WebSocket health probe requires \
+                             non-empty expect-echo"
                         )));
                     }
                     let interval = if health.enable == Some(false) {
@@ -844,6 +886,9 @@ impl OutboundManager {
                     .with_probe(
                         health.probe,
                         minimum_bytes,
+                        minimum_events,
+                        maximum_first_byte,
+                        expected_echo,
                         health.timeout.map(Duration::from_secs),
                     );
 
