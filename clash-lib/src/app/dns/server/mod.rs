@@ -102,7 +102,10 @@ impl Runner for DnsRunner {
                     },
                 }
             } else {
-                info!("dns listener: no listen addresses configured, skipping");
+                error!(
+                    "dns listener: no listener started; no addresses were configured or all \
+                     configured addresses failed to bind"
+                );
             }
         });
 
@@ -118,13 +121,12 @@ impl Runner for DnsRunner {
     fn join(&self) -> futures::future::BoxFuture<'_, Result<(), crate::Error>> {
         let handle = self.task.lock().unwrap().take();
         async move {
-            match handle {
-                Some(handle) => handle.await.map_err(|err| {
+            if let Some(handle) = handle {
+                handle.await.map_err(|err| {
                     crate::Error::Operation(format!(
                         "dns listener join error: {err}"
                     ))
-                })?,
-                None => {}
+                })?;
             }
 
             Ok(())
