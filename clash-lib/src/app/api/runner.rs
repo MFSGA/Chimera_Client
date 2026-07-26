@@ -48,6 +48,7 @@ pub struct ApiRunner {
     cancellation_token: tokio_util::sync::CancellationToken,
     dns_listen_addr: DNSListenAddr,
     dns_enabled: bool,
+    ipv6_allowed: bool,
     task:
         std::sync::Mutex<Option<tokio::task::JoinHandle<Result<(), crate::Error>>>>,
 }
@@ -69,6 +70,7 @@ impl ApiRunner {
         cancellation_token: Option<tokio_util::sync::CancellationToken>,
         dns_listen_addr: DNSListenAddr,
         dns_enabled: bool,
+        ipv6_allowed: bool,
     ) -> Self {
         Self {
             controller_cfg,
@@ -85,6 +87,7 @@ impl ApiRunner {
             cancellation_token: cancellation_token.unwrap_or_default(),
             dns_listen_addr,
             dns_enabled,
+            ipv6_allowed,
             task: std::sync::Mutex::new(None),
         }
     }
@@ -104,6 +107,7 @@ impl Runner for ApiRunner {
         let cwd = self.cwd.clone();
         let dns_listen_addr = self.dns_listen_addr.clone();
         let dns_enabled = self.dns_enabled;
+        let ipv6_allowed = self.ipv6_allowed;
         let cancellation_token = self.cancellation_token.clone();
 
         tracing::debug!("API controller configuration: {:?}", controller_cfg);
@@ -173,6 +177,7 @@ impl Runner for ApiRunner {
                         dns_resolver.clone(),
                         dns_listen_addr,
                         dns_enabled,
+                        ipv6_allowed,
                     ),
                 )
                 .nest(
