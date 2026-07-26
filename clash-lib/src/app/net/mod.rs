@@ -469,17 +469,12 @@ fn validate_linux_interface_flags(
         (false, false) => "none",
     };
 
-    for (flag, state) in [
-        (libc::IFF_UP as u32, "UP"),
-        (libc::IFF_RUNNING as u32, "RUNNING"),
-    ] {
-        if flags & flag == 0 {
-            return Err(Error::InvalidConfig(format!(
-                "configured outbound interface \"{}\" is not {state}: \
-                 index={}, family={families}",
-                interface.name, interface.index
-            )));
-        }
+    if flags & libc::IFF_UP as u32 == 0 {
+        return Err(Error::InvalidConfig(format!(
+            "configured outbound interface \"{}\" is not UP: \
+             index={}, family={families}",
+            interface.name, interface.index
+        )));
     }
 
     Ok(())
@@ -700,7 +695,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn configured_interface_must_be_up_and_running() {
+    fn configured_interface_must_be_up() {
         let interface = test_interface();
 
         let down = super::validate_linux_interface_flags(&interface, 0).unwrap_err();
@@ -712,20 +707,8 @@ mod tests {
                     && message.contains("family=IPv4")
         ));
 
-        let not_running =
-            super::validate_linux_interface_flags(&interface, libc::IFF_UP as u32)
-                .unwrap_err();
-        assert!(matches!(
-            not_running,
-            Error::InvalidConfig(message)
-                if message.contains("is not RUNNING")
-        ));
-
-        super::validate_linux_interface_flags(
-            &interface,
-            (libc::IFF_UP | libc::IFF_RUNNING) as u32,
-        )
-        .unwrap();
+        super::validate_linux_interface_flags(&interface, libc::IFF_UP as u32)
+            .unwrap();
     }
 
     #[cfg(target_os = "linux")]
