@@ -85,6 +85,24 @@ impl DnsRuntimeProvider {
             .await
             .unwrap_or_else(|| self.outbound.clone())
     }
+
+    fn session_for(&self, server_addr: SocketAddr, network: Network) -> Session {
+        let source = if server_addr.is_ipv4() {
+            "0.0.0.0:0".parse().unwrap()
+        } else {
+            "[::]:0".parse().unwrap()
+        };
+
+        Session {
+            source,
+            network,
+            typ: Type::Dns,
+            destination: server_addr.into(),
+            so_mark: self.so_mark,
+            iface: self.iface.clone(),
+            ..Default::default()
+        }
+    }
 }
 
 impl RuntimeProvider for DnsRuntimeProvider {
@@ -105,23 +123,9 @@ impl RuntimeProvider for DnsRuntimeProvider {
         _timeout: Option<Duration>,
     ) -> std::pin::Pin<Box<dyn Send + Future<Output = std::io::Result<Self::Tcp>>>>
     {
-        let src: SocketAddr = if server_addr.is_ipv4() {
-            "0.0.0.0:0".parse().unwrap()
-        } else {
-            "[::]:0".parse().unwrap()
-        };
-
         let provider = self.clone();
         let dns = self.dns_resolver.clone();
-        let sess = Session {
-            source: src,
-            network: Network::Tcp,
-            typ: Type::Dns,
-            destination: server_addr.into(),
-            so_mark: self.so_mark,
-            iface: self.iface.clone(),
-            ..Default::default()
-        };
+        let sess = self.session_for(server_addr, Network::Tcp);
         Box::pin(async move {
             let outbound = provider.pick_outbound(&sess).await;
             let stream = outbound.connect_stream(&sess, dns);
@@ -135,23 +139,9 @@ impl RuntimeProvider for DnsRuntimeProvider {
         server_addr: SocketAddr,
     ) -> std::pin::Pin<Box<dyn Send + Future<Output = std::io::Result<Self::Udp>>>>
     {
-        let src: SocketAddr = if server_addr.is_ipv4() {
-            "0.0.0.0:0".parse().unwrap()
-        } else {
-            "[::]:0".parse().unwrap()
-        };
-
         let provider = self.clone();
         let dns = self.dns_resolver.clone();
-        let sess = Session {
-            source: src,
-            network: Network::Udp,
-            typ: Type::Dns,
-            destination: server_addr.into(),
-            so_mark: self.so_mark,
-            iface: self.iface.clone(),
-            ..Default::default()
-        };
+        let sess = self.session_for(server_addr, Network::Udp);
 
         Box::pin(async move {
             let outbound = provider.pick_outbound(&sess).await;
@@ -160,6 +150,28 @@ impl RuntimeProvider for DnsRuntimeProvider {
                 .await
                 .map(|x| DnsProxyUdpSocket(Mutex::new(x)))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DnsRuntimeProvider;
+    use crate::session::{Network, SocksAddr, Type};
+
+    #[test]
+    fn ipv6_dns_sessions_preserve_target_family_and_socket_mark() {
+        let provider = DnsRuntimeProvider::new_direct(None, Some(7777));
+        let target = "[2606:4700:4700::1111]:853".parse().unwrap();
+
+        for network in [Network::Tcp, Network::Udp] {
+            let session = provider.session_for(target, network);
+
+            assert_eq!(session.network, network);
+            assert_eq!(session.typ, Type::Dns);
+            assert!(session.source.is_ipv6());
+            assert_eq!(session.destination, SocksAddr::Ip(target));
+            assert_eq!(session.so_mark, Some(7777));
+        }
     }
 }
 
