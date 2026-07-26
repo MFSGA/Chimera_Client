@@ -93,7 +93,7 @@ fn best_route_for(dest: IpAddr) -> std::io::Result<(Option<IpAddr>, String)> {
 fn add_excluded_route(
     table: &str,
     dest: &IpNet,
-    transaction: &mut RouteTransaction,
+    transaction: &mut RouteTransaction<'_>,
 ) -> std::io::Result<()> {
     let ipv6 = dest.addr().is_ipv6();
     let cidr = dest.to_string();
@@ -168,24 +168,55 @@ fn run_ip_cmd_for_family(
     }
 }
 
-#[derive(Default)]
-struct RouteTransaction {
+trait IpCommandExecutor {
+    fn execute(
+        &mut self,
+        args: &[&str],
+        allow_missing: bool,
+    ) -> std::io::Result<bool>;
+}
+
+struct SystemIpCommandExecutor;
+
+impl IpCommandExecutor for SystemIpCommandExecutor {
+    fn execute(
+        &mut self,
+        args: &[&str],
+        allow_missing: bool,
+    ) -> std::io::Result<bool> {
+        run_ip_cmd_single(&format!("ip {}", args.join(" ")), args, allow_missing)
+    }
+}
+
+struct RouteTransaction<'a> {
+    executor: &'a mut dyn IpCommandExecutor,
     applied: Vec<Vec<String>>,
 }
 
-impl RouteTransaction {
+impl<'a> RouteTransaction<'a> {
+    fn new(executor: &'a mut dyn IpCommandExecutor) -> Self {
+        Self {
+            executor,
+            applied: Vec::new(),
+        }
+    }
+
     fn apply(
         &mut self,
         add_args: &[&str],
         delete_args: &[&str],
         ipv6: bool,
     ) -> std::io::Result<()> {
-        run_ip_cmd_for_family(add_args, ipv6, false)?;
+        let mut command = Vec::new();
         let mut inverse = Vec::new();
         if ipv6 {
+            command.push("-6".to_owned());
             inverse.push("-6".to_owned());
         }
+        command.extend(add_args.iter().map(|arg| (*arg).to_owned()));
         inverse.extend(delete_args.iter().map(|arg| (*arg).to_owned()));
+        let command = command.iter().map(String::as_str).collect::<Vec<_>>();
+        self.executor.execute(&command, false)?;
         self.applied.push(inverse);
         Ok(())
     }
@@ -194,7 +225,7 @@ impl RouteTransaction {
         while let Some(args) = self.applied.pop() {
             let args = args.iter().map(String::as_str).collect::<Vec<_>>();
             let cmd = format!("ip {}", args.join(" "));
-            if let Err(error) = run_ip_cmd_single(&cmd, &args, true) {
+            if let Err(error) = self.executor.execute(&args, true) {
                 warn!(command = %cmd, %error, "failed to roll back TUN route operation");
             }
         }
@@ -217,7 +248,8 @@ pub fn setup_policy_routing(
     tun_cfg: &TunConfig,
     via: &OutboundInterface,
 ) -> std::io::Result<()> {
-    let mut transaction = RouteTransaction::default();
+    let mut executor = SystemIpCommandExecutor;
+    let mut transaction = RouteTransaction::new(&mut executor);
     let result = setup_policy_routing_inner(tun_cfg, via, &mut transaction);
     if result.is_err() {
         transaction.rollback();
@@ -228,7 +260,7 @@ pub fn setup_policy_routing(
 fn setup_policy_routing_inner(
     tun_cfg: &TunConfig,
     via: &OutboundInterface,
-    transaction: &mut RouteTransaction,
+    transaction: &mut RouteTransaction<'_>,
 ) -> std::io::Result<()> {
     setup_policy_family(
         tun_cfg,
@@ -254,7 +286,7 @@ fn setup_policy_family(
     via: &OutboundInterface,
     table: &str,
     ipv6: bool,
-    transaction: &mut RouteTransaction,
+    transaction: &mut RouteTransaction<'_>,
 ) -> std::io::Result<()> {
     let dev = via.name.as_str();
 
@@ -484,7 +516,30 @@ fn clean_up_policy_family(
 
 #[cfg(test)]
 mod tests {
-    use super::is_missing_ip_state;
+    use super::{IpCommandExecutor, RouteTransaction, is_missing_ip_state};
+
+    #[derive(Default)]
+    struct MockExecutor {
+        commands: Vec<(Vec<String>, bool)>,
+        fail_at: Option<usize>,
+    }
+
+    impl IpCommandExecutor for MockExecutor {
+        fn execute(
+            &mut self,
+            args: &[&str],
+            allow_missing: bool,
+        ) -> std::io::Result<bool> {
+            self.commands.push((
+                args.iter().map(|arg| (*arg).to_owned()).collect(),
+                allow_missing,
+            ));
+            if self.fail_at == Some(self.commands.len()) {
+                return Err(std::io::Error::other("injected command failure"));
+            }
+            Ok(true)
+        }
+    }
 
     #[test]
     fn detect_missing_ip_rule_errors() {
@@ -494,5 +549,80 @@ mod tests {
         assert!(is_missing_ip_state("RTNETLINK answers: No such process"));
         assert!(is_missing_ip_state("Error: FIB table does not exist."));
         assert!(!is_missing_ip_state("RTNETLINK answers: File exists"));
+    }
+
+    #[test]
+    fn rollback_runs_only_applied_operations_in_reverse_order() {
+        let mut executor = MockExecutor {
+            fail_at: Some(2),
+            ..Default::default()
+        };
+        {
+            let mut transaction = RouteTransaction::new(&mut executor);
+            transaction
+                .apply(
+                    &["route", "add", "first"],
+                    &["route", "del", "first"],
+                    false,
+                )
+                .unwrap();
+            transaction
+                .apply(
+                    &["route", "add", "second"],
+                    &["route", "del", "second"],
+                    false,
+                )
+                .unwrap_err();
+            transaction.rollback();
+        }
+
+        assert_eq!(
+            executor.commands,
+            vec![
+                (vec!["route".into(), "add".into(), "first".into()], false,),
+                (vec!["route".into(), "add".into(), "second".into()], false,),
+                (vec!["route".into(), "del".into(), "first".into()], true,),
+            ]
+        );
+    }
+
+    #[test]
+    fn ipv6_transaction_prefixes_apply_and_rollback_commands() {
+        let mut executor = MockExecutor::default();
+        {
+            let mut transaction = RouteTransaction::new(&mut executor);
+            transaction
+                .apply(
+                    &["route", "add", "default"],
+                    &["route", "del", "default"],
+                    true,
+                )
+                .unwrap();
+            transaction.rollback();
+        }
+
+        assert_eq!(
+            executor.commands,
+            vec![
+                (
+                    vec![
+                        "-6".into(),
+                        "route".into(),
+                        "add".into(),
+                        "default".into(),
+                    ],
+                    false,
+                ),
+                (
+                    vec![
+                        "-6".into(),
+                        "route".into(),
+                        "del".into(),
+                        "default".into(),
+                    ],
+                    true,
+                ),
+            ]
+        );
     }
 }
