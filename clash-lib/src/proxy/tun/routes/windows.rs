@@ -248,7 +248,7 @@ pub fn add_excluded_route(
         "failed to add excluded route {} via interface index {}: {}",
         dest, best_route.InterfaceIndex, err
     );
-    Err(std::io::Error::other(err.message().to_string()))
+    Err(std::io::Error::other(err.message()))
 }
 
 fn get_guid(iface: &OutboundInterface) -> Option<GUID> {
