@@ -184,36 +184,46 @@ async fn effective_interface_for_destination(
     #[cfg(target_os = "linux")] so_mark: Option<u32>,
 ) -> std::io::Result<Option<OutboundInterface>> {
     let default_iface = default_outbound_interface().await;
-    let mut effective_iface =
-        select_effective_iface(explicit, &default_iface).cloned();
+    let effective_iface = select_effective_iface(explicit, &default_iface).cloned();
 
     #[cfg(target_os = "linux")]
-    if let Some(destination) = destination.filter(|_| effective_iface.is_none())
-        && !destination.is_loopback()
-    {
-        let route = route_for_destination(destination, so_mark)
-            .await
-            .map_err(new_io_error)?;
-        debug!(
-            destination = %destination,
-            interface = %route.interface_name,
-            interface_index = route.interface_index,
-            gateway = ?route.gateway,
-            preferred_source = ?route.preferred_source,
-            table = route.table,
-            metric = ?route.metric,
-            fwmark = ?so_mark,
-            "selected outbound route"
-        );
-        effective_iface =
-            Some(get_interface_by_name(&route.interface_name).ok_or_else(|| {
-                new_io_error(format!(
-                    "route interface \"{}\" disappeared before connecting \
-                         to {destination}",
-                    route.interface_name
-                ))
-            })?);
-    }
+    let effective_iface = {
+        let mut effective_iface = effective_iface;
+        if let Some(destination) = destination.filter(|_| effective_iface.is_none())
+            && !destination.is_loopback()
+        {
+            let route = route_for_destination(destination, so_mark)
+                .await
+                .map_err(new_io_error)?;
+            debug!(
+                destination = %destination,
+                interface = %route.interface_name,
+                interface_index = route.interface_index,
+                gateway = ?route.gateway,
+                preferred_source = ?route.preferred_source,
+                table = route.table,
+                metric = ?route.metric,
+                fwmark = ?so_mark,
+                "selected outbound route"
+            );
+            effective_iface = Some(
+                get_interface_by_name(&route.interface_name).ok_or_else(|| {
+                    new_io_error(format!(
+                        "route interface \"{}\" disappeared before connecting \
+                             to {destination}",
+                        route.interface_name
+                    ))
+                })?,
+            );
+        }
+        effective_iface
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    let effective_iface = {
+        let _ = destination;
+        effective_iface
+    };
 
     Ok(effective_iface)
 }

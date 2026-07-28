@@ -419,7 +419,7 @@ pub fn get_interface_by_name(name: &str) -> Option<OutboundInterface> {
     Some(outbound)
 }
 
-#[cfg(feature = "tun")]
+#[cfg(all(feature = "tun", target_os = "linux"))]
 fn get_interface_by_index(index: u32) -> Option<OutboundInterface> {
     network_interface::NetworkInterface::show()
         .ok()?
