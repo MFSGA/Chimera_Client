@@ -10,6 +10,9 @@ mod middlewares;
 mod runner;
 mod websocket;
 
+#[cfg(feature = "dashboard")]
+mod embedded_dashboard;
+
 pub use runner::ApiRunner;
 
 pub struct AppState {
