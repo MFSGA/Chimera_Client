@@ -143,7 +143,7 @@ impl Dispatcher {
                     rhs,
                     self.manager.clone(),
                     sess.clone(),
-                    rule,
+                    rule.map(|matcher| matcher.as_ref()),
                 )
                 .await;
                 let shutdown_mode = if sess.typ == crate::session::Type::HttpConnect
@@ -417,7 +417,7 @@ impl Dispatcher {
                             outbound_datagram,
                             manager.clone(),
                             sess.clone(),
-                            rule,
+                            rule.map(|matcher| matcher.as_ref()),
                         )
                         .await;
 
