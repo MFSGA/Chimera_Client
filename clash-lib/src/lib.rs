@@ -497,8 +497,12 @@ async fn create_components(
                  interface"
             );
         }
-        init_net_config(config.tun.so_mark, config.general.interface.as_ref())
-            .await?;
+        init_net_config(
+            config.tun.enable,
+            config.tun.so_mark,
+            config.general.interface.as_ref(),
+        )
+        .await?;
         install_default_socket_protector();
     }
 

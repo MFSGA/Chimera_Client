@@ -8,7 +8,10 @@ use network_interface::{
     NetworkInterface, NetworkInterfaceConfig, V4IfAddr, V6IfAddr,
 };
 use serde::Serialize;
-use std::sync::{Arc, LazyLock};
+use std::sync::{
+    Arc, LazyLock,
+    atomic::{AtomicBool, Ordering},
+};
 #[cfg(feature = "tun")]
 use tracing::trace;
 
@@ -21,6 +24,8 @@ pub static DEFAULT_OUTBOUND_INTERFACE: LazyLock<
 #[cfg(feature = "tun")]
 pub static TUN_SOMARK: LazyLock<tokio::sync::RwLock<Option<u32>>> =
     LazyLock::new(Default::default);
+#[cfg(feature = "tun")]
+pub static TUN_ENABLED: AtomicBool = AtomicBool::new(false);
 #[cfg(all(feature = "tun", target_os = "linux"))]
 static ROUTE_NETLINK_HANDLE: tokio::sync::OnceCell<rtnetlink::Handle> =
     tokio::sync::OnceCell::const_new();
@@ -435,6 +440,7 @@ pub(crate) async fn windows_fallback_outbound_interface(
 
 #[cfg(feature = "tun")]
 pub async fn init_net_config(
+    tun_enabled: bool,
     tun_somark: Option<u32>,
     interface: Option<&Interface>,
 ) -> Result<()> {
@@ -443,6 +449,7 @@ pub async fn init_net_config(
     let should_cache_fallback = configured_interface.is_none();
     *DEFAULT_OUTBOUND_INTERFACE.write().await = configured_interface;
     *TUN_SOMARK.write().await = tun_somark;
+    TUN_ENABLED.store(tun_enabled, Ordering::Release);
     #[cfg(target_os = "windows")]
     {
         set_windows_tun_interface_index(None).await;
@@ -463,6 +470,7 @@ pub async fn init_net_config(
 
 #[cfg(feature = "tun")]
 pub async fn clear_net_config() {
+    TUN_ENABLED.store(false, Ordering::Release);
     *DEFAULT_OUTBOUND_INTERFACE.write().await = None;
     *TUN_SOMARK.write().await = None;
     #[cfg(target_os = "windows")]

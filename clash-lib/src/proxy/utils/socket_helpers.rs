@@ -14,9 +14,9 @@ use tokio::time::timeout;
 use tracing::warn;
 use tracing::{debug, error, instrument, trace};
 
-#[cfg(feature = "tun")]
-use crate::app::net::DEFAULT_OUTBOUND_INTERFACE;
 use crate::app::net::OutboundInterface;
+#[cfg(feature = "tun")]
+use crate::app::net::{DEFAULT_OUTBOUND_INTERFACE, TUN_ENABLED};
 #[cfg(all(feature = "tun", any(target_os = "linux", target_os = "windows")))]
 use crate::app::net::{get_interface_by_name, route_for_destination};
 #[cfg(all(feature = "tun", target_os = "windows"))]
@@ -180,6 +180,15 @@ fn select_effective_iface<'a>(
     explicit.or(default.as_ref())
 }
 
+#[cfg(all(feature = "tun", any(target_os = "linux", target_os = "windows")))]
+fn should_auto_bind_destination(
+    destination: std::net::IpAddr,
+    has_effective_iface: bool,
+    tun_enabled: bool,
+) -> bool {
+    tun_enabled && !has_effective_iface && !destination.is_loopback()
+}
+
 #[cfg(feature = "tun")]
 async fn default_outbound_interface() -> Option<OutboundInterface> {
     DEFAULT_OUTBOUND_INTERFACE.read().await.clone()
@@ -197,8 +206,12 @@ async fn effective_interface_for_destination(
     #[cfg(target_os = "linux")]
     let effective_iface = {
         let mut effective_iface = effective_iface;
-        if let Some(destination) = destination.filter(|_| effective_iface.is_none())
-            && !destination.is_loopback()
+        if let Some(destination) = destination
+            && should_auto_bind_destination(
+                destination,
+                effective_iface.is_some(),
+                TUN_ENABLED.load(std::sync::atomic::Ordering::Acquire),
+            )
         {
             let route = route_for_destination(destination, so_mark)
                 .await
@@ -230,8 +243,12 @@ async fn effective_interface_for_destination(
     #[cfg(target_os = "windows")]
     let effective_iface = {
         let mut effective_iface = effective_iface;
-        if let Some(destination) = destination.filter(|_| effective_iface.is_none())
-            && !destination.is_loopback()
+        if let Some(destination) = destination
+            && should_auto_bind_destination(
+                destination,
+                effective_iface.is_some(),
+                TUN_ENABLED.load(std::sync::atomic::Ordering::Acquire),
+            )
         {
             let tun_interface_index = windows_tun_interface_index().await;
             let selected = match route_for_destination(destination, None).await {
@@ -747,6 +764,11 @@ mod tests {
 
     #[cfg(feature = "tun")]
     use super::select_effective_iface;
+    #[cfg(all(
+        feature = "tun",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    use super::should_auto_bind_destination;
     use super::{
         new_dual_stack_udp_socket, new_udp_socket, should_prefer_ipv4_udp_socket,
     };
@@ -810,6 +832,18 @@ mod tests {
             .expect("default interface should be used");
 
         assert_eq!(effective.name, "default");
+    }
+
+    #[cfg(all(feature = "tun", any(target_os = "linux", target_os = "windows")))]
+    #[test]
+    fn automatic_interface_binding_requires_runtime_tun() {
+        let destination = Ipv4Addr::new(1, 1, 1, 1).into();
+        let loopback = Ipv4Addr::LOCALHOST.into();
+
+        assert!(!should_auto_bind_destination(destination, false, false));
+        assert!(!should_auto_bind_destination(destination, true, true));
+        assert!(!should_auto_bind_destination(loopback, false, true));
+        assert!(should_auto_bind_destination(destination, false, true));
     }
 
     #[test]
