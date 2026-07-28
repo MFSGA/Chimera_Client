@@ -53,6 +53,7 @@ enum UnpadState {
         content: Vec<u8>,
         remaining_padding_len: u16,
     },
+    Passthrough,
     Done,
 }
 
@@ -98,6 +99,7 @@ impl VisionUnpadder {
                         return Ok(UnpadResult::default());
                     }
                     if &data[..16] != expected_uuid {
+                        self.state = UnpadState::Passthrough;
                         return Ok(UnpadResult {
                             content: data.to_vec(),
                             command: None,
@@ -250,6 +252,12 @@ impl VisionUnpadder {
                         }
                     }
                 }
+                UnpadState::Passthrough => {
+                    return Ok(UnpadResult {
+                        content: data.to_vec(),
+                        command: None,
+                    });
+                }
                 UnpadState::Done => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -258,5 +266,29 @@ impl VisionUnpadder {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VisionUnpadder;
+
+    #[test]
+    fn uuid_mismatch_switches_to_permanent_passthrough() {
+        let expected_uuid = [0x11; 16];
+        let mut unpadder = VisionUnpadder::new(expected_uuid);
+        let first = [0x22; 16];
+
+        let first_result = unpadder.unpad(&first).expect("first block");
+        assert_eq!(first_result.content, first);
+        assert!(first_result.command.is_none());
+        assert!(!unpadder.is_waiting_for_uuid());
+
+        let fragmented_follow_up = b"short";
+        let second_result = unpadder
+            .unpad(fragmented_follow_up)
+            .expect("follow-up block");
+        assert_eq!(second_result.content, fragmented_follow_up);
+        assert!(second_result.command.is_none());
     }
 }
