@@ -35,8 +35,20 @@ npm run build
 
 Output goes to `dist/`. This is a static SPA — no server-side rendering.
 
+Run the same frontend quality gate used by CI before submitting changes:
+
+```bash
+npm ci
+npm run lint
+npm run build
+```
+
 ## Embedding in the Binary
 
 The dashboard is served by clash-rs when the `dashboard` feature flag is enabled. The built `dist/` folder is embedded into the binary at compile time and served under `/ui/`.
 
 The app uses `base: './'` in Vite config to support being served from any path prefix.
+
+Normal Cargo builds install and build the dashboard automatically. CI builds it
+once, adds `dist/chimera-prebuilt.marker`, and shares that directory with every Rust
+target so cross-compilation containers do not need Node.js.

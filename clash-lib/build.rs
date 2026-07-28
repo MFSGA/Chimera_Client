@@ -35,6 +35,19 @@ fn build_dashboard() -> anyhow::Result<()> {
         );
     }
 
+    // CI builds the dashboard once and shares the output with every Rust target.
+    // The marker avoids requiring Node.js inside each cross-compilation container.
+    let prebuilt_marker = dashboard_dir.join("dist/chimera-prebuilt.marker");
+    println!("cargo:rerun-if-changed={}", prebuilt_marker.display());
+    if prebuilt_marker.is_file() {
+        anyhow::ensure!(
+            dashboard_dir.join("dist/index.html").is_file(),
+            "{} exists but dist/index.html is missing",
+            prebuilt_marker.display()
+        );
+        return Ok(());
+    }
+
     let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
     // Nix supplies a pre-fetched, read-only npm cache through npm_config_cache.
     // Keep the temporary-cache fallback for ordinary Cargo development.

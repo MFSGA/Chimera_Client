@@ -48,6 +48,11 @@ External Controller REST 与 WebSocket API 展示运行状态，并提供配置�
 
 未启用 `dashboard` feature 时，构建脚本直接返回，不要求执行前端构建。
 
+CI 使用一条可复现的预构建分支：Dashboard job 只安装、检查和构建一次前端，随后将带有
+`chimera-prebuilt.marker` 的 `dist/` 作为 artifact 交给所有 Rust 目标。Cargo 看到该
+标记后会校验 `dist/index.html` 并直接嵌入资源，避免每个 cross 容器重复安装 Node.js
+和 npm 依赖。
+
 ### HTTP 路由与缓存
 
 未配置 `external-ui` 时，External Controller 注册以下路由：
@@ -174,6 +179,8 @@ cargo build -p clash-rs --no-default-features \
 3. 前端初次构建需要安装 npm 依赖，在离线或 registry 不可用环境中可能失败。
 4. immutable 缓存依赖 Vite 内容哈希；不要对非哈希文件复用同名不同内容。
 5. secret 位于浏览器本地存储，浏览器环境中的恶意脚本或扩展可能读取它。
+6. 预构建 marker 只能由已经完成 `npm run build` 的受控流程生成；CI 会将 marker 与
+   同一次构建产生的 `dist/index.html` 一起打包。
 
 建议先在受控环境验证 `/ui/`、认证和 WebSocket，再进入正式发布流程。希望完全避免
 Node.js 构建依赖的发行环境可以关闭 `dashboard` feature。
@@ -190,6 +197,19 @@ cargo check -p clash-rs
 ```
 
 结果均通过。Vite 报告单个生产 chunk 超过 500 KB 的性能提醒，但不影响构建。
+
+CI 额外执行相同的前端质量门，并将其设为所有 Rust 编译矩阵的前置任务。Dependabot
+按月检查 `clash-dashboard/package-lock.json` 对应的 npm 依赖。
+
+## Reference Alignment
+
+本功能保持 `ref/` 的 `dashboard` feature、源码变化监听、Windows `npm.cmd` 选择、
+临时 npm cache 和 `RustEmbed` 路由结构。
+
+Chimera 有一项有意差异：当前 CI 使用本仓库自己的多目标 `cross` 矩阵，而不是 `ref/`
+的共享 Rust workflow。为了避免要求每个 cross 镜像都预装 Node.js，Chimera 增加一次
+构建、多目标复用的 `dist` artifact 和 marker。该差异只影响构建编排，不改变 Dashboard
+资源内容或运行时路由。
 
 建议发布前补充：
 
