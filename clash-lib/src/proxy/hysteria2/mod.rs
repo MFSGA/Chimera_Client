@@ -309,7 +309,11 @@ impl Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> anyhow::Result<(Connection, SendRequest<OpenStreams, Bytes>)> {
+    ) -> anyhow::Result<(
+        Connection,
+        SendRequest<OpenStreams, Bytes>,
+        tokio::task::JoinHandle<()>,
+    )> {
         tracing::trace!(
             "hysteria2 new_authed_connection_inner: starting connection to {:?}",
             self.opts.addr
@@ -361,7 +365,11 @@ impl Handler {
         &self,
         sess: &Session,
         server_socket_addr: SocketAddr,
-    ) -> anyhow::Result<(Connection, SendRequest<OpenStreams, Bytes>)> {
+    ) -> anyhow::Result<(
+        Connection,
+        SendRequest<OpenStreams, Bytes>,
+        tokio::task::JoinHandle<()>,
+    )> {
         // todo: Here maybe we should use a AsyncUdpSocket which implement salamander obfs
         // and port hopping
         let create_socket = || async {
@@ -426,22 +434,32 @@ impl Handler {
             .connect(server_socket_addr, self.opts.sni.as_deref().unwrap_or(""))?
             .await?;
         tracing::trace!("hysteria2 QUIC connection established");
-        let (guard, cc_rx, udp) = Self::auth(&session, &self.opts.password).await?;
+        let (guard, driver_task, cc_rx, udp) =
+            Self::auth(&session, &self.opts.password).await?;
         tracing::trace!("hysteria2 authentication successful, udp={}", udp);
         *self.support_udp.write().unwrap() = udp;
         Self::configure_brutal_cc(&session, self.select_brutal_bps(cc_rx));
 
-        Ok((session, guard))
+        Ok((session, guard, driver_task))
     }
 
     async fn auth(
         conn: &quinn::Connection,
         passwd: &str,
-    ) -> anyhow::Result<(SendRequest<OpenStreams, Bytes>, CcRx, bool)> {
+    ) -> anyhow::Result<(
+        SendRequest<OpenStreams, Bytes>,
+        tokio::task::JoinHandle<()>,
+        CcRx,
+        bool,
+    )> {
         let h3_conn = h3_quinn::Connection::new(conn.clone());
 
-        let (_, mut sender) =
+        let (mut driver, mut sender) =
             h3::client::builder().build::<_, _, Bytes>(h3_conn).await?;
+        let driver_task = tokio::spawn(async move {
+            let err = driver.wait_idle().await;
+            tracing::debug!("hysteria2 h3 driver ended: {err}");
+        });
 
         let req = http::Request::post("https://hysteria/auth")
             .header("Hysteria-Auth", passwd)
@@ -475,7 +493,7 @@ impl Handler {
             .to_str()?
             .parse()?;
 
-        Ok((sender, cc_rx, support_udp))
+        Ok((sender, driver_task, cc_rx, support_udp))
     }
 
     async fn connect_tcp(
@@ -529,7 +547,7 @@ impl Handler {
         }) {
             Some(s) => Ok(s.clone()),
             None => {
-                let (session, guard) = self
+                let (session, guard, driver_task) = self
                     .new_authed_connection_inner(sess, resolver)
                     .await
                     .map_err(|e| {
@@ -543,6 +561,7 @@ impl Handler {
                 let hyst_conn = HysteriaConnection::new_with_task_loop(
                     session,
                     self.opts.udp_mtu,
+                    driver_task,
                 );
                 *quinn_conn_lock = Some(hyst_conn.clone());
                 *self.guard.lock().await = Some(guard);
@@ -555,6 +574,7 @@ impl Handler {
 pub struct HysteriaConnection {
     pub conn: Arc<quinn::Connection>,
     pub udp_sessions: Arc<tokio::sync::Mutex<HashMap<u32, UdpSession>>>,
+    h3_driver_task: Option<tokio::task::JoinHandle<()>>,
 
     // config
     pub udp_mtu: Option<usize>,
@@ -564,11 +584,13 @@ impl HysteriaConnection {
     pub fn new_with_task_loop(
         conn: Arc<quinn::Connection>,
         udp_mtu: Option<u32>,
+        h3_driver_task: tokio::task::JoinHandle<()>,
     ) -> Arc<Self> {
         let s = Arc::new(Self {
             conn,
             udp_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             udp_mtu: udp_mtu.map(|x| x as usize),
+            h3_driver_task: Some(h3_driver_task),
         });
         tokio::spawn(Self::spawn_tasks(s.clone()));
 
@@ -671,6 +693,14 @@ impl HysteriaConnection {
             _ => {
                 tracing::warn!("hysteria2 udp session not found: {}", session_id);
             }
+        }
+    }
+}
+
+impl Drop for HysteriaConnection {
+    fn drop(&mut self) {
+        if let Some(driver_task) = self.h3_driver_task.take() {
+            driver_task.abort();
         }
     }
 }
