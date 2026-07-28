@@ -1,6 +1,6 @@
 use std::{
     io,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     time::Duration,
 };
 
@@ -8,14 +8,18 @@ use socket2::TcpKeepalive;
 
 use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
 use tokio::time::timeout;
-use tracing::{debug, error, instrument, trace};
+use tracing::{debug, error, instrument, trace, warn};
 
 #[cfg(feature = "tun")]
 use crate::app::net::DEFAULT_OUTBOUND_INTERFACE;
 use crate::app::net::OutboundInterface;
-#[cfg(all(feature = "tun", target_os = "linux"))]
+#[cfg(all(feature = "tun", any(target_os = "linux", target_os = "windows")))]
 use crate::app::net::{get_interface_by_name, route_for_destination};
-#[cfg(all(feature = "tun", target_os = "linux"))]
+#[cfg(all(feature = "tun", target_os = "windows"))]
+use crate::app::net::{
+    windows_fallback_outbound_interface, windows_tun_interface_index,
+};
+#[cfg(all(feature = "tun", any(target_os = "linux", target_os = "windows")))]
 use crate::common::errors::new_io_error;
 use crate::proxy::utils::platform::{
     maybe_protect_socket, must_bind_socket_on_interface,
@@ -219,7 +223,112 @@ async fn effective_interface_for_destination(
         effective_iface
     };
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    let effective_iface = {
+        let mut effective_iface = effective_iface;
+        if let Some(destination) = destination.filter(|_| effective_iface.is_none())
+            && !destination.is_loopback()
+        {
+            let tun_interface_index = windows_tun_interface_index().await;
+            let selected = match route_for_destination(destination, None).await {
+                Ok(route) if tun_interface_index == Some(route.interface_index) => {
+                    let fallback = windows_fallback_outbound_interface(destination)
+                        .await
+                        .ok_or_else(|| {
+                            new_io_error(format!(
+                                "Windows route for {destination} resolves to the \
+                                 Chimera TUN interface (index {}) and no pre-TUN \
+                                 fallback interface is available",
+                                route.interface_index
+                            ))
+                        })?;
+                    if fallback.index == route.interface_index {
+                        return Err(new_io_error(format!(
+                            "cached Windows fallback interface for {destination} \
+                             is the Chimera TUN interface itself (index {})",
+                            route.interface_index
+                        )));
+                    }
+                    warn!(
+                        destination = %destination,
+                        tun_interface_index = route.interface_index,
+                        fallback_interface = %fallback.name,
+                        fallback_interface_index = fallback.index,
+                        "Windows best route points at TUN; using the pre-TUN fallback interface"
+                    );
+                    Some(fallback)
+                }
+                Ok(route) => {
+                    debug!(
+                        destination = %destination,
+                        interface = %route.interface_name,
+                        interface_index = route.interface_index,
+                        gateway = ?route.gateway,
+                        preferred_source = ?route.preferred_source,
+                        metric = ?route.metric,
+                        "selected Windows outbound route"
+                    );
+                    if let Some(interface) =
+                        get_interface_by_name(&route.interface_name)
+                    {
+                        Some(interface)
+                    } else if let Some(fallback) =
+                        windows_fallback_outbound_interface(destination).await
+                    {
+                        warn!(
+                            destination = %destination,
+                            route_interface = %route.interface_name,
+                            fallback_interface = %fallback.name,
+                            fallback_interface_index = fallback.index,
+                            "Windows route interface disappeared; using the pre-TUN fallback interface"
+                        );
+                        Some(fallback)
+                    } else if tun_interface_index.is_none() {
+                        warn!(
+                            destination = %destination,
+                            route_interface = %route.interface_name,
+                            "Windows route interface disappeared; leaving the socket unbound for system routing"
+                        );
+                        None
+                    } else {
+                        return Err(new_io_error(format!(
+                            "route interface \"{}\" disappeared before connecting \
+                             to {destination}, and no pre-TUN fallback interface is \
+                             available",
+                            route.interface_name
+                        )));
+                    }
+                }
+                Err(error) => {
+                    if let Some(fallback) =
+                        windows_fallback_outbound_interface(destination).await
+                    {
+                        warn!(
+                            destination = %destination,
+                            fallback_interface = %fallback.name,
+                            fallback_interface_index = fallback.index,
+                            error = %error,
+                            "Windows route lookup failed; using the pre-TUN fallback interface"
+                        );
+                        Some(fallback)
+                    } else if tun_interface_index.is_none() {
+                        warn!(
+                            destination = %destination,
+                            error = %error,
+                            "Windows route lookup failed before TUN routing; leaving the socket unbound for system routing"
+                        );
+                        None
+                    } else {
+                        return Err(new_io_error(error.to_string()));
+                    }
+                }
+            };
+            effective_iface = selected;
+        }
+        effective_iface
+    };
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     let effective_iface = {
         let _ = destination;
         effective_iface
@@ -275,9 +384,40 @@ pub async fn new_protected_dual_stack_udp_socket(
     #[cfg(feature = "tun")]
     {
         let default_iface = default_outbound_interface().await;
-        let effective_iface = select_effective_iface(iface, &default_iface);
+        #[cfg(target_os = "windows")]
+        let automatic_iface = if select_effective_iface(iface, &default_iface)
+            .is_none()
+            && windows_tun_interface_index().await.is_some()
+        {
+            let mut fallback = windows_fallback_outbound_interface(IpAddr::V4(
+                Ipv4Addr::UNSPECIFIED,
+            ))
+            .await;
+            if fallback.is_none() {
+                fallback = windows_fallback_outbound_interface(IpAddr::V6(
+                    Ipv6Addr::UNSPECIFIED,
+                ))
+                .await;
+            }
+            if let Some(fallback) = fallback.as_ref() {
+                warn!(
+                    interface = %fallback.name,
+                    interface_index = fallback.index,
+                    "pinning multi-destination Windows UDP socket to the pre-TUN fallback interface"
+                );
+            }
+            fallback
+        } else {
+            None
+        };
+        #[cfg(target_os = "windows")]
+        let effective_iface = select_effective_iface(iface, &default_iface)
+            .cloned()
+            .or(automatic_iface);
+        #[cfg(not(target_os = "windows"))]
+        let effective_iface = select_effective_iface(iface, &default_iface).cloned();
         return new_dual_stack_udp_socket(
-            effective_iface,
+            effective_iface.as_ref(),
             #[cfg(target_os = "linux")]
             so_mark,
         );

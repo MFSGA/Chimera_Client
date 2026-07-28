@@ -24,6 +24,20 @@ pub static TUN_SOMARK: LazyLock<tokio::sync::RwLock<Option<u32>>> =
 #[cfg(all(feature = "tun", target_os = "linux"))]
 static ROUTE_NETLINK_HANDLE: tokio::sync::OnceCell<rtnetlink::Handle> =
     tokio::sync::OnceCell::const_new();
+#[cfg(all(feature = "tun", target_os = "windows"))]
+static WINDOWS_TUN_INTERFACE_INDEX: LazyLock<tokio::sync::RwLock<Option<u32>>> =
+    LazyLock::new(Default::default);
+#[cfg(all(feature = "tun", target_os = "windows"))]
+static WINDOWS_FALLBACK_OUTBOUND_INTERFACES: LazyLock<
+    tokio::sync::RwLock<WindowsFallbackOutboundInterfaces>,
+> = LazyLock::new(Default::default);
+
+#[cfg(all(feature = "tun", target_os = "windows"))]
+#[derive(Debug, Clone, Default)]
+struct WindowsFallbackOutboundInterfaces {
+    ipv4: Option<OutboundInterface>,
+    ipv6: Option<OutboundInterface>,
+}
 
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddressFamily {
@@ -214,6 +228,79 @@ pub async fn route_for_destination(
     })
 }
 
+#[cfg(all(feature = "tun", target_os = "windows"))]
+fn windows_sockaddr_to_ip(
+    address: &windows::Win32::Networking::WinSock::SOCKADDR_INET,
+) -> Option<IpAddr> {
+    use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6};
+
+    let family = unsafe { address.si_family };
+    let address = if family == AF_INET {
+        IpAddr::V4(unsafe { address.Ipv4.sin_addr }.into())
+    } else if family == AF_INET6 {
+        IpAddr::V6(unsafe { address.Ipv6.sin6_addr }.into())
+    } else {
+        return None;
+    };
+
+    (!address.is_unspecified()).then_some(address)
+}
+
+#[cfg(all(feature = "tun", target_os = "windows"))]
+pub async fn route_for_destination(
+    destination: IpAddr,
+    _fwmark: Option<u32>,
+) -> std::result::Result<RouteDecision, RouteSelectionError> {
+    use windows::Win32::{
+        NetworkManagement::IpHelper::{GetBestRoute2, MIB_IPFORWARD_ROW2},
+        Networking::WinSock::SOCKADDR_INET,
+    };
+
+    let destination_address = SOCKADDR_INET::from(SocketAddr::new(destination, 0));
+    let mut route = MIB_IPFORWARD_ROW2::default();
+    let mut preferred_source = SOCKADDR_INET::default();
+    let result = unsafe {
+        GetBestRoute2(
+            None,
+            0,
+            None,
+            &destination_address,
+            0,
+            &mut route,
+            &mut preferred_source,
+        )
+    };
+    result
+        .to_hresult()
+        .ok()
+        .map_err(|error| RouteSelectionError::QueryFailed {
+            destination,
+            message: error.message(),
+        })?;
+
+    let interface = get_interface_by_index(route.InterfaceIndex).ok_or(
+        RouteSelectionError::InterfaceNotFound {
+            destination,
+            interface_index: route.InterfaceIndex,
+        },
+    )?;
+
+    Ok(RouteDecision {
+        family: if destination.is_ipv4() {
+            AddressFamily::Ipv4
+        } else {
+            AddressFamily::Ipv6
+        },
+        destination,
+        interface_index: route.InterfaceIndex,
+        interface_name: interface.name,
+        gateway: windows_sockaddr_to_ip(&route.NextHop),
+        preferred_source: windows_sockaddr_to_ip(&preferred_source),
+        table: 0,
+        metric: Some(route.Metric),
+    })
+}
+
 #[cfg(all(feature = "tun", target_os = "linux"))]
 fn build_interface_route(
     destination: ipnet::IpNet,
@@ -256,7 +343,10 @@ pub async fn add_route_to_interface(
         })
 }
 
-#[cfg(any(not(feature = "tun"), not(target_os = "linux")))]
+#[cfg(any(
+    not(feature = "tun"),
+    not(any(target_os = "linux", target_os = "windows"))
+))]
 pub async fn route_for_destination(
     _destination: IpAddr,
     _fwmark: Option<u32>,
@@ -295,14 +385,74 @@ fn is_candidate_outbound_v6(addr: Ipv6Addr) -> bool {
     addr.is_unique_local() || is_global_unicast_like(addr)
 }
 
+#[cfg(all(feature = "tun", target_os = "windows"))]
+async fn resolve_windows_fallback_interface(
+    destination: IpAddr,
+) -> Option<OutboundInterface> {
+    route_for_destination(destination, None)
+        .await
+        .ok()
+        .and_then(|route| get_interface_by_index(route.interface_index))
+}
+
+#[cfg(all(feature = "tun", target_os = "windows"))]
+async fn refresh_windows_fallback_outbound_interfaces() {
+    // GetBestRoute2 only inspects the route table; these probes do not send any
+    // network traffic. Capture both families before the TUN split routes exist.
+    let ipv4 =
+        resolve_windows_fallback_interface(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)))
+            .await;
+    let ipv6 = resolve_windows_fallback_interface(IpAddr::V6(Ipv6Addr::new(
+        0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111,
+    )))
+    .await;
+    let interfaces = WindowsFallbackOutboundInterfaces { ipv4, ipv6 };
+    trace!(?interfaces, "cached Windows fallback outbound interfaces");
+    *WINDOWS_FALLBACK_OUTBOUND_INTERFACES.write().await = interfaces;
+}
+
+#[cfg(all(feature = "tun", target_os = "windows"))]
+pub(crate) async fn set_windows_tun_interface_index(index: Option<u32>) {
+    *WINDOWS_TUN_INTERFACE_INDEX.write().await = index;
+}
+
+#[cfg(all(feature = "tun", target_os = "windows"))]
+pub(crate) async fn windows_tun_interface_index() -> Option<u32> {
+    *WINDOWS_TUN_INTERFACE_INDEX.read().await
+}
+
+#[cfg(all(feature = "tun", target_os = "windows"))]
+pub(crate) async fn windows_fallback_outbound_interface(
+    destination: IpAddr,
+) -> Option<OutboundInterface> {
+    let interfaces = WINDOWS_FALLBACK_OUTBOUND_INTERFACES.read().await;
+    if destination.is_ipv4() {
+        interfaces.ipv4.clone()
+    } else {
+        interfaces.ipv6.clone()
+    }
+}
+
 #[cfg(feature = "tun")]
 pub async fn init_net_config(
     tun_somark: Option<u32>,
     interface: Option<&Interface>,
 ) -> Result<()> {
-    *DEFAULT_OUTBOUND_INTERFACE.write().await =
-        resolve_outbound_interface(interface).await?;
+    let configured_interface = resolve_outbound_interface(interface).await?;
+    #[cfg(target_os = "windows")]
+    let should_cache_fallback = configured_interface.is_none();
+    *DEFAULT_OUTBOUND_INTERFACE.write().await = configured_interface;
     *TUN_SOMARK.write().await = tun_somark;
+    #[cfg(target_os = "windows")]
+    {
+        set_windows_tun_interface_index(None).await;
+        if should_cache_fallback {
+            refresh_windows_fallback_outbound_interfaces().await;
+        } else {
+            *WINDOWS_FALLBACK_OUTBOUND_INTERFACES.write().await =
+                WindowsFallbackOutboundInterfaces::default();
+        }
+    }
     trace!(
         "default outbound interface: {:?}, tun somark: {:?}",
         *DEFAULT_OUTBOUND_INTERFACE.read().await,
@@ -315,6 +465,12 @@ pub async fn init_net_config(
 pub async fn clear_net_config() {
     *DEFAULT_OUTBOUND_INTERFACE.write().await = None;
     *TUN_SOMARK.write().await = None;
+    #[cfg(target_os = "windows")]
+    {
+        set_windows_tun_interface_index(None).await;
+        *WINDOWS_FALLBACK_OUTBOUND_INTERFACES.write().await =
+            WindowsFallbackOutboundInterfaces::default();
+    }
 }
 
 /// Represents a parsed outbound interface for use in runtime.
@@ -419,7 +575,7 @@ pub fn get_interface_by_name(name: &str) -> Option<OutboundInterface> {
     Some(outbound)
 }
 
-#[cfg(all(feature = "tun", target_os = "linux"))]
+#[cfg(all(feature = "tun", any(target_os = "linux", target_os = "windows")))]
 fn get_interface_by_index(index: u32) -> Option<OutboundInterface> {
     network_interface::NetworkInterface::show()
         .ok()?
@@ -575,7 +731,69 @@ async fn validate_configured_interface_state(
     validate_linux_interface_state(interface, &state)
 }
 
-#[cfg(all(feature = "tun", not(target_os = "linux")))]
+#[cfg(all(feature = "tun", target_os = "windows"))]
+async fn validate_configured_interface_state(
+    interface: &OutboundInterface,
+) -> Result<()> {
+    use windows::Win32::NetworkManagement::{
+        IpHelper::{GetIfEntry2, MIB_IF_ROW2},
+        Ndis::{
+            IfOperStatusDown, IfOperStatusLowerLayerDown, IfOperStatusNotPresent,
+            IfOperStatusTesting, MediaConnectStateDisconnected,
+            NET_IF_ADMIN_STATUS_UP,
+        },
+    };
+
+    let mut row = MIB_IF_ROW2 {
+        InterfaceIndex: interface.index,
+        ..Default::default()
+    };
+    let result = unsafe { GetIfEntry2(&mut row) };
+    result.to_hresult().ok().map_err(|error| {
+        Error::InvalidConfig(format!(
+            "failed to inspect configured outbound interface \"{}\" via \
+             GetIfEntry2: index={}, error={}",
+            interface.name,
+            interface.index,
+            error.message()
+        ))
+    })?;
+
+    if row.AdminStatus != NET_IF_ADMIN_STATUS_UP {
+        return Err(Error::InvalidConfig(format!(
+            "configured outbound interface \"{}\" is not administratively UP: \
+             index={}, admin_status={:?}; enable the interface or choose another \
+             interface-name",
+            interface.name, interface.index, row.AdminStatus
+        )));
+    }
+
+    if row.OperStatus == IfOperStatusDown
+        || row.OperStatus == IfOperStatusLowerLayerDown
+        || row.OperStatus == IfOperStatusNotPresent
+        || row.OperStatus == IfOperStatusTesting
+    {
+        return Err(Error::InvalidConfig(format!(
+            "configured outbound interface \"{}\" is not operational: index={}, \
+             oper_status={:?}, media_state={:?}; connect the interface or choose \
+             another interface-name",
+            interface.name, interface.index, row.OperStatus, row.MediaConnectState
+        )));
+    }
+
+    if row.MediaConnectState == MediaConnectStateDisconnected {
+        return Err(Error::InvalidConfig(format!(
+            "configured outbound interface \"{}\" has no connected media: \
+             index={}, oper_status={:?}, media_state={:?}; connect the interface \
+             or choose another interface-name",
+            interface.name, interface.index, row.OperStatus, row.MediaConnectState
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(all(feature = "tun", not(any(target_os = "linux", target_os = "windows"))))]
 async fn validate_configured_interface_state(
     _interface: &OutboundInterface,
 ) -> Result<()> {
@@ -728,7 +946,9 @@ impl Interface {
 
 #[cfg(all(test, feature = "tun"))]
 mod tests {
-    use super::{Interface, OutboundInterface, resolve_outbound_interface};
+    #[cfg(target_os = "linux")]
+    use super::OutboundInterface;
+    use super::{Interface, resolve_outbound_interface};
     use crate::Error;
 
     #[cfg(target_os = "linux")]
@@ -766,6 +986,26 @@ mod tests {
     #[tokio::test]
     async fn unconfigured_interface_does_not_guess_an_outbound() {
         assert!(resolve_outbound_interface(None).await.unwrap().is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_sockaddr_conversion_preserves_family_and_ignores_unspecified() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+        use windows::Win32::Networking::WinSock::SOCKADDR_INET;
+
+        let ipv4 = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        let ipv6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 10));
+        let ipv4_sockaddr = SOCKADDR_INET::from(SocketAddr::new(ipv4, 0));
+        let ipv6_sockaddr = SOCKADDR_INET::from(SocketAddr::new(ipv6, 0));
+        let unspecified = SOCKADDR_INET::from(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            0,
+        ));
+
+        assert_eq!(super::windows_sockaddr_to_ip(&ipv4_sockaddr), Some(ipv4));
+        assert_eq!(super::windows_sockaddr_to_ip(&ipv6_sockaddr), Some(ipv6));
+        assert_eq!(super::windows_sockaddr_to_ip(&unspecified), None);
     }
 
     #[cfg(target_os = "linux")]
