@@ -58,6 +58,7 @@ use self::{group::GroupProxyAPIResponse, utils::RemoteConnector};
 pub use group::{fallback, relay, selector, urltest};
 pub use options::HandlerCommonOptions;
 
+#[cfg(feature = "http_port")]
 #[derive(thiserror::Error, Debug)]
 pub enum ProxyError {
     #[error(transparent)]

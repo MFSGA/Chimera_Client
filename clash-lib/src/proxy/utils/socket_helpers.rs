@@ -1,6 +1,8 @@
+#[cfg(all(feature = "tun", target_os = "windows"))]
+use std::net::IpAddr;
 use std::{
     io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     time::Duration,
 };
 
@@ -8,7 +10,9 @@ use socket2::TcpKeepalive;
 
 use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
 use tokio::time::timeout;
-use tracing::{debug, error, instrument, trace, warn};
+#[cfg(all(feature = "tun", target_os = "windows"))]
+use tracing::warn;
+use tracing::{debug, error, instrument, trace};
 
 #[cfg(feature = "tun")]
 use crate::app::net::DEFAULT_OUTBOUND_INTERFACE;

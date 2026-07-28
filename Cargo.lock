@@ -821,6 +821,7 @@ dependencies = [
  "sock2proc",
  "socket2",
  "subtle",
+ "syn",
  "sysinfo",
  "tempfile",
  "thiserror 2.0.18",
