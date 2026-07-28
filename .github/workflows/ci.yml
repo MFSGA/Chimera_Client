@@ -242,7 +242,7 @@ jobs:
         uses: actions/upload-artifact@v7
         if: ${{ !matrix.no-release }}
         with:
-          name: ${{ matrix.release-name || matrix.target }}
+          name: binary-${{ matrix.release-name || matrix.target }}
           path: ${{ env.PACKAGE }}-${{ matrix.release-name || matrix.target }}${{ matrix.postfix }}
 
       - name: Setup tmate session
@@ -269,7 +269,7 @@ jobs:
         uses: actions/upload-artifact/merge@v7
         with:
           name: binaries
-          pattern: "*"
+          pattern: "binary-*"
           retention-days: 1
 
       - name: Download binaries
