@@ -36,17 +36,26 @@ fn build_dashboard() -> anyhow::Result<()> {
     }
 
     let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
-    let npm_cache = std::env::temp_dir().join("npm-cache");
+    // Nix supplies a pre-fetched, read-only npm cache through npm_config_cache.
+    // Keep the temporary-cache fallback for ordinary Cargo development.
+    let npm_cache = std::env::var_os("npm_config_cache")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("npm-cache"));
 
-    let status = std::process::Command::new(npm)
-        .args(["ci", "--prefer-offline", "--cache"])
-        .arg(&npm_cache)
-        .current_dir(&dashboard_dir)
-        .status()
-        .map_err(|e| {
-            anyhow::anyhow!("npm not found; is Node.js installed? ({e})")
-        })?;
-    anyhow::ensure!(status.success(), "`npm ci` failed with status {status}");
+    // npmConfigHook installs and patches node_modules before Cargo starts.
+    // Re-running `npm ci` here would overwrite those Nix-store interpreters
+    // with `/usr/bin/env node`, which does not exist in a pure Nix sandbox.
+    if std::env::var_os("CHIMERA_DASHBOARD_DEPS_READY").is_none() {
+        let status = std::process::Command::new(npm)
+            .args(["ci", "--prefer-offline", "--cache"])
+            .arg(&npm_cache)
+            .current_dir(&dashboard_dir)
+            .status()
+            .map_err(|e| {
+                anyhow::anyhow!("npm not found; is Node.js installed? ({e})")
+            })?;
+        anyhow::ensure!(status.success(), "`npm ci` failed with status {status}");
+    }
 
     let status = std::process::Command::new(npm)
         .args(["run", "build"])
