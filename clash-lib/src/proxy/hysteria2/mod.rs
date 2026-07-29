@@ -12,7 +12,7 @@ use std::{
     fmt::{Debug, Formatter},
     fs,
     io::{self, BufReader},
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::SocketAddr,
     num::ParseIntError,
     path::Path,
     pin::Pin,
@@ -129,64 +129,6 @@ impl Handler {
     const DEFAULT_MAX_IDLE_TIMEOUT: std::time::Duration =
         std::time::Duration::from_secs(300);
     const MIN_INITIAL_CWND_PACKETS: u64 = 2;
-
-    fn default_bind_addr(server_addr: SocketAddr) -> SocketAddr {
-        match server_addr {
-            SocketAddr::V4(_) => SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
-            SocketAddr::V6(_) => SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0),
-        }
-    }
-
-    fn select_bind_addr(server_addr: SocketAddr, sess: &Session) -> SocketAddr {
-        let default_bind_addr = Self::default_bind_addr(server_addr);
-
-        let Some(iface) = sess.iface.as_ref() else {
-            return default_bind_addr;
-        };
-
-        match server_addr {
-            SocketAddr::V4(_) => match iface.addr_v4 {
-                Some(bind_ip) => {
-                    let bind_addr = SocketAddr::new(bind_ip.into(), 0);
-                    debug!(
-                        server_addr = %server_addr,
-                        iface = %iface.name,
-                        bind_addr = %bind_addr,
-                        "hysteria2 socket bound to interface address"
-                    );
-                    bind_addr
-                }
-                None => {
-                    warn!(
-                        server_addr = %server_addr,
-                        iface = %iface.name,
-                        "hysteria2 connect-via has no IPv4 address on selected interface, using wildcard bind"
-                    );
-                    default_bind_addr
-                }
-            },
-            SocketAddr::V6(_) => match iface.addr_v6 {
-                Some(bind_ip) => {
-                    let bind_addr = SocketAddr::new(bind_ip.into(), 0);
-                    debug!(
-                        server_addr = %server_addr,
-                        iface = %iface.name,
-                        bind_addr = %bind_addr,
-                        "hysteria2 socket bound to interface address"
-                    );
-                    bind_addr
-                }
-                None => {
-                    warn!(
-                        server_addr = %server_addr,
-                        iface = %iface.name,
-                        "hysteria2 connect-via has no IPv6 address on selected interface, using wildcard bind"
-                    );
-                    default_bind_addr
-                }
-            },
-        }
-    }
 
     fn append_custom_ca(
         root_store: &mut RootCertStore,
@@ -310,41 +252,6 @@ impl Handler {
         }
     }
 
-    async fn resolve_server_addr(
-        &self,
-        resolver: ThreadSafeDNSResolver,
-    ) -> anyhow::Result<SocketAddr> {
-        match self.opts.addr.clone() {
-            SocksAddr::Ip(ip) => Ok(ip),
-            SocksAddr::Domain(domain, port) => {
-                let ip = resolver
-                    .resolve(domain.as_str(), false)
-                    .await?
-                    .ok_or_else(|| anyhow!("resolve domain {domain} failed"))?;
-                Ok(SocketAddr::new(ip, port))
-            }
-        }
-    }
-
-    fn create_udp_socket(
-        server_addr: SocketAddr,
-        sess: &Session,
-    ) -> io::Result<std::net::UdpSocket> {
-        let domain = match server_addr {
-            SocketAddr::V4(_) => socket2::Domain::IPV4,
-            SocketAddr::V6(_) => socket2::Domain::IPV6,
-        };
-        let bind_addr = Self::select_bind_addr(server_addr, sess);
-        let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
-        #[cfg(target_os = "linux")]
-        if let Some(so_mark) = sess.so_mark {
-            socket.set_mark(so_mark)?;
-        }
-        socket.set_nonblocking(true)?;
-        socket.bind(&bind_addr.into())?;
-        Ok(socket.into())
-    }
-
     fn tls_server_name(&self, server_addr: SocketAddr) -> String {
         self.opts
             .sni
@@ -402,27 +309,67 @@ impl Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> anyhow::Result<(Connection, SendRequest<OpenStreams, Bytes>)> {
+    ) -> anyhow::Result<(
+        Connection,
+        SendRequest<OpenStreams, Bytes>,
+        tokio::task::JoinHandle<()>,
+    )> {
         tracing::trace!(
             "hysteria2 new_authed_connection_inner: starting connection to {:?}",
             self.opts.addr
         );
         // Everytime we enstablish a new session, we should lookup the server
         // address. maybe it changed since it use ddns
-        let server_socket_addr = match self.opts.addr.clone() {
-            SocksAddr::Ip(ip) => ip,
+        let server_socket_addrs = match self.opts.addr.clone() {
+            SocksAddr::Ip(ip) => vec![ip],
             SocksAddr::Domain(d, port) => {
                 // Proxy server domains must resolve to real endpoint IPs. Using
                 // enhanced DNS here may return a fake-ip address and make QUIC
                 // connect to the virtual pool instead of the Hysteria2 server.
-                let ip = resolver
-                    .resolve(d.as_str(), false)
+                resolver
+                    .resolve_all(d.as_str(), false)
                     .await?
-                    .ok_or_else(|| anyhow!("resolve domain {} failed", d))?;
-                SocketAddr::new(ip, port)
+                    .into_iter()
+                    .map(|ip| SocketAddr::new(ip, port))
+                    .collect()
             }
         };
+        if server_socket_addrs.is_empty() {
+            return Err(anyhow!("resolve domain {} failed", self.opts.addr));
+        }
 
+        let mut last_error = None;
+        for server_socket_addr in server_socket_addrs {
+            match self
+                .new_authed_connection_to(sess, server_socket_addr)
+                .await
+            {
+                Ok(connection) => return Ok(connection),
+                Err(error) => {
+                    warn!(
+                        server = %server_socket_addr,
+                        error = %error,
+                        "hysteria2 connection attempt failed"
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            anyhow!("no address available for {}", self.opts.addr)
+        }))
+    }
+
+    async fn new_authed_connection_to(
+        &self,
+        sess: &Session,
+        server_socket_addr: SocketAddr,
+    ) -> anyhow::Result<(
+        Connection,
+        SendRequest<OpenStreams, Bytes>,
+        tokio::task::JoinHandle<()>,
+    )> {
         // todo: Here maybe we should use a AsyncUdpSocket which implement salamander obfs
         // and port hopping
         let create_socket = || async {
@@ -487,22 +434,32 @@ impl Handler {
             .connect(server_socket_addr, self.opts.sni.as_deref().unwrap_or(""))?
             .await?;
         tracing::trace!("hysteria2 QUIC connection established");
-        let (guard, cc_rx, udp) = Self::auth(&session, &self.opts.password).await?;
+        let (guard, driver_task, cc_rx, udp) =
+            Self::auth(&session, &self.opts.password).await?;
         tracing::trace!("hysteria2 authentication successful, udp={}", udp);
         *self.support_udp.write().unwrap() = udp;
         Self::configure_brutal_cc(&session, self.select_brutal_bps(cc_rx));
 
-        Ok((session, guard))
+        Ok((session, guard, driver_task))
     }
 
     async fn auth(
         conn: &quinn::Connection,
         passwd: &str,
-    ) -> anyhow::Result<(SendRequest<OpenStreams, Bytes>, CcRx, bool)> {
+    ) -> anyhow::Result<(
+        SendRequest<OpenStreams, Bytes>,
+        tokio::task::JoinHandle<()>,
+        CcRx,
+        bool,
+    )> {
         let h3_conn = h3_quinn::Connection::new(conn.clone());
 
-        let (_, mut sender) =
+        let (mut driver, mut sender) =
             h3::client::builder().build::<_, _, Bytes>(h3_conn).await?;
+        let driver_task = tokio::spawn(async move {
+            let err = driver.wait_idle().await;
+            tracing::debug!("hysteria2 h3 driver ended: {err}");
+        });
 
         let req = http::Request::post("https://hysteria/auth")
             .header("Hysteria-Auth", passwd)
@@ -536,7 +493,7 @@ impl Handler {
             .to_str()?
             .parse()?;
 
-        Ok((sender, cc_rx, support_udp))
+        Ok((sender, driver_task, cc_rx, support_udp))
     }
 
     async fn connect_tcp(
@@ -590,7 +547,7 @@ impl Handler {
         }) {
             Some(s) => Ok(s.clone()),
             None => {
-                let (session, guard) = self
+                let (session, guard, driver_task) = self
                     .new_authed_connection_inner(sess, resolver)
                     .await
                     .map_err(|e| {
@@ -604,6 +561,7 @@ impl Handler {
                 let hyst_conn = HysteriaConnection::new_with_task_loop(
                     session,
                     self.opts.udp_mtu,
+                    driver_task,
                 );
                 *quinn_conn_lock = Some(hyst_conn.clone());
                 *self.guard.lock().await = Some(guard);
@@ -616,6 +574,7 @@ impl Handler {
 pub struct HysteriaConnection {
     pub conn: Arc<quinn::Connection>,
     pub udp_sessions: Arc<tokio::sync::Mutex<HashMap<u32, UdpSession>>>,
+    h3_driver_task: Option<tokio::task::JoinHandle<()>>,
 
     // config
     pub udp_mtu: Option<usize>,
@@ -625,11 +584,13 @@ impl HysteriaConnection {
     pub fn new_with_task_loop(
         conn: Arc<quinn::Connection>,
         udp_mtu: Option<u32>,
+        h3_driver_task: tokio::task::JoinHandle<()>,
     ) -> Arc<Self> {
         let s = Arc::new(Self {
             conn,
             udp_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             udp_mtu: udp_mtu.map(|x| x as usize),
+            h3_driver_task: Some(h3_driver_task),
         });
         tokio::spawn(Self::spawn_tasks(s.clone()));
 
@@ -732,6 +693,14 @@ impl HysteriaConnection {
             _ => {
                 tracing::warn!("hysteria2 udp session not found: {}", session_id);
             }
+        }
+    }
+}
+
+impl Drop for HysteriaConnection {
+    fn drop(&mut self) {
+        if let Some(driver_task) = self.h3_driver_task.take() {
+            driver_task.abort();
         }
     }
 }
