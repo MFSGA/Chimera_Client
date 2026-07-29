@@ -44,26 +44,8 @@ impl<T> Node<T> {
         self.children.insert(key.to_string(), child);
     }
 
-    fn traverse<F>(&self, prefix: &mut Vec<String>, f: &mut F) -> bool
-    where
-        F: FnMut(&str, &T) -> bool,
-    {
-        if let Some(data) = self.data.as_deref() {
-            let domain = prefix.iter().rev().cloned().collect::<Vec<_>>().join(".");
-            if !f(&domain, data) {
-                return false;
-            }
-        }
-
-        for (label, child) in &self.children {
-            prefix.push(label.clone());
-            if !child.traverse(prefix, f) {
-                return false;
-            }
-            prefix.pop();
-        }
-
-        true
+    pub fn get_children(&self) -> &HashMap<String, Node<T>> {
+        &self.children
     }
 }
 
@@ -125,8 +107,49 @@ impl<T> StringTrie<T> {
     where
         F: FnMut(&str, &T) -> bool,
     {
-        let mut prefix = Vec::new();
-        self.root.traverse(&mut prefix, &mut f);
+        for (key, child) in self.root.get_children() {
+            Self::traverse_inner(&[key], child, &mut f);
+            if let Some(data) = child.get_data()
+                && !f(key, data)
+            {
+                return;
+            }
+        }
+    }
+
+    fn traverse_inner<'a, F>(
+        keys: &'a [&String],
+        node: &'a Node<T>,
+        f: &mut F,
+    ) -> bool
+    where
+        F: FnMut(&str, &T) -> bool,
+    {
+        for (key, child) in node.get_children() {
+            let keys = [&[key], keys].concat();
+            if let Some(data) = child.get_data() {
+                let domain = keys
+                    .iter()
+                    .map(|key| key.as_str())
+                    .collect::<Vec<_>>()
+                    .join(DOMAIN_STEP);
+                let domain = if domain.starts_with(DOMAIN_STEP) {
+                    COMPLEX_WILDCARD.to_string() + &domain
+                } else {
+                    domain
+                };
+
+                if !f(&domain, data) {
+                    return false;
+                }
+            }
+
+            if !Self::traverse_inner(&keys, child, f) {
+                return false;
+            }
+        }
+
+        true
     }
 
     fn insert_inner(&mut self, parts: &[&str], data: Arc<T>) {

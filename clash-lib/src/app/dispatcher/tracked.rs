@@ -125,12 +125,11 @@ pub struct TrackedStream {
 
 #[allow(unused)]
 impl TrackedStream {
-    #[allow(clippy::borrowed_box)]
     pub async fn new(
         inner: BoxedChainedStream,
         manager: Arc<StatisticsManager>,
         sess: Session,
-        rule: Option<&Box<dyn RuleMatcher>>,
+        rule: Option<&dyn RuleMatcher>,
     ) -> Self {
         let uuid = uuid::Uuid::new_v4();
         let chain = inner.chain().clone();
@@ -143,7 +142,6 @@ impl TrackedStream {
                 session_holder: sess,
                 start_time: chrono::Utc::now(),
                 rule: rule
-                    .as_ref()
                     .map(|matcher| matcher.type_name().to_owned())
                     .unwrap_or_default(),
                 rule_payload: rule
@@ -446,12 +444,11 @@ pub struct TrackedDatagram {
 }
 
 impl TrackedDatagram {
-    #[allow(clippy::borrowed_box)]
     pub async fn new(
         inner: BoxedChainedDatagram,
         manager: Arc<StatisticsManager>,
         sess: Session,
-        rule: Option<&Box<dyn RuleMatcher>>,
+        rule: Option<&dyn RuleMatcher>,
     ) -> Self {
         let uuid = uuid::Uuid::new_v4();
         let chain = inner.chain().clone();
@@ -461,7 +458,6 @@ impl TrackedDatagram {
             session_holder: sess,
             start_time: chrono::Utc::now(),
             rule: rule
-                .as_ref()
                 .map(|matcher| matcher.type_name().to_owned())
                 .unwrap_or_default(),
             rule_payload: rule.map(|matcher| matcher.payload()).unwrap_or_default(),
