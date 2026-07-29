@@ -30,6 +30,35 @@ pub struct HttpClient {
     timeout: tokio::time::Duration,
 }
 
+fn make_direct_outbound() -> AnyOutboundHandler {
+    Arc::new(direct::Handler::new(PROXY_DIRECT))
+}
+
+async fn resolve_http_outbound(
+    registry: Option<&OutboundHandlerRegistry>,
+    outbound_name: Option<&str>,
+) -> io::Result<AnyOutboundHandler> {
+    let Some(name) = outbound_name else {
+        return Ok(make_direct_outbound());
+    };
+    if name == PROXY_DIRECT {
+        return Ok(make_direct_outbound());
+    }
+
+    let registry = registry.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("HTTP outbound \"{name}\" was requested, but no outbound registry is available"),
+        )
+    })?;
+    registry.read().await.get(name).cloned().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("configured HTTP outbound \"{name}\" was not found"),
+        )
+    })
+}
+
 impl HttpClient {
     pub fn new(
         dns_resolver: ThreadSafeDNSResolver,
@@ -100,22 +129,9 @@ impl HttpClient {
             .extensions()
             .get::<ClashHTTPClientExt>()
             .and_then(|ext| ext.outbound.clone());
-        let make_direct =
-            || Arc::new(direct::Handler::new(PROXY_DIRECT)) as AnyOutboundHandler;
-        let outbound: AnyOutboundHandler = if let Some(name) = outbound_name {
-            if let Some(registry) = &self.outbounds {
-                registry
-                    .read()
-                    .await
-                    .get(&name)
-                    .cloned()
-                    .unwrap_or_else(make_direct)
-            } else {
-                make_direct()
-            }
-        } else {
-            make_direct()
-        };
+        let outbound =
+            resolve_http_outbound(self.outbounds.as_ref(), outbound_name.as_deref())
+                .await?;
 
         trace!(outbound = %outbound.name(), "using outbound");
         #[cfg(feature = "tun")]
@@ -201,4 +217,48 @@ pub fn new_http_client(
     bootstrap_outbounds: Option<OutboundHandlerRegistry>,
 ) -> io::Result<HttpClient> {
     HttpClient::new(dns_resolver, bootstrap_outbounds, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn named_http_outbound_resolves_from_shared_registry() {
+        let named =
+            Arc::new(direct::Handler::new("PROXY-GROUP")) as AnyOutboundHandler;
+        let registry = Arc::new(tokio::sync::RwLock::new(HashMap::from([(
+            "PROXY-GROUP".to_owned(),
+            named.clone(),
+        )])));
+
+        let selected = resolve_http_outbound(Some(&registry), Some("PROXY-GROUP"))
+            .await
+            .expect("registered outbound should resolve");
+
+        assert!(Arc::ptr_eq(&selected, &named));
+    }
+
+    #[tokio::test]
+    async fn missing_named_http_outbound_returns_not_found() {
+        let registry = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+
+        let error = resolve_http_outbound(Some(&registry), Some("MISSING"))
+            .await
+            .expect_err("missing outbound must not silently use DIRECT");
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("MISSING"));
+    }
+
+    #[tokio::test]
+    async fn direct_http_outbound_does_not_require_registry() {
+        let selected = resolve_http_outbound(None, Some(PROXY_DIRECT))
+            .await
+            .expect("DIRECT should always be available");
+
+        assert_eq!(selected.name(), PROXY_DIRECT);
+    }
 }
