@@ -1,8 +1,11 @@
 use async_trait::async_trait;
+use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use std::{
+    collections::VecDeque,
     fmt::Debug,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{Arc, LazyLock},
+    time::Duration,
 };
 use tracing::trace;
 
@@ -62,6 +65,28 @@ fn global_direct_connector() -> Arc<dyn RemoteConnector> {
     Arc::new(DirectConnector::new())
 }
 
+fn interleave_ip_families(addresses: Vec<IpAddr>) -> Vec<IpAddr> {
+    let prefer_ipv6 = addresses.first().is_some_and(IpAddr::is_ipv6);
+    let (mut ipv4, mut ipv6): (VecDeque<_>, VecDeque<_>) =
+        addresses.into_iter().partition(IpAddr::is_ipv4);
+    let mut ordered = Vec::with_capacity(ipv4.len() + ipv6.len());
+
+    while !ipv4.is_empty() || !ipv6.is_empty() {
+        let (primary, secondary) = if prefer_ipv6 {
+            (&mut ipv6, &mut ipv4)
+        } else {
+            (&mut ipv4, &mut ipv6)
+        };
+        if let Some(address) = primary.pop_front() {
+            ordered.push(address);
+        }
+        if let Some(address) = secondary.pop_front() {
+            ordered.push(address);
+        }
+    }
+    ordered
+}
+
 #[async_trait]
 impl RemoteConnector for DirectConnector {
     async fn connect_stream(
@@ -72,20 +97,59 @@ impl RemoteConnector for DirectConnector {
         iface: Option<&OutboundInterface>,
         #[cfg(target_os = "linux")] so_mark: Option<u32>,
     ) -> std::io::Result<AnyStream> {
-        let dial_addr = resolver
-            .resolve(address, false)
-            .await
-            .map_err(|v| new_io_error(format!("can't resolve dns: {v}")))?
-            .ok_or(new_io_error("no dns result"))?;
+        let addresses = if let Ok(ip) = address.parse() {
+            vec![ip]
+        } else {
+            resolver
+                .resolve_all(address, false)
+                .await
+                .map_err(|error| {
+                    new_io_error(format!("can't resolve dns: {error}"))
+                })?
+        };
+        if addresses.is_empty() {
+            return Err(new_io_error("no dns result"));
+        }
 
-        new_protected_tcp_stream(
-            (dial_addr, port).into(),
-            iface,
-            #[cfg(target_os = "linux")]
-            so_mark,
-        )
-        .await
-        .map(|x| Box::new(x) as _)
+        let mut attempts = FuturesUnordered::new();
+        for (attempt, dial_addr) in
+            interleave_ip_families(addresses).into_iter().enumerate()
+        {
+            let iface = iface.cloned();
+            attempts.push(
+                async move {
+                    if attempt > 0 {
+                        tokio::time::sleep(Duration::from_millis(
+                            300 * attempt as u64,
+                        ))
+                        .await;
+                    }
+                    let result = new_protected_tcp_stream(
+                        (dial_addr, port).into(),
+                        iface.as_ref(),
+                        #[cfg(target_os = "linux")]
+                        so_mark,
+                    )
+                    .await;
+                    (dial_addr, result)
+                }
+                .boxed(),
+            );
+        }
+
+        let mut errors = Vec::new();
+        while let Some((dial_addr, result)) = attempts.next().await {
+            match result {
+                Ok(stream) => return Ok(Box::new(stream) as _),
+                Err(error) => {
+                    errors.push(format!("{dial_addr}: {error}"));
+                }
+            }
+        }
+        Err(new_io_error(format!(
+            "all resolved addresses failed: {}",
+            errors.join("; ")
+        )))
     }
 
     async fn connect_datagram(
@@ -202,5 +266,60 @@ impl RemoteConnector for ProxyConnector {
         let stream = ChainedDatagramWrapper::new(s);
         stream.append_to_chain(self.proxy.name()).await;
         Ok(Box::new(stream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{net::IpAddr, sync::Arc};
+
+    use tokio::net::TcpListener;
+
+    use super::{DirectConnector, RemoteConnector};
+    use crate::app::dns::MockClashResolver;
+
+    #[tokio::test]
+    async fn direct_connector_tries_the_next_resolved_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut resolver = MockClashResolver::new();
+        resolver
+            .expect_resolve_all()
+            .withf(|host, enhanced| host == "proxy.test" && !enhanced)
+            .once()
+            .returning(|_, _| {
+                Ok(vec![
+                    "127.0.0.2".parse::<IpAddr>().unwrap(),
+                    "127.0.0.1".parse::<IpAddr>().unwrap(),
+                ])
+            });
+
+        let stream = DirectConnector::new()
+            .connect_stream(
+                Arc::new(resolver),
+                "proxy.test",
+                port,
+                None,
+                #[cfg(target_os = "linux")]
+                None,
+            )
+            .await
+            .expect("second resolved address should connect");
+
+        drop(stream);
+        drop(listener);
+    }
+
+    #[test]
+    fn happy_eyeballs_interleaves_address_families() {
+        let addresses = ["192.0.2.1", "192.0.2.2", "2001:db8::1", "2001:db8::2"]
+            .map(|address| address.parse().unwrap())
+            .to_vec();
+
+        assert_eq!(
+            super::interleave_ip_families(addresses),
+            ["192.0.2.1", "2001:db8::1", "192.0.2.2", "2001:db8::2",]
+                .map(|address| address.parse::<IpAddr>().unwrap())
+        );
     }
 }

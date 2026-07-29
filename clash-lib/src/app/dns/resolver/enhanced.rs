@@ -637,6 +637,43 @@ impl ClashResolver for EnhancedResolver {
         }
     }
 
+    async fn resolve_all(
+        &self,
+        host: &str,
+        enhanced: bool,
+    ) -> anyhow::Result<Vec<net::IpAddr>> {
+        if let Some(ip) = parse_ip_literal(host) {
+            return Ok(vec![ip]);
+        }
+        if enhanced {
+            return Ok(self.resolve(host, true).await?.into_iter().collect());
+        }
+
+        let ipv4 = self.lookup_ip(host, rr::RecordType::A);
+        let ipv6_enabled = self.ipv6.load(Relaxed);
+        let ipv6 = async {
+            if ipv6_enabled {
+                self.lookup_ip(host, rr::RecordType::AAAA).await
+            } else {
+                Ok(Vec::new())
+            }
+        };
+        let (ipv4, ipv6) = tokio::join!(ipv4, ipv6);
+        let mut addresses = Vec::new();
+        if let Ok(ipv4) = ipv4 {
+            addresses.extend(ipv4);
+        }
+        if let Ok(ipv6) = ipv6 {
+            addresses.extend(ipv6);
+        }
+        addresses.sort_unstable();
+        addresses.dedup();
+        if addresses.is_empty() {
+            return Err(anyhow!("no record for hostname: {}", host));
+        }
+        Ok(addresses)
+    }
+
     #[instrument(skip(self), level = "trace")]
     async fn resolve_v4(
         &self,

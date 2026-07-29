@@ -4,7 +4,7 @@ docs/
 start*.*
 release*.*
 
-config*.yaml
+config*.yaml*
 
 cache.db
 scripts/

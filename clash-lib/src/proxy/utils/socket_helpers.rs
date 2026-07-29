@@ -13,6 +13,10 @@ use tracing::{debug, error, instrument, trace};
 #[cfg(feature = "tun")]
 use crate::app::net::DEFAULT_OUTBOUND_INTERFACE;
 use crate::app::net::OutboundInterface;
+#[cfg(all(feature = "tun", target_os = "linux"))]
+use crate::app::net::{get_interface_by_name, route_for_destination};
+#[cfg(all(feature = "tun", target_os = "linux"))]
+use crate::common::errors::new_io_error;
 use crate::proxy::utils::platform::{
     maybe_protect_socket, must_bind_socket_on_interface,
 };
@@ -173,10 +177,51 @@ async fn default_outbound_interface() -> Option<OutboundInterface> {
     DEFAULT_OUTBOUND_INTERFACE.read().await.clone()
 }
 
+#[cfg(feature = "tun")]
+async fn effective_interface_for_destination(
+    destination: Option<std::net::IpAddr>,
+    explicit: Option<&OutboundInterface>,
+    #[cfg(target_os = "linux")] so_mark: Option<u32>,
+) -> std::io::Result<Option<OutboundInterface>> {
+    let default_iface = default_outbound_interface().await;
+    let mut effective_iface =
+        select_effective_iface(explicit, &default_iface).cloned();
+
+    #[cfg(target_os = "linux")]
+    if let Some(destination) = destination.filter(|_| effective_iface.is_none())
+        && !destination.is_loopback()
+    {
+        let route = route_for_destination(destination, so_mark)
+            .await
+            .map_err(new_io_error)?;
+        debug!(
+            destination = %destination,
+            interface = %route.interface_name,
+            interface_index = route.interface_index,
+            gateway = ?route.gateway,
+            preferred_source = ?route.preferred_source,
+            table = route.table,
+            metric = ?route.metric,
+            fwmark = ?so_mark,
+            "selected outbound route"
+        );
+        effective_iface =
+            Some(get_interface_by_name(&route.interface_name).ok_or_else(|| {
+                new_io_error(format!(
+                    "route interface \"{}\" disappeared before connecting \
+                         to {destination}",
+                    route.interface_name
+                ))
+            })?);
+    }
+
+    Ok(effective_iface)
+}
+
 /// Create an outbound TCP socket protected from being routed back into TUN.
 ///
-/// This mirrors mihomo's dialer behavior: a per-session explicit interface
-/// wins, otherwise the detected default outbound interface is applied.
+/// A per-session or configured interface wins. On Linux, automatic mode
+/// queries the kernel route for this concrete destination before binding.
 pub async fn new_protected_tcp_stream(
     endpoint: SocketAddr,
     iface: Option<&OutboundInterface>,
@@ -184,11 +229,16 @@ pub async fn new_protected_tcp_stream(
 ) -> std::io::Result<TcpStream> {
     #[cfg(feature = "tun")]
     {
-        let default_iface = default_outbound_interface().await;
-        let effective_iface = select_effective_iface(iface, &default_iface);
+        let effective_iface = effective_interface_for_destination(
+            Some(endpoint.ip()),
+            iface,
+            #[cfg(target_os = "linux")]
+            so_mark,
+        )
+        .await?;
         return new_tcp_stream(
             endpoint,
-            effective_iface,
+            effective_iface.as_ref(),
             #[cfg(target_os = "linux")]
             so_mark,
         )
@@ -498,11 +548,16 @@ pub async fn new_protected_udp_socket(
 ) -> std::io::Result<UdpSocket> {
     #[cfg(feature = "tun")]
     {
-        let default_iface = default_outbound_interface().await;
-        let effective_iface = select_effective_iface(iface, &default_iface);
+        let effective_iface = effective_interface_for_destination(
+            family_hint.map(|address| address.ip()),
+            iface,
+            #[cfg(target_os = "linux")]
+            so_mark,
+        )
+        .await?;
         return new_udp_socket(
             src,
-            effective_iface,
+            effective_iface.as_ref(),
             #[cfg(target_os = "linux")]
             so_mark,
             family_hint,

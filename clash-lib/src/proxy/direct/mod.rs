@@ -1,7 +1,6 @@
 use std::fmt::Debug;
 
 use async_trait::async_trait;
-use futures::TryFutureExt;
 
 pub(crate) mod datagram;
 
@@ -15,13 +14,12 @@ use crate::{
         },
         dns::ThreadSafeDNSResolver,
     },
-    common::errors::map_io_error,
     config::internal::proxy::PROXY_DIRECT,
     proxy::{
         ConnectorType, DialWithConnector, OutboundHandler, OutboundType,
         utils::{
-            RemoteConnector, new_protected_dual_stack_udp_socket,
-            new_protected_tcp_stream,
+            GLOBAL_DIRECT_CONNECTOR, RemoteConnector,
+            new_protected_dual_stack_udp_socket, new_protected_udp_socket,
         },
     },
 };
@@ -68,19 +66,16 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> std::io::Result<BoxedChainedStream> {
-        let remote_ip = resolver
-            .resolve(sess.destination.host().as_str(), false)
-            .map_err(map_io_error)
-            .await?
-            .ok_or_else(|| std::io::Error::other("no dns result"))?;
-
-        let s = new_protected_tcp_stream(
-            (remote_ip, sess.destination.port()).into(),
-            sess.iface.as_ref(),
-            #[cfg(target_os = "linux")]
-            sess.so_mark,
-        )
-        .await?;
+        let s = GLOBAL_DIRECT_CONNECTOR
+            .connect_stream(
+                resolver,
+                sess.destination.host().as_str(),
+                sess.destination.port(),
+                sess.iface.as_ref(),
+                #[cfg(target_os = "linux")]
+                sess.so_mark,
+            )
+            .await?;
 
         let s = ChainedStreamWrapper::new(s);
         s.append_to_chain(self.name()).await;
@@ -92,15 +87,30 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> std::io::Result<BoxedChainedDatagram> {
-        // The outbound socket is shared across all destinations from the same
-        // client. Use a dual-stack socket so one socket can send to both IPv4
-        // and IPv6 destinations without EAFNOSUPPORT.
-        let udp = new_protected_dual_stack_udp_socket(
-            sess.iface.as_ref(),
-            #[cfg(target_os = "linux")]
-            sess.so_mark,
-        )
-        .await?;
+        let udp = if sess.typ == crate::session::Type::Dns {
+            let destination = sess.destination.ip().ok_or_else(|| {
+                std::io::Error::other(
+                    "DNS UDP destination must be resolved before dialing",
+                )
+            })?;
+            new_protected_udp_socket(
+                None,
+                sess.iface.as_ref(),
+                #[cfg(target_os = "linux")]
+                sess.so_mark,
+                Some((destination, sess.destination.port()).into()),
+            )
+            .await?
+        } else {
+            // General direct UDP sockets may serve multiple destinations, so
+            // they must not be pinned to the first packet's route.
+            new_protected_dual_stack_udp_socket(
+                sess.iface.as_ref(),
+                #[cfg(target_os = "linux")]
+                sess.so_mark,
+            )
+            .await?
+        };
 
         let d =
             ChainedDatagramWrapper::new(OutboundDatagramImpl::new(udp, resolver));
@@ -225,6 +235,37 @@ mod tests {
             .expect("timed out")
             .expect("stream ended");
         assert_eq!(pkt.data, b"hello-v4");
+    }
+
+    #[tokio::test]
+    async fn test_connect_datagram_dns_uses_resolved_upstream() {
+        let echo = spawn_udp_echo("127.0.0.1:0").await;
+        let handler = Handler::new("DIRECT");
+        let sess = Session {
+            network: Network::Udp,
+            typ: Type::Dns,
+            destination: SocksAddr::Ip(echo),
+            ..Default::default()
+        };
+
+        let mut datagram = handler
+            .connect_datagram(&sess, make_resolver())
+            .await
+            .expect("DNS connect_datagram failed");
+        datagram
+            .send(UdpPacket {
+                data: b"dns-query".to_vec(),
+                dst_addr: SocksAddr::Ip(echo),
+                ..Default::default()
+            })
+            .await
+            .expect("DNS send failed");
+
+        let packet = tokio::time::timeout(Duration::from_secs(2), datagram.next())
+            .await
+            .expect("DNS response timed out")
+            .expect("DNS stream ended");
+        assert_eq!(packet.data, b"dns-query");
     }
 
     /// Same direct UDP socket, two different IPv4 destinations. This validates

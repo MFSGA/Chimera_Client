@@ -24,8 +24,12 @@ rustPlatform.buildRustPackage {
         || baseName == "logs"
         || baseName == "nix"
         || baseName == ".git"
+        || baseName == ".direnv"
+        || baseName == ".envrc"
+        || baseName == "cache.db"
         || baseName == "result"
         || lib.hasPrefix "result-" baseName
+        || lib.hasInfix ".yaml" baseName
         || lib.hasSuffix ".log" baseName
       );
   };
