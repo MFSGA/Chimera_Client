@@ -44,6 +44,7 @@ struct ConfigState {
     dns_resolver: ThreadSafeDNSResolver,
     dns_listen_addr: DNSListenAddr,
     dns_enabled: bool,
+    ipv6_allowed: bool,
 }
 
 pub fn routes(
@@ -53,6 +54,7 @@ pub fn routes(
     dns_resolver: ThreadSafeDNSResolver,
     dns_listen_addr: DNSListenAddr,
     dns_enabled: bool,
+    ipv6_allowed: bool,
 ) -> Router<Arc<AppState>> {
     Router::new()
         .route(
@@ -66,6 +68,7 @@ pub fn routes(
             dns_resolver,
             dns_listen_addr,
             dns_enabled,
+            ipv6_allowed,
         })
 }
 
@@ -259,10 +262,25 @@ impl PatchConfigRequest {
     }
 }
 
+fn validate_ipv6_update(
+    requested: Option<bool>,
+    allowed: bool,
+) -> Result<(), &'static str> {
+    if requested == Some(true) && !allowed {
+        Err("IPv6 cannot be enabled while TUN is IPv4-only")
+    } else {
+        Ok(())
+    }
+}
+
 async fn patch_configs(
     State(state): State<ConfigState>,
     Json(payload): Json<PatchConfigRequest>,
 ) -> impl IntoResponse {
+    if let Err(message) = validate_ipv6_update(payload.ipv6, state.ipv6_allowed) {
+        return (StatusCode::BAD_REQUEST, message).into_response();
+    }
+
     let inbound_manager = state.inbound_manager.clone();
     let mut need_restart = false;
     if let Some(bind_address) = payload.bind_address.clone() {
@@ -320,4 +338,17 @@ async fn patch_configs(
     }
 
     StatusCode::ACCEPTED.into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_ipv6_update;
+
+    #[test]
+    fn blocks_enabling_ipv6_for_ipv4_only_tun() {
+        assert!(validate_ipv6_update(Some(true), false).is_err());
+        assert!(validate_ipv6_update(Some(false), false).is_ok());
+        assert!(validate_ipv6_update(None, false).is_ok());
+        assert!(validate_ipv6_update(Some(true), true).is_ok());
+    }
 }

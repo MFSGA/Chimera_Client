@@ -297,6 +297,7 @@ pub async fn start(
         Some(shutdown_token.child_token()),
         components.dns_listen.clone(),
         components.dns_enabled,
+        components.ipv6_allowed,
     ));
 
     // api_listener is not part of components because it requires components to be
@@ -379,6 +380,7 @@ pub async fn start(
                         Some(reload_token.child_token()),
                         new_components.dns_listen.clone(),
                         new_components.dns_enabled,
+                        new_components.ipv6_allowed,
                     ));
                     let mut g = global_state.lock().await;
 
@@ -440,6 +442,7 @@ struct RuntimeComponents {
     inbound_manager: Arc<InboundManager>,
     dns_listen: DNSListenAddr,
     dns_enabled: bool,
+    ipv6_allowed: bool,
 }
 
 impl RuntimeComponents {
@@ -483,6 +486,7 @@ async fn create_components(
     cwd: PathBuf,
     config: InternalConfig,
 ) -> Result<RuntimeComponents> {
+    let ipv6_allowed = !config.tun.enable || config.tun.gateway_v6.is_some();
     #[cfg(feature = "tun")]
     {
         if config.tun.enable {
@@ -778,6 +782,7 @@ async fn create_components(
         dns_listener,
         dns_listen,
         dns_enabled: dns_enable,
+        ipv6_allowed,
     })
 }
 

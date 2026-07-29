@@ -6,11 +6,21 @@ use hickory_proto::{
 };
 use tracing::debug;
 
+fn should_filter_aaaa(req: &Message, ipv6_enabled: bool) -> bool {
+    !ipv6_enabled
+        && req.queries.first().map(|query| query.query_type())
+            == Some(hickory_proto::rr::RecordType::AAAA)
+}
+
 pub async fn exchange_with_resolver<'a>(
     resolver: &'a ThreadSafeDNSResolver,
     req: &'a Message,
     enhanced: bool,
 ) -> Result<Message, chimera_dns::DNSError> {
+    if should_filter_aaaa(req, resolver.ipv6()) {
+        return Ok(build_dns_response_message(req, false, false));
+    }
+
     if req.queries.first().map(|q| q.query_type())
         == Some(hickory_proto::rr::RecordType::AAAA)
         || !resolver.fake_ip_enabled()
@@ -63,5 +73,39 @@ pub async fn exchange_with_resolver<'a>(
             debug!("dns resolve error: {}", e);
             Err(chimera_dns::DNSError::QueryFailed(e.to_string()))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hickory_proto::{
+        op::{Message, MessageType, OpCode, Query},
+        rr::{Name, RecordType},
+    };
+
+    use super::should_filter_aaaa;
+
+    fn query(record_type: RecordType) -> Message {
+        let mut message = Message::new(0, MessageType::Query, OpCode::Query);
+        message.add_query(Query::query(
+            Name::from_ascii("example.com.").unwrap(),
+            record_type,
+        ));
+        message
+    }
+
+    #[test]
+    fn filters_aaaa_when_ipv6_is_disabled() {
+        assert!(should_filter_aaaa(&query(RecordType::AAAA), false));
+    }
+
+    #[test]
+    fn keeps_aaaa_when_ipv6_is_enabled() {
+        assert!(!should_filter_aaaa(&query(RecordType::AAAA), true));
+    }
+
+    #[test]
+    fn keeps_ipv4_queries_when_ipv6_is_disabled() {
+        assert!(!should_filter_aaaa(&query(RecordType::A), false));
     }
 }

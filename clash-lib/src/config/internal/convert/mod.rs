@@ -54,6 +54,7 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
     }
     let dns: crate::app::dns::Config = (&c).try_into()?;
     let mut tun = tun::convert(c.tun.take())?;
+    validate_dns_tun_ipv6(&dns, &tun)?;
     configure_fake_ip_route(&dns, &mut tun)?;
 
     config::Config {
@@ -127,6 +128,18 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
     .validate()
 }
 
+fn validate_dns_tun_ipv6(
+    dns: &crate::app::dns::Config,
+    tun: &config::TunConfig,
+) -> Result<(), Error> {
+    if tun.enable && dns.ipv6 && tun.gateway_v6.is_none() {
+        return Err(Error::InvalidConfig(
+            "dns IPv6 responses require tun.ipv6 when TUN is enabled".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn configure_fake_ip_route(
     dns: &crate::app::dns::Config,
     tun: &mut config::TunConfig,
@@ -195,6 +208,46 @@ tun:
 
         let converted = convert(cfg).expect("internal convert should succeed");
         assert_eq!(converted.tun.so_mark, Some(6666));
+    }
+
+    #[test]
+    fn reject_dns_ipv6_with_ipv4_only_tun() {
+        let mut cfg = parse_config(
+            r#"
+tun:
+  enable: true
+  ipv6: false
+"#,
+        );
+        cfg.ipv6 = true;
+        cfg.dns.ipv6 = true;
+
+        let error = match convert(cfg) {
+            Ok(_) => panic!("IPv4-only TUN must reject DNS IPv6"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            Error::InvalidConfig(message)
+                if message.contains("dns IPv6 responses require tun.ipv6")
+        ));
+    }
+
+    #[test]
+    fn allow_dns_ipv6_with_ipv6_tun() {
+        let mut cfg = parse_config(
+            r#"
+tun:
+  enable: true
+  ipv6: true
+"#,
+        );
+        cfg.ipv6 = true;
+        cfg.dns.ipv6 = true;
+
+        let converted = convert(cfg).expect("dual-stack TUN should be valid");
+        assert!(converted.dns.ipv6);
+        assert!(converted.tun.gateway_v6.is_some());
     }
 
     #[test]
