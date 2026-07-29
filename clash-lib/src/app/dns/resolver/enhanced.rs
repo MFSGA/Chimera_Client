@@ -335,12 +335,22 @@ impl EnhancedResolver {
                     let client_id = c.id();
                     c.exchange(message)
                         .inspect_err(|x| {
-                            error!(
-                                client = %client_id,
-                                query = %query_name,
-                                record_type = %query_type,
-                                err = ?x,
-                                "resolve error");
+                            if x.to_string().contains("receiver was canceled") {
+                                debug!(
+                                    client = %client_id,
+                                    query = %query_name,
+                                    record_type = %query_type,
+                                    "dns upstream query canceled after another response completed"
+                                );
+                            } else {
+                                error!(
+                                    client = %client_id,
+                                    query = %query_name,
+                                    record_type = %query_type,
+                                    err = ?x,
+                                    "resolve error"
+                                );
+                            }
                         })
                         .inspect_ok(|response| {
                             let ips = Self::ip_list_of_message(response)

@@ -5,6 +5,7 @@ use crate::{
         net::DEFAULT_OUTBOUND_INTERFACE,
     },
     common::errors::new_io_error,
+    config::internal::config::DnsHijackRule,
     proxy::datagram::UdpPacket,
     session::{Network, Session, Type},
 };
@@ -32,12 +33,26 @@ enum FlushState {
     Disconnected,
 }
 
+fn should_hijack_udp_dns(
+    enabled: bool,
+    rules: &[DnsHijackRule],
+    destination: std::net::SocketAddr,
+) -> bool {
+    enabled
+        && if rules.is_empty() {
+            destination.port() == 53
+        } else {
+            rules.iter().any(|rule| rule.matches_udp(destination))
+        }
+}
+
 pub(crate) async fn handle_inbound_datagram(
     socket: watfaq_netstack::UdpSocket,
     dispatcher: Arc<Dispatcher>,
     resolver: ThreadSafeDNSResolver,
     so_mark: Option<u32>,
     dns_hijack: bool,
+    dns_hijack_rules: Vec<DnsHijackRule>,
 ) {
     // tun i/o
     // lr: app packets went into tun will be accessed from lr
@@ -123,7 +138,7 @@ pub(crate) async fn handle_inbound_datagram(
 
             trace!("tun -> dispatcher: {:?}", pkt);
 
-            if dns_hijack && pkt.dst_addr.port() == 53 {
+            if should_hijack_udp_dns(dns_hijack, &dns_hijack_rules, remote_addr) {
                 trace!("got dns packet: {:?}, returning from Clash DNS server", pkt);
 
                 match hickory_proto::op::Message::from_vec(&pkt.data) {
@@ -372,8 +387,14 @@ impl Sink<UdpPacket> for TunDatagram {
 
 #[cfg(test)]
 mod tests {
-    use super::{TunDatagram, is_noise_datagram};
-    use crate::{proxy::datagram::UdpPacket, session::SocksAddr};
+    use super::{TunDatagram, is_noise_datagram, should_hijack_udp_dns};
+    use crate::{
+        config::internal::config::{
+            DnsHijackAddress, DnsHijackProtocol, DnsHijackRule,
+        },
+        proxy::datagram::UdpPacket,
+        session::SocksAddr,
+    };
     use futures::{Sink, task::noop_waker_ref};
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -390,6 +411,31 @@ mod tests {
                 53,
             )),
         )
+    }
+
+    #[test]
+    fn udp_dns_hijack_uses_rules_and_preserves_empty_list_compatibility() {
+        let destination = "1.1.1.1:53".parse().unwrap();
+        let tcp_rule = DnsHijackRule {
+            protocol: DnsHijackProtocol::Tcp,
+            address: DnsHijackAddress::Any,
+            port: 53,
+        };
+        let udp_rule = DnsHijackRule {
+            protocol: DnsHijackProtocol::Udp,
+            address: DnsHijackAddress::Ip("1.1.1.1".parse().unwrap()),
+            port: 53,
+        };
+
+        assert!(!should_hijack_udp_dns(false, &[], destination));
+        assert!(should_hijack_udp_dns(true, &[], destination));
+        assert!(!should_hijack_udp_dns(true, &[tcp_rule], destination));
+        assert!(should_hijack_udp_dns(true, &[udp_rule], destination));
+        assert!(!should_hijack_udp_dns(
+            true,
+            &[udp_rule],
+            "8.8.8.8:53".parse().unwrap()
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]

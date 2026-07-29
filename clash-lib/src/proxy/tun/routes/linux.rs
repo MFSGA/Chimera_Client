@@ -1,6 +1,6 @@
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 
-use ipnet::{IpNet, Ipv4Net};
+use ipnet::IpNet;
 use tracing::warn;
 
 use crate::{
@@ -8,11 +8,15 @@ use crate::{
     config::internal::config::TunConfig,
 };
 
-const FWMARK_MAIN_RULE_PREF: &str = "100";
-const DNS_HIJACK_RULE_PREF: &str = "101";
+const FWMARK_MAIN_RULE_PREF: &str = "88";
+// DNS must be selected before the main-table lookup at preference 90.
+// Chimera's SO_MARK-to-main rule at preference 88 prevents its own upstream
+// DNS traffic from looping back into the TUN.
+const DNS_HIJACK_RULE_PREF: &str = "89";
 const ROUTE_ALL_RULE_PREF: &str = "102";
-const MAIN_SUPPRESS_RULE_PREF: &str = "103";
-const NIXOS_SOURCE_MAIN_RULE_PREF: &str = "90";
+// Resolve connected, LAN, VPN, and other specific main-table routes before the
+// catch-all TUN rule, while suppressing only the physical default route.
+const MAIN_SUPPRESS_RULE_PREF: &str = "90";
 
 fn is_missing_ip_state(stderr: &str) -> bool {
     matches!(
@@ -106,38 +110,6 @@ fn add_excluded_route(table: &str, dest: &IpNet) -> std::io::Result<()> {
     }
 }
 
-fn is_nixos() -> bool {
-    std::path::Path::new("/etc/NIXOS").exists()
-        || std::path::Path::new("/run/current-system/sw/bin").exists()
-}
-
-fn main_route_source_v4() -> std::io::Result<Option<Ipv4Addr>> {
-    let output = std::process::Command::new("ip")
-        .args(["-4", "route", "get", "1.1.1.1"])
-        .output()?;
-    warn!("executing: ip -4 route get 1.1.1.1");
-    if !output.status.success() {
-        return Err(new_io_error(format!(
-            "query default IPv4 source failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let Some(line) = stdout.lines().next() else {
-        return Ok(None);
-    };
-
-    let mut parts = line.split_whitespace();
-    while let Some(part) = parts.next() {
-        if part == "src" {
-            return Ok(parts.next().and_then(|src| src.parse().ok()));
-        }
-    }
-
-    Ok(None)
-}
-
 pub fn delete_interface(name: &str) -> std::io::Result<()> {
     let cmd_str = format!("ip link del dev {name}");
     let args = ["link", "del", "dev", name];
@@ -146,32 +118,6 @@ pub fn delete_interface(name: &str) -> std::io::Result<()> {
         warn!("deleted stale tun interface {}", name);
     }
     Ok(())
-}
-
-pub fn ensure_interface_address(name: &str, addr: Ipv4Net) -> std::io::Result<()> {
-    let cidr = addr.to_string();
-    let cmd = std::process::Command::new("ip")
-        .args(["addr", "add", &cidr, "dev", name])
-        .output()?;
-    warn!("executing: ip addr add {} dev {}", cidr, name);
-
-    if cmd.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&cmd.stderr);
-    if stderr.contains("File exists") {
-        warn!(
-            "address {} already configured on {}, continuing",
-            cidr, name
-        );
-        return Ok(());
-    }
-
-    Err(new_io_error(format!(
-        "ip addr add {} dev {} failed: {}",
-        cidr, name, stderr
-    )))
 }
 
 fn run_ip_cmd_single(
@@ -227,10 +173,9 @@ fn delete_ip_cmd_all(args: &[&str], enable_v6: bool) -> std::io::Result<()> {
 
 /// three rules are added:
 /// # ip route add default dev wg0 table 2468
-/// # ip rule add pref 90 from $OUTBOUND_IPV4 table main (NixOS only)
-/// # ip rule add pref 100 fwmark 1234 table main
+/// # ip rule add pref 88 fwmark 1234 table main
+/// # ip rule add pref 90 table main suppress_prefixlength 0
 /// # ip rule add pref 102 not fwmark 1234 table 2468
-/// # ip rule add pref 103 table main suppress_prefixlength 0
 /// for ipv6
 /// # ip -6 ...
 pub fn setup_policy_routing(
@@ -248,29 +193,6 @@ pub fn setup_policy_routing(
 
     for route in &tun_cfg.route_exclude_address {
         add_excluded_route(&table, route)?;
-    }
-
-    if is_nixos() {
-        match main_route_source_v4()? {
-            Some(addr_v4) => {
-                run_ip_cmd(
-                    &[
-                        "rule",
-                        "add",
-                        "pref",
-                        NIXOS_SOURCE_MAIN_RULE_PREF,
-                        "from",
-                        &format!("{addr_v4}/32"),
-                        "table",
-                        "main",
-                    ],
-                    false,
-                )?;
-            }
-            None => {
-                warn!("NixOS source-main rule skipped: no default IPv4 source found")
-            }
-        }
     }
 
     if let Some(so_mark) = tun_cfg.so_mark {
@@ -318,14 +240,31 @@ pub fn setup_policy_routing(
         enable_v6,
     )?;
 
+    for port in tun_cfg.dns_hijack_udp_ports() {
+        run_ip_cmd(
+            &[
+                "rule",
+                "add",
+                "pref",
+                DNS_HIJACK_RULE_PREF,
+                "ipproto",
+                "udp",
+                "dport",
+                &port.to_string(),
+                "table",
+                &table,
+            ],
+            enable_v6,
+        )?;
+    }
+
     Ok(())
 }
 
 /// policy rules to clean up:
-/// # ip rule del pref 90 from $OUTBOUND_IPV4 table main (NixOS only)
-/// # ip rule del pref 100 fwmark $SO_MARK table main
+/// # ip rule del pref 88 fwmark $SO_MARK table main
+/// # ip rule del pref 90 table main suppress_prefixlength 0
 /// # ip rule del pref 102 not fwmark $SO_MARK table $TABLE
-/// # ip rule del pref 103 table main suppress_prefixlength 0
 /// for v6
 /// # ip -6 ...
 pub fn maybe_routes_clean_up(tun_cfg: &TunConfig) -> std::io::Result<()> {
@@ -345,19 +284,8 @@ pub fn maybe_routes_clean_up(tun_cfg: &TunConfig) -> std::io::Result<()> {
         )?;
     }
 
-    if is_nixos() {
-        delete_ip_cmd_all(
-            &[
-                "rule",
-                "del",
-                "pref",
-                NIXOS_SOURCE_MAIN_RULE_PREF,
-                "table",
-                "main",
-            ],
-            false,
-        )?;
-    }
+    // Also removes the broad source-address bypass emitted by older builds.
+    delete_ip_cmd_all(&["rule", "del", "pref", "90", "table", "main"], false)?;
 
     if let Some(so_mark) = tun_cfg.so_mark {
         delete_ip_cmd_all(
@@ -432,33 +360,17 @@ pub fn maybe_routes_clean_up(tun_cfg: &TunConfig) -> std::io::Result<()> {
         enable_v6,
     )?;
 
-    if let Some(so_mark) = tun_cfg.so_mark {
+    for port in tun_cfg.dns_hijack_udp_ports() {
         delete_ip_cmd_all(
             &[
                 "rule",
                 "del",
                 "pref",
                 DNS_HIJACK_RULE_PREF,
-                "not",
-                "fwmark",
-                &so_mark.to_string(),
+                "ipproto",
+                "udp",
                 "dport",
-                "53",
-                "table",
-                &table,
-            ],
-            enable_v6,
-        )?;
-
-        delete_ip_cmd_all(
-            &[
-                "rule",
-                "del",
-                "not",
-                "fwmark",
-                &so_mark.to_string(),
-                "dport",
-                "53",
+                &port.to_string(),
                 "table",
                 &table,
             ],
@@ -466,6 +378,7 @@ pub fn maybe_routes_clean_up(tun_cfg: &TunConfig) -> std::io::Result<()> {
         )?;
     }
 
+    // Remove rules left by older builds that did not include ipproto.
     delete_ip_cmd_all(
         &[
             "rule",
@@ -475,6 +388,14 @@ pub fn maybe_routes_clean_up(tun_cfg: &TunConfig) -> std::io::Result<()> {
             "dport",
             "53",
             "table",
+            &table,
+        ],
+        enable_v6,
+    )?;
+    // Remove the rule emitted by transparent-dns step 1.
+    delete_ip_cmd_all(
+        &[
+            "rule", "del", "pref", "101", "ipproto", "udp", "dport", "53", "table",
             &table,
         ],
         enable_v6,

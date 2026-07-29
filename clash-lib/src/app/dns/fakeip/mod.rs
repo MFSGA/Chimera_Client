@@ -33,11 +33,11 @@ pub trait Store: Sync + Send {
 pub type ThreadSafeFakeDns = Arc<RwLock<FakeDns>>;
 
 pub struct FakeDns {
-    max: u32,
-    min: u32,
+    first: u32,
+    capacity: u32,
     #[allow(dead_code)]
     gateway: u32,
-    offset: u32,
+    cursor: u32,
     skipped_hostnames: Option<trie::StringTrie<bool>>,
     ipnet: ipnet::IpNet,
     store: Box<dyn Store>,
@@ -45,26 +45,33 @@ pub struct FakeDns {
 
 impl FakeDns {
     pub fn new(opt: Opts) -> Result<Self, Error> {
-        let ip = match opt.ipnet.network() {
-            net::IpAddr::V4(ip) => ip,
-            _ => unreachable!("fakeip range must be valid ipv4 subnet"),
+        let network = match opt.ipnet {
+            ipnet::IpNet::V4(network) => network,
+            ipnet::IpNet::V6(_) => {
+                return Err(Error::InvalidConfig(
+                    "fake-ip-range must be an IPv4 subnet".to_string(),
+                ));
+            }
         };
-        // avoid tun gateway and its subnet broadcast
-        let min = Self::ip_to_uint(&ip) + 8;
-        let prefix_len = opt.ipnet.prefix_len();
-        let max_prefix_len = opt.ipnet.max_prefix_len();
-        debug_assert_eq!(max_prefix_len, 32, "v4 subnet");
+        if network.prefix_len() > 30 {
+            return Err(Error::InvalidConfig(
+                "fake-ip-range must contain a network address, a gateway, at \
+                 least one allocatable address, and a broadcast address"
+                    .to_string(),
+            ));
+        }
 
-        // do not allocate the last 16 IPs in the range, to avoid broadcast and multicast addresses.
-        let total = (1 << (max_prefix_len - prefix_len)) - 16;
-
-        let max = min + total - 1;
+        let network_addr = Self::ip_to_uint(&network.network());
+        let broadcast = Self::ip_to_uint(&network.broadcast());
+        let gateway = network_addr + 1;
+        let first = network_addr + 2;
+        let capacity = broadcast - first;
 
         Ok(Self {
-            max,
-            min,
-            gateway: min - 1,
-            offset: 0,
+            first,
+            capacity,
+            gateway,
+            cursor: 0,
             skipped_hostnames: opt.skipped_hostnames,
             ipnet: opt.ipnet,
             store: opt.store,
@@ -155,32 +162,26 @@ impl FakeDns {
     }
 
     async fn get(&mut self, host: &str) -> net::IpAddr {
-        let current = self.offset;
-
-        loop {
-            self.offset = (self.offset + 1) % (self.max - self.min);
-
-            if self.offset == current {
-                self.offset = (self.offset + 1) % (self.max - self.min);
-                let ip = net::Ipv4Addr::from(self.min + self.offset - 1);
-                info!(
-                    fake_ip = %ip,
-                    range = %self.ipnet,
-                    "fake-ip pool full, evicting previous mapping"
-                );
-                self.store.del_by_ip(std::net::IpAddr::V4(ip)).await;
-                break;
-            }
-
-            let ip = net::Ipv4Addr::from(self.min + self.offset - 1);
-            if !self.store.exist(std::net::IpAddr::V4(ip)).await {
-                break;
+        for _ in 0..self.capacity {
+            let ip = net::Ipv4Addr::from(self.first + self.cursor);
+            self.cursor = (self.cursor + 1) % self.capacity;
+            if !self.store.exist(net::IpAddr::V4(ip)).await {
+                self.store.put_by_ip(net::IpAddr::V4(ip), host).await;
+                return net::IpAddr::V4(ip);
             }
         }
 
-        let ip = net::Ipv4Addr::from(self.min + self.offset - 1);
-        self.store.put_by_ip(std::net::IpAddr::V4(ip), host).await;
-        std::net::IpAddr::V4(ip)
+        // The pool is full. Reuse the oldest candidate selected by the cursor.
+        let ip = net::Ipv4Addr::from(self.first + self.cursor);
+        self.cursor = (self.cursor + 1) % self.capacity;
+        self.store.del_by_ip(net::IpAddr::V4(ip)).await;
+        info!(
+            fake_ip = %ip,
+            range = %self.ipnet,
+            "fake-ip pool full, evicting previous mapping"
+        );
+        self.store.put_by_ip(net::IpAddr::V4(ip), host).await;
+        net::IpAddr::V4(ip)
     }
 
     fn ip_to_uint(ip: &net::Ipv4Addr) -> u32 {
@@ -225,6 +226,62 @@ mod tests {
         assert!(pool.exist(net::IpAddr::from([192, 168, 0, 3])).await);
         assert!(!pool.exist(net::IpAddr::from([192, 168, 0, 4])).await);
         assert!(!pool.exist("::1".parse().unwrap()).await);
+    }
+
+    #[tokio::test]
+    async fn test_allocates_every_usable_address_without_gateway_or_broadcast() {
+        let store = Box::new(InMemStore::new(10));
+        let mut pool = FakeDns::new(Opts {
+            ipnet: "192.168.0.0/29".parse().unwrap(),
+            skipped_hostnames: None,
+            store,
+        })
+        .unwrap();
+
+        let mut allocated = Vec::new();
+        for index in 0..5 {
+            allocated.push(pool.lookup(&format!("{index}.example")).await);
+        }
+
+        assert_eq!(
+            allocated,
+            [
+                "192.168.0.2",
+                "192.168.0.3",
+                "192.168.0.4",
+                "192.168.0.5",
+                "192.168.0.6"
+            ]
+            .map(|ip| ip.parse::<net::IpAddr>().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_30_pool_allocates_its_single_usable_address() {
+        let store = Box::new(InMemStore::new(10));
+        let mut pool = FakeDns::new(Opts {
+            ipnet: "192.168.0.0/30".parse().unwrap(),
+            skipped_hostnames: None,
+            store,
+        })
+        .unwrap();
+
+        assert_eq!(
+            pool.lookup("example.com").await,
+            "192.168.0.2".parse::<net::IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_rejects_too_small_or_ipv6_pool() {
+        for ipnet in ["192.168.0.0/31", "192.168.0.1/32", "fd00::/64"] {
+            let result = FakeDns::new(Opts {
+                ipnet: ipnet.parse().unwrap(),
+                skipped_hostnames: None,
+                store: Box::new(InMemStore::new(10)),
+            });
+            assert!(result.is_err(), "{ipnet} must be rejected");
+        }
     }
 
     #[tokio::test]

@@ -52,6 +52,9 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
             _ => {}
         }
     }
+    let dns: crate::app::dns::Config = (&c).try_into()?;
+    let mut tun = tun::convert(c.tun.take())?;
+    configure_fake_ip_route(&dns, &mut tun)?;
 
     config::Config {
         proxies: c.proxy.take().unwrap_or_default().into_iter().try_fold(
@@ -113,9 +116,8 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
             })
             .collect::<Result<Vec<_>, _>>()?,
         general: general::convert(&c)?,
-        // relate to dns::Config
-        dns: (&c).try_into()?,
-        tun: tun::convert(c.tun.take())?,
+        dns,
+        tun,
         experimental: c.experimental.take(),
         profile: Profile {
             store_selected: c.profile.store_selected,
@@ -125,9 +127,44 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
     .validate()
 }
 
+fn configure_fake_ip_route(
+    dns: &crate::app::dns::Config,
+    tun: &mut config::TunConfig,
+) -> Result<(), Error> {
+    if !tun.enable || !dns.enable || dns.enhance_mode != def::DNSMode::FakeIp {
+        return Ok(());
+    }
+
+    let fake_ip_range = match dns.fake_ip_range {
+        ipnet::IpNet::V4(range) => range,
+        ipnet::IpNet::V6(_) => {
+            return Err(Error::InvalidConfig(
+                "fake-ip-range must be an IPv4 subnet".to_string(),
+            ));
+        }
+    };
+
+    let tun_network = tun.gateway.trunc();
+    if tun_network.contains(&fake_ip_range.network())
+        || fake_ip_range.contains(&tun_network.network())
+    {
+        return Err(Error::InvalidConfig(format!(
+            "tun gateway subnet `{tun_network}` overlaps fake-ip-range \
+             `{fake_ip_range}`; use separate subnets"
+        )));
+    }
+
+    let fake_ip_route = ipnet::IpNet::V4(fake_ip_range.trunc());
+    if !tun.route_all && !tun.routes.contains(&fake_ip_route) {
+        tun.routes.push(fake_ip_route);
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::config::def;
+    use crate::{Error, config::def};
 
     use super::convert;
 
@@ -203,6 +240,51 @@ tun:
 
         let converted = convert(cfg).expect("internal convert should succeed");
         assert!(converted.tun.route_all);
+    }
+
+    #[test]
+    fn fake_ip_mode_adds_route_for_separate_default_pool() {
+        let mut cfg = parse_config(
+            r#"
+tun:
+  enable: true
+"#,
+        );
+        cfg.dns.enable = true;
+        cfg.dns.enhanced_mode = def::DNSMode::FakeIp;
+        cfg.dns.nameserver = vec!["1.1.1.1".to_string()];
+
+        let converted = convert(cfg).expect("internal convert should succeed");
+        assert_eq!(converted.tun.gateway.to_string(), "198.18.0.1/30");
+        assert!(
+            converted
+                .tun
+                .routes
+                .contains(&"198.19.0.0/16".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn reject_overlapping_tun_and_fake_ip_subnets() {
+        let mut cfg = parse_config(
+            r#"
+tun:
+  enable: true
+  gateway: 198.18.0.1/30
+"#,
+        );
+        cfg.dns.enable = true;
+        cfg.dns.enhanced_mode = def::DNSMode::FakeIp;
+        cfg.dns.fake_ip_range = "198.18.0.0/16".to_string();
+        cfg.dns.nameserver = vec!["1.1.1.1".to_string()];
+
+        match convert(cfg) {
+            Err(Error::InvalidConfig(message)) => {
+                assert!(message.contains("overlaps fake-ip-range"));
+            }
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("overlapping subnets must be rejected"),
+        }
     }
 
     #[test]

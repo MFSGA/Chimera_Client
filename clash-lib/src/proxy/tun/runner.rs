@@ -269,24 +269,6 @@ impl TunRunner {
                         info!("reconciling routes for existing tun {}", &tun_name);
                     }
 
-                    #[cfg(target_os = "linux")]
-                    if cfg.dns_hijack
-                        && let Some(dedicated_dns_ip) = cfg.dedicated_dns_ipv4()
-                    {
-                        routes::ensure_interface_address(
-                            &tun_name,
-                            ipnet::Ipv4Net::new(
-                                dedicated_dns_ip,
-                                cfg.gateway.prefix_len(),
-                            )
-                            .map_err(|err| {
-                                Error::Operation(format!(
-                                    "failed to build dedicated tun dns cidr: {err}"
-                                ))
-                            })?,
-                        )?;
-                    }
-
                     maybe_add_routes(cfg, &tun_name)?;
 
                     dev
@@ -316,6 +298,7 @@ impl Runner for TunRunner {
         let dispatcher = self.dispatcher.clone();
         let resolver = self.resolver.clone();
         let dns_hijack = self.cfg.dns_hijack;
+        let dns_hijack_rules = self.cfg.dns_hijack_rules.clone();
         let cancellation_token = self.cancellation_token.clone();
 
         let handle = tokio::spawn(async move {
@@ -426,6 +409,7 @@ impl Runner for TunRunner {
                     resolver.clone(),
                     so_mark,
                     dns_hijack,
+                    dns_hijack_rules.clone(),
                 )
                 .await;
                 Err(Error::Operation("tun stopped unexpectedly 3".to_string()))

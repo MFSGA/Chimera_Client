@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     str::FromStr,
 };
 
@@ -205,19 +205,56 @@ pub struct TunConfig {
     pub so_mark: Option<u32>,
     pub route_table: u32,
     pub dns_hijack: bool,
+    pub dns_hijack_rules: Vec<DnsHijackRule>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DnsHijackProtocol {
+    Udp,
+    Tcp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DnsHijackAddress {
+    Any,
+    Ip(IpAddr),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DnsHijackRule {
+    pub protocol: DnsHijackProtocol,
+    pub address: DnsHijackAddress,
+    pub port: u16,
+}
+
+impl DnsHijackRule {
+    pub fn matches_udp(&self, destination: SocketAddr) -> bool {
+        self.protocol == DnsHijackProtocol::Udp
+            && self.port == destination.port()
+            && match self.address {
+                DnsHijackAddress::Any => true,
+                DnsHijackAddress::Ip(address) => address == destination.ip(),
+            }
+    }
 }
 
 impl TunConfig {
-    pub fn dedicated_dns_ipv4(&self) -> Option<Ipv4Addr> {
-        let network = u32::from(self.gateway.network());
-        let broadcast = u32::from(self.gateway.broadcast());
-        let candidate = network.checked_add(2)?;
-
-        if candidate >= broadcast {
-            return None;
+    pub fn dns_hijack_udp_ports(&self) -> Vec<u16> {
+        if !self.dns_hijack {
+            return Vec::new();
+        }
+        if self.dns_hijack_rules.is_empty() {
+            return vec![53];
         }
 
-        Some(Ipv4Addr::from(candidate))
+        let mut ports = Vec::new();
+        for rule in &self.dns_hijack_rules {
+            if rule.protocol == DnsHijackProtocol::Udp && !ports.contains(&rule.port)
+            {
+                ports.push(rule.port);
+            }
+        }
+        ports
     }
 }
 
@@ -263,97 +300,75 @@ pub struct InlineRuleProvider {
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, SocketAddr};
 
-    use super::TunConfig;
+    use super::{DnsHijackAddress, DnsHijackProtocol, DnsHijackRule, TunConfig};
 
     #[test]
-    fn dedicated_dns_is_gateway_plus_one_in_24() {
-        let tun = TunConfig {
-            gateway: "198.18.0.1/24".parse().unwrap(),
-            ..Default::default()
+    fn dns_hijack_rule_matches_udp_destination() {
+        let any = DnsHijackRule {
+            protocol: DnsHijackProtocol::Udp,
+            address: DnsHijackAddress::Any,
+            port: 53,
         };
-        assert_eq!(tun.dedicated_dns_ipv4(), Some(Ipv4Addr::new(198, 18, 0, 2)));
+        let specific = DnsHijackRule {
+            protocol: DnsHijackProtocol::Udp,
+            address: DnsHijackAddress::Ip("1.1.1.1".parse().unwrap()),
+            port: 53,
+        };
+        let tcp = DnsHijackRule {
+            protocol: DnsHijackProtocol::Tcp,
+            ..any
+        };
+
+        assert!(any.matches_udp("8.8.8.8:53".parse().unwrap()));
+        assert!(!any.matches_udp("8.8.8.8:5353".parse().unwrap()));
+        assert!(specific.matches_udp("1.1.1.1:53".parse().unwrap()));
+        assert!(!specific.matches_udp("8.8.8.8:53".parse().unwrap()));
+        assert!(!tcp.matches_udp("1.1.1.1:53".parse().unwrap()));
+
+        let ipv6 = DnsHijackRule {
+            address: DnsHijackAddress::Ip(IpAddr::V6(
+                "2001:4860:4860::8888".parse().unwrap(),
+            )),
+            ..any
+        };
+        assert!(ipv6.matches_udp(SocketAddr::new(
+            "2001:4860:4860::8888".parse().unwrap(),
+            53
+        )));
     }
 
     #[test]
-    fn dedicated_dns_in_16_subnet() {
+    fn dns_hijack_udp_ports_follow_protocol_rules() {
         let tun = TunConfig {
-            gateway: "10.0.0.1/16".parse().unwrap(),
+            dns_hijack: true,
+            dns_hijack_rules: vec![
+                DnsHijackRule {
+                    protocol: DnsHijackProtocol::Tcp,
+                    address: DnsHijackAddress::Any,
+                    port: 53,
+                },
+                DnsHijackRule {
+                    protocol: DnsHijackProtocol::Udp,
+                    address: DnsHijackAddress::Any,
+                    port: 5353,
+                },
+                DnsHijackRule {
+                    protocol: DnsHijackProtocol::Udp,
+                    address: DnsHijackAddress::Any,
+                    port: 5353,
+                },
+            ],
             ..Default::default()
         };
-        assert_eq!(tun.dedicated_dns_ipv4(), Some(Ipv4Addr::new(10, 0, 0, 2)));
-    }
+        assert_eq!(tun.dns_hijack_udp_ports(), vec![5353]);
 
-    #[test]
-    fn dedicated_dns_gateway_is_network_plus_one() {
-        let tun = TunConfig {
-            gateway: "172.16.0.5/24".parse().unwrap(),
+        let legacy = TunConfig {
+            dns_hijack: true,
             ..Default::default()
         };
-        // gateway addr (172.16.0.5) != network+1 (172.16.0.1), but
-        // dedicated_dns_ipv4 computes from network address: network+2 = 172.16.0.2
-        assert_eq!(tun.dedicated_dns_ipv4(), Some(Ipv4Addr::new(172, 16, 0, 2)));
-    }
-
-    #[test]
-    fn dedicated_dns_in_30_subnet_room_for_dns() {
-        let tun = TunConfig {
-            gateway: "10.0.0.1/30".parse().unwrap(),
-            ..Default::default()
-        };
-        // /30 subnet: network=10.0.0.0, broadcast=10.0.0.3
-        // network+2 = 10.0.0.2 < 10.0.0.3, so Some(10.0.0.2)
-        assert_eq!(tun.dedicated_dns_ipv4(), Some(Ipv4Addr::new(10, 0, 0, 2)));
-    }
-
-    #[test]
-    fn dedicated_dns_in_31_subnet_too_small() {
-        let tun = TunConfig {
-            gateway: "10.0.0.1/31".parse().unwrap(),
-            ..Default::default()
-        };
-        // /31 subnet: network=10.0.0.0, broadcast=10.0.0.1
-        // candidate overflow would clamp, so None
-        assert_eq!(tun.dedicated_dns_ipv4(), None);
-    }
-
-    #[test]
-    fn dedicated_dns_in_32_subnet_too_small() {
-        let tun = TunConfig {
-            gateway: "10.0.0.1/32".parse().unwrap(),
-            ..Default::default()
-        };
-        // /32 subnet: network=10.0.0.1, broadcast=10.0.0.1
-        // network+2 = 10.0.0.3 > 10.0.0.1, so None
-        assert_eq!(tun.dedicated_dns_ipv4(), None);
-    }
-
-    #[test]
-    fn dedicated_dns_overflow_protection() {
-        // Use network address near u32::MAX to test checked_add safety
-        let tun = TunConfig {
-            gateway: "255.255.255.0/24".parse().unwrap(),
-            ..Default::default()
-        };
-        // network = 255.255.255.0, broadcast = 255.255.255.255
-        // network+2 = 255.255.255.2 <= broadcast = 255.255.255.255, ok
-        assert_eq!(
-            tun.dedicated_dns_ipv4(),
-            Some(Ipv4Addr::new(255, 255, 255, 2))
-        );
-    }
-
-    #[test]
-    fn dedicated_dns_default_gateway() {
-        let tun = TunConfig {
-            gateway: "198.18.0.1/24".parse().unwrap(),
-            ..Default::default()
-        };
-        let dns = tun.dedicated_dns_ipv4().unwrap();
-        // DNS must not be the gateway IP itself
-        assert_ne!(dns, Ipv4Addr::new(198, 18, 0, 1));
-        // DNS must not be a public IP
-        assert!(!dns.is_global());
+        assert_eq!(legacy.dns_hijack_udp_ports(), vec![53]);
+        assert!(TunConfig::default().dns_hijack_udp_ports().is_empty());
     }
 }
