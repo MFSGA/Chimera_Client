@@ -434,6 +434,25 @@ pub struct HealthCheck {
     pub url: Option<String>,
     pub interval: Option<u64>,
     pub lazy: Option<bool>,
+    #[serde(rename = "type", default)]
+    pub probe: HealthCheckProbe,
+    pub minimum_bytes: Option<usize>,
+    pub minimum_events: Option<usize>,
+    pub maximum_first_byte_ms: Option<u64>,
+    pub expect_echo: Option<String>,
+    pub timeout: Option<u64>,
+}
+
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum HealthCheckProbe {
+    #[default]
+    Http,
+    Download,
+    Sse,
+    Websocket,
 }
 
 #[cfg(feature = "trojan")]
@@ -496,7 +515,43 @@ pub enum Hysteria2Obfs {
 
 #[cfg(test)]
 mod tests {
-    use super::OutboundProxyProtocol;
+    use super::{HealthCheck, HealthCheckProbe, OutboundProxyProtocol};
+
+    #[test]
+    fn download_health_check_config_parses() {
+        let health: HealthCheck = serde_yaml::from_str(
+            r#"
+enable: true
+url: https://probe.example/64k.bin
+interval: 300
+timeout: 10
+type: download
+minimum-bytes: 65536
+"#,
+        )
+        .expect("health check config should parse");
+
+        assert_eq!(health.probe, HealthCheckProbe::Download);
+        assert_eq!(health.minimum_bytes, Some(65_536));
+        assert_eq!(health.timeout, Some(10));
+    }
+
+    #[test]
+    fn streaming_health_check_configs_parse() {
+        let sse: HealthCheck = serde_yaml::from_str(
+            "type: sse\nminimum-events: 3\nmaximum-first-byte-ms: 3000",
+        )
+        .unwrap();
+        assert_eq!(sse.probe, HealthCheckProbe::Sse);
+        assert_eq!(sse.minimum_events, Some(3));
+        assert_eq!(sse.maximum_first_byte_ms, Some(3000));
+
+        let websocket: HealthCheck =
+            serde_yaml::from_str("type: websocket\nexpect-echo: chimera-health")
+                .unwrap();
+        assert_eq!(websocket.probe, HealthCheckProbe::Websocket);
+        assert_eq!(websocket.expect_echo.as_deref(), Some("chimera-health"));
+    }
 
     #[test]
     fn outbound_vless_parses_xhttp_opts() {
