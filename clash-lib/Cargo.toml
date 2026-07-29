@@ -116,6 +116,9 @@ etherparse = { version = "0.20", optional = true }
 
 base64 = "0.22"
 
+# Builtin dashboard
+rust-embed = { version = "8", optional = true }
+
 aws-lc-rs = { version = "1", default-features = false, optional = true }
 
 axum = { version = "0.8", features = ["ws"] }
@@ -197,6 +200,8 @@ tracing = ["tokio/tracing"]
 port = ["http_port", "mixed_port"]
 
 reality = ["tls", "aws-lc-rs", "dep:aws-lc-rs"]
+
+dashboard = ["dep:rust-embed"]
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_Networking_WinSock",
@@ -211,6 +216,9 @@ sock2proc = { git = "https://github.com/Watfaq/sock2proc.git", rev = "9f9e630" }
 
 [target.'cfg(target_os="linux")'.dependencies]
 rtnetlink = "0.21"
+
+[build-dependencies]
+anyhow = "1"
 
 [dev-dependencies]
 bollard = "0.21"

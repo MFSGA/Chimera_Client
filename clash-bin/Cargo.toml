@@ -7,7 +7,7 @@ edition = { workspace = true }
 # authors = { workspace = true }
 
 [features]
-default = ["standard", "aws-lc-rs"]
+default = ["standard", "aws-lc-rs", "dashboard"]
 standard = [
     "shadowsocks",
     "trojan",
@@ -45,6 +45,8 @@ aws-lc-rs = ["dep:aws-lc-rs", "clash-lib/aws-lc-rs"]
 ring = ["clash-lib/ring"]
 tracing = ["clash-lib/tracing"]
 extended-health-check = ["clash-lib/extended-health-check"]
+
+dashboard = ["clash-lib/dashboard"]
 
 perf = ["plus"]
 

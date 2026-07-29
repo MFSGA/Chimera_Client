@@ -84,6 +84,26 @@ jobs:
           docker pull p4gefau1t/trojan-go:latest
           docker pull nicolaka/netshoot:latest
 
+      # Protocol servers run in Docker and connect back to the host-side echo
+      # listeners allocated from this range. Newer hosted-runner images may
+      # reject bridge traffic in INPUT even though Docker networking is ready.
+      - name: Allow Docker access to throughput echo servers
+        run: |
+          docker_bridge="$(docker network inspect bridge --format '{{index .Options "com.docker.network.bridge.name"}}')"
+          if [ -z "${docker_bridge}" ]; then
+            docker_bridge="docker0"
+          fi
+          sudo iptables -I INPUT 1 \
+            -i "${docker_bridge}" \
+            -p tcp \
+            --dport 30001:30100 \
+            -j ACCEPT
+          sudo iptables -C INPUT \
+            -i "${docker_bridge}" \
+            -p tcp \
+            --dport 30001:30100 \
+            -j ACCEPT
+
       # Download once so parallel clash-rs instances don't race to fetch it
       - name: Download Country.mmdb
         run: |

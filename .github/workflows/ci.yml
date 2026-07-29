@@ -28,8 +28,37 @@ env:
 
 # Arm builder https://github.blog/changelog/2024-09-03-github-actions-arm64-linux-and-windows-runners-are-now-generally-available/
 jobs:
+  dashboard:
+    name: Dashboard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: clash-dashboard/package-lock.json
+      - name: Install dashboard dependencies
+        working-directory: clash-dashboard
+        run: npm ci
+      - name: Lint dashboard
+        working-directory: clash-dashboard
+        run: npm run lint
+      - name: Build dashboard
+        working-directory: clash-dashboard
+        run: npm run build
+      - name: Mark dashboard as prebuilt
+        run: touch clash-dashboard/dist/chimera-prebuilt.marker
+      - name: Upload dashboard build
+        uses: actions/upload-artifact@v7
+        with:
+          name: dashboard-dist
+          path: clash-dashboard/dist/
+          retention-days: 1
+
   compile:
     name: ${{ matrix.release-name || matrix.target || 'Unknown' }}
+    needs: dashboard
     runs-on: ${{ matrix.os || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
@@ -110,6 +139,11 @@ jobs:
       - uses: actions/checkout@v6
         with:
           submodules: true
+      - name: Download dashboard build
+        uses: actions/download-artifact@v8
+        with:
+          name: dashboard-dist
+          path: clash-dashboard/dist
       - uses: actions/cache@v5
         with:
           path: |
@@ -208,7 +242,7 @@ jobs:
         uses: actions/upload-artifact@v7
         if: ${{ !matrix.no-release }}
         with:
-          name: ${{ matrix.release-name || matrix.target }}
+          name: binary-${{ matrix.release-name || matrix.target }}
           path: ${{ env.PACKAGE }}-${{ matrix.release-name || matrix.target }}${{ matrix.postfix }}
 
       - name: Setup tmate session
@@ -235,7 +269,7 @@ jobs:
         uses: actions/upload-artifact/merge@v7
         with:
           name: binaries
-          pattern: "*"
+          pattern: "binary-*"
           retention-days: 1
 
       - name: Download binaries
