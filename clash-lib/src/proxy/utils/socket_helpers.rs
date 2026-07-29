@@ -533,11 +533,11 @@ pub async fn new_tcp_stream(
             }
         }
 
-        return Err(last_err.unwrap_or_else(|| {
+        Err(last_err.unwrap_or_else(|| {
             io::Error::other(
                 "tcp connect retry loop exited without a captured error",
             )
-        }));
+        }))
     }
 }
 
@@ -907,7 +907,7 @@ mod tests {
         Some(OutboundInterface {
             name: iface.name,
             addr_v4: Some(Ipv4Addr::LOCALHOST),
-            addr_v6: Some(Ipv4Addr::LOCALHOST.to_ipv6_mapped().into()),
+            addr_v6: Some(Ipv4Addr::LOCALHOST.to_ipv6_mapped()),
             index: iface.index,
             netmask_v4: None,
             broadcast_v4: None,

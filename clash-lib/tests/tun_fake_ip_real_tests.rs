@@ -182,10 +182,7 @@ fn spawn_fixed_a_dns(port: u16, ip: Ipv4Addr) {
     thread::spawn(move || {
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).expect("dns bind");
         let mut buf = [0u8; 512];
-        loop {
-            let Ok((len, peer)) = socket.recv_from(&mut buf) else {
-                break;
-            };
+        while let Ok((len, peer)) = socket.recv_from(&mut buf) {
             if let Some(response) = build_a_response(&buf[..len], ip) {
                 let _ = socket.send_to(&response, peer);
             }

@@ -73,6 +73,7 @@ impl HealthCheck {
         self
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_check(
         proxy_manager: &ProxyManager,
         proxies: &Vec<AnyOutboundHandler>,

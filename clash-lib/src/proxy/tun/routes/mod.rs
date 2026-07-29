@@ -81,8 +81,7 @@ pub async fn maybe_add_routes(
                     .filter_map(|route| {
                         best_route_for_destination(route).transpose().map(
                             |best_route| {
-                                best_route
-                                    .map(|best_route| (route.clone(), best_route))
+                                best_route.map(|best_route| (*route, best_route))
                             },
                         )
                     })

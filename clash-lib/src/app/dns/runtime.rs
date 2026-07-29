@@ -154,6 +154,7 @@ impl RuntimeProvider for DnsRuntimeProvider {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::DnsRuntimeProvider;
     use crate::session::{Network, SocksAddr, Type};

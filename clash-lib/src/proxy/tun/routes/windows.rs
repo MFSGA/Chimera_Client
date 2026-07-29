@@ -382,6 +382,7 @@ pub fn maybe_routes_clean_up(_: &TunConfig) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::should_skip_best_route_lookup;
     use ipnet::IpNet;

@@ -89,6 +89,7 @@ pub struct Client {
 }
 
 impl Client {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         server: String,
         port: u16,
@@ -296,6 +297,7 @@ fn validate_response_status(
     Ok(response.into_body())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_request(
     server: &str,
     port: u16,
@@ -593,6 +595,9 @@ mod tests {
         time::{Duration, timeout},
     };
     use tokio_stream::wrappers::ReceiverStream;
+
+    type TestSessions =
+        Arc<Mutex<HashMap<String, mpsc::Sender<Result<Frame<Bytes>, Infallible>>>>>;
 
     #[test]
     fn xhttp_request_adds_default_padding_referer() {
@@ -1094,11 +1099,10 @@ mod tests {
             while let Some(frame_res) = body.frame().await {
                 match frame_res {
                     Ok(frame) => {
-                        if let Some(data) = frame.data_ref() {
-                            if tx.send(Ok(Frame::data(data.clone()))).await.is_err()
-                            {
-                                break;
-                            }
+                        if let Some(data) = frame.data_ref()
+                            && tx.send(Ok(Frame::data(data.clone()))).await.is_err()
+                        {
+                            break;
                         }
                     }
                     Err(_) => break,
@@ -1114,9 +1118,7 @@ mod tests {
 
     async fn handle_split_modes(
         req: Request<Incoming>,
-        sessions: Arc<
-            Mutex<HashMap<String, mpsc::Sender<Result<Frame<Bytes>, Infallible>>>>,
-        >,
+        sessions: TestSessions,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
         let path = req.uri().path().to_owned();
         let parts = path
@@ -1196,9 +1198,7 @@ mod tests {
 
     async fn handle_split_modes_with_post_content_type(
         req: Request<Incoming>,
-        sessions: Arc<
-            Mutex<HashMap<String, mpsc::Sender<Result<Frame<Bytes>, Infallible>>>>,
-        >,
+        sessions: TestSessions,
         post_content_types: Arc<Mutex<Vec<Option<String>>>>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
         if req.method() == Method::POST {

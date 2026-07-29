@@ -297,15 +297,14 @@ impl AsyncRead for VisionStream {
                 return Poll::Ready(Ok(()));
             }
 
-            if this.vless_response_pending {
-                if let Some(consumed) = consume_vless_response_header(&mut this.raw)?
-                {
-                    debug!(
-                        "VISION READ: consumed {consumed} bytes of VLESS response header"
-                    );
-                    this.vless_response_pending = false;
-                    continue;
-                }
+            if this.vless_response_pending
+                && let Some(consumed) = consume_vless_response_header(&mut this.raw)?
+            {
+                debug!(
+                    "VISION READ: consumed {consumed} bytes of VLESS response header"
+                );
+                this.vless_response_pending = false;
+                continue;
             }
 
             if this.read_mode != ReadMode::Framed {
