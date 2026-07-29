@@ -295,9 +295,10 @@ impl Dispatcher {
                 // SS2022 and dual-stack UDP inbounds can surface IPv4 targets as
                 // IPv4-mapped IPv6. Keep the canonical IP before fake-IP reverse
                 // lookup may replace the destination with a domain.
-                if let SocksAddr::Ip(addr) = &mut packet.dst_addr {
-                    *addr = addr.to_canonical();
-                    sess.resolved_ip = Some(addr.ip());
+                if let SocksAddr::Ip(addr) = &packet.dst_addr {
+                    let canonical = addr.to_canonical();
+                    packet.dst_addr = SocksAddr::Ip(canonical);
+                    sess.resolved_ip = Some(canonical.ip());
                 }
 
                 let dest = match reverse_lookup(&resolver, &packet.dst_addr).await {

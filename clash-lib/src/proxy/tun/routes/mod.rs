@@ -31,6 +31,8 @@ use tracing::warn;
 use crate::config::internal::config::TunConfig;
 
 use crate::app::net::get_interface_by_name;
+#[cfg(windows)]
+use crate::app::net::set_windows_tun_interface_index;
 
 #[allow(dead_code)]
 pub async fn maybe_add_routes(
@@ -160,6 +162,9 @@ pub async fn maybe_add_routes(
                 add_route(&tun_iface, r)?;
             }
         }
+
+        #[cfg(windows)]
+        set_windows_tun_interface_index(Some(tun_iface.index)).await;
     }
 
     Ok(())

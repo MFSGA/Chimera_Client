@@ -419,6 +419,7 @@ fn resolve_xhttp_min_posts_interval_ms(xhttp_opts: &XhttpOpt) -> Option<u64> {
         .and_then(|extra| extra.sc_min_posts_interval_ms)
 }
 
+#[cfg(feature = "reality")]
 fn resolve_xhttp_upload_server_name(s: &OutboundVless) -> String {
     s.xhttp_opts
         .as_ref()

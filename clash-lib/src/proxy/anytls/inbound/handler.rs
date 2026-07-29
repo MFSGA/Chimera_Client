@@ -7,9 +7,11 @@ use super::{
         UDP_OVER_TCP_V2_MAGIC_HOST, read_frame, write_frame,
     },
 };
+#[cfg(all(target_os = "linux", feature = "tun"))]
+use crate::app::net::TUN_SOMARK;
 use crate::{
     Dispatcher,
-    proxy::AnyStream,
+    proxy::{AnyStream, utils::new_protected_tcp_stream},
     session::{Network, Session, SocksAddr, Type},
 };
 use bytes::BufMut;
@@ -30,18 +32,55 @@ const RELAY_BUFFER_SIZE: usize = 16 * 1024;
 ///
 /// The 32 bytes already consumed for the password check are prepended before
 /// piping the rest of the (decrypted) application stream to the backend.
+async fn connect_fallback_backend(
+    fallback_addr: &str,
+) -> std::io::Result<tokio::net::TcpStream> {
+    let endpoints = tokio::net::lookup_host(fallback_addr).await?;
+    #[cfg(all(target_os = "linux", feature = "tun"))]
+    let so_mark = *TUN_SOMARK.read().await;
+    #[cfg(all(target_os = "linux", not(feature = "tun")))]
+    let so_mark = None;
+    let mut errors = Vec::new();
+
+    for endpoint in endpoints {
+        match new_protected_tcp_stream(
+            endpoint,
+            None,
+            #[cfg(target_os = "linux")]
+            so_mark,
+        )
+        .await
+        {
+            Ok(stream) => return Ok(stream),
+            Err(error) => errors.push(format!("{endpoint}: {error}")),
+        }
+    }
+
+    if errors.is_empty() {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("fallback address {fallback_addr} resolved to no endpoints"),
+        ))
+    } else {
+        Err(std::io::Error::other(format!(
+            "all fallback endpoints failed: {}",
+            errors.join("; ")
+        )))
+    }
+}
+
 async fn handle_fallback(
     mut tls_stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
     already_read: &[u8],
     fallback_addr: &str,
     src_addr: SocketAddr,
 ) {
-    let mut backend = match tokio::net::TcpStream::connect(fallback_addr).await {
-        Ok(s) => s,
-        Err(e) => {
+    let mut backend = match connect_fallback_backend(fallback_addr).await {
+        Ok(stream) => stream,
+        Err(error) => {
             debug!(
                 "anytls fallback: failed to connect to {fallback_addr} for \
-                 {src_addr}: {e}"
+                 {src_addr}: {error}"
             );
             return;
         }

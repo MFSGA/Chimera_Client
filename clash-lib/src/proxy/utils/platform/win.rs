@@ -35,9 +35,7 @@ impl SocketProtector for DefaultSocketProtector {
             return Ok(());
         };
 
-        let handle = SOCKET(handle.try_into().map_err(|_| {
-            io::Error::other("invalid socket handle for Windows protector")
-        })?);
+        let handle = SOCKET(handle);
         let family = match socket_family(handle) {
             Ok(family) => family,
             Err(err) => {
