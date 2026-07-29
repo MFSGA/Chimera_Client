@@ -269,7 +269,7 @@ impl TunRunner {
                         info!("reconciling routes for existing tun {}", &tun_name);
                     }
 
-                    maybe_add_routes(cfg, &tun_name)?;
+                    maybe_add_routes(cfg, &tun_name).await?;
 
                     dev
                 }

@@ -105,6 +105,21 @@ pub(super) fn convert(
     match before {
         Some(t) => {
             let (dns_hijack, dns_hijack_rules) = parse_dns_hijack(t.dns_hijack)?;
+            let gateway_v6 = match (t.ipv6, t.gateway_v6) {
+                (Some(false), Some(_)) => {
+                    return Err(Error::InvalidConfig(
+                        "tun ipv6 is false but gateway-v6 is configured".to_owned(),
+                    ));
+                }
+                (Some(true), None) => Some(def::default_tun_address_v6()),
+                (_, gateway) => gateway,
+            };
+            if gateway_v6.is_some() && t.route_table == t.route_table_v6 {
+                return Err(Error::InvalidConfig(
+                    "tun route-table-v6 must differ from route-table when IPv6 is enabled"
+                        .to_owned(),
+                ));
+            }
             let mut route_exclude_address =
                 parse_routes(t.route_exclude_address, "route-exclude-address")?;
 
@@ -147,8 +162,7 @@ pub(super) fn convert(
                 gateway: t.gateway.parse().map_err(|e| {
                     Error::InvalidConfig(format!("parse tun gateway: {e}"))
                 })?,
-                gateway_v6: t
-                    .gateway_v6
+                gateway_v6: gateway_v6
                     .map(|gateway| {
                         gateway.parse().map_err(|e| {
                             Error::InvalidConfig(format!(
@@ -160,6 +174,7 @@ pub(super) fn convert(
                 mtu: t.mtu,
                 so_mark: t.so_mark,
                 route_table: t.route_table,
+                route_table_v6: t.route_table_v6,
                 dns_hijack,
                 dns_hijack_rules,
             })
@@ -197,8 +212,71 @@ mod tests {
 
         assert_eq!(converted.device_id, "utun1989");
         assert_eq!(converted.route_table, 2468);
+        assert_eq!(converted.route_table_v6, 2469);
         assert_eq!(converted.gateway.to_string(), "198.18.0.1/30");
         assert!(!converted.dns_hijack);
+    }
+
+    #[test]
+    fn parse_separate_ipv6_route_table() {
+        let tun = parse_tun("enable: true\nroute-table: 100\nroute-table-v6: 101");
+        let converted = convert(Some(tun)).expect("tun convert should succeed");
+
+        assert_eq!(converted.route_table, 100);
+        assert_eq!(converted.route_table_v6, 101);
+    }
+
+    #[test]
+    fn explicitly_enable_ipv6_with_default_gateway() {
+        let converted = convert(Some(parse_tun("enable: true\nipv6: true")))
+            .expect("IPv6 config should succeed");
+
+        assert_eq!(
+            converted.gateway_v6.unwrap().to_string(),
+            "fd00:198:18::1/126"
+        );
+    }
+
+    #[test]
+    fn preserve_gateway_v6_as_legacy_enable_switch() {
+        let converted =
+            convert(Some(parse_tun("enable: true\ngateway-v6: fd00::1/126")))
+                .expect("legacy IPv6 config should succeed");
+
+        assert_eq!(converted.gateway_v6.unwrap().to_string(), "fd00::1/126");
+    }
+
+    #[test]
+    fn reject_gateway_v6_when_ipv6_is_disabled() {
+        let error = match convert(Some(parse_tun(
+            "enable: true\nipv6: false\ngateway-v6: fd00::1/126",
+        ))) {
+            Ok(_) => panic!("conflicting IPv6 config should fail"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            crate::Error::InvalidConfig(message)
+                if message.contains("ipv6 is false")
+        ));
+    }
+
+    #[test]
+    fn reject_shared_route_table_when_ipv6_is_enabled() {
+        let tun = parse_tun(
+            "enable: true\ngateway-v6: fd00:198:18::1/126\nroute-table: 100\nroute-table-v6: 100",
+        );
+        let error = match convert(Some(tun)) {
+            Ok(_) => panic!("shared table should fail"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            crate::Error::InvalidConfig(message)
+                if message.contains("route-table-v6 must differ")
+        ));
     }
 
     #[test]

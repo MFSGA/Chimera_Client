@@ -1,10 +1,11 @@
 use std::net::IpAddr;
 
 use ipnet::IpNet;
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 use crate::{
-    app::net::OutboundInterface, common::errors::new_io_error,
+    app::net::{OutboundInterface, add_route_to_interface, route_for_destination},
+    common::errors::new_io_error,
     config::internal::config::TunConfig,
 };
 
@@ -41,72 +42,49 @@ pub fn check_ip_command_installed() -> std::io::Result<()> {
         })
 }
 
-pub fn add_route(via: &OutboundInterface, dest: &IpNet) -> std::io::Result<()> {
-    let cmd = std::process::Command::new("ip")
-        .arg("route")
-        .arg("add")
-        .arg(dest.to_string())
-        .arg("dev")
-        .arg(&via.name)
-        .output()?;
-    warn!("executing: ip route add {} dev {}", dest, via.name);
-    if !cmd.status.success() {
-        return Err(new_io_error(format!(
-            "add route failed: {}",
-            String::from_utf8_lossy(&cmd.stderr)
-        )));
-    }
-    Ok(())
+pub async fn add_route(
+    via: &OutboundInterface,
+    dest: &IpNet,
+) -> std::io::Result<()> {
+    add_route_to_interface(*dest, via.index)
+        .await
+        .map_err(|error| new_io_error(error.to_string()))
 }
 
-fn best_route_for(dest: IpAddr) -> std::io::Result<(Option<IpAddr>, String)> {
-    let output = std::process::Command::new("ip")
-        .args(["route", "get", &dest.to_string()])
-        .output()?;
-    warn!("executing: ip route get {}", dest);
-    if !output.status.success() {
-        return Err(new_io_error(format!(
-            "query best route for {} failed: {}",
-            dest,
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let Some(line) = stdout.lines().next() else {
-        return Err(new_io_error(format!("no best route found for {dest}")));
-    };
-
-    let mut gateway = None;
-    let mut dev = None;
-    let mut parts = line.split_whitespace();
-    while let Some(part) = parts.next() {
-        match part {
-            "via" => gateway = parts.next().and_then(|gateway| gateway.parse().ok()),
-            "dev" => {
-                dev = parts.next().map(ToOwned::to_owned);
-            }
-            _ => {}
-        }
-    }
-
-    let dev = dev
-        .ok_or_else(|| new_io_error(format!("no route device found for {dest}")))?;
-    Ok((gateway, dev))
+async fn best_route_for(dest: IpAddr) -> std::io::Result<(Option<IpAddr>, String)> {
+    let route = route_for_destination(dest, None)
+        .await
+        .map_err(|error| new_io_error(error.to_string()))?;
+    Ok((route.gateway, route.interface_name))
 }
 
-fn add_excluded_route(table: &str, dest: &IpNet) -> std::io::Result<()> {
+async fn add_excluded_route(
+    table: &str,
+    dest: &IpNet,
+    transaction: &mut RouteTransaction<'_>,
+) -> std::io::Result<()> {
+    let ipv6 = dest.addr().is_ipv6();
     let cidr = dest.to_string();
-    let (gateway, dev) = best_route_for(dest.addr())?;
+    let (gateway, dev) = best_route_for(dest.addr()).await?;
 
     let mut args = vec!["route", "add", &cidr];
     if let Some(gateway) = gateway {
         let gateway = gateway.to_string();
         args.extend(["via", &gateway, "dev", &dev, "table", table]);
-        run_ip_cmd(&args, false)
+        transaction.apply(
+            &args,
+            &[
+                "route", "del", &cidr, "via", &gateway, "dev", &dev, "table", table,
+            ],
+            ipv6,
+        )
     } else {
         args.extend(["dev", &dev, "table", table]);
-        run_ip_cmd(&args, false)
+        transaction.apply(
+            &args,
+            &["route", "del", &cidr, "dev", &dev, "table", table],
+            ipv6,
+        )
     }
 }
 
@@ -115,7 +93,7 @@ pub fn delete_interface(name: &str) -> std::io::Result<()> {
     let args = ["link", "del", "dev", name];
     let deleted = run_ip_cmd_single(&cmd_str, &args, true)?;
     if deleted {
-        warn!("deleted stale tun interface {}", name);
+        info!("deleted stale tun interface {}", name);
     }
     Ok(())
 }
@@ -126,48 +104,104 @@ fn run_ip_cmd_single(
     allow_missing: bool,
 ) -> std::io::Result<bool> {
     let cmd = std::process::Command::new("ip").args(args).output()?;
-    warn!("executing: {}", cmd_str);
+    debug!("executing: {}", cmd_str);
     if cmd.status.success() {
         return Ok(true);
     }
 
     let stderr = String::from_utf8_lossy(&cmd.stderr);
     if allow_missing && is_missing_ip_state(&stderr) {
-        warn!("{} already absent: {}", cmd_str, stderr.trim());
+        debug!("{} already absent: {}", cmd_str, stderr.trim());
         return Ok(false);
     }
 
     Err(new_io_error(format!("{} failed: {}", cmd_str, stderr)))
 }
 
-/// Run an ip command for IPv4 and optionally IPv6.
-///
-/// When allow_missing is true this returns Ok(false) for already-absent rules
-/// or routes, allowing cleanup to be idempotent across restarts.
-fn run_ip_cmd_with_mode(
+fn run_ip_cmd_for_family(
     args: &[&str],
-    enable_v6: bool,
+    ipv6: bool,
     allow_missing: bool,
 ) -> std::io::Result<bool> {
-    let cmd_str = format!("ip {}", args.join(" "));
-    let mut changed = run_ip_cmd_single(&cmd_str, args, allow_missing)?;
+    if ipv6 {
+        let mut family_args = vec!["-6"];
+        family_args.extend_from_slice(args);
+        run_ip_cmd_single(
+            &format!("ip {}", family_args.join(" ")),
+            &family_args,
+            allow_missing,
+        )
+    } else {
+        run_ip_cmd_single(&format!("ip {}", args.join(" ")), args, allow_missing)
+    }
+}
 
-    if enable_v6 {
-        let mut v6_args = vec!["-6"];
-        v6_args.extend_from_slice(args);
-        let v6_cmd_str = format!("ip -6 {}", args.join(" "));
-        changed |= run_ip_cmd_single(&v6_cmd_str, &v6_args, allow_missing)?;
+trait IpCommandExecutor: Send {
+    fn execute(
+        &mut self,
+        args: &[&str],
+        allow_missing: bool,
+    ) -> std::io::Result<bool>;
+}
+
+struct SystemIpCommandExecutor;
+
+impl IpCommandExecutor for SystemIpCommandExecutor {
+    fn execute(
+        &mut self,
+        args: &[&str],
+        allow_missing: bool,
+    ) -> std::io::Result<bool> {
+        run_ip_cmd_single(&format!("ip {}", args.join(" ")), args, allow_missing)
+    }
+}
+
+struct RouteTransaction<'a> {
+    executor: &'a mut dyn IpCommandExecutor,
+    applied: Vec<Vec<String>>,
+}
+
+impl<'a> RouteTransaction<'a> {
+    fn new(executor: &'a mut dyn IpCommandExecutor) -> Self {
+        Self {
+            executor,
+            applied: Vec::new(),
+        }
     }
 
-    Ok(changed)
+    fn apply(
+        &mut self,
+        add_args: &[&str],
+        delete_args: &[&str],
+        ipv6: bool,
+    ) -> std::io::Result<()> {
+        let mut command = Vec::new();
+        let mut inverse = Vec::new();
+        if ipv6 {
+            command.push("-6".to_owned());
+            inverse.push("-6".to_owned());
+        }
+        command.extend(add_args.iter().map(|arg| (*arg).to_owned()));
+        inverse.extend(delete_args.iter().map(|arg| (*arg).to_owned()));
+        let command = command.iter().map(String::as_str).collect::<Vec<_>>();
+        self.executor.execute(&command, false)?;
+        self.applied.push(inverse);
+        Ok(())
+    }
+
+    fn rollback(&mut self) {
+        while let Some(args) = self.applied.pop() {
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let cmd = format!("ip {}", args.join(" "));
+            if let Err(error) = self.executor.execute(&args, true) {
+                warn!(command = %cmd, %error, "failed to roll back TUN route operation");
+            }
+        }
+    }
 }
 
-fn run_ip_cmd(args: &[&str], enable_v6: bool) -> std::io::Result<()> {
-    run_ip_cmd_with_mode(args, enable_v6, false).map(|_| ())
-}
-
-fn delete_ip_cmd_all(args: &[&str], enable_v6: bool) -> std::io::Result<()> {
-    while run_ip_cmd_with_mode(args, enable_v6, true)? {}
+fn delete_ip_cmd_all(args: &[&str], ipv6: bool) -> std::io::Result<()> {
+    while run_ip_cmd_for_family(args, ipv6, true)? {}
     Ok(())
 }
 
@@ -178,25 +212,70 @@ fn delete_ip_cmd_all(args: &[&str], enable_v6: bool) -> std::io::Result<()> {
 /// # ip rule add pref 102 not fwmark 1234 table 2468
 /// for ipv6
 /// # ip -6 ...
-pub fn setup_policy_routing(
+pub async fn setup_policy_routing(
     tun_cfg: &TunConfig,
     via: &OutboundInterface,
 ) -> std::io::Result<()> {
-    let table = tun_cfg.route_table.to_string();
-    let dev = via.name.as_str();
-    let enable_v6 = tun_cfg.gateway_v6.is_some();
+    let mut executor = SystemIpCommandExecutor;
+    let mut transaction = RouteTransaction::new(&mut executor);
+    let result = setup_policy_routing_inner(tun_cfg, via, &mut transaction).await;
+    if result.is_err() {
+        transaction.rollback();
+    }
+    result
+}
 
-    run_ip_cmd(
-        &["route", "add", "default", "dev", dev, "table", &table],
-        enable_v6,
+async fn setup_policy_routing_inner(
+    tun_cfg: &TunConfig,
+    via: &OutboundInterface,
+    transaction: &mut RouteTransaction<'_>,
+) -> std::io::Result<()> {
+    setup_policy_family(
+        tun_cfg,
+        via,
+        &tun_cfg.route_table.to_string(),
+        false,
+        transaction,
+    )
+    .await?;
+    if tun_cfg.gateway_v6.is_some() {
+        setup_policy_family(
+            tun_cfg,
+            via,
+            &tun_cfg.route_table_v6.to_string(),
+            true,
+            transaction,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn setup_policy_family(
+    tun_cfg: &TunConfig,
+    via: &OutboundInterface,
+    table: &str,
+    ipv6: bool,
+    transaction: &mut RouteTransaction<'_>,
+) -> std::io::Result<()> {
+    let dev = via.name.as_str();
+
+    transaction.apply(
+        &["route", "add", "default", "dev", dev, "table", table],
+        &["route", "del", "default", "dev", dev, "table", table],
+        ipv6,
     )?;
 
-    for route in &tun_cfg.route_exclude_address {
-        add_excluded_route(&table, route)?;
+    for route in tun_cfg
+        .route_exclude_address
+        .iter()
+        .filter(|route| route.addr().is_ipv6() == ipv6)
+    {
+        add_excluded_route(table, route, transaction).await?;
     }
 
     if let Some(so_mark) = tun_cfg.so_mark {
-        run_ip_cmd(
+        transaction.apply(
             &[
                 "rule",
                 "add",
@@ -207,10 +286,20 @@ pub fn setup_policy_routing(
                 "table",
                 "main",
             ],
-            enable_v6,
+            &[
+                "rule",
+                "del",
+                "pref",
+                FWMARK_MAIN_RULE_PREF,
+                "fwmark",
+                &so_mark.to_string(),
+                "table",
+                "main",
+            ],
+            ipv6,
         )?;
 
-        run_ip_cmd(
+        transaction.apply(
             &[
                 "rule",
                 "add",
@@ -220,13 +309,24 @@ pub fn setup_policy_routing(
                 "fwmark",
                 &so_mark.to_string(),
                 "table",
-                &table,
+                table,
             ],
-            enable_v6,
+            &[
+                "rule",
+                "del",
+                "pref",
+                ROUTE_ALL_RULE_PREF,
+                "not",
+                "fwmark",
+                &so_mark.to_string(),
+                "table",
+                table,
+            ],
+            ipv6,
         )?;
     }
 
-    run_ip_cmd(
+    transaction.apply(
         &[
             "rule",
             "add",
@@ -237,11 +337,21 @@ pub fn setup_policy_routing(
             "suppress_prefixlength",
             "0",
         ],
-        enable_v6,
+        &[
+            "rule",
+            "del",
+            "pref",
+            MAIN_SUPPRESS_RULE_PREF,
+            "table",
+            "main",
+            "suppress_prefixlength",
+            "0",
+        ],
+        ipv6,
     )?;
 
     for port in tun_cfg.dns_hijack_udp_ports() {
-        run_ip_cmd(
+        transaction.apply(
             &[
                 "rule",
                 "add",
@@ -252,9 +362,21 @@ pub fn setup_policy_routing(
                 "dport",
                 &port.to_string(),
                 "table",
-                &table,
+                table,
             ],
-            enable_v6,
+            &[
+                "rule",
+                "del",
+                "pref",
+                DNS_HIJACK_RULE_PREF,
+                "ipproto",
+                "udp",
+                "dport",
+                &port.to_string(),
+                "table",
+                table,
+            ],
+            ipv6,
         )?;
     }
 
@@ -272,20 +394,30 @@ pub fn maybe_routes_clean_up(tun_cfg: &TunConfig) -> std::io::Result<()> {
         return Ok(());
     }
 
-    let table = tun_cfg.route_table.to_string();
-    let enable_v6 = tun_cfg.gateway_v6.is_some();
+    clean_up_policy_family(tun_cfg, &tun_cfg.route_table.to_string(), false)?;
+    if tun_cfg.gateway_v6.is_some() {
+        clean_up_policy_family(tun_cfg, &tun_cfg.route_table_v6.to_string(), true)?;
+    }
+    Ok(())
+}
 
-    delete_ip_cmd_all(&["route", "del", "default", "table", &table], enable_v6)?;
+fn clean_up_policy_family(
+    tun_cfg: &TunConfig,
+    table: &str,
+    ipv6: bool,
+) -> std::io::Result<()> {
+    delete_ip_cmd_all(&["route", "del", "default", "table", table], ipv6)?;
 
-    for route in &tun_cfg.route_exclude_address {
+    for route in tun_cfg
+        .route_exclude_address
+        .iter()
+        .filter(|route| route.addr().is_ipv6() == ipv6)
+    {
         delete_ip_cmd_all(
-            &["route", "del", &route.to_string(), "table", &table],
-            enable_v6,
+            &["route", "del", &route.to_string(), "table", table],
+            ipv6,
         )?;
     }
-
-    // Also removes the broad source-address bypass emitted by older builds.
-    delete_ip_cmd_all(&["rule", "del", "pref", "90", "table", "main"], false)?;
 
     if let Some(so_mark) = tun_cfg.so_mark {
         delete_ip_cmd_all(
@@ -299,7 +431,7 @@ pub fn maybe_routes_clean_up(tun_cfg: &TunConfig) -> std::io::Result<()> {
                 "table",
                 "main",
             ],
-            enable_v6,
+            ipv6,
         )?;
 
         delete_ip_cmd_all(
@@ -312,34 +444,9 @@ pub fn maybe_routes_clean_up(tun_cfg: &TunConfig) -> std::io::Result<()> {
                 "fwmark",
                 &so_mark.to_string(),
                 "table",
-                &table,
+                table,
             ],
-            enable_v6,
-        )?;
-
-        delete_ip_cmd_all(
-            &[
-                "rule",
-                "del",
-                "fwmark",
-                &so_mark.to_string(),
-                "table",
-                "main",
-            ],
-            enable_v6,
-        )?;
-
-        delete_ip_cmd_all(
-            &[
-                "rule",
-                "del",
-                "not",
-                "fwmark",
-                &so_mark.to_string(),
-                "table",
-                &table,
-            ],
-            enable_v6,
+            ipv6,
         )?;
     }
     delete_ip_cmd_all(
@@ -353,11 +460,7 @@ pub fn maybe_routes_clean_up(tun_cfg: &TunConfig) -> std::io::Result<()> {
             "suppress_prefixlength",
             "0",
         ],
-        enable_v6,
-    )?;
-    delete_ip_cmd_all(
-        &["rule", "del", "table", "main", "suppress_prefixlength", "0"],
-        enable_v6,
+        ipv6,
     )?;
 
     for port in tun_cfg.dns_hijack_udp_ports() {
@@ -372,42 +475,41 @@ pub fn maybe_routes_clean_up(tun_cfg: &TunConfig) -> std::io::Result<()> {
                 "dport",
                 &port.to_string(),
                 "table",
-                &table,
+                table,
             ],
-            enable_v6,
+            ipv6,
         )?;
     }
-
-    // Remove rules left by older builds that did not include ipproto.
-    delete_ip_cmd_all(
-        &[
-            "rule",
-            "del",
-            "pref",
-            DNS_HIJACK_RULE_PREF,
-            "dport",
-            "53",
-            "table",
-            &table,
-        ],
-        enable_v6,
-    )?;
-    // Remove the rule emitted by transparent-dns step 1.
-    delete_ip_cmd_all(
-        &[
-            "rule", "del", "pref", "101", "ipproto", "udp", "dport", "53", "table",
-            &table,
-        ],
-        enable_v6,
-    )?;
-    delete_ip_cmd_all(&["rule", "del", "dport", "53", "table", &table], enable_v6)?;
 
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::is_missing_ip_state;
+    use super::{IpCommandExecutor, RouteTransaction, is_missing_ip_state};
+
+    #[derive(Default)]
+    struct MockExecutor {
+        commands: Vec<(Vec<String>, bool)>,
+        fail_at: Option<usize>,
+    }
+
+    impl IpCommandExecutor for MockExecutor {
+        fn execute(
+            &mut self,
+            args: &[&str],
+            allow_missing: bool,
+        ) -> std::io::Result<bool> {
+            self.commands.push((
+                args.iter().map(|arg| (*arg).to_owned()).collect(),
+                allow_missing,
+            ));
+            if self.fail_at == Some(self.commands.len()) {
+                return Err(std::io::Error::other("injected command failure"));
+            }
+            Ok(true)
+        }
+    }
 
     #[test]
     fn detect_missing_ip_rule_errors() {
@@ -417,5 +519,80 @@ mod tests {
         assert!(is_missing_ip_state("RTNETLINK answers: No such process"));
         assert!(is_missing_ip_state("Error: FIB table does not exist."));
         assert!(!is_missing_ip_state("RTNETLINK answers: File exists"));
+    }
+
+    #[test]
+    fn rollback_runs_only_applied_operations_in_reverse_order() {
+        let mut executor = MockExecutor {
+            fail_at: Some(2),
+            ..Default::default()
+        };
+        {
+            let mut transaction = RouteTransaction::new(&mut executor);
+            transaction
+                .apply(
+                    &["route", "add", "first"],
+                    &["route", "del", "first"],
+                    false,
+                )
+                .unwrap();
+            transaction
+                .apply(
+                    &["route", "add", "second"],
+                    &["route", "del", "second"],
+                    false,
+                )
+                .unwrap_err();
+            transaction.rollback();
+        }
+
+        assert_eq!(
+            executor.commands,
+            vec![
+                (vec!["route".into(), "add".into(), "first".into()], false,),
+                (vec!["route".into(), "add".into(), "second".into()], false,),
+                (vec!["route".into(), "del".into(), "first".into()], true,),
+            ]
+        );
+    }
+
+    #[test]
+    fn ipv6_transaction_prefixes_apply_and_rollback_commands() {
+        let mut executor = MockExecutor::default();
+        {
+            let mut transaction = RouteTransaction::new(&mut executor);
+            transaction
+                .apply(
+                    &["route", "add", "default"],
+                    &["route", "del", "default"],
+                    true,
+                )
+                .unwrap();
+            transaction.rollback();
+        }
+
+        assert_eq!(
+            executor.commands,
+            vec![
+                (
+                    vec![
+                        "-6".into(),
+                        "route".into(),
+                        "add".into(),
+                        "default".into(),
+                    ],
+                    false,
+                ),
+                (
+                    vec![
+                        "-6".into(),
+                        "route".into(),
+                        "del".into(),
+                        "default".into(),
+                    ],
+                    true,
+                ),
+            ]
+        );
     }
 }

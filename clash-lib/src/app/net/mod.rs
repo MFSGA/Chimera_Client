@@ -57,6 +57,12 @@ pub enum RouteSelectionError {
         destination: IpAddr,
         message: String,
     },
+    #[error("failed to {operation} route {destination}: {message}")]
+    NetlinkOperation {
+        operation: &'static str,
+        destination: ipnet::IpNet,
+        message: String,
+    },
     #[error("invalid route query output for {destination}: {message}")]
     InvalidOutput {
         destination: IpAddr,
@@ -206,6 +212,48 @@ pub async fn route_for_destination(
         table: parsed.table,
         metric: parsed.metric,
     })
+}
+
+#[cfg(all(feature = "tun", target_os = "linux"))]
+fn build_interface_route(
+    destination: ipnet::IpNet,
+    interface_index: u32,
+) -> std::result::Result<
+    rtnetlink::packet_route::route::RouteMessage,
+    RouteSelectionError,
+> {
+    use rtnetlink::{RouteMessageBuilder, packet_route::route::RouteScope};
+
+    Ok(RouteMessageBuilder::<IpAddr>::new()
+        .destination_prefix(destination.addr(), destination.prefix_len())
+        .map_err(|error| RouteSelectionError::NetlinkOperation {
+            operation: "build",
+            destination,
+            message: error.to_string(),
+        })?
+        .output_interface(interface_index)
+        .scope(RouteScope::Link)
+        .build())
+}
+
+#[cfg(all(feature = "tun", target_os = "linux"))]
+pub async fn add_route_to_interface(
+    destination: ipnet::IpNet,
+    interface_index: u32,
+) -> std::result::Result<(), RouteSelectionError> {
+    let route = build_interface_route(destination, interface_index)?;
+
+    route_netlink_handle()
+        .await?
+        .route()
+        .add(route)
+        .execute()
+        .await
+        .map_err(|error| RouteSelectionError::NetlinkOperation {
+            operation: "add",
+            destination,
+            message: error.to_string(),
+        })
 }
 
 #[cfg(any(not(feature = "tun"), not(target_os = "linux")))]
@@ -729,5 +777,29 @@ mod tests {
         assert_eq!(route.interface_index, 7);
         assert_eq!(route.gateway, None);
         assert_eq!(route.table, 254);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn builds_link_scoped_interface_route() {
+        use rtnetlink::packet_route::route::{RouteAttribute, RouteScope};
+
+        let destination = "fd00:198:18::/64".parse().unwrap();
+        let message = super::build_interface_route(destination, 42).unwrap();
+
+        assert_eq!(message.header.destination_prefix_length, 64);
+        assert_eq!(message.header.scope, RouteScope::Link);
+        assert!(
+            message
+                .attributes
+                .iter()
+                .any(|attribute| matches!(attribute, RouteAttribute::Oif(42)))
+        );
+        assert!(message.attributes.iter().any(|attribute| matches!(
+            attribute,
+            RouteAttribute::Destination(address)
+                if super::route_address_to_ip(address)
+                    == Some("fd00:198:18::".parse().unwrap())
+        )));
     }
 }

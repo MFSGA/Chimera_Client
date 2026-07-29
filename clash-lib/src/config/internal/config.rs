@@ -204,6 +204,7 @@ pub struct TunConfig {
     pub mtu: Option<u16>,
     pub so_mark: Option<u32>,
     pub route_table: u32,
+    pub route_table_v6: u32,
     pub dns_hijack: bool,
     pub dns_hijack_rules: Vec<DnsHijackRule>,
 }

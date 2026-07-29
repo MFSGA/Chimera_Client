@@ -17,6 +17,7 @@ use crate::{
 };
 
 const DEFAULT_ROUTE_TABLE: u32 = 2468;
+const DEFAULT_ROUTE_TABLE_V6: u32 = 2469;
 
 fn default_tun_device_id() -> String {
     "utun1989".to_string()
@@ -28,8 +29,16 @@ fn default_tun_address() -> String {
     "198.18.0.1/30".to_string()
 }
 
+pub(crate) fn default_tun_address_v6() -> String {
+    "fd00:198:18::1/126".to_string()
+}
+
 fn default_route_table() -> u32 {
     DEFAULT_ROUTE_TABLE
+}
+
+fn default_route_table_v6() -> u32 {
+    DEFAULT_ROUTE_TABLE_V6
 }
 
 /// todo: will support only in gui
@@ -59,6 +68,7 @@ pub struct TunConfig {
     pub device_id: String,
     #[serde(default = "default_tun_address")]
     pub gateway: String,
+    pub ipv6: Option<bool>,
     #[serde(alias = "gateway_v6", alias = "gateway-v6")]
     pub gateway_v6: Option<String>,
     pub routes: Option<Vec<String>>,
@@ -75,6 +85,8 @@ pub struct TunConfig {
     pub so_mark: Option<u32>,
     #[serde(default = "default_route_table", alias = "route_table")]
     pub route_table: u32,
+    #[serde(default = "default_route_table_v6", alias = "route_table_v6")]
+    pub route_table_v6: u32,
     #[serde(default, alias = "dns_hijack")]
     pub dns_hijack: DnsHijack,
 }

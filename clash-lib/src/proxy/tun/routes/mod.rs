@@ -33,7 +33,10 @@ use crate::config::internal::config::TunConfig;
 use crate::app::net::get_interface_by_name;
 
 #[allow(dead_code)]
-pub fn maybe_add_routes(cfg: &TunConfig, tun_name: &str) -> std::io::Result<()> {
+pub async fn maybe_add_routes(
+    cfg: &TunConfig,
+    tun_name: &str,
+) -> std::io::Result<()> {
     if cfg.route_all || !cfg.routes.is_empty() {
         #[cfg(target_os = "linux")]
         linux::check_ip_command_installed()?;
@@ -111,6 +114,9 @@ pub fn maybe_add_routes(cfg: &TunConfig, tun_name: &str) -> std::io::Result<()> 
                 }
 
                 for r in default_routes {
+                    #[cfg(target_os = "linux")]
+                    add_route(&tun_iface, &r).await?;
+                    #[cfg(not(target_os = "linux"))]
                     add_route(&tun_iface, &r)?;
                 }
 
@@ -144,10 +150,13 @@ pub fn maybe_add_routes(cfg: &TunConfig, tun_name: &str) -> std::io::Result<()> 
             }
             #[cfg(target_os = "linux")]
             {
-                linux::setup_policy_routing(cfg, &tun_iface)?;
+                linux::setup_policy_routing(cfg, &tun_iface).await?;
             }
         } else {
             for r in &cfg.routes {
+                #[cfg(target_os = "linux")]
+                add_route(&tun_iface, r).await?;
+                #[cfg(not(target_os = "linux"))]
                 add_route(&tun_iface, r)?;
             }
         }
