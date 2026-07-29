@@ -229,6 +229,24 @@ pub fn setup_default_crypto_provider() {
     });
 }
 
+async fn wait_for_shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        )?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
+}
+
 pub async fn start(
     config: InternalConfig,
     cwd: String,
@@ -394,7 +412,7 @@ pub async fn start(
     });
 
     tokio::select! {
-        result = tokio::signal::ctrl_c() => {
+        result = wait_for_shutdown_signal() => {
             result.map_err(Error::Io)?;
             shutdown_token.cancel();
         }
