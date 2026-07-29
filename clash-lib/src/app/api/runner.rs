@@ -6,7 +6,7 @@ use axum::{
     routing::{get, post},
 };
 
-use http::{Method, header};
+use http::{HeaderValue, Method, header};
 use tokio::sync::{Mutex, broadcast::Sender};
 use tower::{Layer, ServiceBuilder, util::MapRequestLayer};
 use tower_http::{
@@ -51,6 +51,77 @@ pub struct ApiRunner {
     ipv6_allowed: bool,
     task:
         std::sync::Mutex<Option<tokio::task::JoinHandle<Result<(), crate::Error>>>>,
+}
+
+fn build_cors_layer(configured_origins: Option<&[String]>) -> (CorsLayer, usize) {
+    let mut allow_any_origin = false;
+    let mut valid_origins = Vec::new();
+
+    for value in configured_origins.unwrap_or_default() {
+        if value == "*" {
+            allow_any_origin = true;
+            continue;
+        }
+
+        if value == "null" {
+            valid_origins.push(HeaderValue::from_static("null"));
+            continue;
+        }
+
+        let uri = match value.parse::<http::Uri>() {
+            Ok(uri) => uri,
+            Err(err) => {
+                warn!("ignored invalid CORS origin '{}': {}", value, err);
+                continue;
+            }
+        };
+        let (Some(scheme), Some(authority)) = (uri.scheme(), uri.authority()) else {
+            warn!(
+                "ignored invalid CORS origin '{}': expected scheme://authority",
+                value
+            );
+            continue;
+        };
+        if uri.path() != "/" || uri.query().is_some() {
+            warn!(
+                "ignored invalid CORS origin '{}': paths and queries are not allowed",
+                value
+            );
+            continue;
+        }
+
+        let normalized = format!("{scheme}://{authority}");
+        match normalized.parse::<HeaderValue>() {
+            Ok(origin) => valid_origins.push(origin),
+            Err(err) => warn!("ignored invalid CORS origin '{}': {}", value, err),
+        }
+    }
+
+    let valid_origin_count = valid_origins.len() + usize::from(allow_any_origin);
+    let cors = CorsLayer::new()
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
+
+    if allow_any_origin {
+        (
+            cors.allow_private_network(true).allow_origin(Any),
+            valid_origin_count,
+        )
+    } else if valid_origins.is_empty() {
+        (cors, 0)
+    } else {
+        (
+            cors.allow_private_network(true)
+                .allow_origin(AllowOrigin::from(valid_origins)),
+            valid_origin_count,
+        )
+    }
 }
 
 impl ApiRunner {
@@ -114,39 +185,14 @@ impl Runner for ApiRunner {
         let ipc_addr = controller_cfg.external_controller_ipc;
         let tcp_addr = controller_cfg.external_controller;
 
-        let origins: AllowOrigin = controller_cfg
-            .cors_allow_origins
-            .as_ref()
-            .map(|origins| {
-                origins
-                    .iter()
-                    .filter_map(|value| match value.parse() {
-                        Ok(origin) => Some(origin),
-                        Err(err) => {
-                            warn!(
-                                "ignored invalid CORS origin '{}': {}",
-                                value, err
-                            );
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .into()
-            })
-            .unwrap_or_else(|| Any.into());
-
-        let cors = CorsLayer::new()
-            .allow_methods([
-                Method::GET,
-                Method::POST,
-                Method::PUT,
-                Method::PATCH,
-                // todo: decide if we want to allow DELETE method
-                Method::DELETE,
-            ])
-            .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
-            .allow_private_network(true)
-            .allow_origin(origins);
+        let (cors, valid_cors_origin_count) =
+            build_cors_layer(controller_cfg.cors_allow_origins.as_deref());
+        if valid_cors_origin_count == 0 {
+            debug!(
+                "cross-origin browser access to the API is disabled; configure \
+                 cors-allow-origins to enable it"
+            );
+        }
 
         let app_state = Arc::new(AppState {
             log_source_tx: self.log_source.clone(),
@@ -201,7 +247,17 @@ impl Runner for ApiRunner {
                 ))
                 .route_layer(cors)
                 .with_state(app_state.clone())
-                .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()));
+                .layer(ServiceBuilder::new().layer(
+                    TraceLayer::new_for_http().make_span_with(
+                        |request: &http::Request<axum::body::Body>| {
+                            tracing::debug_span!(
+                                "http_request",
+                                method = %request.method(),
+                                path = %request.uri().path()
+                            )
+                        },
+                    ),
+                ));
 
             if let Some(external_ui) = controller_cfg.external_ui.clone() {
                 router = router
@@ -261,20 +317,18 @@ impl Runner for ApiRunner {
                                     .to_string(),
                             ));
                         }
-                        if !addr.ip().is_loopback()
-                            && controller_cfg.cors_allow_origins.is_none()
-                        {
+                        if !addr.ip().is_loopback() && valid_cors_origin_count == 0 {
                             error!(
                                 "API server is listening on a non-loopback address \
-                             without CORS origins configured. This is insecure!"
+                                 without any valid CORS origins. This is insecure!"
                             );
                             error!(
-                                "Please set CORS origins in the configuration to \
-                             secure the API server."
+                                "Please configure at least one valid \
+                                 cors-allow-origins entry."
                             );
                             return Err(crate::Error::Operation(
                                 "API server is listening on a non-loopback address \
-                             without CORS origins configured. This is insecure!"
+                                 without any valid CORS origins"
                                     .to_string(),
                             ));
                         }
@@ -362,5 +416,82 @@ impl Runner for ApiRunner {
                 None => Ok(()),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::Body, routing::get};
+    use http::{Request, header};
+    use tower::ServiceExt as _;
+
+    async fn call_with_cors(
+        configured_origins: Option<&[String]>,
+        request: Request<Body>,
+    ) -> http::Response<Body> {
+        let (cors, _) = build_cors_layer(configured_origins);
+        Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(cors)
+            .oneshot(request)
+            .await
+            .expect("CORS test router should respond")
+    }
+
+    #[tokio::test]
+    async fn cors_is_disabled_without_explicit_origins() {
+        let request = Request::builder()
+            .uri("/")
+            .header(header::ORIGIN, "https://evil.example")
+            .body(Body::empty())
+            .expect("request should build");
+
+        let response = call_with_cors(None, request).await;
+
+        assert!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_origin_enables_cors_and_private_network_access() {
+        let origins = vec!["https://dashboard.example".to_owned()];
+        let request = Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/")
+            .header(header::ORIGIN, "https://dashboard.example")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+            .header("access-control-request-private-network", "true")
+            .body(Body::empty())
+            .expect("request should build");
+
+        let response = call_with_cors(Some(&origins), request).await;
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .expect("configured origin should be allowed"),
+            "https://dashboard.example"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-private-network")
+                .expect("private network access should be explicitly allowed"),
+            "true"
+        );
+    }
+
+    #[test]
+    fn invalid_origins_do_not_count_as_configured() {
+        let origins = vec!["https://example.com/path".to_owned()];
+        let (_, valid_origin_count) = build_cors_layer(Some(&origins));
+
+        assert_eq!(valid_origin_count, 0);
     }
 }

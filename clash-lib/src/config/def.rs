@@ -101,9 +101,10 @@ pub struct Config {
     /// 2. # Note
     /// - setting this to `*` will listen on all interfaces, which is
     ///   essentially the same as setting it to `0.0.0.0`
-    /// - setting this to non local IP will enable `allow_lan` automatically
-    /// - and if you don't want `allow_lan` to be enabled, you should set this
-    ///   to `localhost` or `127.1`
+    /// - binding to a wildcard or non-loopback address does not enable LAN
+    ///   access by itself; `allow-lan: true` must still be set explicitly
+    /// - to keep the proxy local-only, use a loopback address such as
+    ///   `localhost` or `127.0.0.1`
     pub bind_address: BindAddress,
     /// 3. Proxy settings
     #[serde(rename = "proxies")]

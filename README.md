@@ -58,6 +58,35 @@ cargo run -p clash-rs -- -t -c config.yaml
 cargo run -p clash-rs -- --version
 ```
 
+## 局域网代理
+
+局域网代理需要同时显式开启访问权限并监听非回环地址：
+
+```yaml
+allow-lan: true
+bind-address: 0.0.0.0
+
+port: 7890
+socks-port: 7891
+mixed-port: 7892
+
+# 对局域网开放时建议配置认证。
+authentication:
+  - "proxy-user:replace-with-a-strong-password"
+```
+
+其他设备应使用运行 Chimera 的电脑在局域网中的 IPv4 地址，而不是 `127.0.0.1`。控制 API 的 `GET /configs` 会在 `lan-ips` 中返回候选地址。
+
+`bind-address: 0.0.0.0` 本身不会自动允许其他设备访问；`allow-lan: true` 仍然是必需条件。Windows 用户还需要允许 Chimera 通过专用网络防火墙，并确认路由器没有启用客户端隔离。
+
+目前已对 SOCKS5 TCP、HTTP CONNECT 和 Mixed 中的 SOCKS5 TCP 进行真实非回环地址端到端测试。传统 SOCKS、HTTP 和 Mixed 入口尚无独立 UDP 监听，因此暂不宣称支持 SOCKS5 UDP ASSOCIATE。
+
+对应测试：
+
+```bash
+cargo test -p clash-lib --test lan_proxy_tests --all-features -- --nocapture
+```
+
 ## Feature 设计
 
 项目通过 Cargo features 控制可选功能。常见 feature 包括：

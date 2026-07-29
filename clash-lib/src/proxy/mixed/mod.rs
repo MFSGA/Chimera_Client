@@ -5,7 +5,12 @@ use crate::{
     session::{Network, Session},
 };
 
-use super::{http, inbound::InboundHandlerTrait, socks, utils::apply_tcp_options};
+use super::{
+    http,
+    inbound::{InboundHandlerTrait, is_inbound_client_allowed},
+    socks,
+    utils::apply_tcp_options,
+};
 use crate::common::errors::new_io_error;
 use async_trait::async_trait;
 use hyper_util::rt::TokioIo;
@@ -72,9 +77,11 @@ impl InboundHandlerTrait for MixedInbound {
                     continue;
                 }
             };
-            if !self.allow_lan
-                && src_addr.ip() != socket.local_addr()?.ip().to_canonical()
-            {
+            if !is_inbound_client_allowed(
+                self.allow_lan,
+                src_addr,
+                socket.local_addr()?,
+            ) {
                 warn!("Connection from {} is not allowed", src_addr);
                 continue;
             }

@@ -12,7 +12,7 @@ use crate::{
     Dispatcher,
     config::internal::listener::InboundUser,
     proxy::{
-        inbound::InboundHandlerTrait,
+        inbound::{InboundHandlerTrait, is_inbound_client_allowed},
         utils::{ToCanonical, try_create_dualstack_tcplistener},
     },
 };
@@ -91,8 +91,6 @@ impl InboundHandlerTrait for AnytlsInbound {
 
     async fn listen_tcp(&self) -> std::io::Result<()> {
         let listener = try_create_dualstack_tcplistener(self.addr)?;
-        let local_addr = listener.local_addr()?;
-        let local_ip = local_addr.ip();
 
         let mut users_rx = self.users_rx.clone();
         let mut user_map =
@@ -111,10 +109,11 @@ impl InboundHandlerTrait for AnytlsInbound {
 
                     let src_addr = src_addr.to_canonical();
 
-                    if !self.allow_lan
-                        && !local_ip.is_unspecified()
-                        && src_addr.ip() != local_ip
-                    {
+                    if !is_inbound_client_allowed(
+                        self.allow_lan,
+                        src_addr,
+                        stream.local_addr()?,
+                    ) {
                         warn!(
                             "anytls inbound {}: connection from {} rejected (not allowed)",
                             self.addr, src_addr

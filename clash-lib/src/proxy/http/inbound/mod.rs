@@ -6,7 +6,7 @@ use crate::{
     app::dispatcher::Dispatcher,
     common::{auth::ThreadSafeAuthenticator, errors::new_io_error},
     proxy::{
-        inbound::InboundHandlerTrait,
+        inbound::{InboundHandlerTrait, is_inbound_client_allowed},
         utils::{ToCanonical, apply_tcp_options, try_create_dualstack_tcplistener},
     },
 };
@@ -66,9 +66,11 @@ impl InboundHandlerTrait for HttpInbound {
             let (socket, _) = listener.accept().await?;
             let src_addr = socket.peer_addr()?.to_canonical();
 
-            if !self.allow_lan
-                && src_addr.ip() != socket.local_addr()?.ip().to_canonical()
-            {
+            if !is_inbound_client_allowed(
+                self.allow_lan,
+                src_addr,
+                socket.local_addr()?,
+            ) {
                 warn!("Connection from {} is not allowed", src_addr);
                 continue;
             }
