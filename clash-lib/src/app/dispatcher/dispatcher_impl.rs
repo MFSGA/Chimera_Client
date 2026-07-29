@@ -113,7 +113,7 @@ impl Dispatcher {
             RunMode::Direct => (PROXY_DIRECT, None),
         };
 
-        let rule_summary = rule_summary(rule);
+        let rule_summary = rule_summary(rule.map(Box::as_ref));
         debug!("dispatching {} to {}[{}]", sess, outbound_name, mode);
 
         let mgr = self.outbound_manager.clone();
@@ -354,7 +354,7 @@ impl Dispatcher {
                         outbound_name
                     };
 
-                let rule_summary = rule_summary(rule);
+                let rule_summary = rule_summary(rule.map(Box::as_ref));
                 debug!(
                     outbound_name = %outbound_name,
                     rule = %rule_summary,
@@ -620,7 +620,7 @@ async fn reverse_lookup(
     Some(dst)
 }
 
-fn rule_summary(rule: Option<&Box<dyn crate::app::router::RuleMatcher>>) -> String {
+fn rule_summary(rule: Option<&dyn crate::app::router::RuleMatcher>) -> String {
     rule.map(|rule| {
         let payload = rule.payload();
         if payload.is_empty() {
@@ -807,6 +807,7 @@ impl OutboundHandleMap {
     }
 }
 
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::{OutboundHandleMap, try_queue_outbound_packet};

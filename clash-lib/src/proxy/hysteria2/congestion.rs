@@ -133,11 +133,7 @@ impl Controller for Brutal {
             None => max_budget,
         };
 
-        self.budget_at_last_sent = if bytes > budget as u64 {
-            0
-        } else {
-            budget as u64 - bytes
-        };
+        self.budget_at_last_sent = (budget as u64).saturating_sub(bytes);
         self.last_send_time = Some(now);
     }
 

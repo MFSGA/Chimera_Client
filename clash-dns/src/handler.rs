@@ -528,10 +528,7 @@ mod tests {
     use hickory_proto::rr::{DNSClass, Name, RData, RecordType};
     use rustls::{ClientConfig, pki_types::ServerName};
     use std::{sync::Arc, time::Duration};
-    use tokio::{
-        net::{TcpListener, UdpSocket},
-        task::JoinHandle,
-    };
+    use tokio::net::{TcpListener, UdpSocket};
 
     async fn send_query(
         client: &mut Client<TokioRuntimeProvider>,
@@ -635,10 +632,10 @@ mod tests {
             super::get_dns_listener(cfg, mock_exchanger, std::path::Path::new("."))
                 .await;
         assert!(listener.is_some());
-        let _: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+        std::mem::drop(tokio::spawn(async move {
             listener.unwrap().await?;
-            Ok(())
-        });
+            Ok::<(), anyhow::Error>(())
+        }));
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 

@@ -211,10 +211,12 @@ pub fn resolve_outbound_interface(
         Interface::Name(name) => get_interface_by_name(name),
     });
 
-    if interface.is_some() && configured.is_none() {
+    if let Some(interface) = interface
+        && configured.is_none()
+    {
         warn!(
             "configured outbound interface {} not found, falling back to auto-detect",
-            interface.expect("checked is_some")
+            interface
         );
     }
 
