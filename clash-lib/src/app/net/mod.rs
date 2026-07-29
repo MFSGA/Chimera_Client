@@ -301,7 +301,7 @@ pub async fn init_net_config(
     interface: Option<&Interface>,
 ) -> Result<()> {
     *DEFAULT_OUTBOUND_INTERFACE.write().await =
-        resolve_outbound_interface(interface)?;
+        resolve_outbound_interface(interface).await?;
     *TUN_SOMARK.write().await = tun_somark;
     trace!(
         "default outbound interface: {:?}, tun somark: {:?}",
@@ -458,9 +458,29 @@ pub fn get_interface_by_ip(ip: IpAddr) -> Option<OutboundInterface> {
 }
 
 #[cfg(all(feature = "tun", target_os = "linux"))]
-fn validate_linux_interface_flags(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxOperState {
+    Unknown,
+    Down,
+    Up,
+    Other,
+}
+
+#[cfg(all(feature = "tun", target_os = "linux"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LinuxInterfaceState {
+    index: u32,
+    name: String,
+    admin_up: bool,
+    lower_up: Option<bool>,
+    oper_state: Option<LinuxOperState>,
+    carrier: Option<bool>,
+}
+
+#[cfg(all(feature = "tun", target_os = "linux"))]
+fn validate_linux_interface_state(
     interface: &OutboundInterface,
-    flags: u32,
+    state: &LinuxInterfaceState,
 ) -> Result<()> {
     let families = match (interface.addr_v4.is_some(), interface.addr_v6.is_some()) {
         (true, true) => "IPv4/IPv6",
@@ -469,53 +489,101 @@ fn validate_linux_interface_flags(
         (false, false) => "none",
     };
 
-    for (flag, state) in [
-        (libc::IFF_UP as u32, "UP"),
-        (libc::IFF_RUNNING as u32, "RUNNING"),
-    ] {
-        if flags & flag == 0 {
-            return Err(Error::InvalidConfig(format!(
-                "configured outbound interface \"{}\" is not {state}: \
-                 index={}, family={families}",
-                interface.name, interface.index
-            )));
-        }
+    if !state.admin_up {
+        return Err(Error::InvalidConfig(format!(
+            "configured outbound interface \"{}\" is not administratively UP: \
+             index={}, family={families}, admin_up={}, lower_up={:?}, \
+             oper_state={:?}, carrier={:?}; enable the interface or choose \
+             another interface-name",
+            state.name,
+            state.index,
+            state.admin_up,
+            state.lower_up,
+            state.oper_state,
+            state.carrier,
+        )));
     }
 
     Ok(())
 }
 
 #[cfg(all(feature = "tun", target_os = "linux"))]
-fn validate_configured_interface_state(interface: &OutboundInterface) -> Result<()> {
-    let flags_path = format!("/sys/class/net/{}/flags", interface.name);
-    let raw_flags = std::fs::read_to_string(&flags_path).map_err(|error| {
-        Error::InvalidConfig(format!(
-            "failed to inspect configured outbound interface \"{}\": \
-             index={}, error={error}",
-            interface.name, interface.index
-        ))
-    })?;
-    let flags = u32::from_str_radix(raw_flags.trim().trim_start_matches("0x"), 16)
-        .map_err(|error| {
-        Error::InvalidConfig(format!(
-            "failed to parse state for configured outbound interface \"{}\": \
-             index={}, error={error}",
-            interface.name, interface.index
-        ))
-    })?;
+async fn inspect_linux_interface_state(
+    interface: &OutboundInterface,
+) -> Result<LinuxInterfaceState> {
+    use futures::TryStreamExt;
+    use rtnetlink::packet_route::link::{LinkAttribute, LinkFlags, State};
 
-    validate_linux_interface_flags(interface, flags)
+    let handle = route_netlink_handle().await.map_err(|error| {
+        Error::InvalidConfig(format!(
+            "failed to inspect configured outbound interface \"{}\" via \
+             rtnetlink: index={}, error={error}",
+            interface.name, interface.index
+        ))
+    })?;
+    let mut links = handle.link().get().match_index(interface.index).execute();
+    let message = links
+        .try_next()
+        .await
+        .map_err(|error| {
+            Error::InvalidConfig(format!(
+                "failed to inspect configured outbound interface \"{}\" via \
+                 rtnetlink: index={}, error={error}",
+                interface.name, interface.index
+            ))
+        })?
+        .ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "configured outbound interface \"{}\" disappeared during \
+                 rtnetlink inspection: index={}",
+                interface.name, interface.index
+            ))
+        })?;
+
+    let mut oper_state = None;
+    let mut carrier = None;
+    for attribute in &message.attributes {
+        match attribute {
+            LinkAttribute::OperState(value) => {
+                oper_state = Some(match value {
+                    State::Unknown => LinuxOperState::Unknown,
+                    State::Down | State::LowerLayerDown => LinuxOperState::Down,
+                    State::Up => LinuxOperState::Up,
+                    _ => LinuxOperState::Other,
+                });
+            }
+            LinkAttribute::Carrier(value) => carrier = Some(*value != 0),
+            _ => {}
+        }
+    }
+
+    Ok(LinuxInterfaceState {
+        index: message.header.index,
+        name: interface.name.clone(),
+        admin_up: message.header.flags.contains(LinkFlags::Up),
+        lower_up: Some(message.header.flags.contains(LinkFlags::LowerUp)),
+        oper_state,
+        carrier,
+    })
+}
+
+#[cfg(all(feature = "tun", target_os = "linux"))]
+async fn validate_configured_interface_state(
+    interface: &OutboundInterface,
+) -> Result<()> {
+    let state = inspect_linux_interface_state(interface).await?;
+    validate_linux_interface_state(interface, &state)
 }
 
 #[cfg(all(feature = "tun", not(target_os = "linux")))]
-fn validate_configured_interface_state(
+async fn validate_configured_interface_state(
     _interface: &OutboundInterface,
 ) -> Result<()> {
     Ok(())
 }
 
 #[cfg(feature = "tun")]
-pub fn resolve_outbound_interface(
+pub async fn resolve_outbound_interface(
     interface: Option<&Interface>,
 ) -> Result<Option<OutboundInterface>> {
     let Some(interface) = interface else {
@@ -539,7 +607,7 @@ pub fn resolve_outbound_interface(
         )));
     }
 
-    validate_configured_interface_state(&configured)?;
+    validate_configured_interface_state(&configured).await?;
 
     Ok(Some(configured))
 }
@@ -678,11 +746,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn configured_interface_does_not_fall_back_when_missing() {
+    #[tokio::test]
+    async fn configured_interface_does_not_fall_back_when_missing() {
         let interface = Interface::Name("__chimera_missing_interface__".to_owned());
 
-        let error = resolve_outbound_interface(Some(&interface)).unwrap_err();
+        let error = resolve_outbound_interface(Some(&interface))
+            .await
+            .unwrap_err();
 
         assert!(matches!(
             error,
@@ -693,39 +763,66 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn unconfigured_interface_does_not_guess_an_outbound() {
-        assert!(resolve_outbound_interface(None).unwrap().is_none());
+    #[tokio::test]
+    async fn unconfigured_interface_does_not_guess_an_outbound() {
+        assert!(resolve_outbound_interface(None).await.unwrap().is_none());
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn configured_interface_must_be_up_and_running() {
+    fn netlink_interface_state_requires_admin_up() {
         let interface = test_interface();
-
-        let down = super::validate_linux_interface_flags(&interface, 0).unwrap_err();
+        let state = super::LinuxInterfaceState {
+            index: 42,
+            name: "test0".to_owned(),
+            admin_up: false,
+            lower_up: Some(true),
+            oper_state: Some(super::LinuxOperState::Up),
+            carrier: Some(true),
+        };
+        let down =
+            super::validate_linux_interface_state(&interface, &state).unwrap_err();
         assert!(matches!(
             down,
             Error::InvalidConfig(message)
-                if message.contains("is not UP")
+                if message.contains("is not administratively UP")
                     && message.contains("index=42")
                     && message.contains("family=IPv4")
         ));
+    }
 
-        let not_running =
-            super::validate_linux_interface_flags(&interface, libc::IFF_UP as u32)
-                .unwrap_err();
-        assert!(matches!(
-            not_running,
-            Error::InvalidConfig(message)
-                if message.contains("is not RUNNING")
-        ));
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sysfs_0x1003_does_not_override_healthy_netlink_state() {
+        let interface = test_interface();
+        let sysfs_flags = 0x1003_u32;
+        assert_eq!(sysfs_flags & libc::IFF_RUNNING as u32, 0);
 
-        super::validate_linux_interface_flags(
-            &interface,
-            (libc::IFF_UP | libc::IFF_RUNNING) as u32,
-        )
-        .unwrap();
+        let state = super::LinuxInterfaceState {
+            index: 42,
+            name: "test0".to_owned(),
+            admin_up: true,
+            lower_up: Some(true),
+            oper_state: Some(super::LinuxOperState::Up),
+            carrier: Some(true),
+        };
+        super::validate_linux_interface_state(&interface, &state).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unknown_operstate_and_carrier_do_not_mean_down() {
+        let interface = test_interface();
+        let state = super::LinuxInterfaceState {
+            index: 42,
+            name: "test0".to_owned(),
+            admin_up: true,
+            lower_up: None,
+            oper_state: Some(super::LinuxOperState::Unknown),
+            carrier: None,
+        };
+
+        super::validate_linux_interface_state(&interface, &state).unwrap();
     }
 
     #[cfg(target_os = "linux")]

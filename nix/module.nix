@@ -98,6 +98,8 @@ in
     systemd.services.chimera-client = {
       description = "Chimera Client rule-based proxy service";
       documentation = [ "https://github.com/mfsga/Chimera_Client" ];
+      startLimitIntervalSec = 60;
+      startLimitBurst = 5;
       wantedBy = [ "multi-user.target" ];
       wants = [ "network-online.target" ];
       after = [
