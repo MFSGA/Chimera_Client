@@ -268,7 +268,7 @@ pub async fn start(
     let controller_cfg = config.general.controller.clone();
     let log_level = config.general.log_level;
 
-    let components = create_components(cwd.clone(), config).await?;
+    let components = create_components(cwd.clone(), config, true).await?;
 
     let (reload_tx, mut reload_rx) = mpsc::channel(1);
 
@@ -342,22 +342,40 @@ pub async fn start(
                     info!("reloading get config 2");
                     let controller_cfg = config.general.controller.clone();
 
-                    active_components.stop_all_and_join().await;
-
+                    // Build the replacement runtime while the current one is still
+                    // serving traffic. Construction performs all fallible config,
+                    // provider, DNS, and data-file initialization without binding
+                    // listeners or touching the active network configuration.
                     let new_components =
-                        match create_components(cwd_clone.clone(), config).await {
+                        match create_components(cwd_clone.clone(), config, false).await {
                             Ok(components) => components,
                             Err(e) => {
-                                error!("failed to create components during reload: {}", e);
+                                error!(
+                                    "failed to prepare components during reload; keeping the active runtime: {}",
+                                    e
+                                );
                                 let _ = done.send(Err(e));
                                 continue;
                             }
                         };
-                    info!("reloading get components 3333");
-                    if done.send(Ok(())).is_err() {
-                        warn!("config reload response channel dropped before completion");
+
+                    // Validate and install the replacement interface/mark only after
+                    // the complete candidate runtime has been prepared. A failure at
+                    // this point still leaves every old listener and task running.
+                    #[cfg(feature = "tun")]
+                    if let Err(e) = new_components.activate_network_config().await {
+                        error!(
+                            "failed to activate network config during reload; keeping the active runtime: {}",
+                            e
+                        );
+                        let _ = done.send(Err(e));
+                        continue;
                     }
-                    info!("reloading send 444");
+
+                    // The replacement is ready. Stop the old data plane without
+                    // clearing the network configuration that now belongs to the
+                    // candidate, then start the new one.
+                    active_components.stop_all_and_join(false).await;
                     new_components.start_all();
 
                     // TODO: every reload is causing the API server to restart, we should
@@ -398,6 +416,10 @@ pub async fn start(
 
                     active_components = new_components;
                     active_api_listener = new_api_listener;
+
+                    if done.send(Ok(())).is_err() {
+                        warn!("config reload response channel dropped before completion");
+                    }
                 }
                 _ = reload_token.cancelled() => {
                     info!("runtime shutdown requested");
@@ -405,7 +427,7 @@ pub async fn start(
                     if let Err(err) = active_api_listener.join().await {
                         warn!("failed waiting for api listener shutdown: {}", err);
                     }
-                    active_components.stop_all_and_join().await;
+                    active_components.stop_all_and_join(true).await;
                     break;
                 }
             }
@@ -428,6 +450,24 @@ pub async fn start(
     Ok(())
 }
 
+#[cfg(feature = "tun")]
+#[derive(Clone)]
+struct RuntimeNetworkConfig {
+    tun_enabled: bool,
+    tun_so_mark: Option<u32>,
+    interface: Option<app::net::Interface>,
+}
+
+#[cfg(feature = "tun")]
+impl RuntimeNetworkConfig {
+    async fn activate(&self) -> Result<()> {
+        init_net_config(self.tun_enabled, self.tun_so_mark, self.interface.as_ref())
+            .await?;
+        install_default_socket_protector();
+        Ok(())
+    }
+}
+
 struct RuntimeComponents {
     cache_store: profile::ThreadSafeCacheFile,
     dns_resolver: ThreadSafeDNSResolver,
@@ -443,6 +483,8 @@ struct RuntimeComponents {
     dns_listen: DNSListenAddr,
     dns_enabled: bool,
     ipv6_allowed: bool,
+    #[cfg(feature = "tun")]
+    network_config: RuntimeNetworkConfig,
 }
 
 impl RuntimeComponents {
@@ -460,7 +502,12 @@ impl RuntimeComponents {
         Runner::shutdown(self.inbound_manager.as_ref());
     }
 
-    async fn stop_all_and_join(&self) {
+    #[cfg(feature = "tun")]
+    async fn activate_network_config(&self) -> Result<()> {
+        self.network_config.activate().await
+    }
+
+    async fn stop_all_and_join(&self, clear_network: bool) {
         self.stop_all();
 
         tracing::debug!("todo: validate");
@@ -473,7 +520,9 @@ impl RuntimeComponents {
             if let Err(err) = self.tun_runner.join().await {
                 warn!("failed waiting for tun runner shutdown: {}", err);
             }
-            clear_net_config().await;
+            if clear_network {
+                clear_net_config().await;
+            }
         }
 
         if let Err(err) = self.inbound_manager.join().await {
@@ -485,10 +534,17 @@ impl RuntimeComponents {
 async fn create_components(
     cwd: PathBuf,
     config: InternalConfig,
+    activate_network: bool,
 ) -> Result<RuntimeComponents> {
     let ipv6_allowed = !config.tun.enable || config.tun.gateway_v6.is_some();
     #[cfg(feature = "tun")]
-    {
+    let network_config = RuntimeNetworkConfig {
+        tun_enabled: config.tun.enable,
+        tun_so_mark: config.tun.so_mark,
+        interface: config.general.interface.clone(),
+    };
+    #[cfg(feature = "tun")]
+    if activate_network {
         if config.tun.enable {
             debug!("tun enabled, initializing default outbound interface");
         } else if config.general.interface.is_some() {
@@ -505,6 +561,8 @@ async fn create_components(
         .await?;
         install_default_socket_protector();
     }
+    #[cfg(not(feature = "tun"))]
+    let _ = activate_network;
 
     let cancellation_token = tokio_util::sync::CancellationToken::new();
 
@@ -787,6 +845,8 @@ async fn create_components(
         dns_listen,
         dns_enabled: dns_enable,
         ipv6_allowed,
+        #[cfg(feature = "tun")]
+        network_config,
     })
 }
 

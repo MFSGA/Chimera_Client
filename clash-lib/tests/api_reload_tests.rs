@@ -52,6 +52,16 @@ where
 }
 
 fn write_config(path: &PathBuf, api_port: u16, socks_port: u16, mode: &str) {
+    write_config_with_extra(path, api_port, socks_port, mode, "");
+}
+
+fn write_config_with_extra(
+    path: &PathBuf,
+    api_port: u16,
+    socks_port: u16,
+    mode: &str,
+    extra: &str,
+) {
     std::fs::write(
         path,
         format!(
@@ -61,6 +71,7 @@ mode: {mode}\n\
 mmdb: null\n\
 external-controller: 127.0.0.1:{api_port}\n\
 socks-port: {socks_port}\n\
+{extra}\
 dns:\n\
   enable: false\n\
 profile:\n\
@@ -74,6 +85,7 @@ rules:\n\
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
 async fn put_configs_reloads_runtime_from_file() {
     let api_port = TcpListener::bind("127.0.0.1:0")
         .expect("failed to reserve port")
@@ -95,7 +107,7 @@ async fn put_configs_reloads_runtime_from_file() {
     write_config(&reload_config, api_port, socks_port, "rule");
 
     let cwd = temp_dir.clone();
-    std::thread::spawn(move || {
+    let runtime = std::thread::spawn(move || {
         clash_lib::start_scaffold(Options {
             config: Config::File(initial_config.to_string_lossy().to_string()),
             cwd: Some(cwd.to_string_lossy().to_string()),
@@ -156,4 +168,82 @@ async fn put_configs_reloads_runtime_from_file() {
     let reloaded_json: serde_json::Value = serde_json::from_slice(&reloaded_body)
         .expect("failed to parse reloaded response");
     assert_eq!(reloaded_json["mode"], "rule");
+
+    assert!(clash_lib::shutdown());
+    runtime.join().expect("runtime thread panicked");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn failed_reload_keeps_existing_runtime_available() {
+    let api_port = TcpListener::bind("127.0.0.1:0")
+        .expect("failed to reserve API port")
+        .local_addr()
+        .expect("failed to read API address")
+        .port();
+    let socks_port = TcpListener::bind("127.0.0.1:0")
+        .expect("failed to reserve SOCKS port")
+        .local_addr()
+        .expect("failed to read SOCKS address")
+        .port();
+    let temp_dir =
+        std::env::temp_dir().join(format!("chimera-api-reload-rollback-{api_port}"));
+    std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+
+    let initial_config = temp_dir.join("initial.yaml");
+    let invalid_config = temp_dir.join("invalid-interface.yaml");
+    write_config(&initial_config, api_port, socks_port, "global");
+    write_config_with_extra(
+        &invalid_config,
+        api_port,
+        socks_port,
+        "rule",
+        "interface-name: __chimera_missing_interface__\n",
+    );
+
+    let cwd = temp_dir.clone();
+    let runtime = std::thread::spawn(move || {
+        clash_lib::start_scaffold(Options {
+            config: Config::File(initial_config.to_string_lossy().to_string()),
+            cwd: Some(cwd.to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            config_path: Some(initial_config.to_string_lossy().to_string()),
+        })
+        .expect("failed to start clash");
+    });
+
+    wait_port_ready(api_port);
+    wait_port_ready(socks_port);
+
+    let configs_url = format!("http://127.0.0.1:{api_port}/configs");
+    let put_request = hyper::Request::builder()
+        .uri(&configs_url)
+        .method(http::Method::PUT)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(
+            "{\"path\":\"invalid-interface.yaml\"}",
+        )))
+        .expect("failed to build PUT request");
+    let put_response = send_http_request(configs_url.parse().unwrap(), put_request)
+        .await
+        .expect("failed to request invalid reload");
+    assert_eq!(
+        put_response.status(),
+        http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+
+    let get_request = hyper::Request::builder()
+        .uri(&configs_url)
+        .method(http::Method::GET)
+        .body(http_body_util::Empty::<Bytes>::new())
+        .expect("failed to build GET request");
+    let response = send_http_request(configs_url.parse().unwrap(), get_request)
+        .await
+        .expect("active API stopped after failed reload");
+    assert_eq!(response.status(), http::StatusCode::OK);
+    wait_port_ready(socks_port);
+
+    assert!(clash_lib::shutdown());
+    runtime.join().expect("runtime thread panicked");
 }
