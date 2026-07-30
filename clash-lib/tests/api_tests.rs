@@ -44,6 +44,34 @@ rules:\n\
     (path, socks_port)
 }
 
+fn start_wildcard_cors_client() -> (ClashInstance, u16) {
+    let api_port = available_port();
+    let (config_path, socks_port) = isolated_config(api_port);
+    let config = std::fs::read_to_string(&config_path)
+        .expect("failed to read isolated test configuration");
+    std::fs::write(
+        &config_path,
+        format!("{config}cors-allow-origins:\n  - \"*\"\n"),
+    )
+    .expect("failed to enable wildcard CORS for isolated test configuration");
+
+    let wd =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
+    let clash = ClashInstance::start(
+        Options {
+            config: Config::File(config_path.to_string_lossy().to_string()),
+            cwd: Some(wd.to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            config_path: Some(config_path.to_string_lossy().to_string()),
+        },
+        vec![api_port, socks_port],
+    )
+    .expect("failed to start client with wildcard CORS origins");
+
+    (clash, api_port)
+}
+
 async fn get_allow_lan(port: u16) -> bool {
     let url = format!("http://127.0.0.1:{}/configs", port);
     let req = hyper::Request::builder()
@@ -69,6 +97,170 @@ async fn get_allow_lan(port: u16) -> bool {
     json.get("allow-lan")
         .and_then(|v| v.as_bool())
         .expect("'allow-lan' not found or not a bool")
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn test_wildcard_cors_returns_any_origin_header() {
+    let (_clash, api_port) = start_wildcard_cors_client();
+    let version_url = format!("http://127.0.0.1:{api_port}/version");
+    let req = hyper::Request::builder()
+        .uri(&version_url)
+        .header(hyper::header::AUTHORIZATION, "Bearer clash-rs")
+        .header(http::header::ORIGIN, "https://example.com")
+        .method(http::method::Method::GET)
+        .body(http_body_util::Empty::<Bytes>::new())
+        .expect("failed to build CORS request");
+
+    let res = send_http_request(version_url.parse().unwrap(), req)
+        .await
+        .expect("failed to send CORS request");
+
+    assert_eq!(res.status(), http::StatusCode::OK);
+    assert_eq!(
+        res.headers()
+            .get(http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|value| value.to_str().ok()),
+        Some("*")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn test_cors_preflight_without_auth_returns_cors_headers() {
+    let (_clash, api_port) = start_wildcard_cors_client();
+    let version_url = format!("http://127.0.0.1:{api_port}/version");
+    let req = hyper::Request::builder()
+        .uri(&version_url)
+        .header(http::header::ORIGIN, "https://example.com")
+        .header(http::header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+        .header(
+            http::header::ACCESS_CONTROL_REQUEST_HEADERS,
+            "authorization",
+        )
+        .method(http::method::Method::OPTIONS)
+        .body(http_body_util::Empty::<Bytes>::new())
+        .expect("failed to build CORS preflight request");
+
+    let res = send_http_request(version_url.parse().unwrap(), req)
+        .await
+        .expect("failed to send CORS preflight request");
+
+    assert_eq!(res.status(), http::StatusCode::OK);
+    assert_eq!(
+        res.headers()
+            .get(http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|value| value.to_str().ok()),
+        Some("*")
+    );
+    assert!(
+        res.headers()
+            .get(http::header::ACCESS_CONTROL_ALLOW_METHODS)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("GET")),
+        "preflight response should allow GET"
+    );
+    assert!(
+        res.headers()
+            .get(http::header::ACCESS_CONTROL_ALLOW_HEADERS)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("authorization")),
+        "preflight response should allow Authorization"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn test_config_reload_rejects_empty_or_directory_path_without_panicking() {
+    let api_port = available_port();
+    let (config_path, socks_port) = isolated_config(api_port);
+    let config = std::fs::read_to_string(config_path)
+        .expect("failed to read isolated test configuration");
+    let wd =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
+    let _clash = ClashInstance::start(
+        Options {
+            config: Config::Str(config),
+            cwd: Some(wd.to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            config_path: None,
+        },
+        vec![api_port, socks_port],
+    )
+    .expect("failed to start isolated client");
+
+    let configs_url = format!("http://127.0.0.1:{api_port}/configs");
+    for (body, message) in [
+        ("{\"path\":\"\"}", "empty path"),
+        ("{\"path\":\".\"}", "directory path"),
+    ] {
+        let req = hyper::Request::builder()
+            .uri(&configs_url)
+            .header(hyper::header::AUTHORIZATION, "Bearer clash-rs")
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .method(http::method::Method::PUT)
+            .body(body.to_owned())
+            .expect("failed to build invalid reload request");
+        let res = send_http_request::<String>(configs_url.parse().unwrap(), req)
+            .await
+            .expect("failed to send invalid reload request");
+        assert_eq!(
+            res.status(),
+            http::StatusCode::BAD_REQUEST,
+            "{message} should be rejected"
+        );
+    }
+
+    let req = hyper::Request::builder()
+        .uri(&configs_url)
+        .header(hyper::header::AUTHORIZATION, "Bearer clash-rs")
+        .method(http::method::Method::GET)
+        .body(http_body_util::Empty::<Bytes>::new())
+        .expect("failed to build health check request");
+    let res = send_http_request(configs_url.parse().unwrap(), req)
+        .await
+        .expect("API should remain available after invalid reload requests");
+    assert_eq!(res.status(), http::StatusCode::OK);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn test_config_reload_via_empty_path_uses_stored_config_path() {
+    let api_port = available_port();
+    let (config_path, socks_port) = isolated_config(api_port);
+    let config_path = config_path.to_string_lossy().to_string();
+    let wd =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
+    let _clash = ClashInstance::start(
+        Options {
+            config: Config::File(config_path.clone()),
+            cwd: Some(wd.to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            config_path: Some(config_path),
+        },
+        vec![api_port, socks_port],
+    )
+    .expect("failed to start isolated client with stored config path");
+
+    let configs_url = format!("http://127.0.0.1:{api_port}/configs");
+    let req = hyper::Request::builder()
+        .uri(&configs_url)
+        .header(hyper::header::AUTHORIZATION, "Bearer clash-rs")
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .method(http::method::Method::PUT)
+        .body("{\"path\":\"\"}".to_owned())
+        .expect("failed to build stored-path reload request");
+    let res = send_http_request::<String>(configs_url.parse().unwrap(), req)
+        .await
+        .expect("failed to send stored-path reload request");
+
+    assert_eq!(
+        res.status(),
+        http::StatusCode::NO_CONTENT,
+        "empty path should reload the stored config path"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
