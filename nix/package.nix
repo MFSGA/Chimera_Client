@@ -39,10 +39,11 @@ rustPlatform.buildRustPackage {
 
   cargoLock = {
     lockFile = ../Cargo.lock;
-    # This repository is distributed outside nixpkgs and currently contains
-    # pinned Cargo git dependencies. Replace this with outputHashes before a
-    # future nixpkgs submission.
-    allowBuiltinFetchGit = true;
+    outputHashes = {
+      "netstack-lwip-0.3.4" = "sha256-Brc1uCCaAe07eg0nr6Q/WIcDys/d7Ds6DmYyckdpc2o=";
+      "shadowsocks-1.25.0" = "sha256-PszneYxJ256hhAIcuaaGgtixjiNvlg4P/jMVEiZzz5c=";
+      "sock2proc-0.1.0" = "sha256-1HC1KE8ii8mbTwFiXaKFsZHXGrF1OiZKbxmPC5PBflY=";
+    };
   };
 
   npmDeps = fetchNpmDeps {
