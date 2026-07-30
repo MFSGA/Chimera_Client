@@ -4,6 +4,7 @@
   pkg-config,
   cmake,
   protobuf,
+  nodejs,
   llvmPackages,
 }:
 
@@ -46,6 +47,7 @@ rustPlatform.buildRustPackage {
     pkg-config
     cmake
     protobuf
+    nodejs
     llvmPackages.libclang
   ];
 
