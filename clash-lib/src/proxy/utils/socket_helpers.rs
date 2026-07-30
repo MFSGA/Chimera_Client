@@ -437,11 +437,11 @@ pub async fn new_protected_dual_stack_udp_socket(
             .or(automatic_iface);
         #[cfg(not(target_os = "windows"))]
         let effective_iface = select_effective_iface(iface, &default_iface).cloned();
-        return new_dual_stack_udp_socket(
+        new_dual_stack_udp_socket(
             effective_iface.as_ref(),
             #[cfg(target_os = "linux")]
             so_mark,
-        );
+        )
     }
 
     #[cfg(not(feature = "tun"))]
@@ -485,11 +485,11 @@ pub async fn new_tcp_stream(
             #[cfg(target_os = "linux")]
             so_mark,
         )?;
-        return timeout(
+        timeout(
             TCP_CONNECT_TIMEOUT,
             TcpSocket::from_std_stream(socket.into()).connect(endpoint),
         )
-        .await?;
+        .await?
     }
 
     #[cfg(target_os = "windows")]

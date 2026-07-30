@@ -209,13 +209,12 @@ pub async fn route_for_destination(
         })?;
 
     let parsed = parse_netlink_route(destination, &message)?;
-    let interface =
-        get_interface_by_index(parsed.interface_index).ok_or_else(|| {
-            RouteSelectionError::InterfaceNotFound {
-                destination,
-                interface_index: parsed.interface_index,
-            }
-        })?;
+    let interface = get_interface_by_index(parsed.interface_index).ok_or(
+        RouteSelectionError::InterfaceNotFound {
+            destination,
+            interface_index: parsed.interface_index,
+        },
+    )?;
 
     Ok(RouteDecision {
         family: if destination.is_ipv4() {

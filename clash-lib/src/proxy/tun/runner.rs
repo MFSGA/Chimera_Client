@@ -210,13 +210,14 @@ impl TunRunner {
                     }
 
                     #[cfg(target_os = "linux")]
-                    if cfg.route_all && !removed_existing_tun {
-                        if let Err(err) = routes::maybe_routes_clean_up(cfg) {
-                            error!(
-                                "failed to clean up stale tun routes for {}: {}",
-                                tun_name, err
-                            );
-                        }
+                    if cfg.route_all
+                        && !removed_existing_tun
+                        && let Err(err) = routes::maybe_routes_clean_up(cfg)
+                    {
+                        error!(
+                            "failed to clean up stale tun routes for {}: {}",
+                            tun_name, err
+                        );
                     }
 
                     if tun_exist {
