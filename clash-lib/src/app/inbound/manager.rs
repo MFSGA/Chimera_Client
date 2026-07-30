@@ -212,6 +212,8 @@ impl InboundManager {
                 InboundOpts::Mixed { common_opts, .. } => {
                     ports.mixed_port = Some(common_opts.port)
                 }
+                #[cfg(feature = "shadowsocks")]
+                InboundOpts::Shadowsocks { .. } => {}
                 #[cfg(feature = "anytls")]
                 InboundOpts::Anytls { .. } => {}
             }
@@ -279,6 +281,8 @@ impl InboundManager {
                     ports.mixed_port.is_some()
                         && Some(common_opts.port) == ports.mixed_port
                 }
+                #[cfg(feature = "shadowsocks")]
+                InboundOpts::Shadowsocks { .. } => false,
                 #[cfg(feature = "anytls")]
                 InboundOpts::Anytls { .. } => false,
             })
@@ -293,6 +297,8 @@ impl InboundManager {
                 InboundOpts::Socks { .. } => ports.socks_port,
                 #[cfg(feature = "mixed_port")]
                 InboundOpts::Mixed { .. } => ports.mixed_port,
+                #[cfg(feature = "shadowsocks")]
+                InboundOpts::Shadowsocks { .. } => None,
                 #[cfg(feature = "anytls")]
                 InboundOpts::Anytls { .. } => None,
             };

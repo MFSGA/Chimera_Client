@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use super::config::BindAddress;
 
-#[cfg(feature = "anytls")]
+#[cfg(any(feature = "anytls", feature = "shadowsocks"))]
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, Eq, PartialEq)]
 pub struct InboundUser {
     pub name: String,
@@ -35,6 +35,18 @@ pub enum InboundOpts {
         #[serde(default = "default_bool_true")]
         udp: bool,
     },
+    #[cfg(feature = "shadowsocks")]
+    #[serde(alias = "shadowsocks")]
+    Shadowsocks {
+        #[serde(flatten)]
+        common_opts: CommonInboundOpts,
+        #[serde(default = "default_bool_true")]
+        udp: bool,
+        cipher: String,
+        password: String,
+        #[serde(default)]
+        users: Vec<InboundUser>,
+    },
     #[cfg(feature = "anytls")]
     #[serde(alias = "anytls")]
     Anytls {
@@ -60,6 +72,8 @@ impl InboundOpts {
             InboundOpts::Http { common_opts, .. } => common_opts,
             #[cfg(feature = "mixed_port")]
             InboundOpts::Mixed { common_opts, .. } => common_opts,
+            #[cfg(feature = "shadowsocks")]
+            InboundOpts::Shadowsocks { common_opts, .. } => common_opts,
             #[cfg(feature = "anytls")]
             InboundOpts::Anytls { common_opts, .. } => common_opts,
         }
@@ -72,6 +86,8 @@ impl InboundOpts {
             InboundOpts::Http { common_opts, .. } => common_opts,
             #[cfg(feature = "mixed_port")]
             InboundOpts::Mixed { common_opts, .. } => common_opts,
+            #[cfg(feature = "shadowsocks")]
+            InboundOpts::Shadowsocks { common_opts, .. } => common_opts,
             #[cfg(feature = "anytls")]
             InboundOpts::Anytls { common_opts, .. } => common_opts,
         }
@@ -84,6 +100,8 @@ impl InboundOpts {
             InboundOpts::Socks { .. } => "socks",
             #[cfg(feature = "mixed_port")]
             InboundOpts::Mixed { .. } => "mixed",
+            #[cfg(feature = "shadowsocks")]
+            InboundOpts::Shadowsocks { .. } => "shadowsocks",
             #[cfg(feature = "anytls")]
             InboundOpts::Anytls { .. } => "anytls",
         }

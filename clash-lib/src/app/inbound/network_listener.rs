@@ -11,6 +11,10 @@ use crate::proxy::anytls::inbound::{
 use crate::proxy::http::HttpInbound;
 #[cfg(feature = "mixed_port")]
 use crate::proxy::mixed::MixedInbound;
+#[cfg(feature = "shadowsocks")]
+use crate::proxy::shadowsocks::inbound::{
+    InboundOptions as ShadowsocksInboundOptions, ShadowsocksInbound,
+};
 use crate::{
     app::dispatcher::Dispatcher,
     common::auth::ThreadSafeAuthenticator,
@@ -103,6 +107,29 @@ fn build_handler(
             authenticator,
             fw_mark,
         ))),
+        #[cfg(feature = "shadowsocks")]
+        InboundOpts::Shadowsocks {
+            common_opts,
+            udp,
+            cipher,
+            password,
+            users,
+        } => {
+            let (users_tx, users_rx) = tokio::sync::watch::channel(users.clone());
+            Some(Arc::new(ShadowsocksInbound::new(
+                ShadowsocksInboundOptions {
+                    addr: (common_opts.listen.0, common_opts.port).into(),
+                    password: password.clone(),
+                    cipher: cipher.clone(),
+                    udp: *udp,
+                    allow_lan: common_opts.allow_lan,
+                    dispatcher,
+                    fw_mark: common_opts.fw_mark,
+                    users_rx,
+                    static_users_tx: Some(users_tx),
+                },
+            )))
+        }
         #[cfg(feature = "anytls")]
         InboundOpts::Anytls {
             common_opts,

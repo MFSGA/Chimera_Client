@@ -1,6 +1,7 @@
 use shadowsocks::crypto::CipherKind;
 use std::io;
 
+pub mod inbound;
 pub mod outbound;
 
 pub(crate) fn map_cipher(cipher: &str) -> std::io::Result<CipherKind> {
