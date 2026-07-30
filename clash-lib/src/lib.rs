@@ -214,6 +214,62 @@ pub fn start_scaffold(opts: Options) -> Result<()> {
     })
 }
 
+/// Start one runtime in a background thread with an independent shutdown token.
+/// This is primarily useful for integration tests that need multiple instances.
+pub fn start_scaffold_instance(
+    opts: Options,
+) -> Result<(
+    std::thread::JoinHandle<()>,
+    tokio_util::sync::CancellationToken,
+)> {
+    let config_path = opts.config_path.or_else(|| {
+        if let Config::File(ref path) = opts.config {
+            Some(path.clone())
+        } else {
+            None
+        }
+    });
+    let config: InternalConfig = opts.config.try_parse()?;
+    let cwd = opts.cwd.unwrap_or_else(|| ".".to_string());
+    let rt_kind = opts.rt.unwrap_or(TokioRuntime::MultiThread);
+    let log_file = opts.log_file;
+    let token = tokio_util::sync::CancellationToken::new();
+    let token_clone = token.clone();
+
+    let handle = std::thread::spawn(move || {
+        let rt = match rt_kind {
+            TokioRuntime::MultiThread => tokio::runtime::Builder::new_multi_thread(),
+            TokioRuntime::SingleThread => {
+                tokio::runtime::Builder::new_current_thread()
+            }
+        }
+        .enable_all()
+        .build()
+        .expect("failed to build integration-test runtime");
+
+        let (log_tx, _) = broadcast::channel(100);
+        let log_collector = app::logging::EventCollector::new(vec![log_tx.clone()]);
+        app::logging::setup_logging(
+            config.general.log_level,
+            log_collector,
+            &cwd,
+            log_file,
+        );
+
+        if let Err(err) = rt.block_on(start_with_shutdown_token(
+            config,
+            cwd,
+            config_path,
+            log_tx,
+            token_clone,
+        )) {
+            eprintln!("independent runtime error: {err}");
+        }
+    });
+
+    Ok((handle, token))
+}
+
 static CRYPTO_PROVIDER_LOCK: OnceLock<()> = OnceLock::new();
 
 pub fn setup_default_crypto_provider() {
@@ -253,15 +309,22 @@ pub async fn start(
     config_path: Option<String>,
     log_tx: broadcast::Sender<LogEvent>,
 ) -> Result<()> {
-    setup_default_crypto_provider();
-
     let shutdown_token = tokio_util::sync::CancellationToken::new();
-
     {
         let mut token_guard = SHUTDOWN_TOKEN.lock().unwrap();
         token_guard.push(shutdown_token.clone());
     }
+    start_with_shutdown_token(config, cwd, config_path, log_tx, shutdown_token).await
+}
 
+async fn start_with_shutdown_token(
+    config: InternalConfig,
+    cwd: String,
+    config_path: Option<String>,
+    log_tx: broadcast::Sender<LogEvent>,
+    shutdown_token: tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    setup_default_crypto_provider();
     let cwd = PathBuf::from(cwd);
 
     // things we need to clone before consuming config
