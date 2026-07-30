@@ -1,7 +1,10 @@
+mod datagram;
+
 use std::{net::SocketAddr, sync::Arc};
 
 use async_trait::async_trait;
 use shadowsocks::{
+    ProxySocket,
     config::{ServerConfig, ServerUser, ServerUserManager},
     context::Context,
     relay::{Address, tcprelay::proxy_stream::server::ProxyServerStream},
@@ -14,8 +17,11 @@ use crate::{
     config::internal::listener::InboundUser,
     proxy::{
         inbound::{InboundHandlerTrait, is_inbound_client_allowed},
-        shadowsocks::map_cipher,
-        utils::{ToCanonical, apply_tcp_options, try_create_dualstack_tcplistener},
+        shadowsocks::{inbound::datagram::InboundShadowsocksDatagram, map_cipher},
+        utils::{
+            ToCanonical, apply_tcp_options, new_udp_socket,
+            try_create_dualstack_tcplistener,
+        },
     },
     session::{Network, Session, SocksAddr, Type},
 };
@@ -111,7 +117,7 @@ impl InboundHandlerTrait for ShadowsocksInbound {
     }
 
     fn handle_udp(&self) -> bool {
-        false
+        self._udp_requested
     }
 
     async fn listen_tcp(&self) -> std::io::Result<()> {
@@ -202,6 +208,100 @@ impl InboundHandlerTrait for ShadowsocksInbound {
     }
 
     async fn listen_udp(&self) -> std::io::Result<()> {
-        Err(new_io_error("Shadowsocks UDP inbound is not enabled yet"))
+        let mut users_rx = self.users_rx.clone();
+
+        loop {
+            let context =
+                Context::new_shared(shadowsocks::config::ServerType::Server);
+            let mut config = self.build_server_config()?;
+            if let Some(manager) =
+                build_user_manager(&users_rx.borrow_and_update(), self.addr)
+            {
+                config.set_user_manager(
+                    Arc::try_unwrap(manager)
+                        .unwrap_or_else(|manager| (*manager).clone()),
+                );
+            }
+
+            let socket = new_udp_socket(
+                Some(self.addr),
+                None,
+                #[cfg(target_os = "linux")]
+                self.fw_mark,
+                None,
+            )
+            .await?;
+            let socket: ProxySocket<shadowsocks::net::UdpSocket> =
+                ProxySocket::from_socket(
+                    shadowsocks::relay::udprelay::proxy_socket::UdpSocketType::Server,
+                    context,
+                    &config,
+                    socket.into(),
+                );
+            let datagram = Box::new(InboundShadowsocksDatagram::new(socket));
+            let session = Session {
+                network: Network::Udp,
+                typ: Type::Shadowsocks,
+                source: self.addr,
+                so_mark: self.fw_mark,
+                ..Default::default()
+            };
+            let closer = self.dispatcher.dispatch_datagram(session, datagram).await;
+
+            users_rx.changed().await.map_err(|_| {
+                new_io_error("Shadowsocks user update channel closed")
+            })?;
+            let _ = closer.send(0);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const VALID_KEY: &str = "3SYJ/f8nmVuzKvKglykRQDSgg10e/ADilkdRWrrY9HU=";
+
+    fn test_addr() -> SocketAddr {
+        "127.0.0.1:8080".parse().unwrap()
+    }
+
+    #[test]
+    fn empty_user_list_uses_single_user_mode() {
+        assert!(build_user_manager(&[], test_addr()).is_none());
+    }
+
+    #[test]
+    fn valid_user_builds_manager() {
+        let users = vec![InboundUser {
+            name: "user1".to_owned(),
+            password: VALID_KEY.to_owned(),
+        }];
+        assert!(build_user_manager(&users, test_addr()).is_some());
+    }
+
+    #[test]
+    fn invalid_user_key_does_not_panic() {
+        let users = vec![InboundUser {
+            name: "bad".to_owned(),
+            password: "not-valid-base64!!!".to_owned(),
+        }];
+        let _ = build_user_manager(&users, test_addr());
+    }
+
+    #[test]
+    fn valid_and_invalid_users_can_be_mixed() {
+        let users = vec![
+            InboundUser {
+                name: "good".to_owned(),
+                password: VALID_KEY.to_owned(),
+            },
+            InboundUser {
+                name: "bad".to_owned(),
+                password: "!!!".to_owned(),
+            },
+        ];
+        assert!(build_user_manager(&users, test_addr()).is_some());
     }
 }
