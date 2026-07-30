@@ -452,7 +452,9 @@ async fn handle_udp_session(
         ..Default::default()
     };
 
-    let _ = dispatcher.dispatch_datagram(sess, Box::new(datagram)).await;
+    let close_sender = dispatcher.dispatch_datagram(sess, Box::new(datagram)).await;
+    cancel_c.cancelled().await;
+    let _ = close_sender.send(0);
 }
 
 /// Handle a plain TCP relay session (the common case).
