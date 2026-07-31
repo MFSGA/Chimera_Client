@@ -95,10 +95,23 @@ pub(super) fn convert(
             "ignoring top-level `mixed-port` because `mixed_port` feature is disabled"
         );
     }
+    #[cfg(feature = "redir")]
+    if let Some(Port(redir_port)) = c.redir_port
+        && !all_inbounds.insert(InboundOpts::Redir {
+            common_opts: CommonInboundOpts {
+                name: "REDIR-IN".into(),
+                listen: bind_address,
+                port: redir_port,
+                allow_lan: c.allow_lan.unwrap_or_default(),
+                fw_mark: c.routing_mark,
+            },
+        })
+    {
+        warn!("Duplicate REDIR inbound listener found: {}", redir_port);
+    }
+    #[cfg(not(feature = "redir"))]
     if c.redir_port.is_some() {
-        warn!(
-            "ignoring top-level `redir-port` because redir inbound is not implemented"
-        );
+        warn!("ignoring top-level `redir-port` because `redir` feature is disabled");
     }
     if c.tproxy_port.is_some() {
         warn!(
@@ -106,4 +119,30 @@ pub(super) fn convert(
         );
     }
     Ok(all_inbounds)
+}
+
+#[cfg(all(test, feature = "redir"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn top_level_redir_port_builds_listener() {
+        let config = def::Config {
+            redir_port: Some(Port(7892)),
+            allow_lan: Some(true),
+            routing_mark: Some(123),
+            ..Default::default()
+        };
+
+        let inbounds = convert(None, &config).unwrap();
+        let redir = inbounds
+            .iter()
+            .find(|inbound| matches!(inbound, InboundOpts::Redir { .. }))
+            .expect("redir listener should be created");
+        let common = redir.common_opts();
+        assert_eq!(common.name, "REDIR-IN");
+        assert_eq!(common.port, 7892);
+        assert!(common.allow_lan);
+        assert_eq!(common.fw_mark, Some(123));
+    }
 }
