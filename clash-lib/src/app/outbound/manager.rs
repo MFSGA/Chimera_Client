@@ -689,6 +689,7 @@ impl OutboundManager {
                             loadbalance::HandlerOptions {
                                 name: proto.name.clone(),
                                 udp: proto.udp.unwrap_or(true),
+                                strategy: proto.strategy,
                                 common_opts: crate::proxy::HandlerCommonOptions {
                                     icon: proto.icon.clone(),
                                     url: Some(proto.url.clone()),

@@ -405,6 +405,8 @@ pub enum LoadBalanceStrategy {
     #[default]
     #[serde(rename = "round-robin")]
     RoundRobin,
+    #[serde(rename = "consistent-hashing")]
+    ConsistentHashing,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
