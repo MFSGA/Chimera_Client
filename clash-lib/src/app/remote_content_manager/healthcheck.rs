@@ -174,11 +174,10 @@ impl HealthCheck {
         let minimum_events = self.minimum_events;
         let maximum_first_byte = self.maximum_first_byte;
         let expected_echo = self.expected_echo.clone();
-        let proxies = self.inner.read().await.proxies.clone();
 
         {
             let url = self.url.clone();
-            let proxies = proxies.clone();
+            let proxies = self.inner.read().await.proxies.clone();
             tokio::spawn(async move {
                 Self::run_check(
                     &proxy_manager,
@@ -212,7 +211,10 @@ impl HealthCheck {
                     _ = ticker.tick() => {
                         debug!("healthcheck ticking: {}, lazy: {}", url, lazy);
                         let now = tokio::time::Instant::now();
-                        let last_check = inner.read().await.last_check;
+                        let (last_check, proxies) = {
+                            let inner = inner.read().await;
+                            (inner.last_check, inner.proxies.clone())
+                        };
                         if !lazy || now.duration_since(last_check).as_secs() >= interval {
                             Self::run_check(
                                 &proxy_manager,
@@ -256,9 +258,9 @@ impl HealthCheck {
         .await;
     }
 
-    // pub async fn update(&self, proxies: Vec<AnyOutboundHandler>) {
-    //     self.inner.write().await.proxies = proxies;
-    // }
+    pub async fn update(&self, proxies: Vec<AnyOutboundHandler>) {
+        self.inner.write().await.proxies = proxies;
+    }
 
     pub fn auto(&self) -> bool {
         self.interval != 0
