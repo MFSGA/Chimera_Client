@@ -38,6 +38,8 @@ pub mod hysteria2;
 pub mod inbound;
 #[cfg(feature = "mixed_port")]
 pub mod mixed;
+#[cfg(all(feature = "redir", target_os = "linux"))]
+pub mod redir;
 #[cfg(feature = "shadowsocks")]
 pub mod shadowsocks;
 pub mod socks;

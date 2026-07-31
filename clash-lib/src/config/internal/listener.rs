@@ -35,6 +35,11 @@ pub enum InboundOpts {
         #[serde(default = "default_bool_true")]
         udp: bool,
     },
+    #[cfg(feature = "redir")]
+    Redir {
+        #[serde(flatten)]
+        common_opts: CommonInboundOpts,
+    },
     #[cfg(feature = "shadowsocks")]
     #[serde(alias = "shadowsocks")]
     Shadowsocks {
@@ -72,6 +77,8 @@ impl InboundOpts {
             InboundOpts::Http { common_opts, .. } => common_opts,
             #[cfg(feature = "mixed_port")]
             InboundOpts::Mixed { common_opts, .. } => common_opts,
+            #[cfg(feature = "redir")]
+            InboundOpts::Redir { common_opts } => common_opts,
             #[cfg(feature = "shadowsocks")]
             InboundOpts::Shadowsocks { common_opts, .. } => common_opts,
             #[cfg(feature = "anytls")]
@@ -86,6 +93,8 @@ impl InboundOpts {
             InboundOpts::Http { common_opts, .. } => common_opts,
             #[cfg(feature = "mixed_port")]
             InboundOpts::Mixed { common_opts, .. } => common_opts,
+            #[cfg(feature = "redir")]
+            InboundOpts::Redir { common_opts } => common_opts,
             #[cfg(feature = "shadowsocks")]
             InboundOpts::Shadowsocks { common_opts, .. } => common_opts,
             #[cfg(feature = "anytls")]
@@ -100,6 +109,8 @@ impl InboundOpts {
             InboundOpts::Socks { .. } => "socks",
             #[cfg(feature = "mixed_port")]
             InboundOpts::Mixed { .. } => "mixed",
+            #[cfg(feature = "redir")]
+            InboundOpts::Redir { .. } => "redir",
             #[cfg(feature = "shadowsocks")]
             InboundOpts::Shadowsocks { .. } => "shadowsocks",
             #[cfg(feature = "anytls")]
@@ -118,4 +129,23 @@ pub struct CommonInboundOpts {
     pub port: u16,
     /// Linux routing mark
     pub fw_mark: Option<u32>,
+}
+
+#[cfg(all(test, feature = "redir"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redir_listener_deserializes() {
+        let listener: InboundOpts = serde_yaml::from_str(
+            "type: redir\nname: transparent\nlisten: 127.0.0.1\nport: 7892\nallow-lan: true\nfw-mark: 123\n",
+        )
+        .unwrap();
+        assert_eq!(listener.type_name(), "redir");
+        let common = listener.common_opts();
+        assert_eq!(common.name, "transparent");
+        assert_eq!(common.port, 7892);
+        assert!(common.allow_lan);
+        assert_eq!(common.fw_mark, Some(123));
+    }
 }
