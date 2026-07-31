@@ -352,6 +352,8 @@ async fn file_provider_populates_group_and_routes_real_tcp() {
     let (_cwd, _client, api_port, socks_port) = start_file_provider_client();
     let provider = get_json(api_port, "/providers/proxies/local").await;
     assert_eq!(provider["name"], "local");
+    assert_eq!(provider["vehicleType"], "File");
+    assert!(provider["updatedAt"].is_string());
     let group = get_json(api_port, "/proxies/balanced").await;
     assert_eq!(group["all"], serde_json::json!(["DIRECT", "REJECT"]));
 
@@ -398,6 +400,8 @@ proxies:
     assert!(cwd.path().join("http-provider.yaml").is_file());
     let provider = get_json(api_port, "/providers/proxies/local").await;
     assert_eq!(provider["name"], "local");
+    assert_eq!(provider["vehicleType"], "HTTP");
+    assert!(provider["updatedAt"].is_string());
     let group = get_json(api_port, "/proxies/balanced").await;
     assert_eq!(group["all"], serde_json::json!(["DIRECT", "REJECT"]));
 
@@ -434,6 +438,8 @@ proxies:
 
     let (cwd, _client, api_port, socks_port) =
         start_http_provider_client(&server.url("/refresh.yaml"), 0);
+    let updated_before =
+        get_json(api_port, "/providers/proxies/local").await["updatedAt"].clone();
     assert!(roundtrip(socks_port, target_port, b"before-refresh").await);
     target_task.await.unwrap();
 
@@ -448,9 +454,13 @@ proxies:
 "#,
         );
     });
+    tokio::time::sleep(Duration::from_millis(10)).await;
     put_provider(api_port, "local").await;
     reject_mock.assert();
 
+    let provider = get_json(api_port, "/providers/proxies/local").await;
+    assert_eq!(provider["vehicleType"], "HTTP");
+    assert_ne!(provider["updatedAt"], updated_before);
     let group = get_json(api_port, "/proxies/balanced").await;
     assert_eq!(group["all"], serde_json::json!(["REJECT"]));
     assert!(!roundtrip(socks_port, target_port, b"after-refresh").await);
