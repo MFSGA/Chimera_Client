@@ -135,13 +135,35 @@ fn start_http_provider_client(
     provider_url: &str,
     interval: u64,
 ) -> (tempfile::TempDir, ClashInstance, u16, u16) {
-    start_http_provider_client_with_cache(provider_url, interval, None)
+    start_http_provider_client_inner(provider_url, interval, None, "load-balance")
+}
+
+fn start_http_provider_client_for_group(
+    provider_url: &str,
+    interval: u64,
+    group_type: &str,
+) -> (tempfile::TempDir, ClashInstance, u16, u16) {
+    start_http_provider_client_inner(provider_url, interval, None, group_type)
 }
 
 fn start_http_provider_client_with_cache(
     provider_url: &str,
     interval: u64,
     cached_provider: Option<&str>,
+) -> (tempfile::TempDir, ClashInstance, u16, u16) {
+    start_http_provider_client_inner(
+        provider_url,
+        interval,
+        cached_provider,
+        "load-balance",
+    )
+}
+
+fn start_http_provider_client_inner(
+    provider_url: &str,
+    interval: u64,
+    cached_provider: Option<&str>,
+    group_type: &str,
 ) -> (tempfile::TempDir, ClashInstance, u16, u16) {
     let (api_reservation, socks_reservation) = reserve_ports();
     let api_port = api_reservation.local_addr().unwrap().port();
@@ -173,7 +195,7 @@ proxy-providers:
       enable: false
 proxy-groups:
   - name: balanced
-    type: load-balance
+    type: {group_type}
     use:
       - local
     url: http://127.0.0.1/
@@ -467,6 +489,63 @@ proxies:
     let cached = fs::read_to_string(cwd.path().join("http-provider.yaml"))
         .expect("failed to read refreshed provider cache");
     assert!(cached.contains("type: reject"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn selector_group_tracks_manual_provider_refresh() {
+    let server = httpmock::MockServer::start();
+    let mut direct_mock = server.mock(|when, then| {
+        when.method(httpmock::Method::GET).path("/selector.yaml");
+        then.status(200).body(
+            r#"
+proxies:
+  - name: selector-direct
+    type: direct
+"#,
+        );
+    });
+    let target = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind local target");
+    let target_port = target.local_addr().unwrap().port();
+    let target_task = tokio::spawn(async move {
+        let (mut stream, _) = target.accept().await.unwrap();
+        let mut request = [0u8; 128];
+        let len = stream.read(&mut request).await.unwrap();
+        stream.write_all(&request[..len]).await.unwrap();
+    });
+
+    let (_cwd, _client, api_port, socks_port) = start_http_provider_client_for_group(
+        &server.url("/selector.yaml"),
+        0,
+        "select",
+    );
+    let group = get_json(api_port, "/proxies/balanced").await;
+    assert_eq!(group["type"], "Selector");
+    assert_eq!(group["all"], serde_json::json!(["DIRECT"]));
+    assert_eq!(group["now"], "DIRECT");
+    assert!(roundtrip(socks_port, target_port, b"selector-before").await);
+    target_task.await.unwrap();
+
+    direct_mock.delete();
+    let reject_mock = server.mock(|when, then| {
+        when.method(httpmock::Method::GET).path("/selector.yaml");
+        then.status(200).body(
+            r#"
+proxies:
+  - name: selector-reject
+    type: reject
+"#,
+        );
+    });
+    put_provider(api_port, "local").await;
+    reject_mock.assert();
+
+    let group = get_json(api_port, "/proxies/balanced").await;
+    assert_eq!(group["all"], serde_json::json!(["REJECT"]));
+    assert_eq!(group["now"], "REJECT");
+    assert!(!roundtrip(socks_port, target_port, b"selector-after").await);
 }
 
 #[tokio::test(flavor = "current_thread")]
