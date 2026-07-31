@@ -800,6 +800,117 @@ impl OutboundManager {
         Ok(())
     }
 
+    fn parse_provider_proxies(
+        name: &str,
+        content: &[u8],
+    ) -> Result<Vec<AnyOutboundHandler>, Error> {
+        let scheme: ProviderScheme =
+            serde_yaml::from_slice(content).map_err(|error| {
+                Error::InvalidConfig(format!(
+                    "failed to parse proxy provider `{name}`: {error}"
+                ))
+            })?;
+        let proxy_defs = scheme.proxies.ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "proxy provider `{name}` has empty proxies"
+            ))
+        })?;
+
+        let mut proxies = Vec::with_capacity(proxy_defs.len());
+        for definition in proxy_defs {
+            let protocol = OutboundProxyProtocol::try_from(definition)?;
+            proxies.extend(Self::load_plain_outbounds(vec![protocol]));
+        }
+        if proxies.is_empty() {
+            return Err(Error::InvalidConfig(format!(
+                "proxy provider `{name}` has no usable proxies"
+            )));
+        }
+        Ok(proxies)
+    }
+
+    fn build_provider_health_check(
+        name: &str,
+        proxies: Vec<AnyOutboundHandler>,
+        provider_interval: Option<u64>,
+        health: crate::config::internal::proxy::HealthCheck,
+        proxy_manager: ProxyManager,
+    ) -> Result<HealthCheck, Error> {
+        if matches!(
+            health.probe,
+            HealthCheckProbe::Download | HealthCheckProbe::Sse
+        ) && !cfg!(feature = "extended-health-check")
+        {
+            return Err(Error::InvalidConfig(format!(
+                "proxy provider `{name}` uses an extended health probe, but \
+                 extended-health-check is disabled"
+            )));
+        }
+        if health.probe == HealthCheckProbe::Websocket
+            && !cfg!(all(feature = "extended-health-check", feature = "ws"))
+        {
+            return Err(Error::InvalidConfig(format!(
+                "proxy provider `{name}` uses WebSocket health probe, but \
+                 extended-health-check or ws is disabled"
+            )));
+        }
+
+        let minimum_bytes = health.minimum_bytes.unwrap_or(65_536);
+        if health.probe == HealthCheckProbe::Download && minimum_bytes == 0 {
+            return Err(Error::InvalidConfig(format!(
+                "proxy provider `{name}` download health probe requires \
+                 minimum-bytes greater than zero"
+            )));
+        }
+        let minimum_events = health.minimum_events.unwrap_or(3);
+        if health.probe == HealthCheckProbe::Sse && minimum_events == 0 {
+            return Err(Error::InvalidConfig(format!(
+                "proxy provider `{name}` SSE health probe requires \
+                 minimum-events greater than zero"
+            )));
+        }
+        let maximum_first_byte =
+            Duration::from_millis(health.maximum_first_byte_ms.unwrap_or(3_000));
+        if health.probe == HealthCheckProbe::Sse && maximum_first_byte.is_zero() {
+            return Err(Error::InvalidConfig(format!(
+                "proxy provider `{name}` SSE health probe requires \
+                 maximum-first-byte-ms greater than zero"
+            )));
+        }
+        let expected_echo = health
+            .expect_echo
+            .unwrap_or_else(|| "chimera-health".to_owned());
+        if health.probe == HealthCheckProbe::Websocket && expected_echo.is_empty() {
+            return Err(Error::InvalidConfig(format!(
+                "proxy provider `{name}` WebSocket health probe requires \
+                 non-empty expect-echo"
+            )));
+        }
+        let interval = if health.enable == Some(false) {
+            0
+        } else {
+            health.interval.or(provider_interval).unwrap_or_default()
+        };
+
+        Ok(HealthCheck::new(
+            proxies,
+            health
+                .url
+                .unwrap_or_else(|| DEFAULT_LATENCY_TEST_URL.to_owned()),
+            interval,
+            health.lazy.unwrap_or(true),
+            proxy_manager,
+        )
+        .with_probe(
+            health.probe,
+            minimum_bytes,
+            minimum_events,
+            maximum_first_byte,
+            expected_echo,
+            health.timeout.map(Duration::from_secs),
+        ))
+    }
+
     async fn load_proxy_providers(
         &mut self,
         cwd: String,
@@ -867,110 +978,14 @@ impl OutboundManager {
                         ))
                     })?;
 
-                    let scheme: ProviderScheme = serde_yaml::from_slice(&content).map_err(|e| {
-                        Error::InvalidConfig(format!(
-                            "failed to parse file provider `{name}` from {}: {e}",
-                            path.display()
-                        ))
-                    })?;
-
-                    let proxy_defs = scheme.proxies.ok_or_else(|| {
-                        Error::InvalidConfig(format!(
-                            "file provider `{name}` has empty proxies"
-                        ))
-                    })?;
-
-                    let mut proxies = Vec::with_capacity(proxy_defs.len());
-                    for def in proxy_defs {
-                        let protocol = OutboundProxyProtocol::try_from(def)?;
-                        let mut loaded = Self::load_plain_outbounds(vec![protocol]);
-                        if let Some(handler) = loaded.pop() {
-                            proxies.push(handler);
-                        }
-                    }
-
-                    let health = file.health_check;
-                    if matches!(
-                        health.probe,
-                        HealthCheckProbe::Download | HealthCheckProbe::Sse
-                    ) && !cfg!(feature = "extended-health-check")
-                    {
-                        return Err(Error::InvalidConfig(format!(
-                            "file provider `{name}` uses download health probe, \
-                             but extended-health-check is disabled"
-                        )));
-                    }
-                    if health.probe == HealthCheckProbe::Websocket
-                        && !cfg!(all(
-                            feature = "extended-health-check",
-                            feature = "ws"
-                        ))
-                    {
-                        return Err(Error::InvalidConfig(format!(
-                            "file provider `{name}` uses WebSocket health probe, \
-                             but extended-health-check or ws is disabled"
-                        )));
-                    }
-                    let minimum_bytes = health.minimum_bytes.unwrap_or(65_536);
-                    if health.probe == HealthCheckProbe::Download
-                        && minimum_bytes == 0
-                    {
-                        return Err(Error::InvalidConfig(format!(
-                            "file provider `{name}` download health probe requires \
-                             minimum-bytes greater than zero"
-                        )));
-                    }
-                    let minimum_events = health.minimum_events.unwrap_or(3);
-                    if health.probe == HealthCheckProbe::Sse && minimum_events == 0 {
-                        return Err(Error::InvalidConfig(format!(
-                            "file provider `{name}` SSE health probe requires \
-                             minimum-events greater than zero"
-                        )));
-                    }
-                    let maximum_first_byte = Duration::from_millis(
-                        health.maximum_first_byte_ms.unwrap_or(3_000),
-                    );
-                    if health.probe == HealthCheckProbe::Sse
-                        && maximum_first_byte.is_zero()
-                    {
-                        return Err(Error::InvalidConfig(format!(
-                            "file provider `{name}` SSE health probe requires \
-                             maximum-first-byte-ms greater than zero"
-                        )));
-                    }
-                    let expected_echo = health
-                        .expect_echo
-                        .unwrap_or_else(|| "chimera-health".to_owned());
-                    if health.probe == HealthCheckProbe::Websocket
-                        && expected_echo.is_empty()
-                    {
-                        return Err(Error::InvalidConfig(format!(
-                            "file provider `{name}` WebSocket health probe requires \
-                             non-empty expect-echo"
-                        )));
-                    }
-                    let interval = if health.enable == Some(false) {
-                        0
-                    } else {
-                        health.interval.or(file.interval).unwrap_or_default()
-                    };
-                    let health_check = HealthCheck::new(
+                    let proxies = Self::parse_provider_proxies(&name, &content)?;
+                    let health_check = Self::build_provider_health_check(
+                        &name,
                         proxies.clone(),
-                        health
-                            .url
-                            .unwrap_or_else(|| DEFAULT_LATENCY_TEST_URL.to_owned()),
-                        interval,
-                        health.lazy.unwrap_or(true),
+                        file.interval,
+                        file.health_check,
                         self.proxy_manager.clone(),
-                    )
-                    .with_probe(
-                        health.probe,
-                        minimum_bytes,
-                        minimum_events,
-                        maximum_first_byte,
-                        expected_echo,
-                        health.timeout.map(Duration::from_secs),
-                    );
+                    )?;
 
                     let provider = Arc::new(RwLock::new(
                         PlainProvider::new(
