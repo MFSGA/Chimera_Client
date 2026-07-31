@@ -320,6 +320,23 @@ mod tests {
     }
 
     #[test]
+    fn source_cidr_and_domain_regex_work_as_leaves() {
+        let mut source_session = session("example.com", 443, Network::Tcp);
+        source_session.source = "192.168.1.20:50000".parse().unwrap();
+        let source = rule("AND", "((SRC-IP-CIDR,192.168.1.0/24),(NETWORK,TCP))");
+        assert!(source.apply(&source_session));
+        source_session.source = "10.0.0.20:50000".parse().unwrap();
+        assert!(!source.apply(&source_session));
+
+        let regex = rule(
+            "AND",
+            r"((DOMAIN-REGEX,^api[0-9]+\.example\.com$),(NETWORK,TCP))",
+        );
+        assert!(regex.apply(&session("api12.example.com", 443, Network::Tcp)));
+        assert!(!regex.apply(&session("www.example.com", 443, Network::Tcp)));
+    }
+
+    #[test]
     fn domain_suffix_and_keyword_work_as_leaves() {
         let suffix = rule("AND", "((DOMAIN-SUFFIX,example.com),(NETWORK,TCP))");
         assert!(suffix.apply(&session("api.example.com", 443, Network::Tcp)));
