@@ -53,6 +53,14 @@ pub enum RuleType {
         port: u16,
         target: String,
     },
+    ProcessName {
+        process_name: String,
+        target: String,
+    },
+    ProcessPath {
+        process_path: String,
+        target: String,
+    },
     Network {
         network: Network,
         target: String,
@@ -133,6 +141,14 @@ impl RuleType {
                 })?,
                 target: target.to_string(),
             }),
+            "PROCESS-NAME" => Ok(RuleType::ProcessName {
+                process_name: payload.to_string(),
+                target: target.to_string(),
+            }),
+            "PROCESS-PATH" => Ok(RuleType::ProcessPath {
+                process_path: payload.to_string(),
+                target: target.to_string(),
+            }),
             "NETWORK" => Ok(RuleType::Network {
                 network: match payload.to_ascii_uppercase().as_str() {
                     "TCP" => Network::Tcp,
@@ -173,6 +189,8 @@ impl RuleType {
             RuleType::RuleSet { target, .. } => target,
             RuleType::SrcPort { target, .. } => target,
             RuleType::DstPort { target, .. } => target,
+            RuleType::ProcessName { target, .. } => target,
+            RuleType::ProcessPath { target, .. } => target,
             RuleType::Network { target, .. } => target,
             RuleType::Composite { target, .. } => target,
         }
@@ -323,6 +341,18 @@ mod tests {
             RuleType::try_from("SRC-IP-CIDR,192.168.1.0/24,DIRECT".to_string())
                 .unwrap();
         assert!(matches!(source, RuleType::SrcCidr { .. }));
+    }
+
+    #[test]
+    fn parse_process_rules() {
+        let name =
+            RuleType::try_from("PROCESS-NAME,steam.exe,GAME".to_string()).unwrap();
+        assert!(matches!(name, RuleType::ProcessName { .. }));
+        let path = RuleType::try_from(
+            "PROCESS-PATH,C:\\Games\\Steam\\steam.exe,GAME".to_string(),
+        )
+        .unwrap();
+        assert!(matches!(path, RuleType::ProcessPath { .. }));
     }
 
     #[test]
