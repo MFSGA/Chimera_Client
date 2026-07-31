@@ -4,6 +4,8 @@ use async_trait::async_trait;
 use tokio::net::TcpListener;
 use tracing::{trace, warn};
 
+mod udp;
+
 use crate::{
     app::dispatcher::Dispatcher,
     proxy::{
@@ -49,7 +51,7 @@ impl InboundHandlerTrait for TproxyInbound {
     }
 
     fn handle_udp(&self) -> bool {
-        false
+        true
     }
 
     async fn listen_tcp(&self) -> io::Result<()> {
@@ -88,8 +90,6 @@ impl InboundHandlerTrait for TproxyInbound {
     }
 
     async fn listen_udp(&self) -> io::Result<()> {
-        Err(io::Error::other(
-            "tproxy UDP support is not enabled in this migration batch",
-        ))
+        udp::listen(self.addr, self.dispatcher.clone(), self.fw_mark).await
     }
 }
