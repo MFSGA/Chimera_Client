@@ -16,7 +16,7 @@ use crate::{
         router::rules::{
             composite::CompositeRule, domain::Domain, domain_keyword::DomainKeyword,
             domain_suffix::DomainSuffix, final_::Final, ipcidr::IpCidr,
-            network::NetworkRule, ruleset::RuleSet,
+            network::NetworkRule, port::PortRule, ruleset::RuleSet,
         },
     },
     common::{geodata::GeoDataLookup, mmdb::MmdbLookup},
@@ -353,6 +353,16 @@ pub fn map_rule_type(
             ipnet,
             target,
             no_resolve,
+        }),
+        RuleType::SrcPort { port, target } => Box::new(PortRule {
+            port,
+            target,
+            source: true,
+        }),
+        RuleType::DstPort { port, target } => Box::new(PortRule {
+            port,
+            target,
+            source: false,
         }),
         RuleType::Network { network, target } => {
             Box::new(NetworkRule { network, target })
