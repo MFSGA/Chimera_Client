@@ -14,7 +14,7 @@ use crate::{
             rule_provider::{RuleProviderImpl, ThreadSafeRuleProvider},
         },
         router::rules::{
-            domain::Domain, domain_keyword::DomainKeyword,
+            composite::CompositeRule, domain::Domain, domain_keyword::DomainKeyword,
             domain_suffix::DomainSuffix, final_::Final, ipcidr::IpCidr,
             network::NetworkRule, ruleset::RuleSet,
         },
@@ -376,6 +376,18 @@ pub fn map_rule_type(
             )),
         },
 
+        RuleType::Composite {
+            operator,
+            expression,
+            target,
+        } => Ok(Box::new(CompositeRule::new(
+            &operator,
+            &expression,
+            &target,
+            mmdb,
+            geodata,
+            rule_provider_registry,
+        )?)),
         RuleType::Match { target } => Ok(Box::new(Final { target })),
     }
 }
