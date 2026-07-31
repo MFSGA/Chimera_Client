@@ -1,4 +1,4 @@
-use std::{net::TcpListener as StdTcpListener, path::PathBuf, time::Duration};
+use std::{fs, net::TcpListener as StdTcpListener, path::PathBuf, time::Duration};
 
 use bytes::{Buf, Bytes};
 use clash_lib::{Config, Options};
@@ -63,6 +63,66 @@ rules:
     )
     .expect("failed to start load-balance client");
     (client, api_port, socks_port)
+}
+
+fn start_file_provider_client() -> (tempfile::TempDir, ClashInstance, u16, u16) {
+    let api_port = available_port();
+    let socks_port = available_port();
+    let cwd = tempfile::tempdir().expect("failed to create provider tempdir");
+    fs::write(
+        cwd.path().join("providers.yaml"),
+        r#"
+proxies:
+  - name: provider-direct
+    type: direct
+  - name: provider-reject
+    type: reject
+"#,
+    )
+    .expect("failed to write provider file");
+    let config = format!(
+        r#"
+allow-lan: false
+bind-address: 127.0.0.1
+socks-port: {socks_port}
+mode: rule
+log-level: error
+mmdb: null
+external-controller: 127.0.0.1:{api_port}
+secret: test-secret
+tun:
+  enable: false
+proxy-providers:
+  local:
+    type: file
+    path: providers.yaml
+    health-check:
+      enable: false
+proxy-groups:
+  - name: balanced
+    type: load-balance
+    use:
+      - local
+    url: http://127.0.0.1/
+    interval: 3600
+    lazy: true
+    strategy: round-robin
+rules:
+  - MATCH,balanced
+"#
+    );
+    let client = ClashInstance::start(
+        Options {
+            config: Config::Str(config),
+            cwd: Some(cwd.path().to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            config_path: None,
+        },
+        vec![api_port, socks_port],
+    )
+    .expect("failed to start file-provider client");
+    (cwd, client, api_port, socks_port)
 }
 
 async fn socks5_connect(proxy_port: u16, target_port: u16) -> TcpStream {
@@ -160,6 +220,36 @@ async fn load_balance_rotates_real_tcp_connections() {
     assert!(roundtrip(socks_port, target_port, b"first-direct").await);
     assert!(!roundtrip(socks_port, target_port, b"second-reject").await);
     assert!(roundtrip(socks_port, target_port, b"third-direct").await);
+    target_task.await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn file_provider_populates_group_and_routes_real_tcp() {
+    let target = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind local target");
+    let target_port = target.local_addr().unwrap().port();
+    let target_task = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut stream, _) = target.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut request = [0u8; 128];
+                let len = stream.read(&mut request).await.unwrap();
+                stream.write_all(&request[..len]).await.unwrap();
+            });
+        }
+    });
+
+    let (_cwd, _client, api_port, socks_port) = start_file_provider_client();
+    let provider = get_json(api_port, "/providers/proxies/local").await;
+    assert_eq!(provider["name"], "local");
+    let group = get_json(api_port, "/proxies/balanced").await;
+    assert_eq!(group["all"], serde_json::json!(["DIRECT", "REJECT"]));
+
+    assert!(roundtrip(socks_port, target_port, b"provider-first").await);
+    assert!(!roundtrip(socks_port, target_port, b"provider-second").await);
+    assert!(roundtrip(socks_port, target_port, b"provider-third").await);
     target_task.await.unwrap();
 }
 

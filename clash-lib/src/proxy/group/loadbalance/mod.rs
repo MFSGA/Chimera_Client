@@ -118,13 +118,7 @@ impl OutboundHandler for Handler {
     }
 
     async fn support_udp(&self) -> bool {
-        if !self.opts.udp {
-            return false;
-        }
-        match self.selected_proxy(false, &Session::default()).await {
-            Ok(proxy) => proxy.support_udp().await,
-            Err(_) => false,
-        }
+        self.opts.udp
     }
 
     async fn connect_stream(
