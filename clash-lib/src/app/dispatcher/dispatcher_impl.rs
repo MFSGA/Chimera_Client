@@ -105,6 +105,13 @@ impl Dispatcher {
             };
 
         sess.destination = dest.clone();
+        if sess.process_name.is_none() {
+            sess.process_name = find_process_name(
+                sess.source,
+                dest.clone().try_into_socket_addr(),
+                sess.network,
+            );
+        }
 
         let mode = *self.mode.read().await;
         let (outbound_name, rule) = match mode {
