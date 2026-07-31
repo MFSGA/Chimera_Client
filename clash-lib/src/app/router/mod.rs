@@ -16,7 +16,7 @@ use crate::{
         router::rules::{
             domain::Domain, domain_keyword::DomainKeyword,
             domain_suffix::DomainSuffix, final_::Final, ipcidr::IpCidr,
-            ruleset::RuleSet,
+            network::NetworkRule, ruleset::RuleSet,
         },
     },
     common::{geodata::GeoDataLookup, mmdb::MmdbLookup},
@@ -354,6 +354,9 @@ pub fn map_rule_type(
             target,
             no_resolve,
         }),
+        RuleType::Network { network, target } => {
+            Box::new(NetworkRule { network, target })
+        }
         RuleType::RuleSet { rule_set, target } => match rule_provider_registry {
             Some(rule_provider_registry) => Box::new(RuleSet::new(
                 rule_set.clone(),
