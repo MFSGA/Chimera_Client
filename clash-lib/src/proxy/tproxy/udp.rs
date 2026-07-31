@@ -287,3 +287,50 @@ fn set_socket_option(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_ipv4_sockaddr_from_network_byte_order() {
+        let address = libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: 12_345u16.to_be(),
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_ne_bytes([192, 0, 2, 10]),
+            },
+            sin_zero: [0; 8],
+        };
+
+        assert_eq!(
+            sockaddr_v4(&address),
+            SocketAddr::from(([192, 0, 2, 10], 12_345))
+        );
+    }
+
+    #[test]
+    fn converts_ipv6_sockaddr_from_network_byte_order() {
+        let ip = Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 2, 3, 4, 5);
+        let address = libc::sockaddr_in6 {
+            sin6_family: libc::AF_INET6 as libc::sa_family_t,
+            sin6_port: 53u16.to_be(),
+            sin6_flowinfo: 0,
+            sin6_addr: libc::in6_addr {
+                s6_addr: ip.octets(),
+            },
+            sin6_scope_id: 0,
+        };
+
+        assert_eq!(sockaddr_v6(&address), SocketAddr::new(ip.into(), 53));
+    }
+
+    #[test]
+    fn rejects_unsupported_sockaddr_family() {
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        storage.ss_family = libc::AF_UNSPEC as libc::sa_family_t;
+
+        let error = storage_to_socket_addr(&storage).unwrap_err();
+        assert!(error.to_string().contains("unsupported tproxy source"));
+    }
+}
