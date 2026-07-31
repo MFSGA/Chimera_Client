@@ -244,6 +244,17 @@ async fn put_provider(api_port: u16, name: &str) {
     assert_eq!(response.status(), http::StatusCode::ACCEPTED);
 }
 
+async fn wait_for_group_proxies(api_port: u16, expected: serde_json::Value) {
+    for _ in 0..30 {
+        let group = get_json(api_port, "/proxies/balanced").await;
+        if group["all"] == expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("proxy group did not refresh to {expected}");
+}
+
 async fn roundtrip(proxy_port: u16, target_port: u16, payload: &[u8]) -> bool {
     let mut stream = socks5_connect(proxy_port, target_port).await;
     if stream.write_all(payload).await.is_err() {
@@ -417,6 +428,55 @@ proxies:
     assert!(!roundtrip(socks_port, target_port, b"after-refresh").await);
     let cached = fs::read_to_string(cwd.path().join("http-provider.yaml"))
         .expect("failed to read refreshed provider cache");
+    assert!(cached.contains("type: reject"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn http_provider_interval_refreshes_live_proxy_set() {
+    let server = httpmock::MockServer::start();
+    let mut direct_mock = server.mock(|when, then| {
+        when.method(httpmock::Method::GET).path("/interval.yaml");
+        then.status(200).body(
+            r#"
+proxies:
+  - name: interval-direct
+    type: direct
+"#,
+        );
+    });
+    let target = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind local target");
+    let target_port = target.local_addr().unwrap().port();
+    let target_task = tokio::spawn(async move {
+        let (mut stream, _) = target.accept().await.unwrap();
+        let mut request = [0u8; 128];
+        let len = stream.read(&mut request).await.unwrap();
+        stream.write_all(&request[..len]).await.unwrap();
+    });
+
+    let (cwd, _client, api_port, socks_port) =
+        start_http_provider_client(&server.url("/interval.yaml"), 1);
+    assert!(roundtrip(socks_port, target_port, b"before-interval").await);
+    target_task.await.unwrap();
+
+    direct_mock.delete();
+    let reject_mock = server.mock(|when, then| {
+        when.method(httpmock::Method::GET).path("/interval.yaml");
+        then.status(200).body(
+            r#"
+proxies:
+  - name: interval-reject
+    type: reject
+"#,
+        );
+    });
+    wait_for_group_proxies(api_port, serde_json::json!(["REJECT"])).await;
+    assert!(reject_mock.calls() >= 1);
+    assert!(!roundtrip(socks_port, target_port, b"after-interval").await);
+    let cached = fs::read_to_string(cwd.path().join("http-provider.yaml"))
+        .expect("failed to read interval-refreshed cache");
     assert!(cached.contains("type: reject"));
 }
 
