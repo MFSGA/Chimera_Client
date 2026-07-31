@@ -129,8 +129,20 @@ fn start_http_provider_client(
     provider_url: &str,
     interval: u64,
 ) -> (tempfile::TempDir, ClashInstance, u16, u16) {
+    start_http_provider_client_with_cache(provider_url, interval, None)
+}
+
+fn start_http_provider_client_with_cache(
+    provider_url: &str,
+    interval: u64,
+    cached_provider: Option<&str>,
+) -> (tempfile::TempDir, ClashInstance, u16, u16) {
     let (api_port, socks_port) = available_ports();
     let cwd = tempfile::tempdir().expect("failed to create provider tempdir");
+    if let Some(cached_provider) = cached_provider {
+        fs::write(cwd.path().join("http-provider.yaml"), cached_provider)
+            .expect("failed to write provider cache");
+    }
     let config = format!(
         r#"
 allow-lan: false
@@ -435,6 +447,50 @@ proxies:
     let cached = fs::read_to_string(cwd.path().join("http-provider.yaml"))
         .expect("failed to read refreshed provider cache");
     assert!(cached.contains("type: reject"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn http_provider_starts_from_cache_during_remote_outage() {
+    let server = httpmock::MockServer::start();
+    let unavailable_mock = server.mock(|when, then| {
+        when.method(httpmock::Method::GET).path("/offline.yaml");
+        then.status(503).body("provider unavailable");
+    });
+    let target = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind local target");
+    let target_port = target.local_addr().unwrap().port();
+    let target_task = tokio::spawn(async move {
+        let (mut stream, _) = target.accept().await.unwrap();
+        let mut request = [0u8; 128];
+        let len = stream.read(&mut request).await.unwrap();
+        stream.write_all(&request[..len]).await.unwrap();
+    });
+    let cached_provider = r#"
+proxies:
+  - name: cached-direct
+    type: direct
+"#;
+
+    let (cwd, _client, api_port, socks_port) = start_http_provider_client_with_cache(
+        &server.url("/offline.yaml"),
+        1,
+        Some(cached_provider),
+    );
+    wait_for_group_proxies(api_port, serde_json::json!(["DIRECT"])).await;
+    for _ in 0..30 {
+        if unavailable_mock.calls() > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(unavailable_mock.calls() > 0);
+    assert!(roundtrip(socks_port, target_port, b"cached-provider").await);
+    target_task.await.unwrap();
+    let cached = fs::read_to_string(cwd.path().join("http-provider.yaml"))
+        .expect("failed to read provider cache after outage");
+    assert!(cached.contains("type: direct"));
 }
 
 #[tokio::test(flavor = "current_thread")]
