@@ -229,7 +229,7 @@ async fn get_json(api_port: u16, path: &str) -> serde_json::Value {
     .expect("failed to parse API response")
 }
 
-async fn put_provider(api_port: u16, name: &str) {
+async fn provider_update_status(api_port: u16, name: &str) -> http::StatusCode {
     let path = format!("/providers/proxies/{name}");
     let url = format!("http://127.0.0.1:{api_port}{path}");
     let request = hyper::Request::builder()
@@ -238,10 +238,17 @@ async fn put_provider(api_port: u16, name: &str) {
         .method(http::Method::PUT)
         .body(http_body_util::Empty::<Bytes>::new())
         .expect("failed to build provider update request");
-    let response = send_http_request(url.parse().unwrap(), request)
+    send_http_request(url.parse().unwrap(), request)
         .await
-        .expect("failed to update provider");
-    assert_eq!(response.status(), http::StatusCode::ACCEPTED);
+        .expect("failed to update provider")
+        .status()
+}
+
+async fn put_provider(api_port: u16, name: &str) {
+    assert_eq!(
+        provider_update_status(api_port, name).await,
+        http::StatusCode::ACCEPTED
+    );
 }
 
 async fn wait_for_group_proxies(api_port: u16, expected: serde_json::Value) {
@@ -429,6 +436,57 @@ proxies:
     let cached = fs::read_to_string(cwd.path().join("http-provider.yaml"))
         .expect("failed to read refreshed provider cache");
     assert!(cached.contains("type: reject"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn failed_http_provider_refresh_keeps_live_proxy_set() {
+    let server = httpmock::MockServer::start();
+    let mut direct_mock = server.mock(|when, then| {
+        when.method(httpmock::Method::GET).path("/failure.yaml");
+        then.status(200).body(
+            r#"
+proxies:
+  - name: stable-direct
+    type: direct
+"#,
+        );
+    });
+    let target = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind local target");
+    let target_port = target.local_addr().unwrap().port();
+    let target_task = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut stream, _) = target.accept().await.unwrap();
+            let mut request = [0u8; 128];
+            let len = stream.read(&mut request).await.unwrap();
+            stream.write_all(&request[..len]).await.unwrap();
+        }
+    });
+
+    let (cwd, _client, api_port, socks_port) =
+        start_http_provider_client(&server.url("/failure.yaml"), 0);
+    assert!(roundtrip(socks_port, target_port, b"before-failure").await);
+
+    direct_mock.delete();
+    let invalid_mock = server.mock(|when, then| {
+        when.method(httpmock::Method::GET).path("/failure.yaml");
+        then.status(200).body("proxies: [");
+    });
+    assert_eq!(
+        provider_update_status(api_port, "local").await,
+        http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    invalid_mock.assert();
+
+    let group = get_json(api_port, "/proxies/balanced").await;
+    assert_eq!(group["all"], serde_json::json!(["DIRECT"]));
+    assert!(roundtrip(socks_port, target_port, b"after-failure").await);
+    target_task.await.unwrap();
+    let cached = fs::read_to_string(cwd.path().join("http-provider.yaml"))
+        .expect("failed to read provider cache after failed refresh");
+    assert!(cached.contains("type: direct"));
 }
 
 #[tokio::test(flavor = "current_thread")]
