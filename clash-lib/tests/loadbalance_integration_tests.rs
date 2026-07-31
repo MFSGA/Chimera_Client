@@ -127,6 +127,7 @@ rules:
 
 fn start_http_provider_client(
     provider_url: &str,
+    interval: u64,
 ) -> (tempfile::TempDir, ClashInstance, u16, u16) {
     let api_port = available_port();
     let socks_port = available_port();
@@ -148,7 +149,7 @@ proxy-providers:
     type: http
     url: {provider_url}
     path: http-provider.yaml
-    interval: 0
+    interval: {interval}
     health-check:
       enable: false
 proxy-groups:
@@ -226,6 +227,21 @@ async fn get_json(api_port: u16, path: &str) -> serde_json::Value {
             .reader(),
     )
     .expect("failed to parse API response")
+}
+
+async fn put_provider(api_port: u16, name: &str) {
+    let path = format!("/providers/proxies/{name}");
+    let url = format!("http://127.0.0.1:{api_port}{path}");
+    let request = hyper::Request::builder()
+        .uri(&url)
+        .header(http::header::AUTHORIZATION, "Bearer test-secret")
+        .method(http::Method::PUT)
+        .body(http_body_util::Empty::<Bytes>::new())
+        .expect("failed to build provider update request");
+    let response = send_http_request(url.parse().unwrap(), request)
+        .await
+        .expect("failed to update provider");
+    assert_eq!(response.status(), http::StatusCode::ACCEPTED);
 }
 
 async fn roundtrip(proxy_port: u16, target_port: u16, payload: &[u8]) -> bool {
@@ -338,7 +354,7 @@ proxies:
     });
 
     let (cwd, _client, api_port, socks_port) =
-        start_http_provider_client(&server.url("/providers.yaml"));
+        start_http_provider_client(&server.url("/providers.yaml"), 0);
     provider_mock.assert();
     assert!(cwd.path().join("http-provider.yaml").is_file());
     let provider = get_json(api_port, "/providers/proxies/local").await;
@@ -350,6 +366,58 @@ proxies:
     assert!(!roundtrip(socks_port, target_port, b"http-second").await);
     assert!(roundtrip(socks_port, target_port, b"http-third").await);
     target_task.await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn http_provider_put_replaces_live_proxy_set() {
+    let server = httpmock::MockServer::start();
+    let mut direct_mock = server.mock(|when, then| {
+        when.method(httpmock::Method::GET).path("/refresh.yaml");
+        then.status(200).body(
+            r#"
+proxies:
+  - name: remote-direct
+    type: direct
+"#,
+        );
+    });
+    let target = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind local target");
+    let target_port = target.local_addr().unwrap().port();
+    let target_task = tokio::spawn(async move {
+        let (mut stream, _) = target.accept().await.unwrap();
+        let mut request = [0u8; 128];
+        let len = stream.read(&mut request).await.unwrap();
+        stream.write_all(&request[..len]).await.unwrap();
+    });
+
+    let (cwd, _client, api_port, socks_port) =
+        start_http_provider_client(&server.url("/refresh.yaml"), 0);
+    assert!(roundtrip(socks_port, target_port, b"before-refresh").await);
+    target_task.await.unwrap();
+
+    direct_mock.delete();
+    let reject_mock = server.mock(|when, then| {
+        when.method(httpmock::Method::GET).path("/refresh.yaml");
+        then.status(200).body(
+            r#"
+proxies:
+  - name: remote-reject
+    type: reject
+"#,
+        );
+    });
+    put_provider(api_port, "local").await;
+    reject_mock.assert();
+
+    let group = get_json(api_port, "/proxies/balanced").await;
+    assert_eq!(group["all"], serde_json::json!(["REJECT"]));
+    assert!(!roundtrip(socks_port, target_port, b"after-refresh").await);
+    let cached = fs::read_to_string(cwd.path().join("http-provider.yaml"))
+        .expect("failed to read refreshed provider cache");
+    assert!(cached.contains("type: reject"));
 }
 
 #[tokio::test(flavor = "current_thread")]
