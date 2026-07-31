@@ -12,7 +12,9 @@ use crate::{
     config::internal::{
         config::BindAddress,
         listener::InboundOpts,
-        proxy::{OutboundGroupProtocol, OutboundProxyProtocol},
+        proxy::{
+            OutboundGroupProtocol, OutboundProxyProtocol, OutboundProxyProviderDef,
+        },
     },
 };
 
@@ -115,6 +117,9 @@ pub struct Config {
     #[serde(rename = "proxy-groups")]
     /// 4. Proxy group settings
     pub proxy_group: Option<Vec<OutboundGroupProtocol>>,
+    #[serde(rename = "proxy-providers")]
+    /// Proxy provider settings
+    pub proxy_provider: Option<HashMap<String, OutboundProxyProviderDef>>,
     #[serde(rename = "rules")]
     /// 5. Rule settings
     pub rule: Option<Vec<String>>,

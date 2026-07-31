@@ -437,15 +437,32 @@ pub struct OutboundGroupRelay {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
-#[serde(tag = "type")]
+#[serde(tag = "type", rename_all = "kebab-case")]
 pub enum OutboundProxyProviderDef {
     Http(OutboundHttpProvider),
     File(OutboundFileProvider),
 }
 
+impl OutboundProxyProviderDef {
+    pub fn set_name(&mut self, name: String) {
+        match self {
+            Self::Http(provider) => provider.name = name,
+            Self::File(provider) => provider.name = name,
+        }
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 #[serde(rename_all = "kebab-case")]
-pub struct OutboundHttpProvider {}
+pub struct OutboundHttpProvider {
+    #[serde(skip)]
+    pub name: String,
+    pub url: String,
+    pub interval: u64,
+    pub path: String,
+    #[serde(default)]
+    pub health_check: HealthCheck,
+}
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 #[serde(rename_all = "kebab-case")]

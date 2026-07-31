@@ -91,7 +91,16 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
             },
         )?,
         proxy_groups: proxy_group::convert(c.proxy_group.take(), &mut proxy_names)?,
-        proxy_providers: HashMap::new(),
+        proxy_providers: c
+            .proxy_provider
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name, mut provider)| {
+                provider.set_name(name.clone());
+                (name, provider)
+            })
+            .collect(),
         rule_providers: rule_provider::convert(c.rule_provider.take()),
         proxy_names,
         users: c
@@ -194,6 +203,54 @@ profile: {{}}
         );
         yaml.parse::<def::Config>()
             .expect("def config should parse")
+    }
+
+    #[test]
+    fn proxy_providers_parse_and_receive_map_names() {
+        let cfg = parse_config(
+            r#"
+proxy-providers:
+  local-set:
+    type: file
+    path: ./providers/local.yaml
+    interval: 600
+    health-check:
+      enable: true
+      url: http://127.0.0.1/generate_204
+      interval: 300
+  remote-set:
+    type: http
+    url: https://example.com/providers.yaml
+    interval: 3600
+    path: ./providers/remote.yaml
+    health-check:
+      enable: false
+"#,
+        );
+
+        let converted = convert(cfg).expect("proxy providers should convert");
+        let local = converted.proxy_providers.get("local-set").unwrap();
+        match local {
+            crate::config::internal::proxy::OutboundProxyProviderDef::File(file) => {
+                assert_eq!(file.name, "local-set");
+                assert_eq!(file.path, "./providers/local.yaml");
+                assert_eq!(file.interval, Some(600));
+                assert_eq!(file.health_check.enable, Some(true));
+            }
+            _ => panic!("expected file provider"),
+        }
+
+        let remote = converted.proxy_providers.get("remote-set").unwrap();
+        match remote {
+            crate::config::internal::proxy::OutboundProxyProviderDef::Http(http) => {
+                assert_eq!(http.name, "remote-set");
+                assert_eq!(http.url, "https://example.com/providers.yaml");
+                assert_eq!(http.interval, 3600);
+                assert_eq!(http.path, "./providers/remote.yaml");
+                assert_eq!(http.health_check.enable, Some(false));
+            }
+            _ => panic!("expected HTTP provider"),
+        }
     }
 
     #[test]
