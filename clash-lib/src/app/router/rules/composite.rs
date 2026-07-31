@@ -320,6 +320,23 @@ mod tests {
     }
 
     #[test]
+    fn process_rules_work_as_composite_leaves() {
+        let mut process_session = session("example.com", 443, Network::Tcp);
+        process_session.process_name =
+            Some("C:\\Games\\Steam\\steam.exe".to_string());
+
+        let name = rule("AND", "((PROCESS-NAME,steam.exe),(NETWORK,TCP))");
+        assert!(!name.apply(&process_session));
+        process_session.process_name = Some("steam.exe".to_string());
+        assert!(name.apply(&process_session));
+
+        process_session.process_name =
+            Some("C:\\Games\\Steam\\steam.exe".to_string());
+        let path = rule("AND", "((PROCESS-PATH,Games\\Steam),(NETWORK,TCP))");
+        assert!(path.apply(&process_session));
+    }
+
+    #[test]
     fn source_cidr_and_domain_regex_work_as_leaves() {
         let mut source_session = session("example.com", 443, Network::Tcp);
         source_session.source = "192.168.1.20:50000".parse().unwrap();
