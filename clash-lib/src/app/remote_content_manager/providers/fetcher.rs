@@ -1,5 +1,6 @@
 use std::{
     fs::{self, metadata},
+    io::{self, Write},
     path::Path,
     sync::Arc,
     time::{Duration, SystemTime},
@@ -13,6 +14,23 @@ use tracing::{info, trace, warn};
 use crate::common::utils;
 
 use super::{ProviderVehicleType, ThreadSafeProviderVehicle};
+
+fn write_cache_atomically(path: &Path, content: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(content)?;
+    temporary.flush()?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(path)
+        .map(|_| ())
+        .map_err(|error| error.error)
+}
 
 fn cache_needs_immediate_update(
     now: SystemTime,
@@ -116,13 +134,7 @@ where
         };
 
         if self.vehicle_type() != ProviderVehicleType::File && !is_local {
-            let p = self.vehicle.path().to_owned();
-            let path = Path::new(p.as_str());
-            let prefix = path.parent().unwrap();
-            if !prefix.exists() {
-                fs::create_dir_all(prefix)?;
-            }
-            fs::write(self.vehicle.path(), &content)?;
+            write_cache_atomically(Path::new(self.vehicle.path()), &content)?;
         }
 
         inner.hash = utils::sha256(&content)[..16]
@@ -172,14 +184,7 @@ where
         }
 
         if vehicle.typ() != ProviderVehicleType::File {
-            let p = vehicle.path().to_owned();
-            let path = Path::new(p.as_str());
-            let prefix = path.parent().unwrap();
-            if !prefix.exists() {
-                fs::create_dir_all(prefix)?;
-            }
-
-            fs::write(vehicle.path(), &content)?;
+            write_cache_atomically(Path::new(vehicle.path()), &content)?;
         }
 
         this.hash = hash;
@@ -268,7 +273,18 @@ mod tests {
         MockProviderVehicle, ProviderVehicleType,
     };
 
-    use super::{Fetcher, cache_needs_immediate_update};
+    use super::{Fetcher, cache_needs_immediate_update, write_cache_atomically};
+
+    #[test]
+    fn atomic_cache_write_replaces_existing_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("provider.yaml");
+        std::fs::write(&path, b"old provider").unwrap();
+
+        write_cache_atomically(&path, b"new provider").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"new provider");
+    }
 
     #[test]
     fn future_cache_timestamp_does_not_panic_or_force_refresh() {

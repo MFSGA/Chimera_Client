@@ -12,18 +12,18 @@ mod common;
 
 use common::{ClashInstance, send_http_request};
 
-fn available_ports() -> (u16, u16) {
+fn reserve_ports() -> (StdTcpListener, StdTcpListener) {
     let first = StdTcpListener::bind("127.0.0.1:0")
         .expect("failed to reserve first test port");
     let second = StdTcpListener::bind("127.0.0.1:0")
         .expect("failed to reserve second test port");
-    let first_port = first.local_addr().unwrap().port();
-    let second_port = second.local_addr().unwrap().port();
-    (first_port, second_port)
+    (first, second)
 }
 
 fn start_client(strategy: &str) -> (ClashInstance, u16, u16) {
-    let (api_port, socks_port) = available_ports();
+    let (api_reservation, socks_reservation) = reserve_ports();
+    let api_port = api_reservation.local_addr().unwrap().port();
+    let socks_port = socks_reservation.local_addr().unwrap().port();
     let config = format!(
         r#"
 allow-lan: false
@@ -52,6 +52,8 @@ rules:
     );
     let cwd =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
+    drop(api_reservation);
+    drop(socks_reservation);
     let client = ClashInstance::start(
         Options {
             config: Config::Str(config),
@@ -67,7 +69,9 @@ rules:
 }
 
 fn start_file_provider_client() -> (tempfile::TempDir, ClashInstance, u16, u16) {
-    let (api_port, socks_port) = available_ports();
+    let (api_reservation, socks_reservation) = reserve_ports();
+    let api_port = api_reservation.local_addr().unwrap().port();
+    let socks_port = socks_reservation.local_addr().unwrap().port();
     let cwd = tempfile::tempdir().expect("failed to create provider tempdir");
     fs::write(
         cwd.path().join("providers.yaml"),
@@ -111,6 +115,8 @@ rules:
   - MATCH,balanced
 "#
     );
+    drop(api_reservation);
+    drop(socks_reservation);
     let client = ClashInstance::start(
         Options {
             config: Config::Str(config),
@@ -137,7 +143,9 @@ fn start_http_provider_client_with_cache(
     interval: u64,
     cached_provider: Option<&str>,
 ) -> (tempfile::TempDir, ClashInstance, u16, u16) {
-    let (api_port, socks_port) = available_ports();
+    let (api_reservation, socks_reservation) = reserve_ports();
+    let api_port = api_reservation.local_addr().unwrap().port();
+    let socks_port = socks_reservation.local_addr().unwrap().port();
     let cwd = tempfile::tempdir().expect("failed to create provider tempdir");
     if let Some(cached_provider) = cached_provider {
         fs::write(cwd.path().join("http-provider.yaml"), cached_provider)
@@ -176,6 +184,8 @@ rules:
   - MATCH,balanced
 "#
     );
+    drop(api_reservation);
+    drop(socks_reservation);
     let client = ClashInstance::start(
         Options {
             config: Config::Str(config),
