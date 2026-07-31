@@ -214,3 +214,164 @@ impl RuleMatcher for CompositeRule {
         &self.operator
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{Network, SocksAddr};
+
+    fn session(domain: &str, port: u16, network: Network) -> Session {
+        Session {
+            destination: SocksAddr::Domain(domain.to_string(), port),
+            network,
+            ..Default::default()
+        }
+    }
+
+    fn rule(operator: &str, expression: &str) -> CompositeRule {
+        CompositeRule::new(operator, expression, "PROXY", None, None, None).unwrap()
+    }
+
+    #[test]
+    fn and_requires_every_child() {
+        let rule = rule("AND", "((DOMAIN,example.com),(NETWORK,UDP))");
+        assert!(rule.apply(&session("example.com", 53, Network::Udp)));
+        assert!(!rule.apply(&session("example.com", 53, Network::Tcp)));
+        assert!(!rule.apply(&session("other.com", 53, Network::Udp)));
+        assert_eq!(rule.target(), "PROXY");
+        assert_eq!(rule.type_name(), "AND");
+    }
+
+    #[test]
+    fn or_accepts_any_child() {
+        let rule = rule("OR", "((DOMAIN,example.com),(NETWORK,UDP))");
+        assert!(rule.apply(&session("example.com", 443, Network::Tcp)));
+        assert!(rule.apply(&session("other.com", 53, Network::Udp)));
+        assert!(!rule.apply(&session("other.com", 443, Network::Tcp)));
+    }
+
+    #[test]
+    fn not_inverts_one_child() {
+        let rule = rule("NOT", "((DOMAIN,example.com))");
+        assert!(rule.apply(&session("other.com", 443, Network::Tcp)));
+        assert!(!rule.apply(&session("example.com", 443, Network::Tcp)));
+    }
+
+    #[test]
+    fn not_rejects_multiple_children() {
+        assert!(
+            CompositeRule::new(
+                "NOT",
+                "((DOMAIN,example.com),(NETWORK,UDP))",
+                "PROXY",
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn nested_and_with_or_matches_both_networks() {
+        let rule = rule(
+            "AND",
+            "((DOMAIN,example.com),(OR,((NETWORK,UDP),(NETWORK,TCP))))",
+        );
+        assert!(rule.apply(&session("example.com", 53, Network::Udp)));
+        assert!(rule.apply(&session("example.com", 443, Network::Tcp)));
+        assert!(!rule.apply(&session("other.com", 53, Network::Udp)));
+    }
+
+    #[test]
+    fn nested_or_with_and_keeps_pairing() {
+        let rule = rule(
+            "OR",
+            "((AND,((DOMAIN,a.com),(NETWORK,UDP))),(AND,((DOMAIN,b.com),(NETWORK,TCP))))",
+        );
+        assert!(rule.apply(&session("a.com", 53, Network::Udp)));
+        assert!(rule.apply(&session("b.com", 443, Network::Tcp)));
+        assert!(!rule.apply(&session("a.com", 443, Network::Tcp)));
+        assert!(!rule.apply(&session("b.com", 53, Network::Udp)));
+    }
+
+    #[test]
+    fn nested_not_can_filter_network() {
+        let rule = rule("AND", "((DOMAIN,example.com),(NOT,((NETWORK,TCP))))");
+        assert!(rule.apply(&session("example.com", 53, Network::Udp)));
+        assert!(!rule.apply(&session("example.com", 443, Network::Tcp)));
+    }
+
+    #[test]
+    fn or_supports_more_than_two_children() {
+        let rule = rule("OR", "((DOMAIN,a.com),(DOMAIN,b.com),(DOMAIN,c.com))");
+        for domain in ["a.com", "b.com", "c.com"] {
+            assert!(rule.apply(&session(domain, 443, Network::Tcp)));
+        }
+        assert!(!rule.apply(&session("d.com", 443, Network::Tcp)));
+    }
+
+    #[test]
+    fn domain_suffix_and_keyword_work_as_leaves() {
+        let suffix = rule("AND", "((DOMAIN-SUFFIX,example.com),(NETWORK,TCP))");
+        assert!(suffix.apply(&session("api.example.com", 443, Network::Tcp)));
+        assert!(!suffix.apply(&session("api.example.com", 53, Network::Udp)));
+
+        let keyword =
+            rule("OR", "((DOMAIN-KEYWORD,google),(DOMAIN-KEYWORD,youtube))");
+        assert!(keyword.apply(&session("www.google.com", 443, Network::Tcp)));
+        assert!(keyword.apply(&session("m.youtube.com", 443, Network::Tcp)));
+        assert!(!keyword.apply(&session("example.com", 443, Network::Tcp)));
+    }
+
+    #[test]
+    fn rejects_missing_or_unbalanced_parentheses() {
+        for expression in [
+            "(DOMAIN,example.com),(NETWORK,UDP)",
+            "((DOMAIN,example.com),(NETWORK,UDP)",
+            "((DOMAIN,example.com)),(NETWORK,UDP)))",
+        ] {
+            assert!(
+                CompositeRule::new("AND", expression, "PROXY", None, None, None,)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_operator_and_empty_expression() {
+        assert!(
+            CompositeRule::new(
+                "XOR",
+                "((DOMAIN,example.com))",
+                "PROXY",
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(CompositeRule::new("AND", "()", "PROXY", None, None, None).is_err());
+    }
+
+    #[test]
+    fn payload_and_display_preserve_expression() {
+        let expression = "((DOMAIN,example.com),(NETWORK,UDP))";
+        let rule = rule("AND", expression);
+        assert_eq!(rule.payload(), expression);
+        assert!(rule.to_string().contains("PROXY"));
+        assert!(rule.to_string().contains("and"));
+    }
+
+    #[test]
+    fn deeply_nested_expression_matches_expected_pairs() {
+        let rule = rule(
+            "OR",
+            "((AND,((DOMAIN,a.com),(NETWORK,TCP))),(AND,((DOMAIN,b.com),(NETWORK,UDP))))",
+        );
+        assert!(rule.apply(&session("a.com", 443, Network::Tcp)));
+        assert!(rule.apply(&session("b.com", 53, Network::Udp)));
+        assert!(!rule.apply(&session("a.com", 53, Network::Udp)));
+        assert!(!rule.apply(&session("b.com", 443, Network::Tcp)));
+    }
+}
