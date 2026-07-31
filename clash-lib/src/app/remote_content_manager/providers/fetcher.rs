@@ -14,6 +14,14 @@ use crate::common::utils;
 
 use super::{ProviderVehicleType, ThreadSafeProviderVehicle};
 
+fn cache_needs_immediate_update(
+    now: SystemTime,
+    modified: SystemTime,
+    interval: Duration,
+) -> bool {
+    now.duration_since(modified).unwrap_or_default() > interval
+}
+
 struct Inner {
     updated_at: SystemTime,
     hash: [u8; 16],
@@ -84,10 +92,11 @@ where
                 let content = fs::read(&vehicle_path)?;
                 is_local = true;
                 inner.updated_at = meta.modified()?;
-                immediately_update = SystemTime::now()
-                    .duration_since(inner.updated_at)
-                    .expect("wrong system clock")
-                    > self.interval;
+                immediately_update = cache_needs_immediate_update(
+                    SystemTime::now(),
+                    inner.updated_at,
+                    self.interval,
+                );
                 content
             }
             Err(_) => self.vehicle.read().await?,
@@ -246,7 +255,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, sync::Arc, time::Duration};
+    use std::{
+        path::Path,
+        sync::Arc,
+        time::{Duration, SystemTime},
+    };
 
     use futures::future::BoxFuture;
     use tokio::time::sleep;
@@ -255,7 +268,31 @@ mod tests {
         MockProviderVehicle, ProviderVehicleType,
     };
 
-    use super::Fetcher;
+    use super::{Fetcher, cache_needs_immediate_update};
+
+    #[test]
+    fn future_cache_timestamp_does_not_panic_or_force_refresh() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let future = now + Duration::from_secs(60);
+
+        assert!(!cache_needs_immediate_update(
+            now,
+            future,
+            Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn stale_cache_requests_immediate_refresh() {
+        let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let now = modified + Duration::from_secs(60);
+
+        assert!(cache_needs_immediate_update(
+            now,
+            modified,
+            Duration::from_secs(30)
+        ));
+    }
 
     #[tokio::test]
     async fn test_fetcher() {
