@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use crate::Error;
+use crate::{Error, session::Network};
 
 /// todo: support more rule type
 pub enum RuleType {
@@ -35,6 +35,10 @@ pub enum RuleType {
     },
     RuleSet {
         rule_set: String,
+        target: String,
+    },
+    Network {
+        network: Network,
         target: String,
     },
 }
@@ -85,6 +89,18 @@ impl RuleType {
                 rule_set: payload.to_string(),
                 target: target.to_string(),
             }),
+            "NETWORK" => Ok(RuleType::Network {
+                network: match payload.to_ascii_uppercase().as_str() {
+                    "TCP" => Network::Tcp,
+                    "UDP" => Network::Udp,
+                    _ => {
+                        return Err(Error::InvalidConfig(format!(
+                            "unsupported network rule payload: {payload}"
+                        )));
+                    }
+                },
+                target: target.to_string(),
+            }),
             "MATCH" => Ok(RuleType::Match {
                 target: target.to_string(),
             }),
@@ -104,6 +120,7 @@ impl RuleType {
             RuleType::Match { target } => target,
             RuleType::IpCidr { target, .. } => target,
             RuleType::RuleSet { target, .. } => target,
+            RuleType::Network { target, .. } => target,
         }
     }
 }
@@ -181,6 +198,24 @@ mod tests {
     #[test]
     fn invalid_rule_line_still_errors() {
         let rule = RuleType::try_from("DOMAIN-SUFFIX".to_string());
+        assert!(rule.is_err());
+    }
+
+    #[test]
+    fn parse_network_rule() {
+        let rule = RuleType::try_from("NETWORK,udp,PROXY".to_string()).unwrap();
+        match rule {
+            RuleType::Network { network, target } => {
+                assert_eq!(network, crate::session::Network::Udp);
+                assert_eq!(target, "PROXY");
+            }
+            _ => panic!("Expected Network rule"),
+        }
+    }
+
+    #[test]
+    fn reject_invalid_network_rule() {
+        let rule = RuleType::try_from("NETWORK,icmp,PROXY".to_string());
         assert!(rule.is_err());
     }
 
