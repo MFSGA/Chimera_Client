@@ -37,6 +37,14 @@ pub enum RuleType {
         rule_set: String,
         target: String,
     },
+    SrcPort {
+        port: u16,
+        target: String,
+    },
+    DstPort {
+        port: u16,
+        target: String,
+    },
     Network {
         network: Network,
         target: String,
@@ -94,6 +102,20 @@ impl RuleType {
                 rule_set: payload.to_string(),
                 target: target.to_string(),
             }),
+            "SRC-PORT" => Ok(RuleType::SrcPort {
+                port: payload.parse().map_err(|_| {
+                    Error::InvalidConfig(format!("invalid source port: {payload}"))
+                })?,
+                target: target.to_string(),
+            }),
+            "DST-PORT" => Ok(RuleType::DstPort {
+                port: payload.parse().map_err(|_| {
+                    Error::InvalidConfig(format!(
+                        "invalid destination port: {payload}"
+                    ))
+                })?,
+                target: target.to_string(),
+            }),
             "NETWORK" => Ok(RuleType::Network {
                 network: match payload.to_ascii_uppercase().as_str() {
                     "TCP" => Network::Tcp,
@@ -130,6 +152,8 @@ impl RuleType {
             RuleType::Match { target } => target,
             RuleType::IpCidr { target, .. } => target,
             RuleType::RuleSet { target, .. } => target,
+            RuleType::SrcPort { target, .. } => target,
+            RuleType::DstPort { target, .. } => target,
             RuleType::Network { target, .. } => target,
             RuleType::Composite { target, .. } => target,
         }
@@ -263,6 +287,17 @@ mod tests {
             }
             _ => panic!("Expected Composite rule"),
         }
+    }
+
+    #[test]
+    fn parse_port_rules() {
+        let source =
+            RuleType::try_from("SRC-PORT,12345,DIRECT".to_string()).unwrap();
+        assert!(matches!(source, RuleType::SrcPort { port: 12345, .. }));
+        let destination =
+            RuleType::try_from("DST-PORT,443,PROXY".to_string()).unwrap();
+        assert!(matches!(destination, RuleType::DstPort { port: 443, .. }));
+        assert!(RuleType::try_from("DST-PORT,invalid,PROXY".to_string()).is_err());
     }
 
     #[test]

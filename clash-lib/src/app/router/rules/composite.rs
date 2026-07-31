@@ -312,6 +312,14 @@ mod tests {
     }
 
     #[test]
+    fn destination_port_works_as_composite_leaf() {
+        let rule = rule("AND", "((DST-PORT,443),(NETWORK,TCP))");
+        assert!(rule.apply(&session("example.com", 443, Network::Tcp)));
+        assert!(!rule.apply(&session("example.com", 80, Network::Tcp)));
+        assert!(!rule.apply(&session("example.com", 443, Network::Udp)));
+    }
+
+    #[test]
     fn domain_suffix_and_keyword_work_as_leaves() {
         let suffix = rule("AND", "((DOMAIN-SUFFIX,example.com),(NETWORK,TCP))");
         assert!(suffix.apply(&session("api.example.com", 443, Network::Tcp)));
