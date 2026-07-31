@@ -6,6 +6,7 @@ use erased_serde::Serialize;
 use crate::proxy::{AnyOutboundHandler, OutboundHandler};
 
 pub mod fallback;
+pub mod loadbalance;
 pub mod relay;
 pub mod selector;
 pub mod urltest;
