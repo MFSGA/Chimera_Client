@@ -8,7 +8,9 @@ use crate::{
     app::{
         dispatcher::{BoxedChainedDatagram, BoxedChainedStream},
         dns::ThreadSafeDNSResolver,
-        remote_content_manager::providers::proxy_provider::ThreadSafeProxyProvider,
+        remote_content_manager::{
+            ProxyManager, providers::proxy_provider::ThreadSafeProxyProvider,
+        },
     },
     config::internal::proxy::LoadBalanceStrategy,
     proxy::{
@@ -16,7 +18,7 @@ use crate::{
         OutboundHandler, OutboundType,
         group::{
             GroupProxyAPIResponse,
-            loadbalance::helpers::{ConsistentHash, RoundRobin},
+            loadbalance::helpers::{ConsistentHash, RoundRobin, StickySession},
         },
         utils::{RemoteConnector, provider_helper::get_proxies_from_providers},
     },
@@ -34,10 +36,11 @@ pub struct HandlerOptions {
 enum Strategy {
     RoundRobin(RoundRobin),
     ConsistentHash(ConsistentHash),
+    StickySession(StickySession),
 }
 
 impl Strategy {
-    fn select(
+    async fn select(
         &self,
         proxies: &[AnyOutboundHandler],
         session: &Session,
@@ -45,6 +48,7 @@ impl Strategy {
         match self {
             Self::RoundRobin(strategy) => strategy.select(proxies),
             Self::ConsistentHash(strategy) => strategy.select(proxies, session),
+            Self::StickySession(strategy) => strategy.select(proxies, session).await,
         }
     }
 }
@@ -67,6 +71,7 @@ impl Handler {
     pub fn new(
         opts: HandlerOptions,
         providers: Vec<ThreadSafeProxyProvider>,
+        proxy_manager: ProxyManager,
     ) -> Self {
         let strategy = match opts.strategy {
             LoadBalanceStrategy::RoundRobin => {
@@ -74,6 +79,9 @@ impl Handler {
             }
             LoadBalanceStrategy::ConsistentHashing => {
                 Strategy::ConsistentHash(ConsistentHash)
+            }
+            LoadBalanceStrategy::StickySession => {
+                Strategy::StickySession(StickySession::new(proxy_manager))
             }
         };
         Self {
@@ -93,7 +101,7 @@ impl Handler {
         session: &Session,
     ) -> io::Result<AnyOutboundHandler> {
         let proxies = self.get_proxies(touch).await;
-        self.strategy.select(&proxies, session)
+        self.strategy.select(&proxies, session).await
     }
 }
 

@@ -697,6 +697,7 @@ impl OutboundManager {
                                 },
                             },
                             providers,
+                            proxy_manager.clone(),
                         )),
                     );
                 }
