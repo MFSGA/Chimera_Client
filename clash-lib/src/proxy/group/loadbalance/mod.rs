@@ -10,10 +10,14 @@ use crate::{
         dns::ThreadSafeDNSResolver,
         remote_content_manager::providers::proxy_provider::ThreadSafeProxyProvider,
     },
+    config::internal::proxy::LoadBalanceStrategy,
     proxy::{
         AnyOutboundHandler, ConnectorType, DialWithConnector, HandlerCommonOptions,
         OutboundHandler, OutboundType,
-        group::{GroupProxyAPIResponse, loadbalance::helpers::RoundRobin},
+        group::{
+            GroupProxyAPIResponse,
+            loadbalance::helpers::{ConsistentHash, RoundRobin},
+        },
         utils::{RemoteConnector, provider_helper::get_proxies_from_providers},
     },
     session::Session,
@@ -24,12 +28,31 @@ pub struct HandlerOptions {
     pub common_opts: HandlerCommonOptions,
     pub name: String,
     pub udp: bool,
+    pub strategy: LoadBalanceStrategy,
+}
+
+enum Strategy {
+    RoundRobin(RoundRobin),
+    ConsistentHash(ConsistentHash),
+}
+
+impl Strategy {
+    fn select(
+        &self,
+        proxies: &[AnyOutboundHandler],
+        session: &Session,
+    ) -> io::Result<AnyOutboundHandler> {
+        match self {
+            Self::RoundRobin(strategy) => strategy.select(proxies),
+            Self::ConsistentHash(strategy) => strategy.select(proxies, session),
+        }
+    }
 }
 
 pub struct Handler {
     opts: HandlerOptions,
     providers: Vec<ThreadSafeProxyProvider>,
-    strategy: RoundRobin,
+    strategy: Strategy,
 }
 
 impl std::fmt::Debug for Handler {
@@ -45,10 +68,18 @@ impl Handler {
         opts: HandlerOptions,
         providers: Vec<ThreadSafeProxyProvider>,
     ) -> Self {
+        let strategy = match opts.strategy {
+            LoadBalanceStrategy::RoundRobin => {
+                Strategy::RoundRobin(RoundRobin::default())
+            }
+            LoadBalanceStrategy::ConsistentHashing => {
+                Strategy::ConsistentHash(ConsistentHash)
+            }
+        };
         Self {
             opts,
             providers,
-            strategy: RoundRobin::default(),
+            strategy,
         }
     }
 
@@ -56,9 +87,13 @@ impl Handler {
         get_proxies_from_providers(&self.providers, touch).await
     }
 
-    async fn selected_proxy(&self, touch: bool) -> io::Result<AnyOutboundHandler> {
+    async fn selected_proxy(
+        &self,
+        touch: bool,
+        session: &Session,
+    ) -> io::Result<AnyOutboundHandler> {
         let proxies = self.get_proxies(touch).await;
-        self.strategy.select(&proxies)
+        self.strategy.select(&proxies, session)
     }
 }
 
@@ -78,7 +113,7 @@ impl OutboundHandler for Handler {
         if !self.opts.udp {
             return false;
         }
-        match self.selected_proxy(false).await {
+        match self.selected_proxy(false, &Session::default()).await {
             Ok(proxy) => proxy.support_udp().await,
             Err(_) => false,
         }
@@ -89,7 +124,7 @@ impl OutboundHandler for Handler {
         session: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> io::Result<BoxedChainedStream> {
-        let proxy = self.selected_proxy(true).await?;
+        let proxy = self.selected_proxy(true, session).await?;
         let stream = proxy.connect_stream(session, resolver).await?;
         stream.append_to_chain(self.name()).await;
         Ok(stream)
@@ -100,7 +135,7 @@ impl OutboundHandler for Handler {
         session: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> io::Result<BoxedChainedDatagram> {
-        let proxy = self.selected_proxy(true).await?;
+        let proxy = self.selected_proxy(true, session).await?;
         let datagram = proxy.connect_datagram(session, resolver).await?;
         datagram.append_to_chain(self.name()).await;
         Ok(datagram)
@@ -117,7 +152,7 @@ impl OutboundHandler for Handler {
         connector: &dyn RemoteConnector,
     ) -> io::Result<BoxedChainedStream> {
         let stream = self
-            .selected_proxy(true)
+            .selected_proxy(true, session)
             .await?
             .connect_stream_with_connector(session, resolver, connector)
             .await?;
@@ -131,7 +166,7 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
     ) -> io::Result<BoxedChainedDatagram> {
-        self.selected_proxy(true)
+        self.selected_proxy(true, session)
             .await?
             .connect_datagram_with_connector(session, resolver, connector)
             .await
