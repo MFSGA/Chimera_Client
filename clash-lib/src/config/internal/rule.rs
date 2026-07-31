@@ -16,6 +16,10 @@ pub enum RuleType {
         domain_keyword: String,
         target: String,
     },
+    DomainRegex {
+        regex: regex::Regex,
+        target: String,
+    },
     GeoIP {
         target: String,
         country_code: String,
@@ -33,12 +37,29 @@ pub enum RuleType {
         target: String,
         no_resolve: bool,
     },
+    SrcCidr {
+        ipnet: ipnet::IpNet,
+        target: String,
+    },
     RuleSet {
         rule_set: String,
         target: String,
     },
+    SrcPort {
+        port: u16,
+        target: String,
+    },
+    DstPort {
+        port: u16,
+        target: String,
+    },
     Network {
         network: Network,
+        target: String,
+    },
+    Composite {
+        operator: String,
+        expression: String,
         target: String,
     },
 }
@@ -63,6 +84,11 @@ impl RuleType {
                 domain_keyword: payload.to_string(),
                 target: target.to_string(),
             }),
+            "DOMAIN-REGEX" => Ok(RuleType::DomainRegex {
+                regex: regex::Regex::new(payload)
+                    .map_err(|err| Error::InvalidConfig(err.to_string()))?,
+                target: target.to_string(),
+            }),
             "GEOIP" => Ok(RuleType::GeoIP {
                 target: target.to_string(),
                 country_code: payload.to_string(),
@@ -85,8 +111,26 @@ impl RuleType {
                     false
                 },
             }),
+            "SRC-IP-CIDR" => Ok(RuleType::SrcCidr {
+                ipnet: payload.parse()?,
+                target: target.to_string(),
+            }),
             "RULE-SET" => Ok(RuleType::RuleSet {
                 rule_set: payload.to_string(),
+                target: target.to_string(),
+            }),
+            "SRC-PORT" => Ok(RuleType::SrcPort {
+                port: payload.parse().map_err(|_| {
+                    Error::InvalidConfig(format!("invalid source port: {payload}"))
+                })?,
+                target: target.to_string(),
+            }),
+            "DST-PORT" => Ok(RuleType::DstPort {
+                port: payload.parse().map_err(|_| {
+                    Error::InvalidConfig(format!(
+                        "invalid destination port: {payload}"
+                    ))
+                })?,
                 target: target.to_string(),
             }),
             "NETWORK" => Ok(RuleType::Network {
@@ -99,6 +143,11 @@ impl RuleType {
                         )));
                     }
                 },
+                target: target.to_string(),
+            }),
+            "AND" | "OR" | "NOT" => Ok(RuleType::Composite {
+                operator: proto.to_string(),
+                expression: payload.to_string(),
                 target: target.to_string(),
             }),
             "MATCH" => Ok(RuleType::Match {
@@ -115,21 +164,59 @@ impl RuleType {
             RuleType::Domain { target, .. } => target,
             RuleType::DomainSuffix { target, .. } => target,
             RuleType::DomainKeyword { target, .. } => target,
+            RuleType::DomainRegex { target, .. } => target,
             RuleType::GeoIP { target, .. } => target,
             RuleType::GeoSite { target, .. } => target,
             RuleType::Match { target } => target,
             RuleType::IpCidr { target, .. } => target,
+            RuleType::SrcCidr { target, .. } => target,
             RuleType::RuleSet { target, .. } => target,
+            RuleType::SrcPort { target, .. } => target,
+            RuleType::DstPort { target, .. } => target,
             RuleType::Network { target, .. } => target,
+            RuleType::Composite { target, .. } => target,
         }
     }
+}
+
+fn split_rule_tokens(line: &str) -> Result<Vec<&str>, Error> {
+    let mut tokens = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0i32;
+
+    for (idx, ch) in line.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err(Error::InvalidConfig(format!(
+                        "unbalanced parentheses in rule: {line}"
+                    )));
+                }
+            }
+            ',' if depth == 0 => {
+                tokens.push(line[start..idx].trim());
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+
+    if depth != 0 {
+        return Err(Error::InvalidConfig(format!(
+            "unbalanced parentheses in rule: {line}"
+        )));
+    }
+    tokens.push(line[start..].trim());
+    Ok(tokens)
 }
 
 impl TryFrom<String> for RuleType {
     type Error = crate::Error;
 
     fn try_from(line: String) -> Result<Self, Self::Error> {
-        let parts = line.split(',').map(str::trim).collect::<Vec<&str>>();
+        let parts = split_rule_tokens(&line)?;
 
         match parts.as_slice() {
             [proto, target] => RuleType::new(proto, "", target, None),
@@ -199,6 +286,54 @@ mod tests {
     fn invalid_rule_line_still_errors() {
         let rule = RuleType::try_from("DOMAIN-SUFFIX".to_string());
         assert!(rule.is_err());
+    }
+
+    #[test]
+    fn parse_composite_rule_preserves_nested_expression() {
+        let rule = RuleType::try_from(
+            "AND,((DOMAIN,example.com),(NETWORK,TCP)),PROXY".to_string(),
+        )
+        .unwrap();
+        match rule {
+            RuleType::Composite {
+                operator,
+                expression,
+                target,
+            } => {
+                assert_eq!(operator, "AND");
+                assert_eq!(expression, "((DOMAIN,example.com),(NETWORK,TCP))");
+                assert_eq!(target, "PROXY");
+            }
+            _ => panic!("Expected Composite rule"),
+        }
+    }
+
+    #[test]
+    fn parse_domain_regex_and_source_cidr_rules() {
+        let regex = RuleType::try_from(
+            "DOMAIN-REGEX,^api[0-9]+\\.example\\.com$,PROXY".to_string(),
+        )
+        .unwrap();
+        assert!(matches!(regex, RuleType::DomainRegex { .. }));
+        assert!(
+            RuleType::try_from("DOMAIN-REGEX,[invalid,PROXY".to_string()).is_err()
+        );
+
+        let source =
+            RuleType::try_from("SRC-IP-CIDR,192.168.1.0/24,DIRECT".to_string())
+                .unwrap();
+        assert!(matches!(source, RuleType::SrcCidr { .. }));
+    }
+
+    #[test]
+    fn parse_port_rules() {
+        let source =
+            RuleType::try_from("SRC-PORT,12345,DIRECT".to_string()).unwrap();
+        assert!(matches!(source, RuleType::SrcPort { port: 12345, .. }));
+        let destination =
+            RuleType::try_from("DST-PORT,443,PROXY".to_string()).unwrap();
+        assert!(matches!(destination, RuleType::DstPort { port: 443, .. }));
+        assert!(RuleType::try_from("DST-PORT,invalid,PROXY".to_string()).is_err());
     }
 
     #[test]

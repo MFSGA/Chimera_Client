@@ -14,9 +14,9 @@ use crate::{
             rule_provider::{RuleProviderImpl, ThreadSafeRuleProvider},
         },
         router::rules::{
-            domain::Domain, domain_keyword::DomainKeyword,
-            domain_suffix::DomainSuffix, final_::Final, ipcidr::IpCidr,
-            network::NetworkRule, ruleset::RuleSet,
+            composite::CompositeRule, domain::Domain, domain_keyword::DomainKeyword,
+            domain_regex::DomainRegex, domain_suffix::DomainSuffix, final_::Final,
+            ipcidr::IpCidr, network::NetworkRule, port::PortRule, ruleset::RuleSet,
         },
     },
     common::{geodata::GeoDataLookup, mmdb::MmdbLookup},
@@ -326,6 +326,9 @@ pub fn map_rule_type(
             keyword: domain_keyword,
             target,
         })),
+        RuleType::DomainRegex { regex, target } => {
+            Ok(Box::new(DomainRegex { regex, target }))
+        }
         RuleType::GeoIP {
             target,
             country_code,
@@ -352,7 +355,24 @@ pub fn map_rule_type(
         } => Ok(Box::new(IpCidr {
             ipnet,
             target,
+            match_source: false,
             no_resolve,
+        })),
+        RuleType::SrcCidr { ipnet, target } => Ok(Box::new(IpCidr {
+            ipnet,
+            target,
+            match_source: true,
+            no_resolve: true,
+        })),
+        RuleType::SrcPort { port, target } => Ok(Box::new(PortRule {
+            port,
+            target,
+            source: true,
+        })),
+        RuleType::DstPort { port, target } => Ok(Box::new(PortRule {
+            port,
+            target,
+            source: false,
         })),
         RuleType::Network { network, target } => {
             Ok(Box::new(NetworkRule { network, target }))
@@ -376,6 +396,18 @@ pub fn map_rule_type(
             )),
         },
 
+        RuleType::Composite {
+            operator,
+            expression,
+            target,
+        } => Ok(Box::new(CompositeRule::new(
+            &operator,
+            &expression,
+            &target,
+            mmdb,
+            geodata,
+            rule_provider_registry,
+        )?)),
         RuleType::Match { target } => Ok(Box::new(Final { target })),
     }
 }
