@@ -192,3 +192,33 @@ async fn consistent_hash_keeps_real_tcp_target_stable() {
     assert!(outcomes.iter().all(|outcome| *outcome == outcomes[0]));
     target_task.abort();
 }
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn sticky_session_keeps_real_tcp_target_stable() {
+    let target = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind local target");
+    let target_port = target.local_addr().unwrap().port();
+    let target_task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = target.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut request = [0u8; 128];
+                let len = stream.read(&mut request).await.unwrap();
+                stream.write_all(&request[..len]).await.unwrap();
+            });
+        }
+    });
+
+    let (_client, _api_port, socks_port) = start_client("sticky-session");
+    let outcomes = [
+        roundtrip(socks_port, target_port, b"sticky-one").await,
+        roundtrip(socks_port, target_port, b"sticky-two").await,
+        roundtrip(socks_port, target_port, b"sticky-three").await,
+    ];
+    assert!(outcomes.iter().all(|outcome| *outcome == outcomes[0]));
+    target_task.abort();
+}
