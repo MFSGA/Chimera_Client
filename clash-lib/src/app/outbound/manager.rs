@@ -32,7 +32,7 @@ use crate::{
     proxy::{
         AnyOutboundHandler, direct,
         group::{
-            fallback, relay,
+            fallback, loadbalance, relay,
             selector::{self, ThreadSafeSelectorControl},
             urltest,
         },
@@ -657,6 +657,47 @@ impl OutboundManager {
                     );
 
                     handlers.insert(proto.name.clone(), Arc::new(fallback));
+                }
+
+                OutboundGroupProtocol::LoadBalance(proto) => {
+                    if check_group_empty(&proto.proxies, &proto.use_provider) {
+                        return Err(Error::InvalidConfig(format!(
+                            "proxy group {} has no proxies",
+                            proto.name
+                        )));
+                    }
+                    let mut providers = vec![];
+                    if let Some(proxies) = &proto.proxies {
+                        providers.push(make_provider_from_proxies(
+                            &proto.name,
+                            proxies,
+                            proto.interval,
+                            proto.lazy.unwrap_or_default(),
+                            handlers,
+                            proxy_manager.clone(),
+                            provider_registry,
+                        )?);
+                    }
+                    maybe_append_use_providers(
+                        &proto.use_provider,
+                        provider_registry,
+                        &mut providers,
+                    )?;
+                    handlers.insert(
+                        proto.name.clone(),
+                        Arc::new(loadbalance::Handler::new(
+                            loadbalance::HandlerOptions {
+                                name: proto.name.clone(),
+                                udp: proto.udp.unwrap_or(true),
+                                common_opts: crate::proxy::HandlerCommonOptions {
+                                    icon: proto.icon.clone(),
+                                    url: Some(proto.url.clone()),
+                                    connector: None,
+                                },
+                            },
+                            providers,
+                        )),
+                    );
                 }
 
                 OutboundGroupProtocol::Relay(proto) => {

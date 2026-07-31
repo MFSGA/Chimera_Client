@@ -317,6 +317,8 @@ pub enum OutboundGroupProtocol {
     UrlTest(OutboundGroupUrlTest),
     #[serde(rename = "fallback")]
     Fallback(OutboundGroupFallback),
+    #[serde(rename = "load-balance")]
+    LoadBalance(OutboundGroupLoadBalance),
     #[serde(rename = "relay")]
     Relay(OutboundGroupRelay),
     #[serde(rename = "select")]
@@ -331,6 +333,7 @@ impl OutboundGroupProtocol {
         match &self {
             OutboundGroupProtocol::UrlTest(g) => &g.name,
             OutboundGroupProtocol::Fallback(g) => &g.name,
+            OutboundGroupProtocol::LoadBalance(g) => &g.name,
             OutboundGroupProtocol::Relay(g) => &g.name,
             /* OutboundGroupProtocol::LoadBalance(g) => &g.name,
             OutboundGroupProtocol::Smart(g) => &g.name, */
@@ -345,6 +348,7 @@ impl OutboundGroupProtocol {
             OutboundGroupProtocol::Select(g) => g.proxies.as_ref(),
             OutboundGroupProtocol::UrlTest(g) => g.proxies.as_ref(),
             OutboundGroupProtocol::Fallback(g) => g.proxies.as_ref(),
+            OutboundGroupProtocol::LoadBalance(g) => g.proxies.as_ref(),
         }
     }
 }
@@ -378,6 +382,29 @@ pub struct OutboundGroupFallback {
     pub interval: u64,
     pub lazy: Option<bool>,
     pub icon: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+pub struct OutboundGroupLoadBalance {
+    pub name: String,
+    pub proxies: Option<Vec<String>>,
+    #[serde(rename = "use")]
+    pub use_provider: Option<Vec<String>>,
+    pub url: String,
+    #[serde(deserialize_with = "utils::deserialize_u64")]
+    pub interval: u64,
+    pub lazy: Option<bool>,
+    pub udp: Option<bool>,
+    #[serde(default)]
+    pub strategy: LoadBalanceStrategy,
+    pub icon: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, Default)]
+pub enum LoadBalanceStrategy {
+    #[default]
+    #[serde(rename = "round-robin")]
+    RoundRobin,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
