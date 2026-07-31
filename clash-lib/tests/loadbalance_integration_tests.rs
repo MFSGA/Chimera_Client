@@ -125,6 +125,59 @@ rules:
     (cwd, client, api_port, socks_port)
 }
 
+fn start_http_provider_client(
+    provider_url: &str,
+) -> (tempfile::TempDir, ClashInstance, u16, u16) {
+    let api_port = available_port();
+    let socks_port = available_port();
+    let cwd = tempfile::tempdir().expect("failed to create provider tempdir");
+    let config = format!(
+        r#"
+allow-lan: false
+bind-address: 127.0.0.1
+socks-port: {socks_port}
+mode: rule
+log-level: error
+mmdb: null
+external-controller: 127.0.0.1:{api_port}
+secret: test-secret
+tun:
+  enable: false
+proxy-providers:
+  local:
+    type: http
+    url: {provider_url}
+    path: http-provider.yaml
+    interval: 0
+    health-check:
+      enable: false
+proxy-groups:
+  - name: balanced
+    type: load-balance
+    use:
+      - local
+    url: http://127.0.0.1/
+    interval: 3600
+    lazy: true
+    strategy: round-robin
+rules:
+  - MATCH,balanced
+"#
+    );
+    let client = ClashInstance::start(
+        Options {
+            config: Config::Str(config),
+            cwd: Some(cwd.path().to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            config_path: None,
+        },
+        vec![api_port, socks_port],
+    )
+    .expect("failed to start HTTP-provider client");
+    (cwd, client, api_port, socks_port)
+}
+
 async fn socks5_connect(proxy_port: u16, target_port: u16) -> TcpStream {
     let mut stream = TcpStream::connect(("127.0.0.1", proxy_port))
         .await
@@ -250,6 +303,52 @@ async fn file_provider_populates_group_and_routes_real_tcp() {
     assert!(roundtrip(socks_port, target_port, b"provider-first").await);
     assert!(!roundtrip(socks_port, target_port, b"provider-second").await);
     assert!(roundtrip(socks_port, target_port, b"provider-third").await);
+    target_task.await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn http_provider_downloads_caches_and_routes_real_tcp() {
+    let server = httpmock::MockServer::start();
+    let provider_mock = server.mock(|when, then| {
+        when.method(httpmock::Method::GET).path("/providers.yaml");
+        then.status(200).body(
+            r#"
+proxies:
+  - name: remote-direct
+    type: direct
+  - name: remote-reject
+    type: reject
+"#,
+        );
+    });
+    let target = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind local target");
+    let target_port = target.local_addr().unwrap().port();
+    let target_task = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut stream, _) = target.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut request = [0u8; 128];
+                let len = stream.read(&mut request).await.unwrap();
+                stream.write_all(&request[..len]).await.unwrap();
+            });
+        }
+    });
+
+    let (cwd, _client, api_port, socks_port) =
+        start_http_provider_client(&server.url("/providers.yaml"));
+    provider_mock.assert();
+    assert!(cwd.path().join("http-provider.yaml").is_file());
+    let provider = get_json(api_port, "/providers/proxies/local").await;
+    assert_eq!(provider["name"], "local");
+    let group = get_json(api_port, "/proxies/balanced").await;
+    assert_eq!(group["all"], serde_json::json!(["DIRECT", "REJECT"]));
+
+    assert!(roundtrip(socks_port, target_port, b"http-first").await);
+    assert!(!roundtrip(socks_port, target_port, b"http-second").await);
+    assert!(roundtrip(socks_port, target_port, b"http-third").await);
     target_task.await.unwrap();
 }
 

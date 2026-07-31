@@ -18,7 +18,7 @@ use crate::{
             ProxyManager,
             healthcheck::HealthCheck,
             providers::{
-                ProviderVehicleType,
+                ProviderVehicle, ProviderVehicleType, http_vehicle,
                 proxy_provider::{
                     ThreadSafeProxyProvider, plain_provider::PlainProvider,
                 },
@@ -26,8 +26,9 @@ use crate::{
         },
     },
     config::internal::proxy::{
-        HealthCheckProbe, OutboundGroupProtocol, OutboundProxyProtocol,
-        OutboundProxyProviderDef, PROXY_DIRECT, PROXY_GLOBAL, PROXY_REJECT,
+        HealthCheckProbe, OutboundFileProvider, OutboundGroupProtocol,
+        OutboundProxyProtocol, OutboundProxyProviderDef, PROXY_DIRECT, PROXY_GLOBAL,
+        PROXY_REJECT,
     },
     proxy::{
         AnyOutboundHandler, direct,
@@ -803,16 +804,52 @@ impl OutboundManager {
         &mut self,
         cwd: String,
         proxy_providers: HashMap<String, OutboundProxyProviderDef>,
-        _resolver: ThreadSafeDNSResolver,
+        resolver: ThreadSafeDNSResolver,
     ) -> Result<(), Error> {
         let provider_registry = &mut self.proxy_providers;
-        for (name, provider) in proxy_providers.into_iter() {
+        let mut pending = proxy_providers.into_iter().collect::<Vec<_>>();
+        while let Some((name, provider)) = pending.pop() {
             match provider {
-                OutboundProxyProviderDef::Http(_http) => {
-                    debug!(
-                        "http proxy provider `{}` is not implemented yet, skipping",
-                        name
+                OutboundProxyProviderDef::Http(http) => {
+                    debug!("downloading HTTP proxy provider `{}`", name);
+                    let url = http.url.parse::<hyper::Uri>().map_err(|err| {
+                        Error::InvalidConfig(format!(
+                            "invalid URL for HTTP provider `{name}`: {err}"
+                        ))
+                    })?;
+                    let vehicle = http_vehicle::Vehicle::new(
+                        url,
+                        http.path.clone(),
+                        Some(cwd.clone()),
+                        resolver.clone(),
                     );
+                    let content = vehicle.read().await.map_err(|err| {
+                        Error::InvalidConfig(format!(
+                            "failed to download HTTP provider `{name}`: {err}"
+                        ))
+                    })?;
+                    if let Some(parent) = vehicle.path.parent() {
+                        tokio::fs::create_dir_all(parent).await.map_err(|err| {
+                            Error::InvalidConfig(format!(
+                                "failed to create cache directory for HTTP provider `{name}`: {err}"
+                            ))
+                        })?;
+                    }
+                    tokio::fs::write(&vehicle.path, content).await.map_err(|err| {
+                        Error::InvalidConfig(format!(
+                            "failed to cache HTTP provider `{name}` at {}: {err}",
+                            vehicle.path.display()
+                        ))
+                    })?;
+                    pending.push((
+                        name,
+                        OutboundProxyProviderDef::File(OutboundFileProvider {
+                            name: http.name,
+                            path: vehicle.path.to_string_lossy().to_string(),
+                            interval: Some(http.interval),
+                            health_check: http.health_check,
+                        }),
+                    ));
                 }
                 OutboundProxyProviderDef::File(file) => {
                     debug!("loading file proxy provider `{}`", name);
