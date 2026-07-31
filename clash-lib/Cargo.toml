@@ -191,7 +191,7 @@ tun = [
     # "dep:network-interface",
     # "dep:url",
 ]
-tproxy = ["dep:etherparse"]
+tproxy = ["tun", "dep:etherparse"]
 redir = []
 http_port = []
 mixed_port = ["http_port"]
