@@ -15,8 +15,8 @@ use crate::{
         },
         router::rules::{
             composite::CompositeRule, domain::Domain, domain_keyword::DomainKeyword,
-            domain_suffix::DomainSuffix, final_::Final, ipcidr::IpCidr,
-            network::NetworkRule, port::PortRule, ruleset::RuleSet,
+            domain_regex::DomainRegex, domain_suffix::DomainSuffix, final_::Final,
+            ipcidr::IpCidr, network::NetworkRule, port::PortRule, ruleset::RuleSet,
         },
     },
     common::{geodata::GeoDataLookup, mmdb::MmdbLookup},
@@ -326,6 +326,9 @@ pub fn map_rule_type(
             keyword: domain_keyword,
             target,
         })),
+        RuleType::DomainRegex { regex, target } => {
+            Ok(Box::new(DomainRegex { regex, target }))
+        }
         RuleType::GeoIP {
             target,
             country_code,
@@ -352,7 +355,14 @@ pub fn map_rule_type(
         } => Ok(Box::new(IpCidr {
             ipnet,
             target,
+            match_source: false,
             no_resolve,
+        })),
+        RuleType::SrcCidr { ipnet, target } => Ok(Box::new(IpCidr {
+            ipnet,
+            target,
+            match_source: true,
+            no_resolve: true,
         })),
         RuleType::SrcPort { port, target } => Ok(Box::new(PortRule {
             port,

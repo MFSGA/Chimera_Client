@@ -16,6 +16,10 @@ pub enum RuleType {
         domain_keyword: String,
         target: String,
     },
+    DomainRegex {
+        regex: regex::Regex,
+        target: String,
+    },
     GeoIP {
         target: String,
         country_code: String,
@@ -32,6 +36,10 @@ pub enum RuleType {
         ipnet: ipnet::IpNet,
         target: String,
         no_resolve: bool,
+    },
+    SrcCidr {
+        ipnet: ipnet::IpNet,
+        target: String,
     },
     RuleSet {
         rule_set: String,
@@ -76,6 +84,11 @@ impl RuleType {
                 domain_keyword: payload.to_string(),
                 target: target.to_string(),
             }),
+            "DOMAIN-REGEX" => Ok(RuleType::DomainRegex {
+                regex: regex::Regex::new(payload)
+                    .map_err(|err| Error::InvalidConfig(err.to_string()))?,
+                target: target.to_string(),
+            }),
             "GEOIP" => Ok(RuleType::GeoIP {
                 target: target.to_string(),
                 country_code: payload.to_string(),
@@ -97,6 +110,10 @@ impl RuleType {
                 } else {
                     false
                 },
+            }),
+            "SRC-IP-CIDR" => Ok(RuleType::SrcCidr {
+                ipnet: payload.parse()?,
+                target: target.to_string(),
             }),
             "RULE-SET" => Ok(RuleType::RuleSet {
                 rule_set: payload.to_string(),
@@ -147,10 +164,12 @@ impl RuleType {
             RuleType::Domain { target, .. } => target,
             RuleType::DomainSuffix { target, .. } => target,
             RuleType::DomainKeyword { target, .. } => target,
+            RuleType::DomainRegex { target, .. } => target,
             RuleType::GeoIP { target, .. } => target,
             RuleType::GeoSite { target, .. } => target,
             RuleType::Match { target } => target,
             RuleType::IpCidr { target, .. } => target,
+            RuleType::SrcCidr { target, .. } => target,
             RuleType::RuleSet { target, .. } => target,
             RuleType::SrcPort { target, .. } => target,
             RuleType::DstPort { target, .. } => target,
@@ -287,6 +306,23 @@ mod tests {
             }
             _ => panic!("Expected Composite rule"),
         }
+    }
+
+    #[test]
+    fn parse_domain_regex_and_source_cidr_rules() {
+        let regex = RuleType::try_from(
+            "DOMAIN-REGEX,^api[0-9]+\\.example\\.com$,PROXY".to_string(),
+        )
+        .unwrap();
+        assert!(matches!(regex, RuleType::DomainRegex { .. }));
+        assert!(
+            RuleType::try_from("DOMAIN-REGEX,[invalid,PROXY".to_string()).is_err()
+        );
+
+        let source =
+            RuleType::try_from("SRC-IP-CIDR,192.168.1.0/24,DIRECT".to_string())
+                .unwrap();
+        assert!(matches!(source, RuleType::SrcCidr { .. }));
     }
 
     #[test]
