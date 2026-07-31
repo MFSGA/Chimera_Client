@@ -113,18 +113,34 @@ pub(super) fn convert(
     if c.redir_port.is_some() {
         warn!("ignoring top-level `redir-port` because `redir` feature is disabled");
     }
+    #[cfg(feature = "tproxy")]
+    if let Some(Port(tproxy_port)) = c.tproxy_port
+        && !all_inbounds.insert(InboundOpts::Tproxy {
+            common_opts: CommonInboundOpts {
+                name: "TPROXY-IN".into(),
+                listen: bind_address,
+                port: tproxy_port,
+                allow_lan: c.allow_lan.unwrap_or_default(),
+                fw_mark: c.routing_mark,
+            },
+        })
+    {
+        warn!("Duplicate TPROXY inbound listener found: {}", tproxy_port);
+    }
+    #[cfg(not(feature = "tproxy"))]
     if c.tproxy_port.is_some() {
         warn!(
-            "ignoring top-level `tproxy-port` because tproxy inbound is not implemented"
+            "ignoring top-level `tproxy-port` because `tproxy` feature is disabled"
         );
     }
     Ok(all_inbounds)
 }
 
-#[cfg(all(test, feature = "redir"))]
+#[cfg(all(test, any(feature = "redir", feature = "tproxy")))]
 mod tests {
     use super::*;
 
+    #[cfg(feature = "redir")]
     #[test]
     fn top_level_redir_port_builds_listener() {
         let config = def::Config {
@@ -144,5 +160,27 @@ mod tests {
         assert_eq!(common.port, 7892);
         assert!(common.allow_lan);
         assert_eq!(common.fw_mark, Some(123));
+    }
+
+    #[cfg(feature = "tproxy")]
+    #[test]
+    fn top_level_tproxy_port_builds_listener() {
+        let config = def::Config {
+            tproxy_port: Some(Port(7893)),
+            allow_lan: Some(true),
+            routing_mark: Some(124),
+            ..Default::default()
+        };
+
+        let inbounds = convert(None, &config).unwrap();
+        let tproxy = inbounds
+            .iter()
+            .find(|inbound| matches!(inbound, InboundOpts::Tproxy { .. }))
+            .expect("tproxy listener should be created");
+        let common = tproxy.common_opts();
+        assert_eq!(common.name, "TPROXY-IN");
+        assert_eq!(common.port, 7893);
+        assert!(common.allow_lan);
+        assert_eq!(common.fw_mark, Some(124));
     }
 }

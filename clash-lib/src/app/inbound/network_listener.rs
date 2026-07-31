@@ -17,6 +17,8 @@ use crate::proxy::redir::RedirInbound;
 use crate::proxy::shadowsocks::inbound::{
     InboundOptions as ShadowsocksInboundOptions, ShadowsocksInbound,
 };
+#[cfg(all(feature = "tproxy", target_os = "linux"))]
+use crate::proxy::tproxy::TproxyInbound;
 use crate::{
     app::dispatcher::Dispatcher,
     common::auth::ThreadSafeAuthenticator,
@@ -124,6 +126,24 @@ fn build_handler(
             {
                 let _ = (common_opts, dispatcher);
                 warn!("redir inbound is only supported on Linux");
+                None
+            }
+        }
+        #[cfg(feature = "tproxy")]
+        InboundOpts::Tproxy { common_opts } => {
+            #[cfg(target_os = "linux")]
+            {
+                Some(Arc::new(TproxyInbound::new(
+                    (common_opts.listen.0, common_opts.port).into(),
+                    common_opts.allow_lan,
+                    dispatcher,
+                    common_opts.fw_mark,
+                )))
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (common_opts, dispatcher);
+                warn!("tproxy inbound is only supported on Linux");
                 None
             }
         }

@@ -40,6 +40,11 @@ pub enum InboundOpts {
         #[serde(flatten)]
         common_opts: CommonInboundOpts,
     },
+    #[cfg(feature = "tproxy")]
+    Tproxy {
+        #[serde(flatten)]
+        common_opts: CommonInboundOpts,
+    },
     #[cfg(feature = "shadowsocks")]
     #[serde(alias = "shadowsocks")]
     Shadowsocks {
@@ -79,6 +84,8 @@ impl InboundOpts {
             InboundOpts::Mixed { common_opts, .. } => common_opts,
             #[cfg(feature = "redir")]
             InboundOpts::Redir { common_opts } => common_opts,
+            #[cfg(feature = "tproxy")]
+            InboundOpts::Tproxy { common_opts } => common_opts,
             #[cfg(feature = "shadowsocks")]
             InboundOpts::Shadowsocks { common_opts, .. } => common_opts,
             #[cfg(feature = "anytls")]
@@ -95,6 +102,8 @@ impl InboundOpts {
             InboundOpts::Mixed { common_opts, .. } => common_opts,
             #[cfg(feature = "redir")]
             InboundOpts::Redir { common_opts } => common_opts,
+            #[cfg(feature = "tproxy")]
+            InboundOpts::Tproxy { common_opts } => common_opts,
             #[cfg(feature = "shadowsocks")]
             InboundOpts::Shadowsocks { common_opts, .. } => common_opts,
             #[cfg(feature = "anytls")]
@@ -111,6 +120,8 @@ impl InboundOpts {
             InboundOpts::Mixed { .. } => "mixed",
             #[cfg(feature = "redir")]
             InboundOpts::Redir { .. } => "redir",
+            #[cfg(feature = "tproxy")]
+            InboundOpts::Tproxy { .. } => "tproxy",
             #[cfg(feature = "shadowsocks")]
             InboundOpts::Shadowsocks { .. } => "shadowsocks",
             #[cfg(feature = "anytls")]
@@ -131,10 +142,11 @@ pub struct CommonInboundOpts {
     pub fw_mark: Option<u32>,
 }
 
-#[cfg(all(test, feature = "redir"))]
+#[cfg(all(test, any(feature = "redir", feature = "tproxy")))]
 mod tests {
     use super::*;
 
+    #[cfg(feature = "redir")]
     #[test]
     fn redir_listener_deserializes() {
         let listener: InboundOpts = serde_yaml::from_str(
@@ -147,5 +159,20 @@ mod tests {
         assert_eq!(common.port, 7892);
         assert!(common.allow_lan);
         assert_eq!(common.fw_mark, Some(123));
+    }
+
+    #[cfg(feature = "tproxy")]
+    #[test]
+    fn tproxy_listener_deserializes() {
+        let listener: InboundOpts = serde_yaml::from_str(
+            "type: tproxy\nname: transparent-udp\nlisten: 127.0.0.1\nport: 7893\nallow-lan: true\nfw-mark: 124\n",
+        )
+        .unwrap();
+        assert_eq!(listener.type_name(), "tproxy");
+        let common = listener.common_opts();
+        assert_eq!(common.name, "transparent-udp");
+        assert_eq!(common.port, 7893);
+        assert!(common.allow_lan);
+        assert_eq!(common.fw_mark, Some(124));
     }
 }
