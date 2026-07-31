@@ -41,6 +41,11 @@ pub enum RuleType {
         network: Network,
         target: String,
     },
+    Composite {
+        operator: String,
+        expression: String,
+        target: String,
+    },
 }
 
 impl RuleType {
@@ -101,6 +106,11 @@ impl RuleType {
                 },
                 target: target.to_string(),
             }),
+            "AND" | "OR" | "NOT" => Ok(RuleType::Composite {
+                operator: proto.to_string(),
+                expression: payload.to_string(),
+                target: target.to_string(),
+            }),
             "MATCH" => Ok(RuleType::Match {
                 target: target.to_string(),
             }),
@@ -121,15 +131,49 @@ impl RuleType {
             RuleType::IpCidr { target, .. } => target,
             RuleType::RuleSet { target, .. } => target,
             RuleType::Network { target, .. } => target,
+            RuleType::Composite { target, .. } => target,
         }
     }
+}
+
+fn split_rule_tokens(line: &str) -> Result<Vec<&str>, Error> {
+    let mut tokens = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0i32;
+
+    for (idx, ch) in line.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err(Error::InvalidConfig(format!(
+                        "unbalanced parentheses in rule: {line}"
+                    )));
+                }
+            }
+            ',' if depth == 0 => {
+                tokens.push(line[start..idx].trim());
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+
+    if depth != 0 {
+        return Err(Error::InvalidConfig(format!(
+            "unbalanced parentheses in rule: {line}"
+        )));
+    }
+    tokens.push(line[start..].trim());
+    Ok(tokens)
 }
 
 impl TryFrom<String> for RuleType {
     type Error = crate::Error;
 
     fn try_from(line: String) -> Result<Self, Self::Error> {
-        let parts = line.split(',').map(str::trim).collect::<Vec<&str>>();
+        let parts = split_rule_tokens(&line)?;
 
         match parts.as_slice() {
             [proto, target] => RuleType::new(proto, "", target, None),
@@ -199,6 +243,26 @@ mod tests {
     fn invalid_rule_line_still_errors() {
         let rule = RuleType::try_from("DOMAIN-SUFFIX".to_string());
         assert!(rule.is_err());
+    }
+
+    #[test]
+    fn parse_composite_rule_preserves_nested_expression() {
+        let rule = RuleType::try_from(
+            "AND,((DOMAIN,example.com),(NETWORK,TCP)),PROXY".to_string(),
+        )
+        .unwrap();
+        match rule {
+            RuleType::Composite {
+                operator,
+                expression,
+                target,
+            } => {
+                assert_eq!(operator, "AND");
+                assert_eq!(expression, "((DOMAIN,example.com),(NETWORK,TCP))");
+                assert_eq!(target, "PROXY");
+            }
+            _ => panic!("Expected Composite rule"),
+        }
     }
 
     #[test]

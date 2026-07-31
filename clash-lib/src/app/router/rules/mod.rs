@@ -2,6 +2,7 @@ use std::fmt::Display;
 
 use crate::Session;
 
+pub mod composite;
 pub mod domain;
 pub mod domain_keyword;
 pub mod domain_suffix;
