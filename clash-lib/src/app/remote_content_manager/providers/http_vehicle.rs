@@ -55,10 +55,18 @@ impl ProviderVehicle for Vehicle {
         );
         *req.body_mut() = http_body_util::Empty::<bytes::Bytes>::new();
         *req.uri_mut() = self.url.clone();
-        self.http_client
+        let response = self
+            .http_client
             .request(req)
             .await
-            .map_err(|x| io::Error::other(x.to_string()))?
+            .map_err(|x| io::Error::other(x.to_string()))?;
+        if !response.status().is_success() {
+            return Err(io::Error::other(format!(
+                "provider request returned HTTP {}",
+                response.status()
+            )));
+        }
+        response
             .into_body()
             .collect()
             .await
@@ -104,5 +112,24 @@ mod tests {
         let data = v.read().await.unwrap();
         mock.assert();
         assert_eq!(str::from_utf8(&data).unwrap(), "HTTPBIN is awesome");
+    }
+
+    #[tokio::test]
+    async fn rejects_non_success_status() {
+        initialize();
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/unavailable");
+            then.status(503).body("try again later");
+        });
+        let url = server.url("/unavailable").parse::<Uri>().unwrap();
+        let path = std::env::temp_dir().join("http_vehicle_unavailable");
+        let resolver = Arc::new(EnhancedResolver::new_default().await);
+        let vehicle =
+            super::Vehicle::new(url, path, None, resolver as ThreadSafeDNSResolver);
+
+        let error = vehicle.read().await.unwrap_err();
+        mock.assert();
+        assert!(error.to_string().contains("503 Service Unavailable"));
     }
 }

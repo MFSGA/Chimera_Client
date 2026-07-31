@@ -12,17 +12,18 @@ mod common;
 
 use common::{ClashInstance, send_http_request};
 
-fn available_port() -> u16 {
-    StdTcpListener::bind("127.0.0.1:0")
-        .expect("failed to reserve test port")
-        .local_addr()
-        .expect("failed to inspect test port")
-        .port()
+fn available_ports() -> (u16, u16) {
+    let first = StdTcpListener::bind("127.0.0.1:0")
+        .expect("failed to reserve first test port");
+    let second = StdTcpListener::bind("127.0.0.1:0")
+        .expect("failed to reserve second test port");
+    let first_port = first.local_addr().unwrap().port();
+    let second_port = second.local_addr().unwrap().port();
+    (first_port, second_port)
 }
 
 fn start_client(strategy: &str) -> (ClashInstance, u16, u16) {
-    let api_port = available_port();
-    let socks_port = available_port();
+    let (api_port, socks_port) = available_ports();
     let config = format!(
         r#"
 allow-lan: false
@@ -66,8 +67,7 @@ rules:
 }
 
 fn start_file_provider_client() -> (tempfile::TempDir, ClashInstance, u16, u16) {
-    let api_port = available_port();
-    let socks_port = available_port();
+    let (api_port, socks_port) = available_ports();
     let cwd = tempfile::tempdir().expect("failed to create provider tempdir");
     fs::write(
         cwd.path().join("providers.yaml"),
@@ -129,8 +129,7 @@ fn start_http_provider_client(
     provider_url: &str,
     interval: u64,
 ) -> (tempfile::TempDir, ClashInstance, u16, u16) {
-    let api_port = available_port();
-    let socks_port = available_port();
+    let (api_port, socks_port) = available_ports();
     let cwd = tempfile::tempdir().expect("failed to create provider tempdir");
     let config = format!(
         r#"
