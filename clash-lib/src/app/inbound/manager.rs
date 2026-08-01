@@ -31,6 +31,9 @@ use std::{
 use tracing::{trace, warn};
 
 type InboundHandlerMap = HashMap<InboundOpts, Option<JoinHandle<()>>>;
+type NamedListenerHandles = Vec<(String, JoinHandle<()>)>;
+type ProviderListenerPartition =
+    (InboundHandlerMap, NamedListenerHandles, Vec<InboundOpts>);
 type ThreadSafeInboundHandlers = Arc<RwLock<InboundHandlerMap>>;
 type ProviderInboundHandlers = Arc<RwLock<HashMap<String, InboundHandlerMap>>>;
 
@@ -91,7 +94,7 @@ impl Runner for InboundManager {
 impl InboundManager {
     async fn take_all_listener_handles(
         inbound_handlers: ThreadSafeInboundHandlers,
-    ) -> Vec<(String, JoinHandle<()>)> {
+    ) -> NamedListenerHandles {
         inbound_handlers
             .write()
             .await
@@ -106,7 +109,7 @@ impl InboundManager {
 
     async fn take_all_provider_listener_handles(
         provider_handlers: ProviderInboundHandlers,
-    ) -> Vec<(String, JoinHandle<()>)> {
+    ) -> NamedListenerHandles {
         let mut handles = Vec::new();
         for listeners in provider_handlers.write().await.values_mut() {
             for (opts, listener) in listeners.iter_mut() {
@@ -137,7 +140,7 @@ impl InboundManager {
     }
 
     async fn abort_and_join_listener_handles(
-        handles: Vec<(String, JoinHandle<()>)>,
+        handles: NamedListenerHandles,
     ) -> Result<(), crate::Error> {
         let mut last_join_error = None;
 
@@ -176,6 +179,31 @@ impl InboundManager {
         Self::abort_and_join_listener_handles(handles).await
     }
 
+    fn partition_provider_listeners(
+        new_opts: Vec<InboundOpts>,
+        mut old_handlers: InboundHandlerMap,
+    ) -> ProviderListenerPartition {
+        let mut retained = HashMap::new();
+        let mut to_start = Vec::new();
+
+        for opts in new_opts {
+            if let Some(listener) = old_handlers.remove(&opts) {
+                retained.insert(opts, listener);
+            } else {
+                to_start.push(opts);
+            }
+        }
+
+        let removed = old_handlers
+            .into_iter()
+            .filter_map(|(opts, listener)| {
+                listener.map(|handle| (opts.common_opts().name.clone(), handle))
+            })
+            .collect();
+
+        (retained, removed, to_start)
+    }
+
     async fn replace_provider_listeners(
         provider_name: String,
         new_opts: Vec<InboundOpts>,
@@ -184,23 +212,23 @@ impl InboundManager {
         authenticator: ThreadSafeAuthenticator,
         cancellation_token: tokio_util::sync::CancellationToken,
     ) {
-        let old_handles = provider_handlers
+        let old_handlers = provider_handlers
             .write()
             .await
             .remove(&provider_name)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|(opts, listener)| {
-                listener.map(|handle| (opts.common_opts().name.clone(), handle))
-            })
-            .collect();
-        if let Err(error) = Self::abort_and_join_listener_handles(old_handles).await
-        {
+            .unwrap_or_default();
+        let (mut listeners, removed, to_start) =
+            Self::partition_provider_listeners(new_opts, old_handlers);
+        let released_ports = !removed.is_empty() && !to_start.is_empty();
+
+        if let Err(error) = Self::abort_and_join_listener_handles(removed).await {
             warn!(provider = %provider_name, "failed to stop provider listeners: {error}");
         }
+        if released_ports {
+            tokio::task::yield_now().await;
+        }
 
-        let mut listeners = HashMap::new();
-        for opts in new_opts {
+        for opts in to_start {
             let handle = Self::spawn_listener(
                 &opts,
                 dispatcher.clone(),
@@ -583,4 +611,46 @@ pub struct InboundEndpoint {
     pub inbound_type: String,
     pub port: u16,
     pub active: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::pending;
+
+    use super::*;
+
+    fn socks_opts(name: &str, port: u16) -> InboundOpts {
+        serde_yaml::from_str(&format!(
+            "type: socks\nname: {name}\nlisten: 127.0.0.1\nport: {port}\nfw-mark: null\nudp: false\n"
+        ))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn provider_partition_retains_unchanged_listener() {
+        let retained_opts = socks_opts("retained", 11080);
+        let removed_opts = socks_opts("removed", 11081);
+        let added_opts = socks_opts("added", 11082);
+        let retained_handle = tokio::spawn(pending::<()>());
+        let removed_handle = tokio::spawn(pending::<()>());
+        let mut old_handlers = HashMap::new();
+        old_handlers.insert(retained_opts.clone(), Some(retained_handle));
+        old_handlers.insert(removed_opts, Some(removed_handle));
+
+        let (mut retained, mut removed, to_start) =
+            InboundManager::partition_provider_listeners(
+                vec![retained_opts.clone(), added_opts.clone()],
+                old_handlers,
+            );
+
+        assert_eq!(retained.len(), 1);
+        assert!(retained.contains_key(&retained_opts));
+        assert!(!retained[&retained_opts].as_ref().unwrap().is_finished());
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].0, "removed");
+        assert_eq!(to_start, vec![added_opts]);
+
+        retained.remove(&retained_opts).unwrap().unwrap().abort();
+        removed.pop().unwrap().1.abort();
+    }
 }
