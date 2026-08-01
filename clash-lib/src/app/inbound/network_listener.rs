@@ -22,7 +22,7 @@ use crate::proxy::tproxy::TproxyInbound;
 use crate::{
     app::dispatcher::Dispatcher,
     common::auth::ThreadSafeAuthenticator,
-    config::internal::listener::InboundOpts,
+    config::internal::listener::{InboundOpts, InboundUser},
     proxy::{inbound::InboundHandlerTrait, socks::inbound::SocksInbound},
 };
 
@@ -30,12 +30,15 @@ pub(crate) fn build_network_listeners(
     inbound_opts: &InboundOpts,
     dispatcher: Arc<Dispatcher>,
     authenticator: ThreadSafeAuthenticator,
+    users_rx: Option<tokio::sync::watch::Receiver<Vec<InboundUser>>>,
 ) -> Option<Vec<BoxFuture<'static, Result<(), crate::Error>>>> {
     let name = &inbound_opts.common_opts().name;
     let addr = inbound_opts.common_opts().listen.0;
     let port = inbound_opts.common_opts().port;
 
-    if let Some(handler) = build_handler(inbound_opts, dispatcher, authenticator) {
+    if let Some(handler) =
+        build_handler(inbound_opts, dispatcher, authenticator, users_rx)
+    {
         let mut runners: Vec<BoxFuture<'static, Result<(), crate::Error>>> =
             Vec::new();
 
@@ -84,6 +87,9 @@ fn build_handler(
     listener: &InboundOpts,
     dispatcher: Arc<Dispatcher>,
     authenticator: ThreadSafeAuthenticator,
+    #[allow(unused)] users_rx: Option<
+        tokio::sync::watch::Receiver<Vec<InboundUser>>,
+    >,
 ) -> Option<Arc<dyn InboundHandlerTrait>> {
     let fw_mark = listener.common_opts().fw_mark;
     match listener {
@@ -155,7 +161,14 @@ fn build_handler(
             password,
             users,
         } => {
-            let (users_tx, users_rx) = tokio::sync::watch::channel(users.clone());
+            let (users_rx, static_users_tx) = match users_rx {
+                Some(users_rx) => (users_rx, None),
+                None => {
+                    let (users_tx, users_rx) =
+                        tokio::sync::watch::channel(users.clone());
+                    (users_rx, Some(users_tx))
+                }
+            };
             Some(Arc::new(ShadowsocksInbound::new(
                 ShadowsocksInboundOptions {
                     addr: (common_opts.listen.0, common_opts.port).into(),
@@ -166,7 +179,7 @@ fn build_handler(
                     dispatcher,
                     fw_mark: common_opts.fw_mark,
                     users_rx,
-                    static_users_tx: Some(users_tx),
+                    static_users_tx,
                 },
             )))
         }
@@ -179,7 +192,8 @@ fn build_handler(
             fallback,
             users,
         } => {
-            let (_, users_rx) = tokio::sync::watch::channel(users.clone());
+            let users_rx = users_rx
+                .unwrap_or_else(|| tokio::sync::watch::channel(users.clone()).1);
             match AnytlsInbound::new(AnytlsInboundOptions {
                 addr: (common_opts.listen.0, common_opts.port).into(),
                 password: password.clone(),

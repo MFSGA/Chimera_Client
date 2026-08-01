@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 
 use super::config::BindAddress;
 
-#[cfg(any(feature = "anytls", feature = "shadowsocks"))]
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, Eq, PartialEq)]
 pub struct InboundUser {
     pub name: String,

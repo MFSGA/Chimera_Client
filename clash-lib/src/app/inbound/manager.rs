@@ -17,7 +17,7 @@ use crate::{
         config::BindAddress,
         listener::{
             InboundFileProvider, InboundHttpProvider, InboundOpts,
-            InboundProviderDef,
+            InboundProviderDef, InboundUser,
         },
     },
     runner::Runner,
@@ -126,17 +126,20 @@ impl InboundManager {
         dispatcher: Arc<Dispatcher>,
         authenticator: ThreadSafeAuthenticator,
         cancellation_token: tokio_util::sync::CancellationToken,
+        users_rx: Option<tokio::sync::watch::Receiver<Vec<InboundUser>>>,
     ) -> Option<JoinHandle<()>> {
-        build_network_listeners(opts, dispatcher, authenticator).map(|runners| {
-            tokio::spawn(async move {
-                tokio::select! {
-                    _ = cancellation_token.cancelled() => {
-                        trace!("Inbound listener task cancelled");
+        build_network_listeners(opts, dispatcher, authenticator, users_rx).map(
+            |runners| {
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = cancellation_token.cancelled() => {
+                            trace!("Inbound listener task cancelled");
+                        }
+                        _ = futures::future::join_all(runners) => {}
                     }
-                    _ = futures::future::join_all(runners) => {}
-                }
-            })
-        })
+                })
+            },
+        )
     }
 
     async fn abort_and_join_listener_handles(
@@ -234,6 +237,7 @@ impl InboundManager {
                 dispatcher.clone(),
                 authenticator.clone(),
                 cancellation_token.clone(),
+                None,
             );
             listeners.insert(opts, handle);
         }
@@ -374,6 +378,7 @@ impl InboundManager {
                 dispatcher.clone(),
                 authenticator.clone(),
                 cancellation_token.clone(),
+                None,
             );
         }
     }
