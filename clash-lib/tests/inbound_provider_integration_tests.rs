@@ -88,8 +88,24 @@ fn start_http_provider_client(
     interval: u64,
     ports: (u16, u16, u16),
 ) -> (tempfile::TempDir, ClashInstance, u16, u16, u16) {
+    start_http_provider_client_with_cache(provider_url, interval, ports, None)
+}
+
+fn start_http_provider_client_with_cache(
+    provider_url: &str,
+    interval: u64,
+    ports: (u16, u16, u16),
+    cached_provider: Option<&str>,
+) -> (tempfile::TempDir, ClashInstance, u16, u16, u16) {
     let (api_port, inbound_port, replacement_port) = ports;
     let cwd = tempfile::tempdir().expect("failed to create provider tempdir");
+    if let Some(cached_provider) = cached_provider {
+        std::fs::write(
+            cwd.path().join("inbound-provider-cache.yaml"),
+            cached_provider,
+        )
+        .expect("failed to write inbound provider cache");
+    }
     let config = format!(
         r#"
 allow-lan: false
@@ -352,6 +368,58 @@ listeners:
         .iter()
         .find(|listener| listener["name"] == "stable-socks")
         .expect("stable listener should remain exposed by API");
+    assert_eq!(listener["port"], inbound_port);
+    assert_eq!(listener["active"], true);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn http_inbound_provider_starts_from_cache_during_remote_outage() {
+    let server = httpmock::MockServer::start();
+    let ports = available_ports();
+    let (_, inbound_port, _) = ports;
+    let unavailable = server.mock(|when, then| {
+        when.method(httpmock::Method::GET).path("/offline.yaml");
+        then.status(503).body("temporarily unavailable");
+    });
+    let cached_provider = format!(
+        r#"
+listeners:
+  - name: cached-socks
+    type: socks
+    listen: 127.0.0.1
+    port: {inbound_port}
+    udp: false
+"#
+    );
+
+    let (cwd, _client, api_port, _, _) = start_http_provider_client_with_cache(
+        &server.url("/offline.yaml"),
+        1,
+        ports,
+        Some(&cached_provider),
+    );
+    assert_socks_greeting(inbound_port).await;
+    for _ in 0..50 {
+        if unavailable.calls() > 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(unavailable.calls() > 0, "remote refresh was not attempted");
+
+    let cache =
+        std::fs::read_to_string(cwd.path().join("inbound-provider-cache.yaml"))
+            .expect("failed to read cached inbound provider");
+    assert_eq!(cache, cached_provider);
+
+    let configs = get_configs(api_port).await;
+    let listener = configs["listeners"]
+        .as_array()
+        .expect("listeners should be an array")
+        .iter()
+        .find(|listener| listener["name"] == "cached-socks")
+        .expect("cached listener should be exposed by API");
     assert_eq!(listener["port"], inbound_port);
     assert_eq!(listener["active"], true);
 }
