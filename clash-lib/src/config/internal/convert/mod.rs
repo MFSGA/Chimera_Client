@@ -115,6 +115,16 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
             })
             .collect(),
         listeners: listener::convert(c.listeners.take(), &c)?,
+        inbound_providers: c
+            .inbound_provider
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name, mut provider)| {
+                provider.set_name(name.clone());
+                (name, provider)
+            })
+            .collect(),
         rules: c
             .rule
             .take()
@@ -250,6 +260,46 @@ proxy-providers:
                 assert_eq!(http.health_check.enable, Some(false));
             }
             _ => panic!("expected HTTP provider"),
+        }
+    }
+
+    #[test]
+    fn inbound_providers_parse_and_receive_map_names() {
+        let cfg = parse_config(
+            r#"
+inbound-providers:
+  local-listeners:
+    type: file
+    path: ./providers/inbound-local.yaml
+    interval: 600
+  remote-listeners:
+    type: http
+    url: https://example.com/inbound.yaml
+    interval: 3600
+    path: ./providers/inbound-remote.yaml
+"#,
+        );
+
+        let converted = convert(cfg).expect("inbound providers should convert");
+        let local = converted.inbound_providers.get("local-listeners").unwrap();
+        match local {
+            crate::config::internal::listener::InboundProviderDef::File(file) => {
+                assert_eq!(file.name, "local-listeners");
+                assert_eq!(file.path, "./providers/inbound-local.yaml");
+                assert_eq!(file.interval, Some(600));
+            }
+            _ => panic!("expected file inbound provider"),
+        }
+
+        let remote = converted.inbound_providers.get("remote-listeners").unwrap();
+        match remote {
+            crate::config::internal::listener::InboundProviderDef::Http(http) => {
+                assert_eq!(http.name, "remote-listeners");
+                assert_eq!(http.url, "https://example.com/inbound.yaml");
+                assert_eq!(http.interval, 3600);
+                assert_eq!(http.path, "./providers/inbound-remote.yaml");
+            }
+            _ => panic!("expected HTTP inbound provider"),
         }
     }
 

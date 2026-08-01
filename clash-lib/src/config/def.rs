@@ -11,7 +11,7 @@ use crate::{
     },
     config::internal::{
         config::BindAddress,
-        listener::InboundOpts,
+        listener::{InboundOpts, InboundProviderDef},
         proxy::{
             OutboundGroupProtocol, OutboundProxyProtocol, OutboundProxyProviderDef,
         },
@@ -189,6 +189,8 @@ pub struct Config {
     pub tun: Option<TunConfig>,
     /// 12
     pub listeners: Option<Vec<InboundOpts>>,
+    #[serde(rename = "inbound-providers")]
+    pub inbound_provider: Option<HashMap<String, InboundProviderDef>>,
     // 13. these options has default vals,
     // and needs extra processing
     /// whether your network environment supports IPv6

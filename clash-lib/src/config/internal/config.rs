@@ -18,7 +18,7 @@ use crate::{
     config::{
         def::{self, LogLevel, RunMode},
         internal::{
-            listener::InboundOpts,
+            listener::{InboundOpts, InboundProviderDef},
             proxy::{OutboundProxy, OutboundProxyProviderDef},
             rule::RuleType,
         },
@@ -41,6 +41,7 @@ pub struct Config {
     pub users: Vec<auth::User>,
     /// 3.4
     pub listeners: HashSet<InboundOpts>,
+    pub inbound_providers: HashMap<String, InboundProviderDef>,
     /// 4
     pub general: General,
     /// 5

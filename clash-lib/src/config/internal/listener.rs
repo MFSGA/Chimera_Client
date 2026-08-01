@@ -130,6 +130,41 @@ impl InboundOpts {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum InboundProviderDef {
+    Http(InboundHttpProvider),
+    File(InboundFileProvider),
+}
+
+impl InboundProviderDef {
+    pub fn set_name(&mut self, name: String) {
+        match self {
+            Self::Http(provider) => provider.name = name,
+            Self::File(provider) => provider.name = name,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct InboundHttpProvider {
+    #[serde(skip)]
+    pub name: String,
+    pub url: String,
+    pub interval: u64,
+    pub path: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct InboundFileProvider {
+    #[serde(skip)]
+    pub name: String,
+    pub path: String,
+    pub interval: Option<u64>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct CommonInboundOpts {
