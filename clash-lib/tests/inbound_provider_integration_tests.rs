@@ -83,6 +83,48 @@ rules:
     (cwd, client, api_port, inbound_port, replacement_port)
 }
 
+fn start_http_provider_client(
+    provider_url: &str,
+    interval: u64,
+    ports: (u16, u16, u16),
+) -> (tempfile::TempDir, ClashInstance, u16, u16, u16) {
+    let (api_port, inbound_port, replacement_port) = ports;
+    let cwd = tempfile::tempdir().expect("failed to create provider tempdir");
+    let config = format!(
+        r#"
+allow-lan: false
+bind-address: 127.0.0.1
+mode: direct
+log-level: error
+mmdb: null
+external-controller: 127.0.0.1:{api_port}
+secret: test-secret
+tun:
+  enable: false
+inbound-providers:
+  remote:
+    type: http
+    url: {provider_url}
+    path: inbound-provider-cache.yaml
+    interval: {interval}
+rules:
+  - MATCH,DIRECT
+"#
+    );
+    let client = ClashInstance::start(
+        Options {
+            config: Config::Str(config),
+            cwd: Some(cwd.path().to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            config_path: None,
+        },
+        vec![api_port, inbound_port, replacement_port],
+    )
+    .expect("failed to start HTTP inbound-provider client");
+    (cwd, client, api_port, inbound_port, replacement_port)
+}
+
 async fn get_configs(api_port: u16) -> serde_json::Value {
     let url = format!("http://127.0.0.1:{api_port}/configs");
     let request = hyper::Request::builder()
@@ -148,6 +190,48 @@ async fn file_inbound_provider_starts_listener_and_exposes_it_by_api() {
         .find(|listener| listener["name"] == "provider-socks")
         .expect("provider listener should be exposed by API");
     assert_eq!(listener["type"], "socks");
+    assert_eq!(listener["port"], inbound_port);
+    assert_eq!(listener["active"], true);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn http_inbound_provider_downloads_caches_and_starts_listener() {
+    let server = httpmock::MockServer::start();
+    let ports = available_ports();
+    let (_, inbound_port, _) = ports;
+    let provider = server.mock(|when, then| {
+        when.method(httpmock::Method::GET).path("/inbound.yaml");
+        then.status(200).body(format!(
+            r#"
+listeners:
+  - name: remote-socks
+    type: socks
+    listen: 127.0.0.1
+    port: {inbound_port}
+    udp: false
+"#
+        ));
+    });
+
+    let (cwd, _client, api_port, _, _) =
+        start_http_provider_client(&server.url("/inbound.yaml"), 0, ports);
+    provider.assert();
+    wait_port_ready(inbound_port).expect("remote provider listener did not start");
+    assert_socks_greeting(inbound_port).await;
+
+    let cache =
+        std::fs::read_to_string(cwd.path().join("inbound-provider-cache.yaml"))
+            .expect("failed to read inbound provider cache");
+    assert!(cache.contains("remote-socks"));
+
+    let configs = get_configs(api_port).await;
+    let listener = configs["listeners"]
+        .as_array()
+        .expect("listeners should be an array")
+        .iter()
+        .find(|listener| listener["name"] == "remote-socks")
+        .expect("remote provider listener should be exposed by API");
     assert_eq!(listener["port"], inbound_port);
     assert_eq!(listener["active"], true);
 }
