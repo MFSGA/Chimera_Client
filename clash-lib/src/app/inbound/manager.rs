@@ -4,20 +4,35 @@ use tokio::{sync::RwLock, task::JoinHandle};
 
 use crate::{
     app::{
-        dispatcher::Dispatcher, inbound::network_listener::build_network_listeners,
+        dispatcher::Dispatcher,
+        dns::ThreadSafeDNSResolver,
+        inbound::network_listener::build_network_listeners,
+        remote_content_manager::providers::{
+            ThreadSafeProviderVehicle, file_vehicle, http_vehicle,
+            inbound_provider::InboundSetProvider,
+        },
     },
     common::auth::ThreadSafeAuthenticator,
-    config::internal::{config::BindAddress, listener::InboundOpts},
+    config::internal::{
+        config::BindAddress,
+        listener::{
+            InboundFileProvider, InboundHttpProvider, InboundOpts,
+            InboundProviderDef,
+        },
+    },
     runner::Runner,
 };
 use std::{
     collections::{HashMap, HashSet},
+    path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
-use tracing::{debug, trace, warn};
+use tracing::{trace, warn};
 
 type InboundHandlerMap = HashMap<InboundOpts, Option<JoinHandle<()>>>;
 type ThreadSafeInboundHandlers = Arc<RwLock<InboundHandlerMap>>;
+type ProviderInboundHandlers = Arc<RwLock<HashMap<String, InboundHandlerMap>>>;
 
 /// Legacy ports configuration for inbounds.
 /// Newer inbounds have their own port configuration.
@@ -40,6 +55,8 @@ pub struct InboundManager {
 
     /// Inbound options for each inbound type -> listening Task
     inbound_handlers: ThreadSafeInboundHandlers,
+    provider_handlers: ProviderInboundHandlers,
+    inbound_providers: Arc<RwLock<HashMap<String, Arc<InboundSetProvider>>>>,
 
     cancellation_token: tokio_util::sync::CancellationToken,
 }
@@ -87,6 +104,38 @@ impl InboundManager {
             .collect()
     }
 
+    async fn take_all_provider_listener_handles(
+        provider_handlers: ProviderInboundHandlers,
+    ) -> Vec<(String, JoinHandle<()>)> {
+        let mut handles = Vec::new();
+        for listeners in provider_handlers.write().await.values_mut() {
+            for (opts, listener) in listeners.iter_mut() {
+                if let Some(handle) = listener.take() {
+                    handles.push((opts.common_opts().name.clone(), handle));
+                }
+            }
+        }
+        handles
+    }
+
+    fn spawn_listener(
+        opts: &InboundOpts,
+        dispatcher: Arc<Dispatcher>,
+        authenticator: ThreadSafeAuthenticator,
+        cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> Option<JoinHandle<()>> {
+        build_network_listeners(opts, dispatcher, authenticator).map(|runners| {
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = cancellation_token.cancelled() => {
+                        trace!("Inbound listener task cancelled");
+                    }
+                    _ = futures::future::join_all(runners) => {}
+                }
+            })
+        })
+    }
+
     async fn abort_and_join_listener_handles(
         handles: Vec<(String, JoinHandle<()>)>,
     ) -> Result<(), crate::Error> {
@@ -119,6 +168,53 @@ impl InboundManager {
         Self::abort_and_join_listener_handles(handles).await
     }
 
+    async fn stop_all_provider_listener_handles(
+        provider_handlers: ProviderInboundHandlers,
+    ) -> Result<(), crate::Error> {
+        let handles =
+            Self::take_all_provider_listener_handles(provider_handlers).await;
+        Self::abort_and_join_listener_handles(handles).await
+    }
+
+    async fn replace_provider_listeners(
+        provider_name: String,
+        new_opts: Vec<InboundOpts>,
+        provider_handlers: ProviderInboundHandlers,
+        dispatcher: Arc<Dispatcher>,
+        authenticator: ThreadSafeAuthenticator,
+        cancellation_token: tokio_util::sync::CancellationToken,
+    ) {
+        let old_handles = provider_handlers
+            .write()
+            .await
+            .remove(&provider_name)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(opts, listener)| {
+                listener.map(|handle| (opts.common_opts().name.clone(), handle))
+            })
+            .collect();
+        if let Err(error) = Self::abort_and_join_listener_handles(old_handles).await
+        {
+            warn!(provider = %provider_name, "failed to stop provider listeners: {error}");
+        }
+
+        let mut listeners = HashMap::new();
+        for opts in new_opts {
+            let handle = Self::spawn_listener(
+                &opts,
+                dispatcher.clone(),
+                authenticator.clone(),
+                cancellation_token.clone(),
+            );
+            listeners.insert(opts, handle);
+        }
+        provider_handlers
+            .write()
+            .await
+            .insert(provider_name, listeners);
+    }
+
     pub async fn new(
         dispatcher: Arc<Dispatcher>,
         authenticator: ThreadSafeAuthenticator,
@@ -129,10 +225,105 @@ impl InboundManager {
             inbound_handlers: Arc::new(RwLock::new(
                 inbounds_opt.into_iter().map(|opts| (opts, None)).collect(),
             )),
+            provider_handlers: Arc::new(RwLock::new(HashMap::new())),
+            inbound_providers: Arc::new(RwLock::new(HashMap::new())),
             dispatcher,
             authenticator,
             cancellation_token: cancellation_token.unwrap_or_default(),
         }
+    }
+
+    pub async fn load_inbound_providers(
+        &self,
+        cwd: String,
+        providers: HashMap<String, InboundProviderDef>,
+        dns_resolver: ThreadSafeDNSResolver,
+    ) -> Result<(), crate::Error> {
+        for (name, provider) in providers {
+            let (vehicle, interval): (ThreadSafeProviderVehicle, Duration) =
+                match provider {
+                    InboundProviderDef::Http(InboundHttpProvider {
+                        url,
+                        path,
+                        interval,
+                        ..
+                    }) => {
+                        let url = url.parse::<hyper::Uri>().map_err(|error| {
+                            crate::Error::InvalidConfig(format!(
+                                "invalid URL for inbound provider `{name}`: {error}"
+                            ))
+                        })?;
+                        (
+                            Arc::new(http_vehicle::Vehicle::new(
+                                url,
+                                path,
+                                Some(cwd.clone()),
+                                dns_resolver.clone(),
+                            )),
+                            Duration::from_secs(interval),
+                        )
+                    }
+                    InboundProviderDef::File(InboundFileProvider {
+                        path,
+                        interval,
+                        ..
+                    }) => {
+                        let path = PathBuf::from(path);
+                        let path = if path.is_absolute() {
+                            path
+                        } else {
+                            PathBuf::from(&cwd).join(path)
+                        };
+                        let path = path.to_string_lossy().into_owned();
+                        (
+                            Arc::new(file_vehicle::Vehicle::new(&path)),
+                            Duration::from_secs(interval.unwrap_or_default()),
+                        )
+                    }
+                };
+
+            let provider_handlers = self.provider_handlers.clone();
+            let dispatcher = self.dispatcher.clone();
+            let authenticator = self.authenticator.clone();
+            let cancellation_token = self.cancellation_token.clone();
+            let provider_name = name.clone();
+            let on_update = move |new_opts| {
+                let provider_handlers = provider_handlers.clone();
+                let dispatcher = dispatcher.clone();
+                let authenticator = authenticator.clone();
+                let cancellation_token = cancellation_token.clone();
+                let provider_name = provider_name.clone();
+                Box::pin(async move {
+                    Self::replace_provider_listeners(
+                        provider_name,
+                        new_opts,
+                        provider_handlers,
+                        dispatcher,
+                        authenticator,
+                        cancellation_token,
+                    )
+                    .await;
+                }) as BoxFuture<'static, ()>
+            };
+
+            let provider =
+                InboundSetProvider::new(name.clone(), interval, vehicle, on_update)
+                    .map_err(|error| {
+                        crate::Error::InvalidConfig(format!(
+                            "failed to create inbound provider `{name}`: {error}"
+                        ))
+                    })?;
+            provider.initialize().await.map_err(|error| {
+                crate::Error::InvalidConfig(format!(
+                    "failed to initialize inbound provider `{name}`: {error}"
+                ))
+            })?;
+            self.inbound_providers
+                .write()
+                .await
+                .insert(name, Arc::new(provider));
+        }
+        Ok(())
     }
 
     /// Starts all inbounds listeners based on the provided options.
@@ -150,22 +341,12 @@ impl InboundManager {
         }
 
         for (opts, handler) in inbound_handlers.write().await.iter_mut() {
-            *handler = build_network_listeners(
+            *handler = Self::spawn_listener(
                 opts,
                 dispatcher.clone(),
                 authenticator.clone(),
-            )
-            .map(|r| {
-                let listener_token = cancellation_token.clone();
-                tokio::spawn(async move {
-                    tokio::select! {
-                        _ = listener_token.cancelled() => {
-                            trace!("Inbound listener task cancelled");
-                        }
-                        _ = futures::future::join_all(r) => {}
-                    }
-                })
-            });
+                cancellation_token.clone(),
+            );
         }
     }
 
@@ -175,6 +356,12 @@ impl InboundManager {
             Self::stop_all_listener_handles(self.inbound_handlers.clone()).await
         {
             warn!("failed to stop inbound handlers: {}", err);
+        }
+        if let Err(err) =
+            Self::stop_all_provider_listener_handles(self.provider_handlers.clone())
+                .await
+        {
+            warn!("failed to stop provider inbound handlers: {}", err);
         }
     }
 
@@ -339,20 +526,34 @@ impl InboundManager {
     }
 
     pub async fn get_listeners(&self) -> Vec<InboundEndpoint> {
-        let guard = self.inbound_handlers.read().await;
-        guard
+        let mut listeners = self
+            .inbound_handlers
+            .read()
+            .await
             .iter()
-            .map(|(opts, handler)| {
-                let common = opts.common_opts();
-                let active = handler.as_ref().is_some_and(|h| !h.is_finished());
-                InboundEndpoint {
-                    name: common.name.clone(),
-                    inbound_type: opts.type_name().to_string(),
-                    port: common.port,
-                    active,
-                }
-            })
-            .collect()
+            .map(|(opts, handler)| Self::listener_endpoint(opts, handler))
+            .collect::<Vec<_>>();
+        for provider in self.provider_handlers.read().await.values() {
+            listeners.extend(
+                provider
+                    .iter()
+                    .map(|(opts, handler)| Self::listener_endpoint(opts, handler)),
+            );
+        }
+        listeners
+    }
+
+    fn listener_endpoint(
+        opts: &InboundOpts,
+        handler: &Option<JoinHandle<()>>,
+    ) -> InboundEndpoint {
+        let common = opts.common_opts();
+        InboundEndpoint {
+            name: common.name.clone(),
+            inbound_type: opts.type_name().to_string(),
+            port: common.port,
+            active: handler.as_ref().is_some_and(|handle| !handle.is_finished()),
+        }
     }
 
     async fn stop_all_listeners(&self) {
@@ -361,18 +562,6 @@ impl InboundManager {
         {
             warn!("failed to stop inbound handlers: {}", err);
         }
-        debug!("todo for provider");
-        /* for handles in self.provider_handles.write().await.values_mut() {
-            for (opt, handle) in handles.iter_mut() {
-                if let Some(h) = handle.take() {
-                    warn!(
-                        "Shutting down provider inbound handler: {}",
-                        opt.common_opts().name
-                    );
-                    h.abort();
-                }
-            }
-        } */
     }
 
     #[allow(dead_code)]
@@ -380,26 +569,10 @@ impl InboundManager {
         let handles =
             Self::take_all_listener_handles(self.inbound_handlers.clone()).await;
         Self::abort_and_join_listener_handles(handles).await?;
-        debug!("todo join_all_listeners for provider");
-        /* for handles in self.provider_handles.write().await.values_mut() {
-            for (opt, handle) in handles.iter_mut() {
-                if let Some(h) = handle.take() {
-                    warn!(
-                        "Shutting down provider inbound handler: {}",
-                        opt.common_opts().name
-                    );
-                    h.await.unwrap_or_else(|e| {
-                        warn!(
-                            "Provider inbound handler {} shutdown with error: {}",
-                            opt.common_opts().name,
-                            e
-                        );
-                        last_join_error = Some(e);
-                    });
-                }
-            }
-        } */
-        Ok(())
+        let provider_handles =
+            Self::take_all_provider_listener_handles(self.provider_handlers.clone())
+                .await;
+        Self::abort_and_join_listener_handles(provider_handles).await
     }
 }
 
