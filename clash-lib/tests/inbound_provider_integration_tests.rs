@@ -12,21 +12,26 @@ mod common;
 
 use common::{ClashInstance, send_http_request, wait_port_ready};
 
-fn available_ports() -> (u16, u16) {
+fn available_ports() -> (u16, u16, u16) {
     let api =
         StdTcpListener::bind("127.0.0.1:0").expect("failed to reserve API port");
     let inbound =
         StdTcpListener::bind("127.0.0.1:0").expect("failed to reserve inbound port");
+    let replacement = StdTcpListener::bind("127.0.0.1:0")
+        .expect("failed to reserve replacement inbound port");
     let ports = (
         api.local_addr().unwrap().port(),
         inbound.local_addr().unwrap().port(),
+        replacement.local_addr().unwrap().port(),
     );
-    drop((api, inbound));
+    drop((api, inbound, replacement));
     ports
 }
 
-fn start_file_provider_client() -> (tempfile::TempDir, ClashInstance, u16, u16) {
-    let (api_port, inbound_port) = available_ports();
+fn start_file_provider_client(
+    interval: u64,
+) -> (tempfile::TempDir, ClashInstance, u16, u16, u16) {
+    let (api_port, inbound_port, replacement_port) = available_ports();
     let cwd = tempfile::tempdir().expect("failed to create provider tempdir");
     std::fs::write(
         cwd.path().join("inbound-provider.yaml"),
@@ -58,7 +63,7 @@ inbound-providers:
   local:
     type: file
     path: inbound-provider.yaml
-    interval: 0
+    interval: {interval}
 rules:
   - MATCH,DIRECT
 "#
@@ -71,11 +76,11 @@ rules:
             log_file: None,
             config_path: None,
         },
-        vec![api_port, inbound_port],
+        vec![api_port, inbound_port, replacement_port],
     )
     .expect("failed to start file inbound-provider client");
     wait_port_ready(inbound_port).expect("provider SOCKS listener did not start");
-    (cwd, client, api_port, inbound_port)
+    (cwd, client, api_port, inbound_port, replacement_port)
 }
 
 async fn get_configs(api_port: u16) -> serde_json::Value {
@@ -101,6 +106,17 @@ async fn get_configs(api_port: u16) -> serde_json::Value {
     .expect("failed to parse GET /configs response")
 }
 
+fn wait_port_closed(port: u16) {
+    let address = ("127.0.0.1", port);
+    for _ in 0..50 {
+        if std::net::TcpStream::connect(address).is_err() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("provider listener port {port} did not close");
+}
+
 async fn assert_socks_greeting(port: u16) {
     let mut stream = TcpStream::connect(("127.0.0.1", port))
         .await
@@ -120,7 +136,8 @@ async fn assert_socks_greeting(port: u16) {
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
 async fn file_inbound_provider_starts_listener_and_exposes_it_by_api() {
-    let (_cwd, _client, api_port, inbound_port) = start_file_provider_client();
+    let (_cwd, _client, api_port, inbound_port, _replacement_port) =
+        start_file_provider_client(0);
     assert_socks_greeting(inbound_port).await;
 
     let configs = get_configs(api_port).await;
@@ -133,4 +150,43 @@ async fn file_inbound_provider_starts_listener_and_exposes_it_by_api() {
     assert_eq!(listener["type"], "socks");
     assert_eq!(listener["port"], inbound_port);
     assert_eq!(listener["active"], true);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn file_inbound_provider_replaces_listener_on_interval_refresh() {
+    let (cwd, _client, api_port, inbound_port, replacement_port) =
+        start_file_provider_client(1);
+    assert_socks_greeting(inbound_port).await;
+
+    std::fs::write(
+        cwd.path().join("inbound-provider.yaml"),
+        format!(
+            r#"
+listeners:
+  - name: provider-socks
+    type: socks
+    listen: 127.0.0.1
+    port: {replacement_port}
+    udp: false
+"#
+        ),
+    )
+    .expect("failed to update inbound provider file");
+
+    wait_port_ready(replacement_port)
+        .expect("replacement provider SOCKS listener did not start");
+    wait_port_closed(inbound_port);
+    assert_socks_greeting(replacement_port).await;
+
+    let configs = get_configs(api_port).await;
+    let provider_listeners = configs["listeners"]
+        .as_array()
+        .expect("listeners should be an array")
+        .iter()
+        .filter(|listener| listener["name"] == "provider-socks")
+        .collect::<Vec<_>>();
+    assert_eq!(provider_listeners.len(), 1);
+    assert_eq!(provider_listeners[0]["port"], replacement_port);
+    assert_eq!(provider_listeners[0]["active"], true);
 }
