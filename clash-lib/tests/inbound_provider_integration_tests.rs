@@ -238,6 +238,67 @@ listeners:
 
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
+async fn http_inbound_provider_replaces_listener_on_interval_refresh() {
+    let server = httpmock::MockServer::start();
+    let ports = available_ports();
+    let (_, inbound_port, replacement_port) = ports;
+    let mut initial = server.mock(|when, then| {
+        when.method(httpmock::Method::GET).path("/refresh.yaml");
+        then.status(200).body(format!(
+            r#"
+listeners:
+  - name: remote-socks
+    type: socks
+    listen: 127.0.0.1
+    port: {inbound_port}
+    udp: false
+"#
+        ));
+    });
+    let (cwd, _client, api_port, _, _) =
+        start_http_provider_client(&server.url("/refresh.yaml"), 1, ports);
+    assert_socks_greeting(inbound_port).await;
+
+    initial.delete();
+    let replacement = server.mock(|when, then| {
+        when.method(httpmock::Method::GET).path("/refresh.yaml");
+        then.status(200).body(format!(
+            r#"
+listeners:
+  - name: remote-socks
+    type: socks
+    listen: 127.0.0.1
+    port: {replacement_port}
+    udp: false
+"#
+        ));
+    });
+
+    wait_port_ready(replacement_port)
+        .expect("replacement remote provider listener did not start");
+    replacement.assert();
+    wait_port_closed(inbound_port);
+    assert_socks_greeting(replacement_port).await;
+
+    let cache =
+        std::fs::read_to_string(cwd.path().join("inbound-provider-cache.yaml"))
+            .expect("failed to read refreshed inbound provider cache");
+    assert!(cache.contains(&format!("port: {replacement_port}")));
+
+    let configs = get_configs(api_port).await;
+    let provider_listeners = configs["listeners"]
+        .as_array()
+        .expect("listeners should be an array")
+        .iter()
+        .filter(|listener| listener["name"] == "remote-socks")
+        .collect::<Vec<_>>();
+    assert_eq!(provider_listeners.len(), 1);
+    assert_eq!(provider_listeners[0]["port"], replacement_port);
+    assert_eq!(provider_listeners[0]["active"], true);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
 async fn file_inbound_provider_replaces_listener_on_interval_refresh() {
     let (cwd, _client, api_port, inbound_port, replacement_port) =
         start_file_provider_client(1);
