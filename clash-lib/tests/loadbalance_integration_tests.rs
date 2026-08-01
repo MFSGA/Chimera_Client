@@ -317,6 +317,59 @@ async fn roundtrip(proxy_port: u16, target_port: u16, payload: &[u8]) -> bool {
     )
 }
 
+async fn assert_single_node_group_tracks_refresh(group_type: &str, api_type: &str) {
+    let server = httpmock::MockServer::start();
+    let path = format!("/{group_type}.yaml");
+    let mut direct_mock = server.mock(|when, then| {
+        when.method(httpmock::Method::GET).path(path.as_str());
+        then.status(200).body(
+            r#"
+proxies:
+  - name: group-direct
+    type: direct
+"#,
+        );
+    });
+    let target = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind local target");
+    let target_port = target.local_addr().unwrap().port();
+    let target_task = tokio::spawn(async move {
+        let (mut stream, _) = target.accept().await.unwrap();
+        let mut request = [0u8; 128];
+        let len = stream.read(&mut request).await.unwrap();
+        stream.write_all(&request[..len]).await.unwrap();
+    });
+
+    let (_cwd, _client, api_port, socks_port) =
+        start_http_provider_client_for_group(&server.url(&path), 0, group_type);
+    let group = get_json(api_port, "/proxies/balanced").await;
+    assert_eq!(group["type"], api_type);
+    assert_eq!(group["all"], serde_json::json!(["DIRECT"]));
+    assert_eq!(group["now"], "DIRECT");
+    assert!(roundtrip(socks_port, target_port, b"group-before").await);
+    target_task.await.unwrap();
+
+    direct_mock.delete();
+    let reject_mock = server.mock(|when, then| {
+        when.method(httpmock::Method::GET).path(path.as_str());
+        then.status(200).body(
+            r#"
+proxies:
+  - name: group-reject
+    type: reject
+"#,
+        );
+    });
+    put_provider(api_port, "local").await;
+    reject_mock.assert();
+
+    let group = get_json(api_port, "/proxies/balanced").await;
+    assert_eq!(group["all"], serde_json::json!(["REJECT"]));
+    assert_eq!(group["now"], "REJECT");
+    assert!(!roundtrip(socks_port, target_port, b"group-after").await);
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
 async fn load_balance_group_is_exposed_by_api() {
@@ -546,6 +599,18 @@ proxies:
     assert_eq!(group["all"], serde_json::json!(["REJECT"]));
     assert_eq!(group["now"], "REJECT");
     assert!(!roundtrip(socks_port, target_port, b"selector-after").await);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn fallback_group_tracks_manual_provider_refresh() {
+    assert_single_node_group_tracks_refresh("fallback", "Fallback").await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn url_test_group_tracks_manual_provider_refresh() {
+    assert_single_node_group_tracks_refresh("url-test", "URLTest").await;
 }
 
 #[tokio::test(flavor = "current_thread")]
