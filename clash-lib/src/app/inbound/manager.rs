@@ -31,11 +31,22 @@ use std::{
 use tracing::{trace, warn};
 
 type InboundHandlerMap = HashMap<InboundOpts, Option<JoinHandle<()>>>;
+
+struct ProviderHandleEntry {
+    handle: Option<JoinHandle<()>>,
+    users_tx: Option<tokio::sync::watch::Sender<Vec<InboundUser>>>,
+}
+
+type ProviderHandlerMap = HashMap<InboundOpts, ProviderHandleEntry>;
+type ProviderUserChannel = (
+    Option<tokio::sync::watch::Receiver<Vec<InboundUser>>>,
+    Option<tokio::sync::watch::Sender<Vec<InboundUser>>>,
+);
 type NamedListenerHandles = Vec<(String, JoinHandle<()>)>;
 type ProviderListenerPartition =
-    (InboundHandlerMap, NamedListenerHandles, Vec<InboundOpts>);
+    (ProviderHandlerMap, NamedListenerHandles, Vec<InboundOpts>);
 type ThreadSafeInboundHandlers = Arc<RwLock<InboundHandlerMap>>;
-type ProviderInboundHandlers = Arc<RwLock<HashMap<String, InboundHandlerMap>>>;
+type ProviderInboundHandlers = Arc<RwLock<HashMap<String, ProviderHandlerMap>>>;
 
 /// Legacy ports configuration for inbounds.
 /// Newer inbounds have their own port configuration.
@@ -112,8 +123,8 @@ impl InboundManager {
     ) -> NamedListenerHandles {
         let mut handles = Vec::new();
         for listeners in provider_handlers.write().await.values_mut() {
-            for (opts, listener) in listeners.iter_mut() {
-                if let Some(handle) = listener.take() {
+            for (opts, entry) in listeners.iter_mut() {
+                if let Some(handle) = entry.handle.take() {
                     handles.push((opts.common_opts().name.clone(), handle));
                 }
             }
@@ -140,6 +151,35 @@ impl InboundManager {
                 })
             },
         )
+    }
+
+    fn provider_user_channel(opts: &InboundOpts) -> ProviderUserChannel {
+        match opts {
+            #[cfg(feature = "shadowsocks")]
+            InboundOpts::Shadowsocks { users, .. } => {
+                let (tx, rx) = tokio::sync::watch::channel(users.clone());
+                (Some(rx), Some(tx))
+            }
+            #[cfg(feature = "anytls")]
+            InboundOpts::Anytls { users, .. } => {
+                let (tx, rx) = tokio::sync::watch::channel(users.clone());
+                (Some(rx), Some(tx))
+            }
+            _ => (None, None),
+        }
+    }
+
+    fn push_provider_users(opts: &InboundOpts, entry: &ProviderHandleEntry) {
+        let users: Option<&Vec<InboundUser>> = match opts {
+            #[cfg(feature = "shadowsocks")]
+            InboundOpts::Shadowsocks { users, .. } => Some(users),
+            #[cfg(feature = "anytls")]
+            InboundOpts::Anytls { users, .. } => Some(users),
+            _ => None,
+        };
+        if let (Some(users), Some(tx)) = (users, &entry.users_tx) {
+            let _ = tx.send(users.clone());
+        }
     }
 
     async fn abort_and_join_listener_handles(
@@ -184,14 +224,15 @@ impl InboundManager {
 
     fn partition_provider_listeners(
         new_opts: Vec<InboundOpts>,
-        mut old_handlers: InboundHandlerMap,
+        mut old_handlers: ProviderHandlerMap,
     ) -> ProviderListenerPartition {
         let mut retained = HashMap::new();
         let mut to_start = Vec::new();
 
         for opts in new_opts {
-            if let Some(listener) = old_handlers.remove(&opts) {
-                retained.insert(opts, listener);
+            if let Some(entry) = old_handlers.remove(&opts) {
+                Self::push_provider_users(&opts, &entry);
+                retained.insert(opts, entry);
             } else {
                 to_start.push(opts);
             }
@@ -199,8 +240,10 @@ impl InboundManager {
 
         let removed = old_handlers
             .into_iter()
-            .filter_map(|(opts, listener)| {
-                listener.map(|handle| (opts.common_opts().name.clone(), handle))
+            .filter_map(|(opts, entry)| {
+                entry
+                    .handle
+                    .map(|handle| (opts.common_opts().name.clone(), handle))
             })
             .collect();
 
@@ -232,14 +275,15 @@ impl InboundManager {
         }
 
         for opts in to_start {
+            let (users_rx, users_tx) = Self::provider_user_channel(&opts);
             let handle = Self::spawn_listener(
                 &opts,
                 dispatcher.clone(),
                 authenticator.clone(),
                 cancellation_token.clone(),
-                None,
+                users_rx,
             );
-            listeners.insert(opts, handle);
+            listeners.insert(opts, ProviderHandleEntry { handle, users_tx });
         }
         provider_handlers
             .write()
@@ -568,9 +612,9 @@ impl InboundManager {
             .collect::<Vec<_>>();
         for provider in self.provider_handlers.read().await.values() {
             listeners.extend(
-                provider
-                    .iter()
-                    .map(|(opts, handler)| Self::listener_endpoint(opts, handler)),
+                provider.iter().map(|(opts, entry)| {
+                    Self::listener_endpoint(opts, &entry.handle)
+                }),
             );
         }
         listeners
@@ -639,8 +683,20 @@ mod tests {
         let retained_handle = tokio::spawn(pending::<()>());
         let removed_handle = tokio::spawn(pending::<()>());
         let mut old_handlers = HashMap::new();
-        old_handlers.insert(retained_opts.clone(), Some(retained_handle));
-        old_handlers.insert(removed_opts, Some(removed_handle));
+        old_handlers.insert(
+            retained_opts.clone(),
+            ProviderHandleEntry {
+                handle: Some(retained_handle),
+                users_tx: None,
+            },
+        );
+        old_handlers.insert(
+            removed_opts,
+            ProviderHandleEntry {
+                handle: Some(removed_handle),
+                users_tx: None,
+            },
+        );
 
         let (mut retained, mut removed, to_start) =
             InboundManager::partition_provider_listeners(
@@ -650,12 +706,23 @@ mod tests {
 
         assert_eq!(retained.len(), 1);
         assert!(retained.contains_key(&retained_opts));
-        assert!(!retained[&retained_opts].as_ref().unwrap().is_finished());
+        assert!(
+            !retained[&retained_opts]
+                .handle
+                .as_ref()
+                .unwrap()
+                .is_finished()
+        );
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0].0, "removed");
         assert_eq!(to_start, vec![added_opts]);
 
-        retained.remove(&retained_opts).unwrap().unwrap().abort();
+        retained
+            .remove(&retained_opts)
+            .unwrap()
+            .handle
+            .unwrap()
+            .abort();
         removed.pop().unwrap().1.abort();
     }
 }
