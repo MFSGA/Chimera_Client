@@ -299,6 +299,65 @@ listeners:
 
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
+async fn failed_http_inbound_provider_refresh_keeps_listener_and_cache() {
+    let server = httpmock::MockServer::start();
+    let ports = available_ports();
+    let (_, inbound_port, replacement_port) = ports;
+    let mut initial = server.mock(|when, then| {
+        when.method(httpmock::Method::GET).path("/failure.yaml");
+        then.status(200).body(format!(
+            r#"
+listeners:
+  - name: stable-socks
+    type: socks
+    listen: 127.0.0.1
+    port: {inbound_port}
+    udp: false
+"#
+        ));
+    });
+    let (cwd, _client, api_port, _, _) =
+        start_http_provider_client(&server.url("/failure.yaml"), 1, ports);
+    assert_socks_greeting(inbound_port).await;
+    let cache_path = cwd.path().join("inbound-provider-cache.yaml");
+    let cached_before = std::fs::read_to_string(&cache_path)
+        .expect("failed to read initial inbound provider cache");
+
+    initial.delete();
+    let invalid = server.mock(|when, then| {
+        when.method(httpmock::Method::GET).path("/failure.yaml");
+        then.status(200).body("listeners: [not-valid");
+    });
+    for _ in 0..50 {
+        if invalid.calls() > 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(invalid.calls() > 0, "failed refresh was not attempted");
+
+    assert_socks_greeting(inbound_port).await;
+    assert!(
+        std::net::TcpStream::connect(("127.0.0.1", replacement_port)).is_err(),
+        "invalid refresh must not start a replacement listener"
+    );
+    let cached_after = std::fs::read_to_string(cache_path)
+        .expect("failed to read inbound provider cache after failed refresh");
+    assert_eq!(cached_after, cached_before);
+
+    let configs = get_configs(api_port).await;
+    let listener = configs["listeners"]
+        .as_array()
+        .expect("listeners should be an array")
+        .iter()
+        .find(|listener| listener["name"] == "stable-socks")
+        .expect("stable listener should remain exposed by API");
+    assert_eq!(listener["port"], inbound_port);
+    assert_eq!(listener["active"], true);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
 async fn file_inbound_provider_replaces_listener_on_interval_refresh() {
     let (cwd, _client, api_port, inbound_port, replacement_port) =
         start_file_provider_client(1);
