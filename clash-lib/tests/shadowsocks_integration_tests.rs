@@ -10,7 +10,7 @@ use tokio::{
 
 mod common;
 
-use common::ClashInstance;
+use common::{ClashInstance, Socks5UdpSession};
 
 const PASSWORD: &str = "3SYJ/f8nmVuzKvKglykRQDSgg10e/ADilkdRWrrY9HU=";
 
@@ -22,7 +22,7 @@ fn available_port() -> u16 {
         .port()
 }
 
-fn start_shadowsocks_pair() -> (ClashInstance, ClashInstance, u16) {
+fn start_shadowsocks_pair(udp: bool) -> (ClashInstance, ClashInstance, u16) {
     let server_api = available_port();
     let server_port = available_port();
     let client_api = available_port();
@@ -46,7 +46,7 @@ listeners:
     port: {server_port}
     cipher: 2022-blake3-aes-256-gcm
     password: {PASSWORD}
-    udp: false
+    udp: {udp}
 rules:
   - MATCH,DIRECT
 "#
@@ -81,7 +81,7 @@ proxies:
     port: {server_port}
     cipher: 2022-blake3-aes-256-gcm
     password: {PASSWORD}
-    udp: false
+    udp: {udp}
 rules:
   - MATCH,shadowsocks-out
 "#
@@ -99,6 +99,19 @@ rules:
     .expect("failed to start Shadowsocks client");
 
     (server, client, socks_port)
+}
+
+async fn spawn_udp_echo() -> (u16, tokio::task::JoinHandle<()>) {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind Shadowsocks UDP echo target");
+    let port = socket.local_addr().unwrap().port();
+    let task = tokio::spawn(async move {
+        let mut buffer = [0u8; 1024];
+        let (size, source) = socket.recv_from(&mut buffer).await.unwrap();
+        socket.send_to(&buffer[..size], source).await.unwrap();
+    });
+    (port, task)
 }
 
 async fn socks5_connect(proxy_port: u16, target_port: u16) -> TcpStream {
@@ -148,7 +161,7 @@ async fn integration_test_shadowsocks_tcp() {
         stream.shutdown().await.unwrap();
     });
 
-    let (_server, _client, socks_port) = start_shadowsocks_pair();
+    let (_server, _client, socks_port) = start_shadowsocks_pair(false);
     let mut stream = socks5_connect(socks_port, target_port).await;
     stream
         .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
@@ -165,4 +178,95 @@ async fn integration_test_shadowsocks_tcp() {
     let response = String::from_utf8_lossy(&response);
     assert!(response.starts_with("HTTP/1.1 200 OK"));
     assert!(response.ends_with("shadowsocks-roundtrip"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn integration_test_shadowsocks_udp() {
+    let target = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind Shadowsocks UDP echo target");
+    let target_port = target.local_addr().unwrap().port();
+    let target_task = tokio::spawn(async move {
+        let mut buffer = [0u8; 1024];
+        let (size, source) = target.recv_from(&mut buffer).await.unwrap();
+        target.send_to(&buffer[..size], source).await.unwrap();
+    });
+
+    let (_server, _client, socks_port) = start_shadowsocks_pair(true);
+    let session = Socks5UdpSession::connect(socks_port).await;
+    session
+        .send_ipv4(b"shadowsocks-udp-roundtrip", [127, 0, 0, 1], target_port)
+        .await;
+    let (response, source) =
+        tokio::time::timeout(Duration::from_secs(10), session.recv())
+            .await
+            .expect("timed out waiting for Shadowsocks UDP response");
+
+    assert_eq!(response, b"shadowsocks-udp-roundtrip");
+    assert_eq!(source, format!("127.0.0.1:{target_port}"));
+    target_task.await.expect("UDP echo target failed");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn integration_test_shadowsocks_udp_multi_target() {
+    let (first_port, first_task) = spawn_udp_echo().await;
+    let (second_port, second_task) = spawn_udp_echo().await;
+    let (_server, _client, socks_port) = start_shadowsocks_pair(true);
+    let session = Socks5UdpSession::connect(socks_port).await;
+
+    for (payload, port) in [
+        (b"first-target".as_slice(), first_port),
+        (b"second-target".as_slice(), second_port),
+    ] {
+        session.send_ipv4(payload, [127, 0, 0, 1], port).await;
+        let (response, source) =
+            tokio::time::timeout(Duration::from_secs(10), session.recv())
+                .await
+                .expect("timed out waiting for multi-target response");
+        assert_eq!(response, payload);
+        assert_eq!(source, format!("127.0.0.1:{port}"));
+    }
+
+    first_task.await.expect("first UDP target failed");
+    second_task.await.expect("second UDP target failed");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn integration_test_shadowsocks_udp_session_isolation() {
+    let target = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind shared Shadowsocks UDP target");
+    let target_port = target.local_addr().unwrap().port();
+    let target_task = tokio::spawn(async move {
+        let mut buffer = [0u8; 1024];
+        for _ in 0..2 {
+            let (size, source) = target.recv_from(&mut buffer).await.unwrap();
+            target.send_to(&buffer[..size], source).await.unwrap();
+        }
+    });
+
+    let (_server, _client, socks_port) = start_shadowsocks_pair(true);
+    let first = Socks5UdpSession::connect(socks_port).await;
+    let second = Socks5UdpSession::connect(socks_port).await;
+    first
+        .send_ipv4(b"first-client", [127, 0, 0, 1], target_port)
+        .await;
+    second
+        .send_ipv4(b"second-client", [127, 0, 0, 1], target_port)
+        .await;
+
+    let (first_response, _) =
+        tokio::time::timeout(Duration::from_secs(10), first.recv())
+            .await
+            .expect("first Shadowsocks UDP client timed out");
+    let (second_response, _) =
+        tokio::time::timeout(Duration::from_secs(10), second.recv())
+            .await
+            .expect("second Shadowsocks UDP client timed out");
+    assert_eq!(first_response, b"first-client");
+    assert_eq!(second_response, b"second-client");
+    target_task.await.expect("shared UDP target failed");
 }
