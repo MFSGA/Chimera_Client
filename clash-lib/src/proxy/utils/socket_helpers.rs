@@ -638,7 +638,14 @@ pub async fn new_udp_socket(
     };
     debug!("created udp socket");
 
-    if !cfg!(target_os = "android") {
+    #[cfg(target_os = "android")]
+    if let Some(src) = src {
+        socket.bind(&src.into())?;
+        trace!(src = ?src, "android udp socket bound: {socket:?}");
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
         // Skip interface binding for loopback destinations; binding to a
         // physical outbound interface prevents localhost routes from working.
         let dst_is_loopback = family_hint
