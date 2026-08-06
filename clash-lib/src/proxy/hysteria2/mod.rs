@@ -225,6 +225,8 @@ impl Handler {
         };
 
         let mut transport = TransportConfig::default();
+        #[cfg(target_os = "android")]
+        transport.enable_segmentation_offload(false);
         if opts.disable_mtu_discovery {
             tracing::debug!("disable mtu discovery");
             transport.mtu_discovery_config(None);
