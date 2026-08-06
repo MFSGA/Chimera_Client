@@ -35,6 +35,12 @@ pub trait Client: Sync + Send + Debug {
     /// used to identify the client for logging
     fn id(&self) -> String;
     async fn exchange(&self, msg: &op::Message) -> anyhow::Result<op::Message>;
+
+    /// Drop any network-bound transport so the next query reconnects on the
+    /// currently active network. Returns the number of live transports reset.
+    async fn reset_transport(&self) -> anyhow::Result<u32> {
+        Ok(0)
+    }
 }
 
 type ThreadSafeDNSClient = Arc<dyn Client>;
@@ -89,6 +95,12 @@ pub trait ClashResolver: Sync + Send {
 
     fn ipv6(&self) -> bool;
     fn set_ipv6(&self, enable: bool);
+
+    /// Drop all live upstream transports owned by this resolver. The resolver
+    /// remains usable and reconnects lazily on the next query.
+    async fn reset_transports(&self) -> anyhow::Result<u32> {
+        Ok(0)
+    }
 
     fn kind(&self) -> ResolverKind;
 }
