@@ -141,7 +141,7 @@ mod tests {
         let mut client = client_with_ecs(None);
         client.bootstrap_resolver = Some(Arc::new(resolver));
 
-        assert_eq!(client.reset_transport().await.unwrap(), 3);
+        assert_eq!(client.reset_transport().await.unwrap(), 4);
         assert!(client.refresh_address_on_rebuild.load(Ordering::Acquire));
     }
 
@@ -739,7 +739,7 @@ impl Client for DnsClient {
     }
 
     async fn reset_transport(&self) -> anyhow::Result<u32> {
-        let mut reset = if let Some(resolver) = &self.bootstrap_resolver {
+        let reset = if let Some(resolver) = &self.bootstrap_resolver {
             resolver.reset_transports().await?
         } else {
             0
@@ -748,16 +748,11 @@ impl Client for DnsClient {
             .store(true, Ordering::Release);
 
         let mut inner = self.inner.write().await;
-        let had_client = inner.c.take().is_some();
-        let background = inner.bg_handle.take();
-        let had_background = background.is_some();
-        if let Some(background) = background {
+        inner.c.take();
+        if let Some(background) = inner.bg_handle.take() {
             background.abort();
         }
-        if had_client || had_background {
-            reset = reset.saturating_add(1);
-        }
-        Ok(reset)
+        Ok(reset.saturating_add(1))
     }
 
     #[instrument(skip(msg), level = "trace")]
