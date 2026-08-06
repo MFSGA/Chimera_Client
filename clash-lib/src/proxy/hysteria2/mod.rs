@@ -721,6 +721,20 @@ impl OutboundHandler for Handler {
         OutboundType::Hysteria2
     }
 
+    async fn reset_connection_pool(&self) -> io::Result<u32> {
+        let cached = self.conn.lock().await.take();
+        self.guard.lock().await.take();
+
+        let Some(cached) = cached else {
+            return Ok(0);
+        };
+        cached
+            .conn
+            .close(quinn::VarInt::from_u32(0), b"network changed");
+        cached.udp_sessions.lock().await.clear();
+        Ok(1)
+    }
+
     async fn connect_stream(
         &self,
         sess: &Session,

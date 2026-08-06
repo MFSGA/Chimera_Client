@@ -241,6 +241,13 @@ impl Runner for ApiRunner {
                 .nest("/group", handlers::group::routes(outbound_manager.clone()))
                 .nest("/flows", handlers::flows::routes(statistics_manager))
                 .nest("/dns", handlers::dns::routes(dns_resolver.clone()))
+                .nest(
+                    "/network",
+                    handlers::network::routes(
+                        dns_resolver.clone(),
+                        outbound_manager.clone(),
+                    ),
+                )
                 .nest("/rules", handlers::rule::routes(router))
                 .layer(middleware::from_fn(
                     middlewares::fix_json_content_type::fix_content_type,

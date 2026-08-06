@@ -342,6 +342,51 @@ proxies:
 
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
+async fn network_reset_reports_dns_and_connection_pool_counts() {
+    let wd =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
+    let api_port = available_port();
+    let (isolated_config, socks_port) = isolated_config(api_port);
+    let _clash = ClashInstance::start(
+        Options {
+            config: Config::File(isolated_config.to_string_lossy().to_string()),
+            cwd: Some(wd.to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            config_path: Some(isolated_config.to_string_lossy().to_string()),
+        },
+        vec![api_port, socks_port],
+    )
+    .expect("Failed to start clash");
+
+    let url = format!("http://127.0.0.1:{api_port}/network/reset");
+    let request = hyper::Request::builder()
+        .uri(&url)
+        .header(hyper::header::AUTHORIZATION, "Bearer clash-rs")
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .method(http::method::Method::POST)
+        .body(http_body_util::Empty::<Bytes>::new())
+        .expect("Failed to build network reset request");
+    let response = send_http_request(url.parse().unwrap(), request)
+        .await
+        .expect("Failed to send POST /network/reset request");
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_reader(
+        response
+            .collect()
+            .await
+            .expect("Failed to collect network reset response")
+            .aggregate()
+            .reader(),
+    )
+    .expect("Failed to parse network reset response");
+    assert_eq!(json["dnsTransportsReset"], 0);
+    assert_eq!(json["connectionPoolsReset"], 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
 async fn test_get_set_allow_lan() {
     let wd =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");

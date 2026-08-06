@@ -6,6 +6,7 @@ pub mod group;
 pub mod hello;
 pub mod logs;
 pub mod memory;
+pub mod network;
 pub mod provider;
 pub mod proxy;
 pub mod restart;

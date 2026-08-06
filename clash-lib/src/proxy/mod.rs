@@ -92,6 +92,13 @@ pub trait OutboundHandler: Sync + Send + Unpin + DialWithConnector + Debug {
         false
     }
 
+    /// Drop any reusable network-bound connection owned by this handler so
+    /// the next request reconnects on the currently active network. Returns
+    /// the number of live cached connections invalidated.
+    async fn reset_connection_pool(&self) -> io::Result<u32> {
+        Ok(0)
+    }
+
     /// connect to remote target via TCP
     async fn connect_stream(
         &self,

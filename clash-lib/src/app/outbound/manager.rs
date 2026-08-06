@@ -1,4 +1,10 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use tokio::sync::RwLock;
 use tracing::{debug, error};
@@ -72,6 +78,20 @@ static DEFAULT_LATENCY_TEST_URL: &str = "http://www.gstatic.com/generate_204";
 #[derive(Deserialize)]
 struct ProviderScheme {
     proxies: Option<Vec<HashMap<String, Value>>>,
+}
+
+async fn reset_unique_connection_pools(
+    handlers: Vec<AnyOutboundHandler>,
+) -> io::Result<u32> {
+    let mut seen = HashSet::new();
+    let mut reset = 0_u32;
+    for handler in handlers {
+        let identity = Arc::as_ptr(&handler) as *const () as usize;
+        if seen.insert(identity) {
+            reset = reset.saturating_add(handler.reset_connection_pool().await?);
+        }
+    }
+    Ok(reset)
 }
 
 /// Init process:
@@ -160,6 +180,26 @@ impl OutboundManager {
     /// is `async` — callers must `.await` the result.
     pub async fn get_outbound(&self, name: &str) -> Option<AnyOutboundHandler> {
         self.registry.read().await.get(name).cloned()
+    }
+
+    /// Invalidate every reusable network-bound connection owned by configured
+    /// outbounds, including proxies that only exist inside remote providers.
+    pub async fn reset_connection_pools(&self) -> Result<u32, Error> {
+        let mut handlers: Vec<AnyOutboundHandler> =
+            self.registry.read().await.values().cloned().collect();
+        let providers: Vec<ThreadSafeProxyProvider> =
+            self.proxy_providers.values().cloned().collect();
+        for provider in providers {
+            handlers.extend(provider.read().await.proxies().await);
+        }
+
+        reset_unique_connection_pools(handlers)
+            .await
+            .map_err(|error| {
+                Error::Operation(format!(
+                    "failed to reset outbound connection pool: {error}"
+                ))
+            })
     }
 
     /// This does not populate history/liveness information.
@@ -910,5 +950,97 @@ impl OutboundManager {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fmt::Debug,
+        io,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use async_trait::async_trait;
+
+    use super::reset_unique_connection_pools;
+    use crate::{
+        app::{
+            dispatcher::{BoxedChainedDatagram, BoxedChainedStream},
+            dns::ThreadSafeDNSResolver,
+        },
+        proxy::{
+            AnyOutboundHandler, DialWithConnector, OutboundHandler, OutboundType,
+        },
+        session::Session,
+    };
+
+    #[derive(Debug)]
+    struct CountingHandler {
+        name: &'static str,
+        resets: Arc<AtomicUsize>,
+        reset_count: u32,
+    }
+
+    impl DialWithConnector for CountingHandler {}
+
+    #[async_trait]
+    impl OutboundHandler for CountingHandler {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn proto(&self) -> OutboundType {
+            OutboundType::Direct
+        }
+
+        async fn reset_connection_pool(&self) -> io::Result<u32> {
+            self.resets.fetch_add(1, Ordering::SeqCst);
+            Ok(self.reset_count)
+        }
+
+        async fn connect_stream(
+            &self,
+            _sess: &Session,
+            _resolver: ThreadSafeDNSResolver,
+        ) -> io::Result<BoxedChainedStream> {
+            unreachable!("connection-pool reset test does not dial")
+        }
+
+        async fn connect_datagram(
+            &self,
+            _sess: &Session,
+            _resolver: ThreadSafeDNSResolver,
+        ) -> io::Result<BoxedChainedDatagram> {
+            unreachable!("connection-pool reset test does not dial")
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_connection_pools_deduplicates_shared_handlers() {
+        let first_resets = Arc::new(AtomicUsize::new(0));
+        let second_resets = Arc::new(AtomicUsize::new(0));
+        let first: AnyOutboundHandler = Arc::new(CountingHandler {
+            name: "first",
+            resets: first_resets.clone(),
+            reset_count: 1,
+        });
+        let second: AnyOutboundHandler = Arc::new(CountingHandler {
+            name: "second",
+            resets: second_resets.clone(),
+            reset_count: 2,
+        });
+
+        let reset =
+            reset_unique_connection_pools(vec![first.clone(), second, first])
+                .await
+                .unwrap();
+
+        assert_eq!(reset, 3);
+        assert_eq!(first_resets.load(Ordering::SeqCst), 1);
+        assert_eq!(second_resets.load(Ordering::SeqCst), 1);
     }
 }
