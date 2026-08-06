@@ -789,6 +789,31 @@ impl ClashResolver for EnhancedResolver {
         self.ipv6.store(enable, Relaxed);
     }
 
+    async fn reset_transports(&self) -> anyhow::Result<u32> {
+        let mut clients = self.main.clone();
+        if let Some(fallback) = &self.fallback {
+            clients.extend(fallback.iter().cloned());
+        }
+        if let Some(proxy_resolver) = &self.proxy_resolver {
+            clients.extend(proxy_resolver.iter().cloned());
+        }
+        if let Some(policy) = &self.policy {
+            policy.traverse(|_, policy_clients| {
+                clients.extend(policy_clients.iter().cloned());
+                true
+            });
+        }
+
+        let mut reset = 0_u32;
+        for client in clients {
+            reset = reset.saturating_add(client.reset_transport().await?);
+        }
+        if let Some(cache) = &self.reverse_lookup_cache {
+            cache.write().await.clear();
+        }
+        Ok(reset)
+    }
+
     fn kind(&self) -> ResolverKind {
         ResolverKind::Clash
     }
@@ -892,6 +917,27 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct ResetCountingClient {
+        resets: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::app::dns::Client for ResetCountingClient {
+        fn id(&self) -> String {
+            "reset-counting-client".to_owned()
+        }
+
+        async fn exchange(&self, _msg: &op::Message) -> anyhow::Result<op::Message> {
+            unreachable!("reset counting client is not used for queries")
+        }
+
+        async fn reset_transport(&self) -> anyhow::Result<u32> {
+            self.resets.fetch_add(1, Ordering::SeqCst);
+            Ok(1)
+        }
+    }
+
     fn test_query() -> (op::Message, op::Query) {
         let mut request = op::Message::query();
         let mut query = op::Query::new();
@@ -931,6 +977,26 @@ mod tests {
             rr::RData::A(rr::rdata::A(ip)),
         ));
         response
+    }
+
+    #[tokio::test]
+    async fn reset_transports_covers_all_upstream_collections() {
+        let resets = Arc::new(AtomicUsize::new(0));
+        let client = || -> ThreadSafeDNSClient {
+            Arc::new(ResetCountingClient {
+                resets: resets.clone(),
+            })
+        };
+        let mut resolver = EnhancedResolver::new_default().await;
+        resolver.main = vec![client()];
+        resolver.fallback = Some(vec![client()]);
+        resolver.proxy_resolver = Some(vec![client()]);
+        let mut policy = crate::common::trie::StringTrie::new();
+        assert!(policy.insert("policy.example", Arc::new(vec![client()])));
+        resolver.policy = Some(policy);
+
+        assert_eq!(resolver.reset_transports().await.unwrap(), 4);
+        assert_eq!(resets.load(Ordering::SeqCst), 4);
     }
 
     /// Regression test for https://github.com/Watfaq/clash-rs/issues/976

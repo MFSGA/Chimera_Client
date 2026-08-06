@@ -69,6 +69,22 @@ impl Client for DhcpClient {
         )
         .await?
     }
+
+    async fn reset_transport(&self) -> anyhow::Result<u32> {
+        let clients = {
+            let mut inner = self.inner.lock().await;
+            inner.iface_expires_at = Instant::now();
+            inner.dns_expires_at = Instant::now();
+            inner.iface_addr = ipnet::IpNet::default();
+            std::mem::take(&mut inner.clients)
+        };
+
+        let mut reset = 0_u32;
+        for client in clients {
+            reset = reset.saturating_add(client.reset_transport().await?);
+        }
+        Ok(reset)
+    }
 }
 
 impl DhcpClient {

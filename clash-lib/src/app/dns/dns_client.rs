@@ -6,7 +6,10 @@ use std::{
     fmt::{Debug, Display, Formatter},
     net::{self, IpAddr},
     str::FromStr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -81,6 +84,7 @@ mod tests {
             cfg: RwLock::new(DnsConfig::Udp(addr, None, proxy.clone(), None)),
             proxy,
             bootstrap_resolver: None,
+            refresh_address_on_rebuild: AtomicBool::new(false),
             host: url::Host::Domain("example.org".to_string()),
             port: 53,
             net: DNSNetMode::Udp,
@@ -110,6 +114,35 @@ mod tests {
             client.cfg.read().await.addr(),
             net::SocketAddr::from(([203, 0, 113, 10], 53))
         );
+    }
+
+    #[tokio::test]
+    async fn reset_transport_aborts_background_and_marks_address_refresh() {
+        let client = client_with_ecs(None);
+        client.inner.write().await.bg_handle =
+            Some(tokio::spawn(std::future::pending::<()>()));
+
+        let reset = client.reset_transport().await.unwrap();
+
+        assert_eq!(reset, 1);
+        let inner = client.inner.read().await;
+        assert!(inner.c.is_none());
+        assert!(inner.bg_handle.is_none());
+        assert!(client.refresh_address_on_rebuild.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn reset_transport_resets_bootstrap_resolver_first() {
+        let mut resolver = MockClashResolver::new();
+        resolver
+            .expect_reset_transports()
+            .once()
+            .returning(|| Ok(3));
+        let mut client = client_with_ecs(None);
+        client.bootstrap_resolver = Some(Arc::new(resolver));
+
+        assert_eq!(client.reset_transport().await.unwrap(), 3);
+        assert!(client.refresh_address_on_rebuild.load(Ordering::Acquire));
     }
 
     fn build_message(record_type: RecordType) -> Message {
@@ -350,6 +383,7 @@ pub struct DnsClient {
     cfg: RwLock<DnsConfig>,
     proxy: Arc<dyn OutboundHandler>,
     bootstrap_resolver: Option<Arc<dyn ClashResolver>>,
+    refresh_address_on_rebuild: AtomicBool,
 
     // debug purpose
     host: url::Host<String>,
@@ -450,6 +484,16 @@ impl DnsClient {
     async fn rebuild_with_retries(
         &self,
     ) -> anyhow::Result<(client::Client<DnsRuntimeProvider>, JoinHandle<()>)> {
+        if self
+            .refresh_address_on_rebuild
+            .swap(false, Ordering::AcqRel)
+            && let Err(error) = self.refresh_upstream_address().await
+        {
+            self.refresh_address_on_rebuild
+                .store(true, Ordering::Release);
+            return Err(error);
+        }
+
         let err = match self.rebuild_current_address(false).await {
             Ok(result) => return Ok(result),
             Err(err) => err,
@@ -533,6 +577,7 @@ impl DnsClient {
                     cfg: RwLock::new(cfg),
                     proxy: opts.proxy,
                     bootstrap_resolver: opts.father,
+                    refresh_address_on_rebuild: AtomicBool::new(false),
                     host: opts.host,
                     port: opts.port,
                     net: opts.net,
@@ -557,6 +602,7 @@ impl DnsClient {
                     cfg: RwLock::new(cfg),
                     proxy: opts.proxy,
                     bootstrap_resolver: opts.father,
+                    refresh_address_on_rebuild: AtomicBool::new(false),
                     host: opts.host,
                     port: opts.port,
                     net: opts.net,
@@ -581,6 +627,7 @@ impl DnsClient {
                     cfg: RwLock::new(cfg),
                     proxy: opts.proxy,
                     bootstrap_resolver: opts.father,
+                    refresh_address_on_rebuild: AtomicBool::new(false),
                     host: opts.host,
                     port: opts.port,
                     net: opts.net,
@@ -606,6 +653,7 @@ impl DnsClient {
                     cfg: RwLock::new(cfg),
                     proxy: opts.proxy,
                     bootstrap_resolver: opts.father,
+                    refresh_address_on_rebuild: AtomicBool::new(false),
                     host: opts.host,
                     port: opts.port,
                     net: opts.net,
@@ -688,6 +736,28 @@ impl Debug for DnsClient {
 impl Client for DnsClient {
     fn id(&self) -> String {
         format!("{}#{}:{}", self.net, self.host, self.port)
+    }
+
+    async fn reset_transport(&self) -> anyhow::Result<u32> {
+        let mut reset = if let Some(resolver) = &self.bootstrap_resolver {
+            resolver.reset_transports().await?
+        } else {
+            0
+        };
+        self.refresh_address_on_rebuild
+            .store(true, Ordering::Release);
+
+        let mut inner = self.inner.write().await;
+        let had_client = inner.c.take().is_some();
+        let background = inner.bg_handle.take();
+        let had_background = background.is_some();
+        if let Some(background) = background {
+            background.abort();
+        }
+        if had_client || had_background {
+            reset = reset.saturating_add(1);
+        }
+        Ok(reset)
     }
 
     #[instrument(skip(msg), level = "trace")]

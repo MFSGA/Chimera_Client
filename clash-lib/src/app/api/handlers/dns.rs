@@ -4,11 +4,11 @@ use axum::{
     Json, Router,
     extract::{Query, State},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
 };
 use hickory_proto::{op::Message, rr::RecordType};
 use http::StatusCode;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::app::{api::AppState, dns::ThreadSafeDNSResolver};
@@ -21,7 +21,25 @@ struct DNSState {
 pub fn routes(resolver: ThreadSafeDNSResolver) -> Router<Arc<AppState>> {
     Router::new()
         .route("/query", get(query_dns))
+        .route("/reset", post(reset_dns))
         .with_state(DNSState { resolver })
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DnsResetResponse {
+    transports_reset: u32,
+}
+
+async fn reset_dns(
+    State(state): State<DNSState>,
+) -> Result<Json<DnsResetResponse>, (StatusCode, String)> {
+    state
+        .resolver
+        .reset_transports()
+        .await
+        .map(|transports_reset| Json(DnsResetResponse { transports_reset }))
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
 }
 
 #[derive(Deserialize)]
@@ -124,5 +142,48 @@ async fn query_dns(
         Err(err) => {
             (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DNSState, reset_dns};
+    use crate::app::dns::MockClashResolver;
+    use axum::{Json, extract::State};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn reset_dns_reports_reset_transport_count() {
+        let mut resolver = MockClashResolver::new();
+        resolver
+            .expect_reset_transports()
+            .once()
+            .returning(|| Ok(3));
+
+        let Json(response) = reset_dns(State(DNSState {
+            resolver: Arc::new(resolver),
+        }))
+        .await
+        .unwrap();
+
+        assert_eq!(response.transports_reset, 3);
+    }
+
+    #[tokio::test]
+    async fn reset_dns_propagates_resolver_failure() {
+        let mut resolver = MockClashResolver::new();
+        resolver
+            .expect_reset_transports()
+            .once()
+            .returning(|| Err(anyhow::anyhow!("reset failed")));
+
+        let error = reset_dns(State(DNSState {
+            resolver: Arc::new(resolver),
+        }))
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.0, http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(error.1.contains("reset failed"));
     }
 }
