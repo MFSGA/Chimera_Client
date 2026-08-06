@@ -813,23 +813,33 @@ impl AsyncWrite for HystStream {
 
 #[cfg(all(test, docker_test, throughput_test))]
 mod e2e {
-    use std::io::Write as _;
+    use std::{io::Write as _, sync::Arc, time::Duration};
 
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::{Handler, HystOption, HysteriaConnection};
     use crate::{
-        proxy::utils::test_utils::{
-            config_helper,
-            consts::*,
-            docker_runner::{
-                DockerTestRunner, DockerTestRunnerBuilder, RunAndCleanup,
-            },
-            docker_utils::{
-                alloc_port, clash_process_e2e_throughput, find_clash_rs_binary,
+        app::dns::ThreadSafeDNSResolver,
+        proxy::{
+            OutboundHandler,
+            utils::test_utils::{
+                config_helper,
+                consts::*,
+                docker_runner::{
+                    DockerTestRunner, DockerTestRunnerBuilder,
+                    MultiDockerTestRunner, RunAndCleanup,
+                },
+                docker_utils::{
+                    alloc_port, clash_process_e2e_throughput, find_clash_rs_binary,
+                },
             },
         },
+        session::{Session, SocksAddr},
         tests::initialize,
     };
 
     const CONTAINER_PORT: u16 = 10002;
+    const TCP_ECHO_PORT: u16 = 10003;
     const E2E_PAYLOAD_BYTES: usize = 32 * 1024 * 1024; // 32 MB
 
     const HYSTERIA2_SERVER_CONFIG: &str = r#"{
@@ -891,6 +901,16 @@ mod e2e {
         Ok(runner)
     }
 
+    async fn build_tcp_echo_runner() -> anyhow::Result<DockerTestRunner> {
+        DockerTestRunnerBuilder::new()
+            .image(IMAGE_NETEM)
+            .entrypoint(&["sh", "-c"])
+            .cmd(&["exec socat TCP-LISTEN:10003,reuseaddr,fork EXEC:/bin/cat"])
+            .no_port()
+            .build()
+            .await
+    }
+
     fn base_config(server: &str, socks_port: u16, extra: &str) -> String {
         let mmdb = config_helper::test_config_base_dir()
             .join("Country.mmdb")
@@ -922,6 +942,150 @@ rules:
             port = CONTAINER_PORT,
             extra = extra,
         )
+    }
+
+    async fn connect_until_ready(
+        handler: &Handler,
+        session: &Session,
+        resolver: ThreadSafeDNSResolver,
+    ) -> anyhow::Result<Arc<HysteriaConnection>> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match handler
+                .new_authed_connection(session, resolver.clone())
+                .await
+            {
+                Ok(connection) => return Ok(connection),
+                Err(error) if tokio::time::Instant::now() < deadline => {
+                    tracing::debug!(%error, "waiting for hysteria2 test server");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    async fn tcp_echo_roundtrip(
+        handler: Arc<Handler>,
+        resolver: ThreadSafeDNSResolver,
+        target: &str,
+    ) -> anyhow::Result<()> {
+        let session = Session {
+            destination: format!("{target}:{TCP_ECHO_PORT}").parse::<SocksAddr>()?,
+            ..Default::default()
+        };
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            handler.connect_stream(&session, resolver),
+        )
+        .await??;
+        let payload = b"hysteria2-network-reset";
+        stream.write_all(payload).await?;
+        stream.flush().await?;
+        let mut echoed = vec![0u8; payload.len()];
+        stream.read_exact(&mut echoed).await?;
+        anyhow::ensure!(echoed == payload, "unexpected hysteria2 TCP echo payload");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn e2e_network_reset_reauthenticates_hysteria2() -> anyhow::Result<()> {
+        initialize();
+        let hysteria = build_hysteria2_runner(HYSTERIA2_SERVER_CONFIG).await?;
+        let server = hysteria.container_ip().unwrap_or(LOCAL_ADDR.to_owned());
+        let echo = match build_tcp_echo_runner().await {
+            Ok(echo) => echo,
+            Err(error) => {
+                let _ = hysteria.cleanup().await;
+                return Err(error);
+            }
+        };
+        let Some(echo_ip) = echo.container_ip() else {
+            let _ = hysteria.cleanup().await;
+            let _ = echo.cleanup().await;
+            anyhow::bail!("TCP echo container has no IP address");
+        };
+        let mut containers = MultiDockerTestRunner::default();
+        containers.add_with_runner(hysteria);
+        containers.add_with_runner(echo);
+
+        containers
+            .run_and_cleanup(async move {
+                DockerTestRunner::wait_host_tcp_ready(
+                    &echo_ip,
+                    TCP_ECHO_PORT,
+                    Duration::from_secs(5),
+                )
+                .await?;
+                let handler = Arc::new(Handler::new(HystOption {
+                    name: "hysteria2-reset-e2e".to_owned(),
+                    addr: format!("{server}:{CONTAINER_PORT}").parse::<SocksAddr>()?,
+                    ports: None,
+                    sni: Some("example.org".to_owned()),
+                    password: "passwd".to_owned(),
+                    obfs: None,
+                    skip_cert_verify: true,
+                    alpn: Vec::new(),
+                    fingerprint: None,
+                    disable_mtu_discovery: false,
+                    ca: None,
+                    ca_str: None,
+                    up_down: None,
+                    cwnd: None,
+                    udp_mtu: None,
+                }));
+                let resolver = config_helper::build_dns_resolver().await?;
+                let session = Session::default();
+
+                let first = connect_until_ready(&handler, &session, resolver.clone()).await?;
+                tcp_echo_roundtrip(handler.clone(), resolver.clone(), &echo_ip)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("pre-reset TCP roundtrip failed: {error:#}"))?;
+                let cached = handler
+                    .new_authed_connection(&session, resolver.clone())
+                    .await?;
+                anyhow::ensure!(
+                    Arc::ptr_eq(&first, &cached),
+                    "hysteria2 did not reuse the authenticated connection"
+                );
+
+                anyhow::ensure!(
+                    handler.reset_connection_pool().await? == 1,
+                    "network reset did not invalidate the cached hysteria2 connection"
+                );
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while first.conn.close_reason().is_none() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await?;
+
+                tcp_echo_roundtrip(handler.clone(), resolver.clone(), &echo_ip)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("post-reset TCP roundtrip failed: {error:#}"))?;
+                let second = handler
+                    .conn
+                    .lock()
+                    .await
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("hysteria2 did not cache replacement connection"))?;
+                anyhow::ensure!(
+                    !Arc::ptr_eq(&first, &second),
+                    "hysteria2 reused the connection closed by network reset"
+                );
+                anyhow::ensure!(
+                    second.conn.close_reason().is_none(),
+                    "replacement hysteria2 connection was already closed"
+                );
+
+                let second_cached = handler.new_authed_connection(&session, resolver).await?;
+                anyhow::ensure!(
+                    Arc::ptr_eq(&second, &second_cached),
+                    "replacement hysteria2 connection was not cached"
+                );
+                Ok(())
+            })
+            .await
     }
 
     #[tokio::test]
