@@ -815,13 +815,18 @@ impl AsyncWrite for HystStream {
 mod e2e {
     use std::{io::Write as _, sync::Arc, time::Duration};
 
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use futures::{SinkExt as _, StreamExt as _};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::UdpSocket,
+    };
 
     use super::{Handler, HystOption, HysteriaConnection};
     use crate::{
-        app::dns::ThreadSafeDNSResolver,
+        app::{dispatcher::BoxedChainedDatagram, dns::ThreadSafeDNSResolver},
         proxy::{
             OutboundHandler,
+            datagram::UdpPacket,
             utils::test_utils::{
                 config_helper,
                 consts::*,
@@ -834,12 +839,13 @@ mod e2e {
                 },
             },
         },
-        session::{Session, SocksAddr},
+        session::{Network, Session, SocksAddr},
         tests::initialize,
     };
 
     const CONTAINER_PORT: u16 = 10002;
     const TCP_ECHO_PORT: u16 = 10003;
+    const UDP_ECHO_PORT: u16 = 10004;
     const E2E_PAYLOAD_BYTES: usize = 32 * 1024 * 1024; // 32 MB
 
     const HYSTERIA2_SERVER_CONFIG: &str = r#"{
@@ -901,11 +907,13 @@ mod e2e {
         Ok(runner)
     }
 
-    async fn build_tcp_echo_runner() -> anyhow::Result<DockerTestRunner> {
+    async fn build_echo_runner() -> anyhow::Result<DockerTestRunner> {
         DockerTestRunnerBuilder::new()
             .image(IMAGE_NETEM)
             .entrypoint(&["sh", "-c"])
-            .cmd(&["exec socat TCP-LISTEN:10003,reuseaddr,fork EXEC:/bin/cat"])
+            .cmd(&[
+                "socat TCP-LISTEN:10003,reuseaddr,fork EXEC:/bin/cat & exec socat UDP-RECVFROM:10004,reuseaddr,fork EXEC:/bin/cat",
+            ])
             .no_port()
             .build()
             .await
@@ -988,12 +996,88 @@ rules:
         Ok(())
     }
 
+    async fn wait_udp_echo_ready(target: &str) -> anyhow::Result<()> {
+        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        let target = format!("{target}:{UDP_ECHO_PORT}");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let payload = b"udp-echo-ready";
+        let mut buffer = [0u8; 64];
+
+        loop {
+            socket.send_to(payload, &target).await?;
+            match tokio::time::timeout(
+                Duration::from_millis(250),
+                socket.recv_from(&mut buffer),
+            )
+            .await
+            {
+                Ok(Ok((length, _))) if &buffer[..length] == payload => return Ok(()),
+                Ok(Ok(_)) | Err(_) if tokio::time::Instant::now() < deadline => {
+                    continue;
+                }
+                Ok(Ok((length, _))) => {
+                    anyhow::bail!(
+                        "UDP echo service returned unexpected readiness payload: {:?}",
+                        &buffer[..length]
+                    );
+                }
+                Ok(Err(error)) => return Err(error.into()),
+                Err(_) => {
+                    anyhow::bail!("UDP echo service was not ready in 5 seconds")
+                }
+            }
+        }
+    }
+
+    async fn connect_udp_datagram(
+        handler: Arc<Handler>,
+        resolver: ThreadSafeDNSResolver,
+        target: &str,
+    ) -> anyhow::Result<BoxedChainedDatagram> {
+        let session = Session {
+            network: Network::Udp,
+            destination: format!("{target}:{UDP_ECHO_PORT}").parse::<SocksAddr>()?,
+            ..Default::default()
+        };
+        Ok(tokio::time::timeout(
+            Duration::from_secs(5),
+            handler.connect_datagram(&session, resolver),
+        )
+        .await??)
+    }
+
+    async fn udp_echo_roundtrip(
+        datagram: &mut BoxedChainedDatagram,
+        target: &str,
+        payload: &[u8],
+    ) -> anyhow::Result<()> {
+        let destination =
+            format!("{target}:{UDP_ECHO_PORT}").parse::<SocksAddr>()?;
+        datagram
+            .send(UdpPacket {
+                data: payload.to_vec(),
+                dst_addr: destination,
+                ..Default::default()
+            })
+            .await?;
+        let echoed = tokio::time::timeout(Duration::from_secs(5), datagram.next())
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("hysteria2 UDP datagram ended before echo")
+            })?;
+        anyhow::ensure!(
+            echoed.data == payload,
+            "unexpected hysteria2 UDP echo payload"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn e2e_network_reset_reauthenticates_hysteria2() -> anyhow::Result<()> {
         initialize();
         let hysteria = build_hysteria2_runner(HYSTERIA2_SERVER_CONFIG).await?;
         let server = hysteria.container_ip().unwrap_or(LOCAL_ADDR.to_owned());
-        let echo = match build_tcp_echo_runner().await {
+        let echo = match build_echo_runner().await {
             Ok(echo) => echo,
             Err(error) => {
                 let _ = hysteria.cleanup().await;
@@ -1003,7 +1087,7 @@ rules:
         let Some(echo_ip) = echo.container_ip() else {
             let _ = hysteria.cleanup().await;
             let _ = echo.cleanup().await;
-            anyhow::bail!("TCP echo container has no IP address");
+            anyhow::bail!("TCP/UDP echo container has no IP address");
         };
         let mut containers = MultiDockerTestRunner::default();
         containers.add_with_runner(hysteria);
@@ -1017,6 +1101,7 @@ rules:
                     Duration::from_secs(5),
                 )
                 .await?;
+                wait_udp_echo_ready(&echo_ip).await?;
                 let handler = Arc::new(Handler::new(HystOption {
                     name: "hysteria2-reset-e2e".to_owned(),
                     addr: format!("{server}:{CONTAINER_PORT}").parse::<SocksAddr>()?,
@@ -1041,6 +1126,19 @@ rules:
                 tcp_echo_roundtrip(handler.clone(), resolver.clone(), &echo_ip)
                     .await
                     .map_err(|error| anyhow::anyhow!("pre-reset TCP roundtrip failed: {error:#}"))?;
+                let mut first_udp =
+                    connect_udp_datagram(handler.clone(), resolver.clone(), &echo_ip).await?;
+                udp_echo_roundtrip(
+                    &mut first_udp,
+                    &echo_ip,
+                    b"hysteria2-udp-before-reset",
+                )
+                .await
+                .map_err(|error| anyhow::anyhow!("pre-reset UDP roundtrip failed: {error:#}"))?;
+                anyhow::ensure!(
+                    first.udp_sessions.lock().await.len() == 1,
+                    "hysteria2 did not register the pre-reset UDP session"
+                );
                 let cached = handler
                     .new_authed_connection(&session, resolver.clone())
                     .await?;
@@ -1059,10 +1157,26 @@ rules:
                     }
                 })
                 .await?;
+                anyhow::ensure!(
+                    first.udp_sessions.lock().await.is_empty(),
+                    "network reset retained the old hysteria2 UDP session"
+                );
+                anyhow::ensure!(
+                    tokio::time::timeout(Duration::from_secs(2), first_udp.next())
+                        .await?
+                        .is_none(),
+                    "old hysteria2 UDP datagram remained readable after network reset"
+                );
 
-                tcp_echo_roundtrip(handler.clone(), resolver.clone(), &echo_ip)
-                    .await
-                    .map_err(|error| anyhow::anyhow!("post-reset TCP roundtrip failed: {error:#}"))?;
+                let mut second_udp =
+                    connect_udp_datagram(handler.clone(), resolver.clone(), &echo_ip).await?;
+                udp_echo_roundtrip(
+                    &mut second_udp,
+                    &echo_ip,
+                    b"hysteria2-udp-after-reset",
+                )
+                .await
+                .map_err(|error| anyhow::anyhow!("post-reset UDP roundtrip failed: {error:#}"))?;
                 let second = handler
                     .conn
                     .lock()
@@ -1077,6 +1191,13 @@ rules:
                     second.conn.close_reason().is_none(),
                     "replacement hysteria2 connection was already closed"
                 );
+                anyhow::ensure!(
+                    second.udp_sessions.lock().await.len() == 1,
+                    "replacement hysteria2 connection did not register a new UDP session"
+                );
+                tcp_echo_roundtrip(handler.clone(), resolver.clone(), &echo_ip)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("post-reset TCP roundtrip failed: {error:#}"))?;
 
                 let second_cached = handler.new_authed_connection(&session, resolver).await?;
                 anyhow::ensure!(
