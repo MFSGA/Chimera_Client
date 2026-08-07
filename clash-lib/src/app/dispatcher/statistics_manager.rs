@@ -148,6 +148,15 @@ impl StatisticsManager {
         result
     }
 
+    pub async fn summary(&self) -> ConnectionSummary {
+        let connection_count = self.connections.lock().await.len();
+        ConnectionSummary {
+            download_total: self.download_total.load(Ordering::Relaxed),
+            upload_total: self.upload_total.load(Ordering::Relaxed),
+            connection_count,
+        }
+    }
+
     pub async fn snapshot(&self) -> Snapshot {
         let tracked = {
             let connections = self.connections.lock().await;
@@ -281,6 +290,14 @@ pub struct TrackerInfo {
     pub user_upload: AtomicU64,
     #[serde(skip)]
     pub user_download: AtomicU64,
+}
+
+#[derive(Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionSummary {
+    pub download_total: u64,
+    pub upload_total: u64,
+    pub connection_count: usize,
 }
 
 #[derive(Serialize)]
