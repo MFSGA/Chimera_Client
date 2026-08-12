@@ -24,6 +24,7 @@ const CMD_PADDING_CONTINUE: u8 = 0x00;
 const CMD_PADDING_END: u8 = 0x01;
 const CMD_PADDING_DIRECT: u8 = 0x02;
 const TLS_APPLICATION_DATA: u8 = 0x17;
+const MAX_VISION_CONTENT_LEN: usize = u16::MAX as usize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReadMode {
@@ -101,6 +102,7 @@ impl VisionStream {
     }
 
     fn pad_frame(&mut self, data: &[u8], command: u8, is_tls: bool) {
+        debug_assert!(data.len() <= MAX_VISION_CONTENT_LEN);
         let frame = if let Some(uuid) = self.user_uuid.take() {
             super::vision_pad::pad_with_uuid_and_command(
                 data, &uuid, command, is_tls,
@@ -109,6 +111,23 @@ impl VisionStream {
             super::vision_pad::pad_with_command(data, command, is_tls)
         };
         self.write_buf.extend_from_slice(&frame);
+    }
+
+    fn pad_frames(&mut self, data: &[u8], final_command: u8, is_tls: bool) {
+        if data.is_empty() {
+            self.pad_frame(data, final_command, is_tls);
+            return;
+        }
+
+        let chunk_count = data.len().div_ceil(MAX_VISION_CONTENT_LEN);
+        for (index, chunk) in data.chunks(MAX_VISION_CONTENT_LEN).enumerate() {
+            let command = if index + 1 == chunk_count {
+                final_command
+            } else {
+                CMD_PADDING_CONTINUE
+            };
+            self.pad_frame(chunk, command, is_tls);
+        }
     }
 
     fn queue_write_data(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -163,7 +182,7 @@ impl VisionStream {
                         || self.traffic_filter.remaining_filter_count() <= 1
                     {
                         self.pending_write_switch = PendingWriteSwitch::Tls;
-                        self.pad_frame(
+                        self.pad_frames(
                             &prefix,
                             CMD_PADDING_END,
                             self.traffic_filter.is_tls(),
@@ -172,7 +191,7 @@ impl VisionStream {
                         return Ok(processed_len.saturating_sub(existing_inner_len));
                     }
 
-                    self.pad_frame(
+                    self.pad_frames(
                         &prefix,
                         CMD_PADDING_CONTINUE,
                         self.traffic_filter.is_tls(),
@@ -222,7 +241,7 @@ impl VisionStream {
 
         let remaining = self.write_deframer.remaining_data().to_vec();
         self.write_deframer.clear();
-        self.pad_frame(&remaining, CMD_PADDING_END, self.traffic_filter.is_tls());
+        self.pad_frames(&remaining, CMD_PADDING_END, self.traffic_filter.is_tls());
         self.write_shutdown_queued = true;
         self.pending_write_switch = PendingWriteSwitch::Tls;
     }
@@ -391,7 +410,7 @@ impl AsyncWrite for VisionStream {
                 let remaining = this.write_deframer.remaining_data().to_vec();
                 this.write_deframer.clear();
                 this.pending_write_switch = PendingWriteSwitch::Tls;
-                this.pad_frame(
+                this.pad_frames(
                     &remaining,
                     CMD_PADDING_END,
                     this.traffic_filter.is_tls(),
@@ -716,6 +735,75 @@ mod tests {
         let (cmd, content, _, _) = parse_frame(received, 16);
         assert_eq!(cmd, CMD_PADDING_END);
         assert_eq!(content, partial_tls_record);
+    }
+
+    #[tokio::test]
+    async fn plaintext_larger_than_u16_is_split_before_direct_mode() {
+        let (client, mut server) = tokio::io::duplex(256 * 1024);
+        let mut vision =
+            VisionStream::new(Box::new(client), TEST_UUID_STR.to_owned(), None)
+                .expect("vision stream");
+        let payload = vec![0x42; MAX_VISION_CONTENT_LEN + 1];
+
+        vision.write_all(&payload).await.expect("write payload");
+        vision.flush().await.expect("flush payload");
+
+        let mut first_header = [0u8; 21];
+        server
+            .read_exact(&mut first_header)
+            .await
+            .expect("first Vision frame header");
+        assert_eq!(&first_header[..16], &TEST_UUID);
+        assert_eq!(first_header[16], CMD_PADDING_CONTINUE);
+        let first_content_len =
+            u16::from_be_bytes([first_header[17], first_header[18]]) as usize;
+        let first_padding_len =
+            u16::from_be_bytes([first_header[19], first_header[20]]) as usize;
+        assert_eq!(first_content_len, MAX_VISION_CONTENT_LEN);
+
+        let mut first_body = vec![0u8; first_content_len + first_padding_len];
+        server
+            .read_exact(&mut first_body)
+            .await
+            .expect("first Vision frame body");
+        assert!(
+            first_body[..first_content_len]
+                .iter()
+                .all(|byte| *byte == 0x42)
+        );
+
+        let mut second_header = [0u8; 5];
+        server
+            .read_exact(&mut second_header)
+            .await
+            .expect("second Vision frame header");
+        assert_eq!(second_header[0], CMD_PADDING_END);
+        let second_content_len =
+            u16::from_be_bytes([second_header[1], second_header[2]]) as usize;
+        let second_padding_len =
+            u16::from_be_bytes([second_header[3], second_header[4]]) as usize;
+        assert_eq!(second_content_len, 1);
+
+        let mut second_body = vec![0u8; second_content_len + second_padding_len];
+        server
+            .read_exact(&mut second_body)
+            .await
+            .expect("second Vision frame body");
+        assert_eq!(second_body[0], 0x42);
+
+        let direct_payload = b"direct after split";
+        vision
+            .write_all(direct_payload)
+            .await
+            .expect("write direct payload");
+        vision.flush().await.expect("flush direct payload");
+
+        let mut direct = vec![0u8; direct_payload.len()];
+        server
+            .read_exact(&mut direct)
+            .await
+            .expect("direct payload");
+        assert_eq!(direct, direct_payload);
     }
 
     #[test]

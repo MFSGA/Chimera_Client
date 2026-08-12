@@ -20,7 +20,8 @@ pub fn pad_with_command(data: &[u8], command: u8, is_tls: bool) -> Bytes {
 }
 
 fn pad(data: &[u8], uuid: Option<&[u8; 16]>, command: u8, is_tls: bool) -> Bytes {
-    let content_len = data.len() as u16;
+    let content_len = u16::try_from(data.len())
+        .expect("Vision frame content length exceeds u16::MAX");
     let padding_len = calculate_padding_length(content_len as usize, is_tls);
     let uuid_len = if uuid.is_some() { 16 } else { 0 };
     let mut output =
