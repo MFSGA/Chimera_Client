@@ -14,9 +14,11 @@ use tokio::time::timeout;
 use tracing::warn;
 use tracing::{debug, error, instrument, trace};
 
-use crate::app::net::OutboundInterface;
 #[cfg(feature = "tun")]
-use crate::app::net::{DEFAULT_OUTBOUND_INTERFACE, TUN_ENABLED};
+use crate::app::net::DEFAULT_OUTBOUND_INTERFACE;
+use crate::app::net::OutboundInterface;
+#[cfg(all(feature = "tun", any(target_os = "linux", target_os = "windows")))]
+use crate::app::net::TUN_ENABLED;
 #[cfg(all(feature = "tun", any(target_os = "linux", target_os = "windows")))]
 use crate::app::net::{get_interface_by_name, route_for_destination};
 #[cfg(all(feature = "tun", target_os = "windows"))]
@@ -637,6 +639,9 @@ pub async fn new_udp_socket(
         ),
     };
     debug!("created udp socket");
+
+    #[cfg(target_os = "android")]
+    let _ = family;
 
     #[cfg(target_os = "android")]
     if let Some(src) = src {
