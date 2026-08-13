@@ -12,7 +12,7 @@
 
 rustPlatform.buildRustPackage {
   pname = "chimera-client";
-  version = "0.23.0";
+  version = "0.24.4";
 
   src = lib.cleanSourceWith {
     src = ../.;
