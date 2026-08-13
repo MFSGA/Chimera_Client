@@ -308,3 +308,21 @@ pub struct Snapshot {
     pub memory: usize,
     pub connections: Vec<TrackerInfo>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::StatisticsManager;
+
+    #[tokio::test]
+    async fn summary_reports_accumulated_totals() {
+        let manager = StatisticsManager::new();
+        manager.push_uploaded(7);
+        manager.push_downloaded(11);
+
+        let summary = manager.summary().await;
+
+        assert_eq!(summary.upload_total, 7);
+        assert_eq!(summary.download_total, 11);
+        assert_eq!(summary.connection_count, 0);
+    }
+}
