@@ -54,7 +54,14 @@ impl HysteriaDatagramOutbound {
 
         tokio::spawn(async move {
             let next_pkt_id = AtomicU32::new(0);
-            while let Some(next_send) = send_rx.recv().await {
+            loop {
+                let next_send = tokio::select! {
+                    _ = conn.conn.closed() => break,
+                    next_send = send_rx.recv() => match next_send {
+                        Some(next_send) => next_send,
+                        None => break,
+                    },
+                };
                 let pkt_id =
                     next_pkt_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let pkt_id = (pkt_id % u16::MAX as u32) as u16;
@@ -72,8 +79,7 @@ impl HysteriaDatagramOutbound {
                 }
             }
 
-            let removed = udp_sessions.lock().await.remove(&session_id);
-            debug_assert!(removed.is_some());
+            udp_sessions.lock().await.remove(&session_id);
         });
 
         Self {

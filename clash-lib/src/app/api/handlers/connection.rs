@@ -26,6 +26,7 @@ struct ConnectionState {
 pub fn routes(statistics_manager: Arc<StatisticsManager>) -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(get_connections).delete(close_all_connection))
+        .route("/summary", get(get_connection_summary))
         .route("/{id}", delete(close_connection))
         .with_state(ConnectionState { statistics_manager })
 }
@@ -85,6 +86,12 @@ async fn get_connections(
             .await;
         }
     })
+}
+
+async fn get_connection_summary(
+    State(state): State<ConnectionState>,
+) -> impl IntoResponse {
+    Json(state.statistics_manager.summary().await)
 }
 
 async fn close_connection(

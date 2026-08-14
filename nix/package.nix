@@ -5,12 +5,14 @@
   cmake,
   protobuf,
   nodejs,
+  fetchNpmDeps,
+  npmHooks,
   llvmPackages,
 }:
 
 rustPlatform.buildRustPackage {
   pname = "chimera-client";
-  version = "0.23.0";
+  version = "0.24.4";
 
   src = lib.cleanSourceWith {
     src = ../.;
@@ -37,10 +39,16 @@ rustPlatform.buildRustPackage {
 
   cargoLock = {
     lockFile = ../Cargo.lock;
-    # This repository is distributed outside nixpkgs and currently contains
-    # pinned Cargo git dependencies. Replace this with outputHashes before a
-    # future nixpkgs submission.
-    allowBuiltinFetchGit = true;
+    outputHashes = {
+      "netstack-lwip-0.3.4" = "sha256-Brc1uCCaAe07eg0nr6Q/WIcDys/d7Ds6DmYyckdpc2o=";
+      "shadowsocks-1.25.0" = "sha256-PszneYxJ256hhAIcuaaGgtixjiNvlg4P/jMVEiZzz5c=";
+      "sock2proc-0.1.0" = "sha256-1HC1KE8ii8mbTwFiXaKFsZHXGrF1OiZKbxmPC5PBflY=";
+    };
+  };
+
+  npmDeps = fetchNpmDeps {
+    src = ../clash-dashboard;
+    hash = "sha256-fL0PTkAtopysqXr1D8JmtQ7C77SGOBnpweRe02bn7jE=";
   };
 
   nativeBuildInputs = [
@@ -48,10 +56,13 @@ rustPlatform.buildRustPackage {
     cmake
     protobuf
     nodejs
+    npmHooks.npmConfigHook
     llvmPackages.libclang
   ];
 
   LIBCLANG_PATH = "${llvmPackages.libclang.lib}/lib";
+  CHIMERA_DASHBOARD_DEPS_READY = "1";
+  npmRoot = "clash-dashboard";
 
   cargoBuildFlags = [
     "--package"

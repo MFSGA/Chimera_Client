@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use futures::{FutureExt, SinkExt, StreamExt, future::BoxFuture};
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 use network_interface::NetworkInterfaceConfig;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -18,10 +19,13 @@ use crate::{
 
 /// Maximum number of attempts to wait for a newly created TUN interface to
 /// become visible via NetworkInterface::show().
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 const TUN_VISIBILITY_MAX_ATTEMPTS: u32 = 40;
 /// Interval in milliseconds between each visibility poll attempt.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 const TUN_VISIBILITY_POLL_INTERVAL_MS: u64 = 50;
 
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 fn tun_exists(name: &str) -> bool {
     use network_interface::NetworkInterfaceConfig;
 
@@ -30,6 +34,7 @@ fn tun_exists(name: &str) -> bool {
         .unwrap_or_default()
 }
 
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 async fn wait_for_tun_state(name: &str, should_exist: bool) -> Result<(), Error> {
     let mut last_show_err: Option<String> = None;
     let mut attempt = 0u32;
