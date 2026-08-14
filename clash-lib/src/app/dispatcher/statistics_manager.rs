@@ -148,6 +148,15 @@ impl StatisticsManager {
         result
     }
 
+    pub async fn summary(&self) -> ConnectionSummary {
+        let connection_count = self.connections.lock().await.len();
+        ConnectionSummary {
+            download_total: self.download_total.load(Ordering::Relaxed),
+            upload_total: self.upload_total.load(Ordering::Relaxed),
+            connection_count,
+        }
+    }
+
     pub async fn snapshot(&self) -> Snapshot {
         let tracked = {
             let connections = self.connections.lock().await;
@@ -283,6 +292,14 @@ pub struct TrackerInfo {
     pub user_download: AtomicU64,
 }
 
+#[derive(Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionSummary {
+    pub download_total: u64,
+    pub upload_total: u64,
+    pub connection_count: usize,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
@@ -290,4 +307,22 @@ pub struct Snapshot {
     pub upload_total: u64,
     pub memory: usize,
     pub connections: Vec<TrackerInfo>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StatisticsManager;
+
+    #[tokio::test]
+    async fn summary_reports_accumulated_totals() {
+        let manager = StatisticsManager::new();
+        manager.push_uploaded(7);
+        manager.push_downloaded(11);
+
+        let summary = manager.summary().await;
+
+        assert_eq!(summary.upload_total, 7);
+        assert_eq!(summary.download_total, 11);
+        assert_eq!(summary.connection_count, 0);
+    }
 }

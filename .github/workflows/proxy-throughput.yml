@@ -32,7 +32,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -82,6 +82,7 @@ jobs:
         run: |
           docker pull v2fly/v2fly-core:v4.45.2
           docker pull p4gefau1t/trojan-go:latest
+          docker pull tobyxdd/hysteria:latest
           docker pull nicolaka/netshoot:latest
 
       # Download once so parallel clash-rs instances don't race to fetch it
@@ -106,6 +107,17 @@ jobs:
           cargo test -p clash-lib --all-features \
             e2e_throughput \
             -- --test-threads=4 --nocapture 2>&1 | tee throughput-test.log
+
+      - name: Run network reset reconnect tests
+        env:
+          RUST_LOG: ${{ env.RUST_LOG }}
+          CLASH_RS_CI: "true"
+        run: |
+          set -o pipefail
+          RUSTFLAGS="--cfg docker_test --cfg throughput_test" \
+          cargo test -p clash-lib --all-features \
+            proxy::hysteria2::e2e::e2e_network_reset_reauthenticates_hysteria2 \
+            -- --exact --nocapture 2>&1 | tee network-reset-test.log
 
       - name: Format results as Markdown
         if: always()
@@ -140,6 +152,7 @@ jobs:
             ${{ env.THROUGHPUT_RESULTS_FILE }}
             throughput-comment.md
             throughput-test.log
+            network-reset-test.log
           retention-days: 90
 
       - name: Post PR comment

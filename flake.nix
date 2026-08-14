@@ -1,10 +1,8 @@
 {
   description = "Chimera Client development environment";
 
-  # Match the nixpkgs revision used by this NixOS installation without
-  # requiring GitHub access when entering the development shell.
   inputs.nixpkgs.url =
-    "path:/nix/store/pzxxxg9vvzk63122vj38lcmqg9dl6qxk-nixos-26.05.1947.a0374025a863/nixos";
+    "github:NixOS/nixpkgs/a0374025a863d007d98e3297f6aa46cc3141c2f0";
 
   outputs = { self, nixpkgs, ... }:
     let
