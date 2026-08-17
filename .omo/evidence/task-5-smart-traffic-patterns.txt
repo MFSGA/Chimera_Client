@@ -1,0 +1,5 @@
+Task: Smart traffic-pattern and SiteTuning parity
+Reference: ref/clash-lib/src/app/remote_content_manager/mod.rs
+Validation: smart_metric_tests PASS (6), cargo check PASS, git diff --check PASS.
+Tests: minimal traffic => Unknown; large GitHub release => FileDownload with size-scaled tuning; existing fallback/RTT/loss tests remain green.
+Isolation: in-memory only; no ports, DNS, TUN, routes, cache files, or deployed Chimera process touched.
