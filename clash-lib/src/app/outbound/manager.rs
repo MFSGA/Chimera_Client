@@ -38,7 +38,7 @@ use crate::{
     proxy::{
         AnyOutboundHandler, direct,
         group::{
-            fallback, relay,
+            fallback, loadbalance, relay,
             selector::{self, ThreadSafeSelectorControl},
             urltest,
         },
@@ -700,10 +700,47 @@ impl OutboundManager {
                 }
 
                 OutboundGroupProtocol::LoadBalance(proto) => {
-                    return Err(Error::InvalidConfig(format!(
-                        "load-balance proxy group {} runtime is not implemented yet",
-                        proto.name
-                    )));
+                    if check_group_empty(&proto.proxies, &proto.use_provider) {
+                        return Err(Error::InvalidConfig(format!(
+                            "proxy group {} has no proxies",
+                            proto.name
+                        )));
+                    }
+
+                    let mut providers: Vec<ThreadSafeProxyProvider> = vec![];
+                    if let Some(proxies) = &proto.proxies {
+                        providers.push(make_provider_from_proxies(
+                            &proto.name,
+                            proxies,
+                            proto.interval,
+                            proto.lazy.unwrap_or_default(),
+                            handlers,
+                            proxy_manager.clone(),
+                            provider_registry,
+                        )?);
+                    }
+                    maybe_append_use_providers(
+                        &proto.use_provider,
+                        provider_registry,
+                        &mut providers,
+                    )?;
+
+                    let load_balance = loadbalance::Handler::new(
+                        loadbalance::HandlerOptions {
+                            name: proto.name.clone(),
+                            common_opts: crate::proxy::HandlerCommonOptions {
+                                icon: proto.icon.clone(),
+                                url: Some(proto.url.clone()),
+                                connector: None,
+                            },
+                            strategy: proto.strategy.unwrap_or_default(),
+                            udp: true,
+                        },
+                        providers,
+                    )
+                    .map_err(|err| Error::InvalidConfig(err.to_string()))?;
+
+                    handlers.insert(proto.name.clone(), Arc::new(load_balance));
                 }
 
                 OutboundGroupProtocol::Relay(proto) => {

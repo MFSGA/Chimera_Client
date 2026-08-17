@@ -1,0 +1,13 @@
+Task: Load-Balance runtime parity (basic strategies)
+Reference: ref/clash-lib/src/proxy/group/loadbalance/
+Scope:
+- runtime handler/module wiring
+- consistent-hashing strategy
+- round-robin strategy
+- outbound manager integration
+Validation:
+- cargo fmt --check => PASS
+- cargo test -p clash-lib loadbalance --lib => PASS (2 passed)
+- cargo check -p clash-lib => PASS
+Deviation:
+- sticky-session remains intentionally deferred to a separate slice to keep this change reviewable and below 500 changed lines.

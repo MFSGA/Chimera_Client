@@ -799,8 +799,10 @@ dependencies = [
  "memchr",
  "memory-stats",
  "mockall",
+ "murmur3",
  "network-interface",
  "prost",
+ "public-suffix",
  "quinn",
  "quinn-proto",
  "rand 0.10.1",
@@ -2769,6 +2771,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "murmur3"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9252111cf132ba0929b6f8e030cac2a24b507f3a4d6db6fb2896f27b354c714b"
+
+[[package]]
 name = "ndk-context"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3505,6 +3513,12 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "public-suffix"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51315bca45305dd8aa64b831b33e71abac528ca8058c0651346a39b8d3009498"
 
 [[package]]
 name = "quinn"
