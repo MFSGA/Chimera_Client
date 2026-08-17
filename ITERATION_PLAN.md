@@ -215,6 +215,6 @@ Each item must be implemented, tested, and committed separately.
 - Status: in progress on `codex/continuous-iteration`; WireGuard feature/dependency wiring and outbound config parsing are complete, including `pre-shared-key` and legacy `preshared-key` compatibility.
 - Priority: implement WireGuard (`wg`) fully before the other advanced optional protocols.
 - Reference: `ref/clash-lib/src/proxy/tuic/`, `shadowquic/`, `ssh/`, `wg/`, `tailscale/`, and `tor/`.
-- Current gap: WireGuard smoltcp DeviceManager/runtime device wiring remains; tunnel I/O and TCP/UDP SocketPair adapters are complete along with all config/converter prerequisites. Other optional protocols follow after WireGuard.
+- Current gap: WireGuard smoltcp DeviceManager socket/DNS/polling wiring remains; tunnel I/O, TCP/UDP SocketPair adapters, and VirtualIpDevice tokens/capabilities are complete along with all config/converter prerequisites. Other optional protocols follow after WireGuard.
 - Expected test: feature-gated config/converter/runtime tests per protocol, starting with WireGuard.
 - Suggested verification: `cargo test -p clash-lib wireguard_ --lib --features wireguard` and `cargo check -p clash-lib --features wireguard`.

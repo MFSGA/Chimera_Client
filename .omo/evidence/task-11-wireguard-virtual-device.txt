@@ -1,0 +1,9 @@
+Task: WireGuard VirtualIpDevice/RxToken/TxToken parity
+Reference: ref/clash-lib/src/proxy/wg/device.rs VirtualIpDevice section
+Validation:
+- cargo test -p clash-lib wireguard_virtual_device_ --lib --features wireguard => PASS (2)
+- cargo check -p clash-lib --features wireguard => PASS
+- cargo check -p clash-lib => PASS
+- git diff --check => PASS
+Tests cover in-memory receive/transmit token channels and smoltcp Medium::Ip/MTU capabilities.
+Isolation: Tokio channels only; no OS network device, UDP socket, WireGuard peer, TUN, route, DNS, cache, or deployed Chimera process touched.
