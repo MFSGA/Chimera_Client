@@ -1,0 +1,4 @@
+Task: Smart stats cache persistence parity
+Reference: ref/clash-lib/src/app/profile/mod.rs
+Validation: isolated smart_stats round-trip test PASS, cargo check PASS, git diff --check PASS.
+Isolation: tempfile path with store_selected=false; no background flush, project cache.db, deployed process, ports, DNS, TUN, or routes touched.

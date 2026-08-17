@@ -169,7 +169,7 @@ Each item must be implemented, tested, and committed separately.
 
 - Status: completed for config parsing on `codex/continuous-iteration`; Smart group config fields and group dependency accessors match the reference shape. Runtime prerequisites are being added in separate slices; proxy penalty, site/traffic statistics, and `SmartState` integration are complete.
 - Reference: `ref/clash-lib/src/config/internal/proxy.rs`, `ref/clash-lib/src/app/outbound/utils.rs`, and `ref/clash-lib/src/proxy/group/smart/{penalty,stats,state}.rs`.
-- Current gap: Smart runtime selection handler/cache wiring remains. ProxyManager traffic-pattern analysis, packet-loss/RTT metrics, and `SiteTuning` are complete. `proxy::group::smart` temporarily carries a local `dead_code` allowance until the runtime handler consumes these prerequisite modules.
+- Current gap: Smart runtime selection handler wiring remains. ProxyManager traffic-pattern analysis, packet-loss/RTT metrics, `SiteTuning`, and Smart stats cache persistence are complete. `proxy::group::smart` temporarily carries a local `dead_code` allowance until the runtime handler consumes these prerequisite modules.
 - Expected test: config/DAG coverage plus direct unit tests matching `ref` for penalty behavior, site metrics, traffic collection, state integration, and proxy health metrics.
 - Suggested verification: `cargo test -p clash-lib parse_smart_group_options --lib`, `cargo test -p clash-lib smart_group_participates_in_dag_sort --lib`, `cargo test -p clash-lib smart::stats --lib`, and `cargo check -p clash-lib`.
 
