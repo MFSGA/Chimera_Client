@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
     time::Duration,
@@ -7,10 +7,16 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
+use rand::seq::IndexedRandom;
 use smoltcp::{
-    iface::{SocketHandle, SocketSet},
+    iface::{Config, Interface, SocketHandle, SocketSet},
     phy::Device,
-    socket::{tcp, udp},
+    socket::{
+        tcp::{self, RecvError},
+        udp,
+    },
+    time::Instant,
+    wire::IpCidr,
 };
 use tokio::sync::{
     Mutex,
@@ -40,6 +46,11 @@ enum Socket {
         Receiver<Bytes>,
     ),
     Udp(udp::Socket<'static>, Sender<UdpPacket>, Receiver<UdpPacket>),
+}
+
+enum Transfer {
+    Tcp(SocketHandle, Bytes, bool),
+    Udp(SocketHandle, UdpPacket, bool),
 }
 
 enum SenderType {
@@ -212,6 +223,298 @@ impl DeviceManager {
             tokio::time::timeout(Duration::from_secs(5), v4_query)
                 .await
                 .ok()?
+        }
+    }
+
+    pub async fn poll_sockets(&self, mut device: VirtualIpDevice) {
+        let mut config = Config::new(smoltcp::wire::HardwareAddress::Ip);
+        config.random_seed = rand::random();
+        let mut iface = Interface::new(config, &mut device, Instant::now());
+        iface.update_ip_addrs(|addrs| {
+            addrs.push(IpCidr::new(self.addr.into(), 32)).unwrap();
+            if let Some(addr_v6) = self.addr_v6 {
+                addrs.push(IpCidr::new(addr_v6.into(), 128)).unwrap();
+            }
+        });
+
+        let (device_sender, mut device_receiver) = tokio::sync::mpsc::channel(1024);
+        let mut tcp_queue: HashMap<SocketHandle, VecDeque<(Bytes, bool)>> =
+            HashMap::new();
+        let mut udp_queue: HashMap<SocketHandle, VecDeque<(UdpPacket, bool)>> =
+            HashMap::new();
+        let mut next_poll = None;
+
+        loop {
+            let mut sockets = self.socket_set.lock().await;
+            let mut socket_pairs = self.socket_pairs.lock().await;
+            let mut packet_notifier = self.packet_notifier.lock().await;
+            let mut socket_notifier_receiver =
+                self.socket_notifier_receiver.lock().await;
+
+            tokio::select! {
+                Some(socket) = socket_notifier_receiver.recv() => {
+                    match socket {
+                        Socket::Tcp(mut socket, remote, sender, mut receiver) => {
+                            socket
+                                .connect(
+                                    iface.context(),
+                                    remote,
+                                    (
+                                        match remote {
+                                            SocketAddr::V4(_) => IpAddr::V4(self.addr),
+                                            SocketAddr::V6(_) => IpAddr::V6(
+                                                self.addr_v6.expect("ipv6 wireguard address required"),
+                                            ),
+                                        },
+                                        self.get_ephemeral_tcp_port().await,
+                                    ),
+                                )
+                                .unwrap();
+                            let handle = sockets.add(socket);
+                            let device_sender = device_sender.clone();
+                            tokio::spawn(async move {
+                                while let Some(data) = receiver.recv().await {
+                                    if device_sender
+                                        .send(Transfer::Tcp(handle, data, true))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                let _ = device_sender
+                                    .send(Transfer::Tcp(handle, Bytes::new(), false))
+                                    .await;
+                            });
+                            socket_pairs.insert(handle, SenderType::Tcp(sender));
+                            tcp_queue.insert(handle, VecDeque::new());
+                        }
+                        Socket::Udp(socket, sender, mut receiver) => {
+                            let handle = sockets.add(socket);
+                            let device_sender = device_sender.clone();
+                            tokio::spawn(async move {
+                                while let Some(packet) = receiver.recv().await {
+                                    if device_sender
+                                        .send(Transfer::Udp(handle, packet, true))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                let _ = device_sender
+                                    .send(Transfer::Udp(
+                                        handle,
+                                        UdpPacket::default(),
+                                        false,
+                                    ))
+                                    .await;
+                            });
+                            socket_pairs.insert(handle, SenderType::Udp(sender));
+                            udp_queue.insert(handle, VecDeque::new());
+                        }
+                    }
+                    next_poll = None;
+                }
+                _ = packet_notifier.recv() => {
+                    next_poll = None;
+                }
+                Some(transfer) = device_receiver.recv() => {
+                    match transfer {
+                        Transfer::Tcp(handle, data, active) => {
+                            if let Some(queue) = tcp_queue.get_mut(&handle) {
+                                queue.push_back((data, active));
+                                next_poll = None;
+                            }
+                        }
+                        Transfer::Udp(handle, packet, active) => {
+                            if let Some(queue) = udp_queue.get_mut(&handle) {
+                                queue.push_back((packet, active));
+                                next_poll = None;
+                            }
+                        }
+                    }
+                }
+                _ = match (next_poll, socket_pairs.len()) {
+                    (None, 0) => tokio::time::sleep(Duration::MAX),
+                    (None, _) => tokio::time::sleep(Duration::ZERO),
+                    (Some(duration), _) => tokio::time::sleep(duration),
+                } => {
+                    let timestamp = Instant::now();
+                    iface.poll(timestamp, &mut device, &mut sockets);
+
+                    for (handle, sender) in socket_pairs.iter_mut() {
+                        match sender {
+                            SenderType::Tcp(sender) => {
+                                let socket = sockets.get_mut::<tcp::Socket>(*handle);
+                                if socket.may_recv() {
+                                    match socket.recv(|data| (data.len(), data.to_owned())) {
+                                        Ok(data) if !data.is_empty() => {
+                                            if sender.try_send(data.into()).is_err() {
+                                                socket.abort();
+                                            }
+                                        }
+                                        Ok(_) => {}
+                                        Err(RecvError::Finished) => continue,
+                                        Err(error) => warn!(
+                                            "failed to receive wireguard tcp packet: {error:?}"
+                                        ),
+                                    }
+                                }
+
+                                if socket.may_send()
+                                    && let Some(queue) = tcp_queue.get_mut(handle)
+                                    && let Some((data, active)) = queue.pop_front()
+                                {
+                                    if !active {
+                                        socket.abort();
+                                    } else {
+                                        let total = data.len();
+                                        match socket.send_slice(&data) {
+                                            Ok(sent) if sent < total => {
+                                                queue.push_front((
+                                                    Bytes::copy_from_slice(&data[sent..]),
+                                                    true,
+                                                ));
+                                            }
+                                            Ok(_) => {}
+                                            Err(error) => error!(
+                                                "failed to send virtual tcp data: {error:?}"
+                                            ),
+                                        }
+                                    }
+                                }
+                            }
+                            SenderType::Udp(sender) => {
+                                let socket = sockets.get_mut::<udp::Socket>(*handle);
+                                if socket.can_recv() {
+                                    match socket.recv() {
+                                        Ok((data, metadata)) if !data.is_empty() => {
+                                            let packet = UdpPacket::new(
+                                                data.into(),
+                                                SocksAddr::Ip(SocketAddr::new(
+                                                    metadata.endpoint.addr.into(),
+                                                    metadata.endpoint.port,
+                                                )),
+                                                SocksAddr::any_ipv4(),
+                                            );
+                                            if sender.try_send(packet).is_err() {
+                                                socket.close();
+                                            }
+                                        }
+                                        Ok(_) | Err(udp::RecvError::Exhausted) => {}
+                                        Err(udp::RecvError::Truncated) => {
+                                            error!("wireguard udp packet truncated");
+                                            socket.close();
+                                        }
+                                    }
+                                }
+
+                                if socket.can_send()
+                                    && let Some(queue) = udp_queue.get_mut(handle)
+                                    && let Some((packet, active)) = queue.pop_front()
+                                {
+                                    if !active {
+                                        socket.close();
+                                    } else {
+                                        let ip = match &packet.dst_addr {
+                                            SocksAddr::Ip(addr) => addr.ip(),
+                                            SocksAddr::Domain(domain, _) => {
+                                                if let Ok(ip) = domain.parse::<IpAddr>() {
+                                                    ip
+                                                } else if let Some(server) = {
+                                                    let mut rng = rand::rng();
+                                                    self.dns_servers
+                                                        .choose(&mut rng)
+                                                        .copied()
+                                                } {
+                                                    match self.look_up_dns(domain, server).await {
+                                                        Some(ip) => ip,
+                                                        None => continue,
+                                                    }
+                                                } else {
+                                                    match self.resolver.resolve(domain, false).await {
+                                                        Ok(Some(ip)) => ip,
+                                                        _ => continue,
+                                                    }
+                                                }
+                                            }
+                                        };
+
+                                        if !socket.is_open() {
+                                            let local_addr: IpAddr = match ip {
+                                                IpAddr::V4(_) => self.addr.into(),
+                                                IpAddr::V6(_) => self
+                                                    .addr_v6
+                                                    .expect("ipv6 wireguard address required")
+                                                    .into(),
+                                            };
+                                            socket
+                                                .bind((
+                                                    local_addr,
+                                                    self.get_ephemeral_udp_port().await,
+                                                ))
+                                                .unwrap();
+                                        }
+                                        if let Err(error) = socket.send_slice(
+                                            &packet.data,
+                                            (ip, packet.dst_addr.port()),
+                                        ) {
+                                            error!(
+                                                "failed to send virtual udp data: {error:?}"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let mut tcp_ports = Vec::new();
+                    let mut udp_ports = Vec::new();
+                    socket_pairs.retain(|handle, sender_type| match sender_type {
+                        SenderType::Tcp(_) => {
+                            let socket = sockets.get::<tcp::Socket>(*handle);
+                            if socket.is_active() {
+                                true
+                            } else {
+                                if let Some(port) =
+                                    socket.local_endpoint().map(|endpoint| endpoint.port)
+                                {
+                                    tcp_ports.push(port);
+                                }
+                                sockets.remove(*handle);
+                                tcp_queue.remove(handle);
+                                false
+                            }
+                        }
+                        SenderType::Udp(_) => {
+                            let socket = sockets.get::<udp::Socket>(*handle);
+                            if socket.is_open() {
+                                true
+                            } else {
+                                udp_ports.push(socket.endpoint().port);
+                                sockets.remove(*handle);
+                                udp_queue.remove(handle);
+                                false
+                            }
+                        }
+                    });
+
+                    for port in tcp_ports {
+                        self.release_ephemeral_tcp_port(port).await;
+                    }
+                    for port in udp_ports {
+                        self.release_ephemeral_udp_port(port).await;
+                    }
+
+                    next_poll = match iface.poll_delay(timestamp, &sockets) {
+                        Some(smoltcp::time::Duration::ZERO) => None,
+                        Some(delay) => Some(delay.into()),
+                        None => None,
+                    };
+                }
+            }
         }
     }
 
@@ -468,6 +771,42 @@ mod tests {
             lookup.await.unwrap(),
             Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8)))
         );
+    }
+
+    #[tokio::test]
+    async fn wireguard_poll_sockets_registers_tcp_in_memory() {
+        let (to_tunnel_tx, _to_tunnel_rx) = tokio::sync::mpsc::channel(8);
+        let (_from_tunnel_tx, from_tunnel_rx) = tokio::sync::mpsc::channel(8);
+        let (notifier_tx, notifier_rx) = tokio::sync::mpsc::channel(8);
+        let device =
+            VirtualIpDevice::new(to_tunnel_tx, from_tunnel_rx, notifier_tx, 1380);
+        let manager = Arc::new(DeviceManager::new(
+            Ipv4Addr::new(10, 0, 0, 2),
+            None,
+            Arc::new(NoopResolver),
+            vec![],
+            notifier_rx,
+        ));
+        let poll_manager = manager.clone();
+        let poll =
+            tokio::spawn(async move { poll_manager.poll_sockets(device).await });
+
+        let _pair = manager
+            .new_tcp_socket("203.0.113.5:443".parse().unwrap())
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if !manager.socket_pairs.lock().await.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("virtual tcp socket should be registered");
+        assert_eq!(manager.socket_pairs.lock().await.len(), 1);
+
+        poll.abort();
     }
 
     #[tokio::test]
