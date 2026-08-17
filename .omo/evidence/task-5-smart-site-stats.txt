@@ -1,0 +1,9 @@
+Task: Smart proxy group SiteStats parity
+Reference: ref/clash-lib/src/proxy/group/smart/stats.rs
+Scope: SiteStats only; traffic collector/state/handler remain separate slices.
+Tests:
+- cargo test -p clash-lib smart::stats --lib => PASS (4 passed)
+- cargo check -p clash-lib => PASS
+- git diff --check => PASS
+Isolation: pure in-memory unit tests only; no ports, DNS, TUN, routes, cache files, or deployed Chimera process were touched.
+Notes: Three tests are direct behavior adaptations from ref (success rate, delay score, trend); one additional bounded-history test verifies MAX_HISTORY_SIZE=10.
