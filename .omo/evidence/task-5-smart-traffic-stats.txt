@@ -1,0 +1,9 @@
+Task: Smart proxy group TrafficStatsCollector parity
+Reference: ref/clash-lib/src/proxy/group/smart/stats.rs
+Scope: in-memory traffic collector only; SmartState/handler remain separate slices.
+Validation:
+- cargo test -p clash-lib smart::stats --lib => PASS (6 passed total; 2 collector-focused)
+- cargo check -p clash-lib => PASS
+- git diff --check => PASS
+Isolation: pure in-memory unit tests only; no ports, DNS, TUN, routes, cache files, or deployed Chimera process were touched.
+Tests: ref counter/request test adapted locally, plus unknown-session boundary coverage.

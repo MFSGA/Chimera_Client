@@ -1,4 +1,11 @@
-use crate::common::utils::current_timestamp_secs;
+use std::{
+    collections::{HashMap, VecDeque},
+    time::{Duration, Instant},
+};
+
+use crate::{
+    app::remote_content_manager::TrafficStats, common::utils::current_timestamp_secs,
+};
 use serde::{Deserialize, Serialize};
 
 const MAX_HISTORY_SIZE: usize = 10;
@@ -127,6 +134,141 @@ impl Default for SiteStats {
     }
 }
 
+pub struct TrafficStatsCollector {
+    connection_start: HashMap<String, Instant>,
+    session_bytes: HashMap<String, (u64, u64)>,
+    request_counts: HashMap<String, VecDeque<Instant>>,
+    throughput_samples: HashMap<String, VecDeque<(Instant, f64)>>,
+}
+
+impl TrafficStatsCollector {
+    pub fn new() -> Self {
+        Self {
+            connection_start: HashMap::new(),
+            session_bytes: HashMap::new(),
+            request_counts: HashMap::new(),
+            throughput_samples: HashMap::new(),
+        }
+    }
+
+    pub fn start_session(&mut self, session_id: &str) {
+        self.connection_start
+            .insert(session_id.to_string(), Instant::now());
+        self.session_bytes.insert(session_id.to_string(), (0, 0));
+        self.request_counts
+            .insert(session_id.to_string(), VecDeque::new());
+        self.throughput_samples
+            .insert(session_id.to_string(), VecDeque::new());
+    }
+
+    pub fn record_transfer(
+        &mut self,
+        session_id: &str,
+        uploaded: u64,
+        downloaded: u64,
+    ) {
+        if let Some((up, down)) = self.session_bytes.get_mut(session_id) {
+            *up += uploaded;
+            *down += downloaded;
+
+            if let Some(start_time) = self.connection_start.get(session_id) {
+                let elapsed = start_time.elapsed().as_secs_f64();
+                if elapsed > 0.0 {
+                    let current_throughput =
+                        (uploaded + downloaded) as f64 / elapsed;
+                    if let Some(samples) =
+                        self.throughput_samples.get_mut(session_id)
+                    {
+                        samples.push_back((Instant::now(), current_throughput));
+                        if samples.len() > 10 {
+                            samples.pop_front();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn record_request(&mut self, session_id: &str) {
+        if let Some(requests) = self.request_counts.get_mut(session_id) {
+            requests.push_back(Instant::now());
+            let cutoff = Instant::now() - Duration::from_secs(60);
+            while let Some(&front_time) = requests.front() {
+                if front_time < cutoff {
+                    requests.pop_front();
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    pub fn get_stats(&self, session_id: &str) -> Option<TrafficStats> {
+        let start_time = self.connection_start.get(session_id)?;
+        let (uploaded, downloaded) = self.session_bytes.get(session_id)?;
+        let connection_duration = start_time.elapsed();
+        let total_bytes = uploaded + downloaded;
+
+        let average_throughput = if connection_duration.as_secs_f64() > 0.0 {
+            total_bytes as f64 / connection_duration.as_secs_f64()
+        } else {
+            0.0
+        };
+
+        let peak_throughput = self
+            .throughput_samples
+            .get(session_id)
+            .map(|samples| {
+                samples
+                    .iter()
+                    .map(|(_, throughput)| *throughput)
+                    .fold(0.0, f64::max)
+            })
+            .unwrap_or(0.0);
+
+        let request_frequency = self
+            .request_counts
+            .get(session_id)
+            .map(|requests| requests.len() as f64 / 60.0)
+            .unwrap_or(0.0);
+
+        let is_bidirectional = if total_bytes > 0 {
+            let upload_ratio = *uploaded as f64 / total_bytes as f64;
+            upload_ratio > 0.1 && upload_ratio < 0.9
+        } else {
+            false
+        };
+
+        Some(TrafficStats {
+            bytes_uploaded: *uploaded,
+            bytes_downloaded: *downloaded,
+            connection_duration,
+            average_throughput,
+            peak_throughput,
+            request_frequency,
+            is_bidirectional,
+        })
+    }
+
+    pub fn cleanup_old_sessions(&mut self) {
+        let cutoff = Instant::now() - Duration::from_secs(300);
+        self.connection_start
+            .retain(|_, start_time| *start_time > cutoff);
+        self.session_bytes
+            .retain(|session_id, _| self.connection_start.contains_key(session_id));
+        self.request_counts
+            .retain(|session_id, _| self.connection_start.contains_key(session_id));
+        self.throughput_samples
+            .retain(|session_id, _| self.connection_start.contains_key(session_id));
+    }
+}
+
+impl Default for TrafficStatsCollector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,5 +319,27 @@ mod tests {
         assert_eq!(stats.delay_history.len(), MAX_HISTORY_SIZE);
         assert_eq!(stats.success_history.len(), MAX_HISTORY_SIZE);
         assert_eq!(stats.delay_history[0], 2.0);
+    }
+
+    #[test]
+    fn traffic_collector_matches_reference_counters() {
+        let mut collector = TrafficStatsCollector::new();
+        collector.start_session("test-session");
+        collector.record_transfer("test-session", 1000, 2000);
+        collector.record_request("test-session");
+
+        let stats = collector
+            .get_stats("test-session")
+            .expect("tracked session should have stats");
+        assert_eq!(stats.bytes_uploaded, 1000);
+        assert_eq!(stats.bytes_downloaded, 2000);
+        assert!(stats.is_bidirectional);
+        assert!(stats.request_frequency > 0.0);
+    }
+
+    #[test]
+    fn unknown_session_has_no_traffic_stats() {
+        let collector = TrafficStatsCollector::new();
+        assert!(collector.get_stats("missing").is_none());
     }
 }
