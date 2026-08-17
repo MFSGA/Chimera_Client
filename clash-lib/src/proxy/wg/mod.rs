@@ -5,6 +5,7 @@ use crate::proxy::HandlerCommonOptions;
 pub(crate) mod events;
 pub(crate) mod keys;
 pub(crate) mod ports;
+pub(crate) mod wireguard;
 
 pub struct HandlerOptions {
     pub name: String,

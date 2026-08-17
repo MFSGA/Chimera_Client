@@ -1,0 +1,11 @@
+Task: WireGuard allowed-IP filtering and packet protocol routing
+Reference: ref/clash-lib/src/proxy/wg/wireguard.rs route_protocol/is_ip_allowed
+Validation:
+- cargo test -p clash-lib wireguard_allowed_ips_ --lib --features wireguard => PASS
+- cargo test -p clash-lib wireguard_routes_ --lib --features wireguard => PASS
+- cargo check -p clash-lib --features wireguard => PASS
+- cargo check -p clash-lib => PASS
+- git diff --check => PASS
+Tests construct IPv4/IPv6 packets entirely in memory and cover TCP/UDP/local-peer filtering plus empty/non-empty allowed-ip lists.
+Isolation: no UDP socket, WireGuard peer, TUN interface, route, DNS, cache, or deployed Chimera process touched.
+Deviation: reference methods were extracted as pure helpers first so their behavior can be tested before tunnel I/O is wired; the runtime tunnel will call these helpers.
