@@ -1,0 +1,9 @@
+Task: Smart ProxyManager packet-loss and RTT metrics parity
+Reference: ref/clash-lib/src/app/remote_content_manager/mod.rs
+Scope: get_packet_loss/get_rtt only; traffic-pattern/site-tuning and Smart handler remain separate slices.
+Validation:
+- cargo test -p clash-lib smart_metric_tests --lib => PASS (2 passed)
+- cargo check -p clash-lib => PASS
+- git diff --check => PASS
+Isolation: pure in-memory ProxyManager history tests only; no network listeners, DNS, TUN, routes, cache files, or deployed Chimera process were touched.
+Deviation: ref uses Duration::as_millis_f64(), which is unstable on the current stable toolchain; local code uses as_secs_f64() * 1000.0 with equivalent units.
