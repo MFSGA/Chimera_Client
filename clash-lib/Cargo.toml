@@ -112,6 +112,7 @@ smoltcp = { version = "0.13", default-features = false, features = [
     "socket-udp",
     "socket-tcp",
 ], optional = true }
+boringtun = { version = "0.1.0", git = "https://github.com/Watfaq/boring-noise.git", rev = "9ddf1b5", package = "boring-noise", optional = true, default-features = false }
 etherparse = { version = "0.20", optional = true }
 unix-udp-sock = { git = "https://github.com/Watfaq/unix-udp-sock.git", rev = "847c80b519f0fd8cff5c887ae708429897d08671", optional = true }
 
@@ -166,18 +167,26 @@ aws-lc-rs = [
     "rustls/aws-lc-rs",
     "quinn-proto?/rustls-aws-lc-rs",
     "chimera-dns/aws-lc-rs",
+    "boringtun?/aws-lc-rs",
     "dep:log",
     "dep:memchr",
     "dep:subtle",
     "dep:x509-parser",
 ]
-ring = ["tls", "rustls/ring", "quinn-proto?/ring", "chimera-dns/ring"]
+ring = [
+    "tls",
+    "rustls/ring",
+    "quinn-proto?/ring",
+    "chimera-dns/ring",
+    "boringtun?/ring",
+]
 
 ws = ["tokio-tungstenite"]
 
 anytls = ["tls", "dep:rcgen"]
 shadowsocks = ["dep:shadowsocks", "dep:blake3"]
 trojan = []
+wireguard = ["dep:boringtun", "dep:smoltcp"]
 hysteria = [
     "tls",
     "dep:quinn",

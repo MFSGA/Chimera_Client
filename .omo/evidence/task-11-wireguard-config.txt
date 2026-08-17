@@ -1,0 +1,10 @@
+Task: WireGuard feature and config parsing
+Reference: ref/clash-lib/Cargo.toml and ref/clash-lib/src/config/internal/proxy.rs
+Validation:
+- cargo test -p clash-lib wireguard_ --lib --features wireguard => PASS (3)
+- cargo check -p clash-lib --features wireguard => PASS
+- cargo check -p clash-lib => PASS
+- git diff --check => PASS
+Tests mirror ref coverage for standard pre-shared-key, legacy preshared-key alias, and optional PSK.
+Isolation: config/compile only; no WireGuard device, UDP socket, TUN interface, routes, DNS changes, cache files, or deployed Chimera process touched.
+Notes: boring-noise requires an explicit crypto backend when default features are disabled; local aws-lc-rs/ring features now propagate to boringtun conditionally.

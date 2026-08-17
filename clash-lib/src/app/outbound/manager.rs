@@ -482,6 +482,14 @@ impl OutboundManager {
                         })
                         .ok()
                 }
+                #[cfg(feature = "wireguard")]
+                OutboundProxyProtocol::Wireguard(wg) => {
+                    error!(
+                        "wireguard outbound {} parsed but runtime is not implemented yet",
+                        wg.common_opts.name
+                    );
+                    None
+                }
             })
             .collect()
     }

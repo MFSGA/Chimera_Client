@@ -212,8 +212,9 @@ Each item must be implemented, tested, and committed separately.
 
 ### Task 11: Add First Advanced Optional Protocol Feature Skeletons
 
-- Priority: after Smart runtime parity is completed, implement WireGuard (`wg`) first before the other advanced optional protocols.
+- Status: in progress on `codex/continuous-iteration`; WireGuard feature/dependency wiring and outbound config parsing are complete, including `pre-shared-key` and legacy `preshared-key` compatibility.
+- Priority: implement WireGuard (`wg`) fully before the other advanced optional protocols.
 - Reference: `ref/clash-lib/src/proxy/tuic/`, `shadowquic/`, `ssh/`, `wg/`, `tailscale/`, and `tor/`.
-- Current gap: optional protocol feature flags and modules are missing or incomplete compared with `ref`.
-- Expected test: one feature-gated config parsing test per protocol before runtime implementation is expanded.
-- Suggested verification: run focused `cargo check` with each added feature.
+- Current gap: WireGuard converter/runtime modules remain; other optional protocols follow after WireGuard.
+- Expected test: feature-gated config/converter/runtime tests per protocol, starting with WireGuard.
+- Suggested verification: `cargo test -p clash-lib wireguard_ --lib --features wireguard` and `cargo check -p clash-lib --features wireguard`.

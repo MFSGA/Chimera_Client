@@ -43,6 +43,9 @@ pub enum OutboundProxyProtocol {
 
     #[serde(rename = "vless")]
     Vless(OutboundVless),
+    #[cfg(feature = "wireguard")]
+    #[serde(rename = "wireguard")]
+    Wireguard(OutboundWireguard),
     #[cfg(feature = "trojan")]
     #[serde(rename = "trojan")]
     Trojan(OutboundTrojan),
@@ -62,6 +65,10 @@ impl OutboundProxyProtocol {
             #[cfg(feature = "anytls")]
             OutboundProxyProtocol::Anytls(anytls) => &anytls.common_opts.name,
             OutboundProxyProtocol::Vless(vless) => &vless.common_opts.name,
+            #[cfg(feature = "wireguard")]
+            OutboundProxyProtocol::Wireguard(wireguard) => {
+                &wireguard.common_opts.name
+            }
             #[cfg(feature = "trojan")]
             OutboundProxyProtocol::Trojan(trojan) => &trojan.common_opts.name,
             #[cfg(feature = "hysteria")]
@@ -308,6 +315,26 @@ pub struct OutboundVless {
     pub flow: Option<String>,
     #[serde(alias = "fingerprint")]
     pub client_fingerprint: Option<String>,
+}
+
+#[cfg(feature = "wireguard")]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct OutboundWireguard {
+    #[serde(flatten)]
+    pub common_opts: CommonConfigOptions,
+    pub private_key: String,
+    pub public_key: String,
+    #[serde(alias = "preshared-key")]
+    pub pre_shared_key: Option<String>,
+    pub mtu: Option<u16>,
+    pub udp: Option<bool>,
+    pub ip: String,
+    pub ipv6: Option<String>,
+    pub remote_dns_resolve: Option<bool>,
+    pub dns: Option<Vec<String>>,
+    pub allowed_ips: Option<Vec<String>>,
+    pub reserved_bits: Option<Vec<u8>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -715,6 +742,78 @@ xhttp-opts:
         assert_eq!(opts.max_each_post_bytes, Some(1_000_000));
         assert_eq!(opts.max_buffered_posts, Some(30));
         assert_eq!(opts.session_ttl, Some(30));
+    }
+}
+
+#[cfg(all(test, feature = "wireguard"))]
+mod wireguard_tests {
+    use super::{OutboundProxyProtocol, OutboundWireguard};
+
+    const PRIVATE_KEY: &str = "KIlDUePHyYwzjgn18przw/ZwPioJhh2aEyhxb/dtCXI=";
+    const PUBLIC_KEY: &str = "INBZyvB715sA5zatkiX8Jn3Dh5tZZboZ09x4pkr66ig=";
+    const PSK: &str = "+JmZErvtDT4ZfQequxWhZSydBV+ItqUcPMHUWY1j2yc=";
+
+    #[test]
+    fn wireguard_standard_pre_shared_key_and_enum_wiring() {
+        let yaml = format!(
+            r#"
+name: wg-test
+type: wireguard
+server: example.com
+port: 51820
+private-key: {PRIVATE_KEY}
+public-key: {PUBLIC_KEY}
+pre-shared-key: {PSK}
+ip: 10.0.0.2/32
+"#
+        );
+
+        let config: OutboundProxyProtocol =
+            serde_yaml::from_str(&yaml).expect("wireguard config should parse");
+        let OutboundProxyProtocol::Wireguard(config) = config else {
+            panic!("expected wireguard config");
+        };
+        assert_eq!(config.common_opts.name, "wg-test");
+        assert_eq!(config.pre_shared_key.as_deref(), Some(PSK));
+    }
+
+    #[test]
+    fn wireguard_accepts_legacy_preshared_key_alias() {
+        let yaml = format!(
+            r#"
+name: wg-test
+type: wireguard
+server: example.com
+port: 51820
+private-key: {PRIVATE_KEY}
+public-key: {PUBLIC_KEY}
+preshared-key: {PSK}
+ip: 10.0.0.2/32
+"#
+        );
+
+        let config: OutboundWireguard =
+            serde_yaml::from_str(&yaml).expect("legacy preshared-key should parse");
+        assert_eq!(config.pre_shared_key.as_deref(), Some(PSK));
+    }
+
+    #[test]
+    fn wireguard_pre_shared_key_is_optional() {
+        let yaml = format!(
+            r#"
+name: wg-test
+type: wireguard
+server: example.com
+port: 51820
+private-key: {PRIVATE_KEY}
+public-key: {PUBLIC_KEY}
+ip: 10.0.0.2/32
+"#
+        );
+
+        let config: OutboundWireguard =
+            serde_yaml::from_str(&yaml).expect("wireguard without psk should parse");
+        assert!(config.pre_shared_key.is_none());
     }
 }
 
