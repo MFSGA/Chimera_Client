@@ -22,6 +22,8 @@ pub(super) fn convert(
     let mixed_port = c.mixed_port;
     #[cfg(feature = "redir")]
     let redir_port = c.redir_port;
+    #[cfg(feature = "tproxy")]
+    let tproxy_port = c.tproxy_port;
     let bind_address = if c.bind_address == BindAddress::default() && c.ipv6 {
         BindAddress::dual_stack()
     } else {
@@ -115,9 +117,25 @@ pub(super) fn convert(
     if c.redir_port.is_some() {
         warn!("ignoring top-level `redir-port` because `redir` feature is disabled");
     }
+    #[cfg(feature = "tproxy")]
+    if let Some(Port(tproxy_port)) = tproxy_port
+        && !all_inbounds.insert(InboundOpts::TProxy {
+            common_opts: CommonInboundOpts {
+                name: "TPROXY-IN".into(),
+                listen: bind_address,
+                port: tproxy_port,
+                allow_lan: c.allow_lan.unwrap_or_default(),
+                fw_mark: c.routing_mark,
+            },
+            udp: true,
+        })
+    {
+        warn!("Duplicate TPROXY inbound listener found: {}", tproxy_port);
+    }
+    #[cfg(not(feature = "tproxy"))]
     if c.tproxy_port.is_some() {
         warn!(
-            "ignoring top-level `tproxy-port` because tproxy inbound is not implemented"
+            "ignoring top-level `tproxy-port` because `tproxy` feature is disabled"
         );
     }
     Ok(all_inbounds)

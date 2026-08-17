@@ -194,8 +194,9 @@ Each item must be implemented, tested, and committed separately.
 
 ### Task 9: Add TProxy And Redir Module Gates
 
+- Status: in progress on `codex/continuous-iteration`; Redir runtime parity is complete, and TProxy config/port-management wiring is complete. TProxy runtime listener/module wiring remains.
 - Reference: `ref/clash-lib/src/proxy/tproxy/` and `ref/clash-lib/src/proxy/redir/`.
-- Current gap: feature flags exist in `Cargo.toml`, but corresponding proxy modules are not wired in `proxy/mod.rs`.
+- Current gap: TProxy runtime listener/module wiring is still missing; config parsing and top-level `tproxy-port` conversion now match the reference shape.
 - Expected test: compile-gated smoke test or focused `cargo check` proving `tproxy` and `redir` feature builds include the modules on supported platforms.
 - Suggested verification: `cargo check -p clash-lib --features tproxy,redir` on Linux.
 

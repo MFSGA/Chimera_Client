@@ -318,6 +318,29 @@ routing-mark: 6666
         assert_eq!(common.fw_mark, Some(6666));
     }
 
+    #[cfg(feature = "tproxy")]
+    #[test]
+    fn top_level_tproxy_port_creates_tproxy_listener() {
+        let cfg = parse_config(
+            r#"
+tproxy-port: 7893
+routing-mark: 6666
+"#,
+        );
+
+        let converted = convert(cfg).expect("internal convert should succeed");
+        let listener = converted
+            .listeners
+            .iter()
+            .find(|listener| listener.type_name() == "tproxy")
+            .expect("tproxy listener should be created");
+
+        let common = listener.common_opts();
+        assert_eq!(common.name, "TPROXY-IN");
+        assert_eq!(common.port, 7893);
+        assert_eq!(common.fw_mark, Some(6666));
+    }
+
     #[test]
     fn fake_ip_mode_adds_route_for_separate_default_pool() {
         let mut cfg = parse_config(

@@ -109,6 +109,11 @@ fn build_handler(
             authenticator,
             fw_mark,
         ))),
+        #[cfg(feature = "tproxy")]
+        InboundOpts::TProxy { .. } => {
+            warn!("tproxy runtime listener is not wired yet");
+            None
+        }
         #[cfg(feature = "redir")]
         InboundOpts::Redir {
             #[cfg(target_os = "linux")]

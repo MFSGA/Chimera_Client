@@ -1,0 +1,16 @@
+Task 9 slice: TProxy config and port-management wiring
+
+Scope:
+- Add feature-gated InboundOpts::TProxy config variant.
+- Convert top-level tproxy-port into TPROXY-IN with routing mark propagation.
+- Report/change tproxy_port through inbound manager API plumbing.
+- Keep runtime listener explicitly unwired in this slice; next slice will port ref runtime.
+- Add focused conversion test.
+
+Verification:
+- cargo fmt --check: PASS
+- cargo test -p clash-lib top_level_tproxy_port_creates_tproxy_listener --lib --features tproxy: PASS (1 passed)
+- cargo check -p clash-lib --features tproxy: PASS
+- cargo check -p clash-lib: PASS
+
+Deviation: ref/clash-lib/src/proxy/tproxy/ runtime is intentionally not included in this slice because the runtime module is >400 lines and would make the combined config/runtime migration exceed the 500-line step limit. network_listener.rs therefore emits a warning and returns None for TProxy until the next runtime slice.

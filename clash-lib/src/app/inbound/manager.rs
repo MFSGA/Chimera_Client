@@ -212,6 +212,10 @@ impl InboundManager {
                 InboundOpts::Mixed { common_opts, .. } => {
                     ports.mixed_port = Some(common_opts.port)
                 }
+                #[cfg(feature = "tproxy")]
+                InboundOpts::TProxy { common_opts, .. } => {
+                    ports.tproxy_port = Some(common_opts.port)
+                }
                 #[cfg(feature = "redir")]
                 InboundOpts::Redir { common_opts, .. } => {
                     ports.redir_port = Some(common_opts.port)
@@ -285,6 +289,11 @@ impl InboundManager {
                     ports.mixed_port.is_some()
                         && Some(common_opts.port) == ports.mixed_port
                 }
+                #[cfg(feature = "tproxy")]
+                InboundOpts::TProxy { common_opts, .. } => {
+                    ports.tproxy_port.is_some()
+                        && Some(common_opts.port) == ports.tproxy_port
+                }
                 #[cfg(feature = "redir")]
                 InboundOpts::Redir { common_opts, .. } => {
                     ports.redir_port.is_some()
@@ -306,6 +315,8 @@ impl InboundManager {
                 InboundOpts::Socks { .. } => ports.socks_port,
                 #[cfg(feature = "mixed_port")]
                 InboundOpts::Mixed { .. } => ports.mixed_port,
+                #[cfg(feature = "tproxy")]
+                InboundOpts::TProxy { .. } => ports.tproxy_port,
                 #[cfg(feature = "redir")]
                 InboundOpts::Redir { .. } => ports.redir_port,
                 #[cfg(feature = "shadowsocks")]
