@@ -1,0 +1,8 @@
+Task: Smart ProxyManager fallback SiteTuning parity
+Reference: ref/clash-lib/src/app/remote_content_manager/mod.rs get_fallback_tuning
+Scope: SiteTuning type plus UDP/HTTP/file-transfer/default fallback weights; traffic-pattern analysis remains separate.
+Validation:
+- cargo test -p clash-lib smart_metric_tests --lib => PASS (4 passed total; 2 fallback tuning focused)
+- cargo check -p clash-lib => PASS
+- git diff --check => PASS
+Isolation: pure in-memory Session/ProxyManager tests only; no network listeners, DNS, TUN, routes, cache files, or deployed Chimera process were touched.
