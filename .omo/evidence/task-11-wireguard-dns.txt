@@ -1,0 +1,10 @@
+Task: WireGuard internal DNS lookup parity
+Reference: ref/clash-lib/src/proxy/wg/device.rs look_up_dns
+Validation:
+- cargo test -p clash-lib wireguard_dns_lookup_ --lib --features wireguard => PASS
+- cargo check -p clash-lib --features wireguard => PASS
+- cargo check -p clash-lib => PASS
+- git diff --check => PASS
+Test intercepts the virtual UDP DNS query in memory, builds a matching A response, and feeds it back through Tokio channels.
+Isolation: no real DNS request or OS socket occurs; no WireGuard peer, TUN, routes, cache, or deployed Chimera process touched.
+Deviation: Hickory 0.26 uses Message constructor/metadata/public fields instead of the 0.25 setters/getters used by ref; DNS semantics are unchanged.

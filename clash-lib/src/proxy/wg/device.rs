@@ -1,10 +1,12 @@
 use std::{
     collections::HashMap,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
+    time::Duration,
 };
 
 use bytes::{Bytes, BytesMut};
+use futures::{SinkExt, StreamExt};
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
     phy::Device,
@@ -14,9 +16,11 @@ use tokio::sync::{
     Mutex,
     mpsc::{Receiver, Sender},
 };
-use tracing::{Instrument, error, trace_span};
+use tracing::{Instrument, debug, error, trace, trace_span, warn};
 
-use crate::{app::dns::ThreadSafeDNSResolver, proxy::datagram::UdpPacket};
+use crate::{
+    app::dns::ThreadSafeDNSResolver, proxy::datagram::UdpPacket, session::SocksAddr,
+};
 
 use super::{
     events::PortProtocol,
@@ -102,6 +106,113 @@ impl DeviceManager {
             .await
             .expect("wireguard socket manager should be alive");
         UdpPair::new(read_pair.1, write_pair.0)
+    }
+
+    pub async fn look_up_dns(
+        &self,
+        host: &str,
+        server: SocketAddr,
+    ) -> Option<IpAddr> {
+        debug!("looking up {host} on {server}");
+
+        #[async_recursion::async_recursion]
+        async fn query(
+            record_type: hickory_proto::rr::RecordType,
+            host: &str,
+            server: SocketAddr,
+            mut socket: UdpPair,
+        ) -> Option<IpAddr> {
+            let mut message = hickory_proto::op::Message::new(
+                0,
+                hickory_proto::op::MessageType::Query,
+                hickory_proto::op::OpCode::Query,
+            );
+            message.add_query({
+                let mut query = hickory_proto::op::Query::new();
+                let name = hickory_proto::rr::Name::from_str_relaxed(host)
+                    .ok()?
+                    .append_domain(&hickory_proto::rr::Name::root())
+                    .ok()?;
+                query.set_name(name);
+                query.set_query_type(record_type);
+                query
+            });
+            message.metadata.recursion_desired = true;
+
+            socket
+                .feed(UdpPacket::new(
+                    message.to_vec().ok()?,
+                    SocksAddr::any_ipv4(),
+                    server.into(),
+                ))
+                .await
+                .ok()?;
+            socket.flush().await.ok()?;
+            trace!("sent dns query: {message:?}");
+
+            let packet =
+                match tokio::time::timeout(Duration::from_secs(5), socket.next())
+                    .await
+                {
+                    Ok(Some(packet)) => packet,
+                    _ => {
+                        warn!("wg dns query timed out with server {server}");
+                        return None;
+                    }
+                };
+
+            let response =
+                hickory_proto::op::Message::from_vec(&packet.data).ok()?;
+            trace!("got dns response: {response:?}");
+            for answer in &response.answers {
+                if answer.record_type() != record_type {
+                    continue;
+                }
+                match (record_type, &answer.data) {
+                    (_, hickory_proto::rr::RData::CNAME(cname)) => {
+                        return query(
+                            record_type,
+                            &cname.0.to_ascii(),
+                            server,
+                            socket,
+                        )
+                        .await;
+                    }
+                    (
+                        hickory_proto::rr::RecordType::A,
+                        hickory_proto::rr::RData::A(addr),
+                    ) => return Some(IpAddr::V4(addr.0)),
+                    (
+                        hickory_proto::rr::RecordType::AAAA,
+                        hickory_proto::rr::RData::AAAA(addr),
+                    ) => return Some(IpAddr::V6(addr.0)),
+                    _ => return None,
+                }
+            }
+            None
+        }
+
+        let socket = self.new_udp_socket().await;
+        let v4_query = query(hickory_proto::rr::RecordType::A, host, server, socket);
+        if self.addr_v6.is_some() {
+            let socket = self.new_udp_socket().await;
+            let v6_query =
+                query(hickory_proto::rr::RecordType::AAAA, host, server, socket);
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                futures::future::join(v4_query, v6_query),
+            )
+            .await
+            {
+                Ok((_, Some(v6))) => Some(v6),
+                Ok((v4, _)) => v4,
+                _ => None,
+            }
+        } else {
+            tokio::time::timeout(Duration::from_secs(5), v4_query)
+                .await
+                .ok()?
+        }
     }
 
     async fn get_ephemeral_tcp_port(&self) -> u16 {
@@ -306,6 +417,57 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(udp_event, Socket::Udp(_, _, _)));
+    }
+
+    #[tokio::test]
+    async fn wireguard_dns_lookup_round_trips_over_virtual_udp() {
+        let manager = Arc::new(device_manager());
+        let server: SocketAddr = "192.0.2.53:53".parse().unwrap();
+        let lookup_manager = manager.clone();
+        let lookup = tokio::spawn(async move {
+            lookup_manager.look_up_dns("example.com", server).await
+        });
+
+        let event = manager
+            .socket_notifier_receiver
+            .lock()
+            .await
+            .recv()
+            .await
+            .unwrap();
+        let Socket::Udp(_socket, response_tx, mut query_rx) = event else {
+            panic!("dns lookup should create virtual udp socket");
+        };
+        let query_packet = query_rx.recv().await.unwrap();
+        let query =
+            hickory_proto::op::Message::from_vec(&query_packet.data).unwrap();
+        let name = query.queries[0].name().clone();
+
+        let mut response = hickory_proto::op::Message::response(
+            query.metadata.id,
+            query.metadata.op_code,
+        );
+        response.add_query(query.queries[0].clone());
+        response.add_answer(hickory_proto::rr::Record::from_rdata(
+            name,
+            60,
+            hickory_proto::rr::RData::A(hickory_proto::rr::rdata::A(Ipv4Addr::new(
+                203, 0, 113, 8,
+            ))),
+        ));
+        response_tx
+            .send(UdpPacket::new(
+                response.to_vec().unwrap(),
+                server.into(),
+                SocksAddr::any_ipv4(),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            lookup.await.unwrap(),
+            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8)))
+        );
     }
 
     #[tokio::test]
