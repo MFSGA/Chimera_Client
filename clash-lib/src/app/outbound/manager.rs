@@ -737,8 +737,8 @@ impl OutboundManager {
                             udp: true,
                         },
                         providers,
-                    )
-                    .map_err(|err| Error::InvalidConfig(err.to_string()))?;
+                        proxy_manager.clone(),
+                    );
 
                     handlers.insert(proto.name.clone(), Arc::new(load_balance));
                 }

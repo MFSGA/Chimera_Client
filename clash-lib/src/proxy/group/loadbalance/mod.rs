@@ -6,12 +6,16 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tracing::debug;
 
-use self::helpers::{StrategyFn, strategy_consistent_hashring, strategy_rr};
+use self::helpers::{
+    StrategyFn, strategy_consistent_hashring, strategy_rr, strategy_sticky_session,
+};
 use crate::{
     app::{
         dispatcher::{BoxedChainedDatagram, BoxedChainedStream},
         dns::ThreadSafeDNSResolver,
-        remote_content_manager::providers::proxy_provider::ThreadSafeProxyProvider,
+        remote_content_manager::{
+            ProxyManager, providers::proxy_provider::ThreadSafeProxyProvider,
+        },
     },
     config::internal::proxy::LoadBalanceStrategy,
     proxy::{
@@ -53,22 +57,21 @@ impl Handler {
     pub fn new(
         opts: HandlerOptions,
         providers: Vec<ThreadSafeProxyProvider>,
-    ) -> io::Result<Self> {
+        proxy_manager: ProxyManager,
+    ) -> Self {
         let strategy_fn = match opts.strategy {
             LoadBalanceStrategy::ConsistentHashing => strategy_consistent_hashring(),
             LoadBalanceStrategy::RoundRobin => strategy_rr(),
             LoadBalanceStrategy::StickySession => {
-                return Err(io::Error::other(
-                    "sticky-session load-balance strategy is not implemented yet",
-                ));
+                strategy_sticky_session(proxy_manager)
             }
         };
 
-        Ok(Self {
+        Self {
             opts,
             providers,
             inner: Arc::new(Mutex::new(HandlerInner { strategy_fn })),
-        })
+        }
     }
 
     async fn get_proxies(&self, touch: bool) -> Vec<AnyOutboundHandler> {

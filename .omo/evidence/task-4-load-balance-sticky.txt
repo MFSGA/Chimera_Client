@@ -1,0 +1,9 @@
+Task: Complete Load-Balance sticky-session runtime parity
+Reference: ref/clash-lib/src/proxy/group/loadbalance/helpers.rs and ref/clash-lib/src/proxy/group/loadbalance/mod.rs
+Validation:
+- cargo fmt --check => PASS
+- cargo test -p clash-lib loadbalance --lib => PASS (3 passed, 0 failed)
+- cargo check -p clash-lib => PASS
+Notes:
+- Sticky-session uses ProxyManager health state plus a 10-minute/1024-entry LRU cache, matching the reference behavior.
+- Local code explicitly rejects an empty proxy list before hashing to avoid invalid bucket selection; this is a defensive boundary check around the same runtime contract.

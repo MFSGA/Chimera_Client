@@ -1,10 +1,18 @@
-use std::io::Cursor;
+use std::{
+    io::Cursor,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use futures::future::BoxFuture;
 use murmur3::murmur3_32;
 use public_suffix::{DEFAULT_PROVIDER, EffectiveTLDProvider};
+use tokio::sync::Mutex;
 
-use crate::{proxy::AnyOutboundHandler, session::Session};
+use crate::{
+    app::remote_content_manager::ProxyManager, proxy::AnyOutboundHandler,
+    session::Session,
+};
 
 pub type StrategyFn = Box<
     dyn FnMut(
@@ -23,6 +31,12 @@ fn get_key(sess: &Session) -> String {
             .map(|s| s.to_string())
             .unwrap_or_else(|_| host.clone()),
     }
+}
+
+fn get_key_src_and_dst(sess: &Session) -> String {
+    let dst = get_key(sess);
+    let src = sess.source.ip().to_string();
+    format!("{src}-{dst}")
 }
 
 fn jump_hash(key: u64, buckets: i32) -> i32 {
@@ -64,13 +78,65 @@ pub fn strategy_consistent_hashring() -> StrategyFn {
     })
 }
 
+pub fn strategy_sticky_session(proxy_manager: ProxyManager) -> StrategyFn {
+    let max_retry = 5;
+    let lru_cache: lru_time_cache::LruCache<u64, usize> =
+        lru_time_cache::LruCache::with_expiry_duration_and_capacity(
+            std::time::Duration::from_secs(60 * 10),
+            1024,
+        );
+    let lru_cache = Arc::new(Mutex::new(lru_cache));
+
+    Box::new(move |proxies, sess| {
+        let key = murmur3_32(&mut Cursor::new(get_key_src_and_dst(sess)), 0).unwrap()
+            as u64;
+        let proxy_manager = proxy_manager.clone();
+        let lru_cache = lru_cache.clone();
+        let timestamp = || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64
+        };
+
+        Box::pin(async move {
+            if proxies.is_empty() {
+                return Err(std::io::Error::other("no proxy found"));
+            }
+
+            let buckets = proxies.len() as i32;
+            let (start_index, hit) = match lru_cache.lock().await.get(&key) {
+                Some(&index) => (index, true),
+                None => (jump_hash(key + timestamp(), buckets) as usize, false),
+            };
+
+            let mut index = start_index;
+            for _ in 0..max_retry {
+                if let Some(proxy) = proxies.get(index)
+                    && proxy_manager.alive(proxy.name()).await
+                {
+                    if index != start_index || !hit {
+                        lru_cache.lock().await.insert(key, index);
+                    }
+                    return Ok(proxy.clone());
+                }
+                index = jump_hash(key + timestamp(), buckets) as usize;
+            }
+
+            lru_cache.lock().await.insert(key, 0);
+            Err(std::io::Error::other("no proxy found"))
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use super::*;
     use crate::{
-        proxy::utils::test_utils::noop::NoopOutboundHandler, session::SocksAddr,
+        proxy::utils::test_utils::noop::{NoopOutboundHandler, NoopResolver},
+        session::SocksAddr,
     };
 
     fn proxies() -> Vec<AnyOutboundHandler> {
@@ -99,6 +165,25 @@ mod tests {
         let mut strategy = strategy_consistent_hashring();
         let mut session = Session::default();
         session.destination = SocksAddr::Domain("www.example.com".to_string(), 443);
+        let first = strategy(proxies(), &session).await.unwrap();
+        let second = strategy(proxies(), &session).await.unwrap();
+        assert_eq!(first.name(), second.name());
+    }
+
+    #[tokio::test]
+    async fn sticky_session_reuses_cached_proxy_and_checks_health() {
+        let manager = ProxyManager::new(Arc::new(NoopResolver), None);
+        manager.report_alive("a", false).await;
+        manager.report_alive("b", false).await;
+
+        let mut strategy = strategy_sticky_session(manager.clone());
+        let mut session = Session::default();
+        session.destination = SocksAddr::Domain("www.example.com".to_string(), 443);
+
+        assert!(strategy(proxies(), &session).await.is_err());
+
+        manager.report_alive("a", true).await;
+        manager.report_alive("b", true).await;
         let first = strategy(proxies(), &session).await.unwrap();
         let second = strategy(proxies(), &session).await.unwrap();
         assert_eq!(first.name(), second.name());
