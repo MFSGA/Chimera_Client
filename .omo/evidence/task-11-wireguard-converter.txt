@@ -1,0 +1,10 @@
+Task: WireGuard config-to-HandlerOptions converter
+Reference: ref/clash-lib/src/proxy/converters/wireguard.rs
+Validation:
+- cargo test -p clash-lib wireguard_converter_ --lib --features wireguard => PASS (2)
+- cargo check -p clash-lib --features wireguard => PASS
+- cargo check -p clash-lib => PASS
+- git diff --check => PASS
+Tests cover reference field mapping (IPv4/IPv6, UDP, MTU, remote DNS, DNS servers, allowed IPs, reserved bits, dialer proxy) and rejection of IPv6 in the IPv4 field.
+Isolation: Handler construction is lazy; no WireGuard device, socket, TUN, route, DNS change, cache file, or deployed Chimera process was touched.
+Temporary deviation: runtime Handler is currently an options-only scaffold until device/stack slices land.
