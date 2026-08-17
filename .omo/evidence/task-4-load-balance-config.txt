@@ -1,0 +1,9 @@
+Task: Load-Balance proxy group config parsing parity
+Reference: ref/clash-lib/src/config/internal/proxy.rs
+Validation:
+- cargo test -p clash-lib parse_load_balance_group_strategies --lib => PASS (1 passed)
+- cargo check -p clash-lib => PASS
+- cargo fmt --check => PASS
+Notes:
+- Added consistent-hashing, round-robin, and sticky-session strategy deserialization to match ref.
+- Runtime loadbalance handler/module wiring is intentionally deferred to the next parity slice to keep this task small and independently verifiable.

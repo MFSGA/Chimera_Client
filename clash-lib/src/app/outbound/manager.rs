@@ -699,6 +699,13 @@ impl OutboundManager {
                     handlers.insert(proto.name.clone(), Arc::new(fallback));
                 }
 
+                OutboundGroupProtocol::LoadBalance(proto) => {
+                    return Err(Error::InvalidConfig(format!(
+                        "load-balance proxy group {} runtime is not implemented yet",
+                        proto.name
+                    )));
+                }
+
                 OutboundGroupProtocol::Relay(proto) => {
                     if check_group_empty(&proto.proxies, &proto.use_provider) {
                         return Err(Error::InvalidConfig(format!(

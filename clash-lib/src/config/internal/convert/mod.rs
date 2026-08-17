@@ -387,6 +387,66 @@ tun:
     }
 
     #[test]
+    fn parse_load_balance_group_strategies() {
+        let cfg = parse_config(
+            r#"
+proxies:
+  - name: "proxy-a"
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+
+proxy-groups:
+  - name: "hash-balance"
+    type: load-balance
+    proxies:
+      - "proxy-a"
+    url: "http://www.gstatic.com/generate_204"
+    interval: 300
+    strategy: consistent-hashing
+  - name: "rr-balance"
+    type: load-balance
+    proxies:
+      - "proxy-a"
+    url: "http://www.gstatic.com/generate_204"
+    interval: 60
+    strategy: round-robin
+"#,
+        );
+
+        let converted = convert(cfg).expect("internal convert should succeed");
+
+        use crate::config::internal::proxy::{
+            LoadBalanceStrategy, OutboundGroupProtocol, OutboundProxy,
+        };
+
+        let OutboundProxy::ProxyGroup(OutboundGroupProtocol::LoadBalance(hash)) =
+            converted
+                .proxy_groups
+                .get("hash-balance")
+                .expect("hash-balance group should exist")
+        else {
+            panic!("expected hash-balance load-balance group");
+        };
+        assert!(matches!(
+            hash.strategy,
+            Some(LoadBalanceStrategy::ConsistentHashing)
+        ));
+        assert_eq!(hash.interval, 300);
+
+        let OutboundProxy::ProxyGroup(OutboundGroupProtocol::LoadBalance(rr)) =
+            converted
+                .proxy_groups
+                .get("rr-balance")
+                .expect("rr-balance group should exist")
+        else {
+            panic!("expected rr-balance load-balance group");
+        };
+        assert!(matches!(rr.strategy, Some(LoadBalanceStrategy::RoundRobin)));
+        assert_eq!(rr.interval, 60);
+    }
+
+    #[test]
     fn parse_relay_group_with_proxies() {
         let cfg = parse_config(
             r#"

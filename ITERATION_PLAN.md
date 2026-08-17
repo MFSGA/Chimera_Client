@@ -159,10 +159,11 @@ Each item must be implemented, tested, and committed separately.
 
 ### Task 4: Add Load-Balance Proxy Group Config Parsing
 
+- Status: completed on `codex/continuous-iteration`; config parsing and strategy values now match the reference shape.
 - Reference: `ref/clash-lib/src/config/internal/proxy.rs` and `ref/clash-lib/src/proxy/group/loadbalance/`.
-- Current gap: `load-balance` groups and `LoadBalanceStrategy` are absent.
+- Current gap: runtime `loadbalance` handler/module wiring remains a separate parity slice; the scoped config parsing task is complete.
 - Expected test: config parsing test covering `consistent-hashing` and `round-robin` strategy values.
-- Suggested verification: `cargo test -p clash-lib <load_balance_group_test>` and `cargo check -p clash-lib`.
+- Suggested verification: `cargo test -p clash-lib parse_load_balance_group_strategies --lib` and `cargo check -p clash-lib`.
 
 ### Task 5: Add Smart Proxy Group Config Parsing
 
