@@ -1,0 +1,6 @@
+Task: Smart handler scoring/selection parity
+Reference: ref/clash-lib/src/proxy/group/smart/mod.rs
+Scope: handler state/cache loading, provider access, candidate scoring, smart selection, and adaptive retry-count calculation; actual connect/retry/API wiring remains separate.
+Validation: proxy::group::smart::tests PASS (2), cargo check PASS, git diff --check PASS.
+Tests: in-memory Noop proxies prove lower-latency candidate wins reference scoring; retry count covers reference default and explicit override.
+Isolation: no real connections, ports, DNS, TUN, routes, deployed cache.db, or deployed Chimera process touched.
