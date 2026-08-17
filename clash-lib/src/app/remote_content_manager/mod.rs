@@ -58,6 +58,25 @@ pub struct TrafficStats {
     pub is_bidirectional: bool,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum TrafficPatternType {
+    WebBrowsing,
+    VideoStreaming,
+    FileDownload,
+    FileUpload,
+    Gaming,
+    VoiceCall,
+    VideoCall,
+    Messaging,
+    Unknown,
+}
+
+#[derive(Clone, Debug)]
+pub struct TrafficPattern {
+    pub pattern_type: TrafficPatternType,
+    pub confidence: f64,
+}
+
 #[derive(Default)]
 struct ProxyState {
     alive: AtomicBool,
@@ -166,7 +185,407 @@ impl ProxyManager {
         }
     }
 
+    pub async fn analyze_traffic_pattern(
+        &self,
+        stats: &TrafficStats,
+        sess: &Session,
+    ) -> TrafficPattern {
+        if stats.bytes_uploaded + stats.bytes_downloaded < 1024 {
+            return TrafficPattern {
+                pattern_type: TrafficPatternType::Unknown,
+                confidence: 0.1,
+            };
+        }
+
+        [
+            self.detect_streaming_pattern(stats, sess),
+            self.detect_download_pattern(stats, sess),
+            self.detect_upload_pattern(stats, sess),
+            self.detect_gaming_pattern(stats, sess),
+            self.detect_voip_pattern(stats, sess),
+            self.detect_video_call_pattern(stats, sess),
+            self.detect_web_browsing_pattern(stats, sess),
+            self.detect_messaging_pattern(stats, sess),
+        ]
+        .into_iter()
+        .max_by(|a, b| {
+            a.confidence
+                .partial_cmp(&b.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or(TrafficPattern {
+            pattern_type: TrafficPatternType::Unknown,
+            confidence: 0.0,
+        })
+    }
+
+    fn detect_streaming_pattern(
+        &self,
+        stats: &TrafficStats,
+        sess: &Session,
+    ) -> TrafficPattern {
+        let total = stats.bytes_uploaded + stats.bytes_downloaded;
+        let download_ratio = if total > 0 {
+            stats.bytes_downloaded as f64 / total as f64
+        } else {
+            0.0
+        };
+        let mut confidence = 0.0;
+        let host = sess.destination.host().to_lowercase();
+        if ["youtube", "netflix", "twitch", "video", "stream", "hls"]
+            .iter()
+            .any(|needle| host.contains(needle))
+        {
+            confidence += 0.2;
+        }
+        if download_ratio > 0.88 {
+            confidence += 0.3;
+        }
+        confidence += match stats.connection_duration.as_secs() {
+            0..=60 => 0.0,
+            61..=300 => 0.1,
+            301..=1800 => 0.25,
+            _ => 0.3,
+        };
+        if stats.average_throughput > 500_000.0
+            && stats.average_throughput < 100_000_000.0
+        {
+            confidence += 0.25;
+        }
+        if stats.peak_throughput > 0.0
+            && stats.average_throughput > 0.0
+            && stats.peak_throughput / stats.average_throughput < 4.0
+        {
+            confidence += 0.15;
+        }
+        TrafficPattern {
+            pattern_type: TrafficPatternType::VideoStreaming,
+            confidence,
+        }
+    }
+
+    fn detect_download_pattern(
+        &self,
+        stats: &TrafficStats,
+        sess: &Session,
+    ) -> TrafficPattern {
+        let total = stats.bytes_uploaded + stats.bytes_downloaded;
+        let download_ratio = if total > 0 {
+            stats.bytes_downloaded as f64 / total as f64
+        } else {
+            0.0
+        };
+        let mut confidence = 0.0;
+        let host = sess.destination.host().to_lowercase();
+        if ["cdn", "download", "files", "github", "releases"]
+            .iter()
+            .any(|needle| host.contains(needle))
+        {
+            confidence += 0.2;
+        }
+        if download_ratio > 0.94 {
+            confidence += 0.4;
+        }
+        if stats.average_throughput > 5_000_000.0 {
+            confidence += 0.3;
+        }
+        confidence += match stats.bytes_downloaded {
+            10_000_000..=100_000_000 => 0.2,
+            100_000_001.. => 0.3,
+            _ => 0.0,
+        };
+        TrafficPattern {
+            pattern_type: TrafficPatternType::FileDownload,
+            confidence,
+        }
+    }
+
+    fn detect_upload_pattern(
+        &self,
+        stats: &TrafficStats,
+        sess: &Session,
+    ) -> TrafficPattern {
+        let total = stats.bytes_uploaded + stats.bytes_downloaded;
+        let upload_ratio = if total > 0 {
+            stats.bytes_uploaded as f64 / total as f64
+        } else {
+            0.0
+        };
+        let mut confidence = 0.0;
+        let host = sess.destination.host().to_lowercase();
+        if ["upload", "cloud", "drive", "storage", "backup"]
+            .iter()
+            .any(|needle| host.contains(needle))
+        {
+            confidence += 0.2;
+        }
+        if upload_ratio > 0.75 {
+            confidence += 0.4;
+        }
+        if stats.average_throughput > 2_000_000.0 {
+            confidence += 0.3;
+        }
+        if stats.bytes_uploaded > 20_000_000 {
+            confidence += 0.3;
+        }
+        TrafficPattern {
+            pattern_type: TrafficPatternType::FileUpload,
+            confidence,
+        }
+    }
+
+    fn detect_gaming_pattern(
+        &self,
+        stats: &TrafficStats,
+        sess: &Session,
+    ) -> TrafficPattern {
+        let mut confidence = 0.0;
+        let host = sess.destination.host().to_lowercase();
+        if ["game", "steam", "riot", "blizzard", "xbox", "playstation"]
+            .iter()
+            .any(|needle| host.contains(needle))
+        {
+            confidence += 0.3;
+        }
+        if matches!(sess.destination.port(), 3478..=3480 | 27000..=28000 | 7777..=7784)
+        {
+            confidence += 0.2;
+        }
+        if stats.request_frequency > 20.0 {
+            confidence += 0.3;
+        }
+        if stats.average_throughput < 1_000_000.0 && stats.is_bidirectional {
+            confidence += 0.3;
+        }
+        if stats.connection_duration.as_secs() > 600 {
+            confidence += 0.2;
+        }
+        TrafficPattern {
+            pattern_type: TrafficPatternType::Gaming,
+            confidence,
+        }
+    }
+
+    fn detect_voip_pattern(
+        &self,
+        stats: &TrafficStats,
+        sess: &Session,
+    ) -> TrafficPattern {
+        let ratio = if stats.bytes_downloaded > 0 {
+            stats.bytes_uploaded as f64 / stats.bytes_downloaded as f64
+        } else {
+            f64::INFINITY
+        };
+        let mut confidence = 0.0;
+        let host = sess.destination.host().to_lowercase();
+        if ["skype", "zoom", "teams", "discord", "webex", "voip"]
+            .iter()
+            .any(|needle| host.contains(needle))
+        {
+            confidence += 0.3;
+        }
+        if ratio > 0.4 && ratio < 2.5 {
+            confidence += 0.4;
+        }
+        if stats.average_throughput > 16_000.0
+            && stats.average_throughput < 320_000.0
+        {
+            confidence += 0.3;
+        }
+        confidence += match stats.connection_duration.as_secs() {
+            60..=3600 => 0.3,
+            3601.. => 0.2,
+            _ => 0.0,
+        };
+        TrafficPattern {
+            pattern_type: TrafficPatternType::VoiceCall,
+            confidence,
+        }
+    }
+
+    fn detect_video_call_pattern(
+        &self,
+        stats: &TrafficStats,
+        sess: &Session,
+    ) -> TrafficPattern {
+        let ratio = if stats.bytes_downloaded > 0 {
+            stats.bytes_uploaded as f64 / stats.bytes_downloaded as f64
+        } else {
+            f64::INFINITY
+        };
+        let mut confidence = 0.0;
+        let host = sess.destination.host().to_lowercase();
+        if ["zoom", "teams", "meet", "webex", "facetime", "hangouts"]
+            .iter()
+            .any(|needle| host.contains(needle))
+        {
+            confidence += 0.3;
+        }
+        if ratio > 0.2 && ratio < 5.0 {
+            confidence += 0.3;
+        }
+        if stats.average_throughput > 200_000.0
+            && stats.average_throughput < 15_000_000.0
+        {
+            confidence += 0.4;
+        }
+        if stats.connection_duration.as_secs() > 120 {
+            confidence += 0.3;
+        }
+        TrafficPattern {
+            pattern_type: TrafficPatternType::VideoCall,
+            confidence,
+        }
+    }
+
+    fn detect_web_browsing_pattern(
+        &self,
+        stats: &TrafficStats,
+        sess: &Session,
+    ) -> TrafficPattern {
+        let mut confidence = 0.0;
+        let port = sess.destination.port();
+        let host = sess.destination.host().to_lowercase();
+        if port == 80 || port == 443 {
+            confidence += 0.4;
+        }
+        if ["www", "com", "org", "net"]
+            .iter()
+            .any(|needle| host.contains(needle))
+            || host.ends_with(".io")
+        {
+            confidence += 0.1;
+        }
+        let total = stats.bytes_uploaded + stats.bytes_downloaded;
+        let download_ratio = if total > 0 {
+            stats.bytes_downloaded as f64 / total as f64
+        } else {
+            0.0
+        };
+        if download_ratio > 0.65 && download_ratio < 0.93 {
+            confidence += 0.3;
+        }
+        if stats.average_throughput > 50_000.0
+            && stats.average_throughput < 8_000_000.0
+        {
+            confidence += 0.2;
+        }
+        if stats.connection_duration.as_secs() < 1800 {
+            confidence += 0.1;
+        }
+        TrafficPattern {
+            pattern_type: TrafficPatternType::WebBrowsing,
+            confidence,
+        }
+    }
+
+    fn detect_messaging_pattern(
+        &self,
+        stats: &TrafficStats,
+        sess: &Session,
+    ) -> TrafficPattern {
+        let mut confidence = 0.0;
+        let host = sess.destination.host().to_lowercase();
+        if [
+            "whatsapp",
+            "telegram",
+            "signal",
+            "messenger",
+            "slack",
+            "discord",
+        ]
+        .iter()
+        .any(|needle| host.contains(needle))
+        {
+            confidence += 0.3;
+        }
+        if stats.average_throughput < 100_000.0 {
+            confidence += 0.4;
+        }
+        if stats.is_bidirectional
+            && stats.bytes_uploaded + stats.bytes_downloaded < 5_000_000
+        {
+            confidence += 0.3;
+        }
+        if stats.connection_duration.as_secs() > 300 {
+            confidence += 0.3;
+        }
+        TrafficPattern {
+            pattern_type: TrafficPatternType::Messaging,
+            confidence,
+        }
+    }
+
+    fn calculate_data_size_factor(&self, stats: &TrafficStats) -> f64 {
+        match stats.bytes_uploaded + stats.bytes_downloaded {
+            0..=1_000_000 => 1.0,
+            1_000_001..=100_000_000 => 1.2,
+            100_000_001..=1_000_000_000 => 1.5,
+            _ => 2.0,
+        }
+    }
+
     pub async fn get_site_tuning(&self, sess: &Session) -> SiteTuning {
+        if let Some(stats) = sess.traffic_stats.as_ref() {
+            let pattern = self.analyze_traffic_pattern(stats, sess).await;
+            if pattern.confidence > 0.6 {
+                let mut tuning = match pattern.pattern_type {
+                    TrafficPatternType::Gaming => SiteTuning {
+                        delay_weight: Some(0.1),
+                        packet_loss_weight: Some(8000.0),
+                        rtt_weight: Some(0.1),
+                        alive_penalty: Some(20000.0),
+                    },
+                    TrafficPatternType::VoiceCall => SiteTuning {
+                        delay_weight: Some(0.2),
+                        packet_loss_weight: Some(6000.0),
+                        rtt_weight: Some(0.2),
+                        alive_penalty: Some(15000.0),
+                    },
+                    TrafficPatternType::VideoCall => SiteTuning {
+                        delay_weight: Some(0.4),
+                        packet_loss_weight: Some(5000.0),
+                        rtt_weight: Some(0.3),
+                        alive_penalty: Some(12000.0),
+                    },
+                    TrafficPatternType::VideoStreaming => SiteTuning {
+                        delay_weight: Some(0.5),
+                        packet_loss_weight: Some(4000.0),
+                        rtt_weight: Some(0.4),
+                        alive_penalty: Some(10000.0),
+                    },
+                    TrafficPatternType::WebBrowsing => SiteTuning {
+                        delay_weight: Some(0.6),
+                        packet_loss_weight: Some(2000.0),
+                        rtt_weight: Some(0.5),
+                        alive_penalty: Some(6000.0),
+                    },
+                    TrafficPatternType::Messaging => SiteTuning {
+                        delay_weight: Some(0.8),
+                        packet_loss_weight: Some(1500.0),
+                        rtt_weight: Some(0.4),
+                        alive_penalty: Some(5000.0),
+                    },
+                    TrafficPatternType::FileUpload => SiteTuning {
+                        delay_weight: Some(1.2),
+                        packet_loss_weight: Some(800.0),
+                        rtt_weight: Some(0.8),
+                        alive_penalty: Some(4000.0),
+                    },
+                    TrafficPatternType::FileDownload => SiteTuning {
+                        delay_weight: Some(1.5),
+                        packet_loss_weight: Some(500.0),
+                        rtt_weight: Some(1.0),
+                        alive_penalty: Some(3000.0),
+                    },
+                    TrafficPatternType::Unknown => self.get_fallback_tuning(sess),
+                };
+                if let Some(delay_weight) = tuning.delay_weight.as_mut() {
+                    *delay_weight *= self.calculate_data_size_factor(stats);
+                }
+                return tuning;
+            }
+        }
         self.get_fallback_tuning(sess)
     }
 
@@ -721,7 +1140,7 @@ impl ProxyManager {
 mod smart_metric_tests {
     use std::{sync::Arc, time::Duration};
 
-    use super::{ProxyManager, SiteTuning};
+    use super::{ProxyManager, SiteTuning, TrafficPatternType, TrafficStats};
     use crate::{
         proxy::utils::test_utils::noop::NoopResolver,
         session::{Network, Session, SocksAddr},
@@ -800,6 +1219,52 @@ mod smart_metric_tests {
             manager.get_site_tuning(&session).await,
             SiteTuning::default()
         );
+    }
+
+    #[tokio::test]
+    async fn minimal_traffic_data_stays_unknown() {
+        let manager = manager();
+        let stats = TrafficStats {
+            bytes_uploaded: 100,
+            bytes_downloaded: 100,
+            ..Default::default()
+        };
+        let pattern = manager
+            .analyze_traffic_pattern(&stats, &Session::default())
+            .await;
+
+        assert_eq!(pattern.pattern_type, TrafficPatternType::Unknown);
+        assert_eq!(pattern.confidence, 0.1);
+    }
+
+    #[tokio::test]
+    async fn large_download_uses_file_download_tuning_and_size_scaling() {
+        let manager = manager();
+        let mut session = Session::default();
+        session.destination =
+            SocksAddr::Domain("releases.github.com".to_string(), 443);
+        session.traffic_stats = Some(TrafficStats {
+            bytes_uploaded: 1_000_000,
+            bytes_downloaded: 200_000_000,
+            connection_duration: Duration::from_secs(600),
+            average_throughput: 10_000_000.0,
+            peak_throughput: 15_000_000.0,
+            request_frequency: 1.0,
+            is_bidirectional: false,
+        });
+
+        let pattern = manager
+            .analyze_traffic_pattern(
+                session.traffic_stats.as_ref().unwrap(),
+                &session,
+            )
+            .await;
+        assert_eq!(pattern.pattern_type, TrafficPatternType::FileDownload);
+        assert!(pattern.confidence > 0.6);
+
+        let tuning = manager.get_site_tuning(&session).await;
+        assert_eq!(tuning.delay_weight, Some(2.25));
+        assert_eq!(tuning.packet_loss_weight, Some(500.0));
     }
 }
 
