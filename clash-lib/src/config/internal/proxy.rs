@@ -370,6 +370,8 @@ pub enum OutboundGroupProtocol {
     Fallback(OutboundGroupFallback),
     #[serde(rename = "load-balance")]
     LoadBalance(OutboundGroupLoadBalance),
+    #[serde(rename = "smart")]
+    Smart(OutboundGroupSmart),
     #[serde(rename = "relay")]
     Relay(OutboundGroupRelay),
     #[serde(rename = "select")]
@@ -385,9 +387,8 @@ impl OutboundGroupProtocol {
             OutboundGroupProtocol::UrlTest(g) => &g.name,
             OutboundGroupProtocol::Fallback(g) => &g.name,
             OutboundGroupProtocol::LoadBalance(g) => &g.name,
+            OutboundGroupProtocol::Smart(g) => &g.name,
             OutboundGroupProtocol::Relay(g) => &g.name,
-            /* OutboundGroupProtocol::LoadBalance(g) => &g.name,
-            OutboundGroupProtocol::Smart(g) => &g.name, */
             OutboundGroupProtocol::Select(g) => &g.name,
         }
     }
@@ -400,6 +401,7 @@ impl OutboundGroupProtocol {
             OutboundGroupProtocol::UrlTest(g) => g.proxies.as_ref(),
             OutboundGroupProtocol::Fallback(g) => g.proxies.as_ref(),
             OutboundGroupProtocol::LoadBalance(g) => g.proxies.as_ref(),
+            OutboundGroupProtocol::Smart(g) => g.proxies.as_ref(),
         }
     }
 }
@@ -460,6 +462,24 @@ pub enum LoadBalanceStrategy {
     ConsistentHashing,
     #[serde(rename = "sticky-session")]
     StickySession,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+pub struct OutboundGroupSmart {
+    pub name: String,
+    pub proxies: Option<Vec<String>>,
+    pub udp: Option<bool>,
+    #[serde(rename = "use")]
+    pub use_provider: Option<Vec<String>>,
+    pub lazy: Option<bool>,
+    pub icon: Option<String>,
+    pub url: Option<String>,
+    #[serde(rename = "max-retries")]
+    pub max_retries: Option<u32>,
+    #[serde(rename = "site-stickiness")]
+    pub site_stickiness: Option<f64>,
+    #[serde(rename = "bandwidth-weight")]
+    pub bandwidth_weight: Option<f64>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]

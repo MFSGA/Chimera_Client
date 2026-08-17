@@ -453,6 +453,57 @@ tun:
     }
 
     #[test]
+    fn parse_smart_group_options() {
+        let cfg = parse_config(
+            r#"
+proxies:
+  - name: "proxy-a"
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+
+proxy-groups:
+  - name: "smart-auto"
+    type: smart
+    proxies:
+      - "proxy-a"
+    udp: true
+    lazy: true
+    icon: "smart.svg"
+    url: "http://www.gstatic.com/generate_204"
+    max-retries: 5
+    site-stickiness: 0.75
+    bandwidth-weight: 0.25
+"#,
+        );
+
+        let converted = convert(cfg).expect("internal convert should succeed");
+        let group = converted
+            .proxy_groups
+            .get("smart-auto")
+            .expect("smart-auto group should exist");
+
+        use crate::config::internal::proxy::{OutboundGroupProtocol, OutboundProxy};
+        let OutboundProxy::ProxyGroup(OutboundGroupProtocol::Smart(smart)) = group
+        else {
+            panic!("expected smart proxy group");
+        };
+
+        assert_eq!(smart.name, "smart-auto");
+        assert_eq!(smart.proxies, Some(vec!["proxy-a".to_string()]));
+        assert_eq!(smart.udp, Some(true));
+        assert_eq!(smart.lazy, Some(true));
+        assert_eq!(smart.icon.as_deref(), Some("smart.svg"));
+        assert_eq!(
+            smart.url.as_deref(),
+            Some("http://www.gstatic.com/generate_204")
+        );
+        assert_eq!(smart.max_retries, Some(5));
+        assert_eq!(smart.site_stickiness, Some(0.75));
+        assert_eq!(smart.bandwidth_weight, Some(0.25));
+    }
+
+    #[test]
     fn parse_relay_group_with_proxies() {
         let cfg = parse_config(
             r#"

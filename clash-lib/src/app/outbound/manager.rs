@@ -772,6 +772,13 @@ impl OutboundManager {
                     );
                 }
 
+                OutboundGroupProtocol::Smart(proto) => {
+                    return Err(Error::InvalidConfig(format!(
+                        "smart proxy group {} runtime is not implemented yet",
+                        proto.name
+                    )));
+                }
+
                 OutboundGroupProtocol::Relay(proto) => {
                     if check_group_empty(&proto.proxies, &proto.use_provider) {
                         return Err(Error::InvalidConfig(format!(
