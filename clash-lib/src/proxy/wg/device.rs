@@ -1,9 +1,142 @@
+use std::{
+    collections::HashMap,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+};
+
 use bytes::{Bytes, BytesMut};
-use smoltcp::phy::Device;
-use tokio::sync::mpsc::{Receiver, Sender};
+use smoltcp::{
+    iface::{SocketHandle, SocketSet},
+    phy::Device,
+    socket::{tcp, udp},
+};
+use tokio::sync::{
+    Mutex,
+    mpsc::{Receiver, Sender},
+};
 use tracing::{Instrument, error, trace_span};
 
-use super::events::PortProtocol;
+use crate::{app::dns::ThreadSafeDNSResolver, proxy::datagram::UdpPacket};
+
+use super::{
+    events::PortProtocol,
+    ports::PortPool,
+    stack::{
+        tcp::SocketPair,
+        udp::{MAX_PACKET, UdpPair},
+    },
+};
+
+#[allow(clippy::large_enum_variant)]
+enum Socket {
+    Tcp(
+        tcp::Socket<'static>,
+        SocketAddr,
+        Sender<Bytes>,
+        Receiver<Bytes>,
+    ),
+    Udp(udp::Socket<'static>, Sender<UdpPacket>, Receiver<UdpPacket>),
+}
+
+enum SenderType {
+    Tcp(Sender<Bytes>),
+    Udp(Sender<UdpPacket>),
+}
+
+pub struct DeviceManager {
+    addr: Ipv4Addr,
+    addr_v6: Option<Ipv6Addr>,
+    resolver: ThreadSafeDNSResolver,
+    dns_servers: Vec<SocketAddr>,
+    socket_set: Arc<Mutex<SocketSet<'static>>>,
+    socket_pairs: Arc<Mutex<HashMap<SocketHandle, SenderType>>>,
+    tcp_port_pool: PortPool,
+    udp_port_pool: PortPool,
+    packet_notifier: Arc<Mutex<Receiver<()>>>,
+    socket_notifier: Sender<Socket>,
+    socket_notifier_receiver: Arc<Mutex<Receiver<Socket>>>,
+}
+
+impl DeviceManager {
+    pub fn new(
+        addr: Ipv4Addr,
+        addr_v6: Option<Ipv6Addr>,
+        resolver: ThreadSafeDNSResolver,
+        dns_servers: Vec<SocketAddr>,
+        packet_notifier: Receiver<()>,
+    ) -> Self {
+        let (socket_notifier, socket_notifier_receiver) =
+            tokio::sync::mpsc::channel(1024);
+        Self {
+            addr,
+            addr_v6,
+            resolver,
+            dns_servers,
+            socket_set: Arc::new(Mutex::new(SocketSet::new(Vec::new()))),
+            socket_pairs: Arc::new(Mutex::new(HashMap::new())),
+            tcp_port_pool: PortPool::new(),
+            udp_port_pool: PortPool::new(),
+            packet_notifier: Arc::new(Mutex::new(packet_notifier)),
+            socket_notifier,
+            socket_notifier_receiver: Arc::new(Mutex::new(socket_notifier_receiver)),
+        }
+    }
+
+    pub async fn new_tcp_socket(&self, remote: SocketAddr) -> SocketPair {
+        let socket = Self::new_client_socket();
+        let read_pair = tokio::sync::mpsc::channel(1024);
+        let write_pair = tokio::sync::mpsc::channel(1024);
+        self.socket_notifier
+            .send(Socket::Tcp(socket, remote, read_pair.0, write_pair.1))
+            .await
+            .expect("wireguard socket manager should be alive");
+        SocketPair::new(read_pair.1, write_pair.0)
+    }
+
+    pub async fn new_udp_socket(&self) -> UdpPair {
+        let socket = Self::new_client_datagram();
+        let read_pair = tokio::sync::mpsc::channel(1024);
+        let write_pair = tokio::sync::mpsc::channel(1024);
+        self.socket_notifier
+            .send(Socket::Udp(socket, read_pair.0, write_pair.1))
+            .await
+            .expect("wireguard socket manager should be alive");
+        UdpPair::new(read_pair.1, write_pair.0)
+    }
+
+    async fn get_ephemeral_tcp_port(&self) -> u16 {
+        self.tcp_port_pool.next().await.unwrap()
+    }
+
+    async fn release_ephemeral_tcp_port(&self, port: u16) {
+        self.tcp_port_pool.release(port).await;
+    }
+
+    async fn get_ephemeral_udp_port(&self) -> u16 {
+        self.udp_port_pool.next().await.unwrap()
+    }
+
+    async fn release_ephemeral_udp_port(&self, port: u16) {
+        self.udp_port_pool.release(port).await;
+    }
+
+    fn new_client_socket() -> tcp::Socket<'static> {
+        tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0; 65535]),
+            tcp::SocketBuffer::new(vec![0; 65535]),
+        )
+    }
+
+    fn new_client_datagram() -> udp::Socket<'static> {
+        let rx_meta = vec![udp::PacketMetadata::EMPTY; 10];
+        let tx_meta = vec![udp::PacketMetadata::EMPTY; 10];
+        let rx_data = vec![0u8; MAX_PACKET];
+        let tx_data = vec![0u8; MAX_PACKET];
+        let rx_buffer = udp::PacketBuffer::new(rx_meta, rx_data);
+        let tx_buffer = udp::PacketBuffer::new(tx_meta, tx_data);
+        udp::Socket::new(rx_buffer, tx_buffer)
+    }
+}
 
 pub struct VirtualIpDevice {
     mtu: usize,
@@ -130,10 +263,50 @@ impl smoltcp::phy::TxToken for TxToken {
 
 #[cfg(test)]
 mod tests {
+    use std::{net::SocketAddr, sync::Arc};
+
     use bytes::Bytes;
     use smoltcp::phy::{Device, Medium, RxToken as _, TxToken as _};
 
     use super::*;
+    use crate::proxy::utils::test_utils::noop::NoopResolver;
+
+    fn device_manager() -> DeviceManager {
+        let (_packet_tx, packet_rx) = tokio::sync::mpsc::channel(4);
+        DeviceManager::new(
+            Ipv4Addr::new(10, 0, 0, 2),
+            None,
+            Arc::new(NoopResolver),
+            vec![],
+            packet_rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn wireguard_device_manager_creates_virtual_tcp_and_udp_sockets() {
+        let manager = device_manager();
+        let remote: SocketAddr = "203.0.113.5:443".parse().unwrap();
+
+        let _tcp = manager.new_tcp_socket(remote).await;
+        let tcp_event = manager
+            .socket_notifier_receiver
+            .lock()
+            .await
+            .recv()
+            .await
+            .unwrap();
+        assert!(matches!(tcp_event, Socket::Tcp(_, addr, _, _) if addr == remote));
+
+        let _udp = manager.new_udp_socket().await;
+        let udp_event = manager
+            .socket_notifier_receiver
+            .lock()
+            .await
+            .recv()
+            .await
+            .unwrap();
+        assert!(matches!(udp_event, Socket::Udp(_, _, _)));
+    }
 
     #[tokio::test]
     async fn wireguard_virtual_device_tokens_use_memory_channels() {

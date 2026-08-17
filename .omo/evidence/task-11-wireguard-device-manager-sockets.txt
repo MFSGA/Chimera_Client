@@ -1,0 +1,4 @@
+Task: WireGuard DeviceManager virtual socket creation
+Reference: ref/clash-lib/src/proxy/wg/device.rs
+Validation: device-manager socket test PASS; virtual-device tests PASS; wireguard feature check PASS; default check PASS; diff check PASS.
+Isolation: Tokio/smoltcp in-memory sockets only. No OS bind, WireGuard peer, TUN, routes, DNS, cache, or deployed Chimera process touched.
