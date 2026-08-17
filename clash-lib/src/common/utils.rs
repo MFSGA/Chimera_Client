@@ -1,4 +1,8 @@
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use futures::StreamExt;
 use http_body_util::{BodyDataStream, Empty};
@@ -13,6 +17,13 @@ use crate::{
 };
 use sha2::Digest;
 use std::fmt::Write;
+
+pub fn current_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 pub fn default_bool_true() -> bool {
     true
