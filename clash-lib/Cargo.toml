@@ -18,6 +18,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec", "net", "rt"] }
 futures = "0.3"
 async-trait = "0.1"
+async-recursion = "1"
 http = "1"
 hyper = { version = "1", features = ["http1", "http2", "client", "server"] }
 hyper-util = { version = "0.1", features = ["full"] }

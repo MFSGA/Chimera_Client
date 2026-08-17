@@ -1,0 +1,9 @@
+Task: WireGuard tunnel receive/heartbeat/decapsulation slice
+Reference: ref/clash-lib/src/proxy/wg/wireguard.rs
+Validation:
+- cargo test -p clash-lib wireguard_reserved_bits_ --lib --features wireguard => PASS (2)
+- cargo check -p clash-lib --features wireguard => PASS
+- cargo check -p clash-lib => PASS
+- git diff --check => PASS
+Scope: polling, heartbeat timers, ConnectionExpired handshake initiation, receive/decapsulation, allowed-IP filtering, and dispatch to internal virtual-device channel.
+Isolation: tests exercise reserved-bit helpers only; receive/new are not called, so no UDP socket, WireGuard peer, TUN, route, DNS, cache, or deployed Chimera process is touched.
