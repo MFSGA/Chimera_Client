@@ -1,0 +1,9 @@
+Task: Smart proxy group runtime completion
+Reference: ref/clash-lib/src/proxy/group/smart/ plus outbound manager/profile/remote-content-manager wiring
+Validation:
+- cargo test -p clash-lib proxy::group::smart::tests --lib => PASS (3)
+- cargo test -p clash-lib smart --lib => PASS (26)
+- cargo check -p clash-lib => PASS
+- git diff --check => PASS
+Isolation: tests use Noop proxies, in-memory state, and tempfile cache only. No real proxy connection, fixed port, DNS listener, TUN interface, route, system DNS, deployed cache.db, or deployed Chimera process was touched.
+Network/Docker smoke test from ref was intentionally not run because this machine hosts an older deployed version.
