@@ -35,6 +35,12 @@ pub enum InboundOpts {
         #[serde(default = "default_bool_true")]
         udp: bool,
     },
+    #[cfg(feature = "redir")]
+    #[serde(alias = "redir")]
+    Redir {
+        #[serde(flatten)]
+        common_opts: CommonInboundOpts,
+    },
     #[cfg(feature = "shadowsocks")]
     #[serde(alias = "shadowsocks")]
     Shadowsocks {
@@ -72,6 +78,8 @@ impl InboundOpts {
             InboundOpts::Http { common_opts, .. } => common_opts,
             #[cfg(feature = "mixed_port")]
             InboundOpts::Mixed { common_opts, .. } => common_opts,
+            #[cfg(feature = "redir")]
+            InboundOpts::Redir { common_opts, .. } => common_opts,
             #[cfg(feature = "shadowsocks")]
             InboundOpts::Shadowsocks { common_opts, .. } => common_opts,
             #[cfg(feature = "anytls")]
@@ -86,6 +94,8 @@ impl InboundOpts {
             InboundOpts::Http { common_opts, .. } => common_opts,
             #[cfg(feature = "mixed_port")]
             InboundOpts::Mixed { common_opts, .. } => common_opts,
+            #[cfg(feature = "redir")]
+            InboundOpts::Redir { common_opts, .. } => common_opts,
             #[cfg(feature = "shadowsocks")]
             InboundOpts::Shadowsocks { common_opts, .. } => common_opts,
             #[cfg(feature = "anytls")]
@@ -100,6 +110,8 @@ impl InboundOpts {
             InboundOpts::Socks { .. } => "socks",
             #[cfg(feature = "mixed_port")]
             InboundOpts::Mixed { .. } => "mixed",
+            #[cfg(feature = "redir")]
+            InboundOpts::Redir { .. } => "redir",
             #[cfg(feature = "shadowsocks")]
             InboundOpts::Shadowsocks { .. } => "shadowsocks",
             #[cfg(feature = "anytls")]

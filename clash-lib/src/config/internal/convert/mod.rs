@@ -295,6 +295,29 @@ tun:
         assert!(converted.tun.route_all);
     }
 
+    #[cfg(feature = "redir")]
+    #[test]
+    fn top_level_redir_port_creates_redir_listener() {
+        let cfg = parse_config(
+            r#"
+redir-port: 7892
+routing-mark: 6666
+"#,
+        );
+
+        let converted = convert(cfg).expect("internal convert should succeed");
+        let listener = converted
+            .listeners
+            .iter()
+            .find(|listener| listener.type_name() == "redir")
+            .expect("redir listener should be created");
+
+        let common = listener.common_opts();
+        assert_eq!(common.name, "REDIR-IN");
+        assert_eq!(common.port, 7892);
+        assert_eq!(common.fw_mark, Some(6666));
+    }
+
     #[test]
     fn fake_ip_mode_adds_route_for_separate_default_pool() {
         let mut cfg = parse_config(

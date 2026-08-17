@@ -20,6 +20,8 @@ pub(super) fn convert(
     let socks_port = c.socks_port;
     #[cfg(feature = "mixed_port")]
     let mixed_port = c.mixed_port;
+    #[cfg(feature = "redir")]
+    let redir_port = c.redir_port;
     let bind_address = if c.bind_address == BindAddress::default() && c.ipv6 {
         BindAddress::dual_stack()
     } else {
@@ -95,10 +97,23 @@ pub(super) fn convert(
             "ignoring top-level `mixed-port` because `mixed_port` feature is disabled"
         );
     }
+    #[cfg(feature = "redir")]
+    if let Some(Port(redir_port)) = redir_port
+        && !all_inbounds.insert(InboundOpts::Redir {
+            common_opts: CommonInboundOpts {
+                name: "REDIR-IN".into(),
+                listen: bind_address,
+                port: redir_port,
+                allow_lan: c.allow_lan.unwrap_or_default(),
+                fw_mark: c.routing_mark,
+            },
+        })
+    {
+        warn!("Duplicate REDIR inbound listener found: {}", redir_port);
+    }
+    #[cfg(not(feature = "redir"))]
     if c.redir_port.is_some() {
-        warn!(
-            "ignoring top-level `redir-port` because redir inbound is not implemented"
-        );
+        warn!("ignoring top-level `redir-port` because `redir` feature is disabled");
     }
     if c.tproxy_port.is_some() {
         warn!(

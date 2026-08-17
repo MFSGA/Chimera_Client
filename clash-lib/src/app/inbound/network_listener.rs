@@ -11,6 +11,8 @@ use crate::proxy::anytls::inbound::{
 use crate::proxy::http::HttpInbound;
 #[cfg(feature = "mixed_port")]
 use crate::proxy::mixed::MixedInbound;
+#[cfg(all(target_os = "linux", feature = "redir"))]
+use crate::proxy::redir::RedirInbound;
 #[cfg(feature = "shadowsocks")]
 use crate::proxy::shadowsocks::inbound::{
     InboundOptions as ShadowsocksInboundOptions, ShadowsocksInbound,
@@ -107,6 +109,27 @@ fn build_handler(
             authenticator,
             fw_mark,
         ))),
+        #[cfg(feature = "redir")]
+        InboundOpts::Redir {
+            #[cfg(target_os = "linux")]
+            common_opts,
+            ..
+        } => {
+            #[cfg(target_os = "linux")]
+            {
+                Some(Arc::new(RedirInbound::new(
+                    (common_opts.listen.0, common_opts.port).into(),
+                    common_opts.allow_lan,
+                    dispatcher,
+                    fw_mark,
+                )))
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                warn!("redir is not supported on this platform");
+                None
+            }
+        }
         #[cfg(feature = "shadowsocks")]
         InboundOpts::Shadowsocks {
             common_opts,
