@@ -167,10 +167,10 @@ Each item must be implemented, tested, and committed separately.
 
 ### Task 5: Add Smart Proxy Group Config Parsing
 
-- Status: completed for config parsing on `codex/continuous-iteration`; Smart group config fields and group dependency accessors match the reference shape. Runtime prerequisites are being added in separate slices; proxy penalty, `SiteStats`, and `TrafficStatsCollector` are complete.
-- Reference: `ref/clash-lib/src/config/internal/proxy.rs`, `ref/clash-lib/src/app/outbound/utils.rs`, and `ref/clash-lib/src/proxy/group/smart/{penalty,stats}.rs`.
-- Current gap: Smart state integration and runtime selection handler wiring remain. `proxy::group::smart` temporarily carries a local `dead_code` allowance until a later runtime slice consumes the prerequisite modules.
-- Expected test: config/DAG coverage plus direct unit tests matching `ref` for penalty behavior, site metrics, and traffic collection.
+- Status: completed for config parsing on `codex/continuous-iteration`; Smart group config fields and group dependency accessors match the reference shape. Runtime prerequisites are being added in separate slices; proxy penalty, site/traffic statistics, and `SmartState` integration are complete.
+- Reference: `ref/clash-lib/src/config/internal/proxy.rs`, `ref/clash-lib/src/app/outbound/utils.rs`, and `ref/clash-lib/src/proxy/group/smart/{penalty,stats,state}.rs`.
+- Current gap: Smart runtime selection handler/scoring wiring remains. `proxy::group::smart` temporarily carries a local `dead_code` allowance until the runtime handler consumes these prerequisite modules.
+- Expected test: config/DAG coverage plus direct unit tests matching `ref` for penalty behavior, site metrics, traffic collection, and state integration.
 - Suggested verification: `cargo test -p clash-lib parse_smart_group_options --lib`, `cargo test -p clash-lib smart_group_participates_in_dag_sort --lib`, `cargo test -p clash-lib smart::stats --lib`, and `cargo check -p clash-lib`.
 
 ### Task 6: Add VMess Outbound Config And Converter
