@@ -113,6 +113,7 @@ smoltcp = { version = "0.13", default-features = false, features = [
     "socket-tcp",
 ], optional = true }
 etherparse = { version = "0.20", optional = true }
+unix-udp-sock = { git = "https://github.com/Watfaq/unix-udp-sock.git", rev = "847c80b519f0fd8cff5c887ae708429897d08671", optional = true }
 
 base64 = "0.22"
 
@@ -191,7 +192,7 @@ tun = [
     # "dep:network-interface",
     # "dep:url",
 ]
-tproxy = ["dep:etherparse"]
+tproxy = ["dep:etherparse", "dep:unix-udp-sock"]
 redir = []
 http_port = []
 mixed_port = ["http_port"]

@@ -43,6 +43,8 @@ pub mod redir;
 #[cfg(feature = "shadowsocks")]
 pub mod shadowsocks;
 pub mod socks;
+#[cfg(all(target_os = "linux", feature = "tproxy"))]
+pub mod tproxy;
 #[cfg(feature = "trojan")]
 pub mod trojan;
 #[cfg(feature = "tun")]

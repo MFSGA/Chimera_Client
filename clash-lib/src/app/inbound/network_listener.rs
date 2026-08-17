@@ -17,6 +17,8 @@ use crate::proxy::redir::RedirInbound;
 use crate::proxy::shadowsocks::inbound::{
     InboundOptions as ShadowsocksInboundOptions, ShadowsocksInbound,
 };
+#[cfg(all(target_os = "linux", feature = "tproxy"))]
+use crate::proxy::tproxy::TproxyInbound;
 use crate::{
     app::dispatcher::Dispatcher,
     common::auth::ThreadSafeAuthenticator,
@@ -110,9 +112,26 @@ fn build_handler(
             fw_mark,
         ))),
         #[cfg(feature = "tproxy")]
-        InboundOpts::TProxy { .. } => {
-            warn!("tproxy runtime listener is not wired yet");
-            None
+        InboundOpts::TProxy {
+            #[cfg(target_os = "linux")]
+            common_opts,
+            ..
+        } => {
+            #[cfg(target_os = "linux")]
+            {
+                Some(Arc::new(TproxyInbound::new(
+                    (common_opts.listen.0, common_opts.port).into(),
+                    common_opts.allow_lan,
+                    dispatcher,
+                    fw_mark,
+                )))
+            }
+
+            #[cfg(not(target_os = "linux"))]
+            {
+                warn!("tproxy is not supported on this platform");
+                None
+            }
         }
         #[cfg(feature = "redir")]
         InboundOpts::Redir {

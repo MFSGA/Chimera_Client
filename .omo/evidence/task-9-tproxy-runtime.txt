@@ -1,0 +1,8 @@
+Task: TProxy runtime/module wiring parity
+Reference: ref/clash-lib/src/proxy/tproxy/ and ref network listener wiring
+Validation:
+- cargo check -p clash-lib --features tproxy => PASS
+- cargo check -p clash-lib --features tproxy,redir => PASS
+Notes:
+- unix-udp-sock is optional and enabled only by the tproxy feature locally.
+- Privileged packet-flow E2E is not part of this module-wiring task.

@@ -820,7 +820,7 @@ dependencies = [
  "shadowsocks",
  "smoltcp 0.13.1",
  "sock2proc",
- "socket2",
+ "socket2 0.6.4",
  "subtle",
  "syn",
  "sysinfo",
@@ -840,6 +840,7 @@ dependencies = [
  "tracing-log",
  "tracing-subscriber",
  "tun-rs",
+ "unix-udp-sock",
  "url",
  "uuid",
  "watfaq-netstack",
@@ -2158,7 +2159,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2",
+ "socket2 0.6.4",
  "system-configuration",
  "tokio",
  "tower-layer",
@@ -2377,7 +2378,7 @@ version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4d40460c0ce33d6ce4b0630ad68ff63d6661961c48b6dba35e5a4d81cfb48222"
 dependencies = [
- "socket2",
+ "socket2 0.6.4",
  "widestring",
  "windows-registry",
  "windows-result 0.4.1",
@@ -3519,7 +3520,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.2",
  "rustls",
- "socket2",
+ "socket2 0.6.4",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3557,7 +3558,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2",
+ "socket2 0.6.4",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -4184,7 +4185,7 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "shadowsocks-crypto",
- "socket2",
+ "socket2 0.6.4",
  "spin 0.10.0",
  "thiserror 2.0.18",
  "tokio",
@@ -4349,6 +4350,16 @@ dependencies = [
  "sysctl",
  "tracing",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "socket2"
+version = "0.4.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f7916fc008ca5542385b89a3d3ce689953c143e9304a9bf8beec1de48994c0d"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]
@@ -4650,7 +4661,7 @@ dependencies = [
  "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
- "socket2",
+ "socket2 0.6.4",
  "tokio-macros",
  "tracing",
  "windows-sys 0.61.2",
@@ -4711,7 +4722,7 @@ dependencies = [
  "log",
  "once_cell",
  "pin-project",
- "socket2",
+ "socket2 0.6.4",
  "tokio",
  "windows-sys 0.60.2",
 ]
@@ -4980,6 +4991,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "unix-udp-sock"
+version = "0.7.0"
+source = "git+https://github.com/Watfaq/unix-udp-sock.git?rev=847c80b519f0fd8cff5c887ae708429897d08671#847c80b519f0fd8cff5c887ae708429897d08671"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "futures-sink",
+ "libc",
+ "pin-project-lite",
+ "socket2 0.4.10",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "unsafe-libyaml"
 version = "0.2.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5185,7 +5212,7 @@ dependencies = [
  "netstack-smoltcp",
  "rand 0.10.1",
  "smoltcp 0.13.1",
- "socket2",
+ "socket2 0.6.4",
  "tokio",
  "tracing",
  "tracing-subscriber",
