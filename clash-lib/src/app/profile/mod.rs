@@ -10,9 +10,8 @@ struct Db {
     ip_to_host: HashMap<String, String>,
     #[serde(default)]
     host_to_ip: HashMap<String, String>,
-    // todo: implement smart stats persistence in the future
-    // #[serde(default)]
-    // smart_stats: HashMap<String, crate::proxy::group::smart::state::SmartStateData>,
+    #[serde(default)]
+    smart_stats: HashMap<String, crate::proxy::group::smart::state::SmartStateData>,
     #[serde(default)]
     smart_policy_priority: HashMap<String, String>,
 }
@@ -95,6 +94,21 @@ impl ThreadSafeCacheFile {
     pub async fn delete_fake_ip_pair(&self, ip: &str, host: &str) {
         self.0.write().await.delete_fake_ip_pair(ip, host);
     }
+
+    pub async fn set_smart_stats(
+        &self,
+        group_name: &str,
+        stats: crate::proxy::group::smart::state::SmartStateData,
+    ) {
+        self.0.write().await.set_smart_stats(group_name, stats);
+    }
+
+    pub async fn get_smart_stats(
+        &self,
+        group_name: &str,
+    ) -> Option<crate::proxy::group::smart::state::SmartStateData> {
+        self.0.read().await.get_smart_stats(group_name)
+    }
 }
 
 struct CacheFile {
@@ -117,7 +131,7 @@ impl CacheFile {
                         selected: HashMap::new(),
                         ip_to_host: HashMap::new(),
                         host_to_ip: HashMap::new(),
-                        // smart_stats: HashMap::new(),
+                        smart_stats: HashMap::new(),
                         smart_policy_priority: HashMap::new(),
                     }
                 }
@@ -128,7 +142,7 @@ impl CacheFile {
                     selected: HashMap::new(),
                     ip_to_host: HashMap::new(),
                     host_to_ip: HashMap::new(),
-                    // smart_stats: HashMap::new(),
+                    smart_stats: HashMap::new(),
                     smart_policy_priority: HashMap::new(),
                 }
             }
@@ -166,6 +180,49 @@ impl CacheFile {
     pub fn delete_fake_ip_pair(&mut self, ip: &str, host: &str) {
         self.db.ip_to_host.remove(ip);
         self.db.host_to_ip.remove(host);
+    }
+
+    pub fn set_smart_stats(
+        &mut self,
+        group_name: &str,
+        stats: crate::proxy::group::smart::state::SmartStateData,
+    ) {
+        self.db.smart_stats.insert(group_name.to_string(), stats);
+    }
+
+    pub fn get_smart_stats(
+        &self,
+        group_name: &str,
+    ) -> Option<crate::proxy::group::smart::state::SmartStateData> {
+        self.db.smart_stats.get(group_name).cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::proxy::group::smart::state::SmartState;
+
+    use super::ThreadSafeCacheFile;
+
+    #[tokio::test]
+    async fn smart_stats_round_trip_uses_isolated_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("smart-cache.yaml");
+        let cache = ThreadSafeCacheFile::new(path.to_str().unwrap(), false);
+
+        let mut state = SmartState::new();
+        state.record_connection_result("proxy-a", "example.com", None, 250.0, false);
+        cache
+            .set_smart_stats("smart-group", state.export_data())
+            .await;
+
+        let restored = cache
+            .get_smart_stats("smart-group")
+            .await
+            .expect("smart stats should round trip");
+        assert!(restored.penalty["proxy-a"].value() > 0.0);
+        assert!(restored.site_stats["proxy-a"].contains_key("example.com"));
+        assert!(cache.get_smart_stats("missing").await.is_none());
     }
 }
 
