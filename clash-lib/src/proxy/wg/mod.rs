@@ -2,7 +2,9 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::proxy::HandlerCommonOptions;
 
+pub(crate) mod events;
 pub(crate) mod keys;
+pub(crate) mod ports;
 
 pub struct HandlerOptions {
     pub name: String,

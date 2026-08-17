@@ -1,0 +1,9 @@
+Task: WireGuard virtual port pool/events prerequisite
+Reference: ref/clash-lib/src/proxy/wg/{events,ports}.rs
+Validation:
+- cargo test -p clash-lib wireguard_port_pool_ --lib --features wireguard => PASS (2)
+- cargo check -p clash-lib --features wireguard => PASS
+- cargo check -p clash-lib => PASS
+- git diff --check => PASS
+Tests cover virtual-port exhaustion/release and allocation range.
+Isolation: these are in-memory virtual port numbers only; no OS port is bound and no WireGuard device, TUN, route, DNS, cache, or deployed Chimera process is touched.
