@@ -134,6 +134,30 @@ impl ProxyManager {
         if alive { delay } else { None }
     }
 
+    pub async fn get_packet_loss(&self, name: &str) -> Option<f64> {
+        let history = self.delay_history(name).await;
+        if history.is_empty() {
+            None
+        } else {
+            let failed_count = history.iter().filter(|x| x.delay.is_zero()).count();
+            Some(failed_count as f64 / history.len() as f64)
+        }
+    }
+
+    pub async fn get_rtt(&self, name: &str) -> Option<f64> {
+        let history = self.delay_history(name).await;
+        if history.is_empty() {
+            None
+        } else {
+            let avg_rtt = history
+                .iter()
+                .map(|x| x.delay.as_secs_f64() * 1000.0)
+                .sum::<f64>()
+                / history.len() as f64;
+            Some(avg_rtt)
+        }
+    }
+
     pub async fn report_delay(
         &self,
         name: &str,
@@ -649,6 +673,48 @@ impl ProxyManager {
     // pub fn fw_mark(&self) -> Option<u32> {
     //     self.fw_mark
     // }
+}
+
+#[cfg(test)]
+mod smart_metric_tests {
+    use std::{sync::Arc, time::Duration};
+
+    use super::ProxyManager;
+    use crate::proxy::utils::test_utils::noop::NoopResolver;
+
+    fn manager() -> ProxyManager {
+        ProxyManager::new(Arc::new(NoopResolver), None)
+    }
+
+    #[tokio::test]
+    async fn packet_loss_counts_zero_delay_samples() {
+        let manager = manager();
+        manager
+            .report_delay("proxy", true, Some(Duration::from_millis(100)))
+            .await;
+        manager
+            .report_delay("proxy", false, Some(Duration::ZERO))
+            .await;
+        manager
+            .report_delay("proxy", true, Some(Duration::from_millis(300)))
+            .await;
+
+        assert_eq!(manager.get_packet_loss("proxy").await, Some(1.0 / 3.0));
+    }
+
+    #[tokio::test]
+    async fn rtt_averages_recorded_delay_history() {
+        let manager = manager();
+        manager
+            .report_delay("proxy", true, Some(Duration::from_millis(100)))
+            .await;
+        manager
+            .report_delay("proxy", true, Some(Duration::from_millis(300)))
+            .await;
+
+        assert_eq!(manager.get_rtt("proxy").await, Some(200.0));
+        assert_eq!(manager.get_rtt("missing").await, None);
+    }
 }
 
 #[cfg(feature = "extended-health-check")]
