@@ -79,6 +79,14 @@ pub struct ProxyManager {
     fw_mark: Option<u32>,
 }
 
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct SiteTuning {
+    pub delay_weight: Option<f64>,
+    pub packet_loss_weight: Option<f64>,
+    pub rtt_weight: Option<f64>,
+    pub alive_penalty: Option<f64>,
+}
+
 impl ProxyManager {
     pub fn new(dns_resolver: ThreadSafeDNSResolver, fw_mark: Option<u32>) -> Self {
         Self {
@@ -155,6 +163,40 @@ impl ProxyManager {
                 .sum::<f64>()
                 / history.len() as f64;
             Some(avg_rtt)
+        }
+    }
+
+    pub async fn get_site_tuning(&self, sess: &Session) -> SiteTuning {
+        self.get_fallback_tuning(sess)
+    }
+
+    fn get_fallback_tuning(&self, sess: &Session) -> SiteTuning {
+        let is_udp = matches!(sess.network, Network::Udp);
+        let port = sess.destination.port();
+
+        if is_udp {
+            SiteTuning {
+                delay_weight: Some(0.3),
+                packet_loss_weight: Some(3000.0),
+                rtt_weight: Some(0.3),
+                alive_penalty: Some(15000.0),
+            }
+        } else if port == 80 || port == 443 {
+            SiteTuning {
+                delay_weight: Some(0.7),
+                packet_loss_weight: Some(2000.0),
+                rtt_weight: Some(0.7),
+                alive_penalty: Some(8000.0),
+            }
+        } else if matches!(port, 21 | 22 | 115 | 989 | 990) {
+            SiteTuning {
+                delay_weight: Some(1.2),
+                packet_loss_weight: Some(1000.0),
+                rtt_weight: Some(1.2),
+                alive_penalty: Some(5000.0),
+            }
+        } else {
+            SiteTuning::default()
         }
     }
 
@@ -679,8 +721,11 @@ impl ProxyManager {
 mod smart_metric_tests {
     use std::{sync::Arc, time::Duration};
 
-    use super::ProxyManager;
-    use crate::proxy::utils::test_utils::noop::NoopResolver;
+    use super::{ProxyManager, SiteTuning};
+    use crate::{
+        proxy::utils::test_utils::noop::NoopResolver,
+        session::{Network, Session, SocksAddr},
+    };
 
     fn manager() -> ProxyManager {
         ProxyManager::new(Arc::new(NoopResolver), None)
@@ -714,6 +759,47 @@ mod smart_metric_tests {
 
         assert_eq!(manager.get_rtt("proxy").await, Some(200.0));
         assert_eq!(manager.get_rtt("missing").await, None);
+    }
+
+    #[tokio::test]
+    async fn fallback_tuning_prioritizes_udp_latency() {
+        let manager = manager();
+        let mut session = Session::default();
+        session.network = Network::Udp;
+        session.destination = SocksAddr::Domain("game.example".to_string(), 9999);
+
+        assert_eq!(
+            manager.get_site_tuning(&session).await,
+            SiteTuning {
+                delay_weight: Some(0.3),
+                packet_loss_weight: Some(3000.0),
+                rtt_weight: Some(0.3),
+                alive_penalty: Some(15000.0),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_tuning_matches_http_and_file_transfer_ports() {
+        let manager = manager();
+        let mut session = Session::default();
+        session.destination = SocksAddr::Domain("web.example".to_string(), 443);
+        assert_eq!(
+            manager.get_site_tuning(&session).await.delay_weight,
+            Some(0.7)
+        );
+
+        session.destination = SocksAddr::Domain("files.example".to_string(), 22);
+        assert_eq!(
+            manager.get_site_tuning(&session).await.delay_weight,
+            Some(1.2)
+        );
+
+        session.destination = SocksAddr::Domain("other.example".to_string(), 12345);
+        assert_eq!(
+            manager.get_site_tuning(&session).await,
+            SiteTuning::default()
+        );
     }
 }
 
