@@ -1,0 +1,13 @@
+Task: Smart proxy penalty runtime prerequisite
+Reference: ref/clash-lib/src/proxy/group/smart/penalty.rs and ref/clash-lib/src/common/utils.rs
+Implementation:
+- Added current_timestamp_secs helper matching ref semantics.
+- Added Smart ProxyPenalty with exponential failure growth, 80% reward reduction, and 10-second half-life decay.
+- Added a temporary module-local dead_code allowance because the Smart handler/state consumer has not landed yet; remove it when runtime wiring consumes the module.
+Tests/validation:
+- cargo fmt --check => PASS
+- cargo test -p clash-lib penalty_ --lib => PASS (4 passed, 0 failed)
+- cargo check -p clash-lib => PASS
+- git diff --check => PASS
+Environment safety:
+- Pure unit/compile verification only; no ports, DNS, TUN, routes, cache files, or deployed processes touched.

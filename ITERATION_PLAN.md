@@ -167,11 +167,11 @@ Each item must be implemented, tested, and committed separately.
 
 ### Task 5: Add Smart Proxy Group Config Parsing
 
-- Status: completed on `codex/continuous-iteration`; Smart group config fields and group dependency accessors now match the reference shape.
-- Reference: `ref/clash-lib/src/config/internal/proxy.rs` and the Smart group coverage in `ref/clash-lib/src/app/outbound/utils.rs`.
-- Current gap: Smart runtime selection/statistics modules remain a separate parity slice; the scoped config parsing task is complete.
-- Expected test: config parsing test for `type: smart` with proxy references and Smart tuning fields, plus DAG sorting coverage based on the reference group test.
-- Suggested verification: `cargo test -p clash-lib parse_smart_group_options --lib`, `cargo test -p clash-lib smart_group_participates_in_dag_sort --lib`, and `cargo check -p clash-lib`.
+- Status: completed for config parsing on `codex/continuous-iteration`; Smart group config fields and group dependency accessors match the reference shape. Runtime prerequisites are now being added in separate slices; the proxy penalty mechanism is complete.
+- Reference: `ref/clash-lib/src/config/internal/proxy.rs`, `ref/clash-lib/src/app/outbound/utils.rs`, and `ref/clash-lib/src/proxy/group/smart/penalty.rs`.
+- Current gap: Smart state/statistics and runtime selection handler wiring remain. `proxy::group::smart` temporarily carries a local `dead_code` allowance until a later runtime slice consumes the prerequisite modules.
+- Expected test: config parsing and DAG sorting coverage plus direct unit tests for Smart penalty growth, reward, and time decay matching `ref` behavior.
+- Suggested verification: `cargo test -p clash-lib parse_smart_group_options --lib`, `cargo test -p clash-lib smart_group_participates_in_dag_sort --lib`, `cargo test -p clash-lib penalty_ --lib`, and `cargo check -p clash-lib`.
 
 ### Task 6: Add VMess Outbound Config And Converter
 
