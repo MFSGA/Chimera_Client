@@ -40,7 +40,7 @@ use crate::{
         group::{
             fallback, loadbalance, relay,
             selector::{self, ThreadSafeSelectorControl},
-            urltest,
+            smart, urltest,
         },
         reject, socks,
         utils::{DirectConnector, OutboundHandlerRegistry, ProxyConnector},
@@ -773,10 +773,48 @@ impl OutboundManager {
                 }
 
                 OutboundGroupProtocol::Smart(proto) => {
-                    return Err(Error::InvalidConfig(format!(
-                        "smart proxy group {} runtime is not implemented yet",
-                        proto.name
-                    )));
+                    if check_group_empty(&proto.proxies, &proto.use_provider) {
+                        return Err(Error::InvalidConfig(format!(
+                            "proxy group {} has no proxies",
+                            proto.name
+                        )));
+                    }
+
+                    let mut providers: Vec<ThreadSafeProxyProvider> = vec![];
+                    if let Some(proxies) = &proto.proxies {
+                        providers.push(make_provider_from_proxies(
+                            &proto.name,
+                            proxies,
+                            0,
+                            proto.lazy.unwrap_or_default(),
+                            handlers,
+                            proxy_manager.clone(),
+                            provider_registry,
+                        )?);
+                    }
+                    maybe_append_use_providers(
+                        &proto.use_provider,
+                        provider_registry,
+                        &mut providers,
+                    )?;
+
+                    let smart_handler = smart::Handler::new_with_cache(
+                        smart::HandlerOptions {
+                            name: proto.name.clone(),
+                            common_opts: crate::proxy::HandlerCommonOptions {
+                                icon: proto.icon.clone(),
+                                url: proto.url.clone(),
+                                connector: None,
+                            },
+                            udp: proto.udp.unwrap_or(true),
+                            max_retries: proto.max_retries,
+                            bandwidth_weight: proto.bandwidth_weight,
+                        },
+                        providers,
+                        proxy_manager.clone(),
+                        cache_store.clone(),
+                    );
+                    handlers.insert(proto.name.clone(), Arc::new(smart_handler));
                 }
 
                 OutboundGroupProtocol::Relay(proto) => {
