@@ -1,0 +1,12 @@
+Task: WireGuard top-level Handler/runtime completion
+Reference: ref/clash-lib/src/proxy/wg/mod.rs plus outbound-manager wiring
+Validation:
+- cargo test -p clash-lib wireguard_handler_metadata_ --lib --features wireguard => PASS
+- cargo test -p clash-lib wireguard --lib --features wireguard => PASS (21 passed)
+- cargo check -p clash-lib --features wireguard => PASS
+- cargo check -p clash-lib => PASS
+- git diff --check => PASS
+Scope: OnceCell lazy runtime initialization, key/allowed-IP validation, tunnel/device startup, TCP/UDP outbound handlers, remote/local DNS selection, connector registration, Plain API, and outbound-manager loading.
+Isolation: tests are config/in-memory only and do not initialize a valid live WireGuard peer. No fixed port, external DNS, TUN, route, cache, or deployed Chimera process was touched.
+Skipped E2E: ref Docker WireGuard peer smoke test requires container/network privileges and is intentionally not run on this machine because an older Chimera deployment may be active.
+Deviations: invalid keys are returned as errors instead of ref unwrap panics; invalid configured DNS IP strings are ignored during device-manager DNS list construction; rand 0.10 selection is scoped before await; tracing EnteredSpan is dropped before await so spawned tunnel futures remain Send.

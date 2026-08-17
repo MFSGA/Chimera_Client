@@ -212,9 +212,9 @@ Each item must be implemented, tested, and committed separately.
 
 ### Task 11: Add First Advanced Optional Protocol Feature Skeletons
 
-- Status: in progress on `codex/continuous-iteration`; WireGuard feature/dependency wiring and outbound config parsing are complete, including `pre-shared-key` and legacy `preshared-key` compatibility.
-- Priority: implement WireGuard (`wg`) fully before the other advanced optional protocols.
+- Status: WireGuard (`wg`) is completed on `codex/continuous-iteration`; feature/config/converter wiring, key parsing, boringtun tunnel I/O, smoltcp virtual device/socket stack, internal DNS, Handler/API integration, and outbound-manager loading are implemented.
+- Priority: continue with the remaining advanced optional protocols only after the WireGuard work is kept green.
 - Reference: `ref/clash-lib/src/proxy/tuic/`, `shadowquic/`, `ssh/`, `wg/`, `tailscale/`, and `tor/`.
-- Current gap: WireGuard top-level Handler/runtime wiring remains; DeviceManager DNS, smoltcp polling/transfer loop, socket lifecycle, tunnel I/O, stack adapters, and VirtualIpDevice are complete. Other optional protocols follow after WireGuard.
-- Expected test: feature-gated config/converter/runtime tests per protocol, starting with WireGuard.
-- Suggested verification: `cargo test -p clash-lib wireguard_ --lib --features wireguard` and `cargo check -p clash-lib --features wireguard`.
+- Current gap: no known gap for the scoped WireGuard implementation; privileged/container WireGuard peer E2E remains intentionally unrun on this machine because an older Chimera deployment may be active. Other optional protocols remain future tasks.
+- Expected test: feature-gated config/converter/runtime tests per protocol; WireGuard currently has config, key, converter, virtual-device, DNS, polling, tunnel helper, stack-adapter, and Handler tests.
+- Suggested verification: `cargo test -p clash-lib wireguard --lib --features wireguard`, `cargo check -p clash-lib --features wireguard`, and `cargo check -p clash-lib`.

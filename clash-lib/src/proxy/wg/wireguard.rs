@@ -203,14 +203,17 @@ impl WireguardTunnel {
 
             clear_reserved_bits(&mut item.data);
             let mut peer = self.peer.lock().await;
-            let _span = trace_span!(
-                "wg_decapsulate",
-                endpoint = %self.endpoint,
-                size = item.data.len(),
-            )
-            .entered();
+            let result = {
+                let _span = trace_span!(
+                    "wg_decapsulate",
+                    endpoint = %self.endpoint,
+                    size = item.data.len(),
+                )
+                .entered();
+                peer.decapsulate(None, &item.data, &mut send_buf)
+            };
 
-            match peer.decapsulate(None, &item.data, &mut send_buf) {
+            match result {
                 TunnResult::Done => {}
                 TunnResult::Err(error) => {
                     error!("failed to decapsulate packet: {error:?}");
