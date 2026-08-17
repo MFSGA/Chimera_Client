@@ -51,6 +51,9 @@ pub mod trojan;
 pub mod tun;
 pub mod utils;
 pub mod vless;
+#[cfg(feature = "wireguard")]
+#[allow(dead_code)]
+pub mod wg;
 
 mod common;
 mod options;

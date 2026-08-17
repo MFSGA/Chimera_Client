@@ -1,0 +1,10 @@
+Task: WireGuard key parsing prerequisite
+Reference: ref/clash-lib/src/proxy/wg/keys.rs
+Validation:
+- cargo test -p clash-lib wireguard_key_ --lib --features wireguard => PASS (2)
+- cargo check -p clash-lib --features wireguard => PASS
+- cargo check -p clash-lib => PASS
+- git diff --check => PASS
+Tests cover Base64/hex equivalence and invalid key size/characters.
+Isolation: pure byte parsing only; no WireGuard device, socket, TUN interface, routes, DNS, cache, or deployed Chimera process touched.
+Temporary deviation: wg module carries a local dead_code allowance until runtime modules consume the key parser.
