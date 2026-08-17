@@ -1,0 +1,15 @@
+Task: Smart proxy group config parsing parity
+Reference:
+- ref/clash-lib/src/config/internal/proxy.rs
+- ref/clash-lib/src/app/outbound/utils.rs Smart group DAG coverage
+Implementation:
+- Added Smart group config variant and reference fields.
+- Added name/proxies accessors so Smart participates in group dependency sorting.
+- Runtime remains explicitly unsupported in this config-only slice.
+Validation:
+- cargo fmt --check => PASS
+- cargo test -p clash-lib parse_smart_group_options --lib => PASS (1 passed)
+- cargo test -p clash-lib smart_group_participates_in_dag_sort --lib => PASS (1 passed)
+- cargo check -p clash-lib => PASS
+Isolation:
+- Tests are pure config/in-memory DAG tests; no ports, processes, DNS, TUN, cache, or deployed old-version resources are touched.

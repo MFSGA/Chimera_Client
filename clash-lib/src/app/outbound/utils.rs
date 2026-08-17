@@ -167,3 +167,34 @@ pub fn proxy_groups_dag_sort(
         "loop detected in proxy groups: {looped_groups:?}"
     )))
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::config::internal::proxy::{
+        OutboundGroupProtocol, OutboundGroupSelect, OutboundGroupSmart,
+    };
+
+    #[test]
+    fn smart_group_participates_in_dag_sort() {
+        let smart = OutboundGroupSmart {
+            name: "smart".to_owned(),
+            proxies: Some(vec!["select".to_owned()]),
+            ..Default::default()
+        };
+        let select = OutboundGroupSelect {
+            name: "select".to_owned(),
+            proxies: Some(vec!["DIRECT".to_owned()]),
+            ..Default::default()
+        };
+
+        let mut groups = vec![
+            OutboundGroupProtocol::Smart(smart),
+            OutboundGroupProtocol::Select(select),
+        ];
+
+        super::proxy_groups_dag_sort(&mut groups)
+            .expect("smart group DAG should sort");
+        assert_eq!(groups[0].name(), "select");
+        assert_eq!(groups[1].name(), "smart");
+    }
+}

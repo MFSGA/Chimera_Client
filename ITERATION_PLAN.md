@@ -167,10 +167,11 @@ Each item must be implemented, tested, and committed separately.
 
 ### Task 5: Add Smart Proxy Group Config Parsing
 
-- Reference: `ref/clash-lib/src/config/internal/proxy.rs` and `ref/clash-lib/src/proxy/group/smart/`.
-- Current gap: `smart` groups are absent from config and runtime group modules.
-- Expected test: config parsing test for `type: smart` with health-check fields and proxy references.
-- Suggested verification: `cargo test -p clash-lib <smart_group_test>` and `cargo check -p clash-lib`.
+- Status: completed on `codex/continuous-iteration`; Smart group config fields and group dependency accessors now match the reference shape.
+- Reference: `ref/clash-lib/src/config/internal/proxy.rs` and the Smart group coverage in `ref/clash-lib/src/app/outbound/utils.rs`.
+- Current gap: Smart runtime selection/statistics modules remain a separate parity slice; the scoped config parsing task is complete.
+- Expected test: config parsing test for `type: smart` with proxy references and Smart tuning fields, plus DAG sorting coverage based on the reference group test.
+- Suggested verification: `cargo test -p clash-lib parse_smart_group_options --lib`, `cargo test -p clash-lib smart_group_participates_in_dag_sort --lib`, and `cargo check -p clash-lib`.
 
 ### Task 6: Add VMess Outbound Config And Converter
 
