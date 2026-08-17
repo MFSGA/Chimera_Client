@@ -1,0 +1,15 @@
+Task: Add Socks5 Converter Module Parity
+Reference: ref/clash-lib/src/proxy/converters/socks5.rs
+
+Validation:
+- cargo test -p clash-lib converts_socks5_common_fields --lib
+  Result: 1 passed, 0 failed.
+- cargo check -p clash-lib
+  Result: passed.
+- cargo check -p clash-lib --no-default-features
+  Result: blocked by pre-existing unrelated warning-as-error issues in clash-lib/src/app/net/mod.rs and clash-lib/src/lib.rs. The Socks5 converter's own no-TLS unused import was fixed.
+
+Scope:
+- Move OutboundSocks5 -> Handler conversion from socks runtime module into proxy/converters/socks5.rs.
+- Register the converter module.
+- Add a focused conversion test covering name, server, credentials parsing, and UDP flag construction path.

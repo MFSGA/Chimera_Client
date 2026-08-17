@@ -13,7 +13,6 @@ use crate::{
         },
         dns::ThreadSafeDNSResolver,
     },
-    config::internal::proxy::OutboundSocks5,
     impl_default_connector,
     proxy::{
         AnyStream, ConnectorType, DialWithConnector, HandlerCommonOptions,
@@ -139,50 +138,6 @@ impl Handler {
             (bind_ip, bind_port).into(),
             udp_socket,
         ))
-    }
-}
-
-impl TryFrom<OutboundSocks5> for Handler {
-    type Error = crate::Error;
-
-    fn try_from(value: OutboundSocks5) -> Result<Self, Self::Error> {
-        (&value).try_into()
-    }
-}
-
-impl TryFrom<&OutboundSocks5> for Handler {
-    type Error = crate::Error;
-
-    fn try_from(s: &OutboundSocks5) -> Result<Self, Self::Error> {
-        #[cfg(feature = "tls")]
-        let tls_client = if s.tls {
-            Some(Box::new(crate::proxy::transport::TlsClient::new(
-                s.skip_cert_verify,
-                s.sni
-                    .clone()
-                    .unwrap_or_else(|| s.common_opts.server.to_owned()),
-                None,
-                None,
-            )) as Box<dyn Transport>)
-        } else {
-            None
-        };
-        #[cfg(not(feature = "tls"))]
-        let tls_client = None;
-
-        Ok(Self::new(HandlerOptions {
-            name: s.common_opts.name.to_owned(),
-            common_opts: HandlerCommonOptions {
-                connector: s.common_opts.connect_via.clone(),
-                ..Default::default()
-            },
-            server: s.common_opts.server.to_owned(),
-            port: s.common_opts.port,
-            user: s.username.clone(),
-            password: s.password.clone(),
-            udp: s.udp,
-            tls_client,
-        }))
     }
 }
 

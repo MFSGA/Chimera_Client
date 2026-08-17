@@ -201,6 +201,7 @@ Each item must be implemented, tested, and committed separately.
 
 ### Task 10: Add Socks5 Converter Module Parity
 
+- Status: completed on `codex/continuous-iteration`.
 - Reference: `ref/clash-lib/src/proxy/converters/socks5.rs`.
 - Current gap: outbound Socks5 config exists, but converter module parity with `ref` is missing.
 - Expected test: converter test for username/password, UDP flag, and TLS-related fields when enabled.
