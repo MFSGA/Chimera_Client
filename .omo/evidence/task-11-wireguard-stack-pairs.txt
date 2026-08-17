@@ -1,0 +1,10 @@
+Task: WireGuard smoltcp TCP/UDP SocketPair adapters
+Reference: ref/clash-lib/src/proxy/wg/stack/{tcp,udp}.rs
+Validation:
+- cargo test -p clash-lib wireguard_tcp_socket_pair_ --lib --features wireguard => PASS
+- cargo test -p clash-lib wireguard_udp_pair_ --lib --features wireguard => PASS
+- cargo check -p clash-lib --features wireguard => PASS
+- cargo check -p clash-lib => PASS
+- git diff --check => PASS
+Tests cover TCP partial-read buffering/write channel and UDP Sink/Stream forwarding.
+Isolation: Tokio channels only; no OS socket, WireGuard peer, TUN interface, route, DNS, cache, or deployed Chimera process touched.
