@@ -42,6 +42,9 @@ pub(crate) fn maybe_protect_socket(socket: &socket2::Socket) -> io::Result<()> {
     protector.protect_socket_handle(handle)
 }
 
+// Android does not use SO_BINDTODEVICE here. The host application owns
+// network selection/protection, so an interface hint is advisory unless the
+// host bridge explicitly binds the socket to a Network.
 pub(crate) fn must_bind_socket_on_interface(
     _socket: &socket2::Socket,
     iface: &OutboundInterface,
@@ -49,7 +52,7 @@ pub(crate) fn must_bind_socket_on_interface(
 ) -> io::Result<()> {
     trace!(
         iface = %iface.name,
-        "android outbound interface binding is handled by socket protection"
+        "android skips native interface binding; routing is delegated to the host"
     );
     Ok(())
 }
