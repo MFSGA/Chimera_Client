@@ -472,6 +472,22 @@ mod tests {
         )
     }
 
+    fn make_vision_with_read_splice_flag() -> (VisionStream, Arc<AtomicBool>) {
+        let (client, _server) = tokio::io::duplex(65536);
+        let read_flag = Arc::new(AtomicBool::new(false));
+        let write_flag = Arc::new(AtomicBool::new(false));
+        let stream = VisionStream::new(
+            Box::new(client),
+            TEST_UUID_STR.to_owned(),
+            Some(VisionOptions {
+                read_flag: Arc::clone(&read_flag),
+                write_flag,
+            }),
+        )
+        .unwrap();
+        (stream, read_flag)
+    }
+
     fn parse_frame(buf: &[u8], offset: usize) -> (u8, Vec<u8>, u16, usize) {
         let cmd = buf[offset];
         let content_len =
@@ -618,6 +634,38 @@ mod tests {
         let (cmd, content, _, _) = parse_frame(&uplink[..n], 0);
         assert_eq!(cmd, CMD_PADDING_DIRECT);
         assert_eq!(content, app_data);
+    }
+
+    #[test]
+    fn test_read_cmd_end_stays_in_tls_without_splice() {
+        let (mut vs, read_flag) = make_vision_with_read_splice_flag();
+        vs.raw.extend(server_first_frame(
+            &TEST_UUID,
+            CMD_PADDING_END,
+            b"end-frame",
+            0,
+        ));
+
+        assert!(vs.process_raw_read().unwrap());
+        assert_eq!(vs.read_mode, ReadMode::DirectTls);
+        assert!(!read_flag.load(Ordering::Acquire));
+        assert_eq!(&vs.decoded[..], b"end-frame");
+    }
+
+    #[test]
+    fn test_read_cmd_direct_enables_raw_splice() {
+        let (mut vs, read_flag) = make_vision_with_read_splice_flag();
+        vs.raw.extend(server_first_frame(
+            &TEST_UUID,
+            CMD_PADDING_DIRECT,
+            b"direct-frame",
+            0,
+        ));
+
+        assert!(vs.process_raw_read().unwrap());
+        assert_eq!(vs.read_mode, ReadMode::DirectRaw);
+        assert!(read_flag.load(Ordering::Acquire));
+        assert_eq!(&vs.decoded[..], b"direct-frame");
     }
 
     #[tokio::test]
