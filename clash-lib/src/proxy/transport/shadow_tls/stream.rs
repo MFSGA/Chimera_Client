@@ -342,6 +342,11 @@ impl<S: AsyncRead + Unpin> AsyncRead for VerifiedStream<S> {
                                 "appdata verify failed",
                             )));
                         }
+                    } else {
+                        // Non-APPLICATION_DATA records are unexpected after
+                        // verification. Skip this record and read the next
+                        // header instead of reusing the previous payload size.
+                        this.read_state = ReadState::WaitingHeader;
                     }
                 }
                 ReadState::FlushingData => {
