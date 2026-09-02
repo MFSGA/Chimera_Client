@@ -77,15 +77,21 @@ impl InboundHandlerTrait for MixedInbound {
                     continue;
                 }
             };
-            if !is_inbound_client_allowed(
-                self.allow_lan,
-                src_addr,
-                socket.local_addr()?,
-            ) {
+            let local_addr = match socket.local_addr() {
+                Ok(addr) => addr,
+                Err(err) => {
+                    warn!("mixed local_addr failed: {err}");
+                    continue;
+                }
+            };
+            if !is_inbound_client_allowed(self.allow_lan, src_addr, local_addr) {
                 warn!("Connection from {} is not allowed", src_addr);
                 continue;
             }
-            apply_tcp_options(&socket)?;
+            if let Err(err) = apply_tcp_options(&socket) {
+                warn!("mixed apply_tcp_options failed: {err}");
+                continue;
+            }
 
             let mut p = [0; 1];
             let n = match socket.peek(&mut p).await {
@@ -111,7 +117,7 @@ impl InboundHandlerTrait for MixedInbound {
                 socks::SOCKS5_VERSION => {
                     let mut sess = Session {
                         network: Network::Tcp,
-                        source: socket.peer_addr()?.to_canonical(),
+                        source: src_addr,
                         so_mark: fw_mark,
                         ..Default::default()
                     };
@@ -128,7 +134,7 @@ impl InboundHandlerTrait for MixedInbound {
                 }
 
                 _ => {
-                    let src = socket.peer_addr()?.to_canonical();
+                    let src = src_addr;
                     let dispatcher = dispatcher.clone();
                     let authenticator = authenticator.clone();
                     tokio::spawn(async move {

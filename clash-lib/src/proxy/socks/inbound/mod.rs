@@ -65,27 +65,43 @@ impl InboundHandlerTrait for SocksInbound {
         let listener = try_create_dualstack_tcplistener(self.addr)?;
         info!("SOCKS5 TCP prepared. listening on {}", self.addr);
         loop {
-            let (socket, _) = listener.accept().await?;
-            info!(
-                "SOCKS5 TCP accepted connection from {}",
-                socket.peer_addr()?
-            );
+            let (socket, _) = match listener.accept().await {
+                Ok(socket) => socket,
+                Err(err) => {
+                    warn!("socks accept failed: {err}");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            let src_addr = match socket.peer_addr() {
+                Ok(addr) => addr.to_canonical(),
+                Err(err) => {
+                    warn!("socks peer_addr failed: {err}");
+                    continue;
+                }
+            };
+            info!("SOCKS5 TCP accepted connection from {}", src_addr);
 
-            let src_addr = socket.peer_addr()?.to_canonical();
-            if !is_inbound_client_allowed(
-                self.allow_lan,
-                src_addr,
-                socket.local_addr()?,
-            ) {
+            let local_addr = match socket.local_addr() {
+                Ok(addr) => addr,
+                Err(err) => {
+                    warn!("socks local_addr failed: {err}");
+                    continue;
+                }
+            };
+            if !is_inbound_client_allowed(self.allow_lan, src_addr, local_addr) {
                 warn!("Connection from {} is not allowed", src_addr);
                 continue;
             }
-            apply_tcp_options(&socket)?;
+            if let Err(err) = apply_tcp_options(&socket) {
+                warn!("socks apply_tcp_options failed: {err}");
+                continue;
+            }
 
             let mut sess = Session {
                 network: Network::Tcp,
                 typ: Type::Socks5,
-                source: socket.peer_addr()?.to_canonical(),
+                source: src_addr,
                 so_mark: self.fw_mark,
 
                 ..Default::default()
