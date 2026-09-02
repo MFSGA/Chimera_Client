@@ -8,5 +8,7 @@ pub mod shadowsocks;
 pub mod trojan;
 #[cfg(feature = "ws")]
 mod utils;
+#[cfg(feature = "wireguard")]
+pub mod wireguard;
 
 pub mod vless;
