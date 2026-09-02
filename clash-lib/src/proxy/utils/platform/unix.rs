@@ -7,7 +7,14 @@ pub(crate) fn must_bind_socket_on_interface(
     iface: &OutboundInterface,
     #[allow(unused_variables)] family: socket2::Domain,
 ) -> io::Result<()> {
-    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux",))]
+    // Android delegates routing/protection to the host VPN service.
+    // SO_BINDTODEVICE requires privileges normal app processes do not have.
+    #[cfg(target_os = "android")]
+    {
+        let _ = (socket, iface);
+        Ok(())
+    }
+    #[cfg(any(target_os = "fuchsia", target_os = "linux"))]
     {
         use tracing::error;
         socket
