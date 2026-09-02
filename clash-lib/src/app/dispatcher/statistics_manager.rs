@@ -35,9 +35,60 @@ impl ProxyChain {
 
 type ConnectionMap = HashMap<uuid::Uuid, (Tracked, Sender<()>)>;
 
+/// Lightweight snapshot kept after a connection closes.
+///
+/// Unlike `TrackerInfo`, this does not retain the full `Session` or
+/// `ProxyChain`, so the closed-flow history cannot keep those heavier runtime
+/// objects alive after the connection is gone.
+#[derive(Serialize, Clone, Debug)]
+pub struct ClosedFlowInfo {
+    #[serde(rename = "id")]
+    pub uuid: uuid::Uuid,
+    #[serde(rename = "upload")]
+    pub upload_total: u64,
+    #[serde(rename = "download")]
+    pub download_total: u64,
+    #[serde(rename = "start")]
+    pub start_time: DateTime<Utc>,
+    #[serde(rename = "chains")]
+    pub proxy_chain: Vec<String>,
+    pub rule: String,
+    #[serde(rename = "rulePayload")]
+    pub rule_payload: String,
+    pub host: String,
+    pub destination_port: u16,
+    pub network: String,
+    pub source_ip: String,
+    pub country: Option<String>,
+    pub asn: Option<String>,
+}
+
+impl ClosedFlowInfo {
+    pub async fn from_tracker_info(info: &TrackerInfo) -> Self {
+        Self {
+            uuid: info.uuid,
+            upload_total: info.upload_total.load(Ordering::Acquire),
+            download_total: info.download_total.load(Ordering::Acquire),
+            start_time: info.start_time,
+            proxy_chain: info.proxy_chain_holder.snapshot().await,
+            rule: info.rule.clone(),
+            rule_payload: info.rule_payload.clone(),
+            host: info.session_holder.destination.host(),
+            destination_port: info.session_holder.destination.port(),
+            network: match info.session_holder.network {
+                crate::session::Network::Tcp => "tcp".to_string(),
+                crate::session::Network::Udp => "udp".to_string(),
+            },
+            source_ip: info.session_holder.source.ip().to_string(),
+            country: info.session_holder.country.clone(),
+            asn: info.session_holder.asn.clone(),
+        }
+    }
+}
+
 pub struct StatisticsManager {
     connections: Arc<Mutex<ConnectionMap>>,
-    closed_flows: Arc<Mutex<VecDeque<Arc<TrackerInfo>>>>,
+    closed_flows: Arc<Mutex<VecDeque<ClosedFlowInfo>>>,
     upload_temp: AtomicU64,
     download_temp: AtomicU64,
     upload_blip: AtomicU64,
@@ -105,8 +156,11 @@ impl StatisticsManager {
             entry.download += download;
         }
 
+        let flow = ClosedFlowInfo::from_tracker_info(&info).await;
+        drop(info);
+
         let mut closed_flows = self.closed_flows.lock().await;
-        closed_flows.push_back(info);
+        closed_flows.push_back(flow);
         if closed_flows.len() > 1000 {
             closed_flows.pop_front();
         }
@@ -120,7 +174,7 @@ impl StatisticsManager {
             .collect()
     }
 
-    pub async fn closed_flows_snapshot(&self) -> Vec<Arc<TrackerInfo>> {
+    pub async fn closed_flows_snapshot(&self) -> Vec<ClosedFlowInfo> {
         let closed_flows = self.closed_flows.lock().await;
         closed_flows.iter().cloned().collect()
     }
@@ -311,7 +365,50 @@ pub struct Snapshot {
 
 #[cfg(test)]
 mod tests {
-    use super::StatisticsManager;
+    use std::{net::SocketAddr, sync::atomic::AtomicU64};
+
+    use chrono::Utc;
+
+    use crate::session::{Network, Session, SocksAddr};
+
+    use super::{ClosedFlowInfo, StatisticsManager, TrackerInfo};
+
+    #[tokio::test]
+    async fn closed_flow_info_extracts_only_flow_fields() {
+        let chain = super::ProxyChain::default();
+        chain.push("proxy-a".to_string()).await;
+        let info = TrackerInfo {
+            uuid: uuid::Uuid::new_v4(),
+            upload_total: AtomicU64::new(12),
+            download_total: AtomicU64::new(34),
+            start_time: Utc::now(),
+            proxy_chain_holder: chain,
+            rule: "MATCH".to_string(),
+            rule_payload: "payload".to_string(),
+            session_holder: Session {
+                network: Network::Udp,
+                source: "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
+                destination: SocksAddr::Domain("example.com".to_string(), 443),
+                country: Some("US".to_string()),
+                asn: Some("AS-example".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let flow = ClosedFlowInfo::from_tracker_info(&info).await;
+
+        assert_eq!(flow.uuid, info.uuid);
+        assert_eq!(flow.upload_total, 12);
+        assert_eq!(flow.download_total, 34);
+        assert_eq!(flow.host, "example.com");
+        assert_eq!(flow.destination_port, 443);
+        assert_eq!(flow.network, "udp");
+        assert_eq!(flow.source_ip, "127.0.0.1");
+        assert_eq!(flow.proxy_chain, vec!["proxy-a"]);
+        assert_eq!(flow.country.as_deref(), Some("US"));
+        assert_eq!(flow.asn.as_deref(), Some("AS-example"));
+    }
 
     #[tokio::test]
     async fn summary_reports_accumulated_totals() {
