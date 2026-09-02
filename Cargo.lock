@@ -800,6 +800,7 @@ dependencies = [
  "memory-stats",
  "mockall",
  "network-interface",
+ "percent-encoding",
  "prost",
  "quinn",
  "quinn-proto",

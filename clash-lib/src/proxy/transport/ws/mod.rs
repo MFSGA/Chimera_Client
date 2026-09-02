@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use http::Request;
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use std::collections::HashMap;
 use tokio_tungstenite::tungstenite::{
     handshake::client::generate_key, protocol::WebSocketConfig,
@@ -14,6 +15,21 @@ mod websocket_early_data;
 
 pub use websocket::WebsocketConn;
 pub use websocket_early_data::WebsocketEarlyDataConn;
+
+const PATH_AND_QUERY_ENCODE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'\"')
+    .add(b'#')
+    .add(b'<')
+    .add(b'>')
+    .add(b'[')
+    .add(b'\\')
+    .add(b']')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
 
 pub struct Client {
     host: String,
@@ -46,14 +62,15 @@ impl Client {
         }
     }
 
-    fn req(&self) -> Request<()> {
+    fn req(&self) -> std::io::Result<Request<()>> {
+        let path = utf8_percent_encode(&self.path, PATH_AND_QUERY_ENCODE_SET);
         let mut request = Request::builder()
             .method("GET")
             .header("Connection", "Upgrade")
             .header("Upgrade", "websocket")
             .header("Sec-WebSocket-Version", "13")
             .header("Sec-WebSocket-Key", generate_key())
-            .uri(format!("ws://{}:{}{}", self.host, self.port, self.path));
+            .uri(format!("ws://{}:{}{}", self.host, self.port, path));
         for (k, v) in self.headers.iter() {
             request = request.header(k.as_str(), v.as_str());
         }
@@ -68,7 +85,9 @@ impl Client {
             // we will replace this field later
             request = request.header(self.early_data_header_name.as_str(), "xxoo");
         }
-        request.body(()).unwrap()
+        request.body(()).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
+        })
     }
 }
 
@@ -90,7 +109,8 @@ mod tests {
             0,
             String::new(),
         )
-        .req();
+        .req()
+        .expect("request should build");
 
         assert_eq!(
             request
@@ -114,7 +134,8 @@ mod tests {
             0,
             String::new(),
         )
-        .req();
+        .req()
+        .expect("request should build");
 
         assert_eq!(
             request
@@ -124,12 +145,56 @@ mod tests {
             Some("cdn.example.com")
         );
     }
+
+    #[test]
+    fn req_percent_encodes_path_without_normalizing_it() {
+        let request = Client::new(
+            "example.com".to_owned(),
+            443,
+            "/a/./b/../already%20encoded/中文 path?name=中文%20value".to_owned(),
+            HashMap::new(),
+            None,
+            0,
+            String::new(),
+        )
+        .req()
+        .expect("request should build");
+
+        assert_eq!(
+            request.uri().path_and_query().map(ToString::to_string),
+            Some(
+                concat!(
+                    "/a/./b/../already%20encoded/",
+                    "%E4%B8%AD%E6%96%87%20path?name=",
+                    "%E4%B8%AD%E6%96%87%20value"
+                )
+                .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn malformed_request_returns_invalid_input() {
+        let error = Client::new(
+            "bad host".to_owned(),
+            443,
+            "/".to_owned(),
+            HashMap::new(),
+            None,
+            0,
+            String::new(),
+        )
+        .req()
+        .expect_err("invalid URI should fail");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
 }
 
 #[async_trait]
 impl Transport for Client {
     async fn proxy_stream(&self, stream: AnyStream) -> std::io::Result<AnyStream> {
-        let req = self.req();
+        let req = self.req()?;
         if self.max_early_data > 0 {
             let early_data_conn = WebsocketEarlyDataConn::new(
                 stream,
