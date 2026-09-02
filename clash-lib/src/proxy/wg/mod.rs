@@ -8,6 +8,8 @@ mod events;
 mod keys;
 #[allow(dead_code)]
 mod ports;
+#[allow(dead_code)]
+mod stack;
 
 // Consumed by the WireGuard handler once the runtime module is wired in.
 #[allow(dead_code)]
