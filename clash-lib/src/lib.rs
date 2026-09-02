@@ -838,6 +838,16 @@ async fn create_components(
         );
     }
 
+    let tcp_buffer_size = config
+        .experimental
+        .as_ref()
+        .and_then(|exp| exp.tcp_buffer_size);
+    app::dispatcher::set_closed_flows_cap(
+        config
+            .experimental
+            .as_ref()
+            .and_then(|exp| exp.closed_flows_cap),
+    );
     let statistics_manager = StatisticsManager::new();
 
     debug!("initializing dispatcher");
@@ -847,7 +857,7 @@ async fn create_components(
         dns_resolver.clone(),
         config.general.mode,
         statistics_manager.clone(),
-        config.experimental.and_then(|e| e.tcp_buffer_size),
+        tcp_buffer_size,
     ));
 
     debug!("initializing authenticator");

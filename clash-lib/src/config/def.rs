@@ -445,6 +445,8 @@ pub struct EdnsClientSubnet {
 pub struct Experimental {
     /// buffer size for tcp stream bidirectional copy
     pub tcp_buffer_size: Option<usize>,
+    /// max entries in the closed-flows ring buffer (default 50)
+    pub closed_flows_cap: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -551,5 +553,17 @@ mod tests {
             .expect("config should parse");
 
         assert_eq!(cfg.mmdb, None);
+    }
+
+    #[test]
+    fn experimental_closed_flows_cap_parses() {
+        let cfg: Config = "experimental:\n  closed-flows-cap: 64"
+            .parse()
+            .expect("config should parse");
+
+        assert_eq!(
+            cfg.experimental.and_then(|exp| exp.closed_flows_cap),
+            Some(64)
+        );
     }
 }

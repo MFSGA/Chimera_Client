@@ -86,6 +86,20 @@ impl ClosedFlowInfo {
     }
 }
 
+const DEFAULT_CLOSED_FLOWS_CAP: usize = 50;
+
+static CLOSED_FLOWS_CAP: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(DEFAULT_CLOSED_FLOWS_CAP);
+
+pub fn set_closed_flows_cap(cap: Option<usize>) {
+    CLOSED_FLOWS_CAP
+        .store(cap.unwrap_or(DEFAULT_CLOSED_FLOWS_CAP), Ordering::Release);
+}
+
+fn closed_flows_cap() -> usize {
+    CLOSED_FLOWS_CAP.load(Ordering::Acquire)
+}
+
 pub struct StatisticsManager {
     connections: Arc<Mutex<ConnectionMap>>,
     closed_flows: Arc<Mutex<VecDeque<ClosedFlowInfo>>>,
@@ -161,7 +175,8 @@ impl StatisticsManager {
 
         let mut closed_flows = self.closed_flows.lock().await;
         closed_flows.push_back(flow);
-        if closed_flows.len() > 1000 {
+        let cap = closed_flows_cap();
+        while closed_flows.len() > cap {
             closed_flows.pop_front();
         }
     }
