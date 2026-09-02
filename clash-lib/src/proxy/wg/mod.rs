@@ -3,7 +3,11 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use super::HandlerCommonOptions;
 
 #[allow(dead_code)]
+mod events;
+#[allow(dead_code)]
 mod keys;
+#[allow(dead_code)]
+mod ports;
 
 // Consumed by the WireGuard handler once the runtime module is wired in.
 #[allow(dead_code)]
