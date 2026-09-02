@@ -47,6 +47,8 @@ pub mod trojan;
 pub mod tun;
 pub mod utils;
 pub mod vless;
+#[cfg(feature = "wireguard")]
+pub mod wg;
 
 mod common;
 mod options;
