@@ -33,6 +33,7 @@ anytls = ["clash-lib/anytls"]
 reality = ["clash-lib/reality"]
 hysteria = ["clash-lib/hysteria"]
 shadowsocks = ["clash-lib/shadowsocks"]
+wireguard = ["clash-lib/wireguard"]
 tun = ["clash-lib/tun"]
 
 port = ["clash-lib/port"]

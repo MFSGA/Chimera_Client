@@ -115,6 +115,9 @@ smoltcp = { version = "0.13", default-features = false, features = [
 ], optional = true }
 etherparse = { version = "0.20", optional = true }
 
+# WireGuard
+boringtun = { version = "0.1.0", git = "https://github.com/Watfaq/boring-noise.git", rev = "9ddf1b5", package = "boring-noise", optional = true, default-features = false }
+
 base64 = "0.22"
 
 # Builtin dashboard
@@ -168,13 +171,21 @@ aws-lc-rs = [
     "dep:memchr",
     "dep:subtle",
     "dep:x509-parser",
+    "boringtun?/aws-lc-rs",
 ]
-ring = ["tls", "rustls/ring", "quinn-proto?/ring", "chimera-dns/ring"]
+ring = [
+    "tls",
+    "rustls/ring",
+    "quinn-proto?/ring",
+    "chimera-dns/ring",
+    "boringtun?/ring",
+]
 
 ws = ["tokio-tungstenite"]
 
 anytls = ["tls", "dep:rcgen"]
 shadowsocks = ["dep:shadowsocks", "dep:blake3"]
+wireguard = ["dep:boringtun", "dep:smoltcp"]
 trojan = []
 hysteria = [
     "tls",

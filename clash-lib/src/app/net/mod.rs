@@ -8,10 +8,9 @@ use network_interface::{
     NetworkInterface, NetworkInterfaceConfig, V4IfAddr, V6IfAddr,
 };
 use serde::Serialize;
-use std::sync::{
-    Arc, LazyLock,
-    atomic::{AtomicBool, Ordering},
-};
+#[cfg(feature = "tun")]
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 #[cfg(feature = "tun")]
 use tracing::trace;
 

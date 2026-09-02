@@ -570,7 +570,7 @@ impl RuntimeComponents {
         self.network_config.activate().await
     }
 
-    async fn stop_all_and_join(&self, clear_network: bool) {
+    async fn stop_all_and_join(&self, _clear_network: bool) {
         self.stop_all();
 
         tracing::debug!("todo: validate");
@@ -583,7 +583,7 @@ impl RuntimeComponents {
             if let Err(err) = self.tun_runner.join().await {
                 warn!("failed waiting for tun runner shutdown: {}", err);
             }
-            if clear_network {
+            if _clear_network {
                 clear_net_config().await;
             }
         }
