@@ -288,11 +288,11 @@ jobs:
           path: ${{ env.PACKAGE }}-${{ matrix.release-name || matrix.target }}${{ matrix.postfix }}
 
       - name: Setup tmate session
-        if: ${{ failure() }}
+        if: ${{ failure() && github.actor != 'dependabot[bot]' }}
+        timeout-minutes: 15
         uses: mxschmitt/action-tmate@v3
         with:
           detached: true
-          timeout-minutes: 15
           limit-access-to-actor: true
 
   release:

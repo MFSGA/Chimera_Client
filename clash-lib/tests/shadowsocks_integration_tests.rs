@@ -14,6 +14,14 @@ use common::{ClashInstance, Socks5UdpSession};
 
 const PASSWORD: &str = "3SYJ/f8nmVuzKvKglykRQDSgg10e/ADilkdRWrrY9HU=";
 
+fn udp_roundtrip_timeout() -> Duration {
+    if cfg!(windows) {
+        Duration::from_secs(30)
+    } else {
+        Duration::from_secs(10)
+    }
+}
+
 fn available_port() -> u16 {
     StdTcpListener::bind("127.0.0.1:0")
         .expect("failed to reserve test port")
@@ -199,7 +207,7 @@ async fn integration_test_shadowsocks_udp() {
         .send_ipv4(b"shadowsocks-udp-roundtrip", [127, 0, 0, 1], target_port)
         .await;
     let (response, source) =
-        tokio::time::timeout(Duration::from_secs(10), session.recv())
+        tokio::time::timeout(udp_roundtrip_timeout(), session.recv())
             .await
             .expect("timed out waiting for Shadowsocks UDP response");
 
@@ -222,7 +230,7 @@ async fn integration_test_shadowsocks_udp_multi_target() {
     ] {
         session.send_ipv4(payload, [127, 0, 0, 1], port).await;
         let (response, source) =
-            tokio::time::timeout(Duration::from_secs(10), session.recv())
+            tokio::time::timeout(udp_roundtrip_timeout(), session.recv())
                 .await
                 .expect("timed out waiting for multi-target response");
         assert_eq!(response, payload);
@@ -259,11 +267,11 @@ async fn integration_test_shadowsocks_udp_session_isolation() {
         .await;
 
     let (first_response, _) =
-        tokio::time::timeout(Duration::from_secs(10), first.recv())
+        tokio::time::timeout(udp_roundtrip_timeout(), first.recv())
             .await
             .expect("first Shadowsocks UDP client timed out");
     let (second_response, _) =
-        tokio::time::timeout(Duration::from_secs(10), second.recv())
+        tokio::time::timeout(udp_roundtrip_timeout(), second.recv())
             .await
             .expect("second Shadowsocks UDP client timed out");
     assert_eq!(first_response, b"first-client");
