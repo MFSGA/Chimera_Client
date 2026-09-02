@@ -291,7 +291,7 @@ pub enum RuleProviderDef {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+#[serde(rename_all = "kebab-case")]
 pub struct HttpRuleProviderDef {
     pub url: String,
     #[serde(default)]
@@ -304,7 +304,7 @@ pub struct HttpRuleProviderDef {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+#[serde(rename_all = "kebab-case")]
 pub struct FileRuleProviderDef {
     pub path: String,
     pub interval: Option<u64>,
@@ -315,7 +315,7 @@ pub struct FileRuleProviderDef {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+#[serde(rename_all = "kebab-case")]
 pub struct InlineRuleProviderDef {
     pub path: Option<String>,
     pub behavior: RuleSetBehavior,
@@ -564,6 +564,36 @@ mod tests {
         assert_eq!(
             cfg.experimental.and_then(|exp| exp.closed_flows_cap),
             Some(64)
+        );
+    }
+
+    #[test]
+    fn rule_providers_ignore_unknown_fields() {
+        let cfg: Config = r#"
+rule-providers:
+  remote:
+    type: http
+    url: https://example.com/rules.yaml
+    behavior: domain
+    future-http-option: true
+  local:
+    type: file
+    path: rules.yaml
+    behavior: ipcidr
+    future-file-option: 42
+  embedded:
+    type: inline
+    behavior: classical
+    payload:
+      - DOMAIN,example.com
+    future-inline-option: value
+"#
+        .parse()
+        .expect("unknown rule-provider fields should be ignored");
+
+        assert_eq!(
+            cfg.rule_provider.as_ref().map(|providers| providers.len()),
+            Some(3)
         );
     }
 }
