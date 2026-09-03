@@ -406,6 +406,26 @@ impl OutboundManager {
         Ok(())
     }
 
+    #[cfg(feature = "wireguard")]
+    fn load_provider_outbound(
+        outbound: OutboundProxyProtocol,
+    ) -> Result<Option<AnyOutboundHandler>, Error> {
+        match outbound {
+            OutboundProxyProtocol::Wireguard(wg) => {
+                let handler: wg::Handler = wg.try_into()?;
+                Ok(Some(Arc::new(handler) as AnyOutboundHandler))
+            }
+            outbound => Ok(Self::load_plain_outbounds(vec![outbound]).pop()),
+        }
+    }
+
+    #[cfg(not(feature = "wireguard"))]
+    fn load_provider_outbound(
+        outbound: OutboundProxyProtocol,
+    ) -> Result<Option<AnyOutboundHandler>, Error> {
+        Ok(Self::load_plain_outbounds(vec![outbound]).pop())
+    }
+
     pub fn load_plain_outbounds(
         outbounds: Vec<OutboundProxyProtocol>,
     ) -> Vec<AnyOutboundHandler> {
@@ -858,8 +878,9 @@ impl OutboundManager {
                     let mut proxies = Vec::with_capacity(proxy_defs.len());
                     for def in proxy_defs {
                         let protocol = OutboundProxyProtocol::try_from(def)?;
-                        let mut loaded = Self::load_plain_outbounds(vec![protocol]);
-                        if let Some(handler) = loaded.pop() {
+                        if let Some(handler) =
+                            Self::load_provider_outbound(protocol)?
+                        {
                             proxies.push(handler);
                         }
                     }
@@ -981,7 +1002,7 @@ mod tests {
 
     use async_trait::async_trait;
 
-    use super::reset_unique_connection_pools;
+    use super::{OutboundManager, reset_unique_connection_pools};
     use crate::{
         app::{
             dispatcher::{BoxedChainedDatagram, BoxedChainedStream},
@@ -992,6 +1013,9 @@ mod tests {
         },
         session::Session,
     };
+
+    #[cfg(feature = "wireguard")]
+    use crate::config::internal::proxy::{OutboundProxyProtocol, OutboundWireguard};
 
     #[derive(Debug)]
     struct CountingHandler {
@@ -1032,6 +1056,48 @@ mod tests {
         ) -> io::Result<BoxedChainedDatagram> {
             unreachable!("connection-pool reset test does not dial")
         }
+    }
+
+    #[cfg(feature = "wireguard")]
+    #[test]
+    fn provider_wireguard_conversion_is_strict() {
+        let valid: OutboundWireguard = serde_yaml::from_str(
+            r#"
+name: wg
+server: 198.51.100.10
+port: 51820
+private-key: private
+public-key: public
+ip: 10.0.0.2/32
+udp: true
+"#,
+        )
+        .expect("wireguard config should parse");
+        let handler = OutboundManager::load_provider_outbound(
+            OutboundProxyProtocol::Wireguard(valid),
+        )
+        .expect("valid provider wireguard should convert")
+        .expect("wireguard provider should produce a handler");
+        assert!(matches!(handler.proto(), OutboundType::WireGuard));
+
+        let invalid: OutboundWireguard = serde_yaml::from_str(
+            r#"
+name: wg
+server: 198.51.100.10
+port: 51820
+private-key: private
+public-key: public
+ip: not-an-ip
+"#,
+        )
+        .expect("wireguard config shape should parse");
+        assert!(
+            OutboundManager::load_provider_outbound(
+                OutboundProxyProtocol::Wireguard(invalid),
+            )
+            .is_err(),
+            "provider loading must propagate WireGuard conversion errors"
+        );
     }
 
     #[tokio::test]
