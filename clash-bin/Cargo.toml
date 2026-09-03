@@ -10,6 +10,7 @@ edition = { workspace = true }
 default = ["standard", "aws-lc-rs", "dashboard"]
 standard = [
     "shadowsocks",
+    "wireguard",
     "trojan",
     "anytls",
     "ws",
