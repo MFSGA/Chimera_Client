@@ -11,6 +11,7 @@ pub const IMAGE_SINGBOX: &str = "ghcr.io/sagernet/sing-box:v1.13.8";
 pub const IMAGE_SS_RUST: &str = "teddysun/shadowsocks-rust:alpine-1.22.0";
 pub const IMAGE_SHADOW_TLS: &str = "ghcr.io/ihciah/shadow-tls:latest";
 pub const IMAGE_OBFS: &str = "gists/simple-obfs:latest";
+#[cfg(feature = "wireguard")]
 pub const IMAGE_WG: &str = "lscr.io/linuxserver/wireguard:1.0.20210914-legacy";
 
 #[cfg(all(docker_test, throughput_test))]
