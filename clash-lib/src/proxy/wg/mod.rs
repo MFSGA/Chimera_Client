@@ -3,6 +3,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use super::HandlerCommonOptions;
 
 #[allow(dead_code)]
+mod device;
+#[allow(dead_code)]
 mod events;
 #[allow(dead_code)]
 mod keys;
