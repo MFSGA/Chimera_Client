@@ -325,3 +325,100 @@ impl PlainProxyAPIResponse for Handler {
         m
     }
 }
+
+#[cfg(all(test, docker_test))]
+mod tests {
+
+    use crate::proxy::utils::{
+        GLOBAL_DIRECT_CONNECTOR,
+        test_utils::{
+            Suite,
+            config_helper::test_config_base_dir,
+            docker_runner::{DockerTestRunnerBuilder, alloc_docker_port},
+        },
+    };
+
+    use super::{
+        super::utils::test_utils::{consts::*, docker_runner::DockerTestRunner},
+        *,
+    };
+    use crate::{
+        proxy::utils::test_utils::run_test_suites_and_cleanup, tests::initialize,
+    };
+
+    // see: https://github.com/linuxserver/docker-wireguard?tab=readme-ov-file#usage
+    // we shouldn't run the wireguard server with host mode, or
+    // the sysctl of `net.ipv4.conf.all.src_valid_mark` will fail
+    async fn get_runner(host_port: u16) -> anyhow::Result<DockerTestRunner> {
+        let test_config_dir = test_config_base_dir();
+        let wg_config = test_config_dir.join("wg");
+        // the following configs is in accordance with the config in `wg`
+        // dir
+        DockerTestRunnerBuilder::new()
+            .image(IMAGE_WG)
+            .env(&[
+                "PUID=1000",
+                "PGID=1000",
+                "TZ=Etc/UTC",
+                "SERVERPORT=10002",
+                "SERVERURL=127.0.0.1",
+                "PEERS=1",
+                "PEERDNS=auto",
+                "INTERNAL_SUBNET=10.13.13.0",
+                "ALLOWEDIPS=0.0.0.0/0",
+            ])
+            .mounts(&[(wg_config.to_str().unwrap(), "/config")])
+            .sysctls(&[("net.ipv4.conf.all.src_valid_mark", "1")])
+            .cap_add(&["NET_ADMIN"])
+            .net_mode("bridge") // the default network mode for testing is `host`
+            .host_port(host_port, 10002)
+            .build()
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_wg() -> anyhow::Result<()> {
+        initialize();
+        let host_port = alloc_docker_port();
+
+        let runner = get_runner(host_port).await?;
+
+        let opts = HandlerOptions {
+            name: "wg".to_owned(),
+            common_opts: Default::default(),
+            server: runner.container_ip().unwrap_or("127.0.0.1".to_owned()),
+            port: 10002,
+            ip: Ipv4Addr::new(10, 13, 13, 2),
+            ipv6: None,
+            private_key: "KIlDUePHyYwzjgn18przw/ZwPioJhh2aEyhxb/dtCXI=".to_owned(),
+            public_key: "INBZyvB715sA5zatkiX8Jn3Dh5tZZboZ09x4pkr66ig=".to_owned(),
+            pre_shared_key: Some(
+                "+JmZErvtDT4ZfQequxWhZSydBV+ItqUcPMHUWY1j2yc=".to_owned(),
+            ),
+            remote_dns_resolve: false,
+            dns: None,
+            mtu: Some(1000),
+            udp: true,
+            allowed_ips: Some(vec!["0.0.0.0/0".to_owned()]),
+            reserved_bits: None,
+        };
+        let handler = Arc::new(Handler::new(opts));
+        handler
+            .register_connector(GLOBAL_DIRECT_CONNECTOR.clone())
+            .await;
+
+        // cannot run the ping pong test, since the wireguard server is running
+        // on bridge network mode and the `net.ipv4.conf.all.
+        // src_valid_mark` is not supported in the host network mode the
+        // latency test should be enough
+
+        // FIXME: wait for the startup of the test runner in a more elegant way
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        run_test_suites_and_cleanup(
+            handler,
+            runner,
+            &[Suite::LatencyTcp, Suite::DnsUdp],
+        )
+        .await
+    }
+}
