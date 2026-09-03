@@ -458,6 +458,7 @@ pub struct OutboundGroupRelay {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 #[serde(tag = "type")]
+#[serde(rename_all = "kebab-case")]
 pub enum OutboundProxyProviderDef {
     Http(OutboundHttpProvider),
     File(OutboundFileProvider),
@@ -715,7 +716,9 @@ xhttp-opts:
 
 #[cfg(all(test, feature = "wireguard"))]
 mod wireguard_tests {
-    use super::{OutboundProxyProtocol, OutboundWireguard};
+    use super::{
+        OutboundProxyProtocol, OutboundProxyProviderDef, OutboundWireguard,
+    };
 
     const PRE_SHARED_KEY: &str = "+JmZErvtDT4ZfQequxWhZSydBV+ItqUcPMHUWY1j2yc=";
 
@@ -734,6 +737,15 @@ public-key: INBZyvB715sA5zatkiX8Jn3Dh5tZZboZ09x4pkr66ig=
 {pre_shared_key}ip: 10.0.0.2/32
 "#
         )
+    }
+
+    #[test]
+    fn wireguard_file_provider_accepts_clash_type_tag() {
+        let provider: OutboundProxyProviderDef =
+            serde_yaml::from_str("type: file\npath: wireguard-proxies.yaml\n")
+                .expect("wireguard file provider should parse with type: file");
+
+        assert!(matches!(provider, OutboundProxyProviderDef::File(_)));
     }
 
     #[test]
