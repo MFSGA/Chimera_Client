@@ -1,4 +1,7 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    fmt::{Display, Formatter},
+};
 
 use serde::{Deserialize, de::value::MapDeserializer};
 use serde_yaml::Value;
@@ -90,6 +93,27 @@ impl TryFrom<HashMap<String, Value>> for OutboundProxyProtocol {
             .to_owned();
         OutboundProxyProtocol::deserialize(MapDeserializer::new(mapping.into_iter()))
             .map_err(map_serde_error(name))
+    }
+}
+
+impl Display for OutboundProxyProtocol {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OutboundProxyProtocol::Direct(_) => write!(f, "{PROXY_DIRECT}"),
+            OutboundProxyProtocol::Reject(_) => write!(f, "{PROXY_REJECT}"),
+            #[cfg(feature = "shadowsocks")]
+            OutboundProxyProtocol::Ss(_) => write!(f, "Shadowsocks"),
+            OutboundProxyProtocol::Socks5(_) => write!(f, "Socks5"),
+            #[cfg(feature = "anytls")]
+            OutboundProxyProtocol::Anytls(_) => write!(f, "AnyTLS"),
+            OutboundProxyProtocol::Vless(_) => write!(f, "Vless"),
+            #[cfg(feature = "wireguard")]
+            OutboundProxyProtocol::Wireguard(_) => write!(f, "Wireguard"),
+            #[cfg(feature = "trojan")]
+            OutboundProxyProtocol::Trojan(_) => write!(f, "Trojan"),
+            #[cfg(feature = "hysteria")]
+            OutboundProxyProtocol::Hysteria2(_) => write!(f, "Hysteria2"),
+        }
     }
 }
 
@@ -741,6 +765,7 @@ public-key: INBZyvB715sA5zatkiX8Jn3Dh5tZZboZ09x4pkr66ig=
             serde_yaml::from_str(&wireguard_yaml(None))
                 .expect("should parse wireguard");
         assert_eq!(config.name(), "wg-test");
+        assert_eq!(config.to_string(), "Wireguard");
         assert!(matches!(config, OutboundProxyProtocol::Wireguard(_)));
     }
 }
