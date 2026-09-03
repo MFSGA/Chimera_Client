@@ -17,6 +17,7 @@ libc = "0.2"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec", "net", "rt"] }
 futures = "0.3"
+async-recursion = { version = "1", optional = true }
 async-trait = "0.1"
 http = "1"
 hyper = { version = "1", features = ["http1", "http2", "client", "server"] }
@@ -185,7 +186,7 @@ ws = ["tokio-tungstenite"]
 
 anytls = ["tls", "dep:rcgen"]
 shadowsocks = ["dep:shadowsocks", "dep:blake3"]
-wireguard = ["dep:boringtun", "dep:smoltcp"]
+wireguard = ["dep:async-recursion", "dep:boringtun", "dep:smoltcp"]
 trojan = []
 hysteria = [
     "tls",

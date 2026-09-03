@@ -1,10 +1,12 @@
 use std::{
     collections::HashMap,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
+    time::Duration,
 };
 
 use bytes::{Bytes, BytesMut};
+use futures::{SinkExt, StreamExt};
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
     phy::Device,
@@ -14,9 +16,11 @@ use tokio::sync::{
     Mutex,
     mpsc::{Receiver, Sender},
 };
-use tracing::{Instrument, error, trace_span};
+use tracing::{Instrument, debug, error, trace, trace_span, warn};
 
-use crate::{app::dns::ThreadSafeDNSResolver, proxy::datagram::UdpPacket};
+use crate::{
+    app::dns::ThreadSafeDNSResolver, proxy::datagram::UdpPacket, session::SocksAddr,
+};
 
 use super::{
     events::PortProtocol,
@@ -120,6 +124,119 @@ impl DeviceManager {
             .await
             .unwrap();
         UdpPair::new(read_pair.1, write_pair.0)
+    }
+
+    pub async fn look_up_dns(
+        &self,
+        host: &str,
+        server: SocketAddr,
+    ) -> Option<IpAddr> {
+        debug!("looking up {} on {}", host, server);
+
+        #[async_recursion::async_recursion]
+        async fn query(
+            rtype: hickory_proto::rr::RecordType,
+            host: &str,
+            server: SocketAddr,
+            mut socket: UdpPair,
+        ) -> Option<IpAddr> {
+            let mut msg = hickory_proto::op::Message::query();
+
+            msg.add_query({
+                let mut q = hickory_proto::op::Query::new();
+                let name = hickory_proto::rr::Name::from_str_relaxed(host)
+                    .unwrap()
+                    .append_domain(&hickory_proto::rr::Name::root())
+                    .unwrap();
+                q.set_name(name);
+                q.set_query_type(rtype);
+                q
+            });
+
+            msg.metadata.recursion_desired = true;
+
+            let pkt = UdpPacket::new(
+                msg.to_vec().unwrap(),
+                SocksAddr::any_ipv4(),
+                server.into(),
+            );
+
+            socket.feed(pkt).await.ok()?;
+            socket.flush().await.ok()?;
+            trace!("sent dns query: {:?}", msg);
+
+            let pkt =
+                match tokio::time::timeout(Duration::from_secs(5), socket.next())
+                    .await
+                {
+                    Ok(Some(pkt)) => pkt,
+                    _ => {
+                        warn!("wg dns query timed out with server {server}");
+                        return None;
+                    }
+                };
+
+            let msg = hickory_proto::op::Message::from_vec(&pkt.data).ok()?;
+            trace!("got dns response: {:?}", msg);
+            for ans in msg.answers.iter() {
+                if ans.record_type() == rtype {
+                    match (rtype, &ans.data) {
+                        (_, hickory_proto::rr::RData::CNAME(cname)) => {
+                            debug!(
+                                "{} resolved to CNAME {}, asking recursively",
+                                host, cname.0
+                            );
+                            return query(
+                                rtype,
+                                &cname.0.to_ascii(),
+                                server,
+                                socket,
+                            )
+                            .await;
+                        }
+                        (
+                            hickory_proto::rr::RecordType::A,
+                            hickory_proto::rr::RData::A(addr),
+                        ) => {
+                            return Some(std::net::IpAddr::V4(addr.0));
+                        }
+                        (
+                            hickory_proto::rr::RecordType::AAAA,
+                            hickory_proto::rr::RData::AAAA(addr),
+                        ) => {
+                            return Some(std::net::IpAddr::V6(addr.0));
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            None
+        }
+
+        let socket = self.new_udp_socket().await;
+        let v4_query = query(hickory_proto::rr::RecordType::A, host, server, socket);
+        if self.addr_v6.is_some() {
+            let socket = self.new_udp_socket().await;
+            let v6_query =
+                query(hickory_proto::rr::RecordType::AAAA, host, server, socket);
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                futures::future::join(v4_query, v6_query),
+            )
+            .await
+            {
+                Ok((_, Some(v6))) => Some(v6),
+                Ok((v4, _)) => v4,
+                _ => {
+                    warn!("wg dns query timed out with server {server}");
+                    None
+                }
+            }
+        } else {
+            tokio::time::timeout(Duration::from_secs(5), v4_query)
+                .await
+                .ok()?
+        }
     }
 
     async fn get_ephemeral_tcp_port(&self) -> u16 {

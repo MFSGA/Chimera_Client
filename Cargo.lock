@@ -241,6 +241,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-recursion"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b43422f69d8ff38f95f1b2bb76517c91589a924d1559a0e935d7c8ce0274c11"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "async-task"
 version = "4.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -780,6 +791,7 @@ name = "clash-lib"
 version = "0.25.0"
 dependencies = [
  "anyhow",
+ "async-recursion",
  "async-trait",
  "aws-lc-rs",
  "axum",
