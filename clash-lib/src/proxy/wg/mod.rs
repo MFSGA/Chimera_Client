@@ -12,6 +12,8 @@ mod keys;
 mod ports;
 #[allow(dead_code)]
 mod stack;
+#[allow(dead_code)]
+mod wireguard;
 
 // Consumed by the WireGuard handler once the runtime module is wired in.
 #[allow(dead_code)]
