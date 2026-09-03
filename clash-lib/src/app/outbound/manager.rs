@@ -56,6 +56,8 @@ use crate::proxy::anytls;
 use crate::proxy::hysteria2;
 #[cfg(feature = "trojan")]
 use crate::proxy::trojan;
+#[cfg(feature = "wireguard")]
+use crate::proxy::wg;
 
 pub struct OutboundManager {
     /// name -> handler
@@ -484,11 +486,16 @@ impl OutboundManager {
                 }
                 #[cfg(feature = "wireguard")]
                 OutboundProxyProtocol::Wireguard(wg) => {
-                    error!(
-                        "wireguard outbound {} is parsed but runtime wiring is not yet available",
-                        wg.common_opts.name
-                    );
-                    None
+                    let name = wg.common_opts.name.clone();
+                    wg.try_into()
+                        .map(|x: wg::Handler| Arc::new(x) as AnyOutboundHandler)
+                        .inspect_err(|e| {
+                            error!(
+                                "failed to load wireguard outbound {}: {}",
+                                name, e
+                            );
+                        })
+                        .ok()
                 }
             })
             .collect()

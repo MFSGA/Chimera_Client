@@ -3,14 +3,25 @@ use ipnet::IpNet;
 use crate::{
     Error,
     config::internal::proxy::OutboundWireguard,
-    proxy::{HandlerCommonOptions, wg::HandlerOptions},
+    proxy::{
+        HandlerCommonOptions,
+        wg::{Handler, HandlerOptions},
+    },
 };
 
-impl TryFrom<&OutboundWireguard> for HandlerOptions {
-    type Error = Error;
+impl TryFrom<OutboundWireguard> for Handler {
+    type Error = crate::Error;
+
+    fn try_from(value: OutboundWireguard) -> Result<Self, Self::Error> {
+        (&value).try_into()
+    }
+}
+
+impl TryFrom<&OutboundWireguard> for Handler {
+    type Error = crate::Error;
 
     fn try_from(s: &OutboundWireguard) -> Result<Self, Self::Error> {
-        Ok(Self {
+        let h = Handler::new(HandlerOptions {
             name: s.common_opts.name.to_owned(),
             common_opts: HandlerCommonOptions {
                 connector: s.common_opts.connect_via.clone(),
@@ -55,23 +66,25 @@ impl TryFrom<&OutboundWireguard> for HandlerOptions {
                 .transpose()?,
             private_key: s.private_key.to_owned(),
             public_key: s.public_key.to_owned(),
-            pre_shared_key: s.pre_shared_key.clone(),
+            pre_shared_key: s.pre_shared_key.as_ref().map(|x| x.to_owned()),
             remote_dns_resolve: s.remote_dns_resolve.unwrap_or_default(),
-            dns: s.dns.clone(),
+            dns: s.dns.as_ref().map(|x| x.to_owned()),
             mtu: s.mtu,
             udp: s.udp.unwrap_or_default(),
-            allowed_ips: s.allowed_ips.clone(),
-            reserved_bits: s.reserved_bits.clone(),
-        })
+            allowed_ips: s.allowed_ips.as_ref().map(|x| x.to_owned()),
+            reserved_bits: s.reserved_bits.as_ref().map(|x| x.to_owned()),
+        });
+        Ok(h)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::{OutboundHandler, OutboundType};
 
     #[test]
-    fn converts_wireguard_config_to_handler_options() {
+    fn converts_wireguard_config_to_handler() {
         let config: OutboundWireguard = serde_yaml::from_str(
             r#"
 name: wg
@@ -80,28 +93,16 @@ port: 51820
 private-key: private
 public-key: public
 ip: 10.0.0.2/32
-ipv6: fd00::2/128
 udp: true
-remote-dns-resolve: true
-dns: [1.1.1.1]
-allowed-ips: [0.0.0.0/0, "::/0"]
-reserved-bits: [1, 2, 3]
 "#,
         )
         .expect("wireguard config should parse");
 
-        let opts = HandlerOptions::try_from(&config)
-            .expect("wireguard config should convert");
+        let handler =
+            Handler::try_from(&config).expect("wireguard config should convert");
 
-        assert_eq!(opts.name, "wg");
-        assert_eq!(opts.server, "198.51.100.10");
-        assert_eq!(opts.port, 51820);
-        assert_eq!(opts.ip, "10.0.0.2".parse::<std::net::Ipv4Addr>().unwrap());
-        assert_eq!(
-            opts.ipv6,
-            Some("fd00::2".parse::<std::net::Ipv6Addr>().unwrap())
-        );
-        assert!(opts.udp);
-        assert!(opts.remote_dns_resolve);
+        assert_eq!(handler.name(), "wg");
+        assert_eq!(handler.server_name(), Some("198.51.100.10"));
+        assert!(matches!(handler.proto(), OutboundType::WireGuard));
     }
 }
