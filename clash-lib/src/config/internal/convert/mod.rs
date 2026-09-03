@@ -209,6 +209,43 @@ profile: {{}}
 
     #[cfg(feature = "wireguard")]
     #[test]
+    fn preserve_wireguard_http_proxy_provider() {
+        let cfg = parse_config(
+            r#"
+proxy-providers:
+  wg-nodes:
+    type: http
+    url: https://example.com/wireguard.yaml
+    interval: 3600
+    path: providers/wireguard.yaml
+    health-check:
+      enable: true
+      url: https://www.gstatic.com/generate_204
+      interval: 300
+"#,
+        );
+
+        let converted = convert(cfg).expect("internal convert should succeed");
+        let provider = converted
+            .proxy_providers
+            .get("wg-nodes")
+            .expect("wireguard http provider should be preserved");
+
+        match provider {
+            crate::config::internal::proxy::OutboundProxyProviderDef::Http(http) => {
+                assert_eq!(http.name, "wg-nodes");
+                assert_eq!(http.url, "https://example.com/wireguard.yaml");
+                assert_eq!(http.interval, 3600);
+                assert_eq!(http.path, "providers/wireguard.yaml");
+                assert_eq!(http.health_check.enable, Some(true));
+                assert_eq!(http.health_check.interval, Some(300));
+            }
+            _ => panic!("expected http proxy provider"),
+        }
+    }
+
+    #[cfg(feature = "wireguard")]
+    #[test]
     fn preserve_wireguard_file_proxy_provider() {
         let cfg = parse_config(
             r#"

@@ -478,6 +478,10 @@ impl OutboundProxyProviderDef {
 pub struct OutboundHttpProvider {
     #[serde(skip)]
     pub name: String,
+    pub url: String,
+    pub interval: u64,
+    pub path: String,
+    pub health_check: HealthCheck,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
