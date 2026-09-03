@@ -12,7 +12,9 @@ use crate::{
     config::internal::{
         config::BindAddress,
         listener::InboundOpts,
-        proxy::{OutboundGroupProtocol, OutboundProxyProtocol},
+        proxy::{
+            OutboundGroupProtocol, OutboundProxyProtocol, OutboundProxyProviderDef,
+        },
     },
 };
 
@@ -178,6 +180,8 @@ pub struct Config {
     /// mixed-port: 7892
     /// ```
     pub mixed_port: Option<Port>,
+    #[serde(rename = "proxy-providers")]
+    pub proxy_provider: Option<HashMap<String, OutboundProxyProviderDef>>,
     #[serde(rename = "rule-providers")]
     pub rule_provider: Option<HashMap<String, RuleProviderDef>>,
     /// TUN settings

@@ -464,9 +464,21 @@ pub enum OutboundProxyProviderDef {
     File(OutboundFileProvider),
 }
 
+impl OutboundProxyProviderDef {
+    pub fn set_name(&mut self, name: String) {
+        match self {
+            OutboundProxyProviderDef::Http(p) => p.name = name,
+            OutboundProxyProviderDef::File(p) => p.name = name,
+        }
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 #[serde(rename_all = "kebab-case")]
-pub struct OutboundHttpProvider {}
+pub struct OutboundHttpProvider {
+    #[serde(skip)]
+    pub name: String,
+}
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 #[serde(rename_all = "kebab-case")]

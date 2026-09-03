@@ -91,7 +91,18 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
             },
         )?,
         proxy_groups: proxy_group::convert(c.proxy_group.take(), &mut proxy_names)?,
-        proxy_providers: HashMap::new(),
+        proxy_providers: c
+            .proxy_provider
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name, mut provider)| {
+                // `name` is `#[serde(skip)]` so it defaults to ""; populate
+                // from the map key.
+                provider.set_name(name.clone());
+                (name, provider)
+            })
+            .collect(),
         rule_providers: rule_provider::convert(c.rule_provider.take()),
         proxy_names,
         users: c
@@ -194,6 +205,33 @@ profile: {{}}
         );
         yaml.parse::<def::Config>()
             .expect("def config should parse")
+    }
+
+    #[cfg(feature = "wireguard")]
+    #[test]
+    fn preserve_wireguard_file_proxy_provider() {
+        let cfg = parse_config(
+            r#"
+proxy-providers:
+  wg-nodes:
+    type: file
+    path: wireguard-proxies.yaml
+"#,
+        );
+
+        let converted = convert(cfg).expect("internal convert should succeed");
+        let provider = converted
+            .proxy_providers
+            .get("wg-nodes")
+            .expect("wireguard file provider should be preserved");
+
+        match provider {
+            crate::config::internal::proxy::OutboundProxyProviderDef::File(file) => {
+                assert_eq!(file.name, "wg-nodes");
+                assert_eq!(file.path, "wireguard-proxies.yaml");
+            }
+            _ => panic!("expected file proxy provider"),
+        }
     }
 
     #[test]
