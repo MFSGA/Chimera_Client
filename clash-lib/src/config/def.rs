@@ -538,6 +538,8 @@ impl Display for RunMode {
 #[cfg(test)]
 mod tests {
     use super::Config;
+    #[cfg(feature = "wireguard")]
+    use crate::config::internal::proxy::OutboundProxyProtocol;
 
     #[test]
     fn missing_mmdb_defaults_to_country_mmdb() {
@@ -565,6 +567,33 @@ mod tests {
             cfg.experimental.and_then(|exp| exp.closed_flows_cap),
             Some(64)
         );
+    }
+
+    /// Feature-gated test for WireGuard proxy type parsing through the full config.
+    #[cfg(feature = "wireguard")]
+    #[test]
+    fn parse_wireguard_proxy() {
+        let cfg = r#"
+proxies:
+  - name: "wg"
+    type: wireguard
+    server: server
+    port: 51820
+    private-key: "base64privatekey"
+    public-key: "base64publickey"
+    ip: 10.0.0.2
+    dns:
+      - 1.1.1.1
+"#;
+        let c = cfg.parse::<Config>().expect("should parse wireguard");
+        let proxies = c.proxy.unwrap();
+        assert_eq!(proxies.len(), 1);
+        if let OutboundProxyProtocol::Wireguard(w) = &proxies[0] {
+            assert_eq!(w.common_opts.name, "wg");
+            assert_eq!(w.ip, "10.0.0.2");
+        } else {
+            panic!("expected wireguard proxy");
+        }
     }
 
     #[test]
