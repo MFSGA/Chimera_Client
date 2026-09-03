@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
     time::Duration,
@@ -7,10 +7,17 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
+
+use rand::seq::IndexedRandom;
 use smoltcp::{
-    iface::{SocketHandle, SocketSet},
+    iface::{Config, Interface, SocketHandle, SocketSet},
     phy::Device,
-    socket::{tcp, udp},
+    socket::{
+        tcp::{self, RecvError},
+        udp,
+    },
+    time::Instant,
+    wire::IpCidr,
 };
 use tokio::sync::{
     Mutex,
@@ -40,6 +47,11 @@ enum Socket {
         Receiver<Bytes>,
     ),
     Udp(udp::Socket<'static>, Sender<UdpPacket>, Receiver<UdpPacket>),
+}
+
+enum Transfer {
+    Tcp(SocketHandle, Bytes, bool),
+    Udp(SocketHandle, UdpPacket, bool),
 }
 
 enum SenderType {
@@ -236,6 +248,361 @@ impl DeviceManager {
             tokio::time::timeout(Duration::from_secs(5), v4_query)
                 .await
                 .ok()?
+        }
+    }
+
+    pub async fn poll_sockets(&self, mut device: VirtualIpDevice) {
+        let mut config = Config::new(smoltcp::wire::HardwareAddress::Ip);
+        config.random_seed = rand::random();
+
+        let mut iface = Interface::new(config, &mut device, Instant::now());
+        iface.update_ip_addrs(|addrs| {
+            addrs.push(IpCidr::new(self.addr.into(), 32)).unwrap();
+
+            if let Some(addr_v6) = self.addr_v6 {
+                addrs.push(IpCidr::new(addr_v6.into(), 128)).unwrap();
+            }
+        });
+
+        let (device_sender, mut device_receiver) = tokio::sync::mpsc::channel(1024);
+
+        let mut tcp_queue: HashMap<SocketHandle, VecDeque<(Bytes, bool)>> =
+            HashMap::new();
+        let mut udp_queue: HashMap<SocketHandle, VecDeque<(UdpPacket, bool)>> =
+            HashMap::new();
+        let mut next_poll = None;
+
+        loop {
+            let mut sockets = self.socket_set.lock().await;
+            let mut socket_pairs = self.socket_pairs.lock().await;
+
+            let mut packet_notifier = self.packet_notifier.lock().await;
+            let mut socket_notifier_receiver =
+                self.socket_notifier_receiver.lock().await;
+
+            tokio::select! {
+                Some(socket) = socket_notifier_receiver.recv() => {
+                    trace!("got new socket, notifying to poll sockets");
+
+                    match socket {
+                        Socket::Tcp(mut socket, remote, sender, mut receiver) => {
+                            socket
+                            .connect(
+                                iface.context(),
+                                remote,
+                                (match remote {
+                                    SocketAddr::V4(_) => IpAddr::V4(self.addr),
+                                    SocketAddr::V6(_) => IpAddr::V6(self.addr_v6.unwrap()),
+                                }, self.get_ephemeral_tcp_port().await),
+                            )
+                            .unwrap();
+
+                            let handle = sockets.add(socket);
+
+                            let device_sender = device_sender.clone();
+                            tokio::spawn(async move {
+                                loop {
+                                    let data = match receiver.recv().await {
+                                        Some(data) => data,
+                                        None => {
+                                            break;
+                                        }
+                                    };
+                                    trace!("sending {} bytes", data.len());
+                                    device_sender.send(Transfer::Tcp(handle, data, true)).await.unwrap();
+                                }
+                                trace!("socket {} closed, sending close signal", handle);
+                                device_sender
+                                    .send(Transfer::Tcp(handle, Vec::new().into(), false))
+                                    .await
+                                    .unwrap();
+                            });
+
+                            socket_pairs.insert(handle, SenderType::Tcp(sender));
+                            tcp_queue.insert(handle, VecDeque::new());
+                        }
+                        Socket::Udp(socket, sender, mut receiver) => {
+                            let handle = sockets.add(socket);
+
+                            let device_sender = device_sender.clone();
+                            tokio::spawn(async move {
+                                loop {
+                                    let data = match receiver.recv().await {
+                                        Some(data) => data,
+                                        None => {
+                                            break;
+                                        }
+                                    };
+
+                                    device_sender
+                                        .send(Transfer::Udp(handle, data, true))
+                                        .await
+                                        .unwrap();
+                                }
+
+                                trace!("socket {} closed, sending close signal", handle);
+                                device_sender
+                                    .send(Transfer::Udp(handle, UdpPacket::default() , false))
+                                    .await
+                                    .unwrap();
+                            });
+
+                            socket_pairs.insert(handle, SenderType::Udp(sender));
+                            udp_queue.insert(handle, VecDeque::new());
+                        }
+                    };
+
+
+                    next_poll = None;
+                }
+
+                _ = packet_notifier.recv() => {
+                    trace!("lower layer packet received, polling sockets");
+                    next_poll = None;
+                }
+
+                Some(transfer) = device_receiver.recv() => {
+                    match transfer {
+                        Transfer::Tcp(handle, data, active) => {
+                            if let Some(queue) = tcp_queue.get_mut(&handle) {
+                                queue.push_back((data, active));
+                                next_poll = None;
+                            }
+                        }
+
+                        Transfer::Udp(handle, data, active) => {
+                            if let Some(queue) = udp_queue.get_mut(&handle) {
+                                queue.push_back((data, active));
+                                next_poll = None;
+                            }
+                        }
+                    }
+                }
+
+                _ = match (next_poll, socket_pairs.len()) {
+                    (None, 0) => {
+                        tokio::time::sleep(Duration::MAX)
+                    },
+                    (None, _) => {
+                        tokio::time::sleep(Duration::ZERO)
+                    },
+                    (Some(dur), _) => {
+                        tokio::time::sleep(dur)
+                    }
+                } => {
+                    let _ = trace_span!("poll_sockets").enter();
+
+                    let timestamp = Instant::now();
+                    iface.poll(timestamp, &mut device, &mut sockets);
+
+                    for (handle, sender) in socket_pairs.iter_mut() {
+                        match sender {
+                            SenderType::Tcp(sender) => {
+                                let socket = sockets.get_mut::<tcp::Socket>(*handle);
+                                if socket.may_recv() {
+                                    match socket.recv(|data| (data.len(), data.to_owned())) {
+                                        Ok(data) if !data.is_empty() => match sender.try_send(data.into()) {
+                                            Ok(_) => {}
+                                            Err(_) => {
+                                                trace!("socket {} closed from remote(?), aboring connection", handle);
+                                                socket.abort();
+                                            }
+                                        },
+                                        Ok(_) => {}
+                                        Err(RecvError::Finished) => {
+                                            warn!("tcp socket finished");
+                                            continue;
+                                        }
+                                        Err(e) => {
+                                            warn!("failed to receive tcp packet: {:?}", e);
+                                        }
+                                    }
+                                }
+
+                                if socket.may_send()
+                                    && let Some(queue) = tcp_queue.get_mut(handle) {
+                                        let data = queue.pop_front();
+                                        match data { Some((to_transfer_slice, active)) => {
+                                            if !active {
+                                                trace!("socket {} closed from local(?), aboring socket", handle);
+                                                socket.abort();
+                                            } else {
+                                                let total = to_transfer_slice.len();
+                                                trace!("socket {} sending {} bytes", handle, total);
+                                                match socket.send_slice(&to_transfer_slice) {
+                                                    Ok(sent) => {
+                                                        if sent < total {
+                                                            // Sometimes only a subset is sent, so the rest needs to be sent on the next poll
+                                                            let tx_extra = Vec::from(&to_transfer_slice[sent..total]);
+                                                            queue.push_front((tx_extra.into(), true));
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        error!(
+                                                            "Failed to send slice via virtual client socket: {:?}",
+                                                            e
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        } _ => {
+                                            // the local side has closed, but we don't know if the remote should be closed
+                                            // let the dispatcher timeout to close the connection
+                                        }}
+                                    }
+                            }
+                            SenderType::Udp(sender) => {
+                                let socket = sockets.get_mut::<udp::Socket>(*handle);
+                                if socket.can_recv() {
+                                    match socket.recv() {
+                                        Ok((data, md)) if !data.is_empty() => match sender.try_send(UdpPacket::new(data.into(), crate::session::SocksAddr::Ip(SocketAddr::new(md.endpoint.addr.into(), md.endpoint.port)), SocksAddr::any_ipv4())) {
+                                            Ok(_) => {}
+                                            Err(_) => {
+                                                trace!("socket {} closed from remote(?), aboring connection", handle);
+                                                socket.close();
+                                            }
+                                        },
+                                        Ok(_) => {}
+                                        Err(udp::RecvError::Exhausted) => {
+                                            trace!("no more data");
+                                            continue;
+                                        }
+                                        Err(udp::RecvError::Truncated) => {
+                                            panic!("udp packet truncated - this should never happen");
+                                        }
+                                    }
+                                }
+
+                                if socket.can_send()
+                                    && let Some(queue) = udp_queue.get_mut(handle) {
+                                        let data = queue.pop_front();
+                                        if let Some((pkt, active)) = data {
+                                            if !active {
+                                                trace!("socket {} closed from local(?), aboring socket", handle);
+                                                socket.close();
+                                            } else {
+                                                let ip = match &pkt.dst_addr {
+                                                    SocksAddr::Ip(addr) => addr.ip(),
+                                                    SocksAddr::Domain(domain, _) => {
+                                                        if let Ok(ip) = domain.parse::<IpAddr>() {
+                                                            ip
+                                                        } else {
+                                                            let dns_server = self.dns_servers.choose(&mut rand::rng());
+                                                            if let Some(dns_server) = dns_server {
+                                                                let ip = self.look_up_dns(domain, *dns_server).await;
+                                                                if let Some(ip) = ip {
+                                                                    debug!("host {} resolved to {} on wg stack", domain, ip);
+                                                                    ip
+                                                                } else {
+                                                                    warn!("failed to resolve domain on wireguard: {}", domain);
+                                                                    continue;
+                                                                }
+                                                            } else {
+                                                                match self.resolver.resolve(domain, false).await {
+                                                                    Ok(Some(ip)) => {
+                                                                        debug!("host {} resolved to {} on local", domain, ip);
+                                                                        ip
+                                                                    }
+                                                                    _ => {
+                                                                        warn!("failed to resolve domain on wireguard: {}", domain);
+                                                                        continue;
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                };
+
+                                                if !socket.is_open() {
+                                                    let local_addr: IpAddr = match ip {
+                                                        IpAddr::V4(_) => self.addr.into(),
+                                                        IpAddr::V6(_) => self.addr_v6.unwrap().into(),
+                                                    };
+                                                    socket
+                                                        .bind(
+                                                            (local_addr, self.get_ephemeral_udp_port().await),
+                                                        )
+                                                    .unwrap();
+                                                }
+
+                                                match socket.send_slice(&pkt.data, (ip, pkt.dst_addr.port())) {
+                                                    Ok(_) => {}
+                                                    Err(e) => {
+                                                        error!(
+                                                            "Failed to send slice via virtual client socket: {:?}",
+                                                            e
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            // the local side has closed, but we don't know if the remote should be closed
+                                            // let the dispatcher timeout to close the connection
+                                        }
+                                    }
+
+                            }
+                        };
+                    }
+
+                    let mut tcp_port_to_release = Vec::new();
+                    let mut udp_port_to_release = Vec::new();
+
+                    socket_pairs.retain(|handle, sender_type| {
+                        match sender_type {
+                            SenderType::Tcp(_) => {
+                                let socket = sockets.get::<tcp::Socket>(*handle);
+                                if socket.is_active() {
+                                    true
+                                } else {
+                                    if let Some(port) = socket.local_endpoint().map(|x| x.port) {
+                                        tcp_port_to_release.push(port);
+                                    } else {
+                                        warn!("tcp socket {} was never connected, cannot release port", handle);
+                                    }
+
+                                    trace!("socket {} closed, shutting down connection and releasing resources", handle);
+                                    sockets.remove(*handle);
+                                    tcp_queue.remove(handle);
+                                    false
+
+                                }
+                            }
+                            SenderType::Udp(_) => {
+                                let socket = sockets.get::<udp::Socket>(*handle);
+                                if socket.is_open() {
+                                    true
+                                } else {
+                                    let port = socket.endpoint().port;
+                                    udp_port_to_release.push(port);
+
+                                    trace!("socket {} closed, shutting down connection and releasing resources", handle);
+                                    sockets.remove(*handle);
+
+                                    udp_queue.remove(handle);
+                                    false
+                                }
+                            }
+                        }
+                    });
+
+                    for port in tcp_port_to_release {
+                        self.release_ephemeral_tcp_port(port).await;
+                    }
+                    for port in udp_port_to_release {
+                        self.release_ephemeral_udp_port(port).await;
+                    }
+
+                    next_poll = match iface.poll_delay(timestamp, &sockets) {
+                        Some(smoltcp::time::Duration::ZERO) => None,
+                        Some(delay) => {
+                            trace!("device poll delay: {:?}", delay);
+                            Some(delay.into())
+                        }
+                        None => None,
+                    };
+                }
+            }
         }
     }
 
