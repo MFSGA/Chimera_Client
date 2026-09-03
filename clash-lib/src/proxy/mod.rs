@@ -188,6 +188,7 @@ pub enum OutboundType {
     Vless,
     Trojan,
     Anytls,
+    #[cfg(feature = "wireguard")]
     WireGuard,
     Tor,
     Tuic,
@@ -217,6 +218,7 @@ impl Display for OutboundType {
             OutboundType::Vless => write!(f, "Vless"),
             OutboundType::Trojan => write!(f, "Trojan"),
             OutboundType::Anytls => write!(f, "AnyTLS"),
+            #[cfg(feature = "wireguard")]
             OutboundType::WireGuard => write!(f, "WireGuard"),
             OutboundType::Tor => write!(f, "Tor"),
             OutboundType::Tuic => write!(f, "Tuic"),
