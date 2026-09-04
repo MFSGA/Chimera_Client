@@ -7,7 +7,7 @@ use std::{
 };
 
 use tokio::sync::RwLock;
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 use uuid::Uuid;
 
 use erased_serde::Serialize;
@@ -875,11 +875,6 @@ impl OutboundManager {
                             ))
                         })?,
                     ));
-                    provider.read().await.initialize().await.map_err(|e| {
-                        Error::InvalidConfig(format!(
-                            "failed to initialize http provider `{name}`: {e}"
-                        ))
-                    })?;
                     provider_registry.insert(name, provider);
                 }
                 OutboundProxyProviderDef::File(file) => {
@@ -995,14 +990,27 @@ impl OutboundManager {
                             ))
                         })?,
                     ));
-                    provider.read().await.initialize().await.map_err(|e| {
-                        Error::InvalidConfig(format!(
-                            "failed to initialize file provider `{name}`: {e}"
-                        ))
-                    })?;
                     provider_registry.insert(name, provider);
                 }
             }
+        }
+
+        let providers: Vec<(String, ThreadSafeProxyProvider)> = provider_registry
+            .iter()
+            .map(|(name, provider)| (name.clone(), provider.clone()))
+            .collect();
+        let mut failed = Vec::new();
+        for (name, provider) in providers {
+            info!("initializing provider {}", name);
+            if let Err(err) = provider.read().await.initialize().await {
+                error!("failed to initialize proxy provider {}: {}", name, err);
+                failed.push(name);
+                continue;
+            }
+            info!("initialized provider {}", name);
+        }
+        for name in failed {
+            provider_registry.remove(&name);
         }
 
         Ok(())

@@ -275,6 +275,9 @@ proxies:
 
     #[tokio::test]
     async fn remote_provider_refreshes_wireguard_handler() {
+        let cache_dir =
+            tempfile::tempdir().expect("provider cache dir should create");
+        let cache_path = cache_dir.path().join("wireguard.yaml");
         let reads = Arc::new(AtomicUsize::new(0));
         let reads_clone = reads.clone();
         let mut vehicle = MockProviderVehicle::new();
@@ -301,7 +304,7 @@ proxies:
         });
         vehicle
             .expect_path()
-            .return_const("/tmp/chimera-wireguard-provider-refresh".to_owned());
+            .return_const(cache_path.to_string_lossy().into_owned());
         vehicle.expect_typ().return_const(ProviderVehicleType::Http);
 
         let manager = ProxyManager::new(Arc::new(MockClashResolver::new()), None);
