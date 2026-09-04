@@ -122,7 +122,7 @@ where
             fs::write(self.vehicle.path(), &content)?;
         }
 
-        inner.hash = utils::sha256(&content)[..16]
+        inner.hash = utils::md5(&content)[..16]
             .try_into()
             .expect("md5 must be 16 bytes");
 
@@ -158,7 +158,7 @@ where
         let proxies = parser(&content)?;
 
         let now = SystemTime::now();
-        let hash = utils::sha256(&content)[..16]
+        let hash = utils::md5(&content)[..16]
             .try_into()
             .expect("md5 must be 16 bytes");
 

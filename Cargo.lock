@@ -829,6 +829,7 @@ dependencies = [
  "log",
  "lru_time_cache",
  "maxminddb",
+ "md-5",
  "memchr",
  "memory-stats",
  "mockall",

@@ -131,3 +131,9 @@ pub fn sha256(bytes: &[u8]) -> Vec<u8> {
     hasher.update(bytes);
     hasher.finalize().to_vec()
 }
+
+pub fn md5(bytes: &[u8]) -> Vec<u8> {
+    let mut hasher = md5::Md5::new();
+    hasher.update(bytes);
+    hasher.finalize().to_vec()
+}
