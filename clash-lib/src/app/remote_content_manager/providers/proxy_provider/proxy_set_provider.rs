@@ -148,6 +148,13 @@ impl Provider for ProxySetProvider {
         if let Some(updater) = self.fetcher.on_update.as_ref() {
             updater(proxies).await;
         }
+        if let Err(e) = self.fetcher.start_watch().await {
+            warn!(
+                "proxy provider '{}': live file watching unavailable, falling back to interval polling: {}",
+                self.name(),
+                e
+            );
+        }
         Ok(())
     }
 

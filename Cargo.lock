@@ -833,6 +833,7 @@ dependencies = [
  "memory-stats",
  "mockall",
  "network-interface",
+ "notify",
  "percent-encoding",
  "prost",
  "quinn",

@@ -56,6 +56,7 @@ prost = "0.14"
 regex = "1"
 zstd = "0.13"
 filetime = "0.2"
+notify = "8"
 
 tracing = "0.1"
 tracing-log = "0.2"
