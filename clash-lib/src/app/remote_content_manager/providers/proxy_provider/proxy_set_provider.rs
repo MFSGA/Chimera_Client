@@ -205,7 +205,13 @@ impl ProxyProvider for ProxySetProvider {
 
 #[cfg(all(test, feature = "wireguard"))]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
     use super::{ProxyProvider, ProxySetProvider};
     use crate::{
@@ -264,6 +270,69 @@ proxies:
             .expect("wireguard provider should initialize");
         let proxies = provider.proxies().await;
         assert_eq!(proxies.len(), 1);
+        assert!(matches!(proxies[0].proto(), OutboundType::WireGuard));
+    }
+
+    #[tokio::test]
+    async fn remote_provider_refreshes_wireguard_handler() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reads_clone = reads.clone();
+        let mut vehicle = MockProviderVehicle::new();
+        vehicle.expect_read().returning(move || {
+            let name = if reads_clone.fetch_add(1, Ordering::SeqCst) == 0 {
+                "wg-first"
+            } else {
+                "wg-second"
+            };
+            Ok(format!(
+                r#"
+proxies:
+  - name: {name}
+    type: wireguard
+    server: 198.51.100.10
+    port: 51820
+    private-key: private
+    public-key: public
+    ip: 10.0.0.2/32
+    udp: true
+"#
+            )
+            .into_bytes())
+        });
+        vehicle
+            .expect_path()
+            .return_const("/tmp/chimera-wireguard-provider-refresh".to_owned());
+        vehicle.expect_typ().return_const(ProviderVehicleType::Http);
+
+        let manager = ProxyManager::new(Arc::new(MockClashResolver::new()), None);
+        let health = HealthCheck::new(
+            vec![],
+            "http://www.gstatic.com/generate_204".to_owned(),
+            0,
+            true,
+            manager,
+        );
+        let provider = ProxySetProvider::new(
+            "wireguard".to_owned(),
+            Duration::ZERO,
+            Arc::new(vehicle),
+            health,
+        )
+        .expect("wireguard provider should construct");
+
+        provider
+            .initialize()
+            .await
+            .expect("wireguard provider should initialize");
+        assert_eq!(provider.proxies().await[0].name(), "wg-first");
+
+        provider
+            .update()
+            .await
+            .expect("wireguard provider should refresh");
+        let proxies = provider.proxies().await;
+        assert_eq!(proxies.len(), 1);
+        assert_eq!(proxies[0].name(), "wg-second");
         assert!(matches!(proxies[0].proto(), OutboundType::WireGuard));
     }
 }
