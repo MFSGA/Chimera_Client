@@ -256,9 +256,9 @@ impl HealthCheck {
         .await;
     }
 
-    // pub async fn update(&self, proxies: Vec<AnyOutboundHandler>) {
-    //     self.inner.write().await.proxies = proxies;
-    // }
+    pub async fn update(&self, proxies: Vec<AnyOutboundHandler>) {
+        self.inner.write().await.proxies = proxies;
+    }
 
     pub fn auto(&self) -> bool {
         self.interval != 0

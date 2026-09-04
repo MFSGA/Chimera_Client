@@ -24,9 +24,10 @@ use crate::{
             ProxyManager,
             healthcheck::HealthCheck,
             providers::{
-                ProviderVehicle, ProviderVehicleType, http_vehicle,
+                ProviderVehicleType, ThreadSafeProviderVehicle, http_vehicle,
                 proxy_provider::{
                     ThreadSafeProxyProvider, plain_provider::PlainProvider,
+                    proxy_set_provider::ProxySetProvider,
                 },
             },
         },
@@ -407,7 +408,7 @@ impl OutboundManager {
     }
 
     #[cfg(feature = "wireguard")]
-    fn load_provider_outbound(
+    pub(crate) fn load_provider_outbound(
         outbound: OutboundProxyProtocol,
     ) -> Result<Option<AnyOutboundHandler>, Error> {
         match outbound {
@@ -420,7 +421,7 @@ impl OutboundManager {
     }
 
     #[cfg(not(feature = "wireguard"))]
-    fn load_provider_outbound(
+    pub(crate) fn load_provider_outbound(
         outbound: OutboundProxyProtocol,
     ) -> Result<Option<AnyOutboundHandler>, Error> {
         Ok(Self::load_plain_outbounds(vec![outbound]).pop())
@@ -842,7 +843,7 @@ impl OutboundManager {
             match provider {
                 OutboundProxyProviderDef::Http(http) => {
                     debug!("loading http proxy provider `{}`", name);
-                    let vehicle = http_vehicle::Vehicle::new(
+                    let vehicle = Arc::new(http_vehicle::Vehicle::new(
                         http.url.parse::<hyper::Uri>().map_err(|e| {
                             Error::InvalidConfig(format!(
                                 "invalid http proxy provider `{name}` url: {e}"
@@ -851,56 +852,40 @@ impl OutboundManager {
                         &http.path,
                         Some(&cwd),
                         resolver.clone(),
-                    );
-                    let content = vehicle.read().await.map_err(|e| {
-                        Error::InvalidConfig(format!(
-                            "failed to fetch http provider `{name}` from {}: {e}",
-                            http.url
-                        ))
-                    })?;
-                    let scheme: ProviderScheme = serde_yaml::from_slice(&content).map_err(|e| {
-                        Error::InvalidConfig(format!(
-                            "failed to parse http provider `{name}` from {}: {e}",
-                            http.url
-                        ))
-                    })?;
-                    let proxy_defs = scheme.proxies.ok_or_else(|| {
-                        Error::InvalidConfig(format!(
-                            "http provider `{name}` has empty proxies"
-                        ))
-                    })?;
-                    let mut proxies = Vec::with_capacity(proxy_defs.len());
-                    for def in proxy_defs {
-                        let protocol = OutboundProxyProtocol::try_from(def)?;
-                        if let Some(handler) =
-                            Self::load_provider_outbound(protocol)?
-                        {
-                            proxies.push(handler);
-                        }
-                    }
+                    ))
+                        as ThreadSafeProviderVehicle;
                     let health = http.health_check;
-                    let interval = if health.enable == Some(false) {
-                        0
-                    } else {
-                        health.interval.unwrap_or(http.interval)
-                    };
                     let health_check = HealthCheck::new(
-                        proxies.clone(),
+                        vec![],
                         health
                             .url
                             .unwrap_or_else(|| DEFAULT_LATENCY_TEST_URL.to_owned()),
-                        interval,
+                        if health.enable == Some(false) {
+                            0
+                        } else {
+                            health.interval.unwrap_or(http.interval)
+                        },
                         health.lazy.unwrap_or(true),
                         self.proxy_manager.clone(),
                     );
-                    let provider = Arc::new(RwLock::new(
-                        PlainProvider::new(name.clone(), proxies, health_check)
-                            .map_err(|x| {
-                                Error::InvalidConfig(format!(
-                                    "invalid provider config: {x}"
-                                ))
-                            })?,
+                    let provider: ThreadSafeProxyProvider = Arc::new(RwLock::new(
+                        ProxySetProvider::new(
+                            name.clone(),
+                            Duration::from_secs(http.interval),
+                            vehicle,
+                            health_check,
+                        )
+                        .map_err(|x| {
+                            Error::InvalidConfig(format!(
+                                "invalid provider config: {x}"
+                            ))
+                        })?,
                     ));
+                    provider.read().await.initialize().await.map_err(|e| {
+                        Error::InvalidConfig(format!(
+                            "failed to initialize http provider `{name}`: {e}"
+                        ))
+                    })?;
                     provider_registry.insert(name, provider);
                 }
                 OutboundProxyProviderDef::File(file) => {

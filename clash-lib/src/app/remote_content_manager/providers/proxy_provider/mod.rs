@@ -1,4 +1,5 @@
 pub mod plain_provider;
+pub mod proxy_set_provider;
 
 use std::sync::Arc;
 
