@@ -11,8 +11,6 @@ use tracing::{debug, error};
 use uuid::Uuid;
 
 use erased_serde::Serialize;
-use serde::Deserialize;
-use serde_yaml::Value;
 
 use crate::{
     Error,
@@ -24,7 +22,8 @@ use crate::{
             ProxyManager,
             healthcheck::HealthCheck,
             providers::{
-                ProviderVehicleType, ThreadSafeProviderVehicle, http_vehicle,
+                ProviderVehicleType, ThreadSafeProviderVehicle, file_vehicle,
+                http_vehicle,
                 proxy_provider::{
                     ThreadSafeProxyProvider, plain_provider::PlainProvider,
                     proxy_set_provider::ProxySetProvider,
@@ -77,11 +76,6 @@ pub struct OutboundManager {
 
 pub type ThreadSafeOutboundManager = Arc<OutboundManager>;
 static DEFAULT_LATENCY_TEST_URL: &str = "http://www.gstatic.com/generate_204";
-
-#[derive(Deserialize)]
-struct ProviderScheme {
-    proxies: Option<Vec<HashMap<String, Value>>>,
-}
 
 async fn reset_unique_connection_pools(
     handlers: Vec<AnyOutboundHandler>,
@@ -896,36 +890,14 @@ impl OutboundManager {
                     } else {
                         PathBuf::from(&cwd).join(path_buf)
                     };
-
-                    let content = tokio::fs::read(&path).await.map_err(|e| {
-                        Error::InvalidConfig(format!(
-                            "failed to read file provider `{name}` from {}: {e}",
-                            path.display()
-                        ))
-                    })?;
-
-                    let scheme: ProviderScheme = serde_yaml::from_slice(&content).map_err(|e| {
-                        Error::InvalidConfig(format!(
-                            "failed to parse file provider `{name}` from {}: {e}",
-                            path.display()
-                        ))
-                    })?;
-
-                    let proxy_defs = scheme.proxies.ok_or_else(|| {
-                        Error::InvalidConfig(format!(
-                            "file provider `{name}` has empty proxies"
-                        ))
-                    })?;
-
-                    let mut proxies = Vec::with_capacity(proxy_defs.len());
-                    for def in proxy_defs {
-                        let protocol = OutboundProxyProtocol::try_from(def)?;
-                        if let Some(handler) =
-                            Self::load_provider_outbound(protocol)?
-                        {
-                            proxies.push(handler);
-                        }
-                    }
+                    let vehicle = Arc::new(file_vehicle::Vehicle::new(
+                        path.to_str().ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "file provider `{name}` path is not valid UTF-8"
+                            ))
+                        })?,
+                    ))
+                        as ThreadSafeProviderVehicle;
 
                     let health = file.health_check;
                     if matches!(
@@ -993,7 +965,7 @@ impl OutboundManager {
                         health.interval.or(file.interval).unwrap_or_default()
                     };
                     let health_check = HealthCheck::new(
-                        proxies.clone(),
+                        vec![],
                         health
                             .url
                             .unwrap_or_else(|| DEFAULT_LATENCY_TEST_URL.to_owned()),
@@ -1010,10 +982,11 @@ impl OutboundManager {
                         health.timeout.map(Duration::from_secs),
                     );
 
-                    let provider = Arc::new(RwLock::new(
-                        PlainProvider::new(
+                    let provider: ThreadSafeProxyProvider = Arc::new(RwLock::new(
+                        ProxySetProvider::new(
                             name.clone(),
-                            proxies.clone(),
+                            Duration::from_secs(file.interval.unwrap_or_default()),
+                            vehicle,
                             health_check,
                         )
                         .map_err(|x| {
@@ -1022,6 +995,11 @@ impl OutboundManager {
                             ))
                         })?,
                     ));
+                    provider.read().await.initialize().await.map_err(|e| {
+                        Error::InvalidConfig(format!(
+                            "failed to initialize file provider `{name}`: {e}"
+                        ))
+                    })?;
                     provider_registry.insert(name, provider);
                 }
             }
