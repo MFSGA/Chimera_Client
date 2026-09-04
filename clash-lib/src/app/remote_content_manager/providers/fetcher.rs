@@ -255,9 +255,24 @@ where
                     return;
                 }
                 let _ = tx.try_send(());
+            })
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to create file watcher for {}: {}",
+                    file_path.display(),
+                    e
+                )
             })?;
 
-        watcher.watch(&watch_dir, RecursiveMode::NonRecursive)?;
+        watcher
+            .watch(&watch_dir, RecursiveMode::NonRecursive)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to watch directory {}: {}",
+                    watch_dir.display(),
+                    e
+                )
+            })?;
 
         tokio::spawn(async move {
             let _watcher = watcher;
