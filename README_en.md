@@ -2,9 +2,42 @@
 
 [中文](README.md) | [English](README_en.md) | [Русский](README_ru.md) | [فارسی](README_fa.md)
 
+> **Rust-native client ↔ VLESS + REALITY ↔ Rust-native server**
+
+## Chimera Ecosystem
+
+```text
+Chimera Desktop
+       ↕
+Chimera Client (Rust client core)
+       ↕ VLESS / REALITY
+Chimera Proxy Server (Rust server core)
+       ↕
+AChimera · Proxy Wiki
+```
+
+- [Chimera](https://github.com/MFSGA/Chimera) — cross-platform desktop application
+- [Chimera Proxy Server](https://github.com/MFSGA/Chimera_Service) — Pure Rust Xray-compatible server core
+- [AChimera](https://github.com/MFSGA/AChimera) — Android client
+- [Proxy Wiki](https://mfsga.github.io/Proxy_WIKI/) — documentation and deployment notes
+
 Chimera Client is a Rust reimplementation of the Clash proxy client stack. The goal is to stay as compatible as practical with Clash / Mihomo configuration style and operational workflow, while taking advantage of Rust's stronger type safety, async runtime, observability, and cross-platform maintainability.
 
 The current codebase mainly follows the architecture of upstream [`clash-rs`](https://github.com/Watfaq/clash-rs) and continues extending protocols, runtime behavior, and control interfaces for Chimera-specific needs. The project already includes core modules such as the CLI, configuration parsing, runtime assembly, DNS, routing, inbound and outbound management, proxy protocols, TUN, REST API, and hot reload.
+
+## Protocol Compatibility Matrix
+
+| Capability | Status |
+| --- | --- |
+| VLESS + REALITY + TCP | Stable |
+| XHTTP | Stable |
+| TUN | Stable |
+| DNS resolver / listener / Fake IP | Stable |
+| REST API | Stable |
+| Clash / Mihomo configuration compatibility | Partial |
+| VMess | Experimental |
+
+This is a snapshot of the current repository implementation. Platform, Cargo feature, and configuration combinations may affect actual availability.
 
 ## Project Goals
 

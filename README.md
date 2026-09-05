@@ -2,9 +2,42 @@
 
 [中文](README.md) | [English](README_en.md) | [Русский](README_ru.md) | [فارسی](README_fa.md)
 
+> **Rust-native client ↔ VLESS + REALITY ↔ Rust-native server**
+
+## Chimera Ecosystem
+
+```text
+Chimera Desktop
+       ↕
+Chimera Client (Rust client core)
+       ↕ VLESS / REALITY
+Chimera Proxy Server (Rust server core)
+       ↕
+AChimera · Proxy Wiki
+```
+
+- [Chimera](https://github.com/MFSGA/Chimera) — cross-platform desktop application
+- [Chimera Proxy Server](https://github.com/MFSGA/Chimera_Service) — Pure Rust Xray-compatible server core
+- [AChimera](https://github.com/MFSGA/AChimera) — Android client
+- [Proxy Wiki](https://mfsga.github.io/Proxy_WIKI/) — documentation and deployment notes
+
 Chimera Client 是一个使用 Rust 重新实现 Clash 网络代理栈的客户端项目。项目目标是在尽量兼容 Clash / Mihomo 配置与使用习惯的基础上，利用 Rust 生态提供更强的类型安全、异步运行时能力、可观测性和跨平台维护能力。
 
 当前代码主要参考上游 [`clash-rs`](https://github.com/Watfaq/clash-rs) 的架构，并围绕 Chimera 的需求继续补齐协议、运行时和控制接口。项目已经包含 CLI、配置解析、运行时装配、DNS、路由、出入站管理、代理协议、TUN、REST API 和热重载等核心模块。
+
+## 协议兼容矩阵
+
+| 能力 | 状态 |
+| --- | --- |
+| VLESS + REALITY + TCP | Stable |
+| XHTTP | Stable |
+| TUN | Stable |
+| DNS resolver / listener / Fake IP | Stable |
+| REST API | Stable |
+| Clash / Mihomo 配置兼容 | Partial |
+| VMess | Experimental |
+
+状态是当前仓库的实现快照；不同平台、Cargo feature 和配置组合可能影响实际可用范围。
 
 ## 项目目标
 
