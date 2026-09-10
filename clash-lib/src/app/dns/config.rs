@@ -134,12 +134,28 @@ impl Config {
                     net = "TCP";
                 }
                 "tls" => {
-                    port = url.port().unwrap_or(853);
-                    net = "DoT";
+                    #[cfg(not(any(feature = "aws-lc-rs", feature = "ring")))]
+                    return Err(Error::InvalidConfig(
+                        "encrypted DNS requires the `aws-lc-rs` or `ring` feature"
+                            .to_owned(),
+                    ));
+                    #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+                    {
+                        port = url.port().unwrap_or(853);
+                        net = "DoT";
+                    }
                 }
                 "https" => {
-                    port = url.port().unwrap_or(443);
-                    net = "DoH";
+                    #[cfg(not(any(feature = "aws-lc-rs", feature = "ring")))]
+                    return Err(Error::InvalidConfig(
+                        "encrypted DNS requires the `aws-lc-rs` or `ring` feature"
+                            .to_owned(),
+                    ));
+                    #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+                    {
+                        port = url.port().unwrap_or(443);
+                        net = "DoH";
+                    }
                 }
                 "dhcp" => {
                     port = url.port().unwrap_or(0);
@@ -503,6 +519,7 @@ mod tests {
             .expect("address should parse to SocketAddr");
     }
 
+    #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
     #[test]
     fn parse_nameserver_proxy_fragment_for_dns_upstream() {
         let servers =
@@ -514,6 +531,7 @@ mod tests {
         assert_eq!(ns[0].proxy.as_deref(), Some("TESTED"));
     }
 
+    #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
     #[test]
     fn parse_nameserver_proxy_fragment_shorthand() {
         let servers = vec!["tls://8.8.4.4:853#TESTED".to_string()];
@@ -522,5 +540,19 @@ mod tests {
         assert_eq!(ns.len(), 1);
         assert_eq!(ns[0].net, DNSNetMode::DoT);
         assert_eq!(ns[0].proxy.as_deref(), Some("TESTED"));
+    }
+
+    #[cfg(not(any(feature = "aws-lc-rs", feature = "ring")))]
+    #[test]
+    fn reject_encrypted_nameserver_without_crypto_backend() {
+        for server in ["tls://1.1.1.1", "https://dns.example/dns-query"] {
+            let error = Config::parse_nameserver(&[server.to_owned()])
+                .expect_err("encrypted DNS must require a crypto backend");
+            assert!(matches!(
+                error,
+                Error::InvalidConfig(message)
+                    if message.contains("requires the `aws-lc-rs` or `ring` feature")
+            ));
+        }
     }
 }

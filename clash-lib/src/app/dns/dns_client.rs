@@ -16,9 +16,10 @@ use std::{
 use async_trait::async_trait;
 
 use hickory_net::{
-    DnsHandle, client, h2::HttpsClientStream, tcp::TcpClientStream,
-    tls::tls_client_connect, udp::UdpClientStream, xfer::FirstAnswer,
+    DnsHandle, client, tcp::TcpClientStream, udp::UdpClientStream, xfer::FirstAnswer,
 };
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+use hickory_net::{h2::HttpsClientStream, tls::tls_client_connect};
 use hickory_proto::{
     op::{self, DnsRequest, DnsRequestOptions, Message},
     rr::{
@@ -26,17 +27,19 @@ use hickory_proto::{
         rdata::opt::{ClientSubnet, EdnsCode, EdnsOption},
     },
 };
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use rustls::{ClientConfig, pki_types::ServerName};
 use tokio::{sync::RwLock, task::JoinHandle};
 use tracing::{debug, info, instrument, trace, warn};
 
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+use crate::common::tls::{self, GLOBAL_ROOT_STORE};
 use crate::{
     Error,
     app::{
         dns::{self},
         net::OutboundInterface,
     },
-    common::tls::{self, GLOBAL_ROOT_STORE},
     dns::{ThreadSafeDNSClient, dhcp::DhcpClient},
     proxy::OutboundHandler,
 };
@@ -856,6 +859,7 @@ async fn dns_stream_builder(
             let (x, y) = client::Client::<DnsRuntimeProvider>::new(stream, sender);
             Ok((x, tokio::spawn(y)))
         }
+        #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
         DnsConfig::Tls(addr, host, iface, proxy, fw_mark) => {
             let mut tls_config = ClientConfig::builder()
                 .with_root_certificates(GLOBAL_ROOT_STORE.clone())
@@ -890,6 +894,7 @@ async fn dns_stream_builder(
             );
             Ok((x, tokio::spawn(y)))
         }
+        #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
         DnsConfig::Https(addr, host, iface, proxy, fw_mark) => {
             let mut tls_config = ClientConfig::builder()
                 .with_root_certificates(GLOBAL_ROOT_STORE.clone())
@@ -923,5 +928,9 @@ async fn dns_stream_builder(
             let (x, y) = client::Client::<DnsRuntimeProvider>::from_sender(stream);
             Ok((x, tokio::spawn(y)))
         }
+        #[cfg(not(any(feature = "aws-lc-rs", feature = "ring")))]
+        DnsConfig::Tls(..) | DnsConfig::Https(..) => Err(Error::InvalidConfig(
+            "encrypted DNS requires the `aws-lc-rs` or `ring` feature".to_owned(),
+        )),
     }
 }

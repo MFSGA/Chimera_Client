@@ -29,6 +29,14 @@ impl TryFrom<def::Config> for config::Config {
     type Error = crate::Error;
 
     fn try_from(value: def::Config) -> Result<Self, Self::Error> {
+        #[cfg(not(feature = "tun"))]
+        if value.tun.as_ref().is_some_and(|tun| tun.enable) {
+            return Err(Error::InvalidConfig(
+                "tun is enabled in the configuration, but clash-lib was built without the `tun` feature"
+                    .to_owned(),
+            ));
+        }
+
         convert(value)
     }
 }
@@ -205,6 +213,22 @@ profile: {{}}
         );
         yaml.parse::<def::Config>()
             .expect("def config should parse")
+    }
+
+    #[cfg(not(feature = "tun"))]
+    #[test]
+    fn reject_enabled_tun_without_tun_feature() {
+        let cfg = parse_config("tun:\n  enable: true");
+        let error = match super::config::Config::try_from(cfg) {
+            Ok(_) => panic!("enabled TUN must require the tun feature"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            Error::InvalidConfig(message)
+                if message.contains("without the `tun` feature")
+        ));
     }
 
     #[cfg(feature = "wireguard")]

@@ -1030,7 +1030,9 @@ mod tests {
 
     use async_trait::async_trait;
 
-    use super::{OutboundManager, reset_unique_connection_pools};
+    #[cfg(feature = "wireguard")]
+    use super::OutboundManager;
+    use super::reset_unique_connection_pools;
     use crate::{
         app::{
             dispatcher::{BoxedChainedDatagram, BoxedChainedStream},

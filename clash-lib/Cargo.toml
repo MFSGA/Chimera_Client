@@ -26,7 +26,10 @@ hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
 bytes = "1"
 tokio-stream = "0.1"
-tokio-rustls = "0.26"
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "logging",
+    "tls12",
+] }
 webpki-roots = "1.0"
 quinn = { version = "0.11", default-features = false, features = [
     "futures-io",
@@ -38,7 +41,7 @@ h3-quinn = { version = "0.0.10", optional = true }
 quinn-proto = { version = "0.11.14", default-features = false, optional = true }
 maxminddb = "0.28"
 
-hickory-net = { version = "0.26", default-features = false, features = ["https-aws-lc-rs"] }
+hickory-net = { version = "0.26", default-features = false }
 hickory-proto = { version = "0.26", default-features = false }
 hickory-resolver = { version = "0.26", default-features = false, features = ["tokio", "system-config"] }
 url = { version = "2" }
@@ -166,9 +169,11 @@ tls = []
 extended-health-check = []
 
 aws-lc-rs = [
+    "tls",
     "dep:aws-lc-rs",
     "rustls/aws-lc-rs",
     "quinn-proto?/rustls-aws-lc-rs",
+    "hickory-net/https-aws-lc-rs",
     "chimera-dns/aws-lc-rs",
     "dep:log",
     "dep:memchr",
@@ -180,6 +185,7 @@ ring = [
     "tls",
     "rustls/ring",
     "quinn-proto?/ring",
+    "hickory-net/https-ring",
     "chimera-dns/ring",
     "boringtun?/ring",
 ]
@@ -189,7 +195,7 @@ ws = ["tokio-tungstenite"]
 anytls = ["tls", "dep:rcgen"]
 shadowsocks = ["dep:shadowsocks", "dep:blake3"]
 wireguard = ["dep:async-recursion", "dep:boringtun", "dep:smoltcp"]
-trojan = []
+trojan = ["tls"]
 hysteria = [
     "tls",
     "dep:quinn",
