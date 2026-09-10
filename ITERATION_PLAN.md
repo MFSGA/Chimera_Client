@@ -212,3 +212,22 @@ Each item must be implemented, tested, and committed separately.
 - Current gap: optional protocol feature flags and modules are missing or incomplete compared with `ref`.
 - Expected test: one feature-gated config parsing test per protocol before runtime implementation is expanded.
 - Suggested verification: run focused `cargo check` with each added feature.
+
+## 2026-09-10 Feature Boundary Alignment
+
+- Baseline: Chimera `afd9bfca`, local `ref/` `6f50ec9e`.
+- Completed: reject `tun.enable: true` when the binary lacks the `tun` feature;
+  retain the existing enabled-TUN conversion path when the feature is present.
+- Completed: stop `tokio-rustls` and `hickory-net` from implicitly selecting AWS-LC;
+  propagate AWS-LC and Ring through their respective features, and make `trojan`
+  depend explicitly on `tls`.
+- Completed: zero-feature builds retain UDP/TCP DNS and reject DoT/DoH with a
+  clear error when neither crypto backend is compiled.
+- Local deviation: `ref/` does not reject an enabled TUN configuration in a
+  no-TUN build. Chimera does so to keep configuration and compiled capability
+  consistent.
+- Verified: zero-feature, Ring + Trojan + WS, AWS-LC + Trojan + WS, default,
+  all-feature, CLI Ring + Trojan + WS builds; focused TUN and encrypted-DNS
+  tests; formatting and diff checks.
+- Next slice: add these stable combinations to CI, then review whether the
+  general `tls` capability and encrypted-DNS capability need separate features.
