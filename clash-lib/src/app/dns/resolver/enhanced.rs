@@ -481,9 +481,8 @@ impl EnhancedResolver {
     }
 
     fn match_policy(&self, m: &op::Message) -> Option<&Vec<ThreadSafeDNSClient>> {
-        if let (Some(_fallback), Some(_fallback_domain_filters), Some(policy)) =
-            (&self.fallback, &self.fallback_domain_filters, &self.policy)
-            && let Some(domain) = EnhancedResolver::domain_name_of_message(m)
+        if let (Some(policy), Some(domain)) =
+            (&self.policy, EnhancedResolver::domain_name_of_message(m))
         {
             return policy.search(&domain).map(|n| n.get_data().unwrap());
         }
@@ -1153,6 +1152,46 @@ mod tests {
             .expect("TXT query should resolve through main nameserver");
         assert_eq!(proxy_hits.load(Ordering::SeqCst), 1);
         assert_eq!(main_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn nameserver_policy_works_without_fallback() {
+        let mut resolver = EnhancedResolver::new_default().await;
+        resolver.lru_cache = None;
+
+        let policy_hits = Arc::new(AtomicUsize::new(0));
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        resolver.policy = {
+            let mut policy: crate::common::trie::StringTrie<
+                Vec<ThreadSafeDNSClient>,
+            > = crate::common::trie::StringTrie::new();
+            policy.insert(
+                "proxy.example.com",
+                Arc::new(vec![Arc::new(CountingClient {
+                    response: response_with_a(Ipv4Addr::new(203, 0, 113, 10)),
+                    hits: policy_hits.clone(),
+                    id: "policy-ns",
+                })]),
+            );
+            Some(policy)
+        };
+        resolver.main = vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(198, 51, 100, 20)),
+            hits: main_hits.clone(),
+            id: "main-ns",
+        })];
+
+        let response = resolver
+            .exchange_no_cache(&test_query_with_type(rr::RecordType::A))
+            .await
+            .expect("policy nameserver should resolve the query");
+
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&response),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))]
+        );
+        assert_eq!(policy_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(main_hits.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
