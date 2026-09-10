@@ -12,6 +12,12 @@ fn should_filter_aaaa(req: &Message, ipv6_enabled: bool) -> bool {
             == Some(hickory_proto::rr::RecordType::AAAA)
 }
 
+fn should_resolve_fake_ip(req: &Message, fake_ip_enabled: bool) -> bool {
+    fake_ip_enabled
+        && req.queries.first().map(|query| query.query_type())
+            == Some(hickory_proto::rr::RecordType::A)
+}
+
 pub async fn exchange_with_resolver<'a>(
     resolver: &'a ThreadSafeDNSResolver,
     req: &'a Message,
@@ -21,10 +27,7 @@ pub async fn exchange_with_resolver<'a>(
         return Ok(build_dns_response_message(req, false, false));
     }
 
-    if req.queries.first().map(|q| q.query_type())
-        == Some(hickory_proto::rr::RecordType::AAAA)
-        || !resolver.fake_ip_enabled()
-    {
+    if !should_resolve_fake_ip(req, resolver.fake_ip_enabled()) {
         return match resolver.exchange(req).await {
             Ok(m) => Ok(m),
             Err(e) => {
@@ -78,12 +81,18 @@ pub async fn exchange_with_resolver<'a>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use hickory_proto::{
         op::{Message, MessageType, OpCode, Query},
         rr::{Name, RecordType},
     };
 
-    use super::should_filter_aaaa;
+    use crate::app::dns::{MockClashResolver, ThreadSafeDNSResolver};
+
+    use super::{
+        exchange_with_resolver, should_filter_aaaa, should_resolve_fake_ip,
+    };
 
     fn query(record_type: RecordType) -> Message {
         let mut message = Message::new(0, MessageType::Query, OpCode::Query);
@@ -107,5 +116,32 @@ mod tests {
     #[test]
     fn keeps_ipv4_queries_when_ipv6_is_disabled() {
         assert!(!should_filter_aaaa(&query(RecordType::A), false));
+    }
+
+    #[test]
+    fn fake_ip_is_only_used_for_a_queries() {
+        assert!(should_resolve_fake_ip(&query(RecordType::A), true));
+        assert!(!should_resolve_fake_ip(&query(RecordType::AAAA), true));
+        assert!(!should_resolve_fake_ip(&query(RecordType::TXT), true));
+        assert!(!should_resolve_fake_ip(&query(RecordType::A), false));
+    }
+
+    #[tokio::test]
+    async fn non_a_queries_use_upstream_in_fake_ip_mode() {
+        let mut resolver = MockClashResolver::new();
+        resolver.expect_ipv6().return_const(true);
+        resolver.expect_fake_ip_enabled().return_const(true);
+        resolver
+            .expect_exchange()
+            .once()
+            .returning(|_| Ok(Message::response(0, OpCode::Query)));
+
+        let resolver: ThreadSafeDNSResolver = Arc::new(resolver);
+        let response =
+            exchange_with_resolver(&resolver, &query(RecordType::TXT), true)
+                .await
+                .expect("TXT query should use the upstream resolver");
+
+        assert!(response.answers.is_empty());
     }
 }
