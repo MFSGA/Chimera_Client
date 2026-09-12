@@ -21,7 +21,6 @@ use crate::{
     },
     common::{geodata::GeoDataLookup, mmdb::MmdbLookup},
     config::internal::{config::RuleProviderDef, rule::RuleType},
-    print_and_exit,
 };
 
 const MATCH: &str = "MATCH";
@@ -54,7 +53,7 @@ impl Router {
         asn_mmdb: Option<MmdbLookup>,
         geodata: Option<GeoDataLookup>,
         cwd: String,
-    ) -> Self {
+    ) -> Result<Self, crate::Error> {
         let mut rule_provider_registry = HashMap::new();
         Self::load_rule_providers(
             rule_providers,
@@ -64,26 +63,27 @@ impl Router {
             geodata.clone(),
             cwd,
         )
-        .await
-        .ok();
+        .await?;
 
-        Self {
-            rules: rules
-                .into_iter()
-                .map(|r| {
-                    map_rule_type(
-                        r,
-                        country_mmdb.clone(),
-                        geodata.clone(),
-                        Some(&rule_provider_registry),
-                    )
-                })
-                .collect(),
+        let rules = rules
+            .into_iter()
+            .map(|r| {
+                map_rule_type(
+                    r,
+                    country_mmdb.clone(),
+                    geodata.clone(),
+                    Some(&rule_provider_registry),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            rules,
             dns_resolver,
             country_mmdb,
             asn_mmdb,
             rule_providers: rule_provider_registry,
-        }
+        })
     }
 
     pub fn get_rule_providers(&self) -> &HashMap<String, ThreadSafeRuleProvider> {
@@ -224,9 +224,12 @@ impl Router {
             match provider {
                 RuleProviderDef::Http(http) => {
                     let vehicle = http_vehicle::Vehicle::new(
-                        http.url.parse::<hyper::Uri>().unwrap_or_else(|_| {
-                            print_and_exit!("invalid provider url: {}", http.url)
-                        }),
+                        http.url.parse::<hyper::Uri>().map_err(|err| {
+                            crate::Error::InvalidConfig(format!(
+                                "invalid rule provider URL {}: {err}",
+                                http.url
+                            ))
+                        })?,
                         http.path,
                         Some(cwd.clone()),
                         resolver.clone(),
@@ -244,12 +247,14 @@ impl Router {
                     rule_provider_registry.insert(name, Arc::new(provider));
                 }
                 RuleProviderDef::File(file) => {
-                    let vehicle = file_vehicle::Vehicle::new(
-                        PathBuf::from(cwd.clone())
-                            .join(&file.path)
-                            .to_str()
-                            .unwrap(),
-                    );
+                    let path = PathBuf::from(cwd.clone()).join(&file.path);
+                    let path = path.to_str().ok_or_else(|| {
+                        crate::Error::InvalidConfig(format!(
+                            "rule provider path is not valid UTF-8: {}",
+                            path.display()
+                        ))
+                    })?;
+                    let vehicle = file_vehicle::Vehicle::new(path);
                     let provider = RuleProviderImpl::new(
                         name.clone(),
                         file.behavior,
@@ -302,74 +307,72 @@ pub fn map_rule_type(
     mmdb: Option<MmdbLookup>,
     geodata: Option<GeoDataLookup>,
     rule_provider_registry: Option<&HashMap<String, ThreadSafeRuleProvider>>,
-) -> Box<dyn RuleMatcher> {
+) -> Result<Box<dyn RuleMatcher>, crate::Error> {
     match rule_type {
         RuleType::Domain { domain, target } => {
-            Box::new(Domain { domain, target }) as Box<dyn RuleMatcher>
+            Ok(Box::new(Domain { domain, target }) as Box<dyn RuleMatcher>)
         }
         RuleType::DomainSuffix {
             domain_suffix,
             target,
-        } => Box::new(DomainSuffix {
+        } => Ok(Box::new(DomainSuffix {
             suffix: domain_suffix,
             target,
-        }),
+        })),
         RuleType::DomainKeyword {
             domain_keyword,
             target,
-        } => Box::new(DomainKeyword {
+        } => Ok(Box::new(DomainKeyword {
             keyword: domain_keyword,
             target,
-        }),
+        })),
         RuleType::GeoIP {
             target,
             country_code,
             no_resolve,
-        } => Box::new(rules::geoip::GeoIP {
+        } => Ok(Box::new(rules::geoip::GeoIP {
             target,
             country_code,
             no_resolve,
             mmdb: mmdb.clone(),
-        }),
+        })),
         RuleType::GeoSite {
             target,
             country_code,
-        } => Box::new(
-            rules::geodata::GeoSiteMatcher::new(
-                country_code,
-                target,
-                geodata.as_ref(),
-            )
-            .unwrap_or_else(|err| {
-                print_and_exit!("failed to initialize GEOSITE rule: {err}")
-            }),
-        ),
+        } => Ok(Box::new(rules::geodata::GeoSiteMatcher::new(
+            country_code,
+            target,
+            geodata.as_ref(),
+        )?)),
         RuleType::IpCidr {
             ipnet,
             target,
             no_resolve,
             ..
-        } => Box::new(IpCidr {
+        } => Ok(Box::new(IpCidr {
             ipnet,
             target,
             no_resolve,
-        }),
+        })),
         RuleType::RuleSet { rule_set, target } => match rule_provider_registry {
-            Some(rule_provider_registry) => Box::new(RuleSet::new(
+            Some(rule_provider_registry) => Ok(Box::new(RuleSet::new(
                 rule_set.clone(),
                 target,
                 rule_provider_registry
                     .get(&rule_set)
-                    .unwrap_or_else(|| {
-                        print_and_exit!("rule provider {} not found", rule_set)
-                    })
+                    .ok_or_else(|| {
+                        crate::Error::InvalidConfig(format!(
+                            "rule provider {} not found",
+                            rule_set
+                        ))
+                    })?
                     .clone(),
+            ))),
+            None => Err(crate::Error::InvalidConfig(
+                "rule-set cannot be nested inside another rule-set".to_owned(),
             )),
-            None => {
-                unreachable!("rule-set cannot be nested inside another rule-set")
-            }
         },
 
-        RuleType::Match { target } => Box::new(Final { target }),
+        RuleType::Match { target } => Ok(Box::new(Final { target })),
     }
 }
