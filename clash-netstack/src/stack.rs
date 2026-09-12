@@ -187,10 +187,13 @@ impl futures::Sink<Packet> for StackSplitSink {
         trace_ip_packet("tun inbound packet", item.data());
 
         let protocol = {
-            let packet =
-                etherparse::IpSlice::from_slice(item.data()).map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-                })?;
+            let packet = match etherparse::IpSlice::from_slice(item.data()) {
+                Ok(packet) => packet,
+                Err(err) => {
+                    debug!("dropping invalid TUN IP packet: {err}");
+                    return Ok(());
+                }
+            };
             let payload = packet.payload();
             if payload.fragmented {
                 match payload.ip_number {

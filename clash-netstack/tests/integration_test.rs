@@ -539,6 +539,29 @@ async fn test_new_connection_during_active_transfer() {
 }
 
 #[tokio::test]
+async fn malformed_ip_does_not_fail_stack_sink() {
+    let (stack, _tcp_listener, udp_socket) = NetStack::new();
+    let (mut stack_sink, _stack_stream) = stack.split();
+    let (mut udp_read, _udp_write) = udp_socket.split();
+
+    stack_sink
+        .send(Packet::new(vec![0x45, 0x00, 0x00]))
+        .await
+        .expect("malformed IP packet must be dropped, not fail the stack sink");
+    stack_sink
+        .send(Packet::new(build_udp_packet()))
+        .await
+        .unwrap();
+
+    let packet =
+        tokio::time::timeout(std::time::Duration::from_millis(300), udp_read.recv())
+            .await
+            .expect("valid UDP packet was not delivered after malformed IP input")
+            .expect("UDP receive stream ended unexpectedly");
+    assert_eq!(packet.local_addr, "1.1.1.1:5000".parse().unwrap());
+}
+
+#[tokio::test]
 async fn malformed_udp_does_not_end_receive_stream() {
     let (stack, _tcp_listener, udp_socket) = NetStack::new();
     let (mut stack_sink, _stack_stream) = stack.split();
