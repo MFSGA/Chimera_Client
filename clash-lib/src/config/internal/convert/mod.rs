@@ -229,6 +229,19 @@ profile: {{}}
             Error::InvalidConfig(message)
                 if message.contains("without the `tun` feature")
         ));
+
+        let mut internal = convert(parse_config(""))
+            .expect("conversion helper should produce the test fixture");
+        internal.tun.enable = true;
+        let error = match crate::Config::Internal(internal).try_parse() {
+            Ok(_) => panic!("internal config must use the same feature validation"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            Error::InvalidConfig(message)
+                if message.contains("without the `tun` feature")
+        ));
     }
 
     #[cfg(feature = "wireguard")]

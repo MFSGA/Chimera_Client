@@ -55,6 +55,14 @@ pub struct Config {
 
 impl Config {
     pub fn validate(self) -> Result<Self, crate::Error> {
+        #[cfg(not(feature = "tun"))]
+        if self.tun.enable {
+            return Err(Error::InvalidConfig(
+                "tun is enabled in the configuration, but clash-lib was built without the `tun` feature"
+                    .to_owned(),
+            ));
+        }
+
         for r in self.rules.iter() {
             if !self.proxies.contains_key(r.target())
                 && !self.proxy_groups.contains_key(r.target())

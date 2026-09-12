@@ -17,7 +17,6 @@ use super::{Config, ThreadSafeDNSResolver};
 use crate::{
     app::profile::ThreadSafeCacheFile,
     dns::{RuleDispatch, filters::PendingMmdb},
-    print_and_exit,
     proxy::utils::OutboundHandlerRegistry,
 };
 
@@ -27,18 +26,21 @@ pub async fn new(
     mmdb: Option<PendingMmdb>,
     outbounds: OutboundHandlerRegistry,
     rule_dispatch: Option<Arc<RuleDispatch>>,
-) -> ThreadSafeDNSResolver {
+) -> Result<ThreadSafeDNSResolver, crate::Error> {
     if cfg.enable {
         match store {
-            Some(store) => Arc::new(
+            Some(store) => Ok(Arc::new(
                 EnhancedResolver::new(cfg, store, mmdb, outbounds, rule_dispatch)
                     .await,
-            ),
-            _ => print_and_exit!("enhanced resolver requires cache store"),
+            )),
+            _ => Err(crate::Error::InvalidConfig(
+                "enhanced resolver requires cache store".to_owned(),
+            )),
         }
     } else {
-        Arc::new(
-            SystemResolver::new(cfg.ipv6).expect("failed to create system resolver"),
-        )
+        Ok(Arc::new(
+            SystemResolver::new(cfg.ipv6)
+                .map_err(|err| crate::Error::DNSError(err.to_string()))?,
+        ))
     }
 }

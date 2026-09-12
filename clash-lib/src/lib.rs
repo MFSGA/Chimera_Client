@@ -123,7 +123,7 @@ impl Config {
     pub fn try_parse(self) -> Result<InternalConfig> {
         match self {
             // Config::Def(c) => c.try_into(),
-            Config::Internal(c) => Ok(c),
+            Config::Internal(c) => c.validate(),
             Config::File(file) => {
                 TryInto::<def::Config>::try_into(PathBuf::from(file))?.try_into()
             }
@@ -607,7 +607,7 @@ async fn create_components(
         interface: config.general.interface.clone(),
     };
     #[cfg(feature = "tun")]
-    if activate_network {
+    if activate_network && network_config.uses_global_state() {
         if config.tun.enable {
             debug!("tun enabled, initializing default outbound interface");
         } else if config.general.interface.is_some() {
@@ -677,7 +677,7 @@ async fn create_components(
         outbound_registry.clone(),
         system_resolver.clone(),
     )
-    .await;
+    .await?;
     let client = new_http_client(
         control_plane_dns_resolver.clone(),
         Some(outbound_registry.clone()),
@@ -948,7 +948,7 @@ async fn build_auxiliary_dns_resolver(
     cache_store: profile::ThreadSafeCacheFile,
     outbounds: crate::proxy::utils::OutboundHandlerRegistry,
     system_resolver: Arc<SystemResolver>,
-) -> ThreadSafeDNSResolver {
+) -> Result<ThreadSafeDNSResolver> {
     let effective_nameserver = if nameserver.is_empty() {
         default_nameserver.clone()
     } else {
@@ -956,7 +956,7 @@ async fn build_auxiliary_dns_resolver(
     };
 
     if effective_nameserver.is_empty() {
-        return system_resolver;
+        return Ok(system_resolver);
     }
 
     let cfg = dns::Config {
