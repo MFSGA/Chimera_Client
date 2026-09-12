@@ -496,23 +496,13 @@ async fn start_with_shutdown_token(
         config_path,
     }));
 
-    let api_listener = Arc::new(app::api::ApiRunner::new(
+    let api_listener = components.api_listener(
         controller_cfg.clone(),
         log_tx.clone(),
-        components.inbound_manager.clone(),
-        components.dispatcher.clone(),
         global_state.clone(),
-        components.dns_resolver.clone(),
-        components.outbound_manager.clone(),
-        components.statistics_manager.clone(),
-        components.cache_store.clone(),
-        components.router.clone(),
-        cwd.to_string_lossy().to_string(),
-        Some(shutdown_token.child_token()),
-        components.dns_listen.clone(),
-        components.dns_enabled,
-        components.ipv6_allowed,
-    ));
+        &cwd,
+        shutdown_token.child_token(),
+    );
 
     // api_listener is not part of components because it requires components to be
     // initialized before it can be initialized. start it manually.
@@ -542,6 +532,7 @@ async fn start_with_shutdown_token(
         let mut network_runtime_lease = network_runtime_lease;
         let mut active_components = components;
         let mut active_api_listener = api_listener;
+        let mut active_controller_cfg = controller_cfg;
 
         // Listen for config reload signal and reload config
         loop {
@@ -561,7 +552,7 @@ async fn start_with_shutdown_token(
                         }
                     };
                     info!("reloading get config 2");
-                    let controller_cfg = config.general.controller.clone();
+                    let candidate_controller_cfg = config.general.controller.clone();
 
                     // Build the replacement runtime while the current one is still
                     // serving traffic. Construction performs all fallible config,
@@ -600,43 +591,38 @@ async fn start_with_shutdown_token(
                             "failed to activate network config during reload; keeping the active runtime: {}",
                             e
                         );
+                        if let Err(restore_err) = restore_network_after_failed_reload(
+                            &active_components,
+                            &new_components,
+                            &mut network_runtime_lease,
+                        )
+                        .await
+                        {
+                            let fatal = Error::Operation(format!(
+                                "failed to restore active network configuration after reload failure: {restore_err}"
+                            ));
+                            let _ = done.send(Err(fatal));
+                            reload_token.cancel();
+                            return Err(Error::Operation(
+                                "active network configuration could not be restored"
+                                    .to_owned(),
+                            ));
+                        }
                         let _ = done.send(Err(e));
                         continue;
                     }
 
-                    // The replacement is ready. Stop the old data plane without
-                    // clearing the network configuration that now belongs to the
-                    // candidate, then start the new one.
-                    active_components.stop_all_and_join(false).await;
-                    #[cfg(feature = "tun")]
-                    if !new_components.network_config.uses_global_state() {
-                        clear_net_config().await;
-                        network_runtime_lease.deactivate_to_neutral();
-                    }
-                    new_components.start_all();
-
-                    // TODO: every reload is causing the API server to restart, we should
-                    // make the API server reloadable instead of restarting it.
-                    // maybe adding APIs to replace components
-                    // and only recreate the listeners when necessary (e.g. when the listen
-                    // address or port is changed)
-                    let new_api_listener = Arc::new(app::api::ApiRunner::new(
-                        controller_cfg,
+                    // Validate the replacement controller before stopping the old
+                    // data plane. The old controller has to release its listening
+                    // socket first, but the old SOCKS/DNS/TUN runners remain alive
+                    // until every replacement controller endpoint is ready.
+                    let new_api_listener = new_components.api_listener(
+                        candidate_controller_cfg.clone(),
                         log_tx.clone(),
-                        new_components.inbound_manager.clone(),
-                        new_components.dispatcher.clone(),
                         global_state.clone(),
-                        new_components.dns_resolver.clone(),
-                        new_components.outbound_manager.clone(),
-                        new_components.statistics_manager.clone(),
-                        new_components.cache_store.clone(),
-                        new_components.router.clone(),
-                        cwd_clone.to_string_lossy().to_string(),
-                        Some(reload_token.child_token()),
-                        new_components.dns_listen.clone(),
-                        new_components.dns_enabled,
-                        new_components.ipv6_allowed,
-                    ));
+                        &cwd_clone,
+                        reload_token.child_token(),
+                    );
                     active_api_listener.shutdown();
                     if let Err(err) = active_api_listener.join().await {
                         warn!("failed waiting for api listener shutdown: {}", err);
@@ -644,18 +630,64 @@ async fn start_with_shutdown_token(
                     new_api_listener.run_async();
                     if let Err(err) = new_api_listener.wait_ready().await {
                         error!(
-                            "replacement API listener failed to become ready: {}",
+                            "replacement API listener failed to become ready; restoring the active runtime: {}",
                             err
                         );
                         new_api_listener.shutdown();
                         let _ = new_api_listener.join().await;
-                        new_components.stop_all_and_join(false).await;
+
+                        #[cfg(feature = "tun")]
+                        if let Err(restore_err) = restore_network_after_failed_reload(
+                            &active_components,
+                            &new_components,
+                            &mut network_runtime_lease,
+                        )
+                        .await
+                        {
+                            let fatal = Error::Operation(format!(
+                                "failed to restore active network configuration after controller reload failure: {restore_err}"
+                            ));
+                            let _ = done.send(Err(fatal));
+                            reload_token.cancel();
+                            return Err(Error::Operation(
+                                "active network configuration could not be restored"
+                                    .to_owned(),
+                            ));
+                        }
+
+                        let restored_api_listener = active_components.api_listener(
+                            active_controller_cfg.clone(),
+                            log_tx.clone(),
+                            global_state.clone(),
+                            &cwd_clone,
+                            reload_token.child_token(),
+                        );
+                        restored_api_listener.run_async();
+                        if let Err(restore_err) = restored_api_listener.wait_ready().await {
+                            let fatal = Error::Operation(format!(
+                                "failed to restore active API listener after reload failure: {restore_err}"
+                            ));
+                            let _ = done.send(Err(fatal));
+                            reload_token.cancel();
+                            return Err(Error::Operation(
+                                "active API listener could not be restored".to_owned(),
+                            ));
+                        }
+                        active_api_listener = restored_api_listener;
                         let _ = done.send(Err(err));
-                        reload_token.cancel();
-                        return Err(Error::Operation(
-                            "replacement API listener failed during reload".to_owned(),
-                        ));
+                        continue;
                     }
+
+                    // The replacement controller is now bound successfully. Commit
+                    // the data-plane switch only after that last fallible startup
+                    // boundary has passed.
+                    active_components.stop_all_and_join(false).await;
+                    #[cfg(feature = "tun")]
+                    if !new_components.network_config.uses_global_state() {
+                        clear_net_config().await;
+                        network_runtime_lease.deactivate_to_neutral();
+                    }
+                    new_components.start_all();
 
                     let mut g = global_state.lock().await;
                     #[cfg(feature = "tun")]
@@ -666,6 +698,7 @@ async fn start_with_shutdown_token(
 
                     active_components = new_components;
                     active_api_listener = new_api_listener;
+                    active_controller_cfg = candidate_controller_cfg;
 
                     if done.send(Ok(())).is_err() {
                         warn!("config reload response channel dropped before completion");
@@ -745,6 +778,33 @@ struct RuntimeComponents {
 }
 
 impl RuntimeComponents {
+    fn api_listener(
+        &self,
+        controller_cfg: config::internal::config::Controller,
+        log_tx: broadcast::Sender<LogEvent>,
+        global_state: Arc<Mutex<GlobalState>>,
+        cwd: &std::path::Path,
+        cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> Arc<app::api::ApiRunner> {
+        Arc::new(app::api::ApiRunner::new(
+            controller_cfg,
+            log_tx,
+            self.inbound_manager.clone(),
+            self.dispatcher.clone(),
+            global_state,
+            self.dns_resolver.clone(),
+            self.outbound_manager.clone(),
+            self.statistics_manager.clone(),
+            self.cache_store.clone(),
+            self.router.clone(),
+            cwd.to_string_lossy().to_string(),
+            Some(cancellation_token),
+            self.dns_listen.clone(),
+            self.dns_enabled,
+            self.ipv6_allowed,
+        ))
+    }
+
     fn start_all(&self) {
         #[cfg(feature = "tun")]
         self.tun_runner.run_async();
@@ -785,6 +845,25 @@ impl RuntimeComponents {
         if let Err(err) = self.inbound_manager.join().await {
             warn!("failed waiting for inbound manager shutdown: {}", err);
         }
+    }
+}
+
+#[cfg(feature = "tun")]
+async fn restore_network_after_failed_reload(
+    active_components: &RuntimeComponents,
+    new_components: &RuntimeComponents,
+    network_runtime_lease: &mut NetworkRuntimeLease,
+) -> Result<()> {
+    if !new_components.network_config.uses_global_state() {
+        return Ok(());
+    }
+
+    if active_components.network_config.uses_global_state() {
+        active_components.activate_network_config().await
+    } else {
+        clear_net_config().await;
+        network_runtime_lease.deactivate_to_neutral();
+        Ok(())
     }
 }
 

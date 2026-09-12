@@ -175,6 +175,92 @@ async fn put_configs_reloads_runtime_from_file() {
 
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
+async fn controller_bind_failure_restores_existing_runtime() {
+    let api_port = TcpListener::bind("127.0.0.1:0")
+        .expect("failed to reserve API port")
+        .local_addr()
+        .expect("failed to read API address")
+        .port();
+    let socks_port = TcpListener::bind("127.0.0.1:0")
+        .expect("failed to reserve SOCKS port")
+        .local_addr()
+        .expect("failed to read SOCKS address")
+        .port();
+    let blocked_api = TcpListener::bind("127.0.0.1:0")
+        .expect("failed to reserve blocked API port");
+    let blocked_api_port = blocked_api
+        .local_addr()
+        .expect("failed to read blocked API address")
+        .port();
+    let temp_dir = std::env::temp_dir()
+        .join(format!("chimera-api-reload-controller-rollback-{api_port}"));
+    std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+
+    let initial_config = temp_dir.join("initial.yaml");
+    let blocked_config = temp_dir.join("blocked-controller.yaml");
+    write_config(&initial_config, api_port, socks_port, "global");
+    write_config(&blocked_config, blocked_api_port, socks_port, "rule");
+
+    let cwd = temp_dir.clone();
+    let runtime = std::thread::spawn(move || {
+        clash_lib::start_scaffold(Options {
+            config: Config::File(initial_config.to_string_lossy().to_string()),
+            cwd: Some(cwd.to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            config_path: Some(initial_config.to_string_lossy().to_string()),
+        })
+        .expect("failed to start clash");
+    });
+
+    wait_port_ready(api_port);
+    wait_port_ready(socks_port);
+
+    let configs_url = format!("http://127.0.0.1:{api_port}/configs");
+    let put_request = hyper::Request::builder()
+        .uri(&configs_url)
+        .method(http::Method::PUT)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(
+            "{\"path\":\"blocked-controller.yaml\"}",
+        )))
+        .expect("failed to build PUT request");
+    let put_response = send_http_request(configs_url.parse().unwrap(), put_request)
+        .await
+        .expect("failed to request reload with blocked controller");
+    assert_eq!(
+        put_response.status(),
+        http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+
+    wait_port_ready(api_port);
+    wait_port_ready(socks_port);
+
+    let get_request = hyper::Request::builder()
+        .uri(&configs_url)
+        .method(http::Method::GET)
+        .body(http_body_util::Empty::<Bytes>::new())
+        .expect("failed to build GET request");
+    let response = send_http_request(configs_url.parse().unwrap(), get_request)
+        .await
+        .expect("active API was not restored after controller bind failure");
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let body = response
+        .collect()
+        .await
+        .expect("failed to read restored config response")
+        .to_bytes();
+    let config: serde_json::Value =
+        serde_json::from_slice(&body).expect("failed to parse restored config");
+    assert_eq!(config["mode"], "global");
+
+    drop(blocked_api);
+    assert!(clash_lib::shutdown());
+    runtime.join().expect("runtime thread panicked");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
 async fn failed_reload_keeps_existing_runtime_available() {
     let api_port = TcpListener::bind("127.0.0.1:0")
         .expect("failed to reserve API port")
