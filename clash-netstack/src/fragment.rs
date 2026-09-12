@@ -13,10 +13,15 @@ pub(crate) enum IpHeaderTemplate {
     Ipv4 {
         source: [u8; 4],
         destination: [u8; 4],
+        ttl: u8,
+        identification: u16,
     },
     Ipv6 {
         source: [u8; 16],
         destination: [u8; 16],
+        traffic_class: u8,
+        flow_label: etherparse::Ipv6FlowLabel,
+        hop_limit: u8,
     },
 }
 
@@ -32,6 +37,62 @@ impl IpHeaderTemplate {
         match self {
             Self::Ipv4 { destination, .. } => IpAddr::V4(destination.into()),
             Self::Ipv6 { destination, .. } => IpAddr::V6(destination.into()),
+        }
+    }
+
+    pub(crate) fn rebuild(
+        self,
+        protocol: etherparse::IpNumber,
+        payload: &[u8],
+    ) -> std::io::Result<crate::Packet> {
+        match self {
+            Self::Ipv4 {
+                source,
+                destination,
+                ttl,
+                identification,
+            } => {
+                let payload_len = u16::try_from(payload.len()).map_err(|_| {
+                    std::io::Error::other("reassembled payload too large")
+                })?;
+                let mut header = etherparse::Ipv4Header::new(
+                    payload_len,
+                    ttl,
+                    protocol,
+                    source,
+                    destination,
+                )
+                .map_err(std::io::Error::other)?;
+                header.identification = identification;
+                header.dont_fragment = true;
+                header.header_checksum = header.calc_header_checksum();
+                let mut out = header.to_bytes().to_vec();
+                out.extend_from_slice(payload);
+                Ok(crate::Packet::new(out))
+            }
+            Self::Ipv6 {
+                source,
+                destination,
+                traffic_class,
+                flow_label,
+                hop_limit,
+            } => {
+                let payload_length = u16::try_from(payload.len()).map_err(|_| {
+                    std::io::Error::other("reassembled payload too large")
+                })?;
+                let header = etherparse::Ipv6Header {
+                    traffic_class,
+                    flow_label,
+                    payload_length,
+                    next_header: protocol,
+                    hop_limit,
+                    source,
+                    destination,
+                };
+                let mut out = header.to_bytes().to_vec();
+                out.extend_from_slice(payload);
+                Ok(crate::Packet::new(out))
+            }
         }
     }
 }
@@ -221,6 +282,8 @@ fn ipv4_fragment_piece(packet: &[u8]) -> std::io::Result<Option<FragmentPiece<'_
         template: IpHeaderTemplate::Ipv4 {
             source: header.source(),
             destination: header.destination(),
+            ttl: header.ttl(),
+            identification: header.identification(),
         },
         next_header: ipv4.payload().ip_number,
         offset: header.fragments_offset(),
@@ -262,6 +325,9 @@ fn ipv6_fragment_piece(packet: &[u8]) -> std::io::Result<Option<FragmentPiece<'_
                     template: IpHeaderTemplate::Ipv6 {
                         source: header.source(),
                         destination: header.destination(),
+                        traffic_class: header.traffic_class(),
+                        flow_label: header.flow_label(),
+                        hop_limit: header.hop_limit(),
                     },
                     next_header: fragment.next_header(),
                     offset: fragment.fragment_offset(),
