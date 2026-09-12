@@ -121,6 +121,19 @@ fn has_active_stream_capacity(
     Ok(streams.len() < limit)
 }
 
+fn try_reserve_accept_slot(
+    sender: &mpsc::Sender<TcpStream>,
+) -> std::io::Result<Option<mpsc::Permit<'_, TcpStream>>> {
+    match sender.try_reserve() {
+        Ok(permit) => Ok(Some(permit)),
+        Err(mpsc::error::TrySendError::Full(_)) => Ok(None),
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "TCP accept queue closed",
+        )),
+    }
+}
+
 struct StreamShutdownGuard {
     streams: Arc<Mutex<Vec<Weak<TcpStreamHandle>>>>,
 }
@@ -498,20 +511,13 @@ impl TcpListener {
                         continue;
                     }
 
-                    let stream_permit = match tcp_stream_emitter.try_reserve() {
-                        Ok(permit) => permit,
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            debug!(
-                                "TCP accept queue full ({TCP_ACCEPT_QUEUE_SIZE}); dropping SYN from {src_addr}"
-                            );
-                            continue;
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::BrokenPipe,
-                                "TCP accept queue closed",
-                            ));
-                        }
+                    let Some(stream_permit) =
+                        try_reserve_accept_slot(&tcp_stream_emitter)?
+                    else {
+                        debug!(
+                            "TCP accept queue full ({TCP_ACCEPT_QUEUE_SIZE}); dropping SYN from {src_addr}"
+                        );
+                        continue;
                     };
 
                     let mut socket = tcp::Socket::new(
@@ -901,5 +907,27 @@ mod resource_limit_tests {
         assert!(!has_active_stream_capacity(&streams, 2).unwrap());
         drop(first);
         assert!(has_active_stream_capacity(&streams, 2).unwrap());
+    }
+
+    #[test]
+    fn accept_queue_capacity_recovers_after_permit_release() {
+        let (sender, _receiver) = mpsc::channel::<TcpStream>(2);
+        let first = try_reserve_accept_slot(&sender)
+            .unwrap()
+            .expect("first accept slot missing");
+        let _second = try_reserve_accept_slot(&sender)
+            .unwrap()
+            .expect("second accept slot missing");
+
+        assert!(
+            try_reserve_accept_slot(&sender).unwrap().is_none(),
+            "full accept queue must reject additional reservations"
+        );
+
+        drop(first);
+        assert!(
+            try_reserve_accept_slot(&sender).unwrap().is_some(),
+            "released accept slot was not reusable"
+        );
     }
 }
