@@ -193,14 +193,16 @@ impl futures::Sink<Packet> for StackSplitSink {
                 })?;
             let payload = packet.payload();
             if payload.fragmented {
-                if payload.ip_number == etherparse::ip_number::UDP {
-                    IpProtocol::Udp
-                } else {
-                    debug!(
-                        "tun fragmented IP packet ignored (protocol: {:?})",
-                        payload.ip_number
-                    );
-                    return Ok(());
+                match payload.ip_number {
+                    etherparse::ip_number::UDP => IpProtocol::Udp,
+                    etherparse::ip_number::TCP => IpProtocol::Tcp,
+                    _ => {
+                        debug!(
+                            "tun fragmented IP packet ignored (protocol: {:?})",
+                            payload.ip_number
+                        );
+                        return Ok(());
+                    }
                 }
             } else {
                 match payload.ip_number {
