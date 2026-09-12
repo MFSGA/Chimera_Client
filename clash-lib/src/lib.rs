@@ -451,10 +451,8 @@ pub async fn start(
     let network_runtime_lease =
         NetworkRuntimeLease::acquire(uses_process_global_network_state(&config))?;
     let shutdown_token = tokio_util::sync::CancellationToken::new();
-    {
-        let mut token_guard = SHUTDOWN_TOKEN.lock().unwrap();
-        token_guard.push(shutdown_token.clone());
-    }
+    let _shutdown_registration =
+        ShutdownTokenRegistration::register(shutdown_token.clone());
     start_with_shutdown_token(
         config,
         cwd,
@@ -1202,6 +1200,27 @@ async fn create_components(
 static SHUTDOWN_TOKEN: std::sync::Mutex<Vec<tokio_util::sync::CancellationToken>> =
     std::sync::Mutex::new(Vec::new());
 
+struct ShutdownTokenRegistration {
+    token: tokio_util::sync::CancellationToken,
+}
+
+impl ShutdownTokenRegistration {
+    fn register(token: tokio_util::sync::CancellationToken) -> Self {
+        SHUTDOWN_TOKEN.lock().unwrap().push(token.clone());
+        Self { token }
+    }
+}
+
+impl Drop for ShutdownTokenRegistration {
+    fn drop(&mut self) {
+        self.token.cancel();
+        SHUTDOWN_TOKEN
+            .lock()
+            .unwrap()
+            .retain(|token| !token.is_cancelled());
+    }
+}
+
 pub fn shutdown() -> bool {
     let mut token_guard = SHUTDOWN_TOKEN.lock().unwrap();
     if !token_guard.is_empty() {
@@ -1269,6 +1288,21 @@ pub(crate) mod tests {
 
     pub fn initialize() {
         INIT.call_once(crate::setup_default_crypto_provider);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn shutdown_registration_is_pruned_when_runtime_exits() {
+        crate::SHUTDOWN_TOKEN.lock().unwrap().clear();
+        let token = tokio_util::sync::CancellationToken::new();
+        let registration = crate::ShutdownTokenRegistration::register(token.clone());
+
+        assert_eq!(crate::SHUTDOWN_TOKEN.lock().unwrap().len(), 1);
+        drop(registration);
+
+        assert!(token.is_cancelled());
+        assert!(crate::SHUTDOWN_TOKEN.lock().unwrap().is_empty());
+        assert!(!crate::shutdown());
     }
 
     #[cfg(feature = "tun")]
