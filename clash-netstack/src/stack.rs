@@ -5,6 +5,7 @@ use futures::{Stream, future::BoxFuture};
 use log::debug;
 use smoltcp::wire::IpProtocol;
 use std::{
+    collections::VecDeque,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -147,7 +148,7 @@ pub struct StackSplitSink {
     udp_inbound: mpsc::Sender<Packet>,
     tcp_inbound: mpsc::Sender<Packet>,
 
-    packet_container: Option<(Packet, IpProtocol)>,
+    packet_container: VecDeque<(Packet, IpProtocol)>,
     pending_permit: Option<PendingPacketPermit>,
 }
 impl StackSplitSink {
@@ -158,7 +159,7 @@ impl StackSplitSink {
         Self {
             udp_inbound,
             tcp_inbound,
-            packet_container: None,
+            packet_container: VecDeque::new(),
             pending_permit: None,
         }
     }
@@ -170,7 +171,7 @@ impl futures::Sink<Packet> for StackSplitSink {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        if self.packet_container.is_some() {
+        if !self.packet_container.is_empty() {
             futures::ready!(self.as_mut().poll_flush(cx))?;
         }
         std::task::Poll::Ready(Ok(()))
@@ -186,6 +187,7 @@ impl futures::Sink<Packet> for StackSplitSink {
 
         trace_ip_packet("tun inbound packet", item.data());
 
+        let mut mirror_to_tcp = false;
         let protocol = {
             let ipv6_fragment_next =
                 if item.data().first().map(|byte| byte >> 4) == Some(6) {
@@ -206,7 +208,10 @@ impl futures::Sink<Packet> for StackSplitSink {
                     etherparse::ip_number::TCP => IpProtocol::Tcp,
                     etherparse::ip_number::IPV6_DEST_OPTIONS
                     | etherparse::ip_number::IPV6_ROUTE
-                    | etherparse::ip_number::AUTH => IpProtocol::Udp,
+                    | etherparse::ip_number::AUTH => {
+                        mirror_to_tcp = true;
+                        IpProtocol::Udp
+                    }
                     _ => {
                         debug!(
                             "tun fragmented IPv6 packet ignored (next header: {next_header:?})"
@@ -249,7 +254,13 @@ impl futures::Sink<Packet> for StackSplitSink {
                 }
             }
         };
-        self.packet_container.replace((item, protocol));
+        if mirror_to_tcp {
+            self.packet_container
+                .push_back((item.clone(), IpProtocol::Udp));
+            self.packet_container.push_back((item, IpProtocol::Tcp));
+        } else {
+            self.packet_container.push_back((item, protocol));
+        }
 
         Ok(())
     }
@@ -258,51 +269,52 @@ impl futures::Sink<Packet> for StackSplitSink {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        let Some((_, proto)) = self.packet_container.as_ref() else {
-            self.pending_permit = None;
-            return std::task::Poll::Ready(Ok(()));
-        };
-        let proto = *proto;
+        loop {
+            let Some((_, proto)) = self.packet_container.front() else {
+                self.pending_permit = None;
+                return std::task::Poll::Ready(Ok(()));
+            };
+            let proto = *proto;
 
-        if self.pending_permit.is_none() {
-            let sender = match proto {
-                IpProtocol::Udp => self.udp_inbound.clone(),
-                IpProtocol::Tcp | IpProtocol::Icmp | IpProtocol::Icmpv6 => {
-                    self.tcp_inbound.clone()
-                }
-                _ => {
-                    self.packet_container = None;
-                    return std::task::Poll::Ready(Ok(()));
+            if self.pending_permit.is_none() {
+                let sender = match proto {
+                    IpProtocol::Udp => self.udp_inbound.clone(),
+                    IpProtocol::Tcp | IpProtocol::Icmp | IpProtocol::Icmpv6 => {
+                        self.tcp_inbound.clone()
+                    }
+                    _ => {
+                        self.packet_container.pop_front();
+                        continue;
+                    }
+                };
+                self.pending_permit = Some(Box::pin(sender.reserve_owned()));
+            }
+
+            let permit = match self
+                .pending_permit
+                .as_mut()
+                .expect("pending permit must exist")
+                .as_mut()
+                .poll(cx)
+            {
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+                std::task::Poll::Ready(Ok(permit)) => permit,
+                std::task::Poll::Ready(Err(_)) => {
+                    self.pending_permit = None;
+                    return std::task::Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "stack inbound channel closed",
+                    )));
                 }
             };
-            self.pending_permit = Some(Box::pin(sender.reserve_owned()));
+
+            self.pending_permit = None;
+            let (item, _) = self
+                .packet_container
+                .pop_front()
+                .expect("packet must exist while permit is pending");
+            permit.send(item);
         }
-
-        let permit = match self
-            .pending_permit
-            .as_mut()
-            .expect("pending permit must exist")
-            .as_mut()
-            .poll(cx)
-        {
-            std::task::Poll::Pending => return std::task::Poll::Pending,
-            std::task::Poll::Ready(Ok(permit)) => permit,
-            std::task::Poll::Ready(Err(_)) => {
-                self.pending_permit = None;
-                return std::task::Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "stack inbound channel closed",
-                )));
-            }
-        };
-
-        self.pending_permit = None;
-        let (item, _) = self
-            .packet_container
-            .take()
-            .expect("packet must exist while permit is pending");
-        permit.send(item);
-        std::task::Poll::Ready(Ok(()))
     }
 
     fn poll_close(

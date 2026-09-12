@@ -1,5 +1,5 @@
 use crate::{
-    Packet, device::NetstackDevice, packet::IpPacket,
+    Packet, device::NetstackDevice, fragment::FragmentReassembler, packet::IpPacket,
     ring_buffer::LockFreeRingBuffer, stack::IfaceEvent, tcp_stream::TcpStream,
 };
 use futures::task::AtomicWaker;
@@ -35,198 +35,6 @@ const ACTIVE_TCP_STREAM_MAX: usize = 512;
 /// Pending streams not yet accepted by the TUN dispatcher.
 const TCP_ACCEPT_QUEUE_SIZE: usize = 128;
 const IFACE_EVENT_QUEUE_SIZE: usize = 4096;
-
-/// Bound fragmented TCP state separately from active TCP streams. A single
-/// reassembled IP payload is limited to 65,535 bytes by the IP format, so this
-/// caps fragment buffering to roughly 4 MiB plus map overhead.
-const TCP_FRAGMENT_MAX_ACTIVE: usize = 64;
-const TCP_FRAGMENT_TTL: Duration = Duration::from_secs(30);
-
-#[derive(Clone, Debug, Hash, Eq, PartialEq)]
-enum TcpFragmentKey {
-    Ipv4 {
-        source: [u8; 4],
-        destination: [u8; 4],
-        identification: u16,
-    },
-    Ipv6 {
-        source: [u8; 16],
-        destination: [u8; 16],
-        identification: u32,
-    },
-}
-
-struct TcpFragmentState {
-    buffer: etherparse::defrag::IpDefragBuf,
-    updated_at: StdInstant,
-}
-
-#[derive(Default)]
-struct TcpFragmentReassembler {
-    active: HashMap<TcpFragmentKey, TcpFragmentState>,
-}
-
-impl TcpFragmentReassembler {
-    fn prune_expired(&mut self, now: StdInstant) {
-        self.active.retain(|_, state| {
-            now.duration_since(state.updated_at) < TCP_FRAGMENT_TTL
-        });
-    }
-
-    fn evict_oldest_if_full(&mut self) {
-        if self.active.len() < TCP_FRAGMENT_MAX_ACTIVE {
-            return;
-        }
-
-        if let Some(oldest) = self
-            .active
-            .iter()
-            .min_by_key(|(_, state)| state.updated_at)
-            .map(|(key, _)| key.clone())
-        {
-            self.active.remove(&oldest);
-            warn!(
-                "evicting oldest TCP fragment reassembly because active limit ({TCP_FRAGMENT_MAX_ACTIVE}) was reached"
-            );
-        }
-    }
-
-    fn push(
-        &mut self,
-        packet: &etherparse::IpSlice<'_>,
-    ) -> Result<Option<Vec<u8>>, etherparse::defrag::IpDefragError> {
-        let now = StdInstant::now();
-        self.prune_expired(now);
-
-        let (key, offset, more_fragments, payload) = match packet {
-            etherparse::IpSlice::Ipv4(ipv4) => {
-                let header = ipv4.header();
-                (
-                    TcpFragmentKey::Ipv4 {
-                        source: header.source(),
-                        destination: header.destination(),
-                        identification: header.identification(),
-                    },
-                    header.fragments_offset(),
-                    header.more_fragments(),
-                    ipv4.payload().payload,
-                )
-            }
-            etherparse::IpSlice::Ipv6(ipv6) => {
-                let fragment =
-                    ipv6.extensions().clone().into_iter().find_map(|extension| {
-                        match extension {
-                            etherparse::Ipv6ExtensionSlice::Fragment(fragment) => {
-                                Some(fragment)
-                            }
-                            _ => None,
-                        }
-                    });
-                let Some(fragment) = fragment else {
-                    return Ok(None);
-                };
-
-                (
-                    TcpFragmentKey::Ipv6 {
-                        source: ipv6.header().source(),
-                        destination: ipv6.header().destination(),
-                        identification: fragment.identification(),
-                    },
-                    fragment.fragment_offset(),
-                    fragment.more_fragments(),
-                    ipv6.payload().payload,
-                )
-            }
-        };
-
-        if !self.active.contains_key(&key) {
-            self.evict_oldest_if_full();
-            self.active.insert(
-                key.clone(),
-                TcpFragmentState {
-                    buffer: etherparse::defrag::IpDefragBuf::new(
-                        etherparse::ip_number::TCP,
-                        Vec::new(),
-                        Vec::new(),
-                    ),
-                    updated_at: now,
-                },
-            );
-        }
-
-        let complete = {
-            let state = self
-                .active
-                .get_mut(&key)
-                .expect("TCP fragment state must exist after insertion");
-            state.updated_at = now;
-            if let Err(err) = state.buffer.add(offset, more_fragments, payload) {
-                self.active.remove(&key);
-                return Err(err);
-            }
-            state.buffer.is_complete()
-        };
-
-        if !complete {
-            return Ok(None);
-        }
-
-        let state = self
-            .active
-            .remove(&key)
-            .expect("completed TCP fragment state must exist");
-        let (payload, _) = state.buffer.take_bufs();
-        Ok(Some(payload))
-    }
-}
-
-fn rebuild_tcp_ip_packet(
-    packet: &etherparse::IpSlice<'_>,
-    tcp_payload: &[u8],
-) -> std::io::Result<Packet> {
-    match packet {
-        etherparse::IpSlice::Ipv4(ipv4) => {
-            let original = ipv4.header();
-            let payload_len = u16::try_from(tcp_payload.len()).map_err(|_| {
-                std::io::Error::other("reassembled TCP payload too large")
-            })?;
-            let mut header = etherparse::Ipv4Header::new(
-                payload_len,
-                original.ttl(),
-                etherparse::ip_number::TCP,
-                original.source(),
-                original.destination(),
-            )
-            .map_err(std::io::Error::other)?;
-            header.identification = original.identification();
-            header.dont_fragment = true;
-            header.header_checksum = header.calc_header_checksum();
-
-            let mut out = header.to_bytes().to_vec();
-            out.extend_from_slice(tcp_payload);
-            Ok(Packet::new(out))
-        }
-        etherparse::IpSlice::Ipv6(ipv6) => {
-            let payload_length = u16::try_from(tcp_payload.len()).map_err(|_| {
-                std::io::Error::other("reassembled TCP payload too large")
-            })?;
-            let original = ipv6.header();
-            let header = etherparse::Ipv6Header {
-                traffic_class: original.traffic_class(),
-                flow_label: original.flow_label(),
-                payload_length,
-                next_header: etherparse::ip_number::TCP,
-                hop_limit: original.hop_limit(),
-                source: original.source(),
-                destination: original.destination(),
-            };
-
-            let mut out = header.to_bytes().to_vec();
-            out.extend_from_slice(tcp_payload);
-            Ok(Packet::new(out))
-        }
-    }
-}
 
 #[derive(Clone, Debug)]
 struct LastTcpPacketMeta {
@@ -502,7 +310,8 @@ impl TcpListener {
         let mut last_prune_time = std::time::Instant::now();
         let mut syn_drop_count: u64 = 0;
         let mut last_syn_drop_log = std::time::Instant::now();
-        let mut tcp_fragments = TcpFragmentReassembler::default();
+        let mut tcp_fragments =
+            FragmentReassembler::new(etherparse::ip_number::TCP, "TCP");
 
         while let n = inbound.recv_many(&mut packet_buf, 32).await
             && n > 0
@@ -530,42 +339,34 @@ impl TcpListener {
                     }
                 }
 
-                let rebuilt_frame = {
-                    let ip = match etherparse::IpSlice::from_slice(frame.data()) {
-                        Ok(packet) => packet,
+                let rebuilt_frame = match crate::fragment::is_fragmented(
+                    frame.data(),
+                ) {
+                    Ok(true) => match tcp_fragments.push(frame.data()) {
+                        Ok(Some(reassembled)) => {
+                            match reassembled.template.rebuild(
+                                etherparse::ip_number::TCP,
+                                &reassembled.payload,
+                            ) {
+                                Ok(packet) => Some(packet),
+                                Err(err) => {
+                                    warn!(
+                                        "failed to rebuild fragmented TCP packet: {err}"
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                        Ok(None) => continue,
                         Err(err) => {
-                            warn!("Invalid IP packet: {err}");
+                            warn!("invalid TCP fragment sequence: {err}");
                             continue;
                         }
-                    };
-                    let payload = ip.payload();
-                    if payload.fragmented {
-                        if payload.ip_number != etherparse::ip_number::TCP {
-                            warn!(
-                                "fragmented packet on TCP path used protocol {:?}",
-                                payload.ip_number
-                            );
-                            continue;
-                        }
-                        let tcp_payload = match tcp_fragments.push(&ip) {
-                            Ok(Some(payload)) => payload,
-                            Ok(None) => continue,
-                            Err(err) => {
-                                warn!("invalid TCP fragment sequence: {err}");
-                                continue;
-                            }
-                        };
-                        match rebuild_tcp_ip_packet(&ip, &tcp_payload) {
-                            Ok(packet) => Some(packet),
-                            Err(err) => {
-                                warn!(
-                                    "failed to rebuild fragmented TCP packet: {err}"
-                                );
-                                continue;
-                            }
-                        }
-                    } else {
-                        None
+                    },
+                    Ok(false) => None,
+                    Err(err) => {
+                        warn!("invalid fragmented TCP packet: {err}");
+                        continue;
                     }
                 };
                 if let Some(rebuilt_frame) = rebuilt_frame {

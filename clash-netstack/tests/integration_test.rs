@@ -867,6 +867,55 @@ async fn fragmented_ipv6_udp_after_destination_options_reassembles() {
 }
 
 #[tokio::test]
+async fn fragmented_ipv6_tcp_after_destination_options_reassembles() {
+    let src = [0x20; 16];
+    let dst = [0x21; 16];
+    let mut full = Vec::new();
+    etherparse::PacketBuilder::ipv6(src, dst, 64)
+        .tcp(1234, 80, 0, 65535)
+        .syn()
+        .write(&mut full, &[])
+        .unwrap();
+    let mut data = vec![etherparse::ip_number::TCP.0, 0, 0, 0, 0, 0, 0, 0];
+    data.extend_from_slice(&full[40..]);
+    let build = |part: &[u8], offset: usize, more: bool| {
+        let ip = etherparse::Ipv6Header {
+            payload_length: (8 + part.len()) as u16,
+            next_header: etherparse::ip_number::IPV6_FRAG,
+            hop_limit: 64,
+            source: src,
+            destination: dst,
+            ..Default::default()
+        };
+        let frag = etherparse::Ipv6FragmentHeader::new(
+            etherparse::ip_number::IPV6_DEST_OPTIONS,
+            etherparse::IpFragOffset::try_new((offset / 8) as u16).unwrap(),
+            more,
+            0x7788_99aa,
+        );
+        [ip.to_bytes().as_slice(), frag.to_bytes().as_slice(), part].concat()
+    };
+    let (stack, mut listener, _udp) = NetStack::new();
+    let (mut sink, mut output) = stack.split();
+    for packet in [build(&data[16..], 16, false), build(&data[..16], 0, true)] {
+        sink.send(Packet::new(packet)).await.unwrap();
+    }
+    let stream =
+        tokio::time::timeout(std::time::Duration::from_millis(300), listener.next())
+            .await
+            .expect("TCP reassembly timed out")
+            .expect("TCP listener closed");
+    assert_eq!(stream.local_addr().port(), 1234);
+    let reply =
+        tokio::time::timeout(std::time::Duration::from_millis(300), output.next())
+            .await
+            .expect("SYN-ACK timed out")
+            .expect("stack closed")
+            .expect("stack error");
+    assert!(is_any_ip_syn_ack(reply.data()));
+}
+
+#[tokio::test]
 async fn fragmented_ipv4_tcp_syn_reassembles_out_of_order() {
     let [first, second] = build_ipv4_tcp_syn_fragments();
     let (stack, mut tcp_listener, _udp_socket) = NetStack::new();
