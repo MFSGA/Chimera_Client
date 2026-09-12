@@ -89,6 +89,90 @@ fn build_ipv6_udp_fragments(payload: &[u8]) -> [Vec<u8>; 2] {
     ]
 }
 
+fn build_ipv4_tcp_syn_fragments() -> [Vec<u8>; 2] {
+    let full = build_tcp_syn_packet();
+    let tcp = &full[20..];
+    let source = [1, 1, 1, 1];
+    let destination = [2, 2, 2, 2];
+    let split = 8;
+
+    let build = |part: &[u8], offset: usize, more_fragments: bool| {
+        let mut header = etherparse::Ipv4Header::new(
+            part.len() as u16,
+            64,
+            etherparse::ip_number::TCP,
+            source,
+            destination,
+        )
+        .unwrap();
+        header.identification = 0x5252;
+        header.dont_fragment = false;
+        header.more_fragments = more_fragments;
+        header.fragment_offset =
+            etherparse::IpFragOffset::try_new((offset / 8) as u16).unwrap();
+        header.header_checksum = header.calc_header_checksum();
+
+        let mut packet = header.to_bytes().to_vec();
+        packet.extend_from_slice(part);
+        packet
+    };
+
+    [
+        build(&tcp[..split], 0, true),
+        build(&tcp[split..], split, false),
+    ]
+}
+
+fn build_ipv6_tcp_syn_fragments() -> [Vec<u8>; 2] {
+    let source = [0x20; 16];
+    let destination = [0x21; 16];
+    let mut full = Vec::new();
+    etherparse::PacketBuilder::ipv6(source, destination, 64)
+        .tcp(1234, 80, 0, 65535)
+        .syn()
+        .write(&mut full, &[])
+        .unwrap();
+    let tcp = &full[40..];
+    let split = 8;
+
+    let build = |part: &[u8], offset: usize, more_fragments: bool| {
+        let header = etherparse::Ipv6Header {
+            payload_length: (etherparse::Ipv6FragmentHeader::LEN + part.len())
+                as u16,
+            next_header: etherparse::ip_number::IPV6_FRAG,
+            hop_limit: 64,
+            source,
+            destination,
+            ..Default::default()
+        };
+        let fragment = etherparse::Ipv6FragmentHeader::new(
+            etherparse::ip_number::TCP,
+            etherparse::IpFragOffset::try_new((offset / 8) as u16).unwrap(),
+            more_fragments,
+            0x5566_7788,
+        );
+
+        let mut packet = header.to_bytes().to_vec();
+        packet.extend_from_slice(&fragment.to_bytes());
+        packet.extend_from_slice(part);
+        packet
+    };
+
+    [
+        build(&tcp[..split], 0, true),
+        build(&tcp[split..], split, false),
+    ]
+}
+
+fn is_any_ip_syn_ack(packet: &[u8]) -> bool {
+    matches!(
+        etherparse::SlicedPacket::from_ip(packet)
+            .ok()
+            .and_then(|packet| packet.transport),
+        Some(etherparse::TransportSlice::Tcp(tcp)) if tcp.syn() && tcp.ack()
+    )
+}
+
 #[tokio::test]
 async fn test_stack_with_mock_tun_real_tcp_udp() {
     init();
@@ -714,6 +798,83 @@ async fn fragmented_ipv6_udp_reassembles_out_of_order() {
             .expect("reassembled IPv6 UDP datagram timed out")
             .expect("UDP receive stream ended unexpectedly");
     assert_eq!(packet.data(), payload);
+}
+
+#[tokio::test]
+async fn fragmented_ipv4_tcp_syn_reassembles_out_of_order() {
+    let [first, second] = build_ipv4_tcp_syn_fragments();
+    let (stack, mut tcp_listener, _udp_socket) = NetStack::new();
+    let (mut stack_sink, mut stack_stream) = stack.split();
+
+    stack_sink.send(Packet::new(second)).await.unwrap();
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            stack_stream.next(),
+        )
+        .await
+        .is_err(),
+        "incomplete IPv4 TCP fragments produced stack output"
+    );
+
+    stack_sink.send(Packet::new(first)).await.unwrap();
+    let stream = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        tcp_listener.next(),
+    )
+    .await
+    .expect("reassembled IPv4 TCP SYN did not create a stream")
+    .expect("TCP listener ended unexpectedly");
+    assert_eq!(stream.local_addr(), "1.1.1.1:1024".parse().unwrap());
+    assert_eq!(stream.remote_addr(), "2.2.2.2:80".parse().unwrap());
+
+    let reply = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        stack_stream.next(),
+    )
+    .await
+    .expect("reassembled IPv4 TCP SYN did not reach smoltcp")
+    .expect("stack output ended unexpectedly")
+    .expect("stack returned an error");
+    assert!(is_any_ip_syn_ack(reply.data()));
+}
+
+#[tokio::test]
+async fn fragmented_ipv6_tcp_syn_reassembles_out_of_order() {
+    let [first, second] = build_ipv6_tcp_syn_fragments();
+    let (stack, mut tcp_listener, _udp_socket) = NetStack::new();
+    let (mut stack_sink, mut stack_stream) = stack.split();
+
+    stack_sink.send(Packet::new(second)).await.unwrap();
+    stack_sink.send(Packet::new(first)).await.unwrap();
+
+    let stream = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        tcp_listener.next(),
+    )
+    .await
+    .expect("reassembled IPv6 TCP SYN did not create a stream")
+    .expect("TCP listener ended unexpectedly");
+    assert_eq!(stream.local_addr().port(), 1234);
+    assert_eq!(stream.remote_addr().port(), 80);
+    assert_eq!(
+        stream.local_addr().ip(),
+        std::net::IpAddr::V6(std::net::Ipv6Addr::from([0x20; 16]))
+    );
+    assert_eq!(
+        stream.remote_addr().ip(),
+        std::net::IpAddr::V6(std::net::Ipv6Addr::from([0x21; 16]))
+    );
+
+    let reply = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        stack_stream.next(),
+    )
+    .await
+    .expect("reassembled IPv6 TCP SYN did not reach smoltcp")
+    .expect("stack output ended unexpectedly")
+    .expect("stack returned an error");
+    assert!(is_any_ip_syn_ack(reply.data()));
 }
 
 #[tokio::test]
