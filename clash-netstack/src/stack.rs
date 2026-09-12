@@ -187,32 +187,64 @@ impl futures::Sink<Packet> for StackSplitSink {
         trace_ip_packet("tun inbound packet", item.data());
 
         let protocol = {
-            let packet =
-                etherparse::IpSlice::from_slice(item.data()).map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-                })?;
-            let payload = packet.payload();
-            if payload.fragmented {
-                match payload.ip_number {
+            let ipv6_fragment_next =
+                if item.data().first().map(|byte| byte >> 4) == Some(6) {
+                    match crate::fragment::ipv6_fragment_next_header(item.data()) {
+                        Ok(next) => next,
+                        Err(err) => {
+                            debug!("dropping invalid fragmented IPv6 packet: {err}");
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    None
+                };
+
+            if let Some(next_header) = ipv6_fragment_next {
+                match next_header {
                     etherparse::ip_number::UDP => IpProtocol::Udp,
                     etherparse::ip_number::TCP => IpProtocol::Tcp,
+                    etherparse::ip_number::IPV6_DEST_OPTIONS
+                    | etherparse::ip_number::IPV6_ROUTE
+                    | etherparse::ip_number::AUTH => IpProtocol::Udp,
                     _ => {
                         debug!(
-                            "tun fragmented IP packet ignored (protocol: {:?})",
-                            payload.ip_number
+                            "tun fragmented IPv6 packet ignored (next header: {next_header:?})"
                         );
                         return Ok(());
                     }
                 }
             } else {
-                match payload.ip_number {
-                    etherparse::ip_number::TCP => IpProtocol::Tcp,
-                    etherparse::ip_number::UDP => IpProtocol::Udp,
-                    etherparse::ip_number::ICMP => IpProtocol::Icmp,
-                    etherparse::ip_number::IPV6_ICMP => IpProtocol::Icmpv6,
-                    protocol => {
-                        debug!("tun IP packet ignored (protocol: {protocol:?})");
+                let packet = match etherparse::IpSlice::from_slice(item.data()) {
+                    Ok(packet) => packet,
+                    Err(err) => {
+                        debug!("dropping invalid TUN IP packet: {err}");
                         return Ok(());
+                    }
+                };
+                let payload = packet.payload();
+                if payload.fragmented {
+                    match payload.ip_number {
+                        etherparse::ip_number::UDP => IpProtocol::Udp,
+                        etherparse::ip_number::TCP => IpProtocol::Tcp,
+                        _ => {
+                            debug!(
+                                "tun fragmented IP packet ignored (protocol: {:?})",
+                                payload.ip_number
+                            );
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    match payload.ip_number {
+                        etherparse::ip_number::TCP => IpProtocol::Tcp,
+                        etherparse::ip_number::UDP => IpProtocol::Udp,
+                        etherparse::ip_number::ICMP => IpProtocol::Icmp,
+                        etherparse::ip_number::IPV6_ICMP => IpProtocol::Icmpv6,
+                        protocol => {
+                            debug!("tun IP packet ignored (protocol: {protocol:?})");
+                            return Ok(());
+                        }
                     }
                 }
             }
