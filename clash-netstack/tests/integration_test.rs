@@ -1,5 +1,5 @@
 use futures::{SinkExt, StreamExt};
-use watfaq_netstack::{NetStack, Packet};
+use watfaq_netstack::{NetStack, Packet, UdpSocket};
 
 mod common;
 mod mock_tun;
@@ -374,4 +374,214 @@ async fn test_new_connection_during_active_transfer() {
     assert_eq!(relay1_res.unwrap(), CONN1_BYTES, "relay1 bytes mismatch");
     assert_eq!(client1_res.unwrap(), CONN1_BYTES, "client1 bytes mismatch");
     client2_res.unwrap(); // panics if client2 saw RST or timed out
+}
+
+#[tokio::test]
+async fn malformed_udp_does_not_end_receive_stream() {
+    let (stack, _tcp_listener, udp_socket) = NetStack::new();
+    let (mut stack_sink, _stack_stream) = stack.split();
+    let (mut udp_read, _udp_write) = udp_socket.split();
+
+    let mut malformed = build_udp_packet().to_vec();
+    malformed[24..26].copy_from_slice(&7_u16.to_be_bytes());
+    stack_sink.send(Packet::new(malformed)).await.unwrap();
+    stack_sink
+        .send(Packet::new(build_udp_packet()))
+        .await
+        .unwrap();
+
+    let packet =
+        tokio::time::timeout(std::time::Duration::from_millis(300), udp_read.recv())
+            .await
+            .expect("valid UDP packet was not delivered after malformed input")
+            .expect("UDP receive stream ended after malformed input");
+
+    assert_eq!(packet.local_addr, "1.1.1.1:5000".parse().unwrap());
+    assert_eq!(packet.remote_addr, "2.2.2.2:5001".parse().unwrap());
+}
+
+#[tokio::test]
+async fn zero_length_udp_is_emitted() {
+    let (_input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
+    let (_reader, mut writer) = UdpSocket::new(input_rx, output_tx).split();
+
+    writer
+        .send(
+            (
+                Vec::<u8>::new(),
+                "1.1.1.1:5000".parse().unwrap(),
+                "2.2.2.2:5001".parse().unwrap(),
+            )
+                .into(),
+        )
+        .await
+        .unwrap();
+
+    let packet = output_rx
+        .recv()
+        .await
+        .expect("zero-length UDP datagram was not emitted");
+    assert_eq!(packet.data().len(), 28);
+}
+
+#[tokio::test]
+async fn stack_sink_consecutive_feed_calls_make_progress() {
+    let (stack, _tcp_listener, _udp_socket) = NetStack::new();
+    let (mut stack_sink, _stack_stream) = stack.split();
+
+    stack_sink
+        .feed(Packet::new(build_udp_packet()))
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        stack_sink.feed(Packet::new(build_udp_packet())),
+    )
+    .await
+    .expect("second feed blocked without making progress")
+    .unwrap();
+    stack_sink.flush().await.unwrap();
+}
+
+#[tokio::test]
+async fn stack_sink_reports_closed_udp_receiver() {
+    let (stack, _tcp_listener, udp_socket) = NetStack::new();
+    let (mut stack_sink, _stack_stream) = stack.split();
+    drop(udp_socket);
+
+    let err = stack_sink
+        .send(Packet::new(build_udp_packet()))
+        .await
+        .expect_err("closed UDP receiver must be reported to the sink");
+    assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+}
+
+#[tokio::test]
+async fn listener_drop_closes_existing_stream_io() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (stack, mut tcp_listener, _udp_socket) = NetStack::new();
+    let (mut stack_sink, _stack_stream) = stack.split();
+    stack_sink
+        .send(Packet::new(build_tcp_syn_packet()))
+        .await
+        .unwrap();
+
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        tcp_listener.next(),
+    )
+    .await
+    .expect("TCP stream was not created")
+    .expect("TCP listener ended unexpectedly");
+
+    drop(tcp_listener);
+
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        stream.read(&mut byte),
+    )
+    .await
+    .expect("stream read remained pending after listener shutdown")
+    .unwrap();
+    assert_eq!(read, 0, "listener shutdown should surface EOF");
+
+    let err = stream
+        .write(b"x")
+        .await
+        .expect_err("write succeeded after TCP engine shutdown");
+    assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+}
+
+#[tokio::test]
+async fn invalid_tcp_checksum_does_not_create_stream() {
+    let (stack, mut tcp_listener, _udp_socket) = NetStack::new();
+    let (mut stack_sink, _stack_stream) = stack.split();
+    let mut packet = build_tcp_syn_packet().to_vec();
+    packet[36] ^= 0xff;
+
+    stack_sink.send(Packet::new(packet)).await.unwrap();
+
+    let accepted = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        tcp_listener.next(),
+    )
+    .await;
+    assert!(
+        accepted.is_err(),
+        "invalid TCP checksum created an application stream"
+    );
+}
+
+#[tokio::test]
+async fn ipv6_hop_by_hop_udp_is_delivered() {
+    let mut packet = Vec::new();
+    etherparse::PacketBuilder::ipv6([0x20; 16], [0x21; 16], 64)
+        .udp(1234, 4321)
+        .write(&mut packet, b"test")
+        .unwrap();
+    packet[6] = 0;
+    packet.splice(40..40, [17, 0, 0, 0, 0, 0, 0, 0]);
+    let payload_len = (packet.len() - 40) as u16;
+    packet[4..6].copy_from_slice(&payload_len.to_be_bytes());
+
+    let (stack, _tcp_listener, udp_socket) = NetStack::new();
+    let (mut stack_sink, _stack_stream) = stack.split();
+    let (mut udp_read, _udp_write) = udp_socket.split();
+    stack_sink.send(Packet::new(packet)).await.unwrap();
+
+    let packet =
+        tokio::time::timeout(std::time::Duration::from_millis(300), udp_read.recv())
+            .await
+            .expect("IPv6 UDP behind Hop-by-Hop header was not delivered")
+            .expect("UDP receive stream ended unexpectedly");
+    assert_eq!(packet.data(), b"test");
+}
+
+#[tokio::test]
+async fn icmp_echo_reply_works_without_tcp_socket() {
+    let mut packet = Vec::new();
+    etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [10, 0, 0, 1], 64)
+        .icmpv4_echo_request(1, 1)
+        .write(&mut packet, b"ping")
+        .unwrap();
+
+    let (stack, _tcp_listener, _udp_socket) = NetStack::new();
+    let (mut stack_sink, mut stack_stream) = stack.split();
+    stack_sink.send(Packet::new(packet)).await.unwrap();
+
+    let reply = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        stack_stream.next(),
+    )
+    .await
+    .expect("ICMP echo reply timed out")
+    .expect("stack output ended unexpectedly")
+    .expect("stack returned an error");
+    let ihl = ((reply.data()[0] & 0x0f) as usize) * 4;
+    assert_eq!(reply.data()[9], 1);
+    assert_eq!(reply.data()[ihl], 0, "expected ICMP Echo Reply");
+}
+
+#[tokio::test]
+async fn invalid_udp_checksum_is_dropped_without_ending_stream() {
+    let (stack, _tcp_listener, udp_socket) = NetStack::new();
+    let (mut stack_sink, _stack_stream) = stack.split();
+    let (mut udp_read, _udp_write) = udp_socket.split();
+    let mut invalid = build_udp_packet().to_vec();
+    invalid[26] ^= 0xff;
+    stack_sink.send(Packet::new(invalid)).await.unwrap();
+    stack_sink
+        .send(Packet::new(build_udp_packet()))
+        .await
+        .unwrap();
+
+    let packet =
+        tokio::time::timeout(std::time::Duration::from_millis(300), udp_read.recv())
+            .await
+            .expect("valid UDP packet was not delivered after bad checksum")
+            .expect("UDP receive stream ended unexpectedly");
+    assert_eq!(packet.local_addr, "1.1.1.1:5000".parse().unwrap());
 }

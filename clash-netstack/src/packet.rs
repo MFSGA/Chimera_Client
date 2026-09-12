@@ -1,6 +1,6 @@
 use std::net::IpAddr;
 
-use smoltcp::wire::{IpProtocol, IpVersion, Ipv4Packet, Ipv6Packet};
+use smoltcp::wire::{IpVersion, Ipv4Packet, Ipv6Packet};
 
 #[derive(Debug)]
 pub(crate) enum IpPacket<T: AsRef<[u8]>> {
@@ -31,21 +31,10 @@ impl<T: AsRef<[u8]> + Copy> IpPacket<T> {
         }
     }
 
-    pub fn protocol(&self) -> IpProtocol {
+    pub fn verify_checksum(&self) -> bool {
         match *self {
-            IpPacket::Ipv4(ref packet) => packet.next_header(),
-            IpPacket::Ipv6(ref packet) => packet.next_header(),
-        }
-    }
-}
-
-impl<'a, T: AsRef<[u8]> + ?Sized> IpPacket<&'a T> {
-    /// Return a pointer to the payload.
-    #[inline]
-    pub fn payload(&self) -> &'a [u8] {
-        match *self {
-            IpPacket::Ipv4(ref packet) => packet.payload(),
-            IpPacket::Ipv6(ref packet) => packet.payload(),
+            IpPacket::Ipv4(ref packet) => packet.verify_checksum(),
+            IpPacket::Ipv6(_) => true,
         }
     }
 }

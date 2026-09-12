@@ -4,17 +4,13 @@ use crate::{
 };
 use futures::task::AtomicWaker;
 use log::{debug, error, trace, warn};
-use smoltcp::{
-    iface::Interface,
-    socket::tcp,
-    wire::{IpProtocol, TcpPacket},
-};
+use smoltcp::{iface::Interface, socket::tcp, wire::TcpPacket};
 use std::{
     collections::HashMap,
     net::SocketAddr,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant as StdInstant},
@@ -76,14 +72,42 @@ fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
+fn mark_stream_closed(socket_control: &TcpStreamHandle) {
+    socket_control.socket_closed.store(true, Ordering::Release);
+    socket_control.read_closed.store(true, Ordering::Release);
+    socket_control.write_closed.store(true, Ordering::Release);
+    socket_control.recv_waker.wake();
+    socket_control.send_waker.wake();
+}
+
 fn mark_all_streams_closed(
     socket_maps: &HashMap<smoltcp::iface::SocketHandle, Arc<TcpStreamHandle>>,
 ) {
     for socket_control in socket_maps.values() {
-        socket_control.read_closed.store(true, Ordering::Release);
-        socket_control.write_closed.store(true, Ordering::Release);
-        socket_control.recv_waker.wake();
-        socket_control.send_waker.wake();
+        mark_stream_closed(socket_control);
+    }
+}
+
+fn mark_tracked_streams_closed(streams: &Mutex<Vec<Weak<TcpStreamHandle>>>) {
+    if let Ok(mut streams) = streams.lock() {
+        streams.retain(|stream| {
+            if let Some(stream) = stream.upgrade() {
+                mark_stream_closed(&stream);
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
+struct StreamShutdownGuard {
+    streams: Arc<Mutex<Vec<Weak<TcpStreamHandle>>>>,
+}
+
+impl Drop for StreamShutdownGuard {
+    fn drop(&mut self) {
+        mark_tracked_streams_closed(&self.streams);
     }
 }
 
@@ -162,6 +186,7 @@ impl Drop for TcpStreamHandle {
 pub struct TcpListener {
     socket_stream: mpsc::UnboundedReceiver<TcpStream>,
     socket_stream_waker: Arc<AtomicWaker>,
+    tracked_streams: Arc<Mutex<Vec<Weak<TcpStreamHandle>>>>,
 
     task_handle: tokio::task::JoinHandle<()>,
 }
@@ -169,6 +194,7 @@ pub struct TcpListener {
 impl Drop for TcpListener {
     fn drop(&mut self) {
         trace!("TcpListener dropped");
+        mark_tracked_streams_closed(&self.tracked_streams);
         self.task_handle.abort();
     }
 }
@@ -223,15 +249,21 @@ impl TcpListener {
             mpsc::unbounded_channel::<TcpStream>();
 
         let socket_stream_waker = Arc::new(AtomicWaker::new());
+        let tracked_streams = Arc::new(Mutex::new(Vec::new()));
         let last_tcp_packet = Arc::new(Mutex::new(None));
 
         let waker = socket_stream_waker.clone();
+        let poll_packet_tracked_streams = tracked_streams.clone();
+        let task_tracked_streams = tracked_streams.clone();
         let poll_packet_last_tcp_packet = last_tcp_packet.clone();
         let poll_socket_last_tcp_packet = last_tcp_packet;
         let task_handle = tokio::spawn(async move {
+            let _shutdown_guard = StreamShutdownGuard {
+                streams: task_tracked_streams,
+            };
             let rv = tokio::select! {
                 biased;
-                rv = Self::poll_packets(inbound, device.create_injector(), iface_notifier, socket_stream_emitter, waker, poll_packet_last_tcp_packet) => rv,
+                rv = Self::poll_packets(inbound, device.create_injector(), iface_notifier, socket_stream_emitter, waker, poll_packet_tracked_streams, poll_packet_last_tcp_packet) => rv,
                 rv = Self::poll_sockets(&mut iface, &mut device, iface_notifier_rx, poll_socket_last_tcp_packet) => rv,
             };
             if let Err(e) = rv {
@@ -243,6 +275,7 @@ impl TcpListener {
             socket_stream,
             task_handle,
             socket_stream_waker,
+            tracked_streams,
         }
     }
 
@@ -252,6 +285,7 @@ impl TcpListener {
         iface_notifier: mpsc::UnboundedSender<IfaceEvent<'static>>,
         tcp_stream_emitter: mpsc::UnboundedSender<TcpStream>,
         tcp_stream_waker: Arc<AtomicWaker>,
+        tracked_streams: Arc<Mutex<Vec<Weak<TcpStreamHandle>>>>,
         last_tcp_packet: Arc<Mutex<Option<LastTcpPacketMeta>>>,
     ) -> std::io::Result<()> {
         let mut packet_buf = Vec::with_capacity(32);
@@ -280,11 +314,27 @@ impl TcpListener {
                         continue;
                     }
                 };
+                if !packet.verify_checksum() {
+                    warn!("Invalid IP checksum");
+                    continue;
+                }
 
-                // Specially handle icmp packet by TCP interface.
-                if matches!(packet.protocol(), IpProtocol::Icmp | IpProtocol::Icmpv6)
-                {
-                    match device_injector.send(frame) {
+                let sliced = match etherparse::SlicedPacket::from_ip(frame.data()) {
+                    Ok(packet) => packet,
+                    Err(err) => {
+                        warn!("Invalid IP transport packet: {err}");
+                        continue;
+                    }
+                };
+
+                if matches!(
+                    sliced.transport,
+                    Some(
+                        etherparse::TransportSlice::Icmpv4(_)
+                            | etherparse::TransportSlice::Icmpv6(_)
+                    )
+                ) {
+                    match device_injector.send(frame.clone()) {
                         Ok(_) => {}
                         Err(err) => {
                             warn!("Failed to send packet to device: {err}");
@@ -302,18 +352,29 @@ impl TcpListener {
 
                 let src_ip = packet.src_addr();
                 let dst_ip = packet.dst_addr();
-                let payload = packet.payload();
+                let tcp = match sliced.transport {
+                    Some(etherparse::TransportSlice::Tcp(tcp)) => tcp,
+                    _ => {
+                        warn!("TCP input did not contain a complete TCP segment");
+                        continue;
+                    }
+                };
 
-                let packet = match TcpPacket::new_checked(payload) {
+                let packet = match TcpPacket::new_checked(tcp.slice()) {
                     Ok(p) => p,
                     Err(err) => {
                         error!(
                             "invalid TCP err: {err}, src_ip: {src_ip}, dst_ip: \
-                             {dst_ip}, payload: {payload:?}"
+                             {dst_ip}, payload: {:?}",
+                            tcp.slice()
                         );
                         continue;
                     }
                 };
+                if !packet.verify_checksum(&src_ip.into(), &dst_ip.into()) {
+                    warn!("Invalid TCP checksum: {src_ip} -> {dst_ip}");
+                    continue;
+                }
                 let src_port = packet.src_port();
                 let dst_port = packet.dst_port();
 
@@ -335,7 +396,7 @@ impl TcpListener {
                         // Refresh timestamp so the entry doesn't expire
                         // while the connection is still retransmitting SYNs.
                         *time = now;
-                        device_injector.send(frame).map_err(|e| {
+                        device_injector.send(frame.clone()).map_err(|e| {
                             error!("Failed to inject retransmitted SYN packet: {e}");
                             std::io::Error::other(
                                 "Failed to inject retransmitted SYN packet",
@@ -396,6 +457,10 @@ impl TcpListener {
                     trace!("created TCP connection for {src_addr} <-> {dst_addr}");
 
                     let handle = Arc::new(TcpStreamHandle::new());
+                    if let Ok(mut streams) = tracked_streams.lock() {
+                        streams.retain(|stream| stream.strong_count() > 0);
+                        streams.push(Arc::downgrade(&handle));
+                    }
 
                     tcp_stream_emitter
                         .send(TcpStream {
@@ -422,7 +487,7 @@ impl TcpListener {
                     syn_tracker.remove(&(src_addr, dst_addr));
                 }
 
-                device_injector.send(frame).map_err(|e| {
+                device_injector.send(frame.clone()).map_err(|e| {
                     error!("Failed to send packet to device: {e}");
                     std::io::Error::other("Failed to inject packet to device")
                 })?;
@@ -451,6 +516,7 @@ impl TcpListener {
             Arc<TcpStreamHandle>,
         > = HashMap::new();
         let mut next_poll = None;
+        let mut poll_requested = false;
         let mut panic_window_start = StdInstant::now();
         let mut panic_count = 0usize;
 
@@ -461,20 +527,25 @@ impl TcpListener {
                 socket_maps.len()
             );
 
-            let should_poll_now = match (next_poll, socket_maps.len()) {
-                (None, 0) => {
-                    trace!("No sockets to poll, waiting indefinitely");
-                    false
-                }
-                (None, _) => {
-                    trace!("Polling sockets with no delay");
-                    true
-                }
-                (Some(dur), _) => {
-                    trace!("Polling sockets with delay: {dur:?}");
-                    false
+            let should_poll_now = if poll_requested {
+                true
+            } else {
+                match (next_poll, socket_maps.len()) {
+                    (None, 0) => {
+                        trace!("No sockets to poll, waiting indefinitely");
+                        false
+                    }
+                    (None, _) => {
+                        trace!("Polling sockets with no delay");
+                        true
+                    }
+                    (Some(dur), _) => {
+                        trace!("Polling sockets with delay: {dur:?}");
+                        false
+                    }
                 }
             };
+            poll_requested = false;
             let now = smoltcp::time::Instant::now();
 
             if should_poll_now {
@@ -680,6 +751,7 @@ impl TcpListener {
                     Some(event) = notifier_rx.recv() => {
                         trace!("Received iface event, will poll sockets");
                         next_poll = None; // reset the next poll time
+                        poll_requested = true;
                         match event {
                             IfaceEvent::TcpStream(stream) => {
                                 let socket_handle = sockets.add(stream.0);

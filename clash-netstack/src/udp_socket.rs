@@ -75,29 +75,51 @@ pub struct SplitRead {
 
 impl SplitRead {
     pub async fn recv(&mut self) -> Option<UdpPacket> {
-        self.recv.recv().await.and_then(|data| {
+        while let Some(data) = self.recv.recv().await {
             let packet = match IpPacket::new_checked(data.data()) {
                 Ok(p) => p,
                 Err(err) => {
                     error!("invalid IP packet: {err}");
-                    return None;
+                    continue;
                 }
             };
+
+            if !packet.verify_checksum() {
+                error!("invalid IP checksum");
+                continue;
+            }
 
             let src_ip = packet.src_addr();
             let dst_ip = packet.dst_addr();
-            let payload = packet.payload();
-
-            let packet = match smoltcp::wire::UdpPacket::new_checked(payload) {
-                Ok(p) => p,
+            let sliced = match etherparse::SlicedPacket::from_ip(data.data()) {
+                Ok(packet) => packet,
                 Err(err) => {
-                    error!(
-                        "invalid err: {err}, src_ip: {src_ip}, dst_ip: {dst_ip}, \
-                         payload: {payload:?}"
-                    );
-                    return None;
+                    error!("invalid IP packet: {err}");
+                    continue;
                 }
             };
+            let udp = match sliced.transport {
+                Some(etherparse::TransportSlice::Udp(udp)) => udp,
+                _ => {
+                    error!("UDP input did not contain a complete UDP datagram");
+                    continue;
+                }
+            };
+            let packet = match smoltcp::wire::UdpPacket::new_checked(udp.slice()) {
+                Ok(packet) => packet,
+                Err(err) => {
+                    error!(
+                        "invalid UDP err: {err}, src_ip: {src_ip}, dst_ip: {dst_ip}, \
+                         payload: {:?}",
+                        udp.slice()
+                    );
+                    continue;
+                }
+            };
+            if !packet.verify_checksum(&src_ip.into(), &dst_ip.into()) {
+                error!("invalid UDP checksum: {src_ip} -> {dst_ip}");
+                continue;
+            }
             let src_port = packet.src_port();
             let dst_port = packet.dst_port();
 
@@ -106,12 +128,14 @@ impl SplitRead {
 
             trace!("created UDP socket for {src_addr} <-> {dst_addr}");
 
-            Some(UdpPacket {
+            return Some(UdpPacket {
                 data: Packet::new(packet.payload().to_vec()),
                 local_addr: src_addr,
                 remote_addr: dst_addr,
-            })
-        })
+            });
+        }
+
+        None
     }
 }
 
@@ -123,10 +147,6 @@ pub struct SplitWrite {
 
 impl SplitWrite {
     pub async fn send(&mut self, packet: UdpPacket) -> Result<(), std::io::Error> {
-        if packet.data.data().is_empty() {
-            return Ok(());
-        }
-
         let builder = match (packet.local_addr, packet.remote_addr) {
             (SocketAddr::V4(src), SocketAddr::V4(dst)) => {
                 PacketBuilder::ipv4(src.ip().octets(), dst.ip().octets(), 20)
