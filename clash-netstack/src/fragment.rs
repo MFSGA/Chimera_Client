@@ -133,11 +133,13 @@ enum FragmentKey {
         source: [u8; 4],
         destination: [u8; 4],
         identification: u16,
+        protocol: etherparse::IpNumber,
     },
     Ipv6 {
         source: [u8; 16],
         destination: [u8; 16],
         identification: u32,
+        next_header: etherparse::IpNumber,
     },
 }
 
@@ -379,6 +381,7 @@ fn ipv4_fragment_piece(packet: &[u8]) -> std::io::Result<Option<FragmentPiece<'_
             source: header.source(),
             destination: header.destination(),
             identification: header.identification(),
+            protocol: ipv4.payload().ip_number,
         },
         template: IpHeaderTemplate::Ipv4 {
             source: header.source(),
@@ -433,6 +436,7 @@ fn ipv6_fragment_piece(packet: &[u8]) -> std::io::Result<Option<FragmentPiece<'_
                         source: header.source(),
                         destination: header.destination(),
                         identification: fragment.identification(),
+                        next_header: fragment.next_header(),
                     },
                     template: IpHeaderTemplate::Ipv6 {
                         source: header.source(),
@@ -751,6 +755,39 @@ mod tests {
     }
 
     #[test]
+    fn fragment_reassembly_keys_ipv4_by_protocol() {
+        let build = |protocol: etherparse::IpNumber| {
+            let mut header = etherparse::Ipv4Header::new(
+                8,
+                64,
+                protocol,
+                [1, 1, 1, 1],
+                [2, 2, 2, 2],
+            )
+            .unwrap();
+            header.identification = 0x7a7a;
+            header.dont_fragment = false;
+            header.more_fragments = true;
+            header.header_checksum = header.calc_header_checksum();
+            [header.to_bytes().as_slice(), &[0u8; 8]].concat()
+        };
+        let mut reassembler = FragmentReassembler::new_any("test");
+        assert!(
+            reassembler
+                .push(&build(etherparse::ip_number::TCP))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            reassembler
+                .push(&build(etherparse::ip_number::ICMP))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(reassembler.active.len(), 2);
+    }
+
+    #[test]
     fn fragment_reassembly_evicts_oldest_when_active_limit_is_reached() {
         let mut reassembler =
             FragmentReassembler::new(etherparse::ip_number::UDP, "test");
@@ -765,11 +802,13 @@ mod tests {
             source: [1, 1, 1, 1],
             destination: [2, 2, 2, 2],
             identification: 0,
+            protocol: etherparse::ip_number::UDP,
         }));
         assert!(reassembler.active.contains_key(&FragmentKey::Ipv4 {
             source: [1, 1, 1, 1],
             destination: [2, 2, 2, 2],
             identification: FRAGMENT_MAX_ACTIVE as u16,
+            protocol: etherparse::ip_number::UDP,
         }));
     }
 }
