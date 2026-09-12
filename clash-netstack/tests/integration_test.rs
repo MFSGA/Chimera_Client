@@ -164,6 +164,78 @@ fn build_ipv6_tcp_syn_fragments() -> [Vec<u8>; 2] {
     ]
 }
 
+fn build_ipv4_icmp_echo_fragments() -> [Vec<u8>; 2] {
+    let source = [10, 0, 0, 2];
+    let destination = [10, 0, 0, 1];
+    let mut full = Vec::new();
+    etherparse::PacketBuilder::ipv4(source, destination, 64)
+        .icmpv4_echo_request(7, 9)
+        .write(&mut full, b"fragmented-icmpv4-echo")
+        .unwrap();
+    let icmp = &full[20..];
+    let split = 16;
+    let build = |part: &[u8], offset: usize, more_fragments: bool| {
+        let mut header = etherparse::Ipv4Header::new(
+            part.len() as u16,
+            64,
+            etherparse::ip_number::ICMP,
+            source,
+            destination,
+        )
+        .unwrap();
+        header.identification = 0x6262;
+        header.dont_fragment = false;
+        header.more_fragments = more_fragments;
+        header.fragment_offset =
+            etherparse::IpFragOffset::try_new((offset / 8) as u16).unwrap();
+        header.header_checksum = header.calc_header_checksum();
+        [header.to_bytes().as_slice(), part].concat()
+    };
+    [
+        build(&icmp[..split], 0, true),
+        build(&icmp[split..], split, false),
+    ]
+}
+
+fn build_ipv6_icmp_echo_fragments() -> [Vec<u8>; 2] {
+    let source = [0x20; 16];
+    let destination = [0x21; 16];
+    let mut full = Vec::new();
+    etherparse::PacketBuilder::ipv6(source, destination, 64)
+        .icmpv6_echo_request(7, 9)
+        .write(&mut full, b"fragmented-icmpv6-echo")
+        .unwrap();
+    let icmp = &full[40..];
+    let split = 16;
+    let build = |part: &[u8], offset: usize, more_fragments: bool| {
+        let header = etherparse::Ipv6Header {
+            payload_length: (etherparse::Ipv6FragmentHeader::LEN + part.len())
+                as u16,
+            next_header: etherparse::ip_number::IPV6_FRAG,
+            hop_limit: 64,
+            source,
+            destination,
+            ..Default::default()
+        };
+        let fragment = etherparse::Ipv6FragmentHeader::new(
+            etherparse::ip_number::IPV6_ICMP,
+            etherparse::IpFragOffset::try_new((offset / 8) as u16).unwrap(),
+            more_fragments,
+            0x6677_8899,
+        );
+        [
+            header.to_bytes().as_slice(),
+            fragment.to_bytes().as_slice(),
+            part,
+        ]
+        .concat()
+    };
+    [
+        build(&icmp[..split], 0, true),
+        build(&icmp[split..], split, false),
+    ]
+}
+
 fn is_any_ip_syn_ack(packet: &[u8]) -> bool {
     matches!(
         etherparse::SlicedPacket::from_ip(packet)
@@ -780,6 +852,50 @@ async fn icmp_echo_reply_works_without_tcp_socket() {
 }
 
 #[tokio::test]
+async fn fragmented_ipv4_icmp_echo_reassembles_out_of_order() {
+    let [first, second] = build_ipv4_icmp_echo_fragments();
+    let (stack, _tcp, _udp) = NetStack::new();
+    let (mut sink, mut output) = stack.split();
+    sink.send(Packet::new(second)).await.unwrap();
+    sink.send(Packet::new(first)).await.unwrap();
+
+    let reply =
+        tokio::time::timeout(std::time::Duration::from_millis(300), output.next())
+            .await
+            .expect("fragmented ICMPv4 Echo Reply timed out")
+            .expect("stack output closed")
+            .expect("stack error");
+    let packet = etherparse::SlicedPacket::from_ip(reply.data()).unwrap();
+    assert!(matches!(
+        packet.transport,
+        Some(etherparse::TransportSlice::Icmpv4(icmp))
+            if matches!(icmp.icmp_type(), etherparse::Icmpv4Type::EchoReply(_))
+    ));
+}
+
+#[tokio::test]
+async fn fragmented_ipv6_icmp_echo_reassembles_out_of_order() {
+    let [first, second] = build_ipv6_icmp_echo_fragments();
+    let (stack, _tcp, _udp) = NetStack::new();
+    let (mut sink, mut output) = stack.split();
+    sink.send(Packet::new(second)).await.unwrap();
+    sink.send(Packet::new(first)).await.unwrap();
+
+    let reply =
+        tokio::time::timeout(std::time::Duration::from_millis(300), output.next())
+            .await
+            .expect("fragmented ICMPv6 Echo Reply timed out")
+            .expect("stack output closed")
+            .expect("stack error");
+    let packet = etherparse::SlicedPacket::from_ip(reply.data()).unwrap();
+    assert!(matches!(
+        packet.transport,
+        Some(etherparse::TransportSlice::Icmpv6(icmp))
+            if matches!(icmp.icmp_type(), etherparse::Icmpv6Type::EchoReply(_))
+    ));
+}
+
+#[tokio::test]
 async fn fragmented_ipv4_udp_reassembles_out_of_order() {
     let payload = b"fragmented-ipv4-udp-payload";
     let [first, second] = build_ipv4_udp_fragments(payload);
@@ -824,6 +940,46 @@ async fn fragmented_ipv6_udp_reassembles_out_of_order() {
 }
 
 #[tokio::test]
+async fn fragment_overlap_policy_is_version_appropriate() {
+    let payload = b"duplicate-fragment";
+    {
+        let [first, second] = build_ipv6_udp_fragments(payload);
+        let (stack, _tcp, udp) = NetStack::new();
+        let (mut sink, _) = stack.split();
+        let (mut reader, _) = udp.split();
+        for packet in [first.clone(), first, second] {
+            sink.send(Packet::new(packet)).await.unwrap();
+        }
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                reader.recv()
+            )
+            .await
+            .is_err(),
+            "overlapping IPv6 fragments must discard the datagram"
+        );
+    }
+    {
+        let [first, second] = build_ipv4_udp_fragments(payload);
+        let (stack, _tcp, udp) = NetStack::new();
+        let (mut sink, _) = stack.split();
+        let (mut reader, _) = udp.split();
+        for packet in [first.clone(), first, second] {
+            sink.send(Packet::new(packet)).await.unwrap();
+        }
+        let packet = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            reader.recv(),
+        )
+        .await
+        .expect("identical IPv4 duplicate blocked reassembly")
+        .expect("UDP stream closed");
+        assert_eq!(packet.data(), payload);
+    }
+}
+
+#[tokio::test]
 async fn fragmented_ipv6_udp_after_destination_options_reassembles() {
     let src = [0x20; 16];
     let dst = [0x21; 16];
@@ -864,6 +1020,152 @@ async fn fragmented_ipv6_udp_after_destination_options_reassembles() {
             .expect("reassembly timed out")
             .expect("UDP stream closed");
     assert_eq!(packet.data(), payload);
+}
+
+#[tokio::test]
+async fn fragmented_ipv6_udp_with_padding_hop_by_hop_reassembles() {
+    let src = [0x20; 16];
+    let dst = [0x21; 16];
+    let payload = b"pre-fragment-padding";
+    let mut full = Vec::new();
+    etherparse::PacketBuilder::ipv6(src, dst, 64)
+        .udp(5000, 5001)
+        .write(&mut full, payload)
+        .unwrap();
+    let udp = &full[40..];
+    let build = |part: &[u8], offset: usize, more: bool| {
+        let ip = etherparse::Ipv6Header {
+            payload_length: (16 + part.len()) as u16,
+            next_header: etherparse::ip_number::IPV6_HOP_BY_HOP,
+            hop_limit: 64,
+            source: src,
+            destination: dst,
+            ..Default::default()
+        };
+        let hop_by_hop = [etherparse::ip_number::IPV6_FRAG.0, 0, 0, 0, 0, 0, 0, 0];
+        let frag = etherparse::Ipv6FragmentHeader::new(
+            etherparse::ip_number::UDP,
+            etherparse::IpFragOffset::try_new((offset / 8) as u16).unwrap(),
+            more,
+            0x3344_5566,
+        );
+        [
+            ip.to_bytes().as_slice(),
+            hop_by_hop.as_slice(),
+            frag.to_bytes().as_slice(),
+            part,
+        ]
+        .concat()
+    };
+    let (stack, _tcp, udp_socket) = NetStack::new();
+    let (mut sink, _) = stack.split();
+    let (mut reader, _) = udp_socket.split();
+    for packet in [build(&udp[16..], 16, false), build(&udp[..16], 0, true)] {
+        sink.send(Packet::new(packet)).await.unwrap();
+    }
+    let packet =
+        tokio::time::timeout(std::time::Duration::from_millis(300), reader.recv())
+            .await
+            .expect("padding-only Hop-by-Hop reassembly timed out")
+            .expect("UDP stream closed");
+    assert_eq!(packet.data(), payload);
+}
+
+#[tokio::test]
+async fn fragmented_ipv6_udp_with_semantic_destination_option_is_rejected() {
+    let src = [0x20; 16];
+    let dst = [0x21; 16];
+    let mut full = Vec::new();
+    etherparse::PacketBuilder::ipv6(src, dst, 64)
+        .udp(5000, 5001)
+        .write(&mut full, b"semantic-option")
+        .unwrap();
+    let mut data = vec![etherparse::ip_number::UDP.0, 0, 0x22, 0, 0, 0, 0, 0];
+    data.extend_from_slice(&full[40..]);
+    let build = |part: &[u8], offset: usize, more: bool| {
+        let ip = etherparse::Ipv6Header {
+            payload_length: (8 + part.len()) as u16,
+            next_header: etherparse::ip_number::IPV6_FRAG,
+            hop_limit: 64,
+            source: src,
+            destination: dst,
+            ..Default::default()
+        };
+        let frag = etherparse::Ipv6FragmentHeader::new(
+            etherparse::ip_number::IPV6_DEST_OPTIONS,
+            etherparse::IpFragOffset::try_new((offset / 8) as u16).unwrap(),
+            more,
+            0x4455_6677,
+        );
+        [ip.to_bytes().as_slice(), frag.to_bytes().as_slice(), part].concat()
+    };
+    let (stack, _tcp, udp) = NetStack::new();
+    let (mut sink, _) = stack.split();
+    let (mut reader, _) = udp.split();
+    for packet in [build(&data[16..], 16, false), build(&data[..16], 0, true)] {
+        sink.send(Packet::new(packet)).await.unwrap();
+    }
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), reader.recv())
+            .await
+            .is_err(),
+        "semantic Destination Option was silently stripped"
+    );
+}
+
+#[tokio::test]
+async fn fragmented_ipv6_udp_with_auth_after_fragment_is_rejected() {
+    let src = [0x20; 16];
+    let dst = [0x21; 16];
+    let mut full = Vec::new();
+    etherparse::PacketBuilder::ipv6(src, dst, 64)
+        .udp(5000, 5001)
+        .write(&mut full, b"auth-must-not-bypass")
+        .unwrap();
+    let mut data = vec![
+        etherparse::ip_number::UDP.0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        1,
+    ];
+    data.extend_from_slice(&full[40..]);
+    let build = |part: &[u8], offset: usize, more: bool| {
+        let ip = etherparse::Ipv6Header {
+            payload_length: (8 + part.len()) as u16,
+            next_header: etherparse::ip_number::IPV6_FRAG,
+            hop_limit: 64,
+            source: src,
+            destination: dst,
+            ..Default::default()
+        };
+        let frag = etherparse::Ipv6FragmentHeader::new(
+            etherparse::ip_number::AUTH,
+            etherparse::IpFragOffset::try_new((offset / 8) as u16).unwrap(),
+            more,
+            0x5566_7788,
+        );
+        [ip.to_bytes().as_slice(), frag.to_bytes().as_slice(), part].concat()
+    };
+    let (stack, _tcp, udp) = NetStack::new();
+    let (mut sink, _) = stack.split();
+    let (mut reader, _) = udp.split();
+    for packet in [build(&data[16..], 16, false), build(&data[..16], 0, true)] {
+        sink.send(Packet::new(packet)).await.unwrap();
+    }
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), reader.recv())
+            .await
+            .is_err(),
+        "fragmented AH header was silently bypassed"
+    );
 }
 
 #[tokio::test]

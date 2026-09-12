@@ -99,6 +99,7 @@ impl IpHeaderTemplate {
 
 pub(crate) struct ReassembledTransport {
     pub(crate) template: IpHeaderTemplate,
+    pub(crate) protocol: etherparse::IpNumber,
     pub(crate) payload: Vec<u8>,
 }
 
@@ -132,8 +133,46 @@ struct FragmentState {
     next_header: etherparse::IpNumber,
 }
 
+fn validate_overlap(
+    piece: &FragmentPiece<'_>,
+    buffer: &etherparse::defrag::IpDefragBuf,
+) -> std::io::Result<()> {
+    let start = piece.offset.byte_offset();
+    let len = u16::try_from(piece.payload.len())
+        .map_err(|_| std::io::Error::other("fragment payload too large"))?;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| std::io::Error::other("fragment range overflow"))?;
+
+    for section in buffer.sections() {
+        let overlap_start = start.max(section.start);
+        let overlap_end = end.min(section.end);
+        if overlap_start >= overlap_end {
+            continue;
+        }
+        if matches!(piece.key, FragmentKey::Ipv6 { .. }) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "overlapping IPv6 fragments",
+            ));
+        }
+
+        let old_start = usize::from(overlap_start);
+        let old_end = usize::from(overlap_end);
+        let new_start = usize::from(overlap_start - start);
+        let new_end = new_start + (old_end - old_start);
+        if buffer.data()[old_start..old_end] != piece.payload[new_start..new_end] {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "conflicting overlapping IPv4 fragments",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) struct FragmentReassembler {
-    expected_protocol: etherparse::IpNumber,
+    expected_protocol: Option<etherparse::IpNumber>,
     label: &'static str,
     active: HashMap<FragmentKey, FragmentState>,
 }
@@ -144,7 +183,15 @@ impl FragmentReassembler {
         label: &'static str,
     ) -> Self {
         Self {
-            expected_protocol,
+            expected_protocol: Some(expected_protocol),
+            label,
+            active: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn new_any(label: &'static str) -> Self {
+        Self {
+            expected_protocol: None,
             label,
             active: HashMap::new(),
         }
@@ -213,6 +260,10 @@ impl FragmentReassembler {
                     "fragment next-header changed within one datagram",
                 ));
             }
+            if let Err(err) = validate_overlap(&piece, &state.buffer) {
+                self.active.remove(&piece.key);
+                return Err(err);
+            }
             state.updated_at = now;
             if piece.offset.value() == 0 {
                 state.template = piece.template;
@@ -237,12 +288,16 @@ impl FragmentReassembler {
             .expect("completed fragment state must exist");
         let (payload, _) = state.buffer.take_bufs();
         let transport = transport_payload(state.next_header, &payload)?;
-        if transport.0 != self.expected_protocol {
+        if self
+            .expected_protocol
+            .is_some_and(|expected| transport.0 != expected)
+        {
             return Ok(None);
         }
 
         Ok(Some(ReassembledTransport {
             template: state.template,
+            protocol: transport.0,
             payload: transport.1.to_vec(),
         }))
     }
@@ -336,18 +391,18 @@ fn ipv6_fragment_piece(packet: &[u8]) -> std::io::Result<Option<FragmentPiece<'_
                 }));
             }
             etherparse::ip_number::IPV6_HOP_BY_HOP
-            | etherparse::ip_number::IPV6_DEST_OPTIONS
-            | etherparse::ip_number::IPV6_ROUTE => {
+            | etherparse::ip_number::IPV6_DEST_OPTIONS => {
                 let extension = etherparse::Ipv6RawExtHeaderSlice::from_slice(rest)
                     .map_err(std::io::Error::other)?;
+                validate_padding_only_ipv6_options(extension.payload())?;
                 next = extension.next_header();
                 rest = &rest[extension.slice().len()..];
             }
-            etherparse::ip_number::AUTH => {
-                let extension = etherparse::IpAuthHeaderSlice::from_slice(rest)
-                    .map_err(std::io::Error::other)?;
-                next = extension.next_header();
-                rest = &rest[extension.slice().len()..];
+            etherparse::ip_number::IPV6_ROUTE | etherparse::ip_number::AUTH => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unsupported semantic IPv6 extension before Fragment header",
+                ));
             }
             _ => return Ok(None),
         }
@@ -355,11 +410,71 @@ fn ipv6_fragment_piece(packet: &[u8]) -> std::io::Result<Option<FragmentPiece<'_
 }
 
 fn transport_payload(
-    next_header: etherparse::IpNumber,
-    payload: &[u8],
+    mut next_header: etherparse::IpNumber,
+    mut payload: &[u8],
 ) -> std::io::Result<(etherparse::IpNumber, &[u8])> {
-    let (_, protocol, payload) =
-        etherparse::Ipv6ExtensionsSlice::from_slice(next_header, payload)
-            .map_err(std::io::Error::other)?;
-    Ok((protocol, payload))
+    loop {
+        match next_header {
+            etherparse::ip_number::IPV6_DEST_OPTIONS => {
+                let extension =
+                    etherparse::Ipv6RawExtHeaderSlice::from_slice(payload)
+                        .map_err(std::io::Error::other)?;
+                validate_padding_only_ipv6_options(extension.payload())?;
+                next_header = extension.next_header();
+                payload = &payload[extension.slice().len()..];
+            }
+            etherparse::ip_number::IPV6_HOP_BY_HOP
+            | etherparse::ip_number::IPV6_ROUTE
+            | etherparse::ip_number::AUTH => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unsupported semantic IPv6 extension after Fragment header",
+                ));
+            }
+            _ => return Ok((next_header, payload)),
+        }
+    }
+}
+
+fn validate_padding_only_ipv6_options(options: &[u8]) -> std::io::Result<()> {
+    let mut offset = 0usize;
+    while offset < options.len() {
+        match options[offset] {
+            0 => offset += 1, // Pad1
+            1 => {
+                let Some(&len) = options.get(offset + 1) else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "truncated IPv6 PadN option",
+                    ));
+                };
+                let end =
+                    offset.checked_add(2 + usize::from(len)).ok_or_else(|| {
+                        std::io::Error::other("IPv6 option length overflow")
+                    })?;
+                let Some(data) = options.get(offset + 2..end) else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "truncated IPv6 PadN option data",
+                    ));
+                };
+                if data.iter().any(|byte| *byte != 0) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "non-zero IPv6 PadN option data",
+                    ));
+                }
+                offset = end;
+            }
+            option => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "unsupported semantic IPv6 option in fragmented packet: {option}"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
