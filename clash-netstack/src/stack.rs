@@ -206,6 +206,7 @@ impl futures::Sink<Packet> for StackSplitSink {
                 match next_header {
                     etherparse::ip_number::UDP => IpProtocol::Udp,
                     etherparse::ip_number::TCP => IpProtocol::Tcp,
+                    etherparse::ip_number::IPV6_ICMP => IpProtocol::Icmpv6,
                     etherparse::ip_number::IPV6_DEST_OPTIONS
                     | etherparse::ip_number::IPV6_ROUTE
                     | etherparse::ip_number::AUTH => {
@@ -232,6 +233,7 @@ impl futures::Sink<Packet> for StackSplitSink {
                     match payload.ip_number {
                         etherparse::ip_number::UDP => IpProtocol::Udp,
                         etherparse::ip_number::TCP => IpProtocol::Tcp,
+                        etherparse::ip_number::ICMP => IpProtocol::Icmp,
                         _ => {
                             debug!(
                                 "tun fragmented IP packet ignored (protocol: {:?})",

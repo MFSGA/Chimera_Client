@@ -310,8 +310,7 @@ impl TcpListener {
         let mut last_prune_time = std::time::Instant::now();
         let mut syn_drop_count: u64 = 0;
         let mut last_syn_drop_log = std::time::Instant::now();
-        let mut tcp_fragments =
-            FragmentReassembler::new(etherparse::ip_number::TCP, "TCP");
+        let mut control_fragments = FragmentReassembler::new_any("TCP/ICMP");
 
         while let n = inbound.recv_many(&mut packet_buf, 32).await
             && n > 0
@@ -342,12 +341,12 @@ impl TcpListener {
                 let rebuilt_frame = match crate::fragment::is_fragmented(
                     frame.data(),
                 ) {
-                    Ok(true) => match tcp_fragments.push(frame.data()) {
+                    Ok(true) => match control_fragments.push(frame.data()) {
                         Ok(Some(reassembled)) => {
-                            match reassembled.template.rebuild(
-                                etherparse::ip_number::TCP,
-                                &reassembled.payload,
-                            ) {
+                            match reassembled
+                                .template
+                                .rebuild(reassembled.protocol, &reassembled.payload)
+                            {
                                 Ok(packet) => Some(packet),
                                 Err(err) => {
                                     warn!(

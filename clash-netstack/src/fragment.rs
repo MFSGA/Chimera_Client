@@ -99,6 +99,7 @@ impl IpHeaderTemplate {
 
 pub(crate) struct ReassembledTransport {
     pub(crate) template: IpHeaderTemplate,
+    pub(crate) protocol: etherparse::IpNumber,
     pub(crate) payload: Vec<u8>,
 }
 
@@ -171,7 +172,7 @@ fn validate_overlap(
 }
 
 pub(crate) struct FragmentReassembler {
-    expected_protocol: etherparse::IpNumber,
+    expected_protocol: Option<etherparse::IpNumber>,
     label: &'static str,
     active: HashMap<FragmentKey, FragmentState>,
 }
@@ -182,7 +183,15 @@ impl FragmentReassembler {
         label: &'static str,
     ) -> Self {
         Self {
-            expected_protocol,
+            expected_protocol: Some(expected_protocol),
+            label,
+            active: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn new_any(label: &'static str) -> Self {
+        Self {
+            expected_protocol: None,
             label,
             active: HashMap::new(),
         }
@@ -279,12 +288,16 @@ impl FragmentReassembler {
             .expect("completed fragment state must exist");
         let (payload, _) = state.buffer.take_bufs();
         let transport = transport_payload(state.next_header, &payload)?;
-        if transport.0 != self.expected_protocol {
+        if self
+            .expected_protocol
+            .is_some_and(|expected| transport.0 != expected)
+        {
             return Ok(None);
         }
 
         Ok(Some(ReassembledTransport {
             template: state.template,
+            protocol: transport.0,
             payload: transport.1.to_vec(),
         }))
     }
