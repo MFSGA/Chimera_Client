@@ -824,6 +824,46 @@ async fn fragmented_ipv6_udp_reassembles_out_of_order() {
 }
 
 #[tokio::test]
+async fn fragment_overlap_policy_is_version_appropriate() {
+    let payload = b"duplicate-fragment";
+    {
+        let [first, second] = build_ipv6_udp_fragments(payload);
+        let (stack, _tcp, udp) = NetStack::new();
+        let (mut sink, _) = stack.split();
+        let (mut reader, _) = udp.split();
+        for packet in [first.clone(), first, second] {
+            sink.send(Packet::new(packet)).await.unwrap();
+        }
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                reader.recv()
+            )
+            .await
+            .is_err(),
+            "overlapping IPv6 fragments must discard the datagram"
+        );
+    }
+    {
+        let [first, second] = build_ipv4_udp_fragments(payload);
+        let (stack, _tcp, udp) = NetStack::new();
+        let (mut sink, _) = stack.split();
+        let (mut reader, _) = udp.split();
+        for packet in [first.clone(), first, second] {
+            sink.send(Packet::new(packet)).await.unwrap();
+        }
+        let packet = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            reader.recv(),
+        )
+        .await
+        .expect("identical IPv4 duplicate blocked reassembly")
+        .expect("UDP stream closed");
+        assert_eq!(packet.data(), payload);
+    }
+}
+
+#[tokio::test]
 async fn fragmented_ipv6_udp_after_destination_options_reassembles() {
     let src = [0x20; 16];
     let dst = [0x21; 16];

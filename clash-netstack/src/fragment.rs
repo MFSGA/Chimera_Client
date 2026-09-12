@@ -132,6 +132,44 @@ struct FragmentState {
     next_header: etherparse::IpNumber,
 }
 
+fn validate_overlap(
+    piece: &FragmentPiece<'_>,
+    buffer: &etherparse::defrag::IpDefragBuf,
+) -> std::io::Result<()> {
+    let start = piece.offset.byte_offset();
+    let len = u16::try_from(piece.payload.len())
+        .map_err(|_| std::io::Error::other("fragment payload too large"))?;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| std::io::Error::other("fragment range overflow"))?;
+
+    for section in buffer.sections() {
+        let overlap_start = start.max(section.start);
+        let overlap_end = end.min(section.end);
+        if overlap_start >= overlap_end {
+            continue;
+        }
+        if matches!(piece.key, FragmentKey::Ipv6 { .. }) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "overlapping IPv6 fragments",
+            ));
+        }
+
+        let old_start = usize::from(overlap_start);
+        let old_end = usize::from(overlap_end);
+        let new_start = usize::from(overlap_start - start);
+        let new_end = new_start + (old_end - old_start);
+        if buffer.data()[old_start..old_end] != piece.payload[new_start..new_end] {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "conflicting overlapping IPv4 fragments",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) struct FragmentReassembler {
     expected_protocol: etherparse::IpNumber,
     label: &'static str,
@@ -212,6 +250,10 @@ impl FragmentReassembler {
                     std::io::ErrorKind::InvalidData,
                     "fragment next-header changed within one datagram",
                 ));
+            }
+            if let Err(err) = validate_overlap(&piece, &state.buffer) {
+                self.active.remove(&piece.key);
+                return Err(err);
             }
             state.updated_at = now;
             if piece.offset.value() == 0 {
