@@ -69,14 +69,34 @@ pub async fn serve_ipc(
 
     info!("Start API server on IPC address {:?}", path);
 
-    if let Err(e) = tokio::fs::remove_file(&path).await
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        let err = crate::Error::Operation(format!(
-            "Cannot remove existing IPC file: {e}",
-        ));
-        ready_signal.fail(err.to_string());
-        return Err(err);
+    use std::os::unix::fs::FileTypeExt as _;
+
+    match tokio::fs::symlink_metadata(&path).await {
+        Ok(metadata) => {
+            if !metadata.file_type().is_socket() {
+                let err = crate::Error::Operation(format!(
+                    "Existing IPC path is not a Unix socket: {}",
+                    path.display()
+                ));
+                ready_signal.fail(err.to_string());
+                return Err(err);
+            }
+            if let Err(e) = tokio::fs::remove_file(&path).await {
+                let err = crate::Error::Operation(format!(
+                    "Cannot remove existing IPC socket: {e}",
+                ));
+                ready_signal.fail(err.to_string());
+                return Err(err);
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            let err = crate::Error::Operation(format!(
+                "Cannot inspect existing IPC path: {e}",
+            ));
+            ready_signal.fail(err.to_string());
+            return Err(err);
+        }
     }
 
     if let Some(parent) = path.parent()
@@ -143,6 +163,25 @@ pub async fn serve_ipc(
 mod tests {
     use super::*;
     use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn regular_file_at_ipc_path_is_preserved_and_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("api.sock");
+        std::fs::write(&socket_path, b"keep-me").unwrap();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let ready = super::super::runner::ApiReadySignal::new(Some(ready_tx), 1);
+
+        let result =
+            serve_ipc(axum::Router::new(), socket_path.to_str().unwrap(), ready)
+                .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("not a Unix socket"));
+        assert_eq!(std::fs::read(&socket_path).unwrap(), b"keep-me");
+        assert_eq!(ready_rx.await.unwrap(), Err(err.to_string()));
+    }
 
     #[tokio::test]
     async fn ipc_bind_failure_reports_readiness_error() {
