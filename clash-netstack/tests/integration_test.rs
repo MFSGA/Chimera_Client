@@ -824,6 +824,49 @@ async fn fragmented_ipv6_udp_reassembles_out_of_order() {
 }
 
 #[tokio::test]
+async fn fragmented_ipv6_udp_after_destination_options_reassembles() {
+    let src = [0x20; 16];
+    let dst = [0x21; 16];
+    let payload = b"post-fragment-options";
+    let mut full = Vec::new();
+    etherparse::PacketBuilder::ipv6(src, dst, 64)
+        .udp(5000, 5001)
+        .write(&mut full, payload)
+        .unwrap();
+    let mut data = vec![etherparse::ip_number::UDP.0, 0, 0, 0, 0, 0, 0, 0];
+    data.extend_from_slice(&full[40..]);
+    let build = |part: &[u8], offset: usize, more: bool| {
+        let ip = etherparse::Ipv6Header {
+            payload_length: (8 + part.len()) as u16,
+            next_header: etherparse::ip_number::IPV6_FRAG,
+            hop_limit: 64,
+            source: src,
+            destination: dst,
+            ..Default::default()
+        };
+        let frag = etherparse::Ipv6FragmentHeader::new(
+            etherparse::ip_number::IPV6_DEST_OPTIONS,
+            etherparse::IpFragOffset::try_new((offset / 8) as u16).unwrap(),
+            more,
+            0x99aa_bbcc,
+        );
+        [ip.to_bytes().as_slice(), frag.to_bytes().as_slice(), part].concat()
+    };
+    let (stack, _tcp, udp) = NetStack::new();
+    let (mut sink, _) = stack.split();
+    let (mut reader, _) = udp.split();
+    for packet in [build(&data[16..], 16, false), build(&data[..16], 0, true)] {
+        sink.send(Packet::new(packet)).await.unwrap();
+    }
+    let packet =
+        tokio::time::timeout(std::time::Duration::from_millis(300), reader.recv())
+            .await
+            .expect("reassembly timed out")
+            .expect("UDP stream closed");
+    assert_eq!(packet.data(), payload);
+}
+
+#[tokio::test]
 async fn fragmented_ipv4_tcp_syn_reassembles_out_of_order() {
     let [first, second] = build_ipv4_tcp_syn_fragments();
     let (stack, mut tcp_listener, _udp_socket) = NetStack::new();
