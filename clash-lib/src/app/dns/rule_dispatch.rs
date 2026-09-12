@@ -1,16 +1,18 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
-use crate::app::{
-    outbound::manager::ThreadSafeOutboundManager, router::ThreadSafeRouter,
-};
+use crate::app::{outbound::manager::OutboundManager, router::Router};
 
 /// Late-bound reference to `Router`. Populated by `lib.rs` after the router
 /// is constructed; the DNS resolver itself is built earlier.
-pub type PendingRouter = Arc<OnceLock<ThreadSafeRouter>>;
+///
+/// The reference is weak so the resolver and its DNS clients do not retain an
+/// entire router across reloads. `DnsRuntimeProvider` falls back to its
+/// bootstrap outbound when the router has already been dropped.
+pub type PendingRouter = Arc<OnceLock<Weak<Router>>>;
 
 /// Late-bound reference to `OutboundManager`. Populated by `lib.rs` after the
 /// outbound manager is constructed.
-pub type PendingOutboundManager = Arc<OnceLock<ThreadSafeOutboundManager>>;
+pub type PendingOutboundManager = Arc<OnceLock<Weak<OutboundManager>>>;
 
 /// Bundle of late-bound handles consulted by `DnsRuntimeProvider` when
 /// `dns.respect-rules` is enabled, allowing upstream DNS dials to be routed

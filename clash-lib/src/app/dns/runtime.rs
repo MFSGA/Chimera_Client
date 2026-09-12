@@ -75,8 +75,10 @@ impl DnsRuntimeProvider {
         let Some(rd) = &self.rule_dispatch else {
             return self.outbound.clone();
         };
-        let (Some(router), Some(mgr)) = (rd.router.get(), rd.outbound_manager.get())
-        else {
+        let (Some(router), Some(mgr)) = (
+            rd.router.get().and_then(std::sync::Weak::upgrade),
+            rd.outbound_manager.get().and_then(std::sync::Weak::upgrade),
+        ) else {
             return self.outbound.clone();
         };
         let mut sess = sess.clone();

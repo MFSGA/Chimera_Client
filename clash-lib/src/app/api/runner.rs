@@ -7,7 +7,7 @@ use axum::{
 };
 
 use http::{HeaderValue, Method, header};
-use tokio::sync::{Mutex, broadcast::Sender};
+use tokio::sync::{Mutex, broadcast::Sender, oneshot};
 use tower::{Layer, ServiceBuilder, util::MapRequestLayer};
 use tower_http::{
     cors::{AllowOrigin, Any, CorsLayer},
@@ -51,6 +51,11 @@ pub struct ApiRunner {
     ipv6_allowed: bool,
     task:
         std::sync::Mutex<Option<tokio::task::JoinHandle<Result<(), crate::Error>>>>,
+    /// A one-shot readiness result for the first run of this listener. The
+    /// sender is consumed by `run_async`, while the receiver is awaited by the
+    /// startup/reload coordinator before reporting success.
+    ready_tx: std::sync::Mutex<Option<oneshot::Sender<Result<(), String>>>>,
+    ready_rx: Mutex<Option<oneshot::Receiver<Result<(), String>>>>,
 }
 
 fn build_cors_layer(configured_origins: Option<&[String]>) -> (CorsLayer, usize) {
@@ -143,6 +148,7 @@ impl ApiRunner {
         dns_enabled: bool,
         ipv6_allowed: bool,
     ) -> Self {
+        let (ready_tx, ready_rx) = oneshot::channel();
         Self {
             controller_cfg,
             log_source,
@@ -160,6 +166,30 @@ impl ApiRunner {
             dns_enabled,
             ipv6_allowed,
             task: std::sync::Mutex::new(None),
+            ready_tx: std::sync::Mutex::new(Some(ready_tx)),
+            ready_rx: Mutex::new(Some(ready_rx)),
+        }
+    }
+
+    /// Wait until the API listener has completed its bind and security checks.
+    ///
+    /// Binding happens inside the background task, so merely calling
+    /// `run_async` cannot tell a caller whether the configured endpoint is
+    /// usable. Returning the bind error here prevents startup and reload code
+    /// from acknowledging a listener that failed immediately.
+    pub async fn wait_ready(&self) -> Result<(), crate::Error> {
+        let receiver = self.ready_rx.lock().await.take();
+        match receiver {
+            Some(receiver) => match receiver.await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(message)) => Err(crate::Error::Operation(message)),
+                Err(_) => Err(crate::Error::Operation(
+                    "API server exited before becoming ready".to_owned(),
+                )),
+            },
+            None => Err(crate::Error::Operation(
+                "API server readiness was already consumed".to_owned(),
+            )),
         }
     }
 }
@@ -180,6 +210,7 @@ impl Runner for ApiRunner {
         let dns_enabled = self.dns_enabled;
         let ipv6_allowed = self.ipv6_allowed;
         let cancellation_token = self.cancellation_token.clone();
+        let mut ready_tx = self.ready_tx.lock().unwrap().take();
 
         tracing::debug!("API controller configuration: {:?}", controller_cfg);
         let ipc_addr = controller_cfg.external_controller_ipc;
@@ -302,13 +333,30 @@ impl Runner for ApiRunner {
                     middlewares::websocket_uri_rewrite::rewrite_websocket_uri,
                 )
                 .layer(router_clone);
+                let tcp_ready_tx = ready_tx.take();
                 Some(async move {
+                    let mut ready_tx = tcp_ready_tx;
                     info!("Starting API server on TCP address {bind_addr}");
-                    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+                    let listener =
+                        match tokio::net::TcpListener::bind(&bind_addr).await {
+                            Ok(listener) => listener,
+                            Err(err) => {
+                                if let Some(sender) = ready_tx.take() {
+                                    let _ = sender.send(Err(format!(
+                                    "failed to bind API server on {bind_addr}: {err}"
+                                )));
+                                }
+                                return Err(crate::Error::Io(err));
+                            }
+                        };
                     // TCP related security checks
-                    if let Ok(addr) = listener.local_addr() {
-                        if !addr.ip().is_loopback()
-                            && controller_cfg.secret.unwrap_or_default().is_empty()
+                    let security_result = match listener.local_addr() {
+                        Ok(addr)
+                            if !addr.ip().is_loopback()
+                                && controller_cfg
+                                    .secret
+                                    .unwrap_or_default()
+                                    .is_empty() =>
                         {
                             error!(
                                 "API server is listening on a non-loopback address \
@@ -318,13 +366,16 @@ impl Runner for ApiRunner {
                                 "Please set a secret in the configuration to secure \
                              the API server."
                             );
-                            return Err(crate::Error::Operation(
+                            Err(crate::Error::Operation(
                                 "API server is listening on a non-loopback address \
                              without a secret. This is insecure!"
                                     .to_string(),
-                            ));
+                            ))
                         }
-                        if !addr.ip().is_loopback() && valid_cors_origin_count == 0 {
+                        Ok(addr)
+                            if !addr.ip().is_loopback()
+                                && valid_cors_origin_count == 0 =>
+                        {
                             error!(
                                 "API server is listening on a non-loopback address \
                                  without any valid CORS origins. This is insecure!"
@@ -333,12 +384,23 @@ impl Runner for ApiRunner {
                                 "Please configure at least one valid \
                                  cors-allow-origins entry."
                             );
-                            return Err(crate::Error::Operation(
+                            Err(crate::Error::Operation(
                                 "API server is listening on a non-loopback address \
                                  without any valid CORS origins"
                                     .to_string(),
-                            ));
+                            ))
                         }
+                        Ok(_) => Ok(()),
+                        Err(err) => Err(crate::Error::Io(err)),
+                    };
+                    if let Err(err) = security_result {
+                        if let Some(sender) = ready_tx.take() {
+                            let _ = sender.send(Err(err.to_string()));
+                        }
+                        return Err(err);
+                    }
+                    if let Some(sender) = ready_tx.take() {
+                        let _ = sender.send(Ok(()));
                     }
                     axum::serve(
                         listener,
@@ -354,6 +416,16 @@ impl Runner for ApiRunner {
             } else {
                 None
             };
+
+            // IPC-only and disabled-controller configurations do not expose a
+            // TCP bind that can be probed. The task has still built its router,
+            // so treat that point as ready and let the IPC future report any
+            // later socket error through the runner join result.
+            if tcp_fut.is_none()
+                && let Some(sender) = ready_tx.take()
+            {
+                let _ = sender.send(Ok(()));
+            }
 
             // Handle IPC listening
             let ipc_fut = ipc_addr.as_ref().map(|ipc_path| {
