@@ -47,13 +47,13 @@ impl UdpPacket {
 }
 
 pub struct UdpSocket {
-    inbound: mpsc::UnboundedReceiver<Packet>,
+    inbound: mpsc::Receiver<Packet>,
     outbound: mpsc::Sender<Packet>,
 }
 
 impl UdpSocket {
     pub fn new(
-        inbound: mpsc::UnboundedReceiver<Packet>,
+        inbound: mpsc::Receiver<Packet>,
         outbound: mpsc::Sender<Packet>,
     ) -> Self {
         Self { inbound, outbound }
@@ -70,7 +70,7 @@ impl UdpSocket {
 }
 
 pub struct SplitRead {
-    recv: mpsc::UnboundedReceiver<Packet>,
+    recv: mpsc::Receiver<Packet>,
 }
 
 impl SplitRead {

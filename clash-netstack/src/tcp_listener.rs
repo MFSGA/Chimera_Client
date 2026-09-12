@@ -27,6 +27,15 @@ const SYN_TRACK_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 /// Maximum tracked half-open SYN entries. Bounds memory under a SYN flood.
 const SYN_TRACK_MAX: usize = 10_000;
 
+/// Hard cap on live TUN TCP streams. Each stream currently reserves roughly
+/// 1 MiB across smoltcp and application-side buffers, so this bounds that
+/// portion of memory to about 512 MiB.
+const ACTIVE_TCP_STREAM_MAX: usize = 512;
+
+/// Pending streams not yet accepted by the TUN dispatcher.
+const TCP_ACCEPT_QUEUE_SIZE: usize = 128;
+const IFACE_EVENT_QUEUE_SIZE: usize = 4096;
+
 #[derive(Clone, Debug)]
 struct LastTcpPacketMeta {
     src_addr: SocketAddr,
@@ -99,6 +108,17 @@ fn mark_tracked_streams_closed(streams: &Mutex<Vec<Weak<TcpStreamHandle>>>) {
             }
         });
     }
+}
+
+fn has_active_stream_capacity(
+    streams: &Mutex<Vec<Weak<TcpStreamHandle>>>,
+    limit: usize,
+) -> std::io::Result<bool> {
+    let mut streams = streams
+        .lock()
+        .map_err(|_| std::io::Error::other("TCP stream tracker lock poisoned"))?;
+    streams.retain(|stream| stream.strong_count() > 0);
+    Ok(streams.len() < limit)
 }
 
 struct StreamShutdownGuard {
@@ -184,8 +204,7 @@ impl Drop for TcpStreamHandle {
 }
 
 pub struct TcpListener {
-    socket_stream: mpsc::UnboundedReceiver<TcpStream>,
-    socket_stream_waker: Arc<AtomicWaker>,
+    socket_stream: mpsc::Receiver<TcpStream>,
     tracked_streams: Arc<Mutex<Vec<Weak<TcpStreamHandle>>>>,
 
     task_handle: tokio::task::JoinHandle<()>,
@@ -237,22 +256,21 @@ impl TcpListener {
     }
 
     pub fn new(
-        inbound: mpsc::UnboundedReceiver<Packet>,
+        inbound: mpsc::Receiver<Packet>,
         outbound: mpsc::Sender<Packet>,
     ) -> Self {
         // the global bus that drives the iface polling
-        let (iface_notifier, iface_notifier_rx) = mpsc::unbounded_channel();
+        let (iface_notifier, iface_notifier_rx) =
+            mpsc::channel(IFACE_EVENT_QUEUE_SIZE);
         let mut device = NetstackDevice::new(outbound, iface_notifier.clone());
         let mut iface = Self::build_interface(&mut device);
 
         let (socket_stream_emitter, socket_stream) =
-            mpsc::unbounded_channel::<TcpStream>();
+            mpsc::channel::<TcpStream>(TCP_ACCEPT_QUEUE_SIZE);
 
-        let socket_stream_waker = Arc::new(AtomicWaker::new());
         let tracked_streams = Arc::new(Mutex::new(Vec::new()));
         let last_tcp_packet = Arc::new(Mutex::new(None));
 
-        let waker = socket_stream_waker.clone();
         let poll_packet_tracked_streams = tracked_streams.clone();
         let task_tracked_streams = tracked_streams.clone();
         let poll_packet_last_tcp_packet = last_tcp_packet.clone();
@@ -263,7 +281,7 @@ impl TcpListener {
             };
             let rv = tokio::select! {
                 biased;
-                rv = Self::poll_packets(inbound, device.create_injector(), iface_notifier, socket_stream_emitter, waker, poll_packet_tracked_streams, poll_packet_last_tcp_packet) => rv,
+                rv = Self::poll_packets(inbound, device.create_injector(), iface_notifier, socket_stream_emitter, poll_packet_tracked_streams, poll_packet_last_tcp_packet) => rv,
                 rv = Self::poll_sockets(&mut iface, &mut device, iface_notifier_rx, poll_socket_last_tcp_packet) => rv,
             };
             if let Err(e) = rv {
@@ -274,17 +292,15 @@ impl TcpListener {
         TcpListener {
             socket_stream,
             task_handle,
-            socket_stream_waker,
             tracked_streams,
         }
     }
 
     async fn poll_packets(
-        mut inbound: mpsc::UnboundedReceiver<Packet>,
-        device_injector: mpsc::UnboundedSender<Packet>,
-        iface_notifier: mpsc::UnboundedSender<IfaceEvent<'static>>,
-        tcp_stream_emitter: mpsc::UnboundedSender<TcpStream>,
-        tcp_stream_waker: Arc<AtomicWaker>,
+        mut inbound: mpsc::Receiver<Packet>,
+        device_injector: mpsc::Sender<Packet>,
+        iface_notifier: mpsc::Sender<IfaceEvent<'static>>,
+        tcp_stream_emitter: mpsc::Sender<TcpStream>,
         tracked_streams: Arc<Mutex<Vec<Weak<TcpStreamHandle>>>>,
         last_tcp_packet: Arc<Mutex<Option<LastTcpPacketMeta>>>,
     ) -> std::io::Result<()> {
@@ -334,14 +350,14 @@ impl TcpListener {
                             | etherparse::TransportSlice::Icmpv6(_)
                     )
                 ) {
-                    match device_injector.send(frame.clone()) {
+                    match device_injector.send(frame.clone()).await {
                         Ok(_) => {}
                         Err(err) => {
                             warn!("Failed to send packet to device: {err}");
                             continue;
                         }
                     };
-                    match iface_notifier.send(IfaceEvent::Icmp) {
+                    match iface_notifier.send(IfaceEvent::Icmp).await {
                         Ok(_) => continue,
                         Err(err) => {
                             warn!("Failed to send ICMP event: {err}");
@@ -396,7 +412,7 @@ impl TcpListener {
                         // Refresh timestamp so the entry doesn't expire
                         // while the connection is still retransmitting SYNs.
                         *time = now;
-                        device_injector.send(frame.clone()).map_err(|e| {
+                        device_injector.send(frame.clone()).await.map_err(|e| {
                             error!("Failed to inject retransmitted SYN packet: {e}");
                             std::io::Error::other(
                                 "Failed to inject retransmitted SYN packet",
@@ -420,6 +436,39 @@ impl TcpListener {
                         }
                         continue;
                     }
+
+                    if !has_active_stream_capacity(
+                        &tracked_streams,
+                        ACTIVE_TCP_STREAM_MAX,
+                    )? {
+                        syn_drop_count += 1;
+                        if syn_drop_count == 1
+                            || now.duration_since(last_syn_drop_log)
+                                >= Duration::from_secs(10)
+                        {
+                            warn!(
+                                "TCP active stream limit reached ({ACTIVE_TCP_STREAM_MAX}); dropping SYN from {src_addr}"
+                            );
+                            last_syn_drop_log = now;
+                        }
+                        continue;
+                    }
+
+                    let stream_permit = match tcp_stream_emitter.try_reserve() {
+                        Ok(permit) => permit,
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            debug!(
+                                "TCP accept queue full ({TCP_ACCEPT_QUEUE_SIZE}); dropping SYN from {src_addr}"
+                            );
+                            continue;
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                "TCP accept queue closed",
+                            ));
+                        }
+                    };
 
                     let mut socket = tcp::Socket::new(
                         tcp::SocketBuffer::new(vec![
@@ -462,42 +511,39 @@ impl TcpListener {
                         streams.push(Arc::downgrade(&handle));
                     }
 
-                    tcp_stream_emitter
-                        .send(TcpStream {
-                            local_addr: src_addr,
-                            remote_addr: dst_addr,
-
-                            handle: handle.clone(),
-                            stack_notifier: iface_notifier.clone(),
-                        })
-                        .map_err(|e| {
-                            error!("Failed to send TCP stream: {e}");
-                            std::io::Error::other("Failed to send TCP stream")
-                        })?;
+                    stream_permit.send(TcpStream {
+                        local_addr: src_addr,
+                        remote_addr: dst_addr,
+                        handle: handle.clone(),
+                        stack_notifier: iface_notifier.clone(),
+                    });
                     iface_notifier
                         .send(IfaceEvent::TcpStream(Box::new((socket, handle))))
+                        .await
                         .map_err(|e| {
                             error!("Failed to send TCP stream event: {e}");
                             std::io::Error::other("Failed to send TCP stream event")
                         })?;
-                    tcp_stream_waker.wake();
                 } else {
                     // Non-SYN packet: the connection has progressed past the
                     // handshake, so remove the tracker entry to free the slot.
                     syn_tracker.remove(&(src_addr, dst_addr));
                 }
 
-                device_injector.send(frame.clone()).map_err(|e| {
+                device_injector.send(frame.clone()).await.map_err(|e| {
                     error!("Failed to send packet to device: {e}");
                     std::io::Error::other("Failed to inject packet to device")
                 })?;
             }
 
             // trigger another poll to drive the socket state machine
-            iface_notifier.send(IfaceEvent::DeviceReady).map_err(|e| {
-                error!("Failed to send device ready event: {e}");
-                std::io::Error::other("Failed to send device ready event")
-            })?;
+            iface_notifier
+                .send(IfaceEvent::DeviceReady)
+                .await
+                .map_err(|e| {
+                    error!("Failed to send device ready event: {e}");
+                    std::io::Error::other("Failed to send device ready event")
+                })?;
         }
 
         Ok(())
@@ -506,7 +552,7 @@ impl TcpListener {
     async fn poll_sockets(
         iface: &mut Interface,
         device: &mut NetstackDevice,
-        mut notifier_rx: mpsc::UnboundedReceiver<IfaceEvent<'_>>,
+        mut notifier_rx: mpsc::Receiver<IfaceEvent<'_>>,
         last_tcp_packet: Arc<Mutex<Option<LastTcpPacketMeta>>>,
     ) -> std::io::Result<()> {
         // Create a socket set for TCP sockets
@@ -789,27 +835,27 @@ impl futures::Stream for TcpListener {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        match self.socket_stream.try_recv() {
-            Ok(stream) => std::task::Poll::Ready(Some(stream)),
-            Err(e) => match e {
-                mpsc::error::TryRecvError::Empty => {
-                    // Register waker first, then re-check to close the TOCTOU
-                    // window if poll_packets wakes between try_recv and register.
-                    self.socket_stream_waker.register(cx.waker());
-                    match self.socket_stream.try_recv() {
-                        Ok(stream) => std::task::Poll::Ready(Some(stream)),
-                        Err(mpsc::error::TryRecvError::Empty) => {
-                            std::task::Poll::Pending
-                        }
-                        Err(mpsc::error::TryRecvError::Disconnected) => {
-                            std::task::Poll::Ready(None)
-                        }
-                    }
-                }
-                mpsc::error::TryRecvError::Disconnected => {
-                    std::task::Poll::Ready(None)
-                }
-            },
+        self.socket_stream.poll_recv(cx)
+    }
+}
+
+#[cfg(test)]
+mod resource_limit_tests {
+    use super::*;
+
+    #[test]
+    fn active_stream_capacity_recovers_after_drop() {
+        let streams = Mutex::new(Vec::new());
+        let first = Arc::new(TcpStreamHandle::new());
+        let second = Arc::new(TcpStreamHandle::new());
+        {
+            let mut tracked = streams.lock().unwrap();
+            tracked.push(Arc::downgrade(&first));
+            tracked.push(Arc::downgrade(&second));
         }
+
+        assert!(!has_active_stream_capacity(&streams, 2).unwrap());
+        drop(first);
+        assert!(has_active_stream_capacity(&streams, 2).unwrap());
     }
 }
