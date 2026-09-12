@@ -378,18 +378,18 @@ fn ipv6_fragment_piece(packet: &[u8]) -> std::io::Result<Option<FragmentPiece<'_
                 }));
             }
             etherparse::ip_number::IPV6_HOP_BY_HOP
-            | etherparse::ip_number::IPV6_DEST_OPTIONS
-            | etherparse::ip_number::IPV6_ROUTE => {
+            | etherparse::ip_number::IPV6_DEST_OPTIONS => {
                 let extension = etherparse::Ipv6RawExtHeaderSlice::from_slice(rest)
                     .map_err(std::io::Error::other)?;
+                validate_padding_only_ipv6_options(extension.payload())?;
                 next = extension.next_header();
                 rest = &rest[extension.slice().len()..];
             }
-            etherparse::ip_number::AUTH => {
-                let extension = etherparse::IpAuthHeaderSlice::from_slice(rest)
-                    .map_err(std::io::Error::other)?;
-                next = extension.next_header();
-                rest = &rest[extension.slice().len()..];
+            etherparse::ip_number::IPV6_ROUTE | etherparse::ip_number::AUTH => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unsupported semantic IPv6 extension before Fragment header",
+                ));
             }
             _ => return Ok(None),
         }
@@ -397,11 +397,71 @@ fn ipv6_fragment_piece(packet: &[u8]) -> std::io::Result<Option<FragmentPiece<'_
 }
 
 fn transport_payload(
-    next_header: etherparse::IpNumber,
-    payload: &[u8],
+    mut next_header: etherparse::IpNumber,
+    mut payload: &[u8],
 ) -> std::io::Result<(etherparse::IpNumber, &[u8])> {
-    let (_, protocol, payload) =
-        etherparse::Ipv6ExtensionsSlice::from_slice(next_header, payload)
-            .map_err(std::io::Error::other)?;
-    Ok((protocol, payload))
+    loop {
+        match next_header {
+            etherparse::ip_number::IPV6_DEST_OPTIONS => {
+                let extension =
+                    etherparse::Ipv6RawExtHeaderSlice::from_slice(payload)
+                        .map_err(std::io::Error::other)?;
+                validate_padding_only_ipv6_options(extension.payload())?;
+                next_header = extension.next_header();
+                payload = &payload[extension.slice().len()..];
+            }
+            etherparse::ip_number::IPV6_HOP_BY_HOP
+            | etherparse::ip_number::IPV6_ROUTE
+            | etherparse::ip_number::AUTH => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unsupported semantic IPv6 extension after Fragment header",
+                ));
+            }
+            _ => return Ok((next_header, payload)),
+        }
+    }
+}
+
+fn validate_padding_only_ipv6_options(options: &[u8]) -> std::io::Result<()> {
+    let mut offset = 0usize;
+    while offset < options.len() {
+        match options[offset] {
+            0 => offset += 1, // Pad1
+            1 => {
+                let Some(&len) = options.get(offset + 1) else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "truncated IPv6 PadN option",
+                    ));
+                };
+                let end =
+                    offset.checked_add(2 + usize::from(len)).ok_or_else(|| {
+                        std::io::Error::other("IPv6 option length overflow")
+                    })?;
+                let Some(data) = options.get(offset + 2..end) else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "truncated IPv6 PadN option data",
+                    ));
+                };
+                if data.iter().any(|byte| *byte != 0) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "non-zero IPv6 PadN option data",
+                    ));
+                }
+                offset = end;
+            }
+            option => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "unsupported semantic IPv6 option in fragmented packet: {option}"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
