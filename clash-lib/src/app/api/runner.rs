@@ -58,6 +58,56 @@ pub struct ApiRunner {
     ready_rx: Mutex<Option<oneshot::Receiver<Result<(), String>>>>,
 }
 
+#[derive(Clone)]
+pub(super) struct ApiReadySignal {
+    state: Arc<std::sync::Mutex<ApiReadyState>>,
+}
+
+struct ApiReadyState {
+    remaining: usize,
+    sender: Option<oneshot::Sender<Result<(), String>>>,
+}
+
+impl ApiReadySignal {
+    pub(super) fn new(
+        sender: Option<oneshot::Sender<Result<(), String>>>,
+        remaining: usize,
+    ) -> Self {
+        Self {
+            state: Arc::new(std::sync::Mutex::new(ApiReadyState {
+                remaining,
+                sender,
+            })),
+        }
+    }
+
+    pub(super) fn ready(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.sender.is_none() || state.remaining == 0 {
+            return;
+        }
+        state.remaining -= 1;
+        if state.remaining == 0
+            && let Some(sender) = state.sender.take()
+        {
+            let _ = sender.send(Ok(()));
+        }
+    }
+
+    pub(super) fn fail(&self, message: impl Into<String>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(sender) = state.sender.take() {
+            let _ = sender.send(Err(message.into()));
+        }
+    }
+}
+
 fn build_cors_layer(configured_origins: Option<&[String]>) -> (CorsLayer, usize) {
     let mut allow_any_origin = false;
     let mut valid_origins = Vec::new();
@@ -210,11 +260,18 @@ impl Runner for ApiRunner {
         let dns_enabled = self.dns_enabled;
         let ipv6_allowed = self.ipv6_allowed;
         let cancellation_token = self.cancellation_token.clone();
-        let mut ready_tx = self.ready_tx.lock().unwrap().take();
+        let ready_tx = self
+            .ready_tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
 
         tracing::debug!("API controller configuration: {:?}", controller_cfg);
         let ipc_addr = controller_cfg.external_controller_ipc;
         let tcp_addr = controller_cfg.external_controller;
+        let endpoint_count =
+            tcp_addr.is_some() as usize + ipc_addr.is_some() as usize;
+        let ready_signal = ApiReadySignal::new(ready_tx, endpoint_count.max(1));
 
         let (cors, valid_cors_origin_count) =
             build_cors_layer(controller_cfg.cors_allow_origins.as_deref());
@@ -315,6 +372,10 @@ impl Runner for ApiRunner {
                 }
             }
 
+            if endpoint_count == 0 {
+                ready_signal.ready();
+            }
+
             // Handle TCP listening
             let tcp_fut = if let Some(bind_addr) = tcp_addr {
                 let bind_addr = if bind_addr.starts_with(':') {
@@ -333,19 +394,16 @@ impl Runner for ApiRunner {
                     middlewares::websocket_uri_rewrite::rewrite_websocket_uri,
                 )
                 .layer(router_clone);
-                let tcp_ready_tx = ready_tx.take();
+                let tcp_ready_signal = ready_signal.clone();
                 Some(async move {
-                    let mut ready_tx = tcp_ready_tx;
                     info!("Starting API server on TCP address {bind_addr}");
                     let listener =
                         match tokio::net::TcpListener::bind(&bind_addr).await {
                             Ok(listener) => listener,
                             Err(err) => {
-                                if let Some(sender) = ready_tx.take() {
-                                    let _ = sender.send(Err(format!(
+                                tcp_ready_signal.fail(format!(
                                     "failed to bind API server on {bind_addr}: {err}"
-                                )));
-                                }
+                                ));
                                 return Err(crate::Error::Io(err));
                             }
                         };
@@ -394,14 +452,10 @@ impl Runner for ApiRunner {
                         Err(err) => Err(crate::Error::Io(err)),
                     };
                     if let Err(err) = security_result {
-                        if let Some(sender) = ready_tx.take() {
-                            let _ = sender.send(Err(err.to_string()));
-                        }
+                        tcp_ready_signal.fail(err.to_string());
                         return Err(err);
                     }
-                    if let Some(sender) = ready_tx.take() {
-                        let _ = sender.send(Ok(()));
-                    }
+                    tcp_ready_signal.ready();
                     axum::serve(
                         listener,
                         router_clone
@@ -417,21 +471,16 @@ impl Runner for ApiRunner {
                 None
             };
 
-            // IPC-only and disabled-controller configurations do not expose a
-            // TCP bind that can be probed. The task has still built its router,
-            // so treat that point as ready and let the IPC future report any
-            // later socket error through the runner join result.
-            if tcp_fut.is_none()
-                && let Some(sender) = ready_tx.take()
-            {
-                let _ = sender.send(Ok(()));
-            }
-
-            // Handle IPC listening
-            let ipc_fut = ipc_addr.as_ref().map(|ipc_path| {
-                let ipc_path = ipc_path.clone();
-                async move { ipc::serve_ipc(router, &ipc_path).await }
-            });
+            // Handle IPC listening. Readiness is reported only after the
+            // platform listener has actually been created/bound.
+            let ipc_fut =
+                ipc_addr.as_ref().map(|ipc_path| {
+                    let ipc_path = ipc_path.clone();
+                    let ipc_ready_signal = ready_signal.clone();
+                    async move {
+                        ipc::serve_ipc(router, &ipc_path, ipc_ready_signal).await
+                    }
+                });
 
             let result = match (tcp_fut, ipc_fut) {
                 (Some(tcp), Some(ipc)) => {
@@ -470,6 +519,9 @@ impl Runner for ApiRunner {
             };
 
             if let Err(err) = &result {
+                ready_signal.fail(format!(
+                    "API server exited before all listeners became ready: {err}"
+                ));
                 error!("API server task exited with error: {}", err);
             }
 
@@ -572,5 +624,28 @@ mod tests {
         let (_, valid_origin_count) = build_cors_layer(Some(&origins));
 
         assert_eq!(valid_origin_count, 0);
+    }
+
+    #[tokio::test]
+    async fn readiness_waits_for_all_configured_endpoints() {
+        let (ready_tx, mut ready_rx) = oneshot::channel();
+        let ready = ApiReadySignal::new(Some(ready_tx), 2);
+
+        ready.ready();
+        assert!(ready_rx.try_recv().is_err());
+
+        ready.ready();
+        assert_eq!(ready_rx.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn readiness_failure_wins_before_all_endpoints_are_ready() {
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let ready = ApiReadySignal::new(Some(ready_tx), 2);
+
+        ready.ready();
+        ready.fail("ipc bind failed");
+
+        assert_eq!(ready_rx.await.unwrap(), Err("ipc bind failed".to_owned()));
     }
 }
