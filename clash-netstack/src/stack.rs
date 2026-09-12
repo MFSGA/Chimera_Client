@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use futures::Stream;
+use futures::{Stream, future::BoxFuture};
 use log::debug;
 use smoltcp::wire::IpProtocol;
 use std::{
@@ -9,6 +9,12 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::sync::mpsc;
+
+const PACKET_QUEUE_SIZE: usize = 4096;
+type PendingPacketPermit = BoxFuture<
+    'static,
+    Result<mpsc::OwnedPermit<Packet>, mpsc::error::SendError<()>>,
+>;
 
 use crate::{
     UdpSocket,
@@ -42,10 +48,10 @@ impl std::fmt::Debug for IfaceEvent<'_> {
 /// Application can Stream the packets from the stack
 pub struct NetStack {
     // where the packets get into UDP Stack
-    udp_inbound: mpsc::UnboundedSender<Packet>,
+    udp_inbound: mpsc::Sender<Packet>,
     // inject TCP packets into the stack
     // where the packets get into TCP Stack
-    tcp_inbound: mpsc::UnboundedSender<Packet>,
+    tcp_inbound: mpsc::Sender<Packet>,
 
     // outside poll this to receive packets from the stack
     tcp_outbound: mpsc::Receiver<Packet>,
@@ -101,20 +107,22 @@ impl NetStack {
         crate::tcp_listener::TcpListener,
         crate::udp_socket::UdpSocket,
     ) {
-        let (tcp_packet_sender, tcp_packet_receiver) = mpsc::channel::<Packet>(4096);
+        let (tcp_packet_sender, tcp_packet_receiver) =
+            mpsc::channel::<Packet>(PACKET_QUEUE_SIZE);
         // UDP uses a separate bounded channel. UDP is inherently lossy, so
         // drop-on-full is correct; the bound prevents unbounded memory growth
         // if a remote floods responses faster than the consumer can drain them.
-        let (udp_packet_sender, udp_packet_receiver) = mpsc::channel::<Packet>(4096);
+        let (udp_packet_sender, udp_packet_receiver) =
+            mpsc::channel::<Packet>(PACKET_QUEUE_SIZE);
 
         let (udp_inbound_app, udp_outbound_stack) =
-            mpsc::unbounded_channel::<Packet>();
+            mpsc::channel::<Packet>(PACKET_QUEUE_SIZE);
 
         // this UdpSocket is essentially an Iface for UDP but much simpler as it only
         // does packets forwarding
         let udp_socket = UdpSocket::new(udp_outbound_stack, udp_packet_sender);
         let (tcp_inbound_app, tcp_outbound_stack) =
-            mpsc::unbounded_channel::<Packet>();
+            mpsc::channel::<Packet>(PACKET_QUEUE_SIZE);
         let tcp_listener = TcpListener::new(tcp_outbound_stack, tcp_packet_sender);
 
         let stack = NetStack {
@@ -136,20 +144,22 @@ impl NetStack {
 }
 
 pub struct StackSplitSink {
-    udp_inbound: mpsc::UnboundedSender<Packet>,
-    tcp_inbound: mpsc::UnboundedSender<Packet>,
+    udp_inbound: mpsc::Sender<Packet>,
+    tcp_inbound: mpsc::Sender<Packet>,
 
     packet_container: Option<(Packet, IpProtocol)>,
+    pending_permit: Option<PendingPacketPermit>,
 }
 impl StackSplitSink {
     pub fn new(
-        udp_inbound: mpsc::UnboundedSender<Packet>,
-        tcp_inbound: mpsc::UnboundedSender<Packet>,
+        udp_inbound: mpsc::Sender<Packet>,
+        tcp_inbound: mpsc::Sender<Packet>,
     ) -> Self {
         Self {
             udp_inbound,
             tcp_inbound,
             packet_container: None,
+            pending_permit: None,
         }
     }
 }
@@ -205,28 +215,52 @@ impl futures::Sink<Packet> for StackSplitSink {
 
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        let (item, proto) = match self.packet_container.take() {
-            Some(val) => val,
-            None => return std::task::Poll::Ready(Ok(())),
+        let Some((_, proto)) = self.packet_container.as_ref() else {
+            self.pending_permit = None;
+            return std::task::Poll::Ready(Ok(()));
+        };
+        let proto = *proto;
+
+        if self.pending_permit.is_none() {
+            let sender = match proto {
+                IpProtocol::Udp => self.udp_inbound.clone(),
+                IpProtocol::Tcp | IpProtocol::Icmp | IpProtocol::Icmpv6 => {
+                    self.tcp_inbound.clone()
+                }
+                _ => {
+                    self.packet_container = None;
+                    return std::task::Poll::Ready(Ok(()));
+                }
+            };
+            self.pending_permit = Some(Box::pin(sender.reserve_owned()));
+        }
+
+        let permit = match self
+            .pending_permit
+            .as_mut()
+            .expect("pending permit must exist")
+            .as_mut()
+            .poll(cx)
+        {
+            std::task::Poll::Pending => return std::task::Poll::Pending,
+            std::task::Poll::Ready(Ok(permit)) => permit,
+            std::task::Poll::Ready(Err(_)) => {
+                self.pending_permit = None;
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "stack inbound channel closed",
+                )));
+            }
         };
 
-        match proto {
-            IpProtocol::Udp => self.udp_inbound.send(item).map_err(|e| {
-                debug!("Failed to send UDP packet: {e}");
-                std::io::Error::new(std::io::ErrorKind::BrokenPipe, e)
-            })?,
-            IpProtocol::Tcp | IpProtocol::Icmp | IpProtocol::Icmpv6 => {
-                self.tcp_inbound.send(item).map_err(|e| {
-                    debug!("Failed to send TCP packet: {e}");
-                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, e)
-                })?;
-            }
-            _ => {
-                debug!("Unsupported protocol for packet: {proto:?}");
-            }
-        }
+        self.pending_permit = None;
+        let (item, _) = self
+            .packet_container
+            .take()
+            .expect("packet must exist while permit is pending");
+        permit.send(item);
         std::task::Poll::Ready(Ok(()))
     }
 

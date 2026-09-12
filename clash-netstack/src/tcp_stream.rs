@@ -13,8 +13,7 @@ pub struct TcpStream {
     pub(crate) remote_addr: SocketAddr,
 
     pub(crate) handle: Arc<TcpStreamHandle>,
-    pub(crate) stack_notifier:
-        tokio::sync::mpsc::UnboundedSender<IfaceEvent<'static>>,
+    pub(crate) stack_notifier: tokio::sync::mpsc::Sender<IfaceEvent<'static>>,
 }
 
 impl Drop for TcpStream {
@@ -31,9 +30,7 @@ impl Drop for TcpStream {
         self.handle.write_closed.store(true, Ordering::Release);
         self.handle.recv_waker.wake();
         self.handle.send_waker.wake();
-        if let Err(e) = self.stack_notifier.send(IfaceEvent::TcpSocketClosed) {
-            error!("Failed to notify TCP socket closed: {e}");
-        }
+        self.try_notify(IfaceEvent::TcpSocketClosed);
     }
 }
 
@@ -51,10 +48,17 @@ impl TcpStream {
         (r, w)
     }
 
-    fn notify_tcp_socket_ready(&self) {
-        if let Err(e) = self.stack_notifier.send(IfaceEvent::TcpSocketReady) {
-            error!("Failed to notify TCP socket ready: {e}");
+    fn try_notify(&self, event: IfaceEvent<'static>) {
+        match self.stack_notifier.try_send(event) {
+            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                error!("Failed to notify TCP socket: notifier closed");
+            }
         }
+    }
+
+    fn notify_tcp_socket_ready(&self) {
+        self.try_notify(IfaceEvent::TcpSocketReady);
     }
 }
 
@@ -179,8 +183,8 @@ mod tests {
         sync::mpsc,
     };
 
-    fn build_stream() -> (TcpStream, mpsc::UnboundedReceiver<IfaceEvent<'static>>) {
-        let (tx, rx) = mpsc::unbounded_channel();
+    fn build_stream() -> (TcpStream, mpsc::Receiver<IfaceEvent<'static>>) {
+        let (tx, rx) = mpsc::channel(8);
         (
             TcpStream {
                 local_addr: "127.0.0.1:12345".parse().unwrap(),

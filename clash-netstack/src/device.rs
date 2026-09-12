@@ -6,26 +6,28 @@ use smoltcp::{
 };
 use tokio::sync::mpsc;
 
+const DEVICE_RX_QUEUE_SIZE: usize = 4096;
+
 pub struct NetstackDevice {
-    rx_sender: mpsc::UnboundedSender<Packet>,
-    rx_queue: mpsc::UnboundedReceiver<Packet>,
+    rx_sender: mpsc::Sender<Packet>,
+    rx_queue: mpsc::Receiver<Packet>,
 
     tx_sender: mpsc::Sender<Packet>,
     capabilities: DeviceCapabilities,
 
-    iface_notifier: mpsc::UnboundedSender<IfaceEvent<'static>>,
+    iface_notifier: mpsc::Sender<IfaceEvent<'static>>,
 }
 
 impl NetstackDevice {
     pub fn new(
         tx_sender: mpsc::Sender<Packet>,
-        iface_notifier: mpsc::UnboundedSender<IfaceEvent<'static>>,
+        iface_notifier: mpsc::Sender<IfaceEvent<'static>>,
     ) -> Self {
         let mut capabilities = DeviceCapabilities::default();
         capabilities.max_transmission_unit = 1500;
         capabilities.medium = Medium::Ip;
 
-        let (rx_sender, rx_queue) = mpsc::unbounded_channel::<Packet>();
+        let (rx_sender, rx_queue) = mpsc::channel::<Packet>(DEVICE_RX_QUEUE_SIZE);
 
         Self {
             rx_sender,
@@ -36,7 +38,7 @@ impl NetstackDevice {
         }
     }
 
-    pub fn create_injector(&self) -> mpsc::UnboundedSender<Packet> {
+    pub fn create_injector(&self) -> mpsc::Sender<Packet> {
         self.rx_sender.clone()
     }
 }
@@ -57,8 +59,11 @@ impl Device for NetstackDevice {
 
         let rx_token = RxTokenImpl { packet };
         let tx_token = TxTokenImpl { tx_sender: permit };
-        if let Err(e) = self.iface_notifier.send(IfaceEvent::DeviceReady) {
-            error!("device ready notifier dropped: {e}");
+        match self.iface_notifier.try_send(IfaceEvent::DeviceReady) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                error!("device ready notifier closed");
+            }
         }
         Some((rx_token, tx_token))
     }
@@ -120,7 +125,7 @@ mod tests {
     async fn test_receive_drops_inbound_packet_when_tx_channel_full() {
         let (tx_sender, mut tx_receiver) = tokio::sync::mpsc::channel::<Packet>(1);
         let (iface_notifier, _iface_rx) =
-            tokio::sync::mpsc::unbounded_channel::<IfaceEvent<'static>>();
+            tokio::sync::mpsc::channel::<IfaceEvent<'static>>(8);
         let mut device = NetstackDevice::new(tx_sender, iface_notifier);
         let injector = device.create_injector();
 
@@ -133,7 +138,8 @@ mod tests {
         // Simulate an inbound ACK entering rx_queue.
         injector
             .send(Packet::new(vec![0u8; 60]))
-            .expect("unbounded, should not fail");
+            .await
+            .expect("device rx queue should accept packet");
 
         // receive() must not consume the ACK while there is no tx slot.
         {

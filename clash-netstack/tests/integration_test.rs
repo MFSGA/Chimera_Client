@@ -402,7 +402,7 @@ async fn malformed_udp_does_not_end_receive_stream() {
 
 #[tokio::test]
 async fn zero_length_udp_is_emitted() {
-    let (_input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (_input_tx, input_rx) = tokio::sync::mpsc::channel(8);
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
     let (_reader, mut writer) = UdpSocket::new(input_rx, output_tx).split();
 
@@ -442,6 +442,35 @@ async fn stack_sink_consecutive_feed_calls_make_progress() {
     .expect("second feed blocked without making progress")
     .unwrap();
     stack_sink.flush().await.unwrap();
+}
+
+#[tokio::test]
+async fn stack_sink_backpressure_wakes_after_udp_queue_drains() {
+    let (stack, _tcp_listener, udp_socket) = NetStack::new();
+    let (mut stack_sink, _stack_stream) = stack.split();
+    let (mut udp_read, _udp_write) = udp_socket.split();
+
+    for _ in 0..4096 {
+        stack_sink
+            .send(Packet::new(build_udp_packet()))
+            .await
+            .unwrap();
+    }
+
+    let blocked = stack_sink.send(Packet::new(build_udp_packet()));
+    tokio::pin!(blocked);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut blocked)
+            .await
+            .is_err(),
+        "bounded stack input queue did not apply backpressure"
+    );
+
+    udp_read.recv().await.expect("queued UDP packet missing");
+    tokio::time::timeout(std::time::Duration::from_millis(300), blocked)
+        .await
+        .expect("stack sink was not woken after queue capacity became available")
+        .unwrap();
 }
 
 #[tokio::test]
