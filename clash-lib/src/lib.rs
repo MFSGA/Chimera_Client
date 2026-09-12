@@ -215,7 +215,10 @@ pub fn start_scaffold(opts: Options) -> Result<()> {
 }
 
 /// Start one runtime in a background thread with an independent shutdown token.
-/// This is primarily useful for integration tests that need multiple instances.
+/// This is primarily useful for integration tests that need an independently
+/// controlled instance. When the `tun` feature is enabled, starts that need
+/// process-global network/TUN state are rejected while another such runtime is
+/// active.
 pub fn start_scaffold_instance(
     opts: Options,
 ) -> Result<(
@@ -235,6 +238,8 @@ pub fn start_scaffold_instance(
     let log_file = opts.log_file;
     let token = tokio_util::sync::CancellationToken::new();
     let token_clone = token.clone();
+    let network_runtime_lease =
+        NetworkRuntimeLease::acquire(uses_process_global_network_state(&config))?;
 
     let handle = std::thread::spawn(move || {
         let rt = match rt_kind {
@@ -262,6 +267,7 @@ pub fn start_scaffold_instance(
             config_path,
             log_tx,
             token_clone,
+            network_runtime_lease,
         )) {
             eprintln!("independent runtime error: {err}");
         }
@@ -271,6 +277,138 @@ pub fn start_scaffold_instance(
 }
 
 static CRYPTO_PROVIDER_LOCK: OnceLock<()> = OnceLock::new();
+
+#[cfg(feature = "tun")]
+static NETWORK_RUNTIME_STATE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "tun")]
+const CONFIGURED_NETWORK_RUNTIME: usize = usize::MAX;
+
+/// Own the process-global socket/TUN configuration for the lifetime of one
+/// runtime. Runtimes without an interface, mark, or TUN can coexist because
+/// they do not write these slots; a runtime that needs them is exclusive.
+struct NetworkRuntimeLease {
+    #[cfg(feature = "tun")]
+    configured: bool,
+}
+
+impl NetworkRuntimeLease {
+    fn acquire(required: bool) -> Result<Self> {
+        #[cfg(feature = "tun")]
+        {
+            if required {
+                return NETWORK_RUNTIME_STATE
+                    .compare_exchange(
+                        0,
+                        CONFIGURED_NETWORK_RUNTIME,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                    )
+                    .map(|_| Self { configured: true })
+                    .map_err(|_| {
+                        Error::Operation(
+                            "another runtime already owns the process-global network configuration"
+                                .to_owned(),
+                        )
+                    });
+            }
+
+            loop {
+                let users =
+                    NETWORK_RUNTIME_STATE.load(std::sync::atomic::Ordering::Acquire);
+                if users == CONFIGURED_NETWORK_RUNTIME {
+                    return Err(Error::Operation(
+                        "another runtime already owns the process-global network configuration"
+                            .to_owned(),
+                    ));
+                }
+                if NETWORK_RUNTIME_STATE
+                    .compare_exchange(
+                        users,
+                        users + 1,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return Ok(Self { configured: false });
+                }
+            }
+        }
+
+        #[cfg(not(feature = "tun"))]
+        {
+            let _ = required;
+            Ok(Self {})
+        }
+    }
+
+    #[cfg(feature = "tun")]
+    fn ensure_active(&mut self) -> Result<()> {
+        if self.configured {
+            return Ok(());
+        }
+        NETWORK_RUNTIME_STATE
+            .compare_exchange(
+                1,
+                CONFIGURED_NETWORK_RUNTIME,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .map(|_| {
+                self.configured = true;
+            })
+            .map_err(|_| {
+                Error::Operation(
+                    "another runtime already owns the process-global network configuration"
+                        .to_owned(),
+                )
+            })
+    }
+
+    #[cfg(feature = "tun")]
+    fn deactivate_to_neutral(&mut self) {
+        if self.configured {
+            NETWORK_RUNTIME_STATE.store(1, std::sync::atomic::Ordering::Release);
+            self.configured = false;
+        }
+    }
+
+    #[cfg(feature = "tun")]
+    fn release(&mut self) {
+        if self.configured {
+            NETWORK_RUNTIME_STATE.store(0, std::sync::atomic::Ordering::Release);
+            self.configured = false;
+        } else {
+            NETWORK_RUNTIME_STATE.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+}
+
+impl Drop for NetworkRuntimeLease {
+    fn drop(&mut self) {
+        #[cfg(feature = "tun")]
+        {
+            self.release();
+        }
+    }
+}
+
+fn uses_process_global_network_state(config: &InternalConfig) -> bool {
+    #[cfg(feature = "tun")]
+    {
+        config.tun.enable
+            || config.tun.so_mark.is_some()
+            || config.general.interface.is_some()
+    }
+
+    #[cfg(not(feature = "tun"))]
+    {
+        let _ = config;
+        false
+    }
+}
 
 pub fn setup_default_crypto_provider() {
     CRYPTO_PROVIDER_LOCK.get_or_init(|| {
@@ -309,12 +447,23 @@ pub async fn start(
     config_path: Option<String>,
     log_tx: broadcast::Sender<LogEvent>,
 ) -> Result<()> {
+    let config = config.validate()?;
+    let network_runtime_lease =
+        NetworkRuntimeLease::acquire(uses_process_global_network_state(&config))?;
     let shutdown_token = tokio_util::sync::CancellationToken::new();
     {
         let mut token_guard = SHUTDOWN_TOKEN.lock().unwrap();
         token_guard.push(shutdown_token.clone());
     }
-    start_with_shutdown_token(config, cwd, config_path, log_tx, shutdown_token).await
+    start_with_shutdown_token(
+        config,
+        cwd,
+        config_path,
+        log_tx,
+        shutdown_token,
+        network_runtime_lease,
+    )
+    .await
 }
 
 async fn start_with_shutdown_token(
@@ -323,7 +472,9 @@ async fn start_with_shutdown_token(
     config_path: Option<String>,
     log_tx: broadcast::Sender<LogEvent>,
     shutdown_token: tokio_util::sync::CancellationToken,
+    network_runtime_lease: NetworkRuntimeLease,
 ) -> Result<()> {
+    let config = config.validate()?;
     setup_default_crypto_provider();
     let cwd = PathBuf::from(cwd);
 
@@ -345,7 +496,7 @@ async fn start_with_shutdown_token(
         config_path,
     }));
 
-    let api_listener: ArcRunner = Arc::new(app::api::ApiRunner::new(
+    let api_listener = Arc::new(app::api::ApiRunner::new(
         controller_cfg.clone(),
         log_tx.clone(),
         components.inbound_manager.clone(),
@@ -366,6 +517,12 @@ async fn start_with_shutdown_token(
     // api_listener is not part of components because it requires components to be
     // initialized before it can be initialized. start it manually.
     api_listener.run_async();
+    if let Err(err) = api_listener.wait_ready().await {
+        api_listener.shutdown();
+        let _ = api_listener.join().await;
+        components.stop_all_and_join(true).await;
+        return Err(err);
+    }
 
     {
         let mut g = global_state.lock().await;
@@ -382,6 +539,7 @@ async fn start_with_shutdown_token(
 
     let reload_token = shutdown_token.clone();
     let reload_handle = tokio::spawn(async move {
+        let mut network_runtime_lease = network_runtime_lease;
         let mut active_components = components;
         let mut active_api_listener = api_listener;
 
@@ -426,6 +584,17 @@ async fn start_with_shutdown_token(
                     // the complete candidate runtime has been prepared. A failure at
                     // this point still leaves every old listener and task running.
                     #[cfg(feature = "tun")]
+                    if new_components.network_config.uses_global_state()
+                        && let Err(e) = network_runtime_lease.ensure_active()
+                    {
+                        error!(
+                            "failed to acquire network config during reload; keeping the active runtime: {}",
+                            e
+                        );
+                        let _ = done.send(Err(e));
+                        continue;
+                    }
+                    #[cfg(feature = "tun")]
                     if let Err(e) = new_components.activate_network_config().await {
                         error!(
                             "failed to activate network config during reload; keeping the active runtime: {}",
@@ -439,6 +608,11 @@ async fn start_with_shutdown_token(
                     // clearing the network configuration that now belongs to the
                     // candidate, then start the new one.
                     active_components.stop_all_and_join(false).await;
+                    #[cfg(feature = "tun")]
+                    if !new_components.network_config.uses_global_state() {
+                        clear_net_config().await;
+                        network_runtime_lease.deactivate_to_neutral();
+                    }
                     new_components.start_all();
 
                     // TODO: every reload is causing the API server to restart, we should
@@ -446,7 +620,7 @@ async fn start_with_shutdown_token(
                     // maybe adding APIs to replace components
                     // and only recreate the listeners when necessary (e.g. when the listen
                     // address or port is changed)
-                    let new_api_listener: ArcRunner = Arc::new(app::api::ApiRunner::new(
+                    let new_api_listener = Arc::new(app::api::ApiRunner::new(
                         controller_cfg,
                         log_tx.clone(),
                         new_components.inbound_manager.clone(),
@@ -463,19 +637,32 @@ async fn start_with_shutdown_token(
                         new_components.dns_enabled,
                         new_components.ipv6_allowed,
                     ));
-                    let mut g = global_state.lock().await;
-
-                    #[cfg(feature = "tun")]
-                    {
-                        g.tunnel_runner = new_components.tun_runner.clone();
-                    }
-                    g.dns_listener = new_components.dns_listener.clone();
-
                     active_api_listener.shutdown();
                     if let Err(err) = active_api_listener.join().await {
                         warn!("failed waiting for api listener shutdown: {}", err);
                     }
                     new_api_listener.run_async();
+                    if let Err(err) = new_api_listener.wait_ready().await {
+                        error!(
+                            "replacement API listener failed to become ready: {}",
+                            err
+                        );
+                        new_api_listener.shutdown();
+                        let _ = new_api_listener.join().await;
+                        new_components.stop_all_and_join(false).await;
+                        let _ = done.send(Err(err));
+                        reload_token.cancel();
+                        return Err(Error::Operation(
+                            "replacement API listener failed during reload".to_owned(),
+                        ));
+                    }
+
+                    let mut g = global_state.lock().await;
+                    #[cfg(feature = "tun")]
+                    {
+                        g.tunnel_runner = new_components.tun_runner.clone();
+                    }
+                    g.dns_listener = new_components.dns_listener.clone();
 
                     active_components = new_components;
                     active_api_listener = new_api_listener;
@@ -523,7 +710,14 @@ struct RuntimeNetworkConfig {
 
 #[cfg(feature = "tun")]
 impl RuntimeNetworkConfig {
+    fn uses_global_state(&self) -> bool {
+        self.tun_enabled || self.tun_so_mark.is_some() || self.interface.is_some()
+    }
+
     async fn activate(&self) -> Result<()> {
+        if !self.uses_global_state() {
+            return Ok(());
+        }
         init_net_config(self.tun_enabled, self.tun_so_mark, self.interface.as_ref())
             .await?;
         install_default_socket_protector();
@@ -583,7 +777,7 @@ impl RuntimeComponents {
             if let Err(err) = self.tun_runner.join().await {
                 warn!("failed waiting for tun runner shutdown: {}", err);
             }
-            if _clear_network {
+            if _clear_network && self.network_config.uses_global_state() {
                 clear_net_config().await;
             }
         }
@@ -716,7 +910,7 @@ async fn create_components(
         outbound_registry.clone(),
         rule_dispatch.clone(),
     )
-    .await;
+    .await?;
 
     debug!("initializing outbound manager");
     let outbound_manager = Arc::new(
@@ -742,7 +936,10 @@ async fn create_components(
     );
 
     if let Some(rd) = &rule_dispatch
-        && rd.outbound_manager.set(outbound_manager.clone()).is_err()
+        && rd
+            .outbound_manager
+            .set(Arc::downgrade(&outbound_manager))
+            .is_err()
     {
         warn!(
             "RuleDispatch outbound_manager OnceLock was already set — this is \
@@ -826,11 +1023,11 @@ async fn create_components(
             geodata,
             cwd.to_string_lossy().to_string(),
         )
-        .await,
+        .await?,
     );
 
     if let Some(rd) = &rule_dispatch
-        && rd.router.set(router.clone()).is_err()
+        && rd.router.set(Arc::downgrade(&router)).is_err()
     {
         warn!(
             "RuleDispatch router OnceLock was already set — this is unexpected and \
@@ -993,5 +1190,34 @@ pub(crate) mod tests {
 
     pub fn initialize() {
         INIT.call_once(crate::setup_default_crypto_provider);
+    }
+
+    #[cfg(feature = "tun")]
+    #[test]
+    fn network_runtime_lease_rejects_concurrent_owner() {
+        let first = crate::NetworkRuntimeLease::acquire(true)
+            .expect("the test should acquire the first network lease");
+        let second = match crate::NetworkRuntimeLease::acquire(true) {
+            Ok(_) => {
+                panic!("a second runtime must not overwrite global network state")
+            }
+            Err(err) => err,
+        };
+        assert!(
+            second
+                .to_string()
+                .contains("process-global network configuration")
+        );
+        drop(first);
+        crate::NetworkRuntimeLease::acquire(true)
+            .expect("the lease should be reusable after the owner exits");
+
+        let first_neutral = crate::NetworkRuntimeLease::acquire(false)
+            .expect("a runtime without network state should be shareable");
+        let second_neutral = crate::NetworkRuntimeLease::acquire(false)
+            .expect("neutral runtimes should be shareable");
+        assert!(crate::NetworkRuntimeLease::acquire(true).is_err());
+        drop(second_neutral);
+        drop(first_neutral);
     }
 }
