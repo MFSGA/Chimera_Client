@@ -13,7 +13,6 @@ use tokio::sync::mpsc;
 use crate::{
     UdpSocket,
     debug::trace_ip_packet,
-    packet::IpPacket,
     tcp_listener::{TcpListener, TcpStreamHandle},
 };
 
@@ -53,6 +52,7 @@ pub struct NetStack {
     udp_outbound: mpsc::Receiver<Packet>,
 }
 
+#[derive(Clone)]
 pub struct Packet {
     data: Bytes,
 }
@@ -157,14 +157,13 @@ impl futures::Sink<Packet> for StackSplitSink {
     type Error = std::io::Error;
 
     fn poll_ready(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        if self.packet_container.is_none() {
-            std::task::Poll::Ready(Ok(()))
-        } else {
-            std::task::Poll::Pending
+        if self.packet_container.is_some() {
+            futures::ready!(self.as_mut().poll_flush(cx))?;
         }
+        std::task::Poll::Ready(Ok(()))
     }
 
     fn start_send(
@@ -177,21 +176,29 @@ impl futures::Sink<Packet> for StackSplitSink {
 
         trace_ip_packet("tun inbound packet", item.data());
 
-        let packet = IpPacket::new_checked(item.data())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let protocol = {
+            let packet =
+                etherparse::IpSlice::from_slice(item.data()).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                })?;
+            let payload = packet.payload();
+            if payload.fragmented {
+                debug!("tun fragmented IP packet ignored");
+                return Ok(());
+            }
 
-        let protocol = packet.protocol();
-        if matches!(
-            protocol,
-            IpProtocol::Tcp
-                | IpProtocol::Udp
-                | IpProtocol::Icmp
-                | IpProtocol::Icmpv6
-        ) {
-            self.packet_container.replace((item, protocol));
-        } else {
-            debug!("tun IP packet ignored (protocol: {protocol:?})");
-        }
+            match payload.ip_number {
+                etherparse::ip_number::TCP => IpProtocol::Tcp,
+                etherparse::ip_number::UDP => IpProtocol::Udp,
+                etherparse::ip_number::ICMP => IpProtocol::Icmp,
+                etherparse::ip_number::IPV6_ICMP => IpProtocol::Icmpv6,
+                protocol => {
+                    debug!("tun IP packet ignored (protocol: {protocol:?})");
+                    return Ok(());
+                }
+            }
+        };
+        self.packet_container.replace((item, protocol));
 
         Ok(())
     }
@@ -206,13 +213,10 @@ impl futures::Sink<Packet> for StackSplitSink {
         };
 
         match proto {
-            IpProtocol::Udp => match self.udp_inbound.send(item) {
-                Ok(()) => {}
-                Err(e) => {
-                    debug!("Failed to send UDP packet: {e}");
-                    self.packet_container = Some((e.0, proto));
-                }
-            },
+            IpProtocol::Udp => self.udp_inbound.send(item).map_err(|e| {
+                debug!("Failed to send UDP packet: {e}");
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, e)
+            })?,
             IpProtocol::Tcp | IpProtocol::Icmp | IpProtocol::Icmpv6 => {
                 self.tcp_inbound.send(item).map_err(|e| {
                     debug!("Failed to send TCP packet: {e}");
@@ -228,9 +232,9 @@ impl futures::Sink<Packet> for StackSplitSink {
 
     fn poll_close(
         self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        std::task::Poll::Ready(Ok(()))
+        self.poll_flush(cx)
     }
 }
 
