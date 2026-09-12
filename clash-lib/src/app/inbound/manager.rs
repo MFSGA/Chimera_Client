@@ -16,8 +16,23 @@ use std::{
 };
 use tracing::{debug, trace, warn};
 
-type InboundHandlerMap = HashMap<InboundOpts, Option<JoinHandle<()>>>;
+type InboundHandlerMap =
+    HashMap<InboundOpts, Option<JoinHandle<Result<(), crate::Error>>>>;
 type ThreadSafeInboundHandlers = Arc<RwLock<InboundHandlerMap>>;
+type InboundListenerFuture = BoxFuture<'static, Result<(), crate::Error>>;
+
+async fn run_listener_futures(
+    listeners: Vec<InboundListenerFuture>,
+    cancellation_token: tokio_util::sync::CancellationToken,
+) -> Result<(), crate::Error> {
+    tokio::select! {
+        _ = cancellation_token.cancelled() => {
+            trace!("Inbound listener task cancelled");
+            Ok(())
+        }
+        result = futures::future::try_join_all(listeners) => result.map(|_| ()),
+    }
+}
 
 /// Legacy ports configuration for inbounds.
 /// Newer inbounds have their own port configuration.
@@ -74,7 +89,7 @@ impl Runner for InboundManager {
 impl InboundManager {
     async fn take_all_listener_handles(
         inbound_handlers: ThreadSafeInboundHandlers,
-    ) -> Vec<(String, JoinHandle<()>)> {
+    ) -> Vec<(String, JoinHandle<Result<(), crate::Error>>)> {
         inbound_handlers
             .write()
             .await
@@ -88,28 +103,32 @@ impl InboundManager {
     }
 
     async fn abort_and_join_listener_handles(
-        handles: Vec<(String, JoinHandle<()>)>,
+        handles: Vec<(String, JoinHandle<Result<(), crate::Error>>)>,
     ) -> Result<(), crate::Error> {
-        let mut last_join_error = None;
+        let mut last_error = None;
 
         for (name, handler) in handles {
             warn!("Shutting down inbound handler: {}", name);
             handler.abort();
             match handler.await {
-                Ok(()) => {}
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    warn!("Inbound handler {} exited with error: {}", name, err);
+                    last_error = Some(err);
+                }
                 Err(err) if err.is_cancelled() => {
                     trace!("Inbound {} listener task aborted: {}", name, err);
                 }
                 Err(err) => {
                     warn!("Inbound handler {} shutdown with error: {}", name, err);
-                    last_join_error = Some(err);
+                    last_error = Some(crate::Error::Operation(format!(
+                        "inbound handler {name} join error: {err}"
+                    )));
                 }
             }
         }
 
-        last_join_error
-            .map(|err| Err(std::io::Error::other(err).into()))
-            .unwrap_or(Ok(()))
+        last_error.map_or(Ok(()), Err)
     }
 
     async fn stop_all_listener_handles(
@@ -157,14 +176,7 @@ impl InboundManager {
             )
             .map(|r| {
                 let listener_token = cancellation_token.clone();
-                tokio::spawn(async move {
-                    tokio::select! {
-                        _ = listener_token.cancelled() => {
-                            trace!("Inbound listener task cancelled");
-                        }
-                        _ = futures::future::join_all(r) => {}
-                    }
-                })
+                tokio::spawn(run_listener_futures(r, listener_token))
             });
         }
     }
@@ -388,4 +400,33 @@ pub struct InboundEndpoint {
     pub inbound_type: String,
     pub port: u16,
     pub active: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn listener_error_is_returned_without_waiting_for_other_listeners() {
+        let listeners: Vec<InboundListenerFuture> = vec![
+            Box::pin(async {
+                Err(crate::Error::Operation("listener bind failed".to_owned()))
+            }),
+            Box::pin(futures::future::pending()),
+        ];
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_listener_futures(
+                listeners,
+                tokio_util::sync::CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("listener error should be returned promptly");
+
+        assert!(
+            matches!(result, Err(crate::Error::Operation(message)) if message == "listener bind failed")
+        );
+    }
 }
