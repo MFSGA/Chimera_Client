@@ -478,3 +478,47 @@ fn validate_padding_only_ipv6_options(options: &[u8]) -> std::io::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn incomplete_ipv4_fragment(identification: u16) -> Vec<u8> {
+        let mut header = etherparse::Ipv4Header::new(
+            8,
+            64,
+            etherparse::ip_number::UDP,
+            [1, 1, 1, 1],
+            [2, 2, 2, 2],
+        )
+        .unwrap();
+        header.identification = identification;
+        header.dont_fragment = false;
+        header.more_fragments = true;
+        header.header_checksum = header.calc_header_checksum();
+        [header.to_bytes().as_slice(), &[0u8; 8]].concat()
+    }
+
+    #[test]
+    fn fragment_reassembly_evicts_oldest_when_active_limit_is_reached() {
+        let mut reassembler =
+            FragmentReassembler::new(etherparse::ip_number::UDP, "test");
+
+        for identification in 0..=(FRAGMENT_MAX_ACTIVE as u16) {
+            let packet = incomplete_ipv4_fragment(identification);
+            assert!(reassembler.push(&packet).unwrap().is_none());
+        }
+
+        assert_eq!(reassembler.active.len(), FRAGMENT_MAX_ACTIVE);
+        assert!(!reassembler.active.contains_key(&FragmentKey::Ipv4 {
+            source: [1, 1, 1, 1],
+            destination: [2, 2, 2, 2],
+            identification: 0,
+        }));
+        assert!(reassembler.active.contains_key(&FragmentKey::Ipv4 {
+            source: [1, 1, 1, 1],
+            destination: [2, 2, 2, 2],
+            identification: FRAGMENT_MAX_ACTIVE as u16,
+        }));
+    }
+}

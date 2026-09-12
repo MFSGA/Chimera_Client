@@ -921,6 +921,51 @@ async fn fragmented_ipv4_udp_reassembles_out_of_order() {
 }
 
 #[tokio::test]
+async fn ipv6_atomic_fragment_udp_is_processed_as_unfragmented() {
+    let source = [0x20; 16];
+    let destination = [0x21; 16];
+    let payload = b"atomic-fragment";
+    let mut full = Vec::new();
+    etherparse::PacketBuilder::ipv6(source, destination, 64)
+        .udp(5000, 5001)
+        .write(&mut full, payload)
+        .unwrap();
+    let udp = &full[40..];
+    let header = etherparse::Ipv6Header {
+        payload_length: (etherparse::Ipv6FragmentHeader::LEN + udp.len()) as u16,
+        next_header: etherparse::ip_number::IPV6_FRAG,
+        hop_limit: 64,
+        source,
+        destination,
+        ..Default::default()
+    };
+    let fragment = etherparse::Ipv6FragmentHeader::new(
+        etherparse::ip_number::UDP,
+        etherparse::IpFragOffset::ZERO,
+        false,
+        0x1234_5678,
+    );
+    let packet = [
+        header.to_bytes().as_slice(),
+        fragment.to_bytes().as_slice(),
+        udp,
+    ]
+    .concat();
+
+    let (stack, _tcp, udp_socket) = NetStack::new();
+    let (mut sink, _) = stack.split();
+    let (mut reader, _) = udp_socket.split();
+    sink.send(Packet::new(packet)).await.unwrap();
+
+    let packet =
+        tokio::time::timeout(std::time::Duration::from_millis(300), reader.recv())
+            .await
+            .expect("IPv6 atomic fragment UDP timed out")
+            .expect("UDP stream closed");
+    assert_eq!(packet.data(), payload);
+}
+
+#[tokio::test]
 async fn fragmented_ipv6_udp_reassembles_out_of_order() {
     let payload = b"fragmented-ipv6-udp-payload";
     let [first, second] = build_ipv6_udp_fragments(payload);
