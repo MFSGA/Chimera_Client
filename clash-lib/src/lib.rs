@@ -522,6 +522,12 @@ async fn start_with_shutdown_token(
     }
 
     components.start_all();
+    if let Err(err) = components.wait_initial_ready().await {
+        api_listener.shutdown();
+        let _ = api_listener.join().await;
+        components.stop_all_and_join(true).await;
+        return Err(err);
+    }
 
     let cwd_clone = cwd.clone();
 
@@ -766,7 +772,7 @@ struct RuntimeComponents {
 
     #[cfg(feature = "tun")]
     tun_runner: ArcRunner,
-    dns_listener: ArcRunner,
+    dns_listener: Arc<dns::DnsRunner>,
     inbound_manager: Arc<InboundManager>,
     dns_listen: DNSListenAddr,
     dns_enabled: bool,
@@ -808,6 +814,10 @@ impl RuntimeComponents {
         self.tun_runner.run_async();
         self.dns_listener.run_async();
         self.inbound_manager.run_async();
+    }
+
+    async fn wait_initial_ready(&self) -> Result<()> {
+        self.dns_listener.wait_ready().await
     }
 
     fn stop_all(&self) {
@@ -1169,7 +1179,7 @@ async fn create_components(
     )?);
 
     debug!("initializing dns listener");
-    let dns_listener: ArcRunner = Arc::new(dns::DnsRunner::new(
+    let dns_listener = Arc::new(dns::DnsRunner::new(
         dns_enable,
         dns_listen.clone(),
         dns_resolver.clone(),

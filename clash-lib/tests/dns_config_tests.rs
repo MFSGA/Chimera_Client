@@ -1,5 +1,5 @@
 use clash_lib::{
-    Config,
+    Config, Options, TokioRuntime,
     app::dns::{Config as DnsConfig, config::DNSNetMode},
 };
 
@@ -40,6 +40,61 @@ rules:
   - MATCH,DIRECT
 "#
     )
+}
+
+#[test]
+#[serial_test::serial]
+fn occupied_dns_listeners_fail_runtime_startup() {
+    let tcp = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("failed to reserve TCP DNS port");
+    let addr = tcp.local_addr().expect("failed to read DNS address");
+    let udp =
+        std::net::UdpSocket::bind(addr).expect("failed to reserve UDP DNS port");
+    let temp = tempfile::tempdir().expect("failed to create temp dir");
+    let yaml = format!(
+        r#"
+mixed-port: 0
+bind-address: 127.0.0.1
+allow-lan: false
+mode: rule
+log-level: error
+ipv6: false
+mmdb: null
+tun:
+  enable: false
+dns:
+  enable: true
+  ipv6: false
+  listen:
+    udp: {addr}
+    tcp: {addr}
+  enhanced-mode: normal
+  nameserver:
+    - 1.1.1.1
+  default-nameserver:
+    - 1.1.1.1
+profile:
+  store-selected: false
+  store-fake-ip: false
+proxies: []
+rules:
+  - MATCH,DIRECT
+"#
+    );
+
+    let err = clash_lib::start_scaffold(Options {
+        config: Config::Str(yaml),
+        cwd: Some(temp.path().to_string_lossy().to_string()),
+        rt: Some(TokioRuntime::SingleThread),
+        log_file: None,
+        config_path: None,
+    })
+    .expect_err("runtime startup must fail when every DNS listener is occupied");
+
+    assert!(err.to_string().contains("no listener started"));
+    assert!(!clash_lib::shutdown());
+    drop(udp);
+    drop(tcp);
 }
 
 #[test]
