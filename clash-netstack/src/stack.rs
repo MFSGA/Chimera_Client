@@ -193,18 +193,25 @@ impl futures::Sink<Packet> for StackSplitSink {
                 })?;
             let payload = packet.payload();
             if payload.fragmented {
-                debug!("tun fragmented IP packet ignored");
-                return Ok(());
-            }
-
-            match payload.ip_number {
-                etherparse::ip_number::TCP => IpProtocol::Tcp,
-                etherparse::ip_number::UDP => IpProtocol::Udp,
-                etherparse::ip_number::ICMP => IpProtocol::Icmp,
-                etherparse::ip_number::IPV6_ICMP => IpProtocol::Icmpv6,
-                protocol => {
-                    debug!("tun IP packet ignored (protocol: {protocol:?})");
+                if payload.ip_number == etherparse::ip_number::UDP {
+                    IpProtocol::Udp
+                } else {
+                    debug!(
+                        "tun fragmented IP packet ignored (protocol: {:?})",
+                        payload.ip_number
+                    );
                     return Ok(());
+                }
+            } else {
+                match payload.ip_number {
+                    etherparse::ip_number::TCP => IpProtocol::Tcp,
+                    etherparse::ip_number::UDP => IpProtocol::Udp,
+                    etherparse::ip_number::ICMP => IpProtocol::Icmp,
+                    etherparse::ip_number::IPV6_ICMP => IpProtocol::Icmpv6,
+                    protocol => {
+                        debug!("tun IP packet ignored (protocol: {protocol:?})");
+                        return Ok(());
+                    }
                 }
             }
         };

@@ -11,6 +11,84 @@ use common::{
 };
 use mock_tun::MockTun;
 
+fn build_ipv4_udp_fragments(payload: &[u8]) -> [Vec<u8>; 2] {
+    let source = [1, 1, 1, 1];
+    let destination = [2, 2, 2, 2];
+    let mut full = Vec::new();
+    etherparse::PacketBuilder::ipv4(source, destination, 64)
+        .udp(5000, 5001)
+        .write(&mut full, payload)
+        .unwrap();
+    let udp = &full[20..];
+    let split = 16;
+
+    let build = |part: &[u8], offset: usize, more_fragments: bool| {
+        let mut header = etherparse::Ipv4Header::new(
+            part.len() as u16,
+            64,
+            etherparse::ip_number::UDP,
+            source,
+            destination,
+        )
+        .unwrap();
+        header.identification = 0x4242;
+        header.dont_fragment = false;
+        header.more_fragments = more_fragments;
+        header.fragment_offset =
+            etherparse::IpFragOffset::try_new((offset / 8) as u16).unwrap();
+        header.header_checksum = header.calc_header_checksum();
+
+        let mut packet = header.to_bytes().to_vec();
+        packet.extend_from_slice(part);
+        packet
+    };
+
+    [
+        build(&udp[..split], 0, true),
+        build(&udp[split..], split, false),
+    ]
+}
+
+fn build_ipv6_udp_fragments(payload: &[u8]) -> [Vec<u8>; 2] {
+    let source = [0x20; 16];
+    let destination = [0x21; 16];
+    let mut full = Vec::new();
+    etherparse::PacketBuilder::ipv6(source, destination, 64)
+        .udp(5000, 5001)
+        .write(&mut full, payload)
+        .unwrap();
+    let udp = &full[40..];
+    let split = 16;
+
+    let build = |part: &[u8], offset: usize, more_fragments: bool| {
+        let header = etherparse::Ipv6Header {
+            payload_length: (etherparse::Ipv6FragmentHeader::LEN + part.len())
+                as u16,
+            next_header: etherparse::ip_number::IPV6_FRAG,
+            hop_limit: 64,
+            source,
+            destination,
+            ..Default::default()
+        };
+        let fragment = etherparse::Ipv6FragmentHeader::new(
+            etherparse::ip_number::UDP,
+            etherparse::IpFragOffset::try_new((offset / 8) as u16).unwrap(),
+            more_fragments,
+            0x1122_3344,
+        );
+
+        let mut packet = header.to_bytes().to_vec();
+        packet.extend_from_slice(&fragment.to_bytes());
+        packet.extend_from_slice(part);
+        packet
+    };
+
+    [
+        build(&udp[..split], 0, true),
+        build(&udp[split..], split, false),
+    ]
+}
+
 #[tokio::test]
 async fn test_stack_with_mock_tun_real_tcp_udp() {
     init();
@@ -592,6 +670,50 @@ async fn icmp_echo_reply_works_without_tcp_socket() {
     let ihl = ((reply.data()[0] & 0x0f) as usize) * 4;
     assert_eq!(reply.data()[9], 1);
     assert_eq!(reply.data()[ihl], 0, "expected ICMP Echo Reply");
+}
+
+#[tokio::test]
+async fn fragmented_ipv4_udp_reassembles_out_of_order() {
+    let payload = b"fragmented-ipv4-udp-payload";
+    let [first, second] = build_ipv4_udp_fragments(payload);
+    let (stack, _tcp_listener, udp_socket) = NetStack::new();
+    let (mut stack_sink, _stack_stream) = stack.split();
+    let (mut udp_read, _udp_write) = udp_socket.split();
+
+    stack_sink.send(Packet::new(second)).await.unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), udp_read.recv(),)
+            .await
+            .is_err(),
+        "incomplete IPv4 fragments produced a UDP datagram"
+    );
+
+    stack_sink.send(Packet::new(first)).await.unwrap();
+    let packet =
+        tokio::time::timeout(std::time::Duration::from_millis(300), udp_read.recv())
+            .await
+            .expect("reassembled IPv4 UDP datagram timed out")
+            .expect("UDP receive stream ended unexpectedly");
+    assert_eq!(packet.data(), payload);
+}
+
+#[tokio::test]
+async fn fragmented_ipv6_udp_reassembles_out_of_order() {
+    let payload = b"fragmented-ipv6-udp-payload";
+    let [first, second] = build_ipv6_udp_fragments(payload);
+    let (stack, _tcp_listener, udp_socket) = NetStack::new();
+    let (mut stack_sink, _stack_stream) = stack.split();
+    let (mut udp_read, _udp_write) = udp_socket.split();
+
+    stack_sink.send(Packet::new(second)).await.unwrap();
+    stack_sink.send(Packet::new(first)).await.unwrap();
+
+    let packet =
+        tokio::time::timeout(std::time::Duration::from_millis(300), udp_read.recv())
+            .await
+            .expect("reassembled IPv6 UDP datagram timed out")
+            .expect("UDP receive stream ended unexpectedly");
+    assert_eq!(packet.data(), payload);
 }
 
 #[tokio::test]

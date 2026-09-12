@@ -2,11 +2,14 @@ use crate::{Packet, packet::IpPacket};
 use etherparse::PacketBuilder;
 use log::{error, trace, warn};
 use std::{
+    borrow::Cow,
+    collections::HashMap,
     net::SocketAddr,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 
@@ -60,7 +63,10 @@ impl UdpSocket {
     }
 
     pub fn split(self) -> (SplitRead, SplitWrite) {
-        let read = SplitRead { recv: self.inbound };
+        let read = SplitRead {
+            recv: self.inbound,
+            fragments: UdpFragmentReassembler::default(),
+        };
         let write = SplitWrite {
             send: self.outbound,
             dropped_on_full: Arc::new(AtomicU64::new(0)),
@@ -69,8 +75,150 @@ impl UdpSocket {
     }
 }
 
+const UDP_FRAGMENT_MAX_ACTIVE: usize = 64;
+const UDP_FRAGMENT_TTL: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+enum UdpFragmentKey {
+    Ipv4 {
+        source: [u8; 4],
+        destination: [u8; 4],
+        identification: u16,
+    },
+    Ipv6 {
+        source: [u8; 16],
+        destination: [u8; 16],
+        identification: u32,
+    },
+}
+
+struct UdpFragmentState {
+    buffer: etherparse::defrag::IpDefragBuf,
+    updated_at: Instant,
+}
+
+#[derive(Default)]
+struct UdpFragmentReassembler {
+    active: HashMap<UdpFragmentKey, UdpFragmentState>,
+}
+
+impl UdpFragmentReassembler {
+    fn prune_expired(&mut self, now: Instant) {
+        self.active.retain(|_, state| {
+            now.duration_since(state.updated_at) < UDP_FRAGMENT_TTL
+        });
+    }
+
+    fn evict_oldest_if_full(&mut self) {
+        if self.active.len() < UDP_FRAGMENT_MAX_ACTIVE {
+            return;
+        }
+
+        if let Some(oldest) = self
+            .active
+            .iter()
+            .min_by_key(|(_, state)| state.updated_at)
+            .map(|(key, _)| key.clone())
+        {
+            self.active.remove(&oldest);
+            warn!(
+                "evicting oldest UDP fragment reassembly because active limit ({UDP_FRAGMENT_MAX_ACTIVE}) was reached"
+            );
+        }
+    }
+
+    fn push(
+        &mut self,
+        packet: &etherparse::IpSlice<'_>,
+    ) -> Result<Option<Vec<u8>>, etherparse::defrag::IpDefragError> {
+        let now = Instant::now();
+        self.prune_expired(now);
+
+        let (key, offset, more_fragments, payload) = match packet {
+            etherparse::IpSlice::Ipv4(ipv4) => {
+                let header = ipv4.header();
+                (
+                    UdpFragmentKey::Ipv4 {
+                        source: header.source(),
+                        destination: header.destination(),
+                        identification: header.identification(),
+                    },
+                    header.fragments_offset(),
+                    header.more_fragments(),
+                    ipv4.payload().payload,
+                )
+            }
+            etherparse::IpSlice::Ipv6(ipv6) => {
+                let fragment =
+                    ipv6.extensions().clone().into_iter().find_map(|extension| {
+                        match extension {
+                            etherparse::Ipv6ExtensionSlice::Fragment(fragment) => {
+                                Some(fragment)
+                            }
+                            _ => None,
+                        }
+                    });
+                let Some(fragment) = fragment else {
+                    return Ok(None);
+                };
+
+                (
+                    UdpFragmentKey::Ipv6 {
+                        source: ipv6.header().source(),
+                        destination: ipv6.header().destination(),
+                        identification: fragment.identification(),
+                    },
+                    fragment.fragment_offset(),
+                    fragment.more_fragments(),
+                    ipv6.payload().payload,
+                )
+            }
+        };
+
+        if !self.active.contains_key(&key) {
+            self.evict_oldest_if_full();
+            self.active.insert(
+                key.clone(),
+                UdpFragmentState {
+                    buffer: etherparse::defrag::IpDefragBuf::new(
+                        etherparse::ip_number::UDP,
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                    updated_at: now,
+                },
+            );
+        }
+
+        let complete = {
+            let state = self
+                .active
+                .get_mut(&key)
+                .expect("UDP fragment state must exist after insertion");
+            state.updated_at = now;
+            if let Err(err) = state.buffer.add(offset, more_fragments, payload) {
+                self.active.remove(&key);
+                return Err(err);
+            }
+            state.buffer.is_complete()
+        };
+
+        if !complete {
+            return Ok(None);
+        }
+
+        let state = self
+            .active
+            .remove(&key)
+            .expect("completed UDP fragment state must exist");
+        let (payload, _) = state.buffer.take_bufs();
+        Ok(Some(payload))
+    }
+}
+
 pub struct SplitRead {
     recv: mpsc::Receiver<Packet>,
+    fragments: UdpFragmentReassembler,
 }
 
 impl SplitRead {
@@ -91,27 +239,45 @@ impl SplitRead {
 
             let src_ip = packet.src_addr();
             let dst_ip = packet.dst_addr();
-            let sliced = match etherparse::SlicedPacket::from_ip(data.data()) {
+            let sliced = match etherparse::IpSlice::from_slice(data.data()) {
                 Ok(packet) => packet,
                 Err(err) => {
                     error!("invalid IP packet: {err}");
                     continue;
                 }
             };
-            let udp = match sliced.transport {
-                Some(etherparse::TransportSlice::Udp(udp)) => udp,
-                _ => {
-                    error!("UDP input did not contain a complete UDP datagram");
-                    continue;
+            self.fragments.prune_expired(Instant::now());
+            let payload = sliced.payload();
+            if payload.ip_number != etherparse::ip_number::UDP {
+                error!(
+                    "UDP input contained non-UDP payload: {:?}",
+                    payload.ip_number
+                );
+                continue;
+            }
+
+            let udp_data = if payload.fragmented {
+                match self.fragments.push(&sliced) {
+                    Ok(Some(payload)) => Cow::Owned(payload),
+                    Ok(None) => continue,
+                    Err(err) => {
+                        error!("invalid UDP fragment sequence: {err}");
+                        continue;
+                    }
                 }
+            } else {
+                Cow::Borrowed(payload.payload)
             };
-            let packet = match smoltcp::wire::UdpPacket::new_checked(udp.slice()) {
+
+            let packet = match smoltcp::wire::UdpPacket::new_checked(
+                udp_data.as_ref(),
+            ) {
                 Ok(packet) => packet,
                 Err(err) => {
                     error!(
                         "invalid UDP err: {err}, src_ip: {src_ip}, dst_ip: {dst_ip}, \
                          payload: {:?}",
-                        udp.slice()
+                        udp_data.as_ref()
                     );
                     continue;
                 }
