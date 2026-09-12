@@ -13,8 +13,13 @@ pub(crate) enum IpHeaderTemplate {
     Ipv4 {
         source: [u8; 4],
         destination: [u8; 4],
+        dscp: etherparse::IpDscp,
+        ecn: etherparse::IpEcn,
         ttl: u8,
         identification: u16,
+        dont_fragment: bool,
+        options: [u8; 40],
+        options_len: u8,
     },
     Ipv6 {
         source: [u8; 16],
@@ -49,22 +54,32 @@ impl IpHeaderTemplate {
             Self::Ipv4 {
                 source,
                 destination,
+                dscp,
+                ecn,
                 ttl,
                 identification,
+                dont_fragment,
+                options,
+                options_len,
             } => {
-                let payload_len = u16::try_from(payload.len()).map_err(|_| {
-                    std::io::Error::other("reassembled payload too large")
-                })?;
                 let mut header = etherparse::Ipv4Header::new(
-                    payload_len,
+                    0,
                     ttl,
                     protocol,
                     source,
                     destination,
                 )
                 .map_err(std::io::Error::other)?;
+                header.dscp = dscp;
+                header.ecn = ecn;
                 header.identification = identification;
-                header.dont_fragment = true;
+                header.dont_fragment = dont_fragment;
+                header.options = (&options[..usize::from(options_len)])
+                    .try_into()
+                    .map_err(std::io::Error::other)?;
+                header
+                    .set_payload_len(payload.len())
+                    .map_err(std::io::Error::other)?;
                 header.header_checksum = header.calc_header_checksum();
                 let mut out = header.to_bytes().to_vec();
                 out.extend_from_slice(payload);
@@ -337,8 +352,18 @@ fn ipv4_fragment_piece(packet: &[u8]) -> std::io::Result<Option<FragmentPiece<'_
         template: IpHeaderTemplate::Ipv4 {
             source: header.source(),
             destination: header.destination(),
+            dscp: header.dcp(),
+            ecn: header.ecn(),
             ttl: header.ttl(),
             identification: header.identification(),
+            dont_fragment: header.dont_fragment(),
+            options: {
+                let mut options = [0u8; 40];
+                let raw = header.options();
+                options[..raw.len()].copy_from_slice(raw);
+                options
+            },
+            options_len: header.options().len() as u8,
         },
         next_header: ipv4.payload().ip_number,
         offset: header.fragments_offset(),
@@ -497,6 +522,55 @@ mod tests {
         header.more_fragments = true;
         header.header_checksum = header.calc_header_checksum();
         [header.to_bytes().as_slice(), &[0u8; 8]].concat()
+    }
+
+    #[test]
+    fn ipv4_rebuild_preserves_first_fragment_header_semantics() {
+        let build = |part: &[u8], offset: usize, more_fragments: bool| {
+            let mut header = etherparse::Ipv4Header::new(
+                0,
+                42,
+                etherparse::ip_number::UDP,
+                [1, 1, 1, 1],
+                [2, 2, 2, 2],
+            )
+            .unwrap();
+            header.dscp = etherparse::IpDscp::try_new(0x2a).unwrap();
+            header.ecn = etherparse::IpEcn::try_new(3).unwrap();
+            header.options = (&[1, 1, 1, 0][..]).try_into().unwrap();
+            header.set_payload_len(part.len()).unwrap();
+            header.identification = 0x4242;
+            header.dont_fragment = false;
+            header.more_fragments = more_fragments;
+            header.fragment_offset =
+                etherparse::IpFragOffset::try_new((offset / 8) as u16).unwrap();
+            header.header_checksum = header.calc_header_checksum();
+            [header.to_bytes().as_slice(), part].concat()
+        };
+        let payload = [0x5au8; 16];
+        let first = build(&payload[..8], 0, true);
+        let second = build(&payload[8..], 8, false);
+        let mut reassembler =
+            FragmentReassembler::new(etherparse::ip_number::UDP, "test");
+        assert!(reassembler.push(&second).unwrap().is_none());
+        let reassembled = reassembler
+            .push(&first)
+            .unwrap()
+            .expect("fragments should complete");
+        let packet = reassembled
+            .template
+            .rebuild(reassembled.protocol, &reassembled.payload)
+            .unwrap();
+        let ipv4 = etherparse::Ipv4Slice::from_slice(packet.data()).unwrap();
+        let header = ipv4.header();
+        assert_eq!(header.dcp(), etherparse::IpDscp::try_new(0x2a).unwrap());
+        assert_eq!(header.ecn(), etherparse::IpEcn::try_new(3).unwrap());
+        assert_eq!(header.options(), &[1, 1, 1, 0]);
+        assert_eq!(header.ttl(), 42);
+        assert_eq!(header.identification(), 0x4242);
+        assert!(!header.dont_fragment());
+        assert!(!header.more_fragments());
+        assert_eq!(header.fragments_offset().value(), 0);
     }
 
     #[test]
