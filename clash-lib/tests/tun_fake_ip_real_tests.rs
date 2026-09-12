@@ -57,7 +57,7 @@ mmdb: null
 
 tun:
   enable: true
-  device-id: "dev://chimera-test-tun"
+  device-id: "dev://chimera-tun"
   route-all: false
   gateway: "198.19.0.1/30"
   dns-hijack: false
