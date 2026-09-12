@@ -101,17 +101,15 @@ pub async fn serve_ipc(
     #[derive(Clone, Debug)]
     #[allow(dead_code)]
     struct UdsConnectInfo {
-        peer_addr: Arc<tokio::net::unix::SocketAddr>,
-        peer_cred: tokio::net::unix::UCred,
+        peer_addr: Option<Arc<tokio::net::unix::SocketAddr>>,
+        peer_cred: Option<tokio::net::unix::UCred>,
     }
 
     impl Connected<IncomingStream<'_, UnixListener>> for UdsConnectInfo {
         fn connect_info(stream: IncomingStream<'_, UnixListener>) -> Self {
-            let peer_addr = stream.io().peer_addr().unwrap();
-            let peer_cred = stream.io().peer_cred().unwrap();
             Self {
-                peer_addr: Arc::new(peer_addr),
-                peer_cred,
+                peer_addr: stream.io().peer_addr().ok().map(Arc::new),
+                peer_cred: stream.io().peer_cred().ok(),
             }
         }
     }
