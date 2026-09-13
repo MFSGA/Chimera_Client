@@ -7,7 +7,10 @@ use tracing::{trace, warn};
 use crate::{
     app::dispatcher::Dispatcher,
     proxy::{
-        inbound::{InboundHandlerTrait, is_inbound_client_allowed},
+        inbound::{
+            InboundHandlerTrait, InboundReady, is_inbound_client_allowed,
+            report_listener_ready,
+        },
         utils::{ToCanonical, apply_tcp_options, try_create_dualstack_tcplistener},
     },
     session::{Network, Session, Type},
@@ -52,8 +55,11 @@ impl InboundHandlerTrait for RedirInbound {
         false
     }
 
-    async fn listen_tcp(&self) -> io::Result<()> {
-        let listener = try_create_dualstack_tcplistener(self.addr)?;
+    async fn listen_tcp(&self, ready: InboundReady) -> io::Result<()> {
+        let listener = report_listener_ready(
+            ready,
+            try_create_dualstack_tcplistener(self.addr),
+        )?;
 
         loop {
             let (socket, _) = listener.accept().await?;
@@ -89,8 +95,10 @@ impl InboundHandlerTrait for RedirInbound {
         }
     }
 
-    async fn listen_udp(&self) -> io::Result<()> {
-        Err(io::Error::other("redir inbound does not support UDP"))
+    async fn listen_udp(&self, ready: InboundReady) -> io::Result<()> {
+        let err = io::Error::other("redir inbound does not support UDP");
+        let _ = ready.send(Err(err.to_string()));
+        Err(err)
     }
 }
 

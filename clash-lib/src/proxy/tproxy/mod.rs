@@ -9,7 +9,7 @@ mod udp;
 use crate::{
     app::dispatcher::Dispatcher,
     proxy::{
-        inbound::InboundHandlerTrait,
+        inbound::{InboundHandlerTrait, InboundReady, report_listener_ready},
         utils::{ToCanonical, apply_tcp_options, try_create_dualstack_socket},
     },
     session::{Network, Session, Type},
@@ -54,17 +54,8 @@ impl InboundHandlerTrait for TproxyInbound {
         true
     }
 
-    async fn listen_tcp(&self) -> io::Result<()> {
-        let (socket, dual_stack) =
-            try_create_dualstack_socket(self.addr, socket2::Type::STREAM)?;
-        if dual_stack || self.addr.is_ipv4() {
-            socket.set_ip_transparent_v4(true)?;
-        }
-        socket.set_nonblocking(true)?;
-        socket.set_reuse_address(true)?;
-        socket.bind(&self.addr.into())?;
-        socket.listen(1024)?;
-        let listener = TcpListener::from_std(socket.into())?;
+    async fn listen_tcp(&self, ready: InboundReady) -> io::Result<()> {
+        let listener = report_listener_ready(ready, create_tcp_listener(self.addr))?;
 
         loop {
             let (socket, _) = listener.accept().await?;
@@ -89,7 +80,20 @@ impl InboundHandlerTrait for TproxyInbound {
         }
     }
 
-    async fn listen_udp(&self) -> io::Result<()> {
-        udp::listen(self.addr, self.dispatcher.clone(), self.fw_mark).await
+    async fn listen_udp(&self, ready: InboundReady) -> io::Result<()> {
+        udp::listen(self.addr, self.dispatcher.clone(), self.fw_mark, ready).await
     }
+}
+
+fn create_tcp_listener(addr: SocketAddr) -> io::Result<TcpListener> {
+    let (socket, dual_stack) =
+        try_create_dualstack_socket(addr, socket2::Type::STREAM)?;
+    if dual_stack || addr.is_ipv4() {
+        socket.set_ip_transparent_v4(true)?;
+    }
+    socket.set_nonblocking(true)?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    TcpListener::from_std(socket.into())
 }

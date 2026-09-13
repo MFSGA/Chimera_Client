@@ -128,7 +128,7 @@ fn build_handler(
         InboundOpts::Redir { common_opts } => {
             #[cfg(target_os = "linux")]
             {
-                Some(Arc::new(RedirInbound::new(
+                Ok(Arc::new(RedirInbound::new(
                     (common_opts.listen.0, common_opts.port).into(),
                     common_opts.allow_lan,
                     dispatcher,
@@ -138,15 +138,16 @@ fn build_handler(
             #[cfg(not(target_os = "linux"))]
             {
                 let _ = (common_opts, dispatcher);
-                warn!("redir inbound is only supported on Linux");
-                None
+                Err(crate::Error::Operation(
+                    "redir inbound is only supported on Linux".to_owned(),
+                ))
             }
         }
         #[cfg(feature = "tproxy")]
         InboundOpts::Tproxy { common_opts } => {
             #[cfg(target_os = "linux")]
             {
-                Some(Arc::new(TproxyInbound::new(
+                Ok(Arc::new(TproxyInbound::new(
                     (common_opts.listen.0, common_opts.port).into(),
                     common_opts.allow_lan,
                     dispatcher,
@@ -156,8 +157,9 @@ fn build_handler(
             #[cfg(not(target_os = "linux"))]
             {
                 let _ = (common_opts, dispatcher);
-                warn!("tproxy inbound is only supported on Linux");
-                None
+                Err(crate::Error::Operation(
+                    "tproxy inbound is only supported on Linux".to_owned(),
+                ))
             }
         }
         #[cfg(feature = "shadowsocks")]

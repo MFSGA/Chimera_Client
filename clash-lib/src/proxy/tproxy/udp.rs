@@ -13,6 +13,7 @@ use crate::{
     app::dispatcher::Dispatcher,
     proxy::{
         datagram::UdpPacket,
+        inbound::{InboundReady, report_listener_ready},
         tun::TunDatagram,
         utils::{ToCanonical, try_create_dualstack_socket},
     },
@@ -29,8 +30,10 @@ pub(super) async fn listen(
     addr: SocketAddr,
     dispatcher: Arc<Dispatcher>,
     fw_mark: Option<u32>,
+    ready: InboundReady,
 ) -> io::Result<()> {
-    let socket = Arc::new(AsyncFd::new(create_listener(addr)?)?);
+    let socket = create_listener(addr).and_then(AsyncFd::new);
+    let socket = Arc::new(report_listener_ready(ready, socket)?);
     let (response_tx, response_rx) = tokio::sync::mpsc::channel(32);
     let (request_tx, request_rx) = tokio::sync::mpsc::channel(32);
     let datagram = TunDatagram::new(response_tx, request_rx);
