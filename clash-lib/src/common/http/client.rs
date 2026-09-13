@@ -34,6 +34,17 @@ fn make_direct_outbound() -> AnyOutboundHandler {
     Arc::new(direct::Handler::new(PROXY_DIRECT))
 }
 
+fn tls_server_name(
+    host: String,
+) -> io::Result<rustls::pki_types::ServerName<'static>> {
+    host.clone().try_into().map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid TLS server name {host:?}: {err}"),
+        )
+    })
+}
+
 async fn resolve_http_outbound(
     registry: Option<&OutboundHandlerRegistry>,
     outbound_name: Option<&str>,
@@ -113,16 +124,20 @@ impl HttpClient {
         });
 
         if req.headers_mut().get(http::header::HOST).is_none() {
-            req.headers_mut().insert(
-                http::header::HOST,
-                uri.host()
-                    .ok_or(std::io::Error::new(
+            let host_header = uri
+                .host()
+                .ok_or(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "uri must have a host",
+                ))?
+                .parse()
+                .map_err(|err| {
+                    std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        "uri must have a host",
-                    ))?
-                    .parse()
-                    .expect("must parse host header"),
-            );
+                        format!("invalid HTTP host header for {uri}: {err}"),
+                    )
+                })?;
+            req.headers_mut().insert(http::header::HOST, host_header);
         }
 
         let outbound_name = req
@@ -174,12 +189,10 @@ impl HttpClient {
                 let connector =
                     tokio_rustls::TlsConnector::from(self.tls_config.clone());
 
+                let server_name = tls_server_name(host.clone())?;
                 let stream = tokio::time::timeout(
                     self.timeout,
-                    connector.connect(
-                        host.try_into().expect("must be valid SNI"),
-                        stream,
-                    ),
+                    connector.connect(server_name, stream),
                 )
                 .await??;
 
@@ -224,6 +237,20 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    #[test]
+    fn invalid_tls_server_name_returns_error() {
+        let uri: http::Uri = "https://-prefixhypheninvalid.com/"
+            .parse()
+            .expect("URI parser should accept the authority syntax");
+        let host = uri.host().expect("URI should expose a host").to_owned();
+
+        let error = tls_server_name(host)
+            .expect_err("invalid DNS name must be reported, not panic");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("-prefixhypheninvalid.com"));
+    }
 
     #[tokio::test]
     async fn named_http_outbound_resolves_from_shared_registry() {
