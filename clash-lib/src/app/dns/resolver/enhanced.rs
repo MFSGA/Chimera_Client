@@ -279,8 +279,7 @@ impl EnhancedResolver {
                         } else {
                             Box::new(InMemStore::new(1000))
                         },
-                    })
-                    .unwrap(),
+                    })?,
                 ))),
                 DNSMode::RedirHost => {
                     warn!(

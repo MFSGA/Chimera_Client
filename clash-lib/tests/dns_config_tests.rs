@@ -144,6 +144,60 @@ rules:
 }
 
 #[test]
+#[serial_test::serial]
+fn invalid_fake_ip_ranges_fail_runtime_startup() {
+    for (range, expected) in [
+        ("2001:db8::/64", "IPv4 subnet"),
+        ("198.18.0.0/31", "at least one allocatable address"),
+    ] {
+        let temp = tempfile::tempdir().expect("failed to create temp dir");
+        let yaml = format!(
+            r#"
+mixed-port: 0
+bind-address: 127.0.0.1
+allow-lan: false
+mode: rule
+log-level: error
+ipv6: false
+mmdb: null
+tun:
+  enable: false
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: {range}
+  nameserver:
+    - 1.1.1.1
+  default-nameserver:
+    - 1.1.1.1
+profile:
+  store-selected: false
+  store-fake-ip: false
+proxies: []
+rules:
+  - MATCH,DIRECT
+"#
+        );
+
+        let err = clash_lib::start_scaffold(Options {
+            config: Config::Str(yaml),
+            cwd: Some(temp.path().to_string_lossy().to_string()),
+            rt: Some(TokioRuntime::SingleThread),
+            log_file: None,
+            config_path: None,
+        })
+        .expect_err("invalid fake IP range must fail runtime startup");
+
+        assert!(
+            err.to_string().contains(expected),
+            "unexpected error for {range}: {err}"
+        );
+        assert!(!clash_lib::shutdown());
+    }
+}
+
+#[test]
 fn full_dns_fixture_parses_expected_runtime_shape() {
     let yaml = include_str!("data/config/dns/full_dns.yaml");
     let dns = parse_dns(yaml);
