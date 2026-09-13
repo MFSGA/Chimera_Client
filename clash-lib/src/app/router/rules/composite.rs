@@ -181,7 +181,7 @@ impl CompositeRule {
         let rule = RuleType::new(rule_type, rest, "", None)?;
         Ok(RuleExpression::Rule(map_rule_type(
             rule, mmdb, geodata, providers,
-        )))
+        )?))
     }
 }
 
