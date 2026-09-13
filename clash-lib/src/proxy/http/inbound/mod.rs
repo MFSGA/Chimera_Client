@@ -6,7 +6,10 @@ use crate::{
     app::dispatcher::Dispatcher,
     common::{auth::ThreadSafeAuthenticator, errors::new_io_error},
     proxy::{
-        inbound::{InboundHandlerTrait, is_inbound_client_allowed},
+        inbound::{
+            InboundHandlerTrait, InboundReady, is_inbound_client_allowed,
+            report_listener_ready,
+        },
         utils::{ToCanonical, apply_tcp_options, try_create_dualstack_tcplistener},
     },
 };
@@ -59,8 +62,11 @@ impl InboundHandlerTrait for HttpInbound {
         false
     }
 
-    async fn listen_tcp(&self) -> std::io::Result<()> {
-        let listener = try_create_dualstack_tcplistener(self.addr)?;
+    async fn listen_tcp(&self, ready: InboundReady) -> std::io::Result<()> {
+        let listener = report_listener_ready(
+            ready,
+            try_create_dualstack_tcplistener(self.addr),
+        )?;
 
         loop {
             let (socket, _) = match listener.accept().await {
@@ -112,7 +118,9 @@ impl InboundHandlerTrait for HttpInbound {
         }
     }
 
-    async fn listen_udp(&self) -> std::io::Result<()> {
+    async fn listen_udp(&self, ready: InboundReady) -> std::io::Result<()> {
+        let _ =
+            ready.send(Err("unsupported UDP protocol for HTTP inbound".to_owned()));
         Err(new_io_error("unsupported UDP protocol for HTTP inbound"))
     }
 }

@@ -7,7 +7,10 @@ use crate::{
 
 use super::{
     http,
-    inbound::{InboundHandlerTrait, is_inbound_client_allowed},
+    inbound::{
+        InboundHandlerTrait, InboundReady, is_inbound_client_allowed,
+        report_listener_ready,
+    },
     socks,
     utils::apply_tcp_options,
 };
@@ -59,8 +62,11 @@ impl InboundHandlerTrait for MixedInbound {
         false
     }
 
-    async fn listen_tcp(&self) -> std::io::Result<()> {
-        let listener = try_create_dualstack_tcplistener(self.addr)?;
+    async fn listen_tcp(&self, ready: InboundReady) -> std::io::Result<()> {
+        let listener = report_listener_ready(
+            ready,
+            try_create_dualstack_tcplistener(self.addr),
+        )?;
 
         loop {
             let (socket, _) = match listener.accept().await {
@@ -152,7 +158,8 @@ impl InboundHandlerTrait for MixedInbound {
         }
     }
 
-    async fn listen_udp(&self) -> std::io::Result<()> {
+    async fn listen_udp(&self, ready: InboundReady) -> std::io::Result<()> {
+        let _ = ready.send(Err("UDP is not supported".to_owned()));
         Err(new_io_error("UDP is not supported"))
     }
 }

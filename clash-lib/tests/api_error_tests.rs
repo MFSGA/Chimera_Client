@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use clash_lib::{Config, Options};
+use clash_lib::{Config, Options, shutdown, start_scaffold};
 use std::{net::TcpListener, path::PathBuf};
 
 mod common;
@@ -64,6 +64,53 @@ async fn get(api_port: u16, path: &str) -> http::Response<hyper::body::Incoming>
     send_http_request(url.parse().unwrap(), request)
         .await
         .expect("failed to send API request")
+}
+
+#[test]
+#[serial_test::serial]
+fn occupied_socks_listener_fails_runtime_startup() {
+    let blocker = TcpListener::bind("127.0.0.1:0")
+        .expect("failed to reserve occupied SOCKS port");
+    let socks_port = blocker.local_addr().unwrap().port();
+    let config = format!(
+        r#"
+allow-lan: false
+bind-address: 127.0.0.1
+socks-port: {socks_port}
+mode: direct
+log-level: error
+mmdb: null
+dns:
+  enable: false
+tun:
+  enable: false
+proxies: []
+rules:
+  - MATCH,DIRECT
+"#
+    );
+    let cwd =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
+
+    let err = start_scaffold(Options {
+        config: Config::Str(config),
+        cwd: Some(cwd.to_string_lossy().to_string()),
+        rt: None,
+        log_file: None,
+        config_path: None,
+    })
+    .expect_err("occupied SOCKS listener must fail startup");
+
+    let message = err.to_string();
+    assert!(message.contains("SOCKS-IN"), "unexpected error: {message}");
+    assert!(
+        message.contains("failed to become ready"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        !shutdown(),
+        "failed startup must not leave a shutdown token"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

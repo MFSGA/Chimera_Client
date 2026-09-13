@@ -817,7 +817,8 @@ impl RuntimeComponents {
     }
 
     async fn wait_initial_ready(&self) -> Result<()> {
-        self.dns_listener.wait_ready().await
+        self.dns_listener.wait_ready().await?;
+        self.inbound_manager.wait_ready().await
     }
 
     fn stop_all(&self) {

@@ -1,6 +1,9 @@
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
-use tokio::{sync::RwLock, task::JoinHandle};
+use tokio::{
+    sync::{Mutex, RwLock, oneshot},
+    task::JoinHandle,
+};
 
 use crate::{
     app::{
@@ -57,6 +60,8 @@ pub struct InboundManager {
     inbound_handlers: ThreadSafeInboundHandlers,
 
     cancellation_token: tokio_util::sync::CancellationToken,
+    ready_tx: std::sync::Mutex<Option<oneshot::Sender<Result<(), crate::Error>>>>,
+    ready_rx: Mutex<Option<oneshot::Receiver<Result<(), crate::Error>>>>,
 }
 
 impl Runner for InboundManager {
@@ -66,14 +71,27 @@ impl Runner for InboundManager {
         let authenticator = self.authenticator.clone();
         let cancellation_token = self.cancellation_token.clone();
 
+        let ready_tx = self.ready_tx.lock().unwrap().take();
         tokio::spawn(async move {
-            Self::start_all_listeners(
+            let result = Self::start_all_listeners(
                 dispatcher,
                 authenticator,
                 inbound_handlers,
                 cancellation_token,
             )
             .await;
+            match ready_tx {
+                Some(sender) => {
+                    if let Err(Err(err)) = sender.send(result) {
+                        warn!("failed to start inbound listeners: {err}");
+                    }
+                }
+                None => {
+                    if let Err(err) = result {
+                        warn!("failed to start inbound listeners: {err}");
+                    }
+                }
+            }
         });
     }
 
@@ -144,6 +162,7 @@ impl InboundManager {
         inbounds_opt: HashSet<InboundOpts>,
         cancellation_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Self {
+        let (ready_tx, ready_rx) = oneshot::channel();
         Self {
             inbound_handlers: Arc::new(RwLock::new(
                 inbounds_opt.into_iter().map(|opts| (opts, None)).collect(),
@@ -151,6 +170,22 @@ impl InboundManager {
             dispatcher,
             authenticator,
             cancellation_token: cancellation_token.unwrap_or_default(),
+            ready_tx: std::sync::Mutex::new(Some(ready_tx)),
+            ready_rx: Mutex::new(Some(ready_rx)),
+        }
+    }
+
+    pub async fn wait_ready(&self) -> Result<(), crate::Error> {
+        let receiver = self.ready_rx.lock().await.take();
+        match receiver {
+            Some(receiver) => receiver.await.map_err(|_| {
+                crate::Error::Operation(
+                    "inbound manager exited before becoming ready".to_owned(),
+                )
+            })?,
+            None => Err(crate::Error::Operation(
+                "inbound readiness was already consumed".to_owned(),
+            )),
         }
     }
 
@@ -161,24 +196,70 @@ impl InboundManager {
         authenticator: ThreadSafeAuthenticator,
         inbound_handlers: ThreadSafeInboundHandlers,
         cancellation_token: tokio_util::sync::CancellationToken,
-    ) {
+    ) -> Result<(), crate::Error> {
         if let Err(err) =
             Self::stop_all_listener_handles(inbound_handlers.clone()).await
         {
             warn!("failed to stop inbound handlers before restart: {}", err);
         }
 
-        for (opts, handler) in inbound_handlers.write().await.iter_mut() {
-            *handler = build_network_listeners(
-                opts,
+        let options = inbound_handlers
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut readiness = Vec::new();
+
+        for opts in options {
+            let name = opts.common_opts().name.clone();
+            let listeners = match build_network_listeners(
+                &opts,
                 dispatcher.clone(),
                 authenticator.clone(),
-            )
-            .map(|r| {
-                let listener_token = cancellation_token.clone();
-                tokio::spawn(run_listener_futures(r, listener_token))
-            });
+            ) {
+                Ok(listeners) => listeners,
+                Err(err) => {
+                    let _ =
+                        Self::stop_all_listener_handles(inbound_handlers.clone())
+                            .await;
+                    return Err(err);
+                }
+            };
+            readiness.extend(
+                listeners
+                    .ready
+                    .into_iter()
+                    .map(|receiver| (name.clone(), receiver)),
+            );
+            let listener_token = cancellation_token.clone();
+            let handle = tokio::spawn(run_listener_futures(
+                listeners.futures,
+                listener_token,
+            ));
+            if let Some(slot) = inbound_handlers.write().await.get_mut(&opts) {
+                *slot = Some(handle);
+            }
         }
+
+        for (name, receiver) in readiness {
+            let result = match receiver.await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(message)) => Err(crate::Error::Operation(format!(
+                    "inbound {name} failed to become ready: {message}"
+                ))),
+                Err(_) => Err(crate::Error::Operation(format!(
+                    "inbound {name} exited before becoming ready"
+                ))),
+            };
+            if let Err(err) = result {
+                let _ =
+                    Self::stop_all_listener_handles(inbound_handlers.clone()).await;
+                return Err(err);
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn shutdown(&self) {
@@ -203,8 +284,7 @@ impl InboundManager {
             inbound_handlers,
             cancellation_token,
         )
-        .await;
-        Ok(())
+        .await
     }
 
     // RESTFUL API handlers below

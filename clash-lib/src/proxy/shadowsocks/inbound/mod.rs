@@ -16,7 +16,10 @@ use crate::{
     common::errors::new_io_error,
     config::internal::listener::InboundUser,
     proxy::{
-        inbound::{InboundHandlerTrait, is_inbound_client_allowed},
+        inbound::{
+            InboundHandlerTrait, InboundReady, is_inbound_client_allowed,
+            report_listener_ready,
+        },
         shadowsocks::{inbound::datagram::InboundShadowsocksDatagram, map_cipher},
         utils::{
             ToCanonical, apply_tcp_options, new_udp_socket,
@@ -120,12 +123,16 @@ impl InboundHandlerTrait for ShadowsocksInbound {
         self._udp_requested
     }
 
-    async fn listen_tcp(&self) -> std::io::Result<()> {
+    async fn listen_tcp(&self, ready: InboundReady) -> std::io::Result<()> {
         let context = Context::new_shared(shadowsocks::config::ServerType::Server);
-        let config = self.build_server_config()?;
-        let method = map_cipher(&self.cipher)?;
+        let prepared = (|| {
+            let config = self.build_server_config()?;
+            let method = map_cipher(&self.cipher)?;
+            let listener = try_create_dualstack_tcplistener(self.addr)?;
+            Ok((config, method, listener))
+        })();
+        let (config, method, listener) = report_listener_ready(ready, prepared)?;
         let server_key = Arc::new(config.key().to_vec());
-        let listener = try_create_dualstack_tcplistener(self.addr)?;
         let mut users_rx = self.users_rx.clone();
         let mut user_manager =
             build_user_manager(&users_rx.borrow_and_update(), self.addr);
@@ -207,13 +214,22 @@ impl InboundHandlerTrait for ShadowsocksInbound {
         }
     }
 
-    async fn listen_udp(&self) -> std::io::Result<()> {
+    async fn listen_udp(&self, ready: InboundReady) -> std::io::Result<()> {
         let mut users_rx = self.users_rx.clone();
+        let mut ready = Some(ready);
 
         loop {
             let context =
                 Context::new_shared(shadowsocks::config::ServerType::Server);
-            let mut config = self.build_server_config()?;
+            let mut config = match self.build_server_config() {
+                Ok(config) => config,
+                Err(err) => {
+                    if let Some(sender) = ready.take() {
+                        let _ = sender.send(Err(err.to_string()));
+                    }
+                    return Err(err);
+                }
+            };
             if let Some(manager) =
                 build_user_manager(&users_rx.borrow_and_update(), self.addr)
             {
@@ -223,14 +239,26 @@ impl InboundHandlerTrait for ShadowsocksInbound {
                 );
             }
 
-            let socket = new_udp_socket(
+            let socket = match new_udp_socket(
                 Some(self.addr),
                 None,
                 #[cfg(target_os = "linux")]
                 self.fw_mark,
                 None,
             )
-            .await?;
+            .await
+            {
+                Ok(socket) => socket,
+                Err(err) => {
+                    if let Some(sender) = ready.take() {
+                        let _ = sender.send(Err(err.to_string()));
+                    }
+                    return Err(err);
+                }
+            };
+            if let Some(sender) = ready.take() {
+                let _ = sender.send(Ok(()));
+            }
             let socket: ProxySocket<shadowsocks::net::UdpSocket> =
                 ProxySocket::from_socket(
                     shadowsocks::relay::udprelay::proxy_socket::UdpSocketType::Server,

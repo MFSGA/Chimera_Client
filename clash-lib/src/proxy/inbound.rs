@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 
 use async_trait::async_trait;
+use tokio::sync::oneshot;
 
 pub(crate) fn is_inbound_client_allowed(
     allow_lan: bool,
@@ -10,14 +11,32 @@ pub(crate) fn is_inbound_client_allowed(
     allow_lan || peer_addr.ip().to_canonical() == local_addr.ip().to_canonical()
 }
 
+pub(crate) type InboundReady = oneshot::Sender<Result<(), String>>;
+
+pub(crate) fn report_listener_ready<T>(
+    ready: InboundReady,
+    result: std::io::Result<T>,
+) -> std::io::Result<T> {
+    match result {
+        Ok(value) => {
+            let _ = ready.send(Ok(()));
+            Ok(value)
+        }
+        Err(err) => {
+            let _ = ready.send(Err(err.to_string()));
+            Err(err)
+        }
+    }
+}
+
 #[async_trait]
 pub trait InboundHandlerTrait: Sync + Send {
     /// support tcp or not
     fn handle_tcp(&self) -> bool;
     /// support udp or not
     fn handle_udp(&self) -> bool;
-    async fn listen_tcp(&self) -> std::io::Result<()>;
-    async fn listen_udp(&self) -> std::io::Result<()>;
+    async fn listen_tcp(&self, ready: InboundReady) -> std::io::Result<()>;
+    async fn listen_udp(&self, ready: InboundReady) -> std::io::Result<()>;
 }
 
 #[cfg(test)]

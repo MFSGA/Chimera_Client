@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
-use tracing::{error, info, warn};
+use tokio::sync::oneshot;
+use tracing::{error, info};
 
 #[cfg(feature = "anytls")]
 use crate::proxy::anytls::inbound::{
@@ -22,68 +23,80 @@ use crate::{
     proxy::{inbound::InboundHandlerTrait, socks::inbound::SocksInbound},
 };
 
+pub(crate) struct NetworkListeners {
+    pub futures: Vec<BoxFuture<'static, Result<(), crate::Error>>>,
+    pub ready: Vec<oneshot::Receiver<Result<(), String>>>,
+}
+
 pub(crate) fn build_network_listeners(
     inbound_opts: &InboundOpts,
     dispatcher: Arc<Dispatcher>,
     authenticator: ThreadSafeAuthenticator,
-) -> Option<Vec<BoxFuture<'static, Result<(), crate::Error>>>> {
+) -> Result<NetworkListeners, crate::Error> {
     let name = &inbound_opts.common_opts().name;
     let addr = inbound_opts.common_opts().listen.0;
     let port = inbound_opts.common_opts().port;
 
-    if let Some(handler) = build_handler(inbound_opts, dispatcher, authenticator) {
-        let mut runners: Vec<BoxFuture<'static, Result<(), crate::Error>>> =
-            Vec::new();
+    let handler = build_handler(inbound_opts, dispatcher, authenticator)?;
+    let mut runners: Vec<BoxFuture<'static, Result<(), crate::Error>>> = Vec::new();
+    let mut ready = Vec::new();
 
-        if handler.handle_tcp() {
-            let tcp_listener = handler.clone();
+    if handler.handle_tcp() {
+        let tcp_listener = handler.clone();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        ready.push(ready_rx);
 
-            let name = name.clone();
-            runners.push(Box::pin(async move {
-                info!("{} TCP listening at: {}:{}", name, addr, port,);
-                tcp_listener
-                    .listen_tcp()
-                    .await
-                    .inspect_err(|x| {
-                        error!("handler {} tcp listen failed: {x}", name);
-                    })
-                    .map_err(|e| e.into())
-            }));
-        }
-
-        if handler.handle_udp() {
-            let udp_listener = handler.clone();
-            let name = name.clone();
-            runners.push(Box::pin(async move {
-                info!("{} UDP listening at: {}:{}", name, addr, port,);
-                udp_listener
-                    .listen_udp()
-                    .await
-                    .inspect_err(|x| {
-                        error!("handler {} udp listen failed: {x}", name);
-                    })
-                    .map_err(|e| e.into())
-            }));
-        }
-
-        if runners.is_empty() {
-            warn!("no listener for {}", name);
-            return None;
-        }
-        Some(runners)
-    } else {
-        None
+        let name = name.clone();
+        runners.push(Box::pin(async move {
+            info!("starting {} TCP listener at {}:{}", name, addr, port);
+            tcp_listener
+                .listen_tcp(ready_tx)
+                .await
+                .inspect_err(|x| {
+                    error!("handler {} tcp listen failed: {x}", name);
+                })
+                .map_err(Into::into)
+        }));
     }
+
+    if handler.handle_udp() {
+        let udp_listener = handler.clone();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        ready.push(ready_rx);
+
+        let name = name.clone();
+        runners.push(Box::pin(async move {
+            info!("starting {} UDP listener at {}:{}", name, addr, port);
+            udp_listener
+                .listen_udp(ready_tx)
+                .await
+                .inspect_err(|x| {
+                    error!("handler {} udp listen failed: {x}", name);
+                })
+                .map_err(Into::into)
+        }));
+    }
+
+    if runners.is_empty() {
+        return Err(crate::Error::Operation(format!(
+            "inbound {name} has no supported listeners"
+        )));
+    }
+
+    Ok(NetworkListeners {
+        futures: runners,
+        ready,
+    })
 }
 
 fn build_handler(
     listener: &InboundOpts,
     dispatcher: Arc<Dispatcher>,
     authenticator: ThreadSafeAuthenticator,
-) -> Option<Arc<dyn InboundHandlerTrait>> {
+) -> Result<Arc<dyn InboundHandlerTrait>, crate::Error> {
     let fw_mark = listener.common_opts().fw_mark;
     match listener {
-        InboundOpts::Socks { common_opts, .. } => Some(Arc::new(SocksInbound::new(
+        InboundOpts::Socks { common_opts, .. } => Ok(Arc::new(SocksInbound::new(
             (common_opts.listen.0, common_opts.port).into(),
             common_opts.allow_lan,
             dispatcher,
@@ -92,7 +105,7 @@ fn build_handler(
         ))),
 
         #[cfg(feature = "http_port")]
-        InboundOpts::Http { common_opts, .. } => Some(Arc::new(HttpInbound::new(
+        InboundOpts::Http { common_opts, .. } => Ok(Arc::new(HttpInbound::new(
             (common_opts.listen.0, common_opts.port).into(),
             common_opts.allow_lan,
             dispatcher,
@@ -100,7 +113,7 @@ fn build_handler(
             fw_mark,
         ))),
         #[cfg(feature = "mixed_port")]
-        InboundOpts::Mixed { common_opts, .. } => Some(Arc::new(MixedInbound::new(
+        InboundOpts::Mixed { common_opts, .. } => Ok(Arc::new(MixedInbound::new(
             (common_opts.listen.0, common_opts.port).into(),
             common_opts.allow_lan,
             dispatcher,
@@ -116,7 +129,7 @@ fn build_handler(
             users,
         } => {
             let (users_tx, users_rx) = tokio::sync::watch::channel(users.clone());
-            Some(Arc::new(ShadowsocksInbound::new(
+            Ok(Arc::new(ShadowsocksInbound::new(
                 ShadowsocksInboundOptions {
                     addr: (common_opts.listen.0, common_opts.port).into(),
                     password: password.clone(),
@@ -140,7 +153,7 @@ fn build_handler(
             users,
         } => {
             let (_, users_rx) = tokio::sync::watch::channel(users.clone());
-            match AnytlsInbound::new(AnytlsInboundOptions {
+            AnytlsInbound::new(AnytlsInboundOptions {
                 addr: (common_opts.listen.0, common_opts.port).into(),
                 password: password.clone(),
                 certificate: certificate.clone(),
@@ -150,13 +163,9 @@ fn build_handler(
                 dispatcher,
                 fw_mark: common_opts.fw_mark,
                 users_rx,
-            }) {
-                Ok(handler) => Some(Arc::new(handler)),
-                Err(err) => {
-                    warn!("anytls inbound failed to init: {err}");
-                    None
-                }
-            }
+            })
+            .map(|handler| Arc::new(handler) as Arc<dyn InboundHandlerTrait>)
+            .map_err(Into::into)
         }
     }
 }

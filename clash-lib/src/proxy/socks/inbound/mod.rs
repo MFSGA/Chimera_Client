@@ -7,7 +7,10 @@ use crate::{
     app::dispatcher::Dispatcher,
     common::{auth::ThreadSafeAuthenticator, errors::new_io_error},
     proxy::{
-        inbound::{InboundHandlerTrait, is_inbound_client_allowed},
+        inbound::{
+            InboundHandlerTrait, InboundReady, is_inbound_client_allowed,
+            report_listener_ready,
+        },
         utils::{ToCanonical, apply_tcp_options, try_create_dualstack_tcplistener},
     },
     session::{Network, Session, Type},
@@ -61,8 +64,11 @@ impl InboundHandlerTrait for SocksInbound {
         false
     }
 
-    async fn listen_tcp(&self) -> std::io::Result<()> {
-        let listener = try_create_dualstack_tcplistener(self.addr)?;
+    async fn listen_tcp(&self, ready: InboundReady) -> std::io::Result<()> {
+        let listener = report_listener_ready(
+            ready,
+            try_create_dualstack_tcplistener(self.addr),
+        )?;
         info!("SOCKS5 TCP prepared. listening on {}", self.addr);
         loop {
             let (socket, _) = match listener.accept().await {
@@ -116,7 +122,8 @@ impl InboundHandlerTrait for SocksInbound {
         }
     }
 
-    async fn listen_udp(&self) -> io::Result<()> {
+    async fn listen_udp(&self, ready: InboundReady) -> io::Result<()> {
+        let _ = ready.send(Err("UDP is not supported".to_owned()));
         Err(new_io_error("UDP is not supported"))
     }
 }

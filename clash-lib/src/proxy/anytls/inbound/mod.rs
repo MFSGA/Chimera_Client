@@ -12,7 +12,10 @@ use crate::{
     Dispatcher,
     config::internal::listener::InboundUser,
     proxy::{
-        inbound::{InboundHandlerTrait, is_inbound_client_allowed},
+        inbound::{
+            InboundHandlerTrait, InboundReady, is_inbound_client_allowed,
+            report_listener_ready,
+        },
         utils::{ToCanonical, try_create_dualstack_tcplistener},
     },
 };
@@ -89,8 +92,11 @@ impl InboundHandlerTrait for AnytlsInbound {
         false // UDP is tunnelled over TCP; no separate UDP listener needed.
     }
 
-    async fn listen_tcp(&self) -> std::io::Result<()> {
-        let listener = try_create_dualstack_tcplistener(self.addr)?;
+    async fn listen_tcp(&self, ready: InboundReady) -> std::io::Result<()> {
+        let listener = report_listener_ready(
+            ready,
+            try_create_dualstack_tcplistener(self.addr),
+        )?;
 
         let mut users_rx = self.users_rx.clone();
         let mut user_map =
@@ -149,8 +155,9 @@ impl InboundHandlerTrait for AnytlsInbound {
         }
     }
 
-    async fn listen_udp(&self) -> std::io::Result<()> {
+    async fn listen_udp(&self, ready: InboundReady) -> std::io::Result<()> {
         // UDP is handled inside TCP connections via UoT v2; no UDP socket.
+        let _ = ready.send(Ok(()));
         Ok(())
     }
 }
