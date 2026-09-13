@@ -214,6 +214,11 @@ pub fn start_scaffold(opts: Options) -> Result<()> {
     })
 }
 
+enum InstanceStartupEvent {
+    Ready,
+    Failed(Error),
+}
+
 /// Start one runtime in a background thread with an independent shutdown token.
 /// This is primarily useful for integration tests that need an independently
 /// controlled instance. When the `tun` feature is enabled, starts that need
@@ -240,9 +245,10 @@ pub fn start_scaffold_instance(
     let token_clone = token.clone();
     let network_runtime_lease =
         NetworkRuntimeLease::acquire(uses_process_global_network_state(&config))?;
+    let (startup_tx, startup_rx) = std::sync::mpsc::channel();
 
     let handle = std::thread::spawn(move || {
-        let rt = match rt_kind {
+        let rt = match match rt_kind {
             TokioRuntime::MultiThread => tokio::runtime::Builder::new_multi_thread(),
             TokioRuntime::SingleThread => {
                 tokio::runtime::Builder::new_current_thread()
@@ -250,7 +256,14 @@ pub fn start_scaffold_instance(
         }
         .enable_all()
         .build()
-        .expect("failed to build integration-test runtime");
+        {
+            Ok(rt) => rt,
+            Err(err) => {
+                let _ =
+                    startup_tx.send(InstanceStartupEvent::Failed(Error::Io(err)));
+                return;
+            }
+        };
 
         let (log_tx, _) = broadcast::channel(100);
         let log_collector = app::logging::EventCollector::new(vec![log_tx.clone()]);
@@ -268,12 +281,30 @@ pub fn start_scaffold_instance(
             log_tx,
             token_clone,
             network_runtime_lease,
-        )) {
+            Some(startup_tx.clone()),
+        )) && let Err(send_err) =
+            startup_tx.send(InstanceStartupEvent::Failed(err))
+            && let InstanceStartupEvent::Failed(err) = send_err.0
+        {
             eprintln!("independent runtime error: {err}");
         }
     });
 
-    Ok((handle, token))
+    match startup_rx.recv() {
+        Ok(InstanceStartupEvent::Ready) => Ok((handle, token)),
+        Ok(InstanceStartupEvent::Failed(err)) => {
+            token.cancel();
+            let _ = handle.join();
+            Err(err)
+        }
+        Err(err) => {
+            token.cancel();
+            let _ = handle.join();
+            Err(Error::Operation(format!(
+                "independent runtime startup channel closed: {err}"
+            )))
+        }
+    }
 }
 
 static CRYPTO_PROVIDER_LOCK: OnceLock<()> = OnceLock::new();
@@ -460,6 +491,7 @@ pub async fn start(
         log_tx,
         shutdown_token,
         network_runtime_lease,
+        None,
     )
     .await
 }
@@ -471,6 +503,7 @@ async fn start_with_shutdown_token(
     log_tx: broadcast::Sender<LogEvent>,
     shutdown_token: tokio_util::sync::CancellationToken,
     network_runtime_lease: NetworkRuntimeLease,
+    startup_tx: Option<std::sync::mpsc::Sender<InstanceStartupEvent>>,
 ) -> Result<()> {
     let config = config.validate()?;
     setup_default_crypto_provider();
@@ -527,6 +560,15 @@ async fn start_with_shutdown_token(
         let _ = api_listener.join().await;
         components.stop_all_and_join(true).await;
         return Err(err);
+    }
+
+    if let Some(startup_tx) = startup_tx {
+        startup_tx.send(InstanceStartupEvent::Ready).map_err(|_| {
+            Error::Operation(
+                "independent runtime startup receiver dropped before readiness"
+                    .to_owned(),
+            )
+        })?;
     }
 
     let cwd_clone = cwd.clone();

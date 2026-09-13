@@ -113,6 +113,57 @@ rules:
     );
 }
 
+#[test]
+#[serial_test::serial]
+fn occupied_socks_listener_fails_instance_startup() {
+    let blocker = TcpListener::bind("127.0.0.1:0")
+        .expect("failed to reserve occupied SOCKS port");
+    let socks_port = blocker.local_addr().unwrap().port();
+    let api_port = available_port();
+    let config = format!(
+        r#"
+allow-lan: false
+bind-address: 127.0.0.1
+socks-port: {socks_port}
+mode: direct
+log-level: error
+mmdb: null
+external-controller: 127.0.0.1:{api_port}
+dns:
+  enable: false
+tun:
+  enable: false
+proxies: []
+rules:
+  - MATCH,DIRECT
+"#
+    );
+    let cwd =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
+
+    let err = match clash_lib::start_scaffold_instance(Options {
+        config: Config::Str(config),
+        cwd: Some(cwd.to_string_lossy().to_string()),
+        rt: None,
+        log_file: None,
+        config_path: None,
+    }) {
+        Ok((handle, token)) => {
+            token.cancel();
+            let _ = handle.join();
+            panic!("occupied SOCKS listener must fail instance startup");
+        }
+        Err(err) => err,
+    };
+
+    let message = err.to_string();
+    assert!(message.contains("SOCKS-IN"), "unexpected error: {message}");
+    assert!(
+        message.contains("failed to become ready"),
+        "unexpected error: {message}"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
 async fn test_provider_not_found() {
