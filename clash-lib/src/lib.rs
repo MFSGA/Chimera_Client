@@ -1102,6 +1102,7 @@ async fn create_components(
     let cache_store = profile::ThreadSafeCacheFile::new(
         cwd.join("cache.db").as_path().to_str().unwrap(),
         config.profile.store_selected,
+        config.profile.store_smart_stats,
     );
 
     let system_resolver = Arc::new(

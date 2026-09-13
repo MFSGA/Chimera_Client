@@ -194,8 +194,10 @@ mod tests {
     #[test]
     fn traffic_tracking_uses_session_identity() {
         let mut state = SmartState::new();
-        let mut session = Session::default();
-        session.destination = SocksAddr::Domain("example.com".to_string(), 443);
+        let session = Session {
+            destination: SocksAddr::Domain("example.com".to_string(), 443),
+            ..Default::default()
+        };
 
         state.start_traffic_tracking(&session);
         state.record_traffic(&session, 123, 456);

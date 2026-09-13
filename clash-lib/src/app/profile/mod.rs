@@ -20,16 +20,17 @@ struct Db {
 pub struct ThreadSafeCacheFile(Arc<tokio::sync::RwLock<CacheFile>>);
 
 impl ThreadSafeCacheFile {
-    pub fn new(path: &str, store_selected: bool) -> Self {
+    pub fn new(path: &str, store_selected: bool, store_smart_stats: bool) -> Self {
         let store = Arc::new(tokio::sync::RwLock::new(CacheFile::new(
             path,
             store_selected,
+            store_smart_stats,
         )));
 
         let path = path.to_string();
         let store_weak = Arc::downgrade(&store);
 
-        if store_selected {
+        if store_selected || store_smart_stats {
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
@@ -100,14 +101,26 @@ impl ThreadSafeCacheFile {
         group_name: &str,
         stats: crate::proxy::group::smart::state::SmartStateData,
     ) {
-        self.0.write().await.set_smart_stats(group_name, stats);
+        let mut cache = self.0.write().await;
+        if cache.store_smart_stats() {
+            cache.set_smart_stats(group_name, stats);
+        }
     }
 
     pub async fn get_smart_stats(
         &self,
         group_name: &str,
     ) -> Option<crate::proxy::group::smart::state::SmartStateData> {
-        self.0.read().await.get_smart_stats(group_name)
+        let cache = self.0.read().await;
+        if cache.store_smart_stats() {
+            cache.get_smart_stats(group_name)
+        } else {
+            None
+        }
+    }
+
+    pub async fn stores_smart_stats(&self) -> bool {
+        self.0.read().await.store_smart_stats()
     }
 }
 
@@ -115,10 +128,11 @@ struct CacheFile {
     db: Db,
 
     store_selected: bool,
+    store_smart_stats: bool,
 }
 
 impl CacheFile {
-    pub fn new(path: &str, store_selected: bool) -> Self {
+    pub fn new(path: &str, store_selected: bool, store_smart_stats: bool) -> Self {
         let db = match std::fs::read_to_string(path) {
             Ok(s) => match serde_yaml::from_str(&s) {
                 Ok(db) => db,
@@ -148,11 +162,19 @@ impl CacheFile {
             }
         };
 
-        Self { db, store_selected }
+        Self {
+            db,
+            store_selected,
+            store_smart_stats,
+        }
     }
 
     pub fn store_selected(&self) -> bool {
         self.store_selected
+    }
+
+    pub fn store_smart_stats(&self) -> bool {
+        self.store_smart_stats
     }
 
     pub fn set_selected(&mut self, group: &str, server: &str) {
@@ -202,13 +224,13 @@ impl CacheFile {
 mod tests {
     use crate::proxy::group::smart::state::SmartState;
 
-    use super::ThreadSafeCacheFile;
+    use super::*;
 
     #[tokio::test]
     async fn smart_stats_round_trip_uses_isolated_cache() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("smart-cache.yaml");
-        let cache = ThreadSafeCacheFile::new(path.to_str().unwrap(), false);
+        let cache = ThreadSafeCacheFile::new(path.to_str().unwrap(), false, true);
 
         let mut state = SmartState::new();
         state.record_connection_result("proxy-a", "example.com", None, 250.0, false);
@@ -224,11 +246,22 @@ mod tests {
         assert!(restored.site_stats["proxy-a"].contains_key("example.com"));
         assert!(cache.get_smart_stats("missing").await.is_none());
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    #[tokio::test]
+    async fn disabled_smart_stats_are_not_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("smart-cache-disabled.yaml");
+        let cache = ThreadSafeCacheFile::new(path.to_str().unwrap(), false, false);
+        let mut state = SmartState::new();
+        state.record_connection_result("proxy-a", "example.com", None, 250.0, false);
+
+        cache
+            .set_smart_stats("smart-group", state.export_data())
+            .await;
+
+        assert!(!cache.stores_smart_stats().await);
+        assert!(cache.get_smart_stats("smart-group").await.is_none());
+    }
 
     #[tokio::test]
     async fn background_flush_does_not_keep_cache_alive() {
@@ -237,6 +270,7 @@ mod tests {
         let cache = ThreadSafeCacheFile::new(
             path.to_str().expect("cache path must be utf-8"),
             true,
+            false,
         );
         let weak = Arc::downgrade(&cache.0);
 

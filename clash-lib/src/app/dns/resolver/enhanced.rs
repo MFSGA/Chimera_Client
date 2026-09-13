@@ -1429,6 +1429,7 @@ mod tests {
         let cache_store = crate::app::profile::ThreadSafeCacheFile::new(
             temp_dir.path().join("cache.db").to_str().unwrap(),
             false,
+            false,
         );
         let mut config = make_proxy_nameserver_config();
         config.nameserver = vec![NameServer {
@@ -1461,6 +1462,7 @@ mod tests {
         let cache_store = crate::app::profile::ThreadSafeCacheFile::new(
             temp_dir.path().join("cache.db").to_str().unwrap(),
             false,
+            false,
         );
 
         let resolver = EnhancedResolver::new(
@@ -1482,6 +1484,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let cache_store = crate::app::profile::ThreadSafeCacheFile::new(
             temp_dir.path().join("cache.db").to_str().unwrap(),
+            false,
             false,
         );
         let mut config = make_proxy_nameserver_config();
@@ -1506,6 +1509,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let cache_store = crate::app::profile::ThreadSafeCacheFile::new(
             temp_dir.path().join("cache.db").to_str().unwrap(),
+            false,
             false,
         );
         let outbounds = make_outbound_registry(&[
@@ -1540,6 +1544,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let cache_store = crate::app::profile::ThreadSafeCacheFile::new(
             temp_dir.path().join("cache.db").to_str().unwrap(),
+            false,
             false,
         );
 

@@ -60,6 +60,15 @@ pub struct Handler {
     providers: Vec<ThreadSafeProxyProvider>,
     proxy_manager: ProxyManager,
     smart_state: Arc<tokio::sync::Mutex<SmartState>>,
+    cache_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for Handler {
+    fn drop(&mut self) {
+        if let Some(task) = self.cache_task.take() {
+            task.abort();
+        }
+    }
 }
 
 impl std::fmt::Debug for Handler {
@@ -73,53 +82,42 @@ impl std::fmt::Debug for Handler {
 }
 
 impl Handler {
-    pub fn new_with_cache(
+    pub async fn new_with_cache(
         opts: HandlerOptions,
         providers: Vec<ThreadSafeProxyProvider>,
         proxy_manager: ProxyManager,
         cache_store: ThreadSafeCacheFile,
     ) -> Self {
         let group_name = opts.name.clone();
-        let thread_group_name = group_name.clone();
-        let thread_cache_store = cache_store.clone();
-        let (tx, rx) = std::sync::mpsc::sync_channel(0);
+        info!("{} attempting to load smart stats from cache", group_name);
+        let smart_state =
+            Arc::new(tokio::sync::Mutex::new(SmartState::new_with_imported_data(
+                cache_store.get_smart_stats(&group_name).await,
+            )));
 
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new()
-                .expect("failed to create smart cache runtime");
-            let state = rt.block_on(async {
-                info!(
-                    "{} attempting to load smart stats from cache",
-                    thread_group_name
-                );
-                SmartState::new_with_imported_data(
-                    thread_cache_store.get_smart_stats(&thread_group_name).await,
-                )
-            });
-            tx.send(state).expect("failed to send smart state");
-        });
+        let cache_task = if cache_store.stores_smart_stats().await {
+            let cache_store = cache_store.clone();
+            let state = Arc::clone(&smart_state);
+            Some(tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(tokio::time::Duration::from_secs(30));
+                loop {
+                    interval.tick().await;
+                    let data = state.lock().await.export_data();
+                    cache_store.set_smart_stats(&group_name, data).await;
+                }
+            }))
+        } else {
+            None
+        };
 
-        let smart_state = rx.recv().expect("failed to receive smart state");
-        let handler = Self {
+        Self {
             opts,
             providers,
             proxy_manager,
-            smart_state: Arc::new(tokio::sync::Mutex::new(smart_state)),
-        };
-
-        let cache_store = cache_store.clone();
-        let state = Arc::clone(&handler.smart_state);
-        tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(tokio::time::Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                let data = state.lock().await.export_data();
-                cache_store.set_smart_stats(&group_name, data).await;
-            }
-        });
-
-        handler
+            smart_state,
+            cache_task,
+        }
     }
 
     fn name(&self) -> &str {
@@ -131,6 +129,15 @@ impl Handler {
     }
 
     async fn pick_smart(&self, sess: &Session) -> Option<AnyOutboundHandler> {
+        let excluded = HashSet::new();
+        self.pick_smart_excluding(sess, &excluded).await
+    }
+
+    async fn pick_smart_excluding(
+        &self,
+        sess: &Session,
+        excluded: &HashSet<String>,
+    ) -> Option<AnyOutboundHandler> {
         let proxies = self.get_proxies(false).await;
         if proxies.is_empty() {
             return None;
@@ -153,6 +160,9 @@ impl Handler {
 
         for proxy in proxies {
             let name = proxy.name().to_string();
+            if excluded.contains(&name) {
+                continue;
+            }
             let delay = self
                 .proxy_manager
                 .last_delay(&name)
@@ -308,14 +318,11 @@ impl Handler {
         let max_retries = self.calculate_max_retries(&site).await;
         let mut retries = 0;
         while retries < max_retries {
-            let Some(proxy) = self.pick_smart(sess).await else {
+            let Some(proxy) = self.pick_smart_excluding(sess, &tried).await else {
                 break;
             };
             let name = proxy.name().to_string();
-            if !tried.insert(name.clone()) {
-                retries += 1;
-                continue;
-            }
+            tried.insert(name.clone());
 
             let start = Instant::now();
             match proxy.connect_stream(sess, resolver.clone()).await {
@@ -437,19 +444,75 @@ impl GroupProxyAPIResponse for Handler {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use tokio::sync::RwLock;
 
     use super::*;
     use crate::{
-        app::remote_content_manager::{
-            healthcheck::HealthCheck,
-            providers::proxy_provider::plain_provider::PlainProvider,
+        app::{
+            dispatcher::{BoxedChainedStream, ChainedStreamWrapper},
+            remote_content_manager::{
+                healthcheck::HealthCheck,
+                providers::proxy_provider::plain_provider::PlainProvider,
+            },
         },
         proxy::utils::test_utils::noop::{NoopOutboundHandler, NoopResolver},
         session::SocksAddr,
     };
+
+    #[derive(Debug)]
+    struct RetryTestOutbound {
+        name: String,
+        fail: bool,
+        attempts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl DialWithConnector for RetryTestOutbound {}
+
+    #[async_trait]
+    impl OutboundHandler for RetryTestOutbound {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn proto(&self) -> OutboundType {
+            OutboundType::Direct
+        }
+
+        async fn support_udp(&self) -> bool {
+            false
+        }
+
+        async fn connect_stream(
+            &self,
+            _sess: &Session,
+            _resolver: ThreadSafeDNSResolver,
+        ) -> io::Result<BoxedChainedStream> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(io::Error::other("intentional retry test failure"));
+            }
+            let (client, _server) = tokio::io::duplex(64);
+            Ok(Box::new(ChainedStreamWrapper::new(client)))
+        }
+
+        async fn connect_datagram(
+            &self,
+            _sess: &Session,
+            _resolver: ThreadSafeDNSResolver,
+        ) -> io::Result<BoxedChainedDatagram> {
+            Err(io::Error::other("retry test does not use UDP"))
+        }
+
+        async fn support_connector(&self) -> ConnectorType {
+            ConnectorType::None
+        }
+    }
 
     fn test_handler(
         proxy_manager: ProxyManager,
@@ -464,6 +527,7 @@ mod tests {
             providers,
             proxy_manager,
             smart_state: Arc::new(tokio::sync::Mutex::new(SmartState::new())),
+            cache_task: None,
         }
     }
 
@@ -496,10 +560,71 @@ mod tests {
             PlainProvider::new("test".to_string(), proxies, health).unwrap(),
         ));
         let handler = test_handler(manager, vec![provider]);
-        let mut session = Session::default();
-        session.destination = SocksAddr::Domain("example.com".to_string(), 443);
+        let session = Session {
+            destination: SocksAddr::Domain("example.com".to_string(), 443),
+            ..Default::default()
+        };
 
         assert_eq!(handler.pick_smart(&session).await.unwrap().name(), "fast");
+    }
+
+    #[tokio::test]
+    async fn retry_skips_failed_proxy_and_uses_next_candidate() {
+        let resolver: ThreadSafeDNSResolver = Arc::new(NoopResolver);
+        let manager = ProxyManager::new(resolver.clone(), None);
+        let failed_attempts = Arc::new(AtomicUsize::new(0));
+        let success_attempts = Arc::new(AtomicUsize::new(0));
+        let proxies: Vec<AnyOutboundHandler> = vec![
+            Arc::new(RetryTestOutbound {
+                name: "fast-but-broken".to_string(),
+                fail: true,
+                attempts: failed_attempts.clone(),
+            }),
+            Arc::new(RetryTestOutbound {
+                name: "slower-but-working".to_string(),
+                fail: false,
+                attempts: success_attempts.clone(),
+            }),
+        ];
+        manager
+            .report_delay(
+                "fast-but-broken",
+                true,
+                Some(std::time::Duration::from_millis(10)),
+            )
+            .await;
+        manager
+            .report_delay(
+                "slower-but-working",
+                true,
+                Some(std::time::Duration::from_millis(200)),
+            )
+            .await;
+
+        let health = HealthCheck::new(
+            proxies.clone(),
+            "http://example.invalid".to_string(),
+            0,
+            true,
+            manager.clone(),
+        );
+        let provider: ThreadSafeProxyProvider = Arc::new(RwLock::new(
+            PlainProvider::new("test".to_string(), proxies, health).unwrap(),
+        ));
+        let mut handler = test_handler(manager, vec![provider]);
+        handler.opts.max_retries = Some(2);
+        let session = Session {
+            destination: SocksAddr::Domain("example.com".to_string(), 443),
+            ..Default::default()
+        };
+
+        handler
+            .connect_stream(&session, resolver)
+            .await
+            .expect("smart retry should fail over to the next proxy");
+
+        assert_eq!(failed_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(success_attempts.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -510,6 +635,40 @@ mod tests {
 
         handler.opts.max_retries = Some(3);
         assert_eq!(handler.calculate_max_retries("example.com").await, 3);
+    }
+
+    #[tokio::test]
+    async fn dropping_handler_aborts_cache_task() {
+        let resolver: ThreadSafeDNSResolver = Arc::new(NoopResolver);
+        let manager = ProxyManager::new(resolver, None);
+        let dir = tempfile::tempdir().expect("smart cache tempdir");
+        let cache = ThreadSafeCacheFile::new(
+            dir.path().join("cache.yaml").to_str().unwrap(),
+            false,
+            true,
+        );
+        let handler = Handler::new_with_cache(
+            HandlerOptions {
+                name: "smart".to_string(),
+                udp: true,
+                ..Default::default()
+            },
+            vec![],
+            manager,
+            cache,
+        )
+        .await;
+        let abort_handle = handler
+            .cache_task
+            .as_ref()
+            .expect("smart cache task should run when persistence is enabled")
+            .abort_handle();
+        assert!(!abort_handle.is_finished());
+
+        drop(handler);
+        tokio::task::yield_now().await;
+
+        assert!(abort_handle.is_finished());
     }
 
     #[tokio::test]

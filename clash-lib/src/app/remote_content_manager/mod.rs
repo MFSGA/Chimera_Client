@@ -1183,9 +1183,11 @@ mod smart_metric_tests {
     #[tokio::test]
     async fn fallback_tuning_prioritizes_udp_latency() {
         let manager = manager();
-        let mut session = Session::default();
-        session.network = Network::Udp;
-        session.destination = SocksAddr::Domain("game.example".to_string(), 9999);
+        let session = Session {
+            network: Network::Udp,
+            destination: SocksAddr::Domain("game.example".to_string(), 9999),
+            ..Default::default()
+        };
 
         assert_eq!(
             manager.get_site_tuning(&session).await,
@@ -1201,8 +1203,10 @@ mod smart_metric_tests {
     #[tokio::test]
     async fn fallback_tuning_matches_http_and_file_transfer_ports() {
         let manager = manager();
-        let mut session = Session::default();
-        session.destination = SocksAddr::Domain("web.example".to_string(), 443);
+        let mut session = Session {
+            destination: SocksAddr::Domain("web.example".to_string(), 443),
+            ..Default::default()
+        };
         assert_eq!(
             manager.get_site_tuning(&session).await.delay_weight,
             Some(0.7)
@@ -1240,18 +1244,19 @@ mod smart_metric_tests {
     #[tokio::test]
     async fn large_download_uses_file_download_tuning_and_size_scaling() {
         let manager = manager();
-        let mut session = Session::default();
-        session.destination =
-            SocksAddr::Domain("releases.github.com".to_string(), 443);
-        session.traffic_stats = Some(TrafficStats {
-            bytes_uploaded: 1_000_000,
-            bytes_downloaded: 200_000_000,
-            connection_duration: Duration::from_secs(600),
-            average_throughput: 10_000_000.0,
-            peak_throughput: 15_000_000.0,
-            request_frequency: 1.0,
-            is_bidirectional: false,
-        });
+        let session = Session {
+            destination: SocksAddr::Domain("releases.github.com".to_string(), 443),
+            traffic_stats: Some(TrafficStats {
+                bytes_uploaded: 1_000_000,
+                bytes_downloaded: 200_000_000,
+                connection_duration: Duration::from_secs(600),
+                average_throughput: 10_000_000.0,
+                peak_throughput: 15_000_000.0,
+                request_frequency: 1.0,
+                is_bidirectional: false,
+            }),
+            ..Default::default()
+        };
 
         let pattern = manager
             .analyze_traffic_pattern(

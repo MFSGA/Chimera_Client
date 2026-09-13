@@ -813,7 +813,8 @@ impl OutboundManager {
                         providers,
                         proxy_manager.clone(),
                         cache_store.clone(),
-                    );
+                    )
+                    .await;
                     handlers.insert(proto.name.clone(), Arc::new(smart_handler));
                 }
 
