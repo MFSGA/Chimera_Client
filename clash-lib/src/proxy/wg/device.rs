@@ -158,6 +158,23 @@ impl DeviceManager {
         Ok(UdpPair::new(read_pair.1, write_pair.0))
     }
 
+    fn build_dns_query(
+        host: &str,
+        rtype: hickory_proto::rr::RecordType,
+    ) -> Option<Vec<u8>> {
+        let mut msg = hickory_proto::op::Message::query();
+        let mut q = hickory_proto::op::Query::new();
+        let name = hickory_proto::rr::Name::from_str_relaxed(host)
+            .ok()?
+            .append_domain(&hickory_proto::rr::Name::root())
+            .ok()?;
+        q.set_name(name);
+        q.set_query_type(rtype);
+        msg.add_query(q);
+        msg.metadata.recursion_desired = true;
+        msg.to_vec().ok()
+    }
+
     pub async fn look_up_dns(
         &self,
         host: &str,
@@ -172,30 +189,15 @@ impl DeviceManager {
             server: SocketAddr,
             mut socket: UdpPair,
         ) -> Option<IpAddr> {
-            let mut msg = hickory_proto::op::Message::query();
-
-            msg.add_query({
-                let mut q = hickory_proto::op::Query::new();
-                let name = hickory_proto::rr::Name::from_str_relaxed(host)
-                    .unwrap()
-                    .append_domain(&hickory_proto::rr::Name::root())
-                    .unwrap();
-                q.set_name(name);
-                q.set_query_type(rtype);
-                q
-            });
-
-            msg.metadata.recursion_desired = true;
-
             let pkt = UdpPacket::new(
-                msg.to_vec().unwrap(),
+                DeviceManager::build_dns_query(host, rtype)?,
                 SocksAddr::any_ipv4(),
                 server.into(),
             );
 
             socket.feed(pkt).await.ok()?;
             socket.flush().await.ok()?;
-            trace!("sent dns query: {:?}", msg);
+            trace!(host, record_type = ?rtype, "sent WireGuard DNS query");
 
             let pkt =
                 match tokio::time::timeout(Duration::from_secs(5), socket.next())
@@ -880,5 +882,24 @@ mod tests {
             Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)))
         );
         assert_eq!(manager.local_ip_for(IpAddr::V6(Ipv6Addr::LOCALHOST)), None);
+    }
+
+    #[test]
+    fn invalid_remote_dns_name_is_rejected_without_panicking() {
+        let invalid = format!("{}.example", "a".repeat(64));
+        assert!(
+            DeviceManager::build_dns_query(
+                &invalid,
+                hickory_proto::rr::RecordType::A
+            )
+            .is_none()
+        );
+        assert!(
+            DeviceManager::build_dns_query(
+                "example.com",
+                hickory_proto::rr::RecordType::A
+            )
+            .is_some()
+        );
     }
 }
