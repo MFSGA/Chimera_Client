@@ -225,7 +225,8 @@ impl WireguardTunnel {
             {
                 Some(item) => item,
                 None => {
-                    continue;
+                    trace!("wireguard receive stream closed");
+                    break;
                 }
             };
 
