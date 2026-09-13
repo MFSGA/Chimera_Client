@@ -56,10 +56,15 @@ pub struct HandlerOptions {
 
 struct Inner {
     device_manager: Arc<device::DeviceManager>,
-    #[allow(unused)]
     wg_handle: tokio::task::JoinHandle<()>,
-    #[allow(unused)]
     device_manager_handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.wg_handle.abort();
+        self.device_manager_handle.abort();
+    }
 }
 
 pub struct Handler {
@@ -304,7 +309,15 @@ impl OutboundHandler for Handler {
                 .device_manager
                 .look_up_dns(
                     &sess.destination.host(),
-                    (server.parse::<IpAddr>().unwrap(), 53).into(),
+                    (
+                        server.parse::<IpAddr>().map_err(|err| {
+                            new_io_error(format!(
+                                "invalid WireGuard DNS server {server:?}: {err}"
+                            ))
+                        })?,
+                        53,
+                    )
+                        .into(),
                 )
                 .await
                 .ok_or(new_io_error("invalid remote address"))?
@@ -318,7 +331,7 @@ impl OutboundHandler for Handler {
 
         let remote = (ip, sess.destination.port()).into();
 
-        let socket = inner.device_manager.new_tcp_socket(remote).await;
+        let socket = inner.device_manager.new_tcp_socket(remote).await?;
         let chained = ChainedStreamWrapper::new(socket);
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
@@ -335,7 +348,7 @@ impl OutboundHandler for Handler {
             .await
             .map_err(map_io_error)?;
 
-        let socket = inner.device_manager.new_udp_socket().await;
+        let socket = inner.device_manager.new_udp_socket().await?;
         let chained = ChainedDatagramWrapper::new(socket);
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
@@ -361,6 +374,65 @@ impl PlainProxyAPIResponse for Handler {
             Box::new(self.opts.public_key.clone()) as _,
         );
         m
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use crate::app::dns::MockClashResolver;
+
+    use super::*;
+
+    struct TaskDropGuard(Arc<AtomicUsize>);
+
+    impl Drop for TaskDropGuard {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn pending_task(dropped: Arc<AtomicUsize>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let _guard = TaskDropGuard(dropped);
+            std::future::pending::<()>().await;
+        })
+    }
+
+    #[tokio::test]
+    async fn dropping_inner_aborts_background_tasks() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let wg_handle = pending_task(dropped.clone());
+        let device_manager_handle = pending_task(dropped.clone());
+        tokio::task::yield_now().await;
+
+        let (_packet_notifier_tx, packet_notifier_rx) =
+            tokio::sync::mpsc::channel(1);
+        let device_manager = Arc::new(device::DeviceManager::new(
+            Ipv4Addr::LOCALHOST,
+            None,
+            Arc::new(MockClashResolver::new()),
+            vec![],
+            packet_notifier_rx,
+        ));
+
+        drop(Inner {
+            device_manager,
+            wg_handle,
+            device_manager_handle,
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while dropped.load(Ordering::SeqCst) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping WireGuard inner state should abort both background tasks");
     }
 }
 

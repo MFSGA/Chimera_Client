@@ -114,7 +114,10 @@ impl DeviceManager {
         }
     }
 
-    pub async fn new_tcp_socket(&self, remote: SocketAddr) -> SocketPair {
+    pub async fn new_tcp_socket(
+        &self,
+        remote: SocketAddr,
+    ) -> std::io::Result<SocketPair> {
         let socket = Self::new_client_socket();
         let read_pair = tokio::sync::mpsc::channel(1024);
         let write_pair = tokio::sync::mpsc::channel(1024);
@@ -122,11 +125,16 @@ impl DeviceManager {
         self.socket_notifier
             .send(Socket::Tcp(socket, remote, read_pair.0, write_pair.1))
             .await
-            .unwrap();
-        SocketPair::new(read_pair.1, write_pair.0)
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "WireGuard device manager stopped",
+                )
+            })?;
+        Ok(SocketPair::new(read_pair.1, write_pair.0))
     }
 
-    pub async fn new_udp_socket(&self) -> UdpPair {
+    pub async fn new_udp_socket(&self) -> std::io::Result<UdpPair> {
         let socket = Self::new_client_datagram();
         let read_pair = tokio::sync::mpsc::channel(1024);
         let write_pair = tokio::sync::mpsc::channel(1024);
@@ -134,8 +142,13 @@ impl DeviceManager {
         self.socket_notifier
             .send(Socket::Udp(socket, read_pair.0, write_pair.1))
             .await
-            .unwrap();
-        UdpPair::new(read_pair.1, write_pair.0)
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "WireGuard device manager stopped",
+                )
+            })?;
+        Ok(UdpPair::new(read_pair.1, write_pair.0))
     }
 
     pub async fn look_up_dns(
@@ -225,10 +238,10 @@ impl DeviceManager {
             None
         }
 
-        let socket = self.new_udp_socket().await;
+        let socket = self.new_udp_socket().await.ok()?;
         let v4_query = query(hickory_proto::rr::RecordType::A, host, server, socket);
         if self.addr_v6.is_some() {
-            let socket = self.new_udp_socket().await;
+            let socket = self.new_udp_socket().await.ok()?;
             let v6_query =
                 query(hickory_proto::rr::RecordType::AAAA, host, server, socket);
             match tokio::time::timeout(
@@ -309,13 +322,18 @@ impl DeviceManager {
                                         }
                                     };
                                     trace!("sending {} bytes", data.len());
-                                    device_sender.send(Transfer::Tcp(handle, data, true)).await.unwrap();
+                                    if device_sender
+                                        .send(Transfer::Tcp(handle, data, true))
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
                                 }
                                 trace!("socket {} closed, sending close signal", handle);
-                                device_sender
+                                let _ = device_sender
                                     .send(Transfer::Tcp(handle, Vec::new().into(), false))
-                                    .await
-                                    .unwrap();
+                                    .await;
                             });
 
                             socket_pairs.insert(handle, SenderType::Tcp(sender));
@@ -334,17 +352,23 @@ impl DeviceManager {
                                         }
                                     };
 
-                                    device_sender
+                                    if device_sender
                                         .send(Transfer::Udp(handle, data, true))
                                         .await
-                                        .unwrap();
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
                                 }
 
                                 trace!("socket {} closed, sending close signal", handle);
-                                device_sender
-                                    .send(Transfer::Udp(handle, UdpPacket::default() , false))
-                                    .await
-                                    .unwrap();
+                                let _ = device_sender
+                                    .send(Transfer::Udp(
+                                        handle,
+                                        UdpPacket::default(),
+                                        false,
+                                    ))
+                                    .await;
                             });
 
                             socket_pairs.insert(handle, SenderType::Udp(sender));
@@ -668,7 +692,9 @@ impl VirtualIpDevice {
 
                 match packet_receiver.recv().instrument(span).await {
                     Some((proto, data)) => {
-                        inner_packet_sender.send((proto, data)).await.unwrap();
+                        if inner_packet_sender.send((proto, data)).await.is_err() {
+                            break;
+                        }
                         let _ = packet_notifier.try_send(());
                     }
                     _ => {
