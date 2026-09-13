@@ -89,6 +89,35 @@ impl Handler {
         }
     }
 
+    pub fn try_new(opts: HandlerOptions) -> Result<Self, Error> {
+        Self::validate_options(&opts)?;
+        Ok(Self::new(opts))
+    }
+
+    fn parse_key(value: &str, kind: &str) -> Result<KeyBytes, Error> {
+        value.parse::<KeyBytes>().map_err(|err| {
+            Error::InvalidConfig(format!("invalid WireGuard {kind}: {err}"))
+        })
+    }
+
+    fn validate_options(opts: &HandlerOptions) -> Result<(), Error> {
+        Self::parse_key(&opts.private_key, "private key")?;
+        Self::parse_key(&opts.public_key, "public key")?;
+        if let Some(key) = opts.pre_shared_key.as_deref() {
+            Self::parse_key(key, "pre-shared key")?;
+        }
+        if let Some(servers) = &opts.dns {
+            for server in servers {
+                server.parse::<IpAddr>().map_err(|err| {
+                    Error::InvalidConfig(format!(
+                        "invalid WireGuard DNS server {server:?}: {err}"
+                    ))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     /// this is a one time initialization, however in theory sess.so_mark
     /// and sess.iface should be all the same
     /// ideally we move the so_mark and iface to a global context
@@ -129,25 +158,27 @@ impl Handler {
 
                 let wg = wireguard::WireguardTunnel::new(
                     Config {
-                        private_key: self
-                            .opts
-                            .private_key
-                            .parse::<KeyBytes>()
-                            .unwrap()
-                            .0
-                            .into(),
-                        endpoint_public_key: self
-                            .opts
-                            .public_key
-                            .parse::<KeyBytes>()
-                            .unwrap()
-                            .0
-                            .into(),
+                        private_key: Self::parse_key(
+                            &self.opts.private_key,
+                            "private key",
+                        )?
+                        .0
+                        .into(),
+                        endpoint_public_key: Self::parse_key(
+                            &self.opts.public_key,
+                            "public key",
+                        )?
+                        .0
+                        .into(),
                         pre_shared_key: self
                             .opts
                             .pre_shared_key
-                            .as_ref()
-                            .map(|s| s.parse::<KeyBytes>().unwrap().0.into()),
+                            .as_deref()
+                            .map(|s| {
+                                Self::parse_key(s, "pre-shared key")
+                                    .map(|key| key.0.into())
+                            })
+                            .transpose()?,
                         remote_endpoint: (server_ip, self.opts.port).into(),
                         source_peer_ip: self.opts.ip,
                         source_peer_ipv6: self.opts.ipv6,
@@ -195,10 +226,17 @@ impl Handler {
                                 server
                                     .iter()
                                     .map(|s| {
-                                        (s.parse::<IpAddr>().unwrap(), 53).into()
+                                        s.parse::<IpAddr>()
+                                            .map(|ip| (ip, 53).into())
+                                            .map_err(|err| {
+                                                Error::InvalidConfig(format!(
+                                                    "invalid WireGuard DNS server {s:?}: {err}"
+                                                ))
+                                            })
                                     })
-                                    .collect::<Vec<_>>()
+                                    .collect::<Result<Vec<_>, _>>()
                             })
+                            .transpose()?
                             .unwrap_or_default()
                     } else {
                         vec![]
