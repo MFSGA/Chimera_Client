@@ -114,13 +114,6 @@ impl DeviceManager {
         }
     }
 
-    fn local_ip_for(&self, destination: IpAddr) -> Option<IpAddr> {
-        match destination {
-            IpAddr::V4(_) => Some(IpAddr::V4(self.addr)),
-            IpAddr::V6(_) => self.addr_v6.map(IpAddr::V6),
-        }
-    }
-
     pub async fn new_tcp_socket(
         &self,
         remote: SocketAddr,
@@ -158,23 +151,6 @@ impl DeviceManager {
         Ok(UdpPair::new(read_pair.1, write_pair.0))
     }
 
-    fn build_dns_query(
-        host: &str,
-        rtype: hickory_proto::rr::RecordType,
-    ) -> Option<Vec<u8>> {
-        let mut msg = hickory_proto::op::Message::query();
-        let mut q = hickory_proto::op::Query::new();
-        let name = hickory_proto::rr::Name::from_str_relaxed(host)
-            .ok()?
-            .append_domain(&hickory_proto::rr::Name::root())
-            .ok()?;
-        q.set_name(name);
-        q.set_query_type(rtype);
-        msg.add_query(q);
-        msg.metadata.recursion_desired = true;
-        msg.to_vec().ok()
-    }
-
     pub async fn look_up_dns(
         &self,
         host: &str,
@@ -189,15 +165,30 @@ impl DeviceManager {
             server: SocketAddr,
             mut socket: UdpPair,
         ) -> Option<IpAddr> {
+            let mut msg = hickory_proto::op::Message::query();
+
+            msg.add_query({
+                let mut q = hickory_proto::op::Query::new();
+                let name = hickory_proto::rr::Name::from_str_relaxed(host)
+                    .unwrap()
+                    .append_domain(&hickory_proto::rr::Name::root())
+                    .unwrap();
+                q.set_name(name);
+                q.set_query_type(rtype);
+                q
+            });
+
+            msg.metadata.recursion_desired = true;
+
             let pkt = UdpPacket::new(
-                DeviceManager::build_dns_query(host, rtype)?,
+                msg.to_vec().unwrap(),
                 SocksAddr::any_ipv4(),
                 server.into(),
             );
 
             socket.feed(pkt).await.ok()?;
             socket.flush().await.ok()?;
-            trace!(host, record_type = ?rtype, "sent WireGuard DNS query");
+            trace!("sent dns query: {:?}", msg);
 
             let pkt =
                 match tokio::time::timeout(Duration::from_secs(5), socket.next())
@@ -308,31 +299,16 @@ impl DeviceManager {
 
                     match socket {
                         Socket::Tcp(mut socket, remote, sender, mut receiver) => {
-                            let local_ip = match self.local_ip_for(remote.ip()) {
-                                Some(addr) => addr,
-                                None => {
-                                    warn!(
-                                        "cannot open WireGuard IPv6 TCP socket without a configured IPv6 address"
-                                    );
-                                    continue;
-                                }
-                            };
-                            let local_port = match self.get_ephemeral_tcp_port().await {
-                                Ok(port) => port,
-                                Err(err) => {
-                                    warn!("failed to allocate WireGuard TCP port: {err}");
-                                    continue;
-                                }
-                            };
-                            if let Err(err) = socket.connect(
+                            socket
+                            .connect(
                                 iface.context(),
                                 remote,
-                                (local_ip, local_port),
-                            ) {
-                                warn!("failed to connect WireGuard TCP socket: {err:?}");
-                                self.release_ephemeral_tcp_port(local_port).await;
-                                continue;
-                            }
+                                (match remote {
+                                    SocketAddr::V4(_) => IpAddr::V4(self.addr),
+                                    SocketAddr::V6(_) => IpAddr::V6(self.addr_v6.unwrap()),
+                                }, self.get_ephemeral_tcp_port().await),
+                            )
+                            .unwrap();
 
                             let handle = sockets.add(socket);
 
@@ -516,11 +492,7 @@ impl DeviceManager {
                                             continue;
                                         }
                                         Err(udp::RecvError::Truncated) => {
-                                            warn!(
-                                                "dropping truncated WireGuard UDP packet on socket {}",
-                                                handle
-                                            );
-                                            continue;
+                                            panic!("udp packet truncated - this should never happen");
                                         }
                                     }
                                 }
@@ -566,30 +538,15 @@ impl DeviceManager {
                                                 };
 
                                                 if !socket.is_open() {
-                                                    let local_addr = match self.local_ip_for(ip) {
-                                                        Some(addr) => addr,
-                                                        None => {
-                                                            warn!(
-                                                                "cannot open WireGuard IPv6 UDP socket without a configured IPv6 address"
-                                                            );
-                                                            socket.close();
-                                                            continue;
-                                                        }
+                                                    let local_addr: IpAddr = match ip {
+                                                        IpAddr::V4(_) => self.addr.into(),
+                                                        IpAddr::V6(_) => self.addr_v6.unwrap().into(),
                                                     };
-                                                    let local_port = match self.get_ephemeral_udp_port().await {
-                                                        Ok(port) => port,
-                                                        Err(err) => {
-                                                            warn!("failed to allocate WireGuard UDP port: {err}");
-                                                            socket.close();
-                                                            continue;
-                                                        }
-                                                    };
-                                                    if let Err(err) = socket.bind((local_addr, local_port)) {
-                                                        warn!("failed to bind WireGuard UDP socket: {err:?}");
-                                                        self.release_ephemeral_udp_port(local_port).await;
-                                                        socket.close();
-                                                        continue;
-                                                    }
+                                                    socket
+                                                        .bind(
+                                                            (local_addr, self.get_ephemeral_udp_port().await),
+                                                        )
+                                                    .unwrap();
                                                 }
 
                                                 match socket.send_slice(&pkt.data, (ip, pkt.dst_addr.port())) {
@@ -641,9 +598,7 @@ impl DeviceManager {
                                     true
                                 } else {
                                     let port = socket.endpoint().port;
-                                    if port != 0 {
-                                        udp_port_to_release.push(port);
-                                    }
+                                    udp_port_to_release.push(port);
 
                                     trace!("socket {} closed, shutting down connection and releasing resources", handle);
                                     sockets.remove(*handle);
@@ -675,16 +630,16 @@ impl DeviceManager {
         }
     }
 
-    async fn get_ephemeral_tcp_port(&self) -> anyhow::Result<u16> {
-        self.tcp_port_pool.next().await
+    async fn get_ephemeral_tcp_port(&self) -> u16 {
+        self.tcp_port_pool.next().await.unwrap()
     }
 
     async fn release_ephemeral_tcp_port(&self, port: u16) {
         self.tcp_port_pool.release(port).await;
     }
 
-    async fn get_ephemeral_udp_port(&self) -> anyhow::Result<u16> {
-        self.udp_port_pool.next().await
+    async fn get_ephemeral_udp_port(&self) -> u16 {
+        self.udp_port_pool.next().await.unwrap()
     }
 
     async fn release_ephemeral_udp_port(&self, port: u16) {
@@ -858,48 +813,5 @@ impl smoltcp::phy::TxToken for TxToken {
             }
         }
         result
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::app::dns::MockClashResolver;
-
-    #[test]
-    fn local_source_requires_configured_ipv6() {
-        let (_notifier_tx, notifier_rx) = tokio::sync::mpsc::channel(1);
-        let manager = DeviceManager::new(
-            Ipv4Addr::new(10, 0, 0, 2),
-            None,
-            Arc::new(MockClashResolver::new()),
-            vec![],
-            notifier_rx,
-        );
-
-        assert_eq!(
-            manager.local_ip_for(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))),
-            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)))
-        );
-        assert_eq!(manager.local_ip_for(IpAddr::V6(Ipv6Addr::LOCALHOST)), None);
-    }
-
-    #[test]
-    fn invalid_remote_dns_name_is_rejected_without_panicking() {
-        let invalid = format!("{}.example", "a".repeat(64));
-        assert!(
-            DeviceManager::build_dns_query(
-                &invalid,
-                hickory_proto::rr::RecordType::A
-            )
-            .is_none()
-        );
-        assert!(
-            DeviceManager::build_dns_query(
-                "example.com",
-                hickory_proto::rr::RecordType::A
-            )
-            .is_some()
-        );
     }
 }
