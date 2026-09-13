@@ -331,6 +331,15 @@ impl InboundManager {
         }
     }
 
+    pub(crate) async fn snapshot_options(&self) -> HashSet<InboundOpts> {
+        self.inbound_handlers.read().await.keys().cloned().collect()
+    }
+
+    pub(crate) async fn restore_options(&self, options: HashSet<InboundOpts>) {
+        let mut guard = self.inbound_handlers.write().await;
+        *guard = options.into_iter().map(|opts| (opts, None)).collect();
+    }
+
     pub async fn set_allow_lan(&self, allow_lan: bool) {
         let mut guard = self.inbound_handlers.write().await;
         let new_map = guard
@@ -362,16 +371,16 @@ impl InboundManager {
             .extract_if(|opts, _| match &opts {
                 #[cfg(feature = "http_port")]
                 InboundOpts::Http { common_opts } => {
-                    ports.port.is_some() && Some(common_opts.port) == ports.port
+                    ports.port.is_some() && Some(common_opts.port) != ports.port
                 }
                 InboundOpts::Socks { common_opts, .. } => {
                     ports.socks_port.is_some()
-                        && Some(common_opts.port) == ports.socks_port
+                        && Some(common_opts.port) != ports.socks_port
                 }
                 #[cfg(feature = "mixed_port")]
                 InboundOpts::Mixed { common_opts, .. } => {
                     ports.mixed_port.is_some()
-                        && Some(common_opts.port) == ports.mixed_port
+                        && Some(common_opts.port) != ports.mixed_port
                 }
                 #[cfg(feature = "shadowsocks")]
                 InboundOpts::Shadowsocks { .. } => false,

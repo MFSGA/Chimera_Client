@@ -99,6 +99,48 @@ async fn patch_configs(api_port: u16, body: String) -> http::StatusCode {
 
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
+async fn listener_port_patch_rolls_back_on_bind_failure() {
+    let (_clash, api_port) = start_client();
+    let initial = get_configs(api_port).await;
+    let initial_port = initial["socks-port"]
+        .as_u64()
+        .expect("socks-port should be present") as u16;
+
+    let new_port = available_port();
+    assert_ne!(new_port, initial_port);
+    assert_eq!(
+        patch_configs(
+            api_port,
+            serde_json::json!({ "socks-port": new_port }).to_string(),
+        )
+        .await,
+        http::StatusCode::ACCEPTED
+    );
+    assert_eq!(get_configs(api_port).await["socks-port"], new_port);
+    tokio::net::TcpStream::connect(("127.0.0.1", new_port))
+        .await
+        .expect("new SOCKS port should accept connections");
+
+    let blocker = TcpListener::bind("127.0.0.1:0")
+        .expect("failed to reserve occupied patch port");
+    let occupied_port = blocker.local_addr().unwrap().port();
+    assert_eq!(
+        patch_configs(
+            api_port,
+            serde_json::json!({ "socks-port": occupied_port }).to_string(),
+        )
+        .await,
+        http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+
+    assert_eq!(get_configs(api_port).await["socks-port"], new_port);
+    tokio::net::TcpStream::connect(("127.0.0.1", new_port))
+        .await
+        .expect("previous SOCKS listener should be restored after patch failure");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
 async fn test_patch_mode_roundtrip() {
     let (_clash, api_port) = start_client();
     assert_eq!(get_configs(api_port).await["mode"], "rule");

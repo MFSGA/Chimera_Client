@@ -10,6 +10,7 @@ use axum::{
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tracing::error;
 
 use crate::{
     GlobalState,
@@ -282,6 +283,12 @@ async fn patch_configs(
     }
 
     let inbound_manager = state.inbound_manager.clone();
+    let listener_snapshot =
+        if payload.rebuild_listeners() || payload.allow_lan.is_some() {
+            Some(inbound_manager.snapshot_options().await)
+        } else {
+            None
+        };
     let mut need_restart = false;
     if let Some(bind_address) = payload.bind_address.clone() {
         match bind_address.parse::<BindAddress>() {
@@ -324,8 +331,28 @@ async fn patch_configs(
         state.dispatcher.set_mode(mode).await;
     }
 
-    if need_restart {
-        let _ = inbound_manager.restart().await;
+    if need_restart && let Err(err) = inbound_manager.restart().await {
+        error!("failed to apply inbound config patch: {err}");
+        if let Some(snapshot) = listener_snapshot {
+            inbound_manager.restore_options(snapshot).await;
+            if let Err(restore_err) = inbound_manager.restart().await {
+                error!(
+                    "failed to restore inbound listeners after patch failure: {restore_err}"
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "failed to apply inbound configuration: {err}; failed to restore previous listeners: {restore_err}"
+                    ),
+                )
+                    .into_response();
+            }
+        }
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to apply inbound configuration: {err}"),
+        )
+            .into_response();
     }
 
     if let Some(log_level) = payload.log_level {
