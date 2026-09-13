@@ -111,6 +111,18 @@ impl TunRunner {
         })
     }
 
+    pub(crate) fn fresh(
+        &self,
+        cancellation_token: CancellationToken,
+    ) -> Result<TunRunner, Error> {
+        TunRunner::new(
+            self.cfg.clone(),
+            self.dispatcher.clone(),
+            self.resolver.clone(),
+            Some(cancellation_token),
+        )
+    }
+
     async fn new_internal(
         cfg: &TunConfig,
     ) -> Result<

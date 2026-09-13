@@ -261,6 +261,114 @@ async fn controller_bind_failure_restores_existing_runtime() {
 
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
+async fn data_plane_bind_failure_restores_existing_runtime() {
+    // verifies rollback restores the live, patched inbound state rather than stale YAML
+    let api_port = TcpListener::bind("127.0.0.1:0")
+        .expect("failed to reserve API port")
+        .local_addr()
+        .expect("failed to read API address")
+        .port();
+    let socks_port = TcpListener::bind("127.0.0.1:0")
+        .expect("failed to reserve SOCKS port")
+        .local_addr()
+        .expect("failed to read SOCKS address")
+        .port();
+    let blocked_socks = TcpListener::bind("127.0.0.1:0")
+        .expect("failed to reserve blocked SOCKS port");
+    let blocked_socks_port = blocked_socks
+        .local_addr()
+        .expect("failed to read blocked SOCKS address")
+        .port();
+    let temp_dir = std::env::temp_dir()
+        .join(format!("chimera-api-reload-data-plane-rollback-{api_port}"));
+    std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+
+    let initial_config = temp_dir.join("initial.yaml");
+    let blocked_config = temp_dir.join("blocked-socks.yaml");
+    write_config(&initial_config, api_port, socks_port, "global");
+    write_config(&blocked_config, api_port, blocked_socks_port, "rule");
+
+    let cwd = temp_dir.clone();
+    let runtime = std::thread::spawn(move || {
+        clash_lib::start_scaffold(Options {
+            config: Config::File(initial_config.to_string_lossy().to_string()),
+            cwd: Some(cwd.to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            config_path: Some(initial_config.to_string_lossy().to_string()),
+        })
+        .expect("failed to start clash");
+    });
+
+    wait_port_ready(api_port);
+    wait_port_ready(socks_port);
+
+    let patched_socks_port = TcpListener::bind("127.0.0.1:0")
+        .expect("failed to reserve patched SOCKS port")
+        .local_addr()
+        .expect("failed to read patched SOCKS address")
+        .port();
+    let configs_url = format!("http://127.0.0.1:{api_port}/configs");
+    let patch_request = hyper::Request::builder()
+        .uri(&configs_url)
+        .method(http::Method::PATCH)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(format!(
+            "{{\"socks-port\":{patched_socks_port}}}"
+        ))))
+        .expect("failed to build PATCH request");
+    let patch_response =
+        send_http_request(configs_url.parse().unwrap(), patch_request)
+            .await
+            .expect("failed to patch active SOCKS port");
+    assert_eq!(patch_response.status(), http::StatusCode::ACCEPTED);
+    wait_port_ready(patched_socks_port);
+    assert!(TcpStream::connect(("127.0.0.1", socks_port)).is_err());
+
+    let put_request = hyper::Request::builder()
+        .uri(&configs_url)
+        .method(http::Method::PUT)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from("{\"path\":\"blocked-socks.yaml\"}")))
+        .expect("failed to build PUT request");
+    let put_response = send_http_request(configs_url.parse().unwrap(), put_request)
+        .await
+        .expect("failed to request reload with blocked data plane");
+    assert_eq!(
+        put_response.status(),
+        http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+
+    wait_port_ready(api_port);
+    wait_port_ready(patched_socks_port);
+    assert!(TcpStream::connect(("127.0.0.1", socks_port)).is_err());
+
+    let get_request = hyper::Request::builder()
+        .uri(&configs_url)
+        .method(http::Method::GET)
+        .body(http_body_util::Empty::<Bytes>::new())
+        .expect("failed to build GET request");
+    let response = send_http_request(configs_url.parse().unwrap(), get_request)
+        .await
+        .expect("active API was not restored after data-plane bind failure");
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let body = response
+        .collect()
+        .await
+        .expect("failed to read restored config response")
+        .to_bytes();
+    let config: serde_json::Value =
+        serde_json::from_slice(&body).expect("failed to parse restored config");
+    assert_eq!(config["mode"], "global");
+    assert_eq!(config["socks-port"], patched_socks_port);
+
+    drop(blocked_socks);
+    assert!(clash_lib::shutdown());
+    runtime.join().expect("runtime thread panicked");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
 async fn failed_reload_keeps_existing_runtime_available() {
     let api_port = TcpListener::bind("127.0.0.1:0")
         .expect("failed to reserve API port")

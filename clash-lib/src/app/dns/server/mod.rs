@@ -67,6 +67,19 @@ impl DnsRunner {
         }
     }
 
+    pub(crate) fn fresh(
+        &self,
+        cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        Self::new(
+            self.enable,
+            self.listener.clone(),
+            self.resolver.clone(),
+            &self.cwd,
+            Some(cancellation_token),
+        )
+    }
+
     pub async fn wait_ready(&self) -> Result<(), crate::Error> {
         let receiver = self.ready_rx.lock().await.take();
         match receiver {

@@ -175,6 +175,19 @@ impl InboundManager {
         }
     }
 
+    pub(crate) async fn fresh(
+        &self,
+        cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        Self::new(
+            self.dispatcher.clone(),
+            self.authenticator.clone(),
+            self.snapshot_options().await,
+            Some(cancellation_token),
+        )
+        .await
+    }
+
     pub async fn wait_ready(&self) -> Result<(), crate::Error> {
         let receiver = self.ready_rx.lock().await.take();
         match receiver {

@@ -616,6 +616,40 @@ async fn start_with_shutdown_token(
                         continue;
                     }
 
+                    // Prepare restartable copies of the active data-plane runners
+                    // before releasing any active listener. If this ever becomes
+                    // fallible, the current runtime is still completely intact.
+                    let rollback_components = match active_components
+                        .fresh_data_plane()
+                        .await
+                    {
+                        Ok(components) => components,
+                        Err(err) => {
+                            #[cfg(feature = "tun")]
+                            if let Err(restore_err) = restore_network_after_failed_reload(
+                                &active_components,
+                                &new_components,
+                                &mut network_runtime_lease,
+                            )
+                            .await
+                            {
+                                let fatal = Error::Operation(format!(
+                                    "failed to restore active network configuration after rollback preparation failure: {restore_err}"
+                                ));
+                                let _ = done.send(Err(fatal));
+                                reload_token.cancel();
+                                return Err(Error::Operation(
+                                    "active network configuration could not be restored"
+                                        .to_owned(),
+                                ));
+                            }
+                            let _ = done.send(Err(Error::Operation(format!(
+                                "failed to prepare active data-plane rollback: {err}"
+                            ))));
+                            continue;
+                        }
+                    };
+
                     // Validate the replacement controller before stopping the old
                     // data plane. The old controller has to release its listening
                     // socket first, but the old SOCKS/DNS/TUN runners remain alive
@@ -683,8 +717,7 @@ async fn start_with_shutdown_token(
                     }
 
                     // The replacement controller is now bound successfully. Commit
-                    // the data-plane switch only after that last fallible startup
-                    // boundary has passed.
+                    // the data-plane switch only after that boundary has passed.
                     active_components.stop_all_and_join(false).await;
                     #[cfg(feature = "tun")]
                     if !new_components.network_config.uses_global_state() {
@@ -692,6 +725,80 @@ async fn start_with_shutdown_token(
                         network_runtime_lease.deactivate_to_neutral();
                     }
                     new_components.start_all();
+                    if let Err(err) = new_components.wait_initial_ready().await {
+                        error!(
+                            "replacement data plane failed to become ready; restoring the active runtime: {}",
+                            err
+                        );
+                        new_components.stop_all_and_join(false).await;
+                        new_api_listener.shutdown();
+                        let _ = new_api_listener.join().await;
+
+                        #[cfg(feature = "tun")]
+                        if let Err(restore_err) = restore_active_network_config(
+                            &rollback_components,
+                            &mut network_runtime_lease,
+                        )
+                        .await
+                        {
+                            let fatal = Error::Operation(format!(
+                                "failed to restore active network configuration after data-plane reload failure: {restore_err}"
+                            ));
+                            let _ = done.send(Err(fatal));
+                            reload_token.cancel();
+                            return Err(Error::Operation(
+                                "active network configuration could not be restored"
+                                    .to_owned(),
+                            ));
+                        }
+
+                        rollback_components.start_all();
+                        if let Err(restore_err) =
+                            rollback_components.wait_initial_ready().await
+                        {
+                            let fatal = Error::Operation(format!(
+                                "failed to restore active data plane after reload failure: {restore_err}"
+                            ));
+                            let _ = done.send(Err(fatal));
+                            reload_token.cancel();
+                            return Err(Error::Operation(
+                                "active data plane could not be restored".to_owned(),
+                            ));
+                        }
+
+                        {
+                            let mut g = global_state.lock().await;
+                            #[cfg(feature = "tun")]
+                            {
+                                g.tunnel_runner = rollback_components.tun_runner.clone();
+                            }
+                            g.dns_listener = rollback_components.dns_listener.clone();
+                        }
+
+                        let restored_api_listener = rollback_components.api_listener(
+                            active_controller_cfg.clone(),
+                            log_tx.clone(),
+                            global_state.clone(),
+                            &cwd_clone,
+                            reload_token.child_token(),
+                        );
+                        restored_api_listener.run_async();
+                        if let Err(restore_err) = restored_api_listener.wait_ready().await {
+                            let fatal = Error::Operation(format!(
+                                "failed to restore active API listener after data-plane reload failure: {restore_err}"
+                            ));
+                            let _ = done.send(Err(fatal));
+                            reload_token.cancel();
+                            return Err(Error::Operation(
+                                "active API listener could not be restored".to_owned(),
+                            ));
+                        }
+
+                        active_components = rollback_components;
+                        active_api_listener = restored_api_listener;
+                        let _ = done.send(Err(err));
+                        continue;
+                    }
 
                     let mut g = global_state.lock().await;
                     #[cfg(feature = "tun")]
@@ -771,7 +878,7 @@ struct RuntimeComponents {
     statistics_manager: Arc<StatisticsManager>,
 
     #[cfg(feature = "tun")]
-    tun_runner: ArcRunner,
+    tun_runner: Arc<tun::TunRunner>,
     dns_listener: Arc<dns::DnsRunner>,
     inbound_manager: Arc<InboundManager>,
     dns_listen: DNSListenAddr,
@@ -821,6 +928,35 @@ impl RuntimeComponents {
         self.inbound_manager.wait_ready().await
     }
 
+    async fn fresh_data_plane(&self) -> Result<Self> {
+        let cancellation_token = tokio_util::sync::CancellationToken::new();
+        Ok(Self {
+            cache_store: self.cache_store.clone(),
+            dns_resolver: self.dns_resolver.clone(),
+            outbound_manager: self.outbound_manager.clone(),
+            router: self.router.clone(),
+            dispatcher: self.dispatcher.clone(),
+            statistics_manager: self.statistics_manager.clone(),
+            #[cfg(feature = "tun")]
+            tun_runner: Arc::new(
+                self.tun_runner.fresh(cancellation_token.child_token())?,
+            ),
+            dns_listener: Arc::new(
+                self.dns_listener.fresh(cancellation_token.child_token()),
+            ),
+            inbound_manager: Arc::new(
+                self.inbound_manager
+                    .fresh(cancellation_token.child_token())
+                    .await,
+            ),
+            dns_listen: self.dns_listen.clone(),
+            dns_enabled: self.dns_enabled,
+            ipv6_allowed: self.ipv6_allowed,
+            #[cfg(feature = "tun")]
+            network_config: self.network_config.clone(),
+        })
+    }
+
     fn stop_all(&self) {
         self.dns_listener.shutdown();
         #[cfg(feature = "tun")]
@@ -867,7 +1003,16 @@ async fn restore_network_after_failed_reload(
         return Ok(());
     }
 
+    restore_active_network_config(active_components, network_runtime_lease).await
+}
+
+#[cfg(feature = "tun")]
+async fn restore_active_network_config(
+    active_components: &RuntimeComponents,
+    network_runtime_lease: &mut NetworkRuntimeLease,
+) -> Result<()> {
     if active_components.network_config.uses_global_state() {
+        network_runtime_lease.ensure_active()?;
         active_components.activate_network_config().await
     } else {
         clear_net_config().await;
@@ -1172,7 +1317,7 @@ async fn create_components(
     #[cfg(feature = "tun")]
     debug!("initializing tun runner");
     #[cfg(feature = "tun")]
-    let tun_runner: ArcRunner = Arc::new(tun::TunRunner::new(
+    let tun_runner = Arc::new(tun::TunRunner::new(
         config.tun,
         dispatcher.clone(),
         dns_resolver.clone(),
