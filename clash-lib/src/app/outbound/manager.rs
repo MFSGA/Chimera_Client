@@ -1096,8 +1096,8 @@ mod tests {
 name: wg
 server: 198.51.100.10
 port: 51820
-private-key: private
-public-key: public
+private-key: KIlDUePHyYwzjgn18przw/ZwPioJhh2aEyhxb/dtCXI=
+public-key: INBZyvB715sA5zatkiX8Jn3Dh5tZZboZ09x4pkr66ig=
 ip: 10.0.0.2/32
 udp: true
 "#,
@@ -1115,8 +1115,8 @@ udp: true
 name: wg
 server: 198.51.100.10
 port: 51820
-private-key: private
-public-key: public
+private-key: KIlDUePHyYwzjgn18przw/ZwPioJhh2aEyhxb/dtCXI=
+public-key: INBZyvB715sA5zatkiX8Jn3Dh5tZZboZ09x4pkr66ig=
 ip: not-an-ip
 "#,
         )

@@ -21,7 +21,7 @@ impl TryFrom<&OutboundWireguard> for Handler {
     type Error = crate::Error;
 
     fn try_from(s: &OutboundWireguard) -> Result<Self, Self::Error> {
-        let h = Handler::new(HandlerOptions {
+        let h = Handler::try_new(HandlerOptions {
             name: s.common_opts.name.to_owned(),
             common_opts: HandlerCommonOptions {
                 connector: s.common_opts.connect_via.clone(),
@@ -73,7 +73,7 @@ impl TryFrom<&OutboundWireguard> for Handler {
             udp: s.udp.unwrap_or_default(),
             allowed_ips: s.allowed_ips.as_ref().map(|x| x.to_owned()),
             reserved_bits: s.reserved_bits.as_ref().map(|x| x.to_owned()),
-        });
+        })?;
         Ok(h)
     }
 }
@@ -90,8 +90,8 @@ mod tests {
 name: wg
 server: 198.51.100.10
 port: 51820
-private-key: private
-public-key: public
+private-key: KIlDUePHyYwzjgn18przw/ZwPioJhh2aEyhxb/dtCXI=
+public-key: INBZyvB715sA5zatkiX8Jn3Dh5tZZboZ09x4pkr66ig=
 ip: 10.0.0.2/32
 udp: true
 "#,
@@ -104,5 +104,48 @@ udp: true
         assert_eq!(handler.name(), "wg");
         assert_eq!(handler.server_name(), Some("198.51.100.10"));
         assert!(matches!(handler.proto(), OutboundType::WireGuard));
+    }
+
+    #[test]
+    fn rejects_invalid_wireguard_key_during_conversion() {
+        let config: OutboundWireguard = serde_yaml::from_str(
+            r#"
+name: wg
+server: 198.51.100.10
+port: 51820
+private-key: "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+public-key: INBZyvB715sA5zatkiX8Jn3Dh5tZZboZ09x4pkr66ig=
+ip: 10.0.0.2/32
+"#,
+        )
+        .expect("wireguard config shape should parse");
+
+        let error = Handler::try_from(&config)
+            .expect_err("invalid WireGuard key must fail conversion");
+
+        assert!(error.to_string().contains("private key"));
+    }
+
+    #[test]
+    fn rejects_invalid_wireguard_dns_server_during_conversion() {
+        let config: OutboundWireguard = serde_yaml::from_str(
+            r#"
+name: wg
+server: 198.51.100.10
+port: 51820
+private-key: KIlDUePHyYwzjgn18przw/ZwPioJhh2aEyhxb/dtCXI=
+public-key: INBZyvB715sA5zatkiX8Jn3Dh5tZZboZ09x4pkr66ig=
+ip: 10.0.0.2/32
+remote-dns-resolve: true
+dns:
+  - not-an-ip
+"#,
+        )
+        .expect("wireguard config shape should parse");
+
+        let error = Handler::try_from(&config)
+            .expect_err("invalid WireGuard DNS server must fail conversion");
+
+        assert!(error.to_string().contains("DNS server"));
     }
 }
