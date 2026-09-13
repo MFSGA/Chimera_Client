@@ -31,7 +31,7 @@ pub async fn new(
         match store {
             Some(store) => Ok(Arc::new(
                 EnhancedResolver::new(cfg, store, mmdb, outbounds, rule_dispatch)
-                    .await,
+                    .await?,
             )),
             _ => Err(crate::Error::InvalidConfig(
                 "enhanced resolver requires cache store".to_owned(),

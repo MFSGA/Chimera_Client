@@ -80,7 +80,8 @@ impl EnhancedResolver {
                 None,
                 None,
             )
-            .await,
+            .await
+            .expect("default DNS client configuration should be valid"),
             fallback: None,
             fallback_domain_filters: None,
             fallback_ip_filters: None,
@@ -102,7 +103,7 @@ impl EnhancedResolver {
         mmdb: Option<PendingMmdb>,
         outbounds: crate::proxy::utils::OutboundHandlerRegistry,
         rule_dispatch: Option<Arc<RuleDispatch>>,
-    ) -> Self {
+    ) -> Result<Self, Error> {
         let edns_client_subnet = cfg.edns_client_subnet.clone();
         let default_resolver = Arc::new(EnhancedResolver {
             ipv6: AtomicBool::new(false),
@@ -115,7 +116,7 @@ impl EnhancedResolver {
                 cfg.fw_mark,
                 None,
             )
-            .await,
+            .await?,
             fallback: None,
             fallback_domain_filters: None,
             fallback_ip_filters: None,
@@ -141,7 +142,7 @@ impl EnhancedResolver {
                 cfg.fw_mark,
                 None,
             )
-            .await;
+            .await?;
             if clients.is_empty() {
                 warn!(
                     "no usable proxy-server-nameserver clients were initialized; \
@@ -175,7 +176,7 @@ impl EnhancedResolver {
             };
         drop(plain_outbounds);
 
-        Self {
+        Ok(Self {
             ipv6: AtomicBool::new(cfg.ipv6),
             main: make_clients(
                 cfg.nameserver.clone(),
@@ -185,7 +186,7 @@ impl EnhancedResolver {
                 cfg.fw_mark,
                 rule_dispatch.clone(),
             )
-            .await,
+            .await?,
             hosts: cfg.hosts,
             fallback: if !cfg.fallback.is_empty() {
                 Some(
@@ -197,7 +198,7 @@ impl EnhancedResolver {
                         cfg.fw_mark,
                         rule_dispatch.clone(),
                     )
-                    .await,
+                    .await?,
                 )
             } else {
                 None
@@ -252,7 +253,7 @@ impl EnhancedResolver {
                                 cfg.fw_mark,
                                 rule_dispatch.clone(),
                             )
-                            .await,
+                            .await?,
                         ),
                     );
                 }
@@ -303,7 +304,7 @@ impl EnhancedResolver {
                     4096,
                 ),
             ))),
-        }
+        })
     }
 
     #[instrument(skip(message), level = "trace")]
@@ -1424,6 +1425,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_dhcp_interface_is_a_hard_config_error() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_store = crate::app::profile::ThreadSafeCacheFile::new(
+            temp_dir.path().join("cache.db").to_str().unwrap(),
+            false,
+        );
+        let mut config = make_proxy_nameserver_config();
+        config.nameserver = vec![NameServer {
+            net: DNSNetMode::Dhcp,
+            host: url::Host::Domain("__chimera_missing_interface__".to_owned()),
+            port: 0,
+            interface: None,
+            proxy: None,
+        }];
+
+        let result = EnhancedResolver::new(
+            config,
+            cache_store,
+            None,
+            Arc::new(RwLock::new(std::collections::HashMap::new())),
+            None,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::Error::InvalidConfig(message))
+                if message.contains("__chimera_missing_interface__")
+        ));
+    }
+
+    #[tokio::test]
     async fn test_proxy_server_nameserver_initialization() {
         let temp_dir = tempfile::tempdir().unwrap();
         let cache_store = crate::app::profile::ThreadSafeCacheFile::new(
@@ -1438,7 +1471,8 @@ mod tests {
             Arc::new(RwLock::new(std::collections::HashMap::new())),
             None,
         )
-        .await;
+        .await
+        .expect("proxy nameserver config should initialize");
 
         assert!(resolver.proxy_resolver.is_some());
         assert!(resolver.proxy_server_domains.is_none());
@@ -1461,7 +1495,8 @@ mod tests {
             Arc::new(RwLock::new(std::collections::HashMap::new())),
             None,
         )
-        .await;
+        .await
+        .expect("config without proxy nameserver should initialize");
 
         assert!(resolver.proxy_resolver.is_none());
         assert!(resolver.proxy_server_domains.is_none());
@@ -1487,7 +1522,8 @@ mod tests {
             outbounds,
             None,
         )
-        .await;
+        .await
+        .expect("proxy domain config should initialize");
 
         assert!(resolver.proxy_resolver.is_some());
         let domains = resolver
@@ -1517,7 +1553,8 @@ mod tests {
             outbounds,
             None,
         )
-        .await;
+        .await
+        .expect("proxy domain resolver should initialize");
 
         assert!(resolver.proxy_server_domains.is_some());
         assert!(

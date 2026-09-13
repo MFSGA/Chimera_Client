@@ -23,7 +23,7 @@ pub async fn make_clients(
     edns_client_subnet: Option<EdnsClientSubnet>,
     fw_mark: Option<u32>,
     rule_dispatch: Option<Arc<RuleDispatch>>,
-) -> Vec<ThreadSafeDNSClient> {
+) -> Result<Vec<ThreadSafeDNSClient>, crate::Error> {
     let mut rv = Vec::new();
 
     for s in servers {
@@ -62,11 +62,16 @@ pub async fn make_clients(
         .await
         {
             Ok(c) => rv.push(c),
+            Err(e) if s.net == DNSNetMode::Dhcp => {
+                return Err(crate::Error::InvalidConfig(format!(
+                    "initializing DHCP DNS client {s}: {e}"
+                )));
+            }
             Err(e) => warn!("initializing DNS client {} with error {}", &s, e),
         }
     }
 
-    rv
+    Ok(rv)
 }
 
 pub fn build_dns_response_message(

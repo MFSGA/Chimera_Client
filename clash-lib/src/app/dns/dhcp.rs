@@ -88,10 +88,14 @@ impl Client for DhcpClient {
 }
 
 impl DhcpClient {
-    pub async fn new(iface: &str, fw_mark: Option<u32>) -> Self {
-        let iface = get_interface_by_name(iface)
-            .unwrap_or_else(|| panic!("can not find interface: {iface}"));
-        Self {
+    pub async fn new(iface: &str, fw_mark: Option<u32>) -> io::Result<Self> {
+        let iface = get_interface_by_name(iface).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("can not find interface: {iface}"),
+            )
+        })?;
+        Ok(Self {
             iface,
             inner: Mutex::new(Inner {
                 clients: vec![],
@@ -100,7 +104,7 @@ impl DhcpClient {
                 iface_addr: ipnet::IpNet::default(),
             }),
             fw_mark,
-        }
+        })
     }
 
     async fn resolve(&self) -> io::Result<Vec<ThreadSafeDNSClient>> {
@@ -125,7 +129,8 @@ impl DhcpClient {
                 self.fw_mark,
                 None,
             )
-            .await;
+            .await
+            .map_err(|err| io::Error::other(err.to_string()))?;
         }
 
         Ok(self.inner.lock().await.clients.clone())
@@ -228,7 +233,7 @@ async fn probe_dns_server(iface: &OutboundInterface) -> io::Result<Vec<Ipv4Addr>
             dhcproto::v4::OptionCode::DomainName,
         ]));
 
-    let (mut tx, rx) = tokio::sync::oneshot::channel::<Vec<Ipv4Addr>>();
+    let (mut tx, rx) = tokio::sync::oneshot::channel::<io::Result<Vec<Ipv4Addr>>>();
 
     let mut rx = rx.fuse();
 
@@ -241,10 +246,7 @@ async fn probe_dns_server(iface: &OutboundInterface) -> io::Result<Vec<Ipv4Addr>
 
         let get_response = async move {
             loop {
-                let (n_read, _) = r
-                    .recv_from(&mut buf)
-                    .await
-                    .expect("failed to receive DHCP offer");
+                let (n_read, _) = r.recv_from(&mut buf).await?;
 
                 // fucking deep if-else hell
                 if let Ok(reply) = dhcproto::v4::Message::from_bytes(&buf[..n_read])
@@ -265,7 +267,7 @@ async fn probe_dns_server(iface: &OutboundInterface) -> io::Result<Vec<Ipv4Addr>
                                                         "got NS servers {:?} from DHCP",
                                                         dns
                                                     );
-                                                    return dns.clone();
+                                                    return Ok(dns.clone());
                                                 }
                                                 _ => yield_now().await,
                                             }
@@ -281,7 +283,11 @@ async fn probe_dns_server(iface: &OutboundInterface) -> io::Result<Vec<Ipv4Addr>
 
         tokio::select! {
             _ = tx.closed() => {debug!("future cancelled, likely other clients won")},
-            value = get_response => tx.send(value).map_err(|x| debug!("send error: {:?}", x)).unwrap_or_default(),
+            value = get_response => {
+                if let Err(value) = tx.send(value) {
+                    debug!("send error: {:?}", value);
+                }
+            },
         }
     });
 
@@ -290,7 +296,7 @@ async fn probe_dns_server(iface: &OutboundInterface) -> io::Result<Vec<Ipv4Addr>
 
     tokio::select! {
         result = &mut rx => {
-            result.map_err(|_x| io::Error::other("channel error"))
+            result.map_err(|_x| io::Error::other("dhcp receive task exited before returning a result"))?
         },
 
         _ = tokio::time::sleep(Duration::from_secs(10)) => {
@@ -302,7 +308,19 @@ async fn probe_dns_server(iface: &OutboundInterface) -> io::Result<Vec<Ipv4Addr>
 
 #[cfg(test)]
 mod test {
-    use crate::{app::net::get_outbound_interface, dns::dhcp::probe_dns_server};
+    use crate::{
+        app::net::get_outbound_interface,
+        dns::dhcp::{DhcpClient, probe_dns_server},
+    };
+
+    #[tokio::test]
+    async fn missing_interface_is_reported_without_panicking() {
+        let err = DhcpClient::new("__chimera_missing_interface__", None)
+            .await
+            .expect_err("missing DHCP interface should return an error");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("__chimera_missing_interface__"));
+    }
 
     #[tokio::test]
     #[ignore = "requires DHCP server on CI"]

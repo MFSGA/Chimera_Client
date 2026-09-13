@@ -98,6 +98,52 @@ rules:
 }
 
 #[test]
+#[serial_test::serial]
+fn missing_dhcp_interface_fails_runtime_startup() {
+    let temp = tempfile::tempdir().expect("failed to create temp dir");
+    let yaml = r#"
+mixed-port: 0
+bind-address: 127.0.0.1
+allow-lan: false
+mode: rule
+log-level: error
+ipv6: false
+mmdb: null
+tun:
+  enable: false
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: normal
+  nameserver:
+    - dhcp://__chimera_missing_interface__
+  default-nameserver:
+    - 1.1.1.1
+profile:
+  store-selected: false
+  store-fake-ip: false
+proxies: []
+rules:
+  - MATCH,DIRECT
+"#;
+
+    let err = clash_lib::start_scaffold(Options {
+        config: Config::Str(yaml.to_owned()),
+        cwd: Some(temp.path().to_string_lossy().to_string()),
+        rt: Some(TokioRuntime::SingleThread),
+        log_file: None,
+        config_path: None,
+    })
+    .expect_err("missing DHCP interface must fail runtime startup");
+
+    assert!(
+        err.to_string().contains("__chimera_missing_interface__"),
+        "unexpected error: {err}"
+    );
+    assert!(!clash_lib::shutdown());
+}
+
+#[test]
 fn full_dns_fixture_parses_expected_runtime_shape() {
     let yaml = include_str!("data/config/dns/full_dns.yaml");
     let dns = parse_dns(yaml);
