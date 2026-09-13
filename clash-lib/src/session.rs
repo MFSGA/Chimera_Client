@@ -42,7 +42,8 @@ impl FromStr for SocksAddr {
                 let tokens: Vec<_> = s.split(':').collect();
                 if tokens.len() == 2 {
                     let port: u16 = tokens.get(1).unwrap().parse()?;
-                    Ok(Self::Domain(tokens.first().unwrap().to_string(), port))
+                    Self::try_from((tokens.first().unwrap().to_string(), port))
+                        .map_err(Into::into)
                 } else {
                     Err(anyhow!("SocksAddr parse error, value: {s}"))
                 }
@@ -249,10 +250,11 @@ impl SocksAddr {
 impl Clone for SocksAddr {
     fn clone(&self) -> Self {
         match self {
-            SocksAddr::Ip(a) => Self::from(a.to_owned()),
-            SocksAddr::Domain(domain, port) => {
-                Self::try_from((domain.clone(), *port)).unwrap()
-            }
+            SocksAddr::Ip(a) => Self::from(*a),
+            SocksAddr::Domain(domain, port) => match domain.parse::<IpAddr>() {
+                Ok(ip) => Self::from((ip, *port)),
+                Err(_) => Self::Domain(domain.clone(), *port),
+            },
         }
     }
 }
@@ -510,6 +512,29 @@ mod tests {
     use bytes::BytesMut;
 
     use super::SocksAddr;
+
+    #[test]
+    fn cloning_existing_domain_does_not_revalidate_or_panic() {
+        let addr = SocksAddr::Domain("a".repeat(256), 443);
+        assert_eq!(addr.clone(), addr);
+    }
+
+    #[test]
+    fn cloning_domain_ip_preserves_existing_normalization() {
+        let addr = SocksAddr::Domain("127.0.0.1".to_owned(), 443);
+        let cloned = addr.clone();
+        assert!(matches!(addr, SocksAddr::Domain(_, 443)));
+        assert_eq!(
+            cloned,
+            SocksAddr::Ip("127.0.0.1:443".parse().expect("valid socket address"))
+        );
+    }
+
+    #[test]
+    fn parsing_rejects_domain_longer_than_wire_limit() {
+        let value = format!("{}:443", "a".repeat(256));
+        assert!(value.parse::<SocksAddr>().is_err());
+    }
 
     #[test]
     fn socks_addr_peek_read_matches_encoded_domain() {

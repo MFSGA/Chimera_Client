@@ -33,11 +33,11 @@ pub fn maybe_socks_addr(r: &Uri) -> Option<SocksAddr> {
         },
     );
 
-    r.host().map(|x| {
+    r.host().and_then(|x| {
         if let Ok(ip) = x.parse::<IpAddr>() {
-            SocksAddr::Ip((ip, port).into())
+            Some(SocksAddr::Ip((ip, port).into()))
         } else {
-            SocksAddr::Domain(x.to_string(), port)
+            SocksAddr::try_from((x.to_string(), port)).ok()
         }
     })
 }
@@ -165,5 +165,23 @@ pub async fn handle(
 
     if let Err(http_err) = result {
         warn!("Error while serving HTTP connection: {}", http_err);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hyper::Uri;
+
+    use super::maybe_socks_addr;
+
+    #[test]
+    fn rejects_http_host_longer_than_socks_domain_limit() {
+        let host = vec!["a".repeat(63); 5].join(".");
+        assert!(host.len() > u8::MAX as usize);
+        let uri: Uri = format!("http://{host}:80/")
+            .parse()
+            .expect("long authority should still be a valid URI");
+
+        assert!(maybe_socks_addr(&uri).is_none());
     }
 }

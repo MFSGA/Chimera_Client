@@ -614,9 +614,7 @@ async fn reverse_lookup(
                 }
             }
         }
-        crate::session::SocksAddr::Domain(host, port) => (host.to_owned(), *port)
-            .try_into()
-            .expect("must be valid domain"),
+        crate::session::SocksAddr::Domain(_, _) => dst.clone(),
     };
     Some(dst)
 }
