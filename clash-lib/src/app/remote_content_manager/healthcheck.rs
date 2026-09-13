@@ -11,7 +11,6 @@ use super::ProxyManager;
 struct HealCheckInner {
     last_check: Instant,
     proxies: Vec<AnyOutboundHandler>,
-    task_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
 }
 
 pub struct HealthCheck {
@@ -26,6 +25,20 @@ pub struct HealthCheck {
     timeout: Option<std::time::Duration>,
     proxy_manager: ProxyManager,
     inner: Arc<tokio::sync::RwLock<HealCheckInner>>,
+    task_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl Drop for HealthCheck {
+    fn drop(&mut self) {
+        if let Some(handle) = self
+            .task_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            handle.abort();
+        }
+    }
 }
 
 impl HealthCheck {
@@ -50,8 +63,8 @@ impl HealthCheck {
             inner: Arc::new(tokio::sync::RwLock::new(HealCheckInner {
                 last_check: tokio::time::Instant::now(),
                 proxies,
-                task_handle: None,
             })),
+            task_handle: std::sync::Mutex::new(None),
         }
     }
 
@@ -233,7 +246,14 @@ impl HealthCheck {
             }
         });
 
-        self.inner.write().await.task_handle = Some(Arc::new(task_handle));
+        let previous = self
+            .task_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(task_handle);
+        if let Some(previous) = previous {
+            previous.abort();
+        }
     }
 
     pub async fn touch(&self) {
@@ -262,5 +282,42 @@ impl HealthCheck {
 
     pub fn auto(&self) -> bool {
         self.interval != 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::dns::{SystemResolver, ThreadSafeDNSResolver};
+
+    #[tokio::test]
+    async fn dropping_healthcheck_releases_periodic_task_state() {
+        let resolver: ThreadSafeDNSResolver = Arc::new(
+            SystemResolver::new(false).expect("system resolver should initialize"),
+        );
+        let manager = ProxyManager::new(resolver, None);
+        let health = HealthCheck::new(
+            Vec::new(),
+            "http://127.0.0.1/health".to_owned(),
+            3600,
+            false,
+            manager,
+        );
+        let weak = Arc::downgrade(&health.inner);
+
+        health.kick_off().await;
+        assert!(weak.upgrade().is_some());
+        drop(health);
+
+        for _ in 0..32 {
+            if weak.upgrade().is_none() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            weak.upgrade().is_none(),
+            "periodic healthcheck task must not pin obsolete provider state"
+        );
     }
 }
