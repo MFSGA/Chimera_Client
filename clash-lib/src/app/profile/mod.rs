@@ -28,13 +28,15 @@ impl ThreadSafeCacheFile {
         )));
 
         let path = path.to_string();
-        let store_clone = store.clone();
+        let store_weak = Arc::downgrade(&store);
 
         if store_selected {
             tokio::spawn(async move {
-                let store = store_clone;
                 loop {
                     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                    let Some(store) = store_weak.upgrade() else {
+                        break;
+                    };
                     let r = store.read().await;
                     let db = r.db.clone();
                     drop(r);
@@ -164,5 +166,28 @@ impl CacheFile {
     pub fn delete_fake_ip_pair(&mut self, ip: &str, host: &str) {
         self.db.ip_to_host.remove(ip);
         self.db.host_to_ip.remove(host);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn background_flush_does_not_keep_cache_alive() {
+        let temp = tempfile::tempdir().expect("failed to create temp dir");
+        let path = temp.path().join("cache.yaml");
+        let cache = ThreadSafeCacheFile::new(
+            path.to_str().expect("cache path must be utf-8"),
+            true,
+        );
+        let weak = Arc::downgrade(&cache.0);
+
+        drop(cache);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "background cache flush task must not pin obsolete runtime state"
+        );
     }
 }
