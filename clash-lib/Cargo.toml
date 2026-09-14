@@ -39,7 +39,7 @@ quinn = { version = "0.11", default-features = false, features = [
 h3 = { version = "0.0.8", optional = true }
 h3-quinn = { version = "0.0.10", optional = true }
 quinn-proto = { version = "0.11.14", default-features = false, optional = true }
-maxminddb = "0.28"
+maxminddb = "0.31"
 
 hickory-net = { version = "0.26", default-features = false }
 hickory-proto = { version = "0.26", default-features = false }
@@ -57,7 +57,7 @@ serde_yaml = "0.9"
 serde_json = "1"
 prost = "0.14"
 regex = "1"
-zstd = "0.13"
+zstd = "0.14"
 filetime = "0.2"
 notify = "8"
 tempfile = "3.27"
@@ -85,10 +85,10 @@ uuid = { version = "1", features = [
 
 # dns
 chimera-dns = { path = "../clash-dns", default-features = false }
-dhcproto = "0.14"
+dhcproto = "0.15"
 
 # Macro Magic
-educe = "0.6"
+educe = "0.7"
 
 socket2 = { version = "0.6", features = ["all"] }
 
@@ -102,16 +102,16 @@ chrono = { version = "0.4", features = ["serde"] }
 
 sha2 = "0.11"
 md-5 = "0.11"
-blake2 = { version = "0.10.6", optional = true }
+blake2 = { version = "0.11.0", optional = true }
 digest = { version = "0.11.3", optional = true }
 
-tokio-tungstenite = { version = "0.29.0", optional = true }
+tokio-tungstenite = { version = "0.30.0", optional = true }
 tun-rs = { version = "2", features = [
     "async",
     "async_framed",
 ], optional = true }
 watfaq-netstack = { path = "../clash-netstack", optional = true }
-smoltcp = { version = "0.13", default-features = false, features = [
+smoltcp = { version = "0.14", default-features = false, features = [
     "std",
     "log",
     "medium-ip",
@@ -120,12 +120,12 @@ smoltcp = { version = "0.13", default-features = false, features = [
     "socket-udp",
     "socket-tcp",
 ], optional = true }
-etherparse = { version = "0.20", optional = true }
+etherparse = { version = "0.21", optional = true }
 
 # WireGuard
 boringtun = { version = "0.1.0", git = "https://github.com/Watfaq/boring-noise.git", rev = "9ddf1b5", package = "boring-noise", optional = true, default-features = false }
 
-base64 = "0.22"
+base64 = "0.23"
 
 # Builtin dashboard
 rust-embed = { version = "8", optional = true }
@@ -135,7 +135,7 @@ aws-lc-rs = { version = "1", default-features = false, optional = true }
 axum = { version = "0.8", features = ["ws"] }
 tower = { version = "0.5", features = ["util"] }
 
-tower-http = { version = "0.6", features = ["fs", "trace", "cors"] }
+tower-http = { version = "0.7", features = ["fs", "trace", "cors"] }
 
 erased-serde = "0.4"
 
@@ -237,7 +237,7 @@ windows = { version = "0.62", features = [
 sock2proc = { git = "https://github.com/Watfaq/sock2proc.git", rev = "9f9e630" }
 
 [target.'cfg(target_os="linux")'.dependencies]
-rtnetlink = "0.21"
+rtnetlink = "0.23"
 
 [build-dependencies]
 anyhow = "1"
@@ -245,11 +245,11 @@ anyhow = "1"
 [dev-dependencies]
 bollard = "0.21"
 rcgen = "0.14"
-mockall = "0.14.0"
+mockall = "0.15.0"
 tokio-test = "0.4.5"
-serial_test = "3.5"
+serial_test = "4.0"
 httpmock = "0.8.3"
-syn = { version = "2", features = ["full", "visit"] }
+syn = { version = "3", features = ["full", "visit"] }
 
 [lints]
 workspace = true
