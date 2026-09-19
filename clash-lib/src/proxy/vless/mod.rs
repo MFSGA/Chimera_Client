@@ -23,7 +23,7 @@ use tracing::debug;
 
 mod datagram;
 #[allow(dead_code)]
-mod encryption;
+pub(crate) mod encryption;
 mod stream;
 mod tls_deframer;
 mod tls_fuzzy_deframer;

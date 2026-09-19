@@ -5,6 +5,8 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 const METHOD: &str = "mlkem768x25519plus";
 const X25519_PUBLIC_KEY_LEN: usize = 32;
 const MLKEM768_PUBLIC_KEY_LEN: usize = 1184;
+#[cfg(feature = "vless-encryption")]
+const MLKEM768_CIPHERTEXT_LEN: usize = 1088;
 const KEY_TOKEN_MIN_CHARS: usize = 20;
 const DEFAULT_PADDING: [(PaddingKind, i64, i64, i64); 3] = [
     (PaddingKind::Length, 100, 111, 1111),
@@ -20,11 +22,21 @@ pub(crate) enum Appearance {
 }
 
 impl Appearance {
+    #[cfg(feature = "vless-encryption")]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Native => "native",
             Self::XorPub => "xorpub",
             Self::Random => "random",
+        }
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    const fn xor_mode(self) -> u32 {
+        match self {
+            Self::Native => 0,
+            Self::XorPub => 1,
+            Self::Random => 2,
         }
     }
 }
@@ -36,6 +48,7 @@ pub(crate) enum RttMode {
 }
 
 impl RttMode {
+    #[cfg(feature = "vless-encryption")]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::OneRtt => "1rtt",
@@ -76,6 +89,26 @@ pub(crate) struct Config {
     pub(crate) rtt: RttMode,
     pub(crate) padding: Vec<PaddingRule>,
     pub(crate) keys: Vec<KeyMaterial>,
+}
+
+#[cfg(feature = "vless-encryption")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedCrypto {
+    pub(crate) xor_mode: u32,
+    pub(crate) relays_length: usize,
+    pub(crate) key_hashes: Vec<[u8; 32]>,
+}
+
+#[cfg(feature = "vless-encryption")]
+impl PreparedCrypto {
+    pub(crate) fn summary(&self) -> String {
+        format!(
+            "xor-mode={}; relay-bytes={}; key-hashes={}",
+            self.xor_mode,
+            self.relays_length,
+            self.key_hashes.len()
+        )
+    }
 }
 
 impl Config {
@@ -172,7 +205,7 @@ impl Config {
         })
     }
 
-    #[cfg(feature = "aws-lc-rs")]
+    #[cfg(any(feature = "aws-lc-rs", feature = "vless-encryption"))]
     pub(crate) fn validate_crypto_keys(&self) -> io::Result<()> {
         use aws_lc_rs::{
             agreement,
@@ -206,6 +239,35 @@ impl Config {
         Ok(())
     }
 
+    #[cfg(feature = "vless-encryption")]
+    pub(crate) fn prepare_crypto(&self) -> io::Result<PreparedCrypto> {
+        self.validate_crypto_keys()?;
+
+        let relays_length = self
+            .keys
+            .iter()
+            .map(|key| match key.kind {
+                KeyKind::X25519 => X25519_PUBLIC_KEY_LEN + 32,
+                KeyKind::MlKem768 => MLKEM768_CIPHERTEXT_LEN + 32,
+            })
+            .sum::<usize>()
+            .checked_sub(32)
+            .ok_or_else(|| invalid("vless encryption key chain is empty"))?;
+
+        let key_hashes = self
+            .keys
+            .iter()
+            .map(|key| *blake3::hash(&key.bytes).as_bytes())
+            .collect();
+
+        Ok(PreparedCrypto {
+            xor_mode: self.appearance.xor_mode(),
+            relays_length,
+            key_hashes,
+        })
+    }
+
+    #[cfg(feature = "vless-encryption")]
     pub(crate) fn summary(&self) -> String {
         let x25519 = self
             .keys
@@ -465,7 +527,47 @@ mod tests {
         assert_eq!(config.padding[2].kind, PaddingKind::Length);
     }
 
-    #[cfg(feature = "aws-lc-rs")]
+    #[cfg(feature = "vless-encryption")]
+    #[test]
+    fn prepared_crypto_matches_xray_relay_layout_and_key_hashes() {
+        use aws_lc_rs::{
+            agreement,
+            kem::{DecapsulationKey, ML_KEM_768},
+        };
+
+        let x25519_private =
+            agreement::PrivateKey::generate(&agreement::X25519).unwrap();
+        let x25519_public = x25519_private.compute_public_key().unwrap();
+
+        let mlkem_private = DecapsulationKey::generate(&ML_KEM_768).unwrap();
+        let mlkem_public = mlkem_private.encapsulation_key().unwrap();
+        let mlkem_public_bytes = mlkem_public.key_bytes().unwrap();
+
+        let raw = format!(
+            "{METHOD}.random.1rtt.{}.{}",
+            URL_SAFE_NO_PAD.encode(x25519_public.as_ref()),
+            URL_SAFE_NO_PAD.encode(mlkem_public_bytes.as_ref()),
+        );
+        let config = Config::parse(&raw).expect("generated keys should parse");
+        let prepared = config.prepare_crypto().expect("crypto should prepare");
+
+        assert_eq!(prepared.xor_mode, 2);
+        assert_eq!(
+            prepared.relays_length,
+            (X25519_PUBLIC_KEY_LEN + 32) + (MLKEM768_CIPHERTEXT_LEN + 32) - 32
+        );
+        assert_eq!(prepared.key_hashes.len(), 2);
+        assert_eq!(
+            prepared.key_hashes[0],
+            *blake3::hash(x25519_public.as_ref()).as_bytes()
+        );
+        assert_eq!(
+            prepared.key_hashes[1],
+            *blake3::hash(mlkem_public_bytes.as_ref()).as_bytes()
+        );
+    }
+
+    #[cfg(any(feature = "aws-lc-rs", feature = "vless-encryption"))]
     #[test]
     fn crypto_validation_accepts_generated_x25519_and_mlkem_keys() {
         use aws_lc_rs::{
