@@ -1,6 +1,7 @@
 use std::io;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use rand::RngExt;
 
 const METHOD: &str = "mlkem768x25519plus";
 const X25519_PUBLIC_KEY_LEN: usize = 32;
@@ -96,6 +97,30 @@ pub(crate) struct Config {
     pub(crate) keys: Vec<KeyMaterial>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PaddingPlan {
+    pub(crate) total_len: usize,
+    pub(crate) write_lengths: Vec<usize>,
+    pub(crate) gaps_ms: Vec<u64>,
+}
+
+impl PaddingPlan {
+    #[cfg(feature = "vless-encryption")]
+    pub(crate) fn with_hello_prefix(
+        &self,
+        hello_prefix_len: usize,
+    ) -> io::Result<Vec<usize>> {
+        let mut write_lengths = self.write_lengths.clone();
+        let first = write_lengths.first_mut().ok_or_else(|| {
+            invalid("vless encryption padding plan has no length segment")
+        })?;
+        *first = first.checked_add(hello_prefix_len).ok_or_else(|| {
+            invalid("vless encryption hello write length overflow")
+        })?;
+        Ok(write_lengths)
+    }
+}
+
 #[cfg(feature = "vless-encryption")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PreparedCrypto {
@@ -106,13 +131,15 @@ pub(crate) struct PreparedCrypto {
     pub(crate) padding_max_len: usize,
     pub(crate) client_hello_min_len: usize,
     pub(crate) client_hello_max_len: usize,
+    pub(crate) hello_write_lengths: Vec<usize>,
+    pub(crate) padding_gaps_ms: Vec<u64>,
 }
 
 #[cfg(feature = "vless-encryption")]
 impl PreparedCrypto {
     pub(crate) fn summary(&self) -> String {
         format!(
-            "xor-mode={}; relay-bytes={}; key-hashes={}; padding-bytes={}-{}; hello-bytes={}-{}",
+            "xor-mode={}; relay-bytes={}; key-hashes={}; padding-bytes={}-{}; hello-bytes={}-{}; write-segments={}; gap-segments={}",
             self.xor_mode,
             self.relays_length,
             self.key_hashes.len(),
@@ -120,6 +147,8 @@ impl PreparedCrypto {
             self.padding_max_len,
             self.client_hello_min_len,
             self.client_hello_max_len,
+            self.hello_write_lengths.len(),
+            self.padding_gaps_ms.len(),
         )
     }
 }
@@ -290,6 +319,8 @@ impl Config {
             .ok_or_else(|| {
                 invalid("vless encryption client hello length overflow")
             })?;
+        let padding_plan = self.sample_padding_plan();
+        let hello_write_lengths = padding_plan.with_hello_prefix(fixed_hello_len)?;
 
         Ok(PreparedCrypto {
             xor_mode: self.appearance.xor_mode(),
@@ -299,6 +330,8 @@ impl Config {
             padding_max_len,
             client_hello_min_len,
             client_hello_max_len,
+            hello_write_lengths,
+            padding_gaps_ms: padding_plan.gaps_ms,
         })
     }
 
@@ -331,6 +364,48 @@ impl Config {
         }
 
         Ok((min_len, max_len))
+    }
+
+    pub(crate) fn sample_padding_plan(&self) -> PaddingPlan {
+        let mut rng = rand::rng();
+        let mut total_len = 0usize;
+        let mut write_lengths = Vec::new();
+        let mut gaps_ms = Vec::new();
+
+        for rule in &self.padding {
+            let selected = if rule.probability >= 100 {
+                true
+            } else if rule.probability <= 0 {
+                false
+            } else {
+                rng.random_range(0..100) < rule.probability
+            };
+
+            let sampled = if selected {
+                if rule.from == rule.to {
+                    rule.from
+                } else {
+                    rng.random_range(rule.from..=rule.to)
+                }
+            } else {
+                0
+            };
+
+            match rule.kind {
+                PaddingKind::Length => {
+                    let sampled = sampled as usize;
+                    total_len = total_len.saturating_add(sampled);
+                    write_lengths.push(sampled);
+                }
+                PaddingKind::Gap => gaps_ms.push(sampled as u64),
+            }
+        }
+
+        PaddingPlan {
+            total_len,
+            write_lengths,
+            gaps_ms,
+        }
     }
 
     #[cfg(feature = "vless-encryption")]
@@ -576,6 +651,55 @@ mod tests {
         ] {
             assert!(Config::parse(&raw).is_err(), "{raw} must fail");
         }
+    }
+
+    #[test]
+    fn padding_plan_matches_xray_length_gap_shape() {
+        let key = encoded_key(X25519_PUBLIC_KEY_LEN, 6);
+        let raw =
+            format!("{METHOD}.native.1rtt.100-111-1111.75-0-111.50-0-3333.{key}");
+        let config = Config::parse(&raw).expect("padding config");
+
+        for _ in 0..64 {
+            let plan = config.sample_padding_plan();
+
+            assert_eq!(plan.write_lengths.len(), 2);
+            assert_eq!(plan.gaps_ms.len(), 1);
+            assert!((111..=1111).contains(&plan.write_lengths[0]));
+            assert!(plan.write_lengths[1] <= 3333);
+            assert!(plan.gaps_ms[0] <= 111);
+            assert_eq!(plan.total_len, plan.write_lengths.iter().sum::<usize>());
+        }
+    }
+
+    #[test]
+    fn padding_plan_honors_zero_probability() {
+        let key = encoded_key(X25519_PUBLIC_KEY_LEN, 6);
+        let raw = format!("{METHOD}.native.1rtt.100-64-64.0-9-9.0-128-128.{key}");
+        let config = Config::parse(&raw).expect("padding config");
+
+        let plan = config.sample_padding_plan();
+
+        assert_eq!(plan.write_lengths, vec![64, 0]);
+        assert_eq!(plan.gaps_ms, vec![0]);
+        assert_eq!(plan.total_len, 64);
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    #[test]
+    fn padding_plan_adds_fixed_client_hello_prefix_to_first_write() {
+        let plan = PaddingPlan {
+            total_len: 96,
+            write_lengths: vec![64, 32],
+            gaps_ms: vec![7],
+        };
+
+        let writes = plan
+            .with_hello_prefix(1500)
+            .expect("hello prefix should fit");
+
+        assert_eq!(writes, vec![1564, 32]);
+        assert_eq!(plan.write_lengths, vec![64, 32]);
     }
 
     #[test]
