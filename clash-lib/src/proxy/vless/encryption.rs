@@ -12,8 +12,14 @@ const KEY_TOKEN_MIN_CHARS: usize = 20;
 #[cfg(feature = "vless-encryption")]
 const CLIENT_HELLO_IV_LEN: usize = 16;
 #[cfg(feature = "vless-encryption")]
+const AEAD_TAG_LEN: usize = 16;
+#[cfg(feature = "vless-encryption")]
+const ENCRYPTED_LENGTH_LEN: usize = 2 + AEAD_TAG_LEN;
+#[cfg(feature = "vless-encryption")]
+const PFS_PUBLIC_KEY_LEN: usize = MLKEM768_PUBLIC_KEY_LEN + X25519_PUBLIC_KEY_LEN;
+#[cfg(feature = "vless-encryption")]
 const PFS_KEY_EXCHANGE_LEN: usize =
-    18 + MLKEM768_PUBLIC_KEY_LEN + X25519_PUBLIC_KEY_LEN + 16;
+    ENCRYPTED_LENGTH_LEN + PFS_PUBLIC_KEY_LEN + AEAD_TAG_LEN;
 const DEFAULT_PADDING: [(PaddingKind, i64, i64, i64); 3] = [
     (PaddingKind::Length, 100, 111, 1111),
     (PaddingKind::Gap, 75, 0, 111),
@@ -131,11 +137,21 @@ pub(crate) struct PreparedNfsRelays {
 
 #[cfg(feature = "vless-encryption")]
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedOneRttHello {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) pfs_public_key: Vec<u8>,
+    pub(crate) mlkem_private_key: Vec<u8>,
+    pub(crate) x25519_private_key: [u8; X25519_PUBLIC_KEY_LEN],
+}
+
+#[cfg(feature = "vless-encryption")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PreparedCrypto {
     pub(crate) xor_mode: u32,
     pub(crate) relays_length: usize,
     pub(crate) nfs_relays: PreparedNfsRelays,
     pub(crate) nfs_aead_key: [u8; 32],
+    pub(crate) one_rtt_hello: Option<PreparedOneRttHello>,
     pub(crate) key_hashes: Vec<[u8; 32]>,
     pub(crate) padding_min_len: usize,
     pub(crate) padding_max_len: usize,
@@ -391,6 +407,125 @@ impl Config {
     }
 
     #[cfg(feature = "vless-encryption")]
+    fn prepare_one_rtt_hello(
+        &self,
+        nfs_relays: &PreparedNfsRelays,
+        nfs_aead_key: &[u8; 32],
+        padding_plan: &PaddingPlan,
+    ) -> io::Result<PreparedOneRttHello> {
+        use aws_lc_rs::{
+            agreement,
+            encoding::{AsBigEndian, Curve25519SeedBin},
+            kem::{DecapsulationKey, ML_KEM_768},
+        };
+
+        if !matches!(self.rtt, RttMode::OneRtt) {
+            return Err(invalid(
+                "1-RTT hello requested for non-1rtt vless encryption config",
+            ));
+        }
+
+        let mlkem_private = DecapsulationKey::generate(&ML_KEM_768)
+            .map_err(|_| invalid("failed to generate ML-KEM-768 PFS key"))?;
+        let mlkem_public = mlkem_private
+            .encapsulation_key()
+            .map_err(|_| invalid("failed to derive ML-KEM-768 PFS public key"))?;
+        let mlkem_public_bytes = mlkem_public
+            .key_bytes()
+            .map_err(|_| invalid("failed to serialize ML-KEM-768 PFS public key"))?;
+
+        let x25519_private = agreement::PrivateKey::generate(&agreement::X25519)
+            .map_err(|_| invalid("failed to generate X25519 PFS key"))?;
+        let x25519_public = x25519_private
+            .compute_public_key()
+            .map_err(|_| invalid("failed to derive X25519 PFS public key"))?;
+
+        let mut pfs_public_key = Vec::with_capacity(PFS_PUBLIC_KEY_LEN);
+        pfs_public_key.extend_from_slice(mlkem_public_bytes.as_ref());
+        pfs_public_key.extend_from_slice(x25519_public.as_ref());
+        if pfs_public_key.len() != PFS_PUBLIC_KEY_LEN {
+            return Err(invalid(format!(
+                "unexpected VLESS PFS public key length: {}",
+                pfs_public_key.len()
+            )));
+        }
+
+        let mlkem_private_key = mlkem_private
+            .key_bytes()
+            .map_err(|_| invalid("failed to serialize ML-KEM-768 PFS private key"))?
+            .as_ref()
+            .to_vec();
+        let x25519_seed: Curve25519SeedBin<'static> =
+            x25519_private.as_be_bytes().map_err(|_| {
+                invalid("failed to serialize X25519 PFS private key")
+            })?;
+        let x25519_private_key: [u8; X25519_PUBLIC_KEY_LEN] = x25519_seed
+            .as_ref()
+            .try_into()
+            .map_err(|_| invalid("unexpected X25519 PFS private key length"))?;
+
+        let padding_len = padding_plan.total_len;
+        if padding_len < ENCRYPTED_LENGTH_LEN + AEAD_TAG_LEN + 1 {
+            return Err(invalid(format!(
+                "vless encryption padding is too short for AEAD framing: {padding_len}"
+            )));
+        }
+
+        let mut aead = EncryptionAead::new(nfs_aead_key)?;
+        let encrypted_pfs_len = encode_length(PFS_PUBLIC_KEY_LEN + AEAD_TAG_LEN)?;
+        let encrypted_pfs_len = aead.seal(&encrypted_pfs_len)?;
+        if encrypted_pfs_len.len() != ENCRYPTED_LENGTH_LEN {
+            return Err(invalid("unexpected encrypted PFS length field size"));
+        }
+
+        let encrypted_pfs_public = aead.seal(&pfs_public_key)?;
+        if encrypted_pfs_public.len() != PFS_PUBLIC_KEY_LEN + AEAD_TAG_LEN {
+            return Err(invalid("unexpected encrypted PFS public key size"));
+        }
+
+        let encrypted_padding_body_len = padding_len
+            .checked_sub(ENCRYPTED_LENGTH_LEN)
+            .ok_or_else(|| invalid("vless encryption padding length underflow"))?;
+        let encrypted_padding_len =
+            aead.seal(&encode_length(encrypted_padding_body_len)?)?;
+        if encrypted_padding_len.len() != ENCRYPTED_LENGTH_LEN {
+            return Err(invalid("unexpected encrypted padding length field size"));
+        }
+
+        let padding_plaintext_len = encrypted_padding_body_len
+            .checked_sub(AEAD_TAG_LEN)
+            .ok_or_else(|| invalid("vless encryption padding body underflow"))?;
+        let encrypted_padding = aead.seal(&vec![0u8; padding_plaintext_len])?;
+        if encrypted_padding.len() != encrypted_padding_body_len {
+            return Err(invalid("unexpected encrypted padding body size"));
+        }
+
+        let fixed_len =
+            CLIENT_HELLO_IV_LEN + nfs_relays.relays.len() + PFS_KEY_EXCHANGE_LEN;
+        let mut bytes = Vec::with_capacity(fixed_len + padding_len);
+        bytes.extend_from_slice(&nfs_relays.iv);
+        bytes.extend_from_slice(&nfs_relays.relays);
+        bytes.extend_from_slice(&encrypted_pfs_len);
+        bytes.extend_from_slice(&encrypted_pfs_public);
+        bytes.extend_from_slice(&encrypted_padding_len);
+        bytes.extend_from_slice(&encrypted_padding);
+
+        if bytes.len() != fixed_len + padding_len {
+            return Err(invalid(format!(
+                "unexpected VLESS encryption client hello length: {}",
+                bytes.len()
+            )));
+        }
+
+        Ok(PreparedOneRttHello {
+            bytes,
+            pfs_public_key,
+            mlkem_private_key,
+            x25519_private_key,
+        })
+    }
+
+    #[cfg(feature = "vless-encryption")]
     pub(crate) fn prepare_crypto(&self) -> io::Result<PreparedCrypto> {
         self.validate_crypto_keys()?;
 
@@ -445,12 +580,22 @@ impl Config {
             })?;
         let padding_plan = self.sample_padding_plan();
         let hello_write_lengths = padding_plan.with_hello_prefix(fixed_hello_len)?;
+        let one_rtt_hello = if matches!(self.rtt, RttMode::OneRtt) {
+            Some(self.prepare_one_rtt_hello(
+                &nfs_relays,
+                &nfs_aead_key,
+                &padding_plan,
+            )?)
+        } else {
+            None
+        };
 
         Ok(PreparedCrypto {
             xor_mode: self.appearance.xor_mode(),
             relays_length,
             nfs_relays,
             nfs_aead_key,
+            one_rtt_hello,
             key_hashes,
             padding_min_len,
             padding_max_len,
@@ -554,6 +699,75 @@ impl Config {
             self.padding.len(),
         )
     }
+}
+
+#[cfg(feature = "vless-encryption")]
+struct EncryptionAead {
+    key: aws_lc_rs::aead::LessSafeKey,
+    nonce: [u8; 12],
+}
+
+#[cfg(feature = "vless-encryption")]
+impl EncryptionAead {
+    fn new(key: &[u8; 32]) -> io::Result<Self> {
+        use aws_lc_rs::aead::{AES_256_GCM, LessSafeKey, UnboundKey};
+
+        let unbound = UnboundKey::new(&AES_256_GCM, key)
+            .map_err(|_| invalid("failed to create VLESS AES-256-GCM key"))?;
+        Ok(Self {
+            key: LessSafeKey::new(unbound),
+            nonce: [0u8; 12],
+        })
+    }
+
+    fn next_nonce(&mut self) -> io::Result<aws_lc_rs::aead::Nonce> {
+        for index in (0..self.nonce.len()).rev() {
+            self.nonce[index] = self.nonce[index].wrapping_add(1);
+            if self.nonce[index] != 0 {
+                break;
+            }
+        }
+        aws_lc_rs::aead::Nonce::try_assume_unique_for_key(&self.nonce)
+            .map_err(|_| invalid("failed to construct VLESS AEAD nonce"))
+    }
+
+    fn seal(&mut self, plaintext: &[u8]) -> io::Result<Vec<u8>> {
+        use aws_lc_rs::aead::Aad;
+
+        let nonce = self.next_nonce()?;
+        let mut output = plaintext.to_vec();
+        self.key
+            .seal_in_place_append_tag(nonce, Aad::empty(), &mut output)
+            .map_err(|_| {
+                invalid("failed to seal VLESS encryption handshake field")
+            })?;
+        Ok(output)
+    }
+
+    #[cfg(test)]
+    fn open(&mut self, ciphertext: &[u8]) -> io::Result<Vec<u8>> {
+        use aws_lc_rs::aead::Aad;
+
+        let nonce = self.next_nonce()?;
+        let mut output = ciphertext.to_vec();
+        let plaintext = self
+            .key
+            .open_in_place(nonce, Aad::empty(), &mut output)
+            .map_err(|_| {
+                invalid("failed to open VLESS encryption handshake field")
+            })?;
+        let len = plaintext.len();
+        output.truncate(len);
+        Ok(output)
+    }
+}
+
+#[cfg(feature = "vless-encryption")]
+fn encode_length(length: usize) -> io::Result<[u8; 2]> {
+    let length = u16::try_from(length).map_err(|_| {
+        invalid(format!("VLESS encryption length exceeds u16: {length}"))
+    })?;
+    Ok(length.to_be_bytes())
 }
 
 #[cfg(feature = "vless-encryption")]
@@ -946,6 +1160,36 @@ mod tests {
 
     #[cfg(feature = "vless-encryption")]
     #[test]
+    fn nfs_aead_first_seal_matches_xray_go_vector() {
+        let context = [
+            0xff, 0x00, 0x80, 0x41, 0x42, 0x43, 0x7f, 0x01, 0xfe, 0x10, 0x20, 0x30,
+            0x40, 0x50, 0x60, 0x70,
+        ];
+        let material = [0x22u8; 32];
+        let expected_key = [
+            0x79, 0x22, 0x4b, 0x3e, 0xbd, 0xac, 0xc4, 0x03, 0x6d, 0x7a, 0x6f, 0x9b,
+            0x81, 0x19, 0xae, 0xcf, 0x8a, 0xa5, 0x4f, 0x7e, 0x2f, 0x0c, 0x81, 0x15,
+            0xf1, 0xae, 0x6e, 0xa9, 0x28, 0xe4, 0x24, 0xb1,
+        ];
+        let expected_ciphertext = [
+            0xfa, 0x78, 0xc8, 0xfd, 0x36, 0x18, 0x6b, 0x14, 0x0f, 0xe4, 0x07, 0xdd,
+            0xfd, 0x70, 0x9b, 0x6c, 0x5c, 0x92,
+        ];
+
+        let key = blake3_derive_key_raw_context(&context, &material)
+            .expect("binary context should derive");
+        assert_eq!(key, expected_key);
+
+        let mut aead = EncryptionAead::new(&key).expect("AEAD should build");
+        let sealed = aead
+            .seal(&[0x04, 0xd0])
+            .expect("first Xray-compatible seal should succeed");
+
+        assert_eq!(sealed, expected_ciphertext);
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    #[test]
     fn nfs_relay_chain_round_trips_x25519_and_mlkem() {
         use aws_lc_rs::{
             agreement,
@@ -1033,6 +1277,107 @@ mod tests {
                 .expect("server should recover final ML-KEM secret");
             assert_eq!(prepared.nfs_key, final_secret.as_ref());
         }
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    #[test]
+    fn one_rtt_client_hello_matches_xray_nfs_aead_layout() {
+        use aws_lc_rs::{
+            agreement,
+            kem::{Ciphertext, DecapsulationKey, EncapsulationKey, ML_KEM_768},
+        };
+
+        let server_private =
+            agreement::PrivateKey::generate(&agreement::X25519).unwrap();
+        let server_public = server_private.compute_public_key().unwrap();
+        let raw = format!(
+            "{METHOD}.native.1rtt.100-64-64.{}",
+            URL_SAFE_NO_PAD.encode(server_public.as_ref()),
+        );
+        let config = Config::parse(&raw).expect("1rtt config should parse");
+        let prepared = config.prepare_crypto().expect("crypto should prepare");
+        let hello = prepared
+            .one_rtt_hello
+            .as_ref()
+            .expect("1rtt hello should be prepared");
+
+        assert_eq!(
+            hello.bytes.len(),
+            CLIENT_HELLO_IV_LEN + prepared.relays_length + PFS_KEY_EXCHANGE_LEN + 64
+        );
+        assert_eq!(
+            prepared.hello_write_lengths.iter().sum::<usize>(),
+            hello.bytes.len()
+        );
+
+        let mut cursor = CLIENT_HELLO_IV_LEN + prepared.relays_length;
+        let mut aead =
+            EncryptionAead::new(&prepared.nfs_aead_key).expect("AEAD key");
+
+        let pfs_length_plain = aead
+            .open(&hello.bytes[cursor..cursor + ENCRYPTED_LENGTH_LEN])
+            .expect("PFS length should decrypt");
+        cursor += ENCRYPTED_LENGTH_LEN;
+        assert_eq!(
+            u16::from_be_bytes(pfs_length_plain.as_slice().try_into().unwrap())
+                as usize,
+            PFS_PUBLIC_KEY_LEN + AEAD_TAG_LEN
+        );
+
+        let encrypted_pfs_len = PFS_PUBLIC_KEY_LEN + AEAD_TAG_LEN;
+        let pfs_public = aead
+            .open(&hello.bytes[cursor..cursor + encrypted_pfs_len])
+            .expect("PFS public key should decrypt");
+        cursor += encrypted_pfs_len;
+        assert_eq!(pfs_public, hello.pfs_public_key);
+
+        let padding_length_plain = aead
+            .open(&hello.bytes[cursor..cursor + ENCRYPTED_LENGTH_LEN])
+            .expect("padding length should decrypt");
+        cursor += ENCRYPTED_LENGTH_LEN;
+        let encrypted_padding_len =
+            u16::from_be_bytes(padding_length_plain.as_slice().try_into().unwrap())
+                as usize;
+        assert_eq!(encrypted_padding_len, 64 - ENCRYPTED_LENGTH_LEN);
+
+        let padding_plain = aead
+            .open(&hello.bytes[cursor..cursor + encrypted_padding_len])
+            .expect("padding should decrypt");
+        cursor += encrypted_padding_len;
+        assert_eq!(
+            padding_plain.len(),
+            64 - ENCRYPTED_LENGTH_LEN - AEAD_TAG_LEN
+        );
+        assert!(padding_plain.iter().all(|byte| *byte == 0));
+        assert_eq!(cursor, hello.bytes.len());
+
+        let mlkem_private =
+            DecapsulationKey::new(&ML_KEM_768, &hello.mlkem_private_key)
+                .expect("serialized ML-KEM private key should reconstruct");
+        let mlkem_public = EncapsulationKey::new(
+            &ML_KEM_768,
+            &hello.pfs_public_key[..MLKEM768_PUBLIC_KEY_LEN],
+        )
+        .expect("serialized ML-KEM public key should reconstruct");
+        let (ciphertext, shared_client) =
+            mlkem_public.encapsulate().expect("ML-KEM encapsulation");
+        let shared_server = mlkem_private
+            .decapsulate(Ciphertext::from(ciphertext.as_ref()))
+            .expect("ML-KEM private key should decapsulate");
+        assert_eq!(shared_client.as_ref(), shared_server.as_ref());
+
+        let x25519_private = agreement::PrivateKey::from_private_key(
+            &agreement::X25519,
+            &hello.x25519_private_key,
+        )
+        .expect("serialized X25519 private key should reconstruct");
+        let x25519_public = x25519_private
+            .compute_public_key()
+            .expect("X25519 public key should reconstruct");
+        assert_eq!(
+            x25519_public.as_ref(),
+            &hello.pfs_public_key[MLKEM768_PUBLIC_KEY_LEN..]
+        );
     }
 
     #[cfg(feature = "vless-encryption")]
