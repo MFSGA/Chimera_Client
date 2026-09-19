@@ -135,6 +135,7 @@ pub(crate) struct PreparedCrypto {
     pub(crate) xor_mode: u32,
     pub(crate) relays_length: usize,
     pub(crate) nfs_relays: PreparedNfsRelays,
+    pub(crate) nfs_aead_key: [u8; 32],
     pub(crate) key_hashes: Vec<[u8; 32]>,
     pub(crate) padding_min_len: usize,
     pub(crate) padding_max_len: usize,
@@ -422,6 +423,8 @@ impl Config {
         if nfs_relays.nfs_key.is_empty() {
             return Err(invalid("vless encryption final NFS key is empty"));
         }
+        let nfs_aead_key =
+            blake3_derive_key_raw_context(&nfs_relays.iv, &nfs_relays.nfs_key)?;
 
         let (padding_min_len, padding_max_len) = self.padding_length_bounds()?;
         let fixed_hello_len = CLIENT_HELLO_IV_LEN
@@ -447,6 +450,7 @@ impl Config {
             xor_mode: self.appearance.xor_mode(),
             relays_length,
             nfs_relays,
+            nfs_aead_key,
             key_hashes,
             padding_min_len,
             padding_max_len,
@@ -550,6 +554,52 @@ impl Config {
             self.padding.len(),
         )
     }
+}
+
+#[cfg(feature = "vless-encryption")]
+fn blake3_derive_key_raw_context(
+    context: &[u8],
+    key_material: &[u8],
+) -> io::Result<[u8; 32]> {
+    use blake3::hazmat::HasherExt;
+
+    // Xray passes binary IV bytes through Go's string type to BLAKE3's
+    // derive-key context. Rust's high-level API requires UTF-8, so reproduce
+    // the context-hash stage directly for the 16-byte IV context.
+    if context.len() > blake3::BLOCK_LEN {
+        return Err(invalid("vless encryption BLAKE3 context exceeds one block"));
+    }
+
+    const BLAKE3_IV: [u32; 8] = [
+        0x6A09_E667,
+        0xBB67_AE85,
+        0x3C6E_F372,
+        0xA54F_F53A,
+        0x510E_527F,
+        0x9B05_688C,
+        0x1F83_D9AB,
+        0x5BE0_CD19,
+    ];
+    const CHUNK_START: u8 = 1 << 0;
+    const CHUNK_END: u8 = 1 << 1;
+    const ROOT: u8 = 1 << 3;
+    const DERIVE_KEY_CONTEXT: u8 = 1 << 5;
+
+    let mut block = [0u8; blake3::BLOCK_LEN];
+    block[..context.len()].copy_from_slice(context);
+    let output = blake3::platform::Platform::detect().compress_xof(
+        &BLAKE3_IV,
+        &block,
+        context.len() as u8,
+        0,
+        CHUNK_START | CHUNK_END | ROOT | DERIVE_KEY_CONTEXT,
+    );
+    let mut context_key = [0u8; 32];
+    context_key.copy_from_slice(&output[..32]);
+
+    let mut hasher = blake3::Hasher::new_from_context_key(&context_key);
+    hasher.update(key_material);
+    Ok(*hasher.finalize().as_bytes())
 }
 
 #[cfg(feature = "vless-encryption")]
@@ -859,6 +909,39 @@ mod tests {
         assert_eq!(config.padding[0].kind, PaddingKind::Length);
         assert_eq!(config.padding[1].kind, PaddingKind::Gap);
         assert_eq!(config.padding[2].kind, PaddingKind::Length);
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    #[test]
+    fn raw_context_derivation_matches_rust_for_utf8_context() {
+        let material = [0x11u8; 32];
+        let derived = blake3_derive_key_raw_context(b"hello", &material)
+            .expect("raw context derivation should work");
+
+        assert_eq!(derived, blake3::derive_key("hello", &material));
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    #[test]
+    fn raw_context_derivation_matches_xray_go_for_non_utf8_context() {
+        let context = [
+            0xff, 0x00, 0x80, 0x41, 0x42, 0x43, 0x7f, 0x01, 0xfe, 0x10, 0x20, 0x30,
+            0x40, 0x50, 0x60, 0x70,
+        ];
+        let material = [0x11u8; 32];
+
+        // Generated with Xray's Go dependency:
+        // lukechampine.com/blake3.DeriveKey(out, string(context), material).
+        let expected = [
+            0x26, 0x73, 0x7d, 0xde, 0x8e, 0xf1, 0xa3, 0x42, 0x63, 0xea, 0x7a, 0xf3,
+            0x72, 0x92, 0xc0, 0x8c, 0xce, 0x0f, 0xff, 0xfb, 0x62, 0xf0, 0xd2, 0xab,
+            0xab, 0xde, 0x7e, 0x98, 0x80, 0xf0, 0xb2, 0xa9,
+        ];
+
+        let derived = blake3_derive_key_raw_context(&context, &material)
+            .expect("binary context derivation should work");
+
+        assert_eq!(derived, expected);
     }
 
     #[cfg(feature = "vless-encryption")]
