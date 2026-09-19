@@ -123,9 +123,18 @@ impl PaddingPlan {
 
 #[cfg(feature = "vless-encryption")]
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedNfsRelays {
+    pub(crate) iv: [u8; CLIENT_HELLO_IV_LEN],
+    pub(crate) relays: Vec<u8>,
+    pub(crate) nfs_key: Vec<u8>,
+}
+
+#[cfg(feature = "vless-encryption")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PreparedCrypto {
     pub(crate) xor_mode: u32,
     pub(crate) relays_length: usize,
+    pub(crate) nfs_relays: PreparedNfsRelays,
     pub(crate) key_hashes: Vec<[u8; 32]>,
     pub(crate) padding_min_len: usize,
     pub(crate) padding_max_len: usize,
@@ -282,6 +291,105 @@ impl Config {
     }
 
     #[cfg(feature = "vless-encryption")]
+    pub(crate) fn prepare_nfs_relays(
+        &self,
+        iv: [u8; CLIENT_HELLO_IV_LEN],
+    ) -> io::Result<PreparedNfsRelays> {
+        use aws_lc_rs::{
+            agreement,
+            kem::{EncapsulationKey, ML_KEM_768},
+        };
+
+        self.validate_crypto_keys()?;
+
+        let mut relays = Vec::new();
+        let mut nfs_key = Vec::new();
+        let mut previous_chain_mask: Option<[u8; 64]> = None;
+
+        for (index, key) in self.keys.iter().enumerate() {
+            let (mut relay, shared_secret) = match key.kind {
+                KeyKind::X25519 => {
+                    let private_key =
+                        agreement::PrivateKey::generate(&agreement::X25519)
+                            .map_err(|_| {
+                                invalid("failed to generate X25519 relay key")
+                            })?;
+                    let public_key =
+                        private_key.compute_public_key().map_err(|_| {
+                            invalid("failed to compute X25519 relay public key")
+                        })?;
+                    let peer = agreement::UnparsedPublicKey::new(
+                        &agreement::X25519,
+                        &key.bytes,
+                    );
+                    let mut shared_secret = Vec::new();
+                    agreement::agree(
+                        &private_key,
+                        peer,
+                        invalid("failed X25519 relay agreement"),
+                        |material| {
+                            shared_secret.extend_from_slice(material);
+                            Ok(())
+                        },
+                    )?;
+                    (public_key.as_ref().to_vec(), shared_secret)
+                }
+                KeyKind::MlKem768 => {
+                    let peer = EncapsulationKey::new(&ML_KEM_768, &key.bytes)
+                        .map_err(|_| {
+                            invalid("invalid ML-KEM-768 relay public key")
+                        })?;
+                    let (ciphertext, shared_secret) =
+                        peer.encapsulate().map_err(|_| {
+                            invalid("failed ML-KEM-768 relay encapsulation")
+                        })?;
+                    (
+                        ciphertext.as_ref().to_vec(),
+                        shared_secret.as_ref().to_vec(),
+                    )
+                }
+            };
+
+            if !matches!(self.appearance, Appearance::Native) {
+                xor_vless_ctr(&key.bytes, &iv, &mut relay)?;
+            }
+
+            if let Some(mask) = previous_chain_mask {
+                if relay.len() < 32 {
+                    return Err(invalid(
+                        "vless encryption relay is shorter than 32 bytes",
+                    ));
+                }
+                for (byte, mask_byte) in relay[..32].iter_mut().zip(&mask[32..]) {
+                    *byte ^= mask_byte;
+                }
+            }
+
+            relays.extend_from_slice(&relay);
+            nfs_key = shared_secret;
+
+            if index + 1 < self.keys.len() {
+                let mut mask = [0u8; 64];
+                xor_vless_ctr(&nfs_key, &iv, &mut mask)?;
+
+                let next_hash = blake3::hash(&self.keys[index + 1].bytes);
+                let mut chained_hash = *next_hash.as_bytes();
+                for (byte, mask_byte) in chained_hash.iter_mut().zip(&mask[..32]) {
+                    *byte ^= mask_byte;
+                }
+                relays.extend_from_slice(&chained_hash);
+                previous_chain_mask = Some(mask);
+            }
+        }
+
+        Ok(PreparedNfsRelays {
+            iv,
+            relays,
+            nfs_key,
+        })
+    }
+
+    #[cfg(feature = "vless-encryption")]
     pub(crate) fn prepare_crypto(&self) -> io::Result<PreparedCrypto> {
         self.validate_crypto_keys()?;
 
@@ -301,6 +409,19 @@ impl Config {
             .iter()
             .map(|key| *blake3::hash(&key.bytes).as_bytes())
             .collect();
+
+        let mut iv = [0u8; CLIENT_HELLO_IV_LEN];
+        rand::rng().fill(&mut iv);
+        let nfs_relays = self.prepare_nfs_relays(iv)?;
+        if nfs_relays.relays.len() != relays_length {
+            return Err(invalid(format!(
+                "vless encryption relay length mismatch: expected {relays_length}, got {}",
+                nfs_relays.relays.len()
+            )));
+        }
+        if nfs_relays.nfs_key.is_empty() {
+            return Err(invalid("vless encryption final NFS key is empty"));
+        }
 
         let (padding_min_len, padding_max_len) = self.padding_length_bounds()?;
         let fixed_hello_len = CLIENT_HELLO_IV_LEN
@@ -325,6 +446,7 @@ impl Config {
         Ok(PreparedCrypto {
             xor_mode: self.appearance.xor_mode(),
             relays_length,
+            nfs_relays,
             key_hashes,
             padding_min_len,
             padding_max_len,
@@ -428,6 +550,28 @@ impl Config {
             self.padding.len(),
         )
     }
+}
+
+#[cfg(feature = "vless-encryption")]
+fn xor_vless_ctr(
+    key_material: &[u8],
+    iv: &[u8; CLIENT_HELLO_IV_LEN],
+    in_out: &mut [u8],
+) -> io::Result<()> {
+    use aws_lc_rs::{
+        cipher::{AES_256, EncryptingKey, EncryptionContext, UnboundCipherKey},
+        iv::FixedLength,
+    };
+
+    let key_bytes = blake3::derive_key("VLESS", key_material);
+    let unbound = UnboundCipherKey::new(&AES_256, &key_bytes)
+        .map_err(|_| invalid("failed to create VLESS AES-CTR key"))?;
+    let cipher = EncryptingKey::ctr(unbound)
+        .map_err(|_| invalid("failed to create VLESS AES-CTR cipher"))?;
+    cipher
+        .less_safe_encrypt(in_out, EncryptionContext::Iv128(FixedLength::from(*iv)))
+        .map_err(|_| invalid("failed to apply VLESS AES-CTR"))?;
+    Ok(())
 }
 
 fn parse_padding(blocks: &[String]) -> io::Result<Vec<PaddingRule>> {
@@ -715,6 +859,97 @@ mod tests {
         assert_eq!(config.padding[0].kind, PaddingKind::Length);
         assert_eq!(config.padding[1].kind, PaddingKind::Gap);
         assert_eq!(config.padding[2].kind, PaddingKind::Length);
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    #[test]
+    fn nfs_relay_chain_round_trips_x25519_and_mlkem() {
+        use aws_lc_rs::{
+            agreement,
+            kem::{Ciphertext, DecapsulationKey, ML_KEM_768},
+        };
+
+        let x25519_private =
+            agreement::PrivateKey::generate(&agreement::X25519).unwrap();
+        let x25519_public = x25519_private.compute_public_key().unwrap();
+
+        let mlkem_private = DecapsulationKey::generate(&ML_KEM_768).unwrap();
+        let mlkem_public = mlkem_private.encapsulation_key().unwrap();
+        let mlkem_public_bytes = mlkem_public.key_bytes().unwrap();
+
+        for appearance in ["native", "xorpub", "random"] {
+            let raw = format!(
+                "{METHOD}.{appearance}.1rtt.{}.{}",
+                URL_SAFE_NO_PAD.encode(x25519_public.as_ref()),
+                URL_SAFE_NO_PAD.encode(mlkem_public_bytes.as_ref()),
+            );
+            let config = Config::parse(&raw).expect("relay config should parse");
+            let iv = [0x42; CLIENT_HELLO_IV_LEN];
+            let prepared = config
+                .prepare_nfs_relays(iv)
+                .expect("relay chain should prepare");
+
+            assert_eq!(
+                prepared.relays.len(),
+                X25519_PUBLIC_KEY_LEN + 32 + MLKEM768_CIPHERTEXT_LEN
+            );
+            assert_eq!(prepared.iv, iv);
+
+            let mut cursor = 0usize;
+
+            let mut x25519_relay =
+                prepared.relays[cursor..cursor + X25519_PUBLIC_KEY_LEN].to_vec();
+            cursor += X25519_PUBLIC_KEY_LEN;
+            if appearance != "native" {
+                xor_vless_ctr(x25519_public.as_ref(), &iv, &mut x25519_relay)
+                    .expect("appearance mask should reverse");
+            }
+
+            let peer =
+                agreement::UnparsedPublicKey::new(&agreement::X25519, &x25519_relay);
+            let mut first_secret = Vec::new();
+            agreement::agree(
+                &x25519_private,
+                peer,
+                invalid("server-side X25519 agreement failed"),
+                |material| {
+                    first_secret.extend_from_slice(material);
+                    Ok(())
+                },
+            )
+            .expect("server should recover first shared secret");
+
+            let mut chain_mask = [0u8; 64];
+            xor_vless_ctr(&first_secret, &iv, &mut chain_mask)
+                .expect("chain mask should derive");
+
+            let mut chained_hash = prepared.relays[cursor..cursor + 32].to_vec();
+            cursor += 32;
+            for (byte, mask_byte) in chained_hash.iter_mut().zip(&chain_mask[..32]) {
+                *byte ^= mask_byte;
+            }
+            assert_eq!(
+                chained_hash.as_slice(),
+                blake3::hash(mlkem_public_bytes.as_ref()).as_bytes()
+            );
+
+            let mut mlkem_relay =
+                prepared.relays[cursor..cursor + MLKEM768_CIPHERTEXT_LEN].to_vec();
+            for (byte, mask_byte) in
+                mlkem_relay[..32].iter_mut().zip(&chain_mask[32..])
+            {
+                *byte ^= mask_byte;
+            }
+            if appearance != "native" {
+                xor_vless_ctr(mlkem_public_bytes.as_ref(), &iv, &mut mlkem_relay)
+                    .expect("appearance mask should reverse");
+            }
+
+            let final_secret = mlkem_private
+                .decapsulate(Ciphertext::from(mlkem_relay.as_slice()))
+                .expect("server should recover final ML-KEM secret");
+            assert_eq!(prepared.nfs_key, final_secret.as_ref());
+        }
     }
 
     #[cfg(feature = "vless-encryption")]
