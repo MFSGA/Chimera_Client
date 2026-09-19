@@ -8,6 +8,10 @@ const MLKEM768_PUBLIC_KEY_LEN: usize = 1184;
 #[cfg(feature = "vless-encryption")]
 const MLKEM768_CIPHERTEXT_LEN: usize = 1088;
 const KEY_TOKEN_MIN_CHARS: usize = 20;
+#[cfg(feature = "vless-encryption")]
+const CLIENT_HELLO_IV_LEN: usize = 16;
+#[cfg(feature = "vless-encryption")]
+const PFS_KEY_EXCHANGE_LEN: usize = 18 + MLKEM768_PUBLIC_KEY_LEN + X25519_PUBLIC_KEY_LEN + 16;
 const DEFAULT_PADDING: [(PaddingKind, i64, i64, i64); 3] = [
     (PaddingKind::Length, 100, 111, 1111),
     (PaddingKind::Gap, 75, 0, 111),
@@ -97,16 +101,24 @@ pub(crate) struct PreparedCrypto {
     pub(crate) xor_mode: u32,
     pub(crate) relays_length: usize,
     pub(crate) key_hashes: Vec<[u8; 32]>,
+    pub(crate) padding_min_len: usize,
+    pub(crate) padding_max_len: usize,
+    pub(crate) client_hello_min_len: usize,
+    pub(crate) client_hello_max_len: usize,
 }
 
 #[cfg(feature = "vless-encryption")]
 impl PreparedCrypto {
     pub(crate) fn summary(&self) -> String {
         format!(
-            "xor-mode={}; relay-bytes={}; key-hashes={}",
+            "xor-mode={}; relay-bytes={}; key-hashes={}; padding-bytes={}-{}; hello-bytes={}-{}",
             self.xor_mode,
             self.relays_length,
-            self.key_hashes.len()
+            self.key_hashes.len(),
+            self.padding_min_len,
+            self.padding_max_len,
+            self.client_hello_min_len,
+            self.client_hello_max_len,
         )
     }
 }
@@ -260,11 +272,58 @@ impl Config {
             .map(|key| *blake3::hash(&key.bytes).as_bytes())
             .collect();
 
+        let (padding_min_len, padding_max_len) =
+            self.padding_length_bounds()?;
+        let fixed_hello_len = CLIENT_HELLO_IV_LEN
+            .checked_add(relays_length)
+            .and_then(|len| len.checked_add(PFS_KEY_EXCHANGE_LEN))
+            .ok_or_else(|| invalid("vless encryption client hello length overflow"))?;
+        let client_hello_min_len = fixed_hello_len
+            .checked_add(padding_min_len)
+            .ok_or_else(|| invalid("vless encryption client hello length overflow"))?;
+        let client_hello_max_len = fixed_hello_len
+            .checked_add(padding_max_len)
+            .ok_or_else(|| invalid("vless encryption client hello length overflow"))?;
+
         Ok(PreparedCrypto {
             xor_mode: self.appearance.xor_mode(),
             relays_length,
             key_hashes,
+            padding_min_len,
+            padding_max_len,
+            client_hello_min_len,
+            client_hello_max_len,
         })
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    fn padding_length_bounds(&self) -> io::Result<(usize, usize)> {
+        let mut min_len = 0usize;
+        let mut max_len = 0usize;
+
+        for rule in &self.padding {
+            if !matches!(rule.kind, PaddingKind::Length) {
+                continue;
+            }
+
+            let min = if rule.probability == 100 {
+                usize::try_from(rule.from)
+                    .map_err(|_| invalid("negative vless encryption padding length"))?
+            } else {
+                0
+            };
+            let max = usize::try_from(rule.to)
+                .map_err(|_| invalid("negative vless encryption padding length"))?;
+
+            min_len = min_len
+                .checked_add(min)
+                .ok_or_else(|| invalid("vless encryption padding length overflow"))?;
+            max_len = max_len
+                .checked_add(max)
+                .ok_or_else(|| invalid("vless encryption padding length overflow"))?;
+        }
+
+        Ok((min_len, max_len))
     }
 
     #[cfg(feature = "vless-encryption")]
@@ -557,6 +616,13 @@ mod tests {
             (X25519_PUBLIC_KEY_LEN + 32) + (MLKEM768_CIPHERTEXT_LEN + 32) - 32
         );
         assert_eq!(prepared.key_hashes.len(), 2);
+        assert_eq!(prepared.padding_min_len, 111);
+        assert_eq!(prepared.padding_max_len, 4_444);
+        let fixed = CLIENT_HELLO_IV_LEN
+            + prepared.relays_length
+            + PFS_KEY_EXCHANGE_LEN;
+        assert_eq!(prepared.client_hello_min_len, fixed + 111);
+        assert_eq!(prepared.client_hello_max_len, fixed + 4_444);
         assert_eq!(
             prepared.key_hashes[0],
             *blake3::hash(x25519_public.as_ref()).as_bytes()

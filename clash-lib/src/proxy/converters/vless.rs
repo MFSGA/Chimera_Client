@@ -2054,7 +2054,7 @@ mod tests {
             .expect_err("runtime handshake is not implemented yet");
         assert!(
             err.to_string().contains(
-                "vless encryption config is valid (native.1rtt; padding-blocks=1; x25519-keys=1; mlkem768-keys=0; xor-mode=0; relay-bytes=32; key-hashes=1)"
+                "vless encryption config is valid (native.1rtt; padding-blocks=1; x25519-keys=1; mlkem768-keys=0; xor-mode=0; relay-bytes=32; key-hashes=1; padding-bytes=200-300; hello-bytes=1498-1598)"
             ),
             "unexpected error: {err}"
         );
