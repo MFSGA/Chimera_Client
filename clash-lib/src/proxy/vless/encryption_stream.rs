@@ -1,12 +1,17 @@
 #![allow(dead_code)]
 
 use std::{
+    future::Future,
     io,
     pin::Pin,
     task::{Context, Poll},
+    time::Duration,
 };
 
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    time::{Sleep, sleep},
+};
 
 use super::encryption::{
     EncryptionRecordCodec, PreparedCrypto, PreparedOneRttSession,
@@ -42,6 +47,108 @@ impl PendingIo {
     }
 }
 
+struct PendingHelloWrite {
+    data: Vec<u8>,
+    write_lengths: Vec<usize>,
+    gaps_ms: Vec<u64>,
+    offset: usize,
+    segment_index: usize,
+    segment_written: usize,
+    gap_sleep: Option<Pin<Box<Sleep>>>,
+}
+
+impl PendingHelloWrite {
+    fn new(
+        data: Vec<u8>,
+        write_lengths: Vec<usize>,
+        gaps_ms: Vec<u64>,
+    ) -> io::Result<Self> {
+        if write_lengths.is_empty() {
+            return Err(invalid("VLESS encryption hello has no write segments"));
+        }
+        let scheduled_len =
+            write_lengths.iter().try_fold(0usize, |total, len| {
+                total.checked_add(*len).ok_or_else(|| {
+                    invalid("VLESS encryption hello write schedule overflow")
+                })
+            })?;
+        if scheduled_len != data.len() {
+            return Err(invalid(format!(
+                "VLESS encryption hello write schedule length mismatch: expected {}, got {scheduled_len}",
+                data.len()
+            )));
+        }
+        if gaps_ms.len() > write_lengths.len() {
+            return Err(invalid(
+                "VLESS encryption hello has more gaps than write segments",
+            ));
+        }
+
+        Ok(Self {
+            data,
+            write_lengths,
+            gaps_ms,
+            offset: 0,
+            segment_index: 0,
+            segment_written: 0,
+            gap_sleep: None,
+        })
+    }
+
+    fn poll_write(
+        &mut self,
+        inner: &mut AnyStream,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        loop {
+            if let Some(gap_sleep) = self.gap_sleep.as_mut() {
+                match gap_sleep.as_mut().poll(cx) {
+                    Poll::Ready(()) => self.gap_sleep = None,
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+
+            let Some(&segment_len) = self.write_lengths.get(self.segment_index)
+            else {
+                return Poll::Ready(Ok(()));
+            };
+            while self.segment_written < segment_len {
+                let remaining = segment_len - self.segment_written;
+                let segment_end =
+                    self.offset.checked_add(remaining).ok_or_else(|| {
+                        invalid("VLESS encryption hello segment length overflow")
+                    })?;
+                match Pin::new(&mut **inner)
+                    .poll_write(cx, &self.data[self.offset..segment_end])
+                {
+                    Poll::Ready(Ok(0)) => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "failed to write VLESS encryption hello segment",
+                        )));
+                    }
+                    Poll::Ready(Ok(n)) => {
+                        self.offset += n;
+                        self.segment_written += n;
+                    }
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+
+            let completed_index = self.segment_index;
+            self.segment_index += 1;
+            self.segment_written = 0;
+            if let Some(&gap_ms) = self.gaps_ms.get(completed_index)
+                && gap_ms > 0
+            {
+                self.gap_sleep =
+                    Some(Box::pin(sleep(Duration::from_millis(gap_ms))));
+            }
+        }
+    }
+}
+
 struct PendingRecordWrite {
     wire: PendingIo,
     user_len: usize,
@@ -51,7 +158,7 @@ pub(crate) struct EncryptionStream {
     inner: AnyStream,
     prepared: Option<PreparedCrypto>,
     session: Option<PreparedOneRttSession>,
-    hello: PendingIo,
+    hello: PendingHelloWrite,
     server_pfs: PendingIo,
     server_ticket: PendingIo,
     server_padding_len: PendingIo,
@@ -148,13 +255,15 @@ impl EncryptionStream {
         let hello = prepared.one_rtt_hello.as_ref().ok_or_else(|| {
             invalid("VLESS encryption runtime MVP currently supports only 1rtt")
         })?;
+        let pending_hello = PendingHelloWrite::new(
+            hello.bytes.clone(),
+            prepared.hello_write_lengths.clone(),
+            prepared.padding_gaps_ms.clone(),
+        )?;
 
-        // TODO: preserve hello_write_lengths/padding_gaps_ms timing. Sending the
-        // exact prepared hello in one logical write is wire-compatible; only the
-        // traffic-shaping cadence is deferred.
         Ok(Self {
             inner,
-            hello: PendingIo::from_data(hello.bytes.clone()),
+            hello: pending_hello,
             prepared: Some(prepared),
             session: None,
             server_pfs: PendingIo::with_len(SERVER_PFS_RESPONSE_LEN),
@@ -177,7 +286,7 @@ impl EncryptionStream {
             return Poll::Ready(Ok(()));
         }
 
-        match poll_write_pending(&mut self.inner, cx, &mut self.hello) {
+        match self.hello.poll_write(&mut self.inner, cx) {
             Poll::Ready(Ok(())) => {}
             other => return other,
         }
@@ -362,6 +471,122 @@ impl AsyncWrite for EncryptionStream {
             other => return other,
         }
         Pin::new(&mut *self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{Arc, Mutex},
+        task::Context,
+    };
+
+    use futures::task::noop_waker_ref;
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    use super::*;
+
+    struct RecordingStream {
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl AsyncRead for RecordingStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for RecordingStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.writes.lock().unwrap().push(buf.to_vec());
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn recording_stream() -> (AnyStream, Arc<Mutex<Vec<Vec<u8>>>>) {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let stream = RecordingStream {
+            writes: Arc::clone(&writes),
+        };
+        (Box::new(stream), writes)
+    }
+
+    #[test]
+    fn hello_schedule_preserves_write_segments_and_skips_zero_length_writes() {
+        let mut hello =
+            PendingHelloWrite::new(b"abcdef".to_vec(), vec![3, 0, 3], vec![0, 0])
+                .expect("hello schedule should build");
+        let (mut stream, writes) = recording_stream();
+        let mut cx = Context::from_waker(noop_waker_ref());
+
+        assert!(matches!(
+            hello.poll_write(&mut stream, &mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![b"abc".to_vec(), b"def".to_vec()]
+        );
+    }
+
+    #[tokio::test]
+    async fn hello_schedule_waits_at_gap_before_next_segment() {
+        let mut hello =
+            PendingHelloWrite::new(b"abcdef".to_vec(), vec![3, 3], vec![50])
+                .expect("hello schedule should build");
+        let (mut stream, writes) = recording_stream();
+        let mut cx = Context::from_waker(noop_waker_ref());
+
+        assert!(matches!(
+            hello.poll_write(&mut stream, &mut cx),
+            Poll::Pending
+        ));
+        assert_eq!(*writes.lock().unwrap(), vec![b"abc".to_vec()]);
+        assert_eq!(hello.segment_index, 1);
+        assert!(hello.gap_sleep.is_some());
+
+        hello.gap_sleep = None;
+        assert!(matches!(
+            hello.poll_write(&mut stream, &mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![b"abc".to_vec(), b"def".to_vec()]
+        );
+    }
+
+    #[test]
+    fn hello_schedule_rejects_length_mismatch() {
+        let err = match PendingHelloWrite::new(b"abcd".to_vec(), vec![2, 1], vec![])
+        {
+            Ok(_) => panic!("mismatched hello schedule must fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("length mismatch"));
     }
 }
 
