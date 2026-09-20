@@ -16,7 +16,11 @@ use crate::{
             XhttpUplinkDataPlacement,
         },
         vless::{
-            Handler, HandlerOptions, encryption::Config as VlessEncryptionConfig,
+            Handler, HandlerOptions,
+            encryption::{
+                Appearance as VlessEncryptionAppearance,
+                Config as VlessEncryptionConfig, RttMode as VlessEncryptionRttMode,
+            },
         },
     },
 };
@@ -50,6 +54,18 @@ impl TryFrom<&OutboundVless> for Handler {
 
     fn try_from(s: &OutboundVless) -> Result<Self, Self::Error> {
         validate_vless_config(s)?;
+        let encryption = s
+            .encryption
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && *value != "none")
+            .map(VlessEncryptionConfig::parse)
+            .transpose()
+            .map_err(|err| {
+                Error::InvalidConfig(format!(
+                    "invalid vless encryption config: {err}"
+                ))
+            })?;
         let network = s.network.as_deref();
         let skip_cert_verify = s.skip_cert_verify.unwrap_or_default();
         let (server, port) = xhttp_upload_server_port(s);
@@ -75,6 +91,7 @@ impl TryFrom<&OutboundVless> for Handler {
             transport,
             tls: build_tls_transport(network, s, skip_cert_verify)?,
             flow: s.flow.clone(),
+            encryption,
         }))
     }
 }
@@ -98,26 +115,33 @@ fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
                         "invalid vless encryption config: {err}"
                     ))
                 })?;
-            #[cfg(feature = "vless-encryption")]
-            {
-                let prepared = parsed.prepare_crypto().map_err(|err| {
-                    Error::InvalidConfig(format!(
-                        "invalid vless encryption crypto key: {err}"
-                    ))
-                })?;
-                return Err(Error::InvalidConfig(format!(
-                    "vless encryption config is valid ({}; {}) but runtime handshake support is not implemented yet",
-                    parsed.summary(),
-                    prepared.summary()
-                )));
-            }
-            #[cfg(not(feature = "vless-encryption"))]
-            {
-                let _ = parsed;
+            if parsed.appearance != VlessEncryptionAppearance::Native {
                 return Err(Error::InvalidConfig(
-                    "vless encryption requires vless-encryption feature".to_owned(),
+                    "VLESS encryption runtime MVP currently supports only native appearance; xorpub/random are TODO"
+                        .to_owned(),
                 ));
             }
+            if parsed.rtt != VlessEncryptionRttMode::OneRtt {
+                return Err(Error::InvalidConfig(
+                    "VLESS encryption runtime MVP currently supports only 1rtt; 0rtt ticket reuse is TODO"
+                        .to_owned(),
+                ));
+            }
+            if s.flow.as_deref() == Some("xtls-rprx-vision") {
+                return Err(Error::InvalidConfig(
+                    "VLESS encryption with xtls-rprx-vision is TODO".to_owned(),
+                ));
+            }
+            #[cfg(feature = "vless-encryption")]
+            parsed.validate_crypto_keys().map_err(|err| {
+                Error::InvalidConfig(format!(
+                    "invalid vless encryption crypto key: {err}"
+                ))
+            })?;
+            #[cfg(not(feature = "vless-encryption"))]
+            return Err(Error::InvalidConfig(
+                "vless encryption requires vless-encryption feature".to_owned(),
+            ));
         }
     }
 
@@ -2032,7 +2056,7 @@ mod tests {
     }
 
     #[test]
-    fn vless_recognizes_valid_encryption_before_runtime_rejection() {
+    fn vless_accepts_native_one_rtt_encryption_runtime() {
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
         let key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
@@ -2050,14 +2074,42 @@ mod tests {
             ..Default::default()
         };
 
-        let err = validate_vless_config(&outbound)
-            .expect_err("runtime handshake is not implemented yet");
-        assert!(
-            err.to_string().contains(
-                "vless encryption config is valid (native.1rtt; padding-blocks=1; x25519-keys=1; mlkem768-keys=0; xor-mode=0; relay-bytes=32; key-hashes=1; padding-bytes=200-300; hello-bytes=1498-1598; write-segments=1; gap-segments=0)"
-            ),
-            "unexpected error: {err}"
-        );
+        validate_vless_config(&outbound)
+            .expect("native 1rtt encryption runtime should validate");
+        crate::proxy::vless::Handler::try_from(&outbound)
+            .expect("native 1rtt encryption handler should build");
+    }
+
+    #[test]
+    fn vless_encryption_mvp_rejects_zero_rtt_and_random() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
+        for (mode, expected) in [
+            ("native.0rtt", "supports only 1rtt"),
+            ("random.1rtt", "supports only native appearance"),
+        ] {
+            let outbound = OutboundVless {
+                common_opts: CommonConfigOptions {
+                    name: "encrypted-vless-todo".to_owned(),
+                    server: "example.com".to_owned(),
+                    port: 443,
+                    connect_via: None,
+                },
+                uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+                encryption: Some(format!(
+                    "mlkem768x25519plus.{mode}.100-200-300.{key}"
+                )),
+                ..Default::default()
+            };
+
+            let err = validate_vless_config(&outbound)
+                .expect_err("unsupported MVP mode must fail explicitly");
+            assert!(
+                err.to_string().contains(expected),
+                "unexpected error for {mode}: {err}"
+            );
+        }
     }
 
     #[test]

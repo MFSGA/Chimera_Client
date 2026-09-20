@@ -1,3 +1,5 @@
+#[cfg(feature = "vless-encryption")]
+use self::encryption_stream::EncryptionStream;
 use self::stream::VlessStream;
 use super::{
     AnyStream, ConnectorType, DialWithConnector, HandlerCommonOptions,
@@ -45,6 +47,7 @@ pub struct HandlerOptions {
     pub transport: Option<Box<dyn Transport>>,
     pub tls: Option<Box<dyn Transport>>,
     pub flow: Option<String>,
+    pub encryption: Option<encryption::Config>,
 }
 
 pub struct Handler {
@@ -77,6 +80,30 @@ impl Handler {
         is_udp: bool,
         vision_opts: Option<crate::proxy::transport::VisionOptions>,
     ) -> io::Result<AnyStream> {
+        let s = if let Some(config) = self.opts.encryption.as_ref() {
+            if is_udp {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "VLESS encryption UDP runtime is TODO",
+                ));
+            }
+            #[cfg(feature = "vless-encryption")]
+            {
+                let prepared = config.prepare_crypto()?;
+                Box::new(EncryptionStream::new(s, prepared)?) as AnyStream
+            }
+            #[cfg(not(feature = "vless-encryption"))]
+            {
+                let _ = config;
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "VLESS encryption requires vless-encryption feature",
+                ));
+            }
+        } else {
+            s
+        };
+
         let vless_stream = VlessStream::new(
             s,
             &self.opts.uuid,
@@ -192,7 +219,7 @@ impl OutboundHandler for Handler {
     }
 
     async fn support_udp(&self) -> bool {
-        self.opts.udp
+        self.opts.udp && self.opts.encryption.is_none()
     }
 
     async fn connect_stream(
@@ -448,6 +475,7 @@ mod reuse_tests {
             transport: Some(Box::new(ReuseTransport)),
             tls: None,
             flow: None,
+            encryption: None,
         });
 
         let stream = handler
@@ -473,6 +501,7 @@ mod reuse_tests {
             transport: Some(Box::new(ReuseTransport)),
             tls: None,
             flow: Some("xtls-rprx-vision".to_owned()),
+            encryption: None,
         });
 
         let stream = handler
@@ -821,6 +850,7 @@ mod tests {
             udp: true,
             tls: tls_client(None),
             transport: Some(Box::new(ws_client)),
+            encryption: None,
         };
         let handler = Arc::new(Handler::new(opts));
         let mut containers = MultiDockerTestRunner::default();
