@@ -21,7 +21,7 @@ const PFS_PUBLIC_KEY_LEN: usize = MLKEM768_PUBLIC_KEY_LEN + X25519_PUBLIC_KEY_LE
 #[cfg(feature = "vless-encryption")]
 #[cfg_attr(
     not(test),
-    expect(
+    allow(
         dead_code,
         reason = "consumed by the next VLESS encryption runtime-stream slice"
     )
@@ -31,7 +31,7 @@ const SERVER_PFS_PUBLIC_KEY_LEN: usize =
 #[cfg(feature = "vless-encryption")]
 #[cfg_attr(
     not(test),
-    expect(
+    allow(
         dead_code,
         reason = "consumed by the next VLESS encryption runtime-stream slice"
     )
@@ -40,7 +40,7 @@ const SERVER_PFS_RESPONSE_LEN: usize = SERVER_PFS_PUBLIC_KEY_LEN + AEAD_TAG_LEN;
 #[cfg(feature = "vless-encryption")]
 #[cfg_attr(
     not(test),
-    expect(
+    allow(
         dead_code,
         reason = "consumed by the next VLESS encryption runtime-stream slice"
     )
@@ -49,7 +49,7 @@ const ENCRYPTED_TICKET_LEN: usize = 16 + AEAD_TAG_LEN;
 #[cfg(feature = "vless-encryption")]
 #[cfg_attr(
     not(test),
-    expect(
+    allow(
         dead_code,
         reason = "consumed by the next VLESS encryption runtime-stream slice"
     )
@@ -58,7 +58,7 @@ const RECORD_HEADER_LEN: usize = 5;
 #[cfg(feature = "vless-encryption")]
 #[cfg_attr(
     not(test),
-    expect(
+    allow(
         dead_code,
         reason = "consumed by the next VLESS encryption runtime-stream slice"
     )
@@ -67,7 +67,7 @@ const MAX_RECORD_PLAINTEXT_LEN: usize = 8192;
 #[cfg(feature = "vless-encryption")]
 #[cfg_attr(
     not(test),
-    expect(
+    allow(
         dead_code,
         reason = "consumed by the next VLESS encryption runtime-stream slice"
     )
@@ -204,7 +204,7 @@ pub(crate) struct PreparedOneRttHello {
 #[cfg(feature = "vless-encryption")]
 #[cfg_attr(
     not(test),
-    expect(
+    allow(
         dead_code,
         reason = "consumed by the next VLESS encryption runtime-stream slice"
     )
@@ -221,7 +221,7 @@ pub(crate) struct PreparedOneRttSession {
 #[cfg(feature = "vless-encryption")]
 #[cfg_attr(
     not(test),
-    expect(
+    allow(
         dead_code,
         reason = "consumed by the next VLESS encryption runtime-stream slice"
     )
@@ -237,7 +237,7 @@ pub(crate) struct PreparedOneRttServerTail {
 #[cfg(feature = "vless-encryption")]
 #[cfg_attr(
     not(test),
-    expect(
+    allow(
         dead_code,
         reason = "consumed by the next VLESS encryption runtime-stream slice"
     )
@@ -267,7 +267,7 @@ pub(crate) struct PreparedCrypto {
 impl PreparedOneRttHello {
     #[cfg_attr(
         not(test),
-        expect(
+        allow(
             dead_code,
             reason = "consumed by the next VLESS encryption runtime-stream slice"
         )
@@ -357,7 +357,7 @@ impl PreparedOneRttHello {
 impl PreparedOneRttSession {
     #[cfg_attr(
         not(test),
-        expect(
+        allow(
             dead_code,
             reason = "consumed by the next VLESS encryption runtime-stream slice"
         )
@@ -406,7 +406,7 @@ impl PreparedOneRttSession {
 
     #[cfg_attr(
         not(test),
-        expect(
+        allow(
             dead_code,
             reason = "consumed by the next VLESS encryption runtime-stream slice"
         )
@@ -425,7 +425,7 @@ impl PreparedOneRttSession {
 #[cfg(feature = "vless-encryption")]
 #[cfg_attr(
     not(test),
-    expect(
+    allow(
         dead_code,
         reason = "consumed by the next VLESS encryption runtime-stream slice"
     )
@@ -499,7 +499,7 @@ impl EncryptionRecordCodec {
 #[cfg(feature = "vless-encryption")]
 #[cfg_attr(
     not(test),
-    expect(
+    allow(
         dead_code,
         reason = "consumed by the next VLESS encryption runtime-stream slice"
     )
@@ -521,7 +521,7 @@ fn encode_record_header(
 #[cfg(feature = "vless-encryption")]
 #[cfg_attr(
     not(test),
-    expect(
+    allow(
         dead_code,
         reason = "consumed by the next VLESS encryption runtime-stream slice"
     )
@@ -1138,7 +1138,7 @@ impl EncryptionAead {
 
     #[cfg_attr(
         not(test),
-        expect(
+        allow(
             dead_code,
             reason = "consumed by the next VLESS encryption runtime-stream slice"
         )
