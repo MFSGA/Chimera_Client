@@ -24,6 +24,8 @@ use tracing::debug;
 mod datagram;
 #[allow(dead_code)]
 pub(crate) mod encryption;
+#[cfg(feature = "vless-encryption")]
+mod encryption_stream;
 mod stream;
 mod tls_deframer;
 mod tls_fuzzy_deframer;
