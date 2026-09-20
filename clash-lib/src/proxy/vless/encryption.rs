@@ -47,6 +47,33 @@ const SERVER_PFS_RESPONSE_LEN: usize = SERVER_PFS_PUBLIC_KEY_LEN + AEAD_TAG_LEN;
 )]
 const ENCRYPTED_TICKET_LEN: usize = 16 + AEAD_TAG_LEN;
 #[cfg(feature = "vless-encryption")]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "consumed by the next VLESS encryption runtime-stream slice"
+    )
+)]
+const RECORD_HEADER_LEN: usize = 5;
+#[cfg(feature = "vless-encryption")]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "consumed by the next VLESS encryption runtime-stream slice"
+    )
+)]
+const MAX_RECORD_PLAINTEXT_LEN: usize = 8192;
+#[cfg(feature = "vless-encryption")]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "consumed by the next VLESS encryption runtime-stream slice"
+    )
+)]
+const MAX_RECORD_CIPHERTEXT_LEN: usize = 16640;
+#[cfg(feature = "vless-encryption")]
 const PFS_KEY_EXCHANGE_LEN: usize =
     ENCRYPTED_LENGTH_LEN + PFS_PUBLIC_KEY_LEN + AEAD_TAG_LEN;
 const DEFAULT_PADDING: [(PaddingKind, i64, i64, i64); 3] = [
@@ -208,6 +235,18 @@ pub(crate) struct PreparedOneRttServerTail {
 }
 
 #[cfg(feature = "vless-encryption")]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "consumed by the next VLESS encryption runtime-stream slice"
+    )
+)]
+pub(crate) struct EncryptionRecordCodec {
+    aead: EncryptionAead,
+}
+
+#[cfg(feature = "vless-encryption")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PreparedCrypto {
     pub(crate) xor_mode: u32,
@@ -364,6 +403,143 @@ impl PreparedOneRttSession {
             read_aead_nonce: read_aead.nonce,
         })
     }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "consumed by the next VLESS encryption runtime-stream slice"
+        )
+    )]
+    pub(crate) fn record_codecs(
+        &self,
+        tail: &PreparedOneRttServerTail,
+    ) -> io::Result<(EncryptionRecordCodec, EncryptionRecordCodec)> {
+        Ok((
+            EncryptionRecordCodec::new(&self.write_aead_key, [0u8; 12])?,
+            EncryptionRecordCodec::new(&self.read_aead_key, tail.read_aead_nonce)?,
+        ))
+    }
+}
+
+#[cfg(feature = "vless-encryption")]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "consumed by the next VLESS encryption runtime-stream slice"
+    )
+)]
+impl EncryptionRecordCodec {
+    fn new(key: &[u8; 32], nonce: [u8; 12]) -> io::Result<Self> {
+        Ok(Self {
+            aead: EncryptionAead::new_with_nonce(key, nonce)?,
+        })
+    }
+
+    pub(crate) fn seal_record(&mut self, plaintext: &[u8]) -> io::Result<Vec<u8>> {
+        if plaintext.is_empty() {
+            return Ok(Vec::new());
+        }
+        if plaintext.len() > MAX_RECORD_PLAINTEXT_LEN {
+            return Err(invalid(format!(
+                "VLESS encryption record plaintext too large: {} > {MAX_RECORD_PLAINTEXT_LEN}",
+                plaintext.len()
+            )));
+        }
+
+        let ciphertext_len = plaintext
+            .len()
+            .checked_add(AEAD_TAG_LEN)
+            .ok_or_else(|| invalid("VLESS encryption record length overflow"))?;
+        let header = encode_record_header(ciphertext_len)?;
+        let ciphertext = self.aead.seal_with_aad(plaintext, &header)?;
+
+        let mut record = Vec::with_capacity(RECORD_HEADER_LEN + ciphertext.len());
+        record.extend_from_slice(&header);
+        record.extend_from_slice(&ciphertext);
+        Ok(record)
+    }
+
+    pub(crate) fn open_record(&mut self, record: &[u8]) -> io::Result<Vec<u8>> {
+        if record.len() < RECORD_HEADER_LEN {
+            return Err(invalid(
+                "VLESS encryption record is shorter than its header",
+            ));
+        }
+
+        let header: [u8; RECORD_HEADER_LEN] = record[..RECORD_HEADER_LEN]
+            .try_into()
+            .map_err(|_| invalid("invalid VLESS encryption record header"))?;
+        let ciphertext_len = decode_record_header(&header)?;
+        if record.len() != RECORD_HEADER_LEN + ciphertext_len {
+            return Err(invalid(format!(
+                "VLESS encryption record length mismatch: header={ciphertext_len}, actual={}",
+                record.len() - RECORD_HEADER_LEN
+            )));
+        }
+
+        self.aead
+            .open_with_aad(&record[RECORD_HEADER_LEN..], &header)
+    }
+
+    pub(crate) fn open_peer_padding(
+        &mut self,
+        ciphertext: &[u8],
+    ) -> io::Result<Vec<u8>> {
+        self.aead.open(ciphertext)
+    }
+
+    #[cfg(test)]
+    fn nonce(&self) -> [u8; 12] {
+        self.aead.nonce
+    }
+}
+
+#[cfg(feature = "vless-encryption")]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "consumed by the next VLESS encryption runtime-stream slice"
+    )
+)]
+fn encode_record_header(
+    ciphertext_len: usize,
+) -> io::Result<[u8; RECORD_HEADER_LEN]> {
+    if !(AEAD_TAG_LEN + 1..=MAX_RECORD_CIPHERTEXT_LEN).contains(&ciphertext_len) {
+        return Err(invalid(format!(
+            "invalid VLESS encryption record ciphertext length: {ciphertext_len}"
+        )));
+    }
+
+    let length = u16::try_from(ciphertext_len)
+        .map_err(|_| invalid("VLESS encryption record length exceeds u16"))?;
+    Ok([23, 3, 3, (length >> 8) as u8, length as u8])
+}
+
+#[cfg(feature = "vless-encryption")]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "consumed by the next VLESS encryption runtime-stream slice"
+    )
+)]
+fn decode_record_header(header: &[u8; RECORD_HEADER_LEN]) -> io::Result<usize> {
+    if header[0] != 23 || header[1] != 3 || header[2] != 3 {
+        return Err(invalid(format!(
+            "invalid VLESS encryption record header: {header:?}"
+        )));
+    }
+
+    let length = u16::from_be_bytes([header[3], header[4]]) as usize;
+    if !(AEAD_TAG_LEN + 1..=MAX_RECORD_CIPHERTEXT_LEN).contains(&length) {
+        return Err(invalid(format!(
+            "invalid VLESS encryption record ciphertext length: {length}"
+        )));
+    }
+    Ok(length)
 }
 
 #[cfg(feature = "vless-encryption")]
@@ -916,13 +1092,17 @@ struct EncryptionAead {
 #[cfg(feature = "vless-encryption")]
 impl EncryptionAead {
     fn new(key: &[u8; 32]) -> io::Result<Self> {
+        Self::new_with_nonce(key, [0u8; 12])
+    }
+
+    fn new_with_nonce(key: &[u8; 32], nonce: [u8; 12]) -> io::Result<Self> {
         use aws_lc_rs::aead::{AES_256_GCM, LessSafeKey, UnboundKey};
 
         let unbound = UnboundKey::new(&AES_256_GCM, key)
             .map_err(|_| invalid("failed to create VLESS AES-256-GCM key"))?;
         Ok(Self {
             key: LessSafeKey::new(unbound),
-            nonce: [0u8; 12],
+            nonce,
         })
     }
 
@@ -938,15 +1118,21 @@ impl EncryptionAead {
     }
 
     fn seal(&mut self, plaintext: &[u8]) -> io::Result<Vec<u8>> {
+        self.seal_with_aad(plaintext, &[])
+    }
+
+    fn seal_with_aad(
+        &mut self,
+        plaintext: &[u8],
+        aad: &[u8],
+    ) -> io::Result<Vec<u8>> {
         use aws_lc_rs::aead::Aad;
 
         let nonce = self.next_nonce()?;
         let mut output = plaintext.to_vec();
         self.key
-            .seal_in_place_append_tag(nonce, Aad::empty(), &mut output)
-            .map_err(|_| {
-                invalid("failed to seal VLESS encryption handshake field")
-            })?;
+            .seal_in_place_append_tag(nonce, Aad::from(aad), &mut output)
+            .map_err(|_| invalid("failed to seal VLESS encryption field"))?;
         Ok(output)
     }
 
@@ -979,16 +1165,22 @@ impl EncryptionAead {
     }
 
     fn open(&mut self, ciphertext: &[u8]) -> io::Result<Vec<u8>> {
+        self.open_with_aad(ciphertext, &[])
+    }
+
+    fn open_with_aad(
+        &mut self,
+        ciphertext: &[u8],
+        aad: &[u8],
+    ) -> io::Result<Vec<u8>> {
         use aws_lc_rs::aead::Aad;
 
         let nonce = self.next_nonce()?;
         let mut output = ciphertext.to_vec();
-        let plaintext = self
-            .key
-            .open_in_place(nonce, Aad::empty(), &mut output)
-            .map_err(|_| {
-                invalid("failed to open VLESS encryption handshake field")
-            })?;
+        let plaintext =
+            self.key
+                .open_in_place(nonce, Aad::from(aad), &mut output)
+                .map_err(|_| invalid("failed to open VLESS encryption field"))?;
         let len = plaintext.len();
         output.truncate(len);
         Ok(output)
@@ -2001,6 +2193,111 @@ mod tests {
         assert!(
             padding_err.to_string().contains("padding length field"),
             "unexpected error: {padding_err}"
+        );
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    #[test]
+    fn encryption_record_codec_matches_xray_header_and_aad() {
+        let key = [0x31u8; 32];
+        let mut writer =
+            EncryptionRecordCodec::new(&key, [0u8; 12]).expect("writer codec");
+        let mut reader =
+            EncryptionRecordCodec::new(&key, [0u8; 12]).expect("reader codec");
+
+        let record = writer.seal_record(b"hello").expect("record should encrypt");
+
+        assert_eq!(&record[..RECORD_HEADER_LEN], &[23, 3, 3, 0, 21]);
+        assert_eq!(
+            decode_record_header(
+                record[..RECORD_HEADER_LEN]
+                    .try_into()
+                    .expect("record header")
+            )
+            .expect("header should decode"),
+            21
+        );
+        assert_eq!(
+            reader.open_record(&record).expect("record should decrypt"),
+            b"hello"
+        );
+        assert_eq!(writer.nonce(), [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(reader.nonce(), writer.nonce());
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    #[test]
+    fn encryption_record_codec_continues_after_peer_padding() {
+        let key = [0x52u8; 32];
+        let session = PreparedOneRttSession {
+            united_key: vec![0u8; 96],
+            write_aead_context: vec![0u8; PFS_PUBLIC_KEY_LEN],
+            read_aead_context: vec![0u8; SERVER_PFS_PUBLIC_KEY_LEN],
+            write_aead_key: [0x41u8; 32],
+            read_aead_key: key,
+        };
+        let tail = PreparedOneRttServerTail {
+            ticket: [0u8; 16],
+            ticket_seconds: 0,
+            peer_padding_ciphertext_len: 48,
+            read_aead_nonce: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+        };
+        let (_, mut reader) = session
+            .record_codecs(&tail)
+            .expect("record codecs should build");
+
+        let mut server_aead =
+            EncryptionAead::new_with_nonce(&key, tail.read_aead_nonce)
+                .expect("server AEAD");
+        let peer_padding = server_aead
+            .seal(&vec![0u8; 32])
+            .expect("peer padding should encrypt");
+        assert_eq!(peer_padding.len(), tail.peer_padding_ciphertext_len);
+
+        let mut server_codec = EncryptionRecordCodec { aead: server_aead };
+        let record = server_codec
+            .seal_record(b"reply")
+            .expect("server record should encrypt");
+
+        let padding_plain = reader
+            .open_peer_padding(&peer_padding)
+            .expect("peer padding should decrypt");
+        assert_eq!(padding_plain, vec![0u8; 32]);
+        assert_eq!(reader.nonce(), [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
+
+        assert_eq!(
+            reader
+                .open_record(&record)
+                .expect("server record should decrypt"),
+            b"reply"
+        );
+        assert_eq!(reader.nonce(), [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4]);
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    #[test]
+    fn encryption_record_codec_rejects_invalid_lengths_and_header() {
+        let key = [0x63u8; 32];
+        let mut codec = EncryptionRecordCodec::new(&key, [0u8; 12]).expect("codec");
+
+        let oversized = vec![0u8; MAX_RECORD_PLAINTEXT_LEN + 1];
+        let err = codec
+            .seal_record(&oversized)
+            .expect_err("oversized plaintext must fail");
+        assert!(
+            err.to_string().contains("plaintext too large"),
+            "unexpected error: {err}"
+        );
+
+        let mut invalid_header = vec![0u8; RECORD_HEADER_LEN + 17];
+        invalid_header[..RECORD_HEADER_LEN].copy_from_slice(&[22, 3, 3, 0, 17]);
+        let err = codec
+            .open_record(&invalid_header)
+            .expect_err("invalid record header must fail");
+        assert!(
+            err.to_string()
+                .contains("invalid VLESS encryption record header"),
+            "unexpected error: {err}"
         );
     }
 
