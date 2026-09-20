@@ -38,6 +38,15 @@ const SERVER_PFS_PUBLIC_KEY_LEN: usize =
 )]
 const SERVER_PFS_RESPONSE_LEN: usize = SERVER_PFS_PUBLIC_KEY_LEN + AEAD_TAG_LEN;
 #[cfg(feature = "vless-encryption")]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "consumed by the next VLESS encryption runtime-stream slice"
+    )
+)]
+const ENCRYPTED_TICKET_LEN: usize = 16 + AEAD_TAG_LEN;
+#[cfg(feature = "vless-encryption")]
 const PFS_KEY_EXCHANGE_LEN: usize =
     ENCRYPTED_LENGTH_LEN + PFS_PUBLIC_KEY_LEN + AEAD_TAG_LEN;
 const DEFAULT_PADDING: [(PaddingKind, i64, i64, i64); 3] = [
@@ -178,6 +187,24 @@ pub(crate) struct PreparedOneRttSession {
     pub(crate) united_key: Vec<u8>,
     pub(crate) write_aead_context: Vec<u8>,
     pub(crate) read_aead_context: Vec<u8>,
+    pub(crate) write_aead_key: [u8; 32],
+    pub(crate) read_aead_key: [u8; 32],
+}
+
+#[cfg(feature = "vless-encryption")]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "consumed by the next VLESS encryption runtime-stream slice"
+    )
+)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedOneRttServerTail {
+    pub(crate) ticket: [u8; 16],
+    pub(crate) ticket_seconds: u16,
+    pub(crate) peer_padding_ciphertext_len: usize,
+    pub(crate) read_aead_nonce: [u8; 12],
 }
 
 #[cfg(feature = "vless-encryption")]
@@ -270,10 +297,71 @@ impl PreparedOneRttHello {
         united_key.extend_from_slice(&x25519_secret);
         united_key.extend_from_slice(nfs_key);
 
+        let write_aead_context = self.pfs_public_key.clone();
+        let read_aead_context = server_pfs;
+        let write_aead_key =
+            blake3_derive_key_raw_context(&write_aead_context, &united_key)?;
+        let read_aead_key =
+            blake3_derive_key_raw_context(&read_aead_context, &united_key)?;
+
         Ok(PreparedOneRttSession {
             united_key,
-            write_aead_context: self.pfs_public_key.clone(),
-            read_aead_context: server_pfs,
+            write_aead_context,
+            read_aead_context,
+            write_aead_key,
+            read_aead_key,
+        })
+    }
+}
+
+#[cfg(feature = "vless-encryption")]
+impl PreparedOneRttSession {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "consumed by the next VLESS encryption runtime-stream slice"
+        )
+    )]
+    pub(crate) fn decrypt_server_tail(
+        &self,
+        encrypted_ticket: &[u8],
+        encrypted_padding_length: &[u8],
+    ) -> io::Result<PreparedOneRttServerTail> {
+        if encrypted_ticket.len() != ENCRYPTED_TICKET_LEN {
+            return Err(invalid(format!(
+                "unexpected VLESS encryption ticket length: expected {ENCRYPTED_TICKET_LEN}, got {}",
+                encrypted_ticket.len()
+            )));
+        }
+        if encrypted_padding_length.len() != ENCRYPTED_LENGTH_LEN {
+            return Err(invalid(format!(
+                "unexpected VLESS encryption padding length field: expected {ENCRYPTED_LENGTH_LEN}, got {}",
+                encrypted_padding_length.len()
+            )));
+        }
+
+        let mut read_aead = EncryptionAead::new(&self.read_aead_key)?;
+        let ticket_plain = read_aead.open(encrypted_ticket)?;
+        let ticket: [u8; 16] = ticket_plain
+            .as_slice()
+            .try_into()
+            .map_err(|_| invalid("unexpected decrypted VLESS ticket length"))?;
+        let ticket_seconds = u16::from_be_bytes([ticket[0], ticket[1]]);
+
+        let padding_len_plain = read_aead.open(encrypted_padding_length)?;
+        let padding_len_bytes: [u8; 2] =
+            padding_len_plain.as_slice().try_into().map_err(|_| {
+                invalid("unexpected decrypted VLESS padding length size")
+            })?;
+        let peer_padding_ciphertext_len =
+            u16::from_be_bytes(padding_len_bytes) as usize;
+
+        Ok(PreparedOneRttServerTail {
+            ticket,
+            ticket_seconds,
+            peer_padding_ciphertext_len,
+            read_aead_nonce: read_aead.nonce,
         })
     }
 }
@@ -890,7 +978,6 @@ impl EncryptionAead {
         Ok(output)
     }
 
-    #[cfg(test)]
     fn open(&mut self, ciphertext: &[u8]) -> io::Result<Vec<u8>> {
         use aws_lc_rs::aead::Aad;
 
@@ -1796,6 +1883,125 @@ mod tests {
         assert_eq!(session.united_key, expected_united);
         assert_eq!(session.write_aead_context, hello.pfs_public_key);
         assert_eq!(session.read_aead_context, server_pfs_public);
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    #[test]
+    fn one_rtt_server_tail_decrypts_ticket_and_padding_length() {
+        use aws_lc_rs::{
+            agreement,
+            kem::{EncapsulationKey, ML_KEM_768},
+        };
+
+        let nfs_private =
+            agreement::PrivateKey::generate(&agreement::X25519).unwrap();
+        let nfs_public = nfs_private.compute_public_key().unwrap();
+        let raw = format!(
+            "{METHOD}.native.1rtt.100-64-64.{}",
+            URL_SAFE_NO_PAD.encode(nfs_public.as_ref()),
+        );
+        let config = Config::parse(&raw).expect("1rtt config should parse");
+        let prepared = config.prepare_crypto().expect("crypto should prepare");
+        let hello = prepared
+            .one_rtt_hello
+            .as_ref()
+            .expect("1rtt hello should be prepared");
+
+        let client_mlkem_public = EncapsulationKey::new(
+            &ML_KEM_768,
+            &hello.pfs_public_key[..MLKEM768_PUBLIC_KEY_LEN],
+        )
+        .expect("client ML-KEM public key");
+        let (server_mlkem_ciphertext, _) = client_mlkem_public
+            .encapsulate()
+            .expect("server ML-KEM encapsulation");
+
+        let server_x25519_private =
+            agreement::PrivateKey::generate(&agreement::X25519).unwrap();
+        let server_x25519_public =
+            server_x25519_private.compute_public_key().unwrap();
+
+        let mut server_pfs_public = Vec::with_capacity(SERVER_PFS_PUBLIC_KEY_LEN);
+        server_pfs_public.extend_from_slice(server_mlkem_ciphertext.as_ref());
+        server_pfs_public.extend_from_slice(server_x25519_public.as_ref());
+
+        let nfs_aead =
+            EncryptionAead::new(&prepared.nfs_aead_key).expect("NFS AEAD");
+        let encrypted_server_pfs = nfs_aead
+            .seal_with_nonce(&server_pfs_public, [0xff; 12])
+            .expect("server PFS should encrypt");
+
+        let session = hello
+            .derive_server_session(
+                &prepared.nfs_aead_key,
+                &prepared.nfs_relays.nfs_key,
+                &encrypted_server_pfs,
+            )
+            .expect("client should derive server PFS session");
+
+        let mut ticket_plain = [0x44u8; 16];
+        ticket_plain[..2].copy_from_slice(&600u16.to_be_bytes());
+        let mut server_aead =
+            EncryptionAead::new(&session.read_aead_key).expect("server AEAD");
+        let encrypted_ticket = server_aead
+            .seal(&ticket_plain)
+            .expect("ticket should encrypt");
+        let encrypted_padding_length = server_aead
+            .seal(&encode_length(96).expect("padding length"))
+            .expect("padding length should encrypt");
+
+        let tail = session
+            .decrypt_server_tail(&encrypted_ticket, &encrypted_padding_length)
+            .expect("server tail should decrypt");
+
+        assert_eq!(tail.ticket, ticket_plain);
+        assert_eq!(tail.ticket_seconds, 600);
+        assert_eq!(tail.peer_padding_ciphertext_len, 96);
+        assert_eq!(tail.read_aead_nonce, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        assert_eq!(
+            session.write_aead_key,
+            blake3_derive_key_raw_context(
+                &session.write_aead_context,
+                &session.united_key,
+            )
+            .expect("write AEAD key")
+        );
+        assert_eq!(
+            session.read_aead_key,
+            blake3_derive_key_raw_context(
+                &session.read_aead_context,
+                &session.united_key,
+            )
+            .expect("read AEAD key")
+        );
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    #[test]
+    fn one_rtt_server_tail_rejects_wrong_field_lengths() {
+        let session = PreparedOneRttSession {
+            united_key: vec![0u8; 96],
+            write_aead_context: vec![0u8; PFS_PUBLIC_KEY_LEN],
+            read_aead_context: vec![0u8; SERVER_PFS_PUBLIC_KEY_LEN],
+            write_aead_key: [0u8; 32],
+            read_aead_key: [0u8; 32],
+        };
+
+        let ticket_err = session
+            .decrypt_server_tail(&[0u8; 16], &[0u8; ENCRYPTED_LENGTH_LEN])
+            .expect_err("short ticket must fail");
+        assert!(
+            ticket_err.to_string().contains("ticket length"),
+            "unexpected error: {ticket_err}"
+        );
+
+        let padding_err = session
+            .decrypt_server_tail(&[0u8; ENCRYPTED_TICKET_LEN], &[0u8; 2])
+            .expect_err("short padding length field must fail");
+        assert!(
+            padding_err.to_string().contains("padding length field"),
+            "unexpected error: {padding_err}"
+        );
     }
 
     #[cfg(feature = "vless-encryption")]
