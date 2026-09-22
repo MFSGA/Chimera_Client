@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    sync::Arc,
+};
 
 use bytes::Bytes;
 use futures::{Stream, future::BoxFuture};
@@ -21,6 +24,7 @@ use crate::{
     UdpSocket,
     debug::trace_ip_packet,
     tcp_listener::{TcpListener, TcpStreamHandle},
+    udp_socket::UdpIcmpControl,
 };
 
 pub(crate) enum IfaceEvent<'a> {
@@ -57,6 +61,7 @@ pub struct NetStack {
     // outside poll this to receive packets from the stack
     tcp_outbound: mpsc::Receiver<Packet>,
     udp_outbound: mpsc::Receiver<Packet>,
+    udp_icmp_control: UdpIcmpControl,
 }
 
 #[derive(Clone)]
@@ -101,9 +106,58 @@ impl Stream for ReceiverStream {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetStackAddress {
+    pub address: IpAddr,
+    pub prefix_len: u8,
+}
+
+impl NetStackAddress {
+    pub const fn new(address: IpAddr, prefix_len: u8) -> Self {
+        Self {
+            address,
+            prefix_len,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetStackConfig {
+    pub mtu: usize,
+    pub local_addresses: Vec<NetStackAddress>,
+}
+
+impl Default for NetStackConfig {
+    fn default() -> Self {
+        Self {
+            mtu: 1500,
+            local_addresses: vec![
+                NetStackAddress::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 24),
+                NetStackAddress::new(
+                    IpAddr::V6(Ipv6Addr::new(0, 0xfac, 0, 0, 0, 0, 0, 1)),
+                    64,
+                ),
+            ],
+        }
+    }
+}
+
 impl NetStack {
-    /// Returns the NetStack instance, a TcpListener and a UdpSocket
+    /// Returns the NetStack instance, a TcpListener and a UdpSocket using the
+    /// historical default device settings.
     pub fn new() -> (
+        Self,
+        crate::tcp_listener::TcpListener,
+        crate::udp_socket::UdpSocket,
+    ) {
+        Self::new_with_config(NetStackConfig::default())
+    }
+
+    /// Returns the NetStack instance configured for the embedding packet
+    /// device.
+    pub fn new_with_config(
+        config: NetStackConfig,
+    ) -> (
         Self,
         crate::tcp_listener::TcpListener,
         crate::udp_socket::UdpSocket,
@@ -121,16 +175,24 @@ impl NetStack {
 
         // this UdpSocket is essentially an Iface for UDP but much simpler as it only
         // does packets forwarding
-        let udp_socket = UdpSocket::new(udp_outbound_stack, udp_packet_sender);
+        let udp_socket =
+            UdpSocket::new(udp_outbound_stack, udp_packet_sender, config.mtu);
+        let udp_icmp_control = udp_socket.icmp_control();
         let (tcp_inbound_app, tcp_outbound_stack) =
             mpsc::channel::<Packet>(PACKET_QUEUE_SIZE);
-        let tcp_listener = TcpListener::new(tcp_outbound_stack, tcp_packet_sender);
+        let tcp_listener = TcpListener::new(
+            tcp_outbound_stack,
+            tcp_packet_sender,
+            config.mtu,
+            &config.local_addresses,
+        );
 
         let stack = NetStack {
             udp_inbound: udp_inbound_app,
             tcp_inbound: tcp_inbound_app,
             tcp_outbound: tcp_packet_receiver,
             udp_outbound: udp_packet_receiver,
+            udp_icmp_control,
         };
 
         (stack, tcp_listener, udp_socket)
@@ -138,7 +200,11 @@ impl NetStack {
 
     pub fn split(self) -> (StackSplitSink, StackSplitStream) {
         (
-            StackSplitSink::new(self.udp_inbound, self.tcp_inbound),
+            StackSplitSink::new_with_udp_icmp_control(
+                self.udp_inbound,
+                self.tcp_inbound,
+                self.udp_icmp_control,
+            ),
             StackSplitStream::new(self.tcp_outbound, self.udp_outbound),
         )
     }
@@ -147,6 +213,7 @@ impl NetStack {
 pub struct StackSplitSink {
     udp_inbound: mpsc::Sender<Packet>,
     tcp_inbound: mpsc::Sender<Packet>,
+    udp_icmp_control: UdpIcmpControl,
 
     packet_container: VecDeque<(Packet, IpProtocol)>,
     pending_permit: Option<PendingPacketPermit>,
@@ -156,9 +223,22 @@ impl StackSplitSink {
         udp_inbound: mpsc::Sender<Packet>,
         tcp_inbound: mpsc::Sender<Packet>,
     ) -> Self {
+        Self::new_with_udp_icmp_control(
+            udp_inbound,
+            tcp_inbound,
+            UdpIcmpControl::new(1500),
+        )
+    }
+
+    pub(crate) fn new_with_udp_icmp_control(
+        udp_inbound: mpsc::Sender<Packet>,
+        tcp_inbound: mpsc::Sender<Packet>,
+        udp_icmp_control: UdpIcmpControl,
+    ) -> Self {
         Self {
             udp_inbound,
             tcp_inbound,
+            udp_icmp_control,
             packet_container: VecDeque::new(),
             pending_permit: None,
         }
@@ -256,6 +336,24 @@ impl futures::Sink<Packet> for StackSplitSink {
                 }
             }
         };
+        if matches!(protocol, IpProtocol::Icmp | IpProtocol::Icmpv6) {
+            if self.udp_icmp_control.apply_packet_too_big(item.data()) {
+                debug!("applied validated UDP path MTU reduction from ICMP");
+            }
+            if self
+                .udp_icmp_control
+                .apply_destination_unreachable(item.data())
+            {
+                debug!("queued validated UDP destination-unreachable error");
+            }
+            if self
+                .udp_icmp_control
+                .apply_time_exceeded_or_parameter_problem(item.data())
+            {
+                debug!("queued validated UDP ICMP control error");
+            }
+        }
+
         if mirror_to_tcp {
             self.packet_container
                 .push_back((item.clone(), IpProtocol::Udp));

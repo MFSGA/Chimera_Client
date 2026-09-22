@@ -1,6 +1,7 @@
 use crate::{
-    Packet, device::NetstackDevice, fragment::FragmentReassembler, packet::IpPacket,
-    ring_buffer::LockFreeRingBuffer, stack::IfaceEvent, tcp_stream::TcpStream,
+    NetStackAddress, Packet, device::NetstackDevice, fragment::FragmentReassembler,
+    packet::IpPacket, ring_buffer::LockFreeRingBuffer, stack::IfaceEvent,
+    tcp_stream::TcpStream,
 };
 use futures::task::AtomicWaker;
 use log::{debug, error, trace, warn};
@@ -232,7 +233,10 @@ impl Drop for TcpListener {
 }
 
 impl TcpListener {
-    fn build_interface(device: &mut NetstackDevice) -> Interface {
+    fn build_interface(
+        device: &mut NetstackDevice,
+        local_addresses: &[NetStackAddress],
+    ) -> Interface {
         let mut config =
             smoltcp::iface::Config::new(smoltcp::wire::HardwareAddress::Ip);
         config.random_seed = rand::random();
@@ -243,25 +247,41 @@ impl TcpListener {
         );
         iface.set_any_ip(true);
         iface.update_ip_addrs(|ip_addrs| {
-            let _ = ip_addrs.push(smoltcp::wire::IpCidr::new(
-                smoltcp::wire::Ipv4Address::new(10, 0, 0, 1).into(),
-                24,
-            ));
-            let _ = ip_addrs.push(smoltcp::wire::IpCidr::new(
-                smoltcp::wire::Ipv6Address::new(0x0, 0xfac, 0, 0, 0, 0, 0, 1).into(),
-                64,
-            ));
+            for local_address in local_addresses {
+                if ip_addrs
+                    .push(smoltcp::wire::IpCidr::new(
+                        local_address.address.into(),
+                        local_address.prefix_len,
+                    ))
+                    .is_err()
+                {
+                    warn!(
+                        "smoltcp interface address table is full; ignoring {} /{}",
+                        local_address.address, local_address.prefix_len
+                    );
+                    break;
+                }
+            }
         });
 
-        if let Err(err) = iface
-            .routes_mut()
-            .add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 0, 1))
+        if let Some(address) = local_addresses.iter().find_map(|address| {
+            if let std::net::IpAddr::V4(address) = address.address {
+                Some(address)
+            } else {
+                None
+            }
+        }) && let Err(err) = iface.routes_mut().add_default_ipv4_route(address)
         {
             warn!("failed to add default IPv4 route to smoltcp interface: {err}");
         }
-        if let Err(err) = iface.routes_mut().add_default_ipv6_route(
-            smoltcp::wire::Ipv6Address::new(0x0, 0xfac, 0, 0, 0, 0, 0, 1),
-        ) {
+        if let Some(address) = local_addresses.iter().find_map(|address| {
+            if let std::net::IpAddr::V6(address) = address.address {
+                Some(address)
+            } else {
+                None
+            }
+        }) && let Err(err) = iface.routes_mut().add_default_ipv6_route(address)
+        {
             warn!("failed to add default IPv6 route to smoltcp interface: {err}");
         }
 
@@ -271,12 +291,15 @@ impl TcpListener {
     pub fn new(
         inbound: mpsc::Receiver<Packet>,
         outbound: mpsc::Sender<Packet>,
+        mtu: usize,
+        local_addresses: &[NetStackAddress],
     ) -> Self {
         // the global bus that drives the iface polling
         let (iface_notifier, iface_notifier_rx) =
             mpsc::channel(IFACE_EVENT_QUEUE_SIZE);
-        let mut device = NetstackDevice::new(outbound, iface_notifier.clone());
-        let mut iface = Self::build_interface(&mut device);
+        let local_addresses = local_addresses.to_vec();
+        let mut device = NetstackDevice::new(outbound, iface_notifier.clone(), mtu);
+        let mut iface = Self::build_interface(&mut device, &local_addresses);
 
         let (socket_stream_emitter, socket_stream) =
             mpsc::channel::<TcpStream>(TCP_ACCEPT_QUEUE_SIZE);
@@ -295,7 +318,13 @@ impl TcpListener {
             let rv = tokio::select! {
                 biased;
                 rv = Self::poll_packets(inbound, device.create_injector(), iface_notifier, socket_stream_emitter, poll_packet_tracked_streams, poll_packet_last_tcp_packet) => rv,
-                rv = Self::poll_sockets(&mut iface, &mut device, iface_notifier_rx, poll_socket_last_tcp_packet) => rv,
+                rv = Self::poll_sockets(
+                    &mut iface,
+                    &mut device,
+                    iface_notifier_rx,
+                    poll_socket_last_tcp_packet,
+                    local_addresses,
+                ) => rv,
             };
             if let Err(e) = rv {
                 error!("Error in TCP listener: {e}");
@@ -604,6 +633,7 @@ impl TcpListener {
         device: &mut NetstackDevice,
         mut notifier_rx: mpsc::Receiver<IfaceEvent<'_>>,
         last_tcp_packet: Arc<Mutex<Option<LastTcpPacketMeta>>>,
+        local_addresses: Vec<NetStackAddress>,
     ) -> std::io::Result<()> {
         // Create a socket set for TCP sockets
         let mut sockets = smoltcp::iface::SocketSet::new(vec![]);
@@ -685,7 +715,7 @@ impl TcpListener {
                     mark_all_streams_closed(&socket_maps);
                     socket_maps.clear();
                     sockets = smoltcp::iface::SocketSet::new(vec![]);
-                    *iface = Self::build_interface(device);
+                    *iface = Self::build_interface(device, &local_addresses);
                     next_poll = None;
 
                     let now = StdInstant::now();
@@ -892,6 +922,55 @@ impl futures::Stream for TcpListener {
 #[cfg(test)]
 mod resource_limit_tests {
     use super::*;
+
+    #[test]
+    fn interface_uses_configured_local_addresses() {
+        let (outbound, _outbound_rx) = mpsc::channel::<Packet>(8);
+        let (iface_notifier, _iface_rx) = mpsc::channel::<IfaceEvent<'static>>(8);
+        let mut device = NetstackDevice::new(outbound, iface_notifier, 9000);
+        let local_addresses = [
+            NetStackAddress::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 18, 0, 1)),
+                30,
+            ),
+            NetStackAddress::new(
+                std::net::IpAddr::V6("fd00:198:18::1".parse().unwrap()),
+                126,
+            ),
+        ];
+
+        let iface = TcpListener::build_interface(&mut device, &local_addresses);
+        let expected = [
+            smoltcp::wire::IpCidr::new(local_addresses[0].address.into(), 30),
+            smoltcp::wire::IpCidr::new(local_addresses[1].address.into(), 126),
+        ];
+
+        assert_eq!(iface.ip_addrs(), expected.as_slice());
+        assert_eq!(
+            iface.routes().get_default_ipv4_route().unwrap().via_router,
+            local_addresses[0].address.into()
+        );
+        assert_eq!(
+            iface.routes().get_default_ipv6_route().unwrap().via_router,
+            local_addresses[1].address.into()
+        );
+    }
+
+    #[test]
+    fn ipv4_only_interface_has_no_ipv6_identity_or_default_route() {
+        let (outbound, _outbound_rx) = mpsc::channel::<Packet>(8);
+        let (iface_notifier, _iface_rx) = mpsc::channel::<IfaceEvent<'static>>(8);
+        let mut device = NetstackDevice::new(outbound, iface_notifier, 1500);
+        let local_addresses = [NetStackAddress::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 18, 0, 1)),
+            30,
+        )];
+
+        let iface = TcpListener::build_interface(&mut device, &local_addresses);
+
+        assert!(iface.ipv6_addr().is_none());
+        assert!(iface.routes().get_default_ipv6_route().is_none());
+    }
 
     #[test]
     fn active_stream_capacity_recovers_after_drop() {

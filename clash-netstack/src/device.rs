@@ -22,9 +22,10 @@ impl NetstackDevice {
     pub fn new(
         tx_sender: mpsc::Sender<Packet>,
         iface_notifier: mpsc::Sender<IfaceEvent<'static>>,
+        mtu: usize,
     ) -> Self {
         let mut capabilities = DeviceCapabilities::default();
-        capabilities.max_transmission_unit = 1500;
+        capabilities.max_transmission_unit = mtu;
         capabilities.medium = Medium::Ip;
 
         let (rx_sender, rx_queue) = mpsc::channel::<Packet>(DEVICE_RX_QUEUE_SIZE);
@@ -117,6 +118,16 @@ mod tests {
     use super::*;
     use smoltcp::phy::Device;
 
+    #[test]
+    fn configured_mtu_is_reported_by_device() {
+        let (tx_sender, _tx_receiver) = tokio::sync::mpsc::channel::<Packet>(1);
+        let (iface_notifier, _iface_rx) =
+            tokio::sync::mpsc::channel::<IfaceEvent<'static>>(8);
+        let device = NetstackDevice::new(tx_sender, iface_notifier, 9000);
+
+        assert_eq!(device.capabilities().max_transmission_unit, 9000);
+    }
+
     /// Reproduces the ACK-drop bug when the outbound tx channel is full.
     ///
     /// Without the receive() ordering fix, the inbound ACK is consumed from
@@ -126,7 +137,7 @@ mod tests {
         let (tx_sender, mut tx_receiver) = tokio::sync::mpsc::channel::<Packet>(1);
         let (iface_notifier, _iface_rx) =
             tokio::sync::mpsc::channel::<IfaceEvent<'static>>(8);
-        let mut device = NetstackDevice::new(tx_sender, iface_notifier);
+        let mut device = NetstackDevice::new(tx_sender, iface_notifier, 1500);
         let injector = device.create_injector();
 
         // Fill the tx channel to its capacity of 1.

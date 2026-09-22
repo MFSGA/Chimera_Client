@@ -140,6 +140,9 @@ impl TunRunner {
             );
         }
 
+        let effective_mtu =
+            cfg.mtu
+                .unwrap_or(if cfg!(windows) { 65535u16 } else { 1500u16 });
         let mut tun_init_config = TunInitializationConfig::default();
         match Url::parse(&cfg.device_id) {
             Ok(u) => match u.scheme() {
@@ -191,121 +194,133 @@ impl TunRunner {
             }
         };
 
-        let tun =
-            if let Some(fd) = tun_init_config.fd {
-                #[cfg(target_family = "unix")]
-                {
-                    info!("tun started with fd {}", fd);
-                    unsafe { tun_rs::AsyncDevice::from_fd(fd as _)? }
-                }
+        let tun = if let Some(fd) = tun_init_config.fd {
+            #[cfg(target_family = "unix")]
+            {
+                info!("tun started with fd {}", fd);
+                unsafe { tun_rs::AsyncDevice::from_fd(fd as _)? }
+            }
 
-                #[cfg(not(target_family = "unix"))]
-                {
-                    return Err(Error::InvalidConfig(format!(
-                        "tun fd({fd}) is only supported on Unix-like systems"
-                    )));
-                }
-            } else {
-                #[cfg(not(any(target_os = "ios", target_os = "android")))]
-                {
-                    use crate::proxy::tun::routes::maybe_add_routes;
-                    use tun_rs::DeviceBuilder;
+            #[cfg(not(target_family = "unix"))]
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "tun fd({fd}) is only supported on Unix-like systems"
+                )));
+            }
+        } else {
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            {
+                use crate::proxy::tun::routes::maybe_add_routes;
+                use tun_rs::DeviceBuilder;
 
-                    let tun_name =
-                        tun_init_config.tun_name.expect("tun name must be provided");
-                    #[allow(unused_mut)]
-                    let mut tun_exist = tun_exists(&tun_name);
-                    #[cfg(target_os = "linux")]
-                    let mut removed_existing_tun = false;
+                let tun_name =
+                    tun_init_config.tun_name.expect("tun name must be provided");
+                #[allow(unused_mut)]
+                let mut tun_exist = tun_exists(&tun_name);
+                #[cfg(target_os = "linux")]
+                let mut removed_existing_tun = false;
 
-                    #[cfg(target_os = "linux")]
-                    if tun_exist {
-                        if let Err(err) = routes::maybe_routes_clean_up(cfg) {
-                            error!(
-                                "failed to clean up stale tun routes for {}: {}",
-                                tun_name, err
-                            );
-                        }
-                        routes::delete_interface(&tun_name)?;
-                        wait_for_tun_state(&tun_name, false).await?;
-                        tun_exist = false;
-                        removed_existing_tun = true;
-                    }
-
-                    #[cfg(target_os = "linux")]
-                    if cfg.route_all
-                        && !removed_existing_tun
-                        && let Err(err) = routes::maybe_routes_clean_up(cfg)
-                    {
+                #[cfg(target_os = "linux")]
+                if tun_exist {
+                    if let Err(err) = routes::maybe_routes_clean_up(cfg) {
                         error!(
                             "failed to clean up stale tun routes for {}: {}",
                             tun_name, err
                         );
                     }
-
-                    if tun_exist {
-                        info!("tun device {} already exists, using it.", &tun_name);
-                    } else {
-                        info!("tun device {} does not exist, creating.", &tun_name);
-                    }
-
-                    let mut tun_builder = DeviceBuilder::new();
-                    tun_builder =
-                        tun_builder.name(&tun_name).mtu(cfg.mtu.unwrap_or(
-                            if cfg!(windows) { 65535u16 } else { 1500u16 },
-                        ));
-
-                    if !tun_exist {
-                        debug!("setting tun ipv4 addr: {:?}", cfg.gateway);
-                        tun_builder = tun_builder.ipv4(
-                            cfg.gateway.addr(),
-                            cfg.gateway.netmask(),
-                            None,
-                        );
-
-                        if let Some(gateway_v6) = cfg.gateway_v6 {
-                            debug!("setting tun ipv6 addr: {:?}", cfg.gateway_v6);
-                            tun_builder = tun_builder
-                                .ipv6(gateway_v6.addr(), gateway_v6.netmask());
-                        }
-                    }
-                    #[cfg(target_os = "windows")]
-                    {
-                        // Use an explicit GUID when configured, otherwise derive
-                        // a deterministic one from the device name so restarts
-                        // reuse the same adapter instead of creating a new one.
-                        let guid = tun_init_config.guid.unwrap_or_else(|| {
-                            uuid::Uuid::new_v5(
-                                &uuid::Uuid::NAMESPACE_DNS,
-                                tun_name.as_bytes(),
-                            )
-                            .as_u128()
-                        });
-                        tun_builder = tun_builder.device_guid(guid);
-                    }
-
-                    let dev = tun_builder.build_async()?;
-
-                    if !tun_exist {
-                        wait_for_tun_state(&tun_name, true).await?;
-                        info!("setting up routes for tun {}", &tun_name);
-                    } else {
-                        info!("reconciling routes for existing tun {}", &tun_name);
-                    }
-
-                    maybe_add_routes(cfg, &tun_name).await?;
-
-                    dev
+                    routes::delete_interface(&tun_name)?;
+                    wait_for_tun_state(&tun_name, false).await?;
+                    tun_exist = false;
+                    removed_existing_tun = true;
                 }
-                #[cfg(any(target_os = "ios", target_os = "android"))]
+
+                #[cfg(target_os = "linux")]
+                if cfg.route_all
+                    && !removed_existing_tun
+                    && let Err(err) = routes::maybe_routes_clean_up(cfg)
                 {
-                    return Err(Error::InvalidConfig(
-                        "only fd is supported on mobile platforms".to_string(),
-                    ));
+                    error!(
+                        "failed to clean up stale tun routes for {}: {}",
+                        tun_name, err
+                    );
                 }
-            };
 
-        let (stack, tcp_listener, udp_socket) = watfaq_netstack::NetStack::new();
+                if tun_exist {
+                    info!("tun device {} already exists, using it.", &tun_name);
+                } else {
+                    info!("tun device {} does not exist, creating.", &tun_name);
+                }
+
+                let mut tun_builder = DeviceBuilder::new();
+                tun_builder = tun_builder.name(&tun_name).mtu(effective_mtu);
+
+                if !tun_exist {
+                    debug!("setting tun ipv4 addr: {:?}", cfg.gateway);
+                    tun_builder = tun_builder.ipv4(
+                        cfg.gateway.addr(),
+                        cfg.gateway.netmask(),
+                        None,
+                    );
+
+                    if let Some(gateway_v6) = cfg.gateway_v6 {
+                        debug!("setting tun ipv6 addr: {:?}", cfg.gateway_v6);
+                        tun_builder = tun_builder
+                            .ipv6(gateway_v6.addr(), gateway_v6.netmask());
+                    }
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    // Use an explicit GUID when configured, otherwise derive
+                    // a deterministic one from the device name so restarts
+                    // reuse the same adapter instead of creating a new one.
+                    let guid = tun_init_config.guid.unwrap_or_else(|| {
+                        uuid::Uuid::new_v5(
+                            &uuid::Uuid::NAMESPACE_DNS,
+                            tun_name.as_bytes(),
+                        )
+                        .as_u128()
+                    });
+                    tun_builder = tun_builder.device_guid(guid);
+                }
+
+                let dev = tun_builder.build_async()?;
+
+                if !tun_exist {
+                    wait_for_tun_state(&tun_name, true).await?;
+                    info!("setting up routes for tun {}", &tun_name);
+                } else {
+                    info!("reconciling routes for existing tun {}", &tun_name);
+                }
+
+                maybe_add_routes(cfg, &tun_name).await?;
+
+                dev
+            }
+            #[cfg(any(target_os = "ios", target_os = "android"))]
+            {
+                return Err(Error::InvalidConfig(
+                    "only fd is supported on mobile platforms".to_string(),
+                ));
+            }
+        };
+
+        let mut local_addresses = vec![watfaq_netstack::NetStackAddress::new(
+            std::net::IpAddr::V4(cfg.gateway.addr()),
+            cfg.gateway.prefix_len(),
+        )];
+        if let Some(gateway_v6) = cfg.gateway_v6 {
+            local_addresses.push(watfaq_netstack::NetStackAddress::new(
+                std::net::IpAddr::V6(gateway_v6.addr()),
+                gateway_v6.prefix_len(),
+            ));
+        }
+        let (stack, tcp_listener, udp_socket) =
+            watfaq_netstack::NetStack::new_with_config(
+                watfaq_netstack::NetStackConfig {
+                    mtu: effective_mtu as usize,
+                    local_addresses,
+                },
+            );
         Ok((tun, stack, tcp_listener, udp_socket))
     }
 }

@@ -1,5 +1,7 @@
 use futures::{SinkExt, StreamExt};
-use watfaq_netstack::{NetStack, Packet, UdpSocket};
+use watfaq_netstack::{
+    NetStack, NetStackAddress, NetStackConfig, Packet, UdpSocket,
+};
 
 mod common;
 mod mock_tun;
@@ -243,6 +245,396 @@ fn is_any_ip_syn_ack(packet: &[u8]) -> bool {
             .and_then(|packet| packet.transport),
         Some(etherparse::TransportSlice::Tcp(tcp)) if tcp.syn() && tcp.ack()
     )
+}
+
+#[tokio::test]
+async fn configured_local_addresses_keep_transparent_tcp_destination() {
+    init();
+
+    let (stack, mut tcp_listener, _udp_socket) =
+        NetStack::new_with_config(NetStackConfig {
+            mtu: 1500,
+            local_addresses: vec![NetStackAddress::new(
+                "198.18.0.1".parse().unwrap(),
+                30,
+            )],
+        });
+    let (mut stack_sink, mut stack_stream) = stack.split();
+
+    stack_sink
+        .send(Packet::new(build_tcp_syn_packet()))
+        .await
+        .unwrap();
+
+    let reply =
+        tokio::time::timeout(std::time::Duration::from_secs(1), stack_stream.next())
+            .await
+            .expect("transparent TCP SYN did not produce a response")
+            .expect("stack stream closed")
+            .expect("stack stream error");
+    assert!(is_syn_ack(reply.data()));
+
+    let stream =
+        tokio::time::timeout(std::time::Duration::from_secs(1), tcp_listener.next())
+            .await
+            .expect("transparent TCP SYN was not accepted")
+            .expect("TCP listener closed");
+    assert_eq!(stream.local_addr(), "1.1.1.1:1024".parse().unwrap());
+    assert_eq!(stream.remote_addr(), "2.2.2.2:80".parse().unwrap());
+}
+
+#[tokio::test]
+async fn udp_ipv4_output_uses_mips_default_header_policy() {
+    init();
+
+    let (stack, _tcp_listener, udp_socket) = NetStack::new();
+    let (_stack_sink, mut stack_stream) = stack.split();
+    let (_udp_read, mut udp_write) = udp_socket.split();
+    udp_write
+        .send(
+            (
+                b"fits-the-link".as_slice(),
+                "2.2.2.2:5001".parse().unwrap(),
+                "1.1.1.1:5000".parse().unwrap(),
+            )
+                .into(),
+        )
+        .await
+        .unwrap();
+
+    let packet = stack_stream
+        .next()
+        .await
+        .expect("stack stream closed")
+        .expect("stack stream error");
+    let header = etherparse::Ipv4HeaderSlice::from_slice(packet.data()).unwrap();
+    assert_eq!(header.ttl(), 64);
+    assert!(!header.dont_fragment());
+    assert_ne!(header.identification(), 0);
+}
+
+#[tokio::test]
+async fn udp_ipv4_output_fragments_to_configured_mtu() {
+    init();
+
+    let (stack, _tcp_listener, udp_socket) =
+        NetStack::new_with_config(NetStackConfig {
+            mtu: 68,
+            local_addresses: vec![NetStackAddress::new(
+                "198.18.0.1".parse().unwrap(),
+                30,
+            )],
+        });
+    let (_stack_sink, mut stack_stream) = stack.split();
+    let (_udp_read, mut udp_write) = udp_socket.split();
+    let payload = vec![0x5a; 100];
+
+    udp_write
+        .send(
+            (
+                payload.clone(),
+                "2.2.2.2:5001".parse().unwrap(),
+                "1.1.1.1:5000".parse().unwrap(),
+            )
+                .into(),
+        )
+        .await
+        .unwrap();
+
+    let mut identification = None;
+    let mut reassembled = vec![0u8; 8 + payload.len()];
+    let mut fragment_count = 0usize;
+    loop {
+        let packet = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            stack_stream.next(),
+        )
+        .await
+        .expect("timed out waiting for IPv4 UDP fragment")
+        .expect("stack stream closed")
+        .expect("stack stream error");
+        assert!(packet.data().len() <= 68);
+
+        let header = etherparse::Ipv4HeaderSlice::from_slice(packet.data()).unwrap();
+        assert_eq!(header.protocol(), etherparse::ip_number::UDP);
+        assert_eq!(header.ttl(), 64);
+        let current_identification = header.identification();
+        assert_eq!(
+            *identification.get_or_insert(current_identification),
+            current_identification
+        );
+
+        let offset = usize::from(header.fragments_offset().byte_offset());
+        let fragment_payload = &packet.data()[header.slice().len()..];
+        reassembled[offset..offset + fragment_payload.len()]
+            .copy_from_slice(fragment_payload);
+        fragment_count += 1;
+
+        if !header.more_fragments() {
+            break;
+        }
+    }
+
+    assert_eq!(fragment_count, 3);
+    let udp = smoltcp::wire::UdpPacket::new_checked(reassembled.as_slice()).unwrap();
+    assert_eq!(udp.src_port(), 5001);
+    assert_eq!(udp.dst_port(), 5000);
+    assert_eq!(udp.payload(), payload.as_slice());
+    assert!(udp.verify_checksum(
+        &"2.2.2.2".parse::<std::net::Ipv4Addr>().unwrap().into(),
+        &"1.1.1.1".parse::<std::net::Ipv4Addr>().unwrap().into(),
+    ));
+}
+
+#[tokio::test]
+async fn validated_icmpv4_pmtu_update_changes_next_udp_fragmentation() {
+    init();
+
+    let (stack, _tcp_listener, udp_socket) =
+        NetStack::new_with_config(NetStackConfig {
+            mtu: 1500,
+            local_addresses: vec![NetStackAddress::new(
+                "198.18.0.1".parse().unwrap(),
+                30,
+            )],
+        });
+    let (mut stack_sink, mut stack_stream) = stack.split();
+    let (_udp_read, mut udp_write) = udp_socket.split();
+    let payload = vec![0x5a; 100];
+    let local = "2.2.2.2:5001".parse().unwrap();
+    let remote = "1.1.1.1:5000".parse().unwrap();
+
+    udp_write
+        .send((payload.clone(), local, remote).into())
+        .await
+        .unwrap();
+    let first = stack_stream
+        .next()
+        .await
+        .expect("stack stream closed")
+        .expect("stack stream error");
+    assert!(first.data().len() > 68);
+
+    let mut icmp = Vec::new();
+    etherparse::PacketBuilder::ipv4([203, 0, 113, 1], [2, 2, 2, 2], 64)
+        .icmpv4(etherparse::Icmpv4Type::DestinationUnreachable(
+            etherparse::icmpv4::DestUnreachableHeader::FragmentationNeeded {
+                next_hop_mtu: 68,
+            },
+        ))
+        .write(&mut icmp, &first.data()[..28])
+        .unwrap();
+    stack_sink.send(Packet::new(icmp)).await.unwrap();
+
+    udp_write
+        .send((payload, local, remote).into())
+        .await
+        .unwrap();
+
+    let mut fragment_count = 0usize;
+    loop {
+        let packet = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            stack_stream.next(),
+        )
+        .await
+        .expect("timed out waiting for learned-PMTU fragment")
+        .expect("stack stream closed")
+        .expect("stack stream error");
+        let header = etherparse::Ipv4HeaderSlice::from_slice(packet.data()).unwrap();
+        assert!(packet.data().len() <= 68);
+        fragment_count += 1;
+        if !header.more_fragments() {
+            break;
+        }
+    }
+    assert_eq!(fragment_count, 3);
+}
+
+#[tokio::test]
+async fn udp_ipv6_output_uses_stable_automatic_flow_label() {
+    init();
+
+    let (stack, _tcp_listener, udp_socket) = NetStack::new();
+    let (_stack_sink, mut stack_stream) = stack.split();
+    let (_udp_read, mut udp_write) = udp_socket.split();
+    let datagram = || {
+        (
+            b"same-flow".as_slice(),
+            "[2001:db8::2]:5001".parse().unwrap(),
+            "[2001:db8::1]:5000".parse().unwrap(),
+        )
+            .into()
+    };
+
+    udp_write.send(datagram()).await.unwrap();
+    udp_write.send(datagram()).await.unwrap();
+
+    let mut labels = Vec::new();
+    for _ in 0..2 {
+        let packet = stack_stream
+            .next()
+            .await
+            .expect("stack stream closed")
+            .expect("stack stream error");
+        let header = etherparse::Ipv6HeaderSlice::from_slice(packet.data()).unwrap();
+        assert_eq!(header.hop_limit(), 64);
+        labels.push(header.flow_label().value());
+    }
+    assert_ne!(labels[0], 0);
+    assert_eq!(labels[0], labels[1]);
+}
+
+#[tokio::test]
+async fn udp_ipv6_output_fragments_to_configured_mtu() {
+    init();
+
+    let (stack, _tcp_listener, udp_socket) =
+        NetStack::new_with_config(NetStackConfig {
+            mtu: 1280,
+            local_addresses: vec![NetStackAddress::new(
+                "fd00::1".parse().unwrap(),
+                64,
+            )],
+        });
+    let (_stack_sink, mut stack_stream) = stack.split();
+    let (_udp_read, mut udp_write) = udp_socket.split();
+    let payload = vec![0x6a; 2000];
+
+    udp_write
+        .send(
+            (
+                payload.clone(),
+                "[2001:db8::2]:5001".parse().unwrap(),
+                "[2001:db8::1]:5000".parse().unwrap(),
+            )
+                .into(),
+        )
+        .await
+        .unwrap();
+
+    let mut identification = None;
+    let mut reassembled = vec![0u8; 8 + payload.len()];
+    let mut fragment_count = 0usize;
+    loop {
+        let packet = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            stack_stream.next(),
+        )
+        .await
+        .expect("timed out waiting for IPv6 UDP fragment")
+        .expect("stack stream closed")
+        .expect("stack stream error");
+        assert!(packet.data().len() <= 1280);
+
+        let header = etherparse::Ipv6HeaderSlice::from_slice(packet.data()).unwrap();
+        assert_eq!(header.next_header(), etherparse::ip_number::IPV6_FRAG);
+        assert_eq!(header.hop_limit(), 64);
+        let fragment =
+            etherparse::Ipv6FragmentHeaderSlice::from_slice(&packet.data()[40..])
+                .unwrap();
+        assert_eq!(fragment.next_header(), etherparse::ip_number::UDP);
+        let current_identification = fragment.identification();
+        assert_eq!(
+            *identification.get_or_insert(current_identification),
+            current_identification
+        );
+
+        let offset = usize::from(fragment.fragment_offset().byte_offset());
+        let fragment_payload = &packet.data()[48..];
+        reassembled[offset..offset + fragment_payload.len()]
+            .copy_from_slice(fragment_payload);
+        fragment_count += 1;
+
+        if !fragment.more_fragments() {
+            break;
+        }
+    }
+
+    assert_eq!(fragment_count, 2);
+    let udp = smoltcp::wire::UdpPacket::new_checked(reassembled.as_slice()).unwrap();
+    assert_eq!(udp.src_port(), 5001);
+    assert_eq!(udp.dst_port(), 5000);
+    assert_eq!(udp.payload(), payload.as_slice());
+    assert!(udp.verify_checksum(
+        &"2001:db8::2".parse::<std::net::Ipv6Addr>().unwrap().into(),
+        &"2001:db8::1".parse::<std::net::Ipv6Addr>().unwrap().into(),
+    ));
+}
+
+#[tokio::test]
+async fn validated_icmpv6_pmtu_update_changes_next_udp_fragmentation() {
+    init();
+
+    let (stack, _tcp_listener, udp_socket) =
+        NetStack::new_with_config(NetStackConfig {
+            mtu: 1500,
+            local_addresses: vec![NetStackAddress::new(
+                "fd00::1".parse().unwrap(),
+                64,
+            )],
+        });
+    let (mut stack_sink, mut stack_stream) = stack.split();
+    let (_udp_read, mut udp_write) = udp_socket.split();
+    let payload = vec![0x6a; 1400];
+    let local = "[2001:db8::2]:5001".parse().unwrap();
+    let remote = "[2001:db8:1::1]:5000".parse().unwrap();
+
+    udp_write
+        .send((payload.clone(), local, remote).into())
+        .await
+        .unwrap();
+    let first = stack_stream
+        .next()
+        .await
+        .expect("stack stream closed")
+        .expect("stack stream error");
+    assert!(first.data().len() > 1280);
+
+    let mut icmp = Vec::new();
+    etherparse::PacketBuilder::ipv6(
+        "2001:db8:ffff::1"
+            .parse::<std::net::Ipv6Addr>()
+            .unwrap()
+            .octets(),
+        "2001:db8::2"
+            .parse::<std::net::Ipv6Addr>()
+            .unwrap()
+            .octets(),
+        64,
+    )
+    .icmpv6(etherparse::Icmpv6Type::PacketTooBig { mtu: 1280 })
+    .write(&mut icmp, &first.data()[..48])
+    .unwrap();
+    stack_sink.send(Packet::new(icmp)).await.unwrap();
+
+    udp_write
+        .send((payload, local, remote).into())
+        .await
+        .unwrap();
+
+    let mut fragment_count = 0usize;
+    loop {
+        let packet = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            stack_stream.next(),
+        )
+        .await
+        .expect("timed out waiting for learned-PMTU IPv6 fragment")
+        .expect("stack stream closed")
+        .expect("stack stream error");
+        let header = etherparse::Ipv6HeaderSlice::from_slice(packet.data()).unwrap();
+        assert!(packet.data().len() <= 1280);
+        assert_eq!(header.next_header(), etherparse::ip_number::IPV6_FRAG);
+        let fragment =
+            etherparse::Ipv6FragmentHeaderSlice::from_slice(&packet.data()[40..])
+                .unwrap();
+        fragment_count += 1;
+        if !fragment.more_fragments() {
+            break;
+        }
+    }
+    assert_eq!(fragment_count, 2);
 }
 
 #[tokio::test]
@@ -661,7 +1053,7 @@ async fn malformed_udp_does_not_end_receive_stream() {
 async fn zero_length_udp_is_emitted() {
     let (_input_tx, input_rx) = tokio::sync::mpsc::channel(8);
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
-    let (_reader, mut writer) = UdpSocket::new(input_rx, output_tx).split();
+    let (_reader, mut writer) = UdpSocket::new(input_rx, output_tx, 1500).split();
 
     writer
         .send(
@@ -984,29 +1376,39 @@ async fn fragmented_ipv6_udp_reassembles_out_of_order() {
     assert_eq!(packet.data(), payload);
 }
 
-#[tokio::test]
-async fn fragment_overlap_policy_is_version_appropriate() {
-    let payload = b"duplicate-fragment";
-    {
-        let [first, second] = build_ipv6_udp_fragments(payload);
-        let (stack, _tcp, udp) = NetStack::new();
-        let (mut sink, _) = stack.split();
-        let (mut reader, _) = udp.split();
-        for packet in [first.clone(), first, second] {
-            sink.send(Packet::new(packet)).await.unwrap();
+fn fragment_with_more_flag(packet: &[u8]) -> Vec<u8> {
+    match packet[0] >> 4 {
+        4 => {
+            let (mut header, payload) =
+                etherparse::Ipv4Header::from_slice(packet).unwrap();
+            header.more_fragments = true;
+            header.header_checksum = header.calc_header_checksum();
+            [header.to_bytes().as_slice(), payload].concat()
         }
-        assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                reader.recv()
-            )
-            .await
-            .is_err(),
-            "overlapping IPv6 fragments must discard the datagram"
-        );
+        6 => {
+            let header = &packet[..40];
+            let (fragment, payload) =
+                etherparse::Ipv6FragmentHeader::from_slice(&packet[40..]).unwrap();
+            let fragment = etherparse::Ipv6FragmentHeader::new(
+                fragment.next_header,
+                fragment.fragment_offset,
+                true,
+                fragment.identification,
+            );
+            [header, fragment.to_bytes().as_slice(), payload].concat()
+        }
+        version => panic!("unexpected IP version {version}"),
     }
-    {
-        let [first, second] = build_ipv4_udp_fragments(payload);
+}
+
+#[tokio::test]
+async fn fully_covered_fragment_duplicates_are_accepted() {
+    let payload = b"duplicate-fragment";
+    for fragments in [
+        build_ipv4_udp_fragments(payload),
+        build_ipv6_udp_fragments(payload),
+    ] {
+        let [first, second] = fragments;
         let (stack, _tcp, udp) = NetStack::new();
         let (mut sink, _) = stack.split();
         let (mut reader, _) = udp.split();
@@ -1018,9 +1420,36 @@ async fn fragment_overlap_policy_is_version_appropriate() {
             reader.recv(),
         )
         .await
-        .expect("identical IPv4 duplicate blocked reassembly")
+        .expect("fully covered duplicate blocked reassembly")
         .expect("UDP stream closed");
         assert_eq!(packet.data(), payload);
+    }
+}
+
+#[tokio::test]
+async fn duplicate_final_fragment_does_not_complete_reassembly() {
+    let payload = b"duplicate-final-fragment";
+    for fragments in [
+        build_ipv4_udp_fragments(payload),
+        build_ipv6_udp_fragments(payload),
+    ] {
+        let [first, final_fragment] = fragments;
+        let non_final = fragment_with_more_flag(&final_fragment);
+        let (stack, _tcp, udp) = NetStack::new();
+        let (mut sink, _) = stack.split();
+        let (mut reader, _) = udp.split();
+        for packet in [first, non_final, final_fragment] {
+            sink.send(Packet::new(packet)).await.unwrap();
+        }
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                reader.recv(),
+            )
+            .await
+            .is_err(),
+            "a duplicate final fragment must not itself complete reassembly"
+        );
     }
 }
 
