@@ -162,10 +162,16 @@ struct FragmentState {
     saw_not_ect: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OverlapDisposition {
+    New,
+    Duplicate,
+}
+
 fn validate_overlap(
     piece: &FragmentPiece<'_>,
     buffer: &etherparse::defrag::IpDefragBuf,
-) -> std::io::Result<()> {
+) -> std::io::Result<OverlapDisposition> {
     let start = piece.offset.byte_offset();
     let len = u16::try_from(piece.payload.len())
         .map_err(|_| std::io::Error::other("fragment payload too large"))?;
@@ -173,31 +179,34 @@ fn validate_overlap(
         .checked_add(len)
         .ok_or_else(|| std::io::Error::other("fragment range overflow"))?;
 
+    let mut covered_until = start;
+    let mut saw_overlap = false;
     for section in buffer.sections() {
         let overlap_start = start.max(section.start);
         let overlap_end = end.min(section.end);
         if overlap_start >= overlap_end {
             continue;
         }
-        if matches!(piece.key, FragmentKey::Ipv6 { .. }) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "overlapping IPv6 fragments",
-            ));
+        saw_overlap = true;
+        if overlap_start > covered_until {
+            break;
         }
-
-        let old_start = usize::from(overlap_start);
-        let old_end = usize::from(overlap_end);
-        let new_start = usize::from(overlap_start - start);
-        let new_end = new_start + (old_end - old_start);
-        if buffer.data()[old_start..old_end] != piece.payload[new_start..new_end] {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "conflicting overlapping IPv4 fragments",
-            ));
+        covered_until = covered_until.max(overlap_end);
+        if covered_until == end {
+            // MIPS follows Linux here: a fragment whose entire range is
+            // already retained is a duplicate, regardless of IP version or
+            // whether the duplicate bytes differ.
+            return Ok(OverlapDisposition::Duplicate);
         }
     }
-    Ok(())
+
+    if saw_overlap {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "partially overlapping IP fragments",
+        ));
+    }
+    Ok(OverlapDisposition::New)
 }
 
 pub(crate) struct FragmentReassembler {
@@ -291,9 +300,31 @@ impl FragmentReassembler {
                     "fragment next-header changed within one datagram",
                 ));
             }
-            if let Err(err) = validate_overlap(&piece, &state.buffer) {
-                self.active.remove(&piece.key);
-                return Err(err);
+            let duplicate = match validate_overlap(&piece, &state.buffer) {
+                Ok(OverlapDisposition::New) => false,
+                Ok(OverlapDisposition::Duplicate) => true,
+                Err(err) => {
+                    self.active.remove(&piece.key);
+                    return Err(err);
+                }
+            };
+            // A fully covered duplicate contributes no ECN or header metadata.
+            // A duplicate final fragment may still teach the defragmenter the
+            // final length, but MIPS deliberately does not let that duplicate
+            // itself complete reassembly.
+            if duplicate {
+                state.updated_at = now;
+                if !piece.more_fragments
+                    && let Err(err) = state.buffer.add(
+                        piece.offset,
+                        piece.more_fragments,
+                        piece.payload,
+                    )
+                {
+                    self.active.remove(&piece.key);
+                    return Err(std::io::Error::other(err));
+                }
+                return Ok(None);
             }
             let piece_is_ce = piece.ecn == etherparse::IpEcn::CongestionExperienced;
             let piece_is_not_ect = piece.ecn == etherparse::IpEcn::NotEct;
@@ -696,6 +727,53 @@ mod tests {
         };
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(reassembler.active.is_empty());
+    }
+
+    #[test]
+    fn duplicate_fragment_does_not_contribute_ecn_metadata() {
+        let build =
+            |part: &[u8], offset: usize, more: bool, ecn: etherparse::IpEcn| {
+                let mut header = etherparse::Ipv4Header::new(
+                    part.len() as u16,
+                    64,
+                    etherparse::ip_number::UDP,
+                    [1, 1, 1, 1],
+                    [2, 2, 2, 2],
+                )
+                .unwrap();
+                header.ecn = ecn;
+                header.identification = 0x7273;
+                header.more_fragments = more;
+                header.fragment_offset =
+                    etherparse::IpFragOffset::try_new((offset / 8) as u16).unwrap();
+                header.header_checksum = header.calc_header_checksum();
+                [header.to_bytes().as_slice(), part].concat()
+            };
+        let payload = [0x45u8; 16];
+        let first = build(&payload[..8], 0, true, etherparse::IpEcn::Ect0);
+        let duplicate = build(
+            &[0x99; 8],
+            0,
+            true,
+            etherparse::IpEcn::CongestionExperienced,
+        );
+        let second = build(&payload[8..], 8, false, etherparse::IpEcn::Ect0);
+        let mut reassembler =
+            FragmentReassembler::new(etherparse::ip_number::UDP, "test");
+
+        assert!(reassembler.push(&first).unwrap().is_none());
+        assert!(reassembler.push(&duplicate).unwrap().is_none());
+        let reassembled = reassembler
+            .push(&second)
+            .unwrap()
+            .expect("non-duplicate fragments should complete");
+        let packet = reassembled
+            .template
+            .rebuild(reassembled.protocol, &reassembled.payload)
+            .unwrap();
+        let header = etherparse::Ipv4HeaderSlice::from_slice(packet.data()).unwrap();
+        assert_eq!(header.ecn(), etherparse::IpEcn::Ect0);
+        assert_eq!(&reassembled.payload[..8], &payload[..8]);
     }
 
     #[test]
