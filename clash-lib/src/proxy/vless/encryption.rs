@@ -854,7 +854,7 @@ impl Config {
         })
     }
 
-    #[cfg(any(feature = "aws-lc-rs", feature = "vless-encryption"))]
+    #[cfg(feature = "vless-encryption")]
     pub(crate) fn validate_crypto_keys(&self) -> io::Result<()> {
         use aws_lc_rs::{
             agreement,
@@ -3740,7 +3740,7 @@ mod tests {
         );
     }
 
-    #[cfg(any(feature = "aws-lc-rs", feature = "vless-encryption"))]
+    #[cfg(feature = "vless-encryption")]
     #[test]
     fn crypto_validation_accepts_generated_x25519_and_mlkem_keys() {
         use aws_lc_rs::{

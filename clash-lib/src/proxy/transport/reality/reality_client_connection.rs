@@ -2,7 +2,10 @@
 
 use std::io::{self, Read, Write};
 
-use aws_lc_rs::{agreement, digest};
+use aws_lc_rs::{
+    agreement, digest,
+    kem::{Ciphertext, DecapsulationKey, ML_KEM_768},
+};
 use rand::Rng;
 
 use super::common::{
@@ -30,10 +33,14 @@ use super::reality_tls13_keys::{
     derive_traffic_keys,
 };
 use super::reality_tls13_messages::{
-    DEFAULT_ALPN_PROTOCOLS, construct_client_hello, construct_finished,
-    write_record_header,
+    DEFAULT_ALPN_PROTOCOLS, X25519_GROUP, X25519_MLKEM768_GROUP,
+    construct_client_hello_with_key_share, construct_finished, write_record_header,
 };
-use super::reality_util::{extract_server_cipher_suite, extract_server_public_key};
+use super::reality_util::{
+    RealityKeyShare, X25519_KEY_SHARE_LEN, X25519_MLKEM768_CLIENT_KEY_SHARE_LEN,
+    X25519_MLKEM768_SERVER_KEY_SHARE_LEN, extract_server_cipher_suite,
+    extract_server_key_share,
+};
 use super::slide_buffer::SlideBuffer;
 use super::util::allocate_vec;
 
@@ -74,6 +81,105 @@ pub struct RealityClientConfig {
     pub cipher_suites: Vec<CipherSuite>,
     /// ALPN protocols offered in ClientHello (empty = browser-like defaults).
     pub alpn_protocols: Vec<String>,
+    /// Offer X25519MLKEM768 (0x11ec) instead of classic X25519 for TLS key exchange.
+    pub support_x25519_mlkem768: bool,
+}
+
+enum ClientKeyExchange {
+    X25519 {
+        private_key: [u8; 32],
+    },
+    X25519MlKem768 {
+        x25519_private_key: [u8; 32],
+        mlkem_private_key: Vec<u8>,
+    },
+}
+
+fn x25519_shared_secret(
+    private_key: &[u8; 32],
+    peer_public_key: &[u8],
+) -> io::Result<Vec<u8>> {
+    let peer =
+        agreement::UnparsedPublicKey::new(&agreement::X25519, peer_public_key);
+    let private =
+        agreement::PrivateKey::from_private_key(&agreement::X25519, private_key)
+            .map_err(|_| io::Error::other("Failed to create X25519 private key"))?;
+    let mut secret = Vec::new();
+    agreement::agree(
+        &private,
+        peer,
+        io::Error::other("X25519 agreement failed"),
+        |key_material| {
+            secret.extend_from_slice(key_material);
+            Ok(())
+        },
+    )?;
+    Ok(secret)
+}
+
+fn derive_tls_shared_secret(
+    key_exchange: &ClientKeyExchange,
+    server_share: &RealityKeyShare,
+) -> io::Result<Vec<u8>> {
+    match key_exchange {
+        ClientKeyExchange::X25519 { private_key } => {
+            if server_share.group != X25519_GROUP {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "REALITY server selected unexpected key share group 0x{:04x}; expected X25519",
+                        server_share.group
+                    ),
+                ));
+            }
+            x25519_shared_secret(private_key, &server_share.data)
+        }
+        ClientKeyExchange::X25519MlKem768 {
+            x25519_private_key,
+            mlkem_private_key,
+        } => {
+            if server_share.group != X25519_MLKEM768_GROUP
+                || server_share.data.len() != X25519_MLKEM768_SERVER_KEY_SHARE_LEN
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "REALITY server returned invalid X25519MLKEM768 key share: group=0x{:04x}, len={}",
+                        server_share.group,
+                        server_share.data.len()
+                    ),
+                ));
+            }
+
+            let mlkem_private = DecapsulationKey::new(
+                &ML_KEM_768,
+                mlkem_private_key,
+            )
+            .map_err(|_| {
+                io::Error::other("Failed to reconstruct ML-KEM-768 private key")
+            })?;
+            let mlkem_ciphertext_len =
+                X25519_MLKEM768_SERVER_KEY_SHARE_LEN - X25519_KEY_SHARE_LEN;
+            let mlkem_secret = mlkem_private
+                .decapsulate(Ciphertext::from(
+                    &server_share.data[..mlkem_ciphertext_len],
+                ))
+                .map_err(|_| {
+                    io::Error::other(
+                        "Failed to decapsulate ML-KEM-768 server key share",
+                    )
+                })?;
+            let x25519_secret = x25519_shared_secret(
+                x25519_private_key,
+                &server_share.data[mlkem_ciphertext_len..],
+            )?;
+
+            let mut shared_secret = Vec::with_capacity(64);
+            shared_secret.extend_from_slice(mlkem_secret.as_ref());
+            shared_secret.extend_from_slice(&x25519_secret);
+            Ok(shared_secret)
+        }
+    }
 }
 
 /// Handshake state machine for REALITY client
@@ -81,7 +187,7 @@ enum HandshakeState {
     /// ClientHello sent, waiting for ServerHello
     AwaitingServerHello {
         client_hello_bytes: Vec<u8>, // Full ClientHello handshake message (raw bytes for transcript)
-        client_private_key: [u8; 32],
+        key_exchange: ClientKeyExchange,
         auth_key: [u8; 32], // REALITY authentication key for HMAC verification
     },
     /// ServerHello received, processing encrypted handshake messages
@@ -143,7 +249,9 @@ impl RealityClientConnection {
             config,
             handshake_state: HandshakeState::AwaitingServerHello {
                 client_hello_bytes: Vec::new(),
-                client_private_key: [0u8; 32],
+                key_exchange: ClientKeyExchange::X25519 {
+                    private_key: [0u8; 32],
+                },
                 auth_key: [0u8; 32],
             },
             app_read_key: None,
@@ -183,10 +291,55 @@ impl RealityClientConnection {
             .compute_public_key()
             .map_err(|_| io::Error::other("Failed to compute public key"))?;
 
+        let (key_share_group, key_share_data, key_exchange) = if self
+            .config
+            .support_x25519_mlkem768
+        {
+            let mlkem_private =
+                DecapsulationKey::generate(&ML_KEM_768).map_err(|_| {
+                    io::Error::other("Failed to generate ML-KEM-768 key")
+                })?;
+            let mlkem_public = mlkem_private.encapsulation_key().map_err(|_| {
+                io::Error::other("Failed to derive ML-KEM-768 public key")
+            })?;
+            let mlkem_public_bytes = mlkem_public.key_bytes().map_err(|_| {
+                io::Error::other("Failed to serialize ML-KEM-768 public key")
+            })?;
+            let mlkem_private_key = mlkem_private
+                .key_bytes()
+                .map_err(|_| {
+                    io::Error::other("Failed to serialize ML-KEM-768 private key")
+                })?
+                .as_ref()
+                .to_vec();
+
+            let mut key_share =
+                Vec::with_capacity(X25519_MLKEM768_CLIENT_KEY_SHARE_LEN);
+            key_share.extend_from_slice(mlkem_public_bytes.as_ref());
+            key_share.extend_from_slice(our_public_key_bytes.as_ref());
+            (
+                X25519_MLKEM768_GROUP,
+                key_share,
+                ClientKeyExchange::X25519MlKem768 {
+                    x25519_private_key: our_private_bytes,
+                    mlkem_private_key,
+                },
+            )
+        } else {
+            (
+                X25519_GROUP,
+                our_public_key_bytes.as_ref().to_vec(),
+                ClientKeyExchange::X25519 {
+                    private_key: our_private_bytes,
+                },
+            )
+        };
+
         let mut client_random = [0u8; 32];
         rng.fill_bytes(&mut client_random);
 
-        // Perform ECDH with server's public key to derive auth key
+        // REALITY authentication always uses the X25519 component, including
+        // when TLS itself negotiates the X25519MLKEM768 hybrid group.
         let shared_secret =
             perform_ecdh(&our_private_bytes, &self.config.public_key).map_err(
                 |e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()),
@@ -237,10 +390,11 @@ impl RealityClientConnection {
         } else {
             configured_alpn.as_slice()
         };
-        let mut client_hello = construct_client_hello(
+        let mut client_hello = construct_client_hello_with_key_share(
             &client_random,
             &session_id_for_hello,
-            our_public_key_bytes.as_ref(),
+            key_share_group,
+            &key_share_data,
             &self.config.server_name,
             &cipher_suite_ids,
             alpn_protocols,
@@ -280,7 +434,7 @@ impl RealityClientConnection {
         // At this point client_hello contains the encrypted SessionId.
         self.handshake_state = HandshakeState::AwaitingServerHello {
             client_hello_bytes: client_hello, // Save the actual ClientHello bytes
-            client_private_key: our_private_bytes,
+            key_exchange,
             auth_key, // Save auth_key for HMAC certificate verification
         };
 
@@ -373,7 +527,7 @@ impl RealityClientConnection {
     fn process_server_hello(&mut self) -> io::Result<bool> {
         let HandshakeState::AwaitingServerHello {
             client_hello_bytes,
-            client_private_key,
+            key_exchange,
             auth_key,
         } = &self.handshake_state
         else {
@@ -405,7 +559,7 @@ impl RealityClientConnection {
             server_hello.len()
         );
 
-        let server_public_key = extract_server_public_key(&record)?;
+        let server_key_share = extract_server_key_share(&record)?;
         let cipher_suite_id = extract_server_cipher_suite(&record)?;
         let cipher_suite =
             CipherSuite::from_id(cipher_suite_id).ok_or_else(|| {
@@ -441,26 +595,8 @@ impl RealityClientConnection {
             ctx.finish().as_ref().to_vec()
         };
 
-        let peer_public_key = agreement::UnparsedPublicKey::new(
-            &agreement::X25519,
-            &server_public_key,
-        );
-        let my_private_key = agreement::PrivateKey::from_private_key(
-            &agreement::X25519,
-            client_private_key,
-        )
-        .map_err(|_| io::Error::other("Failed to create private key"))?;
-
-        let mut tls_shared_secret = [0u8; 32];
-        agreement::agree(
-            &my_private_key,
-            peer_public_key,
-            io::Error::other("ECDH failed"),
-            |key_material| {
-                tls_shared_secret.copy_from_slice(key_material);
-                Ok(())
-            },
-        )?;
+        let tls_shared_secret =
+            derive_tls_shared_secret(key_exchange, &server_key_share)?;
 
         let hs_keys = derive_handshake_keys(
             cipher_suite,
@@ -1083,6 +1219,11 @@ pub fn feed_reality_client_connection(
 
 #[cfg(test)]
 mod tests {
+    use aws_lc_rs::kem::EncapsulationKey;
+
+    use super::super::reality_util::{
+        X25519_MLKEM768_CLIENT_KEY_SHARE_LEN, extract_client_key_share,
+    };
     use super::*;
 
     fn test_server_public_key() -> [u8; 32] {
@@ -1120,6 +1261,111 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_client_hello_uses_x25519_mlkem768_key_share() {
+        let config = RealityClientConfig {
+            public_key: test_server_public_key(),
+            short_id: vec![],
+            server_name: "example.com".to_owned(),
+            cipher_suites: vec![],
+            alpn_protocols: vec!["h2".to_owned()],
+            support_x25519_mlkem768: true,
+        };
+        let conn = RealityClientConnection::new(config).unwrap();
+        let client_hello = match &conn.handshake_state {
+            HandshakeState::AwaitingServerHello {
+                client_hello_bytes, ..
+            } => client_hello_bytes,
+            _ => panic!("new client must be awaiting ServerHello"),
+        };
+        let mut record =
+            write_record_header(CONTENT_TYPE_HANDSHAKE, client_hello.len() as u16);
+        record.extend_from_slice(client_hello);
+
+        let share = extract_client_key_share(&record).unwrap();
+        assert_eq!(share.group, X25519_MLKEM768_GROUP);
+        assert_eq!(share.data.len(), X25519_MLKEM768_CLIENT_KEY_SHARE_LEN);
+        assert!(matches!(
+            conn.handshake_state,
+            HandshakeState::AwaitingServerHello {
+                key_exchange: ClientKeyExchange::X25519MlKem768 { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn hybrid_tls_secret_is_mlkem_then_x25519() {
+        let config = RealityClientConfig {
+            public_key: test_server_public_key(),
+            short_id: vec![],
+            server_name: "example.com".to_owned(),
+            cipher_suites: vec![],
+            alpn_protocols: vec!["h2".to_owned()],
+            support_x25519_mlkem768: true,
+        };
+        let conn = RealityClientConnection::new(config).unwrap();
+        let (client_hello, key_exchange) = match &conn.handshake_state {
+            HandshakeState::AwaitingServerHello {
+                client_hello_bytes,
+                key_exchange,
+                ..
+            } => (client_hello_bytes, key_exchange),
+            _ => panic!("new client must be awaiting ServerHello"),
+        };
+        let mut record =
+            write_record_header(CONTENT_TYPE_HANDSHAKE, client_hello.len() as u16);
+        record.extend_from_slice(client_hello);
+        let client_share = extract_client_key_share(&record).unwrap();
+
+        let mlkem_public_len =
+            X25519_MLKEM768_CLIENT_KEY_SHARE_LEN - X25519_KEY_SHARE_LEN;
+        let mlkem_public = EncapsulationKey::new(
+            &ML_KEM_768,
+            &client_share.data[..mlkem_public_len],
+        )
+        .unwrap();
+        let (mlkem_ciphertext, mlkem_secret) = mlkem_public.encapsulate().unwrap();
+
+        let server_x25519_private =
+            agreement::PrivateKey::generate(&agreement::X25519).unwrap();
+        let server_x25519_public =
+            server_x25519_private.compute_public_key().unwrap();
+        let client_x25519_public = agreement::UnparsedPublicKey::new(
+            &agreement::X25519,
+            &client_share.data[mlkem_public_len..],
+        );
+        let mut x25519_secret = Vec::new();
+        agreement::agree(
+            &server_x25519_private,
+            client_x25519_public,
+            io::Error::other("server X25519 agreement failed"),
+            |material| {
+                x25519_secret.extend_from_slice(material);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let mut server_share = mlkem_ciphertext.as_ref().to_vec();
+        server_share.extend_from_slice(server_x25519_public.as_ref());
+        assert_eq!(server_share.len(), X25519_MLKEM768_SERVER_KEY_SHARE_LEN);
+
+        let derived = derive_tls_shared_secret(
+            key_exchange,
+            &RealityKeyShare {
+                group: X25519_MLKEM768_GROUP,
+                data: server_share,
+            },
+        )
+        .unwrap();
+        let mut expected = mlkem_secret.as_ref().to_vec();
+        expected.extend_from_slice(&x25519_secret);
+
+        assert_eq!(derived, expected);
+        assert_eq!(derived.len(), 64);
+    }
+
+    #[test]
     fn client_hello_transcript_bytes_use_encrypted_session_id() {
         let server_public = test_server_public_key();
         let config = RealityClientConfig {
@@ -1128,6 +1374,7 @@ mod tests {
             server_name: "example.com".to_string(),
             cipher_suites: vec![],
             alpn_protocols: vec!["h2".to_owned()],
+            support_x25519_mlkem768: false,
         };
 
         let mut conn = RealityClientConnection::new(config).unwrap();
@@ -1160,6 +1407,7 @@ mod tests {
             server_name: "example.com".to_owned(),
             cipher_suites: vec![],
             alpn_protocols: vec!["h3".to_owned()],
+            support_x25519_mlkem768: false,
         };
 
         let conn = RealityClientConnection::new(config).unwrap();
