@@ -160,6 +160,7 @@ default = [
     "tun",
     "port",
     "reality",
+    "vless-encryption",
     "extended-health-check",
 ]
 
@@ -229,6 +230,11 @@ tracing = ["tokio/tracing"]
 port = ["http_port", "mixed_port"]
 
 reality = ["tls", "aws-lc-rs", "dep:aws-lc-rs"]
+vless-encryption = [
+    "dep:aws-lc-rs",
+    "aws-lc-rs/aws-lc-sys",
+    "dep:blake3",
+]
 
 dashboard = ["dep:rust-embed"]
 [target.'cfg(windows)'.dependencies]

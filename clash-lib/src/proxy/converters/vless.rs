@@ -98,16 +98,26 @@ fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
                         "invalid vless encryption config: {err}"
                     ))
                 })?;
-            #[cfg(feature = "aws-lc-rs")]
-            parsed.validate_crypto_keys().map_err(|err| {
-                Error::InvalidConfig(format!(
-                    "invalid vless encryption crypto key: {err}"
-                ))
-            })?;
-            return Err(Error::InvalidConfig(format!(
-                "vless encryption config is valid ({}) but runtime handshake support is not implemented yet",
-                parsed.summary()
-            )));
+            #[cfg(feature = "vless-encryption")]
+            {
+                let prepared = parsed.prepare_crypto().map_err(|err| {
+                    Error::InvalidConfig(format!(
+                        "invalid vless encryption crypto key: {err}"
+                    ))
+                })?;
+                return Err(Error::InvalidConfig(format!(
+                    "vless encryption config is valid ({}; {}) but runtime handshake support is not implemented yet",
+                    parsed.summary(),
+                    prepared.summary()
+                )));
+            }
+            #[cfg(not(feature = "vless-encryption"))]
+            {
+                let _ = parsed;
+                return Err(Error::InvalidConfig(
+                    "vless encryption requires vless-encryption feature".to_owned(),
+                ));
+            }
         }
     }
 
@@ -2075,7 +2085,7 @@ mod tests {
             },
             uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
             encryption: Some(format!(
-                "mlkem768x25519plus.native.1rtt.100-200.{key}"
+                "mlkem768x25519plus.native.1rtt.100-200-300.{key}"
             )),
             ..Default::default()
         };
@@ -2084,7 +2094,7 @@ mod tests {
             .expect_err("runtime handshake is not implemented yet");
         assert!(
             err.to_string().contains(
-                "vless encryption config is valid (native.1rtt; padding-blocks=1; x25519-keys=1; mlkem768-keys=0)"
+                "vless encryption config is valid (native.1rtt; padding-blocks=1; x25519-keys=1; mlkem768-keys=0; xor-mode=0; relay-bytes=32; key-hashes=1; padding-bytes=200-300; hello-bytes=1498-1598; write-segments=1; gap-segments=0)"
             ),
             "unexpected error: {err}"
         );
