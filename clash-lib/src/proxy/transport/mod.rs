@@ -1,3 +1,4 @@
+mod grpc;
 mod tls;
 
 #[cfg(feature = "ws")]
@@ -13,6 +14,7 @@ pub mod v2ray;
 #[cfg(feature = "reality")]
 pub mod splice_tls;
 
+pub use grpc::Client as GrpcClient;
 pub use tls::Client as TlsClient;
 #[cfg(feature = "ws")]
 pub use ws::Client as WsClient;
@@ -46,6 +48,15 @@ pub trait Transport: Send + Sync {
         &self,
         stream: super::AnyStream,
     ) -> std::io::Result<super::AnyStream>;
+
+    /// Return a logical stream from an already-owned underlying connection.
+    ///
+    /// Transports that do not own reusable connections leave this as `None`.
+    /// Callers must invoke this before dialing a new raw stream, otherwise
+    /// connection reuse would still pay the TCP/TLS handshake cost.
+    async fn try_reuse_stream(&self) -> std::io::Result<Option<super::AnyStream>> {
+        Ok(None)
+    }
 
     /// Like `proxy_stream`, but additionally returns a `VisionOptions` for
     /// transports that support XTLS-splice (Reality).  The default

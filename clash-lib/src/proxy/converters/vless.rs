@@ -7,8 +7,8 @@ use crate::{
     proxy::{
         HandlerCommonOptions,
         transport::{
-            TlsClient, Transport, XhttpClient, XhttpDownloadConfig, XhttpMode,
-            XhttpRealityConfig, XhttpSecurity,
+            GrpcClient, TlsClient, Transport, XhttpClient, XhttpDownloadConfig,
+            XhttpMode, XhttpRealityConfig, XhttpSecurity,
         },
         vless::{Handler, HandlerOptions},
     },
@@ -23,7 +23,7 @@ use super::utils::build_ws_client;
 use crate::proxy::transport::WsClient;
 
 const DEFAULT_WS_ALPN: [&str; 1] = ["http/1.1"];
-const DEFAULT_XHTTP_ALPN: [&str; 1] = ["h2"];
+const DEFAULT_H2_ALPN: [&str; 1] = ["h2"];
 
 #[cfg(feature = "reality")]
 use crate::proxy::transport::{
@@ -105,6 +105,15 @@ fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
         ));
     }
 
+    if matches!(s.network.as_deref(), Some("grpc"))
+        && let Some(alpn) = s.alpn.as_ref()
+        && alpn.as_slice() != ["h2"]
+    {
+        return Err(Error::InvalidConfig(
+            "vless grpc requires alpn: [h2]".to_owned(),
+        ));
+    }
+
     #[cfg(feature = "ws")]
     if matches!(s.network.as_deref(), Some("ws"))
         && let Some(ws_opts) = s.ws_opts.as_ref()
@@ -142,6 +151,7 @@ fn build_transport(
             }
         }
         "ws" => build_ws_transport(s),
+        "grpc" => build_grpc_transport(s),
         "xhttp" => build_xhttp_transport(s),
         other => Err(Error::InvalidConfig(format!(
             "unsupported vless network: {other}"
@@ -156,6 +166,10 @@ fn build_tls_transport(
 ) -> Result<Option<Box<dyn Transport>>, Error> {
     if matches!(network, Some("xhttp")) && s.reality_opts.is_some() {
         return build_xhttp_reality_transport(s);
+    }
+
+    if matches!(network, Some("grpc")) && s.reality_opts.is_some() {
+        return build_grpc_reality_transport(s);
     }
 
     if matches!(network, Some("xhttp"))
@@ -206,8 +220,8 @@ fn resolve_vless_alpn(
                 .map(|item| (*item).to_owned())
                 .collect(),
         ),
-        Some("xhttp") => Some(
-            DEFAULT_XHTTP_ALPN
+        Some("grpc" | "xhttp") => Some(
+            DEFAULT_H2_ALPN
                 .iter()
                 .map(|item| (*item).to_owned())
                 .collect(),
@@ -227,7 +241,7 @@ fn build_xhttp_reality_transport(
                 .as_ref()
                 .expect("xhttp reality transport requires reality_opts"),
             server_name,
-            s.alpn.clone(),
+            resolve_vless_alpn(s, Some("xhttp")),
         )?;
         Ok(Some(Box::new(client)))
     }
@@ -236,6 +250,32 @@ fn build_xhttp_reality_transport(
         let _ = s;
         Err(Error::InvalidConfig(
             "vless xhttp reality requires reality feature".to_owned(),
+        ))
+    }
+}
+
+fn build_grpc_reality_transport(
+    s: &OutboundVless,
+) -> Result<Option<Box<dyn Transport>>, Error> {
+    #[cfg(feature = "reality")]
+    {
+        let reality_opts = s.reality_opts.as_ref().ok_or_else(|| {
+            Error::InvalidConfig(
+                "vless grpc reality requires reality_opts".to_owned(),
+            )
+        })?;
+        let client = build_reality_transport_from_opts(
+            reality_opts,
+            resolve_reality_server_name(s),
+            resolve_vless_alpn(s, Some("grpc")),
+        )?;
+        Ok(Some(Box::new(client)))
+    }
+    #[cfg(not(feature = "reality"))]
+    {
+        let _ = s;
+        Err(Error::InvalidConfig(
+            "vless grpc reality requires reality feature".to_owned(),
         ))
     }
 }
@@ -272,7 +312,7 @@ fn build_xhttp_upload_tls_transport(
                 .unwrap_or(false);
             let alpn = alpn.or_else(|| {
                 Some(
-                    DEFAULT_XHTTP_ALPN
+                    DEFAULT_H2_ALPN
                         .iter()
                         .map(|item| (*item).to_owned())
                         .collect(),
@@ -325,6 +365,55 @@ fn build_ws_transport(
             "vless ws network requires ws feature".to_owned(),
         ))
     }
+}
+
+fn build_grpc_transport(
+    s: &OutboundVless,
+) -> Result<Option<Box<dyn Transport>>, Error> {
+    let grpc_opts = s.grpc_opts.as_ref().ok_or_else(|| {
+        Error::InvalidConfig("grpc_opts is required for vless grpc".to_owned())
+    })?;
+    validate_grpc_opts(grpc_opts)?;
+
+    let authority = s
+        .sni
+        .clone()
+        .or_else(|| s.server_name.clone())
+        .unwrap_or_else(|| s.common_opts.server.clone());
+    let path = format!(
+        "/{}",
+        grpc_opts.grpc_service_name.as_deref().unwrap_or_default()
+    )
+    .try_into()
+    .map_err(|err| {
+        Error::InvalidConfig(format!("invalid vless grpc service path: {err}"))
+    })?;
+
+    let client = GrpcClient::new(authority, path)
+        .with_user_agent(grpc_opts.grpc_user_agent.clone())
+        .with_ping_interval(grpc_opts.ping_interval)
+        .with_pool_limits(
+            grpc_opts.max_connections,
+            grpc_opts.min_streams,
+            grpc_opts.max_streams,
+        );
+
+    Ok(Some(Box::new(client)))
+}
+
+fn validate_grpc_opts(
+    grpc_opts: &crate::config::internal::proxy::GrpcOpt,
+) -> Result<(), Error> {
+    if grpc_opts.max_streams.is_some()
+        && (grpc_opts.max_connections.is_some() || grpc_opts.min_streams.is_some())
+    {
+        return Err(Error::InvalidConfig(
+            "vless grpc max-streams conflicts with max-connections and min-streams"
+                .to_owned(),
+        ));
+    }
+
+    Ok(())
 }
 
 fn build_xhttp_transport(
@@ -841,8 +930,8 @@ mod tests {
     #[cfg(feature = "reality")]
     use crate::config::internal::proxy::OutboundTrojanRealityOpts;
     use crate::config::internal::proxy::{
-        CommonConfigOptions, XhttpDownloadSettings, XhttpDownloadXhttpSettings,
-        XhttpExtra, XhttpOpt, XhttpUploadSettings,
+        CommonConfigOptions, GrpcOpt, XhttpDownloadSettings,
+        XhttpDownloadXhttpSettings, XhttpExtra, XhttpOpt, XhttpUploadSettings,
     };
 
     use super::{
@@ -1155,6 +1244,208 @@ mod tests {
         let tls = build_tls_transport(outbound.network.as_deref(), &outbound, false)
             .expect("tls build should succeed");
         assert!(tls.is_some(), "tls transport should be present");
+    }
+
+    #[test]
+    fn vless_grpc_requires_grpc_opts() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "grpc".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            network: Some("grpc".to_owned()),
+            ..Default::default()
+        };
+
+        let err = match build_transport(outbound.network.as_deref(), &outbound) {
+            Ok(_) => panic!("missing grpc_opts must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("grpc_opts is required"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vless_grpc_transport_builds_with_h2_alpn() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "grpc".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            tls: Some(true),
+            network: Some("grpc".to_owned()),
+            grpc_opts: Some(GrpcOpt {
+                grpc_service_name: Some("grpc-service".to_owned()),
+                grpc_user_agent: Some("chimera-grpc/1.0".to_owned()),
+                ping_interval: Some(30),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_vless_alpn(&outbound, outbound.network.as_deref()),
+            Some(vec!["h2".to_owned()])
+        );
+        let transport = build_transport(outbound.network.as_deref(), &outbound)
+            .expect("grpc transport should build");
+        assert!(transport.is_some(), "grpc transport should be present");
+
+        let tls = build_tls_transport(outbound.network.as_deref(), &outbound, false)
+            .expect("grpc tls should build");
+        assert!(tls.is_some(), "grpc tls transport should be present");
+    }
+
+    #[test]
+    fn vless_grpc_accepts_connection_pool_settings() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "grpc-pool".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            network: Some("grpc".to_owned()),
+            grpc_opts: Some(GrpcOpt {
+                grpc_service_name: Some("grpc-service".to_owned()),
+                max_connections: Some(2),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let transport = build_transport(outbound.network.as_deref(), &outbound)
+            .expect("grpc connection pool settings should build");
+        assert!(transport.is_some());
+    }
+
+    #[test]
+    fn vless_grpc_accepts_max_streams_pool_mode() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "grpc-max-streams".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            network: Some("grpc".to_owned()),
+            grpc_opts: Some(GrpcOpt {
+                grpc_service_name: Some("grpc-service".to_owned()),
+                max_streams: Some(16),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let transport = build_transport(outbound.network.as_deref(), &outbound)
+            .expect("grpc max-streams pool mode should build");
+        assert!(transport.is_some());
+    }
+
+    #[test]
+    fn vless_grpc_rejects_conflicting_stream_pool_settings() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "grpc-pool-conflict".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            network: Some("grpc".to_owned()),
+            grpc_opts: Some(GrpcOpt {
+                grpc_service_name: Some("grpc-service".to_owned()),
+                max_connections: Some(2),
+                max_streams: Some(16),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = match build_transport(outbound.network.as_deref(), &outbound) {
+            Ok(_) => panic!("conflicting grpc pool settings must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("max-streams conflicts"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vless_grpc_rejects_non_h2_alpn() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "grpc-http11".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            network: Some("grpc".to_owned()),
+            alpn: Some(vec!["http/1.1".to_owned()]),
+            grpc_opts: Some(GrpcOpt {
+                grpc_service_name: Some("grpc-service".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = validate_vless_config(&outbound)
+            .expect_err("grpc with non-h2 ALPN must fail");
+        assert!(
+            err.to_string().contains("vless grpc requires alpn: [h2]"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(feature = "reality")]
+    #[test]
+    fn vless_grpc_reality_builds_security_and_transport_layers() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "grpc-reality".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            network: Some("grpc".to_owned()),
+            client_fingerprint: Some("chrome".to_owned()),
+            grpc_opts: Some(GrpcOpt {
+                grpc_service_name: Some("grpc-service".to_owned()),
+                ..Default::default()
+            }),
+            reality_opts: Some(OutboundTrojanRealityOpts {
+                public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
+                short_id: None,
+            }),
+            ..Default::default()
+        };
+
+        validate_vless_config(&outbound)
+            .expect("grpc Reality config should be supported");
+        let transport = build_transport(outbound.network.as_deref(), &outbound)
+            .expect("grpc transport should build");
+        assert!(transport.is_some(), "grpc transport should be present");
+
+        let security =
+            build_tls_transport(outbound.network.as_deref(), &outbound, false)
+                .expect("grpc Reality security should build");
+        assert!(
+            security.is_some(),
+            "Reality security layer should be present"
+        );
     }
 
     #[test]
@@ -1611,9 +1902,7 @@ mod tests {
             network: Some("ws".to_owned()),
             ws_opts: Some(WsOpt {
                 path: Some("/websocket".to_owned()),
-                headers: None,
-                max_early_data: None,
-                early_data_header_name: None,
+                ..Default::default()
             }),
             ..Default::default()
         };

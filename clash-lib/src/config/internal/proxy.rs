@@ -269,6 +269,11 @@ pub struct H2Opt {
 #[allow(dead_code)]
 pub struct GrpcOpt {
     pub grpc_service_name: Option<String>,
+    pub grpc_user_agent: Option<String>,
+    pub ping_interval: Option<u64>,
+    pub max_connections: Option<u64>,
+    pub min_streams: Option<u64>,
+    pub max_streams: Option<u64>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
@@ -360,6 +365,7 @@ pub struct OutboundVless {
     pub xhttp_opts: Option<XhttpOpt>,
     #[cfg(feature = "ws")]
     pub ws_opts: Option<WsOpt>,
+    pub grpc_opts: Option<GrpcOpt>,
     #[serde(alias = "realityOpts")]
     pub reality_opts: Option<OutboundTrojanRealityOpts>,
     pub flow: Option<String>,
@@ -786,6 +792,40 @@ xhttp-opts:
         assert_eq!(opts.max_each_post_bytes, Some(1_000_000));
         assert_eq!(opts.max_buffered_posts, Some(30));
         assert_eq!(opts.session_ttl, Some(30));
+    }
+
+    #[test]
+    fn outbound_vless_parses_grpc_opts() {
+        let config = r#"
+name: grpc-demo
+type: vless
+server: example.com
+port: 443
+uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+network: grpc
+grpc-opts:
+  grpc-service-name: grpc-service
+  grpc-user-agent: chimera-test/1.0
+  ping-interval: 30
+  max-connections: 2
+  min-streams: 4
+"#;
+
+        let parsed: OutboundProxyProtocol =
+            serde_yaml::from_str(config).expect("grpc vless config should parse");
+
+        let OutboundProxyProtocol::Vless(vless) = parsed else {
+            panic!("expected vless proxy");
+        };
+
+        assert_eq!(vless.network.as_deref(), Some("grpc"));
+        let grpc = vless.grpc_opts.expect("grpc opts should be present");
+        assert_eq!(grpc.grpc_service_name.as_deref(), Some("grpc-service"));
+        assert_eq!(grpc.grpc_user_agent.as_deref(), Some("chimera-test/1.0"));
+        assert_eq!(grpc.ping_interval, Some(30));
+        assert_eq!(grpc.max_connections, Some(2));
+        assert_eq!(grpc.min_streams, Some(4));
+        assert_eq!(grpc.max_streams, None);
     }
 
     #[test]

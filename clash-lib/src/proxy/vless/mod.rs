@@ -66,6 +66,51 @@ impl Handler {
         }
     }
 
+    fn wrap_vless_stream(
+        &self,
+        s: AnyStream,
+        sess: &Session,
+        is_udp: bool,
+        vision_opts: Option<crate::proxy::transport::VisionOptions>,
+    ) -> io::Result<AnyStream> {
+        let vless_stream = VlessStream::new(
+            s,
+            &self.opts.uuid,
+            &sess.destination,
+            is_udp,
+            self.opts.flow.clone(),
+        )?;
+
+        if self.opts.flow.as_deref() == Some("xtls-rprx-vision") {
+            Ok(Box::new(VisionStream::new(
+                Box::new(vless_stream),
+                self.opts.uuid.clone(),
+                vision_opts,
+            )?))
+        } else {
+            Ok(Box::new(vless_stream))
+        }
+    }
+
+    async fn try_reuse_transport_stream(
+        &self,
+        sess: &Session,
+        is_udp: bool,
+    ) -> io::Result<Option<AnyStream>> {
+        if self.opts.flow.as_deref() == Some("xtls-rprx-vision") {
+            return Ok(None);
+        }
+
+        let Some(transport) = self.opts.transport.as_ref() else {
+            return Ok(None);
+        };
+        let Some(stream) = transport.try_reuse_stream().await? else {
+            return Ok(None);
+        };
+
+        Ok(Some(self.wrap_vless_stream(stream, sess, is_udp, None)?))
+    }
+
     async fn inner_proxy_stream(
         &self,
         s: AnyStream,
@@ -100,23 +145,7 @@ impl Handler {
             s
         };
 
-        let vless_stream = VlessStream::new(
-            s,
-            &self.opts.uuid,
-            &sess.destination,
-            is_udp,
-            self.opts.flow.clone(),
-        )?;
-
-        if self.opts.flow.as_deref() == Some("xtls-rprx-vision") {
-            Ok(Box::new(VisionStream::new(
-                Box::new(vless_stream),
-                self.opts.uuid.clone(),
-                vision_opts,
-            )?))
-        } else {
-            Ok(Box::new(vless_stream))
-        }
+        self.wrap_vless_stream(s, sess, is_udp, vision_opts)
     }
 }
 
@@ -192,6 +221,12 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
     ) -> io::Result<BoxedChainedStream> {
+        if let Some(stream) = self.try_reuse_transport_stream(sess, false).await? {
+            let chained = ChainedStreamWrapper::new(stream);
+            chained.append_to_chain(self.name()).await;
+            return Ok(Box::new(chained));
+        }
+
         let stream = connector
             .connect_stream(
                 resolver,
@@ -215,6 +250,14 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
     ) -> io::Result<BoxedChainedDatagram> {
+        if let Some(stream) = self.try_reuse_transport_stream(sess, true).await? {
+            let datagram =
+                OutboundDatagramVless::new(stream, sess.destination.clone());
+            let chained = ChainedDatagramWrapper::new(datagram);
+            chained.append_to_chain(self.name()).await;
+            return Ok(Box::new(chained));
+        }
+
         let stream = connector
             .connect_stream(
                 resolver,
@@ -232,6 +275,79 @@ impl OutboundHandler for Handler {
         let chained = ChainedDatagramWrapper::new(d);
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
+    }
+}
+
+#[cfg(test)]
+mod reuse_tests {
+    use super::*;
+
+    struct ReuseTransport;
+
+    #[async_trait]
+    impl Transport for ReuseTransport {
+        async fn proxy_stream(&self, stream: AnyStream) -> io::Result<AnyStream> {
+            Ok(stream)
+        }
+
+        async fn try_reuse_stream(&self) -> io::Result<Option<AnyStream>> {
+            let (stream, peer) = tokio::io::duplex(1024);
+            tokio::spawn(async move {
+                let _peer = peer;
+                std::future::pending::<()>().await;
+            });
+            Ok(Some(Box::new(stream)))
+        }
+    }
+
+    #[tokio::test]
+    async fn vless_can_wrap_transport_reuse_stream_before_dialing() {
+        let handler = Handler::new(HandlerOptions {
+            name: "reuse-test".to_owned(),
+            common_opts: HandlerCommonOptions::default(),
+            server: "example.com".to_owned(),
+            port: 443,
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            udp: true,
+            transport: Some(Box::new(ReuseTransport)),
+            tls: None,
+            flow: None,
+        });
+
+        let stream = handler
+            .try_reuse_transport_stream(&Session::default(), false)
+            .await
+            .expect("reuse lookup should succeed");
+
+        assert!(
+            stream.is_some(),
+            "reused logical stream should be wrapped as VLESS"
+        );
+    }
+
+    #[tokio::test]
+    async fn vision_does_not_bypass_fresh_security_handshake() {
+        let handler = Handler::new(HandlerOptions {
+            name: "vision-reuse-test".to_owned(),
+            common_opts: HandlerCommonOptions::default(),
+            server: "example.com".to_owned(),
+            port: 443,
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            udp: true,
+            transport: Some(Box::new(ReuseTransport)),
+            tls: None,
+            flow: Some("xtls-rprx-vision".to_owned()),
+        });
+
+        let stream = handler
+            .try_reuse_transport_stream(&Session::default(), false)
+            .await
+            .expect("reuse lookup should succeed");
+
+        assert!(
+            stream.is_none(),
+            "Vision must keep the fresh handshake path"
+        );
     }
 }
 
