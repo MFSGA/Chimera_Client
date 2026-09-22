@@ -19,8 +19,11 @@ pub use tls::Client as TlsClient;
 #[cfg(feature = "ws")]
 pub use ws::Client as WsClient;
 pub use xhttp::{
-    Client as XhttpClient, XhttpDownloadConfig, XhttpMode, XhttpRealityConfig,
-    XhttpSecurity,
+    Client as XhttpClient, MetadataPlacement as XhttpMetadataPlacement,
+    UplinkDataPlacement as XhttpUplinkDataPlacement, XhttpChunkSizeRange,
+    XhttpDownloadConfig, XhttpMetadataConfig, XhttpMode, XhttpPaddingConfig,
+    XhttpPaddingMethod, XhttpPaddingPlacement, XhttpRealityConfig, XhttpReusePolicy,
+    XhttpReuseValueRange, XhttpSecurity, XhttpSessionIdConfig, XhttpUplinkConfig,
 };
 
 #[allow(unused_imports)]
