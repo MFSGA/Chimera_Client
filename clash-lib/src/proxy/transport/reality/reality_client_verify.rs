@@ -138,16 +138,9 @@ pub fn verify_certificate_hmac(
     let expected_signature = hmac_tag.as_ref(); // Full 64 bytes
 
     log::debug!(
-        "REALITY CLIENT: HMAC verification - ed25519_pubkey={:02x?}",
-        pubkey_data
-    );
-    log::debug!(
-        "REALITY CLIENT: HMAC verification - expected_sig={:02x?}",
-        expected_signature
-    );
-    log::debug!(
-        "REALITY CLIENT: HMAC verification - actual_sig={:02x?}",
-        signature
+        "REALITY CLIENT: Verifying certificate HMAC (pubkey_len={}, signature_len={})",
+        pubkey_data.len(),
+        signature.len()
     );
 
     // Compare full 64-byte signature with expected HMAC using constant-time comparison

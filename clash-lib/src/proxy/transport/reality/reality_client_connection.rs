@@ -37,6 +37,30 @@ use super::reality_util::{extract_server_cipher_suite, extract_server_public_key
 use super::slide_buffer::SlideBuffer;
 use super::util::allocate_vec;
 
+const MIHOMO_REALITY_CLIENT_VERSION: [u8; 3] = [1, 8, 2];
+
+fn build_reality_session_plaintext(
+    short_id: &[u8],
+    timestamp: u32,
+) -> io::Result<[u8; 16]> {
+    if short_id.len() > 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "REALITY short-id too long: {} bytes (max 8)",
+                short_id.len()
+            ),
+        ));
+    }
+
+    let mut plaintext = [0u8; 16];
+    plaintext[..3].copy_from_slice(&MIHOMO_REALITY_CLIENT_VERSION);
+    plaintext[3] = 0;
+    plaintext[4..8].copy_from_slice(&timestamp.to_be_bytes());
+    plaintext[8..8 + short_id.len()].copy_from_slice(short_id);
+    Ok(plaintext)
+}
+
 /// Configuration for REALITY client connections
 #[derive(Clone)]
 pub struct RealityClientConfig {
@@ -181,26 +205,13 @@ impl RealityClientConnection {
             .map_err(|_| io::Error::other("System time error"))?
             .as_secs();
 
-        let mut session_id_plaintext = [0u8; 16];
-        session_id_plaintext[0] = 1; // Protocol version major
-        session_id_plaintext[1] = 8; // Protocol version minor
-        session_id_plaintext[2] = 0; // Protocol version patch
-        session_id_plaintext[3] = 0; // Padding byte
-        // Timestamp (4 bytes as uint32, in seconds)
-        session_id_plaintext[4..8]
-            .copy_from_slice(&(timestamp as u32).to_be_bytes());
-        // Short ID (0-8 bytes), followed by zero padding.
-        if self.config.short_id.len() > 8 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "REALITY short-id too long: {} bytes (max 8)",
-                    self.config.short_id.len()
-                ),
-            ));
-        }
-        session_id_plaintext[8..8 + self.config.short_id.len()]
-            .copy_from_slice(&self.config.short_id);
+        // Mihomo currently identifies its REALITY client as 1.8.2 in
+        // the encrypted Session ID. Keep this wire value aligned with Mihomo
+        // rather than the Chimera package version.
+        let session_id_plaintext = build_reality_session_plaintext(
+            &self.config.short_id,
+            timestamp as u32,
+        )?;
 
         // Create a 32-byte SessionId (16 bytes plaintext + 16 bytes zeros for padding)
         let mut session_id_for_hello = [0u8; 32];
@@ -243,15 +254,10 @@ impl RealityClientConnection {
         // SessionId is at offset 39 in ClientHello handshake
         client_hello[39..71].fill(0);
 
-        log::debug!("REALITY CLIENT: Encrypting SessionId");
-        log::debug!("  auth_key={:02x?}", auth_key);
-        log::debug!("  nonce={:02x?}", nonce);
-        log::debug!("  plaintext={:02x?}", session_id_plaintext);
         log::debug!(
-            "  aad_len={} (ClientHello with zero SessionId)",
+            "REALITY CLIENT: Encrypting SessionId (aad_len={})",
             client_hello.len()
         );
-        log::debug!("  aad[0..4]={:02x?}", &client_hello[0..4]);
 
         let encrypted_session_id = encrypt_session_id(
             &session_id_plaintext,
@@ -260,11 +266,6 @@ impl RealityClientConnection {
             &client_hello,
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-
-        log::debug!(
-            "REALITY CLIENT: Encrypted SessionId={:02x?}",
-            encrypted_session_id
-        );
 
         // Restore the encrypted SessionId before writing or storing ClientHello.
         // REALITY transcripts use the wire ClientHello, not the zeroed AAD form.
@@ -400,9 +401,8 @@ impl RealityClientConnection {
         let server_hello = &record[TLS_RECORD_HEADER_SIZE..]; // Skip TLS record header (includes handshake header)
 
         log::debug!(
-            "REALITY CLIENT: ServerHello for transcript: len={}, bytes={:02x?}",
-            server_hello.len(),
-            server_hello
+            "REALITY CLIENT: ServerHello received for transcript ({} bytes)",
+            server_hello.len()
         );
 
         let server_public_key = extract_server_public_key(&record)?;
@@ -426,14 +426,9 @@ impl RealityClientConnection {
         let mut full_transcript =
             digest::Context::new(cipher_suite.digest_algorithm());
         log::debug!(
-            "REALITY CLIENT: Transcript includes ClientHello ({} bytes), first bytes: {:02x?}",
+            "REALITY CLIENT: Transcript includes ClientHello={} bytes, ServerHello={} bytes",
             client_hello_bytes.len(),
-            &client_hello_bytes[..client_hello_bytes.len().min(20)]
-        );
-        log::debug!(
-            "REALITY CLIENT: Transcript includes ServerHello ({} bytes), first bytes: {:02x?}",
-            server_hello.len(),
-            &server_hello[..server_hello.len().min(20)]
+            server_hello.len()
         );
         full_transcript.update(&client_hello_bytes); // Use actual ClientHello bytes, not hash!
         full_transcript.update(server_hello); // ServerHello already includes handshake header
@@ -529,14 +524,6 @@ impl RealityClientConnection {
 
         let (server_hs_key, server_hs_iv) =
             derive_traffic_keys(server_handshake_traffic_secret, *cipher_suite)?;
-
-        if *handshake_seq == 0 {
-            log::debug!(
-                "REALITY CLIENT: Server HS key={:02x?}, iv={:02x?}",
-                &server_hs_key[..16],
-                server_hs_iv
-            );
-        }
 
         if self.ciphertext_read_buf.len() < TLS_RECORD_HEADER_SIZE {
             return Ok(false);
@@ -779,11 +766,7 @@ impl RealityClientConnection {
         let handshake_hash_vec: Vec<u8> = handshake_hash.as_ref().to_vec();
 
         log::debug!(
-            "REALITY CLIENT: Handshake hash for client Finished: {:02x?}",
-            handshake_hash_vec
-        );
-        log::debug!(
-            "REALITY CLIENT: Transcript bytes len={}, accumulated_plaintext len={}",
+            "REALITY CLIENT: Building client Finished from transcript bytes={}, accumulated handshake bytes={}",
             transcript_bytes.len(),
             accumulated_plaintext.len()
         );
@@ -793,10 +776,6 @@ impl RealityClientConnection {
             &client_hs_secret,
             &handshake_hash_vec,
         )?;
-        log::debug!(
-            "REALITY CLIENT: Client verify data: {:02x?}",
-            client_verify_data
-        );
         let client_finished = construct_finished(&client_verify_data)?;
 
         let (client_hs_key, client_hs_iv) =
@@ -1117,6 +1096,27 @@ mod tests {
         let mut server_public = [0u8; 32];
         server_public.copy_from_slice(server_public_key.as_ref());
         server_public
+    }
+
+    #[test]
+    fn reality_session_plaintext_matches_mihomo_client_version() {
+        let timestamp = 0x1234_5678;
+        let short_id = [0xaa, 0xbb, 0xcc, 0xdd];
+
+        let plaintext =
+            build_reality_session_plaintext(&short_id, timestamp).unwrap();
+
+        assert_eq!(&plaintext[..4], &[1, 8, 2, 0]);
+        assert_eq!(&plaintext[4..8], &timestamp.to_be_bytes());
+        assert_eq!(&plaintext[8..12], &short_id);
+        assert_eq!(&plaintext[12..], &[0; 4]);
+    }
+
+    #[test]
+    fn reality_session_plaintext_rejects_long_short_id() {
+        let err = build_reality_session_plaintext(&[0u8; 9], 0)
+            .expect_err("Reality short-id is limited to 8 bytes");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]

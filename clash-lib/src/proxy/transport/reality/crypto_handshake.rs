@@ -333,6 +333,7 @@ mod tests {
 
     #[test]
     fn test_connection_has_required_methods() {
+        crate::setup_default_crypto_provider();
         // This test ensures rustls::Connection has the methods we need
         // It won't compile if the methods don't exist
         use std::sync::Arc;
