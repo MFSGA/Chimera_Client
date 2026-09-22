@@ -250,11 +250,8 @@ impl Client {
             self.verify_name.clone(),
         )?))
     }
-}
 
-#[async_trait]
-impl Transport for Client {
-    async fn proxy_stream(&self, stream: AnyStream) -> io::Result<AnyStream> {
+    pub(crate) fn rustls_client_config(&self) -> io::Result<rustls::ClientConfig> {
         let verifier = self.certificate_verifier()?;
 
         #[cfg(feature = "anytls")]
@@ -305,6 +302,14 @@ impl Transport for Client {
             tls_config.key_log = Arc::new(rustls::KeyLogFile::new());
         }
 
+        Ok(tls_config)
+    }
+}
+
+#[async_trait]
+impl Transport for Client {
+    async fn proxy_stream(&self, stream: AnyStream) -> io::Result<AnyStream> {
+        let tls_config = self.rustls_client_config()?;
         let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
         let dns_name =
             rustls::pki_types::ServerName::try_from(self.sni.as_str().to_owned())

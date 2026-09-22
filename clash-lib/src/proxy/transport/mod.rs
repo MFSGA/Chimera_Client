@@ -53,6 +53,22 @@ pub trait Transport: Send + Sync {
         stream: super::AnyStream,
     ) -> std::io::Result<super::AnyStream>;
 
+    /// Let a transport establish its own underlying connection when its wire
+    /// protocol cannot be layered over the caller's pre-dialed TCP stream.
+    ///
+    /// QUIC-based transports use this hook so they can dial UDP while still
+    /// honoring the active resolver, interface/mark, and chained connector.
+    /// Stream-based transports leave the default `None` result and continue
+    /// through `proxy_stream` with the caller-owned TCP connection.
+    async fn connect_stream_with_connector(
+        &self,
+        _sess: &crate::session::Session,
+        _resolver: crate::app::dns::ThreadSafeDNSResolver,
+        _connector: &dyn crate::proxy::utils::RemoteConnector,
+    ) -> std::io::Result<Option<super::AnyStream>> {
+        Ok(None)
+    }
+
     /// Return a logical stream from an already-owned underlying connection.
     ///
     /// Transports that do not own reusable connections leave this as `None`.
