@@ -21,9 +21,10 @@ pub use ws::Client as WsClient;
 pub use xhttp::{
     Client as XhttpClient, MetadataPlacement as XhttpMetadataPlacement,
     UplinkDataPlacement as XhttpUplinkDataPlacement, XhttpChunkSizeRange,
-    XhttpDownloadConfig, XhttpMetadataConfig, XhttpMode, XhttpPaddingConfig,
-    XhttpPaddingMethod, XhttpPaddingPlacement, XhttpRealityConfig, XhttpReusePolicy,
-    XhttpReuseValueRange, XhttpSecurity, XhttpSessionIdConfig, XhttpUplinkConfig,
+    XhttpDownloadConfig, XhttpEndpointConfig, XhttpHttpVersion, XhttpMetadataConfig,
+    XhttpMode, XhttpPaddingConfig, XhttpPaddingMethod, XhttpPaddingPlacement,
+    XhttpRealityConfig, XhttpReusePolicy, XhttpReuseValueRange, XhttpSecurity,
+    XhttpSessionIdConfig, XhttpUplinkConfig,
 };
 
 #[allow(unused_imports)]

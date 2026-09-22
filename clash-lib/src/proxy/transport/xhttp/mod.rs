@@ -62,6 +62,8 @@ const READ_CHUNK_SIZE: usize = 8 * 1024;
 const DEFAULT_XHTTP_ALPN: [&str; 1] = ["h2"];
 const DEFAULT_XHTTP_USER_AGENT: &str = "Mozilla/5.0";
 
+type H1SendRequest =
+    hyper::client::conn::http1::SendRequest<BoxBody<Bytes, Infallible>>;
 type H2SendRequest =
     hyper::client::conn::http2::SendRequest<BoxBody<Bytes, Infallible>>;
 
@@ -153,7 +155,14 @@ pub enum XhttpMode {
     PacketUp,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum XhttpHttpVersion {
+    Http1,
+    #[default]
+    Http2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum XhttpSecurity {
     None,
     Tls,
@@ -167,6 +176,22 @@ pub struct XhttpRealityConfig {
     pub short_id: Vec<u8>,
     pub server_name: String,
     pub alpn_protocols: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct XhttpEndpointConfig {
+    pub server: String,
+    pub port: u16,
+    pub security: XhttpSecurity,
+    pub server_name: String,
+    pub alpn_protocols: Vec<String>,
+    pub skip_cert_verify: bool,
+    pub fingerprint: Option<String>,
+    pub verify_name: Option<String>,
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
+    #[cfg_attr(not(feature = "reality"), allow(dead_code))]
+    pub reality: Option<XhttpRealityConfig>,
 }
 
 #[allow(dead_code)]
@@ -197,10 +222,12 @@ pub struct Client {
     headers: HashMap<String, String>,
     use_tls: bool,
     mode: XhttpMode,
+    http_version: XhttpHttpVersion,
     max_each_post_bytes: usize,
     no_grpc_header: bool,
     min_posts_interval_ms: Option<u64>,
     download: Option<XhttpDownloadConfig>,
+    upload_endpoint: Option<XhttpEndpointConfig>,
     auto_reality: bool,
     metadata: XhttpMetadataConfig,
     uplink: XhttpUplinkConfig,
@@ -241,10 +268,12 @@ impl Client {
             headers,
             use_tls,
             mode,
+            http_version: XhttpHttpVersion::Http2,
             max_each_post_bytes,
             no_grpc_header,
             min_posts_interval_ms,
             download,
+            upload_endpoint: None,
             auto_reality: false,
             metadata: XhttpMetadataConfig::default(),
             uplink: XhttpUplinkConfig::default(),
@@ -258,8 +287,21 @@ impl Client {
         }
     }
 
+    pub fn with_upload_endpoint(
+        mut self,
+        upload_endpoint: Option<XhttpEndpointConfig>,
+    ) -> Self {
+        self.upload_endpoint = upload_endpoint;
+        self
+    }
+
     pub fn with_auto_reality(mut self, auto_reality: bool) -> Self {
         self.auto_reality = auto_reality;
+        self
+    }
+
+    pub fn with_http_version(mut self, http_version: XhttpHttpVersion) -> Self {
+        self.http_version = http_version;
         self
     }
 
@@ -316,6 +358,11 @@ impl Client {
 
     fn effective_mode(&self) -> XhttpMode {
         match self.mode {
+            XhttpMode::Auto
+                if matches!(self.http_version, XhttpHttpVersion::Http1) =>
+            {
+                XhttpMode::PacketUp
+            }
             XhttpMode::Auto if self.download.is_some() => XhttpMode::StreamUp,
             XhttpMode::Auto if self.auto_reality => XhttpMode::StreamOne,
             XhttpMode::Auto => XhttpMode::StreamUp,
@@ -338,6 +385,20 @@ impl Client {
 
         Some("application/octet-stream")
     }
+}
+
+async fn handshake_http1(stream: AnyStream) -> io::Result<H1SendRequest> {
+    let io = TokioIo::new(stream);
+    let (sender, conn) =
+        hyper::client::conn::http1::handshake::<_, BoxBody<Bytes, Infallible>>(io)
+            .await
+            .map_err(map_io_error)?;
+
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    Ok(sender)
 }
 
 async fn handshake_http2(
@@ -396,28 +457,28 @@ async fn send_h2_request(
     sender.send_request(request).await.map_err(map_io_error)
 }
 
-async fn connect_download_stream(
-    config: &XhttpDownloadConfig,
-) -> io::Result<AnyStream> {
-    let endpoint = tokio::net::lookup_host((config.server.as_str(), config.port))
-        .await?
-        .next()
-        .ok_or_else(|| {
-            io::Error::other("xhttp download server resolved no addresses")
-        })?;
-    #[cfg(all(feature = "tun", target_os = "linux"))]
-    let so_mark = *TUN_SOMARK.read().await;
-    #[cfg(all(not(feature = "tun"), target_os = "linux"))]
-    let so_mark = None;
-    let tcp = new_protected_tcp_stream(
-        endpoint,
-        None,
-        #[cfg(target_os = "linux")]
-        so_mark,
-    )
-    .await?;
-    let stream: AnyStream = Box::new(tcp);
+impl From<&XhttpDownloadConfig> for XhttpEndpointConfig {
+    fn from(config: &XhttpDownloadConfig) -> Self {
+        Self {
+            server: config.server.clone(),
+            port: config.port,
+            security: config.security,
+            server_name: config.server_name.clone(),
+            alpn_protocols: config.alpn_protocols.clone(),
+            skip_cert_verify: config.skip_cert_verify,
+            fingerprint: config.fingerprint.clone(),
+            verify_name: config.verify_name.clone(),
+            tls_cert: config.tls_cert.clone(),
+            tls_key: config.tls_key.clone(),
+            reality: config.reality.clone(),
+        }
+    }
+}
 
+async fn secure_endpoint_stream(
+    config: &XhttpEndpointConfig,
+    stream: AnyStream,
+) -> io::Result<AnyStream> {
     match config.security {
         XhttpSecurity::None => Ok(stream),
         XhttpSecurity::Tls => {
@@ -468,6 +529,50 @@ async fn connect_download_stream(
             }
         }
     }
+}
+
+async fn connect_endpoint_stream(
+    config: &XhttpEndpointConfig,
+) -> io::Result<AnyStream> {
+    let endpoint = tokio::net::lookup_host((config.server.as_str(), config.port))
+        .await?
+        .next()
+        .ok_or_else(|| io::Error::other("xhttp endpoint resolved no addresses"))?;
+    #[cfg(all(feature = "tun", target_os = "linux"))]
+    let so_mark = *TUN_SOMARK.read().await;
+    #[cfg(all(not(feature = "tun"), target_os = "linux"))]
+    let so_mark = None;
+    let tcp = new_protected_tcp_stream(
+        endpoint,
+        None,
+        #[cfg(target_os = "linux")]
+        so_mark,
+    )
+    .await?;
+    secure_endpoint_stream(config, Box::new(tcp)).await
+}
+
+async fn connect_download_stream(
+    config: &XhttpDownloadConfig,
+) -> io::Result<AnyStream> {
+    connect_endpoint_stream(&XhttpEndpointConfig::from(config)).await
+}
+
+async fn connect_plain_stream(server: &str, port: u16) -> io::Result<AnyStream> {
+    let endpoint = XhttpEndpointConfig {
+        server: server.to_owned(),
+        port,
+        security: XhttpSecurity::None,
+        server_name: server.to_owned(),
+        alpn_protocols: vec!["http/1.1".to_owned()],
+        skip_cert_verify: false,
+        fingerprint: None,
+        verify_name: None,
+        tls_cert: None,
+        tls_key: None,
+        reality: None,
+    };
+    connect_endpoint_stream(&endpoint).await
 }
 
 async fn acquire_download_sender(
@@ -629,15 +734,57 @@ fn build_request(
     body: BoxBody<Bytes, Infallible>,
     padding: &XhttpPaddingConfig,
 ) -> io::Result<Request<BoxBody<Bytes, Infallible>>> {
+    build_request_for_version(
+        server,
+        port,
+        path,
+        host,
+        headers,
+        use_tls,
+        content_type,
+        method,
+        body,
+        padding,
+        XhttpHttpVersion::Http2,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_request_for_version(
+    server: &str,
+    port: u16,
+    path: &str,
+    host: Option<&str>,
+    headers: &HashMap<String, String>,
+    use_tls: bool,
+    content_type: Option<&str>,
+    method: &str,
+    body: BoxBody<Bytes, Infallible>,
+    padding: &XhttpPaddingConfig,
+    http_version: XhttpHttpVersion,
+) -> io::Result<Request<BoxBody<Bytes, Infallible>>> {
     let scheme = if use_tls { "https" } else { "http" };
     let mut uri = format!("{scheme}://{server}:{port}{path}");
     let mut headers = headers.clone();
     padding.apply(&mut uri, &mut headers)?;
 
+    let parsed_uri: http::Uri = uri.parse().map_err(map_io_error)?;
+    let request_uri = match http_version {
+        XhttpHttpVersion::Http1 => parsed_uri
+            .path_and_query()
+            .map(|value| value.as_str().to_owned())
+            .unwrap_or_else(|| "/".to_owned()),
+        XhttpHttpVersion::Http2 => uri,
+    };
+    let version = match http_version {
+        XhttpHttpVersion::Http1 => Version::HTTP_11,
+        XhttpHttpVersion::Http2 => Version::HTTP_2,
+    };
+
     let mut request = Request::builder()
         .method(method)
-        .uri(uri)
-        .version(Version::HTTP_2)
+        .uri(request_uri)
+        .version(version)
         .header("cache-control", "no-store");
 
     if let Some(content_type) = content_type {
@@ -651,10 +798,18 @@ fn build_request(
         request = request.header("user-agent", DEFAULT_XHTTP_USER_AGENT);
     }
 
-    if !headers.keys().any(|key| key.eq_ignore_ascii_case("host"))
-        && let Some(host) = host
-    {
-        request = request.header("Host", host);
+    if !headers.keys().any(|key| key.eq_ignore_ascii_case("host")) {
+        if let Some(host) = host {
+            request = request.header("Host", host);
+        } else if matches!(http_version, XhttpHttpVersion::Http1) {
+            let default_port = if use_tls { 443 } else { 80 };
+            let authority = if port == default_port {
+                server.to_owned()
+            } else {
+                format!("{server}:{port}")
+            };
+            request = request.header("Host", authority);
+        }
     }
 
     for (key, value) in headers {
@@ -689,6 +844,38 @@ fn leased_stream(stream: AnyStream, active: Arc<AtomicU64>) -> AnyStream {
 #[async_trait]
 impl Transport for Client {
     async fn proxy_stream(&self, stream: AnyStream) -> io::Result<AnyStream> {
+        if matches!(self.http_version, XhttpHttpVersion::Http1) {
+            if self.reuse_policy.is_some()
+                || self
+                    .download
+                    .as_ref()
+                    .and_then(|download| download.reuse_policy.as_ref())
+                    .is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "xhttp HTTP/1.1 currently does not support reuse settings",
+                ));
+            }
+            if !matches!(self.effective_mode(), XhttpMode::PacketUp) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "xhttp HTTP/1.1 currently supports only packet-up mode",
+                ));
+            }
+            let stream = if let Some(endpoint) = self.upload_endpoint.as_ref() {
+                secure_endpoint_stream(endpoint, stream).await?
+            } else {
+                stream
+            };
+            return proxy_packet_up_http1(self, stream).await;
+        }
+
+        let stream = if let Some(endpoint) = self.upload_endpoint.as_ref() {
+            secure_endpoint_stream(endpoint, stream).await?
+        } else {
+            stream
+        };
         let sender = handshake_http2(
             stream,
             self.reuse_policy
@@ -727,7 +914,9 @@ impl Transport for Client {
     }
 
     async fn try_reuse_stream(&self) -> io::Result<Option<AnyStream>> {
-        if self.reuse_policy.is_none() {
+        if matches!(self.http_version, XhttpHttpVersion::Http1)
+            || self.reuse_policy.is_none()
+        {
             return Ok(None);
         }
 
@@ -915,6 +1104,190 @@ async fn proxy_stream_up(
     Ok(Box::new(app_stream))
 }
 
+async fn proxy_packet_up_http1(
+    client: &Client,
+    stream: AnyStream,
+) -> io::Result<AnyStream> {
+    let session_id = client.session.generate();
+    let mut initial_upload_stream = Some(stream);
+
+    let response = if let Some(download) = client.download.as_ref() {
+        let mut downlink_headers = download.headers.clone();
+        let downlink_path = client.metadata.apply(
+            &download.path,
+            &mut downlink_headers,
+            &session_id,
+            None,
+        )?;
+        let downlink_request = build_request_for_version(
+            &download.server,
+            download.port,
+            &downlink_path,
+            download.host.as_deref(),
+            &downlink_headers,
+            matches!(
+                download.security,
+                XhttpSecurity::Tls | XhttpSecurity::Reality
+            ),
+            None,
+            "GET",
+            http_body_util::Empty::<Bytes>::new().boxed(),
+            &client.padding,
+            XhttpHttpVersion::Http1,
+        )?;
+        let downlink_stream =
+            connect_endpoint_stream(&XhttpEndpointConfig::from(download)).await?;
+        let mut downlink_sender = handshake_http1(downlink_stream).await?;
+        downlink_sender
+            .send_request(downlink_request)
+            .await
+            .map_err(map_io_error)
+            .and_then(validate_response_status)?
+    } else {
+        let mut downlink_headers = client.headers.clone();
+        let downlink_path = client.metadata.apply(
+            &client.path,
+            &mut downlink_headers,
+            &session_id,
+            None,
+        )?;
+        let downlink_request = build_request_for_version(
+            &client.server,
+            client.port,
+            &downlink_path,
+            client.host.as_deref(),
+            &downlink_headers,
+            client.use_tls,
+            None,
+            "GET",
+            http_body_util::Empty::<Bytes>::new().boxed(),
+            &client.padding,
+            XhttpHttpVersion::Http1,
+        )?;
+        let initial_stream = initial_upload_stream.take().ok_or_else(|| {
+            io::Error::other("initial HTTP/1.1 stream is unavailable")
+        })?;
+        let mut downlink_sender = handshake_http1(initial_stream).await?;
+        downlink_sender
+            .send_request(downlink_request)
+            .await
+            .map_err(map_io_error)
+            .and_then(validate_response_status)?
+    };
+
+    let (app_stream, transport_stream) = tokio::io::duplex(DUPLEX_BUFFER_SIZE);
+    let (mut transport_reader, mut transport_writer) =
+        tokio::io::split(transport_stream);
+
+    let base_path = client.path.clone();
+    let max_each_post_bytes = client.max_each_post_bytes;
+    let server = client.server.clone();
+    let port = client.port;
+    let host = client.host.clone();
+    let headers = client.headers.clone();
+    let metadata = client.metadata.clone();
+    let uplink = client.uplink.clone();
+    let padding = client.padding.clone();
+    let min_posts_interval_ms = client.min_posts_interval_ms;
+    let upload_endpoint = client.upload_endpoint.clone();
+    let use_tls = client.use_tls;
+
+    tokio::spawn(async move {
+        let mut seq: u64 = 0;
+        let mut last_write_at: Option<Instant> = None;
+        let mut initial_upload_stream = initial_upload_stream;
+        let mut buf = vec![0; READ_CHUNK_SIZE];
+
+        loop {
+            match transport_reader.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    let chunk_size = max_each_post_bytes.max(1);
+                    for chunk in buf[..n].chunks(chunk_size) {
+                        let mut request_headers = headers.clone();
+                        let request_path = match metadata.apply(
+                            &base_path,
+                            &mut request_headers,
+                            &session_id,
+                            Some(seq),
+                        ) {
+                            Ok(path) => path,
+                            Err(_) => return,
+                        };
+                        let body = Full::new(
+                            uplink.apply_payload(chunk, &mut request_headers),
+                        )
+                        .boxed();
+                        let request = match build_request_for_version(
+                            &server,
+                            port,
+                            &request_path,
+                            host.as_deref(),
+                            &request_headers,
+                            use_tls,
+                            uplink.content_type(),
+                            uplink.method(),
+                            body,
+                            &padding,
+                            XhttpHttpVersion::Http1,
+                        ) {
+                            Ok(request) => request,
+                            Err(_) => return,
+                        };
+
+                        if let Some(delay) = remaining_post_interval(
+                            min_posts_interval_ms,
+                            last_write_at.map(|instant| instant.elapsed()),
+                        ) {
+                            tokio::time::sleep(delay).await;
+                        }
+                        last_write_at = Some(Instant::now());
+
+                        let upload_stream = if let Some(stream) =
+                            initial_upload_stream.take()
+                        {
+                            stream
+                        } else {
+                            match upload_endpoint.as_ref() {
+                                Some(endpoint) => {
+                                    match connect_endpoint_stream(endpoint).await {
+                                        Ok(stream) => stream,
+                                        Err(_) => return,
+                                    }
+                                }
+                                None => {
+                                    match connect_plain_stream(&server, port).await {
+                                        Ok(stream) => stream,
+                                        Err(_) => return,
+                                    }
+                                }
+                            }
+                        };
+                        let mut sender = match handshake_http1(upload_stream).await {
+                            Ok(sender) => sender,
+                            Err(_) => return,
+                        };
+                        match sender.send_request(request).await {
+                            Ok(response) if response.status().is_success() => {
+                                seq += 1;
+                            }
+                            _ => return,
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        forward_response_body(response, &mut transport_writer).await;
+        let _ = transport_writer.shutdown().await;
+    });
+
+    Ok(Box::new(app_stream))
+}
+
 fn remaining_post_interval(
     interval_ms: Option<u64>,
     elapsed_since_last_write: Option<Duration>,
@@ -1054,9 +1427,10 @@ async fn forward_response_body(
 mod tests {
     use super::{
         Client, MetadataPlacement, UplinkDataPlacement, XhttpChunkSizeRange,
-        XhttpDownloadConfig, XhttpMetadataConfig, XhttpMode, XhttpPaddingConfig,
-        XhttpReusePolicy, XhttpReuseValueRange, XhttpSecurity, XhttpUplinkConfig,
-        build_request, connect_download_stream, open_separate_downlink_response,
+        XhttpDownloadConfig, XhttpEndpointConfig, XhttpHttpVersion,
+        XhttpMetadataConfig, XhttpMode, XhttpPaddingConfig, XhttpReusePolicy,
+        XhttpReuseValueRange, XhttpSecurity, XhttpUplinkConfig, build_request,
+        connect_download_stream, open_separate_downlink_response,
         remaining_post_interval,
     };
     use crate::{
@@ -1065,7 +1439,7 @@ mod tests {
     };
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use bytes::Bytes;
-    use http::{Method, Request, Response, StatusCode};
+    use http::{Method, Request, Response, StatusCode, Version};
     use http_body_util::{BodyExt, Empty, StreamBody, combinators::BoxBody};
     use hyper::body::{Frame, Incoming};
     use hyper_util::{
@@ -1159,6 +1533,59 @@ mod tests {
         (addr, fingerprint)
     }
 
+    async fn spawn_tls_h1_xhttp_server(
+        sessions: TestSessions,
+    ) -> std::net::SocketAddr {
+        crate::setup_default_crypto_provider();
+
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["xhttp.example.com".to_owned()])
+                .expect("test certificate should generate");
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(signing_key.serialize_der())
+                .expect("test private key should serialize");
+        let mut tls_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .expect("test TLS config should build");
+        tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test TLS listener should bind");
+        let addr = listener.local_addr().expect("listener should expose addr");
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    return;
+                };
+                let acceptor = acceptor.clone();
+                let sessions = sessions.clone();
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    let io = TokioIo::new(tls);
+                    let service = hyper::service::service_fn(move |req| {
+                        let sessions = sessions.clone();
+                        async move {
+                            assert_eq!(req.version(), Version::HTTP_11);
+                            handle_split_modes(req, sessions).await
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, service)
+                        .await;
+                });
+            }
+        });
+
+        addr
+    }
+
     fn pinned_tls_download(
         addr: std::net::SocketAddr,
         fingerprint: String,
@@ -1180,6 +1607,37 @@ mod tests {
             reality: None,
             reuse_policy: None,
         }
+    }
+
+    #[tokio::test]
+    async fn xhttp_upload_endpoint_secures_connector_owned_stream() {
+        let (addr, fingerprint) = spawn_tls_h2_download_server().await;
+        let endpoint =
+            XhttpEndpointConfig::from(&pinned_tls_download(addr, fingerprint));
+        let client = Client::new(
+            addr.ip().to_string(),
+            addr.port(),
+            "/xhttp/".to_owned(),
+            None,
+            HashMap::new(),
+            true,
+            XhttpMode::StreamUp,
+            1_000_000,
+            false,
+            None,
+            None,
+        )
+        .with_upload_endpoint(Some(endpoint));
+
+        let raw = TcpStream::connect(addr)
+            .await
+            .expect("connector-owned raw TCP should connect");
+        let logical = client
+            .proxy_stream(Box::new(raw))
+            .await
+            .expect("xhttp should apply upload TLS before H2");
+
+        drop(logical);
     }
 
     #[tokio::test]
@@ -1881,6 +2339,292 @@ mod tests {
         })
         .await
         .expect("content-type should be recorded");
+    }
+
+    #[tokio::test]
+    async fn xhttp_http1_packet_up_echoes_bytes_over_separate_connections() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should expose addr");
+        let sessions = Arc::new(Mutex::new(HashMap::<
+            String,
+            mpsc::Sender<Result<Frame<Bytes>, Infallible>>,
+        >::new()));
+
+        tokio::spawn({
+            let sessions = sessions.clone();
+            async move {
+                loop {
+                    let Ok((tcp, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let sessions = sessions.clone();
+                    tokio::spawn(async move {
+                        let io = TokioIo::new(tcp);
+                        let service = hyper::service::service_fn(move |req| {
+                            let sessions = sessions.clone();
+                            async move {
+                                assert_eq!(req.version(), Version::HTTP_11);
+                                assert!(req.headers().contains_key("host"));
+                                handle_split_modes(req, sessions).await
+                            }
+                        });
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(io, service)
+                            .await;
+                    });
+                }
+            }
+        });
+
+        let stream = TcpStream::connect(addr)
+            .await
+            .expect("client should connect");
+        let client = Client::new(
+            "127.0.0.1".to_owned(),
+            addr.port(),
+            "/xhttp/".to_owned(),
+            None,
+            HashMap::new(),
+            false,
+            XhttpMode::PacketUp,
+            1_000_000,
+            false,
+            None,
+            None,
+        )
+        .with_http_version(XhttpHttpVersion::Http1);
+
+        let mut proxied = client
+            .proxy_stream(Box::new(stream))
+            .await
+            .expect("HTTP/1.1 packet-up transport should connect");
+        proxied
+            .write_all(b"ping")
+            .await
+            .expect("write should succeed");
+        proxied.flush().await.expect("flush should succeed");
+
+        let mut buf = [0_u8; 4];
+        timeout(Duration::from_secs(2), proxied.read_exact(&mut buf))
+            .await
+            .expect("read should finish")
+            .expect("read should succeed");
+        assert_eq!(&buf, b"ping");
+    }
+
+    #[tokio::test]
+    async fn xhttp_http1_packet_up_supports_separate_download_settings() {
+        let upload_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upload listener should bind");
+        let upload_addr = upload_listener
+            .local_addr()
+            .expect("upload listener should expose addr");
+        let download_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("download listener should bind");
+        let download_addr = download_listener
+            .local_addr()
+            .expect("download listener should expose addr");
+
+        let sessions: TestSessions = Arc::new(Mutex::new(HashMap::new()));
+        let upload_methods = Arc::new(Mutex::new(Vec::<Method>::new()));
+        let download_methods = Arc::new(Mutex::new(Vec::<Method>::new()));
+
+        tokio::spawn({
+            let sessions = sessions.clone();
+            let upload_methods = upload_methods.clone();
+            async move {
+                let (tcp, _) = upload_listener
+                    .accept()
+                    .await
+                    .expect("upload accept should succeed");
+                let io = TokioIo::new(tcp);
+                let service = hyper::service::service_fn(move |req| {
+                    let sessions = sessions.clone();
+                    let upload_methods = upload_methods.clone();
+                    async move {
+                        upload_methods.lock().await.push(req.method().clone());
+                        handle_split_modes(req, sessions).await
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, service)
+                    .await;
+            }
+        });
+
+        tokio::spawn({
+            let sessions = sessions.clone();
+            let download_methods = download_methods.clone();
+            async move {
+                let (tcp, _) = download_listener
+                    .accept()
+                    .await
+                    .expect("download accept should succeed");
+                let io = TokioIo::new(tcp);
+                let service = hyper::service::service_fn(move |req| {
+                    let sessions = sessions.clone();
+                    let download_methods = download_methods.clone();
+                    async move {
+                        download_methods.lock().await.push(req.method().clone());
+                        handle_split_modes(req, sessions).await
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, service)
+                    .await;
+            }
+        });
+
+        let download = XhttpDownloadConfig {
+            server: "127.0.0.1".to_owned(),
+            port: download_addr.port(),
+            path: "/xhttp/".to_owned(),
+            host: None,
+            headers: HashMap::new(),
+            security: XhttpSecurity::None,
+            server_name: "127.0.0.1".to_owned(),
+            alpn_protocols: vec!["http/1.1".to_owned()],
+            skip_cert_verify: false,
+            fingerprint: None,
+            verify_name: None,
+            tls_cert: None,
+            tls_key: None,
+            reality: None,
+            reuse_policy: None,
+        };
+        let client = Client::new(
+            "127.0.0.1".to_owned(),
+            upload_addr.port(),
+            "/xhttp/".to_owned(),
+            None,
+            HashMap::new(),
+            false,
+            XhttpMode::PacketUp,
+            1_000_000,
+            false,
+            None,
+            Some(download),
+        )
+        .with_http_version(XhttpHttpVersion::Http1);
+
+        let stream = TcpStream::connect(upload_addr)
+            .await
+            .expect("upload client should connect");
+        let mut proxied = client
+            .proxy_stream(Box::new(stream))
+            .await
+            .expect("HTTP/1.1 separate download should connect");
+        proxied
+            .write_all(b"ping")
+            .await
+            .expect("write should succeed");
+        proxied.flush().await.expect("flush should succeed");
+
+        let mut buf = [0_u8; 4];
+        timeout(Duration::from_secs(2), proxied.read_exact(&mut buf))
+            .await
+            .expect("read should finish")
+            .expect("read should succeed");
+        assert_eq!(&buf, b"ping");
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let upload = upload_methods.lock().await;
+                let download = download_methods.lock().await;
+                if !upload.is_empty() && !download.is_empty() {
+                    assert_eq!(upload.as_slice(), [Method::POST]);
+                    assert_eq!(download.as_slice(), [Method::GET]);
+                    break;
+                }
+                drop(download);
+                drop(upload);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("HTTP/1.1 methods should be observed");
+    }
+
+    #[tokio::test]
+    async fn xhttp_http1_tls_packet_up_echoes_bytes() {
+        let sessions = Arc::new(Mutex::new(HashMap::<
+            String,
+            mpsc::Sender<Result<Frame<Bytes>, Infallible>>,
+        >::new()));
+        let addr = spawn_tls_h1_xhttp_server(sessions).await;
+
+        let endpoint = XhttpEndpointConfig {
+            server: "127.0.0.1".to_owned(),
+            port: addr.port(),
+            security: XhttpSecurity::Tls,
+            server_name: "xhttp.example.com".to_owned(),
+            alpn_protocols: vec!["http/1.1".to_owned()],
+            skip_cert_verify: true,
+            fingerprint: None,
+            verify_name: None,
+            tls_cert: None,
+            tls_key: None,
+            reality: None,
+        };
+        let client = Client::new(
+            "127.0.0.1".to_owned(),
+            addr.port(),
+            "/xhttp/".to_owned(),
+            None,
+            HashMap::new(),
+            true,
+            XhttpMode::PacketUp,
+            1_000_000,
+            false,
+            None,
+            None,
+        )
+        .with_upload_endpoint(Some(endpoint))
+        .with_http_version(XhttpHttpVersion::Http1);
+
+        let raw = TcpStream::connect(addr)
+            .await
+            .expect("client should connect");
+        let mut proxied = client
+            .proxy_stream(Box::new(raw))
+            .await
+            .expect("TLS HTTP/1.1 packet-up transport should connect");
+        proxied
+            .write_all(b"ping")
+            .await
+            .expect("write should succeed");
+        proxied.flush().await.expect("flush should succeed");
+
+        let mut buf = [0_u8; 4];
+        timeout(Duration::from_secs(2), proxied.read_exact(&mut buf))
+            .await
+            .expect("read should finish")
+            .expect("read should succeed");
+        assert_eq!(&buf, b"ping");
+    }
+
+    #[test]
+    fn xhttp_http1_auto_resolves_to_packet_up() {
+        let client = Client::new(
+            "example.com".to_owned(),
+            80,
+            "/xhttp/".to_owned(),
+            None,
+            HashMap::new(),
+            false,
+            XhttpMode::Auto,
+            1_000_000,
+            false,
+            None,
+            None,
+        )
+        .with_http_version(XhttpHttpVersion::Http1);
+
+        assert_eq!(client.effective_mode(), XhttpMode::PacketUp);
     }
 
     #[tokio::test]
