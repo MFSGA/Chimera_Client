@@ -206,6 +206,13 @@ hysteria = [
     "dep:blake2",
     "dep:digest",
 ]
+xhttp-h3 = [
+    "tls",
+    "dep:quinn",
+    "dep:h3",
+    "dep:h3-quinn",
+    "dep:quinn-proto",
+]
 tun = [
     "dep:tun-rs",
     "dep:watfaq-netstack",

@@ -12,6 +12,8 @@ use std::{
 };
 
 use async_trait::async_trait;
+#[cfg(feature = "xhttp-h3")]
+use bytes::Buf;
 use bytes::Bytes;
 use http::{Request, StatusCode, Version};
 use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
@@ -25,6 +27,8 @@ use tokio_stream::wrappers::ReceiverStream;
 
 mod meta;
 mod padding;
+#[cfg(feature = "xhttp-h3")]
+mod quinn_datagram;
 mod reuse;
 mod session;
 mod uplink;
@@ -50,10 +54,24 @@ use super::TlsClient;
 use super::Transport;
 #[cfg(all(feature = "tun", target_os = "linux"))]
 use crate::app::net::TUN_SOMARK;
+#[cfg(feature = "xhttp-h3")]
+use crate::{
+    app::dns::ThreadSafeDNSResolver,
+    proxy::utils::RemoteConnector,
+    session::{Session, SocksAddr},
+};
 use crate::{
     common::errors::map_io_error,
     proxy::{AnyStream, utils::new_protected_tcp_stream},
 };
+#[cfg(feature = "xhttp-h3")]
+use quinn::{
+    Endpoint, EndpointConfig, TokioRuntime, TransportConfig,
+    crypto::rustls::QuicClientConfig,
+};
+
+#[cfg(feature = "xhttp-h3")]
+type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
 
 const DUPLEX_BUFFER_SIZE: usize = 64 * 1024;
 const FRAME_CHANNEL_CAPACITY: usize = 32;
@@ -99,6 +117,66 @@ impl ReusableH2 {
     fn has_capacity(&self) -> bool {
         self.limits.max_concurrency == 0
             || self.active.load(Ordering::Acquire) < self.limits.max_concurrency
+    }
+}
+
+#[cfg(feature = "xhttp-h3")]
+struct ReusableH3 {
+    sender: H3SendRequest,
+    created_at: Instant,
+    active: Arc<AtomicU64>,
+    reuse_count: u64,
+    request_count: Arc<AtomicU64>,
+    limits: ReuseLimits,
+}
+
+#[cfg(feature = "xhttp-h3")]
+impl ReusableH3 {
+    fn retired(&self) -> bool {
+        if self.limits.c_max_reuse_times != 0
+            && self.reuse_count >= self.limits.c_max_reuse_times
+        {
+            return true;
+        }
+        if self.limits.h_max_request_times != 0
+            && self.request_count.load(Ordering::Acquire)
+                >= self.limits.h_max_request_times
+        {
+            return true;
+        }
+        self.limits.h_max_reusable_secs != 0
+            && self.created_at.elapsed().as_secs() >= self.limits.h_max_reusable_secs
+    }
+
+    fn has_capacity(&self) -> bool {
+        self.limits.max_concurrency == 0
+            || self.active.load(Ordering::Acquire) < self.limits.max_concurrency
+    }
+}
+
+#[cfg(feature = "xhttp-h3")]
+struct H3UploadSender {
+    sender: H3SendRequest,
+    active: Option<Arc<AtomicU64>>,
+    request_count: Option<Arc<AtomicU64>>,
+}
+
+#[cfg(feature = "xhttp-h3")]
+struct H3DownlinkSender {
+    sender: H3SendRequest,
+    active: Option<Arc<AtomicU64>>,
+    request_count: Option<Arc<AtomicU64>>,
+}
+
+#[cfg(feature = "xhttp-h3")]
+struct H3ActiveLease(Option<Arc<AtomicU64>>);
+
+#[cfg(feature = "xhttp-h3")]
+impl Drop for H3ActiveLease {
+    fn drop(&mut self) {
+        if let Some(active) = self.0.take() {
+            active.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -160,6 +238,8 @@ pub enum XhttpHttpVersion {
     Http1,
     #[default]
     Http2,
+    #[cfg_attr(not(feature = "xhttp-h3"), allow(dead_code))]
+    Http3,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -236,7 +316,11 @@ pub struct Client {
     reuse_policy: Option<XhttpReusePolicy>,
     reuse_max_connections: Option<u64>,
     reuse_pool: Mutex<Vec<ReusableH2>>,
+    #[cfg(feature = "xhttp-h3")]
+    h3_reuse_pool: Mutex<Vec<ReusableH3>>,
     download_reuse_max_connections: Option<u64>,
+    #[cfg(feature = "xhttp-h3")]
+    h3_download_reuse_pool: Mutex<Vec<ReusableH3>>,
     download_reuse_pool: Mutex<Vec<ReusableH2>>,
 }
 
@@ -282,8 +366,12 @@ impl Client {
             reuse_policy: None,
             reuse_max_connections: None,
             reuse_pool: Mutex::new(Vec::new()),
+            #[cfg(feature = "xhttp-h3")]
+            h3_reuse_pool: Mutex::new(Vec::new()),
             download_reuse_max_connections,
             download_reuse_pool: Mutex::new(Vec::new()),
+            #[cfg(feature = "xhttp-h3")]
+            h3_download_reuse_pool: Mutex::new(Vec::new()),
         }
     }
 
@@ -750,7 +838,7 @@ fn build_request(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_request_for_version(
+fn build_request_for_version<B>(
     server: &str,
     port: u16,
     path: &str,
@@ -759,10 +847,10 @@ fn build_request_for_version(
     use_tls: bool,
     content_type: Option<&str>,
     method: &str,
-    body: BoxBody<Bytes, Infallible>,
+    body: B,
     padding: &XhttpPaddingConfig,
     http_version: XhttpHttpVersion,
-) -> io::Result<Request<BoxBody<Bytes, Infallible>>> {
+) -> io::Result<Request<B>> {
     let scheme = if use_tls { "https" } else { "http" };
     let mut uri = format!("{scheme}://{server}:{port}{path}");
     let mut headers = headers.clone();
@@ -774,11 +862,12 @@ fn build_request_for_version(
             .path_and_query()
             .map(|value| value.as_str().to_owned())
             .unwrap_or_else(|| "/".to_owned()),
-        XhttpHttpVersion::Http2 => uri,
+        XhttpHttpVersion::Http2 | XhttpHttpVersion::Http3 => uri,
     };
     let version = match http_version {
         XhttpHttpVersion::Http1 => Version::HTTP_11,
         XhttpHttpVersion::Http2 => Version::HTTP_2,
+        XhttpHttpVersion::Http3 => Version::HTTP_3,
     };
 
     let mut request = Request::builder()
@@ -841,9 +930,919 @@ fn leased_stream(stream: AnyStream, active: Arc<AtomicU64>) -> AnyStream {
     })
 }
 
+#[cfg(feature = "xhttp-h3")]
+fn count_h3_request(request_count: Option<&Arc<AtomicU64>>) {
+    if let Some(request_count) = request_count {
+        request_count.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(feature = "xhttp-h3")]
+async fn proxy_stream_one_h3(
+    client: &Client,
+    mut sender: H3SendRequest,
+    request_count: Option<Arc<AtomicU64>>,
+) -> io::Result<AnyStream> {
+    let request = build_request_for_version(
+        &client.server,
+        client.port,
+        &client.path,
+        client.host.as_deref(),
+        &client.headers,
+        true,
+        client.request_content_type("POST"),
+        "POST",
+        (),
+        &client.padding,
+        XhttpHttpVersion::Http3,
+    )?;
+    count_h3_request(request_count.as_ref());
+    let request_stream = sender.send_request(request).await.map_err(|err| {
+        io::Error::other(format!("xhttp HTTP/3 request failed: {err}"))
+    })?;
+    let (mut request_sender, mut response_receiver) = request_stream.split();
+    let (app_stream, transport_stream) = tokio::io::duplex(DUPLEX_BUFFER_SIZE);
+    let (mut transport_reader, mut transport_writer) =
+        tokio::io::split(transport_stream);
+
+    tokio::spawn(async move {
+        let mut buf = vec![0; READ_CHUNK_SIZE];
+        loop {
+            match transport_reader.read(&mut buf).await {
+                Ok(0) => {
+                    let _ = request_sender.finish().await;
+                    break;
+                }
+                Ok(n) => {
+                    if request_sender
+                        .send_data(Bytes::copy_from_slice(&buf[..n]))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        let _sender = sender;
+        let response = match response_receiver.recv_response().await {
+            Ok(response) if response.status() == StatusCode::OK => response,
+            Ok(response) => {
+                tracing::debug!(
+                    status = %response.status(),
+                    "xhttp HTTP/3 returned non-success response"
+                );
+                let _ = transport_writer.shutdown().await;
+                return;
+            }
+            Err(err) => {
+                tracing::debug!(error = %err, "xhttp HTTP/3 response failed");
+                let _ = transport_writer.shutdown().await;
+                return;
+            }
+        };
+        let _ = response;
+
+        loop {
+            match response_receiver.recv_data().await {
+                Ok(Some(mut data)) => {
+                    while data.has_remaining() {
+                        let bytes = data.copy_to_bytes(data.remaining());
+                        if transport_writer.write_all(&bytes).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        let _ = transport_writer.shutdown().await;
+    });
+
+    Ok(Box::new(app_stream))
+}
+
+#[cfg(feature = "xhttp-h3")]
+async fn proxy_stream_up_h3(
+    client: &Client,
+    mut sender: H3SendRequest,
+    downlink_sender: Option<H3DownlinkSender>,
+    request_count: Option<Arc<AtomicU64>>,
+) -> io::Result<AnyStream> {
+    let session_id = client.session.generate();
+
+    let (mut downlink_sender, downlink_active, downlink_request_count) =
+        match downlink_sender {
+            Some(downlink) => (
+                downlink.sender,
+                H3ActiveLease(downlink.active),
+                downlink.request_count,
+            ),
+            None => (sender.clone(), H3ActiveLease(None), request_count.clone()),
+        };
+    let (
+        downlink_server,
+        downlink_port,
+        downlink_base_path,
+        downlink_host,
+        mut downlink_headers,
+    ) = if let Some(download) = client.download.as_ref() {
+        (
+            download.server.as_str(),
+            download.port,
+            download.path.as_str(),
+            download.host.as_deref(),
+            download.headers.clone(),
+        )
+    } else {
+        (
+            client.server.as_str(),
+            client.port,
+            client.path.as_str(),
+            client.host.as_deref(),
+            client.headers.clone(),
+        )
+    };
+    let downlink_path = client.metadata.apply(
+        downlink_base_path,
+        &mut downlink_headers,
+        &session_id,
+        None,
+    )?;
+    let downlink_request = build_request_for_version(
+        downlink_server,
+        downlink_port,
+        &downlink_path,
+        downlink_host,
+        &downlink_headers,
+        true,
+        None,
+        "GET",
+        (),
+        &client.padding,
+        XhttpHttpVersion::Http3,
+    )?;
+    count_h3_request(downlink_request_count.as_ref());
+    let mut downlink = downlink_sender
+        .send_request(downlink_request)
+        .await
+        .map_err(|err| {
+            io::Error::other(format!("xhttp HTTP/3 downlink request failed: {err}"))
+        })?;
+    downlink.finish().await.map_err(|err| {
+        io::Error::other(format!("xhttp HTTP/3 downlink finish failed: {err}"))
+    })?;
+    let response = downlink.recv_response().await.map_err(|err| {
+        io::Error::other(format!("xhttp HTTP/3 downlink response failed: {err}"))
+    })?;
+    if !response.status().is_success() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unexpected xhttp HTTP/3 response status: {}",
+                response.status()
+            ),
+        ));
+    }
+
+    let mut upload_headers = client.headers.clone();
+    let upload_path = client.metadata.apply(
+        &client.path,
+        &mut upload_headers,
+        &session_id,
+        None,
+    )?;
+    let upload_request = build_request_for_version(
+        &client.server,
+        client.port,
+        &upload_path,
+        client.host.as_deref(),
+        &upload_headers,
+        true,
+        client.request_content_type("POST"),
+        "POST",
+        (),
+        &client.padding,
+        XhttpHttpVersion::Http3,
+    )?;
+    count_h3_request(request_count.as_ref());
+    let upload = sender.send_request(upload_request).await.map_err(|err| {
+        io::Error::other(format!("xhttp HTTP/3 stream-up request failed: {err}"))
+    })?;
+    let (mut upload_sender, mut upload_receiver) = upload.split();
+
+    let (app_stream, transport_stream) = tokio::io::duplex(DUPLEX_BUFFER_SIZE);
+    let (mut transport_reader, mut transport_writer) =
+        tokio::io::split(transport_stream);
+
+    tokio::spawn(async move {
+        let mut buf = vec![0; READ_CHUNK_SIZE];
+        loop {
+            match transport_reader.read(&mut buf).await {
+                Ok(0) => {
+                    let _ = upload_sender.finish().await;
+                    break;
+                }
+                Ok(n) => {
+                    if upload_sender
+                        .send_data(Bytes::copy_from_slice(&buf[..n]))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        let _sender = sender;
+        match upload_receiver.recv_response().await {
+            Ok(response) if response.status().is_success() => {
+                while let Ok(Some(_)) = upload_receiver.recv_data().await {}
+            }
+            _ => {}
+        }
+    });
+
+    tokio::spawn(async move {
+        let _downlink_sender = downlink_sender;
+        let _downlink_active = downlink_active;
+        loop {
+            match downlink.recv_data().await {
+                Ok(Some(mut data)) => {
+                    while data.has_remaining() {
+                        let bytes = data.copy_to_bytes(data.remaining());
+                        if transport_writer.write_all(&bytes).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        let _ = transport_writer.shutdown().await;
+    });
+
+    Ok(Box::new(app_stream))
+}
+
+#[cfg(feature = "xhttp-h3")]
+async fn proxy_packet_up_h3(
+    client: &Client,
+    mut sender: H3SendRequest,
+    downlink_sender: Option<H3DownlinkSender>,
+    request_count: Option<Arc<AtomicU64>>,
+) -> io::Result<AnyStream> {
+    let session_id = client.session.generate();
+    let (mut downlink_sender, downlink_active, downlink_request_count) =
+        match downlink_sender {
+            Some(downlink) => (
+                downlink.sender,
+                H3ActiveLease(downlink.active),
+                downlink.request_count,
+            ),
+            None => (sender.clone(), H3ActiveLease(None), request_count.clone()),
+        };
+    let (
+        downlink_server,
+        downlink_port,
+        downlink_base_path,
+        downlink_host,
+        mut downlink_headers,
+    ) = if let Some(download) = client.download.as_ref() {
+        (
+            download.server.as_str(),
+            download.port,
+            download.path.as_str(),
+            download.host.as_deref(),
+            download.headers.clone(),
+        )
+    } else {
+        (
+            client.server.as_str(),
+            client.port,
+            client.path.as_str(),
+            client.host.as_deref(),
+            client.headers.clone(),
+        )
+    };
+    let downlink_path = client.metadata.apply(
+        downlink_base_path,
+        &mut downlink_headers,
+        &session_id,
+        None,
+    )?;
+    let downlink_request = build_request_for_version(
+        downlink_server,
+        downlink_port,
+        &downlink_path,
+        downlink_host,
+        &downlink_headers,
+        true,
+        None,
+        "GET",
+        (),
+        &client.padding,
+        XhttpHttpVersion::Http3,
+    )?;
+    count_h3_request(downlink_request_count.as_ref());
+    let mut downlink = downlink_sender
+        .send_request(downlink_request)
+        .await
+        .map_err(|err| {
+            io::Error::other(format!("xhttp HTTP/3 downlink request failed: {err}"))
+        })?;
+    downlink.finish().await.map_err(|err| {
+        io::Error::other(format!("xhttp HTTP/3 downlink finish failed: {err}"))
+    })?;
+    let response = downlink.recv_response().await.map_err(|err| {
+        io::Error::other(format!("xhttp HTTP/3 downlink response failed: {err}"))
+    })?;
+    if !response.status().is_success() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unexpected xhttp HTTP/3 response status: {}",
+                response.status()
+            ),
+        ));
+    }
+
+    let (app_stream, transport_stream) = tokio::io::duplex(DUPLEX_BUFFER_SIZE);
+    let (mut transport_reader, mut transport_writer) =
+        tokio::io::split(transport_stream);
+    let base_path = client.path.clone();
+    let max_each_post_bytes = client.max_each_post_bytes;
+    let server = client.server.clone();
+    let port = client.port;
+    let host = client.host.clone();
+    let headers = client.headers.clone();
+    let metadata = client.metadata.clone();
+    let uplink = client.uplink.clone();
+    let padding = client.padding.clone();
+    let min_posts_interval_ms = client.min_posts_interval_ms;
+
+    tokio::spawn(async move {
+        let mut seq: u64 = 0;
+        let mut last_write_at: Option<Instant> = None;
+        let mut buf = vec![0; READ_CHUNK_SIZE];
+        loop {
+            match transport_reader.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    let chunk_size = max_each_post_bytes.max(1);
+                    for chunk in buf[..n].chunks(chunk_size) {
+                        let mut request_headers = headers.clone();
+                        let request_path = match metadata.apply(
+                            &base_path,
+                            &mut request_headers,
+                            &session_id,
+                            Some(seq),
+                        ) {
+                            Ok(path) => path,
+                            Err(_) => return,
+                        };
+                        let payload =
+                            uplink.apply_payload(chunk, &mut request_headers);
+                        let request = match build_request_for_version(
+                            &server,
+                            port,
+                            &request_path,
+                            host.as_deref(),
+                            &request_headers,
+                            true,
+                            uplink.content_type(),
+                            uplink.method(),
+                            (),
+                            &padding,
+                            XhttpHttpVersion::Http3,
+                        ) {
+                            Ok(request) => request,
+                            Err(_) => return,
+                        };
+
+                        if let Some(delay) = remaining_post_interval(
+                            min_posts_interval_ms,
+                            last_write_at.map(|instant| instant.elapsed()),
+                        ) {
+                            tokio::time::sleep(delay).await;
+                        }
+                        last_write_at = Some(Instant::now());
+
+                        count_h3_request(request_count.as_ref());
+                        let mut upload = match sender.send_request(request).await {
+                            Ok(upload) => upload,
+                            Err(_) => return,
+                        };
+                        if !payload.is_empty()
+                            && upload.send_data(payload).await.is_err()
+                        {
+                            return;
+                        }
+                        if upload.finish().await.is_err() {
+                            return;
+                        }
+                        match upload.recv_response().await {
+                            Ok(response) if response.status().is_success() => {
+                                seq += 1;
+                            }
+                            _ => return,
+                        }
+                        while let Ok(Some(_)) = upload.recv_data().await {}
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        let _downlink_sender = downlink_sender;
+        let _downlink_active = downlink_active;
+        loop {
+            match downlink.recv_data().await {
+                Ok(Some(mut data)) => {
+                    while data.has_remaining() {
+                        let bytes = data.copy_to_bytes(data.remaining());
+                        if transport_writer.write_all(&bytes).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        let _ = transport_writer.shutdown().await;
+    });
+
+    Ok(Box::new(app_stream))
+}
+
+#[cfg(feature = "xhttp-h3")]
+fn h3_keep_alive_interval(period: Option<i64>) -> io::Result<Option<Duration>> {
+    match period {
+        None | Some(-1) => Ok(None),
+        Some(0) => Ok(Some(Duration::from_secs(10))),
+        Some(period) if period > 0 => Ok(Some(Duration::from_secs(period as u64))),
+        Some(period) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "xhttp h-keep-alive-period must be -1, 0, or a positive number, got {period}"
+            ),
+        )),
+    }
+}
+
+#[cfg(feature = "xhttp-h3")]
+async fn connect_h3_sender(
+    endpoint_config: &XhttpEndpointConfig,
+    sess: &Session,
+    resolver: ThreadSafeDNSResolver,
+    connector: &dyn RemoteConnector,
+    keep_alive_period: Option<i64>,
+) -> io::Result<H3SendRequest> {
+    if !matches!(endpoint_config.security, XhttpSecurity::Tls) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "xhttp HTTP/3 currently supports standard TLS security only",
+        ));
+    }
+
+    let tls = TlsClient::new_with_fingerprint(
+        endpoint_config.skip_cert_verify,
+        endpoint_config.server_name.clone(),
+        Some(vec!["h3".to_owned()]),
+        Some("h3".to_owned()),
+        endpoint_config.fingerprint.clone(),
+    )
+    .with_verify_name(endpoint_config.verify_name.clone())
+    .with_client_auth(
+        endpoint_config.tls_cert.clone(),
+        endpoint_config.tls_key.clone(),
+    )?;
+    let mut tls_config = tls.rustls_client_config()?;
+    tls_config.alpn_protocols = vec![b"h3".to_vec()];
+    let quic_crypto = QuicClientConfig::try_from(tls_config).map_err(|err| {
+        io::Error::other(format!("invalid QUIC TLS config: {err}"))
+    })?;
+    let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
+    if keep_alive_period.is_some() {
+        let mut transport = TransportConfig::default();
+        transport.keep_alive_interval(h3_keep_alive_interval(keep_alive_period)?);
+        client_config.transport_config(Arc::new(transport));
+    }
+
+    let peer_addrs = if let Ok(ip) = endpoint_config.server.parse() {
+        vec![std::net::SocketAddr::new(ip, endpoint_config.port)]
+    } else {
+        resolver
+            .resolve_all(&endpoint_config.server, false)
+            .await
+            .map_err(|err| {
+                io::Error::other(format!("xhttp HTTP/3 DNS failed: {err}"))
+            })?
+            .into_iter()
+            .map(|ip| std::net::SocketAddr::new(ip, endpoint_config.port))
+            .collect::<Vec<_>>()
+    };
+    if peer_addrs.is_empty() {
+        return Err(io::Error::other(
+            "xhttp HTTP/3 endpoint resolved no addresses",
+        ));
+    }
+
+    let mut errors = Vec::new();
+    for peer_addr in peer_addrs {
+        let datagram = match connector
+            .connect_datagram(
+                resolver.clone(),
+                None,
+                SocksAddr::Ip(peer_addr),
+                sess.iface.as_ref(),
+                #[cfg(target_os = "linux")]
+                sess.so_mark,
+            )
+            .await
+        {
+            Ok(datagram) => datagram,
+            Err(err) => {
+                errors.push(format!("{peer_addr}: UDP dial failed: {err}"));
+                continue;
+            }
+        };
+        let socket = quinn_datagram::ConnectorUdpSocket::new(datagram, peer_addr);
+        let mut endpoint = match Endpoint::new_with_abstract_socket(
+            EndpointConfig::default(),
+            None,
+            socket,
+            Arc::new(TokioRuntime),
+        ) {
+            Ok(endpoint) => endpoint,
+            Err(err) => {
+                errors.push(format!("{peer_addr}: QUIC endpoint failed: {err}"));
+                continue;
+            }
+        };
+        endpoint.set_default_client_config(client_config.clone());
+        let connecting = match endpoint
+            .connect(peer_addr, &endpoint_config.server_name)
+        {
+            Ok(connecting) => connecting,
+            Err(err) => {
+                errors
+                    .push(format!("{peer_addr}: QUIC connect setup failed: {err}"));
+                continue;
+            }
+        };
+        let connection = match connecting.await {
+            Ok(connection) => connection,
+            Err(err) => {
+                errors.push(format!("{peer_addr}: QUIC handshake failed: {err}"));
+                continue;
+            }
+        };
+        let h3_connection = h3_quinn::Connection::new(connection.clone());
+        let (mut driver, sender) = h3::client::builder()
+            .build::<_, _, Bytes>(h3_connection)
+            .await
+            .map_err(|err| {
+                io::Error::other(format!("HTTP/3 setup failed: {err}"))
+            })?;
+        tokio::spawn(async move {
+            let _endpoint = endpoint;
+            let _connection = connection;
+            let err = driver.wait_idle().await;
+            tracing::debug!(error = %err, "xhttp HTTP/3 driver ended");
+        });
+        return Ok(sender);
+    }
+
+    Err(io::Error::other(format!(
+        "all xhttp HTTP/3 endpoints failed: {}",
+        errors.join("; ")
+    )))
+}
+
+#[cfg(feature = "xhttp-h3")]
+async fn acquire_h3_upload_sender(
+    client: &Client,
+    endpoint_config: &XhttpEndpointConfig,
+    sess: &Session,
+    resolver: ThreadSafeDNSResolver,
+    connector: &dyn RemoteConnector,
+) -> io::Result<H3UploadSender> {
+    let Some(reuse_policy) = client.reuse_policy.as_ref() else {
+        return Ok(H3UploadSender {
+            sender: connect_h3_sender(
+                endpoint_config,
+                sess,
+                resolver,
+                connector,
+                None,
+            )
+            .await?,
+            active: None,
+            request_count: None,
+        });
+    };
+
+    {
+        let mut pool = client.h3_reuse_pool.lock().await;
+        pool.retain(|connection| !connection.retired());
+        let should_open_fresh = match client.reuse_max_connections {
+            Some(0) => true,
+            Some(max_connections) => (pool.len() as u64) < max_connections,
+            None => !pool.iter().any(ReusableH3::has_capacity),
+        };
+        if !should_open_fresh
+            && let Some(connection) =
+                pool.iter_mut().find(|connection| connection.has_capacity())
+        {
+            connection.reuse_count += 1;
+            connection.active.fetch_add(1, Ordering::AcqRel);
+            return Ok(H3UploadSender {
+                sender: connection.sender.clone(),
+                active: Some(connection.active.clone()),
+                request_count: Some(connection.request_count.clone()),
+            });
+        }
+    }
+
+    let sender = connect_h3_sender(
+        endpoint_config,
+        sess,
+        resolver,
+        connector,
+        Some(reuse_policy.h_keep_alive_period),
+    )
+    .await?;
+    if client.reuse_max_connections == Some(0) {
+        return Ok(H3UploadSender {
+            sender,
+            active: None,
+            request_count: None,
+        });
+    }
+
+    let active = Arc::new(AtomicU64::new(1));
+    let request_count = Arc::new(AtomicU64::new(0));
+    client.h3_reuse_pool.lock().await.push(ReusableH3 {
+        sender: sender.clone(),
+        created_at: Instant::now(),
+        active: active.clone(),
+        reuse_count: 0,
+        request_count: request_count.clone(),
+        limits: reuse_policy.sample_limits(),
+    });
+    Ok(H3UploadSender {
+        sender,
+        active: Some(active),
+        request_count: Some(request_count),
+    })
+}
+
+#[cfg(feature = "xhttp-h3")]
+async fn acquire_h3_download_sender(
+    client: &Client,
+    download: &XhttpDownloadConfig,
+    sess: &Session,
+    resolver: ThreadSafeDNSResolver,
+    connector: &dyn RemoteConnector,
+) -> io::Result<H3DownlinkSender> {
+    let Some(reuse_policy) = download.reuse_policy.as_ref() else {
+        return Ok(H3DownlinkSender {
+            sender: connect_h3_sender(
+                &XhttpEndpointConfig::from(download),
+                sess,
+                resolver,
+                connector,
+                None,
+            )
+            .await?,
+            active: None,
+            request_count: None,
+        });
+    };
+
+    {
+        let mut pool = client.h3_download_reuse_pool.lock().await;
+        pool.retain(|connection| !connection.retired());
+        let should_open_fresh = match client.download_reuse_max_connections {
+            Some(0) => true,
+            Some(max_connections) => (pool.len() as u64) < max_connections,
+            None => !pool.iter().any(ReusableH3::has_capacity),
+        };
+
+        if !should_open_fresh
+            && let Some(connection) =
+                pool.iter_mut().find(|connection| connection.has_capacity())
+        {
+            connection.reuse_count += 1;
+            connection.active.fetch_add(1, Ordering::AcqRel);
+            return Ok(H3DownlinkSender {
+                sender: connection.sender.clone(),
+                active: Some(connection.active.clone()),
+                request_count: Some(connection.request_count.clone()),
+            });
+        }
+    }
+
+    let sender = connect_h3_sender(
+        &XhttpEndpointConfig::from(download),
+        sess,
+        resolver,
+        connector,
+        Some(reuse_policy.h_keep_alive_period),
+    )
+    .await?;
+    if client.download_reuse_max_connections == Some(0) {
+        return Ok(H3DownlinkSender {
+            sender,
+            active: None,
+            request_count: None,
+        });
+    }
+
+    let active = Arc::new(AtomicU64::new(1));
+    let request_count = Arc::new(AtomicU64::new(0));
+    client.h3_download_reuse_pool.lock().await.push(ReusableH3 {
+        sender: sender.clone(),
+        created_at: Instant::now(),
+        active: active.clone(),
+        reuse_count: 0,
+        request_count: request_count.clone(),
+        limits: reuse_policy.sample_limits(),
+    });
+    Ok(H3DownlinkSender {
+        sender,
+        active: Some(active),
+        request_count: Some(request_count),
+    })
+}
+
+#[cfg(feature = "xhttp-h3")]
+async fn open_h3_logical_stream(
+    client: &Client,
+    sender: H3SendRequest,
+    downlink_sender: Option<H3DownlinkSender>,
+    request_count: Option<Arc<AtomicU64>>,
+) -> io::Result<AnyStream> {
+    match client.effective_mode() {
+        XhttpMode::StreamOne => {
+            proxy_stream_one_h3(client, sender, request_count).await
+        }
+        XhttpMode::PacketUp => {
+            proxy_packet_up_h3(client, sender, downlink_sender, request_count).await
+        }
+        XhttpMode::StreamUp => {
+            proxy_stream_up_h3(client, sender, downlink_sender, request_count).await
+        }
+        XhttpMode::Auto => unreachable!("effective_mode resolves auto"),
+    }
+}
+
+#[cfg(feature = "xhttp-h3")]
+async fn try_reuse_h3_stream(client: &Client) -> io::Result<Option<AnyStream>> {
+    if client.reuse_policy.is_none() || client.download.is_some() {
+        return Ok(None);
+    }
+
+    let selected = {
+        let mut pool = client.h3_reuse_pool.lock().await;
+        pool.retain(|connection| !connection.retired());
+
+        if let Some(max_connections) = client.reuse_max_connections
+            && (max_connections == 0 || (pool.len() as u64) < max_connections)
+        {
+            return Ok(None);
+        }
+
+        let Some(connection) =
+            pool.iter_mut().find(|connection| connection.has_capacity())
+        else {
+            return Ok(None);
+        };
+        connection.reuse_count += 1;
+        connection.active.fetch_add(1, Ordering::AcqRel);
+        Some((
+            connection.sender.clone(),
+            connection.active.clone(),
+            connection.request_count.clone(),
+        ))
+    };
+
+    let Some((sender, active, request_count)) = selected else {
+        return Ok(None);
+    };
+    match open_h3_logical_stream(client, sender, None, Some(request_count)).await {
+        Ok(stream) => Ok(Some(leased_stream(stream, active))),
+        Err(err) => {
+            active.fetch_sub(1, Ordering::AcqRel);
+            client.h3_reuse_pool.lock().await.clear();
+            Err(err)
+        }
+    }
+}
+
+#[cfg(feature = "xhttp-h3")]
+async fn connect_h3_stream(
+    client: &Client,
+    sess: &Session,
+    resolver: ThreadSafeDNSResolver,
+    connector: &dyn RemoteConnector,
+) -> io::Result<AnyStream> {
+    let endpoint_config = client.upload_endpoint.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "xhttp HTTP/3 requires transport-owned TLS endpoint security",
+        )
+    })?;
+    let mut upload = acquire_h3_upload_sender(
+        client,
+        endpoint_config,
+        sess,
+        resolver.clone(),
+        connector,
+    )
+    .await?;
+    let downlink_sender = if let Some(download) = client.download.as_ref() {
+        Some(
+            acquire_h3_download_sender(client, download, sess, resolver, connector)
+                .await?,
+        )
+    } else {
+        None
+    };
+
+    let logical = match open_h3_logical_stream(
+        client,
+        upload.sender,
+        downlink_sender,
+        upload.request_count,
+    )
+    .await
+    {
+        Ok(logical) => logical,
+        Err(err) => {
+            if let Some(active) = upload.active.take() {
+                active.fetch_sub(1, Ordering::AcqRel);
+                client.h3_reuse_pool.lock().await.clear();
+            }
+            return Err(err);
+        }
+    };
+    Ok(match upload.active.take() {
+        Some(active) => leased_stream(logical, active),
+        None => logical,
+    })
+}
+
 #[async_trait]
 impl Transport for Client {
+    async fn connect_stream_with_connector(
+        &self,
+        sess: &crate::session::Session,
+        resolver: crate::app::dns::ThreadSafeDNSResolver,
+        connector: &dyn crate::proxy::utils::RemoteConnector,
+    ) -> io::Result<Option<AnyStream>> {
+        if !matches!(self.http_version, XhttpHttpVersion::Http3) {
+            return Ok(None);
+        }
+        #[cfg(feature = "xhttp-h3")]
+        {
+            return connect_h3_stream(self, sess, resolver, connector)
+                .await
+                .map(Some);
+        }
+        #[cfg(not(feature = "xhttp-h3"))]
+        {
+            let _ = sess;
+            let _ = resolver;
+            let _ = connector;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "xhttp HTTP/3 requires xhttp-h3 feature",
+            ))
+        }
+    }
+
     async fn proxy_stream(&self, stream: AnyStream) -> io::Result<AnyStream> {
+        if matches!(self.http_version, XhttpHttpVersion::Http3) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "xhttp HTTP/3 must use the transport-owned QUIC dial path",
+            ));
+        }
         if matches!(self.http_version, XhttpHttpVersion::Http1) {
             if self.reuse_policy.is_some()
                 || self
@@ -914,10 +1913,21 @@ impl Transport for Client {
     }
 
     async fn try_reuse_stream(&self) -> io::Result<Option<AnyStream>> {
-        if matches!(self.http_version, XhttpHttpVersion::Http1)
-            || self.reuse_policy.is_none()
-        {
+        if self.reuse_policy.is_none() {
             return Ok(None);
+        }
+        if matches!(self.http_version, XhttpHttpVersion::Http1) {
+            return Ok(None);
+        }
+        if matches!(self.http_version, XhttpHttpVersion::Http3) {
+            #[cfg(feature = "xhttp-h3")]
+            {
+                return try_reuse_h3_stream(self).await;
+            }
+            #[cfg(not(feature = "xhttp-h3"))]
+            {
+                return Ok(None);
+            }
         }
 
         let selected = {
@@ -1433,11 +2443,17 @@ mod tests {
         connect_download_stream, open_separate_downlink_response,
         remaining_post_interval,
     };
+    #[cfg(feature = "xhttp-h3")]
+    use crate::{
+        app::dns::MockClashResolver, proxy::utils::DirectConnector, session::Session,
+    };
     use crate::{
         common::utils::{encode_hex, sha256},
         proxy::transport::Transport,
     };
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    #[cfg(feature = "xhttp-h3")]
+    use bytes::Buf;
     use bytes::Bytes;
     use http::{Method, Request, Response, StatusCode, Version};
     use http_body_util::{BodyExt, Empty, StreamBody, combinators::BoxBody};
@@ -1459,6 +2475,412 @@ mod tests {
 
     type TestSessions =
         Arc<Mutex<HashMap<String, mpsc::Sender<Result<Frame<Bytes>, Infallible>>>>>;
+
+    #[cfg(feature = "xhttp-h3")]
+    async fn spawn_h3_packet_up_echo_server() -> std::net::SocketAddr {
+        crate::setup_default_crypto_provider();
+
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["xhttp.example.com".to_owned()])
+                .expect("test certificate should generate");
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(signing_key.serialize_der())
+                .expect("test private key should serialize");
+        let mut tls_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .expect("test TLS config should build");
+        tls_config.alpn_protocols = vec![b"h3".to_vec()];
+        let quic_crypto =
+            quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
+                .expect("test QUIC TLS config should build");
+        let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
+        let endpoint =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap())
+                .expect("test QUIC endpoint should bind");
+        let addr = endpoint.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let incoming = endpoint
+                .accept()
+                .await
+                .expect("test QUIC connection should arrive");
+            let connection =
+                incoming.await.expect("test QUIC handshake should succeed");
+            let h3_connection = h3_quinn::Connection::new(connection);
+            let mut h3_server = h3::server::builder()
+                .build(h3_connection)
+                .await
+                .expect("test HTTP/3 server should build");
+
+            let resolver = h3_server
+                .accept()
+                .await
+                .expect("test HTTP/3 accept should succeed")
+                .expect("test HTTP/3 downlink should arrive");
+            let (request, mut downlink) = resolver
+                .resolve_request()
+                .await
+                .expect("test HTTP/3 downlink should resolve");
+            assert_eq!(request.version(), Version::HTTP_3);
+            assert_eq!(request.method(), Method::GET);
+            downlink
+                .send_response(
+                    Response::builder().status(StatusCode::OK).body(()).unwrap(),
+                )
+                .await
+                .expect("test HTTP/3 downlink response should send");
+
+            for seq in 0..3_u64 {
+                let resolver = h3_server
+                    .accept()
+                    .await
+                    .expect("test HTTP/3 upload accept should succeed")
+                    .expect("test HTTP/3 upload should arrive");
+                let (request, mut upload) = resolver
+                    .resolve_request()
+                    .await
+                    .expect("test HTTP/3 upload should resolve");
+                assert_eq!(request.version(), Version::HTTP_3);
+                assert_eq!(request.method(), Method::POST);
+                assert!(
+                    request.uri().path().ends_with(&format!("/{seq}")),
+                    "unexpected upload path: {}",
+                    request.uri().path()
+                );
+
+                let mut echoed = Vec::new();
+                while let Some(mut data) = upload
+                    .recv_data()
+                    .await
+                    .expect("test HTTP/3 upload body should read")
+                {
+                    echoed.extend_from_slice(&data.copy_to_bytes(data.remaining()));
+                }
+                assert_eq!(
+                    echoed.len(),
+                    [4, 4, 1][seq as usize],
+                    "unexpected upload body length for seq {seq}"
+                );
+                upload
+                    .send_response(
+                        Response::builder().status(StatusCode::OK).body(()).unwrap(),
+                    )
+                    .await
+                    .expect("test HTTP/3 upload response should send");
+                upload
+                    .finish()
+                    .await
+                    .expect("test HTTP/3 upload response should finish");
+                downlink
+                    .send_data(Bytes::from(echoed))
+                    .await
+                    .expect("test HTTP/3 downlink echo should send");
+            }
+            // Keep the QUIC endpoint alive after the final DATA frame. Dropping
+            // the endpoint immediately can race the last packet before the test
+            // client has consumed it.
+            std::future::pending::<()>().await;
+        });
+
+        addr
+    }
+
+    #[cfg(feature = "xhttp-h3")]
+    async fn spawn_h3_stream_up_echo_server() -> std::net::SocketAddr {
+        crate::setup_default_crypto_provider();
+
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["xhttp.example.com".to_owned()])
+                .expect("test certificate should generate");
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(signing_key.serialize_der())
+                .expect("test private key should serialize");
+        let mut tls_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .expect("test TLS config should build");
+        tls_config.alpn_protocols = vec![b"h3".to_vec()];
+        let quic_crypto =
+            quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
+                .expect("test QUIC TLS config should build");
+        let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
+        let endpoint =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap())
+                .expect("test QUIC endpoint should bind");
+        let addr = endpoint.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let incoming = endpoint
+                .accept()
+                .await
+                .expect("test QUIC connection should arrive");
+            let connection =
+                incoming.await.expect("test QUIC handshake should succeed");
+            let h3_connection = h3_quinn::Connection::new(connection);
+            let mut h3_server = h3::server::builder()
+                .build(h3_connection)
+                .await
+                .expect("test HTTP/3 server should build");
+
+            let resolver = h3_server
+                .accept()
+                .await
+                .expect("test HTTP/3 downlink accept should succeed")
+                .expect("test HTTP/3 downlink should arrive");
+            let (downlink_request, mut downlink) = resolver
+                .resolve_request()
+                .await
+                .expect("test HTTP/3 downlink should resolve");
+            assert_eq!(downlink_request.version(), Version::HTTP_3);
+            assert_eq!(downlink_request.method(), Method::GET);
+            downlink
+                .send_response(
+                    Response::builder().status(StatusCode::OK).body(()).unwrap(),
+                )
+                .await
+                .expect("test HTTP/3 downlink response should send");
+
+            let resolver = h3_server
+                .accept()
+                .await
+                .expect("test HTTP/3 stream-up accept should succeed")
+                .expect("test HTTP/3 stream-up should arrive");
+            let (upload_request, mut upload) = resolver
+                .resolve_request()
+                .await
+                .expect("test HTTP/3 stream-up should resolve");
+            assert_eq!(upload_request.version(), Version::HTTP_3);
+            assert_eq!(upload_request.method(), Method::POST);
+            assert_eq!(upload_request.uri().path(), downlink_request.uri().path());
+            upload
+                .send_response(
+                    Response::builder().status(StatusCode::OK).body(()).unwrap(),
+                )
+                .await
+                .expect("test HTTP/3 stream-up response should send");
+
+            while let Some(mut data) = upload
+                .recv_data()
+                .await
+                .expect("test HTTP/3 stream-up body should read")
+            {
+                let bytes = data.copy_to_bytes(data.remaining());
+                downlink
+                    .send_data(bytes)
+                    .await
+                    .expect("test HTTP/3 downlink echo should send");
+            }
+            std::future::pending::<()>().await;
+        });
+
+        addr
+    }
+
+    #[cfg(feature = "xhttp-h3")]
+    async fn spawn_h3_download_settings_servers() -> (
+        std::net::SocketAddr,
+        std::net::SocketAddr,
+        tokio::sync::oneshot::Receiver<Vec<u8>>,
+    ) {
+        crate::setup_default_crypto_provider();
+
+        fn server_config() -> quinn::ServerConfig {
+            let rcgen::CertifiedKey { cert, signing_key } =
+                rcgen::generate_simple_self_signed(vec![
+                    "xhttp.example.com".to_owned(),
+                ])
+                .expect("test certificate should generate");
+            let cert_der =
+                rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+            let key_der = rustls::pki_types::PrivateKeyDer::try_from(
+                signing_key.serialize_der(),
+            )
+            .expect("test private key should serialize");
+            let mut tls_config = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert_der], key_der)
+                .expect("test TLS config should build");
+            tls_config.alpn_protocols = vec![b"h3".to_vec()];
+            let quic_crypto =
+                quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
+                    .expect("test QUIC TLS config should build");
+            quinn::ServerConfig::with_crypto(Arc::new(quic_crypto))
+        }
+
+        let upload_endpoint =
+            quinn::Endpoint::server(server_config(), "127.0.0.1:0".parse().unwrap())
+                .expect("test upload QUIC endpoint should bind");
+        let upload_addr = upload_endpoint.local_addr().unwrap();
+        let download_endpoint =
+            quinn::Endpoint::server(server_config(), "127.0.0.1:0".parse().unwrap())
+                .expect("test download QUIC endpoint should bind");
+        let download_addr = download_endpoint.local_addr().unwrap();
+        let (upload_tx, upload_rx) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            let incoming = upload_endpoint
+                .accept()
+                .await
+                .expect("test upload QUIC connection should arrive");
+            let connection = incoming
+                .await
+                .expect("test upload QUIC handshake should succeed");
+            let h3_connection = h3_quinn::Connection::new(connection);
+            let mut h3_server = h3::server::builder()
+                .build::<_, Bytes>(h3_connection)
+                .await
+                .expect("test upload HTTP/3 server should build");
+            let resolver = h3_server
+                .accept()
+                .await
+                .expect("test upload HTTP/3 accept should succeed")
+                .expect("test upload HTTP/3 request should arrive");
+            let (request, mut upload) = resolver
+                .resolve_request()
+                .await
+                .expect("test upload HTTP/3 request should resolve");
+            assert_eq!(request.method(), Method::POST);
+            assert!(request.uri().path().starts_with("/upload/"));
+            upload
+                .send_response(
+                    Response::builder().status(StatusCode::OK).body(()).unwrap(),
+                )
+                .await
+                .expect("test upload HTTP/3 response should send");
+            let mut body = Vec::new();
+            while let Some(mut data) = upload
+                .recv_data()
+                .await
+                .expect("test upload HTTP/3 body should read")
+            {
+                body.extend_from_slice(&data.copy_to_bytes(data.remaining()));
+            }
+            let _ = upload_tx.send(body);
+            std::future::pending::<()>().await;
+        });
+
+        tokio::spawn(async move {
+            let incoming = download_endpoint
+                .accept()
+                .await
+                .expect("test download QUIC connection should arrive");
+            let connection = incoming
+                .await
+                .expect("test download QUIC handshake should succeed");
+            let h3_connection = h3_quinn::Connection::new(connection);
+            let mut h3_server = h3::server::builder()
+                .build::<_, Bytes>(h3_connection)
+                .await
+                .expect("test download HTTP/3 server should build");
+            let resolver = h3_server
+                .accept()
+                .await
+                .expect("test download HTTP/3 accept should succeed")
+                .expect("test download HTTP/3 request should arrive");
+            let (request, mut downlink) = resolver
+                .resolve_request()
+                .await
+                .expect("test download HTTP/3 request should resolve");
+            assert_eq!(request.method(), Method::GET);
+            assert!(request.uri().path().starts_with("/download/"));
+            downlink
+                .send_response(
+                    Response::builder().status(StatusCode::OK).body(()).unwrap(),
+                )
+                .await
+                .expect("test download HTTP/3 response should send");
+            downlink
+                .send_data(Bytes::from_static(b"down-h3"))
+                .await
+                .expect("test download HTTP/3 body should send");
+            std::future::pending::<()>().await;
+        });
+
+        (upload_addr, download_addr, upload_rx)
+    }
+
+    #[cfg(feature = "xhttp-h3")]
+    async fn spawn_h3_stream_one_echo_server(
+        request_count: usize,
+    ) -> std::net::SocketAddr {
+        crate::setup_default_crypto_provider();
+
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["xhttp.example.com".to_owned()])
+                .expect("test certificate should generate");
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(signing_key.serialize_der())
+                .expect("test private key should serialize");
+        let mut tls_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .expect("test TLS config should build");
+        tls_config.alpn_protocols = vec![b"h3".to_vec()];
+        let quic_crypto =
+            quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
+                .expect("test QUIC TLS config should build");
+        let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
+        let endpoint =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap())
+                .expect("test QUIC endpoint should bind");
+        let addr = endpoint.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let incoming = endpoint
+                .accept()
+                .await
+                .expect("test QUIC connection should arrive");
+            let connection =
+                incoming.await.expect("test QUIC handshake should succeed");
+            let h3_connection = h3_quinn::Connection::new(connection);
+            let mut h3_server = h3::server::builder()
+                .build(h3_connection)
+                .await
+                .expect("test HTTP/3 server should build");
+            for _ in 0..request_count {
+                let resolver = h3_server
+                    .accept()
+                    .await
+                    .expect("test HTTP/3 accept should succeed")
+                    .expect("test HTTP/3 request should arrive");
+                let (request, mut stream) = resolver
+                    .resolve_request()
+                    .await
+                    .expect("test HTTP/3 request should resolve");
+                assert_eq!(request.version(), Version::HTTP_3);
+                assert_eq!(request.method(), Method::POST);
+                stream
+                    .send_response(
+                        Response::builder().status(StatusCode::OK).body(()).unwrap(),
+                    )
+                    .await
+                    .expect("test HTTP/3 response headers should send");
+
+                while let Some(mut data) = stream
+                    .recv_data()
+                    .await
+                    .expect("test HTTP/3 request body should read")
+                {
+                    let bytes = data.copy_to_bytes(data.remaining());
+                    stream
+                        .send_data(bytes)
+                        .await
+                        .expect("test HTTP/3 response data should send");
+                }
+                stream
+                    .finish()
+                    .await
+                    .expect("test HTTP/3 response should finish");
+            }
+            std::future::pending::<()>().await;
+        });
+
+        addr
+    }
 
     fn auto_client(
         auto_reality: bool,
@@ -1726,6 +3148,27 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "xhttp-h3")]
+    #[test]
+    fn xhttp_http3_keepalive_period_maps_to_quic_interval() {
+        assert_eq!(super::h3_keep_alive_interval(None).unwrap(), None);
+        assert_eq!(super::h3_keep_alive_interval(Some(-1)).unwrap(), None);
+        assert_eq!(
+            super::h3_keep_alive_interval(Some(0)).unwrap(),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(
+            super::h3_keep_alive_interval(Some(30)).unwrap(),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            super::h3_keep_alive_interval(Some(-2))
+                .expect_err("invalid negative keepalive must fail")
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
     #[test]
     fn xhttp_request_adds_default_padding_referer() {
         let request = build_request(
@@ -1760,6 +3203,450 @@ mod tests {
             (100..=1_000).contains(&padding_len),
             "unexpected default padding length: {padding_len}"
         );
+    }
+
+    #[cfg(feature = "xhttp-h3")]
+    #[tokio::test]
+    async fn xhttp_http3_stream_one_echoes_bytes_through_connector_udp() {
+        let addr = spawn_h3_stream_one_echo_server(1).await;
+        let endpoint = XhttpEndpointConfig {
+            server: "127.0.0.1".to_owned(),
+            port: addr.port(),
+            security: XhttpSecurity::Tls,
+            server_name: "xhttp.example.com".to_owned(),
+            alpn_protocols: vec!["h3".to_owned()],
+            skip_cert_verify: true,
+            fingerprint: None,
+            verify_name: None,
+            tls_cert: None,
+            tls_key: None,
+            reality: None,
+        };
+        let client = Client::new(
+            "127.0.0.1".to_owned(),
+            addr.port(),
+            "/xhttp/".to_owned(),
+            None,
+            HashMap::new(),
+            true,
+            XhttpMode::StreamOne,
+            1_000_000,
+            false,
+            None,
+            None,
+        )
+        .with_upload_endpoint(Some(endpoint))
+        .with_http_version(XhttpHttpVersion::Http3);
+        let resolver = Arc::new(MockClashResolver::new());
+        let connector = DirectConnector::new();
+        let mut proxied = client
+            .connect_stream_with_connector(&Session::default(), resolver, &connector)
+            .await
+            .expect("HTTP/3 transport-owned dial should succeed")
+            .expect("HTTP/3 should return a logical stream");
+
+        proxied.write_all(b"ping-h3").await.expect("HTTP/3 write");
+        proxied.flush().await.expect("HTTP/3 flush");
+        let mut buf = [0u8; 7];
+        timeout(Duration::from_secs(3), proxied.read_exact(&mut buf))
+            .await
+            .expect("HTTP/3 echo timed out")
+            .expect("HTTP/3 read failed");
+        assert_eq!(&buf, b"ping-h3");
+    }
+
+    #[cfg(feature = "xhttp-h3")]
+    #[tokio::test]
+    async fn xhttp_http3_reuses_one_quic_connection_for_logical_streams() {
+        let addr = spawn_h3_stream_one_echo_server(2).await;
+        let endpoint = XhttpEndpointConfig {
+            server: "127.0.0.1".to_owned(),
+            port: addr.port(),
+            security: XhttpSecurity::Tls,
+            server_name: "xhttp.example.com".to_owned(),
+            alpn_protocols: vec!["h3".to_owned()],
+            skip_cert_verify: true,
+            fingerprint: None,
+            verify_name: None,
+            tls_cert: None,
+            tls_key: None,
+            reality: None,
+        };
+        let client = Client::new(
+            "127.0.0.1".to_owned(),
+            addr.port(),
+            "/xhttp/".to_owned(),
+            None,
+            HashMap::new(),
+            true,
+            XhttpMode::StreamOne,
+            1_000_000,
+            false,
+            None,
+            None,
+        )
+        .with_upload_endpoint(Some(endpoint))
+        .with_http_version(XhttpHttpVersion::Http3)
+        .with_reuse_policy(Some(XhttpReusePolicy {
+            max_concurrency: Some(XhttpReuseValueRange { min: 1, max: 1 }),
+            max_connections: None,
+            c_max_reuse_times: Some(XhttpReuseValueRange { min: 1, max: 1 }),
+            h_max_request_times: Some(XhttpReuseValueRange { min: 0, max: 0 }),
+            h_max_reusable_secs: Some(XhttpReuseValueRange { min: 0, max: 0 }),
+            h_keep_alive_period: 0,
+        }));
+        let resolver = Arc::new(MockClashResolver::new());
+        let connector = DirectConnector::new();
+        let mut first = client
+            .connect_stream_with_connector(&Session::default(), resolver, &connector)
+            .await
+            .expect("first HTTP/3 pooled dial should succeed")
+            .expect("first HTTP/3 pooled stream should exist");
+
+        assert!(
+            client
+                .try_reuse_stream()
+                .await
+                .expect("active H3 reuse lookup should succeed")
+                .is_none(),
+            "max-concurrency=1 must block H3 reuse while active"
+        );
+        first.write_all(b"one1").await.expect("first H3 write");
+        first.flush().await.expect("first H3 flush");
+        let mut first_buf = [0u8; 4];
+        timeout(Duration::from_secs(3), first.read_exact(&mut first_buf))
+            .await
+            .expect("first H3 reuse read timed out")
+            .expect("first H3 reuse read failed");
+        assert_eq!(&first_buf, b"one1");
+        drop(first);
+
+        let mut second = client
+            .try_reuse_stream()
+            .await
+            .expect("second H3 reuse lookup should succeed")
+            .expect("same QUIC/H3 connection should be reusable");
+        second.write_all(b"two2").await.expect("second H3 write");
+        second.flush().await.expect("second H3 flush");
+        let mut second_buf = [0u8; 4];
+        timeout(Duration::from_secs(3), second.read_exact(&mut second_buf))
+            .await
+            .expect("second H3 reuse read timed out")
+            .expect("second H3 reuse read failed");
+        assert_eq!(&second_buf, b"two2");
+        drop(second);
+
+        assert!(
+            client
+                .try_reuse_stream()
+                .await
+                .expect("retired H3 reuse lookup should succeed")
+                .is_none(),
+            "c-max-reuse-times=1 must retire the H3 connection"
+        );
+    }
+
+    #[cfg(feature = "xhttp-h3")]
+    #[tokio::test]
+    async fn xhttp_http3_reuses_separate_download_connection() {
+        let addr = spawn_h3_stream_one_echo_server(2).await;
+        let reuse_policy = XhttpReusePolicy {
+            max_concurrency: Some(XhttpReuseValueRange { min: 1, max: 1 }),
+            max_connections: None,
+            c_max_reuse_times: Some(XhttpReuseValueRange { min: 2, max: 2 }),
+            h_max_request_times: Some(XhttpReuseValueRange { min: 0, max: 0 }),
+            h_max_reusable_secs: Some(XhttpReuseValueRange { min: 0, max: 0 }),
+            h_keep_alive_period: 0,
+        };
+        let download = XhttpDownloadConfig {
+            server: "127.0.0.1".to_owned(),
+            port: addr.port(),
+            path: "/xhttp/".to_owned(),
+            host: None,
+            headers: HashMap::new(),
+            security: XhttpSecurity::Tls,
+            server_name: "xhttp.example.com".to_owned(),
+            alpn_protocols: vec!["h3".to_owned()],
+            skip_cert_verify: true,
+            fingerprint: None,
+            verify_name: None,
+            tls_cert: None,
+            tls_key: None,
+            reality: None,
+            reuse_policy: Some(reuse_policy),
+        };
+        let client = Client::new(
+            "upload.invalid".to_owned(),
+            443,
+            "/upload/".to_owned(),
+            None,
+            HashMap::new(),
+            true,
+            XhttpMode::StreamUp,
+            1_000_000,
+            false,
+            None,
+            Some(download.clone()),
+        );
+        let resolver = Arc::new(MockClashResolver::new());
+        let connector = DirectConnector::new();
+        let session = Session::default();
+
+        async fn roundtrip(
+            mut lease: super::H3DownlinkSender,
+            addr: std::net::SocketAddr,
+        ) -> Option<Arc<std::sync::atomic::AtomicU64>> {
+            super::count_h3_request(lease.request_count.as_ref());
+            let request = Request::builder()
+                .method(Method::POST)
+                .version(Version::HTTP_3)
+                .uri(format!("https://127.0.0.1:{}/xhttp/", addr.port()))
+                .body(())
+                .unwrap();
+            let mut stream = lease
+                .sender
+                .send_request(request)
+                .await
+                .expect("pooled H3 request should send");
+            stream
+                .finish()
+                .await
+                .expect("pooled H3 request should finish");
+            let response = stream
+                .recv_response()
+                .await
+                .expect("pooled H3 response should arrive");
+            assert_eq!(response.status(), StatusCode::OK);
+            while stream
+                .recv_data()
+                .await
+                .expect("pooled H3 response body should drain")
+                .is_some()
+            {}
+            lease.active.take()
+        }
+
+        let first = super::acquire_h3_download_sender(
+            &client,
+            &download,
+            &session,
+            resolver.clone(),
+            &connector,
+        )
+        .await
+        .expect("first H3 download sender should connect");
+        let first_active = roundtrip(first, addr).await;
+        drop(super::H3ActiveLease(first_active));
+
+        let second = super::acquire_h3_download_sender(
+            &client, &download, &session, resolver, &connector,
+        )
+        .await
+        .expect("second H3 download sender should reuse");
+        let second_active = roundtrip(second, addr).await;
+        drop(super::H3ActiveLease(second_active));
+
+        let pool = client.h3_download_reuse_pool.lock().await;
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool[0].reuse_count, 1);
+    }
+
+    #[cfg(feature = "xhttp-h3")]
+    #[tokio::test]
+    async fn xhttp_http3_stream_up_uses_separate_download_settings() {
+        let (upload_addr, download_addr, upload_body) =
+            spawn_h3_download_settings_servers().await;
+        let endpoint = XhttpEndpointConfig {
+            server: "127.0.0.1".to_owned(),
+            port: upload_addr.port(),
+            security: XhttpSecurity::Tls,
+            server_name: "xhttp.example.com".to_owned(),
+            alpn_protocols: vec!["h3".to_owned()],
+            skip_cert_verify: true,
+            fingerprint: None,
+            verify_name: None,
+            tls_cert: None,
+            tls_key: None,
+            reality: None,
+        };
+        let reuse_policy = XhttpReusePolicy {
+            max_concurrency: Some(XhttpReuseValueRange { min: 2, max: 2 }),
+            max_connections: None,
+            c_max_reuse_times: Some(XhttpReuseValueRange { min: 2, max: 2 }),
+            h_max_request_times: Some(XhttpReuseValueRange { min: 0, max: 0 }),
+            h_max_reusable_secs: Some(XhttpReuseValueRange { min: 0, max: 0 }),
+            h_keep_alive_period: 0,
+        };
+        let download = XhttpDownloadConfig {
+            server: "127.0.0.1".to_owned(),
+            port: download_addr.port(),
+            path: "/download/".to_owned(),
+            host: None,
+            headers: HashMap::new(),
+            security: XhttpSecurity::Tls,
+            server_name: "xhttp.example.com".to_owned(),
+            alpn_protocols: vec!["h3".to_owned()],
+            skip_cert_verify: true,
+            fingerprint: None,
+            verify_name: None,
+            tls_cert: None,
+            tls_key: None,
+            reality: None,
+            reuse_policy: Some(reuse_policy.clone()),
+        };
+        let client = Client::new(
+            "127.0.0.1".to_owned(),
+            upload_addr.port(),
+            "/upload/".to_owned(),
+            None,
+            HashMap::new(),
+            true,
+            XhttpMode::StreamUp,
+            1_000_000,
+            false,
+            None,
+            Some(download),
+        )
+        .with_upload_endpoint(Some(endpoint))
+        .with_http_version(XhttpHttpVersion::Http3)
+        .with_reuse_policy(Some(reuse_policy));
+        let resolver = Arc::new(MockClashResolver::new());
+        let connector = DirectConnector::new();
+        let mut proxied = client
+            .connect_stream_with_connector(&Session::default(), resolver, &connector)
+            .await
+            .expect("HTTP/3 split-endpoint dial should succeed")
+            .expect("HTTP/3 split-endpoint should return a logical stream");
+
+        proxied
+            .write_all(b"up-h3")
+            .await
+            .expect("HTTP/3 split-endpoint upload should write");
+        proxied.flush().await.expect("HTTP/3 upload should flush");
+        let mut buf = [0u8; 7];
+        timeout(Duration::from_secs(3), proxied.read_exact(&mut buf))
+            .await
+            .expect("HTTP/3 download-settings read timed out")
+            .expect("HTTP/3 download-settings read failed");
+        assert_eq!(&buf, b"down-h3");
+        assert_eq!(client.h3_reuse_pool.lock().await.len(), 1);
+        assert_eq!(client.h3_download_reuse_pool.lock().await.len(), 1);
+
+        proxied
+            .shutdown()
+            .await
+            .expect("HTTP/3 upload should close");
+        let uploaded = timeout(Duration::from_secs(3), upload_body)
+            .await
+            .expect("HTTP/3 upload capture timed out")
+            .expect("HTTP/3 upload capture sender dropped");
+        assert_eq!(uploaded, b"up-h3");
+    }
+
+    #[cfg(feature = "xhttp-h3")]
+    #[tokio::test]
+    async fn xhttp_http3_stream_up_echoes_streaming_post() {
+        let addr = spawn_h3_stream_up_echo_server().await;
+        let endpoint = XhttpEndpointConfig {
+            server: "127.0.0.1".to_owned(),
+            port: addr.port(),
+            security: XhttpSecurity::Tls,
+            server_name: "xhttp.example.com".to_owned(),
+            alpn_protocols: vec!["h3".to_owned()],
+            skip_cert_verify: true,
+            fingerprint: None,
+            verify_name: None,
+            tls_cert: None,
+            tls_key: None,
+            reality: None,
+        };
+        let client = Client::new(
+            "127.0.0.1".to_owned(),
+            addr.port(),
+            "/xhttp/".to_owned(),
+            None,
+            HashMap::new(),
+            true,
+            XhttpMode::StreamUp,
+            1_000_000,
+            false,
+            None,
+            None,
+        )
+        .with_upload_endpoint(Some(endpoint))
+        .with_http_version(XhttpHttpVersion::Http3);
+        let resolver = Arc::new(MockClashResolver::new());
+        let connector = DirectConnector::new();
+        let mut proxied = client
+            .connect_stream_with_connector(&Session::default(), resolver, &connector)
+            .await
+            .expect("HTTP/3 stream-up dial should succeed")
+            .expect("HTTP/3 stream-up should return a logical stream");
+
+        proxied
+            .write_all(b"stream-h3")
+            .await
+            .expect("HTTP/3 stream-up write");
+        proxied.flush().await.expect("HTTP/3 stream-up flush");
+        let mut buf = [0u8; 9];
+        timeout(Duration::from_secs(3), proxied.read_exact(&mut buf))
+            .await
+            .expect("HTTP/3 stream-up echo timed out")
+            .expect("HTTP/3 stream-up read failed");
+        assert_eq!(&buf, b"stream-h3");
+    }
+
+    #[cfg(feature = "xhttp-h3")]
+    #[tokio::test]
+    async fn xhttp_http3_packet_up_echoes_sequenced_posts() {
+        let addr = spawn_h3_packet_up_echo_server().await;
+        let endpoint = XhttpEndpointConfig {
+            server: "127.0.0.1".to_owned(),
+            port: addr.port(),
+            security: XhttpSecurity::Tls,
+            server_name: "xhttp.example.com".to_owned(),
+            alpn_protocols: vec!["h3".to_owned()],
+            skip_cert_verify: true,
+            fingerprint: None,
+            verify_name: None,
+            tls_cert: None,
+            tls_key: None,
+            reality: None,
+        };
+        let client = Client::new(
+            "127.0.0.1".to_owned(),
+            addr.port(),
+            "/xhttp/".to_owned(),
+            None,
+            HashMap::new(),
+            true,
+            XhttpMode::PacketUp,
+            4,
+            false,
+            None,
+            None,
+        )
+        .with_upload_endpoint(Some(endpoint))
+        .with_http_version(XhttpHttpVersion::Http3);
+        let resolver = Arc::new(MockClashResolver::new());
+        let connector = DirectConnector::new();
+        let mut proxied = client
+            .connect_stream_with_connector(&Session::default(), resolver, &connector)
+            .await
+            .expect("HTTP/3 packet-up dial should succeed")
+            .expect("HTTP/3 packet-up should return a logical stream");
+
+        proxied
+            .write_all(b"packet-h3")
+            .await
+            .expect("HTTP/3 packet-up write");
+        proxied.flush().await.expect("HTTP/3 packet-up flush");
+        let mut buf = [0u8; 9];
+        timeout(Duration::from_secs(3), proxied.read_exact(&mut buf))
+            .await
+            .expect("HTTP/3 packet-up echo timed out")
+            .expect("HTTP/3 packet-up read failed");
+        assert_eq!(&buf, b"packet-h3");
     }
 
     #[tokio::test]

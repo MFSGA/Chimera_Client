@@ -111,6 +111,30 @@ impl Handler {
         Ok(Some(self.wrap_vless_stream(stream, sess, is_udp, None)?))
     }
 
+    async fn try_transport_owned_stream(
+        &self,
+        sess: &Session,
+        resolver: ThreadSafeDNSResolver,
+        connector: &dyn RemoteConnector,
+        is_udp: bool,
+    ) -> io::Result<Option<AnyStream>> {
+        if self.opts.flow.as_deref() == Some("xtls-rprx-vision") {
+            return Ok(None);
+        }
+
+        let Some(transport) = self.opts.transport.as_ref() else {
+            return Ok(None);
+        };
+        let Some(stream) = transport
+            .connect_stream_with_connector(sess, resolver, connector)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(self.wrap_vless_stream(stream, sess, is_udp, None)?))
+    }
+
     async fn inner_proxy_stream(
         &self,
         s: AnyStream,
@@ -226,6 +250,14 @@ impl OutboundHandler for Handler {
             chained.append_to_chain(self.name()).await;
             return Ok(Box::new(chained));
         }
+        if let Some(stream) = self
+            .try_transport_owned_stream(sess, resolver.clone(), connector, false)
+            .await?
+        {
+            let chained = ChainedStreamWrapper::new(stream);
+            chained.append_to_chain(self.name()).await;
+            return Ok(Box::new(chained));
+        }
 
         let stream = connector
             .connect_stream(
@@ -257,6 +289,16 @@ impl OutboundHandler for Handler {
             chained.append_to_chain(self.name()).await;
             return Ok(Box::new(chained));
         }
+        if let Some(stream) = self
+            .try_transport_owned_stream(sess, resolver.clone(), connector, true)
+            .await?
+        {
+            let datagram =
+                OutboundDatagramVless::new(stream, sess.destination.clone());
+            let chained = ChainedDatagramWrapper::new(datagram);
+            chained.append_to_chain(self.name()).await;
+            return Ok(Box::new(chained));
+        }
 
         let stream = connector
             .connect_stream(
@@ -280,7 +322,10 @@ impl OutboundHandler for Handler {
 
 #[cfg(test)]
 mod reuse_tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::{app::dns::MockClashResolver, proxy::utils::DirectConnector};
 
     struct ReuseTransport;
 
@@ -298,6 +343,93 @@ mod reuse_tests {
             });
             Ok(Some(Box::new(stream)))
         }
+    }
+
+    struct OwnedDialTransport;
+
+    #[async_trait]
+    impl Transport for OwnedDialTransport {
+        async fn proxy_stream(&self, _stream: AnyStream) -> io::Result<AnyStream> {
+            panic!("owned-dial transport must bypass the pre-dialed TCP path");
+        }
+
+        async fn connect_stream_with_connector(
+            &self,
+            _sess: &Session,
+            _resolver: ThreadSafeDNSResolver,
+            _connector: &dyn RemoteConnector,
+        ) -> io::Result<Option<AnyStream>> {
+            let (stream, peer) = tokio::io::duplex(1024);
+            tokio::spawn(async move {
+                let _peer = peer;
+                std::future::pending::<()>().await;
+            });
+            Ok(Some(Box::new(stream)))
+        }
+    }
+
+    #[tokio::test]
+    async fn vless_can_wrap_transport_owned_stream_before_tcp_dial() {
+        let handler = Handler::new(HandlerOptions {
+            name: "owned-dial-test".to_owned(),
+            common_opts: HandlerCommonOptions::default(),
+            server: "example.com".to_owned(),
+            port: 443,
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            udp: true,
+            transport: Some(Box::new(OwnedDialTransport)),
+            tls: None,
+            flow: None,
+        });
+        let resolver = Arc::new(MockClashResolver::new());
+        let connector = DirectConnector::new();
+
+        let stream = handler
+            .try_transport_owned_stream(
+                &Session::default(),
+                resolver,
+                &connector,
+                false,
+            )
+            .await
+            .expect("owned transport dial should succeed");
+
+        assert!(
+            stream.is_some(),
+            "owned logical stream should be wrapped as VLESS before TCP dial"
+        );
+    }
+
+    #[tokio::test]
+    async fn vision_does_not_use_transport_owned_stream() {
+        let handler = Handler::new(HandlerOptions {
+            name: "vision-owned-dial-test".to_owned(),
+            common_opts: HandlerCommonOptions::default(),
+            server: "example.com".to_owned(),
+            port: 443,
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            udp: true,
+            transport: Some(Box::new(OwnedDialTransport)),
+            tls: None,
+            flow: Some("xtls-rprx-vision".to_owned()),
+        });
+        let resolver = Arc::new(MockClashResolver::new());
+        let connector = DirectConnector::new();
+
+        let stream = handler
+            .try_transport_owned_stream(
+                &Session::default(),
+                resolver,
+                &connector,
+                false,
+            )
+            .await
+            .expect("owned transport lookup should succeed");
+
+        assert!(
+            stream.is_none(),
+            "Vision must preserve the existing splice-capable TCP path"
+        );
     }
 
     #[tokio::test]

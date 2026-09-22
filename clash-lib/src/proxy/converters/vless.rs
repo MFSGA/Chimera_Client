@@ -202,9 +202,13 @@ fn build_tls_transport(
     skip_cert_verify: bool,
 ) -> Result<Option<Box<dyn Transport>>, Error> {
     if matches!(network, Some("xhttp")) {
-        if matches!(resolve_xhttp_http_version(s)?, XhttpHttpVersion::Http1) {
-            // HTTP/1.1 packet-up opens more than one underlying connection,
-            // so XHTTP must own endpoint security for every GET/POST socket.
+        if matches!(
+            resolve_xhttp_http_version(s)?,
+            XhttpHttpVersion::Http1 | XhttpHttpVersion::Http3
+        ) {
+            // HTTP/1.1 packet-up opens more than one TCP connection, while
+            // HTTP/3 owns a UDP/QUIC endpoint. In both cases XHTTP must own
+            // endpoint security rather than wrapping a pre-dialed TCP stream.
             return Ok(None);
         }
         if s.xhttp_opts
@@ -413,6 +417,60 @@ fn resolve_xhttp_http_version(s: &OutboundVless) -> Result<XhttpHttpVersion, Err
     match s.alpn.as_deref() {
         None => Ok(XhttpHttpVersion::Http2),
         Some([value]) if value == "h2" => Ok(XhttpHttpVersion::Http2),
+        Some([value]) if value == "h3" => {
+            #[cfg(not(feature = "xhttp-h3"))]
+            {
+                Err(Error::InvalidConfig(
+                    "vless xhttp HTTP/3 requires xhttp-h3 feature".to_owned(),
+                ))
+            }
+            #[cfg(feature = "xhttp-h3")]
+            {
+                let opts = s.xhttp_opts.as_ref().ok_or_else(|| {
+                    Error::InvalidConfig(
+                        "xhttp_opts is required for vless xhttp".to_owned(),
+                    )
+                })?;
+                if let Some(download) = resolve_xhttp_download_settings(opts) {
+                    if matches!(parse_xhttp_mode(opts)?, XhttpMode::StreamOne) {
+                        return Err(Error::InvalidConfig(
+                            "vless xhttp HTTP/3 stream-one does not support download-settings"
+                                .to_owned(),
+                        ));
+                    }
+                    let download_reuse =
+                        download.reuse_settings.as_ref().or_else(|| {
+                            download.xhttp_settings.as_ref().and_then(|settings| {
+                                settings.reuse_settings.as_ref()
+                            })
+                        });
+                    build_xhttp_reuse_policy(download_reuse)?;
+                }
+                build_xhttp_reuse_policy(opts.reuse_settings.as_ref())?;
+                if s.reality_opts.is_some() {
+                    return Err(Error::InvalidConfig(
+                        "vless xhttp HTTP/3 currently supports standard TLS only"
+                            .to_owned(),
+                    ));
+                }
+                let tls_enabled = opts
+                    .upload_settings
+                    .as_ref()
+                    .and_then(|settings| settings.tls)
+                    .or(s.tls)
+                    .unwrap_or(false);
+                let upload_security = opts
+                    .upload_settings
+                    .as_ref()
+                    .and_then(|settings| settings.security.as_deref());
+                if !tls_enabled && !matches!(upload_security, Some("tls")) {
+                    return Err(Error::InvalidConfig(
+                        "vless xhttp HTTP/3 requires TLS".to_owned(),
+                    ));
+                }
+                Ok(XhttpHttpVersion::Http3)
+            }
+        }
         Some([value]) if value == "http/1.1" => {
             let opts = s.xhttp_opts.as_ref().ok_or_else(|| {
                 Error::InvalidConfig(
@@ -438,8 +496,10 @@ fn resolve_xhttp_http_version(s: &OutboundVless) -> Result<XhttpHttpVersion, Err
                         .to_owned(),
                 ));
             }
-            if !matches!(parse_xhttp_mode(opts)?, XhttpMode::Auto | XhttpMode::PacketUp)
-            {
+            if !matches!(
+                parse_xhttp_mode(opts)?,
+                XhttpMode::Auto | XhttpMode::PacketUp
+            ) {
                 return Err(Error::InvalidConfig(
                     "vless xhttp HTTP/1.1 currently supports only mode: auto or packet-up"
                         .to_owned(),
@@ -448,7 +508,7 @@ fn resolve_xhttp_http_version(s: &OutboundVless) -> Result<XhttpHttpVersion, Err
             Ok(XhttpHttpVersion::Http1)
         }
         _ => Err(Error::InvalidConfig(
-            "vless xhttp currently supports alpn: [h2] or [http/1.1]; HTTP/3 is not implemented yet"
+            "vless xhttp currently supports alpn: [h2], [h3], or [http/1.1]"
                 .to_owned(),
         )),
     }
@@ -476,8 +536,11 @@ fn build_xhttp_transport(
         upload_settings.and_then(|settings| settings.xhttp_settings.as_ref());
     let upload_security =
         upload_settings.and_then(|settings| settings.security.as_deref());
-    let own_primary_security = matches!(http_version, XhttpHttpVersion::Http1)
-        && (s.tls.unwrap_or(false) || s.reality_opts.is_some());
+    let own_primary_security = matches!(
+        http_version,
+        XhttpHttpVersion::Http1 | XhttpHttpVersion::Http3
+    ) && (s.tls.unwrap_or(false)
+        || s.reality_opts.is_some());
     let upload_endpoint =
         build_xhttp_upload_endpoint_config(s, own_primary_security)?;
     let upload_uses_security = upload_endpoint
@@ -600,10 +663,10 @@ fn build_xhttp_upload_endpoint_config(
         .and_then(|settings| settings.alpn.clone())
         .or_else(|| s.alpn.clone())
         .unwrap_or_else(|| vec!["h2".to_owned()]);
-    let expected_alpn = if own_primary_security {
-        "http/1.1"
-    } else {
-        "h2"
+    let expected_alpn = match s.alpn.as_deref() {
+        Some([value]) if value == "h3" => "h3",
+        _ if own_primary_security => "http/1.1",
+        _ => "h2",
     };
     if alpn_protocols.as_slice() != [expected_alpn] {
         return Err(Error::InvalidConfig(format!(
@@ -747,6 +810,14 @@ fn build_xhttp_download_config(
             )));
         }
     };
+    if matches!(http_version, XhttpHttpVersion::Http3)
+        && !matches!(security, XhttpSecurity::Tls)
+    {
+        return Err(Error::InvalidConfig(
+            "xhttp HTTP/3 download-settings currently supports standard TLS only"
+                .to_owned(),
+        ));
+    }
 
     let server_name = download_settings
         .sni
@@ -776,6 +847,7 @@ fn build_xhttp_download_config(
     let expected_alpn = match http_version {
         XhttpHttpVersion::Http1 => "http/1.1",
         XhttpHttpVersion::Http2 => "h2",
+        XhttpHttpVersion::Http3 => "h3",
     };
     let alpn_protocols = download_settings
         .alpn
@@ -2096,8 +2168,9 @@ mod tests {
             .expect("HTTP/1.1 Reality handler should build");
     }
 
+    #[cfg(feature = "xhttp-h3")]
     #[test]
-    fn vless_xhttp_rejects_non_h2_alpn_until_backend_exists() {
+    fn vless_xhttp_accepts_http3_stream_one_tls() {
         let outbound = OutboundVless {
             common_opts: CommonConfigOptions {
                 name: "xhttp-h3".to_owned(),
@@ -2106,17 +2179,295 @@ mod tests {
                 connect_via: None,
             },
             uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            tls: Some(true),
             alpn: Some(vec!["h3".to_owned()]),
             network: Some("xhttp".to_owned()),
+            xhttp_opts: Some(XhttpOpt {
+                path: Some("/xhttp/".to_owned()),
+                mode: Some("stream-one".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        validate_vless_config(&outbound).expect("xhttp h3 should validate");
+        assert_eq!(
+            resolve_xhttp_http_version(&outbound).expect("HTTP version"),
+            XhttpHttpVersion::Http3
+        );
+        let endpoint = build_xhttp_upload_endpoint_config(&outbound, true)
+            .expect("HTTP/3 TLS endpoint should build")
+            .expect("HTTP/3 should own TLS security");
+        assert!(matches!(
+            endpoint.security,
+            crate::proxy::transport::XhttpSecurity::Tls
+        ));
+        assert_eq!(endpoint.alpn_protocols, vec!["h3".to_owned()]);
+        crate::proxy::vless::Handler::try_from(&outbound)
+            .expect("HTTP/3 VLESS handler should build");
+    }
+
+    #[cfg(feature = "xhttp-h3")]
+    #[test]
+    fn vless_xhttp_accepts_http3_packet_up_tls() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp-h3-packet-up".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            tls: Some(true),
+            alpn: Some(vec!["h3".to_owned()]),
+            network: Some("xhttp".to_owned()),
+            xhttp_opts: Some(XhttpOpt {
+                path: Some("/xhttp/".to_owned()),
+                mode: Some("packet-up".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        validate_vless_config(&outbound).expect("HTTP/3 packet-up should validate");
+        crate::proxy::vless::Handler::try_from(&outbound)
+            .expect("HTTP/3 packet-up handler should build");
+    }
+
+    #[cfg(feature = "xhttp-h3")]
+    #[test]
+    fn vless_xhttp_accepts_http3_stream_up_tls() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp-h3-stream-up".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            tls: Some(true),
+            alpn: Some(vec!["h3".to_owned()]),
+            network: Some("xhttp".to_owned()),
+            xhttp_opts: Some(XhttpOpt {
+                path: Some("/xhttp/".to_owned()),
+                mode: Some("stream-up".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        validate_vless_config(&outbound).expect("HTTP/3 stream-up should validate");
+        crate::proxy::vless::Handler::try_from(&outbound)
+            .expect("HTTP/3 stream-up handler should build");
+    }
+
+    #[cfg(feature = "xhttp-h3")]
+    #[test]
+    fn vless_xhttp_http3_accepts_upload_reuse() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp-h3-reuse".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            tls: Some(true),
+            alpn: Some(vec!["h3".to_owned()]),
+            network: Some("xhttp".to_owned()),
+            xhttp_opts: Some(XhttpOpt {
+                mode: Some("stream-one".to_owned()),
+                reuse_settings: Some(XhttpReuseSettings {
+                    max_concurrency: Some("2".to_owned()),
+                    c_max_reuse_times: Some("4".to_owned()),
+                    h_max_request_times: Some("8".to_owned()),
+                    h_max_reusable_secs: Some("60".to_owned()),
+                    h_keep_alive_period: Some("0".to_owned()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        validate_vless_config(&outbound).expect("HTTP/3 reuse should validate");
+        crate::proxy::vless::Handler::try_from(&outbound)
+            .expect("HTTP/3 reuse handler should build");
+    }
+
+    #[cfg(feature = "xhttp-h3")]
+    #[test]
+    fn vless_xhttp_http3_accepts_nonzero_keepalive_period() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp-h3-keepalive".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            tls: Some(true),
+            alpn: Some(vec!["h3".to_owned()]),
+            network: Some("xhttp".to_owned()),
+            xhttp_opts: Some(XhttpOpt {
+                mode: Some("stream-one".to_owned()),
+                reuse_settings: Some(XhttpReuseSettings {
+                    h_keep_alive_period: Some("10".to_owned()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        validate_vless_config(&outbound)
+            .expect("HTTP/3 nonzero keepalive should validate");
+        crate::proxy::vless::Handler::try_from(&outbound)
+            .expect("HTTP/3 nonzero keepalive handler should build");
+    }
+
+    #[cfg(feature = "xhttp-h3")]
+    #[test]
+    fn vless_xhttp_http3_accepts_download_settings_for_split_modes() {
+        for mode in ["stream-up", "packet-up"] {
+            let outbound = OutboundVless {
+                common_opts: CommonConfigOptions {
+                    name: format!("xhttp-h3-download-{mode}"),
+                    server: "upload.example.com".to_owned(),
+                    port: 443,
+                    connect_via: None,
+                },
+                uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+                tls: Some(true),
+                alpn: Some(vec!["h3".to_owned()]),
+                network: Some("xhttp".to_owned()),
+                xhttp_opts: Some(XhttpOpt {
+                    path: Some("/upload/".to_owned()),
+                    mode: Some(mode.to_owned()),
+                    reuse_settings: Some(XhttpReuseSettings {
+                        max_concurrency: Some("2".to_owned()),
+                        c_max_reuse_times: Some("2".to_owned()),
+                        h_keep_alive_period: Some("0".to_owned()),
+                        ..Default::default()
+                    }),
+                    download_settings: Some(XhttpDownloadSettings {
+                        address: "download.example.com".to_owned(),
+                        port: 8443,
+                        network: "xhttp".to_owned(),
+                        tls: Some(true),
+                        alpn: Some(vec!["h3".to_owned()]),
+                        path: Some("/download/".to_owned()),
+                        reuse_settings: Some(XhttpReuseSettings {
+                            max_concurrency: Some("1".to_owned()),
+                            c_max_reuse_times: Some("2".to_owned()),
+                            h_keep_alive_period: Some("0".to_owned()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+
+            validate_vless_config(&outbound)
+                .expect("HTTP/3 split-mode download-settings should validate");
+            crate::proxy::vless::Handler::try_from(&outbound)
+                .expect("HTTP/3 split-mode download-settings handler should build");
+        }
+    }
+
+    #[cfg(feature = "xhttp-h3")]
+    #[test]
+    fn vless_xhttp_http3_stream_one_rejects_download_settings() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp-h3-download-stream-one".to_owned(),
+                server: "upload.example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            tls: Some(true),
+            alpn: Some(vec!["h3".to_owned()]),
+            network: Some("xhttp".to_owned()),
+            xhttp_opts: Some(XhttpOpt {
+                mode: Some("stream-one".to_owned()),
+                download_settings: Some(XhttpDownloadSettings {
+                    address: "download.example.com".to_owned(),
+                    port: 8443,
+                    network: "xhttp".to_owned(),
+                    tls: Some(true),
+                    alpn: Some(vec!["h3".to_owned()]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
             ..Default::default()
         };
 
         let err = validate_vless_config(&outbound)
-            .expect_err("xhttp h3 must fail until an HTTP/3 backend exists");
+            .expect_err("HTTP/3 stream-one must reject separate download-settings");
         assert!(
-            err.to_string().contains("HTTP/3 is not implemented yet"),
-            "unexpected error: {err}"
+            err.to_string()
+                .contains("stream-one does not support download-settings")
         );
+    }
+
+    #[cfg(all(feature = "xhttp-h3", feature = "reality"))]
+    #[test]
+    fn vless_xhttp_http3_rejects_reality() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp-h3-reality".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            tls: Some(true),
+            alpn: Some(vec!["h3".to_owned()]),
+            network: Some("xhttp".to_owned()),
+            reality_opts: Some(OutboundTrojanRealityOpts {
+                public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
+                short_id: None,
+            }),
+            xhttp_opts: Some(XhttpOpt {
+                mode: Some("stream-one".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = validate_vless_config(&outbound)
+            .expect_err("HTTP/3 Reality is not implemented");
+        assert!(err.to_string().contains("standard TLS only"));
+    }
+
+    #[cfg(not(feature = "xhttp-h3"))]
+    #[test]
+    fn vless_xhttp_http3_requires_feature() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp-h3-disabled".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            tls: Some(true),
+            alpn: Some(vec!["h3".to_owned()]),
+            network: Some("xhttp".to_owned()),
+            xhttp_opts: Some(XhttpOpt {
+                mode: Some("stream-one".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = validate_vless_config(&outbound)
+            .expect_err("HTTP/3 feature must fail explicitly when disabled");
+        assert!(err.to_string().contains("requires xhttp-h3 feature"));
     }
 
     #[test]
