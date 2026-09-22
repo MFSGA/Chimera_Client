@@ -52,6 +52,12 @@ pub struct HandlerOptions {
 pub struct Handler {
     opts: HandlerOptions,
     connector: tokio::sync::RwLock<Option<Arc<dyn RemoteConnector>>>,
+    #[cfg(feature = "vless-encryption")]
+    #[allow(
+        dead_code,
+        reason = "wired into the zero-RTT encryption stream in the next slice"
+    )]
+    zero_rtt_cache: Option<Arc<encryption::ZeroRttSessionCache>>,
 }
 
 impl std::fmt::Debug for Handler {
@@ -66,9 +72,18 @@ impl_default_connector!(Handler);
 
 impl Handler {
     pub fn new(opts: HandlerOptions) -> Self {
+        #[cfg(feature = "vless-encryption")]
+        let zero_rtt_cache = opts
+            .encryption
+            .as_ref()
+            .filter(|config| config.uses_zero_rtt())
+            .map(|_| Arc::new(encryption::ZeroRttSessionCache::default()));
+
         Self {
             opts,
             connector: Default::default(),
+            #[cfg(feature = "vless-encryption")]
+            zero_rtt_cache,
         }
     }
 
@@ -89,7 +104,11 @@ impl Handler {
             #[cfg(feature = "vless-encryption")]
             {
                 let prepared = config.prepare_crypto()?;
-                Box::new(EncryptionStream::new(s, prepared)?) as AnyStream
+                Box::new(EncryptionStream::new(
+                    s,
+                    prepared,
+                    self.zero_rtt_cache.clone(),
+                )?) as AnyStream
             }
             #[cfg(not(feature = "vless-encryption"))]
             {
@@ -352,6 +371,8 @@ impl OutboundHandler for Handler {
 
 #[cfg(test)]
 mod reuse_tests {
+    #[cfg(feature = "vless-encryption")]
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use std::sync::Arc;
 
     use super::*;
@@ -396,6 +417,36 @@ mod reuse_tests {
             });
             Ok(Some(Box::new(stream)))
         }
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    #[test]
+    fn zero_rtt_handler_owns_cache_only_for_zero_rtt_mode() {
+        let key = URL_SAFE_NO_PAD.encode([0x77; 32]);
+        let zero_rtt = encryption::Config::parse(&format!(
+            "mlkem768x25519plus.native.0rtt.{key}"
+        ))
+        .expect("zero-rtt encryption config should parse");
+        let one_rtt = encryption::Config::parse(&format!(
+            "mlkem768x25519plus.native.1rtt.{key}"
+        ))
+        .expect("one-rtt encryption config should parse");
+
+        let options = |encryption| HandlerOptions {
+            name: "cache-test".to_owned(),
+            common_opts: HandlerCommonOptions::default(),
+            server: "example.com".to_owned(),
+            port: 443,
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            udp: false,
+            transport: None,
+            tls: None,
+            flow: None,
+            encryption: Some(encryption),
+        };
+
+        assert!(Handler::new(options(zero_rtt)).zero_rtt_cache.is_some());
+        assert!(Handler::new(options(one_rtt)).zero_rtt_cache.is_none());
     }
 
     #[tokio::test]

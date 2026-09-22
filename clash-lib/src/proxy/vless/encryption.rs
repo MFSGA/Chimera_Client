@@ -1,5 +1,11 @@
 use std::io;
 
+#[cfg(feature = "vless-encryption")]
+use std::{
+    sync::RwLock,
+    time::{Duration, Instant},
+};
+
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 #[cfg(feature = "vless-encryption")]
 use rand::RngExt;
@@ -76,6 +82,8 @@ const MAX_RECORD_CIPHERTEXT_LEN: usize = 16640;
 #[cfg(feature = "vless-encryption")]
 const PFS_KEY_EXCHANGE_LEN: usize =
     ENCRYPTED_LENGTH_LEN + PFS_PUBLIC_KEY_LEN + AEAD_TAG_LEN;
+#[cfg(feature = "vless-encryption")]
+const ZERO_RTT_PFS_KEY_LEN: usize = 64;
 const DEFAULT_PADDING: [(PaddingKind, i64, i64, i64); 3] = [
     (PaddingKind::Length, 100, 111, 1111),
     (PaddingKind::Gap, 75, 0, 111),
@@ -186,6 +194,102 @@ impl PaddingPlan {
 
 #[cfg(feature = "vless-encryption")]
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ZeroRttSession {
+    pub(crate) pfs_key: [u8; ZERO_RTT_PFS_KEY_LEN],
+    pub(crate) ticket: [u8; 16],
+    pub(crate) expires_at: Instant,
+}
+
+#[cfg(feature = "vless-encryption")]
+#[derive(Debug, Default)]
+pub(crate) struct ZeroRttSessionCache {
+    state: RwLock<Option<ZeroRttSession>>,
+}
+
+#[cfg(feature = "vless-encryption")]
+#[allow(
+    dead_code,
+    reason = "cache accessors are wired into the zero-RTT stream in the next slice"
+)]
+impl ZeroRttSessionCache {
+    pub(crate) fn snapshot(&self) -> Option<ZeroRttSession> {
+        self.snapshot_at(Instant::now())
+    }
+
+    fn snapshot_at(&self, now: Instant) -> Option<ZeroRttSession> {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match state.as_ref() {
+            Some(session) if now < session.expires_at => Some(session.clone()),
+            Some(_) => {
+                *state = None;
+                None
+            }
+            None => None,
+        }
+    }
+
+    pub(crate) fn store(
+        &self,
+        pfs_key: [u8; ZERO_RTT_PFS_KEY_LEN],
+        ticket: [u8; 16],
+        ticket_seconds: u16,
+    ) {
+        self.store_at(pfs_key, ticket, ticket_seconds, Instant::now());
+    }
+
+    fn store_at(
+        &self,
+        pfs_key: [u8; ZERO_RTT_PFS_KEY_LEN],
+        ticket: [u8; 16],
+        ticket_seconds: u16,
+        now: Instant,
+    ) {
+        if ticket_seconds == 0 {
+            return;
+        }
+        let expires_at = now + Duration::from_secs(u64::from(ticket_seconds));
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state = Some(ZeroRttSession {
+            pfs_key,
+            ticket,
+            expires_at,
+        });
+    }
+
+    pub(crate) fn invalidate(&self) {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state = None;
+    }
+
+    pub(crate) fn invalidate_if_pfs_key_matches(
+        &self,
+        pfs_key: &[u8; ZERO_RTT_PFS_KEY_LEN],
+    ) -> bool {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let matches = state
+            .as_ref()
+            .is_some_and(|session| &session.pfs_key == pfs_key);
+        if matches {
+            *state = None;
+        }
+        matches
+    }
+}
+
+#[cfg(feature = "vless-encryption")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PreparedNfsRelays {
     pub(crate) iv: [u8; CLIENT_HELLO_IV_LEN],
     pub(crate) relays: Vec<u8>,
@@ -211,6 +315,7 @@ pub(crate) struct PreparedOneRttHello {
 )]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PreparedOneRttSession {
+    pub(crate) pfs_key: [u8; ZERO_RTT_PFS_KEY_LEN],
     pub(crate) united_key: Vec<u8>,
     pub(crate) write_aead_context: Vec<u8>,
     pub(crate) read_aead_context: Vec<u8>,
@@ -249,6 +354,7 @@ pub(crate) struct EncryptionRecordCodec {
 #[cfg(feature = "vless-encryption")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PreparedCrypto {
+    pub(crate) rtt: RttMode,
     pub(crate) xor_mode: u32,
     pub(crate) relays_length: usize,
     pub(crate) nfs_relays: PreparedNfsRelays,
@@ -261,6 +367,103 @@ pub(crate) struct PreparedCrypto {
     pub(crate) client_hello_max_len: usize,
     pub(crate) hello_write_lengths: Vec<usize>,
     pub(crate) padding_gaps_ms: Vec<u64>,
+}
+
+#[cfg(feature = "vless-encryption")]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "consumed by the zero-RTT runtime stream in the next slice"
+    )
+)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedZeroRttSession {
+    pub(crate) prewrite: Vec<u8>,
+    pub(crate) pfs_key: [u8; ZERO_RTT_PFS_KEY_LEN],
+    pub(crate) united_key: Vec<u8>,
+    pub(crate) write_aead_context: [u8; 32],
+    pub(crate) write_aead_key: [u8; 32],
+}
+
+#[cfg(feature = "vless-encryption")]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "consumed by the zero-RTT runtime stream in the next slice"
+    )
+)]
+impl PreparedZeroRttSession {
+    pub(crate) fn write_codec(&self) -> io::Result<EncryptionRecordCodec> {
+        EncryptionRecordCodec::new(&self.write_aead_key, [0u8; 12])
+    }
+
+    pub(crate) fn read_codec(
+        &self,
+        server_context: [u8; 16],
+    ) -> io::Result<EncryptionRecordCodec> {
+        let read_aead_key =
+            blake3_derive_key_raw_context(&server_context, &self.united_key)?;
+        EncryptionRecordCodec::new(&read_aead_key, [0u8; 12])
+    }
+}
+
+#[cfg(feature = "vless-encryption")]
+impl PreparedCrypto {
+    #[allow(
+        dead_code,
+        reason = "wired into the zero-RTT runtime stream in the next slice"
+    )]
+    pub(crate) fn prepare_zero_rtt(
+        &self,
+        cached: &ZeroRttSession,
+    ) -> io::Result<PreparedZeroRttSession> {
+        if !matches!(self.rtt, RttMode::ZeroRtt) {
+            return Err(invalid(
+                "zero-RTT session requested for non-0rtt vless encryption config",
+            ));
+        }
+
+        let mut nfs_aead = EncryptionAead::new(&self.nfs_aead_key)?;
+        let encrypted_ticket_len = nfs_aead.seal(&encode_length(32)?)?;
+        if encrypted_ticket_len.len() != ENCRYPTED_LENGTH_LEN {
+            return Err(invalid(
+                "unexpected encrypted zero-RTT ticket length field size",
+            ));
+        }
+        let encrypted_ticket = nfs_aead.seal(&cached.ticket)?;
+        let write_aead_context: [u8; 32] = encrypted_ticket
+            .as_slice()
+            .try_into()
+            .map_err(|_| invalid("unexpected encrypted zero-RTT ticket size"))?;
+
+        let mut united_key =
+            Vec::with_capacity(cached.pfs_key.len() + self.nfs_relays.nfs_key.len());
+        united_key.extend_from_slice(&cached.pfs_key);
+        united_key.extend_from_slice(&self.nfs_relays.nfs_key);
+        let write_aead_key =
+            blake3_derive_key_raw_context(&write_aead_context, &united_key)?;
+
+        let mut prewrite = Vec::with_capacity(
+            CLIENT_HELLO_IV_LEN
+                + self.nfs_relays.relays.len()
+                + ENCRYPTED_LENGTH_LEN
+                + write_aead_context.len(),
+        );
+        prewrite.extend_from_slice(&self.nfs_relays.iv);
+        prewrite.extend_from_slice(&self.nfs_relays.relays);
+        prewrite.extend_from_slice(&encrypted_ticket_len);
+        prewrite.extend_from_slice(&write_aead_context);
+
+        Ok(PreparedZeroRttSession {
+            prewrite,
+            pfs_key: cached.pfs_key,
+            united_key,
+            write_aead_context,
+            write_aead_key,
+        })
+    }
 }
 
 #[cfg(feature = "vless-encryption")]
@@ -329,11 +532,20 @@ impl PreparedOneRttHello {
             },
         )?;
 
-        let mut united_key = Vec::with_capacity(
-            mlkem_secret.as_ref().len() + x25519_secret.len() + nfs_key.len(),
-        );
-        united_key.extend_from_slice(mlkem_secret.as_ref());
-        united_key.extend_from_slice(&x25519_secret);
+        let mut pfs_key = [0u8; ZERO_RTT_PFS_KEY_LEN];
+        let mlkem_secret: [u8; 32] = mlkem_secret
+            .as_ref()
+            .try_into()
+            .map_err(|_| invalid("unexpected ML-KEM-768 shared-secret length"))?;
+        let x25519_secret: [u8; 32] = x25519_secret
+            .as_slice()
+            .try_into()
+            .map_err(|_| invalid("unexpected X25519 shared-secret length"))?;
+        pfs_key[..32].copy_from_slice(&mlkem_secret);
+        pfs_key[32..].copy_from_slice(&x25519_secret);
+
+        let mut united_key = Vec::with_capacity(pfs_key.len() + nfs_key.len());
+        united_key.extend_from_slice(&pfs_key);
         united_key.extend_from_slice(nfs_key);
 
         let write_aead_context = self.pfs_public_key.clone();
@@ -344,6 +556,7 @@ impl PreparedOneRttHello {
             blake3_derive_key_raw_context(&read_aead_context, &united_key)?;
 
         Ok(PreparedOneRttSession {
+            pfs_key,
             united_key,
             write_aead_context,
             read_aead_context,
@@ -543,6 +756,11 @@ fn decode_record_header(header: &[u8; RECORD_HEADER_LEN]) -> io::Result<usize> {
 }
 
 impl Config {
+    #[cfg(feature = "vless-encryption")]
+    pub(crate) fn uses_zero_rtt(&self) -> bool {
+        matches!(self.rtt, RttMode::ZeroRtt)
+    }
+
     pub(crate) fn parse(raw: &str) -> io::Result<Self> {
         let parts = raw.split('.').collect::<Vec<_>>();
         if parts.len() < 4 {
@@ -782,12 +1000,8 @@ impl Config {
             kem::{DecapsulationKey, ML_KEM_768},
         };
 
-        if !matches!(self.rtt, RttMode::OneRtt) {
-            return Err(invalid(
-                "1-RTT hello requested for non-1rtt vless encryption config",
-            ));
-        }
-
+        // A 0-RTT client still needs this full handshake as the cache-miss /
+        // expired-ticket fallback that seeds a reusable session.
         let mlkem_private = DecapsulationKey::generate(&ML_KEM_768)
             .map_err(|_| invalid("failed to generate ML-KEM-768 PFS key"))?;
         let mlkem_public = mlkem_private
@@ -943,17 +1157,14 @@ impl Config {
             })?;
         let padding_plan = self.sample_padding_plan();
         let hello_write_lengths = padding_plan.with_hello_prefix(fixed_hello_len)?;
-        let one_rtt_hello = if matches!(self.rtt, RttMode::OneRtt) {
-            Some(self.prepare_one_rtt_hello(
-                &nfs_relays,
-                &nfs_aead_key,
-                &padding_plan,
-            )?)
-        } else {
-            None
-        };
+        let one_rtt_hello = Some(self.prepare_one_rtt_hello(
+            &nfs_relays,
+            &nfs_aead_key,
+            &padding_plan,
+        )?);
 
         Ok(PreparedCrypto {
+            rtt: self.rtt,
             xor_mode: self.appearance.xor_mode(),
             relays_length,
             nfs_relays,
@@ -1492,6 +1703,61 @@ mod tests {
         URL_SAFE_NO_PAD.encode(vec![value; len])
     }
 
+    #[cfg(feature = "vless-encryption")]
+    #[test]
+    fn zero_rtt_cache_expires_at_server_ticket_deadline() {
+        let cache = ZeroRttSessionCache::default();
+        let now = Instant::now();
+        let pfs_key = [0x11; ZERO_RTT_PFS_KEY_LEN];
+        let ticket = [0x22; 16];
+
+        cache.store_at(pfs_key, ticket, 10, now);
+
+        let session = cache
+            .snapshot_at(now + Duration::from_secs(9))
+            .expect("ticket should still be valid before its deadline");
+        assert_eq!(session.pfs_key, pfs_key);
+        assert_eq!(session.ticket, ticket);
+        assert_eq!(session.expires_at, now + Duration::from_secs(10));
+
+        assert!(cache.snapshot_at(now + Duration::from_secs(10)).is_none());
+        assert!(cache.snapshot_at(now + Duration::from_secs(11)).is_none());
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    #[test]
+    fn zero_rtt_cache_invalidation_does_not_remove_newer_pfs_state() {
+        let cache = ZeroRttSessionCache::default();
+        let now = Instant::now();
+        let current_pfs = [0x71; ZERO_RTT_PFS_KEY_LEN];
+
+        cache.store_at(current_pfs, [0x72; 16], 30, now);
+        assert!(!cache.invalidate_if_pfs_key_matches(&[0x73; ZERO_RTT_PFS_KEY_LEN]));
+        assert_eq!(
+            cache.snapshot_at(now).expect("cache should remain").pfs_key,
+            current_pfs
+        );
+
+        assert!(cache.invalidate_if_pfs_key_matches(&current_pfs));
+        assert!(cache.snapshot_at(now).is_none());
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    #[test]
+    fn zero_rtt_cache_ignores_zero_lifetime_and_supports_invalidation() {
+        let cache = ZeroRttSessionCache::default();
+        let now = Instant::now();
+
+        cache.store_at([0x33; ZERO_RTT_PFS_KEY_LEN], [0x44; 16], 0, now);
+        assert!(cache.snapshot_at(now).is_none());
+
+        cache.store_at([0x55; ZERO_RTT_PFS_KEY_LEN], [0x66; 16], 30, now);
+        assert!(cache.snapshot_at(now).is_some());
+
+        cache.invalidate();
+        assert!(cache.snapshot_at(now).is_none());
+    }
+
     #[test]
     fn parses_x25519_and_mlkem_key_chain() {
         let x25519 = encoded_key(X25519_PUBLIC_KEY_LEN, 7);
@@ -1879,6 +2145,146 @@ mod tests {
 
     #[cfg(feature = "vless-encryption")]
     #[test]
+    fn zero_rtt_prewrite_matches_xray_ticket_and_record_contexts() {
+        use aws_lc_rs::agreement;
+
+        let server_private =
+            agreement::PrivateKey::generate(&agreement::X25519).unwrap();
+        let server_public = server_private.compute_public_key().unwrap();
+        let raw = format!(
+            "{METHOD}.native.0rtt.{}",
+            URL_SAFE_NO_PAD.encode(server_public.as_ref()),
+        );
+        let config = Config::parse(&raw).expect("0rtt config should parse");
+        let prepared = config.prepare_crypto().expect("crypto should prepare");
+        let cached = ZeroRttSession {
+            pfs_key: [0x11; ZERO_RTT_PFS_KEY_LEN],
+            ticket: [0x22; 16],
+            expires_at: Instant::now() + Duration::from_secs(60),
+        };
+        let zero_rtt = prepared
+            .prepare_zero_rtt(&cached)
+            .expect("zero-rtt session should prepare");
+
+        assert_eq!(
+            zero_rtt.prewrite.len(),
+            CLIENT_HELLO_IV_LEN + prepared.relays_length + ENCRYPTED_LENGTH_LEN + 32
+        );
+
+        let relay_start = CLIENT_HELLO_IV_LEN;
+        let relay_end = relay_start + prepared.relays_length;
+        let relay_public = agreement::UnparsedPublicKey::new(
+            &agreement::X25519,
+            &zero_rtt.prewrite[relay_start..relay_end],
+        );
+        let mut server_nfs_key = Vec::new();
+        agreement::agree(
+            &server_private,
+            relay_public,
+            invalid("server X25519 agreement failed"),
+            |material| {
+                server_nfs_key.extend_from_slice(material);
+                Ok(())
+            },
+        )
+        .expect("server should recover NFS key");
+        assert_eq!(server_nfs_key, prepared.nfs_relays.nfs_key);
+
+        let nfs_aead_key = blake3_derive_key_raw_context(
+            &zero_rtt.prewrite[..CLIENT_HELLO_IV_LEN],
+            &server_nfs_key,
+        )
+        .expect("server NFS key should derive");
+        let mut nfs_aead =
+            EncryptionAead::new(&nfs_aead_key).expect("server NFS AEAD");
+        let ticket_len_plain = nfs_aead
+            .open(&zero_rtt.prewrite[relay_end..relay_end + ENCRYPTED_LENGTH_LEN])
+            .expect("ticket length should decrypt");
+        assert_eq!(
+            u16::from_be_bytes(ticket_len_plain.as_slice().try_into().unwrap()),
+            32
+        );
+
+        let ticket_start = relay_end + ENCRYPTED_LENGTH_LEN;
+        let encrypted_ticket = &zero_rtt.prewrite[ticket_start..ticket_start + 32];
+        let ticket_plain = nfs_aead
+            .open(encrypted_ticket)
+            .expect("ticket should decrypt");
+        assert_eq!(ticket_plain, cached.ticket);
+        assert_eq!(encrypted_ticket, zero_rtt.write_aead_context);
+
+        let mut expected_united = cached.pfs_key.to_vec();
+        expected_united.extend_from_slice(&server_nfs_key);
+        assert_eq!(zero_rtt.united_key, expected_united);
+        assert_eq!(
+            zero_rtt.write_aead_key,
+            blake3_derive_key_raw_context(encrypted_ticket, &expected_united)
+                .expect("upload record key should derive")
+        );
+
+        let mut client_writer = zero_rtt.write_codec().expect("client writer");
+        let upload_record = client_writer
+            .seal_record(b"ping")
+            .expect("client upload should encrypt");
+        let mut server_reader =
+            EncryptionRecordCodec::new(&zero_rtt.write_aead_key, [0u8; 12])
+                .expect("server reader");
+        assert_eq!(
+            server_reader
+                .open_record(&upload_record)
+                .expect("server upload decrypt"),
+            b"ping"
+        );
+
+        let server_context = [0x99; 16];
+        let server_write_key =
+            blake3_derive_key_raw_context(&server_context, &expected_united)
+                .expect("download record key should derive");
+        let mut server_writer =
+            EncryptionRecordCodec::new(&server_write_key, [0u8; 12])
+                .expect("server writer");
+        let download_record = server_writer
+            .seal_record(b"pong")
+            .expect("server download should encrypt");
+        let mut client_reader = zero_rtt
+            .read_codec(server_context)
+            .expect("client reader should derive");
+        assert_eq!(
+            client_reader
+                .open_record(&download_record)
+                .expect("client download decrypt"),
+            b"pong"
+        );
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    #[test]
+    fn zero_rtt_preparation_rejects_one_rtt_config() {
+        use aws_lc_rs::agreement;
+
+        let server_private =
+            agreement::PrivateKey::generate(&agreement::X25519).unwrap();
+        let server_public = server_private.compute_public_key().unwrap();
+        let raw = format!(
+            "{METHOD}.native.1rtt.100-64-64.{}",
+            URL_SAFE_NO_PAD.encode(server_public.as_ref()),
+        );
+        let config = Config::parse(&raw).expect("1rtt config should parse");
+        let prepared = config.prepare_crypto().expect("crypto should prepare");
+        let cached = ZeroRttSession {
+            pfs_key: [0x11; ZERO_RTT_PFS_KEY_LEN],
+            ticket: [0x22; 16],
+            expires_at: Instant::now() + Duration::from_secs(60),
+        };
+
+        let err = prepared
+            .prepare_zero_rtt(&cached)
+            .expect_err("1rtt config must not prepare zero-rtt wire state");
+        assert!(err.to_string().contains("non-0rtt"));
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    #[test]
     fn one_rtt_client_hello_matches_xray_nfs_aead_layout() {
         use aws_lc_rs::{
             agreement,
@@ -2154,6 +2560,7 @@ mod tests {
     #[test]
     fn one_rtt_server_tail_rejects_wrong_field_lengths() {
         let session = PreparedOneRttSession {
+            pfs_key: [0u8; ZERO_RTT_PFS_KEY_LEN],
             united_key: vec![0u8; 96],
             write_aead_context: vec![0u8; PFS_PUBLIC_KEY_LEN],
             read_aead_context: vec![0u8; SERVER_PFS_PUBLIC_KEY_LEN],
@@ -2212,6 +2619,7 @@ mod tests {
     fn encryption_record_codec_continues_after_peer_padding() {
         let key = [0x52u8; 32];
         let session = PreparedOneRttSession {
+            pfs_key: [0u8; ZERO_RTT_PFS_KEY_LEN],
             united_key: vec![0u8; 96],
             write_aead_context: vec![0u8; PFS_PUBLIC_KEY_LEN],
             read_aead_context: vec![0u8; SERVER_PFS_PUBLIC_KEY_LEN],
@@ -2395,12 +2803,353 @@ mod tests {
         });
 
         let mut stream =
-            EncryptionStream::new(Box::new(client), prepared).expect("stream");
+            EncryptionStream::new(Box::new(client), prepared, None).expect("stream");
         stream.write_all(b"ping").await.expect("encrypted ping");
 
         let mut pong = [0u8; 4];
         stream.read_exact(&mut pong).await.expect("encrypted pong");
         assert_eq!(&pong, b"pong");
+
+        server_task.await.expect("server task");
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    #[tokio::test]
+    async fn encryption_stream_zero_rtt_cache_miss_seeds_from_one_rtt() {
+        use std::sync::Arc;
+
+        use aws_lc_rs::{
+            agreement,
+            kem::{EncapsulationKey, ML_KEM_768},
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        use super::super::encryption_stream::EncryptionStream;
+
+        let nfs_private =
+            agreement::PrivateKey::generate(&agreement::X25519).unwrap();
+        let nfs_public = nfs_private.compute_public_key().unwrap();
+        let raw = format!(
+            "{METHOD}.native.0rtt.100-64-64.{}",
+            URL_SAFE_NO_PAD.encode(nfs_public.as_ref()),
+        );
+        let config = Config::parse(&raw).expect("0rtt config should parse");
+        let prepared = config.prepare_crypto().expect("crypto should prepare");
+        let server_prepared = prepared.clone();
+        let cache = Arc::new(ZeroRttSessionCache::default());
+        assert!(cache.snapshot().is_none());
+
+        let (client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let hello = server_prepared
+                .one_rtt_hello
+                .as_ref()
+                .expect("fallback 1rtt hello");
+            let mut received_hello = vec![0u8; hello.bytes.len()];
+            server
+                .read_exact(&mut received_hello)
+                .await
+                .expect("fallback client hello");
+            assert_eq!(received_hello, hello.bytes);
+
+            let client_mlkem_public = EncapsulationKey::new(
+                &ML_KEM_768,
+                &hello.pfs_public_key[..MLKEM768_PUBLIC_KEY_LEN],
+            )
+            .expect("client ML-KEM public key");
+            let (mlkem_ciphertext, mlkem_secret) = client_mlkem_public
+                .encapsulate()
+                .expect("server ML-KEM encapsulation");
+            let server_x25519_private =
+                agreement::PrivateKey::generate(&agreement::X25519).unwrap();
+            let server_x25519_public =
+                server_x25519_private.compute_public_key().unwrap();
+            let client_x25519_public = agreement::UnparsedPublicKey::new(
+                &agreement::X25519,
+                &hello.pfs_public_key[MLKEM768_PUBLIC_KEY_LEN..],
+            );
+            let mut x25519_secret = Vec::new();
+            agreement::agree(
+                &server_x25519_private,
+                client_x25519_public,
+                invalid("server X25519 agreement failed"),
+                |material| {
+                    x25519_secret.extend_from_slice(material);
+                    Ok(())
+                },
+            )
+            .expect("server X25519 agreement");
+
+            let mut server_pfs = Vec::with_capacity(SERVER_PFS_PUBLIC_KEY_LEN);
+            server_pfs.extend_from_slice(mlkem_ciphertext.as_ref());
+            server_pfs.extend_from_slice(server_x25519_public.as_ref());
+            let nfs_aead = EncryptionAead::new(&server_prepared.nfs_aead_key)
+                .expect("NFS AEAD");
+            let encrypted_server_pfs = nfs_aead
+                .seal_with_nonce(&server_pfs, [0xff; 12])
+                .expect("server PFS encryption");
+
+            let mut expected_pfs = [0u8; ZERO_RTT_PFS_KEY_LEN];
+            expected_pfs[..32].copy_from_slice(mlkem_secret.as_ref());
+            expected_pfs[32..].copy_from_slice(&x25519_secret);
+            let mut united_key = expected_pfs.to_vec();
+            united_key.extend_from_slice(&server_prepared.nfs_relays.nfs_key);
+            let client_write_key =
+                blake3_derive_key_raw_context(&hello.pfs_public_key, &united_key)
+                    .expect("client write key");
+            let server_write_key =
+                blake3_derive_key_raw_context(&server_pfs, &united_key)
+                    .expect("server write key");
+
+            let mut ticket = [0x44u8; 16];
+            ticket[..2].copy_from_slice(&60u16.to_be_bytes());
+            let mut server_aead =
+                EncryptionAead::new(&server_write_key).expect("server AEAD");
+            let encrypted_ticket = server_aead.seal(&ticket).expect("server ticket");
+            let encrypted_padding_len = server_aead
+                .seal(&encode_length(48).expect("padding length"))
+                .expect("server padding length");
+            let encrypted_padding =
+                server_aead.seal(&[0u8; 32]).expect("server padding");
+
+            let mut server_hello = Vec::new();
+            server_hello.extend_from_slice(&encrypted_server_pfs);
+            server_hello.extend_from_slice(&encrypted_ticket);
+            server_hello.extend_from_slice(&encrypted_padding_len);
+            server_hello.extend_from_slice(&encrypted_padding);
+            server
+                .write_all(&server_hello)
+                .await
+                .expect("fallback server hello");
+
+            let mut header = [0u8; RECORD_HEADER_LEN];
+            server
+                .read_exact(&mut header)
+                .await
+                .expect("client record header");
+            let body_len =
+                decode_record_header(&header).expect("client record header");
+            let mut body = vec![0u8; body_len];
+            server
+                .read_exact(&mut body)
+                .await
+                .expect("client record body");
+            let mut record = header.to_vec();
+            record.extend_from_slice(&body);
+            let mut upload_reader =
+                EncryptionRecordCodec::new(&client_write_key, [0u8; 12])
+                    .expect("client record codec");
+            assert_eq!(
+                upload_reader.open_record(&record).expect("upload decrypt"),
+                b"ping"
+            );
+
+            (expected_pfs, ticket)
+        });
+
+        let mut stream = EncryptionStream::new(
+            Box::new(client),
+            prepared,
+            Some(Arc::clone(&cache)),
+        )
+        .expect("zero-rtt fallback stream");
+        stream
+            .write_all(b"ping")
+            .await
+            .expect("fallback encrypted ping");
+
+        let (expected_pfs, expected_ticket) =
+            server_task.await.expect("server task");
+        let cached = cache.snapshot().expect("fallback must seed cache");
+        assert_eq!(cached.pfs_key, expected_pfs);
+        assert_eq!(cached.ticket, expected_ticket);
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    #[tokio::test]
+    async fn encryption_stream_native_zero_rtt_uses_cached_ticket() {
+        use std::sync::Arc;
+
+        use aws_lc_rs::agreement;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        use super::super::encryption_stream::EncryptionStream;
+
+        let nfs_private =
+            agreement::PrivateKey::generate(&agreement::X25519).unwrap();
+        let nfs_public = nfs_private.compute_public_key().unwrap();
+        let raw = format!(
+            "{METHOD}.native.0rtt.{}",
+            URL_SAFE_NO_PAD.encode(nfs_public.as_ref()),
+        );
+        let config = Config::parse(&raw).expect("0rtt config should parse");
+        let prepared = config.prepare_crypto().expect("crypto should prepare");
+        let relays_length = prepared.relays_length;
+        let cached_pfs_key = [0x31; ZERO_RTT_PFS_KEY_LEN];
+        let cached_ticket = [0x42; 16];
+        let cache = Arc::new(ZeroRttSessionCache::default());
+        cache.store(cached_pfs_key, cached_ticket, 60);
+
+        let (client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let prewrite_len =
+                CLIENT_HELLO_IV_LEN + relays_length + ENCRYPTED_LENGTH_LEN + 32;
+            let mut prewrite = vec![0u8; prewrite_len];
+            server
+                .read_exact(&mut prewrite)
+                .await
+                .expect("zero-rtt prewrite");
+
+            let relay_start = CLIENT_HELLO_IV_LEN;
+            let relay_end = relay_start + relays_length;
+            let relay_public = agreement::UnparsedPublicKey::new(
+                &agreement::X25519,
+                &prewrite[relay_start..relay_end],
+            );
+            let mut nfs_key = Vec::new();
+            agreement::agree(
+                &nfs_private,
+                relay_public,
+                invalid("server X25519 agreement failed"),
+                |material| {
+                    nfs_key.extend_from_slice(material);
+                    Ok(())
+                },
+            )
+            .expect("server NFS agreement");
+
+            let nfs_aead_key = blake3_derive_key_raw_context(
+                &prewrite[..CLIENT_HELLO_IV_LEN],
+                &nfs_key,
+            )
+            .expect("server NFS AEAD key");
+            let mut nfs_aead =
+                EncryptionAead::new(&nfs_aead_key).expect("server NFS AEAD");
+            let ticket_len = nfs_aead
+                .open(&prewrite[relay_end..relay_end + ENCRYPTED_LENGTH_LEN])
+                .expect("ticket length decrypt");
+            assert_eq!(
+                u16::from_be_bytes(ticket_len.as_slice().try_into().unwrap()),
+                32
+            );
+            let ticket_start = relay_end + ENCRYPTED_LENGTH_LEN;
+            let encrypted_ticket = &prewrite[ticket_start..ticket_start + 32];
+            assert_eq!(
+                nfs_aead.open(encrypted_ticket).expect("ticket decrypt"),
+                cached_ticket
+            );
+
+            let mut united_key = cached_pfs_key.to_vec();
+            united_key.extend_from_slice(&nfs_key);
+            let upload_key =
+                blake3_derive_key_raw_context(encrypted_ticket, &united_key)
+                    .expect("upload key");
+
+            let mut header = [0u8; RECORD_HEADER_LEN];
+            server.read_exact(&mut header).await.expect("upload header");
+            let body_len = decode_record_header(&header).expect("upload header");
+            let mut body = vec![0u8; body_len];
+            server.read_exact(&mut body).await.expect("upload body");
+            let mut record = header.to_vec();
+            record.extend_from_slice(&body);
+            let mut upload_reader =
+                EncryptionRecordCodec::new(&upload_key, [0u8; 12])
+                    .expect("upload reader");
+            assert_eq!(
+                upload_reader.open_record(&record).expect("upload decrypt"),
+                b"ping"
+            );
+
+            let server_context = [0x53; 16];
+            let download_key =
+                blake3_derive_key_raw_context(&server_context, &united_key)
+                    .expect("download key");
+            let mut download_writer =
+                EncryptionRecordCodec::new(&download_key, [0u8; 12])
+                    .expect("download writer");
+            let pong = download_writer
+                .seal_record(b"pong")
+                .expect("download encrypt");
+            let mut response = server_context.to_vec();
+            response.extend_from_slice(&pong);
+            server
+                .write_all(&response)
+                .await
+                .expect("zero-rtt response");
+        });
+
+        let mut stream = EncryptionStream::new(
+            Box::new(client),
+            prepared,
+            Some(Arc::clone(&cache)),
+        )
+        .expect("zero-rtt stream");
+        stream.write_all(b"ping").await.expect("zero-rtt ping");
+        let mut pong = [0u8; 4];
+        stream.read_exact(&mut pong).await.expect("zero-rtt pong");
+        assert_eq!(&pong, b"pong");
+        assert!(cache.snapshot().is_some());
+
+        server_task.await.expect("server task");
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    #[tokio::test]
+    async fn encryption_stream_zero_rtt_invalid_header_expires_matching_cache() {
+        use std::sync::Arc;
+
+        use aws_lc_rs::agreement;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        use super::super::encryption_stream::EncryptionStream;
+
+        let nfs_private =
+            agreement::PrivateKey::generate(&agreement::X25519).unwrap();
+        let nfs_public = nfs_private.compute_public_key().unwrap();
+        let raw = format!(
+            "{METHOD}.native.0rtt.{}",
+            URL_SAFE_NO_PAD.encode(nfs_public.as_ref()),
+        );
+        let config = Config::parse(&raw).expect("0rtt config should parse");
+        let prepared = config.prepare_crypto().expect("crypto should prepare");
+        let prewrite_len =
+            CLIENT_HELLO_IV_LEN + prepared.relays_length + ENCRYPTED_LENGTH_LEN + 32;
+        let cache = Arc::new(ZeroRttSessionCache::default());
+        cache.store([0x61; ZERO_RTT_PFS_KEY_LEN], [0x72; 16], 60);
+
+        let (client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let mut request = vec![0u8; prewrite_len + RECORD_HEADER_LEN + 20];
+            server
+                .read_exact(&mut request)
+                .await
+                .expect("zero-rtt request");
+
+            let mut rejection = vec![0x81; 16];
+            rejection.extend_from_slice(&[0, 0, 0, 0, 0]);
+            server
+                .write_all(&rejection)
+                .await
+                .expect("rejection response");
+        });
+
+        let mut stream = EncryptionStream::new(
+            Box::new(client),
+            prepared,
+            Some(Arc::clone(&cache)),
+        )
+        .expect("zero-rtt stream");
+        stream.write_all(b"ping").await.expect("zero-rtt ping");
+        let mut byte = [0u8; 1];
+        let err = stream
+            .read_exact(&mut byte)
+            .await
+            .expect_err("invalid first record must reject cached ticket");
+        assert!(
+            err.to_string().contains("new handshake needed"),
+            "unexpected error: {err}"
+        );
+        assert!(cache.snapshot().is_none());
 
         server_task.await.expect("server task");
     }

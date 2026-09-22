@@ -2,6 +2,7 @@ use std::{
     future::Future,
     io,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
@@ -13,6 +14,7 @@ use tokio::{
 
 use super::encryption::{
     EncryptionRecordCodec, PreparedCrypto, PreparedOneRttSession,
+    PreparedZeroRttSession, RttMode, ZeroRttSessionCache,
 };
 use crate::proxy::AnyStream;
 
@@ -152,11 +154,25 @@ struct PendingRecordWrite {
     user_len: usize,
 }
 
+enum RuntimeMode {
+    OneRtt {
+        zero_rtt_cache: Option<Arc<ZeroRttSessionCache>>,
+    },
+    ZeroRtt {
+        prepared: Box<PreparedZeroRttSession>,
+        zero_rtt_cache: Arc<ZeroRttSessionCache>,
+        server_context: PendingIo,
+        peer_confirmed: bool,
+        prewrite: Option<Vec<u8>>,
+    },
+}
+
 pub(crate) struct EncryptionStream {
     inner: AnyStream,
     prepared: Option<PreparedCrypto>,
     session: Option<PreparedOneRttSession>,
-    hello: PendingHelloWrite,
+    mode: RuntimeMode,
+    hello: Option<PendingHelloWrite>,
     server_pfs: PendingIo,
     server_ticket: PendingIo,
     server_padding_len: PendingIo,
@@ -244,30 +260,87 @@ impl EncryptionStream {
     pub(crate) fn new(
         inner: AnyStream,
         prepared: PreparedCrypto,
+        zero_rtt_cache: Option<Arc<ZeroRttSessionCache>>,
     ) -> io::Result<Self> {
         if prepared.xor_mode != 0 {
             return Err(invalid(
                 "VLESS encryption runtime MVP currently supports only native appearance",
             ));
         }
-        let hello = prepared.one_rtt_hello.as_ref().ok_or_else(|| {
-            invalid("VLESS encryption runtime MVP currently supports only 1rtt")
-        })?;
-        let pending_hello = PendingHelloWrite::new(
-            hello.bytes.clone(),
-            prepared.hello_write_lengths.clone(),
-            prepared.padding_gaps_ms.clone(),
-        )?;
+
+        let (mode, hello, prepared, write_codec) = match prepared.rtt {
+            RttMode::OneRtt => {
+                let hello = prepared.one_rtt_hello.as_ref().ok_or_else(|| {
+                    invalid("VLESS encryption runtime lost 1rtt fallback hello")
+                })?;
+                let pending_hello = PendingHelloWrite::new(
+                    hello.bytes.clone(),
+                    prepared.hello_write_lengths.clone(),
+                    prepared.padding_gaps_ms.clone(),
+                )?;
+                (
+                    RuntimeMode::OneRtt {
+                        zero_rtt_cache: None,
+                    },
+                    Some(pending_hello),
+                    Some(prepared),
+                    None,
+                )
+            }
+            RttMode::ZeroRtt => {
+                let zero_rtt_cache = zero_rtt_cache.ok_or_else(|| {
+                    invalid("VLESS zero-RTT runtime is missing its session cache")
+                })?;
+                if let Some(cached) = zero_rtt_cache.snapshot() {
+                    let mut zero_rtt = prepared.prepare_zero_rtt(&cached)?;
+                    let write_codec = zero_rtt.write_codec()?;
+                    let prewrite = Some(std::mem::take(&mut zero_rtt.prewrite));
+                    (
+                        RuntimeMode::ZeroRtt {
+                            prepared: Box::new(zero_rtt),
+                            zero_rtt_cache,
+                            server_context: PendingIo::with_len(16),
+                            peer_confirmed: false,
+                            prewrite,
+                        },
+                        None,
+                        None,
+                        Some(write_codec),
+                    )
+                } else {
+                    let hello =
+                        prepared.one_rtt_hello.as_ref().ok_or_else(|| {
+                            invalid(
+                                "VLESS encryption runtime lost 1rtt fallback hello",
+                            )
+                        })?;
+                    let pending_hello = PendingHelloWrite::new(
+                        hello.bytes.clone(),
+                        prepared.hello_write_lengths.clone(),
+                        prepared.padding_gaps_ms.clone(),
+                    )?;
+                    (
+                        RuntimeMode::OneRtt {
+                            zero_rtt_cache: Some(zero_rtt_cache),
+                        },
+                        Some(pending_hello),
+                        Some(prepared),
+                        None,
+                    )
+                }
+            }
+        };
 
         Ok(Self {
             inner,
-            hello: pending_hello,
-            prepared: Some(prepared),
+            hello,
+            mode,
+            prepared,
             session: None,
             server_pfs: PendingIo::with_len(SERVER_PFS_RESPONSE_LEN),
             server_ticket: PendingIo::with_len(ENCRYPTED_TICKET_LEN),
             server_padding_len: PendingIo::with_len(ENCRYPTED_LENGTH_LEN),
-            write_codec: None,
+            write_codec,
             read_codec: None,
             peer_padding: None,
             handshake_done: false,
@@ -283,8 +356,15 @@ impl EncryptionStream {
         if self.handshake_done {
             return Poll::Ready(Ok(()));
         }
+        if matches!(self.mode, RuntimeMode::ZeroRtt { .. }) {
+            self.handshake_done = true;
+            return Poll::Ready(Ok(()));
+        }
 
-        match self.hello.poll_write(&mut self.inner, cx) {
+        let hello = self.hello.as_mut().ok_or_else(|| {
+            io::Error::other("VLESS encryption runtime lost 1rtt hello writer")
+        })?;
+        match hello.poll_write(&mut self.inner, cx) {
             Poll::Ready(Ok(())) => {}
             other => return other,
         }
@@ -339,6 +419,12 @@ impl EncryptionStream {
             &self.server_padding_len.data,
         )?;
         let (write_codec, read_codec) = session.record_codecs(&tail)?;
+        if let RuntimeMode::OneRtt {
+            zero_rtt_cache: Some(cache),
+        } = &self.mode
+        {
+            cache.store(session.pfs_key, tail.ticket, tail.ticket_seconds);
+        }
 
         self.peer_padding =
             Some(PendingIo::with_len(tail.peer_padding_ciphertext_len));
@@ -348,6 +434,70 @@ impl EncryptionStream {
         self.session = None;
         self.handshake_done = true;
         Poll::Ready(Ok(()))
+    }
+
+    fn poll_zero_rtt_server_context(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.read_codec.is_some() {
+            return Poll::Ready(Ok(()));
+        }
+        let RuntimeMode::ZeroRtt {
+            prepared,
+            server_context,
+            ..
+        } = &mut self.mode
+        else {
+            return Poll::Ready(Ok(()));
+        };
+
+        match poll_read_pending(
+            &mut self.inner,
+            cx,
+            server_context,
+            "unexpected EOF while reading VLESS zero-RTT server context",
+        ) {
+            Poll::Ready(Ok(())) => {}
+            other => return other,
+        }
+        let server_context: [u8; 16] =
+            server_context.data.as_slice().try_into().map_err(|_| {
+                io::Error::other("invalid VLESS zero-RTT server context")
+            })?;
+        self.read_codec = Some(prepared.read_codec(server_context)?);
+        Poll::Ready(Ok(()))
+    }
+
+    fn invalidate_zero_rtt_on_invalid_header(&mut self) -> bool {
+        let RuntimeMode::ZeroRtt {
+            prepared,
+            zero_rtt_cache,
+            peer_confirmed,
+            ..
+        } = &mut self.mode
+        else {
+            return false;
+        };
+        if *peer_confirmed {
+            return false;
+        }
+
+        zero_rtt_cache.invalidate_if_pfs_key_matches(&prepared.pfs_key);
+        true
+    }
+
+    fn mark_zero_rtt_peer_confirmed(&mut self) {
+        if let RuntimeMode::ZeroRtt { peer_confirmed, .. } = &mut self.mode {
+            *peer_confirmed = true;
+        }
+    }
+
+    fn take_zero_rtt_prewrite(&mut self) -> Option<Vec<u8>> {
+        let RuntimeMode::ZeroRtt { prewrite, .. } = &mut self.mode else {
+            return None;
+        };
+        prewrite.take()
     }
 
     fn poll_peer_padding(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -413,7 +563,7 @@ impl AsyncWrite for EncryptionStream {
             if count == 0 {
                 return Poll::Ready(Ok(0));
             }
-            let wire = match self
+            let mut wire = match self
                 .write_codec
                 .as_mut()
                 .ok_or_else(|| {
@@ -426,6 +576,10 @@ impl AsyncWrite for EncryptionStream {
                 Ok(wire) => wire,
                 Err(err) => return Poll::Ready(Err(err)),
             };
+            if let Some(mut prewrite) = self.take_zero_rtt_prewrite() {
+                prewrite.extend_from_slice(&wire);
+                wire = prewrite;
+            }
             self.pending_write = Some(PendingRecordWrite {
                 wire: PendingIo::from_data(wire),
                 user_len: count,
@@ -487,6 +641,11 @@ impl AsyncRead for EncryptionStream {
             Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
             Poll::Pending => return Poll::Pending,
         }
+        match self.poll_zero_rtt_server_context(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Pending => return Poll::Pending,
+        }
         match self.poll_peer_padding(cx) {
             Poll::Ready(Ok(())) => {}
             Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
@@ -525,8 +684,16 @@ impl AsyncRead for EncryptionStream {
         if self.read_ciphertext.is_none() {
             let len = match decode_record_len(&self.read_header.data) {
                 Ok(len) => len,
-                Err(err) => return Poll::Ready(Err(err)),
+                Err(err) => {
+                    if self.invalidate_zero_rtt_on_invalid_header() {
+                        return Poll::Ready(Err(invalid(format!(
+                            "VLESS zero-RTT ticket rejected; new handshake needed: {err}"
+                        ))));
+                    }
+                    return Poll::Ready(Err(err));
+                }
             };
+            self.mark_zero_rtt_peer_confirmed();
             self.read_ciphertext = Some(PendingIo::with_len(len));
         }
 
