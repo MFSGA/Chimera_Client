@@ -21,7 +21,7 @@ const PFS_PUBLIC_KEY_LEN: usize = MLKEM768_PUBLIC_KEY_LEN + X25519_PUBLIC_KEY_LE
 #[cfg(feature = "vless-encryption")]
 #[cfg_attr(
     not(test),
-    expect(
+    allow(
         dead_code,
         reason = "consumed by the next VLESS encryption runtime-stream slice"
     )
@@ -31,7 +31,7 @@ const SERVER_PFS_PUBLIC_KEY_LEN: usize =
 #[cfg(feature = "vless-encryption")]
 #[cfg_attr(
     not(test),
-    expect(
+    allow(
         dead_code,
         reason = "consumed by the next VLESS encryption runtime-stream slice"
     )
@@ -40,7 +40,7 @@ const SERVER_PFS_RESPONSE_LEN: usize = SERVER_PFS_PUBLIC_KEY_LEN + AEAD_TAG_LEN;
 #[cfg(feature = "vless-encryption")]
 #[cfg_attr(
     not(test),
-    expect(
+    allow(
         dead_code,
         reason = "consumed by the next VLESS encryption runtime-stream slice"
     )
@@ -49,7 +49,7 @@ const ENCRYPTED_TICKET_LEN: usize = 16 + AEAD_TAG_LEN;
 #[cfg(feature = "vless-encryption")]
 #[cfg_attr(
     not(test),
-    expect(
+    allow(
         dead_code,
         reason = "consumed by the next VLESS encryption runtime-stream slice"
     )
@@ -58,7 +58,7 @@ const RECORD_HEADER_LEN: usize = 5;
 #[cfg(feature = "vless-encryption")]
 #[cfg_attr(
     not(test),
-    expect(
+    allow(
         dead_code,
         reason = "consumed by the next VLESS encryption runtime-stream slice"
     )
@@ -67,7 +67,7 @@ const MAX_RECORD_PLAINTEXT_LEN: usize = 8192;
 #[cfg(feature = "vless-encryption")]
 #[cfg_attr(
     not(test),
-    expect(
+    allow(
         dead_code,
         reason = "consumed by the next VLESS encryption runtime-stream slice"
     )
@@ -90,7 +90,7 @@ pub(crate) enum Appearance {
 }
 
 impl Appearance {
-    #[cfg(feature = "vless-encryption")]
+    #[cfg(test)]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Native => "native",
@@ -116,7 +116,7 @@ pub(crate) enum RttMode {
 }
 
 impl RttMode {
-    #[cfg(feature = "vless-encryption")]
+    #[cfg(test)]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::OneRtt => "1rtt",
@@ -204,7 +204,7 @@ pub(crate) struct PreparedOneRttHello {
 #[cfg(feature = "vless-encryption")]
 #[cfg_attr(
     not(test),
-    expect(
+    allow(
         dead_code,
         reason = "consumed by the next VLESS encryption runtime-stream slice"
     )
@@ -221,7 +221,7 @@ pub(crate) struct PreparedOneRttSession {
 #[cfg(feature = "vless-encryption")]
 #[cfg_attr(
     not(test),
-    expect(
+    allow(
         dead_code,
         reason = "consumed by the next VLESS encryption runtime-stream slice"
     )
@@ -237,7 +237,7 @@ pub(crate) struct PreparedOneRttServerTail {
 #[cfg(feature = "vless-encryption")]
 #[cfg_attr(
     not(test),
-    expect(
+    allow(
         dead_code,
         reason = "consumed by the next VLESS encryption runtime-stream slice"
     )
@@ -267,7 +267,7 @@ pub(crate) struct PreparedCrypto {
 impl PreparedOneRttHello {
     #[cfg_attr(
         not(test),
-        expect(
+        allow(
             dead_code,
             reason = "consumed by the next VLESS encryption runtime-stream slice"
         )
@@ -357,7 +357,7 @@ impl PreparedOneRttHello {
 impl PreparedOneRttSession {
     #[cfg_attr(
         not(test),
-        expect(
+        allow(
             dead_code,
             reason = "consumed by the next VLESS encryption runtime-stream slice"
         )
@@ -406,7 +406,7 @@ impl PreparedOneRttSession {
 
     #[cfg_attr(
         not(test),
-        expect(
+        allow(
             dead_code,
             reason = "consumed by the next VLESS encryption runtime-stream slice"
         )
@@ -425,7 +425,7 @@ impl PreparedOneRttSession {
 #[cfg(feature = "vless-encryption")]
 #[cfg_attr(
     not(test),
-    expect(
+    allow(
         dead_code,
         reason = "consumed by the next VLESS encryption runtime-stream slice"
     )
@@ -499,7 +499,7 @@ impl EncryptionRecordCodec {
 #[cfg(feature = "vless-encryption")]
 #[cfg_attr(
     not(test),
-    expect(
+    allow(
         dead_code,
         reason = "consumed by the next VLESS encryption runtime-stream slice"
     )
@@ -521,7 +521,7 @@ fn encode_record_header(
 #[cfg(feature = "vless-encryption")]
 #[cfg_attr(
     not(test),
-    expect(
+    allow(
         dead_code,
         reason = "consumed by the next VLESS encryption runtime-stream slice"
     )
@@ -540,24 +540,6 @@ fn decode_record_header(header: &[u8; RECORD_HEADER_LEN]) -> io::Result<usize> {
         )));
     }
     Ok(length)
-}
-
-#[cfg(feature = "vless-encryption")]
-impl PreparedCrypto {
-    pub(crate) fn summary(&self) -> String {
-        format!(
-            "xor-mode={}; relay-bytes={}; key-hashes={}; padding-bytes={}-{}; hello-bytes={}-{}; write-segments={}; gap-segments={}",
-            self.xor_mode,
-            self.relays_length,
-            self.key_hashes.len(),
-            self.padding_min_len,
-            self.padding_max_len,
-            self.client_hello_min_len,
-            self.client_hello_max_len,
-            self.hello_write_lengths.len(),
-            self.padding_gaps_ms.len(),
-        )
-    }
 }
 
 impl Config {
@@ -1061,7 +1043,7 @@ impl Config {
         }
     }
 
-    #[cfg(feature = "vless-encryption")]
+    #[cfg(test)]
     pub(crate) fn summary(&self) -> String {
         let x25519 = self
             .keys
@@ -1138,7 +1120,7 @@ impl EncryptionAead {
 
     #[cfg_attr(
         not(test),
-        expect(
+        allow(
             dead_code,
             reason = "consumed by the next VLESS encryption runtime-stream slice"
         )
@@ -2272,6 +2254,155 @@ mod tests {
             b"reply"
         );
         assert_eq!(reader.nonce(), [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4]);
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    #[tokio::test]
+    async fn encryption_stream_native_one_rtt_round_trips_records() {
+        use aws_lc_rs::{
+            agreement,
+            kem::{EncapsulationKey, ML_KEM_768},
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        use super::super::encryption_stream::EncryptionStream;
+
+        let nfs_private =
+            agreement::PrivateKey::generate(&agreement::X25519).unwrap();
+        let nfs_public = nfs_private.compute_public_key().unwrap();
+        let raw = format!(
+            "{METHOD}.native.1rtt.100-64-64.{}",
+            URL_SAFE_NO_PAD.encode(nfs_public.as_ref()),
+        );
+        let config = Config::parse(&raw).expect("1rtt config should parse");
+        let prepared = config.prepare_crypto().expect("crypto should prepare");
+        let server_prepared = prepared.clone();
+
+        let (client, mut server) = tokio::io::duplex(128);
+        let server_task = tokio::spawn(async move {
+            let hello = server_prepared.one_rtt_hello.as_ref().expect("1rtt hello");
+
+            let mut received_hello = vec![0u8; hello.bytes.len()];
+            server
+                .read_exact(&mut received_hello)
+                .await
+                .expect("client hello");
+            assert_eq!(received_hello, hello.bytes);
+
+            let client_mlkem_public = EncapsulationKey::new(
+                &ML_KEM_768,
+                &hello.pfs_public_key[..MLKEM768_PUBLIC_KEY_LEN],
+            )
+            .expect("client ML-KEM public key");
+            let (mlkem_ciphertext, mlkem_secret) = client_mlkem_public
+                .encapsulate()
+                .expect("server ML-KEM encapsulation");
+
+            let server_x25519_private =
+                agreement::PrivateKey::generate(&agreement::X25519).unwrap();
+            let server_x25519_public =
+                server_x25519_private.compute_public_key().unwrap();
+            let client_x25519_public = agreement::UnparsedPublicKey::new(
+                &agreement::X25519,
+                &hello.pfs_public_key[MLKEM768_PUBLIC_KEY_LEN..],
+            );
+            let mut x25519_secret = Vec::new();
+            agreement::agree(
+                &server_x25519_private,
+                client_x25519_public,
+                invalid("server X25519 agreement failed"),
+                |material| {
+                    x25519_secret.extend_from_slice(material);
+                    Ok(())
+                },
+            )
+            .expect("server X25519 agreement");
+
+            let mut server_pfs = Vec::with_capacity(SERVER_PFS_PUBLIC_KEY_LEN);
+            server_pfs.extend_from_slice(mlkem_ciphertext.as_ref());
+            server_pfs.extend_from_slice(server_x25519_public.as_ref());
+
+            let nfs_aead = EncryptionAead::new(&server_prepared.nfs_aead_key)
+                .expect("NFS AEAD");
+            let encrypted_server_pfs = nfs_aead
+                .seal_with_nonce(&server_pfs, [0xff; 12])
+                .expect("server PFS encryption");
+
+            let mut united_key = Vec::new();
+            united_key.extend_from_slice(mlkem_secret.as_ref());
+            united_key.extend_from_slice(&x25519_secret);
+            united_key.extend_from_slice(&server_prepared.nfs_relays.nfs_key);
+
+            let client_write_key =
+                blake3_derive_key_raw_context(&hello.pfs_public_key, &united_key)
+                    .expect("client write key");
+            let server_write_key =
+                blake3_derive_key_raw_context(&server_pfs, &united_key)
+                    .expect("server write key");
+
+            let mut server_aead =
+                EncryptionAead::new(&server_write_key).expect("server AEAD");
+            let ticket = [0u8; 16];
+            let encrypted_ticket = server_aead.seal(&ticket).expect("server ticket");
+            let encrypted_padding_len = server_aead
+                .seal(&encode_length(48).expect("padding length"))
+                .expect("server padding length");
+            let encrypted_padding =
+                server_aead.seal(&[0u8; 32]).expect("server padding");
+            assert_eq!(encrypted_padding.len(), 48);
+
+            let mut server_hello = Vec::new();
+            server_hello.extend_from_slice(&encrypted_server_pfs);
+            server_hello.extend_from_slice(&encrypted_ticket);
+            server_hello.extend_from_slice(&encrypted_padding_len);
+            server_hello.extend_from_slice(&encrypted_padding);
+            server.write_all(&server_hello).await.expect("server hello");
+
+            let mut header = [0u8; RECORD_HEADER_LEN];
+            server
+                .read_exact(&mut header)
+                .await
+                .expect("client record header");
+            let body_len =
+                decode_record_header(&header).expect("client record header");
+            let mut body = vec![0u8; body_len];
+            server
+                .read_exact(&mut body)
+                .await
+                .expect("client record body");
+            let mut record = header.to_vec();
+            record.extend_from_slice(&body);
+
+            let mut client_reader =
+                EncryptionRecordCodec::new(&client_write_key, [0u8; 12])
+                    .expect("client record codec");
+            assert_eq!(
+                client_reader
+                    .open_record(&record)
+                    .expect("client record decrypt"),
+                b"ping"
+            );
+
+            let mut server_writer = EncryptionRecordCodec::new(
+                &server_write_key,
+                [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3],
+            )
+            .expect("server record codec");
+            let pong = server_writer
+                .seal_record(b"pong")
+                .expect("server record encrypt");
+            server.write_all(&pong).await.expect("server pong");
+        });
+
+        let mut stream =
+            EncryptionStream::new(Box::new(client), prepared).expect("stream");
+        stream.write_all(b"ping").await.expect("encrypted ping");
+
+        let mut pong = [0u8; 4];
+        stream.read_exact(&mut pong).await.expect("encrypted pong");
+        assert_eq!(&pong, b"pong");
+
+        server_task.await.expect("server task");
     }
 
     #[cfg(feature = "vless-encryption")]
