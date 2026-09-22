@@ -82,6 +82,30 @@ fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
         }
     }
 
+    match (&s.certificate, &s.private_key) {
+        (Some(_), Some(_)) | (None, None) => {}
+        _ => {
+            return Err(Error::InvalidConfig(
+                "vless certificate and private-key must both be set or both omitted"
+                    .to_owned(),
+            ));
+        }
+    }
+
+    if s.certificate.is_some() {
+        if s.reality_opts.is_some() {
+            return Err(Error::InvalidConfig(
+                "vless certificate/private-key client auth is not supported with reality"
+                    .to_owned(),
+            ));
+        }
+        if !vless_standard_tls_enabled(s) {
+            return Err(Error::InvalidConfig(
+                "vless certificate/private-key requires standard TLS".to_owned(),
+            ));
+        }
+    }
+
     if let Some(client_fingerprint) = s.client_fingerprint.as_deref() {
         if s.reality_opts.is_some() {
             if client_fingerprint != "chrome" {
@@ -137,6 +161,19 @@ fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
     Ok(())
 }
 
+fn vless_standard_tls_enabled(s: &OutboundVless) -> bool {
+    if matches!(s.network.as_deref(), Some("xhttp"))
+        && let Some(upload_settings) = s
+            .xhttp_opts
+            .as_ref()
+            .and_then(|opts| opts.upload_settings.as_ref())
+    {
+        return matches!(upload_settings.security.as_deref(), Some("tls"));
+    }
+
+    s.tls.unwrap_or_default() && s.reality_opts.is_none()
+}
+
 fn build_transport(
     network: Option<&str>,
     s: &OutboundVless,
@@ -182,6 +219,9 @@ fn build_tls_transport(
             upload_settings,
             s.alpn.clone(),
             s.fingerprint.clone(),
+            s.name_cert_verify.clone(),
+            s.certificate.clone(),
+            s.private_key.clone(),
         );
     }
 
@@ -200,13 +240,17 @@ fn build_tls_transport(
         .unwrap_or_else(|| s.common_opts.server.clone());
     let alpn = resolve_vless_alpn(s, network);
 
-    Ok(Some(Box::new(TlsClient::new_with_fingerprint(
+    let client = TlsClient::new_with_fingerprint(
         skip_cert_verify,
         server_name,
         alpn,
         None,
         s.fingerprint.clone(),
-    ))))
+    )
+    .with_verify_name(s.name_cert_verify.clone())
+    .with_client_auth(s.certificate.clone(), s.private_key.clone())?;
+
+    Ok(Some(Box::new(client)))
 }
 
 fn resolve_vless_alpn(
@@ -284,6 +328,9 @@ fn build_xhttp_upload_tls_transport(
     upload_settings: &XhttpUploadSettings,
     alpn: Option<Vec<String>>,
     fingerprint: Option<String>,
+    verify_name: Option<String>,
+    certificate: Option<String>,
+    private_key: Option<String>,
 ) -> Result<Option<Box<dyn Transport>>, Error> {
     match upload_settings.security.as_deref().unwrap_or("none") {
         "none" => Ok(None),
@@ -319,13 +366,17 @@ fn build_xhttp_upload_tls_transport(
                 )
             });
 
-            Ok(Some(Box::new(TlsClient::new_with_fingerprint(
+            let client = TlsClient::new_with_fingerprint(
                 skip_cert_verify,
                 server_name,
                 alpn,
                 None,
                 fingerprint,
-            ))))
+            )
+            .with_verify_name(verify_name)
+            .with_client_auth(certificate, private_key)?;
+
+            Ok(Some(Box::new(client)))
         }
         other => Err(Error::InvalidConfig(format!(
             "unsupported xhttp upload_settings security: {other}"
@@ -927,11 +978,10 @@ fn decode_reality_short_id(short_id: Option<&str>) -> Result<Vec<u8>, Error> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "reality")]
-    use crate::config::internal::proxy::OutboundTrojanRealityOpts;
     use crate::config::internal::proxy::{
-        CommonConfigOptions, GrpcOpt, XhttpDownloadSettings,
-        XhttpDownloadXhttpSettings, XhttpExtra, XhttpOpt, XhttpUploadSettings,
+        CommonConfigOptions, GrpcOpt, OutboundTrojanRealityOpts,
+        XhttpDownloadSettings, XhttpDownloadXhttpSettings, XhttpExtra, XhttpOpt,
+        XhttpUploadSettings,
     };
 
     use super::{
@@ -1175,6 +1225,105 @@ mod tests {
         assert_eq!(
             resolve_vless_alpn(&outbound, outbound.network.as_deref()),
             Some(vec!["h2".to_owned()])
+        );
+    }
+
+    #[test]
+    fn vless_mtls_requires_certificate_and_private_key_pair() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "mtls-missing-key".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            tls: Some(true),
+            certificate: Some("client-cert.pem".to_owned()),
+            ..Default::default()
+        };
+
+        let err = validate_vless_config(&outbound)
+            .expect_err("mTLS must require a certificate/private-key pair");
+        assert!(
+            err.to_string()
+                .contains("certificate and private-key must both be set"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vless_mtls_requires_standard_tls() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "mtls-no-tls".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            certificate: Some("client-cert.pem".to_owned()),
+            private_key: Some("client-key.pem".to_owned()),
+            ..Default::default()
+        };
+
+        let err = validate_vless_config(&outbound)
+            .expect_err("mTLS without TLS must fail");
+        assert!(
+            err.to_string().contains("requires standard TLS"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vless_mtls_builds_with_standard_tls() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "mtls".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            tls: Some(true),
+            certificate: Some("client-cert.pem".to_owned()),
+            private_key: Some("client-key.pem".to_owned()),
+            name_cert_verify: Some("verify.example.com".to_owned()),
+            ..Default::default()
+        };
+
+        validate_vless_config(&outbound).expect("valid mTLS config should pass");
+        let tls = build_tls_transport(outbound.network.as_deref(), &outbound, false)
+            .expect("mTLS transport should build");
+        assert!(tls.is_some(), "mTLS transport should be present");
+    }
+
+    #[test]
+    fn vless_mtls_rejects_reality_combination() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "mtls-reality".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            certificate: Some("client-cert.pem".to_owned()),
+            private_key: Some("client-key.pem".to_owned()),
+            reality_opts: Some(OutboundTrojanRealityOpts {
+                public_key: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+                    .to_owned(),
+                short_id: None,
+            }),
+            ..Default::default()
+        };
+
+        let err = validate_vless_config(&outbound)
+            .expect_err("mTLS with Reality must not be silently ignored");
+        assert!(
+            err.to_string()
+                .contains("client auth is not supported with reality"),
+            "unexpected error: {err}"
         );
     }
 

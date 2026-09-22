@@ -357,6 +357,9 @@ pub struct OutboundVless {
     pub tls: Option<bool>,
     pub alpn: Option<Vec<String>>,
     pub skip_cert_verify: Option<bool>,
+    pub name_cert_verify: Option<String>,
+    pub certificate: Option<String>,
+    pub private_key: Option<String>,
     #[serde(alias = "servername", alias = "serverName")]
     pub server_name: Option<String>,
     pub sni: Option<String>,
@@ -838,6 +841,9 @@ port: 443
 uuid: b831381d-6324-4d53-ad4f-8cda48b30811
 fingerprint: 0123456789abcdef
 client-fingerprint: chrome
+name-cert-verify: verify.example.com
+certificate: client-cert.pem
+private-key: client-key.pem
 alpn:
   - h2
   - http/1.1
@@ -852,6 +858,12 @@ alpn:
 
         assert_eq!(vless.fingerprint.as_deref(), Some("0123456789abcdef"));
         assert_eq!(vless.client_fingerprint.as_deref(), Some("chrome"));
+        assert_eq!(
+            vless.name_cert_verify.as_deref(),
+            Some("verify.example.com")
+        );
+        assert_eq!(vless.certificate.as_deref(), Some("client-cert.pem"));
+        assert_eq!(vless.private_key.as_deref(), Some("client-key.pem"));
         assert_eq!(
             vless.alpn,
             Some(vec!["h2".to_owned(), "http/1.1".to_owned()])
