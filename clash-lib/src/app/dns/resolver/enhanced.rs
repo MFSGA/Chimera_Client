@@ -5,6 +5,7 @@ use crate::{
     config::def::DNSMode,
     dns::{
         ClashResolver, Config, ResolverKind, RuleDispatch, ThreadSafeDNSClient,
+        ThreadSafeDNSResolver,
         fakeip::{self, FileStore, InMemStore, ThreadSafeFakeDns},
         filters::{
             DomainFilter, FallbackDomainFilter, FallbackIPFilter, GeoIPFilter,
@@ -44,6 +45,7 @@ pub struct EnhancedResolver {
 
     proxy_resolver: Option<Vec<ThreadSafeDNSClient>>,
     proxy_server_domains: Option<trie::StringTrie<bool>>,
+    direct_resolver: Option<ThreadSafeDNSResolver>,
 
     fake_dns: Option<ThreadSafeFakeDns>,
 
@@ -53,17 +55,26 @@ pub struct EnhancedResolver {
 
 impl EnhancedResolver {
     fn from_clients(main: Vec<ThreadSafeDNSClient>, ipv6: bool) -> Self {
+        Self::from_clients_with_fallback(main, None, ipv6)
+    }
+
+    fn from_clients_with_fallback(
+        main: Vec<ThreadSafeDNSClient>,
+        fallback: Option<Vec<ThreadSafeDNSClient>>,
+        ipv6: bool,
+    ) -> Self {
         Self {
             ipv6: AtomicBool::new(ipv6),
             hosts: None,
             main,
-            fallback: None,
+            fallback,
             fallback_domain_filters: None,
             fallback_ip_filters: None,
             lru_cache: None,
             policy: None,
             proxy_resolver: None,
             proxy_server_domains: None,
+            direct_resolver: None,
             fake_dns: None,
             reverse_lookup_cache: None,
         }
@@ -108,6 +119,7 @@ impl EnhancedResolver {
 
             proxy_resolver: None,
             proxy_server_domains: None,
+            direct_resolver: None,
 
             fake_dns: None,
 
@@ -144,6 +156,7 @@ impl EnhancedResolver {
 
             proxy_resolver: None,
             proxy_server_domains: None,
+            direct_resolver: None,
 
             fake_dns: None,
 
@@ -195,6 +208,27 @@ impl EnhancedResolver {
             rule_dispatch.clone(),
         )
         .await?;
+
+        let direct_resolver = if let Some(direct_nameserver) = cfg.direct_nameserver
+        {
+            let clients = make_clients(
+                direct_nameserver,
+                Some(default_resolver.clone()),
+                Some(outbound_resolver.clone()),
+                outbounds.clone(),
+                edns_client_subnet.clone(),
+                cfg.fw_mark,
+                None,
+            )
+            .await?;
+            Some(Arc::new(Self::from_clients_with_fallback(
+                clients,
+                Some(main.clone()),
+                cfg.ipv6,
+            )) as ThreadSafeDNSResolver)
+        } else {
+            None
+        };
 
         let plain_outbounds = outbounds.read().await;
         let proxy_server_domains = plain_outbounds
@@ -325,6 +359,7 @@ impl EnhancedResolver {
 
             proxy_resolver,
             proxy_server_domains: proxy_server_domains_trie,
+            direct_resolver,
 
             reverse_lookup_cache: Some(Arc::new(RwLock::new(
                 lru_time_cache::LruCache::with_expiry_duration_and_capacity(
@@ -840,6 +875,9 @@ impl ClashResolver for EnhancedResolver {
         for client in clients {
             reset = reset.saturating_add(client.reset_transport().await?);
         }
+        if let Some(direct_resolver) = &self.direct_resolver {
+            reset = reset.saturating_add(direct_resolver.reset_transports().await?);
+        }
         if let Some(cache) = &self.reverse_lookup_cache {
             cache.write().await.clear();
         }
@@ -852,6 +890,10 @@ impl ClashResolver for EnhancedResolver {
 
     fn fake_ip_enabled(&self) -> bool {
         self.fake_dns.is_some()
+    }
+
+    fn direct_resolver(&self) -> Option<ThreadSafeDNSResolver> {
+        self.direct_resolver.clone()
     }
 
     async fn is_fake_ip(&self, ip: std::net::IpAddr) -> bool {
@@ -1012,6 +1054,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_resolver_prefers_direct_nameserver_without_fallback_query() {
+        let direct_hits = Arc::new(AtomicUsize::new(0));
+        let fallback_hits = Arc::new(AtomicUsize::new(0));
+        let resolver = EnhancedResolver::from_clients_with_fallback(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(203, 0, 113, 10)),
+                hits: direct_hits.clone(),
+                id: "direct-ns",
+            })],
+            Some(vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(198, 51, 100, 20)),
+                hits: fallback_hits.clone(),
+                id: "fallback-ns",
+            })]),
+            false,
+        );
+
+        let ip = resolver
+            .resolve_v4("example.com", false)
+            .await
+            .expect("direct resolver query should succeed");
+
+        assert_eq!(ip, Some(Ipv4Addr::new(203, 0, 113, 10)));
+        assert_eq!(direct_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn direct_resolver_falls_back_when_direct_nameserver_has_no_ip() {
+        let direct_hits = Arc::new(AtomicUsize::new(0));
+        let fallback_hits = Arc::new(AtomicUsize::new(0));
+        let direct_response = op::Message::response(0, op::OpCode::Query);
+        let resolver = EnhancedResolver::from_clients_with_fallback(
+            vec![Arc::new(CountingClient {
+                response: direct_response,
+                hits: direct_hits.clone(),
+                id: "direct-ns",
+            })],
+            Some(vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(198, 51, 100, 20)),
+                hits: fallback_hits.clone(),
+                id: "fallback-ns",
+            })]),
+            false,
+        );
+
+        let ip = resolver
+            .resolve_v4("example.com", false)
+            .await
+            .expect("fallback resolver query should succeed");
+
+        assert_eq!(ip, Some(Ipv4Addr::new(198, 51, 100, 20)));
+        assert_eq!(direct_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn reset_transports_covers_all_upstream_collections() {
         let resets = Arc::new(AtomicUsize::new(0));
         let client = || -> ThreadSafeDNSClient {
@@ -1023,12 +1122,16 @@ mod tests {
         resolver.main = vec![client()];
         resolver.fallback = Some(vec![client()]);
         resolver.proxy_resolver = Some(vec![client()]);
+        resolver.direct_resolver = Some(Arc::new(EnhancedResolver::from_clients(
+            vec![client()],
+            false,
+        )));
         let mut policy = crate::common::trie::StringTrie::new();
         assert!(policy.insert("policy.example", Arc::new(vec![client()])));
         resolver.policy = Some(policy);
 
-        assert_eq!(resolver.reset_transports().await.unwrap(), 4);
-        assert_eq!(resets.load(Ordering::SeqCst), 4);
+        assert_eq!(resolver.reset_transports().await.unwrap(), 5);
+        assert_eq!(resets.load(Ordering::SeqCst), 5);
     }
 
     /// Regression test for https://github.com/Watfaq/clash-rs/issues/976
@@ -1537,6 +1640,56 @@ mod tests {
 
         assert!(resolver.proxy_resolver.is_none());
         assert!(resolver.proxy_server_domains.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_direct_nameserver_initializes_direct_resolver() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_store = crate::app::profile::ThreadSafeCacheFile::new(
+            temp_dir.path().join("cache.db").to_str().unwrap(),
+            false,
+        );
+        let mut config = make_proxy_nameserver_config();
+        config.direct_nameserver = Some(vec![NameServer {
+            net: DNSNetMode::Udp,
+            host: url::Host::Ipv4("223.5.5.5".parse().unwrap()),
+            port: 53,
+            interface: None,
+            proxy: None,
+        }]);
+
+        let resolver = EnhancedResolver::new(
+            config,
+            cache_store,
+            None,
+            Arc::new(RwLock::new(std::collections::HashMap::new())),
+            None,
+        )
+        .await
+        .expect("direct nameserver config should initialize");
+
+        assert!(resolver.direct_resolver().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_direct_resolver_absent_without_direct_nameserver() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_store = crate::app::profile::ThreadSafeCacheFile::new(
+            temp_dir.path().join("cache.db").to_str().unwrap(),
+            false,
+        );
+
+        let resolver = EnhancedResolver::new(
+            make_proxy_nameserver_config(),
+            cache_store,
+            None,
+            Arc::new(RwLock::new(std::collections::HashMap::new())),
+            None,
+        )
+        .await
+        .expect("config without direct nameserver should initialize");
+
+        assert!(resolver.direct_resolver().is_none());
     }
 
     #[tokio::test]

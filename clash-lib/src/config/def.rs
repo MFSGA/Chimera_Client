@@ -403,6 +403,8 @@ pub struct DNS {
     pub nameserver: Vec<String>,
     /// DNS upstreams dedicated to resolving proxy node hostnames
     pub proxy_server_nameserver: Vec<String>,
+    /// DNS upstreams used when the final outbound is DIRECT.
+    pub direct_nameserver: Vec<String>,
     /// Fallback DNS upstream servers
     pub fallback: Vec<String>,
     /// Fallback DNS filter

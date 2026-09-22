@@ -93,6 +93,12 @@ pub trait ClashResolver: Sync + Send {
     async fn fake_ip_for_host(&self, host: &str) -> Option<std::net::IpAddr>;
     fn fake_ip_enabled(&self) -> bool;
 
+    /// Optional resolver used for the final DNS lookup of DIRECT outbounds.
+    /// Routing/classification continues to use the primary resolver.
+    fn direct_resolver(&self) -> Option<ThreadSafeDNSResolver> {
+        None
+    }
+
     fn ipv6(&self) -> bool;
     fn set_ipv6(&self, enable: bool);
 

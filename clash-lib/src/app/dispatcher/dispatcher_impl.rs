@@ -77,6 +77,19 @@ impl Dispatcher {
         self.resolver.clone()
     }
 
+    fn resolver_for_outbound(
+        resolver: &ThreadSafeDNSResolver,
+        outbound_name: &str,
+    ) -> ThreadSafeDNSResolver {
+        if outbound_name == PROXY_DIRECT {
+            resolver
+                .direct_resolver()
+                .unwrap_or_else(|| resolver.clone())
+        } else {
+            resolver.clone()
+        }
+    }
+
     pub fn statistics_manager(&self) -> Arc<StatisticsManager> {
         self.manager.clone()
     }
@@ -132,8 +145,11 @@ impl Dispatcher {
             }
         };
 
+        let connect_resolver =
+            Self::resolver_for_outbound(&self.resolver, outbound_name);
+
         match handler
-            .connect_stream(&sess, self.resolver.clone())
+            .connect_stream(&sess, connect_resolver)
             .instrument(info_span!("connect_stream", outbound_name = outbound_name,))
             .await
         {
@@ -393,8 +409,10 @@ impl Dispatcher {
                             resolved_dest = %sess.destination,
                             "building outbound datagram"
                         );
+                        let connect_resolver =
+                            Self::resolver_for_outbound(&resolver, &outbound_name);
                         let outbound_datagram = match handler
-                            .connect_datagram(&sess, resolver.clone())
+                            .connect_datagram(&sess, connect_resolver)
                             .await
                         {
                             Ok(v) => v,
@@ -820,14 +838,40 @@ impl OutboundHandleMap {
 #[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
-    use super::{OutboundHandleMap, reverse_lookup, try_queue_outbound_packet};
+    use super::{
+        Dispatcher, OutboundHandleMap, reverse_lookup, try_queue_outbound_packet,
+    };
     use crate::{
-        app::dns::{ClashResolver, MockClashResolver},
+        app::dns::{ClashResolver, MockClashResolver, ThreadSafeDNSResolver},
+        config::internal::proxy::PROXY_DIRECT,
         proxy::datagram::UdpPacket,
         session::{Network, Session, SocksAddr, Type},
     };
     use std::{future::pending, net::SocketAddr, str::FromStr, sync::Arc};
     use tokio::sync::mpsc;
+
+    #[test]
+    fn direct_outbound_uses_direct_resolver_when_configured() {
+        let direct: ThreadSafeDNSResolver = Arc::new(MockClashResolver::new());
+        let expected = direct.clone();
+
+        let mut primary = MockClashResolver::new();
+        primary
+            .expect_direct_resolver()
+            .once()
+            .returning(move || Some(expected.clone()));
+        let primary: ThreadSafeDNSResolver = Arc::new(primary);
+
+        let selected = Dispatcher::resolver_for_outbound(&primary, PROXY_DIRECT);
+        assert!(Arc::ptr_eq(&selected, &direct));
+    }
+
+    #[test]
+    fn non_direct_outbound_keeps_primary_resolver() {
+        let primary: ThreadSafeDNSResolver = Arc::new(MockClashResolver::new());
+        let selected = Dispatcher::resolver_for_outbound(&primary, "PROXY");
+        assert!(Arc::ptr_eq(&selected, &primary));
+    }
 
     #[tokio::test]
     async fn outbound_handle_map_reuses_session_by_source_for_full_cone_nat() {
