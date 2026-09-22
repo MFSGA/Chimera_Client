@@ -797,6 +797,33 @@ xhttp-opts:
         assert_eq!(opts.session_ttl, Some(30));
     }
 
+    #[cfg(feature = "ws")]
+    #[test]
+    fn outbound_vless_parses_ws_http_upgrade_opts() {
+        let config = r#"
+name: ws-upgrade
+type: vless
+server: example.com
+port: 443
+uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+network: ws
+ws-opts:
+  path: /upgrade
+  v2ray-http-upgrade: true
+  v2ray-http-upgrade-fast-open: true
+"#;
+
+        let parsed: OutboundProxyProtocol = serde_yaml::from_str(config)
+            .expect("ws http upgrade config should parse");
+
+        let OutboundProxyProtocol::Vless(vless) = parsed else {
+            panic!("expected vless proxy");
+        };
+        let ws = vless.ws_opts.expect("ws opts should be present");
+        assert_eq!(ws.v2ray_http_upgrade, Some(true));
+        assert_eq!(ws.v2ray_http_upgrade_fast_open, Some(true));
+    }
+
     #[test]
     fn outbound_vless_parses_grpc_opts() {
         let config = r#"

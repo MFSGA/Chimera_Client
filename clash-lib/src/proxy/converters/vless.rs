@@ -1352,6 +1352,91 @@ mod tests {
 
     #[cfg(feature = "ws")]
     #[test]
+    fn vless_ws_http_upgrade_and_fast_open_build() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "ws-upgrade".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            network: Some("ws".to_owned()),
+            ws_opts: Some(WsOpt {
+                path: Some("/upgrade".to_owned()),
+                v2ray_http_upgrade: Some(true),
+                v2ray_http_upgrade_fast_open: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        validate_vless_config(&outbound)
+            .expect("http upgrade fast-open config should validate");
+        let transport = build_transport(outbound.network.as_deref(), &outbound)
+            .expect("http upgrade transport should build");
+        assert!(transport.is_some());
+    }
+
+    #[cfg(feature = "ws")]
+    #[test]
+    fn vless_ws_fast_open_requires_http_upgrade() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "ws-fast-open".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            network: Some("ws".to_owned()),
+            ws_opts: Some(WsOpt {
+                v2ray_http_upgrade_fast_open: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = validate_vless_config(&outbound)
+            .expect_err("fast-open without HTTP upgrade must fail");
+        assert!(
+            err.to_string()
+                .contains("fast-open requires v2ray-http-upgrade"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(feature = "ws")]
+    #[test]
+    fn vless_ws_http_upgrade_accepts_early_data() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "ws-upgrade-early".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            network: Some("ws".to_owned()),
+            ws_opts: Some(WsOpt {
+                max_early_data: Some(2048),
+                early_data_header_name: Some("Sec-WebSocket-Protocol".to_owned()),
+                v2ray_http_upgrade: Some(true),
+                v2ray_http_upgrade_fast_open: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        validate_vless_config(&outbound)
+            .expect("HTTP upgrade early-data config should validate");
+        let transport = build_transport(outbound.network.as_deref(), &outbound)
+            .expect("HTTP upgrade early-data transport should build");
+        assert!(transport.is_some());
+    }
+
+    #[cfg(feature = "ws")]
+    #[test]
     fn vless_ws_requires_ws_opts() {
         let outbound = OutboundVless {
             common_opts: CommonConfigOptions {
