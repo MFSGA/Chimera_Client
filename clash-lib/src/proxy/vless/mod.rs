@@ -379,6 +379,7 @@ impl OutboundHandler for Handler {
 mod reuse_tests {
     #[cfg(feature = "vless-encryption")]
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
     use std::sync::Arc;
 
     use super::*;
@@ -440,60 +441,6 @@ mod reuse_tests {
             });
             Ok(Some(Box::new(stream)))
         }
-    }
-
-    #[cfg(feature = "vless-encryption")]
-    #[test]
-    fn zero_rtt_handler_owns_cache_only_for_zero_rtt_mode() {
-        let key = URL_SAFE_NO_PAD.encode([0x77; 32]);
-        let zero_rtt = encryption::Config::parse(&format!(
-            "mlkem768x25519plus.native.0rtt.{key}"
-        ))
-        .expect("zero-rtt encryption config should parse");
-        let one_rtt = encryption::Config::parse(&format!(
-            "mlkem768x25519plus.native.1rtt.{key}"
-        ))
-        .expect("one-rtt encryption config should parse");
-
-        let options = |encryption| HandlerOptions {
-            name: "cache-test".to_owned(),
-            common_opts: HandlerCommonOptions::default(),
-            server: "example.com".to_owned(),
-            port: 443,
-            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
-            udp: false,
-            transport: None,
-            tls: None,
-            flow: None,
-            encryption: Some(encryption),
-        };
-
-        assert!(Handler::new(options(zero_rtt)).zero_rtt_cache.is_some());
-        assert!(Handler::new(options(one_rtt)).zero_rtt_cache.is_none());
-    }
-
-    #[cfg(feature = "vless-encryption")]
-    #[tokio::test]
-    async fn encrypted_vless_reports_udp_support() {
-        let key = URL_SAFE_NO_PAD.encode([0x78; 32]);
-        let encryption = encryption::Config::parse(&format!(
-            "mlkem768x25519plus.native.0rtt.{key}"
-        ))
-        .expect("encryption config should parse");
-        let handler = Handler::new(HandlerOptions {
-            name: "encrypted-udp".to_owned(),
-            common_opts: HandlerCommonOptions::default(),
-            server: "example.com".to_owned(),
-            port: 443,
-            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
-            udp: true,
-            transport: None,
-            tls: None,
-            flow: None,
-            encryption: Some(encryption),
-        });
-
-        assert!(handler.support_udp().await);
     }
 
     #[tokio::test]
@@ -586,6 +533,60 @@ mod reuse_tests {
             stream.is_none(),
             "Vision must preserve the existing splice-capable TCP path"
         );
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    #[test]
+    fn zero_rtt_handler_owns_cache_only_for_zero_rtt_mode() {
+        let key = URL_SAFE_NO_PAD.encode([0x77; 32]);
+        let zero_rtt = encryption::Config::parse(&format!(
+            "mlkem768x25519plus.native.0rtt.{key}"
+        ))
+        .expect("zero-rtt encryption config should parse");
+        let one_rtt = encryption::Config::parse(&format!(
+            "mlkem768x25519plus.native.1rtt.{key}"
+        ))
+        .expect("one-rtt encryption config should parse");
+
+        let options = |encryption| HandlerOptions {
+            name: "cache-test".to_owned(),
+            common_opts: HandlerCommonOptions::default(),
+            server: "example.com".to_owned(),
+            port: 443,
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            udp: false,
+            transport: None,
+            tls: None,
+            flow: None,
+            encryption: Some(encryption),
+        };
+
+        assert!(Handler::new(options(zero_rtt)).zero_rtt_cache.is_some());
+        assert!(Handler::new(options(one_rtt)).zero_rtt_cache.is_none());
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    #[tokio::test]
+    async fn encrypted_vless_reports_udp_support() {
+        let key = URL_SAFE_NO_PAD.encode([0x78; 32]);
+        let encryption = encryption::Config::parse(&format!(
+            "mlkem768x25519plus.native.0rtt.{key}"
+        ))
+        .expect("encryption config should parse");
+        let handler = Handler::new(HandlerOptions {
+            name: "encrypted-udp".to_owned(),
+            common_opts: HandlerCommonOptions::default(),
+            server: "example.com".to_owned(),
+            port: 443,
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            udp: true,
+            transport: None,
+            tls: None,
+            flow: None,
+            encryption: Some(encryption),
+        });
+
+        assert!(handler.support_udp().await);
     }
 
     #[tokio::test]

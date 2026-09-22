@@ -1305,6 +1305,33 @@ xhttp-opts:
         );
     }
 
+    #[cfg(feature = "ws")]
+    #[test]
+    fn outbound_vless_parses_ws_http_upgrade_opts() {
+        let config = r#"
+name: ws-upgrade
+type: vless
+server: example.com
+port: 443
+uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+network: ws
+ws-opts:
+  path: /upgrade
+  v2ray-http-upgrade: true
+  v2ray-http-upgrade-fast-open: true
+"#;
+
+        let parsed: OutboundProxyProtocol = serde_yaml::from_str(config)
+            .expect("ws http upgrade config should parse");
+
+        let OutboundProxyProtocol::Vless(vless) = parsed else {
+            panic!("expected vless proxy");
+        };
+        let ws = vless.ws_opts.expect("ws opts should be present");
+        assert_eq!(ws.v2ray_http_upgrade, Some(true));
+        assert_eq!(ws.v2ray_http_upgrade_fast_open, Some(true));
+    }
+
     #[test]
     fn outbound_vless_parses_grpc_opts() {
         let config = r#"
@@ -1453,6 +1480,105 @@ reality-opts:
         let reality = vless.reality_opts.expect("reality opts should be present");
         assert_eq!(reality.short_id.as_deref(), Some(""));
         assert_eq!(reality.support_x25519mlkem768, Some(false));
+    }
+
+    #[test]
+    fn outbound_vless_parses_mihomo_flat_download_settings() {
+        let config = r#"
+name: xhttp-flat-download
+type: vless
+server: upload.example.com
+port: 443
+uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+network: xhttp
+xhttp-opts:
+  path: /upload/
+  download-settings:
+    server: download.example.com
+    port: 8443
+    tls: true
+    alpn: [h2]
+    skip-cert-verify: true
+    name-cert-verify: cert.example.com
+    fingerprint: 0123456789abcdef
+    certificate: client-cert.pem
+    private-key: client-key.pem
+    servername: sni.example.com
+    client-fingerprint: none
+    path: /download/
+    host: download-host.example.com
+    headers:
+      X-Download: yes
+    reuse-settings:
+      max-connections: 2
+"#;
+
+        let parsed: OutboundProxyProtocol = serde_yaml::from_str(config)
+            .expect("Mihomo flat download-settings should parse");
+
+        let OutboundProxyProtocol::Vless(vless) = parsed else {
+            panic!("expected vless proxy");
+        };
+        let download = vless
+            .xhttp_opts
+            .and_then(|opts| opts.download_settings)
+            .expect("download settings should be present");
+
+        assert_eq!(download.address, "download.example.com");
+        assert_eq!(download.network, "xhttp");
+        assert_eq!(download.tls, Some(true));
+        assert_eq!(download.alpn, Some(vec!["h2".to_owned()]));
+        assert_eq!(download.skip_cert_verify, Some(true));
+        assert_eq!(
+            download.name_cert_verify.as_deref(),
+            Some("cert.example.com")
+        );
+        assert_eq!(download.fingerprint.as_deref(), Some("0123456789abcdef"));
+        assert_eq!(download.certificate.as_deref(), Some("client-cert.pem"));
+        assert_eq!(download.private_key.as_deref(), Some("client-key.pem"));
+        assert_eq!(download.server_name.as_deref(), Some("sni.example.com"));
+        assert_eq!(download.client_fingerprint.as_deref(), Some("none"));
+        assert_eq!(download.path.as_deref(), Some("/download/"));
+        assert_eq!(download.host, Some("download-host.example.com".to_owned()));
+        assert_eq!(
+            download
+                .reuse_settings
+                .and_then(|settings| settings.max_connections)
+                .as_deref(),
+            Some("2")
+        );
+    }
+
+    #[test]
+    fn outbound_vless_mihomo_download_settings_can_omit_inherited_endpoint() {
+        let config = r#"
+name: xhttp-inherited-download
+type: vless
+server: upload.example.com
+port: 443
+uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+tls: true
+network: xhttp
+xhttp-opts:
+  path: /xhttp/
+  download-settings:
+    client-fingerprint: none
+"#;
+
+        let parsed: OutboundProxyProtocol = serde_yaml::from_str(config)
+            .expect("download-settings may omit inherited server and port");
+
+        let OutboundProxyProtocol::Vless(vless) = parsed else {
+            panic!("expected vless proxy");
+        };
+        let download = vless
+            .xhttp_opts
+            .and_then(|opts| opts.download_settings)
+            .expect("download settings should be present");
+
+        assert!(download.address.is_empty());
+        assert_eq!(download.port, 0);
+        assert_eq!(download.network, "xhttp");
     }
 
     #[test]
