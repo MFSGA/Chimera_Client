@@ -1,4 +1,8 @@
-use crate::{Packet, stack::IfaceEvent};
+use crate::{
+    Packet,
+    outbound_queue::{FairPacketPermit, FairPacketSender},
+    stack::IfaceEvent,
+};
 use log::error;
 use smoltcp::{
     phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
@@ -12,15 +16,15 @@ pub struct NetstackDevice {
     rx_sender: mpsc::Sender<Packet>,
     rx_queue: mpsc::Receiver<Packet>,
 
-    tx_sender: mpsc::Sender<Packet>,
+    tx_sender: FairPacketSender,
     capabilities: DeviceCapabilities,
 
     iface_notifier: mpsc::Sender<IfaceEvent<'static>>,
 }
 
 impl NetstackDevice {
-    pub fn new(
-        tx_sender: mpsc::Sender<Packet>,
+    pub(crate) fn new(
+        tx_sender: FairPacketSender,
         iface_notifier: mpsc::Sender<IfaceEvent<'static>>,
         mtu: usize,
     ) -> Self {
@@ -46,7 +50,7 @@ impl NetstackDevice {
 
 impl Device for NetstackDevice {
     type RxToken<'a> = RxTokenImpl;
-    type TxToken<'a> = TxTokenImpl<'a>;
+    type TxToken<'a> = TxTokenImpl;
 
     fn receive(
         &mut self,
@@ -55,7 +59,7 @@ impl Device for NetstackDevice {
         // Reserve a tx slot first before touching rx_queue. If rx_queue were
         // consumed first, try_reserve() failure would silently drop inbound ACKs
         // and prevent smoltcp from advancing its send window.
-        let permit = self.tx_sender.try_reserve().ok()?;
+        let permit = self.tx_sender.try_reserve_strict()?;
         let packet = self.rx_queue.try_recv().ok()?;
 
         let rx_token = RxTokenImpl { packet };
@@ -71,9 +75,8 @@ impl Device for NetstackDevice {
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         self.tx_sender
-            .try_reserve()
+            .try_reserve_strict()
             .map(|permit| TxTokenImpl { tx_sender: permit })
-            .ok()
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -94,11 +97,11 @@ impl RxToken for RxTokenImpl {
     }
 }
 
-pub struct TxTokenImpl<'a> {
-    tx_sender: mpsc::Permit<'a, Packet>,
+pub struct TxTokenImpl {
+    tx_sender: FairPacketPermit,
 }
 
-impl<'a> TxToken for TxTokenImpl<'a> {
+impl TxToken for TxTokenImpl {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
@@ -116,11 +119,13 @@ impl<'a> TxToken for TxTokenImpl<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::outbound_queue::fair_packet_channel;
+    use futures::future::poll_fn;
     use smoltcp::phy::Device;
 
     #[test]
     fn configured_mtu_is_reported_by_device() {
-        let (tx_sender, _tx_receiver) = tokio::sync::mpsc::channel::<Packet>(1);
+        let (tx_sender, _tx_receiver) = fair_packet_channel(1, 9000);
         let (iface_notifier, _iface_rx) =
             tokio::sync::mpsc::channel::<IfaceEvent<'static>>(8);
         let device = NetstackDevice::new(tx_sender, iface_notifier, 9000);
@@ -134,7 +139,7 @@ mod tests {
     /// rx_queue before a tx slot is reserved and disappears forever.
     #[tokio::test]
     async fn test_receive_drops_inbound_packet_when_tx_channel_full() {
-        let (tx_sender, mut tx_receiver) = tokio::sync::mpsc::channel::<Packet>(1);
+        let (tx_sender, tx_receiver) = fair_packet_channel(1, 1500);
         let (iface_notifier, _iface_rx) =
             tokio::sync::mpsc::channel::<IfaceEvent<'static>>(8);
         let mut device = NetstackDevice::new(tx_sender, iface_notifier, 1500);
@@ -143,8 +148,9 @@ mod tests {
         // Fill the tx channel to its capacity of 1.
         device
             .tx_sender
-            .try_send(Packet::new(vec![0u8; 60]))
-            .expect("should fit in empty channel");
+            .try_reserve_strict()
+            .expect("should fit in empty queue")
+            .send(Packet::new(vec![0u8; 60]));
 
         // Simulate an inbound ACK entering rx_queue.
         injector
@@ -163,7 +169,9 @@ mod tests {
 
         // Drain the tx channel to make space, then verify the ACK is still
         // available for smoltcp to process.
-        tx_receiver.recv().await.expect("should have a packet");
+        poll_fn(|cx| tx_receiver.poll_recv(cx))
+            .await
+            .expect("should have a packet");
 
         let result = device.receive(smoltcp::time::Instant::now());
         assert!(

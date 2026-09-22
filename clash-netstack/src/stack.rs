@@ -4,17 +4,14 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures::{Stream, future::BoxFuture};
+use futures::future::BoxFuture;
 use log::debug;
 use smoltcp::wire::IpProtocol;
-use std::{
-    collections::VecDeque,
-    pin::Pin,
-    task::{Context, Poll},
-};
+use std::collections::VecDeque;
 use tokio::sync::mpsc;
 
 const PACKET_QUEUE_SIZE: usize = 4096;
+const OUTBOUND_PACKET_QUEUE_SIZE: usize = 256;
 type PendingPacketPermit = BoxFuture<
     'static,
     Result<mpsc::OwnedPermit<Packet>, mpsc::error::SendError<()>>,
@@ -23,6 +20,7 @@ type PendingPacketPermit = BoxFuture<
 use crate::{
     UdpSocket,
     debug::trace_ip_packet,
+    outbound_queue::{FairPacketReceiver, fair_packet_channel},
     tcp_listener::{TcpListener, TcpStreamHandle},
     udp_socket::UdpIcmpControl,
 };
@@ -58,9 +56,8 @@ pub struct NetStack {
     // where the packets get into TCP Stack
     tcp_inbound: mpsc::Sender<Packet>,
 
-    // outside poll this to receive packets from the stack
-    tcp_outbound: mpsc::Receiver<Packet>,
-    udp_outbound: mpsc::Receiver<Packet>,
+    // outside poll this to receive packets from the shared fair output queue
+    outbound: FairPacketReceiver,
     udp_icmp_control: UdpIcmpControl,
 }
 
@@ -89,20 +86,6 @@ where
 {
     fn from(data: T) -> Self {
         Packet::new(data)
-    }
-}
-
-/// Thin `Stream` wrapper around a bounded `mpsc::Receiver`.
-struct ReceiverStream(mpsc::Receiver<Packet>);
-
-impl Stream for ReceiverStream {
-    type Item = Packet;
-
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        self.0.poll_recv(cx)
     }
 }
 
@@ -162,27 +145,29 @@ impl NetStack {
         crate::tcp_listener::TcpListener,
         crate::udp_socket::UdpSocket,
     ) {
-        let (tcp_packet_sender, tcp_packet_receiver) =
-            mpsc::channel::<Packet>(PACKET_QUEUE_SIZE);
-        // UDP uses a separate bounded channel. UDP is inherently lossy, so
-        // drop-on-full is correct; the bound prevents unbounded memory growth
-        // if a remote floods responses faster than the consumer can drain them.
-        let (udp_packet_sender, udp_packet_receiver) =
-            mpsc::channel::<Packet>(PACKET_QUEUE_SIZE);
+        // MIPS uses one bounded fair link queue for TCP, UDP and control
+        // traffic. Strict TCP reservations consume capacity without being
+        // eligible for best-effort replacement; UDP can replace already
+        // published backlog when the queue is otherwise full.
+        let (packet_sender, packet_receiver) =
+            fair_packet_channel(OUTBOUND_PACKET_QUEUE_SIZE, config.mtu);
 
         let (udp_inbound_app, udp_outbound_stack) =
             mpsc::channel::<Packet>(PACKET_QUEUE_SIZE);
 
         // this UdpSocket is essentially an Iface for UDP but much simpler as it only
         // does packets forwarding
-        let udp_socket =
-            UdpSocket::new(udp_outbound_stack, udp_packet_sender, config.mtu);
+        let udp_socket = UdpSocket::new_fair(
+            udp_outbound_stack,
+            packet_sender.clone(),
+            config.mtu,
+        );
         let udp_icmp_control = udp_socket.icmp_control();
         let (tcp_inbound_app, tcp_outbound_stack) =
             mpsc::channel::<Packet>(PACKET_QUEUE_SIZE);
         let tcp_listener = TcpListener::new(
             tcp_outbound_stack,
-            tcp_packet_sender,
+            packet_sender,
             config.mtu,
             &config.local_addresses,
         );
@@ -190,8 +175,7 @@ impl NetStack {
         let stack = NetStack {
             udp_inbound: udp_inbound_app,
             tcp_inbound: tcp_inbound_app,
-            tcp_outbound: tcp_packet_receiver,
-            udp_outbound: udp_packet_receiver,
+            outbound: packet_receiver,
             udp_icmp_control,
         };
 
@@ -205,7 +189,7 @@ impl NetStack {
                 self.tcp_inbound,
                 self.udp_icmp_control,
             ),
-            StackSplitStream::new(self.tcp_outbound, self.udp_outbound),
+            StackSplitStream::new(self.outbound),
         )
     }
 }
@@ -426,30 +410,21 @@ impl futures::Sink<Packet> for StackSplitSink {
 }
 
 pub struct StackSplitStream {
-    inner: futures::stream::Select<ReceiverStream, ReceiverStream>,
+    inner: FairPacketReceiver,
 }
 impl StackSplitStream {
-    pub fn new(
-        tcp_outbound: mpsc::Receiver<Packet>,
-        udp_outbound: mpsc::Receiver<Packet>,
-    ) -> Self {
-        Self {
-            inner: futures::stream::select(
-                ReceiverStream(tcp_outbound),
-                ReceiverStream(udp_outbound),
-            ),
-        }
+    pub(crate) fn new(inner: FairPacketReceiver) -> Self {
+        Self { inner }
     }
 }
 impl futures::Stream for StackSplitStream {
     type Item = std::io::Result<Packet>;
 
     fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        use futures::StreamExt;
-        self.inner.poll_next_unpin(cx).map(|opt| {
+        self.inner.poll_recv(cx).map(|opt| {
             opt.map(|packet| {
                 trace_ip_packet("tun reply packet", packet.data());
                 Ok(packet)

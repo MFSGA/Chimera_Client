@@ -1,4 +1,9 @@
-use crate::{Packet, fragment::FragmentReassembler, packet::IpPacket};
+use crate::{
+    Packet,
+    fragment::FragmentReassembler,
+    outbound_queue::{BestEffortSend, FairPacketSender, OutboundFlowKey},
+    packet::IpPacket,
+};
 use etherparse::PacketBuilder;
 use log::{error, trace, warn};
 use std::{
@@ -23,6 +28,12 @@ const UDP_ICMP_ERROR_CAPACITY: usize = 64;
 type PathMtuCache = Arc<Mutex<HashMap<IpAddr, (usize, Instant)>>>;
 type RecentUdpFlows = Arc<Mutex<HashMap<(SocketAddr, SocketAddr), Instant>>>;
 type UdpIcmpErrors = Arc<Mutex<VecDeque<UdpIcmpError>>>;
+
+#[derive(Clone)]
+enum UdpOutbound {
+    Channel(mpsc::Sender<Packet>),
+    Fair(FairPacketSender),
+}
 
 /// A validated asynchronous ICMP error correlated with a recently sent UDP flow.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -483,7 +494,7 @@ fn quoted_udp_flow_and_payload(
 
 pub struct UdpSocket {
     inbound: mpsc::Receiver<Packet>,
-    outbound: mpsc::Sender<Packet>,
+    outbound: UdpOutbound,
     path_mtu: PathMtuCache,
     recent_flows: RecentUdpFlows,
     errors: UdpIcmpErrors,
@@ -496,6 +507,22 @@ impl UdpSocket {
     pub fn new(
         inbound: mpsc::Receiver<Packet>,
         outbound: mpsc::Sender<Packet>,
+        mtu: usize,
+    ) -> Self {
+        Self::new_with_outbound(inbound, UdpOutbound::Channel(outbound), mtu)
+    }
+
+    pub(crate) fn new_fair(
+        inbound: mpsc::Receiver<Packet>,
+        outbound: FairPacketSender,
+        mtu: usize,
+    ) -> Self {
+        Self::new_with_outbound(inbound, UdpOutbound::Fair(outbound), mtu)
+    }
+
+    fn new_with_outbound(
+        inbound: mpsc::Receiver<Packet>,
+        outbound: UdpOutbound,
         mtu: usize,
     ) -> Self {
         Self {
@@ -1159,7 +1186,7 @@ impl SplitRead {
 
 #[derive(Clone)]
 pub struct SplitWrite {
-    send: mpsc::Sender<Packet>,
+    send: UdpOutbound,
     dropped_on_full: Arc<AtomicU64>,
     flow_label_state: RandomState,
     next_fragment_id: Arc<AtomicU32>,
@@ -1241,55 +1268,71 @@ impl SplitWrite {
         }
     }
 
+    fn try_send_output(
+        &self,
+        packet: Packet,
+        flow: &OutboundFlowKey,
+    ) -> Result<bool, std::io::Error> {
+        let outcome = match &self.send {
+            UdpOutbound::Channel(sender) => match sender.try_send(packet) {
+                Ok(()) => BestEffortSend::Enqueued,
+                Err(mpsc::error::TrySendError::Full(_)) => BestEffortSend::Full,
+                Err(mpsc::error::TrySendError::Closed(_)) => BestEffortSend::Closed,
+            },
+            UdpOutbound::Fair(sender) => {
+                sender.try_send_best_effort(packet, flow.clone())
+            }
+        };
+
+        match outcome {
+            BestEffortSend::Enqueued => Ok(true),
+            BestEffortSend::Replaced => {
+                self.record_queue_drop();
+                Ok(true)
+            }
+            BestEffortSend::Full => {
+                self.record_queue_drop();
+                if self.receive_errors.load(Ordering::Relaxed) {
+                    Err(std::io::Error::from_raw_os_error(libc::ENOBUFS))
+                } else {
+                    Ok(false)
+                }
+            }
+            BestEffortSend::Closed => {
+                Err(std::io::Error::other("packet outbound channel closed"))
+            }
+        }
+    }
+
     fn try_send_fragments(
         &self,
         fragments: Vec<Packet>,
+        flow: &OutboundFlowKey,
     ) -> Result<(), std::io::Error> {
         // MIPS admits source-fragmented external output one fragment at a time
-        // in wire order. Queue pressure therefore behaves like ordinary link
-        // loss: fragments already published survive a later admission failure.
+        // in wire order. A full fair queue may replace one already-published
+        // packet from the fattest flow; earlier fragments are not rolled back.
         for fragment in fragments {
-            match self.send.try_send(fragment) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    self.record_queue_drop();
-                    return if self.receive_errors.load(Ordering::Relaxed) {
-                        Err(std::io::Error::from_raw_os_error(libc::ENOBUFS))
-                    } else {
-                        Ok(())
-                    };
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    return Err(std::io::Error::other(
-                        "packet outbound channel closed",
-                    ));
-                }
+            if !self.try_send_output(fragment, flow)? {
+                return Ok(());
             }
         }
         Ok(())
     }
 
-    fn try_send_packet(&self, packet: Packet) -> Result<(), std::io::Error> {
-        match self.send.try_send(packet) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                self.record_queue_drop();
-                if self.receive_errors.load(Ordering::Relaxed) {
-                    Err(std::io::Error::from_raw_os_error(libc::ENOBUFS))
-                } else {
-                    Ok(())
-                }
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                Err(std::io::Error::other("packet outbound channel closed"))
-            }
-        }
+    fn try_send_packet(
+        &self,
+        packet: Packet,
+        flow: &OutboundFlowKey,
+    ) -> Result<(), std::io::Error> {
+        self.try_send_output(packet, flow).map(|_| ())
     }
 
     fn send_ipv4_fragments(
         &self,
         packet: &[u8],
         mtu: usize,
+        flow: &OutboundFlowKey,
     ) -> Result<(), std::io::Error> {
         const IPV4_HEADER_LEN: usize = 20;
         if mtu <= IPV4_HEADER_LEN {
@@ -1342,13 +1385,14 @@ impl SplitWrite {
             fragments.push(Packet::new(out));
         }
 
-        self.try_send_fragments(fragments)
+        self.try_send_fragments(fragments, flow)
     }
 
     fn send_ipv6_fragments(
         &self,
         packet: &[u8],
         mtu: usize,
+        flow: &OutboundFlowKey,
     ) -> Result<(), std::io::Error> {
         const IPV6_HEADER_LEN: usize = 40;
         const FRAGMENT_HEADER_LEN: usize = etherparse::Ipv6FragmentHeader::LEN;
@@ -1405,10 +1449,12 @@ impl SplitWrite {
             fragments.push(Packet::new(out));
         }
 
-        self.try_send_fragments(fragments)
+        self.try_send_fragments(fragments, flow)
     }
 
     pub async fn send(&mut self, packet: UdpPacket) -> Result<(), std::io::Error> {
+        let output_flow =
+            OutboundFlowKey::udp(packet.local_addr, packet.remote_addr);
         let builder = match (packet.local_addr, packet.remote_addr) {
             (SocketAddr::V4(src), SocketAddr::V4(dst)) => {
                 PacketBuilder::ipv4(src.ip().octets(), dst.ip().octets(), 64)
@@ -1500,16 +1546,24 @@ impl SplitWrite {
         }
         if oversized {
             if packet.local_addr.is_ipv4() && packet.remote_addr.is_ipv4() {
-                return self.send_ipv4_fragments(&ip_packet_writer, path_mtu);
+                return self.send_ipv4_fragments(
+                    &ip_packet_writer,
+                    path_mtu,
+                    &output_flow,
+                );
             }
             if packet.local_addr.is_ipv6() && packet.remote_addr.is_ipv6() {
-                return self.send_ipv6_fragments(&ip_packet_writer, path_mtu);
+                return self.send_ipv6_fragments(
+                    &ip_packet_writer,
+                    path_mtu,
+                    &output_flow,
+                );
             }
         }
 
         // UDP is inherently unreliable; drop the packet if the outbound
         // channel is full rather than blocking the UDP handler task.
-        self.try_send_packet(Packet::new(ip_packet_writer))
+        self.try_send_packet(Packet::new(ip_packet_writer), &output_flow)
     }
 }
 
@@ -1520,7 +1574,7 @@ mod tests {
     fn writer_with_fragment_id(next: u32) -> SplitWrite {
         let (send, _recv) = mpsc::channel(1);
         SplitWrite {
-            send,
+            send: UdpOutbound::Channel(send),
             dropped_on_full: Arc::new(AtomicU64::new(0)),
             flow_label_state: RandomState::new(),
             next_fragment_id: Arc::new(AtomicU32::new(next)),
@@ -2487,7 +2541,7 @@ mod tests {
     async fn icmp_pmtu_update_correlates_first_source_fragment() {
         let (send, mut recv) = mpsc::channel(16);
         let mut writer = writer_with_fragment_id(100);
-        writer.send = send;
+        writer.send = UdpOutbound::Channel(send);
         let control = UdpIcmpControl {
             path_mtu: writer.path_mtu.clone(),
             recent_flows: writer.recent_flows.clone(),
@@ -2595,7 +2649,7 @@ mod tests {
     async fn confirmed_path_mtu_controls_udp_fragmentation() {
         let (send, mut recv) = mpsc::channel(8);
         let mut writer = writer_with_fragment_id(100);
-        writer.send = send;
+        writer.send = UdpOutbound::Channel(send);
         writer.confirm_path_mtu_for("1.1.1.1".parse().unwrap(), 68);
 
         writer
@@ -2621,7 +2675,7 @@ mod tests {
     async fn path_mtu_want_sets_df_only_when_ipv4_datagram_fits() {
         let (send, mut recv) = mpsc::channel(8);
         let mut writer = writer_with_fragment_id(100);
-        writer.send = send;
+        writer.send = UdpOutbound::Channel(send);
         writer.set_path_mtu_discovery(PathMtuDiscovery::Want);
         writer.confirm_path_mtu_for("1.1.1.1".parse().unwrap(), 68);
 
@@ -2671,7 +2725,7 @@ mod tests {
         ] {
             let (send, mut recv) = mpsc::channel(8);
             let mut writer = writer_with_fragment_id(100);
-            writer.send = send;
+            writer.send = UdpOutbound::Channel(send);
             writer.set_path_mtu_discovery(policy);
             writer.confirm_path_mtu_for("1.1.1.1".parse().unwrap(), 68);
 
@@ -2700,7 +2754,7 @@ mod tests {
         for policy in [PathMtuDiscovery::Probe, PathMtuDiscovery::Interface] {
             let (send, mut recv) = mpsc::channel(8);
             let mut writer = writer_with_fragment_id(100);
-            writer.send = send;
+            writer.send = UdpOutbound::Channel(send);
             writer.mtu = 68;
             writer.set_path_mtu_discovery(policy);
 
@@ -2725,7 +2779,7 @@ mod tests {
 
         let (send, mut recv) = mpsc::channel(8);
         let mut writer = writer_with_fragment_id(100);
-        writer.send = send;
+        writer.send = UdpOutbound::Channel(send);
         writer.mtu = 68;
         writer.set_path_mtu_discovery(PathMtuDiscovery::Omit);
         writer
@@ -2751,7 +2805,7 @@ mod tests {
     {
         let (send, mut recv) = mpsc::channel(8);
         let mut writer = writer_with_fragment_id(100);
-        writer.send = send;
+        writer.send = UdpOutbound::Channel(send);
         writer.set_path_mtu_discovery(PathMtuDiscovery::Dont);
         let remote: SocketAddr = "1.1.1.1:5000".parse().unwrap();
         writer.confirm_path_mtu_for(remote.ip(), 68);
@@ -2774,7 +2828,7 @@ mod tests {
     async fn explicit_path_mtu_probe_rejects_above_link_mtu_and_restores_policy() {
         let (send, mut recv) = mpsc::channel(8);
         let mut writer = writer_with_fragment_id(100);
-        writer.send = send;
+        writer.send = UdpOutbound::Channel(send);
         writer.mtu = 1280;
         writer.set_path_mtu_discovery(PathMtuDiscovery::Want);
 
@@ -2798,7 +2852,7 @@ mod tests {
     async fn path_mtu_do_rejects_oversized_datagram_without_output() {
         let (send, mut recv) = mpsc::channel(8);
         let mut writer = writer_with_fragment_id(100);
-        writer.send = send;
+        writer.send = UdpOutbound::Channel(send);
         writer.set_path_mtu_discovery(PathMtuDiscovery::Do);
         writer.confirm_path_mtu_for("1.1.1.1".parse().unwrap(), 68);
 
@@ -2946,7 +3000,7 @@ mod tests {
     async fn ipv4_fragmentation_consumes_one_identification_per_datagram() {
         let (send, mut recv) = mpsc::channel(8);
         let mut writer = SplitWrite {
-            send,
+            send: UdpOutbound::Channel(send),
             dropped_on_full: Arc::new(AtomicU64::new(0)),
             flow_label_state: RandomState::new(),
             next_fragment_id: Arc::new(AtomicU32::new(100)),
@@ -2982,7 +3036,7 @@ mod tests {
     async fn fragmented_datagram_keeps_admitted_prefix_on_queue_pressure() {
         let (send, mut recv) = mpsc::channel(1);
         let mut writer = SplitWrite {
-            send,
+            send: UdpOutbound::Channel(send),
             dropped_on_full: Arc::new(AtomicU64::new(0)),
             flow_label_state: RandomState::new(),
             next_fragment_id: Arc::new(AtomicU32::new(1)),

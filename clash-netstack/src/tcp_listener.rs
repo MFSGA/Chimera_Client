@@ -1,7 +1,7 @@
 use crate::{
     NetStackAddress, Packet, device::NetstackDevice, fragment::FragmentReassembler,
-    packet::IpPacket, ring_buffer::LockFreeRingBuffer, stack::IfaceEvent,
-    tcp_stream::TcpStream,
+    outbound_queue::FairPacketSender, packet::IpPacket,
+    ring_buffer::LockFreeRingBuffer, stack::IfaceEvent, tcp_stream::TcpStream,
 };
 use futures::task::AtomicWaker;
 use log::{debug, error, trace, warn};
@@ -288,9 +288,9 @@ impl TcpListener {
         iface
     }
 
-    pub fn new(
+    pub(crate) fn new(
         inbound: mpsc::Receiver<Packet>,
-        outbound: mpsc::Sender<Packet>,
+        outbound: FairPacketSender,
         mtu: usize,
         local_addresses: &[NetStackAddress],
     ) -> Self {
@@ -922,10 +922,11 @@ impl futures::Stream for TcpListener {
 #[cfg(test)]
 mod resource_limit_tests {
     use super::*;
+    use crate::outbound_queue::fair_packet_channel;
 
     #[test]
     fn interface_uses_configured_local_addresses() {
-        let (outbound, _outbound_rx) = mpsc::channel::<Packet>(8);
+        let (outbound, _outbound_rx) = fair_packet_channel(8, 9000);
         let (iface_notifier, _iface_rx) = mpsc::channel::<IfaceEvent<'static>>(8);
         let mut device = NetstackDevice::new(outbound, iface_notifier, 9000);
         let local_addresses = [
@@ -958,7 +959,7 @@ mod resource_limit_tests {
 
     #[test]
     fn ipv4_only_interface_has_no_ipv6_identity_or_default_route() {
-        let (outbound, _outbound_rx) = mpsc::channel::<Packet>(8);
+        let (outbound, _outbound_rx) = fair_packet_channel(8, 1500);
         let (iface_notifier, _iface_rx) = mpsc::channel::<IfaceEvent<'static>>(8);
         let mut device = NetstackDevice::new(outbound, iface_notifier, 1500);
         let local_addresses = [NetStackAddress::new(

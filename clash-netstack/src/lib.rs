@@ -1,6 +1,7 @@
 mod debug;
 mod device;
 mod fragment;
+mod outbound_queue;
 mod packet;
 mod ring_buffer;
 mod stack;
