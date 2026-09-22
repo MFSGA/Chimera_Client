@@ -62,6 +62,8 @@ fn build_dashboard() -> anyhow::Result<()> {
         let status = std::process::Command::new(npm)
             .args(["ci", "--prefer-offline", "--cache"])
             .arg(&npm_cache)
+            .env("npm_config_registry", "https://registry.npmmirror.com")
+            .env("npm_config_replace_registry_host", "always")
             .current_dir(&dashboard_dir)
             .status()
             .map_err(|e| {
@@ -73,6 +75,8 @@ fn build_dashboard() -> anyhow::Result<()> {
     let status = std::process::Command::new(npm)
         .args(["run", "build"])
         .env("npm_config_cache", &npm_cache)
+        .env("npm_config_registry", "https://registry.npmmirror.com")
+        .env("npm_config_replace_registry_host", "always")
         .current_dir(&dashboard_dir)
         .status()
         .map_err(|e| {

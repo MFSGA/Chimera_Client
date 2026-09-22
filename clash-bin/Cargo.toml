@@ -9,6 +9,27 @@ edition = { workspace = true }
 [features]
 default = ["standard", "aws-lc-rs", "dashboard"]
 
+# Capability bundles used by CI feature matrix.
+# Keep these explicit so unsupported combinations fail early.
+minimal = ["tls", "port", "ring"]
+desktop = ["standard", "aws-lc-rs", "dashboard"]
+server = ["standard", "aws-lc-rs"]
+server-ring = [
+    "shadowsocks",
+    "wireguard",
+    "trojan",
+    "anytls",
+    "ws",
+    "tls",
+    "hysteria",
+    "xhttp-h3",
+    "port",
+    "tun",
+    "extended-health-check",
+    "ring",
+]
+full = ["plus", "dashboard", "aws-lc-rs"]
+
 standard = [
     "shadowsocks",
     "wireguard",

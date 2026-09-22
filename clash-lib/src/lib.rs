@@ -539,6 +539,7 @@ async fn start_with_shutdown_token(
     config_path: Option<String>,
     log_tx: broadcast::Sender<LogEvent>,
     shutdown_token: tokio_util::sync::CancellationToken,
+    #[cfg_attr(not(feature = "tun"), allow(unused_variables))]
     network_runtime_lease: NetworkRuntimeLease,
     startup_tx: Option<std::sync::mpsc::Sender<InstanceStartupEvent>>,
 ) -> Result<()> {
@@ -612,6 +613,7 @@ async fn start_with_shutdown_token(
 
     let reload_token = shutdown_token.clone();
     let reload_handle = tokio::spawn(async move {
+        #[cfg(feature = "tun")]
         let mut network_runtime_lease = network_runtime_lease;
         let mut active_components = components;
         let mut active_api_listener = api_listener;

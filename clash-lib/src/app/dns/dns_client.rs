@@ -368,6 +368,7 @@ enum DnsConfig {
         Arc<dyn OutboundHandler>,
         FwMark,
     ),
+    #[allow(dead_code)]
     Tls(
         net::SocketAddr,
         url::Host<String>,
@@ -375,6 +376,7 @@ enum DnsConfig {
         Arc<dyn OutboundHandler>,
         FwMark,
     ),
+    #[allow(dead_code)]
     Https(
         net::SocketAddr,
         url::Host<String>,

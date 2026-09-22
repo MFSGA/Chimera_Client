@@ -8,7 +8,9 @@
 
 let
   cfg = config.services.chimera-client;
-  executable = lib.getExe cfg.package;
+  # The package installs the clash-rs binary while its pname is
+  # chimera-client; do not derive the executable name from the package name.
+  executable = "${cfg.package}/bin/clash-rs";
   stateDirectory = "/var/lib/private/${cfg.stateDirectory}";
   # %d expands to the service credential directory in systemd command lines.
   # Unlike $CREDENTIALS_DIRECTORY it survives escapeSystemdExecArgs unchanged.

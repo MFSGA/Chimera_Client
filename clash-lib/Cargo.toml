@@ -153,6 +153,8 @@ sha1 = "0.11"
 byteorder = "1"
 
 [features]
+# Feature groups are kept explicit so different frontends (desktop/mobile/server)
+# can choose a smaller build surface. Existing default behavior is preserved.
 default = [
     "zero_copy",
     "tls",
@@ -162,6 +164,23 @@ default = [
     "reality",
     "vless-encryption",
     "extended-health-check",
+]
+
+# Minimal runtime capability set. Future targets should prefer this over default.
+core = [
+    "zero_copy",
+    "tls",
+    "port",
+    "extended-health-check",
+]
+
+# Desktop client capability bundle. Select a concrete TLS provider so this
+# bundle is usable as a runtime profile rather than only a compile surface.
+desktop = [
+    "core",
+    "tun",
+    "dashboard",
+    "aws-lc-rs",
 ]
 
 zero_copy = []

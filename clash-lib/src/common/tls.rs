@@ -1,10 +1,12 @@
 #[cfg(feature = "anytls")]
 use rustls::pki_types::PrivateKeyDer;
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{
     RootCertStore,
     client::{WebPkiServerVerifier, danger::ServerCertVerifier},
-    pki_types::{CertificateDer, ServerName, UnixTime},
 };
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use tracing::warn;
 
 use std::sync::{Arc, LazyLock};
@@ -191,9 +193,11 @@ impl ServerCertVerifier for DefaultTlsVerifier {
     }
 }
 
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 #[derive(Debug)]
 pub struct NoHostnameTlsVerifier(Arc<WebPkiServerVerifier>);
 
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 impl NoHostnameTlsVerifier {
     pub fn new() -> Self {
         Self(
@@ -204,6 +208,7 @@ impl NoHostnameTlsVerifier {
     }
 }
 
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 impl ServerCertVerifier for NoHostnameTlsVerifier {
     fn verify_server_cert(
         &self,
