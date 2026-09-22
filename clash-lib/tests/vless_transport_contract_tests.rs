@@ -121,6 +121,123 @@ fn mihomo_vless_grpc_schema_contract_parses() {
 }
 
 #[test]
+fn mihomo_vless_xhttp_schema_contract_parses() {
+    let config = parse_with_proxy(
+        r#"  - name: mihomo-xhttp
+    type: vless
+    server: upload.example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    udp: true
+    tls: true
+    alpn:
+      - h2
+    servername: upload.example.com
+    network: xhttp
+    xhttp-opts:
+      path: /api?ed=2048
+      host: upload-host.example.com
+      mode: auto
+      session-placement: query
+      session-key: x_session
+      session-table: Base62
+      session-length: 10
+      seq-placement: header
+      seq-key: X-Seq
+      x-padding-bytes: 100-1000
+      x-padding-obfs-mode: true
+      x-padding-key: x_padding
+      x-padding-header: X-Padding
+      x-padding-placement: queryInHeader
+      x-padding-method: tokenish
+      uplink-http-method: POST
+      uplink-data-placement: body
+      uplink-chunk-size: 100-200
+      reuse-settings:
+        max-concurrency: 16-32
+        c-max-reuse-times: 0
+        h-max-request-times: 600-900
+        h-max-reusable-secs: 1800-3000
+        h-keep-alive-period: -1
+      download-settings:
+        address: download.example.com
+        port: 8443
+        network: xhttp
+        security: tls
+        server-name: download.example.com
+        skip-cert-verify: true
+        fingerprint: 0123456789abcdef
+        path: /download?token=1
+        host: download-host.example.com
+        headers:
+          X-Download: enabled
+        reuse-settings:
+          max-connections: 4
+"#,
+    );
+
+    let vless = vless(&config, "mihomo-xhttp");
+    assert_eq!(vless.network.as_deref(), Some("xhttp"));
+    assert_eq!(vless.alpn.as_deref(), Some(["h2".to_owned()].as_slice()));
+
+    let xhttp = vless.xhttp_opts.as_ref().expect("xhttp opts");
+    assert_eq!(xhttp.path.as_deref(), Some("/api?ed=2048"));
+    assert_eq!(xhttp.host.as_deref(), Some("upload-host.example.com"));
+    assert_eq!(xhttp.mode.as_deref(), Some("auto"));
+    assert_eq!(xhttp.session_placement.as_deref(), Some("query"));
+    assert_eq!(xhttp.session_key.as_deref(), Some("x_session"));
+    assert_eq!(xhttp.session_table.as_deref(), Some("Base62"));
+    assert_eq!(xhttp.session_length.as_deref(), Some("10"));
+    assert_eq!(xhttp.seq_placement.as_deref(), Some("header"));
+    assert_eq!(xhttp.seq_key.as_deref(), Some("X-Seq"));
+    assert_eq!(xhttp.x_padding_bytes.as_deref(), Some("100-1000"));
+    assert_eq!(xhttp.x_padding_obfs_mode, Some(true));
+    assert_eq!(xhttp.x_padding_key.as_deref(), Some("x_padding"));
+    assert_eq!(xhttp.x_padding_header.as_deref(), Some("X-Padding"));
+    assert_eq!(xhttp.x_padding_placement.as_deref(), Some("queryInHeader"));
+    assert_eq!(xhttp.x_padding_method.as_deref(), Some("tokenish"));
+    assert_eq!(xhttp.uplink_http_method.as_deref(), Some("POST"));
+    assert_eq!(xhttp.uplink_data_placement.as_deref(), Some("body"));
+    assert_eq!(xhttp.uplink_chunk_size.as_deref(), Some("100-200"));
+
+    let reuse = xhttp.reuse_settings.as_ref().expect("reuse settings");
+    assert_eq!(reuse.max_concurrency.as_deref(), Some("16-32"));
+    assert_eq!(reuse.c_max_reuse_times.as_deref(), Some("0"));
+    assert_eq!(reuse.h_max_request_times.as_deref(), Some("600-900"));
+    assert_eq!(reuse.h_max_reusable_secs.as_deref(), Some("1800-3000"));
+    assert_eq!(reuse.h_keep_alive_period.as_deref(), Some("-1"));
+
+    let download = xhttp.download_settings.as_ref().expect("download settings");
+    assert_eq!(download.address, "download.example.com");
+    assert_eq!(download.port, 8443);
+    assert_eq!(download.network, "xhttp");
+    assert_eq!(download.security.as_deref(), Some("tls"));
+    assert_eq!(
+        download.server_name.as_deref(),
+        Some("download.example.com")
+    );
+    assert_eq!(download.skip_cert_verify, Some(true));
+    assert_eq!(download.fingerprint.as_deref(), Some("0123456789abcdef"));
+    assert_eq!(download.path.as_deref(), Some("/download?token=1"));
+    assert_eq!(download.host.as_deref(), Some("download-host.example.com"));
+    assert_eq!(
+        download
+            .headers
+            .as_ref()
+            .and_then(|headers| headers.get("X-Download"))
+            .map(String::as_str),
+        Some("enabled")
+    );
+    assert_eq!(
+        download
+            .reuse_settings
+            .as_ref()
+            .and_then(|reuse| reuse.max_connections.as_deref()),
+        Some("4")
+    );
+}
+
+#[test]
 fn mihomo_vless_tls_verify_name_and_mtls_schema_contract_parses() {
     let config = parse_with_proxy(
         r#"  - name: mihomo-mtls
