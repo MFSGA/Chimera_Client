@@ -42,6 +42,7 @@ impl TryFrom<&OutboundVless> for Handler {
     type Error = crate::Error;
 
     fn try_from(s: &OutboundVless) -> Result<Self, Self::Error> {
+        validate_vless_config(s)?;
         let network = s.network.as_deref();
         let skip_cert_verify = s.skip_cert_verify.unwrap_or_default();
         let (server, port) = xhttp_upload_server_port(s);
@@ -69,6 +70,42 @@ impl TryFrom<&OutboundVless> for Handler {
             flow: s.flow.clone(),
         }))
     }
+}
+
+fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
+    match s.flow.as_deref() {
+        None | Some("") | Some("xtls-rprx-vision") => {}
+        Some(flow) => {
+            return Err(Error::InvalidConfig(format!(
+                "unsupported vless flow: {flow}"
+            )));
+        }
+    }
+
+    if let Some(client_fingerprint) = s.client_fingerprint.as_deref() {
+        if s.reality_opts.is_some() {
+            if client_fingerprint != "chrome" {
+                return Err(Error::InvalidConfig(format!(
+                    "vless reality currently supports only client-fingerprint: chrome, got {client_fingerprint}"
+                )));
+            }
+        } else if client_fingerprint != "none" {
+            return Err(Error::InvalidConfig(format!(
+                "vless client-fingerprint is not implemented for non-reality TLS, got {client_fingerprint}"
+            )));
+        }
+    }
+
+    if matches!(s.network.as_deref(), Some("xhttp"))
+        && let Some(alpn) = s.alpn.as_ref()
+        && alpn.as_slice() != ["h2"]
+    {
+        return Err(Error::InvalidConfig(
+            "vless xhttp currently requires alpn: [h2]; HTTP/1.1 and HTTP/3 backends are not implemented yet".to_owned(),
+        ));
+    }
+
+    Ok(())
 }
 
 fn build_transport(
@@ -107,7 +144,11 @@ fn build_tls_transport(
             .as_ref()
             .and_then(|opts| opts.upload_settings.as_ref())
     {
-        return build_xhttp_upload_tls_transport(upload_settings);
+        return build_xhttp_upload_tls_transport(
+            upload_settings,
+            s.alpn.clone(),
+            s.fingerprint.clone(),
+        );
     }
 
     if !s.tls.unwrap_or_default() {
@@ -123,28 +164,36 @@ fn build_tls_transport(
         .clone()
         .or_else(|| s.server_name.clone())
         .unwrap_or_else(|| s.common_opts.server.clone());
-    let alpn = match network {
+    let alpn = resolve_vless_alpn(s, network);
+
+    Ok(Some(Box::new(TlsClient::new_with_fingerprint(
+        skip_cert_verify,
+        server_name,
+        alpn,
+        None,
+        s.fingerprint.clone(),
+    ))))
+}
+
+fn resolve_vless_alpn(
+    s: &OutboundVless,
+    network: Option<&str>,
+) -> Option<Vec<String>> {
+    s.alpn.clone().or_else(|| match network {
         Some("ws") => Some(
             DEFAULT_WS_ALPN
                 .iter()
                 .map(|item| (*item).to_owned())
-                .collect::<Vec<_>>(),
+                .collect(),
         ),
         Some("xhttp") => Some(
             DEFAULT_XHTTP_ALPN
                 .iter()
                 .map(|item| (*item).to_owned())
-                .collect::<Vec<_>>(),
+                .collect(),
         ),
         _ => None,
-    };
-
-    Ok(Some(Box::new(TlsClient::new(
-        skip_cert_verify,
-        server_name,
-        alpn,
-        None,
-    ))))
+    })
 }
 
 fn build_xhttp_reality_transport(
@@ -158,6 +207,7 @@ fn build_xhttp_reality_transport(
                 .as_ref()
                 .expect("xhttp reality transport requires reality_opts"),
             server_name,
+            s.alpn.clone(),
         )?;
         Ok(Some(Box::new(client)))
     }
@@ -172,6 +222,8 @@ fn build_xhttp_reality_transport(
 
 fn build_xhttp_upload_tls_transport(
     upload_settings: &XhttpUploadSettings,
+    alpn: Option<Vec<String>>,
+    fingerprint: Option<String>,
 ) -> Result<Option<Box<dyn Transport>>, Error> {
     match upload_settings.security.as_deref().unwrap_or("none") {
         "none" => Ok(None),
@@ -198,18 +250,21 @@ fn build_xhttp_upload_tls_transport(
                 .as_ref()
                 .and_then(|settings| settings.insecure)
                 .unwrap_or(false);
-            let alpn = Some(
-                DEFAULT_XHTTP_ALPN
-                    .iter()
-                    .map(|item| (*item).to_owned())
-                    .collect(),
-            );
+            let alpn = alpn.or_else(|| {
+                Some(
+                    DEFAULT_XHTTP_ALPN
+                        .iter()
+                        .map(|item| (*item).to_owned())
+                        .collect(),
+                )
+            });
 
-            Ok(Some(Box::new(TlsClient::new(
+            Ok(Some(Box::new(TlsClient::new_with_fingerprint(
                 skip_cert_verify,
                 server_name,
                 alpn,
                 None,
+                fingerprint,
             ))))
         }
         other => Err(Error::InvalidConfig(format!(
@@ -268,35 +323,38 @@ fn build_xhttp_transport(
     let upload_security =
         upload_settings.and_then(|settings| settings.security.as_deref());
 
-    Ok(Some(Box::new(XhttpClient::new(
-        upload_settings
-            .map(|settings| settings.address.clone())
-            .unwrap_or_else(|| s.common_opts.server.clone()),
-        upload_settings
-            .map(|settings| settings.port)
-            .unwrap_or(s.common_opts.port),
-        normalized_xhttp_path(
+    Ok(Some(Box::new(
+        XhttpClient::new(
+            upload_settings
+                .map(|settings| settings.address.clone())
+                .unwrap_or_else(|| s.common_opts.server.clone()),
+            upload_settings
+                .map(|settings| settings.port)
+                .unwrap_or(s.common_opts.port),
+            normalized_xhttp_path(
+                upload_xhttp_settings
+                    .and_then(|settings| settings.path.as_deref())
+                    .or(xhttp_opts.path.as_deref()),
+            ),
             upload_xhttp_settings
-                .and_then(|settings| settings.path.as_deref())
-                .or(xhttp_opts.path.as_deref()),
-        ),
-        upload_xhttp_settings
-            .and_then(|settings| settings.host.clone())
-            .or_else(|| xhttp_opts.host.clone()),
-        merged_xhttp_headers(
-            xhttp_opts.headers.clone(),
-            extra.and_then(|value| value.headers.clone()),
-            upload_xhttp_settings.and_then(|settings| settings.headers.clone()),
-        ),
-        matches!(upload_security, Some("tls" | "reality"))
-            || s.tls.unwrap_or_default()
-            || s.reality_opts.is_some(),
-        mode,
-        resolve_xhttp_max_each_post_bytes(xhttp_opts),
-        resolve_xhttp_no_grpc_header(xhttp_opts),
-        resolve_xhttp_min_posts_interval_ms(xhttp_opts),
-        build_xhttp_download_config(s, xhttp_opts)?,
-    ))))
+                .and_then(|settings| settings.host.clone())
+                .or_else(|| xhttp_opts.host.clone()),
+            merged_xhttp_headers(
+                xhttp_opts.headers.clone(),
+                extra.and_then(|value| value.headers.clone()),
+                upload_xhttp_settings.and_then(|settings| settings.headers.clone()),
+            ),
+            matches!(upload_security, Some("tls" | "reality"))
+                || s.tls.unwrap_or_default()
+                || s.reality_opts.is_some(),
+            mode,
+            resolve_xhttp_max_each_post_bytes(xhttp_opts),
+            resolve_xhttp_no_grpc_header(xhttp_opts),
+            resolve_xhttp_min_posts_interval_ms(xhttp_opts),
+            build_xhttp_download_config(s, xhttp_opts)?,
+        )
+        .with_auto_reality(s.reality_opts.is_some()),
+    )))
 }
 
 fn build_xhttp_download_config(
@@ -351,6 +409,7 @@ fn build_xhttp_download_config(
         s.reality_opts.as_ref(),
         &security,
         &server_name,
+        s.alpn.as_deref(),
     )?;
 
     Ok(Some(XhttpDownloadConfig {
@@ -452,14 +511,16 @@ fn resolve_xhttp_upload_server_name(s: &OutboundVless) -> String {
 fn build_reality_transport_from_opts(
     reality_opts: &OutboundTrojanRealityOpts,
     server_name: String,
+    alpn_protocols: Option<Vec<String>>,
 ) -> Result<RealityClient, Error> {
     let public_key = decode_reality_public_key(&reality_opts.public_key)?;
     let short_id = decode_reality_short_id(reality_opts.short_id.as_deref())?;
-    Ok(RealityClient::new(
+    Ok(RealityClient::new_with_alpn(
         public_key,
         short_id,
         server_name,
         Vec::new(),
+        alpn_protocols.unwrap_or_default(),
     ))
 }
 
@@ -467,6 +528,7 @@ fn build_xhttp_download_reality_config(
     reality_opts: Option<&OutboundTrojanRealityOpts>,
     security: &XhttpSecurity,
     server_name: &str,
+    alpn_protocols: Option<&[String]>,
 ) -> Result<Option<XhttpRealityConfig>, Error> {
     if !matches!(security, XhttpSecurity::Reality) {
         return Ok(None);
@@ -486,12 +548,16 @@ fn build_xhttp_download_reality_config(
             public_key,
             short_id,
             server_name: server_name.to_owned(),
+            alpn_protocols: alpn_protocols
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| vec!["h2".to_owned()]),
         }))
     }
     #[cfg(not(feature = "reality"))]
     {
         let _ = reality_opts;
         let _ = server_name;
+        let _ = alpn_protocols;
         Err(Error::InvalidConfig(
             "xhttp download_settings reality requires reality feature".to_owned(),
         ))
@@ -652,7 +718,7 @@ fn parse_xhttp_mode(xhttp_opts: &XhttpOpt) -> Result<XhttpMode, Error> {
         "stream-one" => Ok(XhttpMode::StreamOne),
         "stream-up" => Ok(XhttpMode::StreamUp),
         "packet-up" | "split" => Ok(XhttpMode::PacketUp),
-        "auto" => Ok(XhttpMode::PacketUp),
+        "auto" => Ok(XhttpMode::Auto),
         other => Err(Error::InvalidConfig(format!(
             "unsupported xhttp mode: {other}"
         ))),
@@ -691,7 +757,11 @@ fn build_tcp_transport(
 
     let server_name = resolve_reality_server_name(s);
     let reality_opts = s.reality_opts.as_ref().expect("checked is_some above");
-    let client = build_reality_transport_from_opts(reality_opts, server_name)?;
+    let client = build_reality_transport_from_opts(
+        reality_opts,
+        server_name,
+        s.alpn.clone(),
+    )?;
 
     Ok(Some(Box::new(client)))
 }
@@ -755,7 +825,10 @@ mod tests {
         XhttpExtra, XhttpOpt, XhttpUploadSettings,
     };
 
-    use super::{OutboundVless, build_tls_transport};
+    use super::{
+        OutboundVless, XhttpMode, build_tls_transport, build_xhttp_download_config,
+        parse_xhttp_mode, resolve_vless_alpn, validate_vless_config,
+    };
 
     #[cfg(feature = "ws")]
     use crate::config::internal::proxy::WsOpt;
@@ -806,6 +879,217 @@ mod tests {
         };
 
         assert_eq!(resolve_reality_server_name(&outbound), "www.amd.com");
+    }
+
+    #[cfg(feature = "reality")]
+    #[test]
+    fn vless_reality_accepts_explicit_alpn_and_chrome_fingerprint() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "reality-alpn".to_owned(),
+                server: "edge.example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            alpn: Some(vec!["h2".to_owned()]),
+            client_fingerprint: Some("chrome".to_owned()),
+            reality_opts: Some(OutboundTrojanRealityOpts {
+                public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
+                short_id: None,
+            }),
+            ..Default::default()
+        };
+
+        validate_vless_config(&outbound).expect(
+            "reality should accept explicit h2 ALPN with chrome fingerprint",
+        );
+        let transport = build_transport(outbound.network.as_deref(), &outbound)
+            .expect("reality transport should build");
+        assert!(
+            transport.is_some(),
+            "reality handshake transport should be present"
+        );
+    }
+
+    #[cfg(feature = "reality")]
+    #[test]
+    fn vless_reality_rejects_non_chrome_client_fingerprint() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "reality-firefox".to_owned(),
+                server: "edge.example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            client_fingerprint: Some("firefox".to_owned()),
+            reality_opts: Some(OutboundTrojanRealityOpts {
+                public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
+                short_id: None,
+            }),
+            ..Default::default()
+        };
+
+        let err = validate_vless_config(&outbound)
+            .expect_err("unsupported Reality ClientHello fingerprint must fail");
+        assert!(
+            err.to_string()
+                .contains("supports only client-fingerprint: chrome"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vless_non_reality_rejects_unimplemented_client_fingerprint() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "tls-firefox".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            tls: Some(true),
+            client_fingerprint: Some("firefox".to_owned()),
+            ..Default::default()
+        };
+
+        let err = validate_vless_config(&outbound)
+            .expect_err("non-Reality uTLS fingerprint must not be silently ignored");
+        assert!(
+            err.to_string().contains(
+                "client-fingerprint is not implemented for non-reality TLS"
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vless_rejects_unknown_flow() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "bad-flow".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            flow: Some("xtls-rprx-unknown".to_owned()),
+            ..Default::default()
+        };
+
+        let err = validate_vless_config(&outbound)
+            .expect_err("unknown vless flow must be rejected");
+        assert!(
+            err.to_string().contains("unsupported vless flow"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vless_accepts_vision_flow() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "vision".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            flow: Some("xtls-rprx-vision".to_owned()),
+            ..Default::default()
+        };
+
+        validate_vless_config(&outbound)
+            .expect("vision flow should remain supported");
+    }
+
+    #[test]
+    fn vless_explicit_alpn_overrides_transport_default() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "alpn".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            alpn: Some(vec!["h2".to_owned(), "http/1.1".to_owned()]),
+            network: Some("tcp".to_owned()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_vless_alpn(&outbound, outbound.network.as_deref()),
+            Some(vec!["h2".to_owned(), "http/1.1".to_owned()])
+        );
+    }
+
+    #[test]
+    fn vless_xhttp_rejects_non_h2_alpn_until_backend_exists() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp-h3".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            alpn: Some(vec!["h3".to_owned()]),
+            network: Some("xhttp".to_owned()),
+            ..Default::default()
+        };
+
+        let err = validate_vless_config(&outbound)
+            .expect_err("xhttp h3 must fail until an HTTP/3 backend exists");
+        assert!(
+            err.to_string().contains("currently requires alpn: [h2]"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vless_transport_default_alpn_is_preserved_without_override() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "alpn-default".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            network: Some("xhttp".to_owned()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_vless_alpn(&outbound, outbound.network.as_deref()),
+            Some(vec!["h2".to_owned()])
+        );
+    }
+
+    #[test]
+    fn vless_tls_accepts_certificate_fingerprint_pinning() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "fingerprint".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            tls: Some(true),
+            fingerprint: Some("0123456789abcdef".to_owned()),
+            ..Default::default()
+        };
+
+        validate_vless_config(&outbound).expect(
+            "certificate fingerprint should be a supported vless TLS option",
+        );
+        let tls = build_tls_transport(outbound.network.as_deref(), &outbound, false)
+            .expect("vless tls with certificate pinning should build");
+        assert!(tls.is_some(), "tls transport should be present");
     }
 
     #[cfg(feature = "ws")]
@@ -1022,7 +1306,7 @@ mod tests {
     }
 
     #[test]
-    fn vless_xhttp_auto_defaults_to_packet_up() {
+    fn vless_xhttp_auto_is_preserved_for_runtime_resolution() {
         let outbound = OutboundVless {
             common_opts: CommonConfigOptions {
                 name: "xhttp".to_owned(),
@@ -1038,6 +1322,15 @@ mod tests {
             }),
             ..Default::default()
         };
+
+        let opts = outbound
+            .xhttp_opts
+            .as_ref()
+            .expect("xhttp options should be present");
+        assert_eq!(
+            parse_xhttp_mode(opts).expect("auto mode should parse"),
+            XhttpMode::Auto
+        );
 
         let transport = build_transport(outbound.network.as_deref(), &outbound)
             .expect("auto mode should build");
@@ -1194,6 +1487,8 @@ mod tests {
             },
             uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
             network: Some("xhttp".to_owned()),
+            alpn: Some(vec!["h2".to_owned()]),
+            client_fingerprint: Some("chrome".to_owned()),
             xhttp_opts: Some(XhttpOpt {
                 path: Some("/xhttp/".to_owned()),
                 ..Default::default()
@@ -1232,6 +1527,8 @@ mod tests {
             },
             uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
             network: Some("xhttp".to_owned()),
+            alpn: Some(vec!["h2".to_owned()]),
+            client_fingerprint: Some("chrome".to_owned()),
             xhttp_opts: Some(XhttpOpt {
                 path: Some("/upload/".to_owned()),
                 extra: Some(XhttpExtra {
@@ -1262,6 +1559,21 @@ mod tests {
         assert!(
             transport.is_some(),
             "xhttp transport with reality download settings should be present"
+        );
+
+        let xhttp_opts = outbound
+            .xhttp_opts
+            .as_ref()
+            .expect("xhttp options should be present");
+        let download = build_xhttp_download_config(&outbound, xhttp_opts)
+            .expect("download config should build")
+            .expect("download config should be present");
+        assert_eq!(
+            download
+                .reality
+                .expect("reality config should be present")
+                .alpn_protocols,
+            vec!["h2".to_owned()]
         );
     }
 

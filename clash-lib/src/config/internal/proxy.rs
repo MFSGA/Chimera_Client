@@ -191,6 +191,27 @@ pub struct OutboundAnytls {
     pub tls_key: Option<String>,
 }
 
+fn deserialize_optional_string_or_vec<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum StringOrVec {
+        String(String),
+        Vec(Vec<String>),
+    }
+
+    Ok(
+        Option::<StringOrVec>::deserialize(deserializer)?.map(|value| match value {
+            StringOrVec::String(value) => vec![value],
+            StringOrVec::Vec(values) => values,
+        }),
+    )
+}
+
 pub fn map_serde_error(
     name: String,
 ) -> impl FnOnce(serde_yaml::Error) -> crate::Error {
@@ -261,6 +282,7 @@ pub struct XhttpDownloadTlsSettings {
 #[serde(rename_all = "kebab-case")]
 pub struct XhttpDownloadXhttpSettings {
     pub path: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_or_vec")]
     pub host: Option<Vec<String>>,
     pub headers: Option<HashMap<String, String>>,
     pub mode: Option<String>,
@@ -303,6 +325,7 @@ pub type XhttpUploadSettings = XhttpDownloadSettings;
 pub struct XhttpOpt {
     pub path: Option<String>,
     pub mode: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_or_vec")]
     pub host: Option<Vec<String>>,
     pub headers: Option<HashMap<String, String>>,
     pub extra: Option<XhttpExtra>,
@@ -325,6 +348,7 @@ pub struct OutboundVless {
     pub uuid: String,
     pub udp: Option<bool>,
     pub tls: Option<bool>,
+    pub alpn: Option<Vec<String>>,
     pub skip_cert_verify: Option<bool>,
     #[serde(alias = "servername", alias = "serverName")]
     pub server_name: Option<String>,
@@ -337,7 +361,9 @@ pub struct OutboundVless {
     #[serde(alias = "realityOpts")]
     pub reality_opts: Option<OutboundTrojanRealityOpts>,
     pub flow: Option<String>,
-    #[serde(alias = "fingerprint")]
+    /// TLS certificate SHA-256 fingerprint pin.
+    pub fingerprint: Option<String>,
+    /// TLS ClientHello/uTLS-style fingerprint selection.
     pub client_fingerprint: Option<String>,
 }
 
@@ -758,6 +784,75 @@ xhttp-opts:
         assert_eq!(opts.max_each_post_bytes, Some(1_000_000));
         assert_eq!(opts.max_buffered_posts, Some(30));
         assert_eq!(opts.session_ttl, Some(30));
+    }
+
+    #[test]
+    fn outbound_vless_keeps_certificate_and_client_fingerprints_separate() {
+        let config = r#"
+name: vless-fingerprint
+type: vless
+server: example.com
+port: 443
+uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+fingerprint: 0123456789abcdef
+client-fingerprint: chrome
+alpn:
+  - h2
+  - http/1.1
+"#;
+
+        let parsed: OutboundProxyProtocol = serde_yaml::from_str(config)
+            .expect("vless fingerprint config should parse");
+
+        let OutboundProxyProtocol::Vless(vless) = parsed else {
+            panic!("expected vless proxy");
+        };
+
+        assert_eq!(vless.fingerprint.as_deref(), Some("0123456789abcdef"));
+        assert_eq!(vless.client_fingerprint.as_deref(), Some("chrome"));
+        assert_eq!(
+            vless.alpn,
+            Some(vec!["h2".to_owned(), "http/1.1".to_owned()])
+        );
+    }
+
+    #[test]
+    fn outbound_vless_xhttp_accepts_scalar_host() {
+        let config = r#"
+name: xhttp-host
+type: vless
+server: upload.example.com
+port: 443
+uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+network: xhttp
+xhttp-opts:
+  host: upload-host.example.com
+  download-settings:
+    address: download.example.com
+    port: 443
+    network: xhttp
+    xhttp-settings:
+      host: download-host.example.com
+"#;
+
+        let parsed: OutboundProxyProtocol =
+            serde_yaml::from_str(config).expect("scalar xhttp host should parse");
+
+        let OutboundProxyProtocol::Vless(vless) = parsed else {
+            panic!("expected vless proxy");
+        };
+        let opts = vless.xhttp_opts.expect("xhttp opts should be present");
+
+        assert_eq!(
+            opts.host.as_deref(),
+            Some(["upload-host.example.com".to_owned()].as_slice())
+        );
+        assert_eq!(
+            opts.download_settings
+                .and_then(|settings| settings.xhttp_settings)
+                .and_then(|settings| settings.host),
+            Some(vec!["download-host.example.com".to_owned()])
+        );
     }
 }
 

@@ -48,6 +48,8 @@ pub struct RealityClientConfig {
     pub server_name: String,
     /// Supported TLS 1.3 cipher suites (empty = use defaults)
     pub cipher_suites: Vec<CipherSuite>,
+    /// ALPN protocols offered in ClientHello (empty = browser-like defaults).
+    pub alpn_protocols: Vec<String>,
 }
 
 /// Handshake state machine for REALITY client
@@ -213,13 +215,24 @@ impl RealityClientConnection {
         };
         let cipher_suite_ids: Vec<u16> =
             cipher_suites.iter().map(|cs| cs.id()).collect();
+        let configured_alpn = self
+            .config
+            .alpn_protocols
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let alpn_protocols = if configured_alpn.is_empty() {
+            DEFAULT_ALPN_PROTOCOLS
+        } else {
+            configured_alpn.as_slice()
+        };
         let mut client_hello = construct_client_hello(
             &client_random,
             &session_id_for_hello,
             our_public_key_bytes.as_ref(),
             &self.config.server_name,
             &cipher_suite_ids,
-            DEFAULT_ALPN_PROTOCOLS,
+            alpn_protocols,
         )?;
 
         // Now encrypt the SessionId using the ClientHello with zeroed SessionId as AAD
@@ -1093,8 +1106,7 @@ pub fn feed_reality_client_connection(
 mod tests {
     use super::*;
 
-    #[test]
-    fn client_hello_transcript_bytes_use_encrypted_session_id() {
+    fn test_server_public_key() -> [u8; 32] {
         let server_private = [0x42u8; 32];
         let server_private_key = agreement::PrivateKey::from_private_key(
             &agreement::X25519,
@@ -1104,12 +1116,18 @@ mod tests {
         let server_public_key = server_private_key.compute_public_key().unwrap();
         let mut server_public = [0u8; 32];
         server_public.copy_from_slice(server_public_key.as_ref());
+        server_public
+    }
 
+    #[test]
+    fn client_hello_transcript_bytes_use_encrypted_session_id() {
+        let server_public = test_server_public_key();
         let config = RealityClientConfig {
             public_key: server_public,
             short_id: vec![1, 2, 3, 4, 5, 6, 7, 8],
             server_name: "example.com".to_string(),
             cipher_suites: vec![],
+            alpn_protocols: vec!["h2".to_owned()],
         };
 
         let mut conn = RealityClientConnection::new(config).unwrap();
@@ -1131,6 +1149,34 @@ mod tests {
             &stored_client_hello[39..71],
             &[0u8; 32],
             "transcript ClientHello must retain encrypted wire SessionId"
+        );
+    }
+
+    #[test]
+    fn client_hello_uses_configured_alpn() {
+        let config = RealityClientConfig {
+            public_key: test_server_public_key(),
+            short_id: vec![],
+            server_name: "example.com".to_owned(),
+            cipher_suites: vec![],
+            alpn_protocols: vec!["h3".to_owned()],
+        };
+
+        let conn = RealityClientConnection::new(config).unwrap();
+        let client_hello = match &conn.handshake_state {
+            HandshakeState::AwaitingServerHello {
+                client_hello_bytes, ..
+            } => client_hello_bytes,
+            _ => panic!("new client must be awaiting ServerHello"),
+        };
+
+        // ALPN extension: type=0x0010, len=5, list-len=3, proto-len=2, "h3".
+        let expected_alpn = [0x00, 0x10, 0x00, 0x05, 0x00, 0x03, 0x02, b'h', b'3'];
+        assert!(
+            client_hello
+                .windows(expected_alpn.len())
+                .any(|window| window == expected_alpn),
+            "configured ALPN must be encoded in Reality ClientHello"
         );
     }
 }

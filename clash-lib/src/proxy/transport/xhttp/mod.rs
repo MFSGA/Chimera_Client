@@ -38,8 +38,9 @@ const DEFAULT_XHTTP_USER_AGENT: &str = "Mozilla/5.0";
 type H2SendRequest =
     hyper::client::conn::http2::SendRequest<BoxBody<Bytes, Infallible>>;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum XhttpMode {
+    Auto,
     StreamOne,
     StreamUp,
     PacketUp,
@@ -58,6 +59,7 @@ pub struct XhttpRealityConfig {
     pub public_key: [u8; 32],
     pub short_id: Vec<u8>,
     pub server_name: String,
+    pub alpn_protocols: Vec<String>,
 }
 
 #[allow(dead_code)]
@@ -86,6 +88,7 @@ pub struct Client {
     no_grpc_header: bool,
     min_posts_interval_ms: Option<u64>,
     download: Option<XhttpDownloadConfig>,
+    auto_reality: bool,
 }
 
 impl Client {
@@ -115,7 +118,13 @@ impl Client {
             no_grpc_header,
             min_posts_interval_ms,
             download,
+            auto_reality: false,
         }
+    }
+
+    pub fn with_auto_reality(mut self, auto_reality: bool) -> Self {
+        self.auto_reality = auto_reality;
+        self
     }
 
     fn request(
@@ -137,13 +146,24 @@ impl Client {
         )
     }
 
+    fn effective_mode(&self) -> XhttpMode {
+        match self.mode {
+            XhttpMode::Auto if self.download.is_some() => XhttpMode::StreamUp,
+            XhttpMode::Auto if self.auto_reality => XhttpMode::StreamOne,
+            XhttpMode::Auto => XhttpMode::StreamUp,
+            mode => mode,
+        }
+    }
+
     fn request_content_type(&self, method: &str) -> Option<&'static str> {
         if method != "POST" {
             return None;
         }
 
-        if matches!(self.mode, XhttpMode::StreamOne | XhttpMode::StreamUp)
-            && !self.no_grpc_header
+        if matches!(
+            self.effective_mode(),
+            XhttpMode::StreamOne | XhttpMode::StreamUp
+        ) && !self.no_grpc_header
         {
             return Some("application/grpc");
         }
@@ -225,11 +245,12 @@ async fn connect_download_stream(
                         "xhttp download_settings reality requires reality config",
                     )
                 })?;
-                let client = RealityClient::new(
+                let client = RealityClient::new_with_alpn(
                     reality.public_key,
                     reality.short_id.clone(),
                     reality.server_name.clone(),
                     Vec::new(),
+                    reality.alpn_protocols.clone(),
                 );
                 client.proxy_stream(stream).await
             }
@@ -353,10 +374,11 @@ fn build_xhttp_padding_referer(uri: &str) -> String {
 #[async_trait]
 impl Transport for Client {
     async fn proxy_stream(&self, stream: AnyStream) -> io::Result<AnyStream> {
-        match self.mode {
+        match self.effective_mode() {
             XhttpMode::StreamOne => proxy_stream_one(self, stream).await,
             XhttpMode::StreamUp => proxy_stream_up(self, stream).await,
             XhttpMode::PacketUp => proxy_packet_up(self, stream).await,
+            XhttpMode::Auto => unreachable!("effective_mode resolves auto"),
         }
     }
 }
@@ -598,6 +620,55 @@ mod tests {
 
     type TestSessions =
         Arc<Mutex<HashMap<String, mpsc::Sender<Result<Frame<Bytes>, Infallible>>>>>;
+
+    fn auto_client(
+        auto_reality: bool,
+        download: Option<XhttpDownloadConfig>,
+    ) -> Client {
+        Client::new(
+            "example.com".to_owned(),
+            443,
+            "/xhttp/".to_owned(),
+            None,
+            HashMap::new(),
+            true,
+            XhttpMode::Auto,
+            1_000_000,
+            false,
+            None,
+            download,
+        )
+        .with_auto_reality(auto_reality)
+    }
+
+    #[test]
+    fn xhttp_auto_reality_resolves_to_stream_one() {
+        let client = auto_client(true, None);
+        assert_eq!(client.effective_mode(), XhttpMode::StreamOne);
+    }
+
+    #[test]
+    fn xhttp_auto_h2_resolves_to_stream_up() {
+        let client = auto_client(false, None);
+        assert_eq!(client.effective_mode(), XhttpMode::StreamUp);
+    }
+
+    #[test]
+    fn xhttp_auto_with_separate_download_resolves_to_stream_up() {
+        let download = XhttpDownloadConfig {
+            server: "download.example.com".to_owned(),
+            port: 443,
+            path: "/xhttp/".to_owned(),
+            host: None,
+            headers: HashMap::new(),
+            security: XhttpSecurity::Tls,
+            server_name: "download.example.com".to_owned(),
+            skip_cert_verify: false,
+            reality: None,
+        };
+        let client = auto_client(true, Some(download));
+        assert_eq!(client.effective_mode(), XhttpMode::StreamUp);
+    }
 
     #[test]
     fn xhttp_request_adds_default_padding_referer() {

@@ -32,6 +32,7 @@ pub struct Client {
     pub sni: String,
     pub alpn: Option<Vec<String>>,
     pub expected_alpn: Option<String>,
+    pub fingerprint: Option<String>,
     #[cfg(feature = "anytls")]
     pub tls_cert: Option<String>,
     #[cfg(feature = "anytls")]
@@ -50,6 +51,27 @@ impl Client {
             sni,
             alpn,
             expected_alpn,
+            fingerprint: None,
+            #[cfg(feature = "anytls")]
+            tls_cert: None,
+            #[cfg(feature = "anytls")]
+            tls_key: None,
+        }
+    }
+
+    pub fn new_with_fingerprint(
+        skip_cert_verify: bool,
+        sni: String,
+        alpn: Option<Vec<String>>,
+        expected_alpn: Option<String>,
+        fingerprint: Option<String>,
+    ) -> Self {
+        Self {
+            skip_cert_verify,
+            sni,
+            alpn,
+            expected_alpn,
+            fingerprint,
             #[cfg(feature = "anytls")]
             tls_cert: None,
             #[cfg(feature = "anytls")]
@@ -72,6 +94,7 @@ impl Client {
                 sni,
                 alpn,
                 expected_alpn,
+                fingerprint: None,
                 tls_cert: tls_cert.map(ToOwned::to_owned),
                 tls_key: tls_key.map(ToOwned::to_owned),
             }),
@@ -91,7 +114,10 @@ impl Transport for Client {
         #[cfg(feature = "anytls")]
         let mut tls_config = if uses_client_auth {
             build_tls_client_config(
-                Arc::new(DefaultTlsVerifier::new(None, self.skip_cert_verify)),
+                Arc::new(DefaultTlsVerifier::new(
+                    self.fingerprint.clone(),
+                    self.skip_cert_verify,
+                )),
                 self.tls_cert.as_deref(),
                 self.tls_key.as_deref(),
             )?
@@ -115,12 +141,15 @@ impl Transport for Client {
         #[cfg(feature = "anytls")]
         if !uses_client_auth {
             tls_config.dangerous().set_certificate_verifier(Arc::new(
-                DefaultTlsVerifier::new(None, self.skip_cert_verify),
+                DefaultTlsVerifier::new(
+                    self.fingerprint.clone(),
+                    self.skip_cert_verify,
+                ),
             ));
         }
         #[cfg(not(feature = "anytls"))]
         tls_config.dangerous().set_certificate_verifier(Arc::new(
-            DefaultTlsVerifier::new(None, self.skip_cert_verify),
+            DefaultTlsVerifier::new(self.fingerprint.clone(), self.skip_cert_verify),
         ));
 
         if std::env::var("SSLKEYLOGFILE").is_ok() {
@@ -146,5 +175,23 @@ impl Transport for Client {
             Ok(x)
         });
         c.map(|x| Box::new(x) as _)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Client;
+
+    #[test]
+    fn tls_client_preserves_certificate_fingerprint() {
+        let client = Client::new_with_fingerprint(
+            false,
+            "example.com".to_owned(),
+            None,
+            None,
+            Some("0123456789abcdef".to_owned()),
+        );
+
+        assert_eq!(client.fingerprint.as_deref(), Some("0123456789abcdef"));
     }
 }
