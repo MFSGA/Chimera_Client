@@ -234,6 +234,18 @@ impl OutboundHandler for Handler {
         self.opts.udp
     }
 
+    async fn reset_connection_pool(&self) -> io::Result<u32> {
+        let mut cleared = 0u32;
+        if let Some(tls) = self.opts.tls.as_ref() {
+            cleared = cleared.saturating_add(tls.reset_connection_pool().await?);
+        }
+        if let Some(transport) = self.opts.transport.as_ref() {
+            cleared =
+                cleared.saturating_add(transport.reset_connection_pool().await?);
+        }
+        Ok(cleared)
+    }
+
     async fn connect_stream(
         &self,
         sess: &Session,
@@ -374,6 +386,23 @@ mod reuse_tests {
 
     struct ReuseTransport;
 
+    struct ResetTransport {
+        resets: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Transport for ResetTransport {
+        async fn proxy_stream(&self, stream: AnyStream) -> io::Result<AnyStream> {
+            Ok(stream)
+        }
+
+        async fn reset_connection_pool(&self) -> io::Result<u32> {
+            self.resets
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(1)
+        }
+    }
+
     #[async_trait]
     impl Transport for ReuseTransport {
         async fn proxy_stream(&self, stream: AnyStream) -> io::Result<AnyStream> {
@@ -465,6 +494,32 @@ mod reuse_tests {
         });
 
         assert!(handler.support_udp().await);
+    }
+
+    #[tokio::test]
+    async fn vless_delegates_connection_pool_reset_to_transport() {
+        let resets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler = Handler::new(HandlerOptions {
+            name: "reset-test".to_owned(),
+            common_opts: HandlerCommonOptions::default(),
+            server: "example.com".to_owned(),
+            port: 443,
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            udp: true,
+            transport: Some(Box::new(ResetTransport {
+                resets: resets.clone(),
+            })),
+            tls: None,
+            flow: None,
+            encryption: None,
+        });
+
+        assert_eq!(handler.reset_connection_pool().await.unwrap(), 1);
+        assert_eq!(
+            resets.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "VLESS reset must delegate to the active transport"
+        );
     }
 
     #[tokio::test]

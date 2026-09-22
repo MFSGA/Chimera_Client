@@ -425,6 +425,13 @@ impl Client {
 
 #[async_trait]
 impl Transport for Client {
+    async fn reset_connection_pool(&self) -> io::Result<u32> {
+        let mut pool = self.pool.lock().await;
+        let cleared = pool.len() as u32;
+        pool.clear();
+        Ok(cleared)
+    }
+
     async fn proxy_stream(&self, stream: AnyStream) -> io::Result<AnyStream> {
         let sender = handshake_http2(stream, self.ping_interval_secs).await?;
         let (sender, active) = self.register_fresh_sender(sender).await;
@@ -724,6 +731,9 @@ mod tests {
         assert_eq!(second_reply, b"second");
 
         assert_eq!(client.pool.lock().await.len(), 1);
+        assert_eq!(client.reset_connection_pool().await.unwrap(), 1);
+        assert!(client.pool.lock().await.is_empty());
+        assert_eq!(client.reset_connection_pool().await.unwrap(), 0);
     }
 
     #[tokio::test]

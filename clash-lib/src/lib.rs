@@ -11,7 +11,10 @@ use std::{
     collections::HashMap,
     io,
     path::PathBuf,
-    sync::{Arc, OnceLock, atomic::AtomicUsize},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 
 use thiserror::Error;
@@ -152,6 +155,40 @@ impl GlobalState {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+struct RuntimeLifecycle {
+    started: AtomicBool,
+}
+
+impl Default for RuntimeLifecycle {
+    fn default() -> Self {
+        Self {
+            started: AtomicBool::new(false),
+        }
+    }
+}
+
+/// Tracks long-lived runtime tasks so shutdown can gradually move from ad-hoc
+/// handles to a single lifecycle owner.
+#[derive(Default)]
+struct RuntimeTaskRegistry {
+    tasks: Mutex<Vec<&'static str>>,
+}
+
+impl RuntimeTaskRegistry {
+    fn register(&self, name: &'static str) {
+        if let Ok(mut tasks) = self.tasks.try_lock() {
+            tasks.push(name);
+        }
+    }
+
+    async fn shutdown_all(&self) {
+        let mut tasks = self.tasks.lock().await;
+        for name in tasks.drain(..) {
+            debug!("runtime task released: {name}");
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct RuntimeController {
@@ -912,6 +949,8 @@ impl RuntimeNetworkConfig {
 }
 
 struct RuntimeComponents {
+    lifecycle: RuntimeLifecycle,
+    task_registry: Arc<RuntimeTaskRegistry>,
     cache_store: profile::ThreadSafeCacheFile,
     dns_resolver: ThreadSafeDNSResolver,
     outbound_manager: Arc<OutboundManager>,
@@ -959,9 +998,18 @@ impl RuntimeComponents {
     }
 
     fn start_all(&self) {
+        if self.lifecycle.started.swap(true, Ordering::SeqCst) {
+            warn!("runtime components already started");
+            return;
+        }
         #[cfg(feature = "tun")]
-        self.tun_runner.run_async();
+        {
+            self.task_registry.register("tun-runner");
+            self.tun_runner.run_async();
+        }
+        self.task_registry.register("dns-listener");
         self.dns_listener.run_async();
+        self.task_registry.register("inbound-manager");
         self.inbound_manager.run_async();
     }
 
@@ -973,6 +1021,8 @@ impl RuntimeComponents {
     async fn fresh_data_plane(&self) -> Result<Self> {
         let cancellation_token = tokio_util::sync::CancellationToken::new();
         Ok(Self {
+            lifecycle: RuntimeLifecycle::default(),
+            task_registry: Arc::new(RuntimeTaskRegistry::default()),
             cache_store: self.cache_store.clone(),
             dns_resolver: self.dns_resolver.clone(),
             outbound_manager: self.outbound_manager.clone(),
@@ -1000,6 +1050,9 @@ impl RuntimeComponents {
     }
 
     fn stop_all(&self) {
+        if !self.lifecycle.started.swap(false, Ordering::SeqCst) {
+            return;
+        }
         self.dns_listener.shutdown();
         #[cfg(feature = "tun")]
         self.tun_runner.shutdown();
@@ -1032,6 +1085,8 @@ impl RuntimeComponents {
         if let Err(err) = self.inbound_manager.join().await {
             warn!("failed waiting for inbound manager shutdown: {}", err);
         }
+
+        self.task_registry.shutdown_all().await;
     }
 }
 
@@ -1377,6 +1432,8 @@ async fn create_components(
 
     info!("all components initialized");
     Ok(RuntimeComponents {
+        lifecycle: RuntimeLifecycle::default(),
+        task_registry: Arc::new(RuntimeTaskRegistry::default()),
         cache_store,
         dns_resolver,
         outbound_manager,

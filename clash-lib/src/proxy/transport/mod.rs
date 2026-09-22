@@ -78,6 +78,15 @@ pub trait Transport: Send + Sync {
         Ok(None)
     }
 
+    /// Invalidate transport-owned reusable network connections.
+    ///
+    /// Stateless transports keep the default no-op. Pooling transports should
+    /// drop cached connections so the next request redials on the current
+    /// network path after interface/VPN changes.
+    async fn reset_connection_pool(&self) -> std::io::Result<u32> {
+        Ok(0)
+    }
+
     /// Like `proxy_stream`, but additionally returns a `VisionOptions` for
     /// transports that support XTLS-splice (Reality).  The default
     /// implementation delegates to `proxy_stream` and returns `None`,

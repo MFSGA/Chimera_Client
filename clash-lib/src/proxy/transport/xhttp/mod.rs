@@ -1857,6 +1857,34 @@ async fn connect_h3_stream(
 
 #[async_trait]
 impl Transport for Client {
+    async fn reset_connection_pool(&self) -> io::Result<u32> {
+        let mut cleared = 0u32;
+
+        let mut upload_h2 = self.reuse_pool.lock().await;
+        cleared = cleared.saturating_add(upload_h2.len() as u32);
+        upload_h2.clear();
+        drop(upload_h2);
+
+        let mut download_h2 = self.download_reuse_pool.lock().await;
+        cleared = cleared.saturating_add(download_h2.len() as u32);
+        download_h2.clear();
+        drop(download_h2);
+
+        #[cfg(feature = "xhttp-h3")]
+        {
+            let mut upload_h3 = self.h3_reuse_pool.lock().await;
+            cleared = cleared.saturating_add(upload_h3.len() as u32);
+            upload_h3.clear();
+            drop(upload_h3);
+
+            let mut download_h3 = self.h3_download_reuse_pool.lock().await;
+            cleared = cleared.saturating_add(download_h3.len() as u32);
+            download_h3.clear();
+        }
+
+        Ok(cleared)
+    }
+
     async fn connect_stream_with_connector(
         &self,
         sess: &crate::session::Session,
@@ -3415,6 +3443,70 @@ mod tests {
 
     #[cfg(feature = "xhttp-h3")]
     #[tokio::test]
+    async fn xhttp_reset_connection_pool_clears_h3_upload_reuse() {
+        let addr = spawn_h3_stream_one_echo_server(1).await;
+        let endpoint = XhttpEndpointConfig {
+            server: "127.0.0.1".to_owned(),
+            port: addr.port(),
+            security: XhttpSecurity::Tls,
+            server_name: "xhttp.example.com".to_owned(),
+            alpn_protocols: vec!["h3".to_owned()],
+            skip_cert_verify: true,
+            fingerprint: None,
+            verify_name: None,
+            tls_cert: None,
+            tls_key: None,
+            reality: None,
+        };
+        let client = Client::new(
+            "127.0.0.1".to_owned(),
+            addr.port(),
+            "/xhttp/".to_owned(),
+            None,
+            HashMap::new(),
+            true,
+            XhttpMode::StreamOne,
+            1_000_000,
+            false,
+            None,
+            None,
+        )
+        .with_upload_endpoint(Some(endpoint))
+        .with_http_version(XhttpHttpVersion::Http3)
+        .with_reuse_policy(Some(XhttpReusePolicy {
+            max_concurrency: None,
+            max_connections: Some(XhttpReuseValueRange { min: 1, max: 1 }),
+            c_max_reuse_times: None,
+            h_max_request_times: None,
+            h_max_reusable_secs: None,
+            h_keep_alive_period: 0,
+        }));
+        let resolver = Arc::new(MockClashResolver::new());
+        let connector = DirectConnector::new();
+        let mut logical = client
+            .connect_stream_with_connector(&Session::default(), resolver, &connector)
+            .await
+            .expect("pooled H3 dial should succeed")
+            .expect("pooled H3 logical stream should exist");
+
+        logical.write_all(b"ping").await.expect("H3 write");
+        logical.flush().await.expect("H3 flush");
+        let mut buf = [0u8; 4];
+        timeout(Duration::from_secs(3), logical.read_exact(&mut buf))
+            .await
+            .expect("H3 read timed out")
+            .expect("H3 read failed");
+        assert_eq!(&buf, b"ping");
+        drop(logical);
+
+        assert_eq!(client.h3_reuse_pool.lock().await.len(), 1);
+        assert_eq!(client.reset_connection_pool().await.unwrap(), 1);
+        assert!(client.h3_reuse_pool.lock().await.is_empty());
+        assert_eq!(client.reset_connection_pool().await.unwrap(), 0);
+    }
+
+    #[cfg(feature = "xhttp-h3")]
+    #[tokio::test]
     async fn xhttp_http3_reuses_separate_download_connection() {
         let addr = spawn_h3_stream_one_echo_server(2).await;
         let reuse_policy = XhttpReusePolicy {
@@ -3516,6 +3608,10 @@ mod tests {
         let pool = client.h3_download_reuse_pool.lock().await;
         assert_eq!(pool.len(), 1);
         assert_eq!(pool[0].reuse_count, 1);
+        drop(pool);
+
+        assert_eq!(client.reset_connection_pool().await.unwrap(), 1);
+        assert!(client.h3_download_reuse_pool.lock().await.is_empty());
     }
 
     #[cfg(feature = "xhttp-h3")]
@@ -3868,6 +3964,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn xhttp_reset_connection_pool_clears_h2_upload_reuse() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should expose addr");
+
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept should succeed");
+            let io = TokioIo::new(tcp);
+            let service = hyper::service::service_fn(handle_stream_one);
+            let builder = auto::Builder::new(TokioExecutor::new()).http2_only();
+            builder
+                .serve_connection(io, service)
+                .await
+                .expect("server connection should succeed");
+        });
+
+        let stream = TcpStream::connect(addr)
+            .await
+            .expect("client should connect");
+        let client = Client::new(
+            "127.0.0.1".to_owned(),
+            addr.port(),
+            "/xhttp/".to_owned(),
+            None,
+            HashMap::new(),
+            false,
+            XhttpMode::StreamOne,
+            1_000_000,
+            false,
+            None,
+            None,
+        )
+        .with_reuse_policy(Some(XhttpReusePolicy {
+            max_concurrency: None,
+            max_connections: Some(XhttpReuseValueRange { min: 1, max: 1 }),
+            c_max_reuse_times: None,
+            h_max_request_times: None,
+            h_max_reusable_secs: None,
+            h_keep_alive_period: 0,
+        }));
+
+        let logical = client
+            .proxy_stream(Box::new(stream))
+            .await
+            .expect("pooled H2 stream should connect");
+        drop(logical);
+
+        assert_eq!(client.reuse_pool.lock().await.len(), 1);
+        assert_eq!(client.reset_connection_pool().await.unwrap(), 1);
+        assert!(client.reuse_pool.lock().await.is_empty());
+        assert_eq!(client.reset_connection_pool().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn xhttp_max_connections_opens_fresh_until_limit_then_reuses() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -4061,6 +4212,8 @@ mod tests {
             1,
             "both downlink sessions must share one HTTP/2 connection"
         );
+        assert_eq!(client.reset_connection_pool().await.unwrap(), 1);
+        assert!(client.download_reuse_pool.lock().await.is_empty());
     }
 
     #[tokio::test]

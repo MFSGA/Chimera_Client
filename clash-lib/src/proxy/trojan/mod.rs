@@ -119,6 +119,18 @@ impl OutboundHandler for Handler {
         self.opts.udp
     }
 
+    async fn reset_connection_pool(&self) -> io::Result<u32> {
+        let mut cleared = 0u32;
+        if let Some(tls) = self.opts.tls.as_ref() {
+            cleared = cleared.saturating_add(tls.reset_connection_pool().await?);
+        }
+        if let Some(transport) = self.opts.transport.as_ref() {
+            cleared =
+                cleared.saturating_add(transport.reset_connection_pool().await?);
+        }
+        Ok(cleared)
+    }
+
     async fn connect_stream(
         &self,
         sess: &Session,
@@ -240,6 +252,56 @@ impl PlainProxyAPIResponse for Handler {
             m.insert("tls".to_owned(), Box::new(true) as _);
         }
         m
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::*;
+
+    struct ResetTransport {
+        resets: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Transport for ResetTransport {
+        async fn proxy_stream(&self, stream: AnyStream) -> io::Result<AnyStream> {
+            Ok(stream)
+        }
+
+        async fn reset_connection_pool(&self) -> io::Result<u32> {
+            self.resets.fetch_add(1, Ordering::SeqCst);
+            Ok(1)
+        }
+    }
+
+    #[tokio::test]
+    async fn trojan_delegates_connection_pool_reset_to_layers() {
+        let tls_resets = Arc::new(AtomicUsize::new(0));
+        let transport_resets = Arc::new(AtomicUsize::new(0));
+        let handler = Handler::new(HandlerOptions {
+            name: "reset-test".to_owned(),
+            common_opts: HandlerCommonOptions::default(),
+            server: "example.com".to_owned(),
+            port: 443,
+            password: "example".to_owned(),
+            udp: true,
+            tls: Some(Box::new(ResetTransport {
+                resets: tls_resets.clone(),
+            })),
+            transport: Some(Box::new(ResetTransport {
+                resets: transport_resets.clone(),
+            })),
+        });
+
+        assert_eq!(handler.reset_connection_pool().await.unwrap(), 2);
+        assert_eq!(tls_resets.load(Ordering::SeqCst), 1);
+        assert_eq!(transport_resets.load(Ordering::SeqCst), 1);
     }
 }
 
