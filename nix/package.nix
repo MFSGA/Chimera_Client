@@ -5,6 +5,8 @@
   cmake,
   protobuf,
   nodejs,
+  fetchNpmDeps,
+  npmHooks,
   llvmPackages,
 }:
 
@@ -43,15 +45,23 @@ rustPlatform.buildRustPackage {
     allowBuiltinFetchGit = true;
   };
 
+  npmDeps = fetchNpmDeps {
+    src = ../clash-dashboard;
+    hash = "sha256-fL0PTkAtopysqXr1D8JmtQ7C77SGOBnpweRe02bn7jE=";
+  };
+
   nativeBuildInputs = [
     pkg-config
     cmake
     protobuf
     nodejs
+    npmHooks.npmConfigHook
     llvmPackages.libclang
   ];
 
   LIBCLANG_PATH = "${llvmPackages.libclang.lib}/lib";
+  CHIMERA_DASHBOARD_DEPS_READY = "1";
+  npmRoot = "clash-dashboard";
 
   cargoBuildFlags = [
     "--package"
