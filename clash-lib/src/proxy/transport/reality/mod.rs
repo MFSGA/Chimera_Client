@@ -45,6 +45,7 @@ pub struct Client {
     short_id: Vec<u8>,
     server_name: String,
     cipher_suites: Vec<CipherSuite>,
+    alpn_protocols: Vec<String>,
 }
 
 impl Client {
@@ -54,11 +55,28 @@ impl Client {
         server_name: String,
         cipher_suites: Vec<CipherSuite>,
     ) -> Self {
+        Self::new_with_alpn(
+            public_key,
+            short_id,
+            server_name,
+            cipher_suites,
+            Vec::new(),
+        )
+    }
+
+    pub fn new_with_alpn(
+        public_key: [u8; 32],
+        short_id: Vec<u8>,
+        server_name: String,
+        cipher_suites: Vec<CipherSuite>,
+        alpn_protocols: Vec<String>,
+    ) -> Self {
         Self {
             public_key,
             short_id,
             server_name,
             cipher_suites,
+            alpn_protocols,
         }
     }
 
@@ -71,6 +89,7 @@ impl Client {
             short_id: self.short_id.clone(),
             server_name: self.server_name.clone(),
             cipher_suites: self.cipher_suites.clone(),
+            alpn_protocols: self.alpn_protocols.clone(),
         };
         let conn = reality_client_connection::RealityClientConnection::new(config)?;
         let mut connection = CryptoConnection::new_reality_client(conn);
