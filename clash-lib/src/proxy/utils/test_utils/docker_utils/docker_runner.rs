@@ -37,14 +37,27 @@ impl DockerTestRunner {
         let docker = connect_docker()?;
 
         if let Some(image) = body.image.as_deref() {
-            docker
-                .create_image(
-                    Some(CreateImageOptionsBuilder::new().from_image(image).build()),
-                    None,
-                    None,
-                )
-                .try_collect::<Vec<_>>()
-                .await?;
+            match docker.inspect_image(image).await {
+                Ok(_) => {}
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404,
+                    ..
+                }) => {
+                    docker
+                        .create_image(
+                            Some(
+                                CreateImageOptionsBuilder::new()
+                                    .from_image(image)
+                                    .build(),
+                            ),
+                            None,
+                            None,
+                        )
+                        .try_collect::<Vec<_>>()
+                        .await?;
+                }
+                Err(err) => return Err(err.into()),
+            }
         }
 
         let container = docker

@@ -845,23 +845,44 @@ mod tests {
         let mut tmp = tempfile::NamedTempFile::new()?;
         tmp.write_all(ANYTLS_SERVER_CONFIG.as_bytes())?;
 
-        let result = DockerTestRunnerBuilder::new()
+        let mut builder = DockerTestRunnerBuilder::new()
             .image(IMAGE_SINGBOX)
             .cmd(&["run", "-c", "/etc/sing-box/config.json"])
             .mounts(&[
                 (tmp.path().to_str().unwrap(), "/etc/sing-box/config.json"),
                 (cert.to_str().unwrap(), "/etc/ssl/v2ray/fullchain.pem"),
                 (key.to_str().unwrap(), "/etc/ssl/v2ray/privkey.pem"),
-            ])
-            .host_port(host_port, 10002)
-            .build()
-            .await;
+            ]);
+        builder =
+            if crate::proxy::utils::test_utils::docker_utils::use_ci_host_network() {
+                builder.host_network()
+            } else {
+                builder.host_port(host_port, 10002)
+            };
+
+        let runner = builder.build().await?;
+        let ready_port =
+            if crate::proxy::utils::test_utils::docker_utils::use_ci_host_network() {
+                10002
+            } else {
+                host_port
+            };
+        DockerTestRunner::wait_host_tcp_ready(
+            LOCAL_ADDR,
+            ready_port,
+            std::time::Duration::from_secs(20),
+        )
+        .await?;
+        // Sing-box can accept TCP before the AnyTLS/TLS listener is fully
+        // ready, producing a transient TLS EOF on the first client attempt.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         drop(tmp);
-        result
+        Ok(runner)
     }
 
     #[cfg(docker_test)]
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_anytls() -> anyhow::Result<()> {
         initialize();
         let host_port = alloc_docker_port();
@@ -875,11 +896,17 @@ mod tests {
 
         let runner = get_runner(host_port).await?;
 
+        let server_port =
+            if crate::proxy::utils::test_utils::docker_utils::use_ci_host_network() {
+                10002
+            } else {
+                host_port
+            };
         let opts = HandlerOptions {
             name: "test-anytls".to_owned(),
             common_opts: Default::default(),
-            server: runner.container_ip().unwrap_or(LOCAL_ADDR.to_owned()),
-            port: 10002,
+            server: LOCAL_ADDR.to_owned(),
+            port: server_port,
             password: "example".to_owned(),
             udp: true,
             tls: Some(Box::new(tls)),

@@ -840,7 +840,7 @@ mod docker_tests {
         let opts = HandlerOptions {
             name: "test-ss".to_owned(),
             common_opts: Default::default(),
-            server: container.container_ip().unwrap_or(LOCAL_ADDR.to_owned()),
+            server: LOCAL_ADDR.to_owned(),
             port: ci_server_port(host_port),
             password: PASSWORD.to_owned(),
             cipher: CIPHER.to_owned(),
@@ -865,7 +865,7 @@ mod docker_tests {
         let container1 = get_ss_runner(ss_port).await?;
         let container2 = get_shadowtls_runner(
             container1.container_ip(),
-            ci_server_port(ss_port),
+            SS_CONTAINER_PORT,
             shadow_tls_port,
         )
         .await?;
@@ -898,7 +898,7 @@ mod docker_tests {
         let container1 = get_ss_runner(ss_port).await?;
         let container2 = get_obfs_runner(
             container1.container_ip(),
-            ci_server_port(ss_port),
+            SS_CONTAINER_PORT,
             obfs_port,
             mode,
         )
@@ -960,7 +960,7 @@ mod docker_tests {
         let opts = HandlerOptions {
             name: "test-v2ray-plugin".to_owned(),
             common_opts: Default::default(),
-            server: container.container_ip().unwrap_or(LOCAL_ADDR.to_owned()),
+            server: LOCAL_ADDR.to_owned(),
             port: ci_server_port(ss_port),
             password: PASSWORD.to_owned(),
             cipher: CIPHER.to_owned(),

@@ -6,23 +6,22 @@ pub mod docker_runner;
 
 use std::{sync::Arc, time::Duration};
 
+use futures::{SinkExt, StreamExt};
 use network_interface::NetworkInterfaceConfig as _;
 use sysinfo::Networks;
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, split},
-    net::TcpListener,
-};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{
-    app::dispatcher::BoxedChainedStream,
-    proxy::OutboundHandler,
+    proxy::{OutboundHandler, datagram::UdpPacket},
     session::{Session, SocksAddr},
 };
 
 use tracing::{debug, trace};
 
 #[allow(unused_imports)]
-pub use docker_runner::{RunAndCleanup, alloc_docker_port};
+pub use docker_runner::{
+    DockerTestRunner, DockerTestRunnerBuilder, RunAndCleanup, alloc_docker_port,
+};
 
 #[cfg(throughput_test)]
 pub fn alloc_port() -> u16 {
@@ -434,6 +433,31 @@ pub async fn clash_process_e2e_throughput(
     Err(last_err)
 }
 
+const DOCKER_TARGET_TCP_PORT: u16 = 18080;
+const DOCKER_TARGET_UDP_PORT: u16 = 18081;
+const DOCKER_TARGET_DNS_PORT: u16 = 18082;
+
+const DOCKER_TARGET_CMD: &str = r#"
+nc -lk -p 18080 -e sh -c 'dd bs=5 count=1 >/dev/null 2>/dev/null; printf world' &
+nc -u -lk -p 18081 -e sh -c 'dd bs=5 count=1 >/dev/null 2>/dev/null; printf world' &
+nc -u -lk -p 18082 -e sh -c 'printf \\022\\064\\201\\200' &
+wait
+"#;
+
+async fn docker_test_target() -> anyhow::Result<(DockerTestRunner, String)> {
+    let runner = DockerTestRunnerBuilder::new()
+        .image(consts::IMAGE_DOCKER_TEST_TARGET)
+        .no_port()
+        .cmd(&["sh", "-c", DOCKER_TARGET_CMD])
+        .build()
+        .await?;
+    let ip = runner
+        .container_ip()
+        .ok_or_else(|| anyhow::anyhow!("docker test target has no container IP"))?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    Ok((runner, ip))
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum Suite {
     PingPongTcp,
@@ -462,26 +486,49 @@ pub async fn run_test_suites_and_cleanup(
     docker_test_runner: impl RunAndCleanup,
     suites: &[Suite],
 ) -> anyhow::Result<()> {
-    let gateway_ip = docker_test_runner.docker_gateway_ip();
     let suites = suites.to_vec();
+    let (target_runner, target_ip) = docker_test_target().await?;
 
     docker_test_runner
         .run_and_cleanup(async move {
-            for suite in suites {
-                match suite {
-                    Suite::PingPongTcp => {
-                        ping_pong_tcp_test(handler.clone(), gateway_ip.clone())
-                            .await?;
-                    }
-                    Suite::PingPongUdp | Suite::LatencyTcp | Suite::DnsUdp => {
-                        tracing::warn!(
-                            "docker test suite is not migrated yet: {:?}",
-                            suite
-                        );
-                    }
+            let suite_result = async {
+                for suite in suites {
+                    tracing::info!(?suite, %target_ip, "running docker test suite");
+                    let result = match suite {
+                        Suite::PingPongTcp => {
+                            ping_pong_tcp_test(handler.clone(), &target_ip).await
+                        }
+                        Suite::PingPongUdp => {
+                            ping_pong_udp_test(handler.clone(), &target_ip).await
+                        }
+                        Suite::LatencyTcp => {
+                            latency_tcp_test(handler.clone(), &target_ip).await.map(
+                                |latency| {
+                                    tracing::info!(
+                                        ?latency,
+                                        "docker tcp latency test passed"
+                                    );
+                                },
+                            )
+                        }
+                        Suite::DnsUdp => {
+                            dns_udp_test(handler.clone(), &target_ip).await
+                        }
+                    };
+                    result.map_err(|err| {
+                        anyhow::anyhow!("docker suite {suite:?} failed: {err}")
+                    })?;
                 }
+                Ok(())
             }
-            Ok(())
+            .await;
+
+            let cleanup_result = target_runner.cleanup().await;
+            match (suite_result, cleanup_result) {
+                (Err(err), _) => Err(err),
+                (Ok(()), Err(err)) => Err(err),
+                (Ok(()), Ok(())) => Ok(()),
+            }
         })
         .await
 }
@@ -558,113 +605,178 @@ fn destination_list(gateway_ip: Option<String>) -> Vec<String> {
 
 async fn ping_pong_tcp_test(
     handler: Arc<dyn OutboundHandler>,
-    gateway_ip: Option<String>,
+    target_ip: &str,
 ) -> anyhow::Result<()> {
     let resolver = config_helper::build_dns_resolver().await?;
-    let listener = TcpListener::bind("0.0.0.0:0").await?;
-    let port = listener.local_addr()?.port();
+    let dst: SocksAddr =
+        (target_ip.to_owned(), DOCKER_TARGET_TCP_PORT).try_into()?;
+    let sess = Session {
+        destination: dst.clone(),
+        ..Default::default()
+    };
 
-    async fn serve_connection<T>(incoming: T) -> anyhow::Result<()>
-    where
-        T: AsyncRead + AsyncWrite + Unpin,
-    {
-        let (mut read_half, mut write_half) = split(incoming);
-        let mut buf = [0u8; 5];
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        handler.connect_stream(&sess, resolver),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("tcp ping-pong connect timed out for {dst:?}"))??;
 
-        for _ in 0..100 {
-            read_half.read_exact(&mut buf).await?;
-            anyhow::ensure!(&buf == b"hello", "unexpected tcp request payload");
-        }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        stream.write_all(b"hello").await?;
+        stream.flush().await?;
+        let mut response = [0u8; 5];
+        stream.read_exact(&mut response).await?;
+        anyhow::ensure!(&response == b"world", "unexpected tcp response payload");
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!("tcp ping-pong roundtrip timed out for {dst:?}")
+    })??;
 
-        for _ in 0..100 {
-            write_half.write_all(b"world").await?;
-            write_half.flush().await?;
-        }
+    Ok(())
+}
 
-        Ok(())
-    }
+async fn ping_pong_udp_test(
+    handler: Arc<dyn OutboundHandler>,
+    target_ip: &str,
+) -> anyhow::Result<()> {
+    let resolver = config_helper::build_dns_resolver().await?;
+    let dst: SocksAddr =
+        (target_ip.to_owned(), DOCKER_TARGET_UDP_PORT).try_into()?;
+    let sess = Session {
+        destination: dst.clone(),
+        ..Default::default()
+    };
+    let datagram = tokio::time::timeout(
+        Duration::from_secs(5),
+        handler.connect_datagram(&sess, resolver),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("udp ping-pong connect timed out for {dst:?}"))??;
+    let (mut sink, mut stream) = datagram.split();
 
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let server_task = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                accepted = listener.accept() => {
-                    let (stream, _) = accepted?;
-                    if let Err(err) = serve_connection(stream).await {
-                        tracing::warn!("tcp ping-pong target connection failed: {err:?}");
-                    }
-                }
-                _ = &mut shutdown_rx => return Ok::<_, anyhow::Error>(()),
-            }
-        }
-    });
+    sink.send(UdpPacket::new(
+        b"hello".to_vec(),
+        SocksAddr::Ip("127.0.0.1:0".parse()?),
+        dst.clone(),
+    ))
+    .await?;
 
-    async fn proxy_roundtrip(stream: BoxedChainedStream) -> anyhow::Result<()> {
-        let (mut read_half, mut write_half) = split(stream);
-        let mut buf = [0u8; 5];
-
-        for _ in 0..100 {
-            write_half.write_all(b"hello").await?;
-        }
-        write_half.flush().await?;
-
-        for _ in 0..100 {
-            read_half.read_exact(&mut buf).await?;
-            anyhow::ensure!(&buf == b"world", "unexpected tcp response payload");
-        }
-
-        Ok(())
-    }
-
-    let mut first_error = None;
-    for destination in destination_list(gateway_ip) {
-        let dst: SocksAddr = (destination.clone(), port).try_into()?;
-        let sess = Session {
-            destination: dst.clone(),
-            ..Default::default()
-        };
-
-        let stream = match tokio::time::timeout(
-            Duration::from_secs(5),
-            handler.connect_stream(&sess, resolver.clone()),
-        )
+    let response = tokio::time::timeout(Duration::from_secs(5), stream.next())
         .await
-        {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(err)) => {
-                tracing::warn!("tcp ping-pong connect failed for {dst:?}: {err:?}");
-                first_error.get_or_insert_with(|| anyhow::Error::new(err));
-                continue;
-            }
-            Err(_) => {
-                tracing::warn!("tcp ping-pong connect timed out for {dst:?}");
-                continue;
-            }
-        };
+        .map_err(|_| {
+            anyhow::anyhow!("udp ping-pong roundtrip timed out for {dst:?}")
+        })?
+        .ok_or_else(|| anyhow::anyhow!("udp ping-pong stream closed for {dst:?}"))?;
+    anyhow::ensure!(response.data == b"world", "unexpected udp response payload");
+    Ok(())
+}
 
-        match tokio::time::timeout(Duration::from_secs(5), proxy_roundtrip(stream))
-            .await
-        {
-            Ok(Ok(())) => {
-                let _ = shutdown_tx.send(());
-                let _ = server_task.await?;
-                return Ok(());
-            }
-            Ok(Err(err)) => {
-                tracing::warn!(
-                    "tcp ping-pong roundtrip failed for {dst:?}: {err:?}"
-                );
-                first_error.get_or_insert(err);
-            }
-            Err(_) => {
-                tracing::warn!("tcp ping-pong roundtrip timed out for {dst:?}");
-            }
+async fn latency_tcp_test(
+    handler: Arc<dyn OutboundHandler>,
+    target_ip: &str,
+) -> anyhow::Result<Duration> {
+    let resolver = config_helper::build_dns_resolver().await?;
+    let dst: SocksAddr =
+        (target_ip.to_owned(), DOCKER_TARGET_TCP_PORT).try_into()?;
+    let sess = Session {
+        destination: dst.clone(),
+        ..Default::default()
+    };
+    let started = std::time::Instant::now();
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        handler.connect_stream(&sess, resolver),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("tcp latency connect timed out for {dst:?}"))??;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        stream.write_all(b"hello").await?;
+        stream.flush().await?;
+        let mut response = [0u8; 5];
+        stream.read_exact(&mut response).await?;
+        anyhow::ensure!(&response == b"world", "unexpected tcp latency response");
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("tcp latency roundtrip timed out for {dst:?}"))??;
+
+    Ok(started.elapsed())
+}
+
+async fn dns_udp_test(
+    handler: Arc<dyn OutboundHandler>,
+    target_ip: &str,
+) -> anyhow::Result<()> {
+    let resolver = config_helper::build_dns_resolver().await?;
+    let dst: SocksAddr =
+        (target_ip.to_owned(), DOCKER_TARGET_DNS_PORT).try_into()?;
+    let sess = Session {
+        destination: dst.clone(),
+        ..Default::default()
+    };
+    let datagram = tokio::time::timeout(
+        Duration::from_secs(5),
+        handler.connect_datagram(&sess, resolver),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("dns udp connect timed out for {dst:?}"))??;
+    let (mut sink, mut stream) = datagram.split();
+    let query = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03www\x07example\x03com\x00\x00\x01\x00\x01";
+
+    sink.send(UdpPacket::new(
+        query.to_vec(),
+        SocksAddr::Ip("127.0.0.1:0".parse()?),
+        dst.clone(),
+    ))
+    .await?;
+
+    let response = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .map_err(|_| anyhow::anyhow!("dns udp roundtrip timed out for {dst:?}"))?
+        .ok_or_else(|| anyhow::anyhow!("dns udp stream closed for {dst:?}"))?;
+    anyhow::ensure!(
+        response.data.len() >= 4
+            && response.data[..2] == [0x12, 0x34]
+            && response.data[2] & 0x80 != 0,
+        "unexpected dns udp response: {:?}",
+        response.data
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod suite_tests {
+    use std::{future::Future, sync::Arc};
+
+    use super::*;
+    use crate::proxy::direct;
+
+    struct LocalRunner;
+
+    #[async_trait::async_trait]
+    impl RunAndCleanup for LocalRunner {
+        fn docker_gateway_ip(&self) -> Option<String> {
+            Some("127.0.0.1".to_owned())
+        }
+
+        async fn run_and_cleanup(
+            self,
+            f: impl Future<Output = anyhow::Result<()>> + Send + 'static,
+        ) -> anyhow::Result<()> {
+            f.await
         }
     }
 
-    let _ = shutdown_tx.send(());
-    let _ = server_task.await?;
-
-    Err(first_error
-        .unwrap_or_else(|| anyhow::anyhow!("all tcp ping-pong destinations failed")))
+    #[tokio::test]
+    async fn formerly_placeholder_suites_execute_real_roundtrips() {
+        let handler: Arc<dyn OutboundHandler> =
+            Arc::new(direct::Handler::new("test-direct"));
+        run_test_suites_and_cleanup(handler, LocalRunner, Suite::all())
+            .await
+            .expect("restored docker suites must execute real local roundtrips");
+    }
 }
