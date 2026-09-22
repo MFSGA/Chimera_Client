@@ -19,7 +19,7 @@ use crate::{
             Handler, HandlerOptions,
             encryption::{
                 Appearance as VlessEncryptionAppearance,
-                Config as VlessEncryptionConfig, RttMode as VlessEncryptionRttMode,
+                Config as VlessEncryptionConfig,
             },
         },
     },
@@ -118,12 +118,6 @@ fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
             if parsed.appearance != VlessEncryptionAppearance::Native {
                 return Err(Error::InvalidConfig(
                     "VLESS encryption runtime MVP currently supports only native appearance; xorpub/random are TODO"
-                        .to_owned(),
-                ));
-            }
-            if parsed.rtt != VlessEncryptionRttMode::OneRtt {
-                return Err(Error::InvalidConfig(
-                    "VLESS encryption runtime MVP currently supports only 1rtt; 0rtt ticket reuse is TODO"
                         .to_owned(),
                 ));
             }
@@ -2121,35 +2115,55 @@ mod tests {
     }
 
     #[test]
-    fn vless_encryption_mvp_rejects_zero_rtt_and_random() {
+    fn vless_accepts_native_zero_rtt_encryption_runtime() {
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
         let key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
-        for (mode, expected) in [
-            ("native.0rtt", "supports only 1rtt"),
-            ("random.1rtt", "supports only native appearance"),
-        ] {
-            let outbound = OutboundVless {
-                common_opts: CommonConfigOptions {
-                    name: "encrypted-vless-todo".to_owned(),
-                    server: "example.com".to_owned(),
-                    port: 443,
-                    connect_via: None,
-                },
-                uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
-                encryption: Some(format!(
-                    "mlkem768x25519plus.{mode}.100-200-300.{key}"
-                )),
-                ..Default::default()
-            };
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "encrypted-vless-zero-rtt".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            encryption: Some(format!(
+                "mlkem768x25519plus.native.0rtt.100-200-300.{key}"
+            )),
+            ..Default::default()
+        };
 
-            let err = validate_vless_config(&outbound)
-                .expect_err("unsupported MVP mode must fail explicitly");
-            assert!(
-                err.to_string().contains(expected),
-                "unexpected error for {mode}: {err}"
-            );
-        }
+        validate_vless_config(&outbound)
+            .expect("native 0rtt encryption runtime should validate");
+        crate::proxy::vless::Handler::try_from(&outbound)
+            .expect("native 0rtt encryption handler should build");
+    }
+
+    #[test]
+    fn vless_encryption_mvp_rejects_random_appearance() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "encrypted-vless-todo".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            encryption: Some(format!(
+                "mlkem768x25519plus.random.1rtt.100-200-300.{key}"
+            )),
+            ..Default::default()
+        };
+
+        let err = validate_vless_config(&outbound)
+            .expect_err("unsupported appearance must fail explicitly");
+        assert!(
+            err.to_string().contains("supports only native appearance"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
