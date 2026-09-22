@@ -69,12 +69,79 @@ impl Display for DNSNetMode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{app::dns::MockClashResolver, proxy};
+    use crate::{
+        app::{
+            dispatcher::{BoxedChainedDatagram, BoxedChainedStream},
+            dns::MockClashResolver,
+        },
+        proxy::{self, DialWithConnector, OutboundHandler, OutboundType},
+        session::Session,
+    };
     use hickory_proto::{
         op,
         rr::{Name, rdata::opt::EdnsOption},
     };
     use std::str::FromStr;
+
+    #[derive(Debug)]
+    struct ResolverProbeOutbound;
+
+    #[async_trait]
+    impl DialWithConnector for ResolverProbeOutbound {}
+
+    #[async_trait]
+    impl OutboundHandler for ResolverProbeOutbound {
+        fn name(&self) -> &str {
+            "resolver-probe"
+        }
+
+        fn proto(&self) -> OutboundType {
+            OutboundType::Direct
+        }
+
+        async fn connect_stream(
+            &self,
+            _sess: &Session,
+            resolver: Arc<dyn ClashResolver>,
+        ) -> std::io::Result<BoxedChainedStream> {
+            resolver
+                .resolve("proxy.example", false)
+                .await
+                .map_err(std::io::Error::other)?;
+            Err(std::io::Error::other("resolver probe complete"))
+        }
+
+        async fn connect_datagram(
+            &self,
+            _sess: &Session,
+            _resolver: Arc<dyn ClashResolver>,
+        ) -> std::io::Result<BoxedChainedDatagram> {
+            Err(std::io::Error::other("not used by resolver probe"))
+        }
+    }
+
+    #[tokio::test]
+    async fn dns_transport_uses_explicit_outbound_resolver() {
+        let mut resolver = MockClashResolver::new();
+        resolver
+            .expect_resolve()
+            .with(
+                mockall::predicate::eq("proxy.example"),
+                mockall::predicate::eq(false),
+            )
+            .once()
+            .returning(|_, _| Ok(Some(net::IpAddr::from([203, 0, 113, 7]))));
+
+        let cfg = DnsConfig::Tcp(
+            "203.0.113.53:53".parse().unwrap(),
+            None,
+            Arc::new(ResolverProbeOutbound),
+            None,
+        );
+
+        let result = dns_stream_builder(&cfg, Some(Arc::new(resolver)), None).await;
+        assert!(result.is_err());
+    }
 
     fn client_with_ecs(ecs: Option<EdnsClientSubnet>) -> DnsClient {
         let proxy = Arc::new(proxy::direct::Handler::new("test-proxy"));
@@ -87,6 +154,7 @@ mod tests {
             cfg: RwLock::new(DnsConfig::Udp(addr, None, proxy.clone(), None)),
             proxy,
             bootstrap_resolver: None,
+            outbound_resolver: None,
             refresh_address_on_rebuild: AtomicBool::new(false),
             host: url::Host::Domain("example.org".to_string()),
             port: 53,
@@ -269,6 +337,7 @@ impl FromStr for DNSNetMode {
 #[derive(Clone)]
 pub struct Opts {
     pub father: Option<Arc<dyn ClashResolver>>,
+    pub outbound_resolver: Option<Arc<dyn ClashResolver>>,
     pub host: url::Host<String>,
     pub port: u16,
     pub net: DNSNetMode,
@@ -386,6 +455,7 @@ pub struct DnsClient {
     cfg: RwLock<DnsConfig>,
     proxy: Arc<dyn OutboundHandler>,
     bootstrap_resolver: Option<Arc<dyn ClashResolver>>,
+    outbound_resolver: Option<Arc<dyn ClashResolver>>,
     refresh_address_on_rebuild: AtomicBool,
 
     // debug purpose
@@ -402,7 +472,12 @@ impl DnsClient {
         &self,
     ) -> Result<(client::Client<DnsRuntimeProvider>, JoinHandle<()>), Error> {
         let cfg = self.cfg.read().await.clone();
-        dns_stream_builder(&cfg, self.rule_dispatch.clone()).await
+        dns_stream_builder(
+            &cfg,
+            self.outbound_resolver.clone(),
+            self.rule_dispatch.clone(),
+        )
+        .await
     }
 
     async fn refresh_upstream_address(&self) -> anyhow::Result<bool> {
@@ -580,6 +655,7 @@ impl DnsClient {
                     cfg: RwLock::new(cfg),
                     proxy: opts.proxy,
                     bootstrap_resolver: opts.father,
+                    outbound_resolver: opts.outbound_resolver,
                     refresh_address_on_rebuild: AtomicBool::new(false),
                     host: opts.host,
                     port: opts.port,
@@ -605,6 +681,7 @@ impl DnsClient {
                     cfg: RwLock::new(cfg),
                     proxy: opts.proxy,
                     bootstrap_resolver: opts.father,
+                    outbound_resolver: opts.outbound_resolver,
                     refresh_address_on_rebuild: AtomicBool::new(false),
                     host: opts.host,
                     port: opts.port,
@@ -630,6 +707,7 @@ impl DnsClient {
                     cfg: RwLock::new(cfg),
                     proxy: opts.proxy,
                     bootstrap_resolver: opts.father,
+                    outbound_resolver: opts.outbound_resolver,
                     refresh_address_on_rebuild: AtomicBool::new(false),
                     host: opts.host,
                     port: opts.port,
@@ -656,6 +734,7 @@ impl DnsClient {
                     cfg: RwLock::new(cfg),
                     proxy: opts.proxy,
                     bootstrap_resolver: opts.father,
+                    outbound_resolver: opts.outbound_resolver,
                     refresh_address_on_rebuild: AtomicBool::new(false),
                     host: opts.host,
                     port: opts.port,
@@ -818,9 +897,13 @@ impl Client for DnsClient {
 
 async fn dns_stream_builder(
     cfg: &DnsConfig,
+    outbound_resolver: Option<Arc<dyn ClashResolver>>,
     rule_dispatch: Option<Arc<RuleDispatch>>,
 ) -> Result<(client::Client<DnsRuntimeProvider>, JoinHandle<()>), Error> {
-    let dns_resolver = Arc::new(dns::SystemResolver::new(false)?);
+    let dns_resolver: Arc<dyn ClashResolver> = match outbound_resolver {
+        Some(resolver) => resolver,
+        None => Arc::new(dns::SystemResolver::new(false)?),
+    };
     match cfg {
         DnsConfig::Udp(addr, iface, proxy, fw_mark) => {
             let stream = UdpClientStream::builder(

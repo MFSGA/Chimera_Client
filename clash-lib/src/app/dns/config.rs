@@ -10,6 +10,7 @@ use crate::{
 };
 pub use chimera_dns::{DNSListenAddr, DoH3Config, DoHConfig, DoTConfig};
 use ipnet::{AddrParseError, Ipv4Net, Ipv6Net};
+use percent_encoding::percent_decode_str;
 use std::{
     collections::HashMap,
     fmt::Display,
@@ -286,12 +287,18 @@ impl Config {
         let frag = url.fragment()?;
         let pairs = frag.split("&");
         for pair in pairs {
-            if pair.starts_with("proxy=") {
-                let outbound = pair.trim_start_matches("proxy=");
-                return Some(outbound.into());
-            } else if !pair.contains("=") {
-                return Some(pair.into());
-            }
+            let outbound = if let Some(outbound) = pair.strip_prefix("proxy=") {
+                outbound
+            } else if !pair.contains('=') {
+                pair
+            } else {
+                continue;
+            };
+
+            return percent_decode_str(outbound)
+                .decode_utf8()
+                .ok()
+                .map(|value| value.into_owned());
         }
 
         None
@@ -540,6 +547,20 @@ mod tests {
         assert_eq!(ns.len(), 1);
         assert_eq!(ns[0].net, DNSNetMode::DoT);
         assert_eq!(ns[0].proxy.as_deref(), Some("TESTED"));
+    }
+
+    #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+    #[test]
+    fn parse_nameserver_proxy_fragment_decodes_unicode_outbound_name() {
+        let servers = vec![
+            "https://dns.cloudflare.com/dns-query#proxy=🇺🇸 VLESS WebSocket TLS go"
+                .to_string(),
+        ];
+        let ns = Config::parse_nameserver(&servers).expect("parse failed");
+
+        assert_eq!(ns.len(), 1);
+        assert_eq!(ns[0].net, DNSNetMode::DoH);
+        assert_eq!(ns[0].proxy.as_deref(), Some("🇺🇸 VLESS WebSocket TLS go"));
     }
 
     #[cfg(not(any(feature = "aws-lc-rs", feature = "ring")))]

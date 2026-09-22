@@ -52,6 +52,23 @@ pub struct EnhancedResolver {
 }
 
 impl EnhancedResolver {
+    fn from_clients(main: Vec<ThreadSafeDNSClient>, ipv6: bool) -> Self {
+        Self {
+            ipv6: AtomicBool::new(ipv6),
+            hosts: None,
+            main,
+            fallback: None,
+            fallback_domain_filters: None,
+            fallback_ip_filters: None,
+            lru_cache: None,
+            policy: None,
+            proxy_resolver: None,
+            proxy_server_domains: None,
+            fake_dns: None,
+            reverse_lookup_cache: None,
+        }
+    }
+
     /// For testing purpose
     #[cfg(test)]
     pub async fn new_default() -> Self {
@@ -72,6 +89,7 @@ impl EnhancedResolver {
                     interface: None,
                     proxy: None,
                 }],
+                None,
                 None,
                 std::sync::Arc::new(tokio::sync::RwLock::new(
                     std::collections::HashMap::new(),
@@ -111,6 +129,7 @@ impl EnhancedResolver {
             main: make_clients(
                 cfg.default_nameserver.clone(),
                 None,
+                None,
                 Arc::new(RwLock::new(std::collections::HashMap::new())),
                 edns_client_subnet.clone(),
                 cfg.fw_mark,
@@ -137,6 +156,7 @@ impl EnhancedResolver {
             let clients = make_clients(
                 proxy_nameserver,
                 Some(default_resolver.clone()),
+                None,
                 Arc::new(RwLock::new(std::collections::HashMap::new())),
                 edns_client_subnet.clone(),
                 cfg.fw_mark,
@@ -156,6 +176,25 @@ impl EnhancedResolver {
         } else {
             None
         };
+
+        let outbound_resolver: Arc<dyn ClashResolver> = proxy_resolver
+            .as_ref()
+            .map(|clients| {
+                Arc::new(Self::from_clients(clients.clone(), cfg.ipv6))
+                    as Arc<dyn ClashResolver>
+            })
+            .unwrap_or_else(|| default_resolver.clone());
+
+        let main = make_clients(
+            cfg.nameserver.clone(),
+            Some(default_resolver.clone()),
+            Some(outbound_resolver.clone()),
+            outbounds.clone(),
+            edns_client_subnet.clone(),
+            cfg.fw_mark,
+            rule_dispatch.clone(),
+        )
+        .await?;
 
         let plain_outbounds = outbounds.read().await;
         let proxy_server_domains = plain_outbounds
@@ -178,21 +217,14 @@ impl EnhancedResolver {
 
         Ok(Self {
             ipv6: AtomicBool::new(cfg.ipv6),
-            main: make_clients(
-                cfg.nameserver.clone(),
-                Some(default_resolver.clone()),
-                outbounds.clone(),
-                edns_client_subnet.clone(),
-                cfg.fw_mark,
-                rule_dispatch.clone(),
-            )
-            .await?,
+            main,
             hosts: cfg.hosts,
             fallback: if !cfg.fallback.is_empty() {
                 Some(
                     make_clients(
                         cfg.fallback.clone(),
                         Some(default_resolver.clone()),
+                        Some(outbound_resolver.clone()),
                         outbounds.clone(),
                         edns_client_subnet.clone(),
                         cfg.fw_mark,
@@ -248,6 +280,7 @@ impl EnhancedResolver {
                             make_clients(
                                 vec![ns.to_owned()],
                                 Some(default_resolver.clone()),
+                                Some(outbound_resolver.clone()),
                                 outbounds.clone(),
                                 edns_client_subnet.clone(),
                                 cfg.fw_mark,
@@ -1231,6 +1264,7 @@ mod tests {
     async fn test_udp_resolve() {
         let c = DnsClient::new_client(Opts {
             father: None,
+            outbound_resolver: None,
             host: url::Host::Ipv4(Ipv4Addr::from([114, 114, 114, 114])),
             port: 53,
             net: DNSNetMode::Udp,
@@ -1251,6 +1285,7 @@ mod tests {
     async fn test_tcp_resolve() {
         let c = DnsClient::new_client(Opts {
             father: None,
+            outbound_resolver: None,
             host: url::Host::Ipv4(Ipv4Addr::from([1, 1, 1, 1])),
             port: 53,
             net: DNSNetMode::Tcp,
@@ -1271,6 +1306,7 @@ mod tests {
     async fn test_dot_resolve() {
         let c = DnsClient::new_client(Opts {
             father: Some(Arc::new(EnhancedResolver::new_default().await)),
+            outbound_resolver: None,
             host: url::Host::Domain("dns.google".to_string()),
             port: 853,
             net: DNSNetMode::DoT,
@@ -1293,6 +1329,7 @@ mod tests {
 
         let c = DnsClient::new_client(Opts {
             father: Some(default_resolver.clone()),
+            outbound_resolver: None,
             host: url::Host::Domain("cloudflare-dns.com".to_string()),
             port: 443,
             net: DNSNetMode::DoH,
@@ -1313,6 +1350,7 @@ mod tests {
     async fn test_dhcp_client() {
         let c = DnsClient::new_client(Opts {
             father: None,
+            outbound_resolver: None,
             host: url::Host::Domain("en0".to_string()),
             port: 0,
             net: DNSNetMode::Dhcp,

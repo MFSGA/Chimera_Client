@@ -19,6 +19,7 @@ use super::config::NameServer;
 pub async fn make_clients(
     servers: Vec<NameServer>,
     resolver: Option<Arc<dyn ClashResolver>>,
+    outbound_resolver: Option<Arc<dyn ClashResolver>>,
     outbounds: OutboundHandlerRegistry,
     edns_client_subnet: Option<EdnsClientSubnet>,
     fw_mark: Option<u32>,
@@ -45,6 +46,7 @@ pub async fn make_clients(
 
         match DnsClient::new_client(Opts {
             father: resolver.as_ref().cloned(),
+            outbound_resolver: outbound_resolver.as_ref().cloned(),
             host: s.host.clone(),
             port,
             net: s.net.to_owned(),

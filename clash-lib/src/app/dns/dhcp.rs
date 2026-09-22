@@ -124,6 +124,7 @@ impl DhcpClient {
                     })
                     .collect(),
                 None,
+                None,
                 direct_only_registry(),
                 None,
                 self.fw_mark,
