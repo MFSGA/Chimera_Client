@@ -351,9 +351,7 @@ fn build_xhttp_upload_tls_transport(
                         .and_then(|settings| settings.server_name.clone())
                 })
                 .or_else(|| {
-                    xhttp_settings
-                        .and_then(|settings| settings.host.as_ref())
-                        .and_then(|hosts| hosts.first().cloned())
+                    xhttp_settings.and_then(|settings| settings.host.clone())
                 })
                 .unwrap_or_else(|| upload_settings.address.clone());
             let skip_cert_verify = upload_settings
@@ -505,6 +503,7 @@ fn build_xhttp_transport(
                 upload_xhttp_settings
                     .and_then(|settings| settings.path.as_deref())
                     .or(xhttp_opts.path.as_deref()),
+                &metadata,
             ),
             upload_xhttp_settings
                 .and_then(|settings| settings.host.clone())
@@ -521,7 +520,7 @@ fn build_xhttp_transport(
             resolve_xhttp_max_each_post_bytes(xhttp_opts),
             resolve_xhttp_no_grpc_header(xhttp_opts),
             resolve_xhttp_min_posts_interval_ms(xhttp_opts),
-            build_xhttp_download_config(s, xhttp_opts)?,
+            build_xhttp_download_config(s, xhttp_opts, &metadata)?,
         )
         .with_auto_reality(s.reality_opts.is_some())
         .with_metadata(metadata)
@@ -535,6 +534,7 @@ fn build_xhttp_transport(
 fn build_xhttp_download_config(
     s: &OutboundVless,
     xhttp_opts: &XhttpOpt,
+    metadata: &XhttpMetadataConfig,
 ) -> Result<Option<XhttpDownloadConfig>, Error> {
     let Some(download_settings) = resolve_xhttp_download_settings(xhttp_opts) else {
         return Ok(None);
@@ -543,18 +543,47 @@ fn build_xhttp_download_config(
     validate_xhttp_download_settings(download_settings)?;
 
     let xhttp_settings = download_settings.xhttp_settings.as_ref();
+    let download_server = if download_settings.address.is_empty() {
+        s.common_opts.server.clone()
+    } else {
+        download_settings.address.clone()
+    };
+    let download_port = if download_settings.port == 0 {
+        s.common_opts.port
+    } else {
+        download_settings.port
+    };
     let reuse_policy = build_xhttp_reuse_policy(
-        xhttp_settings.and_then(|settings| settings.reuse_settings.as_ref()),
+        download_settings
+            .reuse_settings
+            .as_ref()
+            .or_else(|| {
+                xhttp_settings.and_then(|settings| settings.reuse_settings.as_ref())
+            })
+            .or(xhttp_opts.reuse_settings.as_ref()),
     )?;
     validate_xhttp_runtime_reuse_support(reuse_policy.as_ref())?;
-    let host = xhttp_settings.and_then(|settings| settings.host.clone());
-    let security = match download_settings.security.as_deref().unwrap_or_else(|| {
-        if s.reality_opts.is_some() {
+    let host = download_settings
+        .host
+        .clone()
+        .or_else(|| xhttp_settings.and_then(|settings| settings.host.clone()))
+        .or_else(|| xhttp_opts.host.clone());
+    let download_reality_opts = match download_settings.reality_opts.as_ref() {
+        Some(opts) if opts.public_key.trim().is_empty() => None,
+        Some(opts) => Some(opts),
+        None => s.reality_opts.as_ref(),
+    };
+    let download_tls = download_settings.tls.or(s.tls).unwrap_or(false);
+    let security_name = download_settings.security.as_deref().unwrap_or_else(|| {
+        if download_reality_opts.is_some() {
             "reality"
+        } else if download_tls {
+            "tls"
         } else {
             "none"
         }
-    }) {
+    });
+    let security = match security_name {
         "none" => XhttpSecurity::None,
         "tls" => XhttpSecurity::Tls,
         "reality" => XhttpSecurity::Reality,
@@ -575,40 +604,119 @@ fn build_xhttp_download_config(
                 .as_ref()
                 .and_then(|settings| settings.server_name.clone())
         })
-        .or_else(|| host.as_ref().and_then(|hosts| hosts.first().cloned()))
-        .unwrap_or_else(|| download_settings.address.clone());
+        .or_else(|| s.sni.clone())
+        .or_else(|| s.server_name.clone())
+        .or_else(|| host.clone())
+        .unwrap_or_else(|| download_server.clone());
 
     let skip_cert_verify = download_settings
-        .tls_settings
-        .as_ref()
-        .and_then(|settings| settings.insecure)
+        .skip_cert_verify
+        .or_else(|| {
+            download_settings
+                .tls_settings
+                .as_ref()
+                .and_then(|settings| settings.insecure)
+        })
+        .or(s.skip_cert_verify)
         .unwrap_or(false);
+    let alpn_protocols = download_settings
+        .alpn
+        .clone()
+        .or_else(|| s.alpn.clone())
+        .unwrap_or_else(|| vec!["h2".to_owned()]);
+    if alpn_protocols.as_slice() != ["h2"] {
+        return Err(Error::InvalidConfig(
+            "xhttp download-settings currently requires alpn: [h2]".to_owned(),
+        ));
+    }
+
+    let tls_cert = download_settings
+        .certificate
+        .clone()
+        .or_else(|| s.certificate.clone());
+    let tls_key = download_settings
+        .private_key
+        .clone()
+        .or_else(|| s.private_key.clone());
+    match (&tls_cert, &tls_key) {
+        (Some(_), Some(_)) | (None, None) => {}
+        _ => {
+            return Err(Error::InvalidConfig(
+                "xhttp download-settings certificate and private-key must both be set or both omitted".to_owned(),
+            ));
+        }
+    }
+
+    let client_fingerprint = download_settings
+        .client_fingerprint
+        .as_deref()
+        .or(s.client_fingerprint.as_deref());
+    if let Some(client_fingerprint) = client_fingerprint {
+        match &security {
+            XhttpSecurity::Reality if client_fingerprint == "chrome" => {}
+            XhttpSecurity::Reality => {
+                return Err(Error::InvalidConfig(format!(
+                    "xhttp download-settings reality currently supports only client-fingerprint: chrome, got {client_fingerprint}"
+                )));
+            }
+            _ if client_fingerprint == "none" => {}
+            _ => {
+                return Err(Error::InvalidConfig(format!(
+                    "xhttp download-settings client-fingerprint is not implemented for non-reality TLS, got {client_fingerprint}"
+                )));
+            }
+        }
+    }
 
     let reality = build_xhttp_download_reality_config(
-        s.reality_opts.as_ref(),
+        download_reality_opts,
         &security,
         &server_name,
-        s.alpn.as_deref(),
+        Some(alpn_protocols.as_slice()),
     )?;
 
+    let inherited_headers = merged_xhttp_headers(
+        xhttp_opts.headers.clone(),
+        xhttp_opts
+            .extra
+            .as_ref()
+            .and_then(|extra| extra.headers.clone()),
+        xhttp_settings.and_then(|settings| settings.headers.clone()),
+    );
+
     Ok(Some(XhttpDownloadConfig {
-        server: download_settings.address.clone(),
-        port: download_settings.port,
+        server: download_server,
+        port: download_port,
         path: normalized_xhttp_path(
-            xhttp_settings.and_then(|settings| settings.path.as_deref()),
+            download_settings
+                .path
+                .as_deref()
+                .or_else(|| {
+                    xhttp_settings.and_then(|settings| settings.path.as_deref())
+                })
+                .or(xhttp_opts.path.as_deref()),
+            metadata,
         ),
         host,
         headers: merged_xhttp_headers(
+            Some(inherited_headers),
             None,
-            xhttp_opts
-                .extra
-                .as_ref()
-                .and_then(|extra| extra.headers.clone()),
-            xhttp_settings.and_then(|settings| settings.headers.clone()),
+            download_settings.headers.clone(),
         ),
         security,
         server_name,
+        alpn_protocols,
         skip_cert_verify,
+        fingerprint: download_settings
+            .fingerprint
+            .clone()
+            .or_else(|| s.fingerprint.clone()),
+        verify_name: download_settings
+            .name_cert_verify
+            .clone()
+            .or_else(|| s.name_cert_verify.clone()),
+        tls_cert,
+        tls_key,
         reality,
         reuse_policy,
     }))
@@ -652,10 +760,13 @@ fn resolve_xhttp_no_grpc_header(xhttp_opts: &XhttpOpt) -> bool {
 }
 
 fn resolve_xhttp_min_posts_interval_ms(xhttp_opts: &XhttpOpt) -> Option<u64> {
-    xhttp_opts
-        .extra
-        .as_ref()
-        .and_then(|extra| extra.sc_min_posts_interval_ms)
+    Some(
+        xhttp_opts
+            .extra
+            .as_ref()
+            .and_then(|extra| extra.sc_min_posts_interval_ms)
+            .unwrap_or(30),
+    )
 }
 
 #[cfg(feature = "reality")]
@@ -679,7 +790,7 @@ fn resolve_xhttp_upload_server_name(s: &OutboundVless) -> String {
                         .xhttp_settings
                         .as_ref()
                         .and_then(|value| value.host.as_ref())
-                        .and_then(|hosts| hosts.first().cloned())
+                        .cloned()
                 })
         })
         .or_else(|| s.sni.clone())
@@ -759,7 +870,33 @@ fn merged_xhttp_headers(
     merged
 }
 
+fn validate_xhttp_headers(
+    headers: Option<&std::collections::HashMap<String, String>>,
+    label: &str,
+) -> Result<(), Error> {
+    if headers
+        .into_iter()
+        .flat_map(|headers| headers.keys())
+        .any(|key| key.eq_ignore_ascii_case("host"))
+    {
+        return Err(Error::InvalidConfig(format!(
+            "xhttp {label} headers must not contain Host; use the host field instead"
+        )));
+    }
+
+    Ok(())
+}
+
 fn validate_xhttp_opts(xhttp_opts: &XhttpOpt) -> Result<(), Error> {
+    validate_xhttp_headers(xhttp_opts.headers.as_ref(), "xhttp-opts")?;
+    validate_xhttp_headers(
+        xhttp_opts
+            .extra
+            .as_ref()
+            .and_then(|extra| extra.headers.as_ref()),
+        "extra",
+    )?;
+
     if matches!(xhttp_opts.path.as_deref(), Some("")) {
         return Err(Error::InvalidConfig(
             "xhttp path must not be empty".to_owned(),
@@ -823,26 +960,27 @@ fn validate_xhttp_opts(xhttp_opts: &XhttpOpt) -> Result<(), Error> {
 fn validate_xhttp_upload_settings(
     upload_settings: &XhttpUploadSettings,
 ) -> Result<(), Error> {
-    validate_xhttp_endpoint_settings(upload_settings, "upload_settings")
+    validate_xhttp_endpoint_settings(upload_settings, "upload_settings", true)
 }
 
 fn validate_xhttp_download_settings(
     download_settings: &XhttpDownloadSettings,
 ) -> Result<(), Error> {
-    validate_xhttp_endpoint_settings(download_settings, "download_settings")
+    validate_xhttp_endpoint_settings(download_settings, "download_settings", false)
 }
 
 fn validate_xhttp_endpoint_settings(
     settings: &XhttpDownloadSettings,
     label: &str,
+    require_endpoint: bool,
 ) -> Result<(), Error> {
-    if settings.address.is_empty() {
+    if require_endpoint && settings.address.is_empty() {
         return Err(Error::InvalidConfig(format!(
             "xhttp {label} address must not be empty"
         )));
     }
 
-    if settings.port == 0 {
+    if require_endpoint && settings.port == 0 {
         return Err(Error::InvalidConfig(format!(
             "xhttp {label} port must be greater than zero"
         )));
@@ -863,27 +1001,42 @@ fn validate_xhttp_endpoint_settings(
         )));
     }
 
-    if matches!(
+    validate_xhttp_headers(settings.headers.as_ref(), label)?;
+    validate_xhttp_headers(
         settings
             .xhttp_settings
             .as_ref()
-            .and_then(|settings| settings.path.as_deref()),
-        Some("")
-    ) {
+            .and_then(|settings| settings.headers.as_ref()),
+        label,
+    )?;
+
+    if matches!(settings.path.as_deref(), Some(""))
+        || matches!(
+            settings
+                .xhttp_settings
+                .as_ref()
+                .and_then(|settings| settings.path.as_deref()),
+            Some("")
+        )
+    {
         return Err(Error::InvalidConfig(format!(
             "xhttp {label} path must not be empty"
         )));
     }
 
     #[cfg(not(feature = "tls"))]
-    if matches!(settings.security.as_deref(), Some("tls")) {
+    if matches!(settings.security.as_deref(), Some("tls"))
+        || settings.tls.unwrap_or(false)
+    {
         return Err(Error::InvalidConfig(format!(
             "xhttp {label} tls requires tls feature"
         )));
     }
 
     #[cfg(not(feature = "reality"))]
-    if matches!(settings.security.as_deref(), Some("reality")) {
+    if matches!(settings.security.as_deref(), Some("reality"))
+        || settings.reality_opts.is_some()
+    {
         return Err(Error::InvalidConfig(format!(
             "xhttp {label} reality requires reality feature"
         )));
@@ -1087,9 +1240,9 @@ fn parse_xhttp_padding_bytes(
         (value, value)
     };
 
-    if min > max {
+    if min == 0 || max == 0 || min > max {
         return Err(Error::InvalidConfig(format!(
-            "invalid xhttp x-padding-bytes range: {raw}"
+            "invalid xhttp x-padding-bytes range: {raw}; values must be greater than zero"
         )));
     }
 
@@ -1310,16 +1463,31 @@ fn parse_xhttp_mode(xhttp_opts: &XhttpOpt) -> Result<XhttpMode, Error> {
     }
 }
 
-fn normalized_xhttp_path(path: Option<&str>) -> String {
+fn normalized_xhttp_path(
+    path: Option<&str>,
+    metadata: &XhttpMetadataConfig,
+) -> String {
     let raw = path.unwrap_or("/");
-    let mut normalized = if raw.starts_with('/') {
-        raw.to_owned()
+    let (raw_path, raw_query) = raw
+        .split_once('?')
+        .map_or((raw, None), |(path, query)| (path, Some(query)));
+
+    let mut normalized = if raw_path.starts_with('/') {
+        raw_path.to_owned()
     } else {
-        format!("/{raw}")
+        format!("/{raw_path}")
     };
 
-    if !normalized.ends_with('/') {
+    let needs_path_suffix =
+        matches!(metadata.session_placement, XhttpMetadataPlacement::Path)
+            || matches!(metadata.seq_placement, XhttpMetadataPlacement::Path);
+    if needs_path_suffix && !normalized.ends_with('/') {
         normalized.push('/');
+    }
+
+    if let Some(query) = raw_query.filter(|query| !query.is_empty()) {
+        normalized.push('?');
+        normalized.push_str(query);
     }
 
     normalized
@@ -1410,12 +1578,14 @@ mod tests {
     };
 
     use super::{
-        OutboundVless, XhttpMetadataPlacement, XhttpMode, XhttpPaddingMethod,
-        XhttpPaddingPlacement, XhttpUplinkDataPlacement, build_tls_transport,
-        build_xhttp_download_config, build_xhttp_metadata_config,
-        build_xhttp_padding_config, build_xhttp_reuse_policy,
-        build_xhttp_session_config, build_xhttp_uplink_config, parse_xhttp_mode,
-        resolve_vless_alpn, validate_vless_config,
+        OutboundVless, XhttpMetadataConfig, XhttpMetadataPlacement, XhttpMode,
+        XhttpPaddingMethod, XhttpPaddingPlacement, XhttpUplinkDataPlacement,
+        build_tls_transport, build_xhttp_download_config,
+        build_xhttp_metadata_config, build_xhttp_padding_config,
+        build_xhttp_reuse_policy, build_xhttp_session_config,
+        build_xhttp_uplink_config, normalized_xhttp_path, parse_xhttp_mode,
+        resolve_vless_alpn, resolve_xhttp_min_posts_interval_ms,
+        validate_vless_config,
     };
 
     #[cfg(feature = "ws")]
@@ -2112,6 +2282,35 @@ mod tests {
     }
 
     #[test]
+    fn vless_xhttp_normalizes_path_and_preserves_raw_query() {
+        let metadata = XhttpMetadataConfig::default();
+
+        assert_eq!(
+            normalized_xhttp_path(Some("api?ed=2048"), &metadata),
+            "/api/?ed=2048"
+        );
+        assert_eq!(
+            normalized_xhttp_path(Some("/api?ed=2048"), &metadata),
+            "/api/?ed=2048"
+        );
+    }
+
+    #[test]
+    fn vless_xhttp_non_path_metadata_does_not_force_trailing_slash() {
+        let metadata = XhttpMetadataConfig {
+            session_placement: XhttpMetadataPlacement::Query,
+            session_key: Some("x_session".to_owned()),
+            seq_placement: XhttpMetadataPlacement::Header,
+            seq_key: Some("X-Seq".to_owned()),
+        };
+
+        assert_eq!(
+            normalized_xhttp_path(Some("api?ed=2048"), &metadata),
+            "/api?ed=2048"
+        );
+    }
+
+    #[test]
     fn vless_xhttp_metadata_config_defaults_to_path() {
         let opts = XhttpOpt::default();
 
@@ -2534,6 +2733,24 @@ mod tests {
     }
 
     #[test]
+    fn vless_xhttp_padding_rejects_zero_range() {
+        for value in ["0", "0-0", "0-128"] {
+            let opts = XhttpOpt {
+                x_padding_bytes: Some(value.to_owned()),
+                ..Default::default()
+            };
+
+            let err = build_xhttp_padding_config(&opts)
+                .expect_err("zero padding range must fail");
+
+            assert!(
+                err.to_string().contains("values must be greater than zero"),
+                "unexpected error for {value}: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn vless_xhttp_padding_rejects_unknown_placement_and_method() {
         let bad_placement = XhttpOpt {
             x_padding_placement: Some("path".to_owned()),
@@ -2558,6 +2775,13 @@ mod tests {
                 .contains("unsupported xhttp x-padding-method"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn vless_xhttp_packet_up_defaults_to_30ms_post_interval() {
+        let opts = XhttpOpt::default();
+
+        assert_eq!(resolve_xhttp_min_posts_interval_ms(&opts), Some(30));
     }
 
     #[test]
@@ -2694,6 +2918,105 @@ mod tests {
         let transport = build_transport(outbound.network.as_deref(), &outbound)
             .expect("xhttp stream-one should build");
         assert!(transport.is_some(), "xhttp transport should be present");
+    }
+
+    #[test]
+    fn vless_xhttp_rejects_host_header_case_insensitively() {
+        for key in ["Host", "host", "HOST"] {
+            let outbound = OutboundVless {
+                common_opts: CommonConfigOptions {
+                    name: "xhttp-host-header".to_owned(),
+                    server: "example.com".to_owned(),
+                    port: 443,
+                    connect_via: None,
+                },
+                uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+                network: Some("xhttp".to_owned()),
+                xhttp_opts: Some(XhttpOpt {
+                    headers: Some(std::collections::HashMap::from([(
+                        key.to_owned(),
+                        "other.example.com".to_owned(),
+                    )])),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+
+            let err = match build_transport(outbound.network.as_deref(), &outbound) {
+                Ok(_) => panic!("Host header must be rejected"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string().contains("must not contain Host"),
+                "unexpected error for {key}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn vless_xhttp_allows_non_host_headers() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp-header".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            network: Some("xhttp".to_owned()),
+            xhttp_opts: Some(XhttpOpt {
+                headers: Some(std::collections::HashMap::from([(
+                    "X-Forwarded-For".to_owned(),
+                    "203.0.113.10".to_owned(),
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let transport = build_transport(outbound.network.as_deref(), &outbound)
+            .expect("ordinary xhttp headers should remain valid");
+        assert!(transport.is_some());
+    }
+
+    #[test]
+    fn vless_xhttp_rejects_nested_download_host_header() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp-download-host-header".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            network: Some("xhttp".to_owned()),
+            xhttp_opts: Some(XhttpOpt {
+                download_settings: Some(XhttpDownloadSettings {
+                    address: "download.example.com".to_owned(),
+                    port: 443,
+                    network: "xhttp".to_owned(),
+                    xhttp_settings: Some(XhttpDownloadXhttpSettings {
+                        headers: Some(std::collections::HashMap::from([(
+                            "Host".to_owned(),
+                            "wrong.example.com".to_owned(),
+                        )])),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = match build_transport(outbound.network.as_deref(), &outbound) {
+            Ok(_) => panic!("nested Host header must be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("must not contain Host"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -2914,6 +3237,259 @@ mod tests {
     }
 
     #[test]
+    fn vless_xhttp_mihomo_flat_download_settings_reach_runtime_config() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp-flat-download".to_owned(),
+                server: "upload.example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            network: Some("xhttp".to_owned()),
+            xhttp_opts: Some(XhttpOpt {
+                path: Some("/upload/".to_owned()),
+                download_settings: Some(XhttpDownloadSettings {
+                    address: "download.example.com".to_owned(),
+                    port: 8443,
+                    network: "xhttp".to_owned(),
+                    tls: Some(true),
+                    alpn: Some(vec!["h2".to_owned()]),
+                    skip_cert_verify: Some(true),
+                    name_cert_verify: Some("cert.example.com".to_owned()),
+                    fingerprint: Some("0123456789abcdef".to_owned()),
+                    certificate: Some("client-cert.pem".to_owned()),
+                    private_key: Some("client-key.pem".to_owned()),
+                    client_fingerprint: Some("none".to_owned()),
+                    server_name: Some("sni.example.com".to_owned()),
+                    path: Some("/download/".to_owned()),
+                    host: Some("download-host.example.com".to_owned()),
+                    headers: Some(std::collections::HashMap::from([(
+                        "X-Download".to_owned(),
+                        "yes".to_owned(),
+                    )])),
+                    reuse_settings: Some(XhttpReuseSettings {
+                        max_connections: Some("2".to_owned()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let xhttp_opts = outbound
+            .xhttp_opts
+            .as_ref()
+            .expect("xhttp options should be present");
+        let metadata =
+            build_xhttp_metadata_config(xhttp_opts).expect("metadata should build");
+        let download = build_xhttp_download_config(&outbound, xhttp_opts, &metadata)
+            .expect("flat download settings should build")
+            .expect("download config should be present");
+
+        assert_eq!(download.server, "download.example.com");
+        assert_eq!(download.port, 8443);
+        assert_eq!(download.path, "/download/");
+        assert_eq!(download.host, Some("download-host.example.com".to_owned()));
+        assert_eq!(
+            download.headers.get("X-Download").map(String::as_str),
+            Some("yes")
+        );
+        assert!(matches!(
+            download.security,
+            crate::proxy::transport::XhttpSecurity::Tls
+        ));
+        assert_eq!(download.server_name, "sni.example.com");
+        assert_eq!(download.alpn_protocols, vec!["h2".to_owned()]);
+        assert!(download.skip_cert_verify);
+        assert_eq!(download.verify_name.as_deref(), Some("cert.example.com"));
+        assert_eq!(download.fingerprint.as_deref(), Some("0123456789abcdef"));
+        assert_eq!(download.tls_cert.as_deref(), Some("client-cert.pem"));
+        assert_eq!(download.tls_key.as_deref(), Some("client-key.pem"));
+        assert!(download.reuse_policy.is_some());
+    }
+
+    #[test]
+    fn vless_xhttp_download_settings_inherit_unset_uplink_fields() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp-inherit".to_owned(),
+                server: "upload.example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            tls: Some(true),
+            alpn: Some(vec!["h2".to_owned()]),
+            skip_cert_verify: Some(true),
+            name_cert_verify: Some("verify.example.com".to_owned()),
+            certificate: Some("client-cert.pem".to_owned()),
+            private_key: Some("client-key.pem".to_owned()),
+            server_name: Some("sni.example.com".to_owned()),
+            network: Some("xhttp".to_owned()),
+            fingerprint: Some("0123456789abcdef".to_owned()),
+            client_fingerprint: Some("none".to_owned()),
+            xhttp_opts: Some(XhttpOpt {
+                path: Some("/shared/".to_owned()),
+                host: Some("shared-host.example.com".to_owned()),
+                headers: Some(std::collections::HashMap::from([(
+                    "X-Shared".to_owned(),
+                    "yes".to_owned(),
+                )])),
+                reuse_settings: Some(XhttpReuseSettings {
+                    max_connections: Some("2".to_owned()),
+                    ..Default::default()
+                }),
+                download_settings: Some(XhttpDownloadSettings {
+                    network: "xhttp".to_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let xhttp_opts = outbound
+            .xhttp_opts
+            .as_ref()
+            .expect("xhttp options should be present");
+        let metadata =
+            build_xhttp_metadata_config(xhttp_opts).expect("metadata should build");
+        let download = build_xhttp_download_config(&outbound, xhttp_opts, &metadata)
+            .expect("inherited download settings should build")
+            .expect("download config should be present");
+
+        assert_eq!(download.server, "upload.example.com");
+        assert_eq!(download.port, 443);
+        assert_eq!(download.path, "/shared/");
+        assert_eq!(download.host, Some("shared-host.example.com".to_owned()));
+        assert_eq!(
+            download.headers.get("X-Shared").map(String::as_str),
+            Some("yes")
+        );
+        assert!(matches!(
+            download.security,
+            crate::proxy::transport::XhttpSecurity::Tls
+        ));
+        assert_eq!(download.server_name, "sni.example.com");
+        assert_eq!(download.alpn_protocols, vec!["h2".to_owned()]);
+        assert!(download.skip_cert_verify);
+        assert_eq!(download.verify_name.as_deref(), Some("verify.example.com"));
+        assert_eq!(download.fingerprint.as_deref(), Some("0123456789abcdef"));
+        assert_eq!(download.tls_cert.as_deref(), Some("client-cert.pem"));
+        assert_eq!(download.tls_key.as_deref(), Some("client-key.pem"));
+        assert!(download.reuse_policy.is_some());
+    }
+
+    #[cfg(feature = "reality")]
+    #[test]
+    fn vless_xhttp_download_empty_reality_key_clears_inherited_reality() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp-clear-reality".to_owned(),
+                server: "upload.example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            tls: Some(true),
+            alpn: Some(vec!["h2".to_owned()]),
+            network: Some("xhttp".to_owned()),
+            client_fingerprint: Some("chrome".to_owned()),
+            reality_opts: Some(OutboundTrojanRealityOpts {
+                public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
+                short_id: None,
+            }),
+            xhttp_opts: Some(XhttpOpt {
+                path: Some("/xhttp/".to_owned()),
+                download_settings: Some(XhttpDownloadSettings {
+                    network: "xhttp".to_owned(),
+                    client_fingerprint: Some("none".to_owned()),
+                    reality_opts: Some(OutboundTrojanRealityOpts {
+                        public_key: String::new(),
+                        short_id: None,
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let xhttp_opts = outbound
+            .xhttp_opts
+            .as_ref()
+            .expect("xhttp options should be present");
+        let metadata =
+            build_xhttp_metadata_config(xhttp_opts).expect("metadata should build");
+        let download = build_xhttp_download_config(&outbound, xhttp_opts, &metadata)
+            .expect("empty download reality key should clear inherited Reality")
+            .expect("download config should be present");
+
+        assert!(matches!(
+            download.security,
+            crate::proxy::transport::XhttpSecurity::Tls
+        ));
+        assert!(download.reality.is_none());
+        assert_eq!(download.server, "upload.example.com");
+        assert_eq!(download.port, 443);
+    }
+
+    #[cfg(feature = "reality")]
+    #[test]
+    fn vless_xhttp_download_tls_requires_fingerprint_override_when_reality_is_cleared()
+     {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp-clear-reality-fingerprint".to_owned(),
+                server: "upload.example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            tls: Some(true),
+            network: Some("xhttp".to_owned()),
+            client_fingerprint: Some("chrome".to_owned()),
+            reality_opts: Some(OutboundTrojanRealityOpts {
+                public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
+                short_id: None,
+            }),
+            xhttp_opts: Some(XhttpOpt {
+                download_settings: Some(XhttpDownloadSettings {
+                    network: "xhttp".to_owned(),
+                    reality_opts: Some(OutboundTrojanRealityOpts {
+                        public_key: String::new(),
+                        short_id: None,
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let xhttp_opts = outbound
+            .xhttp_opts
+            .as_ref()
+            .expect("xhttp options should be present");
+        let metadata =
+            build_xhttp_metadata_config(xhttp_opts).expect("metadata should build");
+        let err = build_xhttp_download_config(&outbound, xhttp_opts, &metadata)
+            .expect_err(
+                "non-Reality TLS cannot silently inherit chrome fingerprint",
+            );
+
+        assert!(
+            err.to_string().contains(
+                "client-fingerprint is not implemented for non-reality TLS"
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn vless_xhttp_rejects_non_xhttp_download_network() {
         let outbound = OutboundVless {
             common_opts: CommonConfigOptions {
@@ -3073,7 +3649,9 @@ mod tests {
             .xhttp_opts
             .as_ref()
             .expect("xhttp options should be present");
-        let download = build_xhttp_download_config(&outbound, xhttp_opts)
+        let metadata = build_xhttp_metadata_config(xhttp_opts)
+            .expect("metadata config should build");
+        let download = build_xhttp_download_config(&outbound, xhttp_opts, &metadata)
             .expect("download config should build")
             .expect("download config should be present");
         assert_eq!(

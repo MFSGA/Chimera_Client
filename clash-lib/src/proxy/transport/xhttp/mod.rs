@@ -175,11 +175,16 @@ pub struct XhttpDownloadConfig {
     pub server: String,
     pub port: u16,
     pub path: String,
-    pub host: Option<Vec<String>>,
+    pub host: Option<String>,
     pub headers: HashMap<String, String>,
     pub security: XhttpSecurity,
     pub server_name: String,
+    pub alpn_protocols: Vec<String>,
     pub skip_cert_verify: bool,
+    pub fingerprint: Option<String>,
+    pub verify_name: Option<String>,
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
     pub reality: Option<XhttpRealityConfig>,
     pub reuse_policy: Option<XhttpReusePolicy>,
 }
@@ -188,7 +193,7 @@ pub struct Client {
     server: String,
     port: u16,
     path: String,
-    host: Option<Vec<String>>,
+    host: Option<String>,
     headers: HashMap<String, String>,
     use_tls: bool,
     mode: XhttpMode,
@@ -214,7 +219,7 @@ impl Client {
         server: String,
         port: u16,
         path: String,
-        host: Option<Vec<String>>,
+        host: Option<String>,
         headers: HashMap<String, String>,
         use_tls: bool,
         mode: XhttpMode,
@@ -299,7 +304,7 @@ impl Client {
             &self.server,
             self.port,
             path,
-            self.host.as_ref(),
+            self.host.as_deref(),
             &self.headers,
             self.use_tls,
             self.request_content_type(method),
@@ -418,17 +423,15 @@ async fn connect_download_stream(
         XhttpSecurity::Tls => {
             #[cfg(feature = "tls")]
             {
-                let tls = TlsClient::new(
+                let tls = TlsClient::new_with_fingerprint(
                     config.skip_cert_verify,
                     config.server_name.clone(),
-                    Some(
-                        DEFAULT_XHTTP_ALPN
-                            .iter()
-                            .map(|item| (*item).to_owned())
-                            .collect(),
-                    ),
+                    Some(config.alpn_protocols.clone()),
                     None,
-                );
+                    config.fingerprint.clone(),
+                )
+                .with_verify_name(config.verify_name.clone())
+                .with_client_auth(config.tls_cert.clone(), config.tls_key.clone())?;
                 tls.proxy_stream(stream).await
             }
             #[cfg(not(feature = "tls"))]
@@ -539,7 +542,7 @@ async fn open_separate_downlink_response(
         &download.server,
         download.port,
         &path,
-        download.host.as_ref(),
+        download.host.as_deref(),
         &headers,
         matches!(
             download.security,
@@ -587,7 +590,7 @@ async fn open_downlink_response(
             &client.server,
             client.port,
             &path,
-            client.host.as_ref(),
+            client.host.as_deref(),
             &headers,
             client.use_tls,
             None,
@@ -618,7 +621,7 @@ fn build_request(
     server: &str,
     port: u16,
     path: &str,
-    host: Option<&Vec<String>>,
+    host: Option<&str>,
     headers: &HashMap<String, String>,
     use_tls: bool,
     content_type: Option<&str>,
@@ -649,7 +652,7 @@ fn build_request(
     }
 
     if !headers.keys().any(|key| key.eq_ignore_ascii_case("host"))
-        && let Some(host) = host.and_then(|hosts| hosts.first())
+        && let Some(host) = host
     {
         request = request.header("Host", host);
     }
@@ -858,7 +861,7 @@ async fn proxy_stream_up(
             &server,
             port,
             &request_path,
-            host.as_ref(),
+            host.as_deref(),
             &request_headers,
             use_tls,
             content_type,
@@ -912,6 +915,15 @@ async fn proxy_stream_up(
     Ok(Box::new(app_stream))
 }
 
+fn remaining_post_interval(
+    interval_ms: Option<u64>,
+    elapsed_since_last_write: Option<Duration>,
+) -> Option<Duration> {
+    let interval = Duration::from_millis(interval_ms?);
+    let elapsed = elapsed_since_last_write?;
+    (elapsed < interval).then(|| interval - elapsed)
+}
+
 async fn proxy_packet_up(
     client: &Client,
     mut sender: H2SendRequest,
@@ -944,6 +956,7 @@ async fn proxy_packet_up(
 
     tokio::spawn(async move {
         let mut seq: u64 = 0;
+        let mut last_write_at: Option<Instant> = None;
         let mut buf = vec![0; READ_CHUNK_SIZE];
         loop {
             match transport_reader.read(&mut buf).await {
@@ -969,7 +982,7 @@ async fn proxy_packet_up(
                             &server,
                             port,
                             &request_path,
-                            host.as_ref(),
+                            host.as_deref(),
                             &request_headers,
                             use_tls,
                             uplink.content_type(),
@@ -981,6 +994,14 @@ async fn proxy_packet_up(
                             Err(_) => return,
                         };
 
+                        if let Some(delay) = remaining_post_interval(
+                            min_posts_interval_ms,
+                            last_write_at.map(|instant| instant.elapsed()),
+                        ) {
+                            tokio::time::sleep(delay).await;
+                        }
+                        last_write_at = Some(Instant::now());
+
                         match send_h2_request(
                             &mut sender,
                             request,
@@ -990,14 +1011,6 @@ async fn proxy_packet_up(
                         {
                             Ok(response) if response.status().is_success() => {
                                 seq += 1;
-                                if let Some(interval_ms) = min_posts_interval_ms {
-                                    tokio::time::sleep(
-                                        tokio::time::Duration::from_millis(
-                                            interval_ms,
-                                        ),
-                                    )
-                                    .await;
-                                }
                             }
                             _ => return,
                         }
@@ -1043,9 +1056,13 @@ mod tests {
         Client, MetadataPlacement, UplinkDataPlacement, XhttpChunkSizeRange,
         XhttpDownloadConfig, XhttpMetadataConfig, XhttpMode, XhttpPaddingConfig,
         XhttpReusePolicy, XhttpReuseValueRange, XhttpSecurity, XhttpUplinkConfig,
-        build_request, open_separate_downlink_response,
+        build_request, connect_download_stream, open_separate_downlink_response,
+        remaining_post_interval,
     };
-    use crate::proxy::transport::Transport;
+    use crate::{
+        common::utils::{encode_hex, sha256},
+        proxy::transport::Transport,
+    };
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use bytes::Bytes;
     use http::{Method, Request, Response, StatusCode};
@@ -1063,6 +1080,7 @@ mod tests {
         sync::{Mutex, mpsc},
         time::{Duration, timeout},
     };
+    use tokio_rustls::TlsAcceptor;
     use tokio_stream::wrappers::ReceiverStream;
 
     type TestSessions =
@@ -1088,6 +1106,112 @@ mod tests {
         .with_auto_reality(auto_reality)
     }
 
+    async fn spawn_tls_h2_download_server() -> (std::net::SocketAddr, String) {
+        crate::setup_default_crypto_provider();
+
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec![
+                "download.example.com".to_owned(),
+            ])
+            .expect("test certificate should generate");
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+        let fingerprint = encode_hex(&sha256(cert_der.as_ref()));
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(signing_key.serialize_der())
+                .expect("test private key should serialize");
+
+        let mut tls_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .expect("test TLS config should build");
+        tls_config.alpn_protocols = vec![b"h2".to_vec()];
+        let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test TLS listener should bind");
+        let addr = listener.local_addr().expect("listener should expose addr");
+
+        tokio::spawn(async move {
+            let (tcp, _) =
+                listener.accept().await.expect("TLS accept should succeed");
+            let Ok(tls) = acceptor.accept(tcp).await else {
+                return;
+            };
+            let io = TokioIo::new(tls);
+            let service =
+                hyper::service::service_fn(|req: Request<Incoming>| async move {
+                    assert_eq!(req.method(), Method::GET);
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .body(Empty::<Bytes>::new().boxed())
+                            .expect("response should build"),
+                    )
+                });
+            let builder = auto::Builder::new(TokioExecutor::new()).http2_only();
+            builder
+                .serve_connection(io, service)
+                .await
+                .expect("TLS H2 server connection should succeed");
+        });
+
+        (addr, fingerprint)
+    }
+
+    fn pinned_tls_download(
+        addr: std::net::SocketAddr,
+        fingerprint: String,
+    ) -> XhttpDownloadConfig {
+        XhttpDownloadConfig {
+            server: addr.ip().to_string(),
+            port: addr.port(),
+            path: "/xhttp/".to_owned(),
+            host: None,
+            headers: HashMap::new(),
+            security: XhttpSecurity::Tls,
+            server_name: "download.example.com".to_owned(),
+            alpn_protocols: vec!["h2".to_owned()],
+            skip_cert_verify: true,
+            fingerprint: Some(fingerprint),
+            verify_name: None,
+            tls_cert: None,
+            tls_key: None,
+            reality: None,
+            reuse_policy: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn xhttp_download_tls_uses_certificate_fingerprint_pin() {
+        let (addr, fingerprint) = spawn_tls_h2_download_server().await;
+        let download = pinned_tls_download(addr, fingerprint);
+
+        let stream = connect_download_stream(&download)
+            .await
+            .expect("matching certificate fingerprint should complete TLS");
+        let _sender = super::handshake_http2(stream, None)
+            .await
+            .expect("download TLS stream should negotiate h2");
+    }
+
+    #[tokio::test]
+    async fn xhttp_download_tls_rejects_wrong_certificate_fingerprint() {
+        let (addr, _fingerprint) = spawn_tls_h2_download_server().await;
+        let download = pinned_tls_download(addr, "00".repeat(32));
+
+        let err = match connect_download_stream(&download).await {
+            Ok(_) => panic!("wrong certificate fingerprint must fail TLS"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("cert hash mismatch")
+                || err.to_string().contains("certificate"),
+            "unexpected TLS pinning error: {err}"
+        );
+    }
+
     #[test]
     fn xhttp_auto_reality_resolves_to_stream_one() {
         let client = auto_client(true, None);
@@ -1110,12 +1234,38 @@ mod tests {
             headers: HashMap::new(),
             security: XhttpSecurity::Tls,
             server_name: "download.example.com".to_owned(),
+            alpn_protocols: vec!["h2".to_owned()],
             skip_cert_verify: false,
+            fingerprint: None,
+            verify_name: None,
+            tls_cert: None,
+            tls_key: None,
             reality: None,
             reuse_policy: None,
         };
         let client = auto_client(true, Some(download));
         assert_eq!(client.effective_mode(), XhttpMode::StreamUp);
+    }
+
+    #[test]
+    fn xhttp_post_interval_only_sleeps_for_remaining_time() {
+        assert_eq!(
+            remaining_post_interval(Some(30), None),
+            None,
+            "first post should not be delayed"
+        );
+        assert_eq!(
+            remaining_post_interval(Some(30), Some(Duration::from_millis(10)),),
+            Some(Duration::from_millis(20))
+        );
+        assert_eq!(
+            remaining_post_interval(Some(30), Some(Duration::from_millis(30)),),
+            None
+        );
+        assert_eq!(
+            remaining_post_interval(Some(30), Some(Duration::from_millis(45)),),
+            None
+        );
     }
 
     #[test]
@@ -1452,7 +1602,12 @@ mod tests {
             headers: HashMap::new(),
             security: XhttpSecurity::None,
             server_name: "127.0.0.1".to_owned(),
+            alpn_protocols: vec!["h2".to_owned()],
             skip_cert_verify: false,
+            fingerprint: None,
+            verify_name: None,
+            tls_cert: None,
+            tls_key: None,
             reality: None,
             reuse_policy: Some(reuse_policy),
         };
@@ -2008,7 +2163,12 @@ mod tests {
                 headers: HashMap::new(),
                 security: XhttpSecurity::None,
                 server_name: "127.0.0.1".to_owned(),
+                alpn_protocols: vec!["h2".to_owned()],
                 skip_cert_verify: false,
+                fingerprint: None,
+                verify_name: None,
+                tls_cert: None,
+                tls_key: None,
                 reality: None,
                 reuse_policy: None,
             }),

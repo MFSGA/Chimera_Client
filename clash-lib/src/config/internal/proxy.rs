@@ -233,9 +233,9 @@ where
     ))
 }
 
-fn deserialize_optional_string_or_vec<'de, D>(
+fn deserialize_optional_string_or_singleton_vec<'de, D>(
     deserializer: D,
-) -> Result<Option<Vec<String>>, D::Error>
+) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -246,12 +246,17 @@ where
         Vec(Vec<String>),
     }
 
-    Ok(
-        Option::<StringOrVec>::deserialize(deserializer)?.map(|value| match value {
-            StringOrVec::String(value) => vec![value],
-            StringOrVec::Vec(values) => values,
-        }),
-    )
+    match Option::<StringOrVec>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(StringOrVec::String(value)) => Ok(Some(value)),
+        Some(StringOrVec::Vec(values)) => match values.as_slice() {
+            [] => Ok(None),
+            [value] => Ok(Some(value.clone())),
+            _ => Err(serde::de::Error::custom(
+                "xhttp host accepts a string or a single-element sequence",
+            )),
+        },
+    }
 }
 
 pub fn map_serde_error(
@@ -351,8 +356,11 @@ pub struct XhttpReuseSettings {
 #[serde(rename_all = "kebab-case")]
 pub struct XhttpDownloadXhttpSettings {
     pub path: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_string_or_vec")]
-    pub host: Option<Vec<String>>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_string_or_singleton_vec"
+    )]
+    pub host: Option<String>,
     pub headers: Option<HashMap<String, String>>,
     pub mode: Option<String>,
     pub reuse_settings: Option<XhttpReuseSettings>,
@@ -372,16 +380,40 @@ pub struct XhttpExtra {
     pub sc_min_posts_interval_ms: Option<u64>,
 }
 
+fn default_xhttp_network() -> String {
+    "xhttp".to_owned()
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
 #[serde(rename_all = "kebab-case")]
 pub struct XhttpDownloadSettings {
+    #[serde(default, alias = "server")]
     pub address: String,
+    #[serde(default)]
     pub port: u16,
+    #[serde(default = "default_xhttp_network")]
     pub network: String,
     pub security: Option<String>,
+    pub tls: Option<bool>,
+    pub alpn: Option<Vec<String>>,
+    pub skip_cert_verify: Option<bool>,
+    pub name_cert_verify: Option<String>,
+    pub fingerprint: Option<String>,
+    pub certificate: Option<String>,
+    pub private_key: Option<String>,
+    pub client_fingerprint: Option<String>,
+    pub reality_opts: Option<OutboundTrojanRealityOpts>,
     #[serde(alias = "servername", alias = "serverName")]
     pub server_name: Option<String>,
     pub sni: Option<String>,
+    pub path: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_string_or_singleton_vec"
+    )]
+    pub host: Option<String>,
+    pub headers: Option<HashMap<String, String>>,
+    pub reuse_settings: Option<XhttpReuseSettings>,
     #[serde(alias = "tlsSettings")]
     pub tls_settings: Option<XhttpDownloadTlsSettings>,
     #[serde(alias = "xhttpSettings")]
@@ -395,8 +427,11 @@ pub type XhttpUploadSettings = XhttpDownloadSettings;
 pub struct XhttpOpt {
     pub path: Option<String>,
     pub mode: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_string_or_vec")]
-    pub host: Option<Vec<String>>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_string_or_singleton_vec"
+    )]
+    pub host: Option<String>,
     pub headers: Option<HashMap<String, String>>,
     #[serde(default, deserialize_with = "deserialize_optional_string_or_integer")]
     pub x_padding_bytes: Option<String>,
@@ -1179,16 +1214,33 @@ xhttp-opts:
         };
         let opts = vless.xhttp_opts.expect("xhttp opts should be present");
 
-        assert_eq!(
-            opts.host.as_deref(),
-            Some(["upload-host.example.com".to_owned()].as_slice())
-        );
+        assert_eq!(opts.host.as_deref(), Some("upload-host.example.com"));
         assert_eq!(
             opts.download_settings
                 .and_then(|settings| settings.xhttp_settings)
                 .and_then(|settings| settings.host),
-            Some(vec!["download-host.example.com".to_owned()])
+            Some("download-host.example.com".to_owned())
         );
+    }
+
+    #[test]
+    fn outbound_vless_xhttp_rejects_multiple_host_values() {
+        let config = r#"
+name: xhttp-host-list
+type: vless
+server: upload.example.com
+port: 443
+uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+network: xhttp
+xhttp-opts:
+  host:
+    - upload-a.example.com
+    - upload-b.example.com
+"#;
+
+        let err = serde_yaml::from_str::<OutboundProxyProtocol>(config)
+            .expect_err("multiple xhttp host values must be rejected");
+        assert!(err.to_string().contains("single-element sequence"));
     }
 }
 
