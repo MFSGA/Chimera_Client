@@ -1074,6 +1074,11 @@ mod tests {
     use async_trait::async_trait;
 
     #[cfg(feature = "wireguard")]
+    use std::collections::HashMap;
+    #[cfg(feature = "wireguard")]
+    use tokio::sync::RwLock;
+
+    #[cfg(feature = "wireguard")]
     use super::OutboundManager;
     use super::reset_unique_connection_pools;
     use crate::{
@@ -1088,7 +1093,69 @@ mod tests {
     };
 
     #[cfg(feature = "wireguard")]
-    use crate::config::internal::proxy::{OutboundProxyProtocol, OutboundWireguard};
+    use crate::{
+        app::{
+            dns::MockClashResolver, profile::ThreadSafeCacheFile,
+            remote_content_manager::ProxyManager,
+        },
+        config::internal::proxy::{OutboundProxyProtocol, OutboundWireguard},
+        proxy::{
+            ConnectorType,
+            utils::{OutboundHandlerRegistry, RemoteConnector},
+            wg,
+        },
+    };
+
+    #[cfg(feature = "wireguard")]
+    #[derive(Debug)]
+    struct DatagramCarrier {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[cfg(feature = "wireguard")]
+    impl DialWithConnector for DatagramCarrier {}
+
+    #[cfg(feature = "wireguard")]
+    #[async_trait]
+    impl OutboundHandler for DatagramCarrier {
+        fn name(&self) -> &str {
+            "carrier"
+        }
+
+        fn proto(&self) -> OutboundType {
+            OutboundType::Direct
+        }
+
+        async fn support_connector(&self) -> ConnectorType {
+            ConnectorType::All
+        }
+
+        async fn connect_stream(
+            &self,
+            _sess: &Session,
+            _resolver: ThreadSafeDNSResolver,
+        ) -> io::Result<BoxedChainedStream> {
+            Err(io::Error::other("unexpected carrier stream dial"))
+        }
+
+        async fn connect_datagram(
+            &self,
+            _sess: &Session,
+            _resolver: ThreadSafeDNSResolver,
+        ) -> io::Result<BoxedChainedDatagram> {
+            Err(io::Error::other("unexpected direct carrier datagram dial"))
+        }
+
+        async fn connect_datagram_with_connector(
+            &self,
+            _sess: &Session,
+            _resolver: ThreadSafeDNSResolver,
+            _connector: &dyn RemoteConnector,
+        ) -> io::Result<BoxedChainedDatagram> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("wireguard manager connector sentinel"))
+        }
+    }
 
     #[derive(Debug)]
     struct CountingHandler {
@@ -1171,6 +1238,78 @@ ip: not-an-ip
             .is_err(),
             "provider loading must propagate WireGuard conversion errors"
         );
+    }
+
+    #[cfg(feature = "wireguard")]
+    #[tokio::test]
+    async fn wireguard_dialer_proxy_is_registered_by_manager() {
+        let config: OutboundWireguard = serde_yaml::from_str(
+            r#"
+name: wg
+dialer-proxy: carrier
+server: wg.example
+port: 51820
+private-key: KIlDUePHyYwzjgn18przw/ZwPioJhh2aEyhxb/dtCXI=
+public-key: INBZyvB715sA5zatkiX8Jn3Dh5tZZboZ09x4pkr66ig=
+ip: 10.0.0.2
+allowed-ips: [0.0.0.0/0]
+udp: true
+"#,
+        )
+        .expect("WireGuard config should parse");
+        let wireguard = Arc::new(
+            wg::Handler::try_from(&config).expect("WireGuard handler should build"),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let carrier: AnyOutboundHandler = Arc::new(DatagramCarrier {
+            calls: calls.clone(),
+        });
+
+        let mut handlers = HashMap::new();
+        handlers.insert("wg".to_owned(), wireguard.clone() as AnyOutboundHandler);
+        handlers.insert("carrier".to_owned(), carrier);
+
+        let bootstrap_resolver: ThreadSafeDNSResolver =
+            Arc::new(MockClashResolver::new());
+        let registry: OutboundHandlerRegistry =
+            Arc::new(RwLock::new(HashMap::new()));
+        let manager = OutboundManager {
+            proxy_providers: HashMap::new(),
+            proxy_manager: ProxyManager::new(bootstrap_resolver, None),
+            selector_control: HashMap::new(),
+            cache_store: ThreadSafeCacheFile::new("", false),
+            registry,
+        };
+
+        manager
+            .init_handler_connectors(&handlers)
+            .await
+            .expect("manager should register WireGuard dialer-proxy");
+
+        let mut resolver = MockClashResolver::new();
+        resolver
+            .expect_resolve()
+            .with(
+                mockall::predicate::eq("wg.example"),
+                mockall::predicate::eq(false),
+            )
+            .once()
+            .returning(|_, _| Ok(Some("198.51.100.10".parse().unwrap())));
+
+        let error = match wireguard
+            .connect_stream(&Session::default(), Arc::new(resolver))
+            .await
+        {
+            Ok(_) => panic!("carrier sentinel should stop WireGuard initialization"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("wireguard manager connector sentinel")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

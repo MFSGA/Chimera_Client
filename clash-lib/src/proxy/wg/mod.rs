@@ -14,7 +14,7 @@ use crate::{
     },
     common::errors::{map_io_error, new_io_error},
     impl_default_connector,
-    session::Session,
+    session::{Session, SocksAddr},
 };
 use async_trait::async_trait;
 use erased_serde::Serialize as ErasedSerialize;
@@ -27,7 +27,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::Arc,
 };
-use tokio::sync::OnceCell;
+use tokio::sync::Mutex;
 
 mod device;
 mod events;
@@ -80,7 +80,7 @@ impl Drop for Inner {
 
 pub struct Handler {
     opts: HandlerOptions,
-    inner: OnceCell<Inner>,
+    inner: Mutex<Option<Arc<Inner>>>,
 
     connector: tokio::sync::RwLock<Option<Arc<dyn RemoteConnector>>>,
 }
@@ -99,7 +99,7 @@ impl Handler {
     pub fn new(opts: HandlerOptions) -> Self {
         Self {
             opts,
-            inner: OnceCell::new(),
+            inner: Mutex::new(None),
 
             connector: Default::default(),
         }
@@ -164,86 +164,87 @@ impl Handler {
         &self,
         resolver: ThreadSafeDNSResolver,
         sess: &Session,
-    ) -> Result<&Inner, Error> {
-        self.inner
-            .get_or_try_init(|| async {
-                let recv_pair = tokio::sync::mpsc::channel(1024);
-                let send_pair = tokio::sync::mpsc::channel(1024);
-                let server_ip = resolver
-                    .resolve(&self.opts.server, false)
-                    .await
-                    .map_err(map_io_error)?
-                    .ok_or(new_io_error(
-                        format!("invalid remote server: {}", self.opts.server)
-                            .as_str(),
-                    ))?;
-                let allowed_ips =
-                    Self::parse_allowed_ips(self.opts.allowed_ips.as_deref())?;
+    ) -> Result<Arc<Inner>, Error> {
+        let mut cached = self.inner.lock().await;
+        if let Some(inner) = cached.as_ref() {
+            return Ok(inner.clone());
+        }
 
-                let wg = wireguard::WireguardTunnel::new(
-                    Config {
-                        private_key: Self::parse_key(
-                            &self.opts.private_key,
-                            "private key",
-                        )?
-                        .0
-                        .into(),
-                        endpoint_public_key: Self::parse_key(
-                            &self.opts.public_key,
-                            "public key",
-                        )?
-                        .0
-                        .into(),
-                        pre_shared_key: self
-                            .opts
-                            .pre_shared_key
-                            .as_deref()
-                            .map(|s| {
-                                Self::parse_key(s, "pre-shared key")
-                                    .map(|key| key.0.into())
-                            })
-                            .transpose()?,
-                        remote_endpoint: (server_ip, self.opts.port).into(),
-                        source_peer_ip: self.opts.ip,
-                        source_peer_ipv6: self.opts.ipv6,
-                        keepalive_seconds: normalize_persistent_keepalive(
-                            self.opts.persistent_keepalive,
-                        ),
-                        allowed_ips,
-                        reserved_bits: match &self.opts.reserved_bits {
-                            Some(bits) => [bits[0], bits[1], bits[2]],
-                            None => [0, 0, 0],
-                        },
-                    },
-                    recv_pair.0,
-                    send_pair.1,
-                    resolver.clone(),
-                    self.connector.read().await.as_ref().cloned(),
-                    sess,
-                )
+        let recv_pair = tokio::sync::mpsc::channel(1024);
+        let send_pair = tokio::sync::mpsc::channel(1024);
+        let server_ip = if let Ok(ip) = self.opts.server.parse::<IpAddr>() {
+            ip
+        } else {
+            resolver
+                .resolve(&self.opts.server, false)
                 .await
-                .map_err(map_io_error)?;
+                .map_err(map_io_error)?
+                .ok_or(new_io_error(
+                    format!("invalid remote server: {}", self.opts.server).as_str(),
+                ))?
+        };
+        let allowed_ips = Self::parse_allowed_ips(self.opts.allowed_ips.as_deref())?;
 
-                let wg_handle = tokio::spawn(async move {
-                    wg.start_polling().await;
-                });
+        let wg = wireguard::WireguardTunnel::new(
+            Config {
+                private_key: Self::parse_key(&self.opts.private_key, "private key")?
+                    .0
+                    .into(),
+                endpoint_public_key: Self::parse_key(
+                    &self.opts.public_key,
+                    "public key",
+                )?
+                .0
+                .into(),
+                pre_shared_key: self
+                    .opts
+                    .pre_shared_key
+                    .as_deref()
+                    .map(|s| {
+                        Self::parse_key(s, "pre-shared key").map(|key| key.0.into())
+                    })
+                    .transpose()?,
+                remote_endpoint: (server_ip, self.opts.port).into(),
+                source_peer_ip: self.opts.ip,
+                source_peer_ipv6: self.opts.ipv6,
+                keepalive_seconds: normalize_persistent_keepalive(
+                    self.opts.persistent_keepalive,
+                ),
+                allowed_ips,
+                reserved_bits: match &self.opts.reserved_bits {
+                    Some(bits) => [bits[0], bits[1], bits[2]],
+                    None => [0, 0, 0],
+                },
+            },
+            recv_pair.0,
+            send_pair.1,
+            resolver.clone(),
+            self.connector.read().await.as_ref().cloned(),
+            sess,
+        )
+        .await
+        .map_err(map_io_error)?;
 
-                // use to notify the device manager to poll sockets
-                let packet_notifier = tokio::sync::mpsc::channel(1024);
+        let wg_handle = tokio::spawn(async move {
+            wg.start_polling().await;
+        });
 
-                let device = device::VirtualIpDevice::new(
-                    send_pair.0,
-                    recv_pair.1,
-                    packet_notifier.0,
-                    effective_mtu(self.opts.mtu),
-                );
+        // use to notify the device manager to poll sockets
+        let packet_notifier = tokio::sync::mpsc::channel(1024);
 
-                let device_manager = Arc::new(device::DeviceManager::new(
-                    self.opts.ip,
-                    self.opts.ipv6,
-                    resolver,
-                    if self.opts.remote_dns_resolve {
-                        self.opts
+        let device = device::VirtualIpDevice::new(
+            send_pair.0,
+            recv_pair.1,
+            packet_notifier.0,
+            effective_mtu(self.opts.mtu),
+        );
+
+        let device_manager = Arc::new(device::DeviceManager::new(
+            self.opts.ip,
+            self.opts.ipv6,
+            resolver,
+            if self.opts.remote_dns_resolve {
+                self.opts
                             .dns
                             .as_ref()
                             .map(|server| {
@@ -262,24 +263,24 @@ impl Handler {
                             })
                             .transpose()?
                             .unwrap_or_default()
-                    } else {
-                        vec![]
-                    },
-                    packet_notifier.1,
-                ));
+            } else {
+                vec![]
+            },
+            packet_notifier.1,
+        ));
 
-                let device_manager_clone = device_manager.clone();
-                let device_manager_handle = tokio::spawn(async move {
-                    device_manager_clone.poll_sockets(device).await;
-                });
+        let device_manager_clone = device_manager.clone();
+        let device_manager_handle = tokio::spawn(async move {
+            device_manager_clone.poll_sockets(device).await;
+        });
 
-                Ok(Inner {
-                    device_manager,
-                    wg_handle,
-                    device_manager_handle,
-                })
-            })
-            .await
+        let inner = Arc::new(Inner {
+            device_manager,
+            wg_handle,
+            device_manager_handle,
+        });
+        *cached = Some(inner.clone());
+        Ok(inner)
     }
 }
 
@@ -301,6 +302,11 @@ impl OutboundHandler for Handler {
         self.opts.udp
     }
 
+    async fn reset_connection_pool(&self) -> io::Result<u32> {
+        let cached = self.inner.lock().await.take();
+        if cached.is_some() { Ok(1) } else { Ok(0) }
+    }
+
     /// connect to remote target via TCP
     async fn connect_stream(
         &self,
@@ -312,40 +318,42 @@ impl OutboundHandler for Handler {
             .await
             .map_err(map_io_error)?;
 
-        let ip = if self.opts.remote_dns_resolve
-            && sess.destination.is_domain()
-            && self.opts.dns.as_ref().is_some_and(|x| !x.is_empty())
-        {
-            let server = self
-                .opts
-                .dns
-                .as_ref()
-                .unwrap()
-                .choose(&mut rand::rng())
-                .unwrap();
+        let ip = match &sess.destination {
+            SocksAddr::Ip(addr) => addr.ip(),
+            SocksAddr::Domain(domain, _)
+                if self.opts.remote_dns_resolve
+                    && self.opts.dns.as_ref().is_some_and(|x| !x.is_empty()) =>
+            {
+                let server = self
+                    .opts
+                    .dns
+                    .as_ref()
+                    .unwrap()
+                    .choose(&mut rand::rng())
+                    .unwrap();
 
-            inner
-                .device_manager
-                .look_up_dns(
-                    &sess.destination.host(),
-                    (
-                        server.parse::<IpAddr>().map_err(|err| {
-                            new_io_error(format!(
-                                "invalid WireGuard DNS server {server:?}: {err}"
-                            ))
-                        })?,
-                        53,
+                inner
+                    .device_manager
+                    .look_up_dns(
+                        domain,
+                        (
+                            server.parse::<IpAddr>().map_err(|err| {
+                                new_io_error(format!(
+                                    "invalid WireGuard DNS server {server:?}: {err}"
+                                ))
+                            })?,
+                            53,
+                        )
+                            .into(),
                     )
-                        .into(),
-                )
-                .await
-                .ok_or(new_io_error("invalid remote address"))?
-        } else {
-            resolver
-                .resolve(&sess.destination.host(), false)
+                    .await
+                    .ok_or(new_io_error("invalid remote address"))?
+            }
+            SocksAddr::Domain(domain, _) => resolver
+                .resolve(domain, false)
                 .map_err(map_io_error)
                 .await?
-                .ok_or(new_io_error("invalid remote address"))?
+                .ok_or(new_io_error("invalid remote address"))?,
         };
 
         let remote = (ip, sess.destination.port()).into();
@@ -407,6 +415,39 @@ mod lifecycle_tests {
 
     use super::*;
 
+    #[derive(Debug)]
+    struct FailingDatagramConnector {
+        datagram_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl RemoteConnector for FailingDatagramConnector {
+        async fn connect_stream(
+            &self,
+            _resolver: ThreadSafeDNSResolver,
+            _address: &str,
+            _port: u16,
+            _iface: Option<&crate::app::net::OutboundInterface>,
+            #[cfg(target_os = "linux")] _packet_mark: Option<u32>,
+        ) -> std::io::Result<crate::proxy::AnyStream> {
+            Err(std::io::Error::other(
+                "unexpected WireGuard stream connector call",
+            ))
+        }
+
+        async fn connect_datagram(
+            &self,
+            _resolver: ThreadSafeDNSResolver,
+            _src: Option<std::net::SocketAddr>,
+            _destination: crate::session::SocksAddr,
+            _iface: Option<&crate::app::net::OutboundInterface>,
+            #[cfg(target_os = "linux")] _packet_mark: Option<u32>,
+        ) -> std::io::Result<crate::proxy::AnyOutboundDatagram> {
+            self.datagram_calls.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other("wireguard connector sentinel"))
+        }
+    }
+
     struct TaskDropGuard(Arc<AtomicUsize>);
 
     impl Drop for TaskDropGuard {
@@ -420,6 +461,55 @@ mod lifecycle_tests {
             let _guard = TaskDropGuard(dropped);
             std::future::pending::<()>().await;
         })
+    }
+
+    #[tokio::test]
+    async fn registered_connector_dials_outer_wireguard_datagram() {
+        let datagram_calls = Arc::new(AtomicUsize::new(0));
+        let connector = Arc::new(FailingDatagramConnector {
+            datagram_calls: datagram_calls.clone(),
+        });
+        let handler = Handler::try_new(HandlerOptions {
+            name: "wg".to_owned(),
+            common_opts: Default::default(),
+            server: "wg.example".to_owned(),
+            port: 51820,
+            ip: Ipv4Addr::new(10, 0, 0, 2),
+            ipv6: None,
+            private_key: "KIlDUePHyYwzjgn18przw/ZwPioJhh2aEyhxb/dtCXI=".to_owned(),
+            public_key: "INBZyvB715sA5zatkiX8Jn3Dh5tZZboZ09x4pkr66ig=".to_owned(),
+            pre_shared_key: None,
+            remote_dns_resolve: false,
+            dns: None,
+            mtu: None,
+            udp: true,
+            allowed_ips: Some(vec!["0.0.0.0/0".to_owned()]),
+            reserved_bits: None,
+            persistent_keepalive: None,
+        })
+        .expect("WireGuard test handler should build");
+        handler.register_connector(connector).await;
+
+        let mut resolver = MockClashResolver::new();
+        resolver
+            .expect_resolve()
+            .with(
+                mockall::predicate::eq("wg.example"),
+                mockall::predicate::eq(false),
+            )
+            .once()
+            .returning(|_, _| Ok(Some(IpAddr::from([198, 51, 100, 10]))));
+
+        let error = match handler
+            .initialize_inner(Arc::new(resolver), &Session::default())
+            .await
+        {
+            Ok(_) => panic!("sentinel connector must stop WireGuard initialization"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("wireguard connector sentinel"));
+        assert_eq!(datagram_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -462,6 +552,136 @@ mod lifecycle_tests {
     }
 
     #[tokio::test]
+    async fn tcp_ip_literal_bypasses_dns_resolver() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let wg_handle = pending_task(dropped.clone());
+        let device_manager_handle = pending_task(dropped);
+        tokio::task::yield_now().await;
+
+        let (_packet_notifier_tx, packet_notifier_rx) =
+            tokio::sync::mpsc::channel(1);
+        let device_manager = Arc::new(device::DeviceManager::new(
+            Ipv4Addr::new(10, 0, 0, 2),
+            None,
+            Arc::new(MockClashResolver::new()),
+            vec![],
+            packet_notifier_rx,
+        ));
+        let handler = Handler::new(HandlerOptions {
+            name: "wg-ip-literal".to_owned(),
+            common_opts: Default::default(),
+            server: "198.51.100.1".to_owned(),
+            port: 51820,
+            ip: Ipv4Addr::new(10, 0, 0, 2),
+            ipv6: None,
+            private_key: "KIlDUePHyYwzjgn18przw/ZwPioJhh2aEyhxb/dtCXI=".to_owned(),
+            public_key: "INBZyvB715sA5zatkiX8Jn3Dh5tZZboZ09x4pkr66ig=".to_owned(),
+            pre_shared_key: None,
+            remote_dns_resolve: false,
+            dns: None,
+            mtu: None,
+            udp: true,
+            allowed_ips: Some(vec!["0.0.0.0/0".to_owned()]),
+            reserved_bits: None,
+            persistent_keepalive: None,
+        });
+        *handler.inner.lock().await = Some(Arc::new(Inner {
+            device_manager,
+            wg_handle,
+            device_manager_handle,
+        }));
+
+        let sess = Session {
+            destination: SocksAddr::Ip("203.0.113.9:443".parse().unwrap()),
+            ..Default::default()
+        };
+        let resolver = Arc::new(MockClashResolver::new());
+        let stream = handler
+            .connect_stream(&sess, resolver)
+            .await
+            .expect("literal IP target must not require DNS resolution");
+        drop(stream);
+    }
+
+    #[tokio::test]
+    async fn reset_connection_pool_drops_cached_tunnel() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let wg_handle = pending_task(dropped.clone());
+        let device_manager_handle = pending_task(dropped.clone());
+        tokio::task::yield_now().await;
+
+        let (_packet_notifier_tx, packet_notifier_rx) =
+            tokio::sync::mpsc::channel(1);
+        let device_manager = Arc::new(device::DeviceManager::new(
+            Ipv4Addr::LOCALHOST,
+            None,
+            Arc::new(MockClashResolver::new()),
+            vec![],
+            packet_notifier_rx,
+        ));
+        let handler = Handler::new(HandlerOptions {
+            name: "wg-reset".to_owned(),
+            common_opts: Default::default(),
+            server: "wg-reset.example".to_owned(),
+            port: 51820,
+            ip: Ipv4Addr::LOCALHOST,
+            ipv6: None,
+            private_key: "KIlDUePHyYwzjgn18przw/ZwPioJhh2aEyhxb/dtCXI=".to_owned(),
+            public_key: "INBZyvB715sA5zatkiX8Jn3Dh5tZZboZ09x4pkr66ig=".to_owned(),
+            pre_shared_key: None,
+            remote_dns_resolve: false,
+            dns: None,
+            mtu: None,
+            udp: true,
+            allowed_ips: Some(vec!["0.0.0.0/0".to_owned()]),
+            reserved_bits: None,
+            persistent_keepalive: None,
+        });
+        *handler.inner.lock().await = Some(Arc::new(Inner {
+            device_manager,
+            wg_handle,
+            device_manager_handle,
+        }));
+
+        assert_eq!(handler.reset_connection_pool().await.unwrap(), 1);
+        assert_eq!(handler.reset_connection_pool().await.unwrap(), 0);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while dropped.load(Ordering::SeqCst) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resetting WireGuard should abort both background tasks");
+
+        let datagram_calls = Arc::new(AtomicUsize::new(0));
+        handler
+            .register_connector(Arc::new(FailingDatagramConnector {
+                datagram_calls: datagram_calls.clone(),
+            }))
+            .await;
+        let mut resolver = MockClashResolver::new();
+        resolver
+            .expect_resolve()
+            .with(
+                mockall::predicate::eq("wg-reset.example"),
+                mockall::predicate::eq(false),
+            )
+            .once()
+            .returning(|_, _| Ok(Some(IpAddr::from([198, 51, 100, 10]))));
+
+        let error = match handler
+            .initialize_inner(Arc::new(resolver), &Session::default())
+            .await
+        {
+            Ok(_) => panic!("reset WireGuard should rebuild through the connector"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("wireguard connector sentinel"));
+        assert_eq!(datagram_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn dropping_inner_aborts_background_tasks() {
         let dropped = Arc::new(AtomicUsize::new(0));
         let wg_handle = pending_task(dropped.clone());
@@ -497,12 +717,18 @@ mod lifecycle_tests {
 #[cfg(all(test, docker_test))]
 mod tests {
 
-    use crate::proxy::utils::{
-        GLOBAL_DIRECT_CONNECTOR,
-        test_utils::{
-            Suite,
-            config_helper::test_config_base_dir,
-            docker_runner::{DockerTestRunnerBuilder, alloc_docker_port},
+    use futures::{SinkExt, StreamExt};
+
+    use crate::proxy::{
+        datagram::UdpPacket,
+        utils::{
+            GLOBAL_DIRECT_CONNECTOR,
+            test_utils::{
+                config_helper::{build_dns_resolver, test_config_base_dir},
+                docker_runner::{
+                    DockerTestRunnerBuilder, RunAndCleanup, alloc_docker_port,
+                },
+            },
         },
     };
 
@@ -510,9 +736,7 @@ mod tests {
         super::utils::test_utils::{consts::*, docker_runner::DockerTestRunner},
         *,
     };
-    use crate::{
-        proxy::utils::test_utils::run_test_suites_and_cleanup, tests::initialize,
-    };
+    use crate::tests::initialize;
 
     // see: https://github.com/linuxserver/docker-wireguard?tab=readme-ov-file#usage
     // we shouldn't run the wireguard server with host mode, or
@@ -542,6 +766,44 @@ mod tests {
             .host_port(host_port, 10002)
             .build()
             .await
+    }
+
+    async fn dns_roundtrip_through_wireguard(
+        handler: Arc<Handler>,
+    ) -> anyhow::Result<()> {
+        let src = SocksAddr::Ip("127.0.0.1:0".parse()?);
+        let dst = SocksAddr::Ip("10.13.13.1:53".parse()?);
+        let sess = Session {
+            destination: dst.clone(),
+            ..Default::default()
+        };
+        let resolver = build_dns_resolver().await?;
+        let datagram = handler.connect_datagram(&sess, resolver).await?;
+        let (mut sink, mut stream) = datagram.split();
+        let dns_req = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03www\x06google\x03com\x00\x00\x01\x00\x01";
+        let request = UdpPacket::new(dns_req.to_vec(), src, dst);
+
+        for _ in 0..3 {
+            sink.send(request.clone()).await?;
+            match tokio::time::timeout(
+                tokio::time::Duration::from_secs(5),
+                stream.next(),
+            )
+            .await
+            {
+                Ok(Some(response)) if !response.data.is_empty() => {
+                    anyhow::ensure!(
+                        response.data.len() >= 2
+                            && response.data[..2] == [0x12, 0x34],
+                        "unexpected DNS response transaction id"
+                    );
+                    return Ok(());
+                }
+                _ => continue,
+            }
+        }
+
+        anyhow::bail!("no DNS response received through WireGuard tunnel")
     }
 
     #[tokio::test]
@@ -576,18 +838,12 @@ mod tests {
             .register_connector(GLOBAL_DIRECT_CONNECTOR.clone())
             .await;
 
-        // cannot run the ping pong test, since the wireguard server is running
-        // on bridge network mode and the `net.ipv4.conf.all.
-        // src_valid_mark` is not supported in the host network mode the
-        // latency test should be enough
-
         // FIXME: wait for the startup of the test runner in a more elegant way
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-        run_test_suites_and_cleanup(
-            handler,
-            runner,
-            &[Suite::LatencyTcp, Suite::DnsUdp],
-        )
-        .await
+        runner
+            .run_and_cleanup(async move {
+                dns_roundtrip_through_wireguard(handler).await
+            })
+            .await
     }
 }
