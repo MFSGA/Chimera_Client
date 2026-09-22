@@ -61,10 +61,20 @@ impl Default for DnsHijack {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TunStack {
+    System,
+    Gvisor,
+    Mixed,
+    Mips,
+}
+
 #[derive(Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct TunConfig {
     pub enable: bool,
+    pub stack: Option<TunStack>,
     #[serde(alias = "device_id", alias = "device-url", alias = "device")]
     #[serde(default = "default_tun_device_id")]
     pub device_id: String,

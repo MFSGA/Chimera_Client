@@ -10,7 +10,7 @@ use url::Url;
 use crate::{
     Error,
     app::{dispatcher::Dispatcher, dns::ThreadSafeDNSResolver},
-    config::internal::config::TunConfig,
+    config::internal::config::{TunConfig, TunStackMode},
     proxy::tun::{
         datagram::handle_inbound_datagram, routes, stream::handle_inbound_stream,
     },
@@ -134,6 +134,12 @@ impl TunRunner {
         ),
         Error,
     > {
+        if cfg.stack == TunStackMode::MipsCompat {
+            warn!(
+                "tun stack=mips uses Chimera's built-in smoltcp userspace stack; configuration is compatible, but this is not the Mihomo MIPS implementation"
+            );
+        }
+
         let mut tun_init_config = TunInitializationConfig::default();
         match Url::parse(&cfg.device_id) {
             Ok(u) => match u.scheme() {

@@ -200,9 +200,17 @@ pub struct Profile {
     // store_fake_ip: bool,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum TunStackMode {
+    #[default]
+    Builtin,
+    MipsCompat,
+}
+
 #[derive(Default, Clone)]
 pub struct TunConfig {
     pub enable: bool,
+    pub stack: TunStackMode,
     pub device_id: String,
     pub route_all: bool,
     pub routes: Vec<IpNet>,

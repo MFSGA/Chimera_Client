@@ -104,6 +104,28 @@ pub(super) fn convert(
 
     match before {
         Some(t) => {
+            let stack = match t.stack {
+                None => config::TunStackMode::Builtin,
+                Some(def::TunStack::Mips) => config::TunStackMode::MipsCompat,
+                Some(def::TunStack::System) => {
+                    return Err(Error::InvalidConfig(
+                        "tun stack `system` is not supported; Chimera currently uses its built-in userspace stack"
+                            .to_owned(),
+                    ));
+                }
+                Some(def::TunStack::Gvisor) => {
+                    return Err(Error::InvalidConfig(
+                        "tun stack `gvisor` is not supported; Chimera currently uses its built-in userspace stack"
+                            .to_owned(),
+                    ));
+                }
+                Some(def::TunStack::Mixed) => {
+                    return Err(Error::InvalidConfig(
+                        "tun stack `mixed` is not supported; Chimera currently uses its built-in userspace stack"
+                            .to_owned(),
+                    ));
+                }
+            };
             let (dns_hijack, dns_hijack_rules) = parse_dns_hijack(t.dns_hijack)?;
             let gateway_v6 = match (t.ipv6, t.gateway_v6) {
                 (Some(false), Some(_)) => {
@@ -119,6 +141,21 @@ pub(super) fn convert(
                     "tun route-table-v6 must differ from route-table when IPv6 is enabled"
                         .to_owned(),
                 ));
+            }
+            if stack == config::TunStackMode::MipsCompat
+                && let Some(mtu) = t.mtu
+            {
+                let minimum_mtu = if gateway_v6.is_some() { 1280 } else { 68 };
+                if mtu < minimum_mtu {
+                    return Err(Error::InvalidConfig(format!(
+                        "tun stack `mips` requires mtu >= {minimum_mtu}{}",
+                        if gateway_v6.is_some() {
+                            " when IPv6 is enabled"
+                        } else {
+                            ""
+                        }
+                    )));
+                }
             }
             let mut route_exclude_address =
                 parse_routes(t.route_exclude_address, "route-exclude-address")?;
@@ -155,6 +192,7 @@ pub(super) fn convert(
 
             Ok(config::TunConfig {
                 enable: t.enable,
+                stack,
                 device_id: t.device_id,
                 route_all: t.route_all,
                 routes: parse_routes(t.routes, "routes")?,
@@ -187,7 +225,9 @@ pub(super) fn convert(
 mod tests {
     use crate::config::{
         def,
-        internal::config::{DnsHijackAddress, DnsHijackProtocol, DnsHijackRule},
+        internal::config::{
+            DnsHijackAddress, DnsHijackProtocol, DnsHijackRule, TunStackMode,
+        },
     };
 
     use super::convert;
@@ -215,6 +255,77 @@ mod tests {
         assert_eq!(converted.route_table_v6, 2469);
         assert_eq!(converted.gateway.to_string(), "198.18.0.1/30");
         assert!(!converted.dns_hijack);
+    }
+
+    #[test]
+    fn parse_mihomo_mips_stack_as_compat_mode() {
+        let converted = convert(Some(parse_tun("enable: true\nstack: mips")))
+            .expect("Mihomo mips stack should map to Chimera userspace stack");
+
+        assert_eq!(converted.stack, TunStackMode::MipsCompat);
+    }
+
+    #[test]
+    fn validate_mihomo_mips_minimum_mtu() {
+        for (yaml, expected_minimum) in [
+            ("enable: true\nstack: mips\nmtu: 67", 68),
+            ("enable: true\nstack: mips\nipv6: true\nmtu: 1279", 1280),
+        ] {
+            let error = match convert(Some(parse_tun(yaml))) {
+                Ok(_) => {
+                    panic!("Mihomo MIPS MTU below the protocol minimum must fail")
+                }
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("requires mtu >= {expected_minimum}")),
+                "unexpected error: {error}"
+            );
+        }
+
+        assert_eq!(
+            convert(Some(parse_tun("enable: true\nstack: mips\nmtu: 68")))
+                .unwrap()
+                .mtu,
+            Some(68)
+        );
+        assert_eq!(
+            convert(Some(parse_tun(
+                "enable: true\nstack: mips\nipv6: true\nmtu: 1280"
+            )))
+            .unwrap()
+            .mtu,
+            Some(1280)
+        );
+    }
+
+    #[test]
+    fn omitted_stack_preserves_chimera_builtin_stack() {
+        let converted = convert(Some(parse_tun("enable: true")))
+            .expect("default Chimera TUN stack should remain valid");
+
+        assert_eq!(converted.stack, TunStackMode::Builtin);
+    }
+
+    #[test]
+    fn reject_unimplemented_mihomo_tun_stacks_explicitly() {
+        for stack in ["system", "gvisor", "mixed"] {
+            let error = match convert(Some(parse_tun(&format!(
+                "enable: true\nstack: {stack}"
+            )))) {
+                Ok(_) => panic!("unsupported Mihomo TUN stack must fail explicitly"),
+                Err(error) => error,
+            };
+
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("tun stack `{stack}` is not supported")),
+                "unexpected error for {stack}: {error}"
+            );
+        }
     }
 
     #[test]
