@@ -902,9 +902,16 @@ pub struct OutboundTrojan {
     pub alpn: Option<Vec<String>>,
     pub sni: Option<String>,
     pub skip_cert_verify: Option<bool>,
+    pub name_cert_verify: Option<String>,
+    pub certificate: Option<String>,
+    pub private_key: Option<String>,
+    /// TLS certificate SHA-256 fingerprint pin.
+    pub fingerprint: Option<String>,
+    /// TLS ClientHello/uTLS-style fingerprint selection.
+    pub client_fingerprint: Option<String>,
     pub udp: Option<bool>,
     pub network: Option<String>,
-    // pub grpc_opts: Option<GrpcOpt>,
+    pub grpc_opts: Option<GrpcOpt>,
     #[cfg(feature = "ws")]
     pub ws_opts: Option<WsOpt>,
 }

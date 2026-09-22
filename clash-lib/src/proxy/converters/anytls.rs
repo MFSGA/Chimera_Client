@@ -1,5 +1,7 @@
 use tracing::warn;
 
+use crate::Error;
+
 use crate::{
     config::internal::proxy::OutboundAnytls,
     proxy::{
@@ -30,11 +32,12 @@ impl TryFrom<&OutboundAnytls> for Handler {
                 s.common_opts.server
             );
         }
-        if s.fingerprint.is_some() || s.client_fingerprint.is_some() {
-            warn!(
-                "anytls fingerprint fields are parsed but not applied yet for {}",
-                s.common_opts.name
-            );
+        if let Some(client_fingerprint) = s.client_fingerprint.as_deref()
+            && client_fingerprint != "none"
+        {
+            return Err(Error::InvalidConfig(format!(
+                "anytls client-fingerprint is not implemented, got {client_fingerprint}"
+            )));
         }
         if s.idle_session_check_interval.is_some()
             || s.idle_session_timeout.is_some()
@@ -46,7 +49,7 @@ impl TryFrom<&OutboundAnytls> for Handler {
             );
         }
 
-        let client = TlsClient::new_with_client_auth(
+        let client = TlsClient::new_with_fingerprint(
             skip_cert_verify,
             s.sni
                 .clone()
@@ -55,9 +58,9 @@ impl TryFrom<&OutboundAnytls> for Handler {
                 .clone()
                 .or_else(|| Some(DEFAULT_ALPN.map(str::to_owned).to_vec())),
             None,
-            s.tls_cert.as_deref(),
-            s.tls_key.as_deref(),
-        )?;
+            s.fingerprint.clone(),
+        )
+        .with_client_auth(s.tls_cert.clone(), s.tls_key.clone())?;
 
         Ok(Handler::new(HandlerOptions {
             name: s.common_opts.name.to_owned(),
@@ -72,5 +75,49 @@ impl TryFrom<&OutboundAnytls> for Handler {
             tls: Some(Box::new(client)),
             transport: None,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(extra: &str) -> OutboundAnytls {
+        serde_yaml::from_str(&format!(
+            r#"
+name: anytls-test
+server: 198.51.100.10
+port: 443
+password: secret
+sni: example.com
+{extra}
+"#
+        ))
+        .expect("AnyTLS test config should parse")
+    }
+
+    #[test]
+    fn anytls_accepts_certificate_fingerprint_pinning() {
+        let config = parse("fingerprint: 0123456789abcdef");
+        Handler::try_from(&config)
+            .expect("certificate fingerprint should be wired into TLS");
+    }
+
+    #[test]
+    fn anytls_rejects_unimplemented_client_fingerprint() {
+        let config = parse("client-fingerprint: chrome");
+        let err = Handler::try_from(&config)
+            .expect_err("uTLS fingerprint must not be silently ignored");
+        assert!(
+            err.to_string()
+                .contains("client-fingerprint is not implemented")
+        );
+    }
+
+    #[test]
+    fn anytls_accepts_explicit_no_client_fingerprint() {
+        let config = parse("client-fingerprint: none");
+        Handler::try_from(&config)
+            .expect("client-fingerprint: none should keep standard rustls TLS");
     }
 }

@@ -237,21 +237,6 @@ impl Client {
         }
     }
 
-    #[cfg(feature = "anytls")]
-    pub fn new_with_client_auth(
-        skip_cert_verify: bool,
-        sni: String,
-        alpn: Option<Vec<String>>,
-        expected_alpn: Option<String>,
-        tls_cert: Option<&str>,
-        tls_key: Option<&str>,
-    ) -> io::Result<Self> {
-        Self::new(skip_cert_verify, sni, alpn, expected_alpn).with_client_auth(
-            tls_cert.map(ToOwned::to_owned),
-            tls_key.map(ToOwned::to_owned),
-        )
-    }
-
     pub fn with_verify_name(mut self, verify_name: Option<String>) -> Self {
         self.verify_name = verify_name;
         self
