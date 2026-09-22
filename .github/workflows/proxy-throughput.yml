@@ -6,6 +6,7 @@ on:
     paths:
       - "clash-lib/src/proxy/**"
       - "clash-lib/src/app/**"
+      - "clash-bin/tests/data/config/**"
       - ".github/workflows/proxy-throughput.yml"
   workflow_dispatch:
   push:
@@ -81,9 +82,21 @@ jobs:
       - name: Pull docker images
         run: |
           docker pull v2fly/v2fly-core:v4.45.2
+          docker pull teddysun/xray:26.3.27
+          docker pull alpine:3.20
           docker pull p4gefau1t/trojan-go:latest
           docker pull tobyxdd/hysteria:latest
           docker pull nicolaka/netshoot:latest
+
+      - name: Run VLESS Docker E2E tests
+        env:
+          RUST_LOG: ${{ env.RUST_LOG }}
+        run: |
+          set -o pipefail
+          RUSTFLAGS="--cfg docker_test --cfg throughput_test" \
+          cargo test -p clash-lib --all-features \
+            proxy::vless::tests:: \
+            -- --test-threads=1 --nocapture 2>&1 | tee vless-e2e-test.log
 
       # Download once so parallel clash-rs instances don't race to fetch it
       - name: Download Country.mmdb
@@ -152,6 +165,7 @@ jobs:
             ${{ env.THROUGHPUT_RESULTS_FILE }}
             throughput-comment.md
             throughput-test.log
+            vless-e2e-test.log
             network-reset-test.log
           retention-days: 90
 
