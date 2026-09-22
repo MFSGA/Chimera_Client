@@ -777,6 +777,8 @@ pub struct OutboundTrojanRealityOpts {
     pub public_key: String,
     #[serde(alias = "shortId")]
     pub short_id: Option<String>,
+    #[serde(alias = "supportX25519MLKEM768")]
+    pub support_x25519mlkem768: Option<bool>,
 }
 
 #[cfg(feature = "hysteria")]
@@ -1260,6 +1262,34 @@ encryption: mlkem768x25519plus.native.1rtt.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
                 "mlkem768x25519plus.native.1rtt.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
             )
         );
+    }
+
+    #[test]
+    fn outbound_vless_parses_encryption_and_reality_hybrid_flag() {
+        let config = r#"
+name: vless-reality-options
+type: vless
+server: example.com
+port: 443
+uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+encryption: ""
+reality-opts:
+  public-key: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=
+  short-id: ""
+  support-x25519mlkem768: false
+"#;
+
+        let parsed: OutboundProxyProtocol = serde_yaml::from_str(config)
+            .expect("vless encryption/reality options should parse");
+
+        let OutboundProxyProtocol::Vless(vless) = parsed else {
+            panic!("expected vless proxy");
+        };
+
+        assert_eq!(vless.encryption.as_deref(), Some(""));
+        let reality = vless.reality_opts.expect("reality opts should be present");
+        assert_eq!(reality.short_id.as_deref(), Some(""));
+        assert_eq!(reality.support_x25519mlkem768, Some(false));
     }
 
     #[test]

@@ -256,6 +256,7 @@ pub struct XhttpRealityConfig {
     pub short_id: Vec<u8>,
     pub server_name: String,
     pub alpn_protocols: Vec<String>,
+    pub support_x25519_mlkem768: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -605,7 +606,8 @@ async fn secure_endpoint_stream(
                     reality.server_name.clone(),
                     Vec::new(),
                     reality.alpn_protocols.clone(),
-                );
+                )
+                .with_x25519_mlkem768(reality.support_x25519_mlkem768);
                 client.proxy_stream(stream).await
             }
             #[cfg(not(feature = "reality"))]

@@ -10,6 +10,9 @@ use super::common::{
 use aws_lc_rs::signature::Ed25519KeyPair;
 use std::io::Result;
 
+pub const X25519_GROUP: u16 = 0x001d;
+pub const X25519_MLKEM768_GROUP: u16 = 0x11ec;
+
 /// Construct ServerHello message
 ///
 /// # Arguments
@@ -21,6 +24,22 @@ pub fn construct_server_hello(
     server_random: &[u8; 32],
     session_id: &[u8],
     cipher_suite: u16,
+    key_share_data: &[u8],
+) -> Result<Vec<u8>> {
+    construct_server_hello_with_key_share(
+        server_random,
+        session_id,
+        cipher_suite,
+        X25519_GROUP,
+        key_share_data,
+    )
+}
+
+pub fn construct_server_hello_with_key_share(
+    server_random: &[u8; 32],
+    session_id: &[u8],
+    cipher_suite: u16,
+    key_share_group: u16,
     key_share_data: &[u8],
 ) -> Result<Vec<u8>> {
     let mut server_hello = Vec::new();
@@ -67,7 +86,7 @@ pub fn construct_server_hello(
     let key_share_length = 2 + 2 + key_share_data.len(); // group + length + data
     extensions.extend_from_slice(&[0x00, 0x33]); // type = 51
     extensions.extend_from_slice(&(key_share_length as u16).to_be_bytes());
-    extensions.extend_from_slice(&[0x00, 0x1d]); // group = X25519 (0x001d)
+    extensions.extend_from_slice(&key_share_group.to_be_bytes());
     extensions.extend_from_slice(&(key_share_data.len() as u16).to_be_bytes());
     extensions.extend_from_slice(key_share_data);
 
@@ -276,6 +295,26 @@ pub fn construct_client_hello(
     cipher_suites: &[u16],
     alpn_protocols: &[&str],
 ) -> Result<Vec<u8>> {
+    construct_client_hello_with_key_share(
+        client_random,
+        session_id,
+        X25519_GROUP,
+        client_public_key,
+        server_name,
+        cipher_suites,
+        alpn_protocols,
+    )
+}
+
+pub fn construct_client_hello_with_key_share(
+    client_random: &[u8; 32],
+    session_id: &[u8; 32],
+    key_share_group: u16,
+    client_public_key: &[u8],
+    server_name: &str,
+    cipher_suites: &[u16],
+    alpn_protocols: &[&str],
+) -> Result<Vec<u8>> {
     let mut hello = Vec::with_capacity(512);
 
     // Handshake message type: ClientHello (0x01)
@@ -338,7 +377,7 @@ pub fn construct_client_hello(
         extensions.extend_from_slice(&[0x00, 0x0a]); // Extension type: supported_groups
         extensions.extend_from_slice(&[0x00, 0x04]); // Extension length: 4
         extensions.extend_from_slice(&[0x00, 0x02]); // Supported groups length: 2
-        extensions.extend_from_slice(&[0x00, 0x1d]); // x25519
+        extensions.extend_from_slice(&key_share_group.to_be_bytes());
     }
 
     // key_share extension (type 51)
@@ -348,7 +387,7 @@ pub fn construct_client_hello(
         extensions.extend_from_slice(&(key_share_len as u16).to_be_bytes()); // Extension length
         let key_share_list_len = 4 + client_public_key.len();
         extensions.extend_from_slice(&(key_share_list_len as u16).to_be_bytes()); // Key share list length
-        extensions.extend_from_slice(&[0x00, 0x1d]); // Group: x25519
+        extensions.extend_from_slice(&key_share_group.to_be_bytes());
         extensions
             .extend_from_slice(&(client_public_key.len() as u16).to_be_bytes()); // Key length
         extensions.extend_from_slice(client_public_key); // Public key

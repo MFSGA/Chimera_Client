@@ -198,12 +198,13 @@ pub fn derive_handshake_keys(
     let hmac_algorithm = cipher_suite.hmac_algorithm();
     let digest_algorithm = cipher_suite.digest_algorithm();
 
-    // Validate input lengths
-    if shared_secret.len() != 32 {
+    // X25519 contributes 32 bytes. X25519MLKEM768 contributes the
+    // 32-byte ML-KEM secret followed by the 32-byte X25519 secret.
+    if !matches!(shared_secret.len(), 32 | 64) {
         return Err(Error::new(
             ErrorKind::InvalidInput,
             format!(
-                "Invalid shared_secret length: {} (expected 32)",
+                "Invalid shared_secret length: {} (expected 32 or 64)",
                 shared_secret.len()
             ),
         ));
@@ -485,6 +486,31 @@ mod tests {
         let (key, iv) = result.unwrap();
         assert_eq!(key.len(), 16);
         assert_eq!(iv.len(), 12);
+    }
+
+    #[test]
+    fn handshake_key_derivation_accepts_hybrid_shared_secret() {
+        let client_hash = vec![0x21; 32];
+        let server_hash = vec![0x31; 32];
+
+        assert!(
+            derive_handshake_keys(
+                CS_SHA256,
+                &[0x11; 64],
+                &client_hash,
+                &server_hash,
+            )
+            .is_ok()
+        );
+        assert!(
+            derive_handshake_keys(
+                CS_SHA256,
+                &[0x11; 48],
+                &client_hash,
+                &server_hash,
+            )
+            .is_err()
+        );
     }
 
     #[test]
