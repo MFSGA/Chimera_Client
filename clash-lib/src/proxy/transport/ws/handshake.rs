@@ -15,7 +15,7 @@ use crate::{common::errors::new_io_error, proxy::AnyStream};
 
 const RESPONSE_HEADER_LIMIT: usize = 64 * 1024;
 
-fn serialize_request(request: &Request<()>) -> io::Result<Vec<u8>> {
+pub(super) fn serialize_request(request: &Request<()>) -> io::Result<Vec<u8>> {
     let path = request
         .uri()
         .path_and_query()

@@ -7,7 +7,7 @@ use std::{
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures::{Future, ready};
-use http::{HeaderValue, Request};
+use http::{HeaderValue, Request, Uri, uri::PathAndQuery};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
@@ -70,6 +70,57 @@ impl WebsocketEarlyDataConn {
         }
     }
 
+    fn apply_early_data(
+        req: &mut Request<()>,
+        header_name: &str,
+        buf: &[u8],
+        max_early_data: usize,
+    ) -> std::io::Result<usize> {
+        let early_data_len = cmp::min(max_early_data, buf.len());
+        let encoded = URL_SAFE_NO_PAD.encode(&buf[..early_data_len]);
+
+        if header_name.is_empty() {
+            let uri = req.uri().clone();
+            let mut parts = uri.clone().into_parts();
+            let path_and_query = if let Some(query) = uri.query() {
+                format!("{}{}?{query}", uri.path(), encoded)
+            } else {
+                format!("{}{}", uri.path(), encoded)
+            };
+            parts.path_and_query =
+                Some(path_and_query.parse::<PathAndQuery>().map_err(|err| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid websocket early-data URI: {err}"),
+                    )
+                })?);
+            *req.uri_mut() = Uri::from_parts(parts).map_err(|err| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid websocket early-data URI: {err}"),
+                )
+            })?;
+        } else {
+            let value = HeaderValue::from_str(&encoded).map_err(|err| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid websocket early-data header value: {err}"),
+                )
+            })?;
+            let header = req.headers_mut().get_mut(header_name).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "websocket early-data header placeholder is missing: {header_name}"
+                    ),
+                )
+            })?;
+            *header = value;
+        }
+
+        Ok(early_data_len)
+    }
+
     fn proxy_stream(
         stream: AnyStream,
         req: Request<()>,
@@ -95,6 +146,67 @@ impl WebsocketEarlyDataConn {
         }
 
         Box::pin(run(stream, req, config))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+
+    fn request() -> Request<()> {
+        Request::builder()
+            .uri("ws://example.com:80/ws?token=1")
+            .header("Sec-WebSocket-Protocol", "placeholder")
+            .body(())
+            .unwrap()
+    }
+
+    #[test]
+    fn early_data_uses_configured_header() {
+        let mut req = request();
+
+        let consumed = WebsocketEarlyDataConn::apply_early_data(
+            &mut req,
+            "Sec-WebSocket-Protocol",
+            b"hello-tail",
+            5,
+        )
+        .unwrap();
+
+        assert_eq!(consumed, 5);
+        assert_eq!(
+            req.headers()
+                .get("Sec-WebSocket-Protocol")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "aGVsbG8"
+        );
+        assert_eq!(req.uri().path_and_query().unwrap().as_str(), "/ws?token=1");
+    }
+
+    #[test]
+    fn early_data_without_header_is_appended_to_path_before_query() {
+        let mut req = request();
+
+        let consumed =
+            WebsocketEarlyDataConn::apply_early_data(&mut req, "", b"hello-tail", 5)
+                .unwrap();
+
+        assert_eq!(consumed, 5);
+        assert_eq!(
+            req.uri().path_and_query().unwrap().as_str(),
+            "/wsaGVsbG8?token=1"
+        );
+        assert_eq!(
+            req.headers()
+                .get("Sec-WebSocket-Protocol")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "placeholder"
+        );
     }
 }
 
@@ -144,17 +256,15 @@ impl AsyncWrite for WebsocketEarlyDataConn {
                     _ => {
                         let mut req =
                             self.as_mut().req.take().expect("req must be present");
-                        if let Some(v) = req
-                            .headers_mut()
-                            .get_mut(&self.as_mut().early_data_header_name)
-                        {
-                            self.as_mut().early_data_len =
-                                cmp::min(self.as_mut().early_data_len, buf.len());
-                            let header_value = URL_SAFE_NO_PAD
-                                .encode(&buf[..self.as_mut().early_data_len]);
-                            *v = HeaderValue::from_str(&header_value)
-                                .expect("bad header value");
-                        }
+                        let max_early_data = self.as_mut().early_data_len;
+                        let header_name =
+                            self.as_mut().early_data_header_name.clone();
+                        self.as_mut().early_data_len = Self::apply_early_data(
+                            &mut req,
+                            &header_name,
+                            buf,
+                            max_early_data,
+                        )?;
 
                         let stream =
                             self.as_mut().stream.take().expect("msg: bad state");

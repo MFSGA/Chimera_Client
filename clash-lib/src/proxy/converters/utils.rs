@@ -46,6 +46,10 @@ pub(crate) fn build_ws_client(
         max_early_data,
         early_data_header_name,
     )
+    .with_http_upgrade(
+        ws_opts.v2ray_http_upgrade.unwrap_or(false),
+        ws_opts.v2ray_http_upgrade_fast_open.unwrap_or(false),
+    )
 }
 
 pub(crate) fn resolve_ws_request_host(
