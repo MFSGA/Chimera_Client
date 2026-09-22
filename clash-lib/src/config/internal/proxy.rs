@@ -259,6 +259,45 @@ where
     }
 }
 
+#[cfg(feature = "wireguard")]
+fn deserialize_optional_wireguard_reserved<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<u8>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use base64::{Engine, engine::general_purpose::STANDARD};
+
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum ReservedValue {
+        Bytes(Vec<u8>),
+        Base64(String),
+    }
+
+    let value = Option::<ReservedValue>::deserialize(deserializer)?;
+    let bytes = match value {
+        None => return Ok(None),
+        Some(ReservedValue::Bytes(bytes)) => bytes,
+        Some(ReservedValue::Base64(value)) => {
+            STANDARD.decode(value.trim()).map_err(|err| {
+                serde::de::Error::custom(format!(
+                    "invalid WireGuard reserved base64: {err}"
+                ))
+            })?
+        }
+    };
+
+    if bytes.len() != 3 {
+        return Err(serde::de::Error::custom(format!(
+            "WireGuard reserved must contain exactly 3 bytes, got {}",
+            bytes.len()
+        )));
+    }
+
+    Ok(Some(bytes))
+}
+
 pub fn map_serde_error(
     name: String,
 ) -> impl FnOnce(serde_yaml::Error) -> crate::Error {
@@ -542,7 +581,7 @@ pub struct OutboundVless {
 }
 
 #[cfg(feature = "wireguard")]
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+#[derive(serde::Serialize, Debug, Default, Clone)]
 #[serde(rename_all = "kebab-case")]
 pub struct OutboundWireguard {
     #[serde(flatten)]
@@ -558,7 +597,106 @@ pub struct OutboundWireguard {
     pub remote_dns_resolve: Option<bool>,
     pub dns: Option<Vec<String>>,
     pub allowed_ips: Option<Vec<String>>,
+    #[serde(
+        rename = "reserved",
+        alias = "reserved-bits",
+        default,
+        deserialize_with = "deserialize_optional_wireguard_reserved"
+    )]
     pub reserved_bits: Option<Vec<u8>>,
+    pub persistent_keepalive: Option<u16>,
+}
+
+#[cfg(feature = "wireguard")]
+impl<'de> serde::Deserialize<'de> for OutboundWireguard {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "kebab-case")]
+        struct RawWireguard {
+            name: Option<String>,
+            server: Option<String>,
+            port: Option<u16>,
+            #[serde(alias = "dialer-proxy")]
+            connect_via: Option<String>,
+            private_key: Option<String>,
+            public_key: Option<String>,
+            #[serde(alias = "preshared-key")]
+            pre_shared_key: Option<String>,
+            mtu: Option<u16>,
+            udp: Option<bool>,
+            ip: Option<String>,
+            ipv6: Option<String>,
+            remote_dns_resolve: Option<bool>,
+            dns: Option<Vec<String>>,
+            allowed_ips: Option<Vec<String>>,
+            #[serde(
+                rename = "reserved",
+                alias = "reserved-bits",
+                default,
+                deserialize_with = "deserialize_optional_wireguard_reserved"
+            )]
+            reserved_bits: Option<Vec<u8>>,
+            persistent_keepalive: Option<u16>,
+            #[serde(flatten)]
+            extra: HashMap<String, Value>,
+        }
+
+        let raw = RawWireguard::deserialize(deserializer)?;
+        for (field, message) in [
+            (
+                "peers",
+                "WireGuard multi-peer configuration (peers) is not supported",
+            ),
+            (
+                "ip-stack",
+                "WireGuard ip-stack is not supported; Chimera uses its built-in WireGuard IP stack",
+            ),
+            (
+                "amnezia-wg-option",
+                "AmneziaWG (amnezia-wg-option) is not supported",
+            ),
+        ] {
+            if raw.extra.contains_key(field) {
+                return Err(serde::de::Error::custom(message));
+            }
+        }
+
+        let required = |value: Option<String>, field: &str| {
+            value.ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "missing required WireGuard field `{field}`"
+                ))
+            })
+        };
+
+        Ok(Self {
+            common_opts: CommonConfigOptions {
+                name: required(raw.name, "name")?,
+                server: required(raw.server, "server")?,
+                port: raw.port.ok_or_else(|| {
+                    serde::de::Error::custom(
+                        "missing required WireGuard field `port`",
+                    )
+                })?,
+                connect_via: raw.connect_via,
+            },
+            private_key: required(raw.private_key, "private-key")?,
+            public_key: required(raw.public_key, "public-key")?,
+            pre_shared_key: raw.pre_shared_key,
+            mtu: raw.mtu,
+            udp: raw.udp,
+            ip: required(raw.ip, "ip")?,
+            ipv6: raw.ipv6,
+            remote_dns_resolve: raw.remote_dns_resolve,
+            dns: raw.dns,
+            allowed_ips: raw.allowed_ips,
+            reserved_bits: raw.reserved_bits,
+            persistent_keepalive: raw.persistent_keepalive,
+        })
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -1387,7 +1525,7 @@ server: example.com
 port: 51820
 private-key: KIlDUePHyYwzjgn18przw/ZwPioJhh2aEyhxb/dtCXI=
 public-key: INBZyvB715sA5zatkiX8Jn3Dh5tZZboZ09x4pkr66ig=
-{pre_shared_key}ip: 10.0.0.2/32
+{pre_shared_key}ip: 10.0.0.2
 "#
         )
     }
@@ -1422,6 +1560,91 @@ public-key: INBZyvB715sA5zatkiX8Jn3Dh5tZZboZ09x4pkr66ig=
         let config: OutboundWireguard = serde_yaml::from_str(&wireguard_yaml(None))
             .expect("should parse without pre-shared-key");
         assert!(config.pre_shared_key.is_none());
+    }
+
+    #[test]
+    fn wireguard_parses_reserved_array_and_keepalive() {
+        let yaml = format!(
+            "{}reserved: [209, 98, 59]\npersistent-keepalive: 25\n",
+            wireguard_yaml(None)
+        );
+        let config: OutboundWireguard = serde_yaml::from_str(&yaml)
+            .expect("WireGuard reserved array should parse");
+
+        assert_eq!(config.reserved_bits.as_deref(), Some(&[209, 98, 59][..]));
+        assert_eq!(config.persistent_keepalive, Some(25));
+    }
+
+    #[test]
+    fn wireguard_parses_reserved_base64_and_legacy_alias() {
+        let base64_yaml = format!("{}reserved: U4An\n", wireguard_yaml(None));
+        let base64_config: OutboundWireguard = serde_yaml::from_str(&base64_yaml)
+            .expect("WireGuard reserved base64 should parse");
+        assert_eq!(
+            base64_config.reserved_bits.as_deref(),
+            Some(&[83, 128, 39][..])
+        );
+
+        let legacy_yaml =
+            format!("{}reserved-bits: [1, 2, 3]\n", wireguard_yaml(None));
+        let legacy_config: OutboundWireguard = serde_yaml::from_str(&legacy_yaml)
+            .expect("legacy reserved-bits alias should parse");
+        assert_eq!(legacy_config.reserved_bits.as_deref(), Some(&[1, 2, 3][..]));
+    }
+
+    #[test]
+    fn wireguard_rejects_invalid_reserved_values() {
+        for suffix in ["reserved: [1, 2]\n", "reserved: not-base64!\n"] {
+            let yaml = format!("{}{suffix}", wireguard_yaml(None));
+            let err = serde_yaml::from_str::<OutboundWireguard>(&yaml)
+                .expect_err("invalid reserved value must fail parsing");
+            assert!(err.to_string().contains("reserved"));
+        }
+    }
+
+    #[test]
+    fn wireguard_rejects_multi_peer_with_explicit_error() {
+        let err = serde_yaml::from_str::<OutboundWireguard>(
+            r#"
+name: wg-multi
+private-key: KIlDUePHyYwzjgn18przw/ZwPioJhh2aEyhxb/dtCXI=
+ip: 10.0.0.2
+peers:
+  - server: 198.51.100.10
+    port: 51820
+    public-key: INBZyvB715sA5zatkiX8Jn3Dh5tZZboZ09x4pkr66ig=
+    allowed-ips: [0.0.0.0/0]
+"#,
+        )
+        .expect_err("multi-peer WireGuard must fail explicitly");
+
+        assert!(err.to_string().contains("multi-peer"));
+        assert!(
+            !err.to_string()
+                .contains("missing required WireGuard field `server`")
+        );
+    }
+
+    #[test]
+    fn wireguard_rejects_unsupported_ip_stack() {
+        let yaml = format!(
+            "{}ip-stack:\n  mode: mips\n  congestion-controller: cubic\n",
+            wireguard_yaml(None)
+        );
+        let err = serde_yaml::from_str::<OutboundWireguard>(&yaml)
+            .expect_err("ip-stack must fail explicitly");
+        assert!(err.to_string().contains("ip-stack is not supported"));
+    }
+
+    #[test]
+    fn wireguard_rejects_amnezia_options_explicitly() {
+        let yaml = format!(
+            "{}amnezia-wg-option:\n  version: 3\n  jc: 4\n",
+            wireguard_yaml(None)
+        );
+        let err = serde_yaml::from_str::<OutboundWireguard>(&yaml)
+            .expect_err("AmneziaWG options must fail explicitly");
+        assert!(err.to_string().contains("AmneziaWG"));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use ipnet::IpNet;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::{
     Error,
@@ -8,6 +9,38 @@ use crate::{
         wg::{Handler, HandlerOptions},
     },
 };
+
+fn parse_wireguard_ipv4(value: &str) -> Result<Ipv4Addr, Error> {
+    if let Ok(addr) = value.parse::<Ipv4Addr>() {
+        return Ok(addr);
+    }
+
+    match value.parse::<IpNet>() {
+        Ok(IpNet::V4(net)) => Ok(net.addr()),
+        Ok(IpNet::V6(_)) => Err(Error::InvalidConfig(format!(
+            "invalid WireGuard ip: expected IPv4 address, got {value}"
+        ))),
+        Err(err) => Err(Error::InvalidConfig(format!(
+            "invalid WireGuard ip {value:?}: {err}"
+        ))),
+    }
+}
+
+fn parse_wireguard_ipv6(value: &str) -> Result<Ipv6Addr, Error> {
+    if let Ok(addr) = value.parse::<Ipv6Addr>() {
+        return Ok(addr);
+    }
+
+    match value.parse::<IpNet>() {
+        Ok(IpNet::V6(net)) => Ok(net.addr()),
+        Ok(IpNet::V4(_)) => Err(Error::InvalidConfig(format!(
+            "invalid WireGuard ipv6: expected IPv6 address, got {value}"
+        ))),
+        Err(err) => Err(Error::InvalidConfig(format!(
+            "invalid WireGuard ipv6 {value:?}: {err}"
+        ))),
+    }
+}
 
 impl TryFrom<OutboundWireguard> for Handler {
     type Error = crate::Error;
@@ -29,41 +62,8 @@ impl TryFrom<&OutboundWireguard> for Handler {
             },
             server: s.common_opts.server.to_owned(),
             port: s.common_opts.port,
-            ip: s
-                .ip
-                .parse::<IpNet>()
-                .map(|x| match x.addr() {
-                    std::net::IpAddr::V4(v4) => Ok(v4),
-                    std::net::IpAddr::V6(_) => Err(Error::InvalidConfig(
-                        "invalid ip address: put an v4 address here".to_owned(),
-                    )),
-                })
-                .map_err(|x| {
-                    Error::InvalidConfig(format!(
-                        "invalid ip address: {}, {}",
-                        x, s.ip
-                    ))
-                })??,
-            ipv6: s
-                .ipv6
-                .as_ref()
-                .and_then(|x| {
-                    x.parse::<IpNet>()
-                        .map(|x| match x.addr() {
-                            std::net::IpAddr::V4(_) => Err(Error::InvalidConfig(
-                                "invalid ip address: put an v6 address here"
-                                    .to_owned(),
-                            )),
-                            std::net::IpAddr::V6(v6) => Ok(v6),
-                        })
-                        .map_err(|e| {
-                            Error::InvalidConfig(format!(
-                                "invalid ipv6 address: {e}, {x}"
-                            ))
-                        })
-                        .ok()
-                })
-                .transpose()?,
+            ip: parse_wireguard_ipv4(&s.ip)?,
+            ipv6: s.ipv6.as_deref().map(parse_wireguard_ipv6).transpose()?,
             private_key: s.private_key.to_owned(),
             public_key: s.public_key.to_owned(),
             pre_shared_key: s.pre_shared_key.as_ref().map(|x| x.to_owned()),
@@ -73,6 +73,7 @@ impl TryFrom<&OutboundWireguard> for Handler {
             udp: s.udp.unwrap_or_default(),
             allowed_ips: s.allowed_ips.as_ref().map(|x| x.to_owned()),
             reserved_bits: s.reserved_bits.as_ref().map(|x| x.to_owned()),
+            persistent_keepalive: s.persistent_keepalive,
         })?;
         Ok(h)
     }
@@ -92,7 +93,8 @@ server: 198.51.100.10
 port: 51820
 private-key: KIlDUePHyYwzjgn18przw/ZwPioJhh2aEyhxb/dtCXI=
 public-key: INBZyvB715sA5zatkiX8Jn3Dh5tZZboZ09x4pkr66ig=
-ip: 10.0.0.2/32
+ip: 10.0.0.2
+ipv6: fd00::2
 udp: true
 "#,
         )
@@ -104,6 +106,26 @@ udp: true
         assert_eq!(handler.name(), "wg");
         assert_eq!(handler.server_name(), Some("198.51.100.10"));
         assert!(matches!(handler.proto(), OutboundType::WireGuard));
+    }
+
+    #[test]
+    fn wireguard_address_parser_accepts_bare_and_cidr_forms() {
+        assert_eq!(
+            parse_wireguard_ipv4("10.0.0.2").unwrap(),
+            "10.0.0.2".parse::<Ipv4Addr>().unwrap()
+        );
+        assert_eq!(
+            parse_wireguard_ipv4("10.0.0.2/32").unwrap(),
+            "10.0.0.2".parse::<Ipv4Addr>().unwrap()
+        );
+        assert_eq!(
+            parse_wireguard_ipv6("fd00::2").unwrap(),
+            "fd00::2".parse::<Ipv6Addr>().unwrap()
+        );
+        assert_eq!(
+            parse_wireguard_ipv6("fd00::2/128").unwrap(),
+            "fd00::2".parse::<Ipv6Addr>().unwrap()
+        );
     }
 
     #[test]
@@ -124,6 +146,27 @@ ip: 10.0.0.2/32
             .expect_err("invalid WireGuard key must fail conversion");
 
         assert!(error.to_string().contains("private key"));
+    }
+
+    #[test]
+    fn rejects_invalid_wireguard_allowed_ip_during_conversion() {
+        let config: OutboundWireguard = serde_yaml::from_str(
+            r#"
+name: wg
+server: 198.51.100.10
+port: 51820
+private-key: KIlDUePHyYwzjgn18przw/ZwPioJhh2aEyhxb/dtCXI=
+public-key: INBZyvB715sA5zatkiX8Jn3Dh5tZZboZ09x4pkr66ig=
+ip: 10.0.0.2
+allowed-ips:
+  - not-a-cidr
+"#,
+        )
+        .expect("wireguard config shape should parse");
+
+        let error = Handler::try_from(&config)
+            .expect_err("invalid WireGuard allowed-ip must fail conversion");
+        assert!(error.to_string().contains("allowed-ip"));
     }
 
     #[test]

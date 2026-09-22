@@ -147,6 +147,16 @@ impl WireguardTunnel {
     pub async fn send_ip_packet(&self, packet: &[u8]) -> Result<(), Error> {
         trace_ip_packet("Sending IP packet", packet);
 
+        if let Some(destination) = Self::packet_destination(packet)
+            && !Self::ip_allowed(&self.allowed_ips, destination)
+        {
+            trace!(
+                destination = %destination,
+                "dropping outbound WireGuard packet outside allowed-ips"
+            );
+            return Ok(());
+        }
+
         let mut send_buf = vec![0u8; 65535];
         let mut peer = self.peer.lock().await;
         match peer.encapsulate(packet, &mut send_buf) {
@@ -408,10 +418,320 @@ impl WireguardTunnel {
         }
     }
 
+    fn packet_destination(packet: &[u8]) -> Option<IpAddr> {
+        match IpVersion::of_packet(packet).ok()? {
+            IpVersion::Ipv4 => Ipv4Packet::new_checked(packet)
+                .ok()
+                .map(|packet| IpAddr::V4(packet.dst_addr())),
+            IpVersion::Ipv6 => Ipv6Packet::new_checked(packet)
+                .ok()
+                .map(|packet| IpAddr::V6(packet.dst_addr())),
+        }
+    }
+
+    fn ip_allowed(allowed_ips: &[IpNet], ip: IpAddr) -> bool {
+        allowed_ips.is_empty() || allowed_ips.iter().any(|net| net.contains(&ip))
+    }
+
     fn is_ip_allowed(&self, ip: IpAddr) -> bool {
         trace!("checking if {} is allowed in {:?}", ip, self.allowed_ips);
-        self.allowed_ips.is_empty()
-            || self.allowed_ips.iter().any(|x| x.contains(&ip))
+        Self::ip_allowed(&self.allowed_ips, ip)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+    use std::{
+        io,
+        pin::Pin,
+        sync::{Arc, Mutex as StdMutex},
+        task::{Context, Poll},
+    };
+
+    use async_trait::async_trait;
+    use futures::{Sink, Stream};
+
+    use crate::{
+        app::dns::{MockClashResolver, ThreadSafeDNSResolver},
+        app::net::OutboundInterface,
+        proxy::{AnyOutboundDatagram, AnyStream},
+        session::SocksAddr,
+    };
+
+    #[derive(Debug)]
+    struct RecordingConnector {
+        packets: Arc<StdMutex<Vec<UdpPacket>>>,
+    }
+
+    struct RecordingDatagram {
+        packets: Arc<StdMutex<Vec<UdpPacket>>>,
+    }
+
+    impl Stream for RecordingDatagram {
+        type Item = UdpPacket;
+
+        fn poll_next(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            Poll::Pending
+        }
+    }
+
+    impl Sink<UdpPacket> for RecordingDatagram {
+        type Error = io::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(
+            self: Pin<&mut Self>,
+            item: UdpPacket,
+        ) -> Result<(), Self::Error> {
+            self.get_mut().packets.lock().unwrap().push(item);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[async_trait]
+    impl RemoteConnector for RecordingConnector {
+        async fn connect_stream(
+            &self,
+            _resolver: ThreadSafeDNSResolver,
+            _address: &str,
+            _port: u16,
+            _iface: Option<&OutboundInterface>,
+            #[cfg(target_os = "linux")] _packet_mark: Option<u32>,
+        ) -> io::Result<AnyStream> {
+            Err(io::Error::other("unexpected stream dial"))
+        }
+
+        async fn connect_datagram(
+            &self,
+            _resolver: ThreadSafeDNSResolver,
+            _src: Option<SocketAddr>,
+            _destination: SocksAddr,
+            _iface: Option<&OutboundInterface>,
+            #[cfg(target_os = "linux")] _packet_mark: Option<u32>,
+        ) -> io::Result<AnyOutboundDatagram> {
+            Ok(Box::new(RecordingDatagram {
+                packets: self.packets.clone(),
+            }))
+        }
+    }
+
+    fn ipv4_packet(destination: [u8; 4]) -> Vec<u8> {
+        let mut packet = vec![0u8; 20];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&(20u16).to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 6;
+        packet[12..16].copy_from_slice(&[10, 0, 0, 2]);
+        packet[16..20].copy_from_slice(&destination);
+        packet
+    }
+
+    fn ipv6_packet(destination: [u8; 16]) -> Vec<u8> {
+        let mut packet = vec![0u8; 40];
+        packet[0] = 0x60;
+        packet[6] = 6;
+        packet[7] = 64;
+        packet[8..24]
+            .copy_from_slice(&[0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        packet[24..40].copy_from_slice(&destination);
+        packet
+    }
+
+    #[tokio::test]
+    async fn reserved_bytes_are_written_to_outer_handshake_packet() {
+        let packets = Arc::new(StdMutex::new(Vec::new()));
+        let connector = Arc::new(RecordingConnector {
+            packets: packets.clone(),
+        });
+        let (_to_stack_tx, _to_stack_rx) = tokio::sync::mpsc::channel(4);
+        let (_from_stack_tx, from_stack_rx) = tokio::sync::mpsc::channel(4);
+        let private_key = StaticSecret::from([7u8; 32]);
+        let peer_secret = StaticSecret::from([9u8; 32]);
+        let peer_public = PublicKey::from(&peer_secret);
+
+        let tunnel = WireguardTunnel::new(
+            Config {
+                private_key,
+                endpoint_public_key: peer_public,
+                pre_shared_key: None,
+                remote_endpoint: "198.51.100.10:51820".parse().unwrap(),
+                source_peer_ip: Ipv4Addr::new(10, 0, 0, 2),
+                source_peer_ipv6: None,
+                keepalive_seconds: None,
+                allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+                reserved_bits: [209, 98, 59],
+            },
+            _to_stack_tx,
+            from_stack_rx,
+            Arc::new(MockClashResolver::new()),
+            Some(connector),
+            &Session::default(),
+        )
+        .await
+        .unwrap();
+
+        tunnel
+            .send_ip_packet(&ipv4_packet([203, 0, 113, 9]))
+            .await
+            .unwrap();
+
+        let packets = packets.lock().unwrap();
+        assert_eq!(packets.len(), 1);
+        assert!(packets[0].data.len() > 4);
+        assert_eq!(
+            packets[0].data[0], 1,
+            "first packet should be a handshake initiation"
+        );
+        assert_eq!(&packets[0].data[1..4], &[209, 98, 59]);
+    }
+
+    #[tokio::test]
+    async fn persistent_keepalive_reaches_boringtun_peer() {
+        let packets = Arc::new(StdMutex::new(Vec::new()));
+        let connector = Arc::new(RecordingConnector { packets });
+        let (_to_stack_tx, _to_stack_rx) = tokio::sync::mpsc::channel(4);
+        let (_from_stack_tx, from_stack_rx) = tokio::sync::mpsc::channel(4);
+        let private_key = StaticSecret::from([7u8; 32]);
+        let peer_secret = StaticSecret::from([9u8; 32]);
+        let peer_public = PublicKey::from(&peer_secret);
+
+        let tunnel = WireguardTunnel::new(
+            Config {
+                private_key,
+                endpoint_public_key: peer_public,
+                pre_shared_key: None,
+                remote_endpoint: "198.51.100.10:51820".parse().unwrap(),
+                source_peer_ip: Ipv4Addr::new(10, 0, 0, 2),
+                source_peer_ipv6: None,
+                keepalive_seconds: Some(25),
+                allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+                reserved_bits: [0, 0, 0],
+            },
+            _to_stack_tx,
+            from_stack_rx,
+            Arc::new(MockClashResolver::new()),
+            Some(connector),
+            &Session::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(tunnel.peer.lock().await.persistent_keepalive(), Some(25));
+    }
+
+    #[tokio::test]
+    async fn configured_ipv6_routes_tcp_packets_to_stack() {
+        let packets = Arc::new(StdMutex::new(Vec::new()));
+        let connector = Arc::new(RecordingConnector { packets });
+        let (_to_stack_tx, _to_stack_rx) = tokio::sync::mpsc::channel(4);
+        let (_from_stack_tx, from_stack_rx) = tokio::sync::mpsc::channel(4);
+        let private_key = StaticSecret::from([7u8; 32]);
+        let peer_secret = StaticSecret::from([9u8; 32]);
+        let peer_public = PublicKey::from(&peer_secret);
+        let local_ipv6: Ipv6Addr = "fd00::2".parse().unwrap();
+
+        let tunnel = WireguardTunnel::new(
+            Config {
+                private_key,
+                endpoint_public_key: peer_public,
+                pre_shared_key: None,
+                remote_endpoint: "198.51.100.10:51820".parse().unwrap(),
+                source_peer_ip: Ipv4Addr::new(10, 0, 0, 2),
+                source_peer_ipv6: Some(local_ipv6),
+                keepalive_seconds: None,
+                allowed_ips: vec!["::/0".parse().unwrap()],
+                reserved_bits: [0, 0, 0],
+            },
+            _to_stack_tx,
+            from_stack_rx,
+            Arc::new(MockClashResolver::new()),
+            Some(connector),
+            &Session::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            tunnel.route_protocol(&ipv6_packet(local_ipv6.octets())),
+            Some(PortProtocol::Tcp)
+        );
+        assert_eq!(
+            tunnel.route_protocol(&ipv6_packet(
+                "fd00::3".parse::<Ipv6Addr>().unwrap().octets()
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn packet_destination_reads_ipv4_and_ipv6() {
+        let v4 = ipv4_packet([203, 0, 113, 9]);
+        assert_eq!(
+            WireguardTunnel::packet_destination(&v4),
+            Some("203.0.113.9".parse().unwrap())
+        );
+
+        let v6_destination =
+            [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9];
+        let v6 = ipv6_packet(v6_destination);
+        assert_eq!(
+            WireguardTunnel::packet_destination(&v6),
+            Some("2001:db8::9".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn allowed_ips_filter_outbound_destinations() {
+        let allowed = vec![
+            "203.0.113.0/24".parse::<IpNet>().unwrap(),
+            "2001:db8::/32".parse::<IpNet>().unwrap(),
+        ];
+
+        assert!(WireguardTunnel::ip_allowed(
+            &allowed,
+            "203.0.113.9".parse().unwrap()
+        ));
+        assert!(!WireguardTunnel::ip_allowed(
+            &allowed,
+            "198.51.100.9".parse().unwrap()
+        ));
+        assert!(WireguardTunnel::ip_allowed(
+            &allowed,
+            "2001:db8::9".parse().unwrap()
+        ));
+        assert!(!WireguardTunnel::ip_allowed(
+            &allowed,
+            "2001:db9::9".parse().unwrap()
+        ));
+        assert!(WireguardTunnel::ip_allowed(
+            &[],
+            "198.51.100.9".parse().unwrap()
+        ));
     }
 }
 

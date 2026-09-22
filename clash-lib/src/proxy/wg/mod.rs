@@ -36,6 +36,16 @@ mod ports;
 mod stack;
 mod wireguard;
 
+const DEFAULT_WIREGUARD_MTU: usize = 1408;
+
+fn normalize_persistent_keepalive(seconds: Option<u16>) -> Option<u16> {
+    seconds.filter(|seconds| *seconds != 0)
+}
+
+fn effective_mtu(mtu: Option<u16>) -> usize {
+    mtu.map(usize::from).unwrap_or(DEFAULT_WIREGUARD_MTU)
+}
+
 pub struct HandlerOptions {
     pub name: String,
     pub common_opts: HandlerCommonOptions,
@@ -52,6 +62,7 @@ pub struct HandlerOptions {
     pub udp: bool,
     pub allowed_ips: Option<Vec<String>>,
     pub reserved_bits: Option<Vec<u8>>,
+    pub persistent_keepalive: Option<u16>,
 }
 
 struct Inner {
@@ -105,6 +116,20 @@ impl Handler {
         })
     }
 
+    fn parse_allowed_ips(values: Option<&[String]>) -> Result<Vec<IpNet>, Error> {
+        values
+            .unwrap_or_default()
+            .iter()
+            .map(|value| {
+                value.parse::<IpNet>().map_err(|err| {
+                    Error::InvalidConfig(format!(
+                        "invalid WireGuard allowed-ip {value:?}: {err}"
+                    ))
+                })
+            })
+            .collect()
+    }
+
     fn validate_options(opts: &HandlerOptions) -> Result<(), Error> {
         Self::parse_key(&opts.private_key, "private key")?;
         Self::parse_key(&opts.public_key, "public key")?;
@@ -119,6 +144,15 @@ impl Handler {
                     ))
                 })?;
             }
+        }
+        Self::parse_allowed_ips(opts.allowed_ips.as_deref())?;
+        if let Some(bits) = &opts.reserved_bits
+            && bits.len() != 3
+        {
+            return Err(Error::InvalidConfig(format!(
+                "WireGuard reserved must contain exactly 3 bytes, got {}",
+                bits.len()
+            )));
         }
         Ok(())
     }
@@ -143,23 +177,8 @@ impl Handler {
                         format!("invalid remote server: {}", self.opts.server)
                             .as_str(),
                     ))?;
-                let allowed_ips = self
-                    .opts
-                    .allowed_ips
-                    .as_ref()
-                    .map(|ips| {
-                        ips.iter()
-                            .map(|ip| {
-                                ip.parse::<IpNet>().map_err(|e| {
-                                    new_io_error(
-                                        format!("invalid allowed ip: {e}").as_str(),
-                                    )
-                                })
-                            })
-                            .collect::<Result<Vec<_>, _>>()
-                    })
-                    .transpose()?
-                    .unwrap_or_default();
+                let allowed_ips =
+                    Self::parse_allowed_ips(self.opts.allowed_ips.as_deref())?;
 
                 let wg = wireguard::WireguardTunnel::new(
                     Config {
@@ -187,13 +206,13 @@ impl Handler {
                         remote_endpoint: (server_ip, self.opts.port).into(),
                         source_peer_ip: self.opts.ip,
                         source_peer_ipv6: self.opts.ipv6,
-                        keepalive_seconds: Some(10),
+                        keepalive_seconds: normalize_persistent_keepalive(
+                            self.opts.persistent_keepalive,
+                        ),
                         allowed_ips,
                         reserved_bits: match &self.opts.reserved_bits {
-                            Some(bits) if bits.len() >= 3 => {
-                                [bits[0], bits[1], bits[2]]
-                            }
-                            _ => [0, 0, 0],
+                            Some(bits) => [bits[0], bits[1], bits[2]],
+                            None => [0, 0, 0],
                         },
                     },
                     recv_pair.0,
@@ -216,7 +235,7 @@ impl Handler {
                     send_pair.0,
                     recv_pair.1,
                     packet_notifier.0,
-                    self.opts.mtu.unwrap_or(1420) as usize,
+                    effective_mtu(self.opts.mtu),
                 );
 
                 let device_manager = Arc::new(device::DeviceManager::new(
@@ -403,6 +422,45 @@ mod lifecycle_tests {
         })
     }
 
+    #[test]
+    fn wireguard_mtu_defaults_to_mihomo_value() {
+        assert_eq!(effective_mtu(None), 1408);
+        assert_eq!(effective_mtu(Some(1280)), 1280);
+    }
+
+    #[test]
+    fn persistent_keepalive_zero_disables_timer() {
+        assert_eq!(normalize_persistent_keepalive(None), None);
+        assert_eq!(normalize_persistent_keepalive(Some(0)), None);
+        assert_eq!(normalize_persistent_keepalive(Some(25)), Some(25));
+    }
+
+    #[test]
+    fn handler_options_reject_invalid_reserved_length() {
+        let opts = HandlerOptions {
+            name: "wg".to_owned(),
+            common_opts: Default::default(),
+            server: "198.51.100.1".to_owned(),
+            port: 51820,
+            ip: Ipv4Addr::new(10, 0, 0, 2),
+            ipv6: None,
+            private_key: "KIlDUePHyYwzjgn18przw/ZwPioJhh2aEyhxb/dtCXI=".to_owned(),
+            public_key: "INBZyvB715sA5zatkiX8Jn3Dh5tZZboZ09x4pkr66ig=".to_owned(),
+            pre_shared_key: None,
+            remote_dns_resolve: false,
+            dns: None,
+            mtu: None,
+            udp: true,
+            allowed_ips: None,
+            reserved_bits: Some(vec![1, 2]),
+            persistent_keepalive: None,
+        };
+
+        let err = Handler::try_new(opts)
+            .expect_err("invalid reserved length must fail direct HandlerOptions");
+        assert!(err.to_string().contains("exactly 3 bytes"));
+    }
+
     #[tokio::test]
     async fn dropping_inner_aborts_background_tasks() {
         let dropped = Arc::new(AtomicUsize::new(0));
@@ -511,6 +569,7 @@ mod tests {
             udp: true,
             allowed_ips: Some(vec!["0.0.0.0/0".to_owned()]),
             reserved_bits: None,
+            persistent_keepalive: None,
         };
         let handler = Arc::new(Handler::new(opts));
         handler
