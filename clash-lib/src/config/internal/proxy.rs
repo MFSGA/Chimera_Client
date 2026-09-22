@@ -433,6 +433,10 @@ pub struct XhttpOpt {
     )]
     pub host: Option<String>,
     pub headers: Option<HashMap<String, String>>,
+    #[serde(alias = "noGRPCHeader")]
+    pub no_grpc_header: Option<bool>,
+    pub sc_max_each_post_bytes: Option<usize>,
+    pub sc_min_posts_interval_ms: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_optional_string_or_integer")]
     pub x_padding_bytes: Option<String>,
     pub x_padding_obfs_mode: Option<bool>,
@@ -819,6 +823,9 @@ network: xhttp
 xhttp-opts:
   path: /xhttp/
   mode: split
+  no-grpc-header: false
+  sc-max-each-post-bytes: 4096
+  sc-min-posts-interval-ms: 45
   extra:
     headers:
       X-Test-Extra: enabled
@@ -878,6 +885,9 @@ xhttp-opts:
         assert_eq!(vless.network.as_deref(), Some("xhttp"));
         let opts = vless.xhttp_opts.expect("xhttp_opts should be present");
         assert_eq!(opts.path.as_deref(), Some("/xhttp/"));
+        assert_eq!(opts.no_grpc_header, Some(false));
+        assert_eq!(opts.sc_max_each_post_bytes, Some(4096));
+        assert_eq!(opts.sc_min_posts_interval_ms, Some(45));
         let extra = opts.extra.expect("xhttp extra should be present");
         assert_eq!(
             extra
