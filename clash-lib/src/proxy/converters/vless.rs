@@ -105,6 +105,26 @@ fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
         ));
     }
 
+    #[cfg(feature = "ws")]
+    if matches!(s.network.as_deref(), Some("ws"))
+        && let Some(ws_opts) = s.ws_opts.as_ref()
+    {
+        if ws_opts.max_early_data.is_some_and(|value| value < 0) {
+            return Err(Error::InvalidConfig(
+                "vless ws max-early-data must not be negative".to_owned(),
+            ));
+        }
+
+        let http_upgrade = ws_opts.v2ray_http_upgrade.unwrap_or(false);
+        let fast_open = ws_opts.v2ray_http_upgrade_fast_open.unwrap_or(false);
+        if fast_open && !http_upgrade {
+            return Err(Error::InvalidConfig(
+                "vless ws v2ray-http-upgrade-fast-open requires v2ray-http-upgrade"
+                    .to_owned(),
+            ));
+        }
+    }
+
     Ok(())
 }
 

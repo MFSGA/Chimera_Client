@@ -252,6 +252,8 @@ pub struct WsOpt {
     pub headers: Option<HashMap<String, String>>,
     pub max_early_data: Option<i32>,
     pub early_data_header_name: Option<String>,
+    pub v2ray_http_upgrade: Option<bool>,
+    pub v2ray_http_upgrade_fast_open: Option<bool>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
