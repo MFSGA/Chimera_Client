@@ -2,13 +2,17 @@ use crate::{
     Error,
     config::internal::proxy::{
         OutboundTrojanRealityOpts, OutboundVless, XhttpDownloadSettings, XhttpOpt,
-        XhttpUploadSettings,
+        XhttpReuseSettings, XhttpUploadSettings,
     },
     proxy::{
         HandlerCommonOptions,
         transport::{
-            GrpcClient, TlsClient, Transport, XhttpClient, XhttpDownloadConfig,
-            XhttpMode, XhttpRealityConfig, XhttpSecurity,
+            GrpcClient, TlsClient, Transport, XhttpChunkSizeRange, XhttpClient,
+            XhttpDownloadConfig, XhttpMetadataConfig, XhttpMetadataPlacement,
+            XhttpMode, XhttpPaddingConfig, XhttpPaddingMethod,
+            XhttpPaddingPlacement, XhttpRealityConfig, XhttpReusePolicy,
+            XhttpReuseValueRange, XhttpSecurity, XhttpSessionIdConfig,
+            XhttpUplinkConfig, XhttpUplinkDataPlacement,
         },
         vless::{Handler, HandlerOptions},
     },
@@ -475,7 +479,13 @@ fn build_xhttp_transport(
     })?;
 
     validate_xhttp_opts(xhttp_opts)?;
+    let reuse_policy = build_xhttp_reuse_policy(xhttp_opts.reuse_settings.as_ref())?;
+    validate_xhttp_runtime_reuse_support(reuse_policy.as_ref())?;
     let mode = parse_xhttp_mode(xhttp_opts)?;
+    let metadata = build_xhttp_metadata_config(xhttp_opts)?;
+    let uplink = build_xhttp_uplink_config(xhttp_opts, mode)?;
+    let padding = build_xhttp_padding_config(xhttp_opts)?;
+    let session = build_xhttp_session_config(xhttp_opts)?;
     let extra = xhttp_opts.extra.as_ref();
     let upload_settings = xhttp_opts.upload_settings.as_ref();
     let upload_xhttp_settings =
@@ -513,7 +523,12 @@ fn build_xhttp_transport(
             resolve_xhttp_min_posts_interval_ms(xhttp_opts),
             build_xhttp_download_config(s, xhttp_opts)?,
         )
-        .with_auto_reality(s.reality_opts.is_some()),
+        .with_auto_reality(s.reality_opts.is_some())
+        .with_metadata(metadata)
+        .with_uplink(uplink)
+        .with_padding(padding)
+        .with_session(session)
+        .with_reuse_policy(reuse_policy),
     )))
 }
 
@@ -528,6 +543,10 @@ fn build_xhttp_download_config(
     validate_xhttp_download_settings(download_settings)?;
 
     let xhttp_settings = download_settings.xhttp_settings.as_ref();
+    let reuse_policy = build_xhttp_reuse_policy(
+        xhttp_settings.and_then(|settings| settings.reuse_settings.as_ref()),
+    )?;
+    validate_xhttp_runtime_reuse_support(reuse_policy.as_ref())?;
     let host = xhttp_settings.and_then(|settings| settings.host.clone());
     let security = match download_settings.security.as_deref().unwrap_or_else(|| {
         if s.reality_opts.is_some() {
@@ -591,6 +610,7 @@ fn build_xhttp_download_config(
         server_name,
         skip_cert_verify,
         reality,
+        reuse_policy,
     }))
 }
 
@@ -872,6 +892,411 @@ fn validate_xhttp_endpoint_settings(
     Ok(())
 }
 
+fn build_xhttp_reuse_policy(
+    settings: Option<&XhttpReuseSettings>,
+) -> Result<Option<XhttpReusePolicy>, Error> {
+    let Some(settings) = settings else {
+        return Ok(None);
+    };
+
+    let parse_range = |value: Option<&str>, field: &str| {
+        value
+            .map(|raw| {
+                XhttpReuseValueRange::parse(raw, field)
+                    .map_err(|err| Error::InvalidConfig(err.to_string()))
+            })
+            .transpose()
+    };
+
+    let h_keep_alive_period = settings
+        .h_keep_alive_period
+        .as_deref()
+        .unwrap_or("0")
+        .trim()
+        .parse::<i64>()
+        .map_err(|err| {
+            Error::InvalidConfig(format!("invalid xhttp h-keep-alive-period: {err}"))
+        })?;
+
+    let policy = XhttpReusePolicy {
+        max_concurrency: parse_range(
+            settings.max_concurrency.as_deref(),
+            "max-concurrency",
+        )?,
+        max_connections: parse_range(
+            settings.max_connections.as_deref(),
+            "max-connections",
+        )?,
+        c_max_reuse_times: parse_range(
+            settings.c_max_reuse_times.as_deref(),
+            "c-max-reuse-times",
+        )?,
+        h_max_request_times: parse_range(
+            settings.h_max_request_times.as_deref(),
+            "h-max-request-times",
+        )?,
+        h_max_reusable_secs: parse_range(
+            settings.h_max_reusable_secs.as_deref(),
+            "h-max-reusable-secs",
+        )?,
+        h_keep_alive_period,
+    };
+
+    policy
+        .validate()
+        .map_err(|err| Error::InvalidConfig(err.to_string()))?;
+    Ok(Some(policy))
+}
+
+fn validate_xhttp_runtime_reuse_support(
+    policy: Option<&XhttpReusePolicy>,
+) -> Result<(), Error> {
+    let Some(policy) = policy else {
+        return Ok(());
+    };
+
+    if policy.h_keep_alive_period < -1 {
+        return Err(Error::InvalidConfig(
+            "xhttp reuse-settings h-keep-alive-period must be -1, 0, or a positive number"
+                .to_owned(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn build_xhttp_session_config(
+    xhttp_opts: &XhttpOpt,
+) -> Result<XhttpSessionIdConfig, Error> {
+    let table = xhttp_opts.session_table.as_deref().unwrap_or("");
+    if table.is_empty() || table == "uuid" {
+        return Ok(XhttpSessionIdConfig::default());
+    }
+
+    let length = parse_xhttp_session_length(xhttp_opts.session_length.as_deref())?;
+    XhttpSessionIdConfig::from_table(table, length).map_err(|err| {
+        Error::InvalidConfig(format!("invalid xhttp session config: {err}"))
+    })
+}
+
+fn parse_xhttp_session_length(
+    value: Option<&str>,
+) -> Result<XhttpChunkSizeRange, Error> {
+    let raw = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("16-32");
+
+    let parse_number = |part: &str| {
+        part.trim().parse::<usize>().map_err(|err| {
+            Error::InvalidConfig(format!(
+                "invalid xhttp session-length '{raw}': {err}"
+            ))
+        })
+    };
+
+    let (min, max) = if let Some((min, max)) = raw.split_once('-') {
+        (parse_number(min)?, parse_number(max)?)
+    } else {
+        let value = parse_number(raw)?;
+        (value, value)
+    };
+
+    if min == 0 || min > max {
+        return Err(Error::InvalidConfig(format!(
+            "invalid xhttp session-length range: {raw}"
+        )));
+    }
+
+    Ok(XhttpChunkSizeRange { min, max })
+}
+
+fn build_xhttp_padding_config(
+    xhttp_opts: &XhttpOpt,
+) -> Result<XhttpPaddingConfig, Error> {
+    let defaults = XhttpPaddingConfig::default();
+    let bytes = parse_xhttp_padding_bytes(
+        xhttp_opts.x_padding_bytes.as_deref(),
+        defaults.bytes,
+    )?;
+    let placement = match xhttp_opts
+        .x_padding_placement
+        .as_deref()
+        .unwrap_or("queryInHeader")
+    {
+        "cookie" => XhttpPaddingPlacement::Cookie,
+        "header" => XhttpPaddingPlacement::Header,
+        "query" => XhttpPaddingPlacement::Query,
+        "queryInHeader" | "query-in-header" => XhttpPaddingPlacement::QueryInHeader,
+        other => {
+            return Err(Error::InvalidConfig(format!(
+                "unsupported xhttp x-padding-placement: {other}"
+            )));
+        }
+    };
+    let method = match xhttp_opts.x_padding_method.as_deref().unwrap_or("repeat-x") {
+        "repeat-x" => XhttpPaddingMethod::RepeatX,
+        "tokenish" => XhttpPaddingMethod::Tokenish,
+        other => {
+            return Err(Error::InvalidConfig(format!(
+                "unsupported xhttp x-padding-method: {other}"
+            )));
+        }
+    };
+
+    Ok(XhttpPaddingConfig {
+        bytes,
+        obfs_mode: xhttp_opts.x_padding_obfs_mode.unwrap_or(false),
+        key: xhttp_opts
+            .x_padding_key
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .unwrap_or(defaults.key.as_str())
+            .to_owned(),
+        header: xhttp_opts
+            .x_padding_header
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .unwrap_or(defaults.header.as_str())
+            .to_owned(),
+        placement,
+        method,
+    })
+}
+
+fn parse_xhttp_padding_bytes(
+    value: Option<&str>,
+    default: XhttpChunkSizeRange,
+) -> Result<XhttpChunkSizeRange, Error> {
+    let Some(raw) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(default);
+    };
+
+    let parse_number = |part: &str| {
+        part.trim().parse::<usize>().map_err(|err| {
+            Error::InvalidConfig(format!(
+                "invalid xhttp x-padding-bytes '{raw}': {err}"
+            ))
+        })
+    };
+
+    let (min, max) = if let Some((min, max)) = raw.split_once('-') {
+        (parse_number(min)?, parse_number(max)?)
+    } else {
+        let value = parse_number(raw)?;
+        (value, value)
+    };
+
+    if min > max {
+        return Err(Error::InvalidConfig(format!(
+            "invalid xhttp x-padding-bytes range: {raw}"
+        )));
+    }
+
+    Ok(XhttpChunkSizeRange { min, max })
+}
+
+fn build_xhttp_uplink_config(
+    xhttp_opts: &XhttpOpt,
+    mode: XhttpMode,
+) -> Result<XhttpUplinkConfig, Error> {
+    let method = xhttp_opts
+        .uplink_http_method
+        .as_deref()
+        .unwrap_or("POST")
+        .trim()
+        .to_ascii_uppercase();
+    if !matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") {
+        return Err(Error::InvalidConfig(format!(
+            "unsupported xhttp uplink-http-method: {method}"
+        )));
+    }
+
+    let placement = match xhttp_opts
+        .uplink_data_placement
+        .as_deref()
+        .unwrap_or("body")
+    {
+        "body" => XhttpUplinkDataPlacement::Body,
+        "header" => XhttpUplinkDataPlacement::Header,
+        "cookie" => XhttpUplinkDataPlacement::Cookie,
+        other => {
+            return Err(Error::InvalidConfig(format!(
+                "unsupported xhttp uplink-data-placement: {other}"
+            )));
+        }
+    };
+
+    if !matches!(placement, XhttpUplinkDataPlacement::Body)
+        && !matches!(mode, XhttpMode::PacketUp)
+    {
+        return Err(Error::InvalidConfig(
+            "xhttp header/cookie uplink-data-placement requires packet-up mode"
+                .to_owned(),
+        ));
+    }
+
+    let key = match placement {
+        XhttpUplinkDataPlacement::Body => None,
+        XhttpUplinkDataPlacement::Header => Some(
+            xhttp_opts
+                .uplink_data_key
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .unwrap_or("X-Data")
+                .to_owned(),
+        ),
+        XhttpUplinkDataPlacement::Cookie => Some(
+            xhttp_opts
+                .uplink_data_key
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .unwrap_or("x_data")
+                .to_owned(),
+        ),
+    };
+
+    let chunk_size = parse_xhttp_uplink_chunk_size(
+        xhttp_opts.uplink_chunk_size.as_deref(),
+        placement,
+    )?;
+
+    Ok(XhttpUplinkConfig {
+        method,
+        placement,
+        key,
+        chunk_size,
+    })
+}
+
+fn parse_xhttp_uplink_chunk_size(
+    value: Option<&str>,
+    placement: XhttpUplinkDataPlacement,
+) -> Result<XhttpChunkSizeRange, Error> {
+    let default = match placement {
+        XhttpUplinkDataPlacement::Body => XhttpChunkSizeRange::fixed(1),
+        XhttpUplinkDataPlacement::Header => XhttpChunkSizeRange {
+            min: 3_000,
+            max: 4_000,
+        },
+        XhttpUplinkDataPlacement::Cookie => XhttpChunkSizeRange {
+            min: 2 * 1024,
+            max: 3 * 1024,
+        },
+    };
+
+    let Some(raw) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(default);
+    };
+
+    let parse_number = |part: &str| {
+        part.trim().parse::<usize>().map_err(|err| {
+            Error::InvalidConfig(format!(
+                "invalid xhttp uplink-chunk-size '{raw}': {err}"
+            ))
+        })
+    };
+
+    let (mut min, mut max) = if let Some((min, max)) = raw.split_once('-') {
+        (parse_number(min)?, parse_number(max)?)
+    } else {
+        let value = parse_number(raw)?;
+        (value, value)
+    };
+
+    if min == 0 && max == 0 {
+        return Ok(default);
+    }
+    if min > max {
+        return Err(Error::InvalidConfig(format!(
+            "invalid xhttp uplink-chunk-size range: {raw}"
+        )));
+    }
+
+    if !matches!(placement, XhttpUplinkDataPlacement::Body) {
+        min = min.max(64);
+        max = max.max(min);
+    } else {
+        min = min.max(1);
+        max = max.max(min);
+    }
+
+    Ok(XhttpChunkSizeRange { min, max })
+}
+
+fn build_xhttp_metadata_config(
+    xhttp_opts: &XhttpOpt,
+) -> Result<XhttpMetadataConfig, Error> {
+    let session_placement = parse_xhttp_metadata_placement(
+        xhttp_opts.session_placement.as_deref(),
+        "session-placement",
+    )?;
+    let seq_placement = parse_xhttp_metadata_placement(
+        xhttp_opts.seq_placement.as_deref(),
+        "seq-placement",
+    )?;
+
+    if matches!(session_placement, XhttpMetadataPlacement::Path)
+        && !matches!(seq_placement, XhttpMetadataPlacement::Path)
+    {
+        return Err(Error::InvalidConfig(
+            "xhttp seq-placement must be path when session-placement is path"
+                .to_owned(),
+        ));
+    }
+
+    Ok(XhttpMetadataConfig {
+        session_placement,
+        session_key: normalize_xhttp_metadata_key(
+            session_placement,
+            xhttp_opts.session_key.as_deref(),
+            "X-Session",
+            "x_session",
+        ),
+        seq_placement,
+        seq_key: normalize_xhttp_metadata_key(
+            seq_placement,
+            xhttp_opts.seq_key.as_deref(),
+            "X-Seq",
+            "x_seq",
+        ),
+    })
+}
+
+fn normalize_xhttp_metadata_key(
+    placement: XhttpMetadataPlacement,
+    configured: Option<&str>,
+    header_default: &str,
+    other_default: &str,
+) -> Option<String> {
+    if let Some(configured) = configured.filter(|value| !value.is_empty()) {
+        return Some(configured.to_owned());
+    }
+
+    match placement {
+        XhttpMetadataPlacement::Path => None,
+        XhttpMetadataPlacement::Header => Some(header_default.to_owned()),
+        XhttpMetadataPlacement::Query | XhttpMetadataPlacement::Cookie => {
+            Some(other_default.to_owned())
+        }
+    }
+}
+
+fn parse_xhttp_metadata_placement(
+    value: Option<&str>,
+    field: &str,
+) -> Result<XhttpMetadataPlacement, Error> {
+    match value.unwrap_or("path") {
+        "path" => Ok(XhttpMetadataPlacement::Path),
+        "query" => Ok(XhttpMetadataPlacement::Query),
+        "cookie" => Ok(XhttpMetadataPlacement::Cookie),
+        "header" => Ok(XhttpMetadataPlacement::Header),
+        other => Err(Error::InvalidConfig(format!(
+            "unsupported xhttp {field}: {other}"
+        ))),
+    }
+}
+
 fn parse_xhttp_mode(xhttp_opts: &XhttpOpt) -> Result<XhttpMode, Error> {
     let mode = xhttp_opts.mode.as_deref().unwrap_or("auto");
     match mode {
@@ -981,12 +1406,16 @@ mod tests {
     use crate::config::internal::proxy::{
         CommonConfigOptions, GrpcOpt, OutboundTrojanRealityOpts,
         XhttpDownloadSettings, XhttpDownloadXhttpSettings, XhttpExtra, XhttpOpt,
-        XhttpUploadSettings,
+        XhttpReuseSettings, XhttpUploadSettings,
     };
 
     use super::{
-        OutboundVless, XhttpMode, build_tls_transport, build_xhttp_download_config,
-        parse_xhttp_mode, resolve_vless_alpn, validate_vless_config,
+        OutboundVless, XhttpMetadataPlacement, XhttpMode, XhttpPaddingMethod,
+        XhttpPaddingPlacement, XhttpUplinkDataPlacement, build_tls_transport,
+        build_xhttp_download_config, build_xhttp_metadata_config,
+        build_xhttp_padding_config, build_xhttp_reuse_policy,
+        build_xhttp_session_config, build_xhttp_uplink_config, parse_xhttp_mode,
+        resolve_vless_alpn, validate_vless_config,
     };
 
     #[cfg(feature = "ws")]
@@ -1679,6 +2108,540 @@ mod tests {
         assert!(
             security.is_some(),
             "Reality security layer should be present"
+        );
+    }
+
+    #[test]
+    fn vless_xhttp_metadata_config_defaults_to_path() {
+        let opts = XhttpOpt::default();
+
+        let metadata = build_xhttp_metadata_config(&opts)
+            .expect("default metadata should parse");
+
+        assert_eq!(metadata.session_placement, XhttpMetadataPlacement::Path);
+        assert_eq!(metadata.seq_placement, XhttpMetadataPlacement::Path);
+    }
+
+    #[test]
+    fn vless_xhttp_metadata_config_accepts_query_and_header() {
+        let opts = XhttpOpt {
+            session_placement: Some("query".to_owned()),
+            session_key: Some("auth".to_owned()),
+            seq_placement: Some("header".to_owned()),
+            seq_key: Some("X-Seq".to_owned()),
+            ..Default::default()
+        };
+
+        let metadata =
+            build_xhttp_metadata_config(&opts).expect("metadata should parse");
+
+        assert_eq!(metadata.session_placement, XhttpMetadataPlacement::Query);
+        assert_eq!(metadata.session_key.as_deref(), Some("auth"));
+        assert_eq!(metadata.seq_placement, XhttpMetadataPlacement::Header);
+        assert_eq!(metadata.seq_key.as_deref(), Some("X-Seq"));
+    }
+
+    #[test]
+    fn vless_xhttp_metadata_applies_default_non_path_keys() {
+        let query = XhttpOpt {
+            session_placement: Some("query".to_owned()),
+            seq_placement: Some("header".to_owned()),
+            ..Default::default()
+        };
+        let query_metadata =
+            build_xhttp_metadata_config(&query).expect("default keys should apply");
+        assert_eq!(query_metadata.session_key.as_deref(), Some("x_session"));
+        assert_eq!(query_metadata.seq_key.as_deref(), Some("X-Seq"));
+
+        let cookie = XhttpOpt {
+            session_placement: Some("cookie".to_owned()),
+            seq_placement: Some("cookie".to_owned()),
+            ..Default::default()
+        };
+        let cookie_metadata = build_xhttp_metadata_config(&cookie)
+            .expect("cookie defaults should apply");
+        assert_eq!(cookie_metadata.session_key.as_deref(), Some("x_session"));
+        assert_eq!(cookie_metadata.seq_key.as_deref(), Some("x_seq"));
+    }
+
+    #[test]
+    fn vless_xhttp_metadata_requires_path_seq_when_session_is_path() {
+        let opts = XhttpOpt {
+            session_placement: Some("path".to_owned()),
+            seq_placement: Some("query".to_owned()),
+            seq_key: Some("seq".to_owned()),
+            ..Default::default()
+        };
+
+        let err = build_xhttp_metadata_config(&opts)
+            .expect_err("path session with non-path seq must fail");
+
+        assert!(
+            err.to_string().contains(
+                "seq-placement must be path when session-placement is path"
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vless_xhttp_reuse_policy_parses_ranges_and_negative_keepalive() {
+        let settings = XhttpReuseSettings {
+            max_concurrency: Some("16-32".to_owned()),
+            max_connections: None,
+            c_max_reuse_times: Some("0".to_owned()),
+            h_max_request_times: Some("600-900".to_owned()),
+            h_max_reusable_secs: Some("1800-3000".to_owned()),
+            h_keep_alive_period: Some("-1".to_owned()),
+        };
+
+        let policy = build_xhttp_reuse_policy(Some(&settings))
+            .expect("reuse policy should parse")
+            .expect("reuse policy should be present");
+
+        assert_eq!(
+            policy.max_concurrency,
+            Some(crate::proxy::transport::XhttpReuseValueRange { min: 16, max: 32 })
+        );
+        assert_eq!(
+            policy.c_max_reuse_times,
+            Some(crate::proxy::transport::XhttpReuseValueRange { min: 0, max: 0 })
+        );
+        assert_eq!(policy.h_keep_alive_period, -1);
+    }
+
+    #[test]
+    fn vless_xhttp_reuse_policy_rejects_conflicting_limits() {
+        let settings = XhttpReuseSettings {
+            max_concurrency: Some("16".to_owned()),
+            max_connections: Some("4".to_owned()),
+            ..Default::default()
+        };
+
+        let err = build_xhttp_reuse_policy(Some(&settings))
+            .expect_err("max-concurrency and max-connections must conflict");
+
+        assert!(
+            err.to_string()
+                .contains("max-concurrency conflicts with max-connections"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vless_xhttp_reuse_settings_build_with_supported_runtime_limits() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp-reuse".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            network: Some("xhttp".to_owned()),
+            xhttp_opts: Some(XhttpOpt {
+                reuse_settings: Some(XhttpReuseSettings {
+                    max_concurrency: Some("16-32".to_owned()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let transport = build_transport(outbound.network.as_deref(), &outbound)
+            .expect("supported reuse-settings should build");
+        assert!(transport.is_some(), "xhttp transport should be present");
+    }
+
+    #[test]
+    fn vless_xhttp_reuse_builds_with_max_connections() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp-max-connections".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            network: Some("xhttp".to_owned()),
+            xhttp_opts: Some(XhttpOpt {
+                reuse_settings: Some(XhttpReuseSettings {
+                    max_connections: Some("4".to_owned()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let transport = build_transport(outbound.network.as_deref(), &outbound)
+            .expect("max-connections reuse policy should build");
+        assert!(transport.is_some(), "xhttp transport should be present");
+    }
+
+    #[test]
+    fn vless_xhttp_reuse_accepts_supported_keep_alive_periods() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp-keepalive".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            network: Some("xhttp".to_owned()),
+            xhttp_opts: Some(XhttpOpt {
+                reuse_settings: Some(XhttpReuseSettings {
+                    h_keep_alive_period: Some("-1".to_owned()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let transport = build_transport(outbound.network.as_deref(), &outbound)
+            .expect("-1 keepalive should build");
+        assert!(transport.is_some(), "xhttp transport should be present");
+
+        let positive = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp-keepalive-positive".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            network: Some("xhttp".to_owned()),
+            xhttp_opts: Some(XhttpOpt {
+                reuse_settings: Some(XhttpReuseSettings {
+                    h_keep_alive_period: Some("30".to_owned()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let transport = build_transport(positive.network.as_deref(), &positive)
+            .expect("positive keepalive should build");
+        assert!(transport.is_some(), "xhttp transport should be present");
+    }
+
+    #[test]
+    fn vless_xhttp_reuse_rejects_keep_alive_below_minus_one() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp-keepalive-invalid".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            network: Some("xhttp".to_owned()),
+            xhttp_opts: Some(XhttpOpt {
+                reuse_settings: Some(XhttpReuseSettings {
+                    h_keep_alive_period: Some("-2".to_owned()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = match build_transport(outbound.network.as_deref(), &outbound) {
+            Ok(_) => panic!("keepalive below -1 must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("must be -1, 0, or a positive number"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vless_xhttp_download_reuse_settings_build_runtime_policy() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp-download-reuse".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            network: Some("xhttp".to_owned()),
+            xhttp_opts: Some(XhttpOpt {
+                download_settings: Some(XhttpDownloadSettings {
+                    address: "download.example.com".to_owned(),
+                    port: 443,
+                    network: "xhttp".to_owned(),
+                    security: Some("tls".to_owned()),
+                    xhttp_settings: Some(XhttpDownloadXhttpSettings {
+                        reuse_settings: Some(XhttpReuseSettings {
+                            max_concurrency: Some("8-16".to_owned()),
+                            h_keep_alive_period: Some("30".to_owned()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let transport = build_transport(outbound.network.as_deref(), &outbound)
+            .expect("download reuse-settings should build");
+        assert!(transport.is_some());
+    }
+
+    #[test]
+    fn vless_xhttp_session_defaults_to_uuid() {
+        let opts = XhttpOpt::default();
+
+        let session =
+            build_xhttp_session_config(&opts).expect("default session should parse");
+
+        assert!(uuid::Uuid::parse_str(&session.generate()).is_ok());
+    }
+
+    #[test]
+    fn vless_xhttp_session_base62_length_10_is_valid() {
+        let opts = XhttpOpt {
+            session_table: Some("Base62".to_owned()),
+            session_length: Some("10".to_owned()),
+            ..Default::default()
+        };
+
+        let session = build_xhttp_session_config(&opts)
+            .expect("Base62 length 10 should have sufficient entropy");
+        let generated = session.generate();
+
+        assert_eq!(generated.len(), 10);
+        assert!(generated.bytes().all(|byte| byte.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn vless_xhttp_session_rejects_small_id_space() {
+        let opts = XhttpOpt {
+            session_table: Some("number".to_owned()),
+            session_length: Some("4".to_owned()),
+            ..Default::default()
+        };
+
+        let err = build_xhttp_session_config(&opts)
+            .expect_err("small session space must be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("session-table or session-length is too small"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vless_xhttp_session_rejects_zero_or_reversed_length() {
+        for value in ["0", "16-8"] {
+            let opts = XhttpOpt {
+                session_table: Some("Base62".to_owned()),
+                session_length: Some(value.to_owned()),
+                ..Default::default()
+            };
+
+            let err = build_xhttp_session_config(&opts)
+                .expect_err("invalid session length must fail");
+            assert!(
+                err.to_string().contains("session-length"),
+                "unexpected error for {value}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn vless_xhttp_padding_defaults_match_legacy_behavior() {
+        let opts = XhttpOpt::default();
+
+        let padding =
+            build_xhttp_padding_config(&opts).expect("default padding should parse");
+
+        assert_eq!(padding.bytes.min, 100);
+        assert_eq!(padding.bytes.max, 1_000);
+        assert!(!padding.obfs_mode);
+        assert_eq!(padding.key, "x_padding");
+        assert_eq!(padding.header, "Referer");
+        assert_eq!(padding.placement, XhttpPaddingPlacement::QueryInHeader);
+        assert_eq!(padding.method, XhttpPaddingMethod::RepeatX);
+    }
+
+    #[test]
+    fn vless_xhttp_padding_accepts_obfs_fields() {
+        let opts = XhttpOpt {
+            x_padding_bytes: Some("128-256".to_owned()),
+            x_padding_obfs_mode: Some(true),
+            x_padding_key: Some("pad".to_owned()),
+            x_padding_header: Some("X-Pad".to_owned()),
+            x_padding_placement: Some("header".to_owned()),
+            x_padding_method: Some("tokenish".to_owned()),
+            ..Default::default()
+        };
+
+        let padding =
+            build_xhttp_padding_config(&opts).expect("obfs padding should parse");
+
+        assert_eq!(padding.bytes.min, 128);
+        assert_eq!(padding.bytes.max, 256);
+        assert!(padding.obfs_mode);
+        assert_eq!(padding.key, "pad");
+        assert_eq!(padding.header, "X-Pad");
+        assert_eq!(padding.placement, XhttpPaddingPlacement::Header);
+        assert_eq!(padding.method, XhttpPaddingMethod::Tokenish);
+    }
+
+    #[test]
+    fn vless_xhttp_padding_accepts_mihomo_query_in_header_name() {
+        let opts = XhttpOpt {
+            x_padding_obfs_mode: Some(true),
+            x_padding_placement: Some("queryInHeader".to_owned()),
+            ..Default::default()
+        };
+
+        let padding = build_xhttp_padding_config(&opts)
+            .expect("Mihomo queryInHeader placement should parse");
+
+        assert_eq!(padding.placement, XhttpPaddingPlacement::QueryInHeader);
+        assert_eq!(padding.key, "x_padding");
+        assert_eq!(padding.header, "Referer");
+    }
+
+    #[test]
+    fn vless_xhttp_padding_rejects_reversed_range() {
+        let opts = XhttpOpt {
+            x_padding_bytes: Some("512-128".to_owned()),
+            ..Default::default()
+        };
+
+        let err = build_xhttp_padding_config(&opts)
+            .expect_err("reversed padding range must fail");
+
+        assert!(
+            err.to_string()
+                .contains("invalid xhttp x-padding-bytes range"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vless_xhttp_padding_rejects_unknown_placement_and_method() {
+        let bad_placement = XhttpOpt {
+            x_padding_placement: Some("path".to_owned()),
+            ..Default::default()
+        };
+        let err = build_xhttp_padding_config(&bad_placement)
+            .expect_err("unsupported padding placement must fail");
+        assert!(
+            err.to_string()
+                .contains("unsupported xhttp x-padding-placement"),
+            "unexpected error: {err}"
+        );
+
+        let bad_method = XhttpOpt {
+            x_padding_method: Some("random".to_owned()),
+            ..Default::default()
+        };
+        let err = build_xhttp_padding_config(&bad_method)
+            .expect_err("unsupported padding method must fail");
+        assert!(
+            err.to_string()
+                .contains("unsupported xhttp x-padding-method"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vless_xhttp_uplink_defaults_to_post_body() {
+        let opts = XhttpOpt {
+            mode: Some("packet-up".to_owned()),
+            ..Default::default()
+        };
+
+        let uplink = build_xhttp_uplink_config(&opts, XhttpMode::PacketUp)
+            .expect("default uplink should parse");
+
+        assert_eq!(uplink.method, "POST");
+        assert_eq!(uplink.placement, XhttpUplinkDataPlacement::Body);
+        assert_eq!(uplink.key, None);
+    }
+
+    #[test]
+    fn vless_xhttp_uplink_header_applies_defaults() {
+        let opts = XhttpOpt {
+            mode: Some("packet-up".to_owned()),
+            uplink_data_placement: Some("header".to_owned()),
+            ..Default::default()
+        };
+
+        let uplink = build_xhttp_uplink_config(&opts, XhttpMode::PacketUp)
+            .expect("header uplink should parse");
+
+        assert_eq!(uplink.placement, XhttpUplinkDataPlacement::Header);
+        assert_eq!(uplink.key.as_deref(), Some("X-Data"));
+        assert_eq!(uplink.chunk_size.min, 3_000);
+        assert_eq!(uplink.chunk_size.max, 4_000);
+    }
+
+    #[test]
+    fn vless_xhttp_uplink_cookie_clamps_small_chunk_range() {
+        let opts = XhttpOpt {
+            mode: Some("packet-up".to_owned()),
+            uplink_data_placement: Some("cookie".to_owned()),
+            uplink_chunk_size: Some("1-32".to_owned()),
+            ..Default::default()
+        };
+
+        let uplink = build_xhttp_uplink_config(&opts, XhttpMode::PacketUp)
+            .expect("cookie uplink should parse");
+
+        assert_eq!(uplink.placement, XhttpUplinkDataPlacement::Cookie);
+        assert_eq!(uplink.key.as_deref(), Some("x_data"));
+        assert_eq!(uplink.chunk_size.min, 64);
+        assert_eq!(uplink.chunk_size.max, 64);
+    }
+
+    #[test]
+    fn vless_xhttp_uplink_rejects_nonbody_outside_packet_up() {
+        let opts = XhttpOpt {
+            mode: Some("stream-up".to_owned()),
+            uplink_data_placement: Some("header".to_owned()),
+            ..Default::default()
+        };
+
+        let err = build_xhttp_uplink_config(&opts, XhttpMode::StreamUp)
+            .expect_err("header uplink must require packet-up");
+
+        assert!(
+            err.to_string().contains("requires packet-up mode"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vless_xhttp_uplink_rejects_unsupported_http_method() {
+        let opts = XhttpOpt {
+            mode: Some("packet-up".to_owned()),
+            uplink_http_method: Some("GET".to_owned()),
+            ..Default::default()
+        };
+
+        let err = build_xhttp_uplink_config(&opts, XhttpMode::PacketUp)
+            .expect_err("GET is not supported by current Mihomo xhttp config");
+
+        assert!(
+            err.to_string()
+                .contains("unsupported xhttp uplink-http-method"),
+            "unexpected error: {err}"
         );
     }
 

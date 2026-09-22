@@ -191,6 +191,48 @@ pub struct OutboundAnytls {
     pub tls_key: Option<String>,
 }
 
+fn deserialize_optional_string_or_integer<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum StringOrInteger {
+        String(String),
+        Integer(u64),
+    }
+
+    Ok(Option::<StringOrInteger>::deserialize(deserializer)?.map(
+        |value| match value {
+            StringOrInteger::String(value) => value,
+            StringOrInteger::Integer(value) => value.to_string(),
+        },
+    ))
+}
+
+fn deserialize_optional_string_or_signed_integer<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum StringOrInteger {
+        String(String),
+        Integer(i64),
+    }
+
+    Ok(Option::<StringOrInteger>::deserialize(deserializer)?.map(
+        |value| match value {
+            StringOrInteger::String(value) => value,
+            StringOrInteger::Integer(value) => value.to_string(),
+        },
+    ))
+}
+
 fn deserialize_optional_string_or_vec<'de, D>(
     deserializer: D,
 ) -> Result<Option<Vec<String>>, D::Error>
@@ -287,12 +329,33 @@ pub struct XhttpDownloadTlsSettings {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
 #[serde(rename_all = "kebab-case")]
+pub struct XhttpReuseSettings {
+    #[serde(default, deserialize_with = "deserialize_optional_string_or_integer")]
+    pub max_concurrency: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_or_integer")]
+    pub max_connections: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_or_integer")]
+    pub c_max_reuse_times: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_or_integer")]
+    pub h_max_request_times: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_or_integer")]
+    pub h_max_reusable_secs: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_string_or_signed_integer"
+    )]
+    pub h_keep_alive_period: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+#[serde(rename_all = "kebab-case")]
 pub struct XhttpDownloadXhttpSettings {
     pub path: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_string_or_vec")]
     pub host: Option<Vec<String>>,
     pub headers: Option<HashMap<String, String>>,
     pub mode: Option<String>,
+    pub reuse_settings: Option<XhttpReuseSettings>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
@@ -335,6 +398,14 @@ pub struct XhttpOpt {
     #[serde(default, deserialize_with = "deserialize_optional_string_or_vec")]
     pub host: Option<Vec<String>>,
     pub headers: Option<HashMap<String, String>>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_or_integer")]
+    pub x_padding_bytes: Option<String>,
+    pub x_padding_obfs_mode: Option<bool>,
+    pub x_padding_key: Option<String>,
+    pub x_padding_header: Option<String>,
+    pub x_padding_placement: Option<String>,
+    pub x_padding_method: Option<String>,
+    pub reuse_settings: Option<XhttpReuseSettings>,
     pub extra: Option<XhttpExtra>,
     #[serde(alias = "uploadSettings")]
     pub upload_settings: Option<XhttpUploadSettings>,
@@ -342,6 +413,18 @@ pub struct XhttpOpt {
     pub download_settings: Option<XhttpDownloadSettings>,
     pub download_mode: Option<String>,
     pub upload_mode: Option<String>,
+    pub session_placement: Option<String>,
+    pub session_key: Option<String>,
+    pub session_table: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_or_integer")]
+    pub session_length: Option<String>,
+    pub seq_placement: Option<String>,
+    pub seq_key: Option<String>,
+    pub uplink_http_method: Option<String>,
+    pub uplink_data_placement: Option<String>,
+    pub uplink_data_key: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_or_integer")]
+    pub uplink_chunk_size: Option<String>,
     pub max_each_post_bytes: Option<usize>,
     pub max_buffered_posts: Option<usize>,
     pub session_ttl: Option<u64>,
@@ -729,6 +812,22 @@ xhttp-opts:
       path: /download/
   download-mode: stream-down
   upload-mode: packet-up
+  session-placement: query
+  session-key: auth
+  session-table: Base62
+  session-length: "10"
+  seq-placement: header
+  seq-key: X-Seq
+  x-padding-bytes: "120-180"
+  x-padding-obfs-mode: true
+  x-padding-key: pad
+  x-padding-header: X-Pad
+  x-padding-placement: header
+  x-padding-method: tokenish
+  uplink-http-method: PUT
+  uplink-data-placement: header
+  uplink-data-key: X-Payload
+  uplink-chunk-size: "128-256"
   max-each-post-bytes: 1000000
   max-buffered-posts: 30
   session-ttl: 30
@@ -792,6 +891,22 @@ xhttp-opts:
         assert_eq!(opts.mode.as_deref(), Some("split"));
         assert_eq!(opts.download_mode.as_deref(), Some("stream-down"));
         assert_eq!(opts.upload_mode.as_deref(), Some("packet-up"));
+        assert_eq!(opts.session_placement.as_deref(), Some("query"));
+        assert_eq!(opts.session_key.as_deref(), Some("auth"));
+        assert_eq!(opts.session_table.as_deref(), Some("Base62"));
+        assert_eq!(opts.session_length.as_deref(), Some("10"));
+        assert_eq!(opts.seq_placement.as_deref(), Some("header"));
+        assert_eq!(opts.seq_key.as_deref(), Some("X-Seq"));
+        assert_eq!(opts.x_padding_bytes.as_deref(), Some("120-180"));
+        assert_eq!(opts.x_padding_obfs_mode, Some(true));
+        assert_eq!(opts.x_padding_key.as_deref(), Some("pad"));
+        assert_eq!(opts.x_padding_header.as_deref(), Some("X-Pad"));
+        assert_eq!(opts.x_padding_placement.as_deref(), Some("header"));
+        assert_eq!(opts.x_padding_method.as_deref(), Some("tokenish"));
+        assert_eq!(opts.uplink_http_method.as_deref(), Some("PUT"));
+        assert_eq!(opts.uplink_data_placement.as_deref(), Some("header"));
+        assert_eq!(opts.uplink_data_key.as_deref(), Some("X-Payload"));
+        assert_eq!(opts.uplink_chunk_size.as_deref(), Some("128-256"));
         assert_eq!(opts.max_each_post_bytes, Some(1_000_000));
         assert_eq!(opts.max_buffered_posts, Some(30));
         assert_eq!(opts.session_ttl, Some(30));
@@ -822,6 +937,146 @@ ws-opts:
         let ws = vless.ws_opts.expect("ws opts should be present");
         assert_eq!(ws.v2ray_http_upgrade, Some(true));
         assert_eq!(ws.v2ray_http_upgrade_fast_open, Some(true));
+    }
+
+    #[test]
+    fn outbound_vless_xhttp_parses_reuse_settings() {
+        let config = r#"
+name: xhttp-reuse
+type: vless
+server: example.com
+port: 443
+uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+network: xhttp
+xhttp-opts:
+  reuse-settings:
+    max-concurrency: "16-32"
+    c-max-reuse-times: 0
+    h-max-request-times: "600-900"
+    h-max-reusable-secs: "1800-3000"
+    h-keep-alive-period: -1
+  download-settings:
+    address: download.example.com
+    port: 443
+    network: xhttp
+    security: tls
+    xhttp-settings:
+      reuse-settings:
+        max-connections: 4
+"#;
+
+        let parsed: OutboundProxyProtocol =
+            serde_yaml::from_str(config).expect("xhttp reuse settings should parse");
+
+        let OutboundProxyProtocol::Vless(vless) = parsed else {
+            panic!("expected vless proxy");
+        };
+        let opts = vless.xhttp_opts.expect("xhttp opts should be present");
+        let reuse = opts
+            .reuse_settings
+            .expect("uplink reuse settings should be present");
+        assert_eq!(reuse.max_concurrency.as_deref(), Some("16-32"));
+        assert_eq!(reuse.c_max_reuse_times.as_deref(), Some("0"));
+        assert_eq!(reuse.h_max_request_times.as_deref(), Some("600-900"));
+        assert_eq!(reuse.h_max_reusable_secs.as_deref(), Some("1800-3000"));
+        assert_eq!(reuse.h_keep_alive_period.as_deref(), Some("-1"));
+
+        let download_reuse = opts
+            .download_settings
+            .and_then(|settings| settings.xhttp_settings)
+            .and_then(|settings| settings.reuse_settings)
+            .expect("download reuse settings should be present");
+        assert_eq!(download_reuse.max_connections.as_deref(), Some("4"));
+    }
+
+    #[test]
+    fn outbound_vless_xhttp_accepts_integer_session_length() {
+        let config = r#"
+name: xhttp-session
+type: vless
+server: example.com
+port: 443
+uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+network: xhttp
+xhttp-opts:
+  session-table: Base62
+  session-length: 10
+"#;
+
+        let parsed: OutboundProxyProtocol = serde_yaml::from_str(config)
+            .expect("numeric session-length should parse");
+
+        let OutboundProxyProtocol::Vless(vless) = parsed else {
+            panic!("expected vless proxy");
+        };
+
+        assert_eq!(
+            vless
+                .xhttp_opts
+                .and_then(|opts| opts.session_length)
+                .as_deref(),
+            Some("10")
+        );
+    }
+
+    #[test]
+    fn outbound_vless_xhttp_accepts_integer_padding_bytes() {
+        let config = r#"
+name: xhttp-padding
+type: vless
+server: example.com
+port: 443
+uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+network: xhttp
+xhttp-opts:
+  x-padding-bytes: 256
+"#;
+
+        let parsed: OutboundProxyProtocol = serde_yaml::from_str(config)
+            .expect("numeric x-padding-bytes should parse");
+
+        let OutboundProxyProtocol::Vless(vless) = parsed else {
+            panic!("expected vless proxy");
+        };
+
+        assert_eq!(
+            vless
+                .xhttp_opts
+                .and_then(|opts| opts.x_padding_bytes)
+                .as_deref(),
+            Some("256")
+        );
+    }
+
+    #[test]
+    fn outbound_vless_xhttp_accepts_integer_uplink_chunk_size() {
+        let config = r#"
+name: xhttp-uplink
+type: vless
+server: example.com
+port: 443
+uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+network: xhttp
+xhttp-opts:
+  mode: packet-up
+  uplink-data-placement: cookie
+  uplink-chunk-size: 3072
+"#;
+
+        let parsed: OutboundProxyProtocol = serde_yaml::from_str(config)
+            .expect("numeric uplink chunk size should parse");
+
+        let OutboundProxyProtocol::Vless(vless) = parsed else {
+            panic!("expected vless proxy");
+        };
+
+        assert_eq!(
+            vless
+                .xhttp_opts
+                .and_then(|opts| opts.uplink_chunk_size)
+                .as_deref(),
+            Some("3072")
+        );
     }
 
     #[test]

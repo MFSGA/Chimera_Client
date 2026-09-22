@@ -1,17 +1,47 @@
-use std::{collections::HashMap, convert::Infallible, io};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    io,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    task::{Context, Poll},
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::{Request, StatusCode, Version};
 use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
 use hyper::body::{Frame, Incoming};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    sync::mpsc,
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
+    sync::{Mutex, mpsc},
 };
 use tokio_stream::wrappers::ReceiverStream;
-use uuid::Uuid;
+
+mod meta;
+mod padding;
+mod reuse;
+mod session;
+mod uplink;
+pub use meta::{MetadataConfig as XhttpMetadataConfig, MetadataPlacement};
+pub use padding::{
+    PaddingConfig as XhttpPaddingConfig, PaddingMethod as XhttpPaddingMethod,
+    PaddingPlacement as XhttpPaddingPlacement,
+};
+use reuse::ReuseLimits;
+pub use reuse::{
+    ReusePolicy as XhttpReusePolicy, ValueRange as XhttpReuseValueRange,
+};
+pub use session::SessionIdConfig as XhttpSessionIdConfig;
+pub use uplink::{
+    ChunkSizeRange as XhttpChunkSizeRange, UplinkConfig as XhttpUplinkConfig,
+    UplinkDataPlacement,
+};
 
 #[cfg(feature = "reality")]
 use super::RealityClient;
@@ -30,13 +60,90 @@ const FRAME_CHANNEL_CAPACITY: usize = 32;
 const READ_CHUNK_SIZE: usize = 8 * 1024;
 #[allow(dead_code)]
 const DEFAULT_XHTTP_ALPN: [&str; 1] = ["h2"];
-const DEFAULT_XHTTP_PADDING_BYTES: usize = 100;
-const DEFAULT_XHTTP_PADDING_QUERY_KEY: &str = "x_padding";
-const DEFAULT_XHTTP_PADDING_HEADER: &str = "Referer";
 const DEFAULT_XHTTP_USER_AGENT: &str = "Mozilla/5.0";
 
 type H2SendRequest =
     hyper::client::conn::http2::SendRequest<BoxBody<Bytes, Infallible>>;
+
+struct ReusableH2 {
+    sender: H2SendRequest,
+    created_at: Instant,
+    active: Arc<AtomicU64>,
+    reuse_count: u64,
+    request_count: Arc<AtomicU64>,
+    limits: ReuseLimits,
+}
+
+impl ReusableH2 {
+    fn retired(&self) -> bool {
+        if self.sender.is_closed() {
+            return true;
+        }
+        if self.limits.c_max_reuse_times != 0
+            && self.reuse_count >= self.limits.c_max_reuse_times
+        {
+            return true;
+        }
+        if self.limits.h_max_request_times != 0
+            && self.request_count.load(Ordering::Acquire)
+                >= self.limits.h_max_request_times
+        {
+            return true;
+        }
+        self.limits.h_max_reusable_secs != 0
+            && self.created_at.elapsed().as_secs() >= self.limits.h_max_reusable_secs
+    }
+
+    fn has_capacity(&self) -> bool {
+        self.limits.max_concurrency == 0
+            || self.active.load(Ordering::Acquire) < self.limits.max_concurrency
+    }
+}
+
+struct ReuseLeaseStream {
+    inner: AnyStream,
+    active: Arc<AtomicU64>,
+}
+
+impl AsyncRead for ReuseLeaseStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for ReuseLeaseStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        Pin::new(&mut *self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut *self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut *self.inner).poll_shutdown(cx)
+    }
+}
+
+impl Drop for ReuseLeaseStream {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum XhttpMode {
@@ -74,6 +181,7 @@ pub struct XhttpDownloadConfig {
     pub server_name: String,
     pub skip_cert_verify: bool,
     pub reality: Option<XhttpRealityConfig>,
+    pub reuse_policy: Option<XhttpReusePolicy>,
 }
 
 pub struct Client {
@@ -89,6 +197,15 @@ pub struct Client {
     min_posts_interval_ms: Option<u64>,
     download: Option<XhttpDownloadConfig>,
     auto_reality: bool,
+    metadata: XhttpMetadataConfig,
+    uplink: XhttpUplinkConfig,
+    padding: XhttpPaddingConfig,
+    session: XhttpSessionIdConfig,
+    reuse_policy: Option<XhttpReusePolicy>,
+    reuse_max_connections: Option<u64>,
+    reuse_pool: Mutex<Vec<ReusableH2>>,
+    download_reuse_max_connections: Option<u64>,
+    download_reuse_pool: Mutex<Vec<ReusableH2>>,
 }
 
 impl Client {
@@ -106,6 +223,11 @@ impl Client {
         min_posts_interval_ms: Option<u64>,
         download: Option<XhttpDownloadConfig>,
     ) -> Self {
+        let download_reuse_max_connections = download
+            .as_ref()
+            .and_then(|config| config.reuse_policy.as_ref())
+            .and_then(XhttpReusePolicy::sample_max_connections);
+
         Self {
             server,
             port,
@@ -119,6 +241,15 @@ impl Client {
             min_posts_interval_ms,
             download,
             auto_reality: false,
+            metadata: XhttpMetadataConfig::default(),
+            uplink: XhttpUplinkConfig::default(),
+            padding: XhttpPaddingConfig::default(),
+            session: XhttpSessionIdConfig::default(),
+            reuse_policy: None,
+            reuse_max_connections: None,
+            reuse_pool: Mutex::new(Vec::new()),
+            download_reuse_max_connections,
+            download_reuse_pool: Mutex::new(Vec::new()),
         }
     }
 
@@ -127,9 +258,40 @@ impl Client {
         self
     }
 
+    pub fn with_metadata(mut self, metadata: XhttpMetadataConfig) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    pub fn with_uplink(mut self, uplink: XhttpUplinkConfig) -> Self {
+        self.uplink = uplink;
+        self
+    }
+
+    pub fn with_padding(mut self, padding: XhttpPaddingConfig) -> Self {
+        self.padding = padding;
+        self
+    }
+
+    pub fn with_session(mut self, session: XhttpSessionIdConfig) -> Self {
+        self.session = session;
+        self
+    }
+
+    pub fn with_reuse_policy(
+        mut self,
+        reuse_policy: Option<XhttpReusePolicy>,
+    ) -> Self {
+        self.reuse_max_connections = reuse_policy
+            .as_ref()
+            .and_then(XhttpReusePolicy::sample_max_connections);
+        self.reuse_policy = reuse_policy;
+        self
+    }
+
     fn request(
         &self,
-        method: &'static str,
+        method: &str,
         path: &str,
         body: BoxBody<Bytes, Infallible>,
     ) -> io::Result<Request<BoxBody<Bytes, Infallible>>> {
@@ -143,6 +305,7 @@ impl Client {
             self.request_content_type(method),
             method,
             body,
+            &self.padding,
         )
     }
 
@@ -172,21 +335,60 @@ impl Client {
     }
 }
 
-async fn handshake_http2(stream: AnyStream) -> io::Result<H2SendRequest> {
+async fn handshake_http2(
+    stream: AnyStream,
+    keep_alive_period: Option<i64>,
+) -> io::Result<H2SendRequest> {
     let io = TokioIo::new(stream);
-    let (sender, conn) = hyper::client::conn::http2::handshake::<
-        _,
-        _,
-        BoxBody<Bytes, Infallible>,
-    >(TokioExecutor::new(), io)
-    .await
-    .map_err(map_io_error)?;
+    let mut builder = hyper::client::conn::http2::Builder::new(TokioExecutor::new());
+    builder.timer(TokioTimer::new());
+
+    match keep_alive_period {
+        None => {}
+        Some(-1) => {
+            builder.keep_alive_interval(None);
+        }
+        Some(0) => {
+            builder
+                .keep_alive_interval(Duration::from_secs(45))
+                .keep_alive_while_idle(true);
+        }
+        Some(period) if period > 0 => {
+            builder
+                .keep_alive_interval(Duration::from_secs(period as u64))
+                .keep_alive_while_idle(true);
+        }
+        Some(period) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "xhttp h-keep-alive-period must be -1, 0, or a positive number, got {period}"
+                ),
+            ));
+        }
+    }
+
+    let (sender, conn) = builder
+        .handshake::<_, BoxBody<Bytes, Infallible>>(io)
+        .await
+        .map_err(map_io_error)?;
 
     tokio::spawn(async move {
         let _ = conn.await;
     });
 
     Ok(sender)
+}
+
+async fn send_h2_request(
+    sender: &mut H2SendRequest,
+    request: Request<BoxBody<Bytes, Infallible>>,
+    request_count: Option<&Arc<AtomicU64>>,
+) -> io::Result<http::Response<Incoming>> {
+    if let Some(request_count) = request_count {
+        request_count.fetch_add(1, Ordering::AcqRel);
+    }
+    sender.send_request(request).await.map_err(map_io_error)
 }
 
 async fn connect_download_stream(
@@ -265,43 +467,136 @@ async fn connect_download_stream(
     }
 }
 
+async fn acquire_download_sender(
+    client: &Client,
+    download: &XhttpDownloadConfig,
+) -> io::Result<(
+    H2SendRequest,
+    Option<Arc<AtomicU64>>,
+    Option<Arc<AtomicU64>>,
+)> {
+    let Some(reuse_policy) = download.reuse_policy.as_ref() else {
+        let stream = connect_download_stream(download).await?;
+        let sender = handshake_http2(stream, None).await?;
+        return Ok((sender, None, None));
+    };
+
+    let mut pool = client.download_reuse_pool.lock().await;
+    pool.retain(|connection| !connection.retired());
+
+    let should_open_fresh = match client.download_reuse_max_connections {
+        Some(0) => true,
+        Some(max_connections) => (pool.len() as u64) < max_connections,
+        None => !pool.iter().any(ReusableH2::has_capacity),
+    };
+
+    if !should_open_fresh
+        && let Some(connection) =
+            pool.iter_mut().find(|connection| connection.has_capacity())
+    {
+        connection.reuse_count += 1;
+        connection.active.fetch_add(1, Ordering::AcqRel);
+        return Ok((
+            connection.sender.clone(),
+            Some(connection.active.clone()),
+            Some(connection.request_count.clone()),
+        ));
+    }
+
+    let stream = connect_download_stream(download).await?;
+    let sender =
+        handshake_http2(stream, Some(reuse_policy.h_keep_alive_period)).await?;
+
+    if client.download_reuse_max_connections == Some(0) {
+        return Ok((sender, None, None));
+    }
+
+    let active = Arc::new(AtomicU64::new(1));
+    let request_count = Arc::new(AtomicU64::new(0));
+    pool.push(ReusableH2 {
+        sender: sender.clone(),
+        created_at: Instant::now(),
+        active: active.clone(),
+        reuse_count: 0,
+        request_count: request_count.clone(),
+        limits: reuse_policy.sample_limits(),
+    });
+
+    Ok((sender, Some(active), Some(request_count)))
+}
+
+async fn open_separate_downlink_response(
+    client: &Client,
+    download: &XhttpDownloadConfig,
+    session_id: &str,
+) -> io::Result<(Incoming, Option<Arc<AtomicU64>>)> {
+    let mut headers = download.headers.clone();
+    let path =
+        client
+            .metadata
+            .apply(&download.path, &mut headers, session_id, None)?;
+    let request = build_request(
+        &download.server,
+        download.port,
+        &path,
+        download.host.as_ref(),
+        &headers,
+        matches!(
+            download.security,
+            XhttpSecurity::Tls | XhttpSecurity::Reality
+        ),
+        None,
+        "GET",
+        http_body_util::Empty::<Bytes>::new().boxed(),
+        &client.padding,
+    )?;
+
+    let (mut downlink_sender, active, request_count) =
+        acquire_download_sender(client, download).await?;
+    let result =
+        send_h2_request(&mut downlink_sender, request, request_count.as_ref())
+            .await
+            .and_then(validate_response_status);
+
+    match result {
+        Ok(body) => Ok((body, active)),
+        Err(err) => {
+            if let Some(active) = active {
+                active.fetch_sub(1, Ordering::AcqRel);
+            }
+            Err(err)
+        }
+    }
+}
+
 async fn open_downlink_response(
     client: &Client,
     sender: &mut H2SendRequest,
     session_id: &str,
-) -> io::Result<Incoming> {
+    request_count: Option<&Arc<AtomicU64>>,
+) -> io::Result<(Incoming, Option<Arc<AtomicU64>>)> {
     if let Some(download) = client.download.as_ref() {
-        let stream = connect_download_stream(download).await?;
-        let mut downlink_sender = handshake_http2(stream).await?;
-        let path = format!("{}{}", download.path, session_id);
+        open_separate_downlink_response(client, download, session_id).await
+    } else {
+        let mut headers = client.headers.clone();
+        let path =
+            client
+                .metadata
+                .apply(&client.path, &mut headers, session_id, None)?;
         let request = build_request(
-            &download.server,
-            download.port,
+            &client.server,
+            client.port,
             &path,
-            download.host.as_ref(),
-            &download.headers,
-            matches!(
-                download.security,
-                XhttpSecurity::Tls | XhttpSecurity::Reality
-            ),
+            client.host.as_ref(),
+            &headers,
+            client.use_tls,
             None,
             "GET",
             http_body_util::Empty::<Bytes>::new().boxed(),
+            &client.padding,
         )?;
-        let response = downlink_sender
-            .send_request(request)
-            .await
-            .map_err(map_io_error)?;
-        validate_response_status(response)
-    } else {
-        let path = format!("{}{}", client.path, session_id);
-        let request = client.request(
-            "GET",
-            &path,
-            http_body_util::Empty::<Bytes>::new().boxed(),
-        )?;
-        let response = sender.send_request(request).await.map_err(map_io_error)?;
-        validate_response_status(response)
+        let response = send_h2_request(sender, request, request_count).await?;
+        validate_response_status(response).map(|body| (body, None))
     }
 }
 
@@ -327,19 +622,20 @@ fn build_request(
     headers: &HashMap<String, String>,
     use_tls: bool,
     content_type: Option<&str>,
-    method: &'static str,
+    method: &str,
     body: BoxBody<Bytes, Infallible>,
+    padding: &XhttpPaddingConfig,
 ) -> io::Result<Request<BoxBody<Bytes, Infallible>>> {
     let scheme = if use_tls { "https" } else { "http" };
-    let uri = format!("{scheme}://{server}:{port}{path}");
-    let referer = build_xhttp_padding_referer(&uri);
+    let mut uri = format!("{scheme}://{server}:{port}{path}");
+    let mut headers = headers.clone();
+    padding.apply(&mut uri, &mut headers)?;
 
     let mut request = Request::builder()
         .method(method)
         .uri(uri)
         .version(Version::HTTP_2)
-        .header("cache-control", "no-store")
-        .header(DEFAULT_XHTTP_PADDING_HEADER, referer);
+        .header("cache-control", "no-store");
 
     if let Some(content_type) = content_type {
         request = request.header("content-type", content_type);
@@ -365,35 +661,123 @@ fn build_request(
     request.body(body).map_err(map_io_error)
 }
 
-fn build_xhttp_padding_referer(uri: &str) -> String {
-    let separator = if uri.contains('?') { '&' } else { '?' };
-    let padding = "X".repeat(DEFAULT_XHTTP_PADDING_BYTES);
-    format!("{uri}{separator}{DEFAULT_XHTTP_PADDING_QUERY_KEY}={padding}")
+async fn open_xhttp_logical_stream(
+    client: &Client,
+    sender: H2SendRequest,
+    request_count: Option<Arc<AtomicU64>>,
+) -> io::Result<AnyStream> {
+    match client.effective_mode() {
+        XhttpMode::StreamOne => {
+            proxy_stream_one(client, sender, request_count).await
+        }
+        XhttpMode::StreamUp => proxy_stream_up(client, sender, request_count).await,
+        XhttpMode::PacketUp => proxy_packet_up(client, sender, request_count).await,
+        XhttpMode::Auto => unreachable!("effective_mode resolves auto"),
+    }
+}
+
+fn leased_stream(stream: AnyStream, active: Arc<AtomicU64>) -> AnyStream {
+    Box::new(ReuseLeaseStream {
+        inner: stream,
+        active,
+    })
 }
 
 #[async_trait]
 impl Transport for Client {
     async fn proxy_stream(&self, stream: AnyStream) -> io::Result<AnyStream> {
-        match self.effective_mode() {
-            XhttpMode::StreamOne => proxy_stream_one(self, stream).await,
-            XhttpMode::StreamUp => proxy_stream_up(self, stream).await,
-            XhttpMode::PacketUp => proxy_packet_up(self, stream).await,
-            XhttpMode::Auto => unreachable!("effective_mode resolves auto"),
+        let sender = handshake_http2(
+            stream,
+            self.reuse_policy
+                .as_ref()
+                .map(|policy| policy.h_keep_alive_period),
+        )
+        .await?;
+
+        let Some(reuse_policy) = self.reuse_policy.as_ref() else {
+            return open_xhttp_logical_stream(self, sender, None).await;
+        };
+
+        let request_count = Arc::new(AtomicU64::new(0));
+        let logical = open_xhttp_logical_stream(
+            self,
+            sender.clone(),
+            Some(request_count.clone()),
+        )
+        .await?;
+
+        if self.reuse_max_connections == Some(0) {
+            return Ok(logical);
+        }
+
+        let active = Arc::new(AtomicU64::new(1));
+        self.reuse_pool.lock().await.push(ReusableH2 {
+            sender,
+            created_at: Instant::now(),
+            active: active.clone(),
+            reuse_count: 0,
+            request_count,
+            limits: reuse_policy.sample_limits(),
+        });
+
+        Ok(leased_stream(logical, active))
+    }
+
+    async fn try_reuse_stream(&self) -> io::Result<Option<AnyStream>> {
+        if self.reuse_policy.is_none() {
+            return Ok(None);
+        }
+
+        let selected = {
+            let mut pool = self.reuse_pool.lock().await;
+            pool.retain(|connection| !connection.retired());
+
+            if let Some(max_connections) = self.reuse_max_connections
+                && (max_connections == 0 || (pool.len() as u64) < max_connections)
+            {
+                return Ok(None);
+            }
+
+            let Some(connection) =
+                pool.iter_mut().find(|connection| connection.has_capacity())
+            else {
+                return Ok(None);
+            };
+
+            connection.reuse_count += 1;
+            connection.active.fetch_add(1, Ordering::AcqRel);
+            Some((
+                connection.sender.clone(),
+                connection.active.clone(),
+                connection.request_count.clone(),
+            ))
+        };
+
+        let Some((sender, active, request_count)) = selected else {
+            return Ok(None);
+        };
+
+        match open_xhttp_logical_stream(self, sender, Some(request_count)).await {
+            Ok(stream) => Ok(Some(leased_stream(stream, active))),
+            Err(err) => {
+                active.fetch_sub(1, Ordering::AcqRel);
+                Err(err)
+            }
         }
     }
 }
 
 async fn proxy_stream_one(
     client: &Client,
-    stream: AnyStream,
+    mut sender: H2SendRequest,
+    request_count: Option<Arc<AtomicU64>>,
 ) -> io::Result<AnyStream> {
-    let mut sender = handshake_http2(stream).await?;
     let (tx, rx) =
         mpsc::channel::<Result<Frame<Bytes>, Infallible>>(FRAME_CHANNEL_CAPACITY);
     let request_body = StreamBody::new(ReceiverStream::new(rx)).boxed();
     let request = client.request("POST", &client.path, request_body)?;
     let response = validate_response_status(
-        sender.send_request(request).await.map_err(map_io_error)?,
+        send_h2_request(&mut sender, request, request_count.as_ref()).await?,
     )?;
 
     let (app_stream, transport_stream) = tokio::io::duplex(DUPLEX_BUFFER_SIZE);
@@ -429,11 +813,17 @@ async fn proxy_stream_one(
 
 async fn proxy_stream_up(
     client: &Client,
-    stream: AnyStream,
+    mut sender: H2SendRequest,
+    request_count: Option<Arc<AtomicU64>>,
 ) -> io::Result<AnyStream> {
-    let mut sender = handshake_http2(stream).await?;
-    let session_id = Uuid::new_v4().to_string();
-    let response = open_downlink_response(client, &mut sender, &session_id).await?;
+    let session_id = client.session.generate();
+    let (response, downlink_active) = open_downlink_response(
+        client,
+        &mut sender,
+        &session_id,
+        request_count.as_ref(),
+    )
+    .await?;
 
     let (app_stream, transport_stream) = tokio::io::duplex(DUPLEX_BUFFER_SIZE);
     let (mut transport_reader, mut transport_writer) =
@@ -443,25 +833,38 @@ async fn proxy_stream_up(
     let port = client.port;
     let host = client.host.clone();
     let headers = client.headers.clone();
+    let metadata = client.metadata.clone();
+    let padding = client.padding.clone();
     let use_tls = client.use_tls;
     let content_type = client.request_content_type("POST");
+    let request_count_for_uplink = request_count.clone();
 
     tokio::spawn(async move {
         let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(
             FRAME_CHANNEL_CAPACITY,
         );
-        let request_path = format!("{base_path}{session_id}");
+        let mut request_headers = headers.clone();
+        let request_path = match metadata.apply(
+            &base_path,
+            &mut request_headers,
+            &session_id,
+            None,
+        ) {
+            Ok(path) => path,
+            Err(_) => return,
+        };
         let request_body = StreamBody::new(ReceiverStream::new(rx)).boxed();
         let request = match build_request(
             &server,
             port,
             &request_path,
             host.as_ref(),
-            &headers,
+            &request_headers,
             use_tls,
             content_type,
             "POST",
             request_body,
+            &padding,
         ) {
             Ok(request) => request,
             Err(_) => return,
@@ -486,7 +889,13 @@ async fn proxy_stream_up(
             }
         });
 
-        match sender.send_request(request).await {
+        match send_h2_request(
+            &mut sender,
+            request,
+            request_count_for_uplink.as_ref(),
+        )
+        .await
+        {
             Ok(response) if response.status().is_success() => {}
             _ => {}
         }
@@ -495,6 +904,9 @@ async fn proxy_stream_up(
     tokio::spawn(async move {
         forward_response_body(response, &mut transport_writer).await;
         let _ = transport_writer.shutdown().await;
+        if let Some(active) = downlink_active {
+            active.fetch_sub(1, Ordering::AcqRel);
+        }
     });
 
     Ok(Box::new(app_stream))
@@ -502,11 +914,17 @@ async fn proxy_stream_up(
 
 async fn proxy_packet_up(
     client: &Client,
-    stream: AnyStream,
+    mut sender: H2SendRequest,
+    request_count: Option<Arc<AtomicU64>>,
 ) -> io::Result<AnyStream> {
-    let mut sender = handshake_http2(stream).await?;
-    let session_id = Uuid::new_v4().to_string();
-    let response = open_downlink_response(client, &mut sender, &session_id).await?;
+    let session_id = client.session.generate();
+    let (response, downlink_active) = open_downlink_response(
+        client,
+        &mut sender,
+        &session_id,
+        request_count.as_ref(),
+    )
+    .await?;
 
     let (app_stream, transport_stream) = tokio::io::duplex(DUPLEX_BUFFER_SIZE);
     let (mut transport_reader, mut transport_writer) =
@@ -517,9 +935,12 @@ async fn proxy_packet_up(
     let port = client.port;
     let host = client.host.clone();
     let headers = client.headers.clone();
+    let metadata = client.metadata.clone();
+    let uplink = client.uplink.clone();
+    let padding = client.padding.clone();
     let use_tls = client.use_tls;
-    let content_type = client.request_content_type("POST");
     let min_posts_interval_ms = client.min_posts_interval_ms;
+    let request_count_for_uplink = request_count.clone();
 
     tokio::spawn(async move {
         let mut seq: u64 = 0;
@@ -530,24 +951,43 @@ async fn proxy_packet_up(
                 Ok(n) => {
                     let chunk_size = max_each_post_bytes.max(1);
                     for chunk in buf[..n].chunks(chunk_size) {
-                        let request_path = format!("{base_path}{session_id}/{seq}");
-                        let body = Full::new(Bytes::copy_from_slice(chunk)).boxed();
+                        let mut request_headers = headers.clone();
+                        let request_path = match metadata.apply(
+                            &base_path,
+                            &mut request_headers,
+                            &session_id,
+                            Some(seq),
+                        ) {
+                            Ok(path) => path,
+                            Err(_) => return,
+                        };
+                        let body = Full::new(
+                            uplink.apply_payload(chunk, &mut request_headers),
+                        )
+                        .boxed();
                         let request = match build_request(
                             &server,
                             port,
                             &request_path,
                             host.as_ref(),
-                            &headers,
+                            &request_headers,
                             use_tls,
-                            content_type,
-                            "POST",
+                            uplink.content_type(),
+                            uplink.method(),
                             body,
+                            &padding,
                         ) {
                             Ok(request) => request,
                             Err(_) => return,
                         };
 
-                        match sender.send_request(request).await {
+                        match send_h2_request(
+                            &mut sender,
+                            request,
+                            request_count_for_uplink.as_ref(),
+                        )
+                        .await
+                        {
                             Ok(response) if response.status().is_success() => {
                                 seq += 1;
                                 if let Some(interval_ms) = min_posts_interval_ms {
@@ -571,6 +1011,9 @@ async fn proxy_packet_up(
     tokio::spawn(async move {
         forward_response_body(response, &mut transport_writer).await;
         let _ = transport_writer.shutdown().await;
+        if let Some(active) = downlink_active {
+            active.fetch_sub(1, Ordering::AcqRel);
+        }
     });
 
     Ok(Box::new(app_stream))
@@ -597,9 +1040,13 @@ async fn forward_response_body(
 #[cfg(test)]
 mod tests {
     use super::{
-        Client, XhttpDownloadConfig, XhttpMode, XhttpSecurity, build_request,
+        Client, MetadataPlacement, UplinkDataPlacement, XhttpChunkSizeRange,
+        XhttpDownloadConfig, XhttpMetadataConfig, XhttpMode, XhttpPaddingConfig,
+        XhttpReusePolicy, XhttpReuseValueRange, XhttpSecurity, XhttpUplinkConfig,
+        build_request, open_separate_downlink_response,
     };
     use crate::proxy::transport::Transport;
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use bytes::Bytes;
     use http::{Method, Request, Response, StatusCode};
     use http_body_util::{BodyExt, Empty, StreamBody, combinators::BoxBody};
@@ -665,6 +1112,7 @@ mod tests {
             server_name: "download.example.com".to_owned(),
             skip_cert_verify: false,
             reality: None,
+            reuse_policy: None,
         };
         let client = auto_client(true, Some(download));
         assert_eq!(client.effective_mode(), XhttpMode::StreamUp);
@@ -682,6 +1130,7 @@ mod tests {
             None,
             "GET",
             Empty::<Bytes>::new().boxed(),
+            &XhttpPaddingConfig::default(),
         )
         .expect("request should build");
 
@@ -694,13 +1143,14 @@ mod tests {
             referer.starts_with("http://127.0.0.1:8080/xhttp/?x_padding="),
             "unexpected referer: {referer}"
         );
-        assert_eq!(
-            referer
-                .split("x_padding=")
-                .nth(1)
-                .expect("padding should exist")
-                .len(),
-            100
+        let padding_len = referer
+            .split("x_padding=")
+            .nth(1)
+            .expect("padding should exist")
+            .len();
+        assert!(
+            (100..=1_000).contains(&padding_len),
+            "unexpected default padding length: {padding_len}"
         );
     }
 
@@ -755,6 +1205,295 @@ mod tests {
             .expect("read should finish")
             .expect("read should succeed");
         assert_eq!(&buf, b"ping");
+    }
+
+    #[tokio::test]
+    async fn xhttp_reuses_one_h2_connection_for_multiple_logical_streams() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should expose addr");
+
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept should succeed");
+            let io = TokioIo::new(tcp);
+            let service = hyper::service::service_fn(handle_stream_one);
+            let builder = auto::Builder::new(TokioExecutor::new()).http2_only();
+            builder
+                .serve_connection(io, service)
+                .await
+                .expect("server connection should succeed");
+        });
+
+        let stream = TcpStream::connect(addr)
+            .await
+            .expect("client should connect");
+        let client = Client::new(
+            "127.0.0.1".to_owned(),
+            addr.port(),
+            "/xhttp/".to_owned(),
+            None,
+            HashMap::new(),
+            false,
+            XhttpMode::StreamOne,
+            1_000_000,
+            false,
+            None,
+            None,
+        )
+        .with_reuse_policy(Some(XhttpReusePolicy {
+            max_concurrency: Some(XhttpReuseValueRange { min: 1, max: 1 }),
+            max_connections: None,
+            c_max_reuse_times: Some(XhttpReuseValueRange { min: 1, max: 1 }),
+            h_max_request_times: Some(XhttpReuseValueRange { min: 0, max: 0 }),
+            h_max_reusable_secs: Some(XhttpReuseValueRange { min: 0, max: 0 }),
+            h_keep_alive_period: 0,
+        }));
+
+        let mut first = client
+            .proxy_stream(Box::new(stream))
+            .await
+            .expect("first logical stream should connect");
+
+        assert!(
+            client
+                .try_reuse_stream()
+                .await
+                .expect("reuse lookup should succeed")
+                .is_none(),
+            "max-concurrency=1 must block reuse while first stream is active"
+        );
+
+        first
+            .write_all(b"one1")
+            .await
+            .expect("first write should succeed");
+        first.flush().await.expect("first flush should succeed");
+        let mut first_buf = [0u8; 4];
+        timeout(Duration::from_secs(2), first.read_exact(&mut first_buf))
+            .await
+            .expect("first read should finish")
+            .expect("first read should succeed");
+        assert_eq!(&first_buf, b"one1");
+        drop(first);
+
+        let mut second = client
+            .try_reuse_stream()
+            .await
+            .expect("second reuse lookup should succeed")
+            .expect("same H2 connection should be reusable");
+        second
+            .write_all(b"two2")
+            .await
+            .expect("second write should succeed");
+        second.flush().await.expect("second flush should succeed");
+        let mut second_buf = [0u8; 4];
+        timeout(Duration::from_secs(2), second.read_exact(&mut second_buf))
+            .await
+            .expect("second read should finish")
+            .expect("second read should succeed");
+        assert_eq!(&second_buf, b"two2");
+        drop(second);
+
+        assert!(
+            client
+                .try_reuse_stream()
+                .await
+                .expect("third reuse lookup should succeed")
+                .is_none(),
+            "c-max-reuse-times=1 must retire the connection after one reuse"
+        );
+    }
+
+    #[tokio::test]
+    async fn xhttp_max_connections_opens_fresh_until_limit_then_reuses() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should expose addr");
+
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (tcp, _) =
+                    listener.accept().await.expect("accept should succeed");
+                tokio::spawn(async move {
+                    let io = TokioIo::new(tcp);
+                    let service = hyper::service::service_fn(handle_stream_one);
+                    let builder =
+                        auto::Builder::new(TokioExecutor::new()).http2_only();
+                    builder
+                        .serve_connection(io, service)
+                        .await
+                        .expect("server connection should succeed");
+                });
+            }
+        });
+
+        let client = Client::new(
+            "127.0.0.1".to_owned(),
+            addr.port(),
+            "/xhttp/".to_owned(),
+            None,
+            HashMap::new(),
+            false,
+            XhttpMode::StreamOne,
+            1_000_000,
+            false,
+            None,
+            None,
+        )
+        .with_reuse_policy(Some(XhttpReusePolicy {
+            max_concurrency: None,
+            max_connections: Some(XhttpReuseValueRange { min: 2, max: 2 }),
+            c_max_reuse_times: None,
+            h_max_request_times: None,
+            h_max_reusable_secs: None,
+            h_keep_alive_period: 0,
+        }));
+
+        let first_tcp = TcpStream::connect(addr)
+            .await
+            .expect("first client connection should succeed");
+        let mut first = client
+            .proxy_stream(Box::new(first_tcp))
+            .await
+            .expect("first logical stream should connect");
+        first.write_all(b"one1").await.unwrap();
+        first.flush().await.unwrap();
+        let mut first_buf = [0u8; 4];
+        timeout(Duration::from_secs(2), first.read_exact(&mut first_buf))
+            .await
+            .expect("first read should finish")
+            .expect("first read should succeed");
+        assert_eq!(&first_buf, b"one1");
+        drop(first);
+
+        assert!(
+            client
+                .try_reuse_stream()
+                .await
+                .expect("first reuse lookup should succeed")
+                .is_none(),
+            "pool must request a fresh second connection before max-connections is reached"
+        );
+
+        let second_tcp = TcpStream::connect(addr)
+            .await
+            .expect("second client connection should succeed");
+        let mut second = client
+            .proxy_stream(Box::new(second_tcp))
+            .await
+            .expect("second logical stream should connect");
+        second.write_all(b"two2").await.unwrap();
+        second.flush().await.unwrap();
+        let mut second_buf = [0u8; 4];
+        timeout(Duration::from_secs(2), second.read_exact(&mut second_buf))
+            .await
+            .expect("second read should finish")
+            .expect("second read should succeed");
+        assert_eq!(&second_buf, b"two2");
+        drop(second);
+
+        let mut third = client
+            .try_reuse_stream()
+            .await
+            .expect("second reuse lookup should succeed")
+            .expect("pool must reuse after max-connections is reached");
+        third.write_all(b"tri3").await.unwrap();
+        third.flush().await.unwrap();
+        let mut third_buf = [0u8; 4];
+        timeout(Duration::from_secs(2), third.read_exact(&mut third_buf))
+            .await
+            .expect("third read should finish")
+            .expect("third read should succeed");
+        assert_eq!(&third_buf, b"tri3");
+    }
+
+    #[tokio::test]
+    async fn xhttp_separate_download_reuses_single_h2_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should expose addr");
+
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept should succeed");
+            let io = TokioIo::new(tcp);
+            let service =
+                hyper::service::service_fn(|req: Request<Incoming>| async move {
+                    assert_eq!(req.method(), Method::GET);
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .body(Empty::<Bytes>::new().boxed())
+                            .expect("response should build"),
+                    )
+                });
+            let builder = auto::Builder::new(TokioExecutor::new()).http2_only();
+            builder
+                .serve_connection(io, service)
+                .await
+                .expect("download server connection should succeed");
+        });
+
+        let reuse_policy = XhttpReusePolicy {
+            max_concurrency: None,
+            max_connections: Some(XhttpReuseValueRange { min: 1, max: 1 }),
+            c_max_reuse_times: None,
+            h_max_request_times: None,
+            h_max_reusable_secs: None,
+            h_keep_alive_period: -1,
+        };
+        let download = XhttpDownloadConfig {
+            server: "127.0.0.1".to_owned(),
+            port: addr.port(),
+            path: "/xhttp/".to_owned(),
+            host: None,
+            headers: HashMap::new(),
+            security: XhttpSecurity::None,
+            server_name: "127.0.0.1".to_owned(),
+            skip_cert_verify: false,
+            reality: None,
+            reuse_policy: Some(reuse_policy),
+        };
+        let client = Client::new(
+            "upload.invalid".to_owned(),
+            443,
+            "/xhttp/".to_owned(),
+            None,
+            HashMap::new(),
+            false,
+            XhttpMode::StreamUp,
+            1_000_000,
+            false,
+            None,
+            Some(download),
+        );
+
+        for session_id in ["first", "second"] {
+            let download = client.download.as_ref().expect("download config");
+            let (body, active) = timeout(
+                Duration::from_secs(2),
+                open_separate_downlink_response(&client, download, session_id),
+            )
+            .await
+            .expect("downlink request should finish")
+            .expect("downlink request should succeed");
+
+            body.collect()
+                .await
+                .expect("downlink response body should collect");
+
+            if let Some(active) = active {
+                active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            }
+        }
+
+        assert_eq!(
+            client.download_reuse_pool.lock().await.len(),
+            1,
+            "both downlink sessions must share one HTTP/2 connection"
+        );
     }
 
     #[tokio::test]
@@ -1053,6 +1792,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn xhttp_packet_up_applies_query_session_and_header_seq() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should expose addr");
+        let sessions = Arc::new(Mutex::new(HashMap::<
+            String,
+            mpsc::Sender<Result<Frame<Bytes>, Infallible>>,
+        >::new()));
+
+        tokio::spawn({
+            let sessions = sessions.clone();
+            async move {
+                let (tcp, _) =
+                    listener.accept().await.expect("accept should succeed");
+                let io = TokioIo::new(tcp);
+                let service = hyper::service::service_fn(move |req| {
+                    handle_query_session_header_seq(req, sessions.clone())
+                });
+                let builder = auto::Builder::new(TokioExecutor::new()).http2_only();
+                builder
+                    .serve_connection(io, service)
+                    .await
+                    .expect("server connection should succeed");
+            }
+        });
+
+        let stream = TcpStream::connect(addr)
+            .await
+            .expect("client should connect");
+        let client = Client::new(
+            "127.0.0.1".to_owned(),
+            addr.port(),
+            "/xhttp/".to_owned(),
+            None,
+            HashMap::new(),
+            false,
+            XhttpMode::PacketUp,
+            1_000_000,
+            false,
+            None,
+            None,
+        )
+        .with_metadata(XhttpMetadataConfig {
+            session_placement: MetadataPlacement::Query,
+            session_key: Some("auth".to_owned()),
+            seq_placement: MetadataPlacement::Header,
+            seq_key: Some("X-Seq".to_owned()),
+        });
+
+        let mut proxied = client
+            .proxy_stream(Box::new(stream))
+            .await
+            .expect("packet-up transport should connect");
+        proxied
+            .write_all(b"ping")
+            .await
+            .expect("write should succeed");
+        proxied.flush().await.expect("flush should succeed");
+
+        let mut buf = [0_u8; 4];
+        timeout(Duration::from_secs(2), proxied.read_exact(&mut buf))
+            .await
+            .expect("read should finish")
+            .expect("read should succeed");
+        assert_eq!(&buf, b"ping");
+    }
+
+    #[tokio::test]
+    async fn xhttp_packet_up_places_payload_in_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should expose addr");
+        let sessions = Arc::new(Mutex::new(HashMap::<
+            String,
+            mpsc::Sender<Result<Frame<Bytes>, Infallible>>,
+        >::new()));
+
+        tokio::spawn({
+            let sessions = sessions.clone();
+            async move {
+                let (tcp, _) =
+                    listener.accept().await.expect("accept should succeed");
+                let io = TokioIo::new(tcp);
+                let service = hyper::service::service_fn(move |req| {
+                    handle_header_uplink(req, sessions.clone())
+                });
+                let builder = auto::Builder::new(TokioExecutor::new()).http2_only();
+                builder
+                    .serve_connection(io, service)
+                    .await
+                    .expect("server connection should succeed");
+            }
+        });
+
+        let stream = TcpStream::connect(addr)
+            .await
+            .expect("client should connect");
+        let client = Client::new(
+            "127.0.0.1".to_owned(),
+            addr.port(),
+            "/xhttp/".to_owned(),
+            None,
+            HashMap::new(),
+            false,
+            XhttpMode::PacketUp,
+            1_000_000,
+            false,
+            None,
+            None,
+        )
+        .with_uplink(XhttpUplinkConfig {
+            method: "PUT".to_owned(),
+            placement: UplinkDataPlacement::Header,
+            key: Some("X-Payload".to_owned()),
+            chunk_size: XhttpChunkSizeRange::fixed(4096),
+        });
+
+        let mut proxied = client
+            .proxy_stream(Box::new(stream))
+            .await
+            .expect("packet-up transport should connect");
+        proxied
+            .write_all(b"ping")
+            .await
+            .expect("write should succeed");
+        proxied.flush().await.expect("flush should succeed");
+
+        let mut buf = [0_u8; 4];
+        timeout(Duration::from_secs(2), proxied.read_exact(&mut buf))
+            .await
+            .expect("read should finish")
+            .expect("read should succeed");
+        assert_eq!(&buf, b"ping");
+    }
+
+    #[tokio::test]
     async fn xhttp_packet_up_supports_separate_download_settings() {
         let upload_listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -1133,6 +2010,7 @@ mod tests {
                 server_name: "127.0.0.1".to_owned(),
                 skip_cert_verify: false,
                 reality: None,
+                reuse_policy: None,
             }),
         );
 
@@ -1262,6 +2140,141 @@ mod tests {
             }
             _ => Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)
+                .body(Empty::<Bytes>::new().boxed())
+                .expect("response should build")),
+        }
+    }
+
+    async fn handle_header_uplink(
+        req: Request<Incoming>,
+        sessions: TestSessions,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        let path = req.uri().path().to_owned();
+        let parts = path
+            .trim_start_matches("/xhttp/")
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+
+        match (req.method(), parts.as_slice()) {
+            (&Method::GET, [session_id]) => {
+                let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(32);
+                sessions.lock().await.insert((*session_id).to_owned(), tx);
+                Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .body(StreamBody::new(ReceiverStream::new(rx)).boxed())
+                    .expect("response should build"))
+            }
+            (&Method::PUT, [session_id, "0"]) => {
+                let encoded = req
+                    .headers()
+                    .get("X-Payload-0")
+                    .and_then(|value| value.to_str().ok())
+                    .expect("header payload should be present")
+                    .to_owned();
+                let body = req
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("request body should collect")
+                    .to_bytes();
+                assert!(
+                    body.is_empty(),
+                    "header placement must not use request body"
+                );
+
+                let payload = URL_SAFE_NO_PAD
+                    .decode(encoded)
+                    .expect("header payload should decode");
+
+                let sender = sessions.lock().await.get(*session_id).cloned();
+                if let Some(sender) = sender {
+                    let _ = sender.send(Ok(Frame::data(Bytes::from(payload)))).await;
+                    Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Empty::<Bytes>::new().boxed())
+                        .expect("response should build"))
+                } else {
+                    Ok(Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(Empty::<Bytes>::new().boxed())
+                        .expect("response should build"))
+                }
+            }
+            _ => Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Empty::<Bytes>::new().boxed())
+                .expect("response should build")),
+        }
+    }
+
+    async fn handle_query_session_header_seq(
+        req: Request<Incoming>,
+        sessions: TestSessions,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        let session_id = req.uri().query().and_then(|query| {
+            query.split('&').find_map(|entry| {
+                let (key, value) = entry.split_once('=')?;
+                (key == "auth").then(|| value.to_owned())
+            })
+        });
+
+        match *req.method() {
+            Method::GET => {
+                let Some(session_id) = session_id else {
+                    return Ok(Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Empty::<Bytes>::new().boxed())
+                        .expect("response should build"));
+                };
+                let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(32);
+                sessions.lock().await.insert(session_id, tx);
+                Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .body(StreamBody::new(ReceiverStream::new(rx)).boxed())
+                    .expect("response should build"))
+            }
+            Method::POST => {
+                let Some(session_id) = session_id else {
+                    return Ok(Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Empty::<Bytes>::new().boxed())
+                        .expect("response should build"));
+                };
+                if req
+                    .headers()
+                    .get("X-Seq")
+                    .and_then(|value| value.to_str().ok())
+                    != Some("0")
+                {
+                    return Ok(Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Empty::<Bytes>::new().boxed())
+                        .expect("response should build"));
+                }
+
+                let payload = req
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("request body should collect")
+                    .to_bytes();
+                let sender = sessions.lock().await.get(&session_id).cloned();
+                if let Some(sender) = sender {
+                    let _ = sender.send(Ok(Frame::data(payload))).await;
+                    Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Empty::<Bytes>::new().boxed())
+                        .expect("response should build"))
+                } else {
+                    Ok(Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(Empty::<Bytes>::new().boxed())
+                        .expect("response should build"))
+                }
+            }
+            _ => Ok(Response::builder()
+                .status(StatusCode::METHOD_NOT_ALLOWED)
                 .body(Empty::<Bytes>::new().boxed())
                 .expect("response should build")),
         }
