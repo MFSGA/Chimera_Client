@@ -57,10 +57,7 @@ fn apply_value(
 ) -> io::Result<()> {
     match placement {
         MetadataPlacement::Path => {
-            if !path.ends_with('/') {
-                path.push('/');
-            }
-            path.push_str(value);
+            append_path_segment(path, value);
         }
         MetadataPlacement::Query => {
             let key = require_key(key, "query")?;
@@ -81,6 +78,22 @@ fn apply_value(
     }
 
     Ok(())
+}
+
+fn append_path_segment(path: &mut String, value: &str) {
+    if let Some(query_index) = path.find('?') {
+        let query = path.split_off(query_index);
+        if !path.ends_with('/') {
+            path.push('/');
+        }
+        path.push_str(value);
+        path.push_str(&query);
+    } else {
+        if !path.ends_with('/') {
+            path.push('/');
+        }
+        path.push_str(value);
+    }
 }
 
 fn require_key<'a>(key: Option<&'a str>, placement: &str) -> io::Result<&'a str> {
@@ -125,6 +138,19 @@ mod tests {
             .expect("path placement should apply");
 
         assert_eq!(path, "/xhttp/session-id/7");
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn path_placement_inserts_metadata_before_existing_query() {
+        let config = MetadataConfig::default();
+        let mut headers = HashMap::new();
+
+        let path = config
+            .apply("/xhttp/?ed=2048", &mut headers, "session-id", Some(7))
+            .expect("path placement should preserve query");
+
+        assert_eq!(path, "/xhttp/session-id/7?ed=2048");
         assert!(headers.is_empty());
     }
 

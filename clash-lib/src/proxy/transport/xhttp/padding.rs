@@ -201,6 +201,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_config_matches_mihomo_referer_header() {
+        let config = PaddingConfig::default();
+
+        assert_eq!(config.header, "Referer");
+        assert_eq!(config.key, "x_padding");
+
+        let mut uri = "https://example.com/xhttp/".to_owned();
+        let mut headers = HashMap::new();
+        config.apply(&mut uri, &mut headers).unwrap();
+
+        assert!(headers.contains_key("Referer"));
+    }
+
+    #[test]
     fn legacy_padding_uses_referer_and_ignores_obfs_fields() {
         let config = PaddingConfig {
             bytes: ChunkSizeRange::fixed(8),
