@@ -95,12 +95,6 @@ impl Handler {
         vision_opts: Option<crate::proxy::transport::VisionOptions>,
     ) -> io::Result<AnyStream> {
         let s = if let Some(config) = self.opts.encryption.as_ref() {
-            if is_udp {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "VLESS encryption UDP runtime is TODO",
-                ));
-            }
             #[cfg(feature = "vless-encryption")]
             {
                 let prepared = config.prepare_crypto()?;
@@ -237,7 +231,7 @@ impl OutboundHandler for Handler {
     }
 
     async fn support_udp(&self) -> bool {
-        self.opts.udp && self.opts.encryption.is_none()
+        self.opts.udp
     }
 
     async fn connect_stream(
@@ -447,6 +441,30 @@ mod reuse_tests {
 
         assert!(Handler::new(options(zero_rtt)).zero_rtt_cache.is_some());
         assert!(Handler::new(options(one_rtt)).zero_rtt_cache.is_none());
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    #[tokio::test]
+    async fn encrypted_vless_reports_udp_support() {
+        let key = URL_SAFE_NO_PAD.encode([0x78; 32]);
+        let encryption = encryption::Config::parse(&format!(
+            "mlkem768x25519plus.native.0rtt.{key}"
+        ))
+        .expect("encryption config should parse");
+        let handler = Handler::new(HandlerOptions {
+            name: "encrypted-udp".to_owned(),
+            common_opts: HandlerCommonOptions::default(),
+            server: "example.com".to_owned(),
+            port: 443,
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            udp: true,
+            transport: None,
+            tls: None,
+            flow: None,
+            encryption: Some(encryption),
+        });
+
+        assert!(handler.support_udp().await);
     }
 
     #[tokio::test]

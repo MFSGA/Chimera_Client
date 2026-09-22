@@ -1596,6 +1596,70 @@ fn blake3_derive_key_raw_context(
 }
 
 #[cfg(feature = "vless-encryption")]
+pub(crate) struct VlessCtr {
+    cipher: aws_lc_rs::cipher::EncryptingKey,
+    counter: [u8; CLIENT_HELLO_IV_LEN],
+    keystream: [u8; CLIENT_HELLO_IV_LEN],
+    keystream_offset: usize,
+}
+
+#[cfg(feature = "vless-encryption")]
+impl VlessCtr {
+    pub(crate) fn new(
+        key_material: &[u8],
+        iv: &[u8; CLIENT_HELLO_IV_LEN],
+    ) -> io::Result<Self> {
+        use aws_lc_rs::cipher::{AES_256, EncryptingKey, UnboundCipherKey};
+
+        let key_bytes = blake3::derive_key("VLESS", key_material);
+        let unbound = UnboundCipherKey::new(&AES_256, &key_bytes)
+            .map_err(|_| invalid("failed to create VLESS AES-CTR key"))?;
+        let cipher = EncryptingKey::ecb(unbound)
+            .map_err(|_| invalid("failed to create VLESS AES block cipher"))?;
+        Ok(Self {
+            cipher,
+            counter: *iv,
+            keystream: [0u8; CLIENT_HELLO_IV_LEN],
+            keystream_offset: CLIENT_HELLO_IV_LEN,
+        })
+    }
+
+    pub(crate) fn apply(&mut self, in_out: &mut [u8]) -> io::Result<()> {
+        use aws_lc_rs::cipher::EncryptionContext;
+
+        let mut offset = 0usize;
+        while offset < in_out.len() {
+            if self.keystream_offset == self.keystream.len() {
+                self.keystream = self.counter;
+                self.cipher
+                    .less_safe_encrypt(&mut self.keystream, EncryptionContext::None)
+                    .map_err(|_| {
+                        invalid("failed to generate VLESS CTR keystream")
+                    })?;
+                for byte in self.counter.iter_mut().rev() {
+                    let (next, overflow) = byte.overflowing_add(1);
+                    *byte = next;
+                    if !overflow {
+                        break;
+                    }
+                }
+                self.keystream_offset = 0;
+            }
+
+            let available = self.keystream.len() - self.keystream_offset;
+            let count = available.min(in_out.len() - offset);
+            for index in 0..count {
+                in_out[offset + index] ^=
+                    self.keystream[self.keystream_offset + index];
+            }
+            offset += count;
+            self.keystream_offset += count;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "vless-encryption")]
 fn xor_vless_ctr(
     key_material: &[u8],
     iv: &[u8; CLIENT_HELLO_IV_LEN],
@@ -1963,6 +2027,41 @@ mod tests {
 
     #[cfg(feature = "vless-encryption")]
     #[test]
+    fn vless_ctr_fragmentation_matches_one_shot_xray_ctr() {
+        let key_material = (0..64).map(|value| value as u8).collect::<Vec<_>>();
+        let iv = [0x5a; CLIENT_HELLO_IV_LEN];
+        let plaintext = (0..97)
+            .map(|index| ((index * 13) % 251) as u8)
+            .collect::<Vec<_>>();
+
+        let mut expected = plaintext.clone();
+        xor_vless_ctr(&key_material, &iv, &mut expected)
+            .expect("one-shot CTR should apply");
+
+        let mut actual = plaintext;
+        let mut ctr = VlessCtr::new(&key_material, &iv)
+            .expect("stateful CTR should initialize");
+        let fragment_sizes = [1usize, 4, 5, 7, 16, 3, 31, 30];
+        let mut offset = 0usize;
+        for size in fragment_sizes {
+            let end = (offset + size).min(actual.len());
+            ctr.apply(&mut actual[offset..end])
+                .expect("fragmented CTR should apply");
+            offset = end;
+            if offset == actual.len() {
+                break;
+            }
+        }
+        if offset < actual.len() {
+            ctr.apply(&mut actual[offset..])
+                .expect("remaining CTR bytes should apply");
+        }
+
+        assert_eq!(actual, expected);
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    #[test]
     fn raw_context_derivation_matches_rust_for_utf8_context() {
         let material = [0x11u8; 32];
 
@@ -2255,6 +2354,34 @@ mod tests {
                 .expect("client download decrypt"),
             b"pong"
         );
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    #[test]
+    fn encryption_stream_accepts_xorpub_appearance() {
+        use std::sync::Arc;
+
+        use aws_lc_rs::agreement;
+
+        use super::super::encryption_stream::EncryptionStream;
+
+        let server_private =
+            agreement::PrivateKey::generate(&agreement::X25519).unwrap();
+        let server_public = server_private.compute_public_key().unwrap();
+        let raw = format!(
+            "{METHOD}.xorpub.0rtt.{}",
+            URL_SAFE_NO_PAD.encode(server_public.as_ref()),
+        );
+        let config = Config::parse(&raw).expect("xorpub config should parse");
+        let prepared = config.prepare_crypto().expect("crypto should prepare");
+        assert_eq!(prepared.xor_mode, 1);
+
+        let cache = Arc::new(ZeroRttSessionCache::default());
+        cache.store([0x91; ZERO_RTT_PFS_KEY_LEN], [0x92; 16], 60);
+        let (client, _server) = tokio::io::duplex(4096);
+
+        EncryptionStream::new(Box::new(client), prepared, Some(cache))
+            .expect("xorpub should use the normal encrypted record runtime");
     }
 
     #[cfg(feature = "vless-encryption")]
@@ -3095,6 +3222,162 @@ mod tests {
 
     #[cfg(feature = "vless-encryption")]
     #[tokio::test]
+    async fn encryption_stream_random_zero_rtt_masks_record_headers() {
+        use std::sync::Arc;
+
+        use aws_lc_rs::agreement;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        use super::super::encryption_stream::EncryptionStream;
+
+        let nfs_private =
+            agreement::PrivateKey::generate(&agreement::X25519).unwrap();
+        let nfs_public = nfs_private.compute_public_key().unwrap();
+        let raw = format!(
+            "{METHOD}.random.0rtt.{}",
+            URL_SAFE_NO_PAD.encode(nfs_public.as_ref()),
+        );
+        let config = Config::parse(&raw).expect("random 0rtt config should parse");
+        let prepared = config.prepare_crypto().expect("crypto should prepare");
+        let relays_length = prepared.relays_length;
+        let cached_pfs_key = [0xa1; ZERO_RTT_PFS_KEY_LEN];
+        let cached_ticket = [0xa2; 16];
+        let cache = Arc::new(ZeroRttSessionCache::default());
+        cache.store(cached_pfs_key, cached_ticket, 60);
+
+        let (client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let prewrite_len =
+                CLIENT_HELLO_IV_LEN + relays_length + ENCRYPTED_LENGTH_LEN + 32;
+            let mut prewrite = vec![0u8; prewrite_len];
+            server
+                .read_exact(&mut prewrite)
+                .await
+                .expect("random zero-rtt prewrite");
+
+            let iv: [u8; CLIENT_HELLO_IV_LEN] = prewrite[..CLIENT_HELLO_IV_LEN]
+                .try_into()
+                .expect("client IV");
+            let relay_start = CLIENT_HELLO_IV_LEN;
+            let relay_end = relay_start + relays_length;
+            let mut relay_public = prewrite[relay_start..relay_end].to_vec();
+            xor_vless_ctr(nfs_public.as_ref(), &iv, &mut relay_public)
+                .expect("random relay mask should reverse");
+            let relay_public =
+                agreement::UnparsedPublicKey::new(&agreement::X25519, relay_public);
+            let mut nfs_key = Vec::new();
+            agreement::agree(
+                &nfs_private,
+                relay_public,
+                invalid("server X25519 agreement failed"),
+                |material| {
+                    nfs_key.extend_from_slice(material);
+                    Ok(())
+                },
+            )
+            .expect("server NFS agreement");
+
+            let nfs_aead_key =
+                blake3_derive_key_raw_context(&iv, &nfs_key).expect("NFS AEAD key");
+            let mut nfs_aead =
+                EncryptionAead::new(&nfs_aead_key).expect("server NFS AEAD");
+            let ticket_len = nfs_aead
+                .open(&prewrite[relay_end..relay_end + ENCRYPTED_LENGTH_LEN])
+                .expect("ticket length decrypt");
+            assert_eq!(
+                u16::from_be_bytes(ticket_len.as_slice().try_into().unwrap()),
+                32
+            );
+            let ticket_start = relay_end + ENCRYPTED_LENGTH_LEN;
+            let encrypted_ticket = &prewrite[ticket_start..ticket_start + 32];
+            assert_eq!(
+                nfs_aead.open(encrypted_ticket).expect("ticket decrypt"),
+                cached_ticket
+            );
+
+            let mut united_key = cached_pfs_key.to_vec();
+            united_key.extend_from_slice(&nfs_key);
+            let upload_key =
+                blake3_derive_key_raw_context(encrypted_ticket, &united_key)
+                    .expect("upload key");
+            let mut upload_reader =
+                EncryptionRecordCodec::new(&upload_key, [0u8; 12])
+                    .expect("upload reader");
+            let mut upload_ctr =
+                VlessCtr::new(&united_key, &iv).expect("upload random CTR");
+
+            for expected in [b"ping".as_slice(), b"next".as_slice()] {
+                let mut header = [0u8; RECORD_HEADER_LEN];
+                server
+                    .read_exact(&mut header)
+                    .await
+                    .expect("masked upload header");
+                upload_ctr
+                    .apply(&mut header)
+                    .expect("upload header should unmask");
+                let body_len = decode_record_header(&header).expect("upload header");
+                let mut body = vec![0u8; body_len];
+                server.read_exact(&mut body).await.expect("upload body");
+                let mut record = header.to_vec();
+                record.extend_from_slice(&body);
+                assert_eq!(
+                    upload_reader.open_record(&record).expect("upload decrypt"),
+                    expected
+                );
+            }
+
+            let server_context = [0xb3; 16];
+            let download_key =
+                blake3_derive_key_raw_context(&server_context, &united_key)
+                    .expect("download key");
+            let mut download_writer =
+                EncryptionRecordCodec::new(&download_key, [0u8; 12])
+                    .expect("download writer");
+            let mut download_ctr = VlessCtr::new(&united_key, &server_context)
+                .expect("download random CTR");
+            let mut response = server_context.to_vec();
+            for plaintext in [b"pong".as_slice(), b"done".as_slice()] {
+                let mut record = download_writer
+                    .seal_record(plaintext)
+                    .expect("download encrypt");
+                download_ctr
+                    .apply(&mut record[..RECORD_HEADER_LEN])
+                    .expect("download header should mask");
+                response.extend_from_slice(&record);
+            }
+            server
+                .write_all(&response)
+                .await
+                .expect("random zero-rtt response");
+        });
+
+        let mut stream = EncryptionStream::new(
+            Box::new(client),
+            prepared,
+            Some(Arc::clone(&cache)),
+        )
+        .expect("random zero-rtt stream");
+        stream
+            .write_all(b"ping")
+            .await
+            .expect("first random upload");
+        stream
+            .write_all(b"next")
+            .await
+            .expect("second random upload");
+        let mut response = [0u8; 8];
+        stream
+            .read_exact(&mut response)
+            .await
+            .expect("random zero-rtt download");
+        assert_eq!(&response, b"pongdone");
+        assert!(cache.snapshot().is_some());
+
+        server_task.await.expect("server task");
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    #[tokio::test]
     async fn encryption_stream_zero_rtt_invalid_header_expires_matching_cache() {
         use std::sync::Arc;
 
@@ -3150,6 +3433,203 @@ mod tests {
             "unexpected error: {err}"
         );
         assert!(cache.snapshot().is_none());
+
+        server_task.await.expect("server task");
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    #[tokio::test]
+    async fn encrypted_vless_udp_round_trips_across_record_boundaries() {
+        use std::sync::Arc;
+
+        use aws_lc_rs::agreement;
+        use futures::{SinkExt, StreamExt};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        use super::super::{
+            datagram::OutboundDatagramVless, encryption_stream::EncryptionStream,
+            stream::VlessStream,
+        };
+        use crate::{proxy::datagram::UdpPacket, session::SocksAddr};
+
+        const TEST_UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
+
+        let nfs_private =
+            agreement::PrivateKey::generate(&agreement::X25519).unwrap();
+        let nfs_public = nfs_private.compute_public_key().unwrap();
+        let raw = format!(
+            "{METHOD}.native.0rtt.{}",
+            URL_SAFE_NO_PAD.encode(nfs_public.as_ref()),
+        );
+        let config = Config::parse(&raw).expect("0rtt config should parse");
+        let prepared = config.prepare_crypto().expect("crypto should prepare");
+        let relays_length = prepared.relays_length;
+        let cached_pfs_key = [0x81; ZERO_RTT_PFS_KEY_LEN];
+        let cached_ticket = [0x82; 16];
+        let cache = Arc::new(ZeroRttSessionCache::default());
+        cache.store(cached_pfs_key, cached_ticket, 60);
+
+        let destination: SocksAddr = "1.1.1.1:53".parse().expect("UDP destination");
+        let upload = (0..12_000)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let download = (0..9_000)
+            .map(|index| (255 - (index % 251)) as u8)
+            .collect::<Vec<_>>();
+        let expected_upload = upload.clone();
+        let expected_download = download.clone();
+
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            let prewrite_len =
+                CLIENT_HELLO_IV_LEN + relays_length + ENCRYPTED_LENGTH_LEN + 32;
+            let mut prewrite = vec![0u8; prewrite_len];
+            server
+                .read_exact(&mut prewrite)
+                .await
+                .expect("zero-rtt prewrite");
+
+            let relay_start = CLIENT_HELLO_IV_LEN;
+            let relay_end = relay_start + relays_length;
+            let relay_public = agreement::UnparsedPublicKey::new(
+                &agreement::X25519,
+                &prewrite[relay_start..relay_end],
+            );
+            let mut nfs_key = Vec::new();
+            agreement::agree(
+                &nfs_private,
+                relay_public,
+                invalid("server X25519 agreement failed"),
+                |material| {
+                    nfs_key.extend_from_slice(material);
+                    Ok(())
+                },
+            )
+            .expect("server NFS agreement");
+
+            let nfs_aead_key = blake3_derive_key_raw_context(
+                &prewrite[..CLIENT_HELLO_IV_LEN],
+                &nfs_key,
+            )
+            .expect("server NFS AEAD key");
+            let mut nfs_aead =
+                EncryptionAead::new(&nfs_aead_key).expect("server NFS AEAD");
+            let ticket_len = nfs_aead
+                .open(&prewrite[relay_end..relay_end + ENCRYPTED_LENGTH_LEN])
+                .expect("ticket length decrypt");
+            assert_eq!(
+                u16::from_be_bytes(ticket_len.as_slice().try_into().unwrap()),
+                32
+            );
+            let ticket_start = relay_end + ENCRYPTED_LENGTH_LEN;
+            let encrypted_ticket = &prewrite[ticket_start..ticket_start + 32];
+            assert_eq!(
+                nfs_aead.open(encrypted_ticket).expect("ticket decrypt"),
+                cached_ticket
+            );
+
+            let mut united_key = cached_pfs_key.to_vec();
+            united_key.extend_from_slice(&nfs_key);
+            let upload_key =
+                blake3_derive_key_raw_context(encrypted_ticket, &united_key)
+                    .expect("upload record key");
+            let mut upload_reader =
+                EncryptionRecordCodec::new(&upload_key, [0u8; 12])
+                    .expect("upload reader");
+
+            // IPv4 VLESS request header is 26 bytes here, followed by the
+            // two-byte UDP packet length and its payload. The encrypted stream
+            // must preserve this byte sequence even though it spans records.
+            let expected_plain_len = 26 + 2 + expected_upload.len();
+            let mut plaintext = Vec::with_capacity(expected_plain_len);
+            while plaintext.len() < expected_plain_len {
+                let mut header = [0u8; RECORD_HEADER_LEN];
+                server
+                    .read_exact(&mut header)
+                    .await
+                    .expect("upload record header");
+                let body_len = decode_record_header(&header).expect("upload header");
+                let mut body = vec![0u8; body_len];
+                server
+                    .read_exact(&mut body)
+                    .await
+                    .expect("upload record body");
+                let mut record = header.to_vec();
+                record.extend_from_slice(&body);
+                plaintext.extend_from_slice(
+                    &upload_reader
+                        .open_record(&record)
+                        .expect("upload record decrypt"),
+                );
+            }
+
+            assert_eq!(plaintext.len(), expected_plain_len);
+            assert_eq!(plaintext[0], 0, "VLESS version");
+            assert_eq!(plaintext[17], 0, "no request addons");
+            assert_eq!(plaintext[18], 2, "VLESS UDP command");
+            assert_eq!(u16::from_be_bytes([plaintext[19], plaintext[20]]), 53);
+            assert_eq!(plaintext[21], 1, "IPv4 address type");
+            assert_eq!(&plaintext[22..26], &[1, 1, 1, 1]);
+            assert_eq!(
+                u16::from_be_bytes([plaintext[26], plaintext[27]]) as usize,
+                expected_upload.len()
+            );
+            assert_eq!(&plaintext[28..], expected_upload);
+
+            let server_context = [0x83; 16];
+            let download_key =
+                blake3_derive_key_raw_context(&server_context, &united_key)
+                    .expect("download record key");
+            let mut download_writer =
+                EncryptionRecordCodec::new(&download_key, [0u8; 12])
+                    .expect("download writer");
+
+            let mut response_plain = vec![0, 0]; // VLESS response header.
+            response_plain
+                .extend_from_slice(&(expected_download.len() as u16).to_be_bytes());
+            response_plain.extend_from_slice(&expected_download);
+
+            server
+                .write_all(&server_context)
+                .await
+                .expect("zero-rtt server context");
+            for chunk in response_plain.chunks(MAX_RECORD_PLAINTEXT_LEN) {
+                let record = download_writer
+                    .seal_record(chunk)
+                    .expect("download record encrypt");
+                server.write_all(&record).await.expect("download record");
+            }
+        });
+
+        let encryption_stream = EncryptionStream::new(
+            Box::new(client),
+            prepared,
+            Some(Arc::clone(&cache)),
+        )
+        .expect("zero-rtt stream");
+        let vless_stream = VlessStream::new(
+            Box::new(encryption_stream),
+            TEST_UUID,
+            &destination,
+            true,
+            None,
+        )
+        .expect("VLESS UDP stream");
+        let mut datagram =
+            OutboundDatagramVless::new(Box::new(vless_stream), destination.clone());
+
+        datagram
+            .send(UdpPacket {
+                data: upload,
+                src_addr: destination.clone(),
+                dst_addr: destination.clone(),
+                inbound_user: None,
+            })
+            .await
+            .expect("encrypted UDP upload");
+
+        let response = datagram.next().await.expect("encrypted UDP response");
+        assert_eq!(response.data, download);
 
         server_task.await.expect("server task");
     }

@@ -14,7 +14,7 @@ use tokio::{
 
 use super::encryption::{
     EncryptionRecordCodec, PreparedCrypto, PreparedOneRttSession,
-    PreparedZeroRttSession, RttMode, ZeroRttSessionCache,
+    PreparedZeroRttSession, RttMode, VlessCtr, ZeroRttSessionCache,
 };
 use crate::proxy::AnyStream;
 
@@ -164,6 +164,7 @@ enum RuntimeMode {
         server_context: PendingIo,
         peer_confirmed: bool,
         prewrite: Option<Vec<u8>>,
+        random: bool,
     },
 }
 
@@ -178,6 +179,8 @@ pub(crate) struct EncryptionStream {
     server_padding_len: PendingIo,
     write_codec: Option<EncryptionRecordCodec>,
     read_codec: Option<EncryptionRecordCodec>,
+    random_write_ctr: Option<VlessCtr>,
+    random_read_ctr: Option<VlessCtr>,
     peer_padding: Option<PendingIo>,
     handshake_done: bool,
     pending_write: Option<PendingRecordWrite>,
@@ -262,13 +265,10 @@ impl EncryptionStream {
         prepared: PreparedCrypto,
         zero_rtt_cache: Option<Arc<ZeroRttSessionCache>>,
     ) -> io::Result<Self> {
-        if prepared.xor_mode != 0 {
-            return Err(invalid(
-                "VLESS encryption runtime MVP currently supports only native appearance",
-            ));
-        }
-
-        let (mode, hello, prepared, write_codec) = match prepared.rtt {
+        let random_appearance = prepared.xor_mode == 2;
+        let (mode, hello, prepared, write_codec, random_write_ctr) = match prepared
+            .rtt
+        {
             RttMode::OneRtt => {
                 let hello = prepared.one_rtt_hello.as_ref().ok_or_else(|| {
                     invalid("VLESS encryption runtime lost 1rtt fallback hello")
@@ -285,6 +285,7 @@ impl EncryptionStream {
                     Some(pending_hello),
                     Some(prepared),
                     None,
+                    None,
                 )
             }
             RttMode::ZeroRtt => {
@@ -294,6 +295,14 @@ impl EncryptionStream {
                 if let Some(cached) = zero_rtt_cache.snapshot() {
                     let mut zero_rtt = prepared.prepare_zero_rtt(&cached)?;
                     let write_codec = zero_rtt.write_codec()?;
+                    let random_write_ctr = if random_appearance {
+                        Some(VlessCtr::new(
+                            &zero_rtt.united_key,
+                            &prepared.nfs_relays.iv,
+                        )?)
+                    } else {
+                        None
+                    };
                     let prewrite = Some(std::mem::take(&mut zero_rtt.prewrite));
                     (
                         RuntimeMode::ZeroRtt {
@@ -302,10 +311,12 @@ impl EncryptionStream {
                             server_context: PendingIo::with_len(16),
                             peer_confirmed: false,
                             prewrite,
+                            random: random_appearance,
                         },
                         None,
                         None,
                         Some(write_codec),
+                        random_write_ctr,
                     )
                 } else {
                     let hello =
@@ -326,6 +337,7 @@ impl EncryptionStream {
                         Some(pending_hello),
                         Some(prepared),
                         None,
+                        None,
                     )
                 }
             }
@@ -342,6 +354,8 @@ impl EncryptionStream {
             server_padding_len: PendingIo::with_len(ENCRYPTED_LENGTH_LEN),
             write_codec,
             read_codec: None,
+            random_write_ctr,
+            random_read_ctr: None,
             peer_padding: None,
             handshake_done: false,
             pending_write: None,
@@ -419,6 +433,28 @@ impl EncryptionStream {
             &self.server_padding_len.data,
         )?;
         let (write_codec, read_codec) = session.record_codecs(&tail)?;
+        let random_ctrs = if self
+            .prepared
+            .as_ref()
+            .is_some_and(|prepared| prepared.xor_mode == 2)
+        {
+            let client_iv = self
+                .prepared
+                .as_ref()
+                .ok_or_else(|| {
+                    io::Error::other(
+                        "VLESS encryption runtime lost random appearance context",
+                    )
+                })?
+                .nfs_relays
+                .iv;
+            Some((
+                VlessCtr::new(&session.united_key, &client_iv)?,
+                VlessCtr::new(&session.united_key, &tail.ticket)?,
+            ))
+        } else {
+            None
+        };
         if let RuntimeMode::OneRtt {
             zero_rtt_cache: Some(cache),
         } = &self.mode
@@ -430,6 +466,10 @@ impl EncryptionStream {
             Some(PendingIo::with_len(tail.peer_padding_ciphertext_len));
         self.write_codec = Some(write_codec);
         self.read_codec = Some(read_codec);
+        if let Some((write_ctr, read_ctr)) = random_ctrs {
+            self.random_write_ctr = Some(write_ctr);
+            self.random_read_ctr = Some(read_ctr);
+        }
         self.prepared = None;
         self.session = None;
         self.handshake_done = true;
@@ -446,6 +486,7 @@ impl EncryptionStream {
         let RuntimeMode::ZeroRtt {
             prepared,
             server_context,
+            random,
             ..
         } = &mut self.mode
         else {
@@ -466,6 +507,10 @@ impl EncryptionStream {
                 io::Error::other("invalid VLESS zero-RTT server context")
             })?;
         self.read_codec = Some(prepared.read_codec(server_context)?);
+        if *random {
+            self.random_read_ctr =
+                Some(VlessCtr::new(&prepared.united_key, &server_context)?);
+        }
         Poll::Ready(Ok(()))
     }
 
@@ -576,9 +621,28 @@ impl AsyncWrite for EncryptionStream {
                 Ok(wire) => wire,
                 Err(err) => return Poll::Ready(Err(err)),
             };
-            if let Some(mut prewrite) = self.take_zero_rtt_prewrite() {
-                prewrite.extend_from_slice(&wire);
-                wire = prewrite;
+            let header_offset =
+                if let Some(mut prewrite) = self.take_zero_rtt_prewrite() {
+                    let header_offset = prewrite.len();
+                    prewrite.extend_from_slice(&wire);
+                    wire = prewrite;
+                    header_offset
+                } else {
+                    0
+                };
+            if let Some(ctr) = self.random_write_ctr.as_mut() {
+                let header_end =
+                    header_offset.checked_add(RECORD_HEADER_LEN).ok_or_else(
+                        || io::Error::other("random record header overflow"),
+                    )?;
+                if header_end > wire.len() {
+                    return Poll::Ready(Err(io::Error::other(
+                        "random record header is truncated",
+                    )));
+                }
+                if let Err(err) = ctr.apply(&mut wire[header_offset..header_end]) {
+                    return Poll::Ready(Err(err));
+                }
             }
             self.pending_write = Some(PendingRecordWrite {
                 wire: PendingIo::from_data(wire),
@@ -799,6 +863,13 @@ impl AsyncRead for EncryptionStream {
         }
 
         if self.read_ciphertext.is_none() {
+            if let Some(mut ctr) = self.random_read_ctr.take() {
+                let result = ctr.apply(&mut self.read_header.data);
+                self.random_read_ctr = Some(ctr);
+                if let Err(err) = result {
+                    return Poll::Ready(Err(err));
+                }
+            }
             let len = match decode_record_len(&self.read_header.data) {
                 Ok(len) => len,
                 Err(err) => {

@@ -16,11 +16,7 @@ use crate::{
             XhttpUplinkDataPlacement,
         },
         vless::{
-            Handler, HandlerOptions,
-            encryption::{
-                Appearance as VlessEncryptionAppearance,
-                Config as VlessEncryptionConfig,
-            },
+            Handler, HandlerOptions, encryption::Config as VlessEncryptionConfig,
         },
     },
 };
@@ -115,17 +111,6 @@ fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
                         "invalid vless encryption config: {err}"
                     ))
                 })?;
-            if parsed.appearance != VlessEncryptionAppearance::Native {
-                return Err(Error::InvalidConfig(
-                    "VLESS encryption runtime MVP currently supports only native appearance; xorpub/random are TODO"
-                        .to_owned(),
-                ));
-            }
-            if s.flow.as_deref() == Some("xtls-rprx-vision") {
-                return Err(Error::InvalidConfig(
-                    "VLESS encryption with xtls-rprx-vision is TODO".to_owned(),
-                ));
-            }
             #[cfg(feature = "vless-encryption")]
             parsed.validate_crypto_keys().map_err(|err| {
                 Error::InvalidConfig(format!(
@@ -2140,30 +2125,55 @@ mod tests {
     }
 
     #[test]
-    fn vless_encryption_mvp_rejects_random_appearance() {
+    fn vless_accepts_xorpub_encryption_runtime() {
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
         let key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
         let outbound = OutboundVless {
             common_opts: CommonConfigOptions {
-                name: "encrypted-vless-todo".to_owned(),
+                name: "encrypted-vless-xorpub".to_owned(),
                 server: "example.com".to_owned(),
                 port: 443,
                 connect_via: None,
             },
             uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
             encryption: Some(format!(
-                "mlkem768x25519plus.random.1rtt.100-200-300.{key}"
+                "mlkem768x25519plus.xorpub.0rtt.100-200-300.{key}"
             )),
             ..Default::default()
         };
 
-        let err = validate_vless_config(&outbound)
-            .expect_err("unsupported appearance must fail explicitly");
-        assert!(
-            err.to_string().contains("supports only native appearance"),
-            "unexpected error: {err}"
-        );
+        validate_vless_config(&outbound)
+            .expect("xorpub encryption runtime should validate");
+        crate::proxy::vless::Handler::try_from(&outbound)
+            .expect("xorpub encryption handler should build");
+    }
+
+    #[test]
+    fn vless_accepts_random_encryption_runtime() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
+        for rtt in ["1rtt", "0rtt"] {
+            let outbound = OutboundVless {
+                common_opts: CommonConfigOptions {
+                    name: format!("encrypted-vless-random-{rtt}"),
+                    server: "example.com".to_owned(),
+                    port: 443,
+                    connect_via: None,
+                },
+                uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+                encryption: Some(format!(
+                    "mlkem768x25519plus.random.{rtt}.100-200-300.{key}"
+                )),
+                ..Default::default()
+            };
+
+            validate_vless_config(&outbound)
+                .expect("random encryption runtime should validate");
+            crate::proxy::vless::Handler::try_from(&outbound)
+                .expect("random encryption handler should build");
+        }
     }
 
     #[test]
@@ -2231,6 +2241,35 @@ mod tests {
 
         validate_vless_config(&outbound)
             .expect("vision flow should remain supported");
+    }
+
+    #[test]
+    fn vless_accepts_encryption_with_vision_flow() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
+        for appearance in ["native", "xorpub", "random"] {
+            let outbound = OutboundVless {
+                common_opts: CommonConfigOptions {
+                    name: format!("encrypted-vision-{appearance}"),
+                    server: "example.com".to_owned(),
+                    port: 443,
+                    connect_via: None,
+                },
+                uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+                tls: Some(true),
+                flow: Some("xtls-rprx-vision".to_owned()),
+                encryption: Some(format!(
+                    "mlkem768x25519plus.{appearance}.1rtt.100-200-300.{key}"
+                )),
+                ..Default::default()
+            };
+
+            validate_vless_config(&outbound)
+                .expect("encrypted Vision config should validate");
+            crate::proxy::vless::Handler::try_from(&outbound)
+                .expect("encrypted Vision handler should build");
+        }
     }
 
     #[test]
