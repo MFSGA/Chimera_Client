@@ -267,8 +267,23 @@ impl AsyncRead for VlessStream {
         // bytes are followed by Vision-framed body data in the same stream.
         let vision_flow = self.flow.as_deref() == Some(XTLS_VISION_FLOW);
 
+        // Server-first protocols may read before the application has written
+        // any payload. The VLESS request header still has to be sent first so
+        // the server learns the destination and can establish the upstream
+        // connection.
+        if !self.handshake_sent {
+            if self.pending_write.is_none() {
+                self.prepare_handshake_with_data(&[]);
+            }
+            match self.poll_send_pending_handshake(cx) {
+                Poll::Ready(Ok(_)) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
         // Must receive response before reading for non-Vision flows.
-        if self.handshake_sent && !self.response_received && !vision_flow {
+        if !self.response_received && !vision_flow {
             match self.poll_receive_response(cx) {
                 Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -372,6 +387,40 @@ mod tests {
 
         assert_eq!(&received[..expected_header.len()], expected_header);
         assert_eq!(&received[expected_header.len()..], payload);
+    }
+
+    #[tokio::test]
+    async fn read_first_sends_vless_handshake_for_server_first_protocols() {
+        let (client, mut server) = tokio::io::duplex(1024);
+        let mut stream = test_stream(client, None);
+        let expected_header = stream.build_handshake_header().to_vec();
+
+        let server_task = tokio::spawn(async move {
+            let mut request = vec![0u8; expected_header.len()];
+            server
+                .read_exact(&mut request)
+                .await
+                .expect("server should receive VLESS request header before banner");
+            assert_eq!(request, expected_header);
+
+            server
+                .write_all(&[0, 0])
+                .await
+                .expect("VLESS response header");
+            server
+                .write_all(b"SSH-2.0-test\r\n")
+                .await
+                .expect("server-first banner");
+        });
+
+        let mut banner = vec![0u8; b"SSH-2.0-test\r\n".len()];
+        stream
+            .read_exact(&mut banner)
+            .await
+            .expect("server-first banner should arrive after implicit handshake");
+
+        assert_eq!(&banner, b"SSH-2.0-test\r\n");
+        server_task.await.expect("server task");
     }
 
     #[tokio::test]

@@ -14,7 +14,7 @@ use crate::{
     session::SocksAddr,
 };
 
-const MAX_PACKET_LENGTH: usize = 1024 << 3; // 8KB max packet length
+const MAX_PACKET_LENGTH: usize = u16::MAX as usize;
 
 pub struct OutboundDatagramVless {
     inner: AnyStream,
@@ -104,20 +104,22 @@ impl Sink<UdpPacket> for OutboundDatagramVless {
             ));
         }
 
-        // Handle large packets by chunking them
         let total_len = item.data.len();
         if total_len == 0 {
             return Ok(()); // Skip empty packets
         }
+        if total_len > MAX_PACKET_LENGTH {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "VLESS UDP packet too large: {total_len} > {MAX_PACKET_LENGTH}"
+                ),
+            ));
+        }
 
-        // For now, handle first chunk or small packets
-        let chunk_size = if total_len <= MAX_PACKET_LENGTH {
-            total_len
-        } else {
-            MAX_PACKET_LENGTH
-        };
-
-        this.write_packet(&item.data[..chunk_size])?;
+        // A UDP datagram is atomic. Splitting it into multiple VLESS frames
+        // would change packet boundaries, so encode the whole datagram once.
+        this.write_packet(&item.data)?;
         this.pending_packet = Some(item);
         this.flushed = false;
 
@@ -272,5 +274,63 @@ impl Stream for OutboundDatagramVless {
                 // Partial read: loop and continue accumulating.
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::SinkExt;
+    use tokio::io::AsyncReadExt;
+
+    use super::{MAX_PACKET_LENGTH, OutboundDatagramVless};
+    use crate::{proxy::datagram::UdpPacket, session::SocksAddr};
+
+    fn packet(data: Vec<u8>) -> UdpPacket {
+        let addr: SocksAddr = "1.1.1.1:53".parse().expect("test address");
+        UdpPacket {
+            data,
+            src_addr: addr.clone(),
+            dst_addr: addr,
+            inbound_user: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_datagram_larger_than_8k_is_not_truncated() {
+        let (client, mut server) = tokio::io::duplex(128 * 1024);
+        let remote: SocksAddr = "1.1.1.1:53".parse().expect("test address");
+        let mut datagram = OutboundDatagramVless::new(Box::new(client), remote);
+        let payload = vec![0x5a; 9 * 1024];
+
+        datagram
+            .send(packet(payload.clone()))
+            .await
+            .expect("large valid datagram should send");
+
+        let mut length = [0u8; 2];
+        server.read_exact(&mut length).await.expect("length header");
+        assert_eq!(u16::from_be_bytes(length) as usize, payload.len());
+
+        let mut received = vec![0u8; payload.len()];
+        server
+            .read_exact(&mut received)
+            .await
+            .expect("full datagram");
+        assert_eq!(received, payload);
+    }
+
+    #[tokio::test]
+    async fn udp_datagram_above_u16_frame_limit_is_rejected() {
+        let (client, _server) = tokio::io::duplex(1024);
+        let remote: SocksAddr = "1.1.1.1:53".parse().expect("test address");
+        let mut datagram = OutboundDatagramVless::new(Box::new(client), remote);
+
+        let err = datagram
+            .send(packet(vec![0u8; MAX_PACKET_LENGTH + 1]))
+            .await
+            .expect_err("oversized datagram must fail instead of truncating");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("VLESS UDP packet too large"));
     }
 }

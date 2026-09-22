@@ -15,7 +15,9 @@ use crate::{
             XhttpSecurity, XhttpSessionIdConfig, XhttpUplinkConfig,
             XhttpUplinkDataPlacement,
         },
-        vless::{Handler, HandlerOptions},
+        vless::{
+            Handler, HandlerOptions, encryption::Config as VlessEncryptionConfig,
+        },
     },
 };
 #[cfg(feature = "reality")]
@@ -85,6 +87,39 @@ fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
                 "unsupported vless flow: {flow}"
             )));
         }
+    }
+
+    if let Some(encryption) = s.encryption.as_deref() {
+        let encryption = encryption.trim();
+        if !encryption.is_empty() && encryption != "none" {
+            let parsed =
+                VlessEncryptionConfig::parse(encryption).map_err(|err| {
+                    Error::InvalidConfig(format!(
+                        "invalid vless encryption config: {err}"
+                    ))
+                })?;
+            #[cfg(feature = "aws-lc-rs")]
+            parsed.validate_crypto_keys().map_err(|err| {
+                Error::InvalidConfig(format!(
+                    "invalid vless encryption crypto key: {err}"
+                ))
+            })?;
+            return Err(Error::InvalidConfig(format!(
+                "vless encryption config is valid ({}) but runtime handshake support is not implemented yet",
+                parsed.summary()
+            )));
+        }
+    }
+
+    if s.reality_opts
+        .as_ref()
+        .and_then(|opts| opts.support_x25519mlkem768)
+        .unwrap_or(false)
+    {
+        return Err(Error::InvalidConfig(
+            "vless reality support-x25519mlkem768 is parsed but hybrid KEM runtime support is not implemented yet"
+                .to_owned(),
+        ));
     }
 
     match (&s.certificate, &s.private_key) {
@@ -1889,6 +1924,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: Some("85144f63".to_owned()),
+                support_x25519mlkem768: None,
             }),
             ..Default::default()
         };
@@ -1912,6 +1948,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: None,
+                support_x25519mlkem768: None,
             }),
             ..Default::default()
         };
@@ -1942,6 +1979,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: None,
+                support_x25519mlkem768: None,
             }),
             ..Default::default()
         };
@@ -1976,6 +2014,105 @@ mod tests {
             err.to_string().contains(
                 "client-fingerprint is not implemented for non-reality TLS"
             ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vless_accepts_default_encryption_values() {
+        for encryption in ["", "none"] {
+            let outbound = OutboundVless {
+                common_opts: CommonConfigOptions {
+                    name: "encryption-default".to_owned(),
+                    server: "example.com".to_owned(),
+                    port: 443,
+                    connect_via: None,
+                },
+                uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+                encryption: Some(encryption.to_owned()),
+                ..Default::default()
+            };
+
+            validate_vless_config(&outbound).unwrap_or_else(|err| {
+                panic!("default encryption '{encryption}' should pass: {err}")
+            });
+        }
+    }
+
+    #[test]
+    fn vless_rejects_malformed_encryption_before_runtime_check() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "encrypted-vless".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            encryption: Some("mlkem768x25519plus.native".to_owned()),
+            ..Default::default()
+        };
+
+        let err = validate_vless_config(&outbound)
+            .expect_err("malformed VLESS Encryption must be rejected");
+        assert!(
+            err.to_string().contains("invalid vless encryption config"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vless_recognizes_valid_encryption_before_runtime_rejection() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "encrypted-vless".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            encryption: Some(format!(
+                "mlkem768x25519plus.native.1rtt.100-200.{key}"
+            )),
+            ..Default::default()
+        };
+
+        let err = validate_vless_config(&outbound)
+            .expect_err("runtime handshake is not implemented yet");
+        assert!(
+            err.to_string().contains(
+                "vless encryption config is valid (native.1rtt; padding-blocks=1; x25519-keys=1; mlkem768-keys=0)"
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vless_reality_rejects_unimplemented_hybrid_kem() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "reality-hybrid".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            reality_opts: Some(OutboundTrojanRealityOpts {
+                public_key: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+                    .to_owned(),
+                short_id: None,
+                support_x25519mlkem768: Some(true),
+            }),
+            ..Default::default()
+        };
+
+        let err = validate_vless_config(&outbound)
+            .expect_err("Reality hybrid KEM must not be silently ignored");
+        assert!(
+            err.to_string().contains("support-x25519mlkem768"),
             "unexpected error: {err}"
         );
     }
@@ -2131,6 +2268,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: Some("85144f63".to_owned()),
+                support_x25519mlkem768: None,
             }),
             xhttp_opts: Some(XhttpOpt {
                 mode: Some("packet-up".to_owned()),
@@ -2431,6 +2569,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: None,
+                support_x25519mlkem768: None,
             }),
             xhttp_opts: Some(XhttpOpt {
                 mode: Some("stream-one".to_owned()),
@@ -2576,6 +2715,7 @@ mod tests {
                 public_key: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
                     .to_owned(),
                 short_id: None,
+                support_x25519mlkem768: None,
             }),
             ..Default::default()
         };
@@ -2840,6 +2980,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: None,
+                support_x25519mlkem768: None,
             }),
             ..Default::default()
         };
@@ -4113,6 +4254,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: None,
+                support_x25519mlkem768: None,
             }),
             xhttp_opts: Some(XhttpOpt {
                 path: Some("/xhttp/".to_owned()),
@@ -4122,6 +4264,7 @@ mod tests {
                     reality_opts: Some(OutboundTrojanRealityOpts {
                         public_key: String::new(),
                         short_id: None,
+                        support_x25519mlkem768: None,
                     }),
                     ..Default::default()
                 }),
@@ -4172,6 +4315,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: None,
+                support_x25519mlkem768: None,
             }),
             xhttp_opts: Some(XhttpOpt {
                 download_settings: Some(XhttpDownloadSettings {
@@ -4179,6 +4323,7 @@ mod tests {
                     reality_opts: Some(OutboundTrojanRealityOpts {
                         public_key: String::new(),
                         short_id: None,
+                        support_x25519mlkem768: None,
                     }),
                     ..Default::default()
                 }),
@@ -4300,6 +4445,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: None,
+                support_x25519mlkem768: None,
             }),
             ..Default::default()
         };
@@ -4341,6 +4487,7 @@ mod tests {
                     reality_opts: Some(OutboundTrojanRealityOpts {
                         public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                         short_id: None,
+                        support_x25519mlkem768: None,
                     }),
                     ..Default::default()
                 }),
@@ -4404,6 +4551,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: None,
+                support_x25519mlkem768: None,
             }),
             ..Default::default()
         };

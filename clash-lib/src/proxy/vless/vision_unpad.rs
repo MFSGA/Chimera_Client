@@ -31,6 +31,7 @@ pub struct UnpadResult {
 enum UnpadState {
     Initial {
         expected_uuid: [u8; 16],
+        partial_uuid: Vec<u8>,
     },
     ReadingCommand,
     ReadingContentLength {
@@ -67,7 +68,10 @@ pub struct VisionUnpadder {
 impl VisionUnpadder {
     pub fn new(expected_uuid: [u8; 16]) -> Self {
         Self {
-            state: UnpadState::Initial { expected_uuid },
+            state: UnpadState::Initial {
+                expected_uuid,
+                partial_uuid: Vec::with_capacity(16),
+            },
             first_block: true,
             accumulated_buffer: Vec::new(),
         }
@@ -94,18 +98,30 @@ impl VisionUnpadder {
 
         loop {
             match &mut self.state {
-                UnpadState::Initial { expected_uuid } => {
-                    if data.len() < 16 {
+                UnpadState::Initial {
+                    expected_uuid,
+                    partial_uuid,
+                } => {
+                    let needed = 16usize.saturating_sub(partial_uuid.len());
+                    let take = needed.min(data.len());
+                    partial_uuid.extend_from_slice(&data[..take]);
+                    data = &data[take..];
+
+                    if partial_uuid.len() < 16 {
                         return Ok(UnpadResult::default());
                     }
-                    if &data[..16] != expected_uuid {
+
+                    if partial_uuid.as_slice() != expected_uuid {
+                        let mut content = std::mem::take(partial_uuid);
+                        content.extend_from_slice(data);
                         self.state = UnpadState::Passthrough;
                         return Ok(UnpadResult {
-                            content: data.to_vec(),
+                            content,
                             command: None,
                         });
                     }
-                    data = &data[16..];
+
+                    partial_uuid.clear();
                     self.state = UnpadState::ReadingCommand;
                 }
                 UnpadState::ReadingCommand => {
@@ -272,6 +288,50 @@ impl VisionUnpadder {
 #[cfg(test)]
 mod tests {
     use super::VisionUnpadder;
+
+    #[test]
+    fn fragmented_initial_uuid_is_buffered_until_complete() {
+        let expected_uuid = [0x11; 16];
+        let mut unpadder = VisionUnpadder::new(expected_uuid);
+
+        let first_result = unpadder
+            .unpad(&expected_uuid[..8])
+            .expect("first UUID fragment");
+        assert!(first_result.content.is_empty());
+        assert!(first_result.command.is_none());
+        assert!(unpadder.is_waiting_for_uuid());
+
+        let mut second = expected_uuid[8..].to_vec();
+        second.push(0); // Continue
+        second.extend_from_slice(&5u16.to_be_bytes());
+        second.extend_from_slice(&0u16.to_be_bytes());
+        second.extend_from_slice(b"hello");
+
+        let second_result = unpadder.unpad(&second).expect("second UUID fragment");
+        assert_eq!(second_result.content, b"hello");
+        assert_eq!(second_result.command, Some(super::UnpadCommand::Continue));
+        assert!(!unpadder.is_waiting_for_uuid());
+    }
+
+    #[test]
+    fn fragmented_uuid_mismatch_preserves_all_passthrough_bytes() {
+        let expected_uuid = [0x11; 16];
+        let mut unpadder = VisionUnpadder::new(expected_uuid);
+        let first = [0x22; 8];
+
+        let first_result = unpadder.unpad(&first).expect("first fragment");
+        assert!(first_result.content.is_empty());
+
+        let mut second = vec![0x22; 8];
+        second.extend_from_slice(b"payload");
+        let second_result = unpadder.unpad(&second).expect("second fragment");
+
+        let mut expected = first.to_vec();
+        expected.extend_from_slice(&second);
+        assert_eq!(second_result.content, expected);
+        assert!(second_result.command.is_none());
+        assert!(!unpadder.is_waiting_for_uuid());
+    }
 
     #[test]
     fn uuid_mismatch_switches_to_permanent_passthrough() {
