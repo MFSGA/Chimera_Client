@@ -308,6 +308,8 @@ pub struct Client {
     min_posts_interval_ms: Option<u64>,
     download: Option<XhttpDownloadConfig>,
     upload_endpoint: Option<XhttpEndpointConfig>,
+    upload_ech_config: Option<Vec<u8>>,
+    download_ech_config: Option<Vec<u8>>,
     auto_reality: bool,
     metadata: XhttpMetadataConfig,
     uplink: XhttpUplinkConfig,
@@ -358,6 +360,8 @@ impl Client {
             min_posts_interval_ms,
             download,
             upload_endpoint: None,
+            upload_ech_config: None,
+            download_ech_config: None,
             auto_reality: false,
             metadata: XhttpMetadataConfig::default(),
             uplink: XhttpUplinkConfig::default(),
@@ -380,6 +384,16 @@ impl Client {
         upload_endpoint: Option<XhttpEndpointConfig>,
     ) -> Self {
         self.upload_endpoint = upload_endpoint;
+        self
+    }
+
+    pub fn with_ech_configs(
+        mut self,
+        upload_ech_config: Option<Vec<u8>>,
+        download_ech_config: Option<Vec<u8>>,
+    ) -> Self {
+        self.upload_ech_config = upload_ech_config;
+        self.download_ech_config = download_ech_config;
         self
     }
 
@@ -563,9 +577,10 @@ impl From<&XhttpDownloadConfig> for XhttpEndpointConfig {
     }
 }
 
-async fn secure_endpoint_stream(
+async fn secure_endpoint_stream_with_ech(
     config: &XhttpEndpointConfig,
     stream: AnyStream,
+    ech_config: Option<&[u8]>,
 ) -> io::Result<AnyStream> {
     match config.security {
         XhttpSecurity::None => Ok(stream),
@@ -580,6 +595,7 @@ async fn secure_endpoint_stream(
                     config.fingerprint.clone(),
                 )
                 .with_verify_name(config.verify_name.clone())
+                .with_ech_config(ech_config.map(ToOwned::to_owned))?
                 .with_client_auth(config.tls_cert.clone(), config.tls_key.clone())?;
                 tls.proxy_stream(stream).await
             }
@@ -622,6 +638,13 @@ async fn secure_endpoint_stream(
 async fn connect_endpoint_stream(
     config: &XhttpEndpointConfig,
 ) -> io::Result<AnyStream> {
+    connect_endpoint_stream_with_ech(config, None).await
+}
+
+async fn connect_endpoint_stream_with_ech(
+    config: &XhttpEndpointConfig,
+    ech_config: Option<&[u8]>,
+) -> io::Result<AnyStream> {
     let endpoint = tokio::net::lookup_host((config.server.as_str(), config.port))
         .await?
         .next()
@@ -637,13 +660,22 @@ async fn connect_endpoint_stream(
         so_mark,
     )
     .await?;
-    secure_endpoint_stream(config, Box::new(tcp)).await
+    secure_endpoint_stream_with_ech(config, Box::new(tcp), ech_config).await
 }
 
+#[cfg(test)]
 async fn connect_download_stream(
     config: &XhttpDownloadConfig,
 ) -> io::Result<AnyStream> {
-    connect_endpoint_stream(&XhttpEndpointConfig::from(config)).await
+    connect_download_stream_with_ech(config, None).await
+}
+
+async fn connect_download_stream_with_ech(
+    config: &XhttpDownloadConfig,
+    ech_config: Option<&[u8]>,
+) -> io::Result<AnyStream> {
+    connect_endpoint_stream_with_ech(&XhttpEndpointConfig::from(config), ech_config)
+        .await
 }
 
 async fn connect_plain_stream(server: &str, port: u16) -> io::Result<AnyStream> {
@@ -672,7 +704,11 @@ async fn acquire_download_sender(
     Option<Arc<AtomicU64>>,
 )> {
     let Some(reuse_policy) = download.reuse_policy.as_ref() else {
-        let stream = connect_download_stream(download).await?;
+        let stream = connect_download_stream_with_ech(
+            download,
+            client.download_ech_config.as_deref(),
+        )
+        .await?;
         let sender = handshake_http2(stream, None).await?;
         return Ok((sender, None, None));
     };
@@ -699,7 +735,11 @@ async fn acquire_download_sender(
         ));
     }
 
-    let stream = connect_download_stream(download).await?;
+    let stream = connect_download_stream_with_ech(
+        download,
+        client.download_ech_config.as_deref(),
+    )
+    .await?;
     let sender =
         handshake_http2(stream, Some(reuse_policy.h_keep_alive_period)).await?;
 
@@ -1409,6 +1449,7 @@ async fn connect_h3_sender(
     sess: &Session,
     resolver: ThreadSafeDNSResolver,
     connector: &dyn RemoteConnector,
+    ech_config: Option<&[u8]>,
     keep_alive_period: Option<i64>,
 ) -> io::Result<H3SendRequest> {
     if !matches!(endpoint_config.security, XhttpSecurity::Tls) {
@@ -1426,6 +1467,7 @@ async fn connect_h3_sender(
         endpoint_config.fingerprint.clone(),
     )
     .with_verify_name(endpoint_config.verify_name.clone())
+    .with_ech_config(ech_config.map(ToOwned::to_owned))?
     .with_client_auth(
         endpoint_config.tls_cert.clone(),
         endpoint_config.tls_key.clone(),
@@ -1548,6 +1590,7 @@ async fn acquire_h3_upload_sender(
                 sess,
                 resolver,
                 connector,
+                client.upload_ech_config.as_deref(),
                 None,
             )
             .await?,
@@ -1583,6 +1626,7 @@ async fn acquire_h3_upload_sender(
         sess,
         resolver,
         connector,
+        client.upload_ech_config.as_deref(),
         Some(reuse_policy.h_keep_alive_period),
     )
     .await?;
@@ -1626,6 +1670,7 @@ async fn acquire_h3_download_sender(
                 sess,
                 resolver,
                 connector,
+                client.download_ech_config.as_deref(),
                 None,
             )
             .await?,
@@ -1662,6 +1707,7 @@ async fn acquire_h3_download_sender(
         sess,
         resolver,
         connector,
+        client.download_ech_config.as_deref(),
         Some(reuse_policy.h_keep_alive_period),
     )
     .await?;
@@ -1863,7 +1909,12 @@ impl Transport for Client {
                 ));
             }
             let stream = if let Some(endpoint) = self.upload_endpoint.as_ref() {
-                secure_endpoint_stream(endpoint, stream).await?
+                secure_endpoint_stream_with_ech(
+                    endpoint,
+                    stream,
+                    self.upload_ech_config.as_deref(),
+                )
+                .await?
             } else {
                 stream
             };
@@ -1871,7 +1922,12 @@ impl Transport for Client {
         }
 
         let stream = if let Some(endpoint) = self.upload_endpoint.as_ref() {
-            secure_endpoint_stream(endpoint, stream).await?
+            secure_endpoint_stream_with_ech(
+                endpoint,
+                stream,
+                self.upload_ech_config.as_deref(),
+            )
+            .await?
         } else {
             stream
         };
@@ -2145,8 +2201,11 @@ async fn proxy_packet_up_http1(
             &client.padding,
             XhttpHttpVersion::Http1,
         )?;
-        let downlink_stream =
-            connect_endpoint_stream(&XhttpEndpointConfig::from(download)).await?;
+        let downlink_stream = connect_endpoint_stream_with_ech(
+            &XhttpEndpointConfig::from(download),
+            client.download_ech_config.as_deref(),
+        )
+        .await?;
         let mut downlink_sender = handshake_http1(downlink_stream).await?;
         downlink_sender
             .send_request(downlink_request)
@@ -2200,6 +2259,7 @@ async fn proxy_packet_up_http1(
     let padding = client.padding.clone();
     let min_posts_interval_ms = client.min_posts_interval_ms;
     let upload_endpoint = client.upload_endpoint.clone();
+    let upload_ech_config = client.upload_ech_config.clone();
     let use_tls = client.use_tls;
 
     tokio::spawn(async move {
@@ -2260,7 +2320,12 @@ async fn proxy_packet_up_http1(
                         } else {
                             match upload_endpoint.as_ref() {
                                 Some(endpoint) => {
-                                    match connect_endpoint_stream(endpoint).await {
+                                    match connect_endpoint_stream_with_ech(
+                                        endpoint,
+                                        upload_ech_config.as_deref(),
+                                    )
+                                    .await
+                                    {
                                         Ok(stream) => stream,
                                         Err(_) => return,
                                     }

@@ -402,6 +402,8 @@ pub struct XhttpDownloadSettings {
     pub certificate: Option<String>,
     pub private_key: Option<String>,
     pub client_fingerprint: Option<String>,
+    #[serde(alias = "echOpts")]
+    pub ech_opts: Option<EchOptions>,
     pub reality_opts: Option<OutboundTrojanRealityOpts>,
     #[serde(alias = "servername", alias = "serverName")]
     pub server_name: Option<String>,
@@ -469,6 +471,36 @@ pub struct XhttpOpt {
     pub session_ttl: Option<u64>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct EchOptions {
+    pub enable: Option<bool>,
+    pub config: Option<String>,
+    pub query_server_name: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct ShadowTlsOptions {
+    pub version: Option<u8>,
+    pub password: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct RestlsOptions {
+    pub password: Option<String>,
+    pub version_hint: Option<String>,
+    pub restls_script: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct JlsOptions {
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct OutboundVless {
@@ -499,6 +531,14 @@ pub struct OutboundVless {
     pub fingerprint: Option<String>,
     /// TLS ClientHello/uTLS-style fingerprint selection.
     pub client_fingerprint: Option<String>,
+    #[serde(alias = "echOpts")]
+    pub ech_opts: Option<EchOptions>,
+    #[serde(alias = "shadowTlsOpts")]
+    pub shadow_tls_opts: Option<ShadowTlsOptions>,
+    #[serde(alias = "restlsOpts")]
+    pub restls_opts: Option<RestlsOptions>,
+    #[serde(alias = "jlsOpts")]
+    pub jls_opts: Option<JlsOptions>,
 }
 
 #[cfg(feature = "wireguard")]
@@ -846,6 +886,9 @@ xhttp-opts:
     port: 9443
     network: xhttp
     security: tls
+    ech-opts:
+      enable: true
+      config: upload-ech
     xhttp-settings:
       path: /upload/
   download-settings:
@@ -853,6 +896,8 @@ xhttp-opts:
     port: 8443
     network: xhttp
     security: tls
+    ech-opts:
+      enable: false
     xhttp-settings:
       path: /download/
   download-mode: stream-down
@@ -916,6 +961,17 @@ xhttp-opts:
         assert_eq!(upload.network, "xhttp");
         assert_eq!(upload.security.as_deref(), Some("tls"));
         assert_eq!(
+            upload.ech_opts.as_ref().and_then(|opts| opts.enable),
+            Some(true)
+        );
+        assert_eq!(
+            upload
+                .ech_opts
+                .as_ref()
+                .and_then(|opts| opts.config.as_deref()),
+            Some("upload-ech")
+        );
+        assert_eq!(
             upload
                 .xhttp_settings
                 .and_then(|settings| settings.path)
@@ -929,6 +985,10 @@ xhttp-opts:
         assert_eq!(download.port, 8443);
         assert_eq!(download.network, "xhttp");
         assert_eq!(download.security.as_deref(), Some("tls"));
+        assert_eq!(
+            download.ech_opts.as_ref().and_then(|opts| opts.enable),
+            Some(false)
+        );
         assert_eq!(
             download
                 .xhttp_settings
@@ -1171,6 +1231,55 @@ alpn:
             vless.alpn,
             Some(vec!["h2".to_owned(), "http/1.1".to_owned()])
         );
+    }
+
+    #[test]
+    fn outbound_vless_parses_extended_tls_option_blocks() {
+        let config = r#"
+name: vless-tls-options
+type: vless
+server: example.com
+port: 443
+uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+tls: true
+ech-opts:
+  enable: true
+  config: ech-config
+  query-server-name: ech.example.com
+shadow-tls-opts:
+  version: 3
+  password: shadow-secret
+restls-opts:
+  password: restls-secret
+  version-hint: tls13
+  restls-script: script-data
+jls-opts:
+  username: jls-user
+  password: jls-secret
+"#;
+
+        let parsed: OutboundProxyProtocol = serde_yaml::from_str(config)
+            .expect("extended TLS option blocks should parse");
+
+        let OutboundProxyProtocol::Vless(vless) = parsed else {
+            panic!("expected vless proxy");
+        };
+        let ech = vless.ech_opts.expect("ech opts should be present");
+        assert_eq!(ech.enable, Some(true));
+        assert_eq!(ech.config.as_deref(), Some("ech-config"));
+        assert_eq!(ech.query_server_name.as_deref(), Some("ech.example.com"));
+        let shadow = vless
+            .shadow_tls_opts
+            .expect("shadow tls opts should be present");
+        assert_eq!(shadow.version, Some(3));
+        assert_eq!(shadow.password.as_deref(), Some("shadow-secret"));
+        let restls = vless.restls_opts.expect("restls opts should be present");
+        assert_eq!(restls.password.as_deref(), Some("restls-secret"));
+        assert_eq!(restls.version_hint.as_deref(), Some("tls13"));
+        assert_eq!(restls.restls_script.as_deref(), Some("script-data"));
+        let jls = vless.jls_opts.expect("jls opts should be present");
+        assert_eq!(jls.username.as_deref(), Some("jls-user"));
+        assert_eq!(jls.password.as_deref(), Some("jls-secret"));
     }
 
     #[test]

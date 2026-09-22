@@ -1,8 +1,8 @@
 use crate::{
     Error,
     config::internal::proxy::{
-        OutboundTrojanRealityOpts, OutboundVless, XhttpDownloadSettings, XhttpOpt,
-        XhttpReuseSettings, XhttpUploadSettings,
+        EchOptions, OutboundTrojanRealityOpts, OutboundVless, XhttpDownloadSettings,
+        XhttpOpt, XhttpReuseSettings, XhttpUploadSettings,
     },
     proxy::{
         HandlerCommonOptions,
@@ -20,7 +20,6 @@ use crate::{
         },
     },
 };
-#[cfg(feature = "reality")]
 use base64::{Engine as _, engine::general_purpose};
 use tracing::warn;
 
@@ -173,6 +172,23 @@ fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
         }
     }
 
+    validate_vless_ech_opts(s)?;
+    if s.shadow_tls_opts.is_some() {
+        return Err(Error::InvalidConfig(
+            "vless shadow-tls-opts runtime is not implemented".to_owned(),
+        ));
+    }
+    if s.restls_opts.is_some() {
+        return Err(Error::InvalidConfig(
+            "vless restls-opts runtime is not implemented".to_owned(),
+        ));
+    }
+    if s.jls_opts.is_some() {
+        return Err(Error::InvalidConfig(
+            "vless jls-opts runtime is not implemented".to_owned(),
+        ));
+    }
+
     if matches!(s.network.as_deref(), Some("xhttp")) {
         resolve_xhttp_http_version(s)?;
     }
@@ -209,6 +225,81 @@ fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
     Ok(())
 }
 
+fn decode_ech_config_options(
+    opts: Option<&EchOptions>,
+    context: &str,
+) -> Result<Option<Vec<u8>>, Error> {
+    let Some(opts) = opts else {
+        return Ok(None);
+    };
+    if !opts.enable.unwrap_or(false) {
+        return Ok(None);
+    }
+
+    let config = opts.config.as_deref().map(str::trim).unwrap_or_default();
+    if config.is_empty() {
+        return Err(Error::InvalidConfig(format!(
+            "{context} ECH DNS discovery is not implemented; ech-opts.config is required"
+        )));
+    }
+
+    let decoded = general_purpose::STANDARD.decode(config).map_err(|err| {
+        Error::InvalidConfig(format!(
+            "invalid {context} ech-opts.config base64: {err}"
+        ))
+    })?;
+    TlsClient::validate_ech_config(&decoded).map_err(|err| {
+        Error::InvalidConfig(format!("invalid {context} ECH config: {err}"))
+    })?;
+    Ok(Some(decoded))
+}
+
+fn decode_vless_ech_config(s: &OutboundVless) -> Result<Option<Vec<u8>>, Error> {
+    decode_ech_config_options(s.ech_opts.as_ref(), "vless")
+}
+
+fn resolve_xhttp_ech_config(
+    endpoint_opts: Option<&EchOptions>,
+    s: &OutboundVless,
+    security: XhttpSecurity,
+    context: &str,
+) -> Result<Option<Vec<u8>>, Error> {
+    let opts = endpoint_opts.or(s.ech_opts.as_ref());
+    if opts.and_then(|opts| opts.enable).unwrap_or(false)
+        && !matches!(security, XhttpSecurity::Tls)
+    {
+        return Err(Error::InvalidConfig(format!(
+            "{context} ECH requires standard TLS security"
+        )));
+    }
+    decode_ech_config_options(opts, context)
+}
+
+fn validate_vless_ech_opts(s: &OutboundVless) -> Result<(), Error> {
+    let Some(opts) = s.ech_opts.as_ref() else {
+        return Ok(());
+    };
+    if !opts.enable.unwrap_or(false) {
+        return Ok(());
+    }
+    if !s.tls.unwrap_or_default() {
+        return Err(Error::InvalidConfig(
+            "vless ech-opts requires tls: true".to_owned(),
+        ));
+    }
+    if s.reality_opts.is_some() {
+        return Err(Error::InvalidConfig(
+            "vless ech-opts cannot be combined with reality".to_owned(),
+        ));
+    }
+    if s.shadow_tls_opts.is_some() {
+        return Err(Error::InvalidConfig(
+            "vless ech-opts cannot be combined with shadow-tls-opts".to_owned(),
+        ));
+    }
+    decode_vless_ech_config(s)?;
+    Ok(())
+}
 fn vless_standard_tls_enabled(s: &OutboundVless) -> bool {
     if matches!(s.network.as_deref(), Some("xhttp"))
         && let Some(upload_settings) = s
@@ -302,6 +393,7 @@ fn build_tls_transport(
         s.fingerprint.clone(),
     )
     .with_verify_name(s.name_cert_verify.clone())
+    .with_ech_config(decode_vless_ech_config(s)?)?
     .with_client_auth(s.certificate.clone(), s.private_key.clone())?;
 
     Ok(Some(Box::new(client)))
@@ -591,6 +683,29 @@ fn build_xhttp_transport(
         || s.reality_opts.is_some());
     let upload_endpoint =
         build_xhttp_upload_endpoint_config(s, own_primary_security)?;
+    let upload_ech_config = match upload_endpoint.as_ref() {
+        Some(endpoint) => resolve_xhttp_ech_config(
+            upload_settings.and_then(|settings| settings.ech_opts.as_ref()),
+            s,
+            endpoint.security,
+            "xhttp upload endpoint",
+        )?,
+        None => None,
+    };
+    let download =
+        build_xhttp_download_config(s, xhttp_opts, &metadata, http_version)?;
+    let download_ech_config = match (
+        resolve_xhttp_download_settings(xhttp_opts),
+        download.as_ref(),
+    ) {
+        (Some(settings), Some(config)) => resolve_xhttp_ech_config(
+            settings.ech_opts.as_ref(),
+            s,
+            config.security,
+            "xhttp download endpoint",
+        )?,
+        _ => None,
+    };
     let upload_uses_security = upload_endpoint
         .as_ref()
         .is_some_and(|endpoint| !matches!(endpoint.security, XhttpSecurity::None));
@@ -632,9 +747,10 @@ fn build_xhttp_transport(
             resolve_xhttp_max_each_post_bytes(xhttp_opts),
             resolve_xhttp_no_grpc_header(xhttp_opts),
             resolve_xhttp_min_posts_interval_ms(xhttp_opts),
-            build_xhttp_download_config(s, xhttp_opts, &metadata, http_version)?,
+            download,
         )
         .with_upload_endpoint(upload_endpoint)
+        .with_ech_configs(upload_ech_config, download_ech_config)
         .with_http_version(http_version)
         .with_auto_reality(auto_reality)
         .with_metadata(metadata)
@@ -1875,7 +1991,8 @@ fn decode_reality_short_id(short_id: Option<&str>) -> Result<Vec<u8>, Error> {
 #[cfg(test)]
 mod tests {
     use crate::config::internal::proxy::{
-        CommonConfigOptions, GrpcOpt, OutboundTrojanRealityOpts,
+        CommonConfigOptions, EchOptions, GrpcOpt, JlsOptions,
+        OutboundTrojanRealityOpts, RestlsOptions, ShadowTlsOptions,
         XhttpDownloadSettings, XhttpDownloadXhttpSettings, XhttpExtra, XhttpOpt,
         XhttpReuseSettings, XhttpUploadSettings,
     };
@@ -2028,6 +2145,182 @@ mod tests {
                 "client-fingerprint is not implemented for non-reality TLS"
             ),
             "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(feature = "aws-lc-rs")]
+    #[test]
+    fn vless_ech_explicit_config_builds_standard_tls() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "ech-explicit".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            tls: Some(true),
+            ech_opts: Some(EchOptions {
+                enable: Some(true),
+                config: Some(
+                    "AEn+DQBFKwAgACABWIHUGj4u+PIggYXcR5JF0gYk3dCRioBW8uJq9H4mKAAIAAEAAQABAANAEnB1YmxpYy50bHMtZWNoLmRldgAA"
+                        .to_owned(),
+                ),
+                query_server_name: None,
+            }),
+            ..Default::default()
+        };
+
+        validate_vless_config(&outbound).expect("explicit ECH should validate");
+        crate::proxy::vless::Handler::try_from(&outbound)
+            .expect("explicit ECH handler should build");
+    }
+
+    #[cfg(not(feature = "aws-lc-rs"))]
+    #[test]
+    fn vless_ech_requires_aws_lc_provider() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "ech-provider".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            tls: Some(true),
+            ech_opts: Some(EchOptions {
+                enable: Some(true),
+                config: Some(
+                    "AEn+DQBFKwAgACABWIHUGj4u+PIggYXcR5JF0gYk3dCRioBW8uJq9H4mKAAIAAEAAQABAANAEnB1YmxpYy50bHMtZWNoLmRldgAA"
+                        .to_owned(),
+                ),
+                query_server_name: None,
+            }),
+            ..Default::default()
+        };
+
+        assert!(
+            validate_vless_config(&outbound)
+                .expect_err("ECH must require an HPKE-capable provider")
+                .to_string()
+                .contains("requires aws-lc-rs TLS provider")
+        );
+    }
+
+    #[test]
+    fn vless_ech_rejects_missing_or_invalid_explicit_config() {
+        let base = || OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "ech-invalid".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            tls: Some(true),
+            ..Default::default()
+        };
+
+        let mut missing = base();
+        missing.ech_opts = Some(EchOptions {
+            enable: Some(true),
+            query_server_name: Some("cloudflare-ech.com".to_owned()),
+            ..Default::default()
+        });
+        assert!(
+            validate_vless_config(&missing)
+                .expect_err("ECH DNS discovery is not implemented yet")
+                .to_string()
+                .contains("ECH DNS discovery is not implemented")
+        );
+
+        let mut invalid_base64 = base();
+        invalid_base64.ech_opts = Some(EchOptions {
+            enable: Some(true),
+            config: Some("not base64!".to_owned()),
+            ..Default::default()
+        });
+        assert!(
+            validate_vless_config(&invalid_base64)
+                .expect_err("invalid ECH base64 must fail")
+                .to_string()
+                .contains("ech-opts.config base64")
+        );
+
+        #[cfg(feature = "aws-lc-rs")]
+        {
+            let mut invalid_list = base();
+            invalid_list.ech_opts = Some(EchOptions {
+                enable: Some(true),
+                config: Some("YWJj".to_owned()),
+                ..Default::default()
+            });
+            let err = crate::proxy::vless::Handler::try_from(&invalid_list)
+                .expect_err("malformed ECHConfigList must fail during conversion");
+            assert!(err.to_string().contains("invalid ECH config list"));
+        }
+    }
+
+    #[test]
+    fn vless_rejects_unimplemented_extended_tls_runtimes() {
+        let base = || OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "extended-tls".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            tls: Some(true),
+            ..Default::default()
+        };
+
+        let mut disabled_ech = base();
+        disabled_ech.ech_opts = Some(EchOptions {
+            enable: Some(false),
+            ..Default::default()
+        });
+        validate_vless_config(&disabled_ech)
+            .expect("disabled ECH should not require runtime support");
+
+        let mut ech_dns = base();
+        ech_dns.ech_opts = Some(EchOptions {
+            enable: Some(true),
+            query_server_name: Some("cloudflare-ech.com".to_owned()),
+            ..Default::default()
+        });
+        let err = validate_vless_config(&ech_dns)
+            .expect_err("ECH DNS discovery is not implemented yet");
+        assert!(
+            err.to_string()
+                .contains("ECH DNS discovery is not implemented")
+        );
+
+        let mut shadow_tls = base();
+        shadow_tls.shadow_tls_opts = Some(ShadowTlsOptions::default());
+        let err = validate_vless_config(&shadow_tls)
+            .expect_err("ShadowTLS must not be silently ignored");
+        assert!(
+            err.to_string()
+                .contains("shadow-tls-opts runtime is not implemented")
+        );
+
+        let mut restls = base();
+        restls.restls_opts = Some(RestlsOptions::default());
+        let err = validate_vless_config(&restls)
+            .expect_err("Restls must not be silently ignored");
+        assert!(
+            err.to_string()
+                .contains("restls-opts runtime is not implemented")
+        );
+
+        let mut jls = base();
+        jls.jls_opts = Some(JlsOptions::default());
+        let err = validate_vless_config(&jls)
+            .expect_err("JLS must not be silently ignored");
+        assert!(
+            err.to_string()
+                .contains("jls-opts runtime is not implemented")
         );
     }
 
@@ -2458,6 +2751,111 @@ mod tests {
         assert_eq!(endpoint.alpn_protocols, vec!["h3".to_owned()]);
         crate::proxy::vless::Handler::try_from(&outbound)
             .expect("HTTP/3 VLESS handler should build");
+    }
+
+    #[cfg(all(feature = "xhttp-h3", feature = "aws-lc-rs"))]
+    #[test]
+    fn vless_xhttp_http3_inherits_explicit_ech_config() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp-h3-ech".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            tls: Some(true),
+            alpn: Some(vec!["h3".to_owned()]),
+            network: Some("xhttp".to_owned()),
+            ech_opts: Some(EchOptions {
+                enable: Some(true),
+                config: Some(
+                    "AEn+DQBFKwAgACABWIHUGj4u+PIggYXcR5JF0gYk3dCRioBW8uJq9H4mKAAIAAEAAQABAANAEnB1YmxpYy50bHMtZWNoLmRldgAA"
+                        .to_owned(),
+                ),
+                query_server_name: None,
+            }),
+            xhttp_opts: Some(XhttpOpt {
+                path: Some("/xhttp/".to_owned()),
+                mode: Some("stream-one".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        validate_vless_config(&outbound).expect("HTTP/3 ECH should validate");
+        let endpoint = build_xhttp_upload_endpoint_config(&outbound, true)
+            .expect("HTTP/3 TLS endpoint should build")
+            .expect("HTTP/3 should own TLS security");
+        let inherited = super::resolve_xhttp_ech_config(
+            None,
+            &outbound,
+            endpoint.security,
+            "test upload endpoint",
+        )
+        .expect("top-level ECH should inherit to upload endpoint");
+        assert!(inherited.is_some());
+
+        let disabled = EchOptions {
+            enable: Some(false),
+            ..Default::default()
+        };
+        assert!(
+            super::resolve_xhttp_ech_config(
+                Some(&disabled),
+                &outbound,
+                endpoint.security,
+                "test upload endpoint",
+            )
+            .expect("endpoint override should resolve")
+            .is_none(),
+            "endpoint enable:false should clear inherited ECH"
+        );
+        crate::proxy::vless::Handler::try_from(&outbound)
+            .expect("HTTP/3 ECH VLESS handler should build");
+    }
+
+    #[cfg(all(feature = "xhttp-h3", feature = "aws-lc-rs"))]
+    #[test]
+    fn vless_xhttp_http3_download_accepts_nested_ech_config() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp-h3-download-ech".to_owned(),
+                server: "upload.example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            tls: Some(true),
+            alpn: Some(vec!["h3".to_owned()]),
+            network: Some("xhttp".to_owned()),
+            xhttp_opts: Some(XhttpOpt {
+                path: Some("/upload/".to_owned()),
+                mode: Some("stream-up".to_owned()),
+                download_settings: Some(XhttpDownloadSettings {
+                    address: "download.example.com".to_owned(),
+                    port: 443,
+                    network: "xhttp".to_owned(),
+                    tls: Some(true),
+                    alpn: Some(vec!["h3".to_owned()]),
+                    ech_opts: Some(EchOptions {
+                        enable: Some(true),
+                        config: Some(
+                            "AEn+DQBFKwAgACABWIHUGj4u+PIggYXcR5JF0gYk3dCRioBW8uJq9H4mKAAIAAEAAQABAANAEnB1YmxpYy50bHMtZWNoLmRldgAA"
+                                .to_owned(),
+                        ),
+                        query_server_name: None,
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        validate_vless_config(&outbound).expect("HTTP/3 nested ECH should validate");
+        crate::proxy::vless::Handler::try_from(&outbound)
+            .expect("HTTP/3 nested download ECH handler should build");
     }
 
     #[cfg(feature = "xhttp-h3")]

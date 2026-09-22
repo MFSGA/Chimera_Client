@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-#[cfg(not(feature = "anytls"))]
+#[cfg(any(not(feature = "anytls"), feature = "aws-lc-rs"))]
 use rustls::pki_types::PrivateKeyDer;
 use rustls::{
     DigitallySignedStruct, SignatureScheme,
@@ -57,7 +57,7 @@ impl VerifyNameOverride {
     }
 }
 
-#[cfg(not(feature = "anytls"))]
+#[cfg(any(not(feature = "anytls"), feature = "aws-lc-rs"))]
 fn load_client_auth_material(
     cert: &str,
     key: &str,
@@ -115,6 +115,35 @@ fn load_client_auth_material(
     Ok((certs, private_key))
 }
 
+#[cfg(feature = "aws-lc-rs")]
+fn parse_ech_config_list(config: &[u8]) -> io::Result<rustls::client::EchConfig> {
+    rustls::client::EchConfig::new(
+        rustls::pki_types::EchConfigListBytes::from(config),
+        rustls::crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES,
+    )
+    .map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid ECH config list: {err}"),
+        )
+    })
+}
+
+fn validate_ech_config_list(config: &[u8]) -> io::Result<()> {
+    #[cfg(feature = "aws-lc-rs")]
+    {
+        parse_ech_config_list(config).map(|_| ())
+    }
+    #[cfg(not(feature = "aws-lc-rs"))]
+    {
+        let _ = config;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "ECH requires aws-lc-rs TLS provider",
+        ))
+    }
+}
+
 impl ServerCertVerifier for VerifyNameOverride {
     fn verify_server_cert(
         &self,
@@ -165,6 +194,7 @@ pub struct Client {
     pub verify_name: Option<String>,
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
+    pub ech_config: Option<Vec<u8>>,
 }
 
 impl Client {
@@ -183,6 +213,7 @@ impl Client {
             verify_name: None,
             tls_cert: None,
             tls_key: None,
+            ech_config: None,
         }
     }
 
@@ -202,6 +233,7 @@ impl Client {
             verify_name: None,
             tls_cert: None,
             tls_key: None,
+            ech_config: None,
         }
     }
 
@@ -223,6 +255,21 @@ impl Client {
     pub fn with_verify_name(mut self, verify_name: Option<String>) -> Self {
         self.verify_name = verify_name;
         self
+    }
+
+    pub(crate) fn validate_ech_config(ech_config: &[u8]) -> io::Result<()> {
+        validate_ech_config_list(ech_config)
+    }
+
+    pub fn with_ech_config(
+        mut self,
+        ech_config: Option<Vec<u8>>,
+    ) -> io::Result<Self> {
+        if let Some(config) = ech_config.as_deref() {
+            validate_ech_config_list(config)?;
+        }
+        self.ech_config = ech_config;
+        Ok(self)
     }
 
     pub fn with_client_auth(
@@ -254,40 +301,96 @@ impl Client {
     pub(crate) fn rustls_client_config(&self) -> io::Result<rustls::ClientConfig> {
         let verifier = self.certificate_verifier()?;
 
-        #[cfg(feature = "anytls")]
-        let mut tls_config = build_tls_client_config(
-            verifier,
-            self.tls_cert.as_deref(),
-            self.tls_key.as_deref(),
-        )?;
+        let mut tls_config = if let Some(ech_config) = self.ech_config.as_deref() {
+            #[cfg(feature = "aws-lc-rs")]
+            {
+                use rustls::client::EchMode;
 
-        #[cfg(not(feature = "anytls"))]
-        let mut tls_config = match (
-            self.tls_cert.as_deref(),
-            self.tls_key.as_deref(),
-        ) {
-            (Some(cert), Some(key)) => {
-                let (certs, private_key) = load_client_auth_material(cert, key)?;
-                rustls::ClientConfig::builder()
-                    .dangerous()
-                    .with_custom_certificate_verifier(verifier)
-                    .with_client_auth_cert(certs, private_key)
-                    .map_err(|err| {
-                        io::Error::new(
+                let ech_config = parse_ech_config_list(ech_config)?;
+                let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::aws_lc_rs::default_provider(),
+                ))
+                .with_ech(EchMode::Enable(ech_config))
+                .map_err(|err| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("failed to enable ECH: {err}"),
+                    )
+                })?;
+
+                match (self.tls_cert.as_deref(), self.tls_key.as_deref()) {
+                    (Some(cert), Some(key)) => {
+                        let (certs, private_key) =
+                            load_client_auth_material(cert, key)?;
+                        builder
+                            .dangerous()
+                            .with_custom_certificate_verifier(verifier)
+                            .with_client_auth_cert(certs, private_key)
+                            .map_err(|err| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    format!("invalid TLS client cert/key: {err}"),
+                                )
+                            })?
+                    }
+                    (None, None) => builder
+                        .dangerous()
+                        .with_custom_certificate_verifier(verifier)
+                        .with_no_client_auth(),
+                    _ => {
+                        return Err(io::Error::new(
                             io::ErrorKind::InvalidInput,
-                            format!("invalid TLS client cert/key: {err}"),
-                        )
-                    })?
+                            "tls certificate and private key must both be set or both omitted",
+                        ));
+                    }
+                }
             }
-            (None, None) => rustls::ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(verifier)
-                .with_no_client_auth(),
-            _ => {
+            #[cfg(not(feature = "aws-lc-rs"))]
+            {
+                let _ = (verifier, ech_config);
                 return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "tls certificate and private key must both be set or both omitted",
+                    io::ErrorKind::Unsupported,
+                    "ECH requires aws-lc-rs TLS provider",
                 ));
+            }
+        } else {
+            #[cfg(feature = "anytls")]
+            {
+                build_tls_client_config(
+                    verifier,
+                    self.tls_cert.as_deref(),
+                    self.tls_key.as_deref(),
+                )?
+            }
+
+            #[cfg(not(feature = "anytls"))]
+            {
+                match (self.tls_cert.as_deref(), self.tls_key.as_deref()) {
+                    (Some(cert), Some(key)) => {
+                        let (certs, private_key) =
+                            load_client_auth_material(cert, key)?;
+                        rustls::ClientConfig::builder()
+                            .dangerous()
+                            .with_custom_certificate_verifier(verifier)
+                            .with_client_auth_cert(certs, private_key)
+                            .map_err(|err| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    format!("invalid TLS client cert/key: {err}"),
+                                )
+                            })?
+                    }
+                    (None, None) => rustls::ClientConfig::builder()
+                        .dangerous()
+                        .with_custom_certificate_verifier(verifier)
+                        .with_no_client_auth(),
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "tls certificate and private key must both be set or both omitted",
+                        ));
+                    }
+                }
             }
         };
         tls_config.alpn_protocols = self
