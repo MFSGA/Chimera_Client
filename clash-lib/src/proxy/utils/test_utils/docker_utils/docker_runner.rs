@@ -12,11 +12,11 @@ use bollard::{
     config::ContainerInspectResponse,
     models::{ContainerCreateBody, HostConfig, Mount, MountType, PortBinding},
     query_parameters::{
-        CreateContainerOptions, CreateImageOptionsBuilder, RemoveContainerOptions,
-        StartContainerOptions,
+        CreateContainerOptions, CreateImageOptionsBuilder, LogsOptionsBuilder,
+        RemoveContainerOptions, StartContainerOptions,
     },
 };
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use tokio::net::TcpStream;
 
 const FIRST_DOCKER_TEST_PORT: u16 = 30001;
@@ -217,6 +217,33 @@ impl DockerTestRunner {
         Ok(())
     }
 
+    async fn print_recent_logs(&self) {
+        let options = LogsOptionsBuilder::new()
+            .stdout(true)
+            .stderr(true)
+            .tail("200")
+            .build();
+        let mut logs = self.instance.logs(&self.id, Some(options));
+        let mut output = String::new();
+
+        while let Some(item) = logs.next().await {
+            match item {
+                Ok(line) => output.push_str(&line.to_string()),
+                Err(err) => {
+                    eprintln!("failed to read docker logs for {}: {err}", self.id);
+                    return;
+                }
+            }
+        }
+
+        if !output.trim().is_empty() {
+            eprintln!(
+                "\n--- docker logs for {} ---\n{}\n--- end docker logs ---",
+                self.id, output
+            );
+        }
+    }
+
     pub async fn cleanup(self) -> anyhow::Result<()> {
         self.instance
             .remove_container(
@@ -286,6 +313,9 @@ impl RunAndCleanup for DockerTestRunner {
         f: impl Future<Output = anyhow::Result<()>> + Send + 'static,
     ) -> anyhow::Result<()> {
         let result = run_with_timeout(f).await;
+        if result.is_err() {
+            self.print_recent_logs().await;
+        }
         self.cleanup().await?;
         result
     }
@@ -302,6 +332,11 @@ impl RunAndCleanup for MultiDockerTestRunner {
         f: impl Future<Output = anyhow::Result<()>> + Send + 'static,
     ) -> anyhow::Result<()> {
         let result = run_with_timeout(f).await;
+        if result.is_err() {
+            for runner in &self.runners {
+                runner.print_recent_logs().await;
+            }
+        }
         for runner in self.runners {
             runner.cleanup().await?;
         }

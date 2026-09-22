@@ -353,32 +353,106 @@ mod reuse_tests {
 
 #[cfg(all(test, docker_test))]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, io::Write as _};
+
+    use rcgen::{
+        BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer,
+        KeyPair, KeyUsagePurpose,
+    };
 
     use super::*;
     use crate::{
         proxy::{
-            transport::{TlsClient, WsClient},
-            utils::test_utils::{
-                Suite,
-                docker_utils::{
-                    config_helper::test_config_base_dir,
-                    consts::*,
-                    docker_runner::{
-                        DockerTestRunner, DockerTestRunnerBuilder, alloc_docker_port,
-                    },
+            transport::{GrpcClient, TlsClient, WsClient},
+            utils::test_utils::docker_utils::{
+                config_helper::{build_dns_resolver, test_config_base_dir},
+                consts::*,
+                docker_runner::{
+                    DockerTestRunner, DockerTestRunnerBuilder,
+                    MultiDockerTestRunner, RunAndCleanup, alloc_docker_port,
                 },
-                run_test_suites_and_cleanup,
             },
         },
+        session::SocksAddr,
         tests::initialize,
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const WS_CONTAINER_PORT: u16 = 8443;
+    const XRAY_CONTAINER_PORT: u16 = 10002;
+    const ECHO_CONTAINER_PORT: u16 = 10003;
+    const ECHO_IMAGE: &str = "alpine:3.20";
+    const UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
+
+    const VLESS_GRPC_TLS_SERVER_CONFIG: &str = r#"{
+  "log": {"loglevel": "debug"},
+  "inbounds": [{
+    "listen": "0.0.0.0",
+    "port": 10002,
+    "protocol": "vless",
+    "settings": {
+      "clients": [{"id": "b831381d-6324-4d53-ad4f-8cda48b30811"}],
+      "decryption": "none"
+    },
+    "streamSettings": {
+      "network": "grpc",
+      "security": "tls",
+      "tlsSettings": {
+        "alpn": ["h2"],
+        "certificates": [{
+          "certificateFile": "/etc/ssl/v2ray/fullchain.pem",
+          "keyFile": "/etc/ssl/v2ray/privkey.pem"
+        }]
+      },
+      "grpcSettings": {"serviceName": "grpc-service"}
+    }
+  }],
+  "outbounds": [{"protocol": "freedom"}]
+}"#;
+
+    const VLESS_MTLS_SERVER_CONFIG: &str = r#"{
+  "log": {"loglevel": "debug"},
+  "inbounds": [{
+    "listen": "0.0.0.0",
+    "port": 10002,
+    "protocol": "vless",
+    "settings": {
+      "clients": [{"id": "b831381d-6324-4d53-ad4f-8cda48b30811"}],
+      "decryption": "none"
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "tls",
+      "tlsSettings": {
+        "verifyClientCertificate": true,
+        "certificates": [
+          {
+            "certificateFile": "/etc/ssl/v2ray/fullchain.pem",
+            "keyFile": "/etc/ssl/v2ray/privkey.pem",
+            "usage": "encipherment"
+          },
+          {
+            "certificateFile": "/etc/ssl/v2ray/client-ca.pem",
+            "usage": "verify"
+          }
+        ]
+      }
+    }
+  }],
+  "outbounds": [{"protocol": "freedom"}]
+}"#;
 
     fn ws_server_port(host_port: u16) -> u16 {
         if crate::proxy::utils::test_utils::docker_utils::use_ci_host_network() {
             WS_CONTAINER_PORT
+        } else {
+            host_port
+        }
+    }
+
+    fn server_port(host_port: u16, container_port: u16) -> u16 {
+        if crate::proxy::utils::test_utils::docker_utils::use_ci_host_network() {
+            container_port
         } else {
             host_port
         }
@@ -391,6 +465,75 @@ mod tests {
             alpn,
             None,
         )))
+    }
+
+    fn generate_client_identity() -> anyhow::Result<(String, String, String)> {
+        let mut ca_params = CertificateParams::new(Vec::new())?;
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+        ];
+        let ca_key = KeyPair::generate()?;
+        let ca_cert = ca_params.self_signed(&ca_key)?;
+        let issuer = Issuer::new(ca_params, ca_key);
+
+        let mut client_params =
+            CertificateParams::new(vec!["client.example.org".to_owned()])?;
+        client_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        client_params.extended_key_usages =
+            vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let client_key = KeyPair::generate()?;
+        let client_cert = client_params.signed_by(&client_key, &issuer)?;
+
+        Ok((ca_cert.pem(), client_cert.pem(), client_key.serialize_pem()))
+    }
+
+    async fn get_echo_runner() -> anyhow::Result<DockerTestRunner> {
+        let command = format!("exec nc -lk -p {ECHO_CONTAINER_PORT} -e cat");
+        let runner = DockerTestRunnerBuilder::new()
+            .image(ECHO_IMAGE)
+            .no_port()
+            .cmd(&["sh", "-c", &command])
+            .build()
+            .await?;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        Ok(runner)
+    }
+
+    async fn tcp_echo_roundtrip(
+        handler: Arc<Handler>,
+        echo_ip: String,
+    ) -> anyhow::Result<()> {
+        let resolver = build_dns_resolver().await?;
+        let destination: SocksAddr = (echo_ip, ECHO_CONTAINER_PORT).try_into()?;
+        let session = Session {
+            destination,
+            ..Default::default()
+        };
+
+        let mut stream = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            handler.connect_stream(&session, resolver),
+        )
+        .await??;
+
+        let payload = (0..128 * 1024)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        stream.write_all(&payload).await?;
+        stream.flush().await?;
+
+        let mut echoed = vec![0u8; payload.len()];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stream.read_exact(&mut echoed),
+        )
+        .await??;
+        anyhow::ensure!(echoed == payload, "docker tcp echo payload mismatch");
+
+        Ok(())
     }
 
     async fn get_ws_runner(host_port: u16) -> anyhow::Result<DockerTestRunner> {
@@ -429,6 +572,85 @@ mod tests {
         Ok(runner)
     }
 
+    async fn get_grpc_runner(host_port: u16) -> anyhow::Result<DockerTestRunner> {
+        let test_config_dir = test_config_base_dir();
+        let cert = test_config_dir.join("certs/example.org.pem");
+        let key = test_config_dir.join("certs/example.org-key.pem");
+        let mut config = tempfile::NamedTempFile::new_in(&test_config_dir)?;
+        config.write_all(VLESS_GRPC_TLS_SERVER_CONFIG.as_bytes())?;
+
+        let mut builder = DockerTestRunnerBuilder::new().image(IMAGE_XRAY);
+        builder =
+            if crate::proxy::utils::test_utils::docker_utils::use_ci_host_network() {
+                builder.host_network()
+            } else {
+                builder.host_port(host_port, XRAY_CONTAINER_PORT)
+            };
+
+        let runner = builder
+            .mounts(&[
+                (config.path().to_str().unwrap(), "/etc/xray/config.json"),
+                (cert.to_str().unwrap(), "/etc/ssl/v2ray/fullchain.pem"),
+                (key.to_str().unwrap(), "/etc/ssl/v2ray/privkey.pem"),
+            ])
+            .build()
+            .await?;
+
+        DockerTestRunner::wait_host_tcp_ready(
+            LOCAL_ADDR,
+            server_port(host_port, XRAY_CONTAINER_PORT),
+            std::time::Duration::from_secs(20),
+        )
+        .await?;
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        Ok(runner)
+    }
+
+    async fn get_mtls_runner(
+        host_port: u16,
+        client_ca_pem: &str,
+    ) -> anyhow::Result<DockerTestRunner> {
+        let test_config_dir = test_config_base_dir();
+        let cert = test_config_dir.join("certs/example.org.pem");
+        let key = test_config_dir.join("certs/example.org-key.pem");
+        let mut config = tempfile::NamedTempFile::new_in(&test_config_dir)?;
+        config.write_all(VLESS_MTLS_SERVER_CONFIG.as_bytes())?;
+        let mut client_ca = tempfile::NamedTempFile::new_in(&test_config_dir)?;
+        client_ca.write_all(client_ca_pem.as_bytes())?;
+
+        let mut builder = DockerTestRunnerBuilder::new().image(IMAGE_XRAY);
+        builder =
+            if crate::proxy::utils::test_utils::docker_utils::use_ci_host_network() {
+                builder.host_network()
+            } else {
+                builder.host_port(host_port, XRAY_CONTAINER_PORT)
+            };
+
+        let runner = builder
+            .mounts(&[
+                (config.path().to_str().unwrap(), "/etc/xray/config.json"),
+                (cert.to_str().unwrap(), "/etc/ssl/v2ray/fullchain.pem"),
+                (key.to_str().unwrap(), "/etc/ssl/v2ray/privkey.pem"),
+                (
+                    client_ca.path().to_str().unwrap(),
+                    "/etc/ssl/v2ray/client-ca.pem",
+                ),
+            ])
+            .build()
+            .await?;
+
+        DockerTestRunner::wait_host_tcp_ready(
+            LOCAL_ADDR,
+            server_port(host_port, XRAY_CONTAINER_PORT),
+            std::time::Duration::from_secs(20),
+        )
+        .await?;
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        Ok(runner)
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn test_vless_ws() -> anyhow::Result<()> {
@@ -448,6 +670,10 @@ mod tests {
             "".to_owned(),
         );
 
+        let echo = get_echo_runner().await?;
+        let echo_ip = echo
+            .container_ip()
+            .ok_or_else(|| anyhow::anyhow!("echo container has no IP"))?;
         let runner = get_ws_runner(host_port).await?;
         let opts = HandlerOptions {
             name: "test-vless-ws".into(),
@@ -461,7 +687,97 @@ mod tests {
             transport: Some(Box::new(ws_client)),
         };
         let handler = Arc::new(Handler::new(opts));
-        run_test_suites_and_cleanup(handler, runner, Suite::all()).await
+        let mut containers = MultiDockerTestRunner::default();
+        containers.add_with_runner(runner);
+        containers.add_with_runner(echo);
+        containers
+            .run_and_cleanup(
+                async move { tcp_echo_roundtrip(handler, echo_ip).await },
+            )
+            .await
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_vless_grpc_tls() -> anyhow::Result<()> {
+        initialize();
+        let host_port = alloc_docker_port();
+        let echo = get_echo_runner().await?;
+        let echo_ip = echo
+            .container_ip()
+            .ok_or_else(|| anyhow::anyhow!("echo container has no IP"))?;
+        let runner = get_grpc_runner(host_port).await?;
+
+        let grpc_client =
+            GrpcClient::new("example.org".to_owned(), "/grpc-service".try_into()?)
+                .with_user_agent(Some("chimera-e2e/1.0".to_owned()))
+                .with_ping_interval(Some(5));
+
+        let tls = TlsClient::new(
+            true,
+            "example.org".to_owned(),
+            Some(vec!["h2".to_owned()]),
+            Some("h2".to_owned()),
+        );
+
+        let opts = HandlerOptions {
+            name: "test-vless-grpc-tls".into(),
+            common_opts: Default::default(),
+            server: LOCAL_ADDR.to_owned(),
+            port: server_port(host_port, XRAY_CONTAINER_PORT),
+            uuid: UUID.into(),
+            flow: None,
+            udp: false,
+            tls: Some(Box::new(tls)),
+            transport: Some(Box::new(grpc_client)),
+        };
+        let handler = Arc::new(Handler::new(opts));
+        let mut containers = MultiDockerTestRunner::default();
+        containers.add_with_runner(runner);
+        containers.add_with_runner(echo);
+        containers
+            .run_and_cleanup(async move {
+                tcp_echo_roundtrip(handler.clone(), echo_ip.clone()).await?;
+                tcp_echo_roundtrip(handler, echo_ip).await
+            })
+            .await
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_vless_mtls() -> anyhow::Result<()> {
+        initialize();
+        let host_port = alloc_docker_port();
+        let echo = get_echo_runner().await?;
+        let echo_ip = echo
+            .container_ip()
+            .ok_or_else(|| anyhow::anyhow!("echo container has no IP"))?;
+        let (client_ca, client_cert, client_key) = generate_client_identity()?;
+        let runner = get_mtls_runner(host_port, &client_ca).await?;
+
+        let tls = TlsClient::new(true, "example.org".to_owned(), None, None)
+            .with_client_auth(Some(client_cert), Some(client_key))?;
+
+        let opts = HandlerOptions {
+            name: "test-vless-mtls".into(),
+            common_opts: Default::default(),
+            server: LOCAL_ADDR.to_owned(),
+            port: server_port(host_port, XRAY_CONTAINER_PORT),
+            uuid: UUID.into(),
+            flow: None,
+            udp: false,
+            tls: Some(Box::new(tls)),
+            transport: None,
+        };
+        let handler = Arc::new(Handler::new(opts));
+        let mut containers = MultiDockerTestRunner::default();
+        containers.add_with_runner(runner);
+        containers.add_with_runner(echo);
+        containers
+            .run_and_cleanup(
+                async move { tcp_echo_roundtrip(handler, echo_ip).await },
+            )
+            .await
     }
 }
 
