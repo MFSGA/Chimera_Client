@@ -7,10 +7,12 @@ use stream::{ProxyTlsStream, VerifiedStream};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_rustls::{TlsConnector, client::TlsStream};
 use utils::Hmac;
+use v2::{HandshakeStream as V2HandshakeStream, Stream as V2Stream};
 
 mod prelude;
 mod stream;
 mod utils;
+mod v2;
 
 use super::Transport;
 use crate::{
@@ -25,11 +27,19 @@ use prelude::*;
 /// indistinguishable from a normal TLS handshake on the wire. The actual
 /// application data is XORed / authenticated with an HMAC keyed with
 /// `password` and the server random — see the shadow-tls V3 spec.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShadowtlsVersion {
+    V1,
+    V2,
+    V3,
+}
+
 #[derive(Debug)]
 pub struct Shadowtls {
     host: String,
     password: String,
     strict: bool,
+    version: ShadowtlsVersion,
 }
 
 impl Shadowtls {
@@ -38,6 +48,25 @@ impl Shadowtls {
             host,
             password,
             strict,
+            version: ShadowtlsVersion::V3,
+        }
+    }
+
+    pub fn new_v1(host: String) -> Self {
+        Self {
+            host,
+            password: String::new(),
+            strict: false,
+            version: ShadowtlsVersion::V1,
+        }
+    }
+
+    pub fn new_v2(host: String, password: String) -> Self {
+        Self {
+            host,
+            password,
+            strict: false,
+            version: ShadowtlsVersion::V2,
         }
     }
 
@@ -45,24 +74,61 @@ impl Shadowtls {
         &self,
         stream: AnyStream,
     ) -> std::io::Result<AnyStream> {
-        let proxy_stream = ProxyTlsStream::new(stream, &self.password);
+        match self.version {
+            ShadowtlsVersion::V1 => self.wrap_shadow_tls_v1_stream(stream).await,
+            ShadowtlsVersion::V2 => self.wrap_shadow_tls_v2_stream(stream).await,
+            ShadowtlsVersion::V3 => self.wrap_shadow_tls_v3_stream(stream).await,
+        }
+    }
 
-        // handshake
-        let _hamc_handshake = Hmac::new(&self.password, (&[], &[]));
+    async fn wrap_shadow_tls_v1_stream(
+        &self,
+        stream: AnyStream,
+    ) -> std::io::Result<AnyStream> {
         let sni_name = rustls::pki_types::ServerName::try_from(self.host.clone())
             .map_err(map_io_error)?;
-        // NOTE: the upstream ref injects a `session_id_generator` into
-        // `connect_with_session_id_generator` (a forked tokio-rustls API).
-        // The current project is on the public tokio-rustls 0.26.4, which
-        // only exposes `connect_with` and takes a single `FnOnce(&mut
-        // ClientConnection)` hook — there is no place to override the
-        // session id of the ClientHello from outside. The shadow-tls V3
-        // handshake therefore falls back to standard TLS 1.3; the V1/V2
-        // server-stripped flow is still verified through the ServerHello
-        // captured by `ProxyTlsStream`.
+        let tls = new_v1_connector().connect(sni_name, stream).await?;
+        Ok(tls.into_inner().0)
+    }
+
+    async fn wrap_shadow_tls_v2_stream(
+        &self,
+        stream: AnyStream,
+    ) -> std::io::Result<AnyStream> {
+        let challenge = Hmac::new(&self.password, (&[], &[]));
+        let handshake_stream = V2HandshakeStream::new(stream, challenge);
+        let sni_name = rustls::pki_types::ServerName::try_from(self.host.clone())
+            .map_err(map_io_error)?;
+        let tls = new_connector().connect(sni_name, handshake_stream).await?;
+        let handshake_stream = tls.into_inner().0;
+        let (raw, challenge) = handshake_stream.into_parts();
+        Ok(Box::new(V2Stream::new(raw, challenge.finalize_v2())))
+    }
+
+    async fn wrap_shadow_tls_v3_stream(
+        &self,
+        stream: AnyStream,
+    ) -> std::io::Result<AnyStream> {
+        let proxy_stream = ProxyTlsStream::new(stream, &self.password);
+
+        // ShadowTLS V3 authenticates the ClientHello by replacing its
+        // compatibility session ID with a password-derived signature. This
+        // must happen inside rustls before the ClientHello enters the
+        // handshake transcript; rewriting the bytes below rustls would make
+        // the client/server transcript hashes diverge.
+        let hmac_handshake = Hmac::new(&self.password, (&[], &[]));
+        let sni_name = rustls::pki_types::ServerName::try_from(self.host.clone())
+            .map_err(map_io_error)?;
+        let session_id_generator =
+            move |data: &[u8]| generate_session_id(&hmac_handshake, data);
         let connector = new_connector();
         let mut tls = connector
-            .connect_with(sni_name, proxy_stream, |_| {})
+            .connect_with_session_id_generator(
+                sni_name,
+                proxy_stream,
+                Some(session_id_generator),
+                |_| {},
+            )
             .await?;
 
         // check if is authorized
@@ -129,6 +195,16 @@ fn new_connector() -> TlsConnector {
     let tls_config = rustls::ClientConfig::builder()
         .with_root_certificates(GLOBAL_ROOT_STORE.clone())
         .with_no_client_auth();
+
+    TlsConnector::from(Arc::new(tls_config))
+}
+
+fn new_v1_connector() -> TlsConnector {
+    let tls_config = rustls::ClientConfig::builder_with_protocol_versions(&[
+        &rustls::version::TLS12,
+    ])
+    .with_root_certificates(GLOBAL_ROOT_STORE.clone())
+    .with_no_client_auth();
 
     TlsConnector::from(Arc::new(tls_config))
 }

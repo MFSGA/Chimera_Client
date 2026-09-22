@@ -7,8 +7,8 @@ use crate::{
     proxy::{
         HandlerCommonOptions,
         transport::{
-            GrpcClient, TlsClient, Transport, XhttpChunkSizeRange, XhttpClient,
-            XhttpDownloadConfig, XhttpEndpointConfig, XhttpHttpVersion,
+            GrpcClient, Shadowtls, TlsClient, Transport, XhttpChunkSizeRange,
+            XhttpClient, XhttpDownloadConfig, XhttpEndpointConfig, XhttpHttpVersion,
             XhttpMetadataConfig, XhttpMetadataPlacement, XhttpMode,
             XhttpPaddingConfig, XhttpPaddingMethod, XhttpPaddingPlacement,
             XhttpRealityConfig, XhttpReusePolicy, XhttpReuseValueRange,
@@ -165,11 +165,7 @@ fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
     }
 
     validate_vless_ech_opts(s)?;
-    if s.shadow_tls_opts.is_some() {
-        return Err(Error::InvalidConfig(
-            "vless shadow-tls-opts runtime is not implemented".to_owned(),
-        ));
-    }
+    validate_vless_shadow_tls_opts(s)?;
     if s.restls_opts.is_some() {
         return Err(Error::InvalidConfig(
             "vless restls-opts runtime is not implemented".to_owned(),
@@ -292,6 +288,57 @@ fn validate_vless_ech_opts(s: &OutboundVless) -> Result<(), Error> {
     decode_vless_ech_config(s)?;
     Ok(())
 }
+
+fn validate_vless_shadow_tls_opts(s: &OutboundVless) -> Result<(), Error> {
+    let Some(opts) = s.shadow_tls_opts.as_ref() else {
+        return Ok(());
+    };
+
+    if !s.tls.unwrap_or_default() {
+        return Err(Error::InvalidConfig(
+            "vless shadow-tls-opts requires tls: true".to_owned(),
+        ));
+    }
+    if s.reality_opts.is_some() {
+        return Err(Error::InvalidConfig(
+            "vless shadow-tls-opts cannot be combined with reality".to_owned(),
+        ));
+    }
+    if matches!(s.network.as_deref(), Some("xhttp")) {
+        let xhttp_opts = s.xhttp_opts.as_ref().ok_or_else(|| {
+            Error::InvalidConfig("xhttp_opts is required for vless xhttp".to_owned())
+        })?;
+        if matches!(
+            resolve_xhttp_http_version(s)?,
+            XhttpHttpVersion::Http1 | XhttpHttpVersion::Http3
+        ) || xhttp_opts.upload_settings.is_some()
+        {
+            return Err(Error::InvalidConfig(
+                "vless shadow-tls-opts is not supported when XHTTP owns endpoint security"
+                    .to_owned(),
+            ));
+        }
+    }
+
+    let version = opts.version.unwrap_or(2);
+    if !matches!(version, 1..=3) {
+        return Err(Error::InvalidConfig(format!(
+            "vless shadow-tls-opts supports versions 1, 2, and 3, got {version}"
+        )));
+    }
+    if opts
+        .password
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        return Err(Error::InvalidConfig(
+            "vless shadow-tls-opts password is required".to_owned(),
+        ));
+    }
+
+    Ok(())
+}
 fn vless_standard_tls_enabled(s: &OutboundVless) -> bool {
     if matches!(s.network.as_deref(), Some("xhttp"))
         && let Some(upload_settings) = s
@@ -360,6 +407,37 @@ fn build_tls_transport(
 
     if matches!(network, Some("grpc")) && s.reality_opts.is_some() {
         return build_grpc_reality_transport(s);
+    }
+
+    if let Some(opts) = s.shadow_tls_opts.as_ref() {
+        validate_vless_shadow_tls_opts(s)?;
+        let server_name = s
+            .sni
+            .clone()
+            .or_else(|| s.server_name.clone())
+            .unwrap_or_else(|| s.common_opts.server.clone());
+        let password = opts
+            .password
+            .as_deref()
+            .map(str::trim)
+            .filter(|password| !password.is_empty())
+            .ok_or_else(|| {
+                Error::InvalidConfig(
+                    "vless shadow-tls-opts password is required".to_owned(),
+                )
+            })?
+            .to_owned();
+        let shadow_tls: Box<dyn Transport> = match opts.version.unwrap_or(2) {
+            1 => Box::new(Shadowtls::new_v1(server_name)),
+            2 => Box::new(Shadowtls::new_v2(server_name, password)),
+            3 => Box::new(Shadowtls::new(server_name, password, true)),
+            version => {
+                return Err(Error::InvalidConfig(format!(
+                    "vless shadow-tls-opts supports versions 1, 2, and 3, got {version}"
+                )));
+            }
+        };
+        return Ok(Some(shadow_tls));
     }
 
     if !s.tls.unwrap_or_default() {
@@ -2292,15 +2370,6 @@ mod tests {
                 .contains("ECH DNS discovery is not implemented")
         );
 
-        let mut shadow_tls = base();
-        shadow_tls.shadow_tls_opts = Some(ShadowTlsOptions::default());
-        let err = validate_vless_config(&shadow_tls)
-            .expect_err("ShadowTLS must not be silently ignored");
-        assert!(
-            err.to_string()
-                .contains("shadow-tls-opts runtime is not implemented")
-        );
-
         let mut restls = base();
         restls.restls_opts = Some(RestlsOptions::default());
         let err = validate_vless_config(&restls)
@@ -2317,6 +2386,207 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("jls-opts runtime is not implemented")
+        );
+    }
+
+    #[test]
+    fn vless_shadow_tls_v1_builds_tcp_security_layer() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "shadow-tls-v1".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            tls: Some(true),
+            network: Some("tcp".to_owned()),
+            sni: Some("cover.example.com".to_owned()),
+            shadow_tls_opts: Some(ShadowTlsOptions {
+                version: Some(1),
+                password: Some("shadow-secret".to_owned()),
+            }),
+            ..Default::default()
+        };
+
+        validate_vless_config(&outbound).expect("ShadowTLS V1 should validate");
+        assert!(
+            build_tls_transport(Some("tcp"), &outbound, false)
+                .expect("ShadowTLS V1 transport should build")
+                .is_some()
+        );
+        crate::proxy::vless::Handler::try_from(&outbound)
+            .expect("ShadowTLS V1 VLESS handler should build");
+    }
+
+    #[test]
+    fn vless_shadow_tls_v2_builds_and_is_default() {
+        for version in [None, Some(2)] {
+            let outbound = OutboundVless {
+                common_opts: CommonConfigOptions {
+                    name: "shadow-tls-v2".to_owned(),
+                    server: "example.com".to_owned(),
+                    port: 443,
+                    connect_via: None,
+                },
+                uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+                tls: Some(true),
+                network: Some("tcp".to_owned()),
+                sni: Some("cover.example.com".to_owned()),
+                shadow_tls_opts: Some(ShadowTlsOptions {
+                    version,
+                    password: Some("shadow-secret".to_owned()),
+                }),
+                ..Default::default()
+            };
+
+            validate_vless_config(&outbound).expect("ShadowTLS V2 should validate");
+            assert!(
+                build_tls_transport(Some("tcp"), &outbound, false)
+                    .expect("ShadowTLS V2 transport should build")
+                    .is_some()
+            );
+            crate::proxy::vless::Handler::try_from(&outbound)
+                .expect("ShadowTLS V2 VLESS handler should build");
+        }
+    }
+
+    #[test]
+    fn vless_shadow_tls_v3_builds_tcp_security_layer() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "shadow-tls-v3".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            tls: Some(true),
+            network: Some("tcp".to_owned()),
+            sni: Some("cover.example.com".to_owned()),
+            shadow_tls_opts: Some(ShadowTlsOptions {
+                version: Some(3),
+                password: Some("shadow-secret".to_owned()),
+            }),
+            ..Default::default()
+        };
+
+        validate_vless_config(&outbound).expect("ShadowTLS V3 should validate");
+        assert!(
+            build_tls_transport(Some("tcp"), &outbound, false)
+                .expect("ShadowTLS V3 transport should build")
+                .is_some()
+        );
+        crate::proxy::vless::Handler::try_from(&outbound)
+            .expect("ShadowTLS V3 VLESS handler should build");
+    }
+
+    #[test]
+    fn vless_shadow_tls_v3_builds_tcp_based_transports() {
+        let base = || OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "shadow-tls-transport".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            tls: Some(true),
+            sni: Some("cover.example.com".to_owned()),
+            shadow_tls_opts: Some(ShadowTlsOptions {
+                version: Some(3),
+                password: Some("shadow-secret".to_owned()),
+            }),
+            ..Default::default()
+        };
+
+        #[cfg(feature = "ws")]
+        {
+            let mut ws = base();
+            ws.network = Some("ws".to_owned());
+            ws.ws_opts = Some(WsOpt::default());
+            validate_vless_config(&ws).expect("ShadowTLS WS should validate");
+            crate::proxy::vless::Handler::try_from(&ws)
+                .expect("ShadowTLS WS handler should build");
+        }
+
+        let mut grpc = base();
+        grpc.network = Some("grpc".to_owned());
+        grpc.grpc_opts = Some(GrpcOpt::default());
+        validate_vless_config(&grpc).expect("ShadowTLS gRPC should validate");
+        crate::proxy::vless::Handler::try_from(&grpc)
+            .expect("ShadowTLS gRPC handler should build");
+
+        let mut xhttp = base();
+        xhttp.network = Some("xhttp".to_owned());
+        xhttp.alpn = Some(vec!["h2".to_owned()]);
+        xhttp.xhttp_opts = Some(XhttpOpt {
+            mode: Some("stream-up".to_owned()),
+            ..Default::default()
+        });
+        validate_vless_config(&xhttp).expect("ShadowTLS H2 XHTTP should validate");
+        crate::proxy::vless::Handler::try_from(&xhttp)
+            .expect("ShadowTLS H2 XHTTP handler should build");
+    }
+
+    #[test]
+    fn vless_shadow_tls_rejects_unsupported_shapes() {
+        let base = || OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "shadow-tls-invalid".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            tls: Some(true),
+            network: Some("tcp".to_owned()),
+            shadow_tls_opts: Some(ShadowTlsOptions {
+                version: Some(3),
+                password: Some("shadow-secret".to_owned()),
+            }),
+            ..Default::default()
+        };
+
+        let mut unsupported = base();
+        unsupported.shadow_tls_opts.as_mut().unwrap().version = Some(4);
+        assert!(
+            validate_vless_config(&unsupported)
+                .expect_err("unknown ShadowTLS version must fail")
+                .to_string()
+                .contains("supports versions 1, 2, and 3")
+        );
+
+        let mut missing_password = base();
+        missing_password.shadow_tls_opts.as_mut().unwrap().password = None;
+        assert!(
+            validate_vless_config(&missing_password)
+                .expect_err("ShadowTLS password is required")
+                .to_string()
+                .contains("password is required")
+        );
+
+        let mut xhttp_http1 = base();
+        xhttp_http1.network = Some("xhttp".to_owned());
+        xhttp_http1.alpn = Some(vec!["http/1.1".to_owned()]);
+        xhttp_http1.xhttp_opts = Some(XhttpOpt {
+            mode: Some("packet-up".to_owned()),
+            ..Default::default()
+        });
+        assert!(
+            validate_vless_config(&xhttp_http1)
+                .expect_err("HTTP/1.1 XHTTP owns endpoint security")
+                .to_string()
+                .contains("XHTTP owns endpoint security")
+        );
+
+        let mut no_tls = base();
+        no_tls.tls = Some(false);
+        assert!(
+            validate_vless_config(&no_tls)
+                .expect_err("ShadowTLS requires tls: true")
+                .to_string()
+                .contains("requires tls: true")
         );
     }
 
