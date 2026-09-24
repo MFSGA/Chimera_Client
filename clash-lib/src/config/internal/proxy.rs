@@ -725,7 +725,7 @@ pub struct OutboundTrojan {
     pub skip_cert_verify: Option<bool>,
     pub udp: Option<bool>,
     pub network: Option<String>,
-    // pub grpc_opts: Option<GrpcOpt>,
+    pub grpc_opts: Option<GrpcOpt>,
     #[cfg(feature = "ws")]
     pub ws_opts: Option<WsOpt>,
 }

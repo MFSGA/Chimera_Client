@@ -231,3 +231,23 @@ Each item must be implemented, tested, and committed separately.
   tests; formatting and diff checks.
 - Next slice: add these stable combinations to CI, then review whether the
   general `tls` capability and encrypted-DNS capability need separate features.
+
+## 2026-09-24 Trojan gRPC Transport
+
+- Baseline: `origin/master` `a5d4c970` (v0.26.0). Trojan's converter rejected
+  `network: grpc` and its `grpc-opts` field was commented out, while the shared
+  gRPC transport and VLESS gRPC option type already existed. The current `ref/`
+  is not a browsable source checkout; this slice was adapted from local branch
+  commit `949cbced` and reconciled with the current API.
+- Completed: enabled Trojan `grpc-opts`, constructed the shared gRPC client
+  with service path, user-agent, ping interval, and pool limits; rejected
+  missing options and conflicting pool settings. Kept unrelated TLS-option
+  additions from the source commit out of this slice.
+- Verification: baseline and modified `cargo check -p clash-lib --features
+  trojan` passed; `cargo fmt --all -- --check` passed; focused
+  `cargo test -p clash-lib --lib --features trojan trojan_grpc` passed (3
+  tests). A no-default-feature check without `tun` fails on pre-existing
+  unused-variable warnings in `clash-lib/src/lib.rs`; the supported default
+  feature combination with `trojan` was used for verification.
+- Next slice: re-check current master for equivalent behavior before selecting
+  another protocol compatibility fix.
