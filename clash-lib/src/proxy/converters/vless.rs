@@ -707,21 +707,23 @@ fn build_xhttp_upload_endpoint_config(
     let client_fingerprint = upload
         .and_then(|settings| settings.client_fingerprint.as_deref())
         .or(s.client_fingerprint.as_deref());
-    if let Some(client_fingerprint) = client_fingerprint {
-        match &security {
-            XhttpSecurity::Reality if client_fingerprint == "chrome" => {}
-            XhttpSecurity::Reality => {
-                return Err(Error::InvalidConfig(format!(
-                    "xhttp upload endpoint reality currently supports only client-fingerprint: chrome, got {client_fingerprint}"
-                )));
-            }
-            _ if client_fingerprint == "none" => {}
-            _ => {
-                return Err(Error::InvalidConfig(format!(
-                    "xhttp upload endpoint client-fingerprint is not implemented for non-reality TLS, got {client_fingerprint}"
-                )));
-            }
-        }
+    if let Some(client_fingerprint) = client_fingerprint
+        && !matches!(
+            &security,
+            XhttpSecurity::Reality if client_fingerprint == "chrome"
+        )
+        && !(matches!(security, XhttpSecurity::Tls | XhttpSecurity::None)
+            && client_fingerprint == "none")
+    {
+        let message = match &security {
+            XhttpSecurity::Reality => format!(
+                "xhttp upload endpoint reality currently supports only client-fingerprint: chrome, got {client_fingerprint}"
+            ),
+            _ => format!(
+                "xhttp upload endpoint client-fingerprint is not implemented for non-reality TLS, got {client_fingerprint}"
+            ),
+        };
+        return Err(Error::InvalidConfig(message));
     }
 
     let reality = build_xhttp_reality_config(
@@ -881,21 +883,26 @@ fn build_xhttp_download_config(
         .client_fingerprint
         .as_deref()
         .or(s.client_fingerprint.as_deref());
-    if let Some(client_fingerprint) = client_fingerprint {
-        match &security {
-            XhttpSecurity::Reality if client_fingerprint == "chrome" => {}
-            XhttpSecurity::Reality => {
-                return Err(Error::InvalidConfig(format!(
-                    "xhttp download-settings reality currently supports only client-fingerprint: chrome, got {client_fingerprint}"
-                )));
-            }
-            _ if client_fingerprint == "none" => {}
-            _ => {
-                return Err(Error::InvalidConfig(format!(
-                    "xhttp download-settings client-fingerprint is not implemented for non-reality TLS, got {client_fingerprint}"
-                )));
-            }
-        }
+    if let Some(client_fingerprint) = client_fingerprint
+        && !matches!(
+            &security,
+            XhttpSecurity::Reality if client_fingerprint == "chrome"
+        )
+        && !matches!(
+            &security,
+            XhttpSecurity::Tls | XhttpSecurity::None
+                if client_fingerprint == "none"
+        )
+    {
+        let message = match &security {
+            XhttpSecurity::Reality => format!(
+                "xhttp download-settings reality currently supports only client-fingerprint: chrome, got {client_fingerprint}"
+            ),
+            _ => format!(
+                "xhttp download-settings client-fingerprint is not implemented for non-reality TLS, got {client_fingerprint}"
+            ),
+        };
+        return Err(Error::InvalidConfig(message));
     }
 
     let reality = build_xhttp_reality_config(
