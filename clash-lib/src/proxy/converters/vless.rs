@@ -111,18 +111,12 @@ fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
         }
     }
 
-    if let Some(client_fingerprint) = s.client_fingerprint.as_deref() {
-        if s.reality_opts.is_some() {
-            if client_fingerprint != "chrome" {
-                return Err(Error::InvalidConfig(format!(
-                    "vless reality currently supports only client-fingerprint: chrome, got {client_fingerprint}"
-                )));
-            }
-        } else if client_fingerprint != "none" {
-            return Err(Error::InvalidConfig(format!(
-                "vless client-fingerprint is not implemented for non-reality TLS, got {client_fingerprint}"
-            )));
-        }
+    if let Some(client_fingerprint) = s.client_fingerprint.as_deref()
+        && client_fingerprint != "none"
+    {
+        warn!(
+            "vless client-fingerprint '{client_fingerprint}' is not supported yet, ignoring it"
+        );
     }
 
     if matches!(s.network.as_deref(), Some("xhttp")) {
@@ -707,21 +701,16 @@ fn build_xhttp_upload_endpoint_config(
     let client_fingerprint = upload
         .and_then(|settings| settings.client_fingerprint.as_deref())
         .or(s.client_fingerprint.as_deref());
-    if let Some(client_fingerprint) = client_fingerprint {
-        match &security {
-            XhttpSecurity::Reality if client_fingerprint == "chrome" => {}
-            XhttpSecurity::Reality => {
-                return Err(Error::InvalidConfig(format!(
-                    "xhttp upload endpoint reality currently supports only client-fingerprint: chrome, got {client_fingerprint}"
-                )));
-            }
-            _ if client_fingerprint == "none" => {}
-            _ => {
-                return Err(Error::InvalidConfig(format!(
-                    "xhttp upload endpoint client-fingerprint is not implemented for non-reality TLS, got {client_fingerprint}"
-                )));
-            }
-        }
+    if let Some(client_fingerprint) = client_fingerprint
+        && !matches!(
+            &security,
+            XhttpSecurity::Reality if client_fingerprint == "chrome"
+        )
+        && client_fingerprint != "none"
+    {
+        warn!(
+            "xhttp upload endpoint client-fingerprint '{client_fingerprint}' is not supported yet, ignoring it"
+        );
     }
 
     let reality = build_xhttp_reality_config(
@@ -881,21 +870,16 @@ fn build_xhttp_download_config(
         .client_fingerprint
         .as_deref()
         .or(s.client_fingerprint.as_deref());
-    if let Some(client_fingerprint) = client_fingerprint {
-        match &security {
-            XhttpSecurity::Reality if client_fingerprint == "chrome" => {}
-            XhttpSecurity::Reality => {
-                return Err(Error::InvalidConfig(format!(
-                    "xhttp download-settings reality currently supports only client-fingerprint: chrome, got {client_fingerprint}"
-                )));
-            }
-            _ if client_fingerprint == "none" => {}
-            _ => {
-                return Err(Error::InvalidConfig(format!(
-                    "xhttp download-settings client-fingerprint is not implemented for non-reality TLS, got {client_fingerprint}"
-                )));
-            }
-        }
+    if let Some(client_fingerprint) = client_fingerprint
+        && !matches!(
+            &security,
+            XhttpSecurity::Reality if client_fingerprint == "chrome"
+        )
+        && client_fingerprint != "none"
+    {
+        warn!(
+            "xhttp download-settings client-fingerprint '{client_fingerprint}' is not supported yet, ignoring it"
+        );
     }
 
     let reality = build_xhttp_reality_config(
@@ -1929,7 +1913,7 @@ mod tests {
 
     #[cfg(feature = "reality")]
     #[test]
-    fn vless_reality_rejects_non_chrome_client_fingerprint() {
+    fn vless_reality_allows_client_fingerprint_configuration_with_warning() {
         let outbound = OutboundVless {
             common_opts: CommonConfigOptions {
                 name: "reality-firefox".to_owned(),
@@ -1946,17 +1930,13 @@ mod tests {
             ..Default::default()
         };
 
-        let err = validate_vless_config(&outbound)
-            .expect_err("unsupported Reality ClientHello fingerprint must fail");
-        assert!(
-            err.to_string()
-                .contains("supports only client-fingerprint: chrome"),
-            "unexpected error: {err}"
+        validate_vless_config(&outbound).expect(
+            "Reality client-fingerprint should be accepted for config compatibility",
         );
     }
 
     #[test]
-    fn vless_non_reality_rejects_unimplemented_client_fingerprint() {
+    fn vless_non_reality_allows_client_fingerprint_configuration() {
         let outbound = OutboundVless {
             common_opts: CommonConfigOptions {
                 name: "tls-firefox".to_owned(),
@@ -1970,14 +1950,8 @@ mod tests {
             ..Default::default()
         };
 
-        let err = validate_vless_config(&outbound)
-            .expect_err("non-Reality uTLS fingerprint must not be silently ignored");
-        assert!(
-            err.to_string().contains(
-                "client-fingerprint is not implemented for non-reality TLS"
-            ),
-            "unexpected error: {err}"
-        );
+        validate_vless_config(&outbound)
+            .expect("non-Reality TLS client-fingerprint should be accepted for config compatibility");
     }
 
     #[test]
@@ -4278,20 +4252,13 @@ mod tests {
             .expect("xhttp options should be present");
         let metadata =
             build_xhttp_metadata_config(xhttp_opts).expect("metadata should build");
-        let err = build_xhttp_download_config(
+        build_xhttp_download_config(
             &outbound,
             xhttp_opts,
             &metadata,
             XhttpHttpVersion::Http2,
         )
-        .expect_err("non-Reality TLS cannot silently inherit chrome fingerprint");
-
-        assert!(
-            err.to_string().contains(
-                "client-fingerprint is not implemented for non-reality TLS"
-            ),
-            "unexpected error: {err}"
-        );
+        .expect("non-Reality TLS fingerprint should only warn for compatibility");
     }
 
     #[test]
