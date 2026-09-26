@@ -23,15 +23,18 @@ use std::{
     net,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
     },
     time::{Duration, Instant},
 };
 use tokio::sync::RwLock;
 use tracing::{debug, error, instrument, trace, warn};
 
+const RESPONSE_CACHE_CAPACITY: u64 = 4096;
+
 pub struct EnhancedResolver {
     ipv6: AtomicBool,
+    network_generation: AtomicU64,
     hosts: Option<trie::StringTrie<net::IpAddr>>,
     main: Vec<ThreadSafeDNSClient>,
 
@@ -39,7 +42,7 @@ pub struct EnhancedResolver {
     fallback_domain_filters: Option<Vec<Box<dyn FallbackDomainFilter>>>,
     fallback_ip_filters: Option<Vec<Box<dyn FallbackIPFilter>>>,
 
-    lru_cache: Option<hickory_resolver::ResponseCache>,
+    lru_cache: Option<Arc<RwLock<hickory_resolver::ResponseCache>>>,
     policy: Option<trie::StringTrie<Vec<ThreadSafeDNSClient>>>,
 
     proxy_resolver: Option<Vec<ThreadSafeDNSClient>>,
@@ -55,6 +58,7 @@ impl EnhancedResolver {
     fn from_clients(main: Vec<ThreadSafeDNSClient>, ipv6: bool) -> Self {
         Self {
             ipv6: AtomicBool::new(ipv6),
+            network_generation: AtomicU64::new(0),
             hosts: None,
             main,
             fallback: None,
@@ -80,6 +84,7 @@ impl EnhancedResolver {
 
         EnhancedResolver {
             ipv6: AtomicBool::new(false),
+            network_generation: AtomicU64::new(0),
             hosts: None,
             main: make_clients(
                 vec![NameServer {
@@ -125,6 +130,7 @@ impl EnhancedResolver {
         let edns_client_subnet = cfg.edns_client_subnet.clone();
         let default_resolver = Arc::new(EnhancedResolver {
             ipv6: AtomicBool::new(false),
+            network_generation: AtomicU64::new(0),
             hosts: None,
             main: make_clients(
                 cfg.default_nameserver.clone(),
@@ -217,6 +223,7 @@ impl EnhancedResolver {
 
         Ok(Self {
             ipv6: AtomicBool::new(cfg.ipv6),
+            network_generation: AtomicU64::new(0),
             main,
             hosts: cfg.hosts,
             fallback: if !cfg.fallback.is_empty() {
@@ -267,10 +274,12 @@ impl EnhancedResolver {
             } else {
                 None
             },
-            lru_cache: Some(hickory_resolver::ResponseCache::new(
-                4096,
-                hickory_resolver::TtlConfig::default(),
-            )),
+            lru_cache: Some(Arc::new(RwLock::new(
+                hickory_resolver::ResponseCache::new(
+                    RESPONSE_CACHE_CAPACITY,
+                    hickory_resolver::TtlConfig::default(),
+                ),
+            ))),
             policy: if !cfg.nameserver_policy.is_empty() {
                 let mut p = trie::StringTrie::new();
                 for (domain, ns) in &cfg.nameserver_policy {
@@ -443,6 +452,9 @@ impl EnhancedResolver {
 
     #[instrument(skip_all, level = "trace")]
     async fn exchange(&self, message: &op::Message) -> anyhow::Result<op::Message> {
+        let generation = self
+            .network_generation
+            .load(std::sync::atomic::Ordering::Acquire);
         let q = message
             .queries
             .first()
@@ -451,10 +463,18 @@ impl EnhancedResolver {
         trace!(q = q.to_string(), "start");
         if Self::cacheable_request(message)
             && let Some(lru) = &self.lru_cache
-            && let Some(Ok(cached)) = lru.get(q, Instant::now()).map(|c| {
-                c.inspect_err(|x| warn!("failed to get cached message: {}", x))
-            })
+            && let Some(Ok(cached)) =
+                lru.read().await.get(q, Instant::now()).map(|c| {
+                    c.inspect_err(|x| warn!("failed to get cached message: {}", x))
+                })
         {
+            if generation
+                != self
+                    .network_generation
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return self.exchange_no_cache(message).await;
+            }
             trace!(
                 q = q.to_string(),
                 "cache hit for DNS query, returning cached response",
@@ -479,6 +499,9 @@ impl EnhancedResolver {
         &self,
         message: &op::Message,
     ) -> anyhow::Result<op::Message> {
+        let generation = self
+            .network_generation
+            .load(std::sync::atomic::Ordering::Acquire);
         let q = message
             .queries
             .first()
@@ -508,7 +531,14 @@ impl EnhancedResolver {
                 ips.is_empty() || ips.iter().any(|ip| !ip.is_unspecified())
             }
         {
-            lru.insert(q.clone(), Ok(msg.clone()), Instant::now());
+            let cache = lru.write().await;
+            if generation
+                == self
+                    .network_generation
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                cache.insert(q.clone(), Ok(msg.clone()), Instant::now());
+            }
         }
 
         rv
@@ -646,10 +676,22 @@ impl EnhancedResolver {
             .collect()
     }
 
-    async fn save_reverse_lookup(&self, ip: net::IpAddr, domain: String) {
+    async fn save_reverse_lookup(
+        &self,
+        ip: net::IpAddr,
+        domain: String,
+        generation: u64,
+    ) {
         if let Some(lru) = &self.reverse_lookup_cache {
             trace!("reverse lookup cache insert: {} -> {}", ip, domain);
-            lru.write().await.insert(ip, domain);
+            let mut lru = lru.write().await;
+            if generation
+                == self
+                    .network_generation
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                lru.insert(ip, domain);
+            }
         }
     }
 }
@@ -816,6 +858,9 @@ impl ClashResolver for EnhancedResolver {
 
     #[instrument(skip(self), level = "trace")]
     async fn exchange(&self, message: &op::Message) -> anyhow::Result<op::Message> {
+        let generation = self
+            .network_generation
+            .load(std::sync::atomic::Ordering::Acquire);
         let rv = self.exchange(message).await?;
         let hostname = message
             .queries
@@ -828,7 +873,8 @@ impl ClashResolver for EnhancedResolver {
         let ip_list = EnhancedResolver::ip_list_of_message(&rv);
         if !ip_list.is_empty() {
             for ip in ip_list {
-                self.save_reverse_lookup(ip, hostname.clone()).await;
+                self.save_reverse_lookup(ip, hostname.clone(), generation)
+                    .await;
             }
         }
         Ok(rv)
@@ -843,6 +889,19 @@ impl ClashResolver for EnhancedResolver {
     }
 
     async fn reset_transports(&self) -> anyhow::Result<u32> {
+        self.network_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+
+        if let Some(cache) = &self.lru_cache {
+            *cache.write().await = hickory_resolver::ResponseCache::new(
+                RESPONSE_CACHE_CAPACITY,
+                hickory_resolver::TtlConfig::default(),
+            );
+        }
+        if let Some(cache) = &self.reverse_lookup_cache {
+            cache.write().await.clear();
+        }
+
         let mut clients = self.main.clone();
         if let Some(fallback) = &self.fallback {
             clients.extend(fallback.iter().cloned());
@@ -858,11 +917,16 @@ impl ClashResolver for EnhancedResolver {
         }
 
         let mut reset = 0_u32;
+        let mut first_error = None;
         for client in clients {
-            reset = reset.saturating_add(client.reset_transport().await?);
+            match client.reset_transport().await {
+                Ok(count) => reset = reset.saturating_add(count),
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
         }
-        if let Some(cache) = &self.reverse_lookup_cache {
-            cache.write().await.clear();
+        if let Some(error) = first_error {
+            return Err(error);
         }
         Ok(reset)
     }
@@ -973,6 +1037,27 @@ mod tests {
     #[derive(Debug)]
     struct ResetCountingClient {
         resets: Arc<AtomicUsize>,
+        fail: bool,
+    }
+
+    #[derive(Debug)]
+    struct DelayedClient {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        response: op::Message,
+    }
+
+    #[async_trait]
+    impl crate::app::dns::Client for DelayedClient {
+        fn id(&self) -> String {
+            "delayed-client".to_owned()
+        }
+
+        async fn exchange(&self, _msg: &op::Message) -> anyhow::Result<op::Message> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(self.response.clone())
+        }
     }
 
     #[async_trait]
@@ -987,6 +1072,9 @@ mod tests {
 
         async fn reset_transport(&self) -> anyhow::Result<u32> {
             self.resets.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                anyhow::bail!("reset failed");
+            }
             Ok(1)
         }
     }
@@ -1032,12 +1120,20 @@ mod tests {
         response
     }
 
+    fn response_cache(capacity: u64) -> Arc<RwLock<ResponseCache>> {
+        Arc::new(RwLock::new(ResponseCache::new(
+            capacity,
+            TtlConfig::default(),
+        )))
+    }
+
     #[tokio::test]
     async fn reset_transports_covers_all_upstream_collections() {
         let resets = Arc::new(AtomicUsize::new(0));
         let client = || -> ThreadSafeDNSClient {
             Arc::new(ResetCountingClient {
                 resets: resets.clone(),
+                fail: false,
             })
         };
         let mut resolver = EnhancedResolver::new_default().await;
@@ -1050,6 +1146,87 @@ mod tests {
 
         assert_eq!(resolver.reset_transports().await.unwrap(), 4);
         assert_eq!(resets.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn reset_transports_invalidates_response_cache() {
+        let mut resolver = EnhancedResolver::new_default().await;
+        let cache = response_cache(16);
+        let (_, query) = test_query();
+        cache.write().await.insert(
+            query.clone(),
+            Ok(response_with_a(Ipv4Addr::new(192, 0, 2, 1))),
+            Instant::now(),
+        );
+        resolver.lru_cache = Some(cache.clone());
+
+        resolver.reset_transports().await.unwrap();
+
+        assert!(cache.read().await.get(&query, Instant::now()).is_none());
+    }
+
+    #[tokio::test]
+    async fn late_response_from_previous_network_generation_is_not_cached() {
+        let mut resolver = EnhancedResolver::new_default().await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (mut request, query) = test_query();
+        request.metadata.recursion_desired = true;
+        resolver.lru_cache = Some(response_cache(16));
+        resolver.main = vec![Arc::new(DelayedClient {
+            started: started.clone(),
+            release: release.clone(),
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 8)),
+        })];
+        let resolver = Arc::new(resolver);
+
+        let query_task = {
+            let resolver = resolver.clone();
+            tokio::spawn(async move { resolver.exchange_no_cache(&request).await })
+        };
+        started.notified().await;
+        resolver.reset_transports().await.unwrap();
+        release.notify_one();
+        query_task.await.unwrap().unwrap();
+
+        assert!(
+            resolver
+                .lru_cache
+                .as_ref()
+                .unwrap()
+                .read()
+                .await
+                .get(&query, Instant::now())
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_attempts_every_client_and_clears_cache_after_failure() {
+        let resets = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::new_default().await;
+        resolver.main = vec![
+            Arc::new(ResetCountingClient {
+                resets: resets.clone(),
+                fail: true,
+            }),
+            Arc::new(ResetCountingClient {
+                resets: resets.clone(),
+                fail: false,
+            }),
+        ];
+        let cache = response_cache(16);
+        let (_, query) = test_query();
+        cache.write().await.insert(
+            query.clone(),
+            Ok(response_with_a(Ipv4Addr::new(192, 0, 2, 1))),
+            Instant::now(),
+        );
+        resolver.lru_cache = Some(cache.clone());
+
+        assert!(resolver.reset_transports().await.is_err());
+        assert_eq!(resets.load(Ordering::SeqCst), 2);
+        assert!(cache.read().await.get(&query, Instant::now()).is_none());
     }
 
     /// Regression test for https://github.com/Watfaq/clash-rs/issues/976
@@ -1112,7 +1289,7 @@ mod tests {
     async fn test_lru_cache_hit_with_recursion_desired() {
         let mut resolver = EnhancedResolver::new_default().await;
         resolver.main.clear();
-        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        resolver.lru_cache = Some(response_cache(16));
 
         let (mut request, query) = test_query();
         request.metadata.recursion_desired = true;
@@ -1125,7 +1302,7 @@ mod tests {
         let mut cached =
             op::Message::response(request.metadata.id, request.metadata.op_code);
         cached.add_answer(record);
-        resolver.lru_cache.as_ref().unwrap().insert(
+        resolver.lru_cache.as_ref().unwrap().write().await.insert(
             query,
             Ok(cached),
             Instant::now(),
@@ -1141,7 +1318,7 @@ mod tests {
     #[tokio::test]
     async fn test_lru_skips_nxdomain_response() {
         let mut resolver = EnhancedResolver::new_default().await;
-        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        resolver.lru_cache = Some(response_cache(16));
 
         let (request, query) = test_query();
         let mut response =
@@ -1160,6 +1337,8 @@ mod tests {
                 .lru_cache
                 .as_ref()
                 .unwrap()
+                .read()
+                .await
                 .get(&query, Instant::now())
                 .is_none()
         );
