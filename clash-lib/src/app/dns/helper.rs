@@ -26,6 +26,7 @@ pub async fn make_clients(
     rule_dispatch: Option<Arc<RuleDispatch>>,
 ) -> Result<Vec<ThreadSafeDNSClient>, crate::Error> {
     let mut rv = Vec::new();
+    let had_configured_servers = !servers.is_empty();
 
     for s in servers {
         debug!("building nameserver: {}", s);
@@ -74,6 +75,12 @@ pub async fn make_clients(
         }
     }
 
+    if had_configured_servers && rv.is_empty() {
+        return Err(crate::Error::InvalidConfig(
+            "DNS upstream configuration contains no usable clients".into(),
+        ));
+    }
+
     Ok(rv)
 }
 
@@ -102,4 +109,46 @@ pub fn build_dns_response_message(
     }
 
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::dns::MockClashResolver;
+
+    #[tokio::test]
+    async fn all_unresolvable_upstreams_return_a_configuration_error() {
+        let mut resolver = MockClashResolver::new();
+        resolver
+            .expect_resolve()
+            .with(
+                mockall::predicate::eq("unresolvable.example"),
+                mockall::predicate::eq(false),
+            )
+            .once()
+            .returning(|_, _| Ok(None));
+
+        let result = make_clients(
+            vec![NameServer {
+                net: DNSNetMode::Udp,
+                host: url::Host::Domain("unresolvable.example".to_owned()),
+                port: 53,
+                interface: None,
+                proxy: None,
+                doh_path: None,
+            }],
+            Some(Arc::new(resolver)),
+            None,
+            Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        let error = result
+            .err()
+            .expect("all unusable upstreams must fail initialization");
+        assert!(error.to_string().contains("no usable clients"));
+    }
 }
