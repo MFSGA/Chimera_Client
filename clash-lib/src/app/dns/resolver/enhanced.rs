@@ -93,6 +93,7 @@ impl EnhancedResolver {
                     port: 53,
                     interface: None,
                     proxy: None,
+                    doh_path: None,
                 }],
                 None,
                 None,
@@ -1168,6 +1169,7 @@ mod tests {
             port: 53,
             interface: None,
             proxy: None,
+            doh_path: None,
         }];
         config.fallback_filter.geo_ip = false;
         config.fallback_filter.ip_cidr =
@@ -1678,6 +1680,7 @@ mod tests {
             iface: None,
             proxy: get_default_outbound(),
             ecs: None,
+            doh_path: None,
             fw_mark: None,
             rule_dispatch: None,
         })
@@ -1699,6 +1702,7 @@ mod tests {
             iface: None,
             proxy: get_default_outbound(),
             ecs: None,
+            doh_path: None,
             fw_mark: None,
             rule_dispatch: None,
         })
@@ -1720,6 +1724,7 @@ mod tests {
             iface: None,
             proxy: get_default_outbound(),
             ecs: None,
+            doh_path: None,
             fw_mark: None,
             rule_dispatch: None,
         })
@@ -1743,6 +1748,7 @@ mod tests {
             iface: None,
             proxy: get_default_outbound(),
             ecs: None,
+            doh_path: None,
             fw_mark: None,
             rule_dispatch: None,
         })
@@ -1764,6 +1770,7 @@ mod tests {
             iface: None,
             proxy: get_default_outbound(),
             ecs: None,
+            doh_path: None,
             fw_mark: None,
             rule_dispatch: None,
         })
@@ -1845,6 +1852,7 @@ mod tests {
             port: 53,
             interface: None,
             proxy: None,
+            doh_path: None,
         };
         Config {
             enable: true,
@@ -1856,6 +1864,7 @@ mod tests {
                 port: 53,
                 interface: None,
                 proxy: None,
+                doh_path: None,
             }],
             nameserver: vec![NameServer {
                 net: DNSNetMode::Udp,
@@ -1863,6 +1872,7 @@ mod tests {
                 port: 53,
                 interface: None,
                 proxy: None,
+                doh_path: None,
             }],
             ..Config::default()
         }
@@ -1882,6 +1892,7 @@ mod tests {
             port: 0,
             interface: None,
             proxy: None,
+            doh_path: None,
         }];
 
         let result = EnhancedResolver::new(

@@ -27,6 +27,7 @@ pub struct NameServer {
     pub port: u16,
     pub interface: Option<OutboundInterface>,
     pub proxy: Option<String>,
+    pub doh_path: Option<String>,
 }
 impl Display for NameServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -122,6 +123,19 @@ impl Config {
 
             let iface = Self::parse_outbound_interface(&url);
             let proxy = Self::parse_outbound_proxy(&url);
+            let doh_path = if url.scheme() == "https" {
+                let path = if url.path().is_empty() || url.path() == "/" {
+                    "/dns-query"
+                } else {
+                    url.path()
+                };
+                Some(match url.query() {
+                    Some(query) => format!("{path}?{query}"),
+                    None => path.to_owned(),
+                })
+            } else {
+                None
+            };
             let net: &str;
             let port: u16;
 
@@ -193,6 +207,7 @@ impl Config {
                     })
                     .transpose()?,
                 proxy,
+                doh_path,
             });
         }
 
@@ -600,6 +615,20 @@ mod tests {
         assert_eq!(ns.len(), 1);
         assert_eq!(ns[0].net, DNSNetMode::DoH);
         assert_eq!(ns[0].proxy.as_deref(), Some("TESTED"));
+        assert_eq!(ns[0].doh_path.as_deref(), Some("/dns-query"));
+    }
+
+    #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+    #[test]
+    fn parse_doh_custom_path_and_query() {
+        let servers =
+            vec!["https://dns.example/custom/resolve?tenant=alpha".to_owned()];
+        let ns = Config::parse_nameserver(&servers).expect("parse failed");
+
+        assert_eq!(
+            ns[0].doh_path.as_deref(),
+            Some("/custom/resolve?tenant=alpha")
+        );
     }
 
     #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
