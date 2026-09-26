@@ -3,7 +3,9 @@
 use std::{
     fs,
     io::{Read, Write},
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket},
+    net::{
+        IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
+    },
     path::PathBuf,
     sync::{
         Arc,
@@ -131,6 +133,12 @@ rules:
         proxy_body.contains("proxy-marker"),
         "proxy response should pass through local SOCKS5 proxy: {proxy_body}"
     );
+    let proxy_deadline = Instant::now() + Duration::from_secs(2);
+    while proxy_connects.load(Ordering::SeqCst) != 1
+        && Instant::now() < proxy_deadline
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
     assert_eq!(
         proxy_connects.load(Ordering::SeqCst),
         1,
@@ -407,6 +415,7 @@ fn handle_socks5_connect(
         let _ = std::io::copy(&mut client_to_remote, &mut remote);
     });
     let _ = std::io::copy(&mut remote_to_client, &mut client);
+    client.shutdown(Shutdown::Write)?;
     let _ = up.join();
     Ok(())
 }
