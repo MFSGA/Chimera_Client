@@ -74,9 +74,11 @@ impl Store for InMemStore {
         self.insert_pair(host, ip);
     }
 
-    async fn del_by_ip(&mut self, ip: IpAddr) {
-        if let Some(host) = self.itoh.remove(&ip) {
-            self.htoi.remove(&host);
+    async fn del_by_host(&mut self, host: &str) {
+        if let Some(ip) = self.htoi.remove(host)
+            && self.itoh.get(&ip).map(String::as_str) == Some(host)
+        {
+            self.itoh.remove(&ip);
         }
     }
 

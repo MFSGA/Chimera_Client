@@ -92,8 +92,8 @@ impl ThreadSafeCacheFile {
         self.0.read().await.get_fake_ip(ip_or_host)
     }
 
-    pub async fn delete_fake_ip_pair(&self, ip: &str, host: &str) {
-        self.0.write().await.delete_fake_ip_pair(ip, host);
+    pub async fn delete_fake_ip_by_host(&self, host: &str) {
+        self.0.write().await.delete_fake_ip_by_host(host);
     }
 }
 
@@ -163,9 +163,11 @@ impl CacheFile {
             .cloned()
     }
 
-    pub fn delete_fake_ip_pair(&mut self, ip: &str, host: &str) {
-        self.db.ip_to_host.remove(ip);
+    pub fn delete_fake_ip_by_host(&mut self, host: &str) {
         self.db.host_to_ip.remove(host);
+        self.db
+            .ip_to_host
+            .retain(|_, mapped_host| mapped_host != host);
     }
 }
 

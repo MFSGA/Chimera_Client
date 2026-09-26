@@ -792,7 +792,7 @@ impl ClashResolver for EnhancedResolver {
         if enhanced && self.fake_ip_enabled() {
             let mut fake_dns = self.fake_dns.as_ref().unwrap().write().await;
             if !fake_dns.should_skip(host) {
-                let ip = fake_dns.lookup(host).await;
+                let ip = fake_dns.lookup(host).await?;
                 debug!("fake dns lookup: {} -> {:?}", host, ip);
                 match ip {
                     net::IpAddr::V4(v4) => return Ok(Some(v4)),
