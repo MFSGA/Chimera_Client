@@ -283,5 +283,11 @@ Each item must be implemented, tested, and committed separately.
   passed; `cargo fmt --all -- --check` passed; focused
   `cargo test -p clash-lib --lib --features trojan proxy::vless::vision` passed
   (19 tests).
-- Next slice: inspect the pending VLESS server-first handshake change and its
-  read/write lifecycle before deciding whether it is safe to migrate.
+- Held candidate: the pending `stream.rs` read-first handshake change is not
+  migrated. In the relay's bidirectional copy path, a partially pending first
+  write can coexist with a read poll; if the read path completes that pending
+  write, the write retry may resend the same application bytes. The candidate
+  test covers read-first startup but not this interleaving.
+- Next slice: separate request-header transmission from pending application
+  write ownership, then validate the interleaved read/write lifecycle before
+  considering this candidate again.
