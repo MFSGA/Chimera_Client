@@ -67,25 +67,29 @@ impl DnsRuntimeProvider {
         Self::new(proxy, dns_resolver, iface, so_mark, None)
     }
 
-    /// Pick the outbound handler for an upstream DNS dial. When
-    /// `rule_dispatch` is ready, DNS dials can follow the rule engine; until
-    /// startup finishes, or if a routed outbound cannot be found, this falls
-    /// back to the static DNS outbound.
-    async fn pick_outbound(&self, sess: &Session) -> AnyOutboundHandler {
+    /// Pick the outbound handler for an upstream DNS dial. Rule-respecting
+    /// DNS fails closed if the router or selected outbound is unavailable.
+    async fn pick_outbound(&self, sess: &Session) -> io::Result<AnyOutboundHandler> {
         let Some(rd) = &self.rule_dispatch else {
-            return self.outbound.clone();
+            return Ok(self.outbound.clone());
         };
-        let (Some(router), Some(mgr)) = (
-            rd.router.get().and_then(std::sync::Weak::upgrade),
-            rd.outbound_manager.get().and_then(std::sync::Weak::upgrade),
-        ) else {
-            return self.outbound.clone();
-        };
+        let router = rd
+            .router
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| io::Error::other("DNS rule router is not ready"))?;
+        let mgr = rd
+            .outbound_manager
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| {
+                io::Error::other("DNS rule outbound manager is not ready")
+            })?;
         let mut sess = sess.clone();
         let (name, _) = router.match_route(&mut sess).await;
-        mgr.get_outbound(name)
-            .await
-            .unwrap_or_else(|| self.outbound.clone())
+        mgr.get_outbound(name).await.ok_or_else(|| {
+            io::Error::other("DNS rule selected an unavailable outbound")
+        })
     }
 
     fn session_for(&self, server_addr: SocketAddr, network: Network) -> Session {
@@ -129,7 +133,7 @@ impl RuntimeProvider for DnsRuntimeProvider {
         let dns = self.dns_resolver.clone();
         let sess = self.session_for(server_addr, Network::Tcp);
         Box::pin(async move {
-            let outbound = provider.pick_outbound(&sess).await;
+            let outbound = provider.pick_outbound(&sess).await?;
             let stream = outbound.connect_stream(&sess, dns);
             stream.await.map(AsyncIoTokioAsStd)
         })
@@ -146,7 +150,7 @@ impl RuntimeProvider for DnsRuntimeProvider {
         let sess = self.session_for(server_addr, Network::Udp);
 
         Box::pin(async move {
-            let outbound = provider.pick_outbound(&sess).await;
+            let outbound = provider.pick_outbound(&sess).await?;
             outbound
                 .connect_datagram(&sess, dns)
                 .await
@@ -175,6 +179,21 @@ mod tests {
             assert_eq!(session.destination, SocksAddr::Ip(target));
             assert_eq!(session.so_mark, Some(7777));
         }
+    }
+
+    #[tokio::test]
+    async fn respect_rules_fails_closed_before_router_is_ready() {
+        let mut provider = DnsRuntimeProvider::new_direct(None, None);
+        provider.rule_dispatch = Some(crate::app::dns::RuleDispatch::new());
+        let session =
+            provider.session_for("192.0.2.53:53".parse().unwrap(), Network::Udp);
+
+        let error = provider
+            .pick_outbound(&session)
+            .await
+            .expect_err("rule-based DNS must not silently use the static outbound");
+
+        assert!(error.to_string().contains("router is not ready"));
     }
 }
 
