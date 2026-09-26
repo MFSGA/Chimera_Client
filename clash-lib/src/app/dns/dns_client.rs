@@ -312,7 +312,7 @@ mod tests {
             EdnsOption::Subnet(subnet) => {
                 assert_eq!(subnet.addr(), net::IpAddr::from([1, 2, 3, 0]));
                 assert_eq!(subnet.source_prefix(), 24);
-                assert_eq!(subnet.scope_prefix(), 24);
+                assert_eq!(subnet.scope_prefix(), 0);
             }
             _ => panic!("unexpected edns option"),
         }
@@ -340,7 +340,7 @@ mod tests {
                     net::IpAddr::from_str("2001:db8::").unwrap()
                 );
                 assert_eq!(subnet.source_prefix(), 48);
-                assert_eq!(subnet.scope_prefix(), 48);
+                assert_eq!(subnet.scope_prefix(), 0);
             }
             _ => panic!("unexpected edns option"),
         }
@@ -376,7 +376,38 @@ mod tests {
             EdnsOption::Subnet(subnet) => {
                 assert_eq!(subnet.addr(), net::IpAddr::from([9, 8, 7, 0]));
                 assert_eq!(subnet.source_prefix(), 24);
-                assert_eq!(subnet.scope_prefix(), 24);
+                assert_eq!(subnet.scope_prefix(), 0);
+            }
+            _ => panic!("unexpected edns option"),
+        }
+    }
+
+    #[test]
+    fn apply_edns_client_subnet_normalizes_existing_option_without_config() {
+        let client = client_with_ecs(None);
+        let mut msg = build_message(RecordType::A);
+
+        let mut edns = hickory_proto::op::Edns::new();
+        edns.options_mut()
+            .insert(EdnsOption::Subnet(ClientSubnet::new(
+                net::IpAddr::from([9, 8, 7, 0]),
+                24,
+                24,
+            )));
+        msg.set_edns(edns);
+
+        client.apply_edns_client_subnet(&mut msg);
+
+        let option = msg
+            .edns
+            .as_ref()
+            .and_then(|edns| edns.option(EdnsCode::Subnet))
+            .expect("subnet option should remain");
+        match option {
+            EdnsOption::Subnet(subnet) => {
+                assert_eq!(subnet.addr(), net::IpAddr::from([9, 8, 7, 0]));
+                assert_eq!(subnet.source_prefix(), 24);
+                assert_eq!(subnet.scope_prefix(), 0);
             }
             _ => panic!("unexpected edns option"),
         }
@@ -816,19 +847,25 @@ impl DnsClient {
     }
 
     fn apply_edns_client_subnet(&self, message: &mut Message) {
+        if let Some(EdnsOption::Subnet(existing)) = message
+            .edns
+            .as_ref()
+            .and_then(|edns| edns.option(EdnsCode::Subnet))
+        {
+            let corrected =
+                ClientSubnet::new(existing.addr(), existing.source_prefix(), 0);
+            if let Some(edns) = message.edns.as_mut() {
+                edns.options_mut().remove(EdnsCode::Subnet);
+                edns.options_mut().insert(EdnsOption::Subnet(corrected));
+            }
+            return;
+        }
+
         let Some(ecs) = &self.ecs else {
             return;
         };
 
         if ecs.ipv4.is_none() && ecs.ipv6.is_none() {
-            return;
-        }
-
-        if message
-            .edns
-            .as_ref()
-            .is_some_and(|edns| edns.option(EdnsCode::Subnet).is_some())
-        {
             return;
         }
 
@@ -865,7 +902,7 @@ impl DnsClient {
 
         let options = edns.options_mut();
         options.remove(EdnsCode::Subnet);
-        options.insert(EdnsOption::Subnet(ClientSubnet::new(addr, prefix, prefix)));
+        options.insert(EdnsOption::Subnet(ClientSubnet::new(addr, prefix, 0)));
     }
 }
 
