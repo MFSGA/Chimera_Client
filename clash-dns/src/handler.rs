@@ -72,7 +72,7 @@ where
     async fn handle<H: ResponseHandler>(
         &self,
         request: &Request,
-        mut response_handle: H,
+        response_handle: &mut H,
     ) -> Result<ResponseInfo, DNSError> {
         if request.metadata.op_code != OpCode::Query {
             return Err(DNSError::InvalidOpQuery(format!(
@@ -175,7 +175,7 @@ where
     async fn handle_request<R: ResponseHandler, T: Time>(
         &self,
         request: &Request,
-        response_handle: R,
+        mut response_handle: R,
     ) -> ResponseInfo {
         debug!(
             "got dns request [{}][{:?}][{:?}] from {}",
@@ -185,19 +185,29 @@ where
             request.src()
         );
 
-        self.handle(request, response_handle)
-            .await
-            .unwrap_or_else(|e| {
+        match self.handle(request, &mut response_handle).await {
+            Ok(response_info) => response_info,
+            Err(e) => {
                 debug!("dns request error: {}", e);
                 let mut metadata =
                     Metadata::response_from_request(&request.metadata);
                 metadata.response_code = ResponseCode::ServFail;
-                Header {
+                let fallback_response_info = Header {
                     metadata,
                     counts: HeaderCounts::default(),
                 }
-                .into()
-            })
+                .into();
+                let response = MessageResponseBuilder::from_message_request(request)
+                    .build_no_records(metadata);
+                match response_handle.send_response(response).await {
+                    Ok(response_info) => response_info,
+                    Err(send_error) => {
+                        error!("failed to send DNS SERVFAIL response: {send_error}");
+                        fallback_response_info
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -421,10 +431,14 @@ mod plain_tests {
         tcp::TcpClientStream,
         udp::UdpClientStream,
     };
-    use hickory_proto::rr::{DNSClass, Name, RData, RecordType};
+    use hickory_proto::{
+        op::{Message, MessageType, OpCode, Query, ResponseCode},
+        rr::{DNSClass, Name, RData, RecordType},
+    };
     use std::time::Duration;
     use tokio::{
-        net::{TcpListener, UdpSocket},
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream, UdpSocket},
         task::JoinHandle,
     };
 
@@ -502,6 +516,80 @@ mod plain_tests {
         let (mut client, bg) = Client::<TokioRuntimeProvider>::new(stream, sender);
         tokio::spawn(bg);
         send_query(&mut client).await?;
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn upstream_failure_sends_servfail_over_udp_and_tcp() -> anyhow::Result<()>
+    {
+        let mut mock_exchanger = MockDnsMessageExchanger::new();
+        mock_exchanger.expect_ipv6().returning(|| false);
+        mock_exchanger.expect_exchange().times(2).returning(|_| {
+            async {
+                Err(crate::DNSError::QueryFailed(
+                    "simulated upstream failure".to_string(),
+                ))
+            }
+            .boxed()
+        });
+
+        let udp_sock = UdpSocket::bind("127.0.0.1:0").await?;
+        let udp_addr = udp_sock.local_addr()?;
+        drop(udp_sock);
+
+        let tcp_sock = TcpListener::bind("127.0.0.1:0").await?;
+        let tcp_addr = tcp_sock.local_addr()?;
+        drop(tcp_sock);
+
+        let listener = super::get_dns_listener(
+            DNSListenAddr {
+                udp: Some(udp_addr),
+                tcp: Some(tcp_addr),
+                ..Default::default()
+            },
+            mock_exchanger,
+            std::path::Path::new("."),
+        )
+        .await
+        .expect("at least one listener should start");
+        let handle: JoinHandle<Result<(), crate::DNSError>> = tokio::spawn(listener);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let request_id = 0x1234;
+        let mut query = Message::new(request_id, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(
+            Name::from_ascii("failure.example.")?,
+            RecordType::A,
+        ));
+        let query = query.to_vec()?;
+
+        let udp_client = UdpSocket::bind("127.0.0.1:0").await?;
+        udp_client.send_to(&query, udp_addr).await?;
+        let mut udp_response = [0; 512];
+        let (udp_len, _) = tokio::time::timeout(
+            Duration::from_secs(2),
+            udp_client.recv_from(&mut udp_response),
+        )
+        .await??;
+        let udp_response = Message::from_vec(&udp_response[..udp_len])?;
+        assert_eq!(udp_response.metadata.id, request_id);
+        assert_eq!(udp_response.metadata.response_code, ResponseCode::ServFail);
+
+        let mut tcp_client = TcpStream::connect(tcp_addr).await?;
+        tcp_client.write_u16(query.len().try_into()?).await?;
+        tcp_client.write_all(&query).await?;
+        let tcp_response = tokio::time::timeout(Duration::from_secs(2), async {
+            let response_len = tcp_client.read_u16().await?;
+            let mut response = vec![0; usize::from(response_len)];
+            tcp_client.read_exact(&mut response).await?;
+            Ok::<_, std::io::Error>(response)
+        })
+        .await??;
+        let tcp_response = Message::from_vec(&tcp_response)?;
+        assert_eq!(tcp_response.metadata.id, request_id);
+        assert_eq!(tcp_response.metadata.response_code, ResponseCode::ServFail);
 
         handle.abort();
         Ok(())
