@@ -291,3 +291,19 @@ Each item must be implemented, tested, and committed separately.
 - Next slice: separate request-header transmission from pending application
   write ownership, then validate the interleaved read/write lifecycle before
   considering this candidate again.
+
+## 2026-09-26 VLESS Native Encryption 1-RTT
+
+- Baseline: current local `master` `7697d162`; `cargo check -p clash-lib`
+  passed before changes. The user-selected scope is outbound VLESS native
+  `mlkem768x25519plus.native.1rtt`; 0-RTT, `xorpub`/`random`, encrypted UDP,
+  and hybrid Reality are excluded from this first implementation.
+- Reference: current local `ref/` has no VLESS native-encryption implementation.
+  The wire behavior will be checked against the official Mihomo VLESS config
+  documentation and Xray-core implementation; this is a Chimera extension, not
+  a claim of parity with `ref/`.
+- In progress: add the `encryption` config field, then port and verify the
+  client 1-RTT handshake, TLS-shaped encrypted stream, and supported feature
+  wiring in reviewable commits of at most 500 changed lines each.
+- Verification: pending focused parser/crypto/stream tests, feature-on/off
+  checks, and Xray interop where the local environment supports it.

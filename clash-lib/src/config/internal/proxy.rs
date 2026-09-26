@@ -475,6 +475,8 @@ pub struct OutboundVless {
     #[serde(flatten)]
     pub common_opts: CommonConfigOptions,
     pub uuid: String,
+    /// VLESS native encryption client configuration.
+    pub encryption: Option<String>,
     pub udp: Option<bool>,
     pub tls: Option<bool>,
     pub alpn: Option<Vec<String>>,
@@ -1194,6 +1196,31 @@ alpn:
         assert_eq!(
             vless.alpn,
             Some(vec!["h2".to_owned(), "http/1.1".to_owned()])
+        );
+    }
+
+    #[test]
+    fn outbound_vless_parses_encryption_field() {
+        let config = r#"
+name: vless-encryption
+type: vless
+server: example.com
+port: 443
+uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+encryption: mlkem768x25519plus.native.1rtt.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+"#;
+
+        let parsed: OutboundProxyProtocol = serde_yaml::from_str(config)
+            .expect("vless encryption field should parse");
+
+        let OutboundProxyProtocol::Vless(vless) = parsed else {
+            panic!("expected vless proxy");
+        };
+        assert_eq!(
+            vless.encryption.as_deref(),
+            Some(
+                "mlkem768x25519plus.native.1rtt.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            )
         );
     }
 
