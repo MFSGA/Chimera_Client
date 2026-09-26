@@ -449,7 +449,8 @@ impl EnhancedResolver {
             .ok_or_else(|| anyhow!("invalid query"))?;
 
         trace!(q = q.to_string(), "start");
-        if let Some(lru) = &self.lru_cache
+        if Self::cacheable_request(message)
+            && let Some(lru) = &self.lru_cache
             && let Some(Ok(cached)) = lru.get(q, Instant::now()).map(|c| {
                 c.inspect_err(|x| warn!("failed to get cached message: {}", x))
             })
@@ -478,7 +479,10 @@ impl EnhancedResolver {
         &self,
         message: &op::Message,
     ) -> anyhow::Result<op::Message> {
-        let q = message.queries.first().unwrap();
+        let q = message
+            .queries
+            .first()
+            .ok_or_else(|| anyhow!("invalid query"))?;
 
         let query = async move {
             if EnhancedResolver::is_ip_request(q) {
@@ -495,13 +499,10 @@ impl EnhancedResolver {
         let rv = query.await;
 
         if let Ok(msg) = &rv
+            && Self::cacheable_response(message, msg)
             && let Some(lru) = &self.lru_cache
             && !(q.query_type() == rr::RecordType::TXT
                 && q.name().to_ascii().starts_with("_acme-challenge."))
-            && !matches!(
-                msg.metadata.response_code,
-                op::ResponseCode::NXDomain | op::ResponseCode::ServFail
-            )
             && {
                 let ips = EnhancedResolver::ip_list_of_message(msg);
                 ips.is_empty() || ips.iter().any(|ip| !ip.is_unspecified())
@@ -511,6 +512,26 @@ impl EnhancedResolver {
         }
 
         rv
+    }
+
+    fn cacheable_request(message: &op::Message) -> bool {
+        message.metadata.message_type == op::MessageType::Query
+            && message.metadata.op_code == op::OpCode::Query
+            && message.metadata.recursion_desired
+            && !message.metadata.checking_disabled
+            && !message.metadata.authentic_data
+            && message.edns.is_none()
+            && message.queries.len() == 1
+            && message.queries[0].query_class() == rr::DNSClass::IN
+    }
+
+    fn cacheable_response(request: &op::Message, response: &op::Message) -> bool {
+        Self::cacheable_request(request)
+            && response.metadata.message_type == op::MessageType::Response
+            && response.metadata.op_code == op::OpCode::Query
+            && response.metadata.response_code == op::ResponseCode::NoError
+            && !response.metadata.truncation
+            && response.queries.as_slice() == request.queries.as_slice()
     }
 
     fn match_policy(&self, m: &op::Message) -> Option<&Vec<ThreadSafeDNSClient>> {
@@ -1126,6 +1147,7 @@ mod tests {
         let mut response =
             op::Message::response(request.metadata.id, request.metadata.op_code);
         response.metadata.response_code = op::ResponseCode::NXDomain;
+        response.add_query(query.clone());
         resolver.main = vec![Arc::new(FixedClient { response })];
 
         resolver
@@ -1141,6 +1163,50 @@ mod tests {
                 .get(&query, Instant::now())
                 .is_none()
         );
+    }
+
+    #[test]
+    fn response_cache_requires_a_single_recursive_in_query() {
+        let (mut request, query) = test_query();
+        request.metadata.recursion_desired = true;
+        assert!(EnhancedResolver::cacheable_request(&request));
+
+        let mut multiple_questions = request.clone();
+        multiple_questions.add_query(query.clone());
+        assert!(!EnhancedResolver::cacheable_request(&multiple_questions));
+
+        let mut update = request.clone();
+        update.metadata.op_code = op::OpCode::Update;
+        assert!(!EnhancedResolver::cacheable_request(&update));
+
+        let mut non_in_class = request.clone();
+        non_in_class.queries[0].set_query_class(rr::DNSClass::CH);
+        assert!(!EnhancedResolver::cacheable_request(&non_in_class));
+
+        let mut no_recursion = request.clone();
+        no_recursion.metadata.recursion_desired = false;
+        assert!(!EnhancedResolver::cacheable_request(&no_recursion));
+
+        let mut edns = request.clone();
+        edns.set_edns(op::Edns::new());
+        assert!(!EnhancedResolver::cacheable_request(&edns));
+
+        let mut response =
+            op::Message::response(request.metadata.id, op::OpCode::Query);
+        response.add_query(query);
+        assert!(EnhancedResolver::cacheable_response(&request, &response));
+
+        response.metadata.truncation = true;
+        assert!(!EnhancedResolver::cacheable_response(&request, &response));
+        response.metadata.truncation = false;
+
+        response.queries[0].set_name(
+            rr::Name::from_str_relaxed("other.example")
+                .unwrap()
+                .append_domain(&rr::Name::root())
+                .unwrap(),
+        );
+        assert!(!EnhancedResolver::cacheable_response(&request, &response));
     }
 
     #[tokio::test]
