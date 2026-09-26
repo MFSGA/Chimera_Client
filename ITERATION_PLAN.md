@@ -265,3 +265,23 @@ Each item must be implemented, tested, and committed separately.
   tests).
 - Next slice: review the pending Vision fragmented-record/UUID fixes against
   this updated master before migrating them.
+
+## 2026-09-26 VLESS Vision Fragmentation
+
+- Baseline: local `master` `ddef6af3`. `VisionFilter` parsed a ServerHello only
+  when the full handshake was in one TLS record; `VisionUnpadder` did not retain
+  a UUID split across calls. The outer `VisionStream` already buffers partial
+  UUID bytes and fragmented TLS records at its own framing layer.
+- Source and deviation: migrated the two focused fixes from the existing local
+  pending VLESS worktree patch. The current `ref/` is a gitlink, not a browsable
+  source checkout, so this slice was checked against local implementation and
+  tests rather than asserted as upstream parity.
+- Completed: accumulate ServerHello handshake payload across TLS records and
+  buffer a partial initial UUID; on UUID mismatch, pass through all buffered
+  bytes without loss.
+- Verification: baseline `vision_filter` tests (2) and `vision_unpad` test (1)
+  passed; `cargo fmt --all -- --check` passed; focused
+  `cargo test -p clash-lib --lib --features trojan proxy::vless::vision` passed
+  (19 tests).
+- Next slice: inspect the pending VLESS server-first handshake change and its
+  read/write lifecycle before deciding whether it is safe to migrate.

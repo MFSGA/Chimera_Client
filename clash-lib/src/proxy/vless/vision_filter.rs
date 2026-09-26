@@ -14,6 +14,7 @@ pub struct VisionFilter {
     is_tls: bool,
     is_tls12_or_above: bool,
     supports_xtls: bool,
+    pending_server_hello: Vec<u8>,
 }
 
 struct ParsedServerHello {
@@ -28,6 +29,7 @@ impl VisionFilter {
             is_tls: false,
             is_tls12_or_above: false,
             supports_xtls: false,
+            pending_server_hello: Vec::new(),
         }
     }
 
@@ -80,27 +82,41 @@ impl VisionFilter {
             self.is_tls = true;
         }
 
-        if !self.is_tls12_or_above
-            && data[0] == TLS_CONTENT_TYPE_HANDSHAKE
-            && data[1] == 0x03
-            && data[2] == 0x03
-            && data[5] == TLS_HANDSHAKE_TYPE_SERVER_HELLO
-        {
-            self.is_tls12_or_above = true;
-            self.is_tls = true;
+        if self.is_tls12_or_above || data[0] != TLS_CONTENT_TYPE_HANDSHAKE {
+            return;
+        }
 
-            match parse_server_hello(data) {
-                Ok(parsed) => {
-                    if parsed.is_tls13 && supports_xtls_cipher(parsed.cipher_suite) {
-                        self.supports_xtls = true;
-                    }
-                    if parsed.is_tls13 {
-                        self.stop_filtering("TLS 1.3 handshake detected");
-                    }
+        let payload_len = u16::from_be_bytes([data[3], data[4]]) as usize;
+        if data.len() < 5 + payload_len {
+            self.stop_filtering("incomplete TLS record");
+            return;
+        }
+        let payload = &data[5..5 + payload_len];
+
+        if self.pending_server_hello.is_empty() {
+            if payload.first().copied() != Some(TLS_HANDSHAKE_TYPE_SERVER_HELLO) {
+                return;
+            }
+            self.is_tls = true;
+        }
+
+        self.pending_server_hello.extend_from_slice(payload);
+
+        match try_parse_server_hello_handshake(&self.pending_server_hello) {
+            Ok(Some(parsed)) => {
+                self.is_tls12_or_above = true;
+                if parsed.is_tls13 && supports_xtls_cipher(parsed.cipher_suite) {
+                    self.supports_xtls = true;
                 }
-                Err(err) => {
-                    self.stop_filtering(&format!("invalid ServerHello: {err}"))
+                self.pending_server_hello.clear();
+                if parsed.is_tls13 {
+                    self.stop_filtering("TLS 1.3 handshake detected");
                 }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                self.pending_server_hello.clear();
+                self.stop_filtering(&format!("invalid ServerHello: {err}"));
             }
         }
     }
@@ -116,23 +132,12 @@ fn supports_xtls_cipher(cipher_suite: u16) -> bool {
     )
 }
 
-fn parse_server_hello(record: &[u8]) -> io::Result<ParsedServerHello> {
-    if record.len() < 5 + 4 + 2 + 32 + 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "ServerHello too short",
-        ));
+fn try_parse_server_hello_handshake(
+    payload: &[u8],
+) -> io::Result<Option<ParsedServerHello>> {
+    if payload.len() < 4 {
+        return Ok(None);
     }
-
-    let body_len = u16::from_be_bytes([record[3], record[4]]) as usize;
-    if record.len() < 5 + body_len {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "incomplete TLS record",
-        ));
-    }
-
-    let payload = &record[5..5 + body_len];
     if payload[0] != TLS_HANDSHAKE_TYPE_SERVER_HELLO {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -144,10 +149,7 @@ fn parse_server_hello(record: &[u8]) -> io::Result<ParsedServerHello> {
         | ((payload[2] as usize) << 8)
         | payload[3] as usize;
     if payload.len() < 4 + handshake_len {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "incomplete ServerHello handshake",
-        ));
+        return Ok(None);
     }
 
     let msg = &payload[4..4 + handshake_len];
@@ -196,17 +198,17 @@ fn parse_server_hello(record: &[u8]) -> io::Result<ParsedServerHello> {
         }
     }
 
-    Ok(ParsedServerHello {
+    Ok(Some(ParsedServerHello {
         cipher_suite,
         is_tls13,
-    })
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::VisionFilter;
 
-    fn server_hello(cipher: u16, tls13: bool) -> Vec<u8> {
+    fn server_hello_handshake(cipher: u16, tls13: bool) -> Vec<u8> {
         let mut message = Vec::new();
         message.extend_from_slice(&[0x03, 0x03]);
         message.extend_from_slice(&[0x11; 32]);
@@ -223,11 +225,18 @@ mod tests {
         let mut handshake = vec![0x02];
         handshake.extend_from_slice(&(message.len() as u32).to_be_bytes()[1..]);
         handshake.extend_from_slice(&message);
+        handshake
+    }
 
+    fn handshake_record(payload: &[u8]) -> Vec<u8> {
         let mut record = vec![0x16, 0x03, 0x03];
-        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
-        record.extend_from_slice(&handshake);
+        record.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        record.extend_from_slice(payload);
         record
+    }
+
+    fn server_hello(cipher: u16, tls13: bool) -> Vec<u8> {
+        handshake_record(&server_hello_handshake(cipher, tls13))
     }
 
     #[test]
@@ -243,6 +252,28 @@ mod tests {
             filter.filter_record(&server_hello(cipher, true));
             assert!(!filter.supports_xtls(), "cipher {cipher:#06x}");
         }
+    }
+
+    #[test]
+    fn fragmented_tls13_server_hello_enables_direct_after_second_record() {
+        let handshake = server_hello_handshake(0x1301, true);
+        let split = 12;
+        let first = handshake_record(&handshake[..split]);
+        let second = handshake_record(&handshake[split..]);
+
+        let mut filter = VisionFilter::new();
+        filter.filter_record(&first);
+
+        assert!(filter.is_tls());
+        assert!(!filter.is_tls12_or_above());
+        assert!(!filter.supports_xtls());
+        assert!(filter.is_filtering());
+
+        filter.filter_record(&second);
+
+        assert!(filter.is_tls12_or_above());
+        assert!(filter.supports_xtls());
+        assert!(!filter.is_filtering());
     }
 
     #[test]
