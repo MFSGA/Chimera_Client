@@ -33,9 +33,8 @@ impl Store for FileStore {
         self.0.set_ip_to_host(&ip.to_string(), host).await;
     }
 
-    async fn del_by_ip(&mut self, ip: std::net::IpAddr) {
-        let host = self.get_by_ip(ip).await.unwrap_or_default();
-        self.0.delete_fake_ip_pair(&ip.to_string(), &host).await;
+    async fn del_by_host(&mut self, host: &str) {
+        self.0.delete_fake_ip_by_host(host).await;
     }
 
     async fn exist(&mut self, ip: std::net::IpAddr) -> bool {

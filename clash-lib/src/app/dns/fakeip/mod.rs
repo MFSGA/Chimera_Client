@@ -25,7 +25,7 @@ pub trait Store: Sync + Send {
     async fn pub_by_host(&mut self, host: &str, ip: net::IpAddr);
     async fn get_by_ip(&mut self, ip: net::IpAddr) -> Option<String>;
     async fn put_by_ip(&mut self, ip: net::IpAddr, host: &str);
-    async fn del_by_ip(&mut self, ip: net::IpAddr);
+    async fn del_by_host(&mut self, host: &str);
     async fn exist(&mut self, ip: net::IpAddr) -> bool;
     async fn copy_to(&self, store: &mut Box<dyn Store>);
 }
@@ -78,8 +78,8 @@ impl FakeDns {
         })
     }
 
-    pub async fn lookup(&mut self, host: &str) -> net::IpAddr {
-        if let Some(ip) = self.store.get_by_host(host).await {
+    pub async fn lookup(&mut self, host: &str) -> Result<net::IpAddr, Error> {
+        if let Some(ip) = self.lookup_existing(host).await {
             info!(
                 host = %host,
                 fake_ip = %ip,
@@ -87,10 +87,10 @@ impl FakeDns {
                 reused = true,
                 "fake-ip mapping reused"
             );
-            return ip;
+            return Ok(ip);
         }
 
-        let ip = self.get(host).await;
+        let ip = self.get(host).await?;
         self.store.pub_by_host(host, ip).await;
         info!(
             host = %host,
@@ -99,11 +99,18 @@ impl FakeDns {
             reused = false,
             "fake-ip mapping allocated"
         );
-        ip
+        Ok(ip)
     }
 
     pub async fn lookup_existing(&mut self, host: &str) -> Option<net::IpAddr> {
-        self.store.get_by_host(host).await
+        let ip = self.store.get_by_host(host).await?;
+        if self.is_allocatable(ip)
+            && self.store.get_by_ip(ip).await.as_deref() == Some(host)
+        {
+            return Some(ip);
+        }
+        self.store.del_by_host(host).await;
+        None
     }
 
     pub async fn reverse_lookup(&mut self, ip: net::IpAddr) -> Option<String> {
@@ -146,6 +153,14 @@ impl FakeDns {
         self.ipnet.contains(&ip) && self.store.exist(ip).await
     }
 
+    fn is_allocatable(&self, ip: net::IpAddr) -> bool {
+        let net::IpAddr::V4(ip) = ip else {
+            return false;
+        };
+        let ip = Self::ip_to_uint(&ip);
+        ip >= self.first && ip < self.first + self.capacity
+    }
+
     #[allow(dead_code)]
     pub fn gateway(&self) -> net::Ipv4Addr {
         net::Ipv4Addr::from(self.gateway)
@@ -161,27 +176,20 @@ impl FakeDns {
         src.store.copy_to(&mut self.store).await;
     }
 
-    async fn get(&mut self, host: &str) -> net::IpAddr {
+    async fn get(&mut self, host: &str) -> Result<net::IpAddr, Error> {
         for _ in 0..self.capacity {
             let ip = net::Ipv4Addr::from(self.first + self.cursor);
             self.cursor = (self.cursor + 1) % self.capacity;
             if !self.store.exist(net::IpAddr::V4(ip)).await {
                 self.store.put_by_ip(net::IpAddr::V4(ip), host).await;
-                return net::IpAddr::V4(ip);
+                return Ok(net::IpAddr::V4(ip));
             }
         }
 
-        // The pool is full. Reuse the oldest candidate selected by the cursor.
-        let ip = net::Ipv4Addr::from(self.first + self.cursor);
-        self.cursor = (self.cursor + 1) % self.capacity;
-        self.store.del_by_ip(net::IpAddr::V4(ip)).await;
-        info!(
-            fake_ip = %ip,
-            range = %self.ipnet,
-            "fake-ip pool full, evicting previous mapping"
-        );
-        self.store.put_by_ip(net::IpAddr::V4(ip), host).await;
-        net::IpAddr::V4(ip)
+        Err(Error::DNSError(format!(
+            "fake-ip pool exhausted for range {}",
+            self.ipnet
+        )))
     }
 
     fn ip_to_uint(ip: &net::Ipv4Addr) -> u32 {
@@ -193,7 +201,10 @@ impl FakeDns {
 mod tests {
     use std::{net, sync::Arc};
 
-    use crate::{app::dns::fakeip::mem_store::InMemStore, common::trie};
+    use crate::{
+        app::dns::fakeip::{FileStore, mem_store::InMemStore},
+        common::trie,
+    };
 
     use super::{FakeDns, Opts};
 
@@ -208,14 +219,14 @@ mod tests {
         })
         .unwrap();
 
-        let first = pool.lookup("foo.com").await;
-        let last = pool.lookup("bar.com").await;
+        let first = pool.lookup("foo.com").await.unwrap();
+        let last = pool.lookup("bar.com").await.unwrap();
 
         let bar = pool.reverse_lookup(last).await;
 
         assert_eq!(first, net::IpAddr::from([192, 168, 0, 2]));
         assert_eq!(
-            pool.lookup("foo.com").await,
+            pool.lookup("foo.com").await.unwrap(),
             net::IpAddr::from([192, 168, 0, 2])
         );
         assert_eq!(last, net::IpAddr::from([192, 168, 0, 3]));
@@ -240,7 +251,7 @@ mod tests {
 
         let mut allocated = Vec::new();
         for index in 0..5 {
-            allocated.push(pool.lookup(&format!("{index}.example")).await);
+            allocated.push(pool.lookup(&format!("{index}.example")).await.unwrap());
         }
 
         assert_eq!(
@@ -267,7 +278,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            pool.lookup("example.com").await,
+            pool.lookup("example.com").await.unwrap(),
             "192.168.0.2".parse::<net::IpAddr>().unwrap()
         );
     }
@@ -285,7 +296,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_inmem_cycle_used() {
+    async fn exhausted_pool_keeps_existing_host_mappings_stable() {
         let store = Box::new(InMemStore::new(10));
 
         let ipnet = "192.168.0.0/29".parse::<ipnet::IpNet>().unwrap();
@@ -296,17 +307,16 @@ mod tests {
         })
         .unwrap();
 
-        let foo = pool.lookup("foo.com").await;
-        let bar = pool.lookup("bar.com").await;
+        let foo = pool.lookup("foo.com").await.unwrap();
+        let bar = pool.lookup("bar.com").await.unwrap();
 
         for i in 0..3 {
-            pool.lookup(&format!("{}.com", i)).await;
+            pool.lookup(&format!("{}.com", i)).await.unwrap();
         }
 
-        let baz = pool.lookup("baz.com").await;
-        let next = pool.lookup("foo.com").await;
-        assert_eq!(foo, baz);
-        assert_eq!(next, bar);
+        assert!(pool.lookup("baz.com").await.is_err());
+        assert_eq!(pool.lookup("foo.com").await.unwrap(), foo);
+        assert_eq!(pool.lookup("bar.com").await.unwrap(), bar);
     }
 
     #[tokio::test]
@@ -329,24 +339,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_pool_max_cache_size() {
-        let store = Box::new(InMemStore::new(2));
-
-        let ipnet = "192.168.0.0/24".parse::<ipnet::IpNet>().unwrap();
+    async fn persisted_mapping_outside_current_range_is_replaced() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cache.yaml");
+        let cache = crate::app::profile::ThreadSafeCacheFile::new(
+            path.to_str().unwrap(),
+            false,
+        );
+        cache.set_host_to_ip("stale.example", "203.0.113.7").await;
+        cache.set_ip_to_host("203.0.113.7", "stale.example").await;
         let mut pool = FakeDns::new(Opts {
-            ipnet,
+            ipnet: "192.168.0.0/29".parse().unwrap(),
             skipped_hostnames: None,
-            store,
+            store: Box::new(FileStore::new(cache)),
         })
         .unwrap();
 
-        let first = pool.lookup("foo.com").await;
+        assert_eq!(pool.lookup_existing("stale.example").await, None);
+        let replacement = pool.lookup("stale.example").await.unwrap();
 
-        pool.lookup("bar.com").await;
-        pool.lookup("baz.com").await;
-        let next = pool.lookup("foo.com").await;
-
-        assert_ne!(first, next);
+        assert_eq!(replacement, "192.168.0.2".parse::<net::IpAddr>().unwrap());
+        assert_eq!(
+            pool.reverse_lookup("203.0.113.7".parse().unwrap()).await,
+            None
+        );
     }
 
     #[tokio::test]
@@ -362,8 +378,8 @@ mod tests {
         })
         .unwrap();
 
-        let first = pool.lookup("foo.com").await;
-        let last = pool.lookup("bar.com").await;
+        let first = pool.lookup("foo.com").await.unwrap();
+        let last = pool.lookup("bar.com").await.unwrap();
         assert_eq!(first, net::IpAddr::from([192, 168, 0, 2]));
         assert_eq!(last, net::IpAddr::from([192, 168, 0, 3]));
 
@@ -399,7 +415,7 @@ mod tests {
         .unwrap();
 
         // Allocate one real fake IP.
-        let allocated = pool.lookup("foo.com").await;
+        let allocated = pool.lookup("foo.com").await.unwrap();
         assert!(
             pool.is_fake_ip(allocated).await,
             "allocated IP must be fake"
