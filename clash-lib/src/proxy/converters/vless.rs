@@ -15,9 +15,7 @@ use crate::{
             XhttpSecurity, XhttpSessionIdConfig, XhttpUplinkConfig,
             XhttpUplinkDataPlacement,
         },
-        vless::{
-            Handler, HandlerOptions, encryption::Config as VlessEncryptionConfig,
-        },
+        vless::{Handler, HandlerOptions},
     },
 };
 #[cfg(feature = "reality")]
@@ -86,38 +84,6 @@ fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
             return Err(Error::InvalidConfig(format!(
                 "unsupported vless flow: {flow}"
             )));
-        }
-    }
-
-    if let Some(encryption) = s.encryption.as_deref() {
-        let encryption = encryption.trim();
-        if !encryption.is_empty() && encryption != "none" {
-            let parsed =
-                VlessEncryptionConfig::parse(encryption).map_err(|err| {
-                    Error::InvalidConfig(format!(
-                        "invalid vless encryption config: {err}"
-                    ))
-                })?;
-            #[cfg(feature = "vless-encryption")]
-            {
-                let prepared = parsed.prepare_crypto().map_err(|err| {
-                    Error::InvalidConfig(format!(
-                        "invalid vless encryption crypto key: {err}"
-                    ))
-                })?;
-                return Err(Error::InvalidConfig(format!(
-                    "vless encryption config is valid ({}; {}) but runtime handshake support is not implemented yet",
-                    parsed.summary(),
-                    prepared.summary()
-                )));
-            }
-            #[cfg(not(feature = "vless-encryption"))]
-            {
-                let _ = parsed;
-                return Err(Error::InvalidConfig(
-                    "vless encryption requires vless-encryption feature".to_owned(),
-                ));
-            }
         }
     }
 
@@ -1986,78 +1952,6 @@ mod tests {
 
         validate_vless_config(&outbound)
             .expect("non-Reality TLS client-fingerprint should be accepted for config compatibility");
-    }
-
-    #[test]
-    fn vless_accepts_default_encryption_values() {
-        for encryption in ["", "none"] {
-            let outbound = OutboundVless {
-                common_opts: CommonConfigOptions {
-                    name: "encryption-default".to_owned(),
-                    server: "example.com".to_owned(),
-                    port: 443,
-                    connect_via: None,
-                },
-                uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
-                encryption: Some(encryption.to_owned()),
-                ..Default::default()
-            };
-
-            validate_vless_config(&outbound).unwrap_or_else(|err| {
-                panic!("default encryption '{encryption}' should pass: {err}")
-            });
-        }
-    }
-
-    #[test]
-    fn vless_rejects_malformed_encryption_before_runtime_check() {
-        let outbound = OutboundVless {
-            common_opts: CommonConfigOptions {
-                name: "encrypted-vless".to_owned(),
-                server: "example.com".to_owned(),
-                port: 443,
-                connect_via: None,
-            },
-            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
-            encryption: Some("mlkem768x25519plus.native".to_owned()),
-            ..Default::default()
-        };
-
-        let err = validate_vless_config(&outbound)
-            .expect_err("malformed VLESS Encryption must be rejected");
-        assert!(
-            err.to_string().contains("invalid vless encryption config"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn vless_recognizes_valid_encryption_before_runtime_rejection() {
-        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-
-        let key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
-        let outbound = OutboundVless {
-            common_opts: CommonConfigOptions {
-                name: "encrypted-vless".to_owned(),
-                server: "example.com".to_owned(),
-                port: 443,
-                connect_via: None,
-            },
-            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
-            encryption: Some(format!(
-                "mlkem768x25519plus.native.1rtt.100-200-300.{key}"
-            )),
-            ..Default::default()
-        };
-
-        let err = validate_vless_config(&outbound)
-            .expect_err("runtime handshake is not implemented yet");
-        assert!(
-            err.to_string().contains(
-                "vless encryption config is valid (native.1rtt; padding-blocks=1; x25519-keys=1; mlkem768-keys=0; xor-mode=0; relay-bytes=32; key-hashes=1)"
-            ),
-            "unexpected error: {err}"
-        );
     }
 
     #[test]

@@ -19,7 +19,6 @@ standard = [
     "hysteria",
     "xhttp-h3",
     "reality",
-    "vless-encryption",
     "port",
     "tun",
     "extended-health-check",
@@ -35,7 +34,6 @@ tls = ["clash-lib/tls"]
 trojan = ["clash-lib/trojan"]
 anytls = ["clash-lib/anytls"]
 reality = ["clash-lib/reality"]
-vless-encryption = ["clash-lib/vless-encryption"]
 hysteria = ["clash-lib/hysteria"]
 xhttp-h3 = ["clash-lib/xhttp-h3"]
 shadowsocks = ["clash-lib/shadowsocks"]
