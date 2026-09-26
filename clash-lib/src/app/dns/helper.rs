@@ -58,6 +58,7 @@ pub async fn make_clients(
                 .cloned(),
             proxy,
             ecs: edns_client_subnet.clone(),
+            doh_path: s.doh_path.clone(),
             fw_mark,
             rule_dispatch: rd,
         })

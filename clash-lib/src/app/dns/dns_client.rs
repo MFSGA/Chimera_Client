@@ -79,9 +79,13 @@ mod tests {
     };
     use hickory_proto::{
         op,
-        rr::{Name, rdata::opt::EdnsOption},
+        rr::{self, Name, rdata::opt::EdnsOption},
     };
-    use std::str::FromStr;
+    use std::{net::Ipv4Addr, str::FromStr};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, UdpSocket},
+    };
 
     #[derive(Debug)]
     struct ResolverProbeOutbound;
@@ -163,6 +167,66 @@ mod tests {
             ecs,
             rule_dispatch: None,
         }
+    }
+
+    #[tokio::test]
+    async fn truncated_udp_response_retries_over_tcp() -> anyhow::Result<()> {
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = tcp_listener.local_addr()?;
+        let udp_socket = UdpSocket::bind(addr).await?;
+
+        let udp_task = tokio::spawn(async move {
+            let mut buffer = [0_u8; 2048];
+            let (length, peer) = udp_socket.recv_from(&mut buffer).await?;
+            let request = Message::from_vec(&buffer[..length])?;
+            let mut response =
+                Message::response(request.metadata.id, request.metadata.op_code);
+            response.metadata.truncation = true;
+            response.add_query(request.queries[0].clone());
+            udp_socket.send_to(&response.to_vec()?, peer).await?;
+            anyhow::Ok(())
+        });
+
+        let tcp_task = tokio::spawn(async move {
+            let (mut stream, _) = tcp_listener.accept().await?;
+            let mut length = [0_u8; 2];
+            stream.read_exact(&mut length).await?;
+            let mut buffer = vec![0_u8; u16::from_be_bytes(length) as usize];
+            stream.read_exact(&mut buffer).await?;
+            let request = Message::from_vec(&buffer)?;
+            let query = request.queries[0].clone();
+            let mut response =
+                Message::response(request.metadata.id, request.metadata.op_code);
+            response.add_query(query.clone());
+            response.add_answer(rr::Record::from_rdata(
+                query.name().clone(),
+                60,
+                rr::RData::A(rr::rdata::A(Ipv4Addr::new(192, 0, 2, 53))),
+            ));
+            let response = response.to_vec()?;
+            stream
+                .write_all(&(response.len() as u16).to_be_bytes())
+                .await?;
+            stream.write_all(&response).await?;
+            anyhow::Ok(())
+        });
+
+        let mut client = client_with_ecs(None);
+        client.host = url::Host::Ipv4(Ipv4Addr::LOCALHOST);
+        client.port = addr.port();
+        client.cfg =
+            RwLock::new(DnsConfig::Udp(addr, None, client.proxy.clone(), None));
+
+        let response = client.exchange(&build_message(RecordType::A)).await?;
+
+        assert!(!response.metadata.truncation);
+        assert_eq!(
+            response.answers[0].data,
+            rr::RData::A(rr::rdata::A(Ipv4Addr::new(192, 0, 2, 53)))
+        );
+        udp_task.await??;
+        tcp_task.await??;
+        Ok(())
     }
 
     #[tokio::test]
@@ -344,6 +408,7 @@ pub struct Opts {
     pub iface: Option<OutboundInterface>,
     pub proxy: Arc<dyn OutboundHandler>,
     pub ecs: Option<EdnsClientSubnet>,
+    pub doh_path: Option<String>,
     pub fw_mark: Option<u32>,
     /// When set, upstream dials consult the rule engine. Only populated for
     /// `nameserver`, `fallback`, and `nameserver-policy` clients when
@@ -378,6 +443,7 @@ enum DnsConfig {
     Https(
         net::SocketAddr,
         url::Host<String>,
+        String,
         Option<OutboundInterface>,
         Arc<dyn OutboundHandler>,
         FwMark,
@@ -431,7 +497,7 @@ impl Display for DnsConfig {
                 write!(f, "host: {host}")?;
                 write!(f, "via proxy: {}", proxy.name())
             }
-            DnsConfig::Https(addr, host, iface, proxy, _) => {
+            DnsConfig::Https(addr, host, _, iface, proxy, _) => {
                 write!(f, "HTTPS: {}:{} ", addr.ip(), addr.port())?;
                 if let Some(iface) = iface {
                     write!(f, "bind: {iface} ")?;
@@ -721,6 +787,7 @@ impl DnsClient {
                 let cfg = DnsConfig::Https(
                     net::SocketAddr::new(ip, opts.port),
                     opts.host.clone(),
+                    opts.doh_path.unwrap_or_else(|| "/dns-query".to_owned()),
                     opts.iface.clone(),
                     opts.proxy.clone(),
                     opts.fw_mark,
@@ -877,21 +944,63 @@ impl Client for DnsClient {
         let mut outbound = msg.clone();
         self.apply_edns_client_subnet(&mut outbound);
 
-        let mut req = DnsRequest::new(outbound, DnsRequestOptions::default());
-        if req.metadata.id == 0 {
-            req.metadata.id = rand::random::<u16>();
+        if outbound.metadata.id == 0 {
+            outbound.metadata.id = rand::random::<u16>();
         }
-        self.inner
+
+        let client = self
+            .inner
             .read()
             .await
             .c
             .as_ref()
-            .unwrap()
-            .send(req)
+            .expect("DNS client initialized")
+            .clone();
+        let response = client
+            .send(DnsRequest::new(
+                outbound.clone(),
+                DnsRequestOptions::default(),
+            ))
             .first_answer()
             .await
-            .map_err(|x| Error::DNSError(x.to_string()).into())
-            .map(|x: op::DnsResponse| x.into_message())
+            .map_err(|x| Error::DNSError(x.to_string()))
+            .map(|x: op::DnsResponse| x.into_message())?;
+
+        if !response.metadata.truncation {
+            return Ok(response);
+        }
+
+        let cfg = self.cfg.read().await.clone();
+        let DnsConfig::Udp(addr, iface, proxy, fw_mark) = cfg else {
+            return Ok(response);
+        };
+        warn!(
+            upstream = %self.id(),
+            "UDP DNS response was truncated; retrying over TCP"
+        );
+
+        let tcp_cfg = DnsConfig::Tcp(addr, iface, proxy, fw_mark);
+        let (tcp_client, tcp_background) = dns_stream_builder(
+            &tcp_cfg,
+            self.outbound_resolver.clone(),
+            self.rule_dispatch.clone(),
+        )
+        .await
+        .map_err(|error| Error::DNSError(error.to_string()))?;
+        let tcp_result = tcp_client
+            .send(DnsRequest::new(outbound, DnsRequestOptions::default()))
+            .first_answer()
+            .await;
+        tcp_background.abort();
+        let tcp_response: op::DnsResponse =
+            tcp_result.map_err(|error| Error::DNSError(error.to_string()))?;
+        let tcp_response = tcp_response.into_message();
+        if tcp_response.metadata.truncation {
+            return Err(anyhow!(
+                "DNS upstream returned a truncated response over TCP"
+            ));
+        }
+        Ok(tcp_response)
     }
 }
 
@@ -978,7 +1087,7 @@ async fn dns_stream_builder(
             Ok((x, tokio::spawn(y)))
         }
         #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
-        DnsConfig::Https(addr, host, iface, proxy, fw_mark) => {
+        DnsConfig::Https(addr, host, path, iface, proxy, fw_mark) => {
             let mut tls_config = ClientConfig::builder()
                 .with_root_certificates(GLOBAL_ROOT_STORE.clone())
                 .with_no_client_auth();
@@ -1004,7 +1113,7 @@ async fn dns_stream_builder(
                     rule_dispatch.clone(),
                 ),
             )
-            .build(*addr, host.to_string().into(), "/dns-query".into())
+            .build(*addr, host.to_string().into(), path.clone().into())
             .await
             .map_err(|x| Error::DNSError(x.to_string()))?;
 
