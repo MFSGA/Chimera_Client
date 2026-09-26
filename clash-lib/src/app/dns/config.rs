@@ -208,6 +208,12 @@ impl Config {
             let nameservers =
                 Config::parse_nameserver(std::slice::from_ref(server))?;
 
+            let Some(nameserver) = nameservers.first() else {
+                return Err(Error::InvalidConfig(format!(
+                    "DNS nameserver-policy for {domain} has no usable nameserver"
+                )));
+            };
+
             let (_, valid) = trie::valid_and_split_domain(domain);
             if !valid {
                 return Err(Error::InvalidConfig(format!(
@@ -215,7 +221,7 @@ impl Config {
                     domain
                 )));
             }
-            policy.insert(domain.into(), nameservers[0].clone());
+            policy.insert(domain.into(), nameserver.clone());
         }
         Ok(policy)
     }
@@ -265,7 +271,8 @@ fn parse_listen_addr(addr: &str) -> Result<SocketAddr, Error> {
     }
 }
 
-fn parse_doh_config(cfg: DohListenDef) -> Result<DoHConfig, Error> {
+fn parse_doh_config(cfg: DohListenDef, protocol: &str) -> Result<DoHConfig, Error> {
+    validate_server_certificate(protocol, &cfg.ca_cert, &cfg.ca_key)?;
     Ok(DoHConfig {
         addr: parse_listen_addr(&cfg.addr)?,
         ca_cert: cfg.ca_cert,
@@ -275,11 +282,25 @@ fn parse_doh_config(cfg: DohListenDef) -> Result<DoHConfig, Error> {
 }
 
 fn parse_dot_config(cfg: DotListenDef) -> Result<DoTConfig, Error> {
+    validate_server_certificate("DoT", &cfg.ca_cert, &cfg.ca_key)?;
     Ok(DoTConfig {
         addr: parse_listen_addr(&cfg.addr)?,
         ca_cert: cfg.ca_cert,
         ca_key: cfg.ca_key,
     })
+}
+
+fn validate_server_certificate(
+    protocol: &str,
+    cert: &Option<String>,
+    key: &Option<String>,
+) -> Result<(), Error> {
+    match (cert, key) {
+        (Some(_), Some(_)) | (None, None) => Ok(()),
+        _ => Err(Error::InvalidConfig(format!(
+            "DNS {protocol} listener requires both ca-cert and ca-key when either is configured"
+        ))),
+    }
 }
 
 impl Config {
@@ -342,6 +363,12 @@ impl TryFrom<&crate::config::def::Config> for Config {
         let nameserver_policy =
             Config::parse_nameserver_policy(&dc.nameserver_policy)?;
 
+        if dc.enable && nameservers.is_empty() {
+            return Err(Error::InvalidConfig(
+                "dns enabled, no usable nameserver specified".into(),
+            ));
+        }
+
         if dc.default_nameserver.is_empty() {
             return Err(Error::InvalidConfig(String::from(
                 "default nameserver empty",
@@ -349,6 +376,17 @@ impl TryFrom<&crate::config::def::Config> for Config {
         }
 
         let default_nameserver = Config::parse_nameserver(&dc.default_nameserver)?;
+        if default_nameserver.is_empty() {
+            return Err(Error::InvalidConfig(
+                "default nameserver has no usable entries".into(),
+            ));
+        }
+
+        if dc.enable && matches!(&dc.enhanced_mode, DNSMode::RedirHost) {
+            return Err(Error::InvalidConfig(
+                "dns enhanced-mode redir-host is not implemented".into(),
+            ));
+        }
 
         for ns in &default_nameserver {
             if let url::Host::Domain(_) = ns.host {
@@ -379,13 +417,44 @@ impl TryFrom<&crate::config::def::Config> for Config {
             .map(parse_edns_client_subnet)
             .transpose()?;
 
+        let fallback_ip_cidr = if dc.fallback_filter.ip_cidr.is_empty() {
+            None
+        } else {
+            Some(
+                Config::parse_fallback_ip_cidr(&dc.fallback_filter.ip_cidr)
+                    .map_err(|err| {
+                        Error::InvalidConfig(format!(
+                            "invalid DNS fallback-filter ipcidr: {err}"
+                        ))
+                    })?,
+            )
+        };
+        let fallback_filter = FallbackFilter {
+            geo_ip: dc.fallback_filter.geo_ip,
+            geo_ip_code: dc.fallback_filter.geo_ip_code.to_uppercase(),
+            ip_cidr: fallback_ip_cidr,
+            domain: dc.fallback_filter.domain.clone(),
+        };
+        let hosts = if dc.use_hosts {
+            Config::parse_hosts(&c.hosts).map_err(|err| {
+                Error::InvalidConfig(format!("invalid hosts entry: {err}"))
+            })?
+        } else {
+            let mut tree = trie::StringTrie::new();
+            tree.insert(
+                "localhost",
+                Arc::new("127.0.0.1".parse::<IpAddr>().unwrap()),
+            );
+            tree
+        };
+
         Ok(Self {
             enable: dc.enable,
             ipv6: c.ipv6 && dc.ipv6,
             fw_mark: c.routing_mark,
             nameserver: nameservers,
             fallback,
-            fallback_filter: dc.fallback_filter.clone().into(),
+            fallback_filter,
             listen: dc
                 .listen
                 .clone()
@@ -408,16 +477,21 @@ impl TryFrom<&crate::config::def::Config> for Config {
                             .as_deref()
                             .map(parse_listen_addr)
                             .transpose()?,
-                        doh: cfg.doh.map(parse_doh_config).transpose()?,
+                        doh: cfg
+                            .doh
+                            .map(|cfg| parse_doh_config(cfg, "DoH"))
+                            .transpose()?,
                         dot: cfg.dot.map(parse_dot_config).transpose()?,
-                        doh3: cfg.doh3.map(parse_doh_config).transpose()?.map(
-                            |cfg| DoH3Config {
+                        doh3: cfg
+                            .doh3
+                            .map(|cfg| parse_doh_config(cfg, "DoH3"))
+                            .transpose()?
+                            .map(|cfg| DoH3Config {
                                 addr: cfg.addr,
                                 ca_cert: cfg.ca_cert,
                                 ca_key: cfg.ca_key,
                                 hostname: cfg.hostname,
-                            },
-                        ),
+                            }),
                     }),
                 })
                 .transpose()?
@@ -431,16 +505,7 @@ impl TryFrom<&crate::config::def::Config> for Config {
             fake_ip_filter: dc.fake_ip_filter.clone(),
             store_fake_ip: c.profile.store_fake_ip,
             store_smart_stats: c.profile.store_smart_stats,
-            hosts: if dc.use_hosts && !c.hosts.is_empty() {
-                Config::parse_hosts(&c.hosts).ok()
-            } else {
-                let mut tree = trie::StringTrie::new();
-                tree.insert(
-                    "localhost",
-                    Arc::new("127.0.0.1".parse::<IpAddr>().unwrap()),
-                );
-                Some(tree)
-            },
+            hosts: Some(hosts),
             nameserver_policy,
             edns_client_subnet,
             respect_rules: dc.respect_rules,
@@ -484,18 +549,6 @@ fn parse_edns_client_subnet(
     Ok(EdnsClientSubnet { ipv4, ipv6 })
 }
 
-impl From<crate::config::def::FallbackFilter> for FallbackFilter {
-    fn from(c: crate::config::def::FallbackFilter) -> Self {
-        let ipcidr = Config::parse_fallback_ip_cidr(&c.ip_cidr);
-        Self {
-            geo_ip: c.geo_ip,
-            geo_ip_code: c.geo_ip_code.to_uppercase(),
-            ip_cidr: ipcidr.ok(),
-            domain: c.domain,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,6 +577,17 @@ mod tests {
         let _sock: std::net::SocketAddr = format!("{}:{}", ns[0].host, ns[0].port)
             .parse()
             .expect("address should parse to SocketAddr");
+    }
+
+    #[test]
+    fn nameserver_policy_rejects_skipped_system_entry() {
+        let policy =
+            HashMap::from([("example.com".to_owned(), "system".to_owned())]);
+
+        let error = Config::parse_nameserver_policy(&policy)
+            .expect_err("a policy without a usable nameserver must be rejected");
+
+        assert!(error.to_string().contains("no usable nameserver"));
     }
 
     #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]

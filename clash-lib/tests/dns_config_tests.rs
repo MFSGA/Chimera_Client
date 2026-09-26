@@ -250,6 +250,132 @@ fn dns_enabled_requires_at_least_one_nameserver() {
 }
 
 #[test]
+fn dns_enabled_rejects_only_skipped_nameserver_entries() {
+    let yaml = base_config(
+        r#"
+  enable: true
+  nameserver:
+    - system
+  default-nameserver:
+    - 223.5.5.5
+"#,
+    );
+
+    let err = parse_error(yaml);
+    assert!(
+        err.to_string().contains("no usable nameserver"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn default_nameserver_rejects_only_skipped_entries() {
+    let yaml = base_config(
+        r#"
+  enable: true
+  nameserver:
+    - 1.1.1.1
+  default-nameserver:
+    - system
+"#,
+    );
+
+    let err = parse_error(yaml);
+    assert!(
+        err.to_string().contains("no usable entries"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn invalid_hosts_entry_is_rejected() {
+    let yaml = base_config(
+        r#"
+  enable: true
+  use-hosts: true
+  nameserver:
+    - 1.1.1.1
+  default-nameserver:
+    - 223.5.5.5
+"#,
+    )
+    .replace("dns:\n", "hosts:\n  invalid.example: not-an-ip\ndns:\n");
+
+    let err = parse_error(yaml);
+    assert!(
+        err.to_string().contains("invalid hosts entry"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn invalid_fallback_cidr_is_rejected() {
+    let yaml = base_config(
+        r#"
+  enable: true
+  nameserver:
+    - 1.1.1.1
+  default-nameserver:
+    - 223.5.5.5
+  fallback-filter:
+    ipcidr:
+      - not-a-cidr
+"#,
+    );
+
+    let err = parse_error(yaml);
+    assert!(
+        err.to_string()
+            .contains("invalid DNS fallback-filter ipcidr"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn enabled_redir_host_mode_is_rejected_as_unimplemented() {
+    let yaml = base_config(
+        r#"
+  enable: true
+  enhanced-mode: redir-host
+  nameserver:
+    - 1.1.1.1
+  default-nameserver:
+    - 223.5.5.5
+"#,
+    );
+
+    let err = parse_error(yaml);
+    assert!(
+        err.to_string().contains("redir-host is not implemented"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn encrypted_dns_listeners_reject_incomplete_certificate_pairs() {
+    for protocol in ["doh", "dot", "doh3"] {
+        let listener =
+            format!("  listen:\n    {protocol}:\n      addr: 127.0.0.1:8443\n");
+        let valid_yaml = base_config(&format!(
+            "\n  enable: true\n  nameserver:\n    - 1.1.1.1\n  default-nameserver:\n    - 223.5.5.5\n{listener}"
+        ));
+        parse_dns(&valid_yaml);
+
+        for field in ["ca-cert: server.crt", "ca-key: server.key"] {
+            let listener = format!("{listener}      {field}\n");
+            let yaml = base_config(&format!(
+                "\n  enable: true\n  nameserver:\n    - 1.1.1.1\n  default-nameserver:\n    - 223.5.5.5\n{listener}"
+            ));
+            let err = parse_error(yaml);
+            assert!(
+                err.to_string().contains("requires both ca-cert and ca-key"),
+                "unexpected error for {protocol}: {err}"
+            );
+        }
+    }
+}
+
+#[test]
 fn default_nameserver_must_be_ip_address() {
     let yaml = base_config(
         r#"
