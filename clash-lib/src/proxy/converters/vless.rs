@@ -2055,6 +2055,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "vless-encryption")]
     #[test]
     fn vless_accepts_native_one_rtt_encryption_runtime() {
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -2078,6 +2079,33 @@ mod tests {
             .expect("native 1rtt encryption runtime should validate");
         crate::proxy::vless::Handler::try_from(&outbound)
             .expect("native 1rtt encryption handler should build");
+    }
+
+    #[cfg(not(feature = "vless-encryption"))]
+    #[test]
+    fn vless_encryption_requires_feature_when_disabled() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "encrypted-vless-feature-off".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            encryption: Some(format!("mlkem768x25519plus.native.1rtt.{key}")),
+            ..Default::default()
+        };
+
+        let err = validate_vless_config(&outbound)
+            .expect_err("encryption without its feature must be rejected");
+        assert!(
+            err.to_string()
+                .contains("requires vless-encryption feature"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

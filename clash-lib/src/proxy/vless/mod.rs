@@ -24,7 +24,6 @@ use std::{io, sync::Arc};
 use tracing::debug;
 
 mod datagram;
-#[allow(dead_code)]
 pub(crate) mod encryption;
 #[cfg(feature = "vless-encryption")]
 mod encryption_stream;
