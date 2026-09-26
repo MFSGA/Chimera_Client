@@ -18,6 +18,7 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use futures::{FutureExt, TryFutureExt};
 use hickory_proto::{op, rr};
+use hickory_resolver::net::{DnsError, NetError, NoRecords};
 use rand::seq::IndexedRandom;
 use std::{
     net,
@@ -485,10 +486,7 @@ impl EnhancedResolver {
         trace!(q = q.to_string(), "start");
         if Self::cacheable_request(message)
             && let Some(lru) = &self.lru_cache
-            && let Some(Ok(cached)) =
-                lru.read().await.get(q, Instant::now()).map(|c| {
-                    c.inspect_err(|x| warn!("failed to get cached message: {}", x))
-                })
+            && let Some(cached) = lru.read().await.get(q, Instant::now())
         {
             if generation
                 != self
@@ -497,17 +495,34 @@ impl EnhancedResolver {
             {
                 return self.exchange_no_cache(message).await;
             }
-            trace!(
-                q = q.to_string(),
-                "cache hit for DNS query, returning cached response",
-            );
-            let mut cached = cached;
-            cached.metadata.id = message.metadata.id;
-            cached.metadata.recursion_desired = message.metadata.recursion_desired;
-            if let Some(edns) = cached.edns.as_mut() {
-                edns.options_mut().remove(rr::rdata::opt::EdnsCode::Padding);
+            match cached {
+                Ok(mut cached) => {
+                    trace!(
+                        q = q.to_string(),
+                        "cache hit for DNS query, returning cached response",
+                    );
+                    cached.metadata.id = message.metadata.id;
+                    cached.metadata.recursion_desired =
+                        message.metadata.recursion_desired;
+                    if let Some(edns) = cached.edns.as_mut() {
+                        edns.options_mut().remove(rr::rdata::opt::EdnsCode::Padding);
+                    }
+                    return Ok(cached);
+                }
+                Err(NetError::Dns(DnsError::NoRecordsFound(negative))) => {
+                    trace!(q = q.to_string(), "cache hit for negative DNS response");
+                    let mut response =
+                        build_dns_response_message(message, true, false);
+                    response.metadata.response_code = negative.response_code;
+                    if let Some(authorities) = negative.authorities {
+                        response.authorities.extend(authorities.iter().cloned());
+                    }
+                    return Ok(response);
+                }
+                Err(error) => {
+                    warn!(q = %q, "failed to get cached DNS response: {error}");
+                }
             }
-            return Ok(cached);
         }
         trace!(q = q.to_string(), "querying resolver");
         let res = self.exchange_no_cache(message).await.map(|mut r| {
@@ -553,6 +568,7 @@ impl EnhancedResolver {
 
         if let Ok(msg) = &rv
             && Self::cacheable_response(message, msg)
+            && !msg.answers.is_empty()
             && let Some(lru) = &self.lru_cache
             && !(q.query_type() == rr::RecordType::TXT
                 && q.name().to_ascii().starts_with("_acme-challenge."))
@@ -569,6 +585,17 @@ impl EnhancedResolver {
             {
                 cache.insert(q.clone(), Ok(msg.clone()), Instant::now());
             }
+        } else if let Ok(msg) = &rv
+            && let Some(negative) = Self::negative_cache_entry(message, msg)
+            && let Some(lru) = &self.lru_cache
+            && generation
+                == self
+                    .network_generation
+                    .load(std::sync::atomic::Ordering::Acquire)
+        {
+            lru.write()
+                .await
+                .insert(q.clone(), Err(negative), Instant::now());
         }
 
         rv
@@ -592,6 +619,67 @@ impl EnhancedResolver {
             && response.metadata.response_code == op::ResponseCode::NoError
             && !response.metadata.truncation
             && response.queries.as_slice() == request.queries.as_slice()
+    }
+
+    fn negative_cache_entry(
+        request: &op::Message,
+        response: &op::Message,
+    ) -> Option<NetError> {
+        if !Self::cacheable_request(request)
+            || response.metadata.message_type != op::MessageType::Response
+            || response.metadata.op_code != op::OpCode::Query
+            || !matches!(
+                response.metadata.response_code,
+                op::ResponseCode::NXDomain | op::ResponseCode::NoError
+            )
+            || response.queries.as_slice() != request.queries.as_slice()
+            || !response.metadata.recursion_available
+            || response.metadata.authoritative
+            || response.metadata.truncation
+            || response.metadata.authentic_data
+            || !response.answers.is_empty()
+        {
+            return None;
+        }
+
+        let mut soa_records =
+            response
+                .authorities
+                .iter()
+                .filter_map(|record| match &record.data {
+                    rr::RData::SOA(soa) => Some((record, soa)),
+                    _ => None,
+                });
+        let (record, soa) = soa_records.next()?;
+        if soa_records.next().is_some() {
+            return None;
+        }
+        if !record.name.zone_of(request.queries[0].name()) {
+            return None;
+        }
+        let negative_ttl = record.ttl.min(soa.minimum);
+        if negative_ttl == 0 {
+            return None;
+        }
+
+        let soa_record =
+            rr::Record::from_rdata(record.name.clone(), negative_ttl, soa.clone());
+        let mut no_records = NoRecords::new(
+            request.queries[0].clone(),
+            response.metadata.response_code,
+        );
+        no_records.soa = Some(Box::new(soa_record));
+        no_records.negative_ttl = Some(negative_ttl);
+        let mut authorities = response.authorities.clone();
+        for authority in &mut authorities {
+            if authority.record_type() == rr::RecordType::SOA
+                && authority.name == record.name
+            {
+                authority.ttl = negative_ttl;
+            }
+        }
+        no_records.authorities = Some(authorities.into());
+        Some(NetError::Dns(DnsError::NoRecordsFound(no_records)))
     }
 
     fn hosts_exchange(&self, message: &op::Message) -> Option<op::Message> {
@@ -1643,6 +1731,94 @@ mod tests {
             .exchange_no_cache(&request)
             .await
             .expect("fixed client returns a response");
+
+        assert!(
+            resolver
+                .lru_cache
+                .as_ref()
+                .unwrap()
+                .read()
+                .await
+                .get(&query, Instant::now())
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn negative_cache_preserves_rcode_authority_and_request_id() {
+        for response_code in [op::ResponseCode::NXDomain, op::ResponseCode::NoError]
+        {
+            let mut resolver = EnhancedResolver::new_default().await;
+            resolver.lru_cache = Some(response_cache(16));
+
+            let (mut request, query) = test_query();
+            request.metadata.recursion_desired = true;
+            request.metadata.id = 123;
+            let mut response =
+                op::Message::response(request.metadata.id, request.metadata.op_code);
+            response.metadata.response_code = response_code;
+            response.metadata.recursion_available = true;
+            response.add_query(query.clone());
+            let zone = query.name().clone();
+            let hostmaster = rr::Name::from_str_relaxed("hostmaster.example.com")
+                .unwrap()
+                .append_domain(&rr::Name::root())
+                .unwrap();
+            response.add_authority(rr::Record::from_rdata(
+                zone.clone(),
+                120,
+                rr::RData::SOA(rr::rdata::SOA::new(
+                    zone, hostmaster, 1, 3600, 600, 86400, 60,
+                )),
+            ));
+            let hits = Arc::new(AtomicUsize::new(0));
+            resolver.main = vec![Arc::new(CountingClient {
+                response,
+                hits: hits.clone(),
+                id: "negative-cache-test",
+            })];
+
+            let first = resolver
+                .exchange(&request)
+                .await
+                .expect("fixed client returns a negative response");
+            assert_eq!(first.metadata.response_code, response_code);
+
+            request.metadata.id = 456;
+            let cached = resolver
+                .exchange(&request)
+                .await
+                .expect("negative response should be served from cache");
+            assert_eq!(hits.load(Ordering::SeqCst), 1, "rcode {response_code}");
+            assert_eq!(cached.metadata.id, 456);
+            assert_eq!(cached.metadata.response_code, response_code);
+            assert_eq!(cached.authorities.len(), 1);
+            assert_eq!(cached.authorities[0].ttl, 60);
+        }
+    }
+
+    #[tokio::test]
+    async fn negative_cache_skips_response_without_soa() {
+        let mut resolver = EnhancedResolver::new_default().await;
+        resolver.lru_cache = Some(response_cache(16));
+
+        let (mut request, query) = test_query();
+        request.metadata.recursion_desired = true;
+        let mut response =
+            op::Message::response(request.metadata.id, request.metadata.op_code);
+        response.metadata.response_code = op::ResponseCode::NXDomain;
+        response.metadata.recursion_available = true;
+        response.add_query(query.clone());
+        resolver.main = vec![Arc::new(CountingClient {
+            response,
+            hits: Arc::new(AtomicUsize::new(0)),
+            id: "negative-cache-without-soa-test",
+        })];
+
+        resolver
+            .exchange_no_cache(&request)
+            .await
+            .expect("fixed client returns a negative response");
 
         assert!(
             resolver
