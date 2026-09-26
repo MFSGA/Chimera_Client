@@ -22,6 +22,8 @@ use std::{io, sync::Arc};
 use tracing::debug;
 
 mod datagram;
+#[allow(dead_code)]
+mod encryption;
 mod stream;
 mod tls_deframer;
 mod tls_fuzzy_deframer;
