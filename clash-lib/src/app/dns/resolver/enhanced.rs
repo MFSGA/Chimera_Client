@@ -253,15 +253,22 @@ impl EnhancedResolver {
             } else {
                 None
             },
-            fallback_ip_filters: if cfg.fallback_filter.ip_cidr.is_some()
+            fallback_ip_filters: if cfg
+                .fallback_filter
+                .ip_cidr
+                .as_ref()
+                .is_some_and(|cidrs| !cidrs.is_empty())
                 || cfg.fallback_filter.geo_ip
             {
                 let mut filters = vec![];
 
-                filters.push(Box::new(GeoIPFilter::new(
-                    &cfg.fallback_filter.geo_ip_code,
-                    mmdb,
-                )) as Box<dyn FallbackIPFilter>);
+                if cfg.fallback_filter.geo_ip {
+                    filters.push(Box::new(GeoIPFilter::new(
+                        &cfg.fallback_filter.geo_ip_code,
+                        mmdb,
+                    ))
+                        as Box<dyn FallbackIPFilter>);
+                }
 
                 if let Some(ipcidr) = &cfg.fallback_filter.ip_cidr {
                     for subnet in ipcidr {
@@ -372,45 +379,59 @@ impl EnhancedResolver {
         for c in clients {
             let query_name = query_name.clone();
             let query_type = query_type.clone();
+            let client_id = c.id();
+            let response_client_id = client_id.clone();
+            let error_client_id = client_id.clone();
+            let error_query_name = query_name.clone();
+            let error_query_type = query_type.clone();
+            let success_query_name = query_name;
+            let success_query_type = query_type;
             queries.push(
                 async move {
-                    let client_id = c.id();
-                    c.exchange(message)
-                        .inspect_err(|x| {
-                            if x.to_string().contains("receiver was canceled") {
-                                debug!(
-                                    client = %client_id,
-                                    query = %query_name,
-                                    record_type = %query_type,
-                                    "dns upstream query canceled after another response completed"
-                                );
-                            } else {
-                                error!(
-                                    client = %client_id,
-                                    query = %query_name,
-                                    record_type = %query_type,
-                                    err = ?x,
-                                    "resolve error"
-                                );
-                            }
-                        })
-                        .inspect_ok(|response| {
-                            let ips = Self::ip_list_of_message(response)
-                                .into_iter()
-                                .map(|ip| ip.to_string())
-                                .collect::<Vec<_>>()
-                                .join(",");
-                            debug!(
-                                client = %client_id,
-                                query = %query_name,
-                                record_type = %query_type,
-                                answers = %ips,
-                                answer_count = response.answers.len(),
-                                "dns upstream query succeeded"
-                            );
-                        })
-                        .await
+                    let response = c.exchange(message).await?;
+                    match response.metadata.response_code {
+                        op::ResponseCode::NoError | op::ResponseCode::NXDomain => {}
+                        response_code => {
+                            return Err(anyhow!(
+                                "DNS upstream {response_client_id} returned {response_code}"
+                            ));
+                        }
+                    }
+                    Ok(response)
                 }
+                .inspect_err(move |x| {
+                    if x.to_string().contains("receiver was canceled") {
+                        debug!(
+                            client = %error_client_id,
+                            query = %error_query_name,
+                            record_type = %error_query_type,
+                            "dns upstream query canceled after another response completed"
+                        );
+                    } else {
+                        error!(
+                            client = %error_client_id,
+                            query = %error_query_name,
+                            record_type = %error_query_type,
+                            err = ?x,
+                            "resolve error"
+                        );
+                    }
+                })
+                .inspect_ok(move |response| {
+                    let ips = Self::ip_list_of_message(response)
+                        .into_iter()
+                        .map(|ip| ip.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    debug!(
+                        client = %client_id,
+                        query = %success_query_name,
+                        record_type = %success_query_type,
+                        answers = %ips,
+                        answer_count = response.answers.len(),
+                        "dns upstream query succeeded"
+                    );
+                })
                 .boxed(),
             )
         }
@@ -615,7 +636,9 @@ impl EnhancedResolver {
 
         if let Ok(main_result) = main_query.await {
             let ip_list = EnhancedResolver::ip_list_of_message(&main_result);
-            if !ip_list.is_empty() && !self.should_ip_fallback(&ip_list[0]) {
+            if !ip_list.is_empty()
+                && !ip_list.iter().any(|ip| self.should_ip_fallback(ip))
+            {
                 return Ok(main_result);
             }
         }
@@ -1120,6 +1143,49 @@ mod tests {
         response
     }
 
+    fn response_with_a_records(ips: &[Ipv4Addr]) -> op::Message {
+        let mut response = op::Message::response(0, op::OpCode::Query);
+        let name = rr::Name::from_str_relaxed("proxy.example.com")
+            .unwrap()
+            .append_domain(&rr::Name::root())
+            .unwrap();
+        for ip in ips {
+            response.add_answer(rr::Record::from_rdata(
+                name.clone(),
+                300,
+                rr::RData::A(rr::rdata::A(*ip)),
+            ));
+        }
+        response
+    }
+
+    async fn resolver_with_cidr_fallback() -> EnhancedResolver {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut config = make_proxy_nameserver_config();
+        config.fallback = vec![NameServer {
+            net: DNSNetMode::Udp,
+            host: url::Host::Ipv4("9.9.9.9".parse().unwrap()),
+            port: 53,
+            interface: None,
+            proxy: None,
+        }];
+        config.fallback_filter.geo_ip = false;
+        config.fallback_filter.ip_cidr =
+            Some(vec!["198.51.100.0/24".parse().unwrap()]);
+        EnhancedResolver::new(
+            config,
+            crate::app::profile::ThreadSafeCacheFile::new(
+                temp_dir.path().join("cache.db").to_str().unwrap(),
+                false,
+            ),
+            None,
+            Arc::new(RwLock::new(std::collections::HashMap::new())),
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
     fn response_cache(capacity: u64) -> Arc<RwLock<ResponseCache>> {
         Arc::new(RwLock::new(ResponseCache::new(
             capacity,
@@ -1146,6 +1212,102 @@ mod tests {
 
         assert_eq!(resolver.reset_transports().await.unwrap(), 4);
         assert_eq!(resets.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn batch_exchange_tries_another_upstream_after_servfail() {
+        let (request, _) = test_query();
+        let mut servfail = op::Message::response(0, op::OpCode::Query);
+        servfail.metadata.response_code = op::ResponseCode::ServFail;
+        let clients = vec![
+            Arc::new(FixedClient { response: servfail }) as ThreadSafeDNSClient,
+            Arc::new(FixedClient {
+                response: response_with_a(Ipv4Addr::new(203, 0, 113, 7)),
+            }),
+        ];
+
+        let response = EnhancedResolver::batch_exchange(&clients, &request)
+            .await
+            .expect("the valid upstream response should be selected");
+
+        assert_eq!(response.metadata.response_code, op::ResponseCode::NoError);
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&response),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))]
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_exchange_does_not_accept_only_servfail_responses() {
+        let (request, _) = test_query();
+        let mut servfail = op::Message::response(0, op::OpCode::Query);
+        servfail.metadata.response_code = op::ResponseCode::ServFail;
+        let clients = vec![
+            Arc::new(FixedClient { response: servfail }) as ThreadSafeDNSClient
+        ];
+
+        assert!(
+            EnhancedResolver::batch_exchange(&clients, &request)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_geoip_does_not_force_fallback_when_cidr_is_configured() {
+        let mut resolver = resolver_with_cidr_fallback().await;
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        let fallback_hits = Arc::new(AtomicUsize::new(0));
+        resolver.main = vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+            hits: main_hits.clone(),
+            id: "main-filter-test",
+        })];
+        resolver.fallback = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(203, 0, 113, 10)),
+            hits: fallback_hits.clone(),
+            id: "fallback-filter-test",
+        })]);
+
+        resolver
+            .exchange_no_cache(&test_query_with_type(rr::RecordType::A))
+            .await
+            .unwrap();
+
+        assert_eq!(main_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn fallback_filter_checks_every_answer_ip() {
+        let mut resolver = resolver_with_cidr_fallback().await;
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        let fallback_hits = Arc::new(AtomicUsize::new(0));
+        resolver.main = vec![Arc::new(CountingClient {
+            response: response_with_a_records(&[
+                Ipv4Addr::new(203, 0, 113, 10),
+                Ipv4Addr::new(198, 51, 100, 10),
+            ]),
+            hits: main_hits.clone(),
+            id: "main-multi-ip-test",
+        })];
+        resolver.fallback = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 20)),
+            hits: fallback_hits.clone(),
+            id: "fallback-multi-ip-test",
+        })]);
+
+        let response = resolver
+            .exchange_no_cache(&test_query_with_type(rr::RecordType::A))
+            .await
+            .unwrap();
+
+        assert_eq!(main_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&response),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20))]
+        );
     }
 
     #[tokio::test]
