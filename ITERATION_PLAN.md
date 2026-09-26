@@ -251,3 +251,17 @@ Each item must be implemented, tested, and committed separately.
   feature combination with `trojan` was used for verification.
 - Next slice: re-check current master for equivalent behavior before selecting
   another protocol compatibility fix.
+
+## 2026-09-26 VLESS UDP Datagram Integrity
+
+- Baseline: local `master` `70ebf8c4`. The VLESS UDP sink capped frames at 8 KiB
+  and encoded only the prefix of a larger datagram, silently losing its tail.
+- Completed: retain UDP datagram boundaries by encoding the full payload in one
+  frame; reject payloads larger than the 16-bit frame length instead of
+  truncating them. Added focused coverage for both behaviors.
+- Verification: baseline `cargo check -p clash-lib --features trojan` passed;
+  `cargo fmt --all -- --check` passed; focused
+  `cargo test -p clash-lib --lib --features trojan udp_datagram` passed (2
+  tests).
+- Next slice: review the pending Vision fragmented-record/UUID fixes against
+  this updated master before migrating them.
