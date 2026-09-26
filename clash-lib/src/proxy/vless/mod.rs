@@ -411,6 +411,7 @@ mod reuse_tests {
             transport: Some(Box::new(OwnedDialTransport)),
             tls: None,
             flow: None,
+            encryption: None,
         });
         let resolver = Arc::new(MockClashResolver::new());
         let connector = DirectConnector::new();
@@ -443,6 +444,7 @@ mod reuse_tests {
             transport: Some(Box::new(OwnedDialTransport)),
             tls: None,
             flow: Some("xtls-rprx-vision".to_owned()),
+            encryption: None,
         });
         let resolver = Arc::new(MockClashResolver::new());
         let connector = DirectConnector::new();
@@ -896,6 +898,7 @@ mod tests {
             udp: false,
             tls: Some(Box::new(tls)),
             transport: Some(Box::new(grpc_client)),
+            encryption: None,
         };
         let handler = Arc::new(Handler::new(opts));
         let mut containers = MultiDockerTestRunner::default();
@@ -934,6 +937,7 @@ mod tests {
             udp: false,
             tls: Some(Box::new(tls)),
             transport: None,
+            encryption: None,
         };
         let handler = Arc::new(Handler::new(opts));
         let mut containers = MultiDockerTestRunner::default();
