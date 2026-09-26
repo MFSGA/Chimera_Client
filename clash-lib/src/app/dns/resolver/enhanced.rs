@@ -501,9 +501,13 @@ impl EnhancedResolver {
                 q = q.to_string(),
                 "cache hit for DNS query, returning cached response",
             );
-            let mut reply = build_dns_response_message(message, true, false);
-            reply.add_answers(cached.answers.iter().cloned());
-            return Ok(reply);
+            let mut cached = cached;
+            cached.metadata.id = message.metadata.id;
+            cached.metadata.recursion_desired = message.metadata.recursion_desired;
+            if let Some(edns) = cached.edns.as_mut() {
+                edns.options_mut().remove(rr::rdata::opt::EdnsCode::Padding);
+            }
+            return Ok(cached);
         }
         trace!(q = q.to_string(), "querying resolver");
         let res = self.exchange_no_cache(message).await.map(|mut r| {
@@ -1564,6 +1568,63 @@ mod tests {
             .await
             .expect("should be served from cache");
         assert_eq!(response.metadata.message_type, op::MessageType::Response);
+    }
+
+    #[tokio::test]
+    async fn cache_hit_preserves_complete_response_and_updates_request_id() {
+        let mut resolver = EnhancedResolver::new_default().await;
+        resolver.main.clear();
+        resolver.lru_cache = Some(response_cache(16));
+
+        let (mut request, query) = test_query();
+        request.metadata.recursion_desired = true;
+        request.metadata.id = 777;
+
+        let mut cached = op::Message::response(123, request.metadata.op_code);
+        cached.metadata.authoritative = true;
+        cached.metadata.recursion_available = true;
+        cached.add_query(query.clone());
+        cached.add_answer(rr::Record::from_rdata(
+            query.name().clone(),
+            300,
+            rr::RData::A(rr::rdata::A(Ipv4Addr::new(192, 0, 2, 1))),
+        ));
+        let zone = query.name().clone();
+        let hostmaster = rr::Name::from_str_relaxed("hostmaster.example.com")
+            .unwrap()
+            .append_domain(&rr::Name::root())
+            .unwrap();
+        cached.add_authority(rr::Record::from_rdata(
+            zone.clone(),
+            300,
+            rr::RData::SOA(rr::rdata::SOA::new(
+                zone, hostmaster, 1, 3600, 600, 86400, 60,
+            )),
+        ));
+        cached.add_additional(rr::Record::from_rdata(
+            query.name().clone(),
+            300,
+            rr::RData::A(rr::rdata::A(Ipv4Addr::new(192, 0, 2, 2))),
+        ));
+        resolver.lru_cache.as_ref().unwrap().write().await.insert(
+            query,
+            Ok(cached),
+            Instant::now(),
+        );
+
+        let response = resolver
+            .exchange(&request)
+            .await
+            .expect("should be served from cache");
+
+        assert_eq!(response.metadata.id, 777);
+        assert!(response.metadata.recursion_desired);
+        assert!(response.metadata.authoritative);
+        assert!(response.metadata.recursion_available);
+        assert_eq!(response.queries.len(), 1);
+        assert_eq!(response.answers.len(), 1);
+        assert_eq!(response.authorities.len(), 1);
+        assert_eq!(response.additionals.len(), 1);
     }
 
     #[tokio::test]
