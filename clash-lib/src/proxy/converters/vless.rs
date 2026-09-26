@@ -132,6 +132,12 @@ fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
                     "VLESS encryption with xtls-rprx-vision is TODO".to_owned(),
                 ));
             }
+            if s.reality_opts.is_some() {
+                return Err(Error::InvalidConfig(
+                    "VLESS native encryption with REALITY is outside the current 1rtt runtime scope"
+                        .to_owned(),
+                ));
+            }
             #[cfg(feature = "vless-encryption")]
             parsed.validate_crypto_keys().map_err(|err| {
                 Error::InvalidConfig(format!(
@@ -2138,6 +2144,36 @@ mod tests {
                 "unexpected error for {mode}: {err}"
             );
         }
+    }
+
+    #[cfg(feature = "reality")]
+    #[test]
+    fn vless_encryption_rejects_reality_combination() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "encrypted-vless-reality".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            encryption: Some(format!("mlkem768x25519plus.native.1rtt.{key}")),
+            reality_opts: Some(OutboundTrojanRealityOpts {
+                public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
+                short_id: None,
+            }),
+            ..Default::default()
+        };
+
+        let err = validate_vless_config(&outbound)
+            .expect_err("native encryption with REALITY is outside this slice");
+        assert!(
+            err.to_string().contains("with REALITY is outside"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

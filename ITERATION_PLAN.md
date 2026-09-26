@@ -305,7 +305,8 @@ Each item must be implemented, tested, and committed separately.
 - Completed: added the `encryption` config field and outbound runtime for
   `mlkem768x25519plus.native.1rtt`: X25519 + ML-KEM-768 key agreement, the
   1-RTT hello/PFS exchange, padded TLS-shaped encrypted records, and explicit
-  rejection of unsupported modes, Vision combinations, and encrypted UDP.
+  rejection of unsupported modes, Vision/REALITY combinations, and encrypted
+  UDP.
   Added the optional `vless-encryption` feature to `clash-lib` and forwarded it
   through the CLI's `standard` feature. Implementation was split into
   reviewable commits of at most 500 changed lines; a too-large first port was
@@ -315,15 +316,18 @@ Each item must be implemented, tested, and committed separately.
   tun,tls,aws-lc-rs,port,reality,extended-health-check,vless-encryption` passed;
   `cargo check -p clash-rs --no-default-features --features standard,aws-lc-rs`
   and the corresponding `cargo build` passed. Focused `cargo test -p clash-lib
-  --lib encryption` passed (36 tests), all VLESS converter tests passed (84
-  tests), and the complete `clash-lib` unit suite passed (571 passed, 11
-  ignored). The feature-off rejection test passed with the supported feature
+  --lib encryption` passed (36 tests), all VLESS converter tests passed (85
+  tests), and the complete final
+  `clash-lib` unit suite passed (572 passed, 11 ignored). The feature-off
+  rejection test passed with the supported feature
   set `tun,tls,aws-lc-rs,port,reality,extended-health-check`. The initial
   no-default attempt with only `tun` was blocked by existing unrelated
   unused-code warnings in DNS/TLS/XHTTP modules. The localhost interop script
   `clash-lib/tests/vless_native_encryption_xray_interop.sh` passed against
-  Xray `26.3.27`; `cargo fmt --all -- --check`, `git diff --check`, and the
-  script's `bash -n` check passed.
-- Next slice: consider encrypted UDP and 0-RTT separately, each with an
-  explicit compatibility and replay-safety design; neither is implied by this
-  TCP 1-RTT implementation.
+  Xray `26.3.27` for direct TCP; other transport combinations were not covered
+  by that interop run. The current slice explicitly rejects REALITY and
+  Vision. `cargo fmt --all -- --check`, `git diff --check`, and the script's
+  `bash -n` check passed.
+- Next slice: validate supported outer TLS/XHTTP combinations against Xray,
+  then consider encrypted UDP and 0-RTT separately with explicit compatibility
+  and replay-safety design; none is implied by the direct-TCP 1-RTT result.
