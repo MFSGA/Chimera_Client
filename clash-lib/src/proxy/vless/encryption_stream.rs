@@ -472,6 +472,102 @@ impl AsyncWrite for EncryptionStream {
     }
 }
 
+impl AsyncRead for EncryptionStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        match self.poll_handshake(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Pending => return Poll::Pending,
+        }
+        match self.poll_peer_padding(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Pending => return Poll::Pending,
+        }
+
+        if self.copy_plaintext(buf) {
+            return Poll::Ready(Ok(()));
+        }
+
+        while !self.read_header.complete() {
+            let this = self.as_mut().get_mut();
+            let offset = this.read_header.offset;
+            let inner = &mut this.inner;
+            let header = &mut this.read_header.data;
+            let mut read_buf = ReadBuf::new(&mut header[offset..]);
+            match Pin::new(&mut **inner).poll_read(cx, &mut read_buf) {
+                Poll::Ready(Ok(())) => {
+                    let n = read_buf.filled().len();
+                    if n == 0 {
+                        if offset == 0 {
+                            return Poll::Ready(Ok(()));
+                        }
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "unexpected EOF while reading VLESS encryption record header",
+                        )));
+                    }
+                    this.read_header.offset += n;
+                }
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        if self.read_ciphertext.is_none() {
+            let len = match decode_record_len(&self.read_header.data) {
+                Ok(len) => len,
+                Err(err) => return Poll::Ready(Err(err)),
+            };
+            self.read_ciphertext = Some(PendingIo::with_len(len));
+        }
+
+        let mut ciphertext = self.read_ciphertext.take().expect("ciphertext exists");
+        match poll_read_pending(
+            &mut self.inner,
+            cx,
+            &mut ciphertext,
+            "unexpected EOF while reading VLESS encryption record body",
+        ) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Pending => {
+                self.read_ciphertext = Some(ciphertext);
+                return Poll::Pending;
+            }
+        }
+
+        let mut record =
+            Vec::with_capacity(RECORD_HEADER_LEN + ciphertext.data.len());
+        record.extend_from_slice(&self.read_header.data);
+        record.extend_from_slice(&ciphertext.data);
+        self.read_header = PendingIo::with_len(RECORD_HEADER_LEN);
+
+        self.read_plaintext = match self
+            .read_codec
+            .as_mut()
+            .ok_or_else(|| {
+                io::Error::other("VLESS encryption read codec is not initialized")
+            })
+            .and_then(|codec| codec.open_record(&record))
+        {
+            Ok(plaintext) => plaintext,
+            Err(err) => return Poll::Ready(Err(err)),
+        };
+        self.read_plaintext_offset = 0;
+        self.copy_plaintext(buf);
+        Poll::Ready(Ok(()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -585,101 +681,5 @@ mod tests {
         };
 
         assert!(err.to_string().contains("length mismatch"));
-    }
-}
-
-impl AsyncRead for EncryptionStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        if buf.remaining() == 0 {
-            return Poll::Ready(Ok(()));
-        }
-
-        match self.poll_handshake(cx) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-            Poll::Pending => return Poll::Pending,
-        }
-        match self.poll_peer_padding(cx) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-            Poll::Pending => return Poll::Pending,
-        }
-
-        if self.copy_plaintext(buf) {
-            return Poll::Ready(Ok(()));
-        }
-
-        while !self.read_header.complete() {
-            let this = self.as_mut().get_mut();
-            let offset = this.read_header.offset;
-            let inner = &mut this.inner;
-            let header = &mut this.read_header.data;
-            let mut read_buf = ReadBuf::new(&mut header[offset..]);
-            match Pin::new(&mut **inner).poll_read(cx, &mut read_buf) {
-                Poll::Ready(Ok(())) => {
-                    let n = read_buf.filled().len();
-                    if n == 0 {
-                        if offset == 0 {
-                            return Poll::Ready(Ok(()));
-                        }
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "unexpected EOF while reading VLESS encryption record header",
-                        )));
-                    }
-                    this.read_header.offset += n;
-                }
-                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-
-        if self.read_ciphertext.is_none() {
-            let len = match decode_record_len(&self.read_header.data) {
-                Ok(len) => len,
-                Err(err) => return Poll::Ready(Err(err)),
-            };
-            self.read_ciphertext = Some(PendingIo::with_len(len));
-        }
-
-        let mut ciphertext = self.read_ciphertext.take().expect("ciphertext exists");
-        match poll_read_pending(
-            &mut self.inner,
-            cx,
-            &mut ciphertext,
-            "unexpected EOF while reading VLESS encryption record body",
-        ) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-            Poll::Pending => {
-                self.read_ciphertext = Some(ciphertext);
-                return Poll::Pending;
-            }
-        }
-
-        let mut record =
-            Vec::with_capacity(RECORD_HEADER_LEN + ciphertext.data.len());
-        record.extend_from_slice(&self.read_header.data);
-        record.extend_from_slice(&ciphertext.data);
-        self.read_header = PendingIo::with_len(RECORD_HEADER_LEN);
-
-        self.read_plaintext = match self
-            .read_codec
-            .as_mut()
-            .ok_or_else(|| {
-                io::Error::other("VLESS encryption read codec is not initialized")
-            })
-            .and_then(|codec| codec.open_record(&record))
-        {
-            Ok(plaintext) => plaintext,
-            Err(err) => return Poll::Ready(Err(err)),
-        };
-        self.read_plaintext_offset = 0;
-        self.copy_plaintext(buf);
-        Poll::Ready(Ok(()))
     }
 }

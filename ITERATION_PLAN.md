@@ -328,6 +328,13 @@ Each item must be implemented, tested, and committed separately.
   by that interop run. The current slice explicitly rejects REALITY and
   Vision. `cargo fmt --all -- --check`, `git diff --check`, and the script's
   `bash -n` check passed.
+- CI follow-up for commit `73ebedce`: fixed Clippy's
+  `items_after_test_module` and `useless_vec` findings by moving the test module
+  after runtime impls and passing a fixed-size slice. CI-equivalent
+  `cargo clippy -p clash-lib --all-targets --all-features -- -D warnings`
+  passed locally; the focused encryption filter passed (37 tests), and
+  `cargo test -p clash-lib --test lan_proxy_tests --all-features --locked`
+  passed (2 tests).
 - Next slice: validate supported outer TLS/XHTTP combinations against Xray,
   then consider encrypted UDP and 0-RTT separately with explicit compatibility
   and replay-safety design; none is implied by the direct-TCP 1-RTT result.

@@ -2232,7 +2232,7 @@ mod tests {
             EncryptionAead::new_with_nonce(&key, tail.read_aead_nonce)
                 .expect("server AEAD");
         let peer_padding = server_aead
-            .seal(&vec![0u8; 32])
+            .seal(&[0u8; 32])
             .expect("peer padding should encrypt");
         assert_eq!(peer_padding.len(), tail.peer_padding_ciphertext_len);
 
