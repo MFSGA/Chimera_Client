@@ -529,6 +529,10 @@ impl EnhancedResolver {
             .first()
             .ok_or_else(|| anyhow!("invalid query"))?;
 
+        if let Some(response) = self.hosts_exchange(message) {
+            return Ok(response);
+        }
+
         let query = async move {
             if EnhancedResolver::is_ip_request(q) {
                 return self.ip_exchange(message).await;
@@ -584,6 +588,51 @@ impl EnhancedResolver {
             && response.metadata.response_code == op::ResponseCode::NoError
             && !response.metadata.truncation
             && response.queries.as_slice() == request.queries.as_slice()
+    }
+
+    fn hosts_exchange(&self, message: &op::Message) -> Option<op::Message> {
+        if message.metadata.message_type != op::MessageType::Query
+            || message.metadata.op_code != op::OpCode::Query
+            || message.queries.len() != 1
+        {
+            return None;
+        }
+        let query = message.queries.first()?;
+        if query.query_class() != rr::DNSClass::IN
+            || !matches!(
+                query.query_type(),
+                rr::RecordType::A | rr::RecordType::AAAA
+            )
+        {
+            return None;
+        }
+
+        let domain = query.name().to_ascii();
+        let ip = self
+            .hosts
+            .as_ref()?
+            .search(domain.trim_end_matches('.'))?
+            .get_data()
+            .copied()?;
+
+        let mut response = build_dns_response_message(message, true, true);
+        let record = match (query.query_type(), ip) {
+            (rr::RecordType::A, net::IpAddr::V4(ip)) => {
+                Some(rr::RData::A(rr::rdata::A(ip)))
+            }
+            (rr::RecordType::AAAA, net::IpAddr::V6(ip)) => {
+                Some(rr::RData::AAAA(rr::rdata::AAAA(ip)))
+            }
+            _ => None,
+        };
+        if let Some(data) = record {
+            response.add_answer(rr::Record::from_rdata(
+                query.name().clone(),
+                60,
+                data,
+            ));
+        }
+        Some(response)
     }
 
     fn match_policy(&self, m: &op::Message) -> Option<&Vec<ThreadSafeDNSClient>> {
@@ -1253,6 +1302,44 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn hosts_entries_are_used_for_raw_dns_exchanges() {
+        let mut resolver = EnhancedResolver::new_default().await;
+        resolver.lru_cache = None;
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        resolver.main = vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(203, 0, 113, 10)),
+            hits: upstream_hits.clone(),
+            id: "hosts-bypass-test",
+        })];
+        let mut hosts = crate::common::trie::StringTrie::new();
+        hosts.insert(
+            "proxy.example.com",
+            Arc::new(std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 12))),
+        );
+        resolver.hosts = Some(hosts);
+
+        let a_response = resolver
+            .exchange_no_cache(&test_query_with_type(rr::RecordType::A))
+            .await
+            .unwrap();
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&a_response),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 12))]
+        );
+
+        let aaaa_response = resolver
+            .exchange_no_cache(&test_query_with_type(rr::RecordType::AAAA))
+            .await
+            .unwrap();
+        assert!(aaaa_response.answers.is_empty());
+        assert_eq!(
+            aaaa_response.metadata.response_code,
+            op::ResponseCode::NoError
+        );
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
