@@ -7,12 +7,13 @@ use hickory_proto::{
         Header, HeaderCounts, Message, MessageType, Metadata, OpCode, ResponseCode,
     },
     rr::RecordType,
+    serialize::binary::BinDecoder,
 };
 use hickory_server::{
     Server,
     net::runtime::Time,
     server::{Request, RequestHandler, ResponseHandler, ResponseInfo},
-    zone_handler::MessageResponseBuilder,
+    zone_handler::{MessageResponseBuilder, Queries},
 };
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use rustls::{server::AlwaysResolvesServerRawPublicKeys, sign::CertifiedKey};
@@ -118,6 +119,28 @@ where
                 "invalid message type: {}",
                 request.metadata.message_type
             )));
+        }
+
+        if request.queries.len() > 1 {
+            let mut decoder = BinDecoder::new(&[]);
+            let empty_queries = Queries::read(&mut decoder, 0).map_err(|e| {
+                DNSError::QueryFailed(format!(
+                    "failed to build FORMERR response: {e}"
+                ))
+            })?;
+            let response_edns = request.edns.as_ref().map(|request_edns| {
+                let mut response_edns = hickory_proto::op::Edns::new();
+                response_edns.set_max_payload(request_edns.max_payload());
+                response_edns.set_dnssec_ok(request_edns.flags().dnssec_ok);
+                response_edns
+            });
+            let response =
+                MessageResponseBuilder::new(&empty_queries, response_edns.as_ref())
+                    .error_msg(&request.metadata, ResponseCode::FormErr);
+            return response_handle
+                .send_response(response)
+                .await
+                .map_err(|e| DNSError::QueryFailed(e.to_string()));
         }
 
         let mut metadata = Metadata::response_from_request(&request.metadata);
@@ -605,6 +628,87 @@ mod plain_tests {
         let tcp_response = Message::from_vec(&tcp_response)?;
         assert_eq!(tcp_response.metadata.id, request_id);
         assert_eq!(tcp_response.metadata.response_code, ResponseCode::ServFail);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multi_question_queries_return_formerr_over_udp_and_tcp()
+    -> anyhow::Result<()> {
+        let mut mock_exchanger = MockDnsMessageExchanger::new();
+        mock_exchanger.expect_exchange().never();
+
+        let udp_sock = UdpSocket::bind("127.0.0.1:0").await?;
+        let udp_addr = udp_sock.local_addr()?;
+        drop(udp_sock);
+
+        let tcp_sock = TcpListener::bind("127.0.0.1:0").await?;
+        let tcp_addr = tcp_sock.local_addr()?;
+        drop(tcp_sock);
+
+        let listener = super::get_dns_listener(
+            DNSListenAddr {
+                udp: Some(udp_addr),
+                tcp: Some(tcp_addr),
+                ..Default::default()
+            },
+            mock_exchanger,
+            std::path::Path::new("."),
+        )
+        .await
+        .expect("at least one listener should start");
+        let handle: JoinHandle<Result<(), crate::DNSError>> = tokio::spawn(listener);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let request_id = 0x4321;
+        let mut query = Message::new(request_id, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(
+            Name::from_ascii("first.example.")?,
+            RecordType::A,
+        ));
+        query.add_query(Query::query(
+            Name::from_ascii("second.example.")?,
+            RecordType::AAAA,
+        ));
+        let mut edns = hickory_proto::op::Edns::new();
+        edns.set_max_payload(1232).set_dnssec_ok(true);
+        query.set_edns(edns);
+        let query = query.to_vec()?;
+
+        let udp_client = UdpSocket::bind("127.0.0.1:0").await?;
+        udp_client.send_to(&query, udp_addr).await?;
+        let mut udp_response = [0; 512];
+        let (udp_len, _) = tokio::time::timeout(
+            Duration::from_secs(2),
+            udp_client.recv_from(&mut udp_response),
+        )
+        .await??;
+        let udp_response = Message::from_vec(&udp_response[..udp_len])?;
+        assert_eq!(udp_response.metadata.id, request_id);
+        assert_eq!(udp_response.metadata.response_code, ResponseCode::FormErr);
+        assert!(udp_response.queries.is_empty());
+        let udp_edns = udp_response.edns.as_ref().expect("EDNS should be echoed");
+        assert_eq!(udp_edns.max_payload(), 1232);
+        assert!(udp_edns.flags().dnssec_ok);
+
+        let mut tcp_client = TcpStream::connect(tcp_addr).await?;
+        tcp_client.write_u16(query.len().try_into()?).await?;
+        tcp_client.write_all(&query).await?;
+        let tcp_response = tokio::time::timeout(Duration::from_secs(2), async {
+            let response_len = tcp_client.read_u16().await?;
+            let mut response = vec![0; usize::from(response_len)];
+            tcp_client.read_exact(&mut response).await?;
+            Ok::<_, std::io::Error>(response)
+        })
+        .await??;
+        let tcp_response = Message::from_vec(&tcp_response)?;
+        assert_eq!(tcp_response.metadata.id, request_id);
+        assert_eq!(tcp_response.metadata.response_code, ResponseCode::FormErr);
+        assert!(tcp_response.queries.is_empty());
+        let tcp_edns = tcp_response.edns.as_ref().expect("EDNS should be echoed");
+        assert_eq!(tcp_edns.max_payload(), 1232);
+        assert!(tcp_edns.flags().dnssec_ok);
 
         handle.abort();
         Ok(())
