@@ -146,9 +146,10 @@ mod tests {
         )
         .await;
 
-        let error = result
-            .err()
-            .expect("all unusable upstreams must fail initialization");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("all unusable upstreams must fail initialization"),
+        };
         assert!(error.to_string().contains("no usable clients"));
     }
 }
