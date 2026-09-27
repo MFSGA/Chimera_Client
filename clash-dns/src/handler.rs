@@ -1,7 +1,5 @@
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
-use crate::utils::{
-    load_cert_chain, load_default_cert, load_default_key, load_priv_key,
-};
+use crate::utils::{load_cert_chain, load_priv_key};
 use crate::{DNSListenAddr, DnsMessageExchanger, utils::new_io_error};
 use async_trait::async_trait;
 use hickory_proto::{
@@ -32,19 +30,53 @@ struct CertificateKeyPair {
 }
 
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
-impl From<CertificateKeyPair> for Arc<dyn rustls::server::ResolvesServerCert> {
-    fn from(pair: CertificateKeyPair) -> Self {
-        Arc::new(AlwaysResolvesServerRawPublicKeys::new(Arc::new(
-            CertifiedKey::new(
-                pair.certs,
-                rustls::crypto::CryptoProvider::get_default()
-                    .expect("no default crypto provider installed")
-                    .key_provider
-                    .load_private_key(pair.key)
-                    .expect("unsupported private key type"),
-            ),
-        )))
+impl CertificateKeyPair {
+    fn into_resolver(
+        self,
+    ) -> std::io::Result<Arc<dyn rustls::server::ResolvesServerCert>> {
+        let provider =
+            rustls::crypto::CryptoProvider::get_default().ok_or_else(|| {
+                std::io::Error::other("no default crypto provider installed")
+            })?;
+        let signing_key = provider
+            .key_provider
+            .load_private_key(self.key)
+            .map_err(std::io::Error::other)?;
+        Ok(Arc::new(AlwaysResolvesServerRawPublicKeys::new(Arc::new(
+            CertifiedKey::new(self.certs, signing_key),
+        ))))
     }
+}
+
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+fn load_dns_server_cert(
+    cert: Option<String>,
+    key: Option<String>,
+    cwd: &std::path::Path,
+) -> std::io::Result<Arc<dyn rustls::server::ResolvesServerCert>> {
+    let (Some(cert), Some(key)) = (cert, key) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "encrypted DNS listeners require both ca-cert and ca-key",
+        ));
+    };
+    let cert_path = cwd.join(cert);
+    let key_path = cwd.join(key);
+    let certs = load_cert_chain(&cert_path)?;
+    if certs.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "certificate file {} contains no certificates",
+                cert_path.display()
+            ),
+        ));
+    }
+    CertificateKeyPair {
+        certs,
+        key: load_priv_key(&key_path)?,
+    }
+    .into_resolver()
 }
 
 struct DnsListener<H: RequestHandler> {
@@ -273,24 +305,12 @@ where
                         );
                     }
 
-                    let server_key = c
-                        .ca_key
-                        .map(|x| load_priv_key(&cwd.join(x)))
-                        .transpose()?
-                        .unwrap_or(load_default_key());
-                    let server_cert = c
-                        .ca_cert
-                        .map(|x| load_cert_chain(&cwd.join(x)))
-                        .transpose()?
-                        .unwrap_or(load_default_cert());
+                    let server_cert =
+                        load_dns_server_cert(c.ca_cert, c.ca_key, cwd)?;
                     s.register_https_listener(
                         x,
                         DEFAULT_DNS_SERVER_TIMEOUT,
-                        CertificateKeyPair {
-                            certs: server_cert,
-                            key: server_key,
-                        }
-                        .into(),
+                        server_cert,
                         c.hostname,
                         "/dns-query".to_string(),
                     )?;
@@ -327,24 +347,12 @@ where
                         );
                     }
 
-                    let server_key = c
-                        .ca_key
-                        .map(|x| load_priv_key(&cwd.join(x)))
-                        .transpose()?
-                        .unwrap_or(load_default_key());
-                    let server_cert = c
-                        .ca_cert
-                        .map(|x| load_cert_chain(&cwd.join(x)))
-                        .transpose()?
-                        .unwrap_or(load_default_cert());
+                    let server_cert =
+                        load_dns_server_cert(c.ca_cert, c.ca_key, cwd)?;
                     s.register_tls_listener(
                         x,
                         DEFAULT_DNS_SERVER_TIMEOUT,
-                        CertificateKeyPair {
-                            certs: server_cert,
-                            key: server_key,
-                        }
-                        .into(),
+                        server_cert,
                     )?;
                     info!("DoT dns server listening on: {}", c.addr);
                     Ok(())
@@ -380,24 +388,12 @@ where
                         );
                     }
 
-                    let server_key = c
-                        .ca_key
-                        .map(|x| load_priv_key(&cwd.join(x)))
-                        .transpose()?
-                        .unwrap_or(load_default_key());
-                    let server_cert = c
-                        .ca_cert
-                        .map(|x| load_cert_chain(&cwd.join(x)))
-                        .transpose()?
-                        .unwrap_or(load_default_cert());
+                    let server_cert =
+                        load_dns_server_cert(c.ca_cert, c.ca_key, cwd)?;
                     s.register_h3_listener(
                         x,
                         DEFAULT_DNS_SERVER_TIMEOUT,
-                        CertificateKeyPair {
-                            certs: server_cert,
-                            key: server_key,
-                        }
-                        .into(),
+                        server_cert,
                         c.hostname,
                     )?;
                     info!("DoH3 dns server listening on: {}", c.addr);
@@ -669,6 +665,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn encrypted_listener_without_certificate_is_rejected() {
+        setup_default_crypto_provider();
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        drop(socket);
+
+        let listener = super::get_dns_listener(
+            DNSListenAddr {
+                doh: Some(DoHConfig {
+                    addr,
+                    ca_cert: None,
+                    ca_key: None,
+                    hostname: Some("dns.example.com".to_owned()),
+                }),
+                ..Default::default()
+            },
+            MockDnsMessageExchanger::new(),
+            std::path::Path::new("."),
+        )
+        .await;
+
+        assert!(listener.is_none());
+    }
+
+    #[tokio::test]
+    async fn encrypted_listener_rejects_invalid_certificate_material() {
+        setup_default_crypto_provider();
+        let test_resources =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/resources");
+        let test_cert = test_resources
+            .join("test.cert")
+            .to_string_lossy()
+            .to_string();
+        let test_key = test_resources
+            .join("test.key")
+            .to_string_lossy()
+            .to_string();
+
+        for (cert, key) in [
+            (test_key.as_str(), test_key.as_str()),
+            (test_cert.as_str(), test_cert.as_str()),
+        ] {
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = socket.local_addr().unwrap();
+            drop(socket);
+
+            let listener = super::get_dns_listener(
+                DNSListenAddr {
+                    doh: Some(DoHConfig {
+                        addr,
+                        ca_cert: Some(cert.to_owned()),
+                        ca_key: Some(key.to_owned()),
+                        hostname: Some("dns.example.com".to_owned()),
+                    }),
+                    ..Default::default()
+                },
+                MockDnsMessageExchanger::new(),
+                std::path::Path::new("."),
+            )
+            .await;
+
+            assert!(listener.is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn test_multiple_dns_server() -> anyhow::Result<()> {
         setup_default_crypto_provider();
         let _ = env_logger::try_init();
@@ -713,25 +775,36 @@ mod tests {
         let doh3_addr = doh3_sock.local_addr()?;
         drop(doh3_sock);
 
+        let test_resources =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/resources");
+        let test_cert = test_resources
+            .join("test.cert")
+            .to_string_lossy()
+            .to_string();
+        let test_key = test_resources
+            .join("test.key")
+            .to_string_lossy()
+            .to_string();
+
         let cfg = DNSListenAddr {
             udp: Some(udp_addr),
             tcp: Some(tcp_addr),
             dot: Some(DoTConfig {
                 addr: dot_addr,
-                ca_key: None,
-                ca_cert: None,
+                ca_key: Some(test_key.clone()),
+                ca_cert: Some(test_cert.clone()),
             }),
             doh: Some(DoHConfig {
                 addr: doh_addr,
                 hostname: Some("dns.example.com".to_string()),
-                ca_key: None,
-                ca_cert: None,
+                ca_key: Some(test_key.clone()),
+                ca_cert: Some(test_cert.clone()),
             }),
             doh3: Some(DoH3Config {
                 addr: doh3_addr,
                 hostname: Some("dns.example.com".to_string()),
-                ca_key: None,
-                ca_cert: None,
+                ca_key: Some(test_key),
+                ca_cert: Some(test_cert),
             }),
         };
 

@@ -272,7 +272,9 @@ impl Display for LogLevel {
 #[serde(rename_all = "kebab-case")]
 pub struct DohListenDef {
     pub addr: String,
+    /// Server certificate chain path; required for DoH and DoH3 listeners.
     pub ca_cert: Option<String>,
+    /// Server private key path; required for DoH and DoH3 listeners.
     pub ca_key: Option<String>,
     pub hostname: Option<String>,
 }
@@ -281,7 +283,9 @@ pub struct DohListenDef {
 #[serde(rename_all = "kebab-case")]
 pub struct DotListenDef {
     pub addr: String,
+    /// Server certificate chain path; required for DoT listeners.
     pub ca_cert: Option<String>,
+    /// Server private key path; required for DoT listeners.
     pub ca_key: Option<String>,
 }
 

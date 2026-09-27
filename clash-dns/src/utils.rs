@@ -4,9 +4,6 @@ use std::io;
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use std::{fs, path::Path};
 
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
-use super::dummy_keys::{TEST_CERT, TEST_KEY};
-
 pub fn new_io_error<T>(msg: T) -> io::Error
 where
     T: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -47,18 +44,4 @@ pub fn load_priv_key(key_path: &Path) -> std::io::Result<PrivateKeyDer<'static>>
         rustls_pemfile::private_key(&mut &*key)?
             .ok_or(new_io_error("no private key found"))
     }
-}
-
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
-pub fn load_default_cert() -> Vec<CertificateDer<'static>> {
-    rustls_pemfile::certs(&mut TEST_CERT.as_bytes())
-        .collect::<Result<_, _>>()
-        .unwrap()
-}
-
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
-pub fn load_default_key() -> PrivateKeyDer<'static> {
-    rustls_pemfile::private_key(&mut TEST_KEY.as_bytes())
-        .unwrap()
-        .unwrap()
 }
