@@ -147,7 +147,7 @@ impl Runner for DnsRunner {
                     },
                 }
             } else {
-                let message = "dns listener: no listener started; no addresses were configured or all configured addresses failed to bind";
+                let message = "dns listener: no listener started or one or more configured listeners failed to start";
                 error!("{}", message);
                 if let Some(sender) = ready_tx.take() {
                     let _ = sender.send(Err(message.to_owned()));
