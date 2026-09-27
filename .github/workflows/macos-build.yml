@@ -1,0 +1,118 @@
+name: macOS Build
+
+on:
+  push:
+    branches: ["master"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["master"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RUSTUP_TOOLCHAIN: stable
+
+jobs:
+  dashboard:
+    name: Build dashboard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: clash-dashboard/package-lock.json
+      - name: Install dashboard dependencies
+        working-directory: clash-dashboard
+        run: npm ci
+      - name: Build dashboard
+        working-directory: clash-dashboard
+        run: npm run build
+      - name: Mark dashboard as prebuilt
+        run: touch clash-dashboard/dist/chimera-prebuilt.marker
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dashboard-dist
+          path: clash-dashboard/dist/
+          retention-days: 1
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [dashboard]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: dashboard-dist
+          path: clash-dashboard/dist
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-${{ matrix.target }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: macos-${{ matrix.target }}-
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+      - uses: ilammy/setup-nasm@v1
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "23.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build production binary
+        run: cargo build --locked --release --package clash-rs --target "${TARGET}" -F plus
+        env:
+          TARGET: ${{ matrix.target }}
+          CLASH_GIT_REF: ${{ github.ref }}
+          CLASH_GIT_SHA: ${{ github.sha }}
+      - name: Package release archive
+        id: package
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "clash-rs"))')"
+          archive="chimera-client-${version}-${TARGET}.tar.gz"
+          package_dir="${RUNNER_TEMP}/chimera-client-${version}-${TARGET}"
+          mkdir -p "${package_dir}"
+          install -m 0755 "target/${TARGET}/release/clash-rs" "${package_dir}/clash-rs"
+          cp README.md LICENSE "${package_dir}/"
+          {
+            printf 'Version: %s\n' "${version}"
+            printf 'Target: %s\n' "${TARGET}"
+            printf 'Git ref: %s\n' "${GITHUB_REF}"
+            printf 'Git SHA: %s\n' "${GITHUB_SHA}"
+            printf 'Rust: %s\n' "$(rustc --version)"
+          } > "${package_dir}/BUILD-INFO"
+          tar -C "${RUNNER_TEMP}" -czf "${archive}" "chimera-client-${version}-${TARGET}"
+          echo "archive=${archive}" >> "${GITHUB_OUTPUT}"
+        env:
+          TARGET: ${{ matrix.target }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: chimera-client-${{ matrix.target }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 14
