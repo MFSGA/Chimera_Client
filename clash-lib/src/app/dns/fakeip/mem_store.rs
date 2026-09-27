@@ -1,19 +1,21 @@
-use std::net::IpAddr;
+use std::{collections::HashMap, net::IpAddr};
 
 use async_trait::async_trait;
 
 use super::Store;
 
 pub struct InMemStore {
-    itoh: lru_time_cache::LruCache<IpAddr, String>,
-    htoi: lru_time_cache::LruCache<String, IpAddr>,
+    itoh: HashMap<IpAddr, String>,
+    htoi: HashMap<String, IpAddr>,
 }
 
 impl InMemStore {
-    pub fn new(size: usize) -> Self {
+    /// Creates a bidirectional mapping store with an initial allocation hint.
+    /// Mappings are not evicted; `FakeDns` bounds growth by its address pool.
+    pub fn new(initial_capacity: usize) -> Self {
         Self {
-            itoh: lru_time_cache::LruCache::with_capacity(size),
-            htoi: lru_time_cache::LruCache::with_capacity(size),
+            itoh: HashMap::with_capacity(initial_capacity),
+            htoi: HashMap::with_capacity(initial_capacity),
         }
     }
 
@@ -39,16 +41,13 @@ impl InMemStore {
 #[async_trait]
 impl Store for InMemStore {
     async fn get_by_host(&mut self, host: &str) -> Option<IpAddr> {
-        let ip = *self.htoi.get_mut(host)?;
+        let ip = *self.htoi.get(host)?;
         // Cross-check: if itoh doesn't map this IP back to the same host,
-        // the entry is stale (e.g. htoi survived but itoh was evicted and
-        // the IP was reassigned). Treat as a miss and clean up.
+        // the entry is stale. Treat it as a miss and clean up.
         if self.itoh.get(&ip).map(|h| h.as_str()) != Some(host) {
             self.htoi.remove(host);
             return None;
         }
-        // Touch itoh LRU to keep access ordering in sync.
-        self.itoh.get_mut(&ip);
         Some(ip)
     }
 
@@ -57,17 +56,14 @@ impl Store for InMemStore {
     }
 
     async fn get_by_ip(&mut self, ip: IpAddr) -> Option<String> {
-        let host = self.itoh.get_mut(&ip)?;
+        let host = self.itoh.get(&ip)?;
         // Cross-check: if htoi doesn't map this host back to the same IP,
         // the entry is stale.
         if self.htoi.get(host).copied() != Some(ip) {
             self.itoh.remove(&ip);
             return None;
         }
-        let host = host.clone();
-        // Touch htoi LRU to keep access ordering in sync.
-        self.htoi.get_mut(&host);
-        Some(host)
+        Some(host.clone())
     }
 
     async fn put_by_ip(&mut self, ip: IpAddr, host: &str) {

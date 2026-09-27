@@ -44,8 +44,14 @@ pub struct FakeDns {
 }
 
 impl FakeDns {
-    pub fn new(opt: Opts) -> Result<Self, Error> {
-        let network = match opt.ipnet {
+    /// Maximum supported number of fake-IP addresses in a configured range.
+    /// The default /16 fits, while in-memory mappings remain bounded.
+    const MAX_CAPACITY: u32 = 65_533;
+
+    fn validated_range(
+        ipnet: &ipnet::IpNet,
+    ) -> Result<(ipnet::Ipv4Net, u32), Error> {
+        let network = match ipnet {
             ipnet::IpNet::V4(network) => network,
             ipnet::IpNet::V6(_) => {
                 return Err(Error::InvalidConfig(
@@ -63,9 +69,22 @@ impl FakeDns {
 
         let network_addr = Self::ip_to_uint(&network.network());
         let broadcast = Self::ip_to_uint(&network.broadcast());
+        let capacity = broadcast - (network_addr + 2);
+        if capacity > Self::MAX_CAPACITY {
+            return Err(Error::InvalidConfig(format!(
+                "fake-ip-range capacity {capacity} exceeds the supported limit {}",
+                Self::MAX_CAPACITY
+            )));
+        }
+        Ok((*network, capacity))
+    }
+
+    pub fn new(opt: Opts) -> Result<Self, Error> {
+        let (network, capacity) = Self::validated_range(&opt.ipnet)?;
+
+        let network_addr = Self::ip_to_uint(&network.network());
         let gateway = network_addr + 1;
         let first = network_addr + 2;
-        let capacity = broadcast - first;
 
         Ok(Self {
             first,
@@ -284,8 +303,13 @@ mod tests {
     }
 
     #[test]
-    fn test_rejects_too_small_or_ipv6_pool() {
-        for ipnet in ["192.168.0.0/31", "192.168.0.1/32", "fd00::/64"] {
+    fn test_rejects_unsupported_ranges() {
+        for ipnet in [
+            "192.168.0.0/31",
+            "192.168.0.1/32",
+            "192.168.0.0/15",
+            "fd00::/64",
+        ] {
             let result = FakeDns::new(Opts {
                 ipnet: ipnet.parse().unwrap(),
                 skipped_hostnames: None,
@@ -297,7 +321,7 @@ mod tests {
 
     #[tokio::test]
     async fn exhausted_pool_keeps_existing_host_mappings_stable() {
-        let store = Box::new(InMemStore::new(10));
+        let store = Box::new(InMemStore::new(2));
 
         let ipnet = "192.168.0.0/29".parse::<ipnet::IpNet>().unwrap();
         let mut pool = FakeDns::new(Opts {
