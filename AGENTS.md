@@ -29,7 +29,8 @@ Cargo 的 `-p` 参数使用 package 名称，不一定等于目录名。
 | `clash-dashboard/` | 非 Cargo 包 | React/TypeScript/Vite 内嵌控制面板 |
 | `docs/` | — | 设计、迁移和变更记录 |
 | `nix/`、`flake.nix` | — | Nix 构建、开发环境和 NixOS 模块 |
-| `ref/` | 独立参考仓库 | 本地 clash-rs 参考实现，不属于当前 workspace |
+| `ref/` | Git submodule：`ibigbug/clash-rs` 的 `master` 分支 | Rust 参考实现，不属于当前 workspace |
+| `ref-mihomo/` | Git submodule：`MetaCubeX/mihomo` 的 `Alpha` 分支 | Go 参考实现，不属于当前 workspace |
 
 核心代码导航：
 
@@ -46,6 +47,7 @@ Cargo 的 `-p` 参数使用 package 名称，不一定等于目录名。
 
 - 涉及行为差异或修复方案时，优先查找 `ref/` 中同路径代码及相关测试。
 - 默认只读参考目录；除非任务明确要求，不修改 `ref/`。
+- 需要核对 Go 版 Mihomo 行为时，使用 `ref-mihomo/`；不要将该仓库视为当前 Cargo workspace 的成员。
 - 保留 Chimera 本地品牌、包名和已存在的扩展，不机械复制上游命名。
 - 迁移前核对依赖版本、feature、类型和调用方；参考实现不等于本地已具备对应能力。
 - 用户要求逐步对齐时，每步选择一个可独立编译、易审查的小切片；每步最多 500 行增删，

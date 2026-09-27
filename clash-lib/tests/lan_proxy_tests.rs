@@ -454,7 +454,10 @@ async fn runtime_allow_lan_toggle_changes_access_policy() {
 
         let proxy_addr =
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), socks_port);
-        let simulated_remote = Ipv4Addr::new(127, 0, 0, 2);
+        let simulated_remote =
+            non_loopback_ipv4_addresses().into_iter().next().expect(
+                "LAN toggle test requires an assigned non-loopback IPv4 address",
+            );
         let denied =
             open_socks_tunnel(proxy_addr, echo_addr, Some(simulated_remote)).await;
         assert!(

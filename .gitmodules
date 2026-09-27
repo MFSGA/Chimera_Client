@@ -1,3 +1,8 @@
 [submodule "ref"]
 	path = ref
-	url = https://github.com/Watfaq/clash-rs
+	url = https://github.com/ibigbug/clash-rs.git
+	branch = master
+[submodule "ref-mihomo"]
+	path = ref-mihomo
+	url = https://github.com/MetaCubeX/mihomo.git
+	branch = Alpha

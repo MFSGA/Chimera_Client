@@ -285,8 +285,20 @@ async fn data_plane_bind_failure_restores_existing_runtime() {
 
     let initial_config = temp_dir.join("initial.yaml");
     let blocked_config = temp_dir.join("blocked-socks.yaml");
-    write_config(&initial_config, api_port, socks_port, "global");
-    write_config(&blocked_config, api_port, blocked_socks_port, "rule");
+    write_config_with_extra(
+        &initial_config,
+        api_port,
+        socks_port,
+        "global",
+        "bind-address: 127.0.0.1\n",
+    );
+    write_config_with_extra(
+        &blocked_config,
+        api_port,
+        blocked_socks_port,
+        "rule",
+        "bind-address: 127.0.0.1\n",
+    );
 
     let cwd = temp_dir.clone();
     let runtime = std::thread::spawn(move || {

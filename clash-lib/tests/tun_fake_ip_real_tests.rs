@@ -46,6 +46,12 @@ fn tun_fake_ip_routes_direct_and_proxy_with_real_network() {
     spawn_http_echo(http_port);
     let proxy_connects = spawn_recording_socks5_proxy(socks_port, http_port);
 
+    let device_id = if cfg!(target_os = "macos") {
+        "dev://utun1989"
+    } else {
+        "dev://chimera-tun"
+    };
+
     let conf = format!(
         r#"
 mixed-port: 0
@@ -59,7 +65,7 @@ mmdb: null
 
 tun:
   enable: true
-  device-id: "dev://chimera-tun"
+  device-id: "{device_id}"
   route-all: false
   gateway: "198.19.0.1/30"
   dns-hijack: false
