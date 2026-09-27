@@ -3,8 +3,6 @@ use std::{future::Future, net::SocketAddr};
 use hickory_proto::op::Message;
 use serde::Deserialize;
 
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
-mod dummy_keys;
 mod handler;
 
 #[cfg(all(test, any(feature = "aws-lc-rs", feature = "ring")))]

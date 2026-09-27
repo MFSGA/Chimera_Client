@@ -311,9 +311,9 @@ fn validate_server_certificate(
     key: &Option<String>,
 ) -> Result<(), Error> {
     match (cert, key) {
-        (Some(_), Some(_)) | (None, None) => Ok(()),
+        (Some(_), Some(_)) => Ok(()),
         _ => Err(Error::InvalidConfig(format!(
-            "DNS {protocol} listener requires both ca-cert and ca-key when either is configured"
+            "DNS {protocol} listener requires both ca-cert and ca-key"
         ))),
     }
 }

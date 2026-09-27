@@ -388,14 +388,18 @@ fn enabled_redir_host_mode_is_rejected_as_unimplemented() {
 }
 
 #[test]
-fn encrypted_dns_listeners_reject_incomplete_certificate_pairs() {
+fn encrypted_dns_listeners_require_certificate_pairs() {
     for protocol in ["doh", "dot", "doh3"] {
         let listener =
             format!("  listen:\n    {protocol}:\n      addr: 127.0.0.1:8443\n");
-        let valid_yaml = base_config(&format!(
+        let listener_without_certificate = base_config(&format!(
             "\n  enable: true\n  nameserver:\n    - 1.1.1.1\n  default-nameserver:\n    - 223.5.5.5\n{listener}"
         ));
-        parse_dns(&valid_yaml);
+        let err = parse_error(listener_without_certificate);
+        assert!(
+            err.to_string().contains("requires both ca-cert and ca-key"),
+            "unexpected error for {protocol}: {err}"
+        );
 
         for field in ["ca-cert: server.crt", "ca-key: server.key"] {
             let listener = format!("{listener}      {field}\n");
@@ -408,6 +412,13 @@ fn encrypted_dns_listeners_reject_incomplete_certificate_pairs() {
                 "unexpected error for {protocol}: {err}"
             );
         }
+
+        let listener = format!(
+            "{listener}      ca-cert: server.crt\n      ca-key: server.key\n"
+        );
+        parse_dns(&base_config(&format!(
+            "\n  enable: true\n  nameserver:\n    - 1.1.1.1\n  default-nameserver:\n    - 223.5.5.5\n{listener}"
+        )));
     }
 }
 
