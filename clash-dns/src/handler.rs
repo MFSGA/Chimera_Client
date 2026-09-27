@@ -229,9 +229,10 @@ where
     let mut s = Server::new(handler);
 
     let mut has_server = false;
+    let mut listener_failed = false;
 
     if let Some(addr) = listen.udp {
-        has_server = UdpSocket::bind(addr)
+        let started = UdpSocket::bind(addr)
             .await
             .map(|x| {
                 info!("UDP dns server listening on: {}", addr);
@@ -241,9 +242,11 @@ where
                 error!("failed to listen UDP DNS server on {}: {}", addr, x);
             })
             .is_ok();
+        has_server |= started;
+        listener_failed |= !started;
     }
     if let Some(addr) = listen.tcp {
-        has_server |= TcpListener::bind(addr)
+        let started = TcpListener::bind(addr)
             .await
             .map(|x| {
                 info!("TCP dns server listening on: {}", addr);
@@ -253,11 +256,13 @@ where
                 error!("failed to listen TCP DNS server on {}: {}", addr, x);
             })
             .is_ok();
+        has_server |= started;
+        listener_failed |= !started;
     }
     if let Some(c) = listen.doh {
         #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
         {
-            has_server |= TcpListener::bind(c.addr)
+            let started = TcpListener::bind(c.addr)
                 .await
                 .and_then(|x| {
                     if let (Some(k), Some(c)) = (&c.ca_key, &c.ca_cert) {
@@ -296,6 +301,8 @@ where
                     error!("failed to listen DoH server on {}: {}", c.addr, x);
                 })
                 .is_ok();
+            has_server |= started;
+            listener_failed |= !started;
         }
         #[cfg(not(any(feature = "aws-lc-rs", feature = "ring")))]
         {
@@ -303,12 +310,13 @@ where
                 "DoH listener {} ignored because chimera-dns was built without aws-lc-rs or ring",
                 c.addr
             );
+            listener_failed = true;
         }
     }
     if let Some(c) = listen.dot {
         #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
         {
-            has_server |= TcpListener::bind(c.addr)
+            let started = TcpListener::bind(c.addr)
                 .await
                 .and_then(|x| {
                     if let (Some(k), Some(c)) = (&c.ca_key, &c.ca_cert) {
@@ -345,6 +353,8 @@ where
                     error!("failed to listen DoT DNS server on {}: {}", c.addr, x);
                 })
                 .is_ok();
+            has_server |= started;
+            listener_failed |= !started;
         }
         #[cfg(not(any(feature = "aws-lc-rs", feature = "ring")))]
         {
@@ -352,13 +362,14 @@ where
                 "DoT listener {} ignored because chimera-dns was built without aws-lc-rs or ring",
                 c.addr
             );
+            listener_failed = true;
         }
     }
 
     if let Some(c) = listen.doh3 {
         #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
         {
-            has_server |= UdpSocket::bind(c.addr)
+            let started = UdpSocket::bind(c.addr)
                 .await
                 .and_then(|x| {
                     if let (Some(k), Some(c)) = (&c.ca_key, &c.ca_cert) {
@@ -396,6 +407,8 @@ where
                     error!("failed to listen DoH3 DNS server on {}: {}", c.addr, x);
                 })
                 .is_ok();
+            has_server |= started;
+            listener_failed |= !started;
         }
         #[cfg(not(any(feature = "aws-lc-rs", feature = "ring")))]
         {
@@ -403,10 +416,16 @@ where
                 "DoH3 listener {} ignored because chimera-dns was built without aws-lc-rs or ring",
                 c.addr
             );
+            listener_failed = true;
         }
     }
 
-    if !has_server {
+    if !has_server || listener_failed {
+        error!(
+            has_server,
+            listener_failed,
+            "DNS listener startup failed; every configured listener must start"
+        );
         return None;
     }
 
