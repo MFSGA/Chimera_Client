@@ -62,7 +62,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-15]
     steps:
       - uses: actions/checkout@v6
         with:
@@ -80,7 +80,7 @@ jobs:
           key: quality-${{ matrix.os }}-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: quality-${{ matrix.os }}-
       - uses: ilammy/setup-nasm@v1
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' || runner.os == 'macOS'
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
@@ -176,6 +176,13 @@ jobs:
             postfix: ".exe"
             extra-args: -F "standard"
             no-test: true
+          # macOS
+          - os: macos-15
+            target: aarch64-apple-darwin
+            extra-args: -F "plus"
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            extra-args: -F "plus"
     steps:
       - uses: actions/checkout@v6
         with:
@@ -276,15 +283,44 @@ jobs:
           RUSTFLAGS: ${{ matrix.rustflags || '--cfg tokio_unstable' }}
           CROSS_BUILD_ZIG: ${{ matrix.zig }}
 
+      - name: Package macOS release archive
+        id: package_macos
+        if: ${{ contains(matrix.target, 'apple-darwin') }}
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "clash-rs"))')"
+          archive="chimera-client-${version}-${TARGET}.tar.gz"
+          package_dir="${RUNNER_TEMP}/chimera-client-${version}-${TARGET}"
+          mkdir -p "${package_dir}"
+          install -m 0755 "target/${TARGET}/release/clash-rs" "${package_dir}/clash-rs"
+          cp README.md LICENSE "${package_dir}/"
+          {
+            printf 'Version: %s\n' "${version}"
+            printf 'Target: %s\n' "${TARGET}"
+            printf 'Git ref: %s\n' "${GITHUB_REF}"
+            printf 'Git SHA: %s\n' "${GITHUB_SHA}"
+            printf 'Rust: %s\n' "$(rustc --version)"
+          } > "${package_dir}/BUILD-INFO"
+          tar -C "${RUNNER_TEMP}" -czf "${archive}" "chimera-client-${version}-${TARGET}"
+          echo "archive=${archive}" >> "${GITHUB_OUTPUT}"
+        env:
+          TARGET: ${{ matrix.target }}
+
       - name: Rename binary
-        run: mv target/${{ matrix.target }}/release/clash-rs${{ matrix.postfix }} ${{ env.PACKAGE }}-${{ matrix.release-name || matrix.target }}${{ matrix.postfix }}
+        id: rename_binary
+        if: ${{ !contains(matrix.target, 'apple-darwin') }}
+        run: |
+          binary="${PACKAGE}-${{ matrix.release-name || matrix.target }}${{ matrix.postfix }}"
+          mv "target/${{ matrix.target }}/release/clash-rs${{ matrix.postfix }}" "${binary}"
+          echo "binary=${binary}" >> "${GITHUB_OUTPUT}"
 
       - name: Upload binaries
         uses: actions/upload-artifact@v7
         if: ${{ !matrix.no-release }}
         with:
           name: binary-${{ matrix.release-name || matrix.target }}
-          path: ${{ env.PACKAGE }}-${{ matrix.release-name || matrix.target }}${{ matrix.postfix }}
+          path: ${{ steps.package_macos.outputs.archive || steps.rename_binary.outputs.binary }}
+          if-no-files-found: error
 
       - name: Setup tmate session
         if: ${{ failure() && github.event_name == 'pull_request' && github.actor != 'dependabot[bot]' }}

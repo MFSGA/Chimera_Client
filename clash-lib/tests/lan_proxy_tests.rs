@@ -256,6 +256,23 @@ async fn find_reachable_lan_ip(port: u16) -> io::Result<Ipv4Addr> {
     ))
 }
 
+async fn find_reachable_lan_ip_from_source(
+    port: u16,
+    source_ip: Ipv4Addr,
+) -> io::Result<Ipv4Addr> {
+    for address in non_loopback_ipv4_addresses() {
+        let proxy_addr = SocketAddr::new(IpAddr::V4(address), port);
+        if let Ok(stream) = connect_tcp(proxy_addr, Some(source_ip)).await {
+            drop(stream);
+            return Ok(address);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AddrNotAvailable,
+        "no reachable non-loopback IPv4 address found for the bound source",
+    ))
+}
+
 async fn get_runtime_config(api_port: u16) -> io::Result<serde_json::Value> {
     let url = format!("http://127.0.0.1:{api_port}/configs");
     let request = hyper::Request::builder()
@@ -452,17 +469,27 @@ async fn runtime_allow_lan_toggle_changes_access_policy() {
         )
         .expect("failed to start Chimera for LAN toggle test");
 
-        let proxy_addr =
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), socks_port);
-        // macOS needs a real interface source here; Windows and Linux use the
-        // loopback alias that passed their previous CI runs.
+        // macOS cannot bind the secondary loopback alias used on Windows and
+        // Linux. Find an interface reachable from loopback instead.
         #[cfg(target_os = "macos")]
-        let simulated_remote =
-            non_loopback_ipv4_addresses().into_iter().next().expect(
-                "LAN toggle test requires an assigned non-loopback IPv4 address",
-            );
+        let (proxy_addr, simulated_remote) = {
+            let simulated_remote = Ipv4Addr::LOCALHOST;
+            let listen_ip = find_reachable_lan_ip_from_source(
+                socks_port,
+                simulated_remote,
+            )
+            .await
+            .expect("LAN toggle test requires an interface reachable from loopback");
+            (
+                SocketAddr::new(IpAddr::V4(listen_ip), socks_port),
+                simulated_remote,
+            )
+        };
         #[cfg(not(target_os = "macos"))]
-        let simulated_remote = Ipv4Addr::new(127, 0, 0, 2);
+        let (proxy_addr, simulated_remote) = (
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), socks_port),
+            Ipv4Addr::new(127, 0, 0, 2),
+        );
         let denied =
             open_socks_tunnel(proxy_addr, echo_addr, Some(simulated_remote)).await;
         assert!(
