@@ -256,6 +256,7 @@ async fn find_reachable_lan_ip(port: u16) -> io::Result<Ipv4Addr> {
     ))
 }
 
+#[cfg(target_os = "macos")]
 async fn find_reachable_lan_ip_from_source(
     port: u16,
     source_ip: Ipv4Addr,
