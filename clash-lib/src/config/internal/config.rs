@@ -245,6 +245,15 @@ impl DnsHijackRule {
                 DnsHijackAddress::Ip(address) => address == destination.ip(),
             }
     }
+
+    pub fn matches_tcp(&self, destination: SocketAddr) -> bool {
+        self.protocol == DnsHijackProtocol::Tcp
+            && self.port == destination.port()
+            && match self.address {
+                DnsHijackAddress::Any => true,
+                DnsHijackAddress::Ip(address) => address == destination.ip(),
+            }
+    }
 }
 
 impl TunConfig {

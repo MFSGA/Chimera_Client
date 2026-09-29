@@ -867,6 +867,7 @@ mod tests {
             source: SocketAddr::from_str("127.0.0.1:53000").unwrap(),
             destination: SocksAddr::from_str("8.8.8.8:53").unwrap(),
             resolved_ip: None,
+            sniff_host: None,
             so_mark: None,
             iface: None,
             country: None,

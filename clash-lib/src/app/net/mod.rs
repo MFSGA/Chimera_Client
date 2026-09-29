@@ -443,6 +443,34 @@ pub async fn init_net_config(
     interface: Option<&Interface>,
 ) -> Result<()> {
     let configured_interface = resolve_outbound_interface(interface).await?;
+    #[cfg(target_os = "macos")]
+    let configured_interface = {
+        // macOS route-all TUN installs split default routes, but has no
+        // SO_MARK policy-routing equivalent. Pin Chimera's own outbound
+        // sockets to the pre-TUN physical interface or they re-enter utun.
+        let selected = select_macos_tun_outbound_interface(
+            configured_interface,
+            tun_enabled,
+            get_outbound_interface,
+        );
+        if tun_enabled && selected.is_none() {
+            return Err(Error::InvalidConfig(
+                "TUN is enabled but no physical outbound interface was found; configure interface-name"
+                    .to_owned(),
+            ));
+        }
+        if tun_enabled
+            && interface.is_none()
+            && let Some(selected) = selected.as_ref()
+        {
+            info!(
+                interface = %selected.name,
+                interface_index = selected.index,
+                "selected physical outbound interface for macOS TUN"
+            );
+        }
+        selected
+    };
     #[cfg(target_os = "windows")]
     let should_cache_fallback = configured_interface.is_none();
     *DEFAULT_OUTBOUND_INTERFACE.write().await = configured_interface;
@@ -464,6 +492,19 @@ pub async fn init_net_config(
         *TUN_SOMARK.read().await
     );
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn select_macos_tun_outbound_interface(
+    configured: Option<OutboundInterface>,
+    tun_enabled: bool,
+    fallback: impl FnOnce() -> Option<OutboundInterface>,
+) -> Option<OutboundInterface> {
+    match configured {
+        Some(interface) => Some(interface),
+        None if tun_enabled => fallback(),
+        None => None,
+    }
 }
 
 #[cfg(feature = "tun")]
@@ -952,7 +993,7 @@ impl Interface {
 
 #[cfg(all(test, feature = "tun"))]
 mod tests {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use super::OutboundInterface;
     use super::{Interface, resolve_outbound_interface};
     use crate::Error;
@@ -970,6 +1011,59 @@ mod tests {
             index: 42,
             mac_addr: None,
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_test_interface(name: &str, index: u32) -> OutboundInterface {
+        OutboundInterface {
+            name: name.to_owned(),
+            addr_v4: Some(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+            netmask_v4: None,
+            broadcast_v4: None,
+            addr_v6: None,
+            netmask_v6: None,
+            broadcast_v6: None,
+            index,
+            mac_addr: None,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_tun_uses_physical_default_when_interface_is_unset() {
+        let selected =
+            super::select_macos_tun_outbound_interface(None, true, || {
+                Some(macos_test_interface("en0", 4))
+            })
+            .unwrap();
+
+        assert_eq!(selected.name, "en0");
+        assert_eq!(selected.index, 4);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_tun_preserves_explicit_outbound_interface() {
+        let selected = super::select_macos_tun_outbound_interface(
+            Some(macos_test_interface("en1", 5)),
+            true,
+            || panic!("explicit interface must take precedence"),
+        )
+        .unwrap();
+
+        assert_eq!(selected.name, "en1");
+        assert_eq!(selected.index, 5);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_does_not_guess_interface_when_tun_is_disabled() {
+        let selected =
+            super::select_macos_tun_outbound_interface(None, false, || {
+                panic!("fallback is only used while TUN is enabled")
+            });
+
+        assert!(selected.is_none());
     }
 
     #[tokio::test]

@@ -343,6 +343,9 @@ pub struct Session {
     pub destination: SocksAddr,
     /// The locally resolved IP address of the destination domain.
     pub resolved_ip: Option<IpAddr>,
+    /// The hostname observed in the inbound TLS ClientHello, when available.
+    #[serde(skip)]
+    pub sniff_host: Option<String>,
     /// The packet mark SO_MARK
     pub so_mark: Option<u32>,
     /// The bind interface
@@ -384,6 +387,9 @@ impl Session {
             Box::new(self.destination.port()) as _,
         );
         rv.insert("host".to_string(), Box::new(self.destination.host()) as _);
+        if let Some(host) = &self.sniff_host {
+            rv.insert("sniffHost".to_string(), Box::new(host.clone()) as _);
+        }
         rv.insert("asn".to_string(), Box::new(self.asn.clone()) as _);
         rv.insert("country".to_string(), Box::new(self.country.clone()) as _);
         rv.insert(
@@ -437,6 +443,7 @@ impl Default for Session {
             source: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0),
             destination: SocksAddr::any_ipv4(),
             resolved_ip: None,
+            sniff_host: None,
             so_mark: None,
             iface: None,
             country: None,
@@ -488,6 +495,7 @@ impl Clone for Session {
             source: self.source,
             destination: self.destination.clone(),
             resolved_ip: self.resolved_ip,
+            sniff_host: self.sniff_host.clone(),
             so_mark: self.so_mark,
             iface: self.iface.as_ref().cloned(),
             country: self.country.clone(),

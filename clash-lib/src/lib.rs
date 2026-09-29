@@ -1158,6 +1158,10 @@ async fn create_components(
     // TODO: we should separate the DNS resolver and DNS server config here
     let dns_listen = config.dns.listen.clone();
     let dns_enable = config.dns.enable;
+    let managed_dns_proxy_bridge = cfg!(target_os = "macos")
+        && config.tun.enable
+        && config.tun.dns_hijack
+        && dns_enable;
 
     // Extract the country MMDB file/url config early so they can be consumed
     // here, while the actual MMDB loading happens after OutboundManager (like
@@ -1466,6 +1470,7 @@ async fn build_auxiliary_dns_resolver(
         fake_ip_range: "198.18.0.1/16"
             .parse()
             .expect("static fake-ip-range must parse"),
+        fake_ip_range6: None,
         fake_ip_filter: Vec::new(),
         store_fake_ip: false,
         store_smart_stats: false,
