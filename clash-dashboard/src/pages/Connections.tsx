@@ -18,6 +18,10 @@ function formatDuration(start: string): string {
   return `${Math.floor(diff / 3600)}h ${Math.floor((diff % 3600) / 60)}m`;
 }
 
+function connectionHost(conn: Connection): string {
+  return conn.metadata.sniffHost || conn.metadata.host || conn.metadata.destinationIP || '';
+}
+
 function IconBadge({ bg, children }: { bg: string; children: React.ReactNode }) {
   return (
     <div
@@ -42,7 +46,7 @@ export function Connections() {
     const q = search.toLowerCase();
     return (
       !q ||
-      (conn.metadata.host || '').toLowerCase().includes(q) ||
+      connectionHost(conn).toLowerCase().includes(q) ||
       conn.rule.toLowerCase().includes(q) ||
       conn.chains?.join(' ').toLowerCase().includes(q) ||
       (conn.metadata.asn || '').toLowerCase().includes(q)
@@ -161,7 +165,7 @@ export function Connections() {
                 >
                   <td className="px-4 py-3">
                     <div className="text-[15px] font-medium truncate" style={{ color: 'var(--color-text-primary)' }}>
-                      {conn.metadata.host || conn.metadata.destinationIP}
+                      {connectionHost(conn)}
                       {conn.metadata.destinationPort && `:${conn.metadata.destinationPort}`}
                     </div>
                     {conn.metadata.process && (
@@ -186,7 +190,7 @@ export function Connections() {
                   <td className="px-4 py-3">
                     <button
                       onClick={() => closeOneMutation.mutate(conn.id)}
-                      aria-label={`Close connection to ${conn.metadata.host || conn.id}`}
+                      aria-label={`Close connection to ${connectionHost(conn) || conn.id}`}
                       className="p-1 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity"
                       style={{ color: '#ff3b30' }}
                     >
