@@ -1,11 +1,6 @@
-use std::{
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-    time::Duration,
-};
+use std::sync::Arc;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, warn};
 
 use crate::{
@@ -17,239 +12,6 @@ use crate::{
     config::internal::config::DnsHijackRule,
     session::{Network, Session, Type, find_process_name},
 };
-
-const TLS_SNIFF_TIMEOUT: Duration = Duration::from_millis(100);
-const MAX_TLS_RECORD_LENGTH: usize = 16 * 1024;
-
-fn should_sniff_tls(port: u16) -> bool {
-    matches!(
-        port,
-        443 | 465
-            | 853
-            | 993
-            | 995
-            | 2053
-            | 2083
-            | 2087
-            | 2096
-            | 5228
-            | 8443
-            | 8888
-            | 9443
-            | 10443
-            | 10444
-    )
-}
-
-struct ReplayedTcpStream {
-    inner: watfaq_netstack::TcpStream,
-    buffered: Vec<u8>,
-    offset: usize,
-}
-
-impl AsyncRead for ReplayedTcpStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buffer: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        if this.offset < this.buffered.len() {
-            let count = buffer.remaining().min(this.buffered.len() - this.offset);
-            buffer.put_slice(&this.buffered[this.offset..this.offset + count]);
-            this.offset += count;
-            return Poll::Ready(Ok(()));
-        }
-
-        Pin::new(&mut this.inner).poll_read(cx, buffer)
-    }
-}
-
-impl AsyncWrite for ReplayedTcpStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buffer: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.get_mut().inner).poll_write(cx, buffer)
-    }
-
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
-    }
-}
-
-async fn read_tls_prefix(
-    stream: &mut watfaq_netstack::TcpStream,
-    buffered: &mut Vec<u8>,
-    target_len: usize,
-) -> std::io::Result<bool> {
-    while buffered.len() < target_len {
-        let mut chunk = [0; 1024];
-        let count = (target_len - buffered.len()).min(chunk.len());
-        let read = stream.read(&mut chunk[..count]).await?;
-        if read == 0 {
-            return Ok(false);
-        }
-        buffered.extend_from_slice(&chunk[..read]);
-    }
-    Ok(true)
-}
-
-async fn sniff_tls_server_name(
-    mut stream: watfaq_netstack::TcpStream,
-    destination_port: u16,
-) -> (ReplayedTcpStream, Option<String>) {
-    let mut buffered = Vec::new();
-    if !should_sniff_tls(destination_port) {
-        return (
-            ReplayedTcpStream {
-                inner: stream,
-                buffered,
-                offset: 0,
-            },
-            None,
-        );
-    }
-
-    let sniffed = tokio::time::timeout(TLS_SNIFF_TIMEOUT, async {
-        if !read_tls_prefix(&mut stream, &mut buffered, 5).await.ok()? {
-            return None;
-        }
-
-        if buffered[0] != 0x16 || buffered[1] != 0x03 {
-            return None;
-        }
-
-        let record_length = u16::from_be_bytes([buffered[3], buffered[4]]) as usize;
-        if !(4..=MAX_TLS_RECORD_LENGTH).contains(&record_length) {
-            return None;
-        }
-
-        let record_end = 5 + record_length;
-        if !read_tls_prefix(&mut stream, &mut buffered, record_end)
-            .await
-            .ok()?
-        {
-            return None;
-        }
-
-        parse_tls_server_name(&buffered)
-    })
-    .await
-    .unwrap_or(None);
-
-    (
-        ReplayedTcpStream {
-            inner: stream,
-            buffered,
-            offset: 0,
-        },
-        sniffed,
-    )
-}
-
-fn parse_tls_server_name(record: &[u8]) -> Option<String> {
-    if record.len() < 9 || record[0] != 0x16 || record[1] != 0x03 {
-        return None;
-    }
-
-    let record_length = u16::from_be_bytes([record[3], record[4]]) as usize;
-    let handshake = record.get(5..5 + record_length)?;
-    if handshake.first() != Some(&0x01) {
-        return None;
-    }
-
-    let hello_length = read_u24(handshake, 1)?;
-    let hello_end = 4_usize.checked_add(hello_length)?;
-    let hello = handshake.get(4..hello_end)?;
-    let mut offset = 0;
-
-    take_bytes(hello, &mut offset, 2 + 32)?;
-    let session_id_length = read_u8(hello, &mut offset)? as usize;
-    take_bytes(hello, &mut offset, session_id_length)?;
-    let cipher_suites_length = read_u16(hello, &mut offset)? as usize;
-    take_bytes(hello, &mut offset, cipher_suites_length)?;
-    let compression_methods_length = read_u8(hello, &mut offset)? as usize;
-    take_bytes(hello, &mut offset, compression_methods_length)?;
-    let extensions_length = read_u16(hello, &mut offset)? as usize;
-    let extensions = take_bytes(hello, &mut offset, extensions_length)?;
-
-    let mut offset = 0;
-    while offset < extensions.len() {
-        let extension_type = read_u16(extensions, &mut offset)?;
-        let extension_length = read_u16(extensions, &mut offset)? as usize;
-        let extension = take_bytes(extensions, &mut offset, extension_length)?;
-        if extension_type == 0 {
-            return parse_sni_extension(extension);
-        }
-    }
-
-    None
-}
-
-fn parse_sni_extension(extension: &[u8]) -> Option<String> {
-    let mut offset = 0;
-    let names_length = read_u16(extension, &mut offset)? as usize;
-    let names = take_bytes(extension, &mut offset, names_length)?;
-
-    let mut offset = 0;
-    while offset < names.len() {
-        let name_type = read_u8(names, &mut offset)?;
-        let name_length = read_u16(names, &mut offset)? as usize;
-        let name = take_bytes(names, &mut offset, name_length)?;
-        if name_type == 0 {
-            let host = std::str::from_utf8(name).ok()?.trim_end_matches('.');
-            if host.is_empty()
-                || !host.is_ascii()
-                || host.chars().any(char::is_whitespace)
-                || host.parse::<std::net::IpAddr>().is_ok()
-            {
-                return None;
-            }
-            return Some(host.to_ascii_lowercase());
-        }
-    }
-
-    None
-}
-
-fn take_bytes<'a>(
-    bytes: &'a [u8],
-    offset: &mut usize,
-    length: usize,
-) -> Option<&'a [u8]> {
-    let end = offset.checked_add(length)?;
-    let value = bytes.get(*offset..end)?;
-    *offset = end;
-    Some(value)
-}
-
-fn read_u8(bytes: &[u8], offset: &mut usize) -> Option<u8> {
-    Some(*take_bytes(bytes, offset, 1)?.first()?)
-}
-
-fn read_u16(bytes: &[u8], offset: &mut usize) -> Option<u16> {
-    let value = take_bytes(bytes, offset, 2)?;
-    Some(u16::from_be_bytes([value[0], value[1]]))
-}
-
-fn read_u24(bytes: &[u8], offset: usize) -> Option<usize> {
-    let value = bytes.get(offset..offset + 3)?;
-    Some(
-        ((value[0] as usize) << 16) | ((value[1] as usize) << 8) | value[2] as usize,
-    )
-}
 
 fn should_hijack_tcp_dns(
     enabled: bool,
@@ -353,9 +115,6 @@ pub(crate) async fn handle_inbound_stream(
         return;
     }
 
-    let (stream, sniff_host) =
-        sniff_tls_server_name(stream, destination.port()).await;
-
     let process_name = find_process_name(source, Some(destination), Network::Tcp);
 
     let sess = Session {
@@ -375,7 +134,6 @@ pub(crate) async fn handle_inbound_stream(
             }),
         so_mark,
         process_name,
-        sniff_host,
         ..Default::default()
     };
 
