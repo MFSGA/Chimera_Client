@@ -92,6 +92,16 @@ pub trait ClashResolver: Sync + Send {
     async fn is_fake_ip(&self, ip: std::net::IpAddr) -> bool;
     async fn fake_ip_for_host(&self, host: &str) -> Option<std::net::IpAddr>;
     fn fake_ip_enabled(&self) -> bool;
+    fn fake_ip_v6_enabled(&self) -> bool {
+        false
+    }
+
+    /// Whether this hostname should receive synthetic DNS answers in fake-IP
+    /// mode. Implementations with a fake-IP filter can override this to keep
+    /// explicitly skipped hostnames on real DNS answers.
+    async fn should_fake_ip(&self, _host: &str) -> bool {
+        self.fake_ip_enabled()
+    }
 
     fn ipv6(&self) -> bool;
     fn set_ipv6(&self, enable: bool);

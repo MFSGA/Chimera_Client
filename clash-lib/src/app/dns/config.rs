@@ -65,6 +65,7 @@ pub struct Config {
     pub default_nameserver: Vec<NameServer>,
     pub proxy_server_nameserver: Option<Vec<NameServer>>,
     pub fake_ip_range: ipnet::IpNet,
+    pub fake_ip_range6: Option<ipnet::IpNet>,
     pub fake_ip_filter: Vec<String>,
     pub store_fake_ip: bool,
     pub store_smart_stats: bool,
@@ -517,6 +518,21 @@ impl TryFrom<&crate::config::def::Config> for Config {
             fake_ip_range: dc.fake_ip_range.parse::<ipnet::IpNet>().map_err(
                 |_| Error::InvalidConfig(String::from("invalid fake ip range")),
             )?,
+            fake_ip_range6: dc
+                .fake_ip_range6
+                .as_deref()
+                .map(|range| {
+                    let parsed = range.parse::<ipnet::IpNet>().map_err(|_| {
+                        Error::InvalidConfig("invalid fake IPv6 IP range".to_owned())
+                    })?;
+                    if !parsed.addr().is_ipv6() {
+                        return Err(Error::InvalidConfig(
+                            "fake-ip-range6 must be an IPv6 subnet".to_owned(),
+                        ));
+                    }
+                    Ok(parsed)
+                })
+                .transpose()?,
             fake_ip_filter: dc.fake_ip_filter.clone(),
             store_fake_ip: c.profile.store_fake_ip,
             store_smart_stats: c.profile.store_smart_stats,

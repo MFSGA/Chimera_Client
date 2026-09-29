@@ -34,6 +34,7 @@ dns:
   nameserver-policy:
     example.com: tls://1.1.1.1
   fake-ip-range: 198.18.0.1/16
+  fake-ip-range6: fd00:198:18::/96
   fake-ip-filter:
     - '*.lan'
     - '+.local'

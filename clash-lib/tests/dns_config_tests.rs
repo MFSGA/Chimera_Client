@@ -260,10 +260,33 @@ fn full_dns_fixture_parses_expected_runtime_shape() {
     assert_eq!(dns.fallback_filter.geo_ip_code, "CN");
     assert_eq!(dns.fallback_filter.ip_cidr.as_ref().unwrap().len(), 1);
     assert_eq!(dns.fake_ip_range.to_string(), "198.18.0.1/16");
+    assert_eq!(dns.fake_ip_range6.unwrap().to_string(), "fd00:198:18::/96");
     assert_eq!(dns.fake_ip_filter, vec!["*.lan", "+.local"]);
     assert_eq!(
         dns.edns_client_subnet.unwrap().ipv4.unwrap().to_string(),
         "1.2.3.0/24"
+    );
+}
+
+#[test]
+fn fake_ip_range6_rejects_ipv4_prefix() {
+    let yaml = base_config(
+        r#"
+  enable: true
+  enhanced-mode: fake-ip
+  fake-ip-range6: 198.18.0.0/16
+  nameserver:
+    - 1.1.1.1
+  default-nameserver:
+    - 1.1.1.1
+"#,
+    );
+
+    let error = parse_error(yaml);
+    assert!(
+        error
+            .to_string()
+            .contains("fake-ip-range6 must be an IPv6 subnet")
     );
 }
 

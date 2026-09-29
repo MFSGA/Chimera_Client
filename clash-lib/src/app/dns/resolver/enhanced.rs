@@ -50,6 +50,7 @@ pub struct EnhancedResolver {
     proxy_server_domains: Option<trie::StringTrie<bool>>,
 
     fake_dns: Option<ThreadSafeFakeDns>,
+    fake_dns_v6: Option<ThreadSafeFakeDns>,
 
     reverse_lookup_cache:
         Option<Arc<RwLock<lru_time_cache::LruCache<net::IpAddr, String>>>>,
@@ -70,6 +71,7 @@ impl EnhancedResolver {
             proxy_resolver: None,
             proxy_server_domains: None,
             fake_dns: None,
+            fake_dns_v6: None,
             reverse_lookup_cache: None,
         }
     }
@@ -117,6 +119,7 @@ impl EnhancedResolver {
             proxy_server_domains: None,
 
             fake_dns: None,
+            fake_dns_v6: None,
 
             reverse_lookup_cache: None,
         }
@@ -154,6 +157,7 @@ impl EnhancedResolver {
             proxy_server_domains: None,
 
             fake_dns: None,
+            fake_dns_v6: None,
 
             reverse_lookup_cache: None,
         });
@@ -312,7 +316,7 @@ impl EnhancedResolver {
             } else {
                 None
             },
-            fake_dns: match cfg.enhance_mode {
+            fake_dns: match cfg.enhance_mode.clone() {
                 DNSMode::FakeIp => Some(Arc::new(RwLock::new(
                     fakeip::FakeDns::new(fakeip::Opts {
                         ipnet: cfg.fake_ip_range,
@@ -326,7 +330,7 @@ impl EnhancedResolver {
                             None
                         },
                         store: if cfg.store_fake_ip {
-                            Box::new(FileStore::new(store))
+                            Box::new(FileStore::new(store.clone()))
                         } else {
                             Box::new(InMemStore::new(1000))
                         },
@@ -337,6 +341,31 @@ impl EnhancedResolver {
                         "dns redir-host is not supported and will not do anything"
                     );
                     None
+                }
+                _ => None,
+            },
+            fake_dns_v6: match (cfg.enhance_mode.clone(), cfg.fake_ip_range6) {
+                (DNSMode::FakeIp, Some(ipnet)) => {
+                    let skipped_hostnames = if !cfg.fake_ip_filter.is_empty() {
+                        let mut host = trie::StringTrie::new();
+                        for domain in cfg.fake_ip_filter.iter() {
+                            host.insert(domain.as_str(), Arc::new(true));
+                        }
+                        Some(host)
+                    } else {
+                        None
+                    };
+                    Some(Arc::new(RwLock::new(fakeip::FakeDns::new_v6(
+                        fakeip::Opts {
+                            ipnet,
+                            skipped_hostnames,
+                            store: if cfg.store_fake_ip {
+                                Box::new(FileStore::new(store))
+                            } else {
+                                Box::new(InMemStore::new(1000))
+                            },
+                        },
+                    )?)))
                 }
                 _ => None,
             },
@@ -954,8 +983,8 @@ impl ClashResolver for EnhancedResolver {
             return Ok(Some(ip));
         }
 
-        if enhanced && self.fake_ip_enabled() {
-            let mut fake_dns = self.fake_dns.as_ref().unwrap().write().await;
+        if enhanced && let Some(fake_dns) = &self.fake_dns {
+            let mut fake_dns = fake_dns.write().await;
             if !fake_dns.should_skip(host) {
                 let ip = fake_dns.lookup(host).await?;
                 debug!("fake dns lookup: {} -> {:?}", host, ip);
@@ -997,6 +1026,18 @@ impl ClashResolver for EnhancedResolver {
                 net::IpAddr::V6(v6) => *v6,
                 _ => unreachable!("invalid IP family"),
             }));
+        }
+
+        if enhanced && let Some(fake_dns) = &self.fake_dns_v6 {
+            let mut fake_dns = fake_dns.write().await;
+            if !fake_dns.should_skip(host) {
+                let ip = fake_dns.lookup(host).await?;
+                debug!("fake dns lookup: {} -> {:?}", host, ip);
+                match ip {
+                    net::IpAddr::V6(v6) => return Ok(Some(v6)),
+                    _ => unreachable!("invalid IP family"),
+                }
+            }
         }
 
         match self.lookup_ip(host, rr::RecordType::AAAA).await {
@@ -1101,35 +1142,67 @@ impl ClashResolver for EnhancedResolver {
     }
 
     fn fake_ip_enabled(&self) -> bool {
-        self.fake_dns.is_some()
+        self.fake_dns.is_some() || self.fake_dns_v6.is_some()
+    }
+
+    fn fake_ip_v6_enabled(&self) -> bool {
+        self.fake_dns_v6.is_some()
     }
 
     async fn is_fake_ip(&self, ip: std::net::IpAddr) -> bool {
-        if !self.fake_ip_enabled() {
-            return false;
+        let fake_dns = if ip.is_ipv4() {
+            self.fake_dns.as_ref()
+        } else {
+            self.fake_dns_v6.as_ref()
         }
+        .cloned();
+        let Some(fake_dns) = fake_dns else {
+            return false;
+        };
 
-        let mut fake_dns = self.fake_dns.as_ref().unwrap().write().await;
-        fake_dns.is_fake_ip(ip).await
+        fake_dns.write().await.is_fake_ip(ip).await
     }
 
     async fn reverse_lookup(&self, ip: net::IpAddr) -> Option<String> {
         debug!("reverse lookup: {}", ip);
-        if !self.fake_ip_enabled() {
-            return None;
-        }
-
-        let mut fake_dns = self.fake_dns.as_ref().unwrap().write().await;
-        fake_dns.reverse_lookup(ip).await
+        let fake_dns = if ip.is_ipv4() {
+            self.fake_dns.as_ref()
+        } else {
+            self.fake_dns_v6.as_ref()
+        }?
+        .clone();
+        fake_dns.write().await.reverse_lookup(ip).await
     }
 
     async fn fake_ip_for_host(&self, host: &str) -> Option<net::IpAddr> {
-        if !self.fake_ip_enabled() {
-            return None;
+        if let Some(fake_dns) = &self.fake_dns
+            && let Some(ip) = fake_dns.write().await.lookup_existing(host).await
+        {
+            return Some(ip);
         }
 
-        let mut fake_dns = self.fake_dns.as_ref().unwrap().write().await;
-        fake_dns.lookup_existing(host).await
+        if let Some(fake_dns) = &self.fake_dns_v6 {
+            return fake_dns.write().await.lookup_existing(host).await;
+        }
+
+        None
+    }
+
+    async fn should_fake_ip(&self, host: &str) -> bool {
+        if !self.fake_ip_enabled()
+            || self
+                .hosts
+                .as_ref()
+                .is_some_and(|hosts| hosts.search(host).is_some())
+        {
+            return false;
+        }
+
+        let Some(fake_dns) = self.fake_dns.as_ref().or(self.fake_dns_v6.as_ref())
+        else {
+            return false;
+        };
+        !fake_dns.read().await.should_skip(host)
     }
 }
 
