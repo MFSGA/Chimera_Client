@@ -95,6 +95,13 @@ impl ThreadSafeCacheFile {
     pub async fn delete_fake_ip_by_host(&self, host: &str) {
         self.0.write().await.delete_fake_ip_by_host(host);
     }
+
+    pub async fn delete_fake_ip_by_host_family(&self, host: &str, ipv6: bool) {
+        self.0
+            .write()
+            .await
+            .delete_fake_ip_by_host_family(host, ipv6);
+    }
 }
 
 struct CacheFile {
@@ -168,6 +175,23 @@ impl CacheFile {
         self.db
             .ip_to_host
             .retain(|_, mapped_host| mapped_host != host);
+    }
+
+    pub fn delete_fake_ip_by_host_family(&mut self, host: &str, ipv6: bool) {
+        let host_key = if ipv6 {
+            format!("::chimera-fake-ip-v6::{host}")
+        } else {
+            host.to_owned()
+        };
+        self.db.host_to_ip.remove(&host_key);
+        self.db.ip_to_host.retain(|ip, mapped_host| {
+            if mapped_host != host {
+                return true;
+            }
+            ip.parse::<std::net::IpAddr>()
+                .map(|address| address.is_ipv6() != ipv6)
+                .unwrap_or(true)
+        });
     }
 }
 

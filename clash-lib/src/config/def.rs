@@ -423,6 +423,8 @@ pub struct DNS {
     /// Fake IP addresses pool CIDR
     #[educe(Default = "198.19.0.1/16")]
     pub fake_ip_range: String,
+    /// Optional IPv6 fake IP address pool CIDR
+    pub fake_ip_range6: Option<String>,
     /// Fake IP addresses filter
     pub fake_ip_filter: Vec<String>,
     /// Enable IPv6 DNS responses (AAAA)

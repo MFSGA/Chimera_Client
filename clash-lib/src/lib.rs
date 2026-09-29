@@ -1367,12 +1367,13 @@ async fn create_components(
     )?);
 
     debug!("initializing dns listener");
-    let dns_listener = Arc::new(dns::DnsRunner::new(
+    let dns_listener = Arc::new(dns::DnsRunner::new_with_dns_proxy_bridge(
         dns_enable,
         dns_listen.clone(),
         dns_resolver.clone(),
         &cwd,
         Some(cancellation_token.child_token()),
+        managed_dns_proxy_bridge,
     ));
 
     info!("all components initialized");
