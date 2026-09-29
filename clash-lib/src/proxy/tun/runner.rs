@@ -414,7 +414,10 @@ impl Runner for TunRunner {
                     tokio::spawn(handle_inbound_stream(
                         stream,
                         dsp.clone(),
+                        resolver.clone(),
                         so_mark,
+                        dns_hijack,
+                        dns_hijack_rules.clone(),
                     ));
                 }
 

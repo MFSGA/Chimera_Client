@@ -8,7 +8,7 @@ use crate::{
     config::{
         def,
         internal::{
-            config::{self, Profile},
+            config::{self, DnsHijackAddress, DnsHijackProtocol, Profile},
             proxy::{
                 OutboundDirect, OutboundProxy, OutboundProxyProtocol,
                 OutboundReject, PROXY_DIRECT, PROXY_REJECT,
@@ -63,6 +63,7 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
     let dns: crate::app::dns::Config = (&c).try_into()?;
     let mut tun = tun::convert(c.tun.take())?;
     validate_dns_tun_ipv6(&dns, &tun)?;
+    validate_macos_dns_hijack(&dns, &tun)?;
     configure_fake_ip_route(&dns, &mut tun)?;
 
     config::Config {
@@ -159,6 +160,51 @@ fn validate_dns_tun_ipv6(
     Ok(())
 }
 
+fn validate_macos_dns_hijack(
+    dns: &crate::app::dns::Config,
+    tun: &config::TunConfig,
+) -> Result<(), Error> {
+    if !cfg!(target_os = "macos") || !tun.enable || !tun.dns_hijack {
+        return Ok(());
+    }
+
+    if !tun.route_all {
+        return Err(Error::InvalidConfig(
+            "macOS TUN DNS hijacking requires tun.route-all: true".to_owned(),
+        ));
+    }
+    if !dns.enable {
+        return Err(Error::InvalidConfig(
+            "macOS TUN DNS hijacking requires dns.enable: true".to_owned(),
+        ));
+    }
+    if dns.enhance_mode != def::DNSMode::FakeIp {
+        return Err(Error::InvalidConfig(
+            "macOS TUN DNS hijacking requires dns.enhanced-mode: fake-ip".to_owned(),
+        ));
+    }
+
+    let catches_all_udp_53 = tun.dns_hijack_rules.iter().any(|rule| {
+        rule.protocol == DnsHijackProtocol::Udp
+            && rule.address == DnsHijackAddress::Any
+            && rule.port == 53
+    });
+    let catches_all_tcp_53 = tun.dns_hijack_rules.iter().any(|rule| {
+        rule.protocol == DnsHijackProtocol::Tcp
+            && rule.address == DnsHijackAddress::Any
+            && rule.port == 53
+    });
+    if !tun.dns_hijack_rules.is_empty()
+        && (!catches_all_udp_53 || !catches_all_tcp_53)
+    {
+        return Err(Error::InvalidConfig(
+            "macOS TUN DNS hijacking requires catch-all UDP and TCP port 53 rules (dns-hijack: true)".to_owned(),
+        ));
+    }
+
+    Ok(())
+}
+
 fn configure_fake_ip_route(
     dns: &crate::app::dns::Config,
     tun: &mut config::TunConfig,
@@ -189,6 +235,36 @@ fn configure_fake_ip_route(
     let fake_ip_route = ipnet::IpNet::V4(fake_ip_range.trunc());
     if !tun.route_all && !tun.routes.contains(&fake_ip_route) {
         tun.routes.push(fake_ip_route);
+    }
+
+    if dns.ipv6 {
+        let fake_ip_range6 = match dns.fake_ip_range6 {
+            Some(ipnet::IpNet::V6(range)) => range,
+            Some(ipnet::IpNet::V4(_)) => {
+                return Err(Error::InvalidConfig(
+                    "fake-ip-range6 must be an IPv6 subnet".to_string(),
+                ));
+            }
+            None => return Ok(()),
+        };
+        let tun_network_v6 = tun.gateway_v6.ok_or_else(|| {
+            Error::InvalidConfig(
+                "DNS IPv6 fake-IP requires tun IPv6 to be enabled".to_owned(),
+            )
+        })?;
+        if tun_network_v6.contains(&fake_ip_range6.network())
+            || fake_ip_range6.contains(&tun_network_v6.network())
+        {
+            return Err(Error::InvalidConfig(format!(
+                "tun IPv6 gateway subnet `{tun_network_v6}` overlaps fake-ip-range6 \
+                 `{fake_ip_range6}`; use separate subnets"
+            )));
+        }
+
+        let fake_ip_route6 = ipnet::IpNet::V6(fake_ip_range6.trunc());
+        if !tun.route_all && !tun.routes.contains(&fake_ip_route6) {
+            tun.routes.push(fake_ip_route6);
+        }
     }
 
     Ok(())
@@ -427,6 +503,58 @@ tun:
                 .routes
                 .contains(&"198.19.0.0/16".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn fake_ip_mode_adds_route_for_ipv6_pool() {
+        let mut cfg = parse_config(
+            r#"
+tun:
+  enable: true
+  ipv6: true
+  gateway-v6: fd00:1::1/126
+"#,
+        );
+        cfg.ipv6 = true;
+        cfg.dns.enable = true;
+        cfg.dns.ipv6 = true;
+        cfg.dns.enhanced_mode = def::DNSMode::FakeIp;
+        cfg.dns.fake_ip_range6 = Some("fd00:198:18::/96".to_string());
+        cfg.dns.nameserver = vec!["1.1.1.1".to_string()];
+
+        let converted = convert(cfg).expect("IPv6 fake-IP pool should be valid");
+        assert!(
+            converted
+                .tun
+                .routes
+                .contains(&"fd00:198:18::/96".parse::<ipnet::IpNet>().unwrap())
+        );
+    }
+
+    #[test]
+    fn reject_overlapping_tun_and_fake_ipv6_subnets() {
+        let mut cfg = parse_config(
+            r#"
+tun:
+  enable: true
+  ipv6: true
+  gateway-v6: fd00:198:18::1/120
+"#,
+        );
+        cfg.ipv6 = true;
+        cfg.dns.enable = true;
+        cfg.dns.ipv6 = true;
+        cfg.dns.enhanced_mode = def::DNSMode::FakeIp;
+        cfg.dns.fake_ip_range6 = Some("fd00:198:18::/96".to_string());
+        cfg.dns.nameserver = vec!["1.1.1.1".to_string()];
+
+        match convert(cfg) {
+            Err(Error::InvalidConfig(message)) => {
+                assert!(message.contains("overlaps fake-ip-range6"));
+            }
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("overlapping IPv6 fake-IP and TUN ranges should fail"),
+        }
     }
 
     #[test]

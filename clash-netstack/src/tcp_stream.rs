@@ -1,5 +1,5 @@
 use crate::{stack::IfaceEvent, tcp_listener::TcpStreamHandle};
-use log::{error, trace};
+use log::trace;
 use std::{
     io::{Error, ErrorKind},
     net::SocketAddr,
@@ -52,7 +52,11 @@ impl TcpStream {
         match self.stack_notifier.try_send(event) {
             Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                error!("Failed to notify TCP socket: notifier closed");
+                // The TCP listener may already be shutting down while relay
+                // tasks are being woken and dropped. This notification can no
+                // longer be consumed, so avoid reporting normal teardown as an
+                // error; the listener shutdown guard closes the stream handles.
+                trace!("TCP socket notifier is closed");
             }
         }
     }

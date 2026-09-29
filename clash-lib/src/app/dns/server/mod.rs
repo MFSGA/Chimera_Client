@@ -1,3 +1,5 @@
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
 use futures::FutureExt;
 use hickory_proto::op::Message;
 use tokio::sync::{Mutex, oneshot};
@@ -14,6 +16,8 @@ mod handler;
 pub use handler::exchange_with_resolver;
 
 static DEFAULT_DNS_SERVER_TTL: u32 = 60;
+const MACOS_DNS_PROXY_BRIDGE_ADDR: SocketAddr =
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1053));
 
 struct DnsMessageExchanger {
     resolver: ThreadSafeDNSResolver,
@@ -36,6 +40,8 @@ impl chimera_dns::DnsMessageExchanger for DnsMessageExchanger {
 pub struct DnsRunner {
     enable: bool,
     listener: DNSListenAddr,
+    managed_dns_proxy_bridge: bool,
+    bridge_listener: Option<DNSListenAddr>,
     resolver: ThreadSafeDNSResolver,
     cwd: std::path::PathBuf,
 
@@ -54,10 +60,33 @@ impl DnsRunner {
         cwd: &std::path::Path,
         cancellation_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Self {
+        Self::new_with_dns_proxy_bridge(
+            enable,
+            listen,
+            resolver,
+            cwd,
+            cancellation_token,
+            false,
+        )
+    }
+
+    pub(crate) fn new_with_dns_proxy_bridge(
+        enable: bool,
+        listen: DNSListenAddr,
+        resolver: ThreadSafeDNSResolver,
+        cwd: &std::path::Path,
+        cancellation_token: Option<tokio_util::sync::CancellationToken>,
+        managed_dns_proxy_bridge: bool,
+    ) -> Self {
         let (ready_tx, ready_rx) = oneshot::channel();
+        let bridge_listener = managed_dns_proxy_bridge
+            .then(|| managed_bridge_listener(&listen))
+            .flatten();
         Self {
             enable,
             listener: listen,
+            managed_dns_proxy_bridge,
+            bridge_listener,
             resolver,
             cwd: cwd.to_path_buf(),
             cancellation_token: cancellation_token.unwrap_or_default(),
@@ -71,12 +100,13 @@ impl DnsRunner {
         &self,
         cancellation_token: tokio_util::sync::CancellationToken,
     ) -> Self {
-        Self::new(
+        Self::new_with_dns_proxy_bridge(
             self.enable,
             self.listener.clone(),
             self.resolver.clone(),
             &self.cwd,
             Some(cancellation_token),
+            self.managed_dns_proxy_bridge,
         )
     }
 
@@ -107,12 +137,14 @@ impl Runner for DnsRunner {
             }
             return;
         }
-        if self.listener.udp.is_none()
-            && self.listener.tcp.is_none()
-            && self.listener.doh.is_none()
-            && self.listener.dot.is_none()
-            && self.listener.doh3.is_none()
-        {
+        let mut listen_configs = Vec::new();
+        if has_listener(&self.listener) {
+            listen_configs.push(self.listener.clone());
+        }
+        if let Some(bridge_listener) = &self.bridge_listener {
+            listen_configs.push(bridge_listener.clone());
+        }
+        if listen_configs.is_empty() {
             info!(
                 "dns listener is not configured; internal resolver remains available"
             );
@@ -123,36 +155,42 @@ impl Runner for DnsRunner {
         }
 
         let resolver = self.resolver.clone();
-        let listen = self.listener.clone();
         let cwd = self.cwd.clone();
         let cancellation_token = self.cancellation_token.clone();
 
         let handle = tokio::spawn(async move {
-            let h = DnsMessageExchanger { resolver };
-            let r = chimera_dns::get_dns_listener(listen, h, &cwd).await;
-            if let Some(r) = r {
-                if let Some(sender) = ready_tx.take() {
-                    let _ = sender.send(Ok(()));
+            let mut runners = Vec::with_capacity(listen_configs.len());
+            for listen in listen_configs {
+                let exchanger = DnsMessageExchanger {
+                    resolver: resolver.clone(),
+                };
+                match chimera_dns::get_dns_listener(listen, exchanger, &cwd).await {
+                    Some(runner) => runners.push(runner),
+                    None => {
+                        let message = "dns listener: no listener started or one or more configured listeners failed to start";
+                        error!("{}", message);
+                        if let Some(sender) = ready_tx.take() {
+                            let _ = sender.send(Err(message.to_owned()));
+                        }
+                        return Err(crate::Error::Operation(message.to_owned()));
+                    }
                 }
-                tokio::select! {
-                    res = r => {
-                        res.map_err(|err| {
-                            error!("dns listener error: {}", err);
-                            crate::Error::DNSError(err.to_string())
-                        })
-                    },
-                    _ = cancellation_token.cancelled() => {
-                        info!("dns listener is closed");
-                        Ok(())
-                    },
-                }
-            } else {
-                let message = "dns listener: no listener started or one or more configured listeners failed to start";
-                error!("{}", message);
-                if let Some(sender) = ready_tx.take() {
-                    let _ = sender.send(Err(message.to_owned()));
-                }
-                Err(crate::Error::Operation(message.to_owned()))
+            }
+
+            if let Some(sender) = ready_tx.take() {
+                let _ = sender.send(Ok(()));
+            }
+            tokio::select! {
+                res = futures::future::try_join_all(runners) => {
+                    res.map(|_| ()).map_err(|err: chimera_dns::DNSError| {
+                        error!("dns listener error: {}", err);
+                        crate::Error::DNSError(err.to_string())
+                    })
+                },
+                _ = cancellation_token.cancelled() => {
+                    info!("dns listener is closed");
+                    Ok(())
+                },
             }
         });
 
@@ -182,12 +220,85 @@ impl Runner for DnsRunner {
     }
 }
 
+fn has_listener(listen: &DNSListenAddr) -> bool {
+    listen.udp.is_some()
+        || listen.tcp.is_some()
+        || listen.doh.is_some()
+        || listen.dot.is_some()
+        || listen.doh3.is_some()
+}
+
+fn listener_covers_dns_proxy_bridge(listen: Option<SocketAddr>) -> bool {
+    listen.is_some_and(|listen| {
+        listen.port() == MACOS_DNS_PROXY_BRIDGE_ADDR.port()
+            && match listen {
+                SocketAddr::V4(address) => {
+                    address.ip().is_unspecified()
+                        || *address.ip() == Ipv4Addr::LOCALHOST
+                }
+                SocketAddr::V6(_) => false,
+            }
+    })
+}
+
+fn managed_bridge_listener(existing: &DNSListenAddr) -> Option<DNSListenAddr> {
+    let udp = (!listener_covers_dns_proxy_bridge(existing.udp))
+        .then_some(MACOS_DNS_PROXY_BRIDGE_ADDR);
+    let tcp = (!listener_covers_dns_proxy_bridge(existing.tcp))
+        .then_some(MACOS_DNS_PROXY_BRIDGE_ADDR);
+    (udp.is_some() || tcp.is_some()).then_some(DNSListenAddr {
+        udp,
+        tcp,
+        ..Default::default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{net::SocketAddr, sync::Arc};
+    use std::{
+        net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+        sync::Arc,
+    };
 
     use super::*;
     use crate::app::dns::{SystemResolver, ThreadSafeDNSResolver};
+
+    #[test]
+    fn managed_bridge_adds_local_udp_and_tcp_when_dns_has_no_listeners() {
+        let bridge = managed_bridge_listener(&DNSListenAddr::default())
+            .expect("managed DNS proxy bridge should add listeners");
+        let expected = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1053));
+
+        assert_eq!(bridge.udp, Some(expected));
+        assert_eq!(bridge.tcp, Some(expected));
+    }
+
+    #[test]
+    fn managed_bridge_reuses_matching_user_listener_and_adds_missing_transport() {
+        let expected = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1053));
+        let existing = DNSListenAddr {
+            udp: Some(expected),
+            ..Default::default()
+        };
+
+        let bridge = managed_bridge_listener(&existing)
+            .expect("TCP side of managed DNS proxy bridge should be added");
+        assert_eq!(bridge.udp, None);
+        assert_eq!(bridge.tcp, Some(expected));
+    }
+
+    #[test]
+    fn managed_bridge_avoids_binding_against_matching_ipv4_wildcard_listener() {
+        let wildcard =
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 1053));
+        let existing = DNSListenAddr {
+            udp: Some(wildcard),
+            tcp: Some(wildcard),
+            ..Default::default()
+        };
+
+        assert!(managed_bridge_listener(&existing).is_none());
+    }
 
     #[tokio::test]
     async fn dns_bind_failure_is_reported_by_readiness_and_join() {

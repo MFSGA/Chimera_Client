@@ -43,12 +43,15 @@ pub fn add_route(via: &OutboundInterface, dest: &IpNet) -> std::io::Result<()> {
     }
 }
 
-fn get_default_gateway()
--> std::io::Result<(Option<Ipv4Addr>, Option<std::net::Ipv6Addr>)> {
+fn get_default_gateway(
+    interface: &str,
+) -> std::io::Result<(Option<Ipv4Addr>, Option<std::net::Ipv6Addr>)> {
     // IPv4
     let cmd_v4 = std::process::Command::new("route")
         .arg("-n")
         .arg("get")
+        .arg("-ifscope")
+        .arg(interface)
         .arg("default")
         .output()?;
 
@@ -71,6 +74,8 @@ fn get_default_gateway()
         .arg("-n")
         .arg("get")
         .arg("-inet6")
+        .arg("-ifscope")
+        .arg(interface)
         .arg("default")
         .output()?;
 
@@ -82,6 +87,7 @@ fn get_default_gateway()
                 gateway_v6 = line
                     .split_whitespace()
                     .last()
+                    .and_then(|value| value.split('%').next())
                     .and_then(|x| x.parse::<std::net::Ipv6Addr>().ok());
                 break;
             }
@@ -93,9 +99,12 @@ fn get_default_gateway()
 
 /// it seems to be fine to add the default route multiple times
 pub fn maybe_add_default_route() -> std::io::Result<()> {
-    let (gateway_v4, gateway_v6) = get_default_gateway()?;
     let default_interface =
         get_outbound_interface().ok_or(new_io_error("get default interface"))?;
+    // Query the physical interface explicitly. `route-all` has already added
+    // split defaults by the time this helper runs, so an unscoped lookup can
+    // report the TUN route instead of the physical gateway.
+    let (gateway_v4, gateway_v6) = get_default_gateway(&default_interface.name)?;
 
     // Add IPv4 default route if gateway found
     if let Some(gateway) = gateway_v4 {
@@ -137,7 +146,7 @@ pub fn maybe_add_default_route() -> std::io::Result<()> {
         }
     }
 
-    if gateway_v4.is_none() {
+    if gateway_v4.is_none() && gateway_v6.is_none() {
         Err(new_io_error(
             "cant set default route, default gateway not found",
         ))
@@ -152,9 +161,9 @@ pub fn maybe_routes_clean_up(cfg: &TunConfig) -> std::io::Result<()> {
         return Ok(());
     }
 
-    let (gateway_v4, gateway_v6) = get_default_gateway()?;
     let default_interface =
         get_outbound_interface().ok_or(new_io_error("get default interface"))?;
+    let (gateway_v4, gateway_v6) = get_default_gateway(&default_interface.name)?;
 
     let mut result = Ok(());
 
