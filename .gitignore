@@ -1,6 +1,9 @@
 /target*
 
-docs/ 
+docs/
+!docs/
+docs/*
+!docs/20260928-tun-dns-macos.md
 start*.*
 release*.*
 
