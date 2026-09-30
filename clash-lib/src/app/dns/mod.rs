@@ -103,6 +103,12 @@ pub trait ClashResolver: Sync + Send {
         self.fake_ip_enabled()
     }
 
+    /// Optional resolver used for the final DNS lookup of DIRECT outbounds.
+    /// Routing/classification continues to use the primary resolver.
+    fn direct_resolver(&self) -> Option<ThreadSafeDNSResolver> {
+        None
+    }
+
     fn ipv6(&self) -> bool;
     fn set_ipv6(&self, enable: bool);
 

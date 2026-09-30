@@ -168,6 +168,7 @@ impl FakeDns {
         Self::new_for_family(opt, IpFamily::V4)
     }
 
+    #[cfg(test)]
     pub(crate) fn new_v6(opt: Opts) -> Result<Self, Error> {
         Self::new_for_family(opt, IpFamily::V6)
     }

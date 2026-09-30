@@ -5,6 +5,7 @@ use crate::{
     config::def::DNSMode,
     dns::{
         ClashResolver, Config, ResolverKind, RuleDispatch, ThreadSafeDNSClient,
+        ThreadSafeDNSResolver,
         fakeip::{self, FileStore, InMemStore, ThreadSafeFakeDns},
         filters::{
             DomainFilter, FallbackDomainFilter, FallbackIPFilter, GeoIPFilter,
@@ -18,24 +19,20 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use futures::{FutureExt, TryFutureExt};
 use hickory_proto::{op, rr};
-use hickory_resolver::net::{DnsError, NetError, NoRecords};
 use rand::seq::IndexedRandom;
 use std::{
     net,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
+        atomic::{AtomicBool, Ordering::Relaxed},
     },
     time::{Duration, Instant},
 };
 use tokio::sync::RwLock;
 use tracing::{debug, error, instrument, trace, warn};
 
-const RESPONSE_CACHE_CAPACITY: u64 = 4096;
-
 pub struct EnhancedResolver {
     ipv6: AtomicBool,
-    network_generation: AtomicU64,
     hosts: Option<trie::StringTrie<net::IpAddr>>,
     main: Vec<ThreadSafeDNSClient>,
 
@@ -43,14 +40,14 @@ pub struct EnhancedResolver {
     fallback_domain_filters: Option<Vec<Box<dyn FallbackDomainFilter>>>,
     fallback_ip_filters: Option<Vec<Box<dyn FallbackIPFilter>>>,
 
-    lru_cache: Option<Arc<RwLock<hickory_resolver::ResponseCache>>>,
+    lru_cache: Option<hickory_resolver::ResponseCache>,
     policy: Option<trie::StringTrie<Vec<ThreadSafeDNSClient>>>,
 
     proxy_resolver: Option<Vec<ThreadSafeDNSClient>>,
     proxy_server_domains: Option<trie::StringTrie<bool>>,
+    direct_resolver: Option<ThreadSafeDNSResolver>,
 
     fake_dns: Option<ThreadSafeFakeDns>,
-    fake_dns_v6: Option<ThreadSafeFakeDns>,
 
     reverse_lookup_cache:
         Option<Arc<RwLock<lru_time_cache::LruCache<net::IpAddr, String>>>>,
@@ -58,20 +55,27 @@ pub struct EnhancedResolver {
 
 impl EnhancedResolver {
     fn from_clients(main: Vec<ThreadSafeDNSClient>, ipv6: bool) -> Self {
+        Self::from_clients_with_fallback(main, None, ipv6)
+    }
+
+    fn from_clients_with_fallback(
+        main: Vec<ThreadSafeDNSClient>,
+        fallback: Option<Vec<ThreadSafeDNSClient>>,
+        ipv6: bool,
+    ) -> Self {
         Self {
             ipv6: AtomicBool::new(ipv6),
-            network_generation: AtomicU64::new(0),
             hosts: None,
             main,
-            fallback: None,
+            fallback,
             fallback_domain_filters: None,
             fallback_ip_filters: None,
             lru_cache: None,
             policy: None,
             proxy_resolver: None,
             proxy_server_domains: None,
+            direct_resolver: None,
             fake_dns: None,
-            fake_dns_v6: None,
             reverse_lookup_cache: None,
         }
     }
@@ -87,7 +91,6 @@ impl EnhancedResolver {
 
         EnhancedResolver {
             ipv6: AtomicBool::new(false),
-            network_generation: AtomicU64::new(0),
             hosts: None,
             main: make_clients(
                 vec![NameServer {
@@ -117,9 +120,9 @@ impl EnhancedResolver {
 
             proxy_resolver: None,
             proxy_server_domains: None,
+            direct_resolver: None,
 
             fake_dns: None,
-            fake_dns_v6: None,
 
             reverse_lookup_cache: None,
         }
@@ -135,7 +138,6 @@ impl EnhancedResolver {
         let edns_client_subnet = cfg.edns_client_subnet.clone();
         let default_resolver = Arc::new(EnhancedResolver {
             ipv6: AtomicBool::new(false),
-            network_generation: AtomicU64::new(0),
             hosts: None,
             main: make_clients(
                 cfg.default_nameserver.clone(),
@@ -155,9 +157,9 @@ impl EnhancedResolver {
 
             proxy_resolver: None,
             proxy_server_domains: None,
+            direct_resolver: None,
 
             fake_dns: None,
-            fake_dns_v6: None,
 
             reverse_lookup_cache: None,
         });
@@ -208,6 +210,27 @@ impl EnhancedResolver {
         )
         .await?;
 
+        let direct_resolver = if let Some(direct_nameserver) = cfg.direct_nameserver
+        {
+            let clients = make_clients(
+                direct_nameserver,
+                Some(default_resolver.clone()),
+                Some(outbound_resolver.clone()),
+                outbounds.clone(),
+                edns_client_subnet.clone(),
+                cfg.fw_mark,
+                None,
+            )
+            .await?;
+            Some(Arc::new(Self::from_clients_with_fallback(
+                clients,
+                Some(main.clone()),
+                cfg.ipv6,
+            )) as ThreadSafeDNSResolver)
+        } else {
+            None
+        };
+
         let plain_outbounds = outbounds.read().await;
         let proxy_server_domains = plain_outbounds
             .values()
@@ -229,7 +252,6 @@ impl EnhancedResolver {
 
         Ok(Self {
             ipv6: AtomicBool::new(cfg.ipv6),
-            network_generation: AtomicU64::new(0),
             main,
             hosts: cfg.hosts,
             fallback: if !cfg.fallback.is_empty() {
@@ -259,22 +281,15 @@ impl EnhancedResolver {
             } else {
                 None
             },
-            fallback_ip_filters: if cfg
-                .fallback_filter
-                .ip_cidr
-                .as_ref()
-                .is_some_and(|cidrs| !cidrs.is_empty())
+            fallback_ip_filters: if cfg.fallback_filter.ip_cidr.is_some()
                 || cfg.fallback_filter.geo_ip
             {
                 let mut filters = vec![];
 
-                if cfg.fallback_filter.geo_ip {
-                    filters.push(Box::new(GeoIPFilter::new(
-                        &cfg.fallback_filter.geo_ip_code,
-                        mmdb,
-                    ))
-                        as Box<dyn FallbackIPFilter>);
-                }
+                filters.push(Box::new(GeoIPFilter::new(
+                    &cfg.fallback_filter.geo_ip_code,
+                    mmdb,
+                )) as Box<dyn FallbackIPFilter>);
 
                 if let Some(ipcidr) = &cfg.fallback_filter.ip_cidr {
                     for subnet in ipcidr {
@@ -287,12 +302,10 @@ impl EnhancedResolver {
             } else {
                 None
             },
-            lru_cache: Some(Arc::new(RwLock::new(
-                hickory_resolver::ResponseCache::new(
-                    RESPONSE_CACHE_CAPACITY,
-                    hickory_resolver::TtlConfig::default(),
-                ),
-            ))),
+            lru_cache: Some(hickory_resolver::ResponseCache::new(
+                4096,
+                hickory_resolver::TtlConfig::default(),
+            )),
             policy: if !cfg.nameserver_policy.is_empty() {
                 let mut p = trie::StringTrie::new();
                 for (domain, ns) in &cfg.nameserver_policy {
@@ -316,7 +329,7 @@ impl EnhancedResolver {
             } else {
                 None
             },
-            fake_dns: match cfg.enhance_mode.clone() {
+            fake_dns: match cfg.enhance_mode {
                 DNSMode::FakeIp => Some(Arc::new(RwLock::new(
                     fakeip::FakeDns::new(fakeip::Opts {
                         ipnet: cfg.fake_ip_range,
@@ -330,7 +343,7 @@ impl EnhancedResolver {
                             None
                         },
                         store: if cfg.store_fake_ip {
-                            Box::new(FileStore::new(store.clone()))
+                            Box::new(FileStore::new(store))
                         } else {
                             Box::new(InMemStore::new(1000))
                         },
@@ -344,34 +357,10 @@ impl EnhancedResolver {
                 }
                 _ => None,
             },
-            fake_dns_v6: match (cfg.enhance_mode.clone(), cfg.fake_ip_range6) {
-                (DNSMode::FakeIp, Some(ipnet)) => {
-                    let skipped_hostnames = if !cfg.fake_ip_filter.is_empty() {
-                        let mut host = trie::StringTrie::new();
-                        for domain in cfg.fake_ip_filter.iter() {
-                            host.insert(domain.as_str(), Arc::new(true));
-                        }
-                        Some(host)
-                    } else {
-                        None
-                    };
-                    Some(Arc::new(RwLock::new(fakeip::FakeDns::new_v6(
-                        fakeip::Opts {
-                            ipnet,
-                            skipped_hostnames,
-                            store: if cfg.store_fake_ip {
-                                Box::new(FileStore::new(store))
-                            } else {
-                                Box::new(InMemStore::new(1000))
-                            },
-                        },
-                    )?)))
-                }
-                _ => None,
-            },
 
             proxy_resolver,
             proxy_server_domains: proxy_server_domains_trie,
+            direct_resolver,
 
             reverse_lookup_cache: Some(Arc::new(RwLock::new(
                 lru_time_cache::LruCache::with_expiry_duration_and_capacity(
@@ -410,59 +399,45 @@ impl EnhancedResolver {
         for c in clients {
             let query_name = query_name.clone();
             let query_type = query_type.clone();
-            let client_id = c.id();
-            let response_client_id = client_id.clone();
-            let error_client_id = client_id.clone();
-            let error_query_name = query_name.clone();
-            let error_query_type = query_type.clone();
-            let success_query_name = query_name;
-            let success_query_type = query_type;
             queries.push(
                 async move {
-                    let response = c.exchange(message).await?;
-                    match response.metadata.response_code {
-                        op::ResponseCode::NoError | op::ResponseCode::NXDomain => {}
-                        response_code => {
-                            return Err(anyhow!(
-                                "DNS upstream {response_client_id} returned {response_code}"
-                            ));
-                        }
-                    }
-                    Ok(response)
+                    let client_id = c.id();
+                    c.exchange(message)
+                        .inspect_err(|x| {
+                            if x.to_string().contains("receiver was canceled") {
+                                debug!(
+                                    client = %client_id,
+                                    query = %query_name,
+                                    record_type = %query_type,
+                                    "dns upstream query canceled after another response completed"
+                                );
+                            } else {
+                                error!(
+                                    client = %client_id,
+                                    query = %query_name,
+                                    record_type = %query_type,
+                                    err = ?x,
+                                    "resolve error"
+                                );
+                            }
+                        })
+                        .inspect_ok(|response| {
+                            let ips = Self::ip_list_of_message(response)
+                                .into_iter()
+                                .map(|ip| ip.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            debug!(
+                                client = %client_id,
+                                query = %query_name,
+                                record_type = %query_type,
+                                answers = %ips,
+                                answer_count = response.answers.len(),
+                                "dns upstream query succeeded"
+                            );
+                        })
+                        .await
                 }
-                .inspect_err(move |x| {
-                    if x.to_string().contains("receiver was canceled") {
-                        debug!(
-                            client = %error_client_id,
-                            query = %error_query_name,
-                            record_type = %error_query_type,
-                            "dns upstream query canceled after another response completed"
-                        );
-                    } else {
-                        error!(
-                            client = %error_client_id,
-                            query = %error_query_name,
-                            record_type = %error_query_type,
-                            err = ?x,
-                            "resolve error"
-                        );
-                    }
-                })
-                .inspect_ok(move |response| {
-                    let ips = Self::ip_list_of_message(response)
-                        .into_iter()
-                        .map(|ip| ip.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    debug!(
-                        client = %client_id,
-                        query = %success_query_name,
-                        record_type = %success_query_type,
-                        answers = %ips,
-                        answer_count = response.answers.len(),
-                        "dns upstream query succeeded"
-                    );
-                })
                 .boxed(),
             )
         }
@@ -504,54 +479,24 @@ impl EnhancedResolver {
 
     #[instrument(skip_all, level = "trace")]
     async fn exchange(&self, message: &op::Message) -> anyhow::Result<op::Message> {
-        let generation = self
-            .network_generation
-            .load(std::sync::atomic::Ordering::Acquire);
         let q = message
             .queries
             .first()
             .ok_or_else(|| anyhow!("invalid query"))?;
 
         trace!(q = q.to_string(), "start");
-        if Self::cacheable_request(message)
-            && let Some(lru) = &self.lru_cache
-            && let Some(cached) = lru.read().await.get(q, Instant::now())
+        if let Some(lru) = &self.lru_cache
+            && let Some(Ok(cached)) = lru.get(q, Instant::now()).map(|c| {
+                c.inspect_err(|x| warn!("failed to get cached message: {}", x))
+            })
         {
-            if generation
-                != self
-                    .network_generation
-                    .load(std::sync::atomic::Ordering::Acquire)
-            {
-                return self.exchange_no_cache(message).await;
-            }
-            match cached {
-                Ok(mut cached) => {
-                    trace!(
-                        q = q.to_string(),
-                        "cache hit for DNS query, returning cached response",
-                    );
-                    cached.metadata.id = message.metadata.id;
-                    cached.metadata.recursion_desired =
-                        message.metadata.recursion_desired;
-                    if let Some(edns) = cached.edns.as_mut() {
-                        edns.options_mut().remove(rr::rdata::opt::EdnsCode::Padding);
-                    }
-                    return Ok(cached);
-                }
-                Err(NetError::Dns(DnsError::NoRecordsFound(negative))) => {
-                    trace!(q = q.to_string(), "cache hit for negative DNS response");
-                    let mut response =
-                        build_dns_response_message(message, true, false);
-                    response.metadata.response_code = negative.response_code;
-                    if let Some(authorities) = negative.authorities {
-                        response.authorities.extend(authorities.iter().cloned());
-                    }
-                    return Ok(response);
-                }
-                Err(error) => {
-                    warn!(q = %q, "failed to get cached DNS response: {error}");
-                }
-            }
+            trace!(
+                q = q.to_string(),
+                "cache hit for DNS query, returning cached response",
+            );
+            let mut reply = build_dns_response_message(message, true, false);
+            reply.add_answers(cached.answers.iter().cloned());
+            return Ok(reply);
         }
         trace!(q = q.to_string(), "querying resolver");
         let res = self.exchange_no_cache(message).await.map(|mut r| {
@@ -569,17 +514,7 @@ impl EnhancedResolver {
         &self,
         message: &op::Message,
     ) -> anyhow::Result<op::Message> {
-        let generation = self
-            .network_generation
-            .load(std::sync::atomic::Ordering::Acquire);
-        let q = message
-            .queries
-            .first()
-            .ok_or_else(|| anyhow!("invalid query"))?;
-
-        if let Some(response) = self.hosts_exchange(message) {
-            return Ok(response);
-        }
+        let q = message.queries.first().unwrap();
 
         let query = async move {
             if EnhancedResolver::is_ip_request(q) {
@@ -596,164 +531,22 @@ impl EnhancedResolver {
         let rv = query.await;
 
         if let Ok(msg) = &rv
-            && Self::cacheable_response(message, msg)
-            && !msg.answers.is_empty()
             && let Some(lru) = &self.lru_cache
             && !(q.query_type() == rr::RecordType::TXT
                 && q.name().to_ascii().starts_with("_acme-challenge."))
+            && !matches!(
+                msg.metadata.response_code,
+                op::ResponseCode::NXDomain | op::ResponseCode::ServFail
+            )
             && {
                 let ips = EnhancedResolver::ip_list_of_message(msg);
                 ips.is_empty() || ips.iter().any(|ip| !ip.is_unspecified())
             }
         {
-            let cache = lru.write().await;
-            if generation
-                == self
-                    .network_generation
-                    .load(std::sync::atomic::Ordering::Acquire)
-            {
-                cache.insert(q.clone(), Ok(msg.clone()), Instant::now());
-            }
-        } else if let Ok(msg) = &rv
-            && let Some(negative) = Self::negative_cache_entry(message, msg)
-            && let Some(lru) = &self.lru_cache
-            && generation
-                == self
-                    .network_generation
-                    .load(std::sync::atomic::Ordering::Acquire)
-        {
-            lru.write()
-                .await
-                .insert(q.clone(), Err(negative), Instant::now());
+            lru.insert(q.clone(), Ok(msg.clone()), Instant::now());
         }
 
         rv
-    }
-
-    fn cacheable_request(message: &op::Message) -> bool {
-        message.metadata.message_type == op::MessageType::Query
-            && message.metadata.op_code == op::OpCode::Query
-            && message.metadata.recursion_desired
-            && !message.metadata.checking_disabled
-            && !message.metadata.authentic_data
-            && message.edns.is_none()
-            && message.queries.len() == 1
-            && message.queries[0].query_class() == rr::DNSClass::IN
-    }
-
-    fn cacheable_response(request: &op::Message, response: &op::Message) -> bool {
-        Self::cacheable_request(request)
-            && response.metadata.message_type == op::MessageType::Response
-            && response.metadata.op_code == op::OpCode::Query
-            && response.metadata.response_code == op::ResponseCode::NoError
-            && !response.metadata.truncation
-            && response.queries.as_slice() == request.queries.as_slice()
-    }
-
-    fn negative_cache_entry(
-        request: &op::Message,
-        response: &op::Message,
-    ) -> Option<NetError> {
-        if !Self::cacheable_request(request)
-            || response.metadata.message_type != op::MessageType::Response
-            || response.metadata.op_code != op::OpCode::Query
-            || !matches!(
-                response.metadata.response_code,
-                op::ResponseCode::NXDomain | op::ResponseCode::NoError
-            )
-            || response.queries.as_slice() != request.queries.as_slice()
-            || !response.metadata.recursion_available
-            || response.metadata.authoritative
-            || response.metadata.truncation
-            || response.metadata.authentic_data
-            || !response.answers.is_empty()
-        {
-            return None;
-        }
-
-        let mut soa_records =
-            response
-                .authorities
-                .iter()
-                .filter_map(|record| match &record.data {
-                    rr::RData::SOA(soa) => Some((record, soa)),
-                    _ => None,
-                });
-        let (record, soa) = soa_records.next()?;
-        if soa_records.next().is_some() {
-            return None;
-        }
-        if !record.name.zone_of(request.queries[0].name()) {
-            return None;
-        }
-        let negative_ttl = record.ttl.min(soa.minimum);
-        if negative_ttl == 0 {
-            return None;
-        }
-
-        let soa_record =
-            rr::Record::from_rdata(record.name.clone(), negative_ttl, soa.clone());
-        let mut no_records = NoRecords::new(
-            request.queries[0].clone(),
-            response.metadata.response_code,
-        );
-        no_records.soa = Some(Box::new(soa_record));
-        no_records.negative_ttl = Some(negative_ttl);
-        let mut authorities = response.authorities.clone();
-        for authority in &mut authorities {
-            if authority.record_type() == rr::RecordType::SOA
-                && authority.name == record.name
-            {
-                authority.ttl = negative_ttl;
-            }
-        }
-        no_records.authorities = Some(authorities.into());
-        Some(NetError::Dns(DnsError::NoRecordsFound(no_records)))
-    }
-
-    fn hosts_exchange(&self, message: &op::Message) -> Option<op::Message> {
-        if message.metadata.message_type != op::MessageType::Query
-            || message.metadata.op_code != op::OpCode::Query
-            || message.queries.len() != 1
-        {
-            return None;
-        }
-        let query = message.queries.first()?;
-        if query.query_class() != rr::DNSClass::IN
-            || !matches!(
-                query.query_type(),
-                rr::RecordType::A | rr::RecordType::AAAA
-            )
-        {
-            return None;
-        }
-
-        let domain = query.name().to_ascii();
-        let ip = self
-            .hosts
-            .as_ref()?
-            .search(domain.trim_end_matches('.'))?
-            .get_data()
-            .copied()?;
-
-        let mut response = build_dns_response_message(message, true, true);
-        let record = match (query.query_type(), ip) {
-            (rr::RecordType::A, net::IpAddr::V4(ip)) => {
-                Some(rr::RData::A(rr::rdata::A(ip)))
-            }
-            (rr::RecordType::AAAA, net::IpAddr::V6(ip)) => {
-                Some(rr::RData::AAAA(rr::rdata::AAAA(ip)))
-            }
-            _ => None,
-        };
-        if let Some(data) = record {
-            response.add_answer(rr::Record::from_rdata(
-                query.name().clone(),
-                60,
-                data,
-            ));
-        }
-        Some(response)
     }
 
     fn match_policy(&self, m: &op::Message) -> Option<&Vec<ThreadSafeDNSClient>> {
@@ -807,9 +600,7 @@ impl EnhancedResolver {
 
         if let Ok(main_result) = main_query.await {
             let ip_list = EnhancedResolver::ip_list_of_message(&main_result);
-            if !ip_list.is_empty()
-                && !ip_list.iter().any(|ip| self.should_ip_fallback(ip))
-            {
+            if !ip_list.is_empty() && !self.should_ip_fallback(&ip_list[0]) {
                 return Ok(main_result);
             }
         }
@@ -870,22 +661,10 @@ impl EnhancedResolver {
             .collect()
     }
 
-    async fn save_reverse_lookup(
-        &self,
-        ip: net::IpAddr,
-        domain: String,
-        generation: u64,
-    ) {
+    async fn save_reverse_lookup(&self, ip: net::IpAddr, domain: String) {
         if let Some(lru) = &self.reverse_lookup_cache {
             trace!("reverse lookup cache insert: {} -> {}", ip, domain);
-            let mut lru = lru.write().await;
-            if generation
-                == self
-                    .network_generation
-                    .load(std::sync::atomic::Ordering::Acquire)
-            {
-                lru.insert(ip, domain);
-            }
+            lru.write().await.insert(ip, domain);
         }
     }
 }
@@ -983,13 +762,13 @@ impl ClashResolver for EnhancedResolver {
             return Ok(Some(ip));
         }
 
-        if enhanced && let Some(fake_dns) = &self.fake_dns {
-            let mut fake_dns = fake_dns.write().await;
+        if enhanced && self.fake_ip_enabled() {
+            let mut fake_dns = self.fake_dns.as_ref().unwrap().write().await;
             if !fake_dns.should_skip(host) {
-                let ip = fake_dns.lookup(host).await?;
+                let ip = fake_dns.lookup(host).await;
                 debug!("fake dns lookup: {} -> {:?}", host, ip);
                 match ip {
-                    net::IpAddr::V4(v4) => return Ok(Some(v4)),
+                    Ok(net::IpAddr::V4(v4)) => return Ok(Some(v4)),
                     _ => unreachable!("invalid IP family"),
                 }
             }
@@ -1028,18 +807,6 @@ impl ClashResolver for EnhancedResolver {
             }));
         }
 
-        if enhanced && let Some(fake_dns) = &self.fake_dns_v6 {
-            let mut fake_dns = fake_dns.write().await;
-            if !fake_dns.should_skip(host) {
-                let ip = fake_dns.lookup(host).await?;
-                debug!("fake dns lookup: {} -> {:?}", host, ip);
-                match ip {
-                    net::IpAddr::V6(v6) => return Ok(Some(v6)),
-                    _ => unreachable!("invalid IP family"),
-                }
-            }
-        }
-
         match self.lookup_ip(host, rr::RecordType::AAAA).await {
             Ok(result) => match result.choose(&mut rand::rng()).unwrap() {
                 net::IpAddr::V6(v6) => Ok(Some(*v6)),
@@ -1064,9 +831,6 @@ impl ClashResolver for EnhancedResolver {
 
     #[instrument(skip(self), level = "trace")]
     async fn exchange(&self, message: &op::Message) -> anyhow::Result<op::Message> {
-        let generation = self
-            .network_generation
-            .load(std::sync::atomic::Ordering::Acquire);
         let rv = self.exchange(message).await?;
         let hostname = message
             .queries
@@ -1079,8 +843,7 @@ impl ClashResolver for EnhancedResolver {
         let ip_list = EnhancedResolver::ip_list_of_message(&rv);
         if !ip_list.is_empty() {
             for ip in ip_list {
-                self.save_reverse_lookup(ip, hostname.clone(), generation)
-                    .await;
+                self.save_reverse_lookup(ip, hostname.clone()).await;
             }
         }
         Ok(rv)
@@ -1095,19 +858,6 @@ impl ClashResolver for EnhancedResolver {
     }
 
     async fn reset_transports(&self) -> anyhow::Result<u32> {
-        self.network_generation
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-
-        if let Some(cache) = &self.lru_cache {
-            *cache.write().await = hickory_resolver::ResponseCache::new(
-                RESPONSE_CACHE_CAPACITY,
-                hickory_resolver::TtlConfig::default(),
-            );
-        }
-        if let Some(cache) = &self.reverse_lookup_cache {
-            cache.write().await.clear();
-        }
-
         let mut clients = self.main.clone();
         if let Some(fallback) = &self.fallback {
             clients.extend(fallback.iter().cloned());
@@ -1123,16 +873,14 @@ impl ClashResolver for EnhancedResolver {
         }
 
         let mut reset = 0_u32;
-        let mut first_error = None;
         for client in clients {
-            match client.reset_transport().await {
-                Ok(count) => reset = reset.saturating_add(count),
-                Err(error) if first_error.is_none() => first_error = Some(error),
-                Err(_) => {}
-            }
+            reset = reset.saturating_add(client.reset_transport().await?);
         }
-        if let Some(error) = first_error {
-            return Err(error);
+        if let Some(direct_resolver) = &self.direct_resolver {
+            reset = reset.saturating_add(direct_resolver.reset_transports().await?);
+        }
+        if let Some(cache) = &self.reverse_lookup_cache {
+            cache.write().await.clear();
         }
         Ok(reset)
     }
@@ -1142,67 +890,39 @@ impl ClashResolver for EnhancedResolver {
     }
 
     fn fake_ip_enabled(&self) -> bool {
-        self.fake_dns.is_some() || self.fake_dns_v6.is_some()
+        self.fake_dns.is_some()
     }
 
-    fn fake_ip_v6_enabled(&self) -> bool {
-        self.fake_dns_v6.is_some()
+    fn direct_resolver(&self) -> Option<ThreadSafeDNSResolver> {
+        self.direct_resolver.clone()
     }
 
     async fn is_fake_ip(&self, ip: std::net::IpAddr) -> bool {
-        let fake_dns = if ip.is_ipv4() {
-            self.fake_dns.as_ref()
-        } else {
-            self.fake_dns_v6.as_ref()
-        }
-        .cloned();
-        let Some(fake_dns) = fake_dns else {
+        if !self.fake_ip_enabled() {
             return false;
-        };
+        }
 
-        fake_dns.write().await.is_fake_ip(ip).await
+        let mut fake_dns = self.fake_dns.as_ref().unwrap().write().await;
+        fake_dns.is_fake_ip(ip).await
     }
 
     async fn reverse_lookup(&self, ip: net::IpAddr) -> Option<String> {
         debug!("reverse lookup: {}", ip);
-        let fake_dns = if ip.is_ipv4() {
-            self.fake_dns.as_ref()
-        } else {
-            self.fake_dns_v6.as_ref()
-        }?
-        .clone();
-        fake_dns.write().await.reverse_lookup(ip).await
+        if !self.fake_ip_enabled() {
+            return None;
+        }
+
+        let mut fake_dns = self.fake_dns.as_ref().unwrap().write().await;
+        fake_dns.reverse_lookup(ip).await
     }
 
     async fn fake_ip_for_host(&self, host: &str) -> Option<net::IpAddr> {
-        if let Some(fake_dns) = &self.fake_dns
-            && let Some(ip) = fake_dns.write().await.lookup_existing(host).await
-        {
-            return Some(ip);
+        if !self.fake_ip_enabled() {
+            return None;
         }
 
-        if let Some(fake_dns) = &self.fake_dns_v6 {
-            return fake_dns.write().await.lookup_existing(host).await;
-        }
-
-        None
-    }
-
-    async fn should_fake_ip(&self, host: &str) -> bool {
-        if !self.fake_ip_enabled()
-            || self
-                .hosts
-                .as_ref()
-                .is_some_and(|hosts| hosts.search(host).is_some())
-        {
-            return false;
-        }
-
-        let Some(fake_dns) = self.fake_dns.as_ref().or(self.fake_dns_v6.as_ref())
-        else {
-            return false;
-        };
-        !fake_dns.read().await.should_skip(host)
+        let mut fake_dns = self.fake_dns.as_ref().unwrap().write().await;
+        fake_dns.lookup_existing(host).await
     }
 }
 
@@ -1275,27 +995,6 @@ mod tests {
     #[derive(Debug)]
     struct ResetCountingClient {
         resets: Arc<AtomicUsize>,
-        fail: bool,
-    }
-
-    #[derive(Debug)]
-    struct DelayedClient {
-        started: Arc<tokio::sync::Notify>,
-        release: Arc<tokio::sync::Notify>,
-        response: op::Message,
-    }
-
-    #[async_trait]
-    impl crate::app::dns::Client for DelayedClient {
-        fn id(&self) -> String {
-            "delayed-client".to_owned()
-        }
-
-        async fn exchange(&self, _msg: &op::Message) -> anyhow::Result<op::Message> {
-            self.started.notify_one();
-            self.release.notified().await;
-            Ok(self.response.clone())
-        }
     }
 
     #[async_trait]
@@ -1310,9 +1009,6 @@ mod tests {
 
         async fn reset_transport(&self) -> anyhow::Result<u32> {
             self.resets.fetch_add(1, Ordering::SeqCst);
-            if self.fail {
-                anyhow::bail!("reset failed");
-            }
             Ok(1)
         }
     }
@@ -1358,55 +1054,61 @@ mod tests {
         response
     }
 
-    fn response_with_a_records(ips: &[Ipv4Addr]) -> op::Message {
-        let mut response = op::Message::response(0, op::OpCode::Query);
-        let name = rr::Name::from_str_relaxed("proxy.example.com")
-            .unwrap()
-            .append_domain(&rr::Name::root())
-            .unwrap();
-        for ip in ips {
-            response.add_answer(rr::Record::from_rdata(
-                name.clone(),
-                300,
-                rr::RData::A(rr::rdata::A(*ip)),
-            ));
-        }
-        response
+    #[tokio::test]
+    async fn direct_resolver_prefers_direct_nameserver_without_fallback_query() {
+        let direct_hits = Arc::new(AtomicUsize::new(0));
+        let fallback_hits = Arc::new(AtomicUsize::new(0));
+        let resolver = EnhancedResolver::from_clients_with_fallback(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(203, 0, 113, 10)),
+                hits: direct_hits.clone(),
+                id: "direct-ns",
+            })],
+            Some(vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(198, 51, 100, 20)),
+                hits: fallback_hits.clone(),
+                id: "fallback-ns",
+            })]),
+            false,
+        );
+
+        let ip = resolver
+            .resolve_v4("example.com", false)
+            .await
+            .expect("direct resolver query should succeed");
+
+        assert_eq!(ip, Some(Ipv4Addr::new(203, 0, 113, 10)));
+        assert_eq!(direct_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
     }
 
-    async fn resolver_with_cidr_fallback() -> EnhancedResolver {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let mut config = make_proxy_nameserver_config();
-        config.fallback = vec![NameServer {
-            net: DNSNetMode::Udp,
-            host: url::Host::Ipv4("9.9.9.9".parse().unwrap()),
-            port: 53,
-            interface: None,
-            proxy: None,
-            doh_path: None,
-        }];
-        config.fallback_filter.geo_ip = false;
-        config.fallback_filter.ip_cidr =
-            Some(vec!["198.51.100.0/24".parse().unwrap()]);
-        EnhancedResolver::new(
-            config,
-            crate::app::profile::ThreadSafeCacheFile::new(
-                temp_dir.path().join("cache.db").to_str().unwrap(),
-                false,
-            ),
-            None,
-            Arc::new(RwLock::new(std::collections::HashMap::new())),
-            None,
-        )
-        .await
-        .unwrap()
-    }
+    #[tokio::test]
+    async fn direct_resolver_falls_back_when_direct_nameserver_has_no_ip() {
+        let direct_hits = Arc::new(AtomicUsize::new(0));
+        let fallback_hits = Arc::new(AtomicUsize::new(0));
+        let direct_response = op::Message::response(0, op::OpCode::Query);
+        let resolver = EnhancedResolver::from_clients_with_fallback(
+            vec![Arc::new(CountingClient {
+                response: direct_response,
+                hits: direct_hits.clone(),
+                id: "direct-ns",
+            })],
+            Some(vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(198, 51, 100, 20)),
+                hits: fallback_hits.clone(),
+                id: "fallback-ns",
+            })]),
+            false,
+        );
 
-    fn response_cache(capacity: u64) -> Arc<RwLock<ResponseCache>> {
-        Arc::new(RwLock::new(ResponseCache::new(
-            capacity,
-            TtlConfig::default(),
-        )))
+        let ip = resolver
+            .resolve_v4("example.com", false)
+            .await
+            .expect("fallback resolver query should succeed");
+
+        assert_eq!(ip, Some(Ipv4Addr::new(198, 51, 100, 20)));
+        assert_eq!(direct_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1415,234 +1117,22 @@ mod tests {
         let client = || -> ThreadSafeDNSClient {
             Arc::new(ResetCountingClient {
                 resets: resets.clone(),
-                fail: false,
             })
         };
         let mut resolver = EnhancedResolver::new_default().await;
         resolver.main = vec![client()];
         resolver.fallback = Some(vec![client()]);
         resolver.proxy_resolver = Some(vec![client()]);
+        resolver.direct_resolver = Some(Arc::new(EnhancedResolver::from_clients(
+            vec![client()],
+            false,
+        )));
         let mut policy = crate::common::trie::StringTrie::new();
         assert!(policy.insert("policy.example", Arc::new(vec![client()])));
         resolver.policy = Some(policy);
 
-        assert_eq!(resolver.reset_transports().await.unwrap(), 4);
-        assert_eq!(resets.load(Ordering::SeqCst), 4);
-    }
-
-    #[tokio::test]
-    async fn batch_exchange_tries_another_upstream_after_servfail() {
-        let (request, _) = test_query();
-        let mut servfail = op::Message::response(0, op::OpCode::Query);
-        servfail.metadata.response_code = op::ResponseCode::ServFail;
-        let clients = vec![
-            Arc::new(FixedClient { response: servfail }) as ThreadSafeDNSClient,
-            Arc::new(FixedClient {
-                response: response_with_a(Ipv4Addr::new(203, 0, 113, 7)),
-            }),
-        ];
-
-        let response = EnhancedResolver::batch_exchange(&clients, &request)
-            .await
-            .expect("the valid upstream response should be selected");
-
-        assert_eq!(response.metadata.response_code, op::ResponseCode::NoError);
-        assert_eq!(
-            EnhancedResolver::ip_list_of_message(&response),
-            vec![std::net::IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))]
-        );
-    }
-
-    #[tokio::test]
-    async fn batch_exchange_does_not_accept_only_servfail_responses() {
-        let (request, _) = test_query();
-        let mut servfail = op::Message::response(0, op::OpCode::Query);
-        servfail.metadata.response_code = op::ResponseCode::ServFail;
-        let clients = vec![
-            Arc::new(FixedClient { response: servfail }) as ThreadSafeDNSClient
-        ];
-
-        assert!(
-            EnhancedResolver::batch_exchange(&clients, &request)
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn hosts_entries_are_used_for_raw_dns_exchanges() {
-        let mut resolver = EnhancedResolver::new_default().await;
-        resolver.lru_cache = None;
-        let upstream_hits = Arc::new(AtomicUsize::new(0));
-        resolver.main = vec![Arc::new(CountingClient {
-            response: response_with_a(Ipv4Addr::new(203, 0, 113, 10)),
-            hits: upstream_hits.clone(),
-            id: "hosts-bypass-test",
-        })];
-        let mut hosts = crate::common::trie::StringTrie::new();
-        hosts.insert(
-            "proxy.example.com",
-            Arc::new(std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 12))),
-        );
-        resolver.hosts = Some(hosts);
-
-        let a_response = resolver
-            .exchange_no_cache(&test_query_with_type(rr::RecordType::A))
-            .await
-            .unwrap();
-        assert_eq!(
-            EnhancedResolver::ip_list_of_message(&a_response),
-            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 12))]
-        );
-
-        let aaaa_response = resolver
-            .exchange_no_cache(&test_query_with_type(rr::RecordType::AAAA))
-            .await
-            .unwrap();
-        assert!(aaaa_response.answers.is_empty());
-        assert_eq!(
-            aaaa_response.metadata.response_code,
-            op::ResponseCode::NoError
-        );
-        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn disabled_geoip_does_not_force_fallback_when_cidr_is_configured() {
-        let mut resolver = resolver_with_cidr_fallback().await;
-        let main_hits = Arc::new(AtomicUsize::new(0));
-        let fallback_hits = Arc::new(AtomicUsize::new(0));
-        resolver.main = vec![Arc::new(CountingClient {
-            response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
-            hits: main_hits.clone(),
-            id: "main-filter-test",
-        })];
-        resolver.fallback = Some(vec![Arc::new(CountingClient {
-            response: response_with_a(Ipv4Addr::new(203, 0, 113, 10)),
-            hits: fallback_hits.clone(),
-            id: "fallback-filter-test",
-        })]);
-
-        resolver
-            .exchange_no_cache(&test_query_with_type(rr::RecordType::A))
-            .await
-            .unwrap();
-
-        assert_eq!(main_hits.load(Ordering::SeqCst), 1);
-        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn fallback_filter_checks_every_answer_ip() {
-        let mut resolver = resolver_with_cidr_fallback().await;
-        let main_hits = Arc::new(AtomicUsize::new(0));
-        let fallback_hits = Arc::new(AtomicUsize::new(0));
-        resolver.main = vec![Arc::new(CountingClient {
-            response: response_with_a_records(&[
-                Ipv4Addr::new(203, 0, 113, 10),
-                Ipv4Addr::new(198, 51, 100, 10),
-            ]),
-            hits: main_hits.clone(),
-            id: "main-multi-ip-test",
-        })];
-        resolver.fallback = Some(vec![Arc::new(CountingClient {
-            response: response_with_a(Ipv4Addr::new(192, 0, 2, 20)),
-            hits: fallback_hits.clone(),
-            id: "fallback-multi-ip-test",
-        })]);
-
-        let response = resolver
-            .exchange_no_cache(&test_query_with_type(rr::RecordType::A))
-            .await
-            .unwrap();
-
-        assert_eq!(main_hits.load(Ordering::SeqCst), 1);
-        assert_eq!(fallback_hits.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            EnhancedResolver::ip_list_of_message(&response),
-            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20))]
-        );
-    }
-
-    #[tokio::test]
-    async fn reset_transports_invalidates_response_cache() {
-        let mut resolver = EnhancedResolver::new_default().await;
-        let cache = response_cache(16);
-        let (_, query) = test_query();
-        cache.write().await.insert(
-            query.clone(),
-            Ok(response_with_a(Ipv4Addr::new(192, 0, 2, 1))),
-            Instant::now(),
-        );
-        resolver.lru_cache = Some(cache.clone());
-
-        resolver.reset_transports().await.unwrap();
-
-        assert!(cache.read().await.get(&query, Instant::now()).is_none());
-    }
-
-    #[tokio::test]
-    async fn late_response_from_previous_network_generation_is_not_cached() {
-        let mut resolver = EnhancedResolver::new_default().await;
-        let started = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        let (mut request, query) = test_query();
-        request.metadata.recursion_desired = true;
-        resolver.lru_cache = Some(response_cache(16));
-        resolver.main = vec![Arc::new(DelayedClient {
-            started: started.clone(),
-            release: release.clone(),
-            response: response_with_a(Ipv4Addr::new(192, 0, 2, 8)),
-        })];
-        let resolver = Arc::new(resolver);
-
-        let query_task = {
-            let resolver = resolver.clone();
-            tokio::spawn(async move { resolver.exchange_no_cache(&request).await })
-        };
-        started.notified().await;
-        resolver.reset_transports().await.unwrap();
-        release.notify_one();
-        query_task.await.unwrap().unwrap();
-
-        assert!(
-            resolver
-                .lru_cache
-                .as_ref()
-                .unwrap()
-                .read()
-                .await
-                .get(&query, Instant::now())
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn reset_attempts_every_client_and_clears_cache_after_failure() {
-        let resets = Arc::new(AtomicUsize::new(0));
-        let mut resolver = EnhancedResolver::new_default().await;
-        resolver.main = vec![
-            Arc::new(ResetCountingClient {
-                resets: resets.clone(),
-                fail: true,
-            }),
-            Arc::new(ResetCountingClient {
-                resets: resets.clone(),
-                fail: false,
-            }),
-        ];
-        let cache = response_cache(16);
-        let (_, query) = test_query();
-        cache.write().await.insert(
-            query.clone(),
-            Ok(response_with_a(Ipv4Addr::new(192, 0, 2, 1))),
-            Instant::now(),
-        );
-        resolver.lru_cache = Some(cache.clone());
-
-        assert!(resolver.reset_transports().await.is_err());
-        assert_eq!(resets.load(Ordering::SeqCst), 2);
-        assert!(cache.read().await.get(&query, Instant::now()).is_none());
+        assert_eq!(resolver.reset_transports().await.unwrap(), 5);
+        assert_eq!(resets.load(Ordering::SeqCst), 5);
     }
 
     /// Regression test for https://github.com/Watfaq/clash-rs/issues/976
@@ -1705,7 +1195,7 @@ mod tests {
     async fn test_lru_cache_hit_with_recursion_desired() {
         let mut resolver = EnhancedResolver::new_default().await;
         resolver.main.clear();
-        resolver.lru_cache = Some(response_cache(16));
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
 
         let (mut request, query) = test_query();
         request.metadata.recursion_desired = true;
@@ -1718,7 +1208,7 @@ mod tests {
         let mut cached =
             op::Message::response(request.metadata.id, request.metadata.op_code);
         cached.add_answer(record);
-        resolver.lru_cache.as_ref().unwrap().write().await.insert(
+        resolver.lru_cache.as_ref().unwrap().insert(
             query,
             Ok(cached),
             Instant::now(),
@@ -1732,72 +1222,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_hit_preserves_complete_response_and_updates_request_id() {
-        let mut resolver = EnhancedResolver::new_default().await;
-        resolver.main.clear();
-        resolver.lru_cache = Some(response_cache(16));
-
-        let (mut request, query) = test_query();
-        request.metadata.recursion_desired = true;
-        request.metadata.id = 777;
-
-        let mut cached = op::Message::response(123, request.metadata.op_code);
-        cached.metadata.authoritative = true;
-        cached.metadata.recursion_available = true;
-        cached.add_query(query.clone());
-        cached.add_answer(rr::Record::from_rdata(
-            query.name().clone(),
-            300,
-            rr::RData::A(rr::rdata::A(Ipv4Addr::new(192, 0, 2, 1))),
-        ));
-        let zone = query.name().clone();
-        let hostmaster = rr::Name::from_str_relaxed("hostmaster.example.com")
-            .unwrap()
-            .append_domain(&rr::Name::root())
-            .unwrap();
-        cached.add_authority(rr::Record::from_rdata(
-            zone.clone(),
-            300,
-            rr::RData::SOA(rr::rdata::SOA::new(
-                zone, hostmaster, 1, 3600, 600, 86400, 60,
-            )),
-        ));
-        cached.add_additional(rr::Record::from_rdata(
-            query.name().clone(),
-            300,
-            rr::RData::A(rr::rdata::A(Ipv4Addr::new(192, 0, 2, 2))),
-        ));
-        resolver.lru_cache.as_ref().unwrap().write().await.insert(
-            query,
-            Ok(cached),
-            Instant::now(),
-        );
-
-        let response = resolver
-            .exchange(&request)
-            .await
-            .expect("should be served from cache");
-
-        assert_eq!(response.metadata.id, 777);
-        assert!(response.metadata.recursion_desired);
-        assert!(response.metadata.authoritative);
-        assert!(response.metadata.recursion_available);
-        assert_eq!(response.queries.len(), 1);
-        assert_eq!(response.answers.len(), 1);
-        assert_eq!(response.authorities.len(), 1);
-        assert_eq!(response.additionals.len(), 1);
-    }
-
-    #[tokio::test]
     async fn test_lru_skips_nxdomain_response() {
         let mut resolver = EnhancedResolver::new_default().await;
-        resolver.lru_cache = Some(response_cache(16));
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
 
         let (request, query) = test_query();
         let mut response =
             op::Message::response(request.metadata.id, request.metadata.op_code);
         response.metadata.response_code = op::ResponseCode::NXDomain;
-        response.add_query(query.clone());
         resolver.main = vec![Arc::new(FixedClient { response })];
 
         resolver
@@ -1810,143 +1242,9 @@ mod tests {
                 .lru_cache
                 .as_ref()
                 .unwrap()
-                .read()
-                .await
                 .get(&query, Instant::now())
                 .is_none()
         );
-    }
-
-    #[tokio::test]
-    async fn negative_cache_preserves_rcode_authority_and_request_id() {
-        for response_code in [op::ResponseCode::NXDomain, op::ResponseCode::NoError]
-        {
-            let mut resolver = EnhancedResolver::new_default().await;
-            resolver.lru_cache = Some(response_cache(16));
-
-            let (mut request, query) = test_query();
-            request.metadata.recursion_desired = true;
-            request.metadata.id = 123;
-            let mut response =
-                op::Message::response(request.metadata.id, request.metadata.op_code);
-            response.metadata.response_code = response_code;
-            response.metadata.recursion_available = true;
-            response.add_query(query.clone());
-            let zone = query.name().clone();
-            let hostmaster = rr::Name::from_str_relaxed("hostmaster.example.com")
-                .unwrap()
-                .append_domain(&rr::Name::root())
-                .unwrap();
-            response.add_authority(rr::Record::from_rdata(
-                zone.clone(),
-                120,
-                rr::RData::SOA(rr::rdata::SOA::new(
-                    zone, hostmaster, 1, 3600, 600, 86400, 60,
-                )),
-            ));
-            let hits = Arc::new(AtomicUsize::new(0));
-            resolver.main = vec![Arc::new(CountingClient {
-                response,
-                hits: hits.clone(),
-                id: "negative-cache-test",
-            })];
-
-            let first = resolver
-                .exchange(&request)
-                .await
-                .expect("fixed client returns a negative response");
-            assert_eq!(first.metadata.response_code, response_code);
-
-            request.metadata.id = 456;
-            let cached = resolver
-                .exchange(&request)
-                .await
-                .expect("negative response should be served from cache");
-            assert_eq!(hits.load(Ordering::SeqCst), 1, "rcode {response_code}");
-            assert_eq!(cached.metadata.id, 456);
-            assert_eq!(cached.metadata.response_code, response_code);
-            assert_eq!(cached.authorities.len(), 1);
-            assert_eq!(cached.authorities[0].ttl, 60);
-        }
-    }
-
-    #[tokio::test]
-    async fn negative_cache_skips_response_without_soa() {
-        let mut resolver = EnhancedResolver::new_default().await;
-        resolver.lru_cache = Some(response_cache(16));
-
-        let (mut request, query) = test_query();
-        request.metadata.recursion_desired = true;
-        let mut response =
-            op::Message::response(request.metadata.id, request.metadata.op_code);
-        response.metadata.response_code = op::ResponseCode::NXDomain;
-        response.metadata.recursion_available = true;
-        response.add_query(query.clone());
-        resolver.main = vec![Arc::new(CountingClient {
-            response,
-            hits: Arc::new(AtomicUsize::new(0)),
-            id: "negative-cache-without-soa-test",
-        })];
-
-        resolver
-            .exchange_no_cache(&request)
-            .await
-            .expect("fixed client returns a negative response");
-
-        assert!(
-            resolver
-                .lru_cache
-                .as_ref()
-                .unwrap()
-                .read()
-                .await
-                .get(&query, Instant::now())
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn response_cache_requires_a_single_recursive_in_query() {
-        let (mut request, query) = test_query();
-        request.metadata.recursion_desired = true;
-        assert!(EnhancedResolver::cacheable_request(&request));
-
-        let mut multiple_questions = request.clone();
-        multiple_questions.add_query(query.clone());
-        assert!(!EnhancedResolver::cacheable_request(&multiple_questions));
-
-        let mut update = request.clone();
-        update.metadata.op_code = op::OpCode::Update;
-        assert!(!EnhancedResolver::cacheable_request(&update));
-
-        let mut non_in_class = request.clone();
-        non_in_class.queries[0].set_query_class(rr::DNSClass::CH);
-        assert!(!EnhancedResolver::cacheable_request(&non_in_class));
-
-        let mut no_recursion = request.clone();
-        no_recursion.metadata.recursion_desired = false;
-        assert!(!EnhancedResolver::cacheable_request(&no_recursion));
-
-        let mut edns = request.clone();
-        edns.set_edns(op::Edns::new());
-        assert!(!EnhancedResolver::cacheable_request(&edns));
-
-        let mut response =
-            op::Message::response(request.metadata.id, op::OpCode::Query);
-        response.add_query(query);
-        assert!(EnhancedResolver::cacheable_response(&request, &response));
-
-        response.metadata.truncation = true;
-        assert!(!EnhancedResolver::cacheable_response(&request, &response));
-        response.metadata.truncation = false;
-
-        response.queries[0].set_name(
-            rr::Name::from_str_relaxed("other.example")
-                .unwrap()
-                .append_domain(&rr::Name::root())
-                .unwrap(),
-        );
-        assert!(!EnhancedResolver::cacheable_response(&request, &response));
     }
 
     #[tokio::test]
@@ -2076,8 +1374,8 @@ mod tests {
             net: DNSNetMode::Udp,
             iface: None,
             proxy: get_default_outbound(),
-            ecs: None,
             doh_path: None,
+            ecs: None,
             fw_mark: None,
             rule_dispatch: None,
         })
@@ -2098,8 +1396,8 @@ mod tests {
             net: DNSNetMode::Tcp,
             iface: None,
             proxy: get_default_outbound(),
-            ecs: None,
             doh_path: None,
+            ecs: None,
             fw_mark: None,
             rule_dispatch: None,
         })
@@ -2120,8 +1418,8 @@ mod tests {
             net: DNSNetMode::DoT,
             iface: None,
             proxy: get_default_outbound(),
-            ecs: None,
             doh_path: None,
+            ecs: None,
             fw_mark: None,
             rule_dispatch: None,
         })
@@ -2144,8 +1442,8 @@ mod tests {
             net: DNSNetMode::DoH,
             iface: None,
             proxy: get_default_outbound(),
-            ecs: None,
             doh_path: None,
+            ecs: None,
             fw_mark: None,
             rule_dispatch: None,
         })
@@ -2166,8 +1464,8 @@ mod tests {
             net: DNSNetMode::Dhcp,
             iface: None,
             proxy: get_default_outbound(),
-            ecs: None,
             doh_path: None,
+            ecs: None,
             fw_mark: None,
             rule_dispatch: None,
         })
@@ -2352,6 +1650,57 @@ mod tests {
 
         assert!(resolver.proxy_resolver.is_none());
         assert!(resolver.proxy_server_domains.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_direct_nameserver_initializes_direct_resolver() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_store = crate::app::profile::ThreadSafeCacheFile::new(
+            temp_dir.path().join("cache.db").to_str().unwrap(),
+            false,
+        );
+        let mut config = make_proxy_nameserver_config();
+        config.direct_nameserver = Some(vec![NameServer {
+            net: DNSNetMode::Udp,
+            host: url::Host::Ipv4("223.5.5.5".parse().unwrap()),
+            port: 53,
+            interface: None,
+            proxy: None,
+            doh_path: None,
+        }]);
+
+        let resolver = EnhancedResolver::new(
+            config,
+            cache_store,
+            None,
+            Arc::new(RwLock::new(std::collections::HashMap::new())),
+            None,
+        )
+        .await
+        .expect("direct nameserver config should initialize");
+
+        assert!(resolver.direct_resolver().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_direct_resolver_absent_without_direct_nameserver() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_store = crate::app::profile::ThreadSafeCacheFile::new(
+            temp_dir.path().join("cache.db").to_str().unwrap(),
+            false,
+        );
+
+        let resolver = EnhancedResolver::new(
+            make_proxy_nameserver_config(),
+            cache_store,
+            None,
+            Arc::new(RwLock::new(std::collections::HashMap::new())),
+            None,
+        )
+        .await
+        .expect("config without direct nameserver should initialize");
+
+        assert!(resolver.direct_resolver().is_none());
     }
 
     #[tokio::test]
