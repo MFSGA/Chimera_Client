@@ -471,6 +471,36 @@ pub struct XhttpOpt {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
+pub struct EchOptions {
+    pub enable: Option<bool>,
+    pub config: Option<String>,
+    pub query_server_name: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct ShadowTlsOptions {
+    pub version: Option<u8>,
+    pub password: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct RestlsOptions {
+    pub password: Option<String>,
+    pub version_hint: Option<String>,
+    pub restls_script: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct JlsOptions {
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
 pub struct OutboundVless {
     #[serde(flatten)]
     pub common_opts: CommonConfigOptions,
@@ -500,6 +530,14 @@ pub struct OutboundVless {
     pub fingerprint: Option<String>,
     /// TLS ClientHello/uTLS-style fingerprint selection.
     pub client_fingerprint: Option<String>,
+    #[serde(alias = "echOpts")]
+    pub ech_opts: Option<EchOptions>,
+    #[serde(alias = "shadowTlsOpts")]
+    pub shadow_tls_opts: Option<ShadowTlsOptions>,
+    #[serde(alias = "restlsOpts")]
+    pub restls_opts: Option<RestlsOptions>,
+    #[serde(alias = "jlsOpts")]
+    pub jls_opts: Option<JlsOptions>,
 }
 
 #[cfg(feature = "wireguard")]
