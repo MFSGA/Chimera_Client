@@ -1,7 +1,6 @@
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-
 use futures::FutureExt;
 use hickory_proto::op::Message;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use tokio::sync::{Mutex, oneshot};
 
 use chimera_dns::DNSListenAddr;

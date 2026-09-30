@@ -463,7 +463,7 @@ pub async fn init_net_config(
             && interface.is_none()
             && let Some(selected) = selected.as_ref()
         {
-            info!(
+            tracing::info!(
                 interface = %selected.name,
                 interface_index = selected.index,
                 "selected physical outbound interface for macOS TUN"

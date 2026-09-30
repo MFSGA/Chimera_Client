@@ -95,14 +95,18 @@ impl Dispatcher {
         mut sess: Session,
         mut lhs: Box<dyn ClientStream>,
     ) {
-        let dest: SocksAddr =
-            match reverse_lookup(&self.resolver, &sess.destination).await {
-                Some(dest) => dest,
-                None => {
-                    warn!("failed to resolve destination {}", sess);
-                    return;
-                }
-            };
+        let dest: SocksAddr = match reverse_lookup(&self.resolver, &sess.destination)
+            .await
+        {
+            Some(dest) => dest,
+            None => {
+                warn!(
+                    "dropping flow with fake-IP destination because its domain mapping is missing: {}",
+                    sess
+                );
+                return;
+            }
+        };
 
         sess.destination = dest.clone();
         if sess.process_name.is_none() {
@@ -311,7 +315,10 @@ impl Dispatcher {
                 let dest = match reverse_lookup(&resolver, &packet.dst_addr).await {
                     Some(dest) => dest,
                     None => {
-                        warn!("failed to resolve destination {}", sess);
+                        warn!(
+                            "dropping flow with fake-IP destination because its domain mapping is missing: {}",
+                            sess
+                        );
                         continue;
                     }
                 };
@@ -604,12 +611,7 @@ async fn reverse_lookup(
                             .try_into()
                             .expect("must be valid domain"),
                         None => {
-                            warn!(
-                                "failed to reverse lookup fake ip {}, fallback to \
-                                 raw destination",
-                                ip
-                            );
-                            (*socket_addr).into()
+                            return None;
                         }
                     }
                 } else {
@@ -893,7 +895,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reverse_lookup_falls_back_to_ip_when_fake_ip_record_is_missing() {
+    async fn reverse_lookup_rejects_fake_ip_when_mapping_is_missing() {
         let fake_ip: std::net::IpAddr = "198.18.0.10".parse().unwrap();
         let destination = SocksAddr::from_str("198.18.0.10:443").unwrap();
 
@@ -908,10 +910,9 @@ mod tests {
             &(Arc::new(resolver) as Arc<dyn ClashResolver>),
             &destination,
         )
-        .await
-        .expect("reverse lookup should return fallback destination");
+        .await;
 
-        assert_eq!(resolved, destination);
+        assert!(resolved.is_none());
     }
 }
 
