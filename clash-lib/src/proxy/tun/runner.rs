@@ -3,7 +3,6 @@ use std::sync::Arc;
 use futures::{FutureExt, SinkExt, StreamExt, future::BoxFuture};
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 use network_interface::NetworkInterfaceConfig;
-#[cfg(target_os = "macos")]
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
