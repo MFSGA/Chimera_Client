@@ -64,6 +64,7 @@ pub struct Config {
     pub enhance_mode: DNSMode,
     pub default_nameserver: Vec<NameServer>,
     pub proxy_server_nameserver: Option<Vec<NameServer>>,
+    pub direct_nameserver: Option<Vec<NameServer>>,
     pub fake_ip_range: ipnet::IpNet,
     pub fake_ip_range6: Option<ipnet::IpNet>,
     pub fake_ip_filter: Vec<String>,
@@ -427,6 +428,18 @@ impl TryFrom<&crate::config::def::Config> for Config {
             None
         };
 
+        let direct_nameserver = if !dc.direct_nameserver.is_empty() {
+            let ns = Config::parse_nameserver(&dc.direct_nameserver)?;
+            if ns.is_empty() {
+                return Err(Error::InvalidConfig(String::from(
+                    "direct-nameserver has no usable entries (all skipped)",
+                )));
+            }
+            Some(ns)
+        } else {
+            None
+        };
+
         let edns_client_subnet = dc
             .edns_client_subnet
             .as_ref()
@@ -515,6 +528,7 @@ impl TryFrom<&crate::config::def::Config> for Config {
             enhance_mode: dc.enhanced_mode.clone(),
             default_nameserver,
             proxy_server_nameserver,
+            direct_nameserver,
             fake_ip_range: dc.fake_ip_range.parse::<ipnet::IpNet>().map_err(
                 |_| Error::InvalidConfig(String::from("invalid fake ip range")),
             )?,
