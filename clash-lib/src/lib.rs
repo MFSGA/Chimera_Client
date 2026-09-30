@@ -575,7 +575,10 @@ async fn start_with_shutdown_token(
 
     let reload_token = shutdown_token.clone();
     let reload_handle = tokio::spawn(async move {
+        #[cfg(feature = "tun")]
         let mut network_runtime_lease = network_runtime_lease;
+        #[cfg(not(feature = "tun"))]
+        let _network_runtime_lease = network_runtime_lease;
         let mut active_components = components;
         let mut active_api_listener = api_listener;
         let mut active_controller_cfg = controller_cfg;
@@ -959,14 +962,31 @@ impl RuntimeComponents {
     }
 
     fn start_all(&self) {
-        #[cfg(feature = "tun")]
+        #[cfg(all(feature = "tun", not(target_os = "macos")))]
         self.tun_runner.run_async();
         self.dns_listener.run_async();
+        #[cfg(not(target_os = "macos"))]
         self.inbound_manager.run_async();
     }
 
     async fn wait_initial_ready(&self) -> Result<()> {
         self.dns_listener.wait_ready().await?;
+
+        #[cfg(feature = "tun")]
+        {
+            #[cfg(target_os = "macos")]
+            self.tun_runner.run_async();
+            self.tun_runner.wait_ready().await?;
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            self.inbound_manager.run_async();
+        }
+
+        #[cfg(all(target_os = "macos", not(feature = "tun")))]
+        self.inbound_manager.run_async();
+
         self.inbound_manager.wait_ready().await
     }
 

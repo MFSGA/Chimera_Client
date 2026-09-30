@@ -138,10 +138,13 @@ pub async fn maybe_add_routes(
                              the tun interface"
                         );
                         let name_server = vec!["1.1.1.1".parse().unwrap()];
-                        let _ = windows::set_dns_v4(&tun_iface, &name_server)
-                            .map_err(|e| {
-                                tracing::error!("failed to set dns due to:{}", e)
-                            });
+                        windows::set_dns_v4(&tun_iface, &name_server).map_err(
+                            |e| {
+                                std::io::Error::other(format!(
+                                    "failed to set DNS server on TUN interface: {e}"
+                                ))
+                            },
+                        )?;
                     }
                 }
                 #[cfg(target_os = "macos")]

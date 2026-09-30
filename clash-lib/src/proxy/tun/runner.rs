@@ -3,6 +3,8 @@ use std::sync::Arc;
 use futures::{FutureExt, SinkExt, StreamExt, future::BoxFuture};
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 use network_interface::NetworkInterfaceConfig;
+#[cfg(target_os = "macos")]
+use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use url::Url;
@@ -93,6 +95,8 @@ pub struct TunRunner {
     resolver: ThreadSafeDNSResolver,
     cancellation_token: CancellationToken,
     task: std::sync::Mutex<Option<tokio::task::JoinHandle<Result<(), Error>>>>,
+    ready_tx: std::sync::Mutex<Option<oneshot::Sender<Result<(), String>>>>,
+    ready_rx: AsyncMutex<Option<oneshot::Receiver<Result<(), String>>>>,
 }
 
 impl TunRunner {
@@ -102,13 +106,32 @@ impl TunRunner {
         resolver: ThreadSafeDNSResolver,
         cancellation_token: Option<CancellationToken>,
     ) -> Result<TunRunner, Error> {
+        let (ready_tx, ready_rx) = oneshot::channel();
         Ok(Self {
             cfg,
             dispatcher,
             resolver,
             cancellation_token: cancellation_token.unwrap_or_default(),
             task: std::sync::Mutex::new(None),
+            ready_tx: std::sync::Mutex::new(Some(ready_tx)),
+            ready_rx: AsyncMutex::new(Some(ready_rx)),
         })
+    }
+
+    pub(crate) async fn wait_ready(&self) -> Result<(), Error> {
+        let receiver = self.ready_rx.lock().await.take();
+        match receiver {
+            Some(receiver) => match receiver.await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(message)) => Err(Error::Operation(message)),
+                Err(_) => Err(Error::Operation(
+                    "TUN runner exited before becoming ready".to_owned(),
+                )),
+            },
+            None => Err(Error::Operation(
+                "TUN runner readiness was already consumed".to_owned(),
+            )),
+        }
     }
 
     pub(crate) fn fresh(
@@ -306,8 +329,12 @@ impl TunRunner {
 
 impl Runner for TunRunner {
     fn run_async(&self) {
+        let mut ready_tx = self.ready_tx.lock().unwrap().take();
         if !self.cfg.enable {
             info!("tun is disabled, skipping");
+            if let Some(sender) = ready_tx.take() {
+                let _ = sender.send(Ok(()));
+            }
             return;
         }
 
@@ -321,25 +348,32 @@ impl Runner for TunRunner {
 
         let handle = tokio::spawn(async move {
             let (tun, stack, mut tcp_listener, udp_socket) =
-                TunRunner::new_internal(&cfg)
-                    .await
-                    .inspect_err(|e| match e {
-                        Error::Io(e) => {
-                            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                                error!(
-                                    "tun initialization failed: permission denied. \
+                match TunRunner::new_internal(&cfg).await {
+                    Ok(components) => components,
+                    Err(error) => {
+                        match &error {
+                            Error::Io(e) => {
+                                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                                    error!(
+                                        "tun initialization failed: permission denied. \
                                      Please make sure the program has the \
                                      necessary permissions to create and manage \
                                      TUN interfaces."
-                                );
-                            } else {
-                                error!("tun initialization I/O error: {}", e);
+                                    );
+                                } else {
+                                    error!("tun initialization I/O error: {}", e);
+                                }
+                            }
+                            _ => {
+                                error!("tun initialization error: {}", error);
                             }
                         }
-                        _ => {
-                            error!("tun initialization error: {}", e);
+                        if let Some(sender) = ready_tx.take() {
+                            let _ = sender.send(Err(error.to_string()));
                         }
-                    })?;
+                        return Err(error);
+                    }
+                };
 
             let framed = tun_rs::async_framed::DeviceFramed::new(
                 tun,
@@ -435,6 +469,12 @@ impl Runner for TunRunner {
                 .await;
                 Err(Error::Operation("tun stopped unexpectedly 3".to_string()))
             };
+
+            // Report readiness consistently on every platform only after the
+            // TUN device, routes, stack pumps, and TCP/UDP handlers are ready.
+            if let Some(sender) = ready_tx.take() {
+                let _ = sender.send(Ok(()));
+            }
 
             match tokio::select! {
                 res = fut_dispatcher_tun() => res,

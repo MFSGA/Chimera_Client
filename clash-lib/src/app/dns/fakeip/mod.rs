@@ -186,7 +186,10 @@ impl FakeDns {
     }
 
     pub async fn lookup(&mut self, host: &str) -> Result<net::IpAddr, Error> {
-        if let Some(ip) = self.lookup_existing(host).await {
+        // DNS names are case-insensitive. Use one stable key even when a
+        // resolver sends different casing on separate queries.
+        let host = host.to_ascii_lowercase();
+        if let Some(ip) = self.lookup_existing(&host).await {
             info!(
                 host = %host,
                 fake_ip = %ip,
@@ -197,8 +200,8 @@ impl FakeDns {
             return Ok(ip);
         }
 
-        let ip = self.get(host).await?;
-        self.store.pub_by_host(host, IpFamily::of(ip), ip).await;
+        let ip = self.get(&host).await?;
+        self.store.pub_by_host(&host, IpFamily::of(ip), ip).await;
         info!(
             host = %host,
             fake_ip = %ip,
@@ -210,14 +213,15 @@ impl FakeDns {
     }
 
     pub async fn lookup_existing(&mut self, host: &str) -> Option<net::IpAddr> {
+        let host = host.to_ascii_lowercase();
         let family = self.family();
-        let ip = self.store.get_by_host(host, family).await?;
+        let ip = self.store.get_by_host(&host, family).await?;
         if self.is_allocatable(ip)
-            && self.store.get_by_ip(ip).await.as_deref() == Some(host)
+            && self.store.get_by_ip(ip).await.as_deref() == Some(host.as_str())
         {
             return Some(ip);
         }
-        self.store.del_by_host(host, family).await;
+        self.store.del_by_host(&host, family).await;
         None
     }
 
@@ -225,14 +229,17 @@ impl FakeDns {
         if !self.is_allocatable(ip) {
             None
         } else {
-            self.store.get_by_ip(ip).await
+            self.store
+                .get_by_ip(ip)
+                .await
+                .map(|host| host.to_ascii_lowercase())
         }
     }
 
     pub fn should_skip(&self, domain: &str) -> bool {
         match &self.skipped_hostnames {
             None => false,
-            Some(host) => host.search(domain).is_some(),
+            Some(host) => host.search(&domain.to_ascii_lowercase()).is_some(),
         }
     }
 
@@ -373,6 +380,25 @@ mod tests {
         assert!(pool.exist(net::IpAddr::from([192, 168, 0, 3])).await);
         assert!(!pool.exist(net::IpAddr::from([192, 168, 0, 4])).await);
         assert!(!pool.exist("::1".parse().unwrap()).await);
+    }
+
+    #[tokio::test]
+    async fn fake_ip_host_mapping_is_case_insensitive() {
+        let mut pool = FakeDns::new(Opts {
+            ipnet: "192.168.0.0/29".parse().unwrap(),
+            skipped_hostnames: None,
+            store: Box::new(InMemStore::new(10)),
+        })
+        .unwrap();
+
+        let ip = pool.lookup("ExAmPlE.CoM").await.unwrap();
+
+        assert_eq!(pool.lookup("example.com").await.unwrap(), ip);
+        assert_eq!(pool.lookup_existing("EXAMPLE.COM").await, Some(ip));
+        assert_eq!(
+            pool.reverse_lookup(ip).await.as_deref(),
+            Some("example.com")
+        );
     }
 
     #[tokio::test]
@@ -588,6 +614,7 @@ mod tests {
         .unwrap();
 
         assert!(pool.should_skip("example.com"));
+        assert!(pool.should_skip("EXAMPLE.COM"));
         assert!(!pool.should_skip("foo.com"));
     }
 

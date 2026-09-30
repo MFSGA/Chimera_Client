@@ -178,6 +178,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_query_returns_fake_ip_without_forwarding_to_upstream() {
+        let mut resolver = MockClashResolver::new();
+        resolver.expect_ipv6().return_const(false);
+        resolver.expect_fake_ip_enabled().return_const(true);
+        resolver.expect_fake_ip_v6_enabled().return_const(false);
+        resolver
+            .expect_resolve_v4()
+            .with(
+                mockall::predicate::eq("example.com"),
+                mockall::predicate::eq(true),
+            )
+            .once()
+            .returning(|_, _| Ok(Some("198.18.0.7".parse().unwrap())));
+        resolver.expect_exchange().never();
+
+        let resolver: ThreadSafeDNSResolver = Arc::new(resolver);
+        let response =
+            exchange_with_resolver(&resolver, &query(RecordType::A), true)
+                .await
+                .expect("fake-IP A query should be answered locally");
+
+        assert_eq!(response.answers.len(), 1);
+        assert_eq!(response.answers[0].data.to_string(), "198.18.0.7");
+    }
+
+    #[tokio::test]
     async fn non_a_queries_are_not_forwarded_for_fake_ip_domains() {
         let mut resolver = MockClashResolver::new();
         resolver.expect_ipv6().return_const(true);

@@ -8,7 +8,7 @@ use crate::{
     config::{
         def,
         internal::{
-            config::{self, DnsHijackAddress, DnsHijackProtocol, Profile},
+            config::{self, Profile},
             proxy::{
                 OutboundDirect, OutboundProxy, OutboundProxyProtocol,
                 OutboundReject, PROXY_DIRECT, PROXY_REJECT,
@@ -63,7 +63,6 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
     let dns: crate::app::dns::Config = (&c).try_into()?;
     let mut tun = tun::convert(c.tun.take())?;
     validate_dns_tun_ipv6(&dns, &tun)?;
-    validate_macos_dns_hijack(&dns, &tun)?;
     configure_fake_ip_route(&dns, &mut tun)?;
 
     config::Config {
@@ -157,51 +156,6 @@ fn validate_dns_tun_ipv6(
             "dns IPv6 responses require tun.ipv6 when TUN is enabled".to_owned(),
         ));
     }
-    Ok(())
-}
-
-fn validate_macos_dns_hijack(
-    dns: &crate::app::dns::Config,
-    tun: &config::TunConfig,
-) -> Result<(), Error> {
-    if !cfg!(target_os = "macos") || !tun.enable || !tun.dns_hijack {
-        return Ok(());
-    }
-
-    if !tun.route_all {
-        return Err(Error::InvalidConfig(
-            "macOS TUN DNS hijacking requires tun.route-all: true".to_owned(),
-        ));
-    }
-    if !dns.enable {
-        return Err(Error::InvalidConfig(
-            "macOS TUN DNS hijacking requires dns.enable: true".to_owned(),
-        ));
-    }
-    if dns.enhance_mode != def::DNSMode::FakeIp {
-        return Err(Error::InvalidConfig(
-            "macOS TUN DNS hijacking requires dns.enhanced-mode: fake-ip".to_owned(),
-        ));
-    }
-
-    let catches_all_udp_53 = tun.dns_hijack_rules.iter().any(|rule| {
-        rule.protocol == DnsHijackProtocol::Udp
-            && rule.address == DnsHijackAddress::Any
-            && rule.port == 53
-    });
-    let catches_all_tcp_53 = tun.dns_hijack_rules.iter().any(|rule| {
-        rule.protocol == DnsHijackProtocol::Tcp
-            && rule.address == DnsHijackAddress::Any
-            && rule.port == 53
-    });
-    if !tun.dns_hijack_rules.is_empty()
-        && (!catches_all_udp_53 || !catches_all_tcp_53)
-    {
-        return Err(Error::InvalidConfig(
-            "macOS TUN DNS hijacking requires catch-all UDP and TCP port 53 rules (dns-hijack: true)".to_owned(),
-        ));
-    }
-
     Ok(())
 }
 
@@ -396,6 +350,26 @@ tun:
 
         let converted = convert(cfg).expect("internal convert should succeed");
         assert_eq!(converted.tun.so_mark, Some(6666));
+    }
+
+    #[cfg(feature = "tun")]
+    #[test]
+    fn fake_ip_tun_adds_fake_ip_route_without_hijack_or_route_all() {
+        let mut cfg = parse_config(
+            r#"
+tun:
+  enable: true
+  route-all: false
+  dns-hijack: false
+"#,
+        );
+        cfg.dns.enable = true;
+        cfg.dns.enhanced_mode = def::DNSMode::FakeIp;
+        cfg.dns.nameserver.push("114.114.114.114".to_owned());
+
+        let converted = convert(cfg).expect("TUN fake-IP config should convert");
+        let fake_ip_route: ipnet::IpNet = "198.19.0.0/16".parse().unwrap();
+        assert!(converted.tun.routes.contains(&fake_ip_route));
     }
 
     #[test]
