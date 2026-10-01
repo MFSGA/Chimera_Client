@@ -376,6 +376,30 @@ Each item must be implemented, tested, and committed separately.
   `clash-lib/tests/vless_native_encryption_0rtt_xray_interop.sh` passed against
   Xray 26.2.6, exercising a 1-RTT cache bootstrap followed by a cached 0-RTT
   connection.
-- Next slice: evaluate encrypted UDP separately; it remains intentionally
-  unsupported until its framing, replay, and datagram semantics are covered by
-  an explicit design and interop test.
+- Next slice: evaluate the remaining VLESS compatibility gaps separately;
+  encrypted UDP is now covered by the following slice.
+
+## 2026-10-01 VLESS Native Encryption Encrypted UDP
+
+- Baseline: local `master` `98fb6177` after native 0-RTT and outer transport
+  validation. The existing datagram path already frames VLESS UDP as length +
+  payload over a VLESS UDP request; the missing piece was allowing the native
+  EncryptionStream to wrap that same stream for encrypted UDP.
+- Completed: removed the encrypted-UDP runtime rejection and report UDP support
+  from the VLESS handler whenever the configured outbound has `udp: true`. The
+  existing VLESS datagram framing is therefore carried inside the same native
+  1-RTT encryption records used for TCP streams. Added a handler-level UDP
+  capability regression test and an Xray interop test using a local UDP echo
+  server.
+- Compatibility boundary: this slice covers native `mlkem768x25519plus`
+  1-RTT encryption over the existing TCP-carried VLESS UDP path. It does not
+  claim XUDP/`packet-encoding: xudp` support, 0-RTT UDP, or a UDP transport
+  (`network: udp`). Those remain separate compatibility questions.
+- Verification: the focused encrypted-UDP handler test passed;
+  `cargo clippy -p clash-lib --all-targets --all-features -- -D warnings`
+  passed; `bash -n` passed; and
+  `clash-lib/tests/vless_native_encryption_udp_xray_interop.sh` passed against
+  Xray 26.2.6 with a SOCKS5 UDP-associate → Chimera → encrypted VLESS UDP →
+  Xray → local UDP echo round trip.
+- Next slice: evaluate XUDP/packet-encoding compatibility separately, then
+  revisit any remaining transport/security matrix gaps.

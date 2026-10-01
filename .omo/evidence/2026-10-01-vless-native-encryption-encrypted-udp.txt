@@ -1,0 +1,18 @@
+Task: VLESS native encryption encrypted UDP
+Implementation change: encrypted UDP is now allowed through the existing
+VLESS datagram framing and native EncryptionStream.
+
+Verification:
+- cargo test -p clash-lib --features vless-encryption --lib encrypted_vless_supports_udp
+  Result: 1 passed, 0 failed
+- cargo clippy -p clash-lib --all-targets --all-features -- -D warnings
+  Result: passed
+- bash -n clash-lib/tests/vless_native_encryption_udp_xray_interop.sh
+  Result: passed
+- clash-lib/tests/vless_native_encryption_udp_xray_interop.sh
+  Result: PASS native VLESS 1-RTT encrypted UDP
+  Result: PASS against Xray 26.2.6 (12ee51e, linux/amd64)
+
+The interop test uses a SOCKS5 UDP ASSOCIATE, a local UDP echo server, and an
+Xray VLESS inbound with native VLESS Encryption decryption. It validates one
+complete datagram round trip through Chimera's encrypted VLESS UDP path.
