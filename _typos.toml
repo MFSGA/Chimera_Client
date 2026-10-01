@@ -1,0 +1,20 @@
+[default]
+locale = "en"
+
+[default.extend-words]
+# Explicit Congestion Notification codepoints and names from etherparse.
+ECT = "ECT"
+# Linux rtnetlink output-interface attribute name.
+Oif = "Oif"
+# TCP retransmission timeout acronym.
+RTO = "RTO"
+# libc's msg_controllen field is part of the platform API.
+controllen = "controllen"
+# Intentional partial-read fixtures in Reality buffer tests.
+worl = "worl"
+
+[files]
+extend-exclude = [
+    "clash-dns/src/resources/test.cert",
+    "clash-netstack/examples/flamegraph.svg",
+]
