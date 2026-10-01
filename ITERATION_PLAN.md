@@ -338,3 +338,19 @@ Each item must be implemented, tested, and committed separately.
 - Next slice: validate supported outer TLS/XHTTP combinations against Xray,
   then consider encrypted UDP and 0-RTT separately with explicit compatibility
   and replay-safety design; none is implied by the direct-TCP 1-RTT result.
+
+## 2026-10-01 VLESS Native Encryption Outer TLS/XHTTP Interop
+
+- Baseline: local `master` `cd4457f9`. The direct-TCP native 1-RTT interop
+  already passed against Xray 26.2.6; the remaining supported outer-layer slice
+  was standard TLS over RAW/TCP and XHTTP over TLS.
+- Completed: added
+  `clash-lib/tests/vless_native_encryption_transport_xray_interop.sh`, which
+  generates temporary TLS credentials with Xray, derives matching VLESS
+  Encryption credentials, and exercises both RAW+TLS and XHTTP+TLS through a
+  local SOCKS-to-echo round trip.
+- Verification: `bash -n` passed; the interop script passed both cases against
+  Xray 26.2.6. No runtime code changes were required by this validation slice.
+- Next slice: consider encrypted UDP and 0-RTT separately, with explicit
+  compatibility and replay-safety design; neither is implied by the TLS/XHTTP
+  interop result.

@@ -1,0 +1,15 @@
+Task: VLESS native encryption outer TLS/XHTTP interoperability
+Commit baseline: cd4457f9
+
+Verification commands:
+- bash -n clash-lib/tests/vless_native_encryption_transport_xray_interop.sh
+- clash-lib/tests/vless_native_encryption_transport_xray_interop.sh
+
+Result:
+- PASS native VLESS 1-RTT over tls
+- PASS native VLESS 1-RTT over xhttp-tls
+- PASS VLESS native 1-RTT outer TLS/XHTTP interop against Xray 26.2.6
+  (Xray, Penetrates Everything.) 12ee51e (go1.25.7 linux/amd64)
+
+The interop script used temporary Xray-generated TLS credentials and a local
+SOCKS-to-echo round trip. No runtime source changes were needed for this slice.
