@@ -20,6 +20,7 @@ pub struct OutboundDatagramVless {
     inner: AnyStream,
     remote_addr: SocksAddr,
     xudp: bool,
+    packet_addr: bool,
     xudp_request_written: bool,
     xudp_read_buf: BytesMut,
 
@@ -38,11 +39,17 @@ pub struct OutboundDatagramVless {
 }
 
 impl OutboundDatagramVless {
-    pub fn new(inner: AnyStream, remote_addr: SocksAddr, xudp: bool) -> Self {
+    pub fn new(
+        inner: AnyStream,
+        remote_addr: SocksAddr,
+        xudp: bool,
+        packet_addr: bool,
+    ) -> Self {
         Self {
             inner,
             remote_addr,
             xudp,
+            packet_addr,
             xudp_request_written: false,
             xudp_read_buf: BytesMut::new(),
             write_buf: BytesMut::new(),
@@ -99,6 +106,30 @@ impl OutboundDatagramVless {
             self.write_buf.put_u8(2); // UDP
             destination.write_to_buf_vmess(&mut self.write_buf);
             self.write_buf.put_u16(payload.len() as u16);
+            self.write_buf.put_slice(payload);
+        } else if self.packet_addr {
+            if matches!(destination, SocksAddr::Domain(_, _)) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "VLESS packetaddr does not support domain destinations",
+                ));
+            }
+            let address_len = destination.size();
+            let frame_len =
+                address_len.checked_add(payload.len()).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "VLESS packetaddr frame is too large",
+                    )
+                })?;
+            if frame_len > MAX_PACKET_LENGTH {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "VLESS packetaddr frame is too large",
+                ));
+            }
+            self.write_buf.put_u16(frame_len as u16);
+            destination.write_to_buf_vmess(&mut self.write_buf);
             self.write_buf.put_slice(payload);
         } else {
             // Raw VLESS UDP packet encoding: 2-byte length + payload.
@@ -168,7 +199,15 @@ impl OutboundDatagramVless {
                     "XUDP frame is not UDP",
                 ));
             }
-            parse_xudp_address(&self.xudp_read_buf[7..meta_end])?
+            let (destination, consumed) =
+                parse_port_then_address(&self.xudp_read_buf[7..meta_end])?;
+            if consumed != meta_end - 7 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "XUDP destination has trailing metadata",
+                ));
+            }
+            destination
         };
 
         if options & 1 == 0 {
@@ -198,6 +237,89 @@ impl OutboundDatagramVless {
             dst_addr: destination,
             inbound_user: None,
         }))
+    }
+
+    fn try_decode_packet_addr_frame(&mut self) -> io::Result<PacketAddrDecode> {
+        if self.xudp_read_buf.len() < 2 {
+            return Ok(PacketAddrDecode::Incomplete);
+        }
+
+        let frame_len =
+            u16::from_be_bytes([self.xudp_read_buf[0], self.xudp_read_buf[1]])
+                as usize;
+        if frame_len == 0 {
+            self.xudp_read_buf.advance(2);
+            return Ok(PacketAddrDecode::Skip);
+        }
+        if frame_len > MAX_PACKET_LENGTH {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("VLESS packetaddr frame is too large: {frame_len}"),
+            ));
+        }
+
+        let total_len = 2 + frame_len;
+        if self.xudp_read_buf.len() < total_len {
+            return Ok(PacketAddrDecode::Incomplete);
+        }
+
+        let frame = &self.xudp_read_buf[2..total_len];
+        let (destination, address_len) = parse_port_then_address(frame)?;
+        if matches!(destination, SocksAddr::Domain(_, _)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "VLESS packetaddr response contains a domain destination",
+            ));
+        }
+
+        let data = frame[address_len..].to_vec();
+        self.xudp_read_buf.advance(total_len);
+        if data.is_empty() {
+            return Ok(PacketAddrDecode::Skip);
+        }
+
+        Ok(PacketAddrDecode::Packet(UdpPacket {
+            data,
+            src_addr: destination.clone(),
+            dst_addr: destination,
+            inbound_user: None,
+        }))
+    }
+
+    fn poll_next_packet_addr(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<UdpPacket>> {
+        loop {
+            match self.try_decode_packet_addr_frame() {
+                Ok(PacketAddrDecode::Packet(packet)) => {
+                    return Poll::Ready(Some(packet));
+                }
+                Ok(PacketAddrDecode::Skip) => continue,
+                Ok(PacketAddrDecode::Incomplete) => {}
+                Err(err) => {
+                    debug!("failed to decode VLESS packetaddr frame: {err}");
+                    return Poll::Ready(None);
+                }
+            }
+
+            let mut scratch = [0u8; 8192];
+            let mut read_buf = ReadBuf::new(&mut scratch);
+            match Pin::new(&mut self.inner).poll_read(cx, &mut read_buf) {
+                Poll::Ready(Ok(())) => {
+                    let n = read_buf.filled().len();
+                    if n == 0 {
+                        return Poll::Ready(None);
+                    }
+                    self.xudp_read_buf.extend_from_slice(&scratch[..n]);
+                }
+                Poll::Ready(Err(err)) => {
+                    debug!("failed to read VLESS packetaddr frame: {err}");
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
     }
 
     fn poll_next_xudp(&mut self, cx: &mut Context<'_>) -> Poll<Option<UdpPacket>> {
@@ -242,7 +364,13 @@ enum XudpDecode {
     End,
 }
 
-fn parse_xudp_address(buf: &[u8]) -> io::Result<SocksAddr> {
+enum PacketAddrDecode {
+    Incomplete,
+    Skip,
+    Packet(UdpPacket),
+}
+
+fn parse_port_then_address(buf: &[u8]) -> io::Result<(SocksAddr, usize)> {
     if buf.len() < 3 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -259,10 +387,13 @@ fn parse_xudp_address(buf: &[u8]) -> io::Result<SocksAddr> {
                     "truncated XUDP IPv4 destination",
                 ));
             }
-            Ok(SocksAddr::from((
-                std::net::Ipv4Addr::new(buf[3], buf[4], buf[5], buf[6]),
-                port,
-            )))
+            Ok((
+                SocksAddr::from((
+                    std::net::Ipv4Addr::new(buf[3], buf[4], buf[5], buf[6]),
+                    port,
+                )),
+                7,
+            ))
         }
         0x02 => {
             let len = buf[3] as usize;
@@ -277,7 +408,7 @@ fn parse_xudp_address(buf: &[u8]) -> io::Result<SocksAddr> {
                     io::Error::new(io::ErrorKind::InvalidData, "invalid XUDP domain")
                 })?
                 .to_owned();
-            Ok(SocksAddr::Domain(domain, port))
+            Ok((SocksAddr::Domain(domain, port), 4 + len))
         }
         0x03 => {
             if buf.len() < 19 {
@@ -288,7 +419,10 @@ fn parse_xudp_address(buf: &[u8]) -> io::Result<SocksAddr> {
             }
             let mut octets = [0u8; 16];
             octets.copy_from_slice(&buf[3..19]);
-            Ok(SocksAddr::from((std::net::Ipv6Addr::from(octets), port)))
+            Ok((
+                SocksAddr::from((std::net::Ipv6Addr::from(octets), port)),
+                19,
+            ))
         }
         atyp => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -411,6 +545,9 @@ impl Stream for OutboundDatagramVless {
         if this.xudp {
             return this.poll_next_xudp(cx);
         }
+        if this.packet_addr {
+            return this.poll_next_packet_addr(cx);
+        }
 
         let mut inner = Pin::new(&mut this.inner);
 
@@ -526,7 +663,7 @@ mod tests {
         let (client, mut server) = tokio::io::duplex(128 * 1024);
         let remote: SocksAddr = "1.1.1.1:53".parse().expect("test address");
         let mut datagram =
-            OutboundDatagramVless::new(Box::new(client), remote, false);
+            OutboundDatagramVless::new(Box::new(client), remote, false, false);
         let payload = vec![0x5a; 9 * 1024];
 
         datagram
@@ -551,7 +688,7 @@ mod tests {
         let (client, mut server) = tokio::io::duplex(4096);
         let remote: SocksAddr = "1.1.1.1:53".parse().expect("test address");
         let mut datagram =
-            OutboundDatagramVless::new(Box::new(client), remote, true);
+            OutboundDatagramVless::new(Box::new(client), remote, true, false);
 
         datagram
             .send(packet(b"abc".to_vec()))
@@ -595,7 +732,7 @@ mod tests {
         let (client, mut server) = tokio::io::duplex(4096);
         let remote: SocksAddr = "1.1.1.1:53".parse().expect("test address");
         let mut datagram =
-            OutboundDatagramVless::new(Box::new(client), remote, true);
+            OutboundDatagramVless::new(Box::new(client), remote, true, false);
 
         let frame = [
             0, 12, 0, 0, 2, 1, 2, 0, 53, 1, 8, 8, 8, 8, 0, 3, b'x', b'y', b'z',
@@ -610,11 +747,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn packetaddr_encodes_and_decodes_destination() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let remote: SocksAddr = "1.1.1.1:53".parse().expect("test address");
+        let mut datagram =
+            OutboundDatagramVless::new(Box::new(client), remote, false, true);
+
+        datagram
+            .send(packet(b"abc".to_vec()))
+            .await
+            .expect("packetaddr packet");
+        let mut wire = vec![0u8; 12];
+        server
+            .read_exact(&mut wire)
+            .await
+            .expect("packetaddr frame");
+        assert_eq!(&wire[..], &[0, 10, 0, 53, 1, 1, 1, 1, 1, b'a', b'b', b'c']);
+
+        let response = [0, 10, 0, 53, 1, 8, 8, 8, 8, b'x', b'y', b'z'];
+        let (client2, mut server2) = tokio::io::duplex(4096);
+        let remote2: SocksAddr = "1.1.1.1:53".parse().expect("test address");
+        let mut reader =
+            OutboundDatagramVless::new(Box::new(client2), remote2, false, true);
+        tokio::spawn(async move {
+            server2
+                .write_all(&response)
+                .await
+                .expect("write packetaddr response");
+        });
+        let packet = reader.next().await.expect("packetaddr response");
+        assert_eq!(packet.data, b"xyz");
+        assert_eq!(packet.dst_addr, "8.8.8.8:53".parse().unwrap());
+    }
+
+    #[tokio::test]
+    async fn packetaddr_rejects_domain_destinations() {
+        let (client, _server) = tokio::io::duplex(4096);
+        let remote: SocksAddr = "example.com:443".parse().expect("test address");
+        let mut datagram =
+            OutboundDatagramVless::new(Box::new(client), remote, false, true);
+        let domain: SocksAddr = "example.com:443".parse().expect("test address");
+        let err = datagram
+            .send(UdpPacket {
+                data: b"abc".to_vec(),
+                src_addr: domain.clone(),
+                dst_addr: domain,
+                inbound_user: None,
+            })
+            .await
+            .expect_err("packetaddr must reject domain destinations");
+        assert!(
+            err.to_string()
+                .contains("does not support domain destinations")
+        );
+    }
+
+    #[tokio::test]
     async fn udp_datagram_above_u16_frame_limit_is_rejected() {
         let (client, _server) = tokio::io::duplex(1024);
         let remote: SocksAddr = "1.1.1.1:53".parse().expect("test address");
         let mut datagram =
-            OutboundDatagramVless::new(Box::new(client), remote, false);
+            OutboundDatagramVless::new(Box::new(client), remote, false, false);
 
         let err = datagram
             .send(packet(vec![0u8; MAX_PACKET_LENGTH + 1]))

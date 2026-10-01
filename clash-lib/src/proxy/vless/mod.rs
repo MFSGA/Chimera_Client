@@ -44,6 +44,7 @@ pub struct HandlerOptions {
     pub uuid: String,
     pub udp: bool,
     pub xudp: bool,
+    pub packet_addr: bool,
     pub transport: Option<Box<dyn Transport>>,
     pub tls: Option<Box<dyn Transport>>,
     pub flow: Option<String>,
@@ -119,6 +120,7 @@ impl Handler {
             &sess.destination,
             is_udp,
             self.opts.xudp,
+            self.opts.packet_addr,
             self.opts.flow.clone(),
         )?;
 
@@ -328,6 +330,7 @@ impl OutboundHandler for Handler {
                 stream,
                 sess.destination.clone(),
                 self.opts.xudp,
+                self.opts.packet_addr,
             );
             let chained = ChainedDatagramWrapper::new(datagram);
             chained.append_to_chain(self.name()).await;
@@ -341,6 +344,7 @@ impl OutboundHandler for Handler {
                 stream,
                 sess.destination.clone(),
                 self.opts.xudp,
+                self.opts.packet_addr,
             );
             let chained = ChainedDatagramWrapper::new(datagram);
             chained.append_to_chain(self.name()).await;
@@ -363,6 +367,7 @@ impl OutboundHandler for Handler {
             stream,
             sess.destination.clone(),
             self.opts.xudp,
+            self.opts.packet_addr,
         );
 
         let chained = ChainedDatagramWrapper::new(d);
@@ -442,6 +447,7 @@ mod reuse_tests {
             uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
             udp: false,
             xudp: false,
+            packet_addr: false,
             transport: None,
             tls: None,
             flow: None,
@@ -468,6 +474,7 @@ mod reuse_tests {
             uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
             udp: true,
             xudp: false,
+            packet_addr: false,
             transport: None,
             tls: None,
             flow: None,
@@ -487,6 +494,7 @@ mod reuse_tests {
             uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
             udp: true,
             xudp: false,
+            packet_addr: false,
             transport: Some(Box::new(OwnedDialTransport)),
             tls: None,
             flow: None,
@@ -521,6 +529,7 @@ mod reuse_tests {
             uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
             udp: true,
             xudp: false,
+            packet_addr: false,
             transport: Some(Box::new(OwnedDialTransport)),
             tls: None,
             flow: Some("xtls-rprx-vision".to_owned()),
@@ -555,6 +564,7 @@ mod reuse_tests {
             uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
             udp: true,
             xudp: false,
+            packet_addr: false,
             transport: Some(Box::new(ReuseTransport)),
             tls: None,
             flow: None,
@@ -582,6 +592,7 @@ mod reuse_tests {
             uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
             udp: true,
             xudp: false,
+            packet_addr: false,
             transport: Some(Box::new(ReuseTransport)),
             tls: None,
             flow: Some("xtls-rprx-vision".to_owned()),
@@ -933,6 +944,7 @@ mod tests {
             flow: None,
             udp: true,
             xudp: false,
+            packet_addr: false,
             tls: tls_client(None),
             transport: Some(Box::new(ws_client)),
             encryption: None,
@@ -980,6 +992,7 @@ mod tests {
             flow: None,
             udp: false,
             xudp: false,
+            packet_addr: false,
             tls: Some(Box::new(tls)),
             transport: Some(Box::new(grpc_client)),
             encryption: None,
@@ -1020,6 +1033,7 @@ mod tests {
             flow: None,
             udp: false,
             xudp: false,
+            packet_addr: false,
             tls: Some(Box::new(tls)),
             transport: None,
             encryption: None,

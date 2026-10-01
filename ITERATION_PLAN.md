@@ -422,8 +422,31 @@ Each item must be implemented, tested, and committed separately.
   Xray 26.2.6, exercising native 1-RTT VLESS Encryption + `packet-encoding: xudp`
   + outer TLS + SOCKS5 UDP. A manual XHTTP+TLS variant also completed the same
   round trip.
-- Compatibility boundary: this slice does not implement V2Ray `packetaddr`;
-  that remains intentionally explicit rather than silently falling back to a
-  different wire format.
-- Next slice: implement and interop-test `packetaddr` separately, then audit
-  the remaining VLESS transport/security combinations.
+## 2026-10-01 VLESS packetaddr framing
+
+- Baseline: local `master` `3b1e2f41` after XUDP / `packet-encoding: xudp`.
+  V2Ray/sing-vmess packetaddr uses the magic destination
+  `sp.packet-addr.v2fly.arpa` and prefixes each packet with a port-then-address
+  header; packetaddr supports IPv4/IPv6 but not FQDN destinations.
+- Completed: added `packet-encoding: packetaddr`. VLESS uses the UDP command
+  with the packetaddr magic FQDN, while each datagram carries its actual IP
+  destination in the packet payload before the user bytes. Response framing is
+  decoded symmetrically, and FQDN packetaddr destinations are rejected rather
+  than silently encoded with the wrong address family.
+- Native encryption integration: packetaddr framing is applied below the same
+  VLESS native EncryptionStream, so `mlkem768x25519plus.native.1rtt` can carry
+  packetaddr bytes without changing the encryption record format. The external
+  V2Ray interop used `encryption: none` because V2Ray 5.41.0 does not implement
+  the Xray-native VLESS Encryption mode; native-encryption packetaddr coverage
+  is therefore codec/unit coverage rather than a cross-implementation crypto
+  claim.
+- Verification: focused packetaddr stream, resolver, encoder, decoder, and
+  domain-rejection tests passed; the full `clash-lib` unit suite with
+  `vless-encryption` passed (629 passed, 11 ignored);
+  `cargo clippy -p clash-lib --all-targets --all-features -- -D warnings`
+  passed; and `clash-lib/tests/vless_packetaddr_v2ray_interop.sh` passed against
+  V2Ray 5.41.0. The earlier Xray 26.2.6 native-encryption XUDP/TLS interop
+  also remains passing.
+- Next slice: audit the remaining VLESS transport/security matrix, especially
+  packetaddr/XHTTP and Vision/REALITY combinations, before treating the full
+  compatibility matrix as complete.

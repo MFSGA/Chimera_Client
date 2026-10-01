@@ -14,6 +14,7 @@ const VLESS_VERSION: u8 = 0;
 const VLESS_COMMAND_TCP: u8 = 1;
 const VLESS_COMMAND_UDP: u8 = 2;
 const VLESS_COMMAND_MUX: u8 = 3;
+const VLESS_PACKET_ADDR_MAGIC: &str = "sp.packet-addr.v2fly.arpa";
 const XTLS_VISION_FLOW: &str = "xtls-rprx-vision";
 
 struct PendingWrite {
@@ -35,6 +36,7 @@ pub struct VlessStream {
     destination: SocksAddr,
     is_udp: bool,
     xudp: bool,
+    packet_addr: bool,
     flow: Option<String>,
 }
 
@@ -45,6 +47,7 @@ impl VlessStream {
         destination: &SocksAddr,
         is_udp: bool,
         xudp: bool,
+        packet_addr: bool,
         flow: Option<String>,
     ) -> io::Result<Self> {
         let uuid = uuid::Uuid::parse_str(uuid).map_err(|_| {
@@ -66,6 +69,7 @@ impl VlessStream {
             destination: destination.clone(),
             is_udp,
             xudp,
+            packet_addr,
             flow,
         })
     }
@@ -91,7 +95,14 @@ impl VlessStream {
             buf.put_u8(VLESS_COMMAND_TCP);
         }
 
-        if !(self.is_udp && self.xudp) {
+        if self.is_udp && self.xudp {
+            // XUDP carries the per-packet destination in its mux frames.
+        } else if self.is_udp && self.packet_addr {
+            // PacketAddr uses a VLESS UDP request to a magic FQDN and carries
+            // the actual destination in each UDP payload frame.
+            SocksAddr::Domain(VLESS_PACKET_ADDR_MAGIC.to_owned(), 0)
+                .write_to_buf_vmess(&mut buf);
+        } else {
             self.destination.write_to_buf_vmess(&mut buf);
         }
         buf
@@ -326,7 +337,7 @@ impl AsyncWrite for VlessStream {
 mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use super::{VlessStream, XTLS_VISION_FLOW};
+    use super::{VLESS_PACKET_ADDR_MAGIC, VlessStream, XTLS_VISION_FLOW};
     use crate::session::SocksAddr;
 
     const TEST_UUID: &str = "5415d8e0-df92-3655-afa4-b79de66413f5";
@@ -341,9 +352,51 @@ mod tests {
             &SocksAddr::Domain("example.com".to_owned(), 443),
             false,
             false,
+            false,
             flow,
         )
         .expect("stream should build")
+    }
+
+    #[test]
+    fn vless_xudp_uses_mux_command_without_request_destination() {
+        let (io, _) = tokio::io::duplex(1);
+        let stream = VlessStream::new(
+            Box::new(io),
+            TEST_UUID,
+            &SocksAddr::Domain("example.com".to_owned(), 443),
+            true,
+            true,
+            false,
+            None,
+        )
+        .expect("stream should build");
+
+        let header = stream.build_handshake_header();
+        assert_eq!(header.len(), 19);
+        assert_eq!(header[18], 3, "XUDP uses the VLESS mux command");
+    }
+
+    #[test]
+    fn vless_packetaddr_uses_magic_destination() {
+        let (io, _) = tokio::io::duplex(1);
+        let stream = VlessStream::new(
+            Box::new(io),
+            TEST_UUID,
+            &SocksAddr::Domain("example.com".to_owned(), 443),
+            true,
+            false,
+            true,
+            None,
+        )
+        .expect("stream should build");
+
+        let header = stream.build_handshake_header();
+        assert_eq!(header[18], 2, "packetaddr uses the VLESS UDP command");
+        assert_eq!(&header[19..21], &[0, 0]);
+        assert_eq!(header[21], 2);
+        let len = header[22] as usize;
+        assert_eq!(&header[23..23 + len], VLESS_PACKET_ADDR_MAGIC.as_bytes());
     }
 
     #[test]

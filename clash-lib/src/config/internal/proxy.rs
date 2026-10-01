@@ -510,7 +510,7 @@ pub struct OutboundVless {
     pub udp: Option<bool>,
     /// Enable Xray-compatible VLESS XUDP packet encoding.
     pub xudp: Option<bool>,
-    /// UDP packet encoding (`xudp` is supported; `packetaddr` remains unsupported).
+    /// UDP packet encoding (`xudp` and `packetaddr` are supported).
     pub packet_encoding: Option<String>,
     pub tls: Option<bool>,
     pub alpn: Option<Vec<String>>,

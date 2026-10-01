@@ -89,6 +89,7 @@ impl TryFrom<&OutboundVless> for Handler {
             uuid: s.uuid.clone(),
             udp: s.udp.unwrap_or(true),
             xudp: resolve_vless_xudp(s)?,
+            packet_addr: resolve_vless_packet_addr(s)?,
             transport,
             tls: build_tls_transport(network, s, skip_cert_verify)?,
             flow: s.flow.clone(),
@@ -97,26 +98,32 @@ impl TryFrom<&OutboundVless> for Handler {
     }
 }
 
-fn resolve_vless_xudp(s: &OutboundVless) -> Result<bool, Error> {
-    let explicit = s.xudp.unwrap_or(false);
+fn resolve_vless_packet_encoding(s: &OutboundVless) -> Result<(bool, bool), Error> {
+    let explicit_xudp = s.xudp.unwrap_or(false);
     match s.packet_encoding.as_deref().map(str::trim) {
-        None | Some("") => Ok(explicit),
-        Some("xudp") => Ok(true),
+        None | Some("") => Ok((explicit_xudp, false)),
+        Some("xudp") => Ok((true, false)),
         Some("packetaddr" | "packet") => {
-            if explicit {
+            if explicit_xudp {
                 return Err(Error::InvalidConfig(
                     "vless xudp cannot be combined with packet-encoding: packetaddr"
                         .to_owned(),
                 ));
             }
-            Err(Error::InvalidConfig(
-                "vless packet-encoding: packetaddr is not supported yet".to_owned(),
-            ))
+            Ok((false, true))
         }
         Some(other) => Err(Error::InvalidConfig(format!(
             "unsupported vless packet-encoding: {other}"
         ))),
     }
+}
+
+fn resolve_vless_xudp(s: &OutboundVless) -> Result<bool, Error> {
+    Ok(resolve_vless_packet_encoding(s)?.0)
+}
+
+fn resolve_vless_packet_addr(s: &OutboundVless) -> Result<bool, Error> {
+    Ok(resolve_vless_packet_encoding(s)?.1)
 }
 
 fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
@@ -1912,9 +1919,10 @@ mod tests {
         build_xhttp_padding_config, build_xhttp_reuse_policy,
         build_xhttp_session_config, build_xhttp_uplink_config,
         build_xhttp_upload_endpoint_config, normalized_xhttp_path, parse_xhttp_mode,
-        resolve_vless_alpn, resolve_vless_xudp, resolve_xhttp_http_version,
-        resolve_xhttp_max_each_post_bytes, resolve_xhttp_min_posts_interval_ms,
-        resolve_xhttp_no_grpc_header, validate_vless_config,
+        resolve_vless_alpn, resolve_vless_packet_addr, resolve_vless_xudp,
+        resolve_xhttp_http_version, resolve_xhttp_max_each_post_bytes,
+        resolve_xhttp_min_posts_interval_ms, resolve_xhttp_no_grpc_header,
+        validate_vless_config,
     };
 
     #[cfg(feature = "ws")]
@@ -1950,14 +1958,19 @@ mod tests {
     }
 
     #[test]
-    fn vless_packetaddr_is_rejected_explicitly() {
+    fn vless_packetaddr_enables_packet_addr_mode() {
         let outbound = OutboundVless {
             packet_encoding: Some("packetaddr".to_owned()),
             ..Default::default()
         };
-        let err = resolve_vless_xudp(&outbound)
-            .expect_err("packetaddr is not implemented");
-        assert!(err.to_string().contains("packetaddr is not supported yet"));
+        assert!(
+            resolve_vless_packet_addr(&outbound)
+                .expect("packetaddr should be accepted")
+        );
+        assert!(
+            !resolve_vless_xudp(&outbound)
+                .expect("packetaddr should not enable xudp")
+        );
     }
 
     #[test]
