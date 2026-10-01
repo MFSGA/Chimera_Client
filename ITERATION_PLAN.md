@@ -447,6 +447,17 @@ Each item must be implemented, tested, and committed separately.
   passed; and `clash-lib/tests/vless_packetaddr_v2ray_interop.sh` passed against
   V2Ray 5.41.0. The earlier Xray 26.2.6 native-encryption XUDP/TLS interop
   also remains passing.
-- Next slice: audit the remaining VLESS transport/security matrix, especially
-  packetaddr/XHTTP and Vision/REALITY combinations, before treating the full
-  compatibility matrix as complete.
+## 2026-10-01 VLESS Compatibility Matrix Audit
+
+- Confirmed boundaries: native VLESS Encryption is intentionally rejected with
+  `xtls-rprx-vision` and REALITY in the current runtime, while XUDP and
+  packetaddr are independent UDP payload framings below the VLESS security
+  stream.
+- Verified combinations in this iteration: native Encryption + XUDP + TLS
+  against Xray 26.2.6; native Encryption + XUDP + XHTTP+TLS via the manual
+  transport variant; packetaddr + plain VLESS against V2Ray 5.41.0; and the
+  complete unit suite with all VLESS encryption tests enabled.
+- Remaining work is compatibility expansion rather than an unbounded claim of
+  support: packetaddr over every alternate outer transport, Vision/REALITY with
+  native encryption, and any additional legacy packet-encoding aliases should
+  be validated or explicitly rejected.
