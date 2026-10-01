@@ -59,9 +59,9 @@ impl TlsState {
         !matches!(*self, Self::ReadShutdown | Self::FullyShutdown)
     }
 
-    /// Check if the connection is writeable
+    /// Check if the connection is writable
     #[inline]
-    pub fn writeable(&self) -> bool {
+    pub fn writable(&self) -> bool {
         !matches!(*self, Self::WriteShutdown | Self::FullyShutdown)
     }
 }
@@ -294,7 +294,7 @@ where
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         // Check if write side is shut down
-        if !self.state.writeable() {
+        if !self.state.writable() {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "write side is shut down",
@@ -400,7 +400,7 @@ where
         }
 
         // 2. Send close_notify once (when write side is still open)
-        if self.state.writeable() {
+        if self.state.writable() {
             self.session.send_close_notify();
             self.state.shutdown_write();
         }
