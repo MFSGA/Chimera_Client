@@ -1,22 +1,62 @@
 {
   description = "Chimera Client development environment";
 
-  # Match the nixpkgs revision used by this NixOS installation without
-  # requiring GitHub access when entering the development shell.
-  inputs.nixpkgs.url =
-    "path:/nix/store/pzxxxg9vvzk63122vj38lcmqg9dl6qxk-nixos-26.05.1947.a0374025a863/nixos";
+  # Use a portable, lock-file-pinned nixpkgs source instead of a host-specific
+  # /nix/store path. Flake inputs can be refreshed explicitly with nix flake update.
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
 
   outputs = { self, nixpkgs, ... }:
     let
-      system = "x86_64-linux";
-      pkgs = import nixpkgs { inherit system; };
-      chimeraClient = pkgs.callPackage ./nix/package.nix { };
+      systems = [ "aarch64-darwin" "x86_64-linux" ];
+      forAllSystems = nixpkgs.lib.genAttrs systems;
+      packages = forAllSystems (system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+          chimeraClient = pkgs.callPackage ./nix/package.nix { };
+        in
+        {
+          chimera-client = chimeraClient;
+          default = chimeraClient;
+        }
+      );
+      devShells = forAllSystems (system:
+        let pkgs = import nixpkgs { inherit system; };
+        in {
+          default = pkgs.mkShell {
+            nativeBuildInputs = with pkgs; [
+              cargo
+              cargo-watch
+              cmake
+              git
+              gnumake
+              llvmPackages.libclang
+              llvmPackages.clang
+              nasm
+              ninja
+              nodejs_22
+              pkg-config
+              protobuf
+              rustc
+              rustfmt
+              clippy
+            ];
+
+            buildInputs = with pkgs; [ openssl ];
+
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            RUST_BACKTRACE = "1";
+
+            shellHook = ''
+              echo "Chimera Client development environment"
+              echo "Rust: $(rustc --version)"
+              echo "Node.js: $(node --version)"
+              echo "Run: cargo check --workspace"
+            '';
+          };
+        });
     in
     {
-      packages.${system} = {
-        chimera-client = chimeraClient;
-        default = chimeraClient;
-      };
+      inherit packages;
 
       nixosModules.chimera-client =
         { lib, pkgs, ... }:
@@ -28,36 +68,6 @@
 
       nixosModules.default = self.nixosModules.chimera-client;
 
-      devShells.${system}.default = pkgs.mkShell {
-        nativeBuildInputs = with pkgs; [
-          cargo
-          cargo-watch
-          clang
-          cmake
-          git
-          gnumake
-          llvmPackages.libclang
-          nasm
-          ninja
-          pkg-config
-          protobuf
-          rustc
-          rustfmt
-          clippy
-        ];
-
-        buildInputs = with pkgs; [
-          openssl
-        ];
-
-        LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-        RUST_BACKTRACE = "1";
-
-        shellHook = ''
-          echo "Chimera Client development environment"
-          echo "Rust: $(rustc --version)"
-          echo "Run: cargo check --workspace"
-        '';
-      };
+      inherit devShells;
     };
 }
