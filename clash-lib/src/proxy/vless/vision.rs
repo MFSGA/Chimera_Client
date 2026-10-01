@@ -53,6 +53,7 @@ pub struct VisionStream {
     write_mode: WriteMode,
     pending_write_switch: PendingWriteSwitch,
     write_shutdown_queued: bool,
+    pending_user_write: Option<usize>,
     write_buf: BytesMut,
     write_deframer: FuzzyTlsDeframer,
     read_deframer: FuzzyTlsDeframer,
@@ -87,6 +88,7 @@ impl VisionStream {
             write_mode: WriteMode::Framed,
             pending_write_switch: PendingWriteSwitch::None,
             write_shutdown_queued: false,
+            pending_user_write: None,
             write_buf: BytesMut::new(),
             write_deframer: FuzzyTlsDeframer::new(),
             read_deframer: FuzzyTlsDeframer::new(),
@@ -388,6 +390,17 @@ impl AsyncWrite for VisionStream {
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
 
+        if let Some(consumed) = this.pending_user_write {
+            match this.flush_write_buf(cx) {
+                Poll::Ready(Ok(())) => {
+                    this.pending_user_write = None;
+                    return Poll::Ready(Ok(consumed));
+                }
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
         match this.write_mode {
             WriteMode::DirectTls | WriteMode::DirectRaw => {
                 return Pin::new(&mut this.inner).poll_write(cx, buf);
@@ -419,8 +432,14 @@ impl AsyncWrite for VisionStream {
             }
         };
 
-        ready!(this.flush_write_buf(cx))?;
-        Poll::Ready(Ok(consumed))
+        match this.flush_write_buf(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(consumed)),
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => {
+                this.pending_user_write = Some(consumed);
+                Poll::Pending
+            }
+        }
     }
 
     fn poll_flush(
@@ -470,6 +489,51 @@ mod tests {
                 .unwrap(),
             server,
         )
+    }
+
+    struct PendingOnceWriter {
+        writes: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        pending: bool,
+    }
+
+    impl AsyncRead for PendingOnceWriter {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for PendingOnceWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.pending {
+                self.pending = false;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            self.writes.lock().unwrap().push(buf.to_vec());
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
     }
 
     fn make_vision_with_read_splice_flag() -> (VisionStream, Arc<AtomicBool>) {
@@ -550,6 +614,27 @@ mod tests {
         v.extend_from_slice(&0u16.to_be_bytes());
         v.extend_from_slice(content);
         v
+    }
+
+    #[tokio::test]
+    async fn pending_inner_write_does_not_duplicate_tls_record() {
+        let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = PendingOnceWriter {
+            writes: Arc::clone(&writes),
+            pending: true,
+        };
+        let mut stream =
+            VisionStream::new(Box::new(writer), TEST_UUID_STR.to_owned(), None)
+                .unwrap();
+
+        let payload = tls_record(0x16, Some(1), &[0x00, 0x00, 0x00]);
+        stream.write_all(&payload).await.expect("write TLS record");
+
+        assert_eq!(
+            writes.lock().unwrap().len(),
+            1,
+            "a Pending inner write must not cause Vision to queue the same TLS record twice"
+        );
     }
 
     #[tokio::test]

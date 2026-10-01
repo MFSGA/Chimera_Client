@@ -1,0 +1,31 @@
+Task: VLESS Vision async-write robustness
+Scope: fix Vision framing when the wrapped writer returns Pending after a frame is queued.
+
+Bug:
+- VisionStream queued a TLS record into write_buf.
+- If the wrapped VLESS/encryption stream returned Pending while flushing,
+  VisionStream returned Pending without remembering that the caller's input had
+  already been framed.
+- The retry could queue the same TLS record again.
+- Exploratory native-encryption + Xray Vision interop exposed duplicate identical
+  TLS ClientHello records at the Xray/Vision peer.
+
+Fix:
+- Track pending_user_write in VisionStream.
+- On a retry, finish flushing the already-queued frame and return the original
+  consumed byte count instead of deframing/reframing the caller buffer.
+- Added a PendingOnceWriter regression test that fails if the same TLS record is
+  written twice.
+
+Verification:
+- cargo test -p clash-lib --features vless-encryption --lib
+  Result: 634 passed, 0 failed, 11 ignored
+- cargo clippy -p clash-lib --all-targets --all-features -- -D warnings
+  Result: passed
+- git diff --check
+  Result: passed
+
+Compatibility boundary:
+Native VLESS Encryption + xtls-rprx-vision remains explicitly rejected. The
+pending-write bug is fixed, but a clean end-to-end native-encryption + Vision
+interop result has not yet been established.

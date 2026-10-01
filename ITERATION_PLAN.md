@@ -464,7 +464,13 @@ Each item must be implemented, tested, and committed separately.
   frame rejection.
 - Native VLESS Encryption remains intentionally rejected with
   `xtls-rprx-vision` and REALITY; those are a separate security-stack slice.
-  XHTTP packetaddr cross-implementation coverage is not claimed because the
+  Exploratory Xray 26.2.6 Vision interop exposed a real async-write bug in the
+  Vision framing layer: when its inner writer returned `Pending` after a TLS
+  record had already been queued, the next poll could queue that same record a
+  second time. That bug is now fixed and regression-tested, but native
+  Encryption + Vision still needs a clean end-to-end interop result before the
+  configuration rejection is removed.
+- XHTTP packetaddr cross-implementation coverage is not claimed because the
   available V2Ray 5.41.0 interop target does not provide the corresponding
   XHTTP server transport, while Xray's current VLESS implementation does not
   expose the legacy packetaddr framing as a server-side packet encoding.
