@@ -3,6 +3,7 @@ name = "chimera-dns"
 # repository = { workspace = true }
 version = { workspace = true }
 edition = { workspace = true }
+license = { workspace = true }
 # homepage = { workspace = true }
 # authors = { workspace = true }
 
