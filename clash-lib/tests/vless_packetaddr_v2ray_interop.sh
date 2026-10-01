@@ -5,6 +5,48 @@ ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 CLASH_BIN=${CLASH_BIN:-"$ROOT_DIR/target/debug/clash-rs"}
 V2RAY_IMAGE=${V2RAY_IMAGE:-"v2fly/v2fly-core:latest"}
 UUID=${VLESS_INTEROP_UUID:-"b831381d-6324-4d53-ad4f-8cda48b30811"}
+NETWORK=${VLESS_NETWORK:-tcp}
+
+case "$NETWORK" in
+    tcp)
+        V2RAY_STREAM_SETTINGS=""
+        CLASH_TRANSPORT=""
+        ;;
+    ws)
+        V2RAY_STREAM_SETTINGS=$(cat <<'EOF_WS'
+    ,"streamSettings": {
+      "network": "ws",
+      "wsSettings": {"path": "/vless-packetaddr-ws"}
+    }
+EOF_WS
+)
+        CLASH_TRANSPORT=$(cat <<'EOF_WS'
+    network: ws
+    ws-opts:
+      path: /vless-packetaddr-ws
+EOF_WS
+)
+        ;;
+    grpc)
+        V2RAY_STREAM_SETTINGS=$(cat <<'EOF_GRPC'
+    ,"streamSettings": {
+      "network": "grpc",
+      "grpcSettings": {"serviceName": "vless-packetaddr-grpc"}
+    }
+EOF_GRPC
+)
+        CLASH_TRANSPORT=$(cat <<'EOF_GRPC'
+    network: grpc
+    grpc-opts:
+      grpc-service-name: vless-packetaddr-grpc
+EOF_GRPC
+)
+        ;;
+    *)
+        echo "unsupported VLESS packetaddr interop network: $NETWORK" >&2
+        exit 2
+        ;;
+esac
 
 [[ -x "$CLASH_BIN" ]] || { echo "missing executable: $CLASH_BIN" >&2; exit 2; }
 command -v docker >/dev/null
@@ -57,7 +99,7 @@ cat >"$TMP_DIR/v2ray.json" <<EOF_V2RAY
       "clients": [{"id": "$UUID"}],
       "decryption": "none",
       "packetEncoding": "Packet"
-    }
+    }${V2RAY_STREAM_SETTINGS}
   }],
   "outbounds": [{"protocol": "freedom", "tag": "direct"}]
 }
@@ -81,6 +123,7 @@ proxies:
     udp: true
     packet-encoding: packetaddr
     encryption: none
+${CLASH_TRANSPORT}
 rules:
   - MATCH,v2ray-packetaddr
 EOF_CLASH

@@ -457,7 +457,14 @@ Each item must be implemented, tested, and committed separately.
   against Xray 26.2.6; native Encryption + XUDP + XHTTP+TLS via the manual
   transport variant; packetaddr + plain VLESS against V2Ray 5.41.0; and the
   complete unit suite with all VLESS encryption tests enabled.
-- Remaining work is compatibility expansion rather than an unbounded claim of
-  support: packetaddr over every alternate outer transport, Vision/REALITY with
-  native encryption, and any additional legacy packet-encoding aliases should
-  be validated or explicitly rejected.
+- Compatibility expansion completed for the currently available stream
+  transports: packetaddr was interop-tested against V2Ray 5.41.0 over TCP,
+  WebSocket, and gRPC. The framing is independent of the outer stream wrapper,
+  and the same packetaddr codec passes IPv4/IPv6 unit coverage plus malformed
+  frame rejection.
+- Native VLESS Encryption remains intentionally rejected with
+  `xtls-rprx-vision` and REALITY; those are a separate security-stack slice.
+  XHTTP packetaddr cross-implementation coverage is not claimed because the
+  available V2Ray 5.41.0 interop target does not provide the corresponding
+  XHTTP server transport, while Xray's current VLESS implementation does not
+  expose the legacy packetaddr framing as a server-side packet encoding.

@@ -3,24 +3,33 @@ Implementation: packet-encoding: packetaddr
 
 Verification:
 - cargo test -p clash-lib --features vless-encryption --lib
-  Result: 629 passed, 0 failed, 11 ignored
+  Result: 633 passed, 0 failed, 11 ignored
 - cargo clippy -p clash-lib --all-targets --all-features -- -D warnings
   Result: passed
 - bash -n clash-lib/tests/vless_packetaddr_v2ray_interop.sh
   Result: passed
-- clash-lib/tests/vless_packetaddr_v2ray_interop.sh
+- VLESS_NETWORK=tcp clash-lib/tests/vless_packetaddr_v2ray_interop.sh
+  Result: PASS against V2Ray 5.41.0
+- VLESS_NETWORK=ws clash-lib/tests/vless_packetaddr_v2ray_interop.sh
+  Result: PASS against V2Ray 5.41.0
+- VLESS_NETWORK=grpc clash-lib/tests/vless_packetaddr_v2ray_interop.sh
   Result: PASS against V2Ray 5.41.0
 
 Focused unit coverage:
 - packetaddr magic destination is emitted in the VLESS UDP request header.
 - packetaddr uses port-then-address framing for IPv4/IPv6 destinations.
 - packetaddr response frames decode the destination and payload.
-- FQDN packetaddr destinations are rejected because the packetaddr reference
-  serializer supports IP address families only.
-- packet-encoding:packetaddr resolves to packetaddr mode and not XUDP.
+- IPv6 packetaddr encoding is explicitly covered.
+- empty packetaddr segments are rejected, matching the V2Ray framing contract.
+- FQDN packetaddr destinations are rejected because packetaddr serializes IP
+  address families only.
+- packet-encoding:packetaddr and the legacy packet alias resolve to packetaddr.
+- packet-encoding:packetaddr cannot be combined with xudp:true.
 
 Compatibility note:
 The V2Ray interop test uses encryption:none because V2Ray 5.41.0 does not
 implement Xray-native VLESS Encryption. Native-encryption packetaddr is covered
 by the same framing codec/unit tests but is not claimed as cross-implementation
-crypto interop.
+crypto interop. XHTTP packetaddr cross-implementation interop is also not
+claimed because the available V2Ray target does not provide the required
+server-side XHTTP transport.

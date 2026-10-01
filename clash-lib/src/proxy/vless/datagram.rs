@@ -138,9 +138,10 @@ impl OutboundDatagramVless {
         }
 
         trace!(
-            "encoded VLESS UDP packet: len={}, xudp={}",
+            "encoded VLESS UDP packet: len={}, xudp={}, packetaddr={}",
             payload.len(),
-            self.xudp
+            self.xudp,
+            self.packet_addr
         );
         Ok(())
     }
@@ -248,8 +249,10 @@ impl OutboundDatagramVless {
             u16::from_be_bytes([self.xudp_read_buf[0], self.xudp_read_buf[1]])
                 as usize;
         if frame_len == 0 {
-            self.xudp_read_buf.advance(2);
-            return Ok(PacketAddrDecode::Skip);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "VLESS packetaddr frame cannot be empty",
+            ));
         }
         if frame_len > MAX_PACKET_LENGTH {
             return Err(io::Error::new(
@@ -800,6 +803,51 @@ mod tests {
             err.to_string()
                 .contains("does not support domain destinations")
         );
+    }
+
+    #[tokio::test]
+    async fn packetaddr_encodes_ipv6_destination() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let remote: SocksAddr = "[2001:db8::1]:53".parse().expect("test address");
+        let mut datagram =
+            OutboundDatagramVless::new(Box::new(client), remote, false, true);
+        datagram
+            .send(UdpPacket {
+                data: b"v6".to_vec(),
+                dst_addr: "[2001:db8::2]:5353".parse().unwrap(),
+                ..Default::default()
+            })
+            .await
+            .expect("packetaddr IPv6 packet");
+
+        let mut wire = vec![0u8; 21 + 2];
+        server
+            .read_exact(&mut wire)
+            .await
+            .expect("packetaddr frame");
+        assert_eq!(&wire[..2], &[0, 21]);
+        assert_eq!(&wire[2..4], &[0x14, 0xe9]);
+        assert_eq!(wire[4], 3);
+        assert_eq!(
+            &wire[5..21],
+            "2001:db8::2"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets()
+        );
+        assert_eq!(&wire[21..], b"v6");
+    }
+
+    #[tokio::test]
+    async fn packetaddr_rejects_empty_frame() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let remote: SocksAddr = "1.1.1.1:53".parse().expect("test address");
+        let mut datagram =
+            OutboundDatagramVless::new(Box::new(client), remote, false, true);
+        tokio::spawn(async move {
+            server.write_all(&[0, 0]).await.expect("write empty frame");
+        });
+        assert!(datagram.next().await.is_none());
     }
 
     #[tokio::test]

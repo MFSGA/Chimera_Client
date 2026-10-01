@@ -1974,6 +1974,30 @@ mod tests {
     }
 
     #[test]
+    fn vless_packet_alias_enables_packet_addr_mode() {
+        let outbound = OutboundVless {
+            packet_encoding: Some("packet".to_owned()),
+            ..Default::default()
+        };
+        assert!(
+            resolve_vless_packet_addr(&outbound)
+                .expect("packet alias should be accepted")
+        );
+    }
+
+    #[test]
+    fn vless_packetaddr_conflicts_with_xudp_flag() {
+        let outbound = OutboundVless {
+            xudp: Some(true),
+            packet_encoding: Some("packetaddr".to_owned()),
+            ..Default::default()
+        };
+        let err = resolve_vless_packet_addr(&outbound)
+            .expect_err("packetaddr and xudp must not be combined");
+        assert!(err.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
     fn vless_unknown_packet_encoding_is_rejected() {
         let outbound = OutboundVless {
             packet_encoding: Some("bogus".to_owned()),
