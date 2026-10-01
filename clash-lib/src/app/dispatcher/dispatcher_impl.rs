@@ -40,6 +40,7 @@ pub struct Dispatcher {
     resolver: ThreadSafeDNSResolver,
     manager: Arc<StatisticsManager>,
     tcp_buffer_size: usize,
+    proxy_resolve_local: bool,
     mode: Arc<RwLock<RunMode>>,
     router: ThreadSafeRouter,
 }
@@ -58,12 +59,14 @@ impl Dispatcher {
         mode: RunMode,
         statistics_manager: Arc<StatisticsManager>,
         tcp_buffer_size: Option<usize>,
+        proxy_resolve_local: bool,
     ) -> Self {
         Self {
             outbound_manager,
             resolver,
             manager: statistics_manager,
             tcp_buffer_size: tcp_buffer_size.unwrap_or(DEFAULT_BUFFER_SIZE),
+            proxy_resolve_local,
             mode: Arc::new(RwLock::new(mode)),
             router,
         }
@@ -88,6 +91,76 @@ impl Dispatcher {
         } else {
             resolver.clone()
         }
+    }
+
+    async fn maybe_resolve_proxy_destination_locally(
+        resolver: &ThreadSafeDNSResolver,
+        enabled: bool,
+        outbound_name: &str,
+        sess: &mut Session,
+    ) {
+        if !enabled || outbound_name == PROXY_DIRECT {
+            return;
+        }
+
+        let (host, port) = match &sess.destination {
+            SocksAddr::Domain(host, port) => (host.clone(), *port),
+            SocksAddr::Ip(_) => return,
+        };
+
+        let mut resolved = sess.resolved_ip;
+        if let Some(ip) = resolved
+            && resolver.fake_ip_enabled()
+            && resolver.is_fake_ip(ip).await
+        {
+            resolved = None;
+        }
+
+        if resolved.is_none() {
+            let lookup_resolver = resolver
+                .direct_resolver()
+                .unwrap_or_else(|| resolver.clone());
+            match lookup_resolver.resolve(&host, false).await {
+                Ok(ip) => resolved = ip,
+                Err(error) => {
+                    debug!(
+                        outbound_name,
+                        host = %host,
+                        error = %error,
+                        "local proxy destination resolution failed; keeping domain target"
+                    );
+                    return;
+                }
+            }
+        }
+
+        let Some(ip) = resolved else {
+            debug!(
+                outbound_name,
+                host = %host,
+                "local proxy destination resolution returned no address; keeping domain target"
+            );
+            return;
+        };
+
+        if resolver.fake_ip_enabled() && resolver.is_fake_ip(ip).await {
+            warn!(
+                outbound_name,
+                host = %host,
+                ip = %ip,
+                "local proxy destination resolution returned a fake IP; keeping domain target"
+            );
+            return;
+        }
+
+        sess.resolved_ip = Some(ip);
+        sess.destination = SocksAddr::Ip(SocketAddr::new(ip, port));
+        debug!(
+            outbound_name,
+            host = %host,
+            ip = %ip,
+            "resolved proxy destination locally"
+        );
     }
 
     pub fn statistics_manager(&self) -> Arc<StatisticsManager> {
@@ -151,9 +224,17 @@ impl Dispatcher {
 
         let connect_resolver =
             Self::resolver_for_outbound(&self.resolver, outbound_name);
+        let mut connect_sess = sess.clone();
+        Self::maybe_resolve_proxy_destination_locally(
+            &self.resolver,
+            self.proxy_resolve_local,
+            outbound_name,
+            &mut connect_sess,
+        )
+        .await;
 
         match handler
-            .connect_stream(&sess, connect_resolver)
+            .connect_stream(&connect_sess, connect_resolver)
             .instrument(info_span!("connect_stream", outbound_name = outbound_name,))
             .await
         {
@@ -290,6 +371,7 @@ impl Dispatcher {
         let resolver = self.resolver.clone();
         let mode = self.mode.clone();
         let manager = self.manager.clone();
+        let proxy_resolve_local = self.proxy_resolve_local;
 
         #[rustfmt::skip]
         /*
@@ -386,6 +468,16 @@ impl Dispatcher {
                     };
 
                 let rule_summary = rule_summary(rule.map(Box::as_ref));
+                let mut connect_sess = sess.clone();
+                Self::maybe_resolve_proxy_destination_locally(
+                    &resolver,
+                    proxy_resolve_local,
+                    &outbound_name,
+                    &mut connect_sess,
+                )
+                .await;
+                let outbound_dest = connect_sess.destination.clone();
+
                 debug!(
                     outbound_name = %outbound_name,
                     rule = %rule_summary,
@@ -393,6 +485,7 @@ impl Dispatcher {
                     source = %sess.source,
                     orig_dest = %orig_dest,
                     resolved_dest = %sess.destination,
+                    connect_dest = %outbound_dest,
                     "dispatching udp packet"
                 );
 
@@ -419,7 +512,7 @@ impl Dispatcher {
                         let connect_resolver =
                             Self::resolver_for_outbound(&resolver, &outbound_name);
                         let outbound_datagram = match handler
-                            .connect_datagram(&sess, connect_resolver)
+                            .connect_datagram(&connect_sess, connect_resolver)
                             .await
                         {
                             Ok(v) => v,
@@ -542,7 +635,7 @@ impl Dispatcher {
                         try_queue_outbound_packet(
                             &remote_sender,
                             packet,
-                            dest,
+                            outbound_dest,
                             &sess,
                             &outbound_name,
                             &orig_dest,
@@ -553,7 +646,7 @@ impl Dispatcher {
                         try_queue_outbound_packet(
                             &handle,
                             packet,
-                            dest,
+                            outbound_dest,
                             &sess,
                             &outbound_name,
                             &orig_dest,
@@ -849,7 +942,12 @@ mod tests {
         proxy::datagram::UdpPacket,
         session::{Network, Session, SocksAddr, Type},
     };
-    use std::{future::pending, net::SocketAddr, str::FromStr, sync::Arc};
+    use std::{
+        future::pending,
+        net::{IpAddr, SocketAddr},
+        str::FromStr,
+        sync::Arc,
+    };
     use tokio::sync::mpsc;
 
     #[test]
@@ -873,6 +971,134 @@ mod tests {
         let primary: ThreadSafeDNSResolver = Arc::new(MockClashResolver::new());
         let selected = Dispatcher::resolver_for_outbound(&primary, "PROXY");
         assert!(Arc::ptr_eq(&selected, &primary));
+    }
+
+    #[tokio::test]
+    async fn proxy_local_resolution_replaces_connect_destination() {
+        let real_ip: IpAddr = "203.0.113.7".parse().unwrap();
+        let mut resolver = MockClashResolver::new();
+        resolver.expect_fake_ip_enabled().once().return_const(false);
+        resolver.expect_direct_resolver().once().return_const(None);
+        resolver
+            .expect_resolve()
+            .withf(|host, enhanced| host == "www.google.com" && !enhanced)
+            .once()
+            .returning(move |_, _| Ok(Some(real_ip)));
+        let resolver: ThreadSafeDNSResolver = Arc::new(resolver);
+
+        let mut sess = Session {
+            destination: SocksAddr::Domain("www.google.com".to_owned(), 443),
+            ..Default::default()
+        };
+
+        Dispatcher::maybe_resolve_proxy_destination_locally(
+            &resolver, true, "PROXY", &mut sess,
+        )
+        .await;
+
+        assert_eq!(sess.resolved_ip, Some(real_ip));
+        assert_eq!(
+            sess.destination,
+            SocksAddr::Ip(SocketAddr::new(real_ip, 443))
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_local_resolution_prefers_direct_resolver() {
+        let real_ip: IpAddr = "203.0.113.9".parse().unwrap();
+
+        let mut direct = MockClashResolver::new();
+        direct
+            .expect_resolve()
+            .withf(|host, enhanced| host == "www.google.com" && !enhanced)
+            .once()
+            .returning(move |_, _| Ok(Some(real_ip)));
+        let direct: ThreadSafeDNSResolver = Arc::new(direct);
+        let expected = direct.clone();
+
+        let mut primary = MockClashResolver::new();
+        primary.expect_fake_ip_enabled().once().return_const(false);
+        primary
+            .expect_direct_resolver()
+            .once()
+            .returning(move || Some(expected.clone()));
+        let primary: ThreadSafeDNSResolver = Arc::new(primary);
+
+        let mut sess = Session {
+            destination: SocksAddr::Domain("www.google.com".to_owned(), 443),
+            ..Default::default()
+        };
+
+        Dispatcher::maybe_resolve_proxy_destination_locally(
+            &primary, true, "PROXY", &mut sess,
+        )
+        .await;
+
+        assert_eq!(sess.resolved_ip, Some(real_ip));
+        assert_eq!(
+            sess.destination,
+            SocksAddr::Ip(SocketAddr::new(real_ip, 443))
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_outbound_keeps_domain_when_proxy_local_resolution_is_enabled() {
+        let resolver: ThreadSafeDNSResolver = Arc::new(MockClashResolver::new());
+        let original = SocksAddr::Domain("www.example.com".to_owned(), 443);
+        let mut sess = Session {
+            destination: original.clone(),
+            ..Default::default()
+        };
+
+        Dispatcher::maybe_resolve_proxy_destination_locally(
+            &resolver,
+            true,
+            PROXY_DIRECT,
+            &mut sess,
+        )
+        .await;
+
+        assert_eq!(sess.destination, original);
+        assert_eq!(sess.resolved_ip, None);
+    }
+
+    #[tokio::test]
+    async fn proxy_local_resolution_replaces_existing_fake_resolved_ip() {
+        let fake_ip: IpAddr = "198.19.0.10".parse().unwrap();
+        let real_ip: IpAddr = "203.0.113.8".parse().unwrap();
+        let mut resolver = MockClashResolver::new();
+        resolver
+            .expect_fake_ip_enabled()
+            .times(2)
+            .return_const(true);
+        resolver.expect_direct_resolver().once().return_const(None);
+        resolver
+            .expect_is_fake_ip()
+            .times(2)
+            .returning(move |ip| ip == fake_ip);
+        resolver
+            .expect_resolve()
+            .withf(|host, enhanced| host == "www.google.com" && !enhanced)
+            .once()
+            .returning(move |_, _| Ok(Some(real_ip)));
+        let resolver: ThreadSafeDNSResolver = Arc::new(resolver);
+
+        let mut sess = Session {
+            destination: SocksAddr::Domain("www.google.com".to_owned(), 443),
+            resolved_ip: Some(fake_ip),
+            ..Default::default()
+        };
+
+        Dispatcher::maybe_resolve_proxy_destination_locally(
+            &resolver, true, "PROXY", &mut sess,
+        )
+        .await;
+
+        assert_eq!(sess.resolved_ip, Some(real_ip));
+        assert_eq!(
+            sess.destination,
+            SocksAddr::Ip(SocketAddr::new(real_ip, 443))
+        );
     }
 
     #[tokio::test]

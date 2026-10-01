@@ -1338,6 +1338,10 @@ async fn create_components(
         .experimental
         .as_ref()
         .and_then(|exp| exp.tcp_buffer_size);
+    let proxy_resolve_local = config
+        .experimental
+        .as_ref()
+        .is_some_and(|exp| exp.proxy_resolve_local);
     app::dispatcher::set_closed_flows_cap(
         config
             .experimental
@@ -1354,6 +1358,7 @@ async fn create_components(
         config.general.mode,
         statistics_manager.clone(),
         tcp_buffer_size,
+        proxy_resolve_local,
     ));
 
     debug!("initializing authenticator");

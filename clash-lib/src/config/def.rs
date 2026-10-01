@@ -459,6 +459,13 @@ pub struct Experimental {
     pub tcp_buffer_size: Option<usize>,
     /// max entries in the closed-flows ring buffer (default 50)
     pub closed_flows_cap: Option<usize>,
+    /// Resolve proxy destination domains locally before opening the remote flow.
+    ///
+    /// This preserves the original domain for routing and flow metadata, but
+    /// sends the resolved IP to the selected proxy. It is useful when the
+    /// proxy server's own DNS cannot reliably resolve destination domains.
+    #[serde(default)]
+    pub proxy_resolve_local: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -576,9 +583,25 @@ mod tests {
             .expect("config should parse");
 
         assert_eq!(
-            cfg.experimental.and_then(|exp| exp.closed_flows_cap),
+            cfg.experimental
+                .as_ref()
+                .and_then(|exp| exp.closed_flows_cap),
             Some(64)
         );
+        assert!(
+            !cfg.experimental
+                .as_ref()
+                .is_some_and(|exp| exp.proxy_resolve_local)
+        );
+    }
+
+    #[test]
+    fn experimental_proxy_resolve_local_parses() {
+        let cfg: Config = "experimental:\n  proxy-resolve-local: true"
+            .parse()
+            .expect("config should parse");
+
+        assert!(cfg.experimental.is_some_and(|exp| exp.proxy_resolve_local));
     }
 
     /// Feature-gated test for WireGuard proxy type parsing through the full config.
