@@ -1,0 +1,19 @@
+Task: VLESS native encryption 0-RTT
+Implementation commit: d663c0e7
+
+Verification:
+- cargo test -p clash-lib --features vless-encryption --lib encryption
+  Result: 47 passed, 0 failed
+- cargo test -p clash-lib --features vless-encryption --lib
+  Result: 618 passed, 0 failed, 11 ignored
+- cargo clippy -p clash-lib --all-targets --all-features -- -D warnings
+  Result: passed
+- bash -n clash-lib/tests/vless_native_encryption_0rtt_xray_interop.sh
+  Result: passed
+- clash-lib/tests/vless_native_encryption_0rtt_xray_interop.sh
+  Result: PASS native VLESS 0-RTT: 1-RTT cache bootstrap + cached 0-RTT
+  Result: PASS against Xray 26.2.6 (12ee51e, linux/amd64)
+
+The interop test uses one persistent Chimera Handler/process so the first
+connection seeds the ticket cache and the second connection exercises the
+cached 0-RTT path.

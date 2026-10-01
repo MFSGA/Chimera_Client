@@ -53,10 +53,6 @@ pub struct Handler {
     opts: HandlerOptions,
     connector: tokio::sync::RwLock<Option<Arc<dyn RemoteConnector>>>,
     #[cfg(feature = "vless-encryption")]
-    #[allow(
-        dead_code,
-        reason = "wired into the zero-RTT encryption stream in the next slice"
-    )]
     zero_rtt_cache: Option<Arc<encryption::ZeroRttSessionCache>>,
 }
 

@@ -207,10 +207,6 @@ pub(crate) struct ZeroRttSessionCache {
 }
 
 #[cfg(feature = "vless-encryption")]
-#[allow(
-    dead_code,
-    reason = "cache accessors are wired into the zero-RTT stream in the next slice"
-)]
 impl ZeroRttSessionCache {
     pub(crate) fn snapshot(&self) -> Option<ZeroRttSession> {
         self.snapshot_at(Instant::now())
@@ -260,14 +256,6 @@ impl ZeroRttSessionCache {
             ticket,
             expires_at,
         });
-    }
-
-    pub(crate) fn invalidate(&self) {
-        let mut state = self
-            .state
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *state = None;
     }
 
     pub(crate) fn invalidate_if_pfs_key_matches(
@@ -370,13 +358,6 @@ pub(crate) struct PreparedCrypto {
 }
 
 #[cfg(feature = "vless-encryption")]
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "consumed by the zero-RTT runtime stream in the next slice"
-    )
-)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PreparedZeroRttSession {
     pub(crate) prewrite: Vec<u8>,
@@ -387,13 +368,6 @@ pub(crate) struct PreparedZeroRttSession {
 }
 
 #[cfg(feature = "vless-encryption")]
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "consumed by the zero-RTT runtime stream in the next slice"
-    )
-)]
 impl PreparedZeroRttSession {
     pub(crate) fn write_codec(&self) -> io::Result<EncryptionRecordCodec> {
         EncryptionRecordCodec::new(&self.write_aead_key, [0u8; 12])
@@ -411,10 +385,6 @@ impl PreparedZeroRttSession {
 
 #[cfg(feature = "vless-encryption")]
 impl PreparedCrypto {
-    #[allow(
-        dead_code,
-        reason = "wired into the zero-RTT runtime stream in the next slice"
-    )]
     pub(crate) fn prepare_zero_rtt(
         &self,
         cached: &ZeroRttSession,
@@ -1754,7 +1724,7 @@ mod tests {
         cache.store_at([0x55; ZERO_RTT_PFS_KEY_LEN], [0x66; 16], 30, now);
         assert!(cache.snapshot_at(now).is_some());
 
-        cache.invalidate();
+        assert!(cache.invalidate_if_pfs_key_matches(&[0x55; ZERO_RTT_PFS_KEY_LEN]));
         assert!(cache.snapshot_at(now).is_none());
     }
 

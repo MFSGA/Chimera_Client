@@ -354,3 +354,28 @@ Each item must be implemented, tested, and committed separately.
 - Next slice: consider encrypted UDP and 0-RTT separately, with explicit
   compatibility and replay-safety design; neither is implied by the TLS/XHTTP
   interop result.
+
+## 2026-10-01 VLESS Native Encryption 0-RTT
+
+- Baseline: local `master` `c8240881` after the outer TLS/XHTTP interop slice.
+  Xray documents client `0rtt` as ticket-based session resumption, with `1rtt`
+  remaining available as the forced-handshake mode.
+- Completed: enabled native `mlkem768x25519plus.native.0rtt` runtime support.
+  A per-handler ticket cache is populated by a successful 1-RTT handshake,
+  valid only until the server-provided ticket lifetime. Cache misses and expired
+  tickets fall back to 1-RTT; malformed early response headers invalidate only
+  the matching cached PFS state.
+- Replay compatibility: the implementation keeps a fresh NFS key for each
+  0-RTT attempt rather than replaying a captured first flight. Xray's server
+  tracks the ticket session and rejects a repeated NFS key as a replay, while
+  expired tickets trigger a new handshake.
+- Verification: 47 focused encryption/converter tests passed; the full
+  `clash-lib` unit suite with `vless-encryption` passed (618 passed, 11 ignored);
+  `cargo clippy -p clash-lib --all-targets --all-features -- -D warnings`
+  passed; and
+  `clash-lib/tests/vless_native_encryption_0rtt_xray_interop.sh` passed against
+  Xray 26.2.6, exercising a 1-RTT cache bootstrap followed by a cached 0-RTT
+  connection.
+- Next slice: evaluate encrypted UDP separately; it remains intentionally
+  unsupported until its framing, replay, and datagram semantics are covered by
+  an explicit design and interop test.
