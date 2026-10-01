@@ -13,6 +13,7 @@ use crate::{proxy::AnyStream, session::SocksAddr};
 const VLESS_VERSION: u8 = 0;
 const VLESS_COMMAND_TCP: u8 = 1;
 const VLESS_COMMAND_UDP: u8 = 2;
+const VLESS_COMMAND_MUX: u8 = 3;
 const XTLS_VISION_FLOW: &str = "xtls-rprx-vision";
 
 struct PendingWrite {
@@ -33,6 +34,7 @@ pub struct VlessStream {
     uuid: uuid::Uuid,
     destination: SocksAddr,
     is_udp: bool,
+    xudp: bool,
     flow: Option<String>,
 }
 
@@ -42,6 +44,7 @@ impl VlessStream {
         uuid: &str,
         destination: &SocksAddr,
         is_udp: bool,
+        xudp: bool,
         flow: Option<String>,
     ) -> io::Result<Self> {
         let uuid = uuid::Uuid::parse_str(uuid).map_err(|_| {
@@ -62,6 +65,7 @@ impl VlessStream {
             uuid,
             destination: destination.clone(),
             is_udp,
+            xudp,
             flow,
         })
     }
@@ -79,13 +83,17 @@ impl VlessStream {
         buf.put_u8(addons.len() as u8);
         buf.put_slice(&addons);
 
-        if self.is_udp {
+        if self.is_udp && self.xudp {
+            buf.put_u8(VLESS_COMMAND_MUX);
+        } else if self.is_udp {
             buf.put_u8(VLESS_COMMAND_UDP);
         } else {
             buf.put_u8(VLESS_COMMAND_TCP);
         }
 
-        self.destination.write_to_buf_vmess(&mut buf);
+        if !(self.is_udp && self.xudp) {
+            self.destination.write_to_buf_vmess(&mut buf);
+        }
         buf
     }
 
@@ -331,6 +339,7 @@ mod tests {
             Box::new(io),
             TEST_UUID,
             &SocksAddr::Domain("example.com".to_owned(), 443),
+            false,
             false,
             flow,
         )

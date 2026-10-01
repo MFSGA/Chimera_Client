@@ -401,5 +401,29 @@ Each item must be implemented, tested, and committed separately.
   `clash-lib/tests/vless_native_encryption_udp_xray_interop.sh` passed against
   Xray 26.2.6 with a SOCKS5 UDP-associate → Chimera → encrypted VLESS UDP →
   Xray → local UDP echo round trip.
-- Next slice: evaluate XUDP/packet-encoding compatibility separately, then
-  revisit any remaining transport/security matrix gaps.
+## 2026-10-01 VLESS Native Encryption XUDP / packet-encoding
+
+- Baseline: local `master` `4fef70b8` after native encrypted UDP support.
+  Mihomo exposes `packet-encoding: xudp` for VLESS UDP; XUDP uses the VLESS
+  Mux command and per-datagram destination metadata.
+- Completed: added `packet-encoding: xudp` and the compatible legacy `xudp: true`
+  switch to VLESS configuration. The converter rejects unknown encodings and
+  explicitly rejects `packetaddr` until that separate framing is implemented.
+- Runtime: encrypted VLESS UDP can now switch from the raw two-byte-length
+  framing to XUDP Mux frames. The implementation preserves packet boundaries,
+  carries IPv4/IPv6/domain destinations in Xray's port-then-address order, and
+  decodes response destinations from Keep/Data frames. TCP/stream VLESS continues
+  to use the normal VLESS request command.
+- Verification: XUDP framing unit tests passed; packet-encoding resolver tests
+  passed; the full `clash-lib` unit suite with `vless-encryption` passed
+  (625 passed, 11 ignored); `cargo clippy -p clash-lib --all-targets
+  --all-features -- -D warnings` passed; and
+  `clash-lib/tests/vless_native_encryption_xudp_xray_interop.sh` passed against
+  Xray 26.2.6, exercising native 1-RTT VLESS Encryption + `packet-encoding: xudp`
+  + outer TLS + SOCKS5 UDP. A manual XHTTP+TLS variant also completed the same
+  round trip.
+- Compatibility boundary: this slice does not implement V2Ray `packetaddr`;
+  that remains intentionally explicit rather than silently falling back to a
+  different wire format.
+- Next slice: implement and interop-test `packetaddr` separately, then audit
+  the remaining VLESS transport/security combinations.

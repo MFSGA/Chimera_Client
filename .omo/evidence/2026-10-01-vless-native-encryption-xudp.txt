@@ -1,0 +1,22 @@
+Task: VLESS native encryption XUDP / packet-encoding
+Implementation: native VLESS UDP can use Xray-compatible XUDP Mux framing.
+
+Verification:
+- cargo test -p clash-lib --features vless-encryption --lib
+  Result: 625 passed, 0 failed, 11 ignored
+- cargo clippy -p clash-lib --all-targets --all-features -- -D warnings
+  Result: passed
+- bash -n clash-lib/tests/vless_native_encryption_xudp_xray_interop.sh
+  Result: passed
+- clash-lib/tests/vless_native_encryption_xudp_xray_interop.sh
+  Result: PASS native VLESS 1-RTT packet-encoding:xudp over TLS
+  Result: PASS against Xray 26.2.6 (12ee51e, linux/amd64)
+- Manual XHTTP+TLS variant of the same interop script
+  Result: PASS native VLESS 1-RTT packet-encoding:xudp over XHTTP+TLS
+
+Focused unit coverage:
+- XUDP frame encoder emits Xray/Mux port-then-address metadata and New/Keep
+  session statuses.
+- XUDP response decoder returns the per-frame destination.
+- packet-encoding:xudp and xudp:true resolve to XUDP mode.
+- packetaddr and unknown packet encodings fail explicitly.

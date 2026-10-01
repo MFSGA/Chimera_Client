@@ -508,6 +508,10 @@ pub struct OutboundVless {
     /// VLESS native encryption client configuration.
     pub encryption: Option<String>,
     pub udp: Option<bool>,
+    /// Enable Xray-compatible VLESS XUDP packet encoding.
+    pub xudp: Option<bool>,
+    /// UDP packet encoding (`xudp` is supported; `packetaddr` remains unsupported).
+    pub packet_encoding: Option<String>,
     pub tls: Option<bool>,
     pub alpn: Option<Vec<String>>,
     pub skip_cert_verify: Option<bool>,

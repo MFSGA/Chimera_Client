@@ -19,6 +19,9 @@ const MAX_PACKET_LENGTH: usize = u16::MAX as usize;
 pub struct OutboundDatagramVless {
     inner: AnyStream,
     remote_addr: SocksAddr,
+    xudp: bool,
+    xudp_request_written: bool,
+    xudp_read_buf: BytesMut,
 
     // Write state
     write_buf: BytesMut,
@@ -35,10 +38,13 @@ pub struct OutboundDatagramVless {
 }
 
 impl OutboundDatagramVless {
-    pub fn new(inner: AnyStream, remote_addr: SocksAddr) -> Self {
+    pub fn new(inner: AnyStream, remote_addr: SocksAddr, xudp: bool) -> Self {
         Self {
             inner,
             remote_addr,
+            xudp,
+            xudp_request_written: false,
+            xudp_read_buf: BytesMut::new(),
             write_buf: BytesMut::new(),
             pending_packet: None,
             packet_buf: BytesMut::new(),
@@ -49,12 +55,12 @@ impl OutboundDatagramVless {
         }
     }
 
-    fn write_packet(&mut self, payload: &[u8]) -> Result<(), io::Error> {
+    fn write_packet(
+        &mut self,
+        payload: &[u8],
+        destination: &SocksAddr,
+    ) -> Result<(), io::Error> {
         self.write_buf.clear();
-
-        // VLESS UDP packet format is simpler than expected:
-        // Just 2-byte length + payload data
-        // No address encoding in the packet data phase!
 
         if payload.len() > MAX_PACKET_LENGTH {
             return Err(io::Error::new(
@@ -67,14 +73,227 @@ impl OutboundDatagramVless {
             ));
         }
 
-        // Write length header (big-endian)
-        self.write_buf.put_u16(payload.len() as u16);
+        if self.xudp {
+            // Xray-compatible XUDP packet encoding. The two zero bytes after
+            // the frame length are the mux session id; the remaining frame
+            // metadata is status, option, network, and destination address.
+            let frame_len =
+                5usize.checked_add(destination.size()).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "XUDP destination is too large",
+                    )
+                })?;
+            if frame_len > u16::MAX as usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "XUDP destination frame is too large",
+                ));
+            }
 
-        // Write payload
-        self.write_buf.put_slice(payload);
+            self.write_buf.put_u16(frame_len as u16);
+            self.write_buf.put_u16(0); // mux session id
+            self.write_buf
+                .put_u8(if self.xudp_request_written { 2 } else { 1 });
+            self.write_buf.put_u8(1); // option data
+            self.write_buf.put_u8(2); // UDP
+            destination.write_to_buf_vmess(&mut self.write_buf);
+            self.write_buf.put_u16(payload.len() as u16);
+            self.write_buf.put_slice(payload);
+        } else {
+            // Raw VLESS UDP packet encoding: 2-byte length + payload.
+            self.write_buf.put_u16(payload.len() as u16);
+            self.write_buf.put_slice(payload);
+        }
 
-        trace!("encoded VLESS UDP packet: len={}", payload.len());
+        trace!(
+            "encoded VLESS UDP packet: len={}, xudp={}",
+            payload.len(),
+            self.xudp
+        );
         Ok(())
+    }
+
+    fn try_decode_xudp_frame(&mut self) -> io::Result<XudpDecode> {
+        if self.xudp_read_buf.len() < 6 {
+            return Ok(XudpDecode::Incomplete);
+        }
+
+        let frame_len =
+            u16::from_be_bytes([self.xudp_read_buf[0], self.xudp_read_buf[1]])
+                as usize;
+        if frame_len < 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid XUDP frame length: {frame_len}"),
+            ));
+        }
+
+        let meta_end = 2 + frame_len;
+        if self.xudp_read_buf.len() < meta_end {
+            return Ok(XudpDecode::Incomplete);
+        }
+
+        let status = self.xudp_read_buf[4];
+        let options = self.xudp_read_buf[5];
+        if status == 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected XUDP new frame from server",
+            ));
+        }
+        if status == 3 {
+            self.xudp_read_buf.advance(meta_end);
+            return Ok(XudpDecode::End);
+        }
+        if status != 2 && status != 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected XUDP frame type: {status}"),
+            ));
+        }
+        if options & 2 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "remote closed XUDP session",
+            ));
+        }
+
+        let destination = if frame_len == 4 {
+            self.remote_addr.clone()
+        } else {
+            if self.xudp_read_buf[6] != 2 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "XUDP frame is not UDP",
+                ));
+            }
+            parse_xudp_address(&self.xudp_read_buf[7..meta_end])?
+        };
+
+        if options & 1 == 0 {
+            self.xudp_read_buf.advance(meta_end);
+            return Ok(XudpDecode::Skip);
+        }
+
+        let payload_len = u16::from_be_bytes([
+            self.xudp_read_buf[meta_end],
+            self.xudp_read_buf[meta_end + 1],
+        ]) as usize;
+        let total_len = meta_end + 2 + payload_len;
+        if self.xudp_read_buf.len() < total_len {
+            return Ok(XudpDecode::Incomplete);
+        }
+
+        let payload_start = meta_end + 2;
+        let data = self.xudp_read_buf[payload_start..total_len].to_vec();
+        self.xudp_read_buf.advance(total_len);
+        if data.is_empty() {
+            return Ok(XudpDecode::Skip);
+        }
+
+        Ok(XudpDecode::Packet(UdpPacket {
+            data,
+            src_addr: destination.clone(),
+            dst_addr: destination,
+            inbound_user: None,
+        }))
+    }
+
+    fn poll_next_xudp(&mut self, cx: &mut Context<'_>) -> Poll<Option<UdpPacket>> {
+        loop {
+            match self.try_decode_xudp_frame() {
+                Ok(XudpDecode::Packet(packet)) => {
+                    return Poll::Ready(Some(packet));
+                }
+                Ok(XudpDecode::End) => return Poll::Ready(None),
+                Ok(XudpDecode::Skip) => continue,
+                Ok(XudpDecode::Incomplete) => {}
+                Err(err) => {
+                    debug!("failed to decode XUDP frame: {err}");
+                    return Poll::Ready(None);
+                }
+            }
+
+            let mut scratch = [0u8; 8192];
+            let mut read_buf = ReadBuf::new(&mut scratch);
+            match Pin::new(&mut self.inner).poll_read(cx, &mut read_buf) {
+                Poll::Ready(Ok(())) => {
+                    let n = read_buf.filled().len();
+                    if n == 0 {
+                        return Poll::Ready(None);
+                    }
+                    self.xudp_read_buf.extend_from_slice(&scratch[..n]);
+                }
+                Poll::Ready(Err(err)) => {
+                    debug!("failed to read XUDP frame: {err}");
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+enum XudpDecode {
+    Incomplete,
+    Skip,
+    Packet(UdpPacket),
+    End,
+}
+
+fn parse_xudp_address(buf: &[u8]) -> io::Result<SocksAddr> {
+    if buf.len() < 3 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "truncated XUDP destination",
+        ));
+    }
+
+    let port = u16::from_be_bytes([buf[0], buf[1]]);
+    match buf[2] {
+        0x01 => {
+            if buf.len() < 7 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated XUDP IPv4 destination",
+                ));
+            }
+            Ok(SocksAddr::from((
+                std::net::Ipv4Addr::new(buf[3], buf[4], buf[5], buf[6]),
+                port,
+            )))
+        }
+        0x02 => {
+            let len = buf[3] as usize;
+            if buf.len() < 4 + len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated XUDP domain destination",
+                ));
+            }
+            let domain = std::str::from_utf8(&buf[4..4 + len])
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid XUDP domain")
+                })?
+                .to_owned();
+            Ok(SocksAddr::Domain(domain, port))
+        }
+        0x03 => {
+            if buf.len() < 19 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated XUDP IPv6 destination",
+                ));
+            }
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&buf[3..19]);
+            Ok(SocksAddr::from((std::net::Ipv6Addr::from(octets), port)))
+        }
+        atyp => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown XUDP address type: {atyp}"),
+        )),
     }
 }
 
@@ -119,7 +338,7 @@ impl Sink<UdpPacket> for OutboundDatagramVless {
 
         // A UDP datagram is atomic. Splitting it into multiple VLESS frames
         // would change packet boundaries, so encode the whole datagram once.
-        this.write_packet(&item.data)?;
+        this.write_packet(&item.data, &item.dst_addr)?;
         this.pending_packet = Some(item);
         this.flushed = false;
 
@@ -165,6 +384,9 @@ impl Sink<UdpPacket> for OutboundDatagramVless {
 
         this.flushed = true;
         this.pending_packet = None;
+        if this.xudp {
+            this.xudp_request_written = true;
+        }
 
         Poll::Ready(Ok(()))
     }
@@ -186,6 +408,10 @@ impl Stream for OutboundDatagramVless {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        if this.xudp {
+            return this.poll_next_xudp(cx);
+        }
+
         let mut inner = Pin::new(&mut this.inner);
 
         loop {
@@ -279,8 +505,8 @@ impl Stream for OutboundDatagramVless {
 
 #[cfg(test)]
 mod tests {
-    use futures::SinkExt;
-    use tokio::io::AsyncReadExt;
+    use futures::{SinkExt, StreamExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::{MAX_PACKET_LENGTH, OutboundDatagramVless};
     use crate::{proxy::datagram::UdpPacket, session::SocksAddr};
@@ -299,7 +525,8 @@ mod tests {
     async fn udp_datagram_larger_than_8k_is_not_truncated() {
         let (client, mut server) = tokio::io::duplex(128 * 1024);
         let remote: SocksAddr = "1.1.1.1:53".parse().expect("test address");
-        let mut datagram = OutboundDatagramVless::new(Box::new(client), remote);
+        let mut datagram =
+            OutboundDatagramVless::new(Box::new(client), remote, false);
         let payload = vec![0x5a; 9 * 1024];
 
         datagram
@@ -320,10 +547,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn xudp_encodes_vmess_address_order_and_session_frames() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let remote: SocksAddr = "1.1.1.1:53".parse().expect("test address");
+        let mut datagram =
+            OutboundDatagramVless::new(Box::new(client), remote, true);
+
+        datagram
+            .send(packet(b"abc".to_vec()))
+            .await
+            .expect("first XUDP packet");
+        let mut first = vec![0u8; 19];
+        server
+            .read_exact(&mut first)
+            .await
+            .expect("first XUDP frame");
+        assert_eq!(
+            &first[..],
+            &[
+                0, 12, // metadata length
+                0, 0, // mux session id
+                1, 1, 2, // new, data, UDP
+                0, 53, 1, 1, 1, 1, 1, // port, IPv4 address
+                0, 3, b'a', b'b', b'c',
+            ]
+        );
+
+        datagram
+            .send(packet(b"def".to_vec()))
+            .await
+            .expect("keep XUDP packet");
+        let mut second = vec![0u8; 19];
+        server
+            .read_exact(&mut second)
+            .await
+            .expect("keep XUDP frame");
+        assert_eq!(
+            &second[..],
+            &[
+                0, 12, 0, 0, 2, 1, 2, 0, 53, 1, 1, 1, 1, 1, 0, 3, b'd', b'e', b'f',
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn xudp_decodes_keep_frame_destination() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let remote: SocksAddr = "1.1.1.1:53".parse().expect("test address");
+        let mut datagram =
+            OutboundDatagramVless::new(Box::new(client), remote, true);
+
+        let frame = [
+            0, 12, 0, 0, 2, 1, 2, 0, 53, 1, 8, 8, 8, 8, 0, 3, b'x', b'y', b'z',
+        ];
+        tokio::spawn(async move {
+            server.write_all(&frame).await.expect("write XUDP frame");
+        });
+
+        let packet = datagram.next().await.expect("XUDP packet");
+        assert_eq!(packet.data, b"xyz");
+        assert_eq!(packet.dst_addr, "8.8.8.8:53".parse().unwrap());
+    }
+
+    #[tokio::test]
     async fn udp_datagram_above_u16_frame_limit_is_rejected() {
         let (client, _server) = tokio::io::duplex(1024);
         let remote: SocksAddr = "1.1.1.1:53".parse().expect("test address");
-        let mut datagram = OutboundDatagramVless::new(Box::new(client), remote);
+        let mut datagram =
+            OutboundDatagramVless::new(Box::new(client), remote, false);
 
         let err = datagram
             .send(packet(vec![0u8; MAX_PACKET_LENGTH + 1]))

@@ -88,11 +88,34 @@ impl TryFrom<&OutboundVless> for Handler {
             port,
             uuid: s.uuid.clone(),
             udp: s.udp.unwrap_or(true),
+            xudp: resolve_vless_xudp(s)?,
             transport,
             tls: build_tls_transport(network, s, skip_cert_verify)?,
             flow: s.flow.clone(),
             encryption,
         }))
+    }
+}
+
+fn resolve_vless_xudp(s: &OutboundVless) -> Result<bool, Error> {
+    let explicit = s.xudp.unwrap_or(false);
+    match s.packet_encoding.as_deref().map(str::trim) {
+        None | Some("") => Ok(explicit),
+        Some("xudp") => Ok(true),
+        Some("packetaddr" | "packet") => {
+            if explicit {
+                return Err(Error::InvalidConfig(
+                    "vless xudp cannot be combined with packet-encoding: packetaddr"
+                        .to_owned(),
+                ));
+            }
+            Err(Error::InvalidConfig(
+                "vless packet-encoding: packetaddr is not supported yet".to_owned(),
+            ))
+        }
+        Some(other) => Err(Error::InvalidConfig(format!(
+            "unsupported vless packet-encoding: {other}"
+        ))),
     }
 }
 
@@ -1889,7 +1912,7 @@ mod tests {
         build_xhttp_padding_config, build_xhttp_reuse_policy,
         build_xhttp_session_config, build_xhttp_uplink_config,
         build_xhttp_upload_endpoint_config, normalized_xhttp_path, parse_xhttp_mode,
-        resolve_vless_alpn, resolve_xhttp_http_version,
+        resolve_vless_alpn, resolve_vless_xudp, resolve_xhttp_http_version,
         resolve_xhttp_max_each_post_bytes, resolve_xhttp_min_posts_interval_ms,
         resolve_xhttp_no_grpc_header, validate_vless_config,
     };
@@ -1905,6 +1928,51 @@ mod tests {
     #[cfg(feature = "reality")]
     const TEST_REALITY_PUBLIC_KEY: &str =
         "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+
+    #[test]
+    fn vless_packet_encoding_xudp_enables_xudp() {
+        let outbound = OutboundVless {
+            packet_encoding: Some("xudp".to_owned()),
+            ..Default::default()
+        };
+        assert!(resolve_vless_xudp(&outbound).expect("xudp should be accepted"));
+    }
+
+    #[test]
+    fn vless_xudp_flag_enables_xudp() {
+        let outbound = OutboundVless {
+            xudp: Some(true),
+            ..Default::default()
+        };
+        assert!(
+            resolve_vless_xudp(&outbound).expect("xudp flag should be accepted")
+        );
+    }
+
+    #[test]
+    fn vless_packetaddr_is_rejected_explicitly() {
+        let outbound = OutboundVless {
+            packet_encoding: Some("packetaddr".to_owned()),
+            ..Default::default()
+        };
+        let err = resolve_vless_xudp(&outbound)
+            .expect_err("packetaddr is not implemented");
+        assert!(err.to_string().contains("packetaddr is not supported yet"));
+    }
+
+    #[test]
+    fn vless_unknown_packet_encoding_is_rejected() {
+        let outbound = OutboundVless {
+            packet_encoding: Some("bogus".to_owned()),
+            ..Default::default()
+        };
+        let err =
+            resolve_vless_xudp(&outbound).expect_err("unknown encoding must fail");
+        assert!(
+            err.to_string()
+                .contains("unsupported vless packet-encoding: bogus")
+        );
+    }
 
     #[cfg(feature = "reality")]
     #[test]
@@ -1926,6 +1994,8 @@ mod tests {
     #[test]
     fn vless_reality_prefers_sni_for_server_name() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "reality".to_owned(),
                 server: "edge.example.com".to_owned(),
@@ -1950,6 +2020,8 @@ mod tests {
     #[test]
     fn vless_reality_accepts_explicit_alpn_and_chrome_fingerprint() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "reality-alpn".to_owned(),
                 server: "edge.example.com".to_owned(),
@@ -1982,6 +2054,8 @@ mod tests {
     #[test]
     fn vless_reality_allows_client_fingerprint_configuration_with_warning() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "reality-firefox".to_owned(),
                 server: "edge.example.com".to_owned(),
@@ -2006,6 +2080,8 @@ mod tests {
     #[test]
     fn vless_non_reality_allows_client_fingerprint_configuration() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "tls-firefox".to_owned(),
                 server: "example.com".to_owned(),
@@ -2026,6 +2102,8 @@ mod tests {
     fn vless_accepts_default_encryption_values() {
         for encryption in ["", "none"] {
             let outbound = OutboundVless {
+                xudp: None,
+                packet_encoding: None,
                 common_opts: CommonConfigOptions {
                     name: "encryption-default".to_owned(),
                     server: "example.com".to_owned(),
@@ -2046,6 +2124,8 @@ mod tests {
     #[test]
     fn vless_rejects_malformed_encryption_before_runtime_check() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "encrypted-vless".to_owned(),
                 server: "example.com".to_owned(),
@@ -2072,6 +2152,8 @@ mod tests {
 
         let key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "encrypted-vless".to_owned(),
                 server: "example.com".to_owned(),
@@ -2098,6 +2180,8 @@ mod tests {
 
         let key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "encrypted-vless-feature-off".to_owned(),
                 server: "example.com".to_owned(),
@@ -2124,6 +2208,8 @@ mod tests {
 
         let key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "encrypted-vless-zero-rtt".to_owned(),
                 server: "example.com".to_owned(),
@@ -2149,6 +2235,8 @@ mod tests {
 
         let key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "encrypted-vless-todo".to_owned(),
                 server: "example.com".to_owned(),
@@ -2177,6 +2265,8 @@ mod tests {
 
         let key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "encrypted-vless-reality".to_owned(),
                 server: "example.com".to_owned(),
@@ -2205,6 +2295,8 @@ mod tests {
     #[test]
     fn vless_reality_accepts_hybrid_kem() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "reality-hybrid".to_owned(),
                 server: "example.com".to_owned(),
@@ -2229,6 +2321,8 @@ mod tests {
     #[test]
     fn vless_rejects_unknown_flow() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "bad-flow".to_owned(),
                 server: "example.com".to_owned(),
@@ -2251,6 +2345,8 @@ mod tests {
     #[test]
     fn vless_accepts_vision_flow() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "vision".to_owned(),
                 server: "example.com".to_owned(),
@@ -2269,6 +2365,8 @@ mod tests {
     #[test]
     fn vless_explicit_alpn_overrides_transport_default() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "alpn".to_owned(),
                 server: "example.com".to_owned(),
@@ -2290,6 +2388,8 @@ mod tests {
     #[test]
     fn vless_xhttp_accepts_plain_http1_packet_up() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp-http1".to_owned(),
                 server: "example.com".to_owned(),
@@ -2322,6 +2422,8 @@ mod tests {
     #[test]
     fn vless_xhttp_http1_tls_is_owned_by_xhttp_transport() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp-http1-tls".to_owned(),
                 server: "example.com".to_owned(),
@@ -2364,6 +2466,8 @@ mod tests {
     #[test]
     fn vless_xhttp_http1_reality_is_owned_by_xhttp_transport() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp-http1-reality".to_owned(),
                 server: "example.com".to_owned(),
@@ -2419,6 +2523,8 @@ mod tests {
     #[test]
     fn vless_xhttp_accepts_http3_stream_one_tls() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp-h3".to_owned(),
                 server: "example.com".to_owned(),
@@ -2458,6 +2564,8 @@ mod tests {
     #[test]
     fn vless_xhttp_accepts_http3_packet_up_tls() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp-h3-packet-up".to_owned(),
                 server: "example.com".to_owned(),
@@ -2485,6 +2593,8 @@ mod tests {
     #[test]
     fn vless_xhttp_accepts_http3_stream_up_tls() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp-h3-stream-up".to_owned(),
                 server: "example.com".to_owned(),
@@ -2512,6 +2622,8 @@ mod tests {
     #[test]
     fn vless_xhttp_http3_accepts_upload_reuse() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp-h3-reuse".to_owned(),
                 server: "example.com".to_owned(),
@@ -2546,6 +2658,8 @@ mod tests {
     #[test]
     fn vless_xhttp_http3_accepts_nonzero_keepalive_period() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp-h3-keepalive".to_owned(),
                 server: "example.com".to_owned(),
@@ -2578,6 +2692,8 @@ mod tests {
     fn vless_xhttp_http3_accepts_download_settings_for_split_modes() {
         for mode in ["stream-up", "packet-up"] {
             let outbound = OutboundVless {
+                xudp: None,
+                packet_encoding: None,
                 common_opts: CommonConfigOptions {
                     name: format!("xhttp-h3-download-{mode}"),
                     server: "upload.example.com".to_owned(),
@@ -2628,6 +2744,8 @@ mod tests {
     #[test]
     fn vless_xhttp_http3_stream_one_rejects_download_settings() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp-h3-download-stream-one".to_owned(),
                 server: "upload.example.com".to_owned(),
@@ -2665,6 +2783,8 @@ mod tests {
     #[test]
     fn vless_xhttp_http3_rejects_reality() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp-h3-reality".to_owned(),
                 server: "example.com".to_owned(),
@@ -2696,6 +2816,8 @@ mod tests {
     #[test]
     fn vless_xhttp_http3_requires_feature() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp-h3-disabled".to_owned(),
                 server: "example.com".to_owned(),
@@ -2721,6 +2843,8 @@ mod tests {
     #[test]
     fn vless_transport_default_alpn_is_preserved_without_override() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "alpn-default".to_owned(),
                 server: "example.com".to_owned(),
@@ -2741,6 +2865,8 @@ mod tests {
     #[test]
     fn vless_mtls_requires_certificate_and_private_key_pair() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "mtls-missing-key".to_owned(),
                 server: "example.com".to_owned(),
@@ -2765,6 +2891,8 @@ mod tests {
     #[test]
     fn vless_mtls_requires_standard_tls() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "mtls-no-tls".to_owned(),
                 server: "example.com".to_owned(),
@@ -2788,6 +2916,8 @@ mod tests {
     #[test]
     fn vless_mtls_builds_with_standard_tls() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "mtls".to_owned(),
                 server: "example.com".to_owned(),
@@ -2811,6 +2941,8 @@ mod tests {
     #[test]
     fn vless_mtls_rejects_reality_combination() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "mtls-reality".to_owned(),
                 server: "example.com".to_owned(),
@@ -2841,6 +2973,8 @@ mod tests {
     #[test]
     fn vless_tls_accepts_certificate_fingerprint_pinning() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "fingerprint".to_owned(),
                 server: "example.com".to_owned(),
@@ -2865,6 +2999,8 @@ mod tests {
     #[test]
     fn vless_ws_http_upgrade_and_fast_open_build() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "ws-upgrade".to_owned(),
                 server: "example.com".to_owned(),
@@ -2893,6 +3029,8 @@ mod tests {
     #[test]
     fn vless_ws_fast_open_requires_http_upgrade() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "ws-fast-open".to_owned(),
                 server: "example.com".to_owned(),
@@ -2921,6 +3059,8 @@ mod tests {
     #[test]
     fn vless_ws_http_upgrade_accepts_early_data() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "ws-upgrade-early".to_owned(),
                 server: "example.com".to_owned(),
@@ -2950,6 +3090,8 @@ mod tests {
     #[test]
     fn vless_ws_requires_ws_opts() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "ws".to_owned(),
                 server: "example.com".to_owned(),
@@ -2974,6 +3116,8 @@ mod tests {
     #[test]
     fn vless_ws_tls_uses_http11_alpn() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "ws-tls".to_owned(),
                 server: "example.com".to_owned(),
@@ -2994,6 +3138,8 @@ mod tests {
     #[test]
     fn vless_grpc_requires_grpc_opts() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "grpc".to_owned(),
                 server: "example.com".to_owned(),
@@ -3018,6 +3164,8 @@ mod tests {
     #[test]
     fn vless_grpc_transport_builds_with_h2_alpn() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "grpc".to_owned(),
                 server: "example.com".to_owned(),
@@ -3052,6 +3200,8 @@ mod tests {
     #[test]
     fn vless_grpc_accepts_connection_pool_settings() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "grpc-pool".to_owned(),
                 server: "example.com".to_owned(),
@@ -3076,6 +3226,8 @@ mod tests {
     #[test]
     fn vless_grpc_accepts_max_streams_pool_mode() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "grpc-max-streams".to_owned(),
                 server: "example.com".to_owned(),
@@ -3100,6 +3252,8 @@ mod tests {
     #[test]
     fn vless_grpc_rejects_conflicting_stream_pool_settings() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "grpc-pool-conflict".to_owned(),
                 server: "example.com".to_owned(),
@@ -3130,6 +3284,8 @@ mod tests {
     #[test]
     fn vless_grpc_rejects_non_h2_alpn() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "grpc-http11".to_owned(),
                 server: "example.com".to_owned(),
@@ -3158,6 +3314,8 @@ mod tests {
     #[test]
     fn vless_grpc_reality_builds_security_and_transport_layers() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "grpc-reality".to_owned(),
                 server: "example.com".to_owned(),
@@ -3343,6 +3501,8 @@ mod tests {
     #[test]
     fn vless_xhttp_reuse_settings_build_with_supported_runtime_limits() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp-reuse".to_owned(),
                 server: "example.com".to_owned(),
@@ -3369,6 +3529,8 @@ mod tests {
     #[test]
     fn vless_xhttp_reuse_builds_with_max_connections() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp-max-connections".to_owned(),
                 server: "example.com".to_owned(),
@@ -3395,6 +3557,8 @@ mod tests {
     #[test]
     fn vless_xhttp_reuse_accepts_supported_keep_alive_periods() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp-keepalive".to_owned(),
                 server: "example.com".to_owned(),
@@ -3418,6 +3582,8 @@ mod tests {
         assert!(transport.is_some(), "xhttp transport should be present");
 
         let positive = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp-keepalive-positive".to_owned(),
                 server: "example.com".to_owned(),
@@ -3444,6 +3610,8 @@ mod tests {
     #[test]
     fn vless_xhttp_reuse_rejects_keep_alive_below_minus_one() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp-keepalive-invalid".to_owned(),
                 server: "example.com".to_owned(),
@@ -3476,6 +3644,8 @@ mod tests {
     #[test]
     fn vless_xhttp_download_reuse_settings_build_runtime_policy() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp-download-reuse".to_owned(),
                 server: "example.com".to_owned(),
@@ -3806,6 +3976,8 @@ mod tests {
     #[test]
     fn vless_xhttp_requires_xhttp_opts() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp".to_owned(),
                 server: "example.com".to_owned(),
@@ -3830,6 +4002,8 @@ mod tests {
     #[test]
     fn vless_xhttp_stream_one_transport_builds() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp".to_owned(),
                 server: "example.com".to_owned(),
@@ -3858,6 +4032,8 @@ mod tests {
     fn vless_xhttp_rejects_host_header_case_insensitively() {
         for key in ["Host", "host", "HOST"] {
             let outbound = OutboundVless {
+                xudp: None,
+                packet_encoding: None,
                 common_opts: CommonConfigOptions {
                     name: "xhttp-host-header".to_owned(),
                     server: "example.com".to_owned(),
@@ -3890,6 +4066,8 @@ mod tests {
     #[test]
     fn vless_xhttp_allows_non_host_headers() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp-header".to_owned(),
                 server: "example.com".to_owned(),
@@ -3916,6 +4094,8 @@ mod tests {
     #[test]
     fn vless_xhttp_rejects_nested_download_host_header() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp-download-host-header".to_owned(),
                 server: "example.com".to_owned(),
@@ -3956,6 +4136,8 @@ mod tests {
     #[test]
     fn vless_xhttp_rejects_zero_limits() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp".to_owned(),
                 server: "example.com".to_owned(),
@@ -3985,6 +4167,8 @@ mod tests {
     #[test]
     fn vless_xhttp_rejects_zero_flat_packet_limit() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp".to_owned(),
                 server: "example.com".to_owned(),
@@ -4014,6 +4198,8 @@ mod tests {
     #[test]
     fn vless_xhttp_rejects_zero_flat_post_interval() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp".to_owned(),
                 server: "example.com".to_owned(),
@@ -4043,6 +4229,8 @@ mod tests {
     #[test]
     fn vless_xhttp_rejects_zero_extra_limits() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp".to_owned(),
                 server: "example.com".to_owned(),
@@ -4075,6 +4263,8 @@ mod tests {
     #[test]
     fn vless_xhttp_stream_up_transport_builds() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp".to_owned(),
                 server: "example.com".to_owned(),
@@ -4102,6 +4292,8 @@ mod tests {
     #[test]
     fn vless_xhttp_packet_up_transport_builds() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp".to_owned(),
                 server: "example.com".to_owned(),
@@ -4131,6 +4323,8 @@ mod tests {
     #[test]
     fn vless_xhttp_auto_is_preserved_for_runtime_resolution() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp".to_owned(),
                 server: "example.com".to_owned(),
@@ -4166,6 +4360,8 @@ mod tests {
     #[test]
     fn vless_xhttp_download_settings_transport_builds() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp".to_owned(),
                 server: "legacy-upload.example.com".to_owned(),
@@ -4231,6 +4427,8 @@ mod tests {
     #[test]
     fn vless_xhttp_mihomo_flat_download_settings_reach_runtime_config() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp-flat-download".to_owned(),
                 server: "upload.example.com".to_owned(),
@@ -4311,6 +4509,8 @@ mod tests {
     #[test]
     fn vless_xhttp_http1_download_settings_use_http11_alpn() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp-http1-download".to_owned(),
                 server: "upload.example.com".to_owned(),
@@ -4356,6 +4556,8 @@ mod tests {
     #[test]
     fn vless_xhttp_download_settings_inherit_unset_uplink_fields() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp-inherit".to_owned(),
                 server: "upload.example.com".to_owned(),
@@ -4434,6 +4636,8 @@ mod tests {
     #[test]
     fn vless_xhttp_download_empty_reality_key_clears_inherited_reality() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp-clear-reality".to_owned(),
                 server: "upload.example.com".to_owned(),
@@ -4496,6 +4700,8 @@ mod tests {
     fn vless_xhttp_download_tls_requires_fingerprint_override_when_reality_is_cleared()
      {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp-clear-reality-fingerprint".to_owned(),
                 server: "upload.example.com".to_owned(),
@@ -4544,6 +4750,8 @@ mod tests {
     #[test]
     fn vless_xhttp_rejects_non_xhttp_download_network() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp".to_owned(),
                 server: "upload.example.com".to_owned(),
@@ -4579,6 +4787,8 @@ mod tests {
     #[test]
     fn vless_xhttp_rejects_non_xhttp_upload_network() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp".to_owned(),
                 server: "upload.example.com".to_owned(),
@@ -4615,6 +4825,8 @@ mod tests {
     #[test]
     fn vless_xhttp_supports_reality() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp".to_owned(),
                 server: "example.com".to_owned(),
@@ -4656,6 +4868,8 @@ mod tests {
     #[test]
     fn vless_xhttp_explicit_upload_reality_is_owned_by_transport() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp-upload-reality".to_owned(),
                 server: "legacy-upload.example.com".to_owned(),
@@ -4713,6 +4927,8 @@ mod tests {
     #[test]
     fn vless_xhttp_download_settings_support_reality() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "xhttp".to_owned(),
                 server: "upload.example.com".to_owned(),
@@ -4779,6 +4995,8 @@ mod tests {
     #[test]
     fn vless_ws_transport_builds_with_ws_opts() {
         let outbound = OutboundVless {
+            xudp: None,
+            packet_encoding: None,
             common_opts: CommonConfigOptions {
                 name: "ws".to_owned(),
                 server: "example.com".to_owned(),

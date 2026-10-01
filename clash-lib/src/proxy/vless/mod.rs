@@ -43,6 +43,7 @@ pub struct HandlerOptions {
     pub port: u16,
     pub uuid: String,
     pub udp: bool,
+    pub xudp: bool,
     pub transport: Option<Box<dyn Transport>>,
     pub tls: Option<Box<dyn Transport>>,
     pub flow: Option<String>,
@@ -117,6 +118,7 @@ impl Handler {
             &self.opts.uuid,
             &sess.destination,
             is_udp,
+            self.opts.xudp,
             self.opts.flow.clone(),
         )?;
 
@@ -322,8 +324,11 @@ impl OutboundHandler for Handler {
         connector: &dyn RemoteConnector,
     ) -> io::Result<BoxedChainedDatagram> {
         if let Some(stream) = self.try_reuse_transport_stream(sess, true).await? {
-            let datagram =
-                OutboundDatagramVless::new(stream, sess.destination.clone());
+            let datagram = OutboundDatagramVless::new(
+                stream,
+                sess.destination.clone(),
+                self.opts.xudp,
+            );
             let chained = ChainedDatagramWrapper::new(datagram);
             chained.append_to_chain(self.name()).await;
             return Ok(Box::new(chained));
@@ -332,8 +337,11 @@ impl OutboundHandler for Handler {
             .try_transport_owned_stream(sess, resolver.clone(), connector, true)
             .await?
         {
-            let datagram =
-                OutboundDatagramVless::new(stream, sess.destination.clone());
+            let datagram = OutboundDatagramVless::new(
+                stream,
+                sess.destination.clone(),
+                self.opts.xudp,
+            );
             let chained = ChainedDatagramWrapper::new(datagram);
             chained.append_to_chain(self.name()).await;
             return Ok(Box::new(chained));
@@ -351,7 +359,11 @@ impl OutboundHandler for Handler {
             .await?;
 
         let stream = self.inner_proxy_stream(stream, sess, true).await?;
-        let d = OutboundDatagramVless::new(stream, sess.destination.clone());
+        let d = OutboundDatagramVless::new(
+            stream,
+            sess.destination.clone(),
+            self.opts.xudp,
+        );
 
         let chained = ChainedDatagramWrapper::new(d);
         chained.append_to_chain(self.name()).await;
@@ -429,6 +441,7 @@ mod reuse_tests {
             port: 443,
             uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
             udp: false,
+            xudp: false,
             transport: None,
             tls: None,
             flow: None,
@@ -454,6 +467,7 @@ mod reuse_tests {
             port: 443,
             uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
             udp: true,
+            xudp: false,
             transport: None,
             tls: None,
             flow: None,
@@ -472,6 +486,7 @@ mod reuse_tests {
             port: 443,
             uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
             udp: true,
+            xudp: false,
             transport: Some(Box::new(OwnedDialTransport)),
             tls: None,
             flow: None,
@@ -505,6 +520,7 @@ mod reuse_tests {
             port: 443,
             uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
             udp: true,
+            xudp: false,
             transport: Some(Box::new(OwnedDialTransport)),
             tls: None,
             flow: Some("xtls-rprx-vision".to_owned()),
@@ -538,6 +554,7 @@ mod reuse_tests {
             port: 443,
             uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
             udp: true,
+            xudp: false,
             transport: Some(Box::new(ReuseTransport)),
             tls: None,
             flow: None,
@@ -564,6 +581,7 @@ mod reuse_tests {
             port: 443,
             uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
             udp: true,
+            xudp: false,
             transport: Some(Box::new(ReuseTransport)),
             tls: None,
             flow: Some("xtls-rprx-vision".to_owned()),
@@ -914,6 +932,7 @@ mod tests {
             uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".into(),
             flow: None,
             udp: true,
+            xudp: false,
             tls: tls_client(None),
             transport: Some(Box::new(ws_client)),
             encryption: None,
@@ -960,6 +979,7 @@ mod tests {
             uuid: UUID.into(),
             flow: None,
             udp: false,
+            xudp: false,
             tls: Some(Box::new(tls)),
             transport: Some(Box::new(grpc_client)),
             encryption: None,
@@ -999,6 +1019,7 @@ mod tests {
             uuid: UUID.into(),
             flow: None,
             udp: false,
+            xudp: false,
             tls: Some(Box::new(tls)),
             transport: None,
             encryption: None,
