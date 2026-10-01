@@ -31,3 +31,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docker_test)', 'cfg(throug
 [workspace.lints.clippy]
 redundant_clone = "deny"
 needless_collect = "deny"
+# Rust 1.99's Clippy reports double_must_use on async_trait-generated futures.
+# Those futures are already #[must_use], so the generated attribute adds no
+# actionable signal; keep every other warning denied.
+double_must_use = "allow"
