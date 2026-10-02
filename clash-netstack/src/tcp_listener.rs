@@ -15,7 +15,7 @@ use std::{
     },
     time::{Duration, Instant as StdInstant},
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 const DEFAULT_TCP_SEND_BUFFER_SIZE: u32 = 256 * 1024; // 256 KiB
 const DEFAULT_TCP_RECV_BUFFER_SIZE: u32 = 256 * 1024; // 256 KiB
@@ -220,18 +220,36 @@ pub struct TcpListener {
     socket_stream: mpsc::Receiver<TcpStream>,
     tracked_streams: Arc<Mutex<Vec<Weak<TcpStreamHandle>>>>,
 
-    task_handle: tokio::task::JoinHandle<()>,
+    shutdown_sender: Option<oneshot::Sender<()>>,
+    task_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for TcpListener {
     fn drop(&mut self) {
         trace!("TcpListener dropped");
         mark_tracked_streams_closed(&self.tracked_streams);
-        self.task_handle.abort();
+        if let Some(task_handle) = &self.task_handle {
+            task_handle.abort();
+        }
     }
 }
 
 impl TcpListener {
+    /// Stop the TCP packet engine, close accepted streams with EOF, and wait
+    /// until its background task has finished.
+    pub async fn shutdown(&mut self) -> std::io::Result<()> {
+        if let Some(shutdown_sender) = self.shutdown_sender.take() {
+            let _ = shutdown_sender.send(());
+        }
+        if let Some(task_handle) = self.task_handle.take() {
+            task_handle
+                .await
+                .map_err(|error| std::io::Error::other(error.to_string()))
+        } else {
+            Ok(())
+        }
+    }
+
     fn build_interface(device: &mut NetstackDevice) -> Interface {
         let mut config =
             smoltcp::iface::Config::new(smoltcp::wire::HardwareAddress::Ip);
@@ -280,6 +298,7 @@ impl TcpListener {
 
         let (socket_stream_emitter, socket_stream) =
             mpsc::channel::<TcpStream>(TCP_ACCEPT_QUEUE_SIZE);
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
 
         let tracked_streams = Arc::new(Mutex::new(Vec::new()));
         let last_tcp_packet = Arc::new(Mutex::new(None));
@@ -294,6 +313,7 @@ impl TcpListener {
             };
             let rv = tokio::select! {
                 biased;
+                _ = shutdown_receiver => Ok(()),
                 rv = Self::poll_packets(inbound, device.create_injector(), iface_notifier, socket_stream_emitter, poll_packet_tracked_streams, poll_packet_last_tcp_packet) => rv,
                 rv = Self::poll_sockets(&mut iface, &mut device, iface_notifier_rx, poll_socket_last_tcp_packet) => rv,
             };
@@ -304,7 +324,8 @@ impl TcpListener {
 
         TcpListener {
             socket_stream,
-            task_handle,
+            shutdown_sender: Some(shutdown_sender),
+            task_handle: Some(task_handle),
             tracked_streams,
         }
     }
