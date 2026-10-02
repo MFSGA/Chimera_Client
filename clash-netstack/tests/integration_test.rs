@@ -782,6 +782,60 @@ async fn listener_drop_closes_existing_stream_io() {
 }
 
 #[tokio::test]
+async fn listener_shutdown_waits_for_engine_and_closes_existing_stream_io() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (stack, mut tcp_listener, _udp_socket) = NetStack::new();
+    let (mut stack_sink, _stack_stream) = stack.split();
+    stack_sink
+        .send(Packet::new(build_tcp_syn_packet()))
+        .await
+        .unwrap();
+
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        tcp_listener.next(),
+    )
+    .await
+    .expect("TCP stream was not created")
+    .expect("TCP listener ended unexpectedly");
+
+    tcp_listener
+        .shutdown()
+        .await
+        .expect("TCP engine shutdown failed");
+    tcp_listener
+        .shutdown()
+        .await
+        .expect("repeated TCP engine shutdown should be harmless");
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            tcp_listener.next(),
+        )
+        .await
+        .expect("TCP accept stream did not close")
+        .is_none()
+    );
+
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        stream.read(&mut byte),
+    )
+    .await
+    .expect("stream read remained pending after listener shutdown")
+    .unwrap();
+    assert_eq!(read, 0, "listener shutdown should surface EOF");
+
+    let err = stream
+        .write(b"x")
+        .await
+        .expect_err("write succeeded after TCP engine shutdown");
+    assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+}
+
+#[tokio::test]
 async fn invalid_tcp_checksum_does_not_create_stream() {
     let (stack, mut tcp_listener, _udp_socket) = NetStack::new();
     let (mut stack_sink, _stack_stream) = stack.split();
