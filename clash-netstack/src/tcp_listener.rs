@@ -7,7 +7,7 @@ use log::{debug, error, trace, warn};
 use smoltcp::{iface::Interface, socket::tcp, wire::TcpPacket};
 use std::{
     collections::HashMap,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc, Mutex, Weak,
@@ -79,6 +79,18 @@ fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
             Err(_) => "unknown panic payload".to_string(),
         },
     }
+}
+
+fn invalid_tcp_packet_diagnostic(
+    error: impl std::fmt::Display,
+    source_ip: IpAddr,
+    destination_ip: IpAddr,
+    segment_len: usize,
+) -> String {
+    format!(
+        "invalid TCP segment: {error}, src_ip: {source_ip}, \
+         dst_ip: {destination_ip}, segment_len: {segment_len}"
+    )
 }
 
 fn mark_stream_closed(socket_control: &TcpStreamHandle) {
@@ -458,9 +470,13 @@ impl TcpListener {
                     Ok(p) => p,
                     Err(err) => {
                         error!(
-                            "invalid TCP err: {err}, src_ip: {src_ip}, dst_ip: \
-                             {dst_ip}, payload: {:?}",
-                            tcp.slice()
+                            "{}",
+                            invalid_tcp_packet_diagnostic(
+                                err,
+                                src_ip,
+                                dst_ip,
+                                tcp.slice().len(),
+                            )
                         );
                         continue;
                     }
@@ -913,6 +929,27 @@ impl futures::Stream for TcpListener {
 #[cfg(test)]
 mod resource_limit_tests {
     use super::*;
+
+    #[test]
+    fn invalid_tcp_packet_diagnostic_reports_length_without_segment_bytes() {
+        let secret = b"credential-like-payload";
+        let diagnostic = invalid_tcp_packet_diagnostic(
+            "truncated TCP header",
+            IpAddr::from([192, 0, 2, 10]),
+            IpAddr::from([192, 0, 2, 20]),
+            secret.len(),
+        );
+
+        assert_eq!(
+            diagnostic,
+            format!(
+                "invalid TCP segment: truncated TCP header, src_ip: \
+                 192.0.2.10, dst_ip: 192.0.2.20, segment_len: {}",
+                secret.len()
+            )
+        );
+        assert!(!diagnostic.contains("credential-like-payload"));
+    }
 
     #[test]
     fn active_stream_capacity_recovers_after_drop() {
