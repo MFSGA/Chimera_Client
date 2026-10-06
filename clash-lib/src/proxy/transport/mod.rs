@@ -5,6 +5,8 @@ mod tls;
 mod ws;
 mod xhttp;
 
+use crate::proxy::utils::NetworkPoolContext;
+
 pub mod shadow_tls;
 pub mod simple_obfs;
 pub mod sip003;
@@ -48,10 +50,38 @@ pub use v2ray::{V2RayOBFSOption, V2rayWsClient};
 
 #[async_trait::async_trait]
 pub trait Transport: Send + Sync {
+    /// Retire cached underlying connections after the physical path changes.
+    /// Existing logical streams retain their own handles and are not replayed.
+    async fn reset_connection_pool(&self) -> std::io::Result<u32> {
+        Ok(0)
+    }
+
     async fn proxy_stream(
         &self,
         stream: super::AnyStream,
     ) -> std::io::Result<super::AnyStream>;
+
+    /// Build a stream whose reusable connection belongs to a known network
+    /// generation. Transports without a reusable pool can keep the default.
+    async fn proxy_stream_for_network_generation(
+        &self,
+        stream: super::AnyStream,
+        _generation: Option<u64>,
+    ) -> std::io::Result<super::AnyStream> {
+        self.proxy_stream(stream).await
+    }
+
+    /// Build a stream associated with the actual network path selected by the
+    /// connector. Reusable transports can use path eligibility to retain pools
+    /// on unaffected interfaces while retiring stale ones.
+    async fn proxy_stream_with_pool_context(
+        &self,
+        stream: super::AnyStream,
+        context: NetworkPoolContext,
+    ) -> std::io::Result<super::AnyStream> {
+        self.proxy_stream_for_network_generation(stream, context.network_generation)
+            .await
+    }
 
     /// Let a transport establish its own underlying connection when its wire
     /// protocol cannot be layered over the caller's pre-dialed TCP stream.
@@ -76,6 +106,38 @@ pub trait Transport: Send + Sync {
     /// connection reuse would still pay the TCP/TLS handshake cost.
     async fn try_reuse_stream(&self) -> std::io::Result<Option<super::AnyStream>> {
         Ok(None)
+    }
+
+    /// Only borrow a pooled connection created on the caller's current
+    /// network generation. The default preserves transports without pools.
+    async fn try_reuse_stream_for_network_generation(
+        &self,
+        _generation: Option<u64>,
+    ) -> std::io::Result<Option<super::AnyStream>> {
+        self.try_reuse_stream().await
+    }
+
+    /// Borrow a pooled connection only if it still belongs to an eligible
+    /// network path. Transports that do not track paths keep generation-only
+    /// behavior through the default implementation.
+    async fn try_reuse_stream_with_pool_context(
+        &self,
+        context: NetworkPoolContext,
+    ) -> std::io::Result<Option<super::AnyStream>> {
+        self.try_reuse_stream_for_network_generation(context.network_generation)
+            .await
+    }
+
+    /// Reuse an underlying connection and return its stored path metadata.
+    /// The default is generation-only for transports that do not tag entries.
+    async fn try_reuse_stream_with_pool_metadata(
+        &self,
+        context: NetworkPoolContext,
+    ) -> std::io::Result<Option<(super::AnyStream, NetworkPoolContext)>> {
+        Ok(self
+            .try_reuse_stream_with_pool_context(context.clone())
+            .await?
+            .map(|stream| (stream, context)))
     }
 
     /// Like `proxy_stream`, but additionally returns a `VisionOptions` for

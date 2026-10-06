@@ -20,6 +20,8 @@ const UDP_DOMAIN_MAP_TTL: Duration = Duration::from_secs(60);
 // Stream + Sink trait
 pub struct OutboundDatagramImpl {
     inner: UdpSocket,
+    ipv6_inner: Option<UdpSocket>,
+    receive_ipv6_first: bool,
     resolver: ThreadSafeDNSResolver,
     flushed: bool,
     pkt: Option<UdpPacket>,
@@ -33,6 +35,8 @@ impl OutboundDatagramImpl {
     pub fn new(udp: UdpSocket, resolver: ThreadSafeDNSResolver) -> Self {
         Self {
             inner: udp,
+            ipv6_inner: None,
+            receive_ipv6_first: false,
             resolver,
             flushed: true,
             pkt: None,
@@ -41,6 +45,14 @@ impl OutboundDatagramImpl {
             pending_dns: None,
             resolved_dst: None,
         }
+    }
+}
+
+impl OutboundDatagramImpl {
+    #[cfg(any(test, all(feature = "tun", target_os = "macos")))]
+    pub(crate) fn with_ipv6_socket(mut self, socket: UdpSocket) -> Self {
+        self.ipv6_inner = Some(socket);
+        self
     }
 }
 
@@ -82,6 +94,7 @@ impl Sink<UdpPacket> for OutboundDatagramImpl {
 
         let Self {
             ref mut inner,
+            ref mut ipv6_inner,
             ref mut pkt,
             ref resolver,
             ref mut ip_to_logical,
@@ -147,7 +160,12 @@ impl Sink<UdpPacket> for OutboundDatagramImpl {
             }
         };
 
-        let send_dst = match (inner.local_addr()?.is_ipv6(), dst) {
+        let socket = if dst.is_ipv6() {
+            ipv6_inner.as_ref().unwrap_or(inner)
+        } else {
+            inner
+        };
+        let send_dst = match (socket.local_addr()?.is_ipv6(), dst) {
             (true, SocketAddr::V4(v4)) => {
                 SocketAddr::V6(std::net::SocketAddrV6::new(
                     v4.ip().to_ipv6_mapped(),
@@ -159,7 +177,7 @@ impl Sink<UdpPacket> for OutboundDatagramImpl {
             _ => dst,
         };
 
-        let n = ready!(inner.poll_send_to(cx, p.data.as_slice(), send_dst))?;
+        let n = ready!(socket.poll_send_to(cx, p.data.as_slice(), send_dst))?;
         let now = Instant::now();
         ip_to_logical
             .retain(|_, (_, ts)| now.duration_since(*ts) < UDP_DOMAIN_MAP_TTL);
@@ -195,14 +213,30 @@ impl Stream for OutboundDatagramImpl {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         let Self {
-            ref mut inner,
+            ref inner,
+            ref ipv6_inner,
+            ref mut receive_ipv6_first,
             ref mut recv_buf,
             ref ip_to_logical,
             ..
         } = *self;
         let mut buf = ReadBuf::new(recv_buf.as_mut_slice());
-        match ready!(inner.poll_recv_from(cx, &mut buf)) {
+        let sockets = if *receive_ipv6_first {
+            [ipv6_inner.as_ref(), Some(inner)]
+        } else {
+            [Some(inner), ipv6_inner.as_ref()]
+        };
+        let mut result = Poll::Pending;
+        for socket in sockets.into_iter().flatten() {
+            let polled = socket.poll_recv_from(cx, &mut buf);
+            if polled.is_ready() {
+                result = polled;
+                break;
+            }
+        }
+        match ready!(result) {
             Ok(src) => {
+                *receive_ipv6_first = !*receive_ipv6_first;
                 let data = buf.filled().to_vec();
                 let src = match src {
                     SocketAddr::V6(v6) => {
@@ -237,6 +271,52 @@ mod tests {
     use futures::{SinkExt, StreamExt};
     use std::{collections::HashSet, net::Ipv4Addr, sync::Arc, time::Duration};
     use tokio::net::UdpSocket;
+
+    #[tokio::test]
+    async fn separate_ipv6_socket_routes_both_families_and_receives_replies() {
+        let Ok(v6_echo) = UdpSocket::bind("[::1]:0").await else {
+            return;
+        };
+        let v6_addr = v6_echo.local_addr().unwrap();
+        let v6_task = tokio::spawn(async move {
+            let mut buffer = [0; 32];
+            let (length, peer) = v6_echo.recv_from(&mut buffer).await.unwrap();
+            v6_echo.send_to(&buffer[..length], peer).await.unwrap();
+        });
+        let v4_port = spawn_echo_server().await;
+        let resolver = Arc::new(MockClashResolver::new());
+        let mut datagram = OutboundDatagramImpl::new(
+            UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            resolver,
+        )
+        .with_ipv6_socket(UdpSocket::bind("[::1]:0").await.unwrap());
+        for (destination, payload) in [
+            (format!("127.0.0.1:{v4_port}").parse().unwrap(), b"ipv4"),
+            (v6_addr, b"ipv6"),
+        ] {
+            datagram
+                .send(UdpPacket {
+                    data: payload.to_vec(),
+                    dst_addr: SocksAddr::Ip(destination),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let mut replies = HashSet::new();
+        for _ in 0..2 {
+            replies.insert(
+                tokio::time::timeout(Duration::from_secs(2), datagram.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .data,
+            );
+        }
+        assert!(replies.contains(b"ipv4".as_slice()));
+        assert!(replies.contains(b"ipv6".as_slice()));
+        v6_task.await.unwrap();
+    }
 
     async fn spawn_echo_server() -> u16 {
         let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();

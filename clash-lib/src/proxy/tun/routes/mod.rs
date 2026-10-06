@@ -149,7 +149,7 @@ pub async fn maybe_add_routes(
                 }
                 #[cfg(target_os = "macos")]
                 {
-                    macos::maybe_add_default_route()?;
+                    macos::maybe_add_default_route().await?;
                 }
             }
             #[cfg(target_os = "linux")]

@@ -60,6 +60,7 @@ pub struct InboundManager {
     inbound_handlers: ThreadSafeInboundHandlers,
 
     cancellation_token: tokio_util::sync::CancellationToken,
+    task: std::sync::Mutex<Option<JoinHandle<()>>>,
     ready_tx: std::sync::Mutex<Option<oneshot::Sender<Result<(), crate::Error>>>>,
     ready_rx: Mutex<Option<oneshot::Receiver<Result<(), crate::Error>>>>,
 }
@@ -72,7 +73,7 @@ impl Runner for InboundManager {
         let cancellation_token = self.cancellation_token.clone();
 
         let ready_tx = self.ready_tx.lock().unwrap().take();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let result = Self::start_all_listeners(
                 dispatcher,
                 authenticator,
@@ -93,6 +94,10 @@ impl Runner for InboundManager {
                 }
             }
         });
+        *self
+            .task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(task);
     }
 
     fn shutdown(&self) {
@@ -100,7 +105,21 @@ impl Runner for InboundManager {
     }
 
     fn join(&self) -> BoxFuture<'_, Result<(), crate::Error>> {
-        Box::pin(async move { self.join_all_listeners().await })
+        Box::pin(async move {
+            let task = self
+                .task
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(task) = task {
+                task.await.map_err(|err| {
+                    crate::Error::Operation(format!(
+                        "inbound manager join error: {err}"
+                    ))
+                })?;
+            }
+            self.join_all_listeners().await
+        })
     }
 }
 
@@ -170,6 +189,7 @@ impl InboundManager {
             dispatcher,
             authenticator,
             cancellation_token: cancellation_token.unwrap_or_default(),
+            task: std::sync::Mutex::new(None),
             ready_tx: std::sync::Mutex::new(Some(ready_tx)),
             ready_rx: Mutex::new(Some(ready_rx)),
         }
@@ -191,11 +211,20 @@ impl InboundManager {
     pub async fn wait_ready(&self) -> Result<(), crate::Error> {
         let receiver = self.ready_rx.lock().await.take();
         match receiver {
-            Some(receiver) => receiver.await.map_err(|_| {
-                crate::Error::Operation(
+            Some(receiver) => match tokio::time::timeout(
+                crate::app::runtime_state::COMPONENT_READINESS_TIMEOUT,
+                receiver,
+            )
+            .await
+            {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err(crate::Error::Operation(
                     "inbound manager exited before becoming ready".to_owned(),
-                )
-            })?,
+                )),
+                Err(_) => Err(crate::Error::Operation(
+                    "inbound readiness timed out after 30 seconds".to_owned(),
+                )),
+            },
             None => Err(crate::Error::Operation(
                 "inbound readiness was already consumed".to_owned(),
             )),
@@ -256,7 +285,16 @@ impl InboundManager {
         }
 
         for (name, receiver) in readiness {
-            let result = match receiver.await {
+            let receiver_result = tokio::select! {
+                _ = cancellation_token.cancelled() => {
+                    let _ = Self::stop_all_listener_handles(inbound_handlers.clone()).await;
+                    return Err(crate::Error::Operation(
+                        "inbound startup cancelled before readiness".to_owned(),
+                    ));
+                }
+                result = receiver => result,
+            };
+            let result = match receiver_result {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(message)) => Err(crate::Error::Operation(format!(
                     "inbound {name} failed to become ready: {message}"
@@ -354,6 +392,18 @@ impl InboundManager {
 
     pub(crate) async fn snapshot_options(&self) -> HashSet<InboundOpts> {
         self.inbound_handlers.read().await.keys().cloned().collect()
+    }
+
+    pub(crate) async fn has_configured_listeners(&self) -> bool {
+        !self.inbound_handlers.read().await.is_empty()
+    }
+
+    pub(crate) async fn has_finished_listener(&self) -> bool {
+        self.inbound_handlers
+            .read()
+            .await
+            .values()
+            .any(|handler| handler.as_ref().is_some_and(JoinHandle::is_finished))
     }
 
     pub(crate) async fn restore_options(&self, options: HashSet<InboundOpts>) {

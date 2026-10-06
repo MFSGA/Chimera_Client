@@ -324,6 +324,13 @@ impl Handler {
 
 #[async_trait]
 impl OutboundHandler for Handler {
+    async fn reset_connection_pool(&self) -> io::Result<u32> {
+        match &self.opts.transport {
+            Some(transport) => transport.reset_connection_pool().await,
+            None => Ok(0),
+        }
+    }
+
     fn name(&self) -> &str {
         &self.opts.name
     }
@@ -394,18 +401,27 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
     ) -> io::Result<BoxedChainedStream> {
-        let stream = connector
-            .connect_stream(
+        let pool_context =
+            connector.connection_pool_context(sess.iface.as_ref()).await;
+        let (stream, pool_context) = connector
+            .connect_stream_with_pool_context(
                 resolver,
                 self.opts.server.as_str(),
                 self.opts.port,
                 sess.iface.as_ref(),
                 #[cfg(target_os = "linux")]
                 sess.so_mark,
+                pool_context,
             )
             .await?;
 
         let s = self.inner_proxy_stream(stream, sess).await?;
+        let s = crate::proxy::utils::observe_proxy_target_stream(
+            s,
+            &pool_context,
+            &sess.destination,
+            crate::app::runtime_state::TrafficKind::ProxyTcp,
+        );
         let chained = ChainedStreamWrapper::new(s);
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
@@ -417,14 +433,17 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
     ) -> io::Result<BoxedChainedDatagram> {
-        let stream = connector
-            .connect_stream(
+        let pool_context =
+            connector.connection_pool_context(sess.iface.as_ref()).await;
+        let (stream, pool_context) = connector
+            .connect_stream_with_pool_context(
                 resolver,
                 self.opts.server.as_str(),
                 self.opts.port,
                 sess.iface.as_ref(),
                 #[cfg(target_os = "linux")]
                 sess.so_mark,
+                pool_context,
             )
             .await?;
 
@@ -442,6 +461,13 @@ impl OutboundHandler for Handler {
         let request = Self::encode_uot_connect_request(&sess.destination);
         stream.write_all(&request).await?;
         stream.flush().await?;
+
+        let stream = crate::proxy::utils::observe_proxy_target_stream(
+            stream,
+            &pool_context,
+            &sess.destination,
+            crate::app::runtime_state::TrafficKind::ProxyUdp,
+        );
 
         let datagram = OutboundDatagramAnytls::new(stream, sess.destination.clone());
         let chained = crate::app::dispatcher::ChainedDatagramWrapper::new(datagram);

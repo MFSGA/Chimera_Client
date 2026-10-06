@@ -62,7 +62,10 @@ use crate::{
 };
 use crate::{
     common::errors::map_io_error,
-    proxy::{AnyStream, utils::new_protected_tcp_stream},
+    proxy::{
+        AnyStream,
+        utils::{NetworkPoolContext, new_protected_tcp_stream},
+    },
 };
 #[cfg(feature = "xhttp-h3")]
 use quinn::{
@@ -92,6 +95,8 @@ struct ReusableH2 {
     reuse_count: u64,
     request_count: Arc<AtomicU64>,
     limits: ReuseLimits,
+    network_generation: Option<u64>,
+    path_id: Option<crate::app::flow::NetworkPathId>,
 }
 
 impl ReusableH2 {
@@ -128,6 +133,7 @@ struct ReusableH3 {
     reuse_count: u64,
     request_count: Arc<AtomicU64>,
     limits: ReuseLimits,
+    network_generation: Option<u64>,
 }
 
 #[cfg(feature = "xhttp-h3")]
@@ -315,6 +321,8 @@ pub struct Client {
     session: XhttpSessionIdConfig,
     reuse_policy: Option<XhttpReusePolicy>,
     reuse_max_connections: Option<u64>,
+    recovery_gate: tokio::sync::RwLock<()>,
+    recovery_cancellation: Mutex<tokio_util::sync::CancellationToken>,
     reuse_pool: Mutex<Vec<ReusableH2>>,
     #[cfg(feature = "xhttp-h3")]
     h3_reuse_pool: Mutex<Vec<ReusableH3>>,
@@ -365,6 +373,10 @@ impl Client {
             session: XhttpSessionIdConfig::default(),
             reuse_policy: None,
             reuse_max_connections: None,
+            recovery_gate: tokio::sync::RwLock::new(()),
+            recovery_cancellation: Mutex::new(
+                tokio_util::sync::CancellationToken::new(),
+            ),
             reuse_pool: Mutex::new(Vec::new()),
             #[cfg(feature = "xhttp-h3")]
             h3_reuse_pool: Mutex::new(Vec::new()),
@@ -666,6 +678,7 @@ async fn connect_plain_stream(server: &str, port: u16) -> io::Result<AnyStream> 
 async fn acquire_download_sender(
     client: &Client,
     download: &XhttpDownloadConfig,
+    network_generation: Option<u64>,
 ) -> io::Result<(
     H2SendRequest,
     Option<Arc<AtomicU64>>,
@@ -678,7 +691,9 @@ async fn acquire_download_sender(
     };
 
     let mut pool = client.download_reuse_pool.lock().await;
-    pool.retain(|connection| !connection.retired());
+    pool.retain(|connection| {
+        !connection.retired() && connection.network_generation == network_generation
+    });
 
     let should_open_fresh = match client.download_reuse_max_connections {
         Some(0) => true,
@@ -716,6 +731,8 @@ async fn acquire_download_sender(
         reuse_count: 0,
         request_count: request_count.clone(),
         limits: reuse_policy.sample_limits(),
+        network_generation,
+        path_id: None,
     });
 
     Ok((sender, Some(active), Some(request_count)))
@@ -725,6 +742,7 @@ async fn open_separate_downlink_response(
     client: &Client,
     download: &XhttpDownloadConfig,
     session_id: &str,
+    network_generation: Option<u64>,
 ) -> io::Result<(Incoming, Option<Arc<AtomicU64>>)> {
     let mut headers = download.headers.clone();
     let path =
@@ -748,7 +766,7 @@ async fn open_separate_downlink_response(
     )?;
 
     let (mut downlink_sender, active, request_count) =
-        acquire_download_sender(client, download).await?;
+        acquire_download_sender(client, download, network_generation).await?;
     let result =
         send_h2_request(&mut downlink_sender, request, request_count.as_ref())
             .await
@@ -770,9 +788,16 @@ async fn open_downlink_response(
     sender: &mut H2SendRequest,
     session_id: &str,
     request_count: Option<&Arc<AtomicU64>>,
+    network_generation: Option<u64>,
 ) -> io::Result<(Incoming, Option<Arc<AtomicU64>>)> {
     if let Some(download) = client.download.as_ref() {
-        open_separate_downlink_response(client, download, session_id).await
+        open_separate_downlink_response(
+            client,
+            download,
+            session_id,
+            network_generation,
+        )
+        .await
     } else {
         let mut headers = client.headers.clone();
         let path =
@@ -912,13 +937,18 @@ async fn open_xhttp_logical_stream(
     client: &Client,
     sender: H2SendRequest,
     request_count: Option<Arc<AtomicU64>>,
+    network_generation: Option<u64>,
 ) -> io::Result<AnyStream> {
     match client.effective_mode() {
         XhttpMode::StreamOne => {
             proxy_stream_one(client, sender, request_count).await
         }
-        XhttpMode::StreamUp => proxy_stream_up(client, sender, request_count).await,
-        XhttpMode::PacketUp => proxy_packet_up(client, sender, request_count).await,
+        XhttpMode::StreamUp => {
+            proxy_stream_up(client, sender, request_count, network_generation).await
+        }
+        XhttpMode::PacketUp => {
+            proxy_packet_up(client, sender, request_count, network_generation).await
+        }
         XhttpMode::Auto => unreachable!("effective_mode resolves auto"),
     }
 }
@@ -1540,7 +1570,28 @@ async fn acquire_h3_upload_sender(
     sess: &Session,
     resolver: ThreadSafeDNSResolver,
     connector: &dyn RemoteConnector,
+    network_generation: Option<u64>,
+    allow_pooling: bool,
 ) -> io::Result<H3UploadSender> {
+    if !allow_pooling {
+        let keep_alive = client
+            .reuse_policy
+            .as_ref()
+            .map(|policy| policy.h_keep_alive_period);
+        return Ok(H3UploadSender {
+            sender: connect_h3_sender(
+                endpoint_config,
+                sess,
+                resolver,
+                connector,
+                keep_alive,
+            )
+            .await?,
+            active: None,
+            request_count: None,
+        });
+    }
+
     let Some(reuse_policy) = client.reuse_policy.as_ref() else {
         return Ok(H3UploadSender {
             sender: connect_h3_sender(
@@ -1558,7 +1609,10 @@ async fn acquire_h3_upload_sender(
 
     {
         let mut pool = client.h3_reuse_pool.lock().await;
-        pool.retain(|connection| !connection.retired());
+        pool.retain(|connection| {
+            !connection.retired()
+                && connection.network_generation == network_generation
+        });
         let should_open_fresh = match client.reuse_max_connections {
             Some(0) => true,
             Some(max_connections) => (pool.len() as u64) < max_connections,
@@ -1603,6 +1657,7 @@ async fn acquire_h3_upload_sender(
         reuse_count: 0,
         request_count: request_count.clone(),
         limits: reuse_policy.sample_limits(),
+        network_generation,
     });
     Ok(H3UploadSender {
         sender,
@@ -1618,7 +1673,28 @@ async fn acquire_h3_download_sender(
     sess: &Session,
     resolver: ThreadSafeDNSResolver,
     connector: &dyn RemoteConnector,
+    network_generation: Option<u64>,
+    allow_pooling: bool,
 ) -> io::Result<H3DownlinkSender> {
+    if !allow_pooling {
+        let keep_alive = download
+            .reuse_policy
+            .as_ref()
+            .map(|policy| policy.h_keep_alive_period);
+        return Ok(H3DownlinkSender {
+            sender: connect_h3_sender(
+                &XhttpEndpointConfig::from(download),
+                sess,
+                resolver,
+                connector,
+                keep_alive,
+            )
+            .await?,
+            active: None,
+            request_count: None,
+        });
+    }
+
     let Some(reuse_policy) = download.reuse_policy.as_ref() else {
         return Ok(H3DownlinkSender {
             sender: connect_h3_sender(
@@ -1636,7 +1712,10 @@ async fn acquire_h3_download_sender(
 
     {
         let mut pool = client.h3_download_reuse_pool.lock().await;
-        pool.retain(|connection| !connection.retired());
+        pool.retain(|connection| {
+            !connection.retired()
+                && connection.network_generation == network_generation
+        });
         let should_open_fresh = match client.download_reuse_max_connections {
             Some(0) => true,
             Some(max_connections) => (pool.len() as u64) < max_connections,
@@ -1682,6 +1761,7 @@ async fn acquire_h3_download_sender(
         reuse_count: 0,
         request_count: request_count.clone(),
         limits: reuse_policy.sample_limits(),
+        network_generation,
     });
     Ok(H3DownlinkSender {
         sender,
@@ -1712,14 +1792,20 @@ async fn open_h3_logical_stream(
 }
 
 #[cfg(feature = "xhttp-h3")]
-async fn try_reuse_h3_stream(client: &Client) -> io::Result<Option<AnyStream>> {
+async fn try_reuse_h3_stream(
+    client: &Client,
+    network_generation: Option<u64>,
+) -> io::Result<Option<AnyStream>> {
     if client.reuse_policy.is_none() || client.download.is_some() {
         return Ok(None);
     }
 
     let selected = {
         let mut pool = client.h3_reuse_pool.lock().await;
-        pool.retain(|connection| !connection.retired());
+        pool.retain(|connection| {
+            !connection.retired()
+                && connection.network_generation == network_generation
+        });
 
         if let Some(max_connections) = client.reuse_max_connections
             && (max_connections == 0 || (pool.len() as u64) < max_connections)
@@ -1761,6 +1847,16 @@ async fn connect_h3_stream(
     resolver: ThreadSafeDNSResolver,
     connector: &dyn RemoteConnector,
 ) -> io::Result<AnyStream> {
+    let pool_context = connector.connection_pool_context(sess.iface.as_ref()).await;
+    let network_generation = pool_context.network_generation;
+    let allow_pooling = pool_context.eligible_path_ids.is_none();
+    if !allow_pooling {
+        // H3 entries do not yet carry a physical PathId. Retire unverified
+        // cache entries and use one-shot connections while path-level policy
+        // is active, rather than risk borrowing a connection on a failed NIC.
+        client.h3_reuse_pool.lock().await.clear();
+        client.h3_download_reuse_pool.lock().await.clear();
+    }
     let endpoint_config = client.upload_endpoint.as_ref().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1773,12 +1869,22 @@ async fn connect_h3_stream(
         sess,
         resolver.clone(),
         connector,
+        network_generation,
+        allow_pooling,
     )
     .await?;
     let downlink_sender = if let Some(download) = client.download.as_ref() {
         Some(
-            acquire_h3_download_sender(client, download, sess, resolver, connector)
-                .await?,
+            acquire_h3_download_sender(
+                client,
+                download,
+                sess,
+                resolver,
+                connector,
+                network_generation,
+                allow_pooling,
+            )
+            .await?,
         )
     } else {
         None
@@ -1809,162 +1915,297 @@ async fn connect_h3_stream(
 
 #[async_trait]
 impl Transport for Client {
+    async fn reset_connection_pool(&self) -> io::Result<u32> {
+        let mut cancellation = self.recovery_cancellation.lock().await;
+        cancellation.cancel();
+        let _recovery = self.recovery_gate.write().await;
+        let mut count = 0_u32;
+        for pool in [&self.reuse_pool, &self.download_reuse_pool] {
+            let mut pool = pool.lock().await;
+            count = count.saturating_add(pool.len().min(u32::MAX as usize) as u32);
+            pool.clear();
+        }
+        #[cfg(feature = "xhttp-h3")]
+        for pool in [&self.h3_reuse_pool, &self.h3_download_reuse_pool] {
+            let mut pool = pool.lock().await;
+            count = count.saturating_add(pool.len().min(u32::MAX as usize) as u32);
+            pool.clear();
+        }
+        *cancellation = tokio_util::sync::CancellationToken::new();
+        Ok(count)
+    }
+
     async fn connect_stream_with_connector(
         &self,
         sess: &crate::session::Session,
         resolver: crate::app::dns::ThreadSafeDNSResolver,
         connector: &dyn crate::proxy::utils::RemoteConnector,
     ) -> io::Result<Option<AnyStream>> {
-        if !matches!(self.http_version, XhttpHttpVersion::Http3) {
-            return Ok(None);
-        }
-        #[cfg(feature = "xhttp-h3")]
-        {
-            return connect_h3_stream(self, sess, resolver, connector)
-                .await
-                .map(Some);
-        }
-        #[cfg(not(feature = "xhttp-h3"))]
-        {
-            let _ = sess;
-            let _ = resolver;
-            let _ = connector;
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "xhttp HTTP/3 requires xhttp-h3 feature",
-            ))
+        let cancellation = self.recovery_cancellation.lock().await.clone();
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(io::Error::new(io::ErrorKind::ConnectionAborted, "network changed during transport construction")),
+            result = async {
+                let _recovery = self.recovery_gate.read().await;
+                if !matches!(self.http_version, XhttpHttpVersion::Http3) {
+                    return Ok(None);
+                }
+                #[cfg(feature = "xhttp-h3")]
+                {
+                    return connect_h3_stream(self, sess, resolver, connector)
+                        .await
+                        .map(Some);
+                }
+                #[cfg(not(feature = "xhttp-h3"))]
+                {
+                    let _ = sess;
+                    let _ = resolver;
+                    let _ = connector;
+                    Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "xhttp HTTP/3 requires xhttp-h3 feature",
+                    ))
+                }
+            } => result,
         }
     }
 
     async fn proxy_stream(&self, stream: AnyStream) -> io::Result<AnyStream> {
-        if matches!(self.http_version, XhttpHttpVersion::Http3) {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "xhttp HTTP/3 must use the transport-owned QUIC dial path",
-            ));
-        }
-        if matches!(self.http_version, XhttpHttpVersion::Http1) {
-            if self.reuse_policy.is_some()
-                || self
-                    .download
-                    .as_ref()
-                    .and_then(|download| download.reuse_policy.as_ref())
-                    .is_some()
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "xhttp HTTP/1.1 currently does not support reuse settings",
-                ));
-            }
-            if !matches!(self.effective_mode(), XhttpMode::PacketUp) {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "xhttp HTTP/1.1 currently supports only packet-up mode",
-                ));
-            }
-            let stream = if let Some(endpoint) = self.upload_endpoint.as_ref() {
-                secure_endpoint_stream(endpoint, stream).await?
-            } else {
-                stream
-            };
-            return proxy_packet_up_http1(self, stream).await;
-        }
+        self.proxy_stream_for_network_generation(stream, None).await
+    }
 
-        let stream = if let Some(endpoint) = self.upload_endpoint.as_ref() {
-            secure_endpoint_stream(endpoint, stream).await?
-        } else {
-            stream
-        };
-        let sender = handshake_http2(
+    async fn proxy_stream_for_network_generation(
+        &self,
+        stream: AnyStream,
+        network_generation: Option<u64>,
+    ) -> io::Result<AnyStream> {
+        self.proxy_stream_with_pool_context(
             stream,
-            self.reuse_policy
-                .as_ref()
-                .map(|policy| policy.h_keep_alive_period),
+            NetworkPoolContext::for_generation(network_generation),
         )
-        .await?;
+        .await
+    }
 
-        let Some(reuse_policy) = self.reuse_policy.as_ref() else {
-            return open_xhttp_logical_stream(self, sender, None).await;
-        };
+    async fn proxy_stream_with_pool_context(
+        &self,
+        stream: AnyStream,
+        pool_context: NetworkPoolContext,
+    ) -> io::Result<AnyStream> {
+        let network_generation = pool_context.network_generation;
+        let cancellation = self.recovery_cancellation.lock().await.clone();
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(io::Error::new(io::ErrorKind::ConnectionAborted, "network changed during transport construction")),
+            result = async {
+                let _recovery = self.recovery_gate.read().await;
+                if matches!(self.http_version, XhttpHttpVersion::Http3) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "xhttp HTTP/3 must use the transport-owned QUIC dial path",
+                    ));
+                }
+                if matches!(self.http_version, XhttpHttpVersion::Http1) {
+                    if self.reuse_policy.is_some()
+                        || self
+                            .download
+                            .as_ref()
+                            .and_then(|download| download.reuse_policy.as_ref())
+                            .is_some()
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "xhttp HTTP/1.1 currently does not support reuse settings",
+                        ));
+                    }
+                    if !matches!(self.effective_mode(), XhttpMode::PacketUp) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "xhttp HTTP/1.1 currently supports only packet-up mode",
+                        ));
+                    }
+                    let stream = if let Some(endpoint) = self.upload_endpoint.as_ref() {
+                        secure_endpoint_stream(endpoint, stream).await?
+                    } else {
+                        stream
+                    };
+                    return proxy_packet_up_http1(self, stream).await;
+                }
 
-        let request_count = Arc::new(AtomicU64::new(0));
-        let logical = open_xhttp_logical_stream(
-            self,
-            sender.clone(),
-            Some(request_count.clone()),
-        )
-        .await?;
+                let stream = if let Some(endpoint) = self.upload_endpoint.as_ref() {
+                    secure_endpoint_stream(endpoint, stream).await?
+                } else {
+                    stream
+                };
+                let sender = handshake_http2(
+                    stream,
+                    self.reuse_policy
+                        .as_ref()
+                        .map(|policy| policy.h_keep_alive_period),
+                )
+                .await?;
 
-        if self.reuse_max_connections == Some(0) {
-            return Ok(logical);
+                let Some(reuse_policy) = self.reuse_policy.as_ref() else {
+                    return open_xhttp_logical_stream(
+                        self,
+                        sender,
+                        None,
+                        network_generation,
+                    )
+                    .await;
+                };
+
+                let request_count = Arc::new(AtomicU64::new(0));
+                let logical = open_xhttp_logical_stream(
+                    self,
+                    sender.clone(),
+                    Some(request_count.clone()),
+                    network_generation,
+                )
+                .await?;
+
+                if self.reuse_max_connections == Some(0)
+                    || !pool_context.can_pool_connected_path()
+                {
+                    return Ok(logical);
+                }
+
+                let active = Arc::new(AtomicU64::new(1));
+                self.reuse_pool.lock().await.push(ReusableH2 {
+                    sender,
+                    created_at: Instant::now(),
+                    active: active.clone(),
+                    reuse_count: 0,
+                    request_count,
+                    limits: reuse_policy.sample_limits(),
+                    network_generation,
+                    path_id: pool_context.path_id.clone(),
+                });
+
+                Ok(leased_stream(logical, active))
+            } => result,
         }
-
-        let active = Arc::new(AtomicU64::new(1));
-        self.reuse_pool.lock().await.push(ReusableH2 {
-            sender,
-            created_at: Instant::now(),
-            active: active.clone(),
-            reuse_count: 0,
-            request_count,
-            limits: reuse_policy.sample_limits(),
-        });
-
-        Ok(leased_stream(logical, active))
     }
 
     async fn try_reuse_stream(&self) -> io::Result<Option<AnyStream>> {
-        if self.reuse_policy.is_none() {
-            return Ok(None);
-        }
-        if matches!(self.http_version, XhttpHttpVersion::Http1) {
-            return Ok(None);
-        }
-        if matches!(self.http_version, XhttpHttpVersion::Http3) {
-            #[cfg(feature = "xhttp-h3")]
-            {
-                return try_reuse_h3_stream(self).await;
-            }
-            #[cfg(not(feature = "xhttp-h3"))]
-            {
-                return Ok(None);
-            }
-        }
+        self.try_reuse_stream_for_network_generation(None).await
+    }
 
-        let selected = {
-            let mut pool = self.reuse_pool.lock().await;
-            pool.retain(|connection| !connection.retired());
+    async fn try_reuse_stream_for_network_generation(
+        &self,
+        network_generation: Option<u64>,
+    ) -> io::Result<Option<AnyStream>> {
+        self.try_reuse_stream_with_pool_context(NetworkPoolContext::for_generation(
+            network_generation,
+        ))
+        .await
+    }
 
-            if let Some(max_connections) = self.reuse_max_connections
-                && (max_connections == 0 || (pool.len() as u64) < max_connections)
-            {
-                return Ok(None);
-            }
+    async fn try_reuse_stream_with_pool_context(
+        &self,
+        pool_context: NetworkPoolContext,
+    ) -> io::Result<Option<AnyStream>> {
+        Ok(self
+            .try_reuse_stream_with_pool_metadata(pool_context)
+            .await?
+            .map(|(stream, _)| stream))
+    }
 
-            let Some(connection) =
-                pool.iter_mut().find(|connection| connection.has_capacity())
-            else {
-                return Ok(None);
-            };
+    async fn try_reuse_stream_with_pool_metadata(
+        &self,
+        pool_context: NetworkPoolContext,
+    ) -> io::Result<Option<(AnyStream, NetworkPoolContext)>> {
+        let network_generation = pool_context.network_generation;
+        let cancellation = self.recovery_cancellation.lock().await.clone();
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(io::Error::new(io::ErrorKind::ConnectionAborted, "network changed during transport construction")),
+            result = async {
+                let _recovery = self.recovery_gate.read().await;
+                if self.reuse_policy.is_none() {
+                    return Ok(None);
+                }
+                if matches!(self.http_version, XhttpHttpVersion::Http1) {
+                    return Ok(None);
+                }
+                if matches!(self.http_version, XhttpHttpVersion::Http3) {
+                    #[cfg(feature = "xhttp-h3")]
+                    {
+                        // H3 currently records only the network generation, not
+                        // the physical path selected by its connector.
+                        if pool_context.eligible_path_ids.is_some() {
+                            return Ok(None);
+                        }
+                        return try_reuse_h3_stream(self, network_generation)
+                            .await
+                            .map(|stream| {
+                                stream.map(|stream| (stream, pool_context.clone()))
+                            });
+                    }
+                    #[cfg(not(feature = "xhttp-h3"))]
+                    {
+                        return Ok(None);
+                    }
+                }
 
-            connection.reuse_count += 1;
-            connection.active.fetch_add(1, Ordering::AcqRel);
-            Some((
-                connection.sender.clone(),
-                connection.active.clone(),
-                connection.request_count.clone(),
-            ))
-        };
+                let selected = {
+                    let mut pool = self.reuse_pool.lock().await;
+                    pool.retain(|connection| {
+                        !connection.retired()
+                            && pool_context.permits(
+                                connection.network_generation,
+                                connection.path_id.as_ref(),
+                            )
+                    });
 
-        let Some((sender, active, request_count)) = selected else {
-            return Ok(None);
-        };
+                    if let Some(max_connections) = self.reuse_max_connections
+                        && (max_connections == 0 || (pool.len() as u64) < max_connections)
+                    {
+                        return Ok(None);
+                    }
 
-        match open_xhttp_logical_stream(self, sender, Some(request_count)).await {
-            Ok(stream) => Ok(Some(leased_stream(stream, active))),
-            Err(err) => {
-                active.fetch_sub(1, Ordering::AcqRel);
-                Err(err)
-            }
+                    let Some(connection) =
+                        pool.iter_mut().find(|connection| connection.has_capacity())
+                    else {
+                        return Ok(None);
+                    };
+
+                    connection.reuse_count += 1;
+                    connection.active.fetch_add(1, Ordering::AcqRel);
+                    Some((
+                        connection.sender.clone(),
+                        connection.active.clone(),
+                        connection.request_count.clone(),
+                        connection.network_generation,
+                        connection.path_id.clone(),
+                    ))
+                };
+
+                let Some((sender, active, request_count, stored_generation, path_id)) =
+                    selected
+                else {
+                    return Ok(None);
+                };
+
+                match open_xhttp_logical_stream(
+                    self,
+                    sender,
+                    Some(request_count),
+                    network_generation,
+                )
+                .await
+                {
+                    Ok(stream) => {
+                        let mut connected_context = pool_context;
+                        connected_context.network_generation = stored_generation;
+                        connected_context.path_id = path_id;
+                        Ok(Some((leased_stream(stream, active), connected_context)))
+                    }
+                    Err(err) => {
+                        active.fetch_sub(1, Ordering::AcqRel);
+                        Err(err)
+                    }
+                }
+            } => result,
         }
     }
 }
@@ -2017,6 +2258,7 @@ async fn proxy_stream_up(
     client: &Client,
     mut sender: H2SendRequest,
     request_count: Option<Arc<AtomicU64>>,
+    network_generation: Option<u64>,
 ) -> io::Result<AnyStream> {
     let session_id = client.session.generate();
     let (response, downlink_active) = open_downlink_response(
@@ -2024,6 +2266,7 @@ async fn proxy_stream_up(
         &mut sender,
         &session_id,
         request_count.as_ref(),
+        network_generation,
     )
     .await?;
 
@@ -2311,6 +2554,7 @@ async fn proxy_packet_up(
     client: &Client,
     mut sender: H2SendRequest,
     request_count: Option<Arc<AtomicU64>>,
+    network_generation: Option<u64>,
 ) -> io::Result<AnyStream> {
     let session_id = client.session.generate();
     let (response, downlink_active) = open_downlink_response(
@@ -2318,6 +2562,7 @@ async fn proxy_packet_up(
         &mut sender,
         &session_id,
         request_count.as_ref(),
+        network_generation,
     )
     .await?;
 
@@ -3334,6 +3579,16 @@ mod tests {
             .expect("second H3 reuse read timed out")
             .expect("second H3 reuse read failed");
         assert_eq!(&second_buf, b"two2");
+        assert_eq!(client.reset_connection_pool().await.unwrap(), 1);
+        // Retiring the pool preserves an existing healthy logical stream.
+        second.write_all(b"live").await.unwrap();
+        second.flush().await.unwrap();
+        let mut live = [0; 4];
+        timeout(Duration::from_secs(2), second.read_exact(&mut live))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&live, b"live");
         drop(second);
 
         assert!(
@@ -3432,6 +3687,8 @@ mod tests {
             &session,
             resolver.clone(),
             &connector,
+            None,
+            true,
         )
         .await
         .expect("first H3 download sender should connect");
@@ -3439,7 +3696,7 @@ mod tests {
         drop(super::H3ActiveLease(first_active));
 
         let second = super::acquire_h3_download_sender(
-            &client, &download, &session, resolver, &connector,
+            &client, &download, &session, resolver, &connector, None, true,
         )
         .await
         .expect("second H3 download sender should reuse");
@@ -3650,6 +3907,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn network_reset_cancels_stalled_xhttp_construction() {
+        let client = std::sync::Arc::new(Client::new(
+            "localhost".into(),
+            80,
+            "/xhttp/".into(),
+            None,
+            HashMap::new(),
+            false,
+            XhttpMode::StreamOne,
+            1_000_000,
+            false,
+            None,
+            None,
+        ));
+        let (stream, _silent_peer) = tokio::io::duplex(65536);
+        let constructing = client.clone();
+        let task = tokio::spawn(async move {
+            constructing.proxy_stream(Box::new(stream)).await
+        });
+        timeout(Duration::from_secs(2), async {
+            while client.recovery_gate.try_write().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("construction did not start");
+        timeout(Duration::from_secs(2), client.reset_connection_pool())
+            .await
+            .expect("reset must cancel construction before waiting for its lock")
+            .unwrap();
+        let result = timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(result, Err(error) if error.kind() == std::io::ErrorKind::ConnectionAborted)
+        );
+        assert!(!client.recovery_cancellation.lock().await.is_cancelled());
+    }
+
+    #[tokio::test]
     async fn xhttp_stream_one_echoes_bytes() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -3798,6 +4096,145 @@ mod tests {
                 .is_none(),
             "c-max-reuse-times=1 must retire the connection after one reuse"
         );
+    }
+
+    #[tokio::test]
+    async fn xhttp_h2_pool_rejects_a_connection_from_an_older_network_generation() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should expose addr");
+
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept should succeed");
+            let io = TokioIo::new(tcp);
+            let service = hyper::service::service_fn(handle_stream_one);
+            let builder = auto::Builder::new(TokioExecutor::new()).http2_only();
+            builder
+                .serve_connection(io, service)
+                .await
+                .expect("server connection should succeed");
+        });
+
+        let client = Client::new(
+            "127.0.0.1".to_owned(),
+            addr.port(),
+            "/xhttp/".to_owned(),
+            None,
+            HashMap::new(),
+            false,
+            XhttpMode::StreamOne,
+            1_000_000,
+            false,
+            None,
+            None,
+        )
+        .with_reuse_policy(Some(XhttpReusePolicy {
+            max_concurrency: Some(XhttpReuseValueRange { min: 1, max: 1 }),
+            max_connections: None,
+            c_max_reuse_times: Some(XhttpReuseValueRange { min: 0, max: 0 }),
+            h_max_request_times: Some(XhttpReuseValueRange { min: 0, max: 0 }),
+            h_max_reusable_secs: Some(XhttpReuseValueRange { min: 0, max: 0 }),
+            h_keep_alive_period: 0,
+        }));
+
+        let path_a = crate::app::flow::NetworkPathId {
+            interface: crate::app::flow::InterfaceId {
+                name: "wifi0".to_owned(),
+                index: 4,
+            },
+            family: crate::app::flow::AddressFamily::Ipv4,
+            source_address: Some("192.0.2.10".parse().unwrap()),
+            network_generation: 20,
+        };
+        let path_b = crate::app::flow::NetworkPathId {
+            interface: crate::app::flow::InterfaceId {
+                name: "eth0".to_owned(),
+                index: 5,
+            },
+            family: crate::app::flow::AddressFamily::Ipv4,
+            source_address: Some("198.51.100.10".parse().unwrap()),
+            network_generation: 20,
+        };
+        let both_paths = crate::proxy::utils::NetworkPoolContext {
+            network_generation: Some(20),
+            path_id: Some(path_a.clone()),
+            eligible_path_ids: Some(
+                [path_a.clone(), path_b.clone()].into_iter().collect(),
+            ),
+            reporter: None,
+        };
+
+        let raw = TcpStream::connect(addr)
+            .await
+            .expect("client should connect");
+        let mut first = client
+            .proxy_stream_with_pool_context(Box::new(raw), both_paths.clone())
+            .await
+            .expect("first logical stream should connect");
+        first
+            .write_all(b"epoch")
+            .await
+            .expect("write should succeed");
+        first.flush().await.expect("flush should succeed");
+        let mut response = [0u8; 5];
+        timeout(Duration::from_secs(2), first.read_exact(&mut response))
+            .await
+            .expect("response timeout")
+            .expect("response should be readable");
+        assert_eq!(&response, b"epoch");
+        drop(first);
+
+        let (mut same_generation, reused_context) = client
+            .try_reuse_stream_with_pool_metadata(both_paths)
+            .await
+            .expect("same generation lookup should succeed")
+            .expect("same generation should reuse the pooled connection");
+        assert_eq!(reused_context.path_id.as_ref(), Some(&path_a));
+        same_generation
+            .write_all(b"epoch2")
+            .await
+            .expect("same-generation write should succeed");
+        same_generation
+            .flush()
+            .await
+            .expect("same-generation flush should succeed");
+        let mut same_response = [0u8; 6];
+        timeout(
+            Duration::from_secs(2),
+            same_generation.read_exact(&mut same_response),
+        )
+        .await
+        .expect("same-generation response timeout")
+        .expect("same-generation response should be readable");
+        assert_eq!(&same_response, b"epoch2");
+        drop(same_generation);
+
+        let only_path_b = crate::proxy::utils::NetworkPoolContext {
+            network_generation: Some(20),
+            path_id: None,
+            eligible_path_ids: Some([path_b].into_iter().collect()),
+            reporter: None,
+        };
+        assert!(
+            client
+                .try_reuse_stream_with_pool_context(only_path_b)
+                .await
+                .expect("path eligibility lookup should succeed")
+                .is_none(),
+            "an H2 connection tagged with path A must be retired when only path B remains eligible"
+        );
+        assert!(client.reuse_pool.lock().await.is_empty());
+
+        assert!(
+            client
+                .try_reuse_stream_for_network_generation(Some(21))
+                .await
+                .expect("stale generation lookup should succeed")
+                .is_none(),
+            "a connection created on generation 20 must not be borrowed on generation 21"
+        );
+        assert!(client.reuse_pool.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -3974,7 +4411,7 @@ mod tests {
             let download = client.download.as_ref().expect("download config");
             let (body, active) = timeout(
                 Duration::from_secs(2),
-                open_separate_downlink_response(&client, download, session_id),
+                open_separate_downlink_response(&client, download, session_id, None),
             )
             .await
             .expect("downlink request should finish")

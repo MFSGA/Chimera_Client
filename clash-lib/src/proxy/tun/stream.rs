@@ -7,7 +7,6 @@ use crate::{
     app::{
         dispatcher::Dispatcher,
         dns::{ThreadSafeDNSResolver, exchange_with_resolver},
-        net::DEFAULT_OUTBOUND_INTERFACE,
     },
     config::internal::config::DnsHijackRule,
     session::{Network, Session, Type, find_process_name},
@@ -122,16 +121,7 @@ pub(crate) async fn handle_inbound_stream(
         typ: Type::Tun,
         source,
         destination: destination.into(),
-        iface: DEFAULT_OUTBOUND_INTERFACE
-            .read()
-            .await
-            .clone()
-            .inspect(|x| {
-                debug!(
-                    "selecting outbound interface: {:?} for tun TCP connection",
-                    x
-                );
-            }),
+        iface: None,
         so_mark,
         process_name,
         ..Default::default()

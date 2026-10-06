@@ -387,6 +387,152 @@ async fn network_reset_reports_dns_and_connection_pool_counts() {
 
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
+async fn runtime_path_preference_updates_are_versioned_and_temporary() {
+    let wd =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
+    let api_port = available_port();
+    let (isolated_config, socks_port) = isolated_config(api_port);
+    let _clash = ClashInstance::start(
+        Options {
+            config: Config::File(isolated_config.to_string_lossy().to_string()),
+            cwd: Some(wd.to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            config_path: Some(isolated_config.to_string_lossy().to_string()),
+        },
+        vec![api_port, socks_port],
+    )
+    .expect("Failed to start clash");
+
+    let get_url =
+        format!("http://127.0.0.1:{api_port}/runtime/network/path-preference");
+    let get = || {
+        hyper::Request::builder()
+            .uri(&get_url)
+            .header(hyper::header::AUTHORIZATION, "Bearer clash-rs")
+            .method(http::method::Method::GET)
+            .body(http_body_util::Empty::<Bytes>::new())
+            .expect("failed to build path preference GET")
+    };
+    let response = send_http_request(get_url.parse().unwrap(), get())
+        .await
+        .expect("failed to GET path preference");
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let initial: serde_json::Value = serde_json::from_reader(
+        response.collect().await.unwrap().aggregate().reader(),
+    )
+    .unwrap();
+    assert_eq!(initial["policyVersion"], 0);
+    assert_eq!(initial["priority"], serde_json::json!([]));
+    if initial["automaticSupported"] == false {
+        // Platforms without a path observer report the capability explicitly;
+        // the runtime preference write is intentionally unavailable there.
+        return;
+    }
+
+    let put_body = serde_json::json!({
+        "priority": [{ "interface": "ethernet", "family": "ipv4" }]
+    });
+    let put = hyper::Request::builder()
+        .uri(&get_url)
+        .header(hyper::header::AUTHORIZATION, "Bearer clash-rs")
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .method(http::method::Method::PUT)
+        .body(http_body_util::Full::new(Bytes::from(put_body.to_string())))
+        .expect("failed to build path preference PUT");
+    let response = send_http_request(get_url.parse().unwrap(), put)
+        .await
+        .expect("failed to PUT path preference");
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let configured: serde_json::Value = serde_json::from_reader(
+        response.collect().await.unwrap().aggregate().reader(),
+    )
+    .unwrap();
+    assert_eq!(configured["policyVersion"], 1);
+    assert_eq!(configured["priority"][0]["interface"], "ethernet");
+
+    let effective_url =
+        format!("http://127.0.0.1:{api_port}/runtime/network/effective-paths");
+    let effective_request = hyper::Request::builder()
+        .uri(&effective_url)
+        .header(hyper::header::AUTHORIZATION, "Bearer clash-rs")
+        .method(http::method::Method::GET)
+        .body(http_body_util::Empty::<Bytes>::new())
+        .expect("failed to build effective paths GET");
+    let response =
+        send_http_request(effective_url.parse().unwrap(), effective_request)
+            .await
+            .expect("failed to GET effective paths");
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let effective: serde_json::Value = serde_json::from_reader(
+        response.collect().await.unwrap().aggregate().reader(),
+    )
+    .unwrap();
+    assert_eq!(effective["policyVersion"], 1);
+    assert_eq!(effective["configuredPriority"][0]["interface"], "ethernet");
+
+    let temporary_body = serde_json::json!({
+        "priority": [{ "interface": "wifi", "family": "ipv6" }],
+        "ttlMs": 60000
+    });
+    let temporary = hyper::Request::builder()
+        .uri(&get_url)
+        .header(hyper::header::AUTHORIZATION, "Bearer clash-rs")
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .method(http::method::Method::PUT)
+        .body(http_body_util::Full::new(Bytes::from(
+            temporary_body.to_string(),
+        )))
+        .expect("failed to build temporary path preference PUT");
+    let response = send_http_request(get_url.parse().unwrap(), temporary)
+        .await
+        .expect("failed to PUT temporary path preference");
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let temporary: serde_json::Value = serde_json::from_reader(
+        response.collect().await.unwrap().aggregate().reader(),
+    )
+    .unwrap();
+    assert_eq!(temporary["policyVersion"], 2);
+    assert_eq!(temporary["source"], "temporaryOverride");
+    assert!(temporary["expiresAtMs"].as_i64().is_some());
+
+    let clear = hyper::Request::builder()
+        .uri(&get_url)
+        .header(hyper::header::AUTHORIZATION, "Bearer clash-rs")
+        .method(http::method::Method::DELETE)
+        .body(http_body_util::Empty::<Bytes>::new())
+        .expect("failed to build temporary preference DELETE");
+    let response = send_http_request(get_url.parse().unwrap(), clear)
+        .await
+        .expect("failed to clear temporary path preference");
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let restored: serde_json::Value = serde_json::from_reader(
+        response.collect().await.unwrap().aggregate().reader(),
+    )
+    .unwrap();
+    assert_eq!(restored["policyVersion"], 3);
+    assert_eq!(restored["source"], "runtime");
+    assert_eq!(restored["priority"][0]["interface"], "ethernet");
+
+    let unknown_flow = uuid::Uuid::new_v4();
+    let decision_url = format!(
+        "http://127.0.0.1:{api_port}/runtime/network/path-decision/{unknown_flow}"
+    );
+    let decision_request = hyper::Request::builder()
+        .uri(&decision_url)
+        .header(hyper::header::AUTHORIZATION, "Bearer clash-rs")
+        .method(http::method::Method::GET)
+        .body(http_body_util::Empty::<Bytes>::new())
+        .expect("failed to build path decision GET");
+    let response =
+        send_http_request(decision_url.parse().unwrap(), decision_request)
+            .await
+            .expect("failed to GET path decision");
+    assert_eq!(response.status(), http::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
 async fn connection_summary_avoids_full_connection_payload() {
     let wd =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");

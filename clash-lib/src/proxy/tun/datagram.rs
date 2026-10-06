@@ -2,7 +2,6 @@ use crate::{
     app::{
         dispatcher::Dispatcher,
         dns::{ThreadSafeDNSResolver, exchange_with_resolver},
-        net::DEFAULT_OUTBOUND_INTERFACE,
     },
     common::errors::new_io_error,
     config::internal::config::DnsHijackRule,
@@ -74,13 +73,12 @@ pub(crate) async fn handle_inbound_datagram(
     // is to the tun
     let udp_stream = TunDatagram::new(l_tx, d_rx);
 
-    let default_outbound = DEFAULT_OUTBOUND_INTERFACE.read().await;
     let sess = Session {
         network: Network::Udp,
         typ: Type::Tun,
-        iface: default_outbound.clone().inspect(|x| {
-            debug!("selecting outbound interface: {:?} for tun UDP traffic", x);
-        }),
+        // Resolve the current default at outbound dial time. In particular,
+        // never retain its read guard for the lifetime of this TUN stream.
+        iface: None,
         so_mark,
         ..Default::default()
     };

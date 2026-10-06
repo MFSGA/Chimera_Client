@@ -27,7 +27,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::Arc,
 };
-use tokio::sync::OnceCell;
+use tokio::sync::Mutex;
 
 mod device;
 mod events;
@@ -69,7 +69,7 @@ impl Drop for Inner {
 
 pub struct Handler {
     opts: HandlerOptions,
-    inner: OnceCell<Inner>,
+    inner: Mutex<Option<Arc<Inner>>>,
 
     connector: tokio::sync::RwLock<Option<Arc<dyn RemoteConnector>>>,
 }
@@ -88,7 +88,7 @@ impl Handler {
     pub fn new(opts: HandlerOptions) -> Self {
         Self {
             opts,
-            inner: OnceCell::new(),
+            inner: Mutex::new(None),
 
             connector: Default::default(),
         }
@@ -123,16 +123,17 @@ impl Handler {
         Ok(())
     }
 
-    /// this is a one time initialization, however in theory sess.so_mark
-    /// and sess.iface should be all the same
-    /// ideally we move the so_mark and iface to a global context
+    /// Initialize lazily and serialize construction with network resets.
     async fn initialize_inner(
         &self,
         resolver: ThreadSafeDNSResolver,
         sess: &Session,
-    ) -> Result<&Inner, Error> {
-        self.inner
-            .get_or_try_init(|| async {
+    ) -> Result<Arc<Inner>, Error> {
+        let mut cached = self.inner.lock().await;
+        if let Some(inner) = cached.as_ref() {
+            return Ok(inner.clone());
+        }
+        let inner: Inner = async {
                 let recv_pair = tokio::sync::mpsc::channel(1024);
                 let send_pair = tokio::sync::mpsc::channel(1024);
                 let server_ip = resolver
@@ -254,18 +255,31 @@ impl Handler {
                     device_manager_clone.poll_sockets(device).await;
                 });
 
-                Ok(Inner {
+                Ok::<Inner, Error>(Inner {
                     device_manager,
                     wg_handle,
                     device_manager_handle,
                 })
-            })
-            .await
+            }.await?;
+        let inner = Arc::new(inner);
+        *cached = Some(inner.clone());
+        Ok(inner)
     }
 }
 
 #[async_trait]
 impl OutboundHandler for Handler {
+    async fn reset_connection_pool(&self) -> io::Result<u32> {
+        let cached = self.inner.lock().await.take();
+        if let Some(inner) = cached {
+            inner.wg_handle.abort();
+            inner.device_manager_handle.abort();
+            Ok(1)
+        } else {
+            Ok(0)
+        }
+    }
+
     fn name(&self) -> &str {
         &self.opts.name
     }
