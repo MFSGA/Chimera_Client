@@ -15,10 +15,11 @@ use crate::{
             StatisticsManager,
             statistics_manager::{ProxyChain, TrackerInfo},
         },
+        flow::{FlowContext, FlowId},
         router::RuleMatcher,
     },
     proxy::{ProxyStream, datagram::UdpPacket},
-    session::Session,
+    session::{Session, SocksAddr},
 };
 
 pub struct Tracked(uuid::Uuid, Arc<TrackerInfo>);
@@ -121,6 +122,7 @@ pub struct TrackedStream {
     manager: Arc<StatisticsManager>,
     tracker: Arc<TrackerInfo>,
     close_notify: Receiver<()>,
+    traffic_proof: Option<crate::app::runtime_state::TrafficProof>,
 }
 
 #[allow(unused)]
@@ -131,7 +133,27 @@ impl TrackedStream {
         sess: Session,
         rule: Option<&dyn RuleMatcher>,
     ) -> Self {
+        let inbound_destination = sess.destination.clone();
+        Self::new_with_inbound_destination(
+            inner,
+            manager,
+            sess,
+            inbound_destination,
+            rule,
+        )
+        .await
+    }
+
+    pub(crate) async fn new_with_inbound_destination(
+        inner: BoxedChainedStream,
+        manager: Arc<StatisticsManager>,
+        sess: Session,
+        inbound_destination: SocksAddr,
+        rule: Option<&dyn RuleMatcher>,
+    ) -> Self {
         let uuid = uuid::Uuid::new_v4();
+        let flow_context =
+            FlowContext::from_session(FlowId::new(uuid), &sess, inbound_destination);
         let chain = inner.chain().clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         let s = Self {
@@ -140,6 +162,7 @@ impl TrackedStream {
             tracker: Arc::new(TrackerInfo {
                 uuid,
                 session_holder: sess,
+                flow_context: Some(flow_context),
                 start_time: chrono::Utc::now(),
                 rule: rule
                     .map(|matcher| matcher.type_name().to_owned())
@@ -151,11 +174,20 @@ impl TrackedStream {
                 ..Default::default()
             }),
             close_notify: rx,
+            traffic_proof: None,
         };
 
         manager.track(Tracked(uuid, s.tracker_info()), tx).await;
 
         s
+    }
+
+    pub(crate) fn with_traffic_proof(
+        mut self,
+        proof: Option<crate::app::runtime_state::TrafficProof>,
+    ) -> Self {
+        self.traffic_proof = proof;
+        self
     }
 
     pub fn tracker_info(&self) -> Arc<TrackerInfo> {
@@ -173,8 +205,11 @@ impl TrackedStream {
         Arc<dyn TrackCopy + Send + Sync>,
         Arc<dyn TrackCopy + Send + Sync>,
     ) {
-        let r =
-            Arc::new(ReadTracker::new(self.tracker.clone(), self.manager.clone()));
+        let r = Arc::new(ReadTracker::new(
+            self.tracker.clone(),
+            self.manager.clone(),
+            self.traffic_proof.clone(),
+        ));
         let w = Arc::new(WriteTracker::new(
             self.tracker.clone(),
             self.manager.clone(),
@@ -182,7 +217,7 @@ impl TrackedStream {
         (r, w)
     }
 
-    fn id(&self) -> uuid::Uuid {
+    pub(crate) fn id(&self) -> uuid::Uuid {
         self.tracker.uuid
     }
 }
@@ -210,15 +245,27 @@ impl TrackCopy for WriteTracker {
 pub struct ReadTracker {
     tracker: Arc<TrackerInfo>,
     manager: Arc<StatisticsManager>,
+    traffic_proof: Option<crate::app::runtime_state::TrafficProof>,
 }
 
 #[cfg(all(target_os = "linux", feature = "zero_copy"))]
 impl ReadTracker {
-    fn new(tracker: Arc<TrackerInfo>, manager: Arc<StatisticsManager>) -> Self {
-        Self { tracker, manager }
+    fn new(
+        tracker: Arc<TrackerInfo>,
+        manager: Arc<StatisticsManager>,
+        traffic_proof: Option<crate::app::runtime_state::TrafficProof>,
+    ) -> Self {
+        Self {
+            tracker,
+            manager,
+            traffic_proof,
+        }
     }
 
     fn push_downloaded(&self, download: usize) {
+        if let Some(proof) = &self.traffic_proof {
+            proof.received(download);
+        }
         self.manager.push_downloaded(download);
         self.tracker
             .download_total
@@ -266,8 +313,12 @@ impl AsyncRead for TrackedStream {
             },
         }
 
+        let before = buf.filled().len();
         let v = Pin::new(self.inner.as_mut()).poll_read(cx, buf);
-        let download = buf.filled().len();
+        let download = buf.filled().len().saturating_sub(before);
+        if let Some(proof) = &self.traffic_proof {
+            proof.received(download);
+        }
         self.manager.push_downloaded(download);
         self.tracker
             .download_total
@@ -618,5 +669,53 @@ impl Drop for TrackedDatagram {
         tokio::spawn(async move {
             manager.untrack(id).await;
         });
+    }
+}
+
+#[cfg(test)]
+mod flow_context_tests {
+    use std::net::SocketAddr;
+
+    use crate::{
+        app::dispatcher::{StatisticsManager, tracked::ChainedStreamWrapper},
+        session::{Network, Session, SocksAddr, Type},
+    };
+
+    use super::{BoxedChainedStream, TrackedStream};
+
+    #[tokio::test]
+    async fn tracked_tcp_flow_keeps_ingress_destination_without_changing_api_json() {
+        let (io, _peer) = tokio::io::duplex(64);
+        let inner: BoxedChainedStream = Box::new(ChainedStreamWrapper::new(io));
+        let inbound_destination =
+            SocksAddr::Ip("198.19.0.10:443".parse::<SocketAddr>().unwrap());
+        let session = Session {
+            network: Network::Tcp,
+            typ: Type::Socks5,
+            source: "192.0.2.10:51000".parse().unwrap(),
+            destination: SocksAddr::Domain("example.com".to_string(), 443),
+            ..Default::default()
+        };
+        let tracked = TrackedStream::new_with_inbound_destination(
+            inner,
+            StatisticsManager::new(),
+            session,
+            inbound_destination.clone(),
+            None,
+        )
+        .await;
+
+        let tracker = tracked.tracker_info();
+        let flow = tracker.flow_context.as_ref().unwrap();
+        assert_eq!(flow.id.as_uuid(), tracker.uuid);
+        assert_eq!(flow.inbound_destination, inbound_destination);
+        assert_eq!(
+            flow.destination,
+            SocksAddr::Domain("example.com".to_string(), 443)
+        );
+
+        let api_value = serde_json::to_value(tracker.as_ref()).unwrap();
+        assert!(api_value.get("flowContext").is_none());
+        assert!(api_value.get("flow_context").is_none());
     }
 }

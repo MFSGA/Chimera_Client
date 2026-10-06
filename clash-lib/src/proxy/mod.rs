@@ -112,6 +112,42 @@ pub trait OutboundHandler: Sync + Send + Unpin + DialWithConnector + Debug {
         resolver: ThreadSafeDNSResolver,
     ) -> io::Result<BoxedChainedStream>;
 
+    /// Connect using an already selected network path when the handler owns a
+    /// directly dialed socket. Protocol handlers that do not own that socket
+    /// retain their existing connection behavior.
+    async fn connect_stream_with_path_selection(
+        &self,
+        sess: &Session,
+        resolver: ThreadSafeDNSResolver,
+        _selection: &crate::app::flow::DirectPathSelection,
+    ) -> io::Result<BoxedChainedStream> {
+        self.connect_stream(sess, resolver).await
+    }
+
+    /// Connect with a selected path and return the path that actually won.
+    /// Composite/protocol handlers that do not own the socket keep their
+    /// existing behavior and report the planned path when it is unambiguous.
+    async fn connect_stream_with_path_selection_result(
+        &self,
+        sess: &Session,
+        resolver: ThreadSafeDNSResolver,
+        selection: &crate::app::flow::DirectPathSelection,
+    ) -> io::Result<(BoxedChainedStream, Option<crate::app::flow::NetworkPathId>)>
+    {
+        let path_id = match &sess.destination {
+            crate::session::SocksAddr::Ip(address) => selection
+                .candidates_for_family(crate::app::flow::AddressFamily::from(
+                    address.ip(),
+                ))
+                .first()
+                .map(|path| path.id.clone()),
+            crate::session::SocksAddr::Domain(_, _) => None,
+        };
+        self.connect_stream_with_path_selection(sess, resolver, selection)
+            .await
+            .map(|stream| (stream, path_id))
+    }
+
     async fn connect_stream_with_connector(
         &self,
         _sess: &Session,
@@ -131,6 +167,17 @@ pub trait OutboundHandler: Sync + Send + Unpin + DialWithConnector + Debug {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> io::Result<BoxedChainedDatagram>;
+
+    /// Connect a datagram socket pinned to a selected direct network path.
+    /// Handlers that do not own the target socket keep their current behavior.
+    async fn connect_datagram_with_path_selection(
+        &self,
+        sess: &Session,
+        resolver: ThreadSafeDNSResolver,
+        _selection: &crate::app::flow::DirectPathSelection,
+    ) -> io::Result<BoxedChainedDatagram> {
+        self.connect_datagram(sess, resolver).await
+    }
 
     /// relay related
     async fn support_connector(&self) -> ConnectorType {

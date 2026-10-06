@@ -1,5 +1,4 @@
 use crate::{
-    app::net::DEFAULT_OUTBOUND_INTERFACE,
     config::internal::proxy::PROXY_DIRECT,
     dns::{
         ClashResolver, EdnsClientSubnet, RuleDispatch, ThreadSafeDNSClient,
@@ -7,7 +6,7 @@ use crate::{
     },
     proxy::{
         self,
-        utils::{OutboundHandlerRegistry, SharedOutboundHandler},
+        utils::{NetworkPathSource, OutboundHandlerRegistry, SharedOutboundHandler},
     },
 };
 use hickory_proto::rr::rdata::opt::EdnsCode;
@@ -16,14 +15,20 @@ use tracing::{debug, warn};
 
 use super::config::NameServer;
 
+#[derive(Clone, Default)]
+pub(crate) struct DnsClientNetworkOptions {
+    pub fw_mark: Option<u32>,
+    pub rule_dispatch: Option<Arc<RuleDispatch>>,
+    pub network_path_source: Option<NetworkPathSource>,
+}
+
 pub async fn make_clients(
     servers: Vec<NameServer>,
     resolver: Option<Arc<dyn ClashResolver>>,
     outbound_resolver: Option<Arc<dyn ClashResolver>>,
     outbounds: OutboundHandlerRegistry,
     edns_client_subnet: Option<EdnsClientSubnet>,
-    fw_mark: Option<u32>,
-    rule_dispatch: Option<Arc<RuleDispatch>>,
+    network_options: DnsClientNetworkOptions,
 ) -> Result<Vec<ThreadSafeDNSClient>, crate::Error> {
     let mut rv = Vec::new();
     let had_configured_servers = !servers.is_empty();
@@ -38,7 +43,7 @@ pub async fn make_clients(
         // An explicit `#proxy=...` always wins; rule-engine routing is only
         // applied to nameservers that use the default DIRECT path.
         let rd = if s.proxy.is_none() {
-            rule_dispatch.clone()
+            network_options.rule_dispatch.clone()
         } else {
             None
         };
@@ -51,17 +56,19 @@ pub async fn make_clients(
             host: s.host.clone(),
             port,
             net: s.net.to_owned(),
+            // Unspecified bindings follow the current default at each dial.
+            // Capturing the default here would pin DNS to the startup network.
             iface: s
                 .interface
                 .as_ref()
-                .or(DEFAULT_OUTBOUND_INTERFACE.read().await.as_ref())
                 .inspect(|x| debug!("DNS client interface: {:?}", x))
                 .cloned(),
             proxy,
             ecs: edns_client_subnet.clone(),
             doh_path: s.doh_path.clone(),
-            fw_mark,
+            fw_mark: network_options.fw_mark,
             rule_dispatch: rd,
+            network_path_source: network_options.network_path_source.clone(),
         })
         .await
         {
@@ -141,8 +148,7 @@ mod tests {
             None,
             Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             None,
-            None,
-            None,
+            DnsClientNetworkOptions::default(),
         )
         .await;
 

@@ -178,6 +178,40 @@ rules:
         "proxy rule should connect exactly once to the local SOCKS5 proxy"
     );
 
+    // Reset through the production coordinator while retaining the fake-IP
+    // addresses already handed to applications. No physical NIC is changed.
+    for round in 0..3 {
+        let mut control =
+            TcpStream::connect((Ipv4Addr::LOCALHOST, api_port)).unwrap();
+        control
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        control.write_all(b"POST /network/reset HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer clash-rs\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        let mut response = String::new();
+        control.read_to_string(&mut response).unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "reset failed: {response}"
+        );
+        assert_eq!(
+            query_a(("127.0.0.1", dns_port), DIRECT_DOMAIN),
+            direct_fake_ip
+        );
+        assert_eq!(
+            query_a(("127.0.0.1", dns_port), PROXY_DOMAIN),
+            proxy_fake_ip
+        );
+        let marker = format!("recovered-{round}");
+        assert!(
+            http_get((direct_fake_ip, http_port), DIRECT_DOMAIN, &marker)
+                .contains(&marker)
+        );
+        assert!(
+            http_get((proxy_fake_ip, http_port), PROXY_DOMAIN, &marker)
+                .contains(&marker)
+        );
+    }
+
     runtime.stop();
 
     let logs = fs::read_to_string(&log_path).expect("read log file");
@@ -481,11 +515,11 @@ fn handle_http_echo(mut stream: TcpStream) {
         return;
     };
     let req = String::from_utf8_lossy(&buf[..n]);
-    let body = if req.contains("proxy-marker") {
-        "proxy-marker"
-    } else {
-        "direct-marker"
-    };
+    let body = req
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("/")
+        .trim_start_matches('/');
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),

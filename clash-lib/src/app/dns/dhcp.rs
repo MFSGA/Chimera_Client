@@ -1,8 +1,10 @@
 use crate::{
     dns::{
-        Client, EnhancedResolver, ThreadSafeDNSClient, dns_client::DNSNetMode,
-        helper::make_clients,
+        Client, EnhancedResolver, ThreadSafeDNSClient,
+        dns_client::DNSNetMode,
+        helper::{DnsClientNetworkOptions, make_clients},
     },
+    proxy::utils::NetworkPathSource,
     proxy::utils::{direct_only_registry, new_udp_socket},
 };
 use async_trait::async_trait;
@@ -38,6 +40,7 @@ struct Inner {
 pub struct DhcpClient {
     iface: OutboundInterface,
     fw_mark: Option<u32>,
+    network_path_source: Option<NetworkPathSource>,
 
     inner: Mutex<Inner>,
 }
@@ -88,7 +91,11 @@ impl Client for DhcpClient {
 }
 
 impl DhcpClient {
-    pub async fn new(iface: &str, fw_mark: Option<u32>) -> io::Result<Self> {
+    pub async fn new(
+        iface: &str,
+        fw_mark: Option<u32>,
+        network_path_source: Option<NetworkPathSource>,
+    ) -> io::Result<Self> {
         let iface = get_interface_by_name(iface).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -104,13 +111,21 @@ impl DhcpClient {
                 iface_addr: ipnet::IpNet::default(),
             }),
             fw_mark,
+            network_path_source,
         })
     }
 
     async fn resolve(&self) -> io::Result<Vec<ThreadSafeDNSClient>> {
         let expired = self.update_if_lease_expired().await?;
         if expired {
-            let dns = probe_dns_server(&self.iface).await?;
+            let iface =
+                get_interface_by_name(&self.iface.name).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "DHCP interface disappeared",
+                    )
+                })?;
+            let dns = probe_dns_server(&iface).await?;
             let mut inner = self.inner.lock().await;
 
             inner.clients = make_clients(
@@ -128,8 +143,11 @@ impl DhcpClient {
                 None,
                 direct_only_registry(),
                 None,
-                self.fw_mark,
-                None,
+                DnsClientNetworkOptions {
+                    fw_mark: self.fw_mark,
+                    network_path_source: self.network_path_source.clone(),
+                    ..Default::default()
+                },
             )
             .await
             .map_err(|err| io::Error::other(err.to_string()))?;
@@ -152,7 +170,9 @@ impl DhcpClient {
 
         inner.iface_expires_at = Instant::now().add(IFACE_TTL);
 
-        let iface = &self.iface;
+        let iface = get_interface_by_name(&self.iface.name).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "DHCP interface disappeared")
+        })?;
 
         let addr = iface.addr_v4.ok_or(io::Error::other(format!(
             "no address on interface: {:?}",
@@ -317,7 +337,7 @@ mod test {
 
     #[tokio::test]
     async fn missing_interface_is_reported_without_panicking() {
-        let err = DhcpClient::new("__chimera_missing_interface__", None)
+        let err = DhcpClient::new("__chimera_missing_interface__", None, None)
             .await
             .expect_err("missing DHCP interface should return an error");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);

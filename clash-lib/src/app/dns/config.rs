@@ -1,7 +1,7 @@
 pub use super::dns_client::DNSNetMode;
 use crate::{
     Error,
-    app::net::{OutboundInterface, get_interface_by_name, get_outbound_interface},
+    app::net::{OutboundInterface, get_interface_by_name},
     common::trie,
     config::def::{
         DNSListen, DNSMode, DohListenDef, DotListenDef,
@@ -194,18 +194,13 @@ impl Config {
                 port,
                 net,
                 interface: iface
-                    .map(|x| match x.as_str() {
-                        "auto" => {
-                            get_outbound_interface().ok_or(Error::InvalidConfig(
-                                "DNS nameserver [auto] no outbound interface found"
-                                    .into(),
-                            ))
-                        }
-                        name => get_interface_by_name(name).ok_or(
-                            Error::InvalidConfig(format!(
+                    .filter(|name| name != "auto")
+                    .map(|name| {
+                        get_interface_by_name(&name).ok_or(Error::InvalidConfig(
+                            format!(
                                 "DNS nameserver [{i}] invalid interface: {name}"
-                            )),
-                        ),
+                            ),
+                        ))
                     })
                     .transpose()?,
                 proxy,
@@ -597,6 +592,13 @@ fn parse_edns_client_subnet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_nameserver_binding_is_selected_at_dial_time() {
+        let nameservers =
+            Config::parse_nameserver(&["192.0.2.53#auto".into()]).unwrap();
+        assert!(nameservers[0].interface.is_none());
+    }
 
     #[test]
     fn parse_nameserver_ipv6_without_scheme() {

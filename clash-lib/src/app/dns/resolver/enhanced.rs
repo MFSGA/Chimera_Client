@@ -1,6 +1,9 @@
 use crate::{
     Error,
-    app::{dns::helper::build_dns_response_message, profile::ThreadSafeCacheFile},
+    app::{
+        dns::helper::{DnsClientNetworkOptions, build_dns_response_message},
+        profile::ThreadSafeCacheFile,
+    },
     common::trie,
     config::def::DNSMode,
     dns::{
@@ -14,10 +17,11 @@ use crate::{
         helper::make_clients,
         parse_ip_literal,
     },
+    proxy::utils::NetworkPathSource,
 };
 use anyhow::anyhow;
 use async_trait::async_trait;
-use futures::{FutureExt, TryFutureExt};
+use futures::{FutureExt, StreamExt, TryFutureExt};
 use hickory_proto::{op, rr};
 use rand::seq::IndexedRandom;
 use std::{
@@ -107,8 +111,7 @@ impl EnhancedResolver {
                     std::collections::HashMap::new(),
                 )),
                 None,
-                None,
-                None,
+                DnsClientNetworkOptions::default(),
             )
             .await
             .expect("default DNS client configuration should be valid"),
@@ -135,6 +138,25 @@ impl EnhancedResolver {
         outbounds: crate::proxy::utils::OutboundHandlerRegistry,
         rule_dispatch: Option<Arc<RuleDispatch>>,
     ) -> Result<Self, Error> {
+        Self::new_with_network_path_source(
+            cfg,
+            store,
+            mmdb,
+            outbounds,
+            rule_dispatch,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn new_with_network_path_source(
+        cfg: Config,
+        store: ThreadSafeCacheFile,
+        mmdb: Option<PendingMmdb>,
+        outbounds: crate::proxy::utils::OutboundHandlerRegistry,
+        rule_dispatch: Option<Arc<RuleDispatch>>,
+        network_path_source: Option<NetworkPathSource>,
+    ) -> Result<Self, Error> {
         let edns_client_subnet = cfg.edns_client_subnet.clone();
         let default_resolver = Arc::new(EnhancedResolver {
             ipv6: AtomicBool::new(false),
@@ -145,8 +167,11 @@ impl EnhancedResolver {
                 None,
                 Arc::new(RwLock::new(std::collections::HashMap::new())),
                 edns_client_subnet.clone(),
-                cfg.fw_mark,
-                None,
+                DnsClientNetworkOptions {
+                    fw_mark: cfg.fw_mark,
+                    network_path_source: network_path_source.clone(),
+                    ..Default::default()
+                },
             )
             .await?,
             fallback: None,
@@ -173,8 +198,11 @@ impl EnhancedResolver {
                 None,
                 Arc::new(RwLock::new(std::collections::HashMap::new())),
                 edns_client_subnet.clone(),
-                cfg.fw_mark,
-                None,
+                DnsClientNetworkOptions {
+                    fw_mark: cfg.fw_mark,
+                    network_path_source: network_path_source.clone(),
+                    ..Default::default()
+                },
             )
             .await?;
             if clients.is_empty() {
@@ -205,8 +233,11 @@ impl EnhancedResolver {
             Some(outbound_resolver.clone()),
             outbounds.clone(),
             edns_client_subnet.clone(),
-            cfg.fw_mark,
-            rule_dispatch.clone(),
+            DnsClientNetworkOptions {
+                fw_mark: cfg.fw_mark,
+                rule_dispatch: rule_dispatch.clone(),
+                network_path_source: network_path_source.clone(),
+            },
         )
         .await?;
 
@@ -218,8 +249,11 @@ impl EnhancedResolver {
                 Some(outbound_resolver.clone()),
                 outbounds.clone(),
                 edns_client_subnet.clone(),
-                cfg.fw_mark,
-                None,
+                DnsClientNetworkOptions {
+                    fw_mark: cfg.fw_mark,
+                    network_path_source: network_path_source.clone(),
+                    ..Default::default()
+                },
             )
             .await?;
             Some(Arc::new(Self::from_clients_with_fallback(
@@ -262,8 +296,11 @@ impl EnhancedResolver {
                         Some(outbound_resolver.clone()),
                         outbounds.clone(),
                         edns_client_subnet.clone(),
-                        cfg.fw_mark,
-                        rule_dispatch.clone(),
+                        DnsClientNetworkOptions {
+                            fw_mark: cfg.fw_mark,
+                            rule_dispatch: rule_dispatch.clone(),
+                            network_path_source: network_path_source.clone(),
+                        },
                     )
                     .await?,
                 )
@@ -318,8 +355,11 @@ impl EnhancedResolver {
                                 Some(outbound_resolver.clone()),
                                 outbounds.clone(),
                                 edns_client_subnet.clone(),
-                                cfg.fw_mark,
-                                rule_dispatch.clone(),
+                                DnsClientNetworkOptions {
+                                    fw_mark: cfg.fw_mark,
+                                    rule_dispatch: rule_dispatch.clone(),
+                                    network_path_source: network_path_source.clone(),
+                                },
                             )
                             .await?,
                         ),
@@ -873,16 +913,50 @@ impl ClashResolver for EnhancedResolver {
         }
 
         let mut reset = 0_u32;
+        let mut errors = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        clients
+            .retain(|client| seen.insert(Arc::as_ptr(client) as *const () as usize));
+        let mut pending = futures::stream::FuturesUnordered::new();
         for client in clients {
-            reset = reset.saturating_add(client.reset_transport().await?);
+            pending.push(
+                async move {
+                    tokio::time::timeout(
+                        Duration::from_secs(5),
+                        client.reset_transport(),
+                    )
+                    .await
+                }
+                .boxed(),
+            );
         }
         if let Some(direct_resolver) = &self.direct_resolver {
-            reset = reset.saturating_add(direct_resolver.reset_transports().await?);
+            pending.push(
+                async move {
+                    tokio::time::timeout(
+                        Duration::from_secs(5),
+                        direct_resolver.reset_transports(),
+                    )
+                    .await
+                }
+                .boxed(),
+            );
+        }
+        while let Some(result) = pending.next().await {
+            match result {
+                Ok(Ok(count)) => reset = reset.saturating_add(count),
+                Ok(Err(error)) => errors.push(error.to_string()),
+                Err(_) => errors.push("DNS client reset timed out".to_owned()),
+            }
         }
         if let Some(cache) = &self.reverse_lookup_cache {
             cache.write().await.clear();
         }
-        Ok(reset)
+        if errors.is_empty() {
+            Ok(reset)
+        } else {
+            Err(anyhow!(errors.join("; ")))
+        }
     }
 
     fn kind(&self) -> ResolverKind {
@@ -1378,6 +1452,7 @@ mod tests {
             ecs: None,
             fw_mark: None,
             rule_dispatch: None,
+            network_path_source: None,
         })
         .await
         .expect("build client");
@@ -1400,6 +1475,7 @@ mod tests {
             ecs: None,
             fw_mark: None,
             rule_dispatch: None,
+            network_path_source: None,
         })
         .await
         .expect("build client");
@@ -1422,6 +1498,7 @@ mod tests {
             ecs: None,
             fw_mark: None,
             rule_dispatch: None,
+            network_path_source: None,
         })
         .await
         .expect("build client");
@@ -1446,6 +1523,7 @@ mod tests {
             ecs: None,
             fw_mark: None,
             rule_dispatch: None,
+            network_path_source: None,
         })
         .await
         .expect("build client");
@@ -1468,6 +1546,7 @@ mod tests {
             ecs: None,
             fw_mark: None,
             rule_dispatch: None,
+            network_path_source: None,
         })
         .await
         .expect("build client");

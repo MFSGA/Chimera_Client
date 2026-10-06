@@ -14,6 +14,7 @@ use std::{
     sync::{Arc, OnceLock, atomic::AtomicUsize},
 };
 
+use futures::FutureExt;
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
@@ -138,6 +139,9 @@ pub struct GlobalState {
     tunnel_runner: ArcRunner,
     dns_listener: ArcRunner,
     reload_tx: mpsc::Sender<(Config, oneshot::Sender<Result<()>>)>,
+    network_reset_tx:
+        mpsc::Sender<oneshot::Sender<Result<app::network::NetworkResetResponse>>>,
+    network_status: Arc<tokio::sync::RwLock<app::network::NetworkStatus>>,
     cwd: String,
     /// Path to the config file used at startup. Used by the dashboard "Reload"
     /// button which sends an empty path to mean "reload current config".
@@ -472,6 +476,38 @@ async fn wait_for_shutdown_signal() -> std::io::Result<()> {
     }
 }
 
+enum RuntimeExit<T> {
+    Control(std::result::Result<T, tokio::task::JoinError>),
+    Signal(std::io::Result<()>),
+    Cancelled,
+}
+
+async fn wait_for_control_or_shutdown<T, S>(
+    control: &mut tokio::task::JoinHandle<T>,
+    shutdown: &tokio_util::sync::CancellationToken,
+    signal: S,
+) -> RuntimeExit<T>
+where
+    S: std::future::Future<Output = std::io::Result<()>>,
+{
+    tokio::select! {
+        biased;
+        result = control => RuntimeExit::Control(result),
+        _ = shutdown.cancelled() => RuntimeExit::Cancelled,
+        result = signal => RuntimeExit::Signal(result),
+    }
+}
+
+async fn catch_control_panic<F>(control: F) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    match std::panic::AssertUnwindSafe(control).catch_unwind().await {
+        Ok(result) => result,
+        Err(_) => Err(Error::Operation("runtime control task panicked".to_owned())),
+    }
+}
+
 pub async fn start(
     config: InternalConfig,
     cwd: String,
@@ -516,6 +552,35 @@ async fn start_with_shutdown_token(
     let components = create_components(cwd.clone(), config, true).await?;
 
     let (reload_tx, mut reload_rx) = mpsc::channel(1);
+    let (network_reset_tx, mut network_reset_rx) = mpsc::channel::<
+        oneshot::Sender<Result<app::network::NetworkResetResponse>>,
+    >(8);
+    let network_status = Arc::new(tokio::sync::RwLock::new(
+        app::network::NetworkStatus::default(),
+    ));
+    let observed_tun_exclusion = Arc::new(tokio::sync::RwLock::new(
+        components.tun_candidate_exclusion(),
+    ));
+    let (network_samples_tx, mut network_samples) =
+        tokio::sync::watch::channel(None);
+
+    let (traffic_tx, mut traffic_rx) = mpsc::channel(128);
+    let traffic_reporter = network_status.write().await.traffic_reporter(traffic_tx);
+    components
+        .outbound_manager
+        .attach_network_status(network_status.clone())
+        .await;
+    components
+        .outbound_manager
+        .attach_traffic_reporter(traffic_reporter.clone())
+        .await;
+    components
+        .dispatcher
+        .attach_traffic_reporter(traffic_reporter.clone());
+    components
+        .dispatcher
+        .attach_network_status(network_status.clone());
+    let final_status = network_status.clone();
 
     let global_state = Arc::new(Mutex::new(GlobalState {
         log_level,
@@ -523,6 +588,8 @@ async fn start_with_shutdown_token(
         tunnel_runner: components.tun_runner.clone(),
         dns_listener: components.dns_listener.clone(),
         reload_tx,
+        network_reset_tx,
+        network_status: network_status.clone(),
         cwd: cwd.to_string_lossy().to_string(),
         config_path,
     }));
@@ -539,9 +606,18 @@ async fn start_with_shutdown_token(
     // initialized before it can be initialized. start it manually.
     api_listener.run_async();
     if let Err(err) = api_listener.wait_ready().await {
+        network_status.write().await.set_component(
+            app::runtime_state::RuntimeComponent::Api,
+            app::runtime_state::RuntimeComponentPhase::Failed,
+            Some(err.to_string()),
+        );
         api_listener.shutdown();
         let _ = api_listener.join().await;
         components.stop_all_and_join(true).await;
+        network_status.write().await.lifecycle(
+            app::runtime_state::Lifecycle::Failed,
+            "listenerStartupFailed",
+        );
         return Err(err);
     }
 
@@ -555,13 +631,23 @@ async fn start_with_shutdown_token(
     }
 
     components.start_all();
-    if let Err(err) = components.wait_initial_ready().await {
+    if let Err(err) = components.wait_initial_ready(&network_status).await {
         api_listener.shutdown();
         let _ = api_listener.join().await;
         components.stop_all_and_join(true).await;
+        network_status.write().await.lifecycle(
+            app::runtime_state::Lifecycle::Failed,
+            "listenerStartupFailed",
+        );
         return Err(err);
     }
 
+    refresh_runtime_health(&components, api_listener.as_ref(), &network_status)
+        .await;
+    network_status
+        .write()
+        .await
+        .lifecycle(app::runtime_state::Lifecycle::Running, "listenersReady");
     if let Some(startup_tx) = startup_tx {
         startup_tx.send(InstanceStartupEvent::Ready).map_err(|_| {
             Error::Operation(
@@ -570,11 +656,27 @@ async fn start_with_shutdown_token(
             )
         })?;
     }
+    let network_sampler = app::network::AUTOMATIC_SUPPORTED.then(|| {
+        let sampler_token = shutdown_token.child_token();
+        let tun_exclusion = observed_tun_exclusion.clone();
+        tokio::spawn(app::network::run_sampler(
+            sampler_token,
+            network_samples_tx,
+            move || {
+                let tun_exclusion = tun_exclusion.clone();
+                async move {
+                    let exclusion = tun_exclusion.read().await.clone();
+                    app::network::snapshot_with_tun(exclusion).await
+                }
+            },
+        ))
+    });
+    let sampler_started = network_sampler.is_some();
 
     let cwd_clone = cwd.clone();
 
     let reload_token = shutdown_token.clone();
-    let reload_handle = tokio::spawn(async move {
+    let mut reload_handle = tokio::spawn(async move {
         #[cfg(feature = "tun")]
         let mut network_runtime_lease = network_runtime_lease;
         #[cfg(not(feature = "tun"))]
@@ -582,21 +684,73 @@ async fn start_with_shutdown_token(
         let mut active_components = components;
         let mut active_api_listener = api_listener;
         let mut active_controller_cfg = controller_cfg;
+        let mut network_observer = app::network::NetworkObserver::default();
+        let mut sampler_running = sampler_started;
+        let mut health_interval =
+            tokio::time::interval(std::time::Duration::from_secs(2));
+        health_interval
+            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        network_status.write().await.set_component(
+            app::runtime_state::RuntimeComponent::Control,
+            app::runtime_state::RuntimeComponentPhase::Ready,
+            None,
+        );
 
-        // Listen for config reload signal and reload config
-        loop {
+        // Listen for config reload signal and reload config.
+        let control_result = catch_control_panic(async {
+            loop {
             tokio::select! {
+                biased;
+                _ = reload_token.cancelled() => {
+                    network_status.write().await.lifecycle(app::runtime_state::Lifecycle::Stopping, "shutdownRequested");
+                    info!("runtime shutdown requested");
+                    break Ok(());
+                }
+                Some(done) = network_reset_rx.recv() => {
+                    if done.is_closed() { continue; }
+                    let recovery = async {
+                        let (snapshot, observation_error) = if app::network::AUTOMATIC_SUPPORTED {
+                            match app::network::snapshot_with_tun(
+                                active_components.tun_candidate_exclusion(),
+                            ).await {
+                                Ok(snapshot) => (Some(snapshot), None),
+                                Err(error) => (None, Some(error.to_string())),
+                            }
+                        } else { (None, None) };
+                        active_components.perform_network_recovery(
+                            &mut network_observer,
+                            &network_status,
+                            NetworkRecoveryRequest {
+                                snapshot,
+                                path_changed: true,
+                                cause: app::runtime_state::RecoveryCause::ManualReset,
+                                observation_error,
+                            },
+                            Some(&mut network_samples),
+                        ).await
+                    };
+                    let result = tokio::select! {
+                        biased;
+                        _ = reload_token.cancelled() => { continue; }
+                        result = recovery => result,
+                    };
+                    let _ = done.send(result);
+                }
+
                 maybe_reload = reload_rx.recv() => {
                     let Some((config, done)) = maybe_reload else {
-                        break;
+                        break Err(Error::Operation(
+                            "runtime reload channel closed unexpectedly".to_owned(),
+                        ));
                     };
 
+                    network_status.write().await.lifecycle(app::runtime_state::Lifecycle::Reloading, "reloadRequested");
                     info!("reloading config");
                     let config = match config.try_parse() {
                         Ok(c) => c,
                         Err(e) => {
                             error!("failed to reload config: {}", e);
-                            let _ = done.send(Err(e));
+                            let _ = finish_reload_status(&network_status, done, Err(e)).await;
                             continue;
                         }
                     };
@@ -609,13 +763,19 @@ async fn start_with_shutdown_token(
                     // listeners or touching the active network configuration.
                     let new_components =
                         match create_components(cwd_clone.clone(), config, false).await {
-                            Ok(components) => components,
+                            Ok(components) => {
+                                components.outbound_manager.attach_network_status(network_status.clone()).await;
+                                components.outbound_manager.attach_traffic_reporter(traffic_reporter.clone()).await;
+                                components.dispatcher.attach_traffic_reporter(traffic_reporter.clone());
+                                components.dispatcher.attach_network_status(network_status.clone());
+                                components
+                            },
                             Err(e) => {
                                 error!(
                                     "failed to prepare components during reload; keeping the active runtime: {}",
                                     e
                                 );
-                                let _ = done.send(Err(e));
+                                let _ = finish_reload_status(&network_status, done, Err(e)).await;
                                 continue;
                             }
                         };
@@ -631,7 +791,7 @@ async fn start_with_shutdown_token(
                             "failed to acquire network config during reload; keeping the active runtime: {}",
                             e
                         );
-                        let _ = done.send(Err(e));
+                        let _ = finish_reload_status(&network_status, done, Err(e)).await;
                         continue;
                     }
                     #[cfg(feature = "tun")]
@@ -650,14 +810,14 @@ async fn start_with_shutdown_token(
                             let fatal = Error::Operation(format!(
                                 "failed to restore active network configuration after reload failure: {restore_err}"
                             ));
-                            let _ = done.send(Err(fatal));
+                            let _ = finish_reload_status(&network_status, done, Err(fatal)).await;
                             reload_token.cancel();
-                            return Err(Error::Operation(
+                            break Err(Error::Operation(
                                 "active network configuration could not be restored"
                                     .to_owned(),
                             ));
                         }
-                        let _ = done.send(Err(e));
+                        let _ = finish_reload_status(&network_status, done, Err(e)).await;
                         continue;
                     }
 
@@ -681,16 +841,16 @@ async fn start_with_shutdown_token(
                                 let fatal = Error::Operation(format!(
                                     "failed to restore active network configuration after rollback preparation failure: {restore_err}"
                                 ));
-                                let _ = done.send(Err(fatal));
+                                let _ = finish_reload_status(&network_status, done, Err(fatal)).await;
                                 reload_token.cancel();
-                                return Err(Error::Operation(
+                                break Err(Error::Operation(
                                     "active network configuration could not be restored"
                                         .to_owned(),
                                 ));
                             }
-                            let _ = done.send(Err(Error::Operation(format!(
+                            let _ = finish_reload_status(&network_status, done, Err(Error::Operation(format!(
                                 "failed to prepare active data-plane rollback: {err}"
-                            ))));
+                            )))).await;
                             continue;
                         }
                     };
@@ -712,6 +872,11 @@ async fn start_with_shutdown_token(
                     }
                     new_api_listener.run_async();
                     if let Err(err) = new_api_listener.wait_ready().await {
+                        network_status.write().await.set_component(
+                            app::runtime_state::RuntimeComponent::Api,
+                            app::runtime_state::RuntimeComponentPhase::Failed,
+                            Some(err.to_string()),
+                        );
                         error!(
                             "replacement API listener failed to become ready; restoring the active runtime: {}",
                             err
@@ -730,9 +895,9 @@ async fn start_with_shutdown_token(
                             let fatal = Error::Operation(format!(
                                 "failed to restore active network configuration after controller reload failure: {restore_err}"
                             ));
-                            let _ = done.send(Err(fatal));
+                            let _ = finish_reload_status(&network_status, done, Err(fatal)).await;
                             reload_token.cancel();
-                            return Err(Error::Operation(
+                            break Err(Error::Operation(
                                 "active network configuration could not be restored"
                                     .to_owned(),
                             ));
@@ -747,17 +912,30 @@ async fn start_with_shutdown_token(
                         );
                         restored_api_listener.run_async();
                         if let Err(restore_err) = restored_api_listener.wait_ready().await {
+                            network_status.write().await.set_component(
+                                app::runtime_state::RuntimeComponent::Api,
+                                app::runtime_state::RuntimeComponentPhase::Failed,
+                                Some(restore_err.to_string()),
+                            );
                             let fatal = Error::Operation(format!(
                                 "failed to restore active API listener after reload failure: {restore_err}"
                             ));
-                            let _ = done.send(Err(fatal));
+                            let _ = finish_reload_status(&network_status, done, Err(fatal)).await;
                             reload_token.cancel();
-                            return Err(Error::Operation(
+                            restored_api_listener.shutdown();
+                            let _ = restored_api_listener.join().await;
+                            break Err(Error::Operation(
                                 "active API listener could not be restored".to_owned(),
                             ));
                         }
                         active_api_listener = restored_api_listener;
-                        let _ = done.send(Err(err));
+                        refresh_runtime_health(
+                            &active_components,
+                            active_api_listener.as_ref(),
+                            &network_status,
+                        )
+                        .await;
+                        let _ = finish_reload_status(&network_status, done, Err(err)).await;
                         continue;
                     }
 
@@ -770,7 +948,9 @@ async fn start_with_shutdown_token(
                         network_runtime_lease.deactivate_to_neutral();
                     }
                     new_components.start_all();
-                    if let Err(err) = new_components.wait_initial_ready().await {
+                    if let Err(err) =
+                        new_components.wait_initial_ready(&network_status).await
+                    {
                         error!(
                             "replacement data plane failed to become ready; restoring the active runtime: {}",
                             err
@@ -789,9 +969,9 @@ async fn start_with_shutdown_token(
                             let fatal = Error::Operation(format!(
                                 "failed to restore active network configuration after data-plane reload failure: {restore_err}"
                             ));
-                            let _ = done.send(Err(fatal));
+                            let _ = finish_reload_status(&network_status, done, Err(fatal)).await;
                             reload_token.cancel();
-                            return Err(Error::Operation(
+                            break Err(Error::Operation(
                                 "active network configuration could not be restored"
                                     .to_owned(),
                             ));
@@ -799,14 +979,15 @@ async fn start_with_shutdown_token(
 
                         rollback_components.start_all();
                         if let Err(restore_err) =
-                            rollback_components.wait_initial_ready().await
+                            rollback_components.wait_initial_ready(&network_status).await
                         {
                             let fatal = Error::Operation(format!(
                                 "failed to restore active data plane after reload failure: {restore_err}"
                             ));
-                            let _ = done.send(Err(fatal));
+                            let _ = finish_reload_status(&network_status, done, Err(fatal)).await;
                             reload_token.cancel();
-                            return Err(Error::Operation(
+                            rollback_components.stop_all_and_join(true).await;
+                            break Err(Error::Operation(
                                 "active data plane could not be restored".to_owned(),
                             ));
                         }
@@ -829,19 +1010,34 @@ async fn start_with_shutdown_token(
                         );
                         restored_api_listener.run_async();
                         if let Err(restore_err) = restored_api_listener.wait_ready().await {
+                            network_status.write().await.set_component(
+                                app::runtime_state::RuntimeComponent::Api,
+                                app::runtime_state::RuntimeComponentPhase::Failed,
+                                Some(restore_err.to_string()),
+                            );
                             let fatal = Error::Operation(format!(
                                 "failed to restore active API listener after data-plane reload failure: {restore_err}"
                             ));
-                            let _ = done.send(Err(fatal));
+                            let _ = finish_reload_status(&network_status, done, Err(fatal)).await;
                             reload_token.cancel();
-                            return Err(Error::Operation(
+                            restored_api_listener.shutdown();
+                            let _ = restored_api_listener.join().await;
+                            break Err(Error::Operation(
                                 "active API listener could not be restored".to_owned(),
                             ));
                         }
 
                         active_components = rollback_components;
+                        *observed_tun_exclusion.write().await =
+                            active_components.tun_candidate_exclusion();
                         active_api_listener = restored_api_listener;
-                        let _ = done.send(Err(err));
+                        refresh_runtime_health(
+                            &active_components,
+                            active_api_listener.as_ref(),
+                            &network_status,
+                        )
+                        .await;
+                        let _ = finish_reload_status(&network_status, done, Err(err)).await;
                         continue;
                     }
 
@@ -852,39 +1048,165 @@ async fn start_with_shutdown_token(
                     }
                     g.dns_listener = new_components.dns_listener.clone();
 
+                    *observed_tun_exclusion.write().await =
+                        new_components.tun_candidate_exclusion();
                     active_components = new_components;
                     active_api_listener = new_api_listener;
                     active_controller_cfg = candidate_controller_cfg;
+                    network_observer = app::network::NetworkObserver::default();
+                    refresh_runtime_health(
+                        &active_components,
+                        active_api_listener.as_ref(),
+                        &network_status,
+                    )
+                    .await;
 
-                    if done.send(Ok(())).is_err() {
+                    if finish_reload_status(&network_status, done, Ok(())).await.is_err() {
                         warn!("config reload response channel dropped before completion");
                     }
                 }
-                _ = reload_token.cancelled() => {
-                    info!("runtime shutdown requested");
-                    active_api_listener.shutdown();
-                    if let Err(err) = active_api_listener.join().await {
-                        warn!("failed waiting for api listener shutdown: {}", err);
+                Some(proof) = traffic_rx.recv() => {
+                    network_status.write().await.record_traffic(proof);
+                }
+                _ = health_interval.tick() => {
+                    refresh_runtime_health(
+                        &active_components,
+                        active_api_listener.as_ref(),
+                        &network_status,
+                    ).await;
+                }
+                changed = network_samples.changed(), if sampler_running => {
+                    if changed.is_err() {
+                        warn!("network sampler stopped; automatic recovery is unavailable");
+                        sampler_running = false;
+                        network_status.write().await.observation_failed("network sampler stopped");
+                        continue;
                     }
-                    active_components.stop_all_and_join(true).await;
-                    break;
+                    let sample = network_samples.borrow_and_update().clone();
+                    if let Some(sample) = sample {
+                        match sample.result.clone() {
+                            Ok(snapshot) => {
+                                network_status.write().await.observed_sample(&sample);
+                                active_components.apply_network_observation(
+                                    &mut network_observer,
+                                    &network_status,
+                                    snapshot,
+                                    &mut network_samples,
+                                ).await;
+                            }
+                            Err(error) => {
+                                let mut status = network_status.write().await;
+                                status.observation_failed_sample(&sample);
+                                debug!(error, sample_sequence = sample.sequence, "network observation failed");
+                            }
+                        }
+                    }
                 }
             }
+            }
+        })
+        .await;
+
+        active_api_listener.shutdown();
+        if let Err(err) = active_api_listener.join().await {
+            warn!("failed waiting for API listener shutdown: {}", err);
         }
-        Ok::<(), Error>(())
+        active_components.stop_all_and_join(true).await;
+        if control_result.is_ok() {
+            let mut status = network_status.write().await;
+            status.stop_components();
+            status.lifecycle(
+                app::runtime_state::Lifecycle::Stopped,
+                "resourcesReleased",
+            );
+        } else {
+            network_status.write().await.set_component(
+                app::runtime_state::RuntimeComponent::Control,
+                app::runtime_state::RuntimeComponentPhase::Failed,
+                Some("runtime control task exited unexpectedly".to_owned()),
+            );
+        }
+        control_result
     });
 
-    tokio::select! {
-        result = wait_for_shutdown_signal() => {
-            result.map_err(Error::Io)?;
-            shutdown_token.cancel();
-        }
-        _ = shutdown_token.cancelled() => {}
-    }
+    let exit = wait_for_control_or_shutdown(
+        &mut reload_handle,
+        &shutdown_token,
+        wait_for_shutdown_signal(),
+    )
+    .await;
 
-    reload_handle.await.map_err(|err| {
-        Error::Operation(format!("runtime reload task join error: {err}"))
-    })??;
+    let result = match exit {
+        RuntimeExit::Control(joined) => {
+            if shutdown_token.is_cancelled() {
+                joined
+                    .map_err(|err| {
+                        Error::Operation(format!(
+                            "runtime reload task join error: {err}"
+                        ))
+                    })
+                    .and_then(|result| result)
+            } else {
+                shutdown_token.cancel();
+                let error = match joined {
+                    Ok(Ok(())) => Error::Operation(
+                        "runtime control task exited unexpectedly".to_owned(),
+                    ),
+                    Ok(Err(error)) => error,
+                    Err(err) => Error::Operation(format!(
+                        "runtime control task terminated unexpectedly: {err}"
+                    )),
+                };
+                final_status.write().await.set_component(
+                    app::runtime_state::RuntimeComponent::Control,
+                    app::runtime_state::RuntimeComponentPhase::Failed,
+                    Some("runtime control task exited unexpectedly".to_owned()),
+                );
+                Err(error)
+            }
+        }
+        RuntimeExit::Signal(signal_result) => {
+            shutdown_token.cancel();
+            let joined = reload_handle
+                .await
+                .map_err(|err| {
+                    Error::Operation(format!(
+                        "runtime reload task join error: {err}"
+                    ))
+                })
+                .and_then(|result| result);
+            match signal_result {
+                Ok(()) => joined,
+                Err(error) => Err(Error::Io(error)),
+            }
+        }
+        RuntimeExit::Cancelled => {
+            shutdown_token.cancel();
+            reload_handle
+                .await
+                .map_err(|err| {
+                    Error::Operation(format!(
+                        "runtime reload task join error: {err}"
+                    ))
+                })
+                .and_then(|result| result)
+        }
+    };
+    if let Some(network_sampler) = network_sampler
+        && let Err(error) = network_sampler.await
+    {
+        warn!("network sampler task exited with error: {error}");
+    }
+    if result.is_err() {
+        let mut status = final_status.write().await;
+        status.set_component(
+            app::runtime_state::RuntimeComponent::Control,
+            app::runtime_state::RuntimeComponentPhase::Failed,
+            Some("runtime control task or shutdown failed".to_owned()),
+        );
+        status.lifecycle(app::runtime_state::Lifecycle::Failed, "controlTaskFailed");
+    }
+    result?;
 
     Ok(())
 }
@@ -914,6 +1236,137 @@ impl RuntimeNetworkConfig {
     }
 }
 
+struct NetworkRecoveryRequest {
+    snapshot: Option<app::network::NetworkSnapshot>,
+    path_changed: bool,
+    cause: app::runtime_state::RecoveryCause,
+    observation_error: Option<String>,
+}
+
+async fn recover_to_latest_environment<F, Fut>(
+    observer: &mut app::network::NetworkObserver,
+    status: &tokio::sync::RwLock<app::network::NetworkStatus>,
+    request: NetworkRecoveryRequest,
+    mut latest_samples: Option<
+        &mut tokio::sync::watch::Receiver<Option<app::network::NetworkSample>>,
+    >,
+    mut recover: F,
+) -> Result<app::network::NetworkResetResponse>
+where
+    F: FnMut(Option<app::network::NetworkSnapshot>, bool) -> Fut,
+    Fut: std::future::Future<Output = app::runtime_state::RecoveryReport>,
+{
+    const MAX_RECOVERY_ATTEMPTS_PER_CHANGE: u32 = 2;
+    let mut attempts = 0_u32;
+    let NetworkRecoveryRequest {
+        mut snapshot,
+        mut path_changed,
+        mut cause,
+        mut observation_error,
+    } = request;
+    loop {
+        attempts = attempts.saturating_add(1);
+        let started_at = tokio::time::Instant::now();
+        let token = status
+            .write()
+            .await
+            .begin(cause, snapshot.as_ref())
+            .ok_or_else(|| {
+                Error::Operation(
+                    "runtime cannot recover in its current lifecycle".into(),
+                )
+            })?;
+        let mut report = recover(snapshot.clone(), path_changed).await;
+        report.observation_error = observation_error.take();
+
+        // The sampler runs independently while DNS and pool resets wait. If a
+        // newer network is already known, retain this attempt as superseded and
+        // recover the latest environment before reporting success.
+        if let Some(samples) = latest_samples.as_deref_mut()
+            && let Some(sample) =
+                app::network::take_sample_after(samples, started_at)
+        {
+            match sample.result.clone() {
+                Ok(newest) => {
+                    let changed = snapshot.as_ref() != Some(&newest);
+                    status.write().await.observed_sample(&sample);
+                    if changed {
+                        status.write().await.supersede(token, report);
+                        let retry =
+                            observer.observe(&newest, tokio::time::Instant::now());
+                        path_changed = retry.unwrap_or(true);
+                        cause = if attempts >= MAX_RECOVERY_ATTEMPTS_PER_CHANGE {
+                            app::runtime_state::RecoveryCause::Retry
+                        } else {
+                            app::runtime_state::RecoveryCause::NetworkChanged
+                        };
+                        snapshot = Some(newest);
+                        observation_error = None;
+                        if attempts >= MAX_RECOVERY_ATTEMPTS_PER_CHANGE {
+                            let message =
+                                "network changed repeatedly during recovery";
+                            let token = status
+                                .write()
+                                .await
+                                .begin(cause, snapshot.as_ref())
+                                .ok_or_else(|| Error::Operation(message.into()))?;
+                            let report = app::runtime_state::RecoveryReport {
+                                interface:
+                                    app::runtime_state::ComponentResult::skipped(),
+                                dns: app::runtime_state::ComponentResult::skipped(),
+                                pools: app::runtime_state::ComponentResult::skipped(
+                                ),
+                                observation_error: Some(message.into()),
+                                offline: snapshot
+                                    .as_ref()
+                                    .is_none_or(|value| !value.has_path()),
+                            };
+                            let delay = observer
+                                .retry(path_changed, tokio::time::Instant::now());
+                            status.write().await.complete(
+                                token,
+                                report.clone(),
+                                Some(delay),
+                            );
+                            return report.into_result();
+                        }
+                        continue;
+                    }
+                }
+                Err(error) => {
+                    status.write().await.observation_failed_sample(&sample);
+                    report.observation_error = Some(error);
+                }
+            }
+        }
+
+        let failed = report.error().is_some();
+        let retry = failed
+            .then(|| observer.retry(path_changed, tokio::time::Instant::now()));
+        if !status.write().await.complete(token, report.clone(), retry) {
+            return Err(Error::Operation(
+                "discarded stale network recovery result".into(),
+            ));
+        }
+        if !failed && let Some(snapshot) = snapshot {
+            observer.applied(snapshot);
+        }
+        return report.into_result();
+    }
+}
+
+async fn finish_reload_status(
+    status: &tokio::sync::RwLock<app::network::NetworkStatus>,
+    done: oneshot::Sender<Result<()>>,
+    result: Result<()>,
+) -> std::result::Result<(), Result<()>> {
+    status
+        .write()
+        .await
+        .reload_finished(result.as_ref().err().map(ToString::to_string));
+    done.send(result)
+}
+
 struct RuntimeComponents {
     cache_store: profile::ThreadSafeCacheFile,
     dns_resolver: ThreadSafeDNSResolver,
@@ -934,6 +1387,252 @@ struct RuntimeComponents {
 }
 
 impl RuntimeComponents {
+    fn tun_candidate_exclusion(&self) -> app::network::TunCandidateExclusion {
+        #[cfg(feature = "tun")]
+        {
+            if self.tun_runner.is_enabled() {
+                self.tun_runner
+                    .interface_name_hint()
+                    .map(app::network::TunCandidateExclusion::Named)
+                    .unwrap_or(app::network::TunCandidateExclusion::Unidentified)
+            } else {
+                app::network::TunCandidateExclusion::Disabled
+            }
+        }
+        #[cfg(not(feature = "tun"))]
+        {
+            app::network::TunCandidateExclusion::Disabled
+        }
+    }
+}
+
+async fn refresh_runtime_health(
+    components: &RuntimeComponents,
+    api_listener: &app::api::ApiRunner,
+    status: &tokio::sync::RwLock<app::network::NetworkStatus>,
+) {
+    use app::runtime_state::{
+        RuntimeComponent as Name, RuntimeComponentPhase as Phase,
+    };
+
+    let api_configured = api_listener.is_configured();
+    let api_finished = api_listener.task_finished();
+    let dns_configured = components.dns_listener.is_configured();
+    let dns_finished = components.dns_listener.task_finished();
+    let inbound_configured =
+        components.inbound_manager.has_configured_listeners().await;
+    let inbound_failed = components.inbound_manager.has_finished_listener().await;
+
+    #[cfg(feature = "tun")]
+    let tun_update = {
+        let enabled = components.tun_runner.is_enabled();
+        let failed = enabled && components.tun_runner.task_finished();
+        (
+            Name::Tun,
+            if !enabled {
+                Phase::NotConfigured
+            } else if failed {
+                Phase::Failed
+            } else {
+                Phase::Ready
+            },
+            failed.then(|| "TUN runner task exited unexpectedly".to_owned()),
+        )
+    };
+    #[cfg(not(feature = "tun"))]
+    let tun_update = (Name::Tun, Phase::NotConfigured, None);
+
+    let updates = vec![
+        (
+            Name::Api,
+            if !api_configured {
+                Phase::NotConfigured
+            } else if api_finished {
+                Phase::Failed
+            } else {
+                Phase::Ready
+            },
+            (api_configured && api_finished)
+                .then(|| "API listener task exited unexpectedly".to_owned()),
+        ),
+        (
+            Name::Dns,
+            if !dns_configured {
+                Phase::NotConfigured
+            } else if dns_finished {
+                Phase::Failed
+            } else {
+                Phase::Ready
+            },
+            (dns_configured && dns_finished)
+                .then(|| "DNS listener task exited unexpectedly".to_owned()),
+        ),
+        (
+            Name::Inbound,
+            if !inbound_configured {
+                Phase::NotConfigured
+            } else if inbound_failed {
+                Phase::Failed
+            } else {
+                Phase::Ready
+            },
+            inbound_failed.then(|| {
+                "one or more inbound listener tasks exited unexpectedly".to_owned()
+            }),
+        ),
+        tun_update,
+    ];
+
+    let mut status = status.write().await;
+    for (name, phase, error) in updates {
+        if status.set_component(name, phase, error.clone()) && phase == Phase::Failed
+        {
+            warn!(?name, error = ?error, "runtime component failed");
+        }
+    }
+    status.expire_health();
+}
+
+impl RuntimeComponents {
+    async fn apply_network_observation(
+        &self,
+        observer: &mut app::network::NetworkObserver,
+        status: &tokio::sync::RwLock<app::network::NetworkStatus>,
+        snapshot: app::network::NetworkSnapshot,
+        latest_samples: &mut tokio::sync::watch::Receiver<
+            Option<app::network::NetworkSample>,
+        >,
+    ) {
+        status.write().await.observed(&snapshot);
+        let Some(path_changed) =
+            observer.observe(&snapshot, tokio::time::Instant::now())
+        else {
+            return;
+        };
+        let cause = if observer.is_applied(&snapshot) {
+            app::runtime_state::RecoveryCause::Retry
+        } else {
+            app::runtime_state::RecoveryCause::NetworkChanged
+        };
+        let _ = self
+            .perform_network_recovery(
+                observer,
+                status,
+                NetworkRecoveryRequest {
+                    snapshot: Some(snapshot),
+                    path_changed,
+                    cause,
+                    observation_error: None,
+                },
+                Some(latest_samples),
+            )
+            .await;
+    }
+
+    async fn perform_network_recovery(
+        &self,
+        observer: &mut app::network::NetworkObserver,
+        status: &tokio::sync::RwLock<app::network::NetworkStatus>,
+        request: NetworkRecoveryRequest,
+        latest_samples: Option<
+            &mut tokio::sync::watch::Receiver<Option<app::network::NetworkSample>>,
+        >,
+    ) -> Result<app::network::NetworkResetResponse> {
+        recover_to_latest_environment(
+            observer,
+            status,
+            request,
+            latest_samples,
+            |snapshot, path_changed| async move {
+                self.recover_network(snapshot.as_ref(), path_changed).await
+            },
+        )
+        .await
+    }
+
+    async fn recover_network(
+        &self,
+        snapshot: Option<&app::network::NetworkSnapshot>,
+        path_changed: bool,
+    ) -> app::runtime_state::RecoveryReport {
+        #[cfg(feature = "tun")]
+        let mut interface_result = app::runtime_state::ComponentResult::skipped();
+        #[cfg(not(feature = "tun"))]
+        let interface_result = app::runtime_state::ComponentResult::skipped();
+        #[cfg(feature = "tun")]
+        if self.network_config.uses_global_state()
+            && let Some(snapshot) = snapshot
+        {
+            let selected = if self.network_config.interface.is_some() {
+                app::net::resolve_outbound_interface(
+                    self.network_config.interface.as_ref(),
+                )
+                .await
+            } else if self.network_config.tun_enabled {
+                match snapshot.ipv4.as_ref().or(snapshot.ipv6.as_ref()) {
+                    Some(path) => {
+                        app::net::resolve_outbound_interface(Some(
+                            &app::net::Interface::Name(path.interface.clone()),
+                        ))
+                        .await
+                    }
+                    None => Ok(None),
+                }
+            } else {
+                Ok(None)
+            };
+            match selected {
+                Ok(interface) => {
+                    interface_result =
+                        app::runtime_state::ComponentResult::refreshed(0);
+                    *app::net::DEFAULT_OUTBOUND_INTERFACE.write().await = interface;
+                    #[cfg(target_os = "macos")]
+                    {
+                        let ipv6 = if self.network_config.interface.is_none()
+                            && self.network_config.tun_enabled
+                        {
+                            snapshot.ipv6.as_ref().and_then(|path| {
+                                app::net::get_interface_by_name(&path.interface)
+                            })
+                        } else {
+                            None
+                        };
+                        *app::net::DEFAULT_OUTBOUND_INTERFACE_V6.write().await =
+                            ipv6;
+                    }
+                    app::net::OUTBOUND_INTERFACE_UNAVAILABLE
+                        .store(false, std::sync::atomic::Ordering::Release);
+                }
+                Err(error) => {
+                    app::net::OUTBOUND_INTERFACE_UNAVAILABLE
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    interface_result =
+                        app::runtime_state::ComponentResult::failed(error);
+                }
+            }
+        }
+        if path_changed {
+            self.dispatcher.invalidate_network_sessions();
+        }
+        let mut report = app::network::reset_resources_report(
+            self.dns_resolver.reset_transports(),
+            async {
+                if path_changed {
+                    self.outbound_manager.reset_connection_pools().await
+                } else {
+                    Ok(0)
+                }
+            },
+        )
+        .await;
+        report.interface = interface_result;
+        report.offline = snapshot.is_some_and(|snapshot| !snapshot.has_path());
+        if !path_changed {
+            report.pools = app::runtime_state::ComponentResult::skipped();
+        }
+        report
+    }
+
     fn api_listener(
         &self,
         controller_cfg: config::internal::config::Controller,
@@ -969,15 +1668,56 @@ impl RuntimeComponents {
         self.inbound_manager.run_async();
     }
 
-    async fn wait_initial_ready(&self) -> Result<()> {
-        self.dns_listener.wait_ready().await?;
+    async fn wait_initial_ready(
+        &self,
+        status: &tokio::sync::RwLock<app::network::NetworkStatus>,
+    ) -> Result<()> {
+        if let Err(error) = self.dns_listener.wait_ready().await {
+            status.write().await.set_component(
+                app::runtime_state::RuntimeComponent::Dns,
+                app::runtime_state::RuntimeComponentPhase::Failed,
+                Some(error.to_string()),
+            );
+            return Err(error);
+        }
+        status.write().await.set_component(
+            app::runtime_state::RuntimeComponent::Dns,
+            if self.dns_listener.is_configured() {
+                app::runtime_state::RuntimeComponentPhase::Ready
+            } else {
+                app::runtime_state::RuntimeComponentPhase::NotConfigured
+            },
+            None,
+        );
 
         #[cfg(feature = "tun")]
         {
             #[cfg(target_os = "macos")]
             self.tun_runner.run_async();
-            self.tun_runner.wait_ready().await?;
+            if let Err(error) = self.tun_runner.wait_ready().await {
+                status.write().await.set_component(
+                    app::runtime_state::RuntimeComponent::Tun,
+                    app::runtime_state::RuntimeComponentPhase::Failed,
+                    Some(error.to_string()),
+                );
+                return Err(error);
+            }
+            status.write().await.set_component(
+                app::runtime_state::RuntimeComponent::Tun,
+                if self.tun_runner.is_enabled() {
+                    app::runtime_state::RuntimeComponentPhase::Ready
+                } else {
+                    app::runtime_state::RuntimeComponentPhase::NotConfigured
+                },
+                None,
+            );
         }
+        #[cfg(not(feature = "tun"))]
+        status.write().await.set_component(
+            app::runtime_state::RuntimeComponent::Tun,
+            app::runtime_state::RuntimeComponentPhase::NotConfigured,
+            None,
+        );
 
         #[cfg(target_os = "macos")]
         {
@@ -987,7 +1727,26 @@ impl RuntimeComponents {
         #[cfg(all(target_os = "macos", not(feature = "tun")))]
         self.inbound_manager.run_async();
 
-        self.inbound_manager.wait_ready().await
+        if let Err(error) = self.inbound_manager.wait_ready().await {
+            status.write().await.set_component(
+                app::runtime_state::RuntimeComponent::Inbound,
+                app::runtime_state::RuntimeComponentPhase::Failed,
+                Some(error.to_string()),
+            );
+            return Err(error);
+        }
+        let inbound_configured =
+            self.inbound_manager.has_configured_listeners().await;
+        status.write().await.set_component(
+            app::runtime_state::RuntimeComponent::Inbound,
+            if inbound_configured {
+                app::runtime_state::RuntimeComponentPhase::Ready
+            } else {
+                app::runtime_state::RuntimeComponentPhase::NotConfigured
+            },
+            None,
+        );
+        Ok(())
     }
 
     async fn fresh_data_plane(&self) -> Result<Self> {
@@ -1117,6 +1876,7 @@ async fn create_components(
     let _ = activate_network;
 
     let cancellation_token = tokio_util::sync::CancellationToken::new();
+    let network_path_source = crate::proxy::utils::NetworkPathSource::default();
 
     debug!("initializing cache store");
     let cache_store = profile::ThreadSafeCacheFile::new(
@@ -1164,7 +1924,10 @@ async fn create_components(
         config.general.routing_mask,
         cache_store.clone(),
         outbound_registry.clone(),
-        system_resolver.clone(),
+        AuxiliaryDnsNetworkContext {
+            system_resolver: system_resolver.clone(),
+            network_path_source: network_path_source.clone(),
+        },
     )
     .await?;
     let client = new_http_client(
@@ -1202,18 +1965,19 @@ async fn create_components(
         None
     };
 
-    let dns_resolver = dns::new_resolver(
+    let dns_resolver = dns::resolver::new_with_network_path_source(
         config.dns,
         Some(cache_store.clone()),
         pending_country_mmdb.clone(),
         outbound_registry.clone(),
         rule_dispatch.clone(),
+        Some(network_path_source.clone()),
     )
     .await?;
 
     debug!("initializing outbound manager");
     let outbound_manager = Arc::new(
-        OutboundManager::new(
+        OutboundManager::new_with_network_path_source(
             plain_outbounds,
             config
                 .proxy_groups
@@ -1230,6 +1994,7 @@ async fn create_components(
             cwd.to_string_lossy().to_string(),
             config.general.routing_mask,
             outbound_registry.clone(),
+            network_path_source.clone(),
         )
         .await?,
     );
@@ -1463,6 +2228,11 @@ pub fn shutdown() -> bool {
     }
 }
 
+struct AuxiliaryDnsNetworkContext {
+    system_resolver: Arc<SystemResolver>,
+    network_path_source: crate::proxy::utils::NetworkPathSource,
+}
+
 async fn build_auxiliary_dns_resolver(
     nameserver: Vec<dns::config::NameServer>,
     default_nameserver: Vec<dns::config::NameServer>,
@@ -1470,7 +2240,7 @@ async fn build_auxiliary_dns_resolver(
     fw_mark: Option<u32>,
     cache_store: profile::ThreadSafeCacheFile,
     outbounds: crate::proxy::utils::OutboundHandlerRegistry,
-    system_resolver: Arc<SystemResolver>,
+    network_context: AuxiliaryDnsNetworkContext,
 ) -> Result<ThreadSafeDNSResolver> {
     let effective_nameserver = if nameserver.is_empty() {
         default_nameserver.clone()
@@ -1479,7 +2249,7 @@ async fn build_auxiliary_dns_resolver(
     };
 
     if effective_nameserver.is_empty() {
-        return Ok(system_resolver);
+        return Ok(network_context.system_resolver);
     }
 
     let cfg = dns::Config {
@@ -1507,7 +2277,15 @@ async fn build_auxiliary_dns_resolver(
         respect_rules: false,
     };
 
-    dns::new_resolver(cfg, Some(cache_store), None, outbounds, None).await
+    dns::resolver::new_with_network_path_source(
+        cfg,
+        Some(cache_store),
+        None,
+        outbounds,
+        None,
+        Some(network_context.network_path_source),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1518,6 +2296,417 @@ pub(crate) mod tests {
 
     pub fn initialize() {
         INIT.call_once(crate::setup_default_crypto_provider);
+    }
+
+    #[tokio::test]
+    async fn control_task_completion_is_observed_without_a_shutdown_signal() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let mut control = tokio::spawn(async { 7_u8 });
+        let exit = crate::wait_for_control_or_shutdown(
+            &mut control,
+            &token,
+            std::future::pending(),
+        )
+        .await;
+
+        assert!(matches!(exit, crate::RuntimeExit::Control(Ok(7))));
+        assert!(!token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn panic_in_control_loop_becomes_a_cleanup_error() {
+        let result = crate::catch_control_panic(async {
+            std::panic::panic_any("injected control task failure");
+            #[allow(unreachable_code)]
+            Ok(())
+        })
+        .await;
+
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("control task panicked")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_control_task_supervision() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let mut control = tokio::spawn(std::future::pending::<()>());
+        token.cancel();
+        let exit = crate::wait_for_control_or_shutdown(
+            &mut control,
+            &token,
+            std::future::pending(),
+        )
+        .await;
+
+        assert!(matches!(exit, crate::RuntimeExit::Cancelled));
+        control.abort();
+        let _ = control.await;
+    }
+
+    #[tokio::test]
+    async fn recovery_restarts_on_the_latest_network_sample_before_reporting_success()
+     {
+        use crate::NetworkRecoveryRequest;
+        use crate::app::{
+            network::{NetworkPath, NetworkSample, NetworkSnapshot},
+            runtime_state::{
+                ComponentResult, Lifecycle, RecoveryCause, RecoveryReport,
+            },
+        };
+        use crate::recover_to_latest_environment;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::sync::{Notify, watch};
+
+        let path = |interface: &str, address: &str| NetworkSnapshot {
+            ipv4: Some(NetworkPath {
+                interface: interface.into(),
+                index: if interface == "en0" { 1 } else { 2 },
+                gateway: "192.0.2.1".into(),
+                addresses: vec![address.into()],
+            }),
+            ..Default::default()
+        };
+        let old = path("en0", "192.0.2.2");
+        let in_flight = path("en1", "192.0.2.3");
+        let newest = path("en1", "192.0.2.4");
+        let mut observer = crate::app::network::NetworkObserver::default();
+        observer.applied(old);
+        let mut state = crate::app::network::NetworkStatus::default();
+        state.lifecycle(Lifecycle::Running, "testReady");
+        let status = Arc::new(tokio::sync::RwLock::new(state));
+        let (sample_tx, mut samples) = watch::channel(None);
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let recover = {
+            let entered = entered.clone();
+            let release = release.clone();
+            let calls = calls.clone();
+            move |_snapshot: Option<NetworkSnapshot>, _path_changed: bool| {
+                let attempt = calls.fetch_add(1, Ordering::Relaxed);
+                let entered = entered.clone();
+                let release = release.clone();
+                async move {
+                    if attempt == 0 {
+                        entered.notify_one();
+                        release.notified().await;
+                    }
+                    RecoveryReport {
+                        interface: ComponentResult::refreshed(0),
+                        dns: ComponentResult::refreshed(1),
+                        pools: ComponentResult::refreshed(1),
+                        observation_error: None,
+                        offline: false,
+                    }
+                }
+            }
+        };
+        let worker_status = status.clone();
+        let worker = tokio::spawn(async move {
+            recover_to_latest_environment(
+                &mut observer,
+                &worker_status,
+                NetworkRecoveryRequest {
+                    snapshot: Some(in_flight),
+                    path_changed: true,
+                    cause: RecoveryCause::NetworkChanged,
+                    observation_error: None,
+                },
+                Some(&mut samples),
+                recover,
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .expect("first recovery attempt did not start");
+        sample_tx.send_replace(Some(NetworkSample {
+            sequence: 7,
+            sampled_at: tokio::time::Instant::now(),
+            result: Ok(newest),
+        }));
+        release.notify_one();
+
+        worker.await.unwrap().unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        let state = status.read().await;
+        assert_eq!(
+            state.phase(),
+            crate::app::runtime_state::NetworkPhase::AwaitingTraffic
+        );
+        let json = serde_json::to_value(&*state).unwrap();
+        assert_eq!(json["networkVersion"], 2);
+        assert_eq!(json["lastSampleSequence"], 7);
+        assert_eq!(json["operationHistory"][0]["outcome"], "superseded");
+        assert_eq!(json["lastOperation"]["token"]["networkVersion"], 2);
+    }
+
+    #[tokio::test]
+    async fn repeated_network_changes_during_recovery_fail_with_a_bounded_retry() {
+        use crate::NetworkRecoveryRequest;
+        use crate::app::{
+            network::{NetworkPath, NetworkSample, NetworkSnapshot},
+            runtime_state::{
+                ComponentResult, Lifecycle, RecoveryCause, RecoveryReport,
+            },
+        };
+        use crate::recover_to_latest_environment;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::sync::watch;
+
+        let path = |interface: &str, index: u32, address: &str| NetworkSnapshot {
+            ipv4: Some(NetworkPath {
+                interface: interface.into(),
+                index,
+                gateway: "192.0.2.1".into(),
+                addresses: vec![address.into()],
+            }),
+            ..Default::default()
+        };
+        let mut observer = crate::app::network::NetworkObserver::default();
+        observer.applied(path("en0", 1, "192.0.2.2"));
+        let mut state = crate::app::network::NetworkStatus::default();
+        state.lifecycle(Lifecycle::Running, "testReady");
+        let status = Arc::new(tokio::sync::RwLock::new(state));
+        let (sample_tx, mut samples) = watch::channel(None);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let recover = {
+            let attempts = attempts.clone();
+            move |_snapshot: Option<NetworkSnapshot>, _path_changed: bool| {
+                let attempt = attempts.fetch_add(1, Ordering::Relaxed);
+                let tx = sample_tx.clone();
+                async move {
+                    let next = if attempt == 0 {
+                        path("en1", 2, "192.0.2.3")
+                    } else {
+                        path("en2", 3, "192.0.2.4")
+                    };
+                    tx.send_replace(Some(NetworkSample {
+                        sequence: attempt as u64 + 1,
+                        sampled_at: tokio::time::Instant::now(),
+                        result: Ok(next),
+                    }));
+                    RecoveryReport {
+                        interface: ComponentResult::refreshed(0),
+                        dns: ComponentResult::refreshed(1),
+                        pools: ComponentResult::refreshed(1),
+                        observation_error: None,
+                        offline: false,
+                    }
+                }
+            }
+        };
+        let error = recover_to_latest_environment(
+            &mut observer,
+            &status,
+            NetworkRecoveryRequest {
+                snapshot: Some(path("en1", 4, "192.0.2.5")),
+                path_changed: true,
+                cause: RecoveryCause::NetworkChanged,
+                observation_error: None,
+            },
+            Some(&mut samples),
+            recover,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("changed repeatedly"));
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        let state = status.read().await;
+        assert_eq!(
+            state.phase(),
+            crate::app::runtime_state::NetworkPhase::Degraded
+        );
+        let json = serde_json::to_value(&*state).unwrap();
+        assert!(
+            json["lastError"]
+                .as_str()
+                .unwrap()
+                .contains("changed repeatedly")
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_snapshot_does_not_clear_failed_manual_recovery() {
+        initialize();
+        let cwd = tempfile::tempdir().unwrap();
+        let config = crate::Config::Str(
+            "mode: direct\nmmdb: null\ntun:\n  enable: false\n".into(),
+        )
+        .try_parse()
+        .unwrap();
+        let mut components =
+            crate::create_components(cwd.path().to_path_buf(), config, false)
+                .await
+                .unwrap();
+        let mut dns = crate::app::dns::MockClashResolver::new();
+        dns.expect_reset_transports()
+            .returning(|| Err(anyhow::anyhow!("injected DNS recovery failure")));
+        components.dns_resolver = std::sync::Arc::new(dns);
+        let snapshot = crate::app::network::NetworkSnapshot {
+            ipv4: Some(crate::app::network::NetworkPath {
+                interface: "test".into(),
+                index: 1,
+                gateway: "192.0.2.1".into(),
+                addresses: vec!["192.0.2.2".into()],
+            }),
+            ..Default::default()
+        };
+        let mut observer = crate::app::network::NetworkObserver::default();
+        observer.applied(snapshot.clone());
+        let mut status = crate::app::network::NetworkStatus::default();
+        status.lifecycle(crate::app::runtime_state::Lifecycle::Running, "testReady");
+        let status = tokio::sync::RwLock::new(status);
+        let error = components
+            .perform_network_recovery(
+                &mut observer,
+                &status,
+                crate::NetworkRecoveryRequest {
+                    snapshot: Some(snapshot.clone()),
+                    path_changed: true,
+                    cause: crate::app::runtime_state::RecoveryCause::ManualReset,
+                    observation_error: None,
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("injected DNS recovery failure"));
+        let (_samples_tx, mut samples) = tokio::sync::watch::channel(None);
+        components
+            .apply_network_observation(
+                &mut observer,
+                &status,
+                snapshot,
+                &mut samples,
+            )
+            .await;
+        assert_eq!(
+            status.read().await.phase(),
+            crate::app::runtime_state::NetworkPhase::Degraded
+        );
+        assert!(
+            serde_json::to_value(&*status.read().await).unwrap()["lastError"]
+                .as_str()
+                .unwrap()
+                .contains("injected DNS recovery failure")
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_network_observations_recover_and_deduplicate_without_reset_api()
+     {
+        initialize();
+        let cwd = tempfile::tempdir().unwrap();
+        let config = crate::Config::Str(
+            "mode: direct\nmmdb: null\ntun:\n  enable: false\n".into(),
+        )
+        .try_parse()
+        .unwrap();
+        let mut components =
+            crate::create_components(cwd.path().to_path_buf(), config, false)
+                .await
+                .unwrap();
+        let resets = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut dns = crate::app::dns::MockClashResolver::new();
+        let count = resets.clone();
+        dns.expect_reset_transports().returning(move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(1)
+        });
+        components.dns_resolver = std::sync::Arc::new(dns);
+        let mut observer = crate::app::network::NetworkObserver::default();
+        let mut state = crate::app::network::NetworkStatus::default();
+        state.lifecycle(crate::app::runtime_state::Lifecycle::Running, "testReady");
+        let status = tokio::sync::RwLock::new(state);
+        let (_samples_tx, mut samples) = tokio::sync::watch::channel(None);
+        for round in 0..20 {
+            let snapshot = crate::app::network::NetworkSnapshot {
+                ipv4: Some(crate::app::network::NetworkPath {
+                    interface: format!("test{}", round % 2),
+                    index: round + 1,
+                    gateway: "192.0.2.1".into(),
+                    addresses: vec![format!("192.0.2.{}", round + 2)],
+                }),
+                ..Default::default()
+            };
+            components
+                .apply_network_observation(
+                    &mut observer,
+                    &status,
+                    snapshot.clone(),
+                    &mut samples,
+                )
+                .await;
+            {
+                let mut status = status.write().await;
+                status.observation_failed("temporary snapshot read failure");
+            }
+            components
+                .apply_network_observation(
+                    &mut observer,
+                    &status,
+                    snapshot,
+                    &mut samples,
+                )
+                .await;
+            assert_eq!(
+                resets.load(std::sync::atomic::Ordering::Relaxed),
+                round as usize + 1
+            );
+            assert_eq!(
+                status.read().await.phase(),
+                crate::app::runtime_state::NetworkPhase::AwaitingTraffic
+            );
+        }
+        components
+            .apply_network_observation(
+                &mut observer,
+                &status,
+                Default::default(),
+                &mut samples,
+            )
+            .await;
+        assert_eq!(
+            status.read().await.phase(),
+            crate::app::runtime_state::NetworkPhase::WaitingForNetwork
+        );
+        assert!(
+            !serde_json::to_value(&*status.read().await).unwrap()["lastError"]
+                .is_null()
+        );
+        let online = crate::app::network::NetworkSnapshot {
+            ipv6: Some(crate::app::network::NetworkPath {
+                interface: "test-v6".into(),
+                index: 42,
+                gateway: "fe80::1".into(),
+                addresses: vec!["2001:db8::2".into()],
+            }),
+            ..Default::default()
+        };
+        components
+            .apply_network_observation(&mut observer, &status, online, &mut samples)
+            .await;
+        assert_eq!(
+            status.read().await.phase(),
+            crate::app::runtime_state::NetworkPhase::AwaitingTraffic
+        );
+        assert_eq!(
+            serde_json::to_value(&*status.read().await).unwrap()["failures"],
+            0
+        );
+        assert_eq!(resets.load(std::sync::atomic::Ordering::Relaxed), 22);
     }
 
     #[test]

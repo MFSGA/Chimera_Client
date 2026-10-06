@@ -1,6 +1,6 @@
 use super::{
     ClashResolver, Client, EdnsClientSubnet, RuleDispatch,
-    runtime::DnsRuntimeProvider,
+    runtime::{DnsPathUse, DnsRuntimeProvider, SharedDnsPathUse},
 };
 use std::{
     fmt::{Debug, Display, Formatter},
@@ -29,7 +29,10 @@ use hickory_proto::{
 };
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use rustls::{ClientConfig, pki_types::ServerName};
-use tokio::{sync::RwLock, task::JoinHandle};
+use tokio::{
+    sync::{Mutex, RwLock},
+    task::JoinHandle,
+};
 use tracing::{debug, info, instrument, trace, warn};
 
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
@@ -41,7 +44,7 @@ use crate::{
         net::OutboundInterface,
     },
     dns::{ThreadSafeDNSClient, dhcp::DhcpClient},
-    proxy::OutboundHandler,
+    proxy::{OutboundHandler, utils::NetworkPathSource},
 };
 use anyhow::anyhow;
 
@@ -143,7 +146,14 @@ mod tests {
             None,
         );
 
-        let result = dns_stream_builder(&cfg, Some(Arc::new(resolver)), None).await;
+        let result = dns_stream_builder(
+            &cfg,
+            Some(Arc::new(resolver)),
+            None,
+            None,
+            Arc::new(Mutex::new(DnsPathUse::default())),
+        )
+        .await;
         assert!(result.is_err());
     }
 
@@ -154,6 +164,7 @@ mod tests {
             inner: Arc::new(RwLock::new(Inner {
                 c: None,
                 bg_handle: None,
+                selected_path: None,
             })),
             cfg: RwLock::new(DnsConfig::Udp(addr, None, proxy.clone(), None)),
             proxy,
@@ -166,6 +177,7 @@ mod tests {
             iface: None,
             ecs,
             rule_dispatch: None,
+            network_path_source: None,
         }
     }
 
@@ -230,6 +242,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dns_response_reports_the_selected_network_path() {
+        use crate::app::{
+            flow::{AddressFamily, InterfaceId, InterfaceKind, NetworkPathId},
+            network::{
+                BindingStatus, DefaultRouteEvidence, NetworkSnapshot, NetworkStatus,
+                PathCandidateObservation,
+            },
+        };
+
+        let mut status = NetworkStatus::default();
+        status.set_automatic_supported_for_test(true);
+        let snapshot = NetworkSnapshot {
+            path_candidates: vec![PathCandidateObservation {
+                interface: InterfaceId {
+                    name: "wifi0".to_owned(),
+                    index: 4,
+                },
+                interface_kind: InterfaceKind::Wifi,
+                family: AddressFamily::Ipv4,
+                source_address: "192.0.2.10".parse().unwrap(),
+                scope_id: None,
+                gateway: Some("192.0.2.1".parse().unwrap()),
+                default_route: DefaultRouteEvidence::PrimaryDefaultRoute,
+                binding: BindingStatus::Verified,
+                binding_error: None,
+            }],
+            ..Default::default()
+        };
+        status.observed(&snapshot);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let reporter = status.traffic_reporter(tx);
+        let source = NetworkPathSource::default();
+        source.attach(Arc::new(RwLock::new(status))).await;
+        source.attach_traffic_reporter(reporter).await;
+
+        let mut client = client_with_ecs(None);
+        client.network_path_source = Some(source);
+        let selected_path = Arc::new(Mutex::new(DnsPathUse {
+            path_id: Some(NetworkPathId {
+                interface: InterfaceId {
+                    name: "wifi0".to_owned(),
+                    index: 4,
+                },
+                family: AddressFamily::Ipv4,
+                source_address: Some("192.0.2.10".parse().unwrap()),
+                network_generation: 1,
+            }),
+            endpoint: Some("1.1.1.1:53".parse().unwrap()),
+        }));
+        client.inner.write().await.selected_path = Some(selected_path.clone());
+
+        client
+            .report_path_response(&Message::query(), &selected_path)
+            .await;
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
     async fn refresh_upstream_address_uses_bootstrap_resolver() {
         let mut resolver = MockClashResolver::new();
         resolver
@@ -267,7 +337,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reset_transport_resets_bootstrap_resolver_first() {
+    async fn reset_transport_includes_bootstrap_resolver() {
         let mut resolver = MockClashResolver::new();
         resolver
             .expect_reset_transports()
@@ -277,6 +347,22 @@ mod tests {
         client.bootstrap_resolver = Some(Arc::new(resolver));
 
         assert_eq!(client.reset_transport().await.unwrap(), 4);
+        assert!(client.refresh_address_on_rebuild.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn reset_transport_releases_own_state_when_bootstrap_reset_fails() {
+        let mut resolver = MockClashResolver::new();
+        resolver
+            .expect_reset_transports()
+            .once()
+            .returning(|| Err(anyhow::anyhow!("bootstrap reset failed")));
+        let mut client = client_with_ecs(None);
+        client.bootstrap_resolver = Some(Arc::new(resolver));
+        client.inner.write().await.bg_handle =
+            Some(tokio::spawn(std::future::pending::<()>()));
+        assert!(client.reset_transport().await.is_err());
+        assert!(client.inner.read().await.bg_handle.is_none());
         assert!(client.refresh_address_on_rebuild.load(Ordering::Acquire));
     }
 
@@ -446,6 +532,8 @@ pub struct Opts {
     /// `dns.respect-rules` is true; bootstrap clients (`default-nameserver`,
     /// `proxy-server-nameserver`) leave this `None`.
     pub rule_dispatch: Option<Arc<RuleDispatch>>,
+    /// Shared live network status used for DIRECT DNS socket path selection.
+    pub network_path_source: Option<NetworkPathSource>,
 }
 
 type FwMark = Option<u32>;
@@ -543,6 +631,7 @@ impl Display for DnsConfig {
 struct Inner {
     c: Option<client::Client<DnsRuntimeProvider>>,
     bg_handle: Option<JoinHandle<()>>,
+    selected_path: Option<SharedDnsPathUse>,
 }
 
 /// DnsClient
@@ -562,19 +651,76 @@ pub struct DnsClient {
     iface: Option<OutboundInterface>,
     ecs: Option<EdnsClientSubnet>,
     rule_dispatch: Option<Arc<RuleDispatch>>,
+    network_path_source: Option<NetworkPathSource>,
 }
 
 impl DnsClient {
     async fn build_stream(
         &self,
-    ) -> Result<(client::Client<DnsRuntimeProvider>, JoinHandle<()>), Error> {
+    ) -> Result<
+        (
+            client::Client<DnsRuntimeProvider>,
+            JoinHandle<()>,
+            SharedDnsPathUse,
+        ),
+        Error,
+    > {
         let cfg = self.cfg.read().await.clone();
-        dns_stream_builder(
+        #[cfg(feature = "tun")]
+        let cfg = {
+            let mut cfg = cfg;
+            let iface = match &mut cfg {
+                DnsConfig::Udp(_, iface, ..)
+                | DnsConfig::Tcp(_, iface, ..)
+                | DnsConfig::Tls(_, _, iface, ..)
+                | DnsConfig::Https(_, _, _, iface, ..) => iface,
+            };
+            if let Some(saved) = iface {
+                *iface = crate::app::net::resolve_outbound_interface(Some(
+                    &crate::app::net::Interface::Name(saved.name.clone()),
+                ))
+                .await?;
+            }
+            cfg
+        };
+        let selected_path = Arc::new(Mutex::new(DnsPathUse::default()));
+        let (client, background) = dns_stream_builder(
             &cfg,
             self.outbound_resolver.clone(),
             self.rule_dispatch.clone(),
+            self.network_path_source.clone(),
+            selected_path.clone(),
         )
-        .await
+        .await?;
+        Ok((client, background, selected_path))
+    }
+
+    async fn report_path_response(
+        &self,
+        response: &Message,
+        selected_path: &SharedDnsPathUse,
+    ) {
+        let DnsPathUse { path_id, endpoint } = selected_path.lock().await.clone();
+        let Some(path_id) = path_id else {
+            return;
+        };
+        let Some(destination) = endpoint else {
+            return;
+        };
+        let Some(source) = self.network_path_source.as_ref() else {
+            return;
+        };
+        let Some(reporter) = source.traffic_reporter().await else {
+            return;
+        };
+        let bytes = response.to_vec().map_or(1, |message| message.len());
+        reporter
+            .capture_scoped(
+                crate::app::runtime_state::TrafficKind::Dns,
+                Some(path_id),
+                Some(destination.into()),
+            )
+            .received(bytes);
     }
 
     async fn refresh_upstream_address(&self) -> anyhow::Result<bool> {
@@ -615,7 +761,14 @@ impl DnsClient {
     async fn rebuild_current_address(
         &self,
         address_refreshed: bool,
-    ) -> Result<(client::Client<DnsRuntimeProvider>, JoinHandle<()>), Error> {
+    ) -> Result<
+        (
+            client::Client<DnsRuntimeProvider>,
+            JoinHandle<()>,
+            SharedDnsPathUse,
+        ),
+        Error,
+    > {
         const MAX_RETRIES: u32 = 3;
         const RETRY_DELAY: Duration = Duration::from_millis(200);
 
@@ -658,7 +811,11 @@ impl DnsClient {
     /// rebuild error.
     async fn rebuild_with_retries(
         &self,
-    ) -> anyhow::Result<(client::Client<DnsRuntimeProvider>, JoinHandle<()>)> {
+    ) -> anyhow::Result<(
+        client::Client<DnsRuntimeProvider>,
+        JoinHandle<()>,
+        SharedDnsPathUse,
+    )> {
         if self
             .refresh_address_on_rebuild
             .swap(false, Ordering::AcqRel)
@@ -690,7 +847,14 @@ impl DnsClient {
 
         if matches!(opts.net, DNSNetMode::Dhcp) {
             let host = opts.host.to_string();
-            return Ok(Arc::new(DhcpClient::new(&host, opts.fw_mark).await?));
+            return Ok(Arc::new(
+                DhcpClient::new(
+                    &host,
+                    opts.fw_mark,
+                    opts.network_path_source.clone(),
+                )
+                .await?,
+            ));
         }
 
         let mut ip: Option<IpAddr> = None;
@@ -748,6 +912,7 @@ impl DnsClient {
                     inner: Arc::new(RwLock::new(Inner {
                         c: None,
                         bg_handle: None,
+                        selected_path: None,
                     })),
                     cfg: RwLock::new(cfg),
                     proxy: opts.proxy,
@@ -760,6 +925,7 @@ impl DnsClient {
                     iface: opts.iface,
                     ecs: opts.ecs.clone(),
                     rule_dispatch: opts.rule_dispatch.clone(),
+                    network_path_source: opts.network_path_source.clone(),
                 }))
             }
             DNSNetMode::Tcp => {
@@ -773,6 +939,7 @@ impl DnsClient {
                     inner: Arc::new(RwLock::new(Inner {
                         c: None,
                         bg_handle: None,
+                        selected_path: None,
                     })),
 
                     cfg: RwLock::new(cfg),
@@ -786,6 +953,7 @@ impl DnsClient {
                     iface: opts.iface,
                     ecs: opts.ecs.clone(),
                     rule_dispatch: opts.rule_dispatch.clone(),
+                    network_path_source: opts.network_path_source.clone(),
                 }))
             }
             DNSNetMode::DoT => {
@@ -800,6 +968,7 @@ impl DnsClient {
                     inner: Arc::new(RwLock::new(Inner {
                         c: None,
                         bg_handle: None,
+                        selected_path: None,
                     })),
                     cfg: RwLock::new(cfg),
                     proxy: opts.proxy,
@@ -812,6 +981,7 @@ impl DnsClient {
                     iface: opts.iface,
                     ecs: opts.ecs.clone(),
                     rule_dispatch: opts.rule_dispatch.clone(),
+                    network_path_source: opts.network_path_source.clone(),
                 }))
             }
             DNSNetMode::DoH => {
@@ -827,6 +997,7 @@ impl DnsClient {
                     inner: Arc::new(RwLock::new(Inner {
                         c: None,
                         bg_handle: None,
+                        selected_path: None,
                     })),
 
                     cfg: RwLock::new(cfg),
@@ -840,6 +1011,7 @@ impl DnsClient {
                     iface: opts.iface,
                     ecs: opts.ecs.clone(),
                     rule_dispatch: opts.rule_dispatch.clone(),
+                    network_path_source: opts.network_path_source.clone(),
                 }))
             }
             DNSNetMode::Dhcp => unreachable!("."),
@@ -925,19 +1097,21 @@ impl Client for DnsClient {
     }
 
     async fn reset_transport(&self) -> anyhow::Result<u32> {
-        let reset = if let Some(resolver) = &self.bootstrap_resolver {
-            resolver.reset_transports().await?
-        } else {
-            0
-        };
         self.refresh_address_on_rebuild
             .store(true, Ordering::Release);
 
         let mut inner = self.inner.write().await;
         inner.c.take();
+        inner.selected_path.take();
         if let Some(background) = inner.bg_handle.take() {
             background.abort();
         }
+        drop(inner);
+        let reset = if let Some(resolver) = &self.bootstrap_resolver {
+            resolver.reset_transports().await?
+        } else {
+            0
+        };
         Ok(reset.saturating_add(1))
     }
 
@@ -958,9 +1132,11 @@ impl Client for DnsClient {
                             "dns client background task is finished, likely \
                              connection closed, restarting a new one"
                         );
-                        let (client, bg) = self.rebuild_with_retries().await?;
+                        let (client, bg, selected_path) =
+                            self.rebuild_with_retries().await?;
                         inner.c.replace(client);
                         inner.bg_handle.replace(bg);
+                        inner.selected_path.replace(selected_path);
                     } else {
                         trace!(
                             "dns client background task is still running, reusing \
@@ -971,9 +1147,11 @@ impl Client for DnsClient {
                 _ => {
                     // initializing client
                     info!("initializing dns client: {}", self.cfg.read().await);
-                    let (client, bg) = self.rebuild_with_retries().await?;
+                    let (client, bg, selected_path) =
+                        self.rebuild_with_retries().await?;
                     inner.c.replace(client);
                     inner.bg_handle.replace(bg);
+                    inner.selected_path.replace(selected_path);
                 }
             }
         }
@@ -985,14 +1163,22 @@ impl Client for DnsClient {
             outbound.metadata.id = rand::random::<u16>();
         }
 
-        let client = self
-            .inner
-            .read()
-            .await
-            .c
-            .as_ref()
-            .expect("DNS client initialized")
-            .clone();
+        let (client, selected_path) = {
+            let inner = self.inner.read().await;
+            let client = inner.c.as_ref().ok_or_else(|| {
+                Error::DNSError(
+                    "DNS transport reset during query initialization; retry query"
+                        .to_owned(),
+                )
+            })?;
+            let selected_path = inner.selected_path.as_ref().ok_or_else(|| {
+                Error::DNSError(
+                    "DNS path state reset during query initialization; retry query"
+                        .to_owned(),
+                )
+            })?;
+            (client.clone(), selected_path.clone())
+        };
         let response = client
             .send(DnsRequest::new(
                 outbound.clone(),
@@ -1004,8 +1190,11 @@ impl Client for DnsClient {
             .map(|x: op::DnsResponse| x.into_message())?;
 
         if !response.metadata.truncation {
+            self.report_path_response(&response, &selected_path).await;
             return Ok(response);
         }
+
+        self.report_path_response(&response, &selected_path).await;
 
         let cfg = self.cfg.read().await.clone();
         let DnsConfig::Udp(addr, iface, proxy, fw_mark) = cfg else {
@@ -1017,10 +1206,13 @@ impl Client for DnsClient {
         );
 
         let tcp_cfg = DnsConfig::Tcp(addr, iface, proxy, fw_mark);
+        let tcp_selected_path = Arc::new(Mutex::new(DnsPathUse::default()));
         let (tcp_client, tcp_background) = dns_stream_builder(
             &tcp_cfg,
             self.outbound_resolver.clone(),
             self.rule_dispatch.clone(),
+            self.network_path_source.clone(),
+            tcp_selected_path.clone(),
         )
         .await
         .map_err(|error| Error::DNSError(error.to_string()))?;
@@ -1032,6 +1224,8 @@ impl Client for DnsClient {
         let tcp_response: op::DnsResponse =
             tcp_result.map_err(|error| Error::DNSError(error.to_string()))?;
         let tcp_response = tcp_response.into_message();
+        self.report_path_response(&tcp_response, &tcp_selected_path)
+            .await;
         if tcp_response.metadata.truncation {
             return Err(anyhow!(
                 "DNS upstream returned a truncated response over TCP"
@@ -1045,6 +1239,8 @@ async fn dns_stream_builder(
     cfg: &DnsConfig,
     outbound_resolver: Option<Arc<dyn ClashResolver>>,
     rule_dispatch: Option<Arc<RuleDispatch>>,
+    network_path_source: Option<NetworkPathSource>,
+    selected_path: SharedDnsPathUse,
 ) -> Result<(client::Client<DnsRuntimeProvider>, JoinHandle<()>), Error> {
     let dns_resolver: Arc<dyn ClashResolver> = match outbound_resolver {
         Some(resolver) => resolver,
@@ -1060,6 +1256,8 @@ async fn dns_stream_builder(
                     iface.clone(),
                     *fw_mark,
                     rule_dispatch.clone(),
+                    network_path_source.clone(),
+                    selected_path.clone(),
                 ),
             )
             .with_timeout(Some(Duration::from_secs(5)))
@@ -1079,6 +1277,8 @@ async fn dns_stream_builder(
                     iface.clone(),
                     *fw_mark,
                     rule_dispatch.clone(),
+                    network_path_source.clone(),
+                    selected_path.clone(),
                 ),
             );
 
@@ -1110,6 +1310,8 @@ async fn dns_stream_builder(
                     iface.clone(),
                     *fw_mark,
                     rule_dispatch.clone(),
+                    network_path_source.clone(),
+                    selected_path.clone(),
                 ),
             );
 
@@ -1148,6 +1350,8 @@ async fn dns_stream_builder(
                     iface.clone(),
                     *fw_mark,
                     rule_dispatch.clone(),
+                    network_path_source.clone(),
+                    selected_path.clone(),
                 ),
             )
             .build(*addr, host.to_string().into(), path.clone().into())

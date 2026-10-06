@@ -5,7 +5,10 @@ use super::{
     AnyStream, ConnectorType, DialWithConnector, HandlerCommonOptions,
     OutboundHandler, OutboundType,
     transport::Transport,
-    utils::{GLOBAL_DIRECT_CONNECTOR, RemoteConnector},
+    utils::{
+        GLOBAL_DIRECT_CONNECTOR, NetworkPoolContext, RemoteConnector,
+        observe_proxy_target_stream,
+    },
 };
 use crate::{
     app::{
@@ -78,6 +81,7 @@ impl Handler {
         sess: &Session,
         is_udp: bool,
         vision_opts: Option<crate::proxy::transport::VisionOptions>,
+        pool_context: Option<&NetworkPoolContext>,
     ) -> io::Result<AnyStream> {
         let s = if let Some(config) = self.opts.encryption.as_ref() {
             if is_udp {
@@ -111,21 +115,36 @@ impl Handler {
             self.opts.flow.clone(),
         )?;
 
-        if self.opts.flow.as_deref() == Some("xtls-rprx-vision") {
-            Ok(Box::new(VisionStream::new(
-                Box::new(vless_stream),
-                self.opts.uuid.clone(),
-                vision_opts,
-            )?))
-        } else {
-            Ok(Box::new(vless_stream))
-        }
+        let stream: AnyStream =
+            if self.opts.flow.as_deref() == Some("xtls-rprx-vision") {
+                Box::new(VisionStream::new(
+                    Box::new(vless_stream),
+                    self.opts.uuid.clone(),
+                    vision_opts,
+                )?)
+            } else {
+                Box::new(vless_stream)
+            };
+        Ok(match pool_context {
+            Some(context) => observe_proxy_target_stream(
+                stream,
+                context,
+                &sess.destination,
+                if is_udp {
+                    crate::app::runtime_state::TrafficKind::ProxyUdp
+                } else {
+                    crate::app::runtime_state::TrafficKind::ProxyTcp
+                },
+            ),
+            None => stream,
+        })
     }
 
     async fn try_reuse_transport_stream(
         &self,
         sess: &Session,
         is_udp: bool,
+        pool_context: &NetworkPoolContext,
     ) -> io::Result<Option<AnyStream>> {
         if self.opts.flow.as_deref() == Some("xtls-rprx-vision") {
             return Ok(None);
@@ -134,11 +153,20 @@ impl Handler {
         let Some(transport) = self.opts.transport.as_ref() else {
             return Ok(None);
         };
-        let Some(stream) = transport.try_reuse_stream().await? else {
+        let Some((stream, connected_context)) = transport
+            .try_reuse_stream_with_pool_metadata(pool_context.clone())
+            .await?
+        else {
             return Ok(None);
         };
 
-        Ok(Some(self.wrap_vless_stream(stream, sess, is_udp, None)?))
+        Ok(Some(self.wrap_vless_stream(
+            stream,
+            sess,
+            is_udp,
+            None,
+            Some(&connected_context),
+        )?))
     }
 
     async fn try_transport_owned_stream(
@@ -162,7 +190,9 @@ impl Handler {
             return Ok(None);
         };
 
-        Ok(Some(self.wrap_vless_stream(stream, sess, is_udp, None)?))
+        Ok(Some(
+            self.wrap_vless_stream(stream, sess, is_udp, None, None)?,
+        ))
     }
 
     async fn inner_proxy_stream(
@@ -170,6 +200,7 @@ impl Handler {
         s: AnyStream,
         sess: &Session,
         is_udp: bool,
+        pool_context: NetworkPoolContext,
     ) -> io::Result<AnyStream> {
         let wants_vision_splice =
             self.opts.flow.as_deref() == Some("xtls-rprx-vision");
@@ -193,18 +224,27 @@ impl Handler {
                 vision_opts = opts;
                 stream
             } else {
-                transport.proxy_stream(s).await?
+                transport
+                    .proxy_stream_with_pool_context(s, pool_context.clone())
+                    .await?
             }
         } else {
             s
         };
 
-        self.wrap_vless_stream(s, sess, is_udp, vision_opts)
+        self.wrap_vless_stream(s, sess, is_udp, vision_opts, Some(&pool_context))
     }
 }
 
 #[async_trait]
 impl OutboundHandler for Handler {
+    async fn reset_connection_pool(&self) -> io::Result<u32> {
+        match &self.opts.transport {
+            Some(transport) => transport.reset_connection_pool().await,
+            None => Ok(0),
+        }
+    }
+
     fn name(&self) -> &str {
         &self.opts.name
     }
@@ -275,7 +315,12 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
     ) -> io::Result<BoxedChainedStream> {
-        if let Some(stream) = self.try_reuse_transport_stream(sess, false).await? {
+        let pool_context =
+            connector.connection_pool_context(sess.iface.as_ref()).await;
+        if let Some(stream) = self
+            .try_reuse_transport_stream(sess, false, &pool_context)
+            .await?
+        {
             let chained = ChainedStreamWrapper::new(stream);
             chained.append_to_chain(self.name()).await;
             return Ok(Box::new(chained));
@@ -289,18 +334,21 @@ impl OutboundHandler for Handler {
             return Ok(Box::new(chained));
         }
 
-        let stream = connector
-            .connect_stream(
+        let (stream, connected_pool_context) = connector
+            .connect_stream_with_pool_context(
                 resolver,
                 self.opts.server.as_str(),
                 self.opts.port,
                 sess.iface.as_ref(),
                 #[cfg(target_os = "linux")]
                 sess.so_mark,
+                pool_context,
             )
             .await?;
 
-        let s = self.inner_proxy_stream(stream, sess, false).await?;
+        let s = self
+            .inner_proxy_stream(stream, sess, false, connected_pool_context)
+            .await?;
         let chained = ChainedStreamWrapper::new(s);
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
@@ -312,7 +360,12 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
     ) -> io::Result<BoxedChainedDatagram> {
-        if let Some(stream) = self.try_reuse_transport_stream(sess, true).await? {
+        let pool_context =
+            connector.connection_pool_context(sess.iface.as_ref()).await;
+        if let Some(stream) = self
+            .try_reuse_transport_stream(sess, true, &pool_context)
+            .await?
+        {
             let datagram =
                 OutboundDatagramVless::new(stream, sess.destination.clone());
             let chained = ChainedDatagramWrapper::new(datagram);
@@ -330,18 +383,21 @@ impl OutboundHandler for Handler {
             return Ok(Box::new(chained));
         }
 
-        let stream = connector
-            .connect_stream(
+        let (stream, connected_pool_context) = connector
+            .connect_stream_with_pool_context(
                 resolver,
                 self.opts.server.as_str(),
                 self.opts.port,
                 sess.iface.as_ref(),
                 #[cfg(target_os = "linux")]
                 sess.so_mark,
+                pool_context,
             )
             .await?;
 
-        let stream = self.inner_proxy_stream(stream, sess, true).await?;
+        let stream = self
+            .inner_proxy_stream(stream, sess, true, connected_pool_context)
+            .await?;
         let d = OutboundDatagramVless::new(stream, sess.destination.clone());
 
         let chained = ChainedDatagramWrapper::new(d);
@@ -352,7 +408,8 @@ impl OutboundHandler for Handler {
 
 #[cfg(test)]
 mod reuse_tests {
-    use std::sync::Arc;
+    use std::{net::SocketAddr, sync::Arc};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
     use crate::{app::dns::MockClashResolver, proxy::utils::DirectConnector};
@@ -480,7 +537,11 @@ mod reuse_tests {
         });
 
         let stream = handler
-            .try_reuse_transport_stream(&Session::default(), false)
+            .try_reuse_transport_stream(
+                &Session::default(),
+                false,
+                &NetworkPoolContext::default(),
+            )
             .await
             .expect("reuse lookup should succeed");
 
@@ -506,7 +567,11 @@ mod reuse_tests {
         });
 
         let stream = handler
-            .try_reuse_transport_stream(&Session::default(), false)
+            .try_reuse_transport_stream(
+                &Session::default(),
+                false,
+                &NetworkPoolContext::default(),
+            )
             .await
             .expect("reuse lookup should succeed");
 
@@ -514,6 +579,71 @@ mod reuse_tests {
             stream.is_none(),
             "Vision must keep the fresh handshake path"
         );
+    }
+
+    #[tokio::test]
+    async fn vless_target_response_reports_the_actual_proxy_path() {
+        let mut status = crate::app::runtime_state::RuntimeStatus::default();
+        status.lifecycle(crate::app::runtime_state::Lifecycle::Running, "test");
+        let (tx, mut events) = tokio::sync::mpsc::channel(1);
+        let reporter = status.traffic_reporter(tx);
+        let path_id = crate::app::flow::NetworkPathId {
+            interface: crate::app::flow::InterfaceId {
+                name: "wifi0".to_owned(),
+                index: 4,
+            },
+            family: crate::app::flow::AddressFamily::Ipv4,
+            source_address: Some("192.0.2.10".parse().unwrap()),
+            network_generation: 0,
+        };
+        let destination: SocketAddr = "203.0.113.8:443".parse().unwrap();
+        let context = NetworkPoolContext {
+            network_generation: Some(0),
+            path_id: Some(path_id),
+            eligible_path_ids: None,
+            reporter: Some(reporter),
+        };
+        let handler = Handler::new(HandlerOptions {
+            name: "target-proof-test".to_owned(),
+            common_opts: HandlerCommonOptions::default(),
+            server: "proxy.example.com".to_owned(),
+            port: 443,
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            udp: false,
+            transport: None,
+            tls: None,
+            flow: None,
+            encryption: None,
+        });
+        let session = Session {
+            destination: crate::session::SocksAddr::Ip(destination),
+            ..Default::default()
+        };
+        let (client, mut peer) = tokio::io::duplex(64);
+        let mut observed = handler
+            .wrap_vless_stream(
+                Box::new(client),
+                &session,
+                false,
+                None,
+                Some(&context),
+            )
+            .expect("VLESS stream should wrap");
+
+        observed.write_all(b"request").await.unwrap();
+        let mut request = [0u8; 128];
+        let _ = peer.read(&mut request).await.unwrap();
+        peer.write_all(&[0, 0]).await.unwrap();
+        peer.write_all(b"target response").await.unwrap();
+        let mut response = vec![0; b"target response".len()];
+        observed.read_exact(&mut response).await.unwrap();
+        status.record_traffic(events.recv().await.unwrap());
+
+        let value = serde_json::to_value(status).unwrap();
+        assert_eq!(value["trafficEvidence"][0]["kind"], "proxyTcp");
+        assert_eq!(value["pathHealth"][0]["state"], "available");
+        assert_eq!(value["pathHealth"][0]["path"]["interface"]["name"], "wifi0");
+        assert_eq!(value["destinationPathHealth"][0]["family"], "ipv4");
     }
 }
 

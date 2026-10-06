@@ -11,6 +11,7 @@ use memory_stats::memory_stats;
 use serde::Serialize;
 use tokio::sync::{Mutex, RwLock, oneshot::Sender};
 
+use crate::app::flow::FlowContext;
 use crate::{app::dispatcher::tracked::Tracked, session::Session};
 
 #[derive(Serialize, Clone, Debug, Default)]
@@ -351,6 +352,11 @@ pub struct TrackerInfo {
     pub proxy_chain_holder: ProxyChain,
     #[serde(skip)]
     pub session_holder: Session,
+
+    /// Per-connection facts. UDP trackers aggregate traffic by outbound and
+    /// client source, so only true single-destination flows populate this.
+    #[serde(skip)]
+    pub flow_context: Option<FlowContext>,
 
     /// Per-user byte counters, separate from `upload_total`/`download_total`.
     /// Only incremented when `session_holder.inbound_user` is set.

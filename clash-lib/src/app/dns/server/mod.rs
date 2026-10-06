@@ -112,17 +112,38 @@ impl DnsRunner {
     pub async fn wait_ready(&self) -> Result<(), crate::Error> {
         let receiver = self.ready_rx.lock().await.take();
         match receiver {
-            Some(receiver) => match receiver.await {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(message)) => Err(crate::Error::Operation(message)),
-                Err(_) => Err(crate::Error::Operation(
+            Some(receiver) => match tokio::time::timeout(
+                crate::app::runtime_state::COMPONENT_READINESS_TIMEOUT,
+                receiver,
+            )
+            .await
+            {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(message))) => Err(crate::Error::Operation(message)),
+                Ok(Err(_)) => Err(crate::Error::Operation(
                     "DNS listener exited before becoming ready".to_owned(),
+                )),
+                Err(_) => Err(crate::Error::Operation(
+                    "DNS listener readiness timed out after 30 seconds".to_owned(),
                 )),
             },
             None => Err(crate::Error::Operation(
                 "DNS listener readiness was already consumed".to_owned(),
             )),
         }
+    }
+
+    pub(crate) fn is_configured(&self) -> bool {
+        self.enable
+            && (has_listener(&self.listener) || self.bridge_listener.is_some())
+    }
+
+    pub(crate) fn task_finished(&self) -> bool {
+        self.task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
     }
 }
 

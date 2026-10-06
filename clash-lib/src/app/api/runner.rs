@@ -230,17 +230,38 @@ impl ApiRunner {
     pub async fn wait_ready(&self) -> Result<(), crate::Error> {
         let receiver = self.ready_rx.lock().await.take();
         match receiver {
-            Some(receiver) => match receiver.await {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(message)) => Err(crate::Error::Operation(message)),
-                Err(_) => Err(crate::Error::Operation(
+            Some(receiver) => match tokio::time::timeout(
+                crate::app::runtime_state::COMPONENT_READINESS_TIMEOUT,
+                receiver,
+            )
+            .await
+            {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(message))) => Err(crate::Error::Operation(message)),
+                Ok(Err(_)) => Err(crate::Error::Operation(
                     "API server exited before becoming ready".to_owned(),
+                )),
+                Err(_) => Err(crate::Error::Operation(
+                    "API server readiness timed out after 30 seconds".to_owned(),
                 )),
             },
             None => Err(crate::Error::Operation(
                 "API server readiness was already consumed".to_owned(),
             )),
         }
+    }
+
+    pub(crate) fn is_configured(&self) -> bool {
+        self.controller_cfg.external_controller.is_some()
+            || self.controller_cfg.external_controller_ipc.is_some()
+    }
+
+    pub(crate) fn task_finished(&self) -> bool {
+        self.task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
     }
 }
 
@@ -329,12 +350,10 @@ impl Runner for ApiRunner {
                 .nest("/group", handlers::group::routes(outbound_manager.clone()))
                 .nest("/flows", handlers::flows::routes(statistics_manager))
                 .nest("/dns", handlers::dns::routes(dns_resolver.clone()))
+                .nest("/network", handlers::network::routes(global_state.clone()))
                 .nest(
-                    "/network",
-                    handlers::network::routes(
-                        dns_resolver.clone(),
-                        outbound_manager.clone(),
-                    ),
+                    "/runtime",
+                    handlers::network::status_routes(global_state.clone()),
                 )
                 .nest("/rules", handlers::rule::routes(router))
                 .layer(middleware::from_fn(

@@ -120,17 +120,50 @@ impl TunRunner {
     pub(crate) async fn wait_ready(&self) -> Result<(), Error> {
         let receiver = self.ready_rx.lock().await.take();
         match receiver {
-            Some(receiver) => match receiver.await {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(message)) => Err(Error::Operation(message)),
-                Err(_) => Err(Error::Operation(
+            Some(receiver) => match tokio::time::timeout(
+                crate::app::runtime_state::COMPONENT_READINESS_TIMEOUT,
+                receiver,
+            )
+            .await
+            {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(message))) => Err(Error::Operation(message)),
+                Ok(Err(_)) => Err(Error::Operation(
                     "TUN runner exited before becoming ready".to_owned(),
+                )),
+                Err(_) => Err(Error::Operation(
+                    "TUN readiness timed out after 30 seconds".to_owned(),
                 )),
             },
             None => Err(Error::Operation(
                 "TUN runner readiness was already consumed".to_owned(),
             )),
         }
+    }
+
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.cfg.enable
+    }
+
+    /// Return the configured TUN interface name when its identity is explicit.
+    /// File-descriptor TUNs have no name hint and must not be guessed by prefix.
+    pub(crate) fn interface_name_hint(&self) -> Option<String> {
+        if !self.cfg.enable {
+            return None;
+        }
+        match Url::parse(&self.cfg.device_id) {
+            Ok(url) if url.scheme() == "dev" => url.host_str().map(str::to_owned),
+            Ok(_) => None,
+            Err(_) => Some(self.cfg.device_id.clone()),
+        }
+    }
+
+    pub(crate) fn task_finished(&self) -> bool {
+        self.task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
     }
 
     pub(crate) fn fresh(

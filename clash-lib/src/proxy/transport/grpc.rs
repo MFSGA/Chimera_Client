@@ -23,7 +23,11 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::warn;
 
 use super::Transport;
-use crate::{common::errors::map_io_error, proxy::AnyStream};
+use crate::{
+    app::flow::NetworkPathId,
+    common::errors::map_io_error,
+    proxy::{AnyStream, utils::NetworkPoolContext},
+};
 
 const FRAME_CHANNEL_CAPACITY: usize = 32;
 const READ_CHUNK_SIZE: usize = 8 * 1024;
@@ -36,6 +40,8 @@ type H2SendRequest =
 struct ReusableGrpc {
     sender: H2SendRequest,
     active: Arc<AtomicU64>,
+    network_generation: Option<u64>,
+    path_id: Option<NetworkPathId>,
 }
 
 #[derive(Clone)]
@@ -48,6 +54,8 @@ pub struct Client {
     min_streams: u64,
     max_streams: u64,
     pool: Arc<Mutex<Vec<ReusableGrpc>>>,
+    recovery_gate: Arc<tokio::sync::RwLock<()>>,
+    recovery_cancellation: Arc<Mutex<tokio_util::sync::CancellationToken>>,
 }
 
 impl fmt::Debug for Client {
@@ -75,6 +83,10 @@ impl Client {
             min_streams: 0,
             max_streams: 0,
             pool: Arc::new(Mutex::new(Vec::new())),
+            recovery_gate: Arc::new(tokio::sync::RwLock::new(())),
+            recovery_cancellation: Arc::new(Mutex::new(
+                tokio_util::sync::CancellationToken::new(),
+            )),
         }
     }
 
@@ -308,9 +320,23 @@ async fn forward_grpc_response(
 }
 
 impl Client {
-    async fn try_reuse_sender(&self) -> Option<(H2SendRequest, Arc<AtomicU64>)> {
+    async fn try_reuse_sender(
+        &self,
+        context: &NetworkPoolContext,
+    ) -> Option<(
+        H2SendRequest,
+        Arc<AtomicU64>,
+        Option<u64>,
+        Option<NetworkPathId>,
+    )> {
         let mut pool = self.pool.lock().await;
-        pool.retain(|connection| !connection.sender.is_closed());
+        pool.retain(|connection| {
+            !connection.sender.is_closed()
+                && context.permits(
+                    connection.network_generation,
+                    connection.path_id.as_ref(),
+                )
+        });
 
         let (index, active) = pool
             .iter()
@@ -326,15 +352,27 @@ impl Client {
 
         let connection = &pool[index];
         connection.active.fetch_add(1, Ordering::AcqRel);
-        Some((connection.sender.clone(), connection.active.clone()))
+        Some((
+            connection.sender.clone(),
+            connection.active.clone(),
+            connection.network_generation,
+            connection.path_id.clone(),
+        ))
     }
 
     async fn register_fresh_sender(
         &self,
         sender: H2SendRequest,
+        context: &NetworkPoolContext,
     ) -> (H2SendRequest, Arc<AtomicU64>) {
         let mut pool = self.pool.lock().await;
-        pool.retain(|connection| !connection.sender.is_closed());
+        pool.retain(|connection| {
+            !connection.sender.is_closed()
+                && context.permits(
+                    connection.network_generation,
+                    connection.path_id.as_ref(),
+                )
+        });
 
         if let Some((index, active)) = pool
             .iter()
@@ -351,10 +389,14 @@ impl Client {
         }
 
         let active = Arc::new(AtomicU64::new(1));
-        pool.push(ReusableGrpc {
-            sender: sender.clone(),
-            active: active.clone(),
-        });
+        if context.can_pool_connected_path() {
+            pool.push(ReusableGrpc {
+                sender: sender.clone(),
+                active: active.clone(),
+                network_generation: context.network_generation,
+                path_id: context.path_id.clone(),
+            });
+        }
         (sender, active)
     }
 
@@ -425,17 +467,107 @@ impl Client {
 
 #[async_trait]
 impl Transport for Client {
+    async fn reset_connection_pool(&self) -> io::Result<u32> {
+        let mut cancellation = self.recovery_cancellation.lock().await;
+        cancellation.cancel();
+        let _recovery = self.recovery_gate.write().await;
+        let mut pool = self.pool.lock().await;
+        let count = pool.len().min(u32::MAX as usize) as u32;
+        pool.clear();
+        *cancellation = tokio_util::sync::CancellationToken::new();
+        Ok(count)
+    }
+
     async fn proxy_stream(&self, stream: AnyStream) -> io::Result<AnyStream> {
-        let sender = handshake_http2(stream, self.ping_interval_secs).await?;
-        let (sender, active) = self.register_fresh_sender(sender).await;
-        self.open_logical_stream(sender, active).await
+        self.proxy_stream_for_network_generation(stream, None).await
+    }
+
+    async fn proxy_stream_for_network_generation(
+        &self,
+        stream: AnyStream,
+        network_generation: Option<u64>,
+    ) -> io::Result<AnyStream> {
+        self.proxy_stream_with_pool_context(
+            stream,
+            NetworkPoolContext::for_generation(network_generation),
+        )
+        .await
+    }
+
+    async fn proxy_stream_with_pool_context(
+        &self,
+        stream: AnyStream,
+        context: NetworkPoolContext,
+    ) -> io::Result<AnyStream> {
+        let cancellation = self.recovery_cancellation.lock().await.clone();
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(io::Error::new(io::ErrorKind::ConnectionAborted, "network changed during transport construction")),
+            result = async {
+                let _recovery = self.recovery_gate.read().await;
+                let sender = handshake_http2(stream, self.ping_interval_secs).await?;
+                let (sender, active) = self
+                    .register_fresh_sender(sender, &context)
+                    .await;
+                self.open_logical_stream(sender, active).await
+            } => result,
+        }
     }
 
     async fn try_reuse_stream(&self) -> io::Result<Option<AnyStream>> {
-        let Some((sender, active)) = self.try_reuse_sender().await else {
-            return Ok(None);
-        };
-        self.open_logical_stream(sender, active).await.map(Some)
+        self.try_reuse_stream_for_network_generation(None).await
+    }
+
+    async fn try_reuse_stream_for_network_generation(
+        &self,
+        network_generation: Option<u64>,
+    ) -> io::Result<Option<AnyStream>> {
+        self.try_reuse_stream_with_pool_context(NetworkPoolContext::for_generation(
+            network_generation,
+        ))
+        .await
+    }
+
+    async fn try_reuse_stream_with_pool_context(
+        &self,
+        context: NetworkPoolContext,
+    ) -> io::Result<Option<AnyStream>> {
+        Ok(self
+            .try_reuse_stream_with_pool_metadata(context)
+            .await?
+            .map(|(stream, _)| stream))
+    }
+
+    async fn try_reuse_stream_with_pool_metadata(
+        &self,
+        context: NetworkPoolContext,
+    ) -> io::Result<Option<(AnyStream, NetworkPoolContext)>> {
+        let cancellation = self.recovery_cancellation.lock().await.clone();
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(io::Error::new(io::ErrorKind::ConnectionAborted, "network changed during transport construction")),
+            result = async {
+                let _recovery = self.recovery_gate.read().await;
+                let Some((sender, active, network_generation, path_id)) = self
+                    .try_reuse_sender(&context)
+                    .await
+                else {
+                    return Ok(None);
+                };
+                match self.open_logical_stream(sender, active.clone()).await {
+                    Ok(stream) => {
+                        let mut connected_context = context;
+                        connected_context.network_generation = network_generation;
+                        connected_context.path_id = path_id;
+                        Ok(Some((stream, connected_context)))
+                    }
+                    Err(error) => {
+                        active.fetch_sub(1, Ordering::AcqRel);
+                        Err(error)
+                    }
+                }
+            } => result,
+        }
     }
 }
 
@@ -724,6 +856,119 @@ mod tests {
         assert_eq!(second_reply, b"second");
 
         assert_eq!(client.pool.lock().await.len(), 1);
+        assert_eq!(client.reset_connection_pool().await.unwrap(), 1);
+        assert!(client.try_reuse_stream().await.unwrap().is_none());
+        assert_eq!(client.reset_connection_pool().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn grpc_pool_rejects_a_connection_from_an_older_network_generation() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should expose addr");
+
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept should succeed");
+            let io = TokioIo::new(tcp);
+            let builder = auto::Builder::new(TokioExecutor::new()).http2_only();
+            builder
+                .serve_connection(io, service_fn(grpc_echo_handler))
+                .await
+                .expect("grpc server connection should succeed");
+        });
+
+        let client = Client::new(
+            "grpc.example.com".to_owned(),
+            "/service".try_into().unwrap(),
+        );
+        let path_a = crate::app::flow::NetworkPathId {
+            interface: crate::app::flow::InterfaceId {
+                name: "wifi0".to_owned(),
+                index: 4,
+            },
+            family: crate::app::flow::AddressFamily::Ipv4,
+            source_address: Some("192.0.2.10".parse().unwrap()),
+            network_generation: 10,
+        };
+        let path_b = crate::app::flow::NetworkPathId {
+            interface: crate::app::flow::InterfaceId {
+                name: "eth0".to_owned(),
+                index: 5,
+            },
+            family: crate::app::flow::AddressFamily::Ipv4,
+            source_address: Some("198.51.100.10".parse().unwrap()),
+            network_generation: 10,
+        };
+        let both_paths = NetworkPoolContext {
+            network_generation: Some(10),
+            path_id: Some(path_a.clone()),
+            eligible_path_ids: Some(
+                [path_a.clone(), path_b.clone()].into_iter().collect(),
+            ),
+            reporter: None,
+        };
+        let raw = TcpStream::connect(addr)
+            .await
+            .expect("client should connect");
+        let mut stream = client
+            .proxy_stream_with_pool_context(Box::new(raw), both_paths.clone())
+            .await
+            .expect("first grpc stream should build");
+        stream.write_all(b"generation-10").await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut reply = Vec::new();
+        timeout(Duration::from_secs(2), stream.read_to_end(&mut reply))
+            .await
+            .expect("grpc response timeout")
+            .expect("grpc response read");
+        assert_eq!(reply, b"generation-10");
+        drop(stream);
+
+        let (mut same_generation, reused_context) = client
+            .try_reuse_stream_with_pool_metadata(both_paths)
+            .await
+            .expect("same generation lookup should succeed")
+            .expect("same generation should reuse the pooled connection");
+        assert_eq!(reused_context.path_id.as_ref(), Some(&path_a));
+        same_generation.write_all(b"same-generation").await.unwrap();
+        same_generation.shutdown().await.unwrap();
+        let mut same_reply = Vec::new();
+        timeout(
+            Duration::from_secs(2),
+            same_generation.read_to_end(&mut same_reply),
+        )
+        .await
+        .expect("same generation response timeout")
+        .expect("same generation response read");
+        assert_eq!(same_reply, b"same-generation");
+        drop(same_generation);
+
+        let only_path_b = NetworkPoolContext {
+            network_generation: Some(10),
+            path_id: None,
+            eligible_path_ids: Some([path_b].into_iter().collect()),
+            reporter: None,
+        };
+        assert!(
+            client
+                .try_reuse_stream_with_pool_context(only_path_b)
+                .await
+                .expect("path eligibility lookup should succeed")
+                .is_none(),
+            "a connection tagged with path A must be retired when only path B remains eligible"
+        );
+        assert!(client.pool.lock().await.is_empty());
+
+        assert!(
+            client
+                .try_reuse_stream_for_network_generation(Some(11))
+                .await
+                .expect("stale generation lookup should succeed")
+                .is_none(),
+            "a connection created on generation 10 must not be borrowed on generation 11"
+        );
+        assert!(client.pool.lock().await.is_empty());
     }
 
     #[tokio::test]

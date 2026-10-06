@@ -17,7 +17,7 @@ use super::{Config, ThreadSafeDNSResolver};
 use crate::{
     app::profile::ThreadSafeCacheFile,
     dns::{RuleDispatch, filters::PendingMmdb},
-    proxy::utils::OutboundHandlerRegistry,
+    proxy::utils::{NetworkPathSource, OutboundHandlerRegistry},
 };
 
 pub async fn new(
@@ -27,11 +27,30 @@ pub async fn new(
     outbounds: OutboundHandlerRegistry,
     rule_dispatch: Option<Arc<RuleDispatch>>,
 ) -> Result<ThreadSafeDNSResolver, crate::Error> {
+    new_with_network_path_source(cfg, store, mmdb, outbounds, rule_dispatch, None)
+        .await
+}
+
+pub(crate) async fn new_with_network_path_source(
+    cfg: Config,
+    store: Option<ThreadSafeCacheFile>,
+    mmdb: Option<PendingMmdb>,
+    outbounds: OutboundHandlerRegistry,
+    rule_dispatch: Option<Arc<RuleDispatch>>,
+    network_path_source: Option<NetworkPathSource>,
+) -> Result<ThreadSafeDNSResolver, crate::Error> {
     if cfg.enable {
         match store {
             Some(store) => Ok(Arc::new(
-                EnhancedResolver::new(cfg, store, mmdb, outbounds, rule_dispatch)
-                    .await?,
+                EnhancedResolver::new_with_network_path_source(
+                    cfg,
+                    store,
+                    mmdb,
+                    outbounds,
+                    rule_dispatch,
+                    network_path_source,
+                )
+                .await?,
             )),
             _ => Err(crate::Error::InvalidConfig(
                 "enhanced resolver requires cache store".to_owned(),

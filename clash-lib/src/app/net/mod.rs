@@ -20,11 +20,18 @@ use crate::{Error, Result};
 pub static DEFAULT_OUTBOUND_INTERFACE: LazyLock<
     Arc<tokio::sync::RwLock<Option<OutboundInterface>>>,
 > = LazyLock::new(Default::default);
+#[cfg(all(feature = "tun", target_os = "macos"))]
+pub(crate) static DEFAULT_OUTBOUND_INTERFACE_V6: LazyLock<
+    tokio::sync::RwLock<Option<OutboundInterface>>,
+> = LazyLock::new(Default::default);
 #[cfg(feature = "tun")]
 pub static TUN_SOMARK: LazyLock<tokio::sync::RwLock<Option<u32>>> =
     LazyLock::new(Default::default);
 #[cfg(feature = "tun")]
 pub static TUN_ENABLED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "tun")]
+pub(crate) static OUTBOUND_INTERFACE_UNAVAILABLE: AtomicBool =
+    AtomicBool::new(false);
 #[cfg(all(feature = "tun", target_os = "linux"))]
 static ROUTE_NETLINK_HANDLE: tokio::sync::OnceCell<rtnetlink::Handle> =
     tokio::sync::OnceCell::const_new();
@@ -444,14 +451,39 @@ pub async fn init_net_config(
 ) -> Result<()> {
     let configured_interface = resolve_outbound_interface(interface).await?;
     #[cfg(target_os = "macos")]
+    let physical_snapshot = if tun_enabled && interface.is_none() {
+        Some(crate::app::network::snapshot().await?)
+    } else {
+        None
+    };
+    #[cfg(target_os = "macos")]
+    let ipv6_interface = physical_snapshot.as_ref().and_then(|snapshot| {
+        snapshot
+            .ipv6
+            .as_ref()
+            .and_then(|path| get_interface_by_name(&path.interface))
+    });
+    #[cfg(target_os = "macos")]
     let configured_interface = {
         // macOS route-all TUN installs split default routes, but has no
         // SO_MARK policy-routing equivalent. Pin Chimera's own outbound
         // sockets to the pre-TUN physical interface or they re-enter utun.
+        let physical_default = if tun_enabled && interface.is_none() {
+            let snapshot = physical_snapshot.as_ref().ok_or_else(|| {
+                Error::Operation("physical network snapshot unavailable".to_owned())
+            })?;
+            snapshot
+                .ipv4
+                .as_ref()
+                .or(snapshot.ipv6.as_ref())
+                .and_then(|path| get_interface_by_name(&path.interface))
+        } else {
+            None
+        };
         let selected = select_macos_tun_outbound_interface(
             configured_interface,
             tun_enabled,
-            get_outbound_interface,
+            || physical_default,
         );
         if tun_enabled && selected.is_none() {
             return Err(Error::InvalidConfig(
@@ -474,6 +506,11 @@ pub async fn init_net_config(
     #[cfg(target_os = "windows")]
     let should_cache_fallback = configured_interface.is_none();
     *DEFAULT_OUTBOUND_INTERFACE.write().await = configured_interface;
+    #[cfg(target_os = "macos")]
+    {
+        *DEFAULT_OUTBOUND_INTERFACE_V6.write().await = ipv6_interface;
+    }
+    OUTBOUND_INTERFACE_UNAVAILABLE.store(false, Ordering::Release);
     *TUN_SOMARK.write().await = tun_somark;
     TUN_ENABLED.store(tun_enabled, Ordering::Release);
     #[cfg(target_os = "windows")]
@@ -509,8 +546,13 @@ fn select_macos_tun_outbound_interface(
 
 #[cfg(feature = "tun")]
 pub async fn clear_net_config() {
+    OUTBOUND_INTERFACE_UNAVAILABLE.store(false, Ordering::Release);
     TUN_ENABLED.store(false, Ordering::Release);
     *DEFAULT_OUTBOUND_INTERFACE.write().await = None;
+    #[cfg(target_os = "macos")]
+    {
+        *DEFAULT_OUTBOUND_INTERFACE_V6.write().await = None;
+    }
     *TUN_SOMARK.write().await = None;
     #[cfg(target_os = "windows")]
     {

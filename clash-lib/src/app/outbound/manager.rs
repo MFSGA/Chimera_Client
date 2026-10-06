@@ -6,7 +6,8 @@ use std::{
     time::Duration,
 };
 
-use tokio::sync::RwLock;
+use futures::StreamExt;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
@@ -43,7 +44,10 @@ use crate::{
             urltest,
         },
         reject, socks,
-        utils::{DirectConnector, OutboundHandlerRegistry, ProxyConnector},
+        utils::{
+            DirectConnector, NetworkPathSource, OutboundHandlerRegistry,
+            ProxyConnector,
+        },
         vless,
     },
 };
@@ -72,6 +76,9 @@ pub struct OutboundManager {
     /// HTTP bootstrap clients.  Populated at the end of `new()` and is the
     /// single source of truth for all handlers after initialization.
     registry: OutboundHandlerRegistry,
+    network_path_source: NetworkPathSource,
+    pool_reset_gate: Mutex<()>,
+    pool_network_generation: Mutex<Option<u64>>,
 }
 
 pub type ThreadSafeOutboundManager = Arc<OutboundManager>;
@@ -82,13 +89,66 @@ async fn reset_unique_connection_pools(
 ) -> io::Result<u32> {
     let mut seen = HashSet::new();
     let mut reset = 0_u32;
+    let mut errors = Vec::new();
+    let mut pending = futures::stream::FuturesUnordered::new();
     for handler in handlers {
         let identity = Arc::as_ptr(&handler) as *const () as usize;
         if seen.insert(identity) {
-            reset = reset.saturating_add(handler.reset_connection_pool().await?);
+            pending.push(async move {
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    handler.reset_connection_pool(),
+                )
+                .await
+            });
         }
     }
-    Ok(reset)
+    while let Some(result) = pending.next().await {
+        match result {
+            Ok(Ok(count)) => reset = reset.saturating_add(count),
+            Ok(Err(error)) => errors.push(error.to_string()),
+            Err(_) => errors.push("outbound pool reset timed out".to_owned()),
+        }
+    }
+    if errors.is_empty() {
+        Ok(reset)
+    } else {
+        Err(io::Error::other(errors.join("; ")))
+    }
+}
+
+async fn ensure_pool_generation_current<F, Fut>(
+    network_path_source: &NetworkPathSource,
+    reset_gate: &Mutex<()>,
+    pool_generation: &Mutex<Option<u64>>,
+    reset_pools: F,
+) -> io::Result<bool>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = io::Result<()>>,
+{
+    let Some((generation, ..)) = network_path_source.snapshot().await else {
+        return Ok(false);
+    };
+    let _reset_gate = reset_gate.lock().await;
+    let mut pool_generation = pool_generation.lock().await;
+    if *pool_generation == Some(generation) {
+        return Ok(false);
+    }
+
+    reset_pools().await?;
+    let current_generation = network_path_source
+        .snapshot()
+        .await
+        .map(|(current, ..)| current);
+    if current_generation != Some(generation) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "network changed while retiring stale outbound pools",
+        ));
+    }
+    *pool_generation = Some(generation);
+    Ok(true)
 }
 
 /// Init process:
@@ -120,6 +180,33 @@ impl OutboundManager {
         fw_mark: Option<u32>,
         registry: OutboundHandlerRegistry,
     ) -> Result<Self, Error> {
+        Self::new_with_network_path_source(
+            outbounds,
+            outbound_groups,
+            proxy_providers,
+            proxy_names,
+            dns_resolver,
+            cache_store,
+            cwd,
+            fw_mark,
+            registry,
+            NetworkPathSource::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn new_with_network_path_source(
+        outbounds: Vec<AnyOutboundHandler>,
+        outbound_groups: Vec<OutboundGroupProtocol>,
+        proxy_providers: HashMap<String, OutboundProxyProviderDef>,
+        proxy_names: Vec<String>,
+        dns_resolver: ThreadSafeDNSResolver,
+        cache_store: ThreadSafeCacheFile,
+        cwd: String,
+        fw_mark: Option<u32>,
+        registry: OutboundHandlerRegistry,
+        network_path_source: NetworkPathSource,
+    ) -> Result<Self, Error> {
         // Build all handlers in a plain HashMap during initialization.
         // Once fully assembled it is written into the shared registry so that
         // DNS clients and the HTTP client can look up any handler by name.
@@ -128,7 +215,6 @@ impl OutboundManager {
         let provider_registry = HashMap::new();
         let selector_control = HashMap::new();
         let proxy_manager = ProxyManager::new(dns_resolver.clone(), fw_mark);
-
         let mut m = Self {
             registry,
             // proxy_names: proxy_names_ref,
@@ -136,6 +222,9 @@ impl OutboundManager {
             selector_control,
             proxy_providers: provider_registry,
             cache_store: cache_store.clone(),
+            network_path_source,
+            pool_reset_gate: Mutex::new(()),
+            pool_network_generation: Mutex::new(None),
         };
 
         debug!("initializing proxy providers");
@@ -179,9 +268,68 @@ impl OutboundManager {
         self.registry.read().await.get(name).cloned()
     }
 
+    /// Ensure the first outbound lookup in each observed network generation
+    /// retires any pool created on the previous path before a new flow can use
+    /// it. DNS bootstrap and management lookups keep using `get_outbound`.
+    pub(crate) async fn get_outbound_for_new_flow(
+        &self,
+        name: &str,
+    ) -> io::Result<Option<AnyOutboundHandler>> {
+        ensure_pool_generation_current(
+            &self.network_path_source,
+            &self.pool_reset_gate,
+            &self.pool_network_generation,
+            || async {
+                self.reset_connection_pools_inner()
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| io::Error::other(error.to_string()))
+            },
+        )
+        .await?;
+        Ok(self.get_outbound(name).await)
+    }
+
+    pub(crate) async fn attach_network_status(
+        &self,
+        status: Arc<tokio::sync::RwLock<crate::app::network::NetworkStatus>>,
+    ) {
+        self.network_path_source.attach(status).await;
+    }
+
+    pub(crate) async fn attach_traffic_reporter(
+        &self,
+        reporter: crate::app::runtime_state::TrafficReporter,
+    ) {
+        self.network_path_source
+            .attach_traffic_reporter(reporter)
+            .await;
+    }
+
     /// Invalidate every reusable network-bound connection owned by configured
     /// outbounds, including proxies that only exist inside remote providers.
     pub async fn reset_connection_pools(&self) -> Result<u32, Error> {
+        let _reset_gate = self.pool_reset_gate.lock().await;
+        let generation_before = self
+            .network_path_source
+            .snapshot()
+            .await
+            .map(|(generation, ..)| generation);
+        let result = self.reset_connection_pools_inner().await;
+        if result.is_ok()
+            && generation_before.is_some()
+            && self
+                .network_path_source
+                .snapshot()
+                .await
+                .is_some_and(|(current, ..)| Some(current) == generation_before)
+        {
+            *self.pool_network_generation.lock().await = generation_before;
+        }
+        result
+    }
+
+    async fn reset_connection_pools_inner(&self) -> Result<u32, Error> {
         let mut handlers: Vec<AnyOutboundHandler> =
             self.registry.read().await.values().cloned().collect();
         let providers: Vec<ThreadSafeProxyProvider> =
@@ -534,10 +682,18 @@ impl OutboundManager {
                     connectors.entry(connector_name).or_insert_with(|| {
                         Arc::new(ProxyConnector::new(
                             outbound,
-                            Box::new(DirectConnector::new()),
+                            Box::new(DirectConnector::with_path_source(
+                                self.network_path_source.clone(),
+                            )),
                         ))
                     });
                 handler.register_connector(connector.clone()).await;
+            } else {
+                handler
+                    .register_connector(Arc::new(DirectConnector::with_path_source(
+                        self.network_path_source.clone(),
+                    )))
+                    .await;
             }
         }
 
@@ -1075,14 +1231,16 @@ mod tests {
 
     #[cfg(feature = "wireguard")]
     use super::OutboundManager;
-    use super::reset_unique_connection_pools;
+    use super::{ensure_pool_generation_current, reset_unique_connection_pools};
     use crate::{
         app::{
             dispatcher::{BoxedChainedDatagram, BoxedChainedStream},
             dns::ThreadSafeDNSResolver,
+            network::{NetworkSnapshot, NetworkStatus},
         },
         proxy::{
             AnyOutboundHandler, DialWithConnector, OutboundHandler, OutboundType,
+            utils::NetworkPathSource,
         },
         session::Session,
     };
@@ -1095,6 +1253,7 @@ mod tests {
         name: &'static str,
         resets: Arc<AtomicUsize>,
         reset_count: u32,
+        fail: bool,
     }
 
     impl DialWithConnector for CountingHandler {}
@@ -1111,7 +1270,11 @@ mod tests {
 
         async fn reset_connection_pool(&self) -> io::Result<u32> {
             self.resets.fetch_add(1, Ordering::SeqCst);
-            Ok(self.reset_count)
+            if self.fail {
+                Err(io::Error::other("injected pool failure"))
+            } else {
+                Ok(self.reset_count)
+            }
         }
 
         async fn connect_stream(
@@ -1129,6 +1292,28 @@ mod tests {
         ) -> io::Result<BoxedChainedDatagram> {
             unreachable!("connection-pool reset test does not dial")
         }
+    }
+
+    #[tokio::test]
+    async fn failed_pool_reset_does_not_skip_other_handlers() {
+        let resets = Arc::new(AtomicUsize::new(0));
+        let handlers: Vec<AnyOutboundHandler> = vec![
+            Arc::new(CountingHandler {
+                name: "broken",
+                resets: resets.clone(),
+                reset_count: 0,
+                fail: true,
+            }),
+            Arc::new(CountingHandler {
+                name: "healthy",
+                resets: resets.clone(),
+                reset_count: 1,
+                fail: false,
+            }),
+        ];
+        let error = reset_unique_connection_pools(handlers).await.unwrap_err();
+        assert!(error.to_string().contains("injected pool failure"));
+        assert_eq!(resets.load(Ordering::SeqCst), 2);
     }
 
     #[cfg(feature = "wireguard")]
@@ -1181,11 +1366,13 @@ ip: not-an-ip
             name: "first",
             resets: first_resets.clone(),
             reset_count: 1,
+            fail: false,
         });
         let second: AnyOutboundHandler = Arc::new(CountingHandler {
             name: "second",
             resets: second_resets.clone(),
             reset_count: 2,
+            fail: false,
         });
 
         let reset =
@@ -1196,5 +1383,80 @@ ip: not-an-ip
         assert_eq!(reset, 3);
         assert_eq!(first_resets.load(Ordering::SeqCst), 1);
         assert_eq!(second_resets.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_pool_generation_resets_once_and_retries_after_failure() {
+        let source = NetworkPathSource::default();
+        let mut initial_status = NetworkStatus::default();
+        initial_status.set_automatic_supported_for_test(true);
+        let initial = NetworkSnapshot::default();
+        initial_status.observed(&initial);
+        let shared_status = Arc::new(tokio::sync::RwLock::new(initial_status));
+        source.attach(shared_status.clone()).await;
+
+        let reset_gate = tokio::sync::Mutex::new(());
+        let pool_generation = tokio::sync::Mutex::new(None);
+        let resets = Arc::new(AtomicUsize::new(0));
+        let reset_counter = resets.clone();
+        assert!(
+            ensure_pool_generation_current(
+                &source,
+                &reset_gate,
+                &pool_generation,
+                move || async move {
+                    reset_counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap()
+        );
+
+        let reset_counter = resets.clone();
+        assert!(
+            !ensure_pool_generation_current(
+                &source,
+                &reset_gate,
+                &pool_generation,
+                move || async move {
+                    reset_counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap()
+        );
+
+        let mut changed = initial;
+        changed.interfaces.push("wifi0".to_owned());
+        shared_status.write().await.observed(&changed);
+        assert!(
+            ensure_pool_generation_current(
+                &source,
+                &reset_gate,
+                &pool_generation,
+                || async { Err(io::Error::other("injected reset failure")) },
+            )
+            .await
+            .is_err()
+        );
+
+        let reset_counter = resets.clone();
+        assert!(
+            ensure_pool_generation_current(
+                &source,
+                &reset_gate,
+                &pool_generation,
+                move || async move {
+                    reset_counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(resets.load(Ordering::SeqCst), 2);
+        assert_eq!(*pool_generation.lock().await, Some(2));
     }
 }

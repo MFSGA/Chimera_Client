@@ -14,7 +14,7 @@ fn available_port() -> u16 {
         .port()
 }
 
-fn start_direct_udp_client() -> (ClashInstance, u16) {
+fn start_direct_udp_client_with_controller() -> (ClashInstance, u16, u16) {
     let api_port = available_port();
     let socks_port = available_port();
     let config = format!(
@@ -47,7 +47,12 @@ rules:
         vec![api_port, socks_port],
     )
     .expect("failed to start DIRECT UDP client");
-    (clash, socks_port)
+    (clash, socks_port, api_port)
+}
+
+fn start_direct_udp_client() -> (ClashInstance, u16) {
+    let (clash, socks, _) = start_direct_udp_client_with_controller();
+    (clash, socks)
 }
 
 async fn spawn_echo_server() -> u16 {
@@ -125,4 +130,119 @@ async fn ref_compat_udp_sessions_are_isolated_by_client() {
     assert_eq!(data_b, b"from-b");
     assert_eq!(source_a, expected_source);
     assert_eq!(source_b, expected_source);
+}
+
+// Exercise the same serialized recovery coordinator used by automatic events,
+// without altering the host NIC, routes, or DNS settings.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn network_recovery_replaces_udp_socket_without_restarting_inbound() {
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Empty};
+    let (_clash, socks_port, api_port) = start_direct_udp_client_with_controller();
+    let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo.local_addr().unwrap().port();
+    let (peers_tx, mut peers_rx) = tokio::sync::mpsc::channel(32);
+    let echo_task = tokio::spawn(async move {
+        let mut buffer = [0; 64];
+        while let Ok((length, peer)) = echo.recv_from(&mut buffer).await {
+            peers_tx.send(peer).await.unwrap();
+            echo.send_to(&buffer[..length], peer).await.unwrap();
+        }
+    });
+    let client = Socks5UdpSession::connect(socks_port).await;
+    let mut previous_peer = None;
+    for round in 0..20_u8 {
+        if round > 0 {
+            let uri: hyper::Uri =
+                format!("http://127.0.0.1:{api_port}/network/reset")
+                    .parse()
+                    .unwrap();
+            let request = hyper::Request::builder()
+                .method("POST")
+                .uri(uri.clone())
+                .header("Authorization", "Bearer clash-rs")
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            let response = tokio::time::timeout(
+                Duration::from_secs(20),
+                common::send_http_request(uri, request),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(response.status(), 200);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(json["dnsTransportsReset"].is_number());
+            assert!(json["connectionPoolsReset"].is_number());
+        }
+        client.send_ipv4(&[round], [127, 0, 0, 1], echo_port).await;
+        let (reply, _) = tokio::time::timeout(Duration::from_secs(5), client.recv())
+            .await
+            .unwrap();
+        assert_eq!(reply, [round]);
+        let peer = peers_rx.recv().await.unwrap();
+        if let Some(previous) = previous_peer {
+            assert_ne!(peer, previous, "old outbound socket reused after recovery");
+        }
+        previous_peer = Some(peer);
+    }
+    let status = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let uri: hyper::Uri = format!("http://127.0.0.1:{api_port}/runtime")
+                .parse()
+                .unwrap();
+            let request = hyper::Request::builder()
+                .uri(uri.clone())
+                .header("Authorization", "Bearer clash-rs")
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            let response = common::send_http_request(uri, request).await.unwrap();
+            assert_eq!(response.status(), 200);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if status["phase"] == "trafficVerified" {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("current UDP response was not observed");
+    assert_eq!(status["application"]["phase"], "running");
+    assert_eq!(status["application"]["health"], "healthy");
+    assert!(status["pathCandidates"].is_array());
+    assert!(status["pathCandidatesTruncated"].is_number());
+    let component_statuses = status["components"].as_array().unwrap();
+    for (name, phase) in
+        [("control", "ready"), ("api", "ready"), ("inbound", "ready")]
+    {
+        let component = component_statuses
+            .iter()
+            .find(|component| component["name"] == name)
+            .unwrap();
+        assert_eq!(
+            component["phase"], phase,
+            "{name} component status should be observable"
+        );
+        assert_eq!(component["required"].as_bool(), Some(true));
+    }
+    assert_eq!(
+        status["lastOperation"]["report"]["dns"]["phase"],
+        "refreshed"
+    );
+    assert!(
+        status["trafficEvidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|proof| {
+                proof["kind"] == "directUdp"
+                    && proof["token"] == status["lastOperation"]["token"]
+            })
+    );
+    assert!(status["generation"].as_u64().unwrap() >= 19);
+    assert_eq!(status["failures"], 0);
+    echo_task.abort();
 }

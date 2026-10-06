@@ -1,5 +1,7 @@
-#[cfg(all(feature = "tun", target_os = "windows"))]
+#[cfg(any(target_os = "macos", all(feature = "tun", target_os = "windows")))]
 use std::net::IpAddr;
+#[cfg(target_os = "macos")]
+use std::net::SocketAddrV6;
 use std::{
     io,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -30,6 +32,59 @@ use crate::common::errors::new_io_error;
 use crate::proxy::utils::platform::{
     maybe_protect_socket, must_bind_socket_on_interface,
 };
+
+/// Verify that this process can bind a temporary UDP socket to one reported
+/// source address and its interface. The socket is never connected or used to
+/// send packets.
+#[cfg(target_os = "macos")]
+pub(crate) fn probe_outbound_path_binding(
+    interface_name: &str,
+    interface_index: u32,
+    source_address: IpAddr,
+) -> io::Result<()> {
+    let family = match source_address {
+        IpAddr::V4(_) => socket2::Domain::IPV4,
+        IpAddr::V6(_) => socket2::Domain::IPV6,
+    };
+    let socket = socket2::Socket::new(
+        family,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    let interface = OutboundInterface {
+        name: interface_name.to_owned(),
+        addr_v4: match source_address {
+            IpAddr::V4(address) => Some(address),
+            IpAddr::V6(_) => None,
+        },
+        netmask_v4: None,
+        broadcast_v4: None,
+        addr_v6: match source_address {
+            IpAddr::V4(_) => None,
+            IpAddr::V6(address) => Some(address),
+        },
+        netmask_v6: None,
+        broadcast_v6: None,
+        index: interface_index,
+        mac_addr: None,
+    };
+    must_bind_socket_on_interface(&socket, &interface, family)?;
+
+    let bind_address = match source_address {
+        IpAddr::V4(address) => SocketAddr::from((address, 0)),
+        IpAddr::V6(address) => SocketAddr::V6(SocketAddrV6::new(
+            address,
+            0,
+            0,
+            if address.is_unicast_link_local() {
+                interface_index
+            } else {
+                0
+            },
+        )),
+    };
+    socket.bind(&bind_address.into())
+}
 
 // todo: support in linux to protect dataflow.
 #[allow(unused)]
@@ -192,8 +247,9 @@ fn should_auto_bind_destination(
 }
 
 #[cfg(feature = "tun")]
-async fn default_outbound_interface() -> Option<OutboundInterface> {
-    DEFAULT_OUTBOUND_INTERFACE.read().await.clone()
+async fn default_outbound_interface() -> io::Result<Option<OutboundInterface>> {
+    let saved = DEFAULT_OUTBOUND_INTERFACE.read().await.clone();
+    Ok(saved)
 }
 
 #[cfg(feature = "tun")]
@@ -202,8 +258,52 @@ async fn effective_interface_for_destination(
     explicit: Option<&OutboundInterface>,
     #[cfg(target_os = "linux")] so_mark: Option<u32>,
 ) -> std::io::Result<Option<OutboundInterface>> {
-    let default_iface = default_outbound_interface().await;
+    let default_iface = default_outbound_interface().await?;
+    #[cfg(target_os = "macos")]
+    let default_iface = if destination.is_some_and(|ip| ip.is_ipv6()) {
+        crate::app::net::DEFAULT_OUTBOUND_INTERFACE_V6
+            .read()
+            .await
+            .clone()
+            .or(default_iface)
+    } else {
+        default_iface
+    };
+    if explicit.is_none()
+        && crate::app::net::OUTBOUND_INTERFACE_UNAVAILABLE
+            .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::NetworkUnreachable,
+            "configured outbound interface is unavailable",
+        ));
+    }
     let effective_iface = select_effective_iface(explicit, &default_iface).cloned();
+    #[cfg(feature = "tun")]
+    let effective_iface = if let Some(iface) = effective_iface {
+        Some(
+            crate::app::net::get_interface_by_name(&iface.name).ok_or_else(
+                || {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "outbound interface disappeared",
+                    )
+                },
+            )?,
+        )
+    } else {
+        None
+    };
+    #[cfg(target_os = "macos")]
+    if effective_iface.is_none()
+        && crate::app::net::TUN_ENABLED.load(std::sync::atomic::Ordering::Acquire)
+        && !destination.is_some_and(|ip| ip.is_loopback())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::NetworkUnreachable,
+            "TUN has no physical outbound interface",
+        ));
+    }
 
     #[cfg(target_os = "linux")]
     let effective_iface = {
@@ -399,6 +499,46 @@ pub async fn new_protected_tcp_stream(
     }
 }
 
+/// Create a protected TCP socket pinned to one observed interface and source
+/// address. This is used only after policy selected a concrete NetworkPath.
+pub(crate) async fn new_protected_tcp_stream_with_source(
+    endpoint: SocketAddr,
+    iface: &OutboundInterface,
+    source_address: SocketAddr,
+    #[cfg(target_os = "linux")] so_mark: Option<u32>,
+) -> std::io::Result<TcpStream> {
+    #[cfg(feature = "tun")]
+    {
+        let effective_iface = effective_interface_for_destination(
+            Some(endpoint.ip()),
+            Some(iface),
+            #[cfg(target_os = "linux")]
+            so_mark,
+        )
+        .await?;
+        return new_tcp_stream_with_source(
+            endpoint,
+            effective_iface.as_ref(),
+            Some(source_address),
+            #[cfg(target_os = "linux")]
+            so_mark,
+        )
+        .await;
+    }
+
+    #[cfg(not(feature = "tun"))]
+    {
+        new_tcp_stream_with_source(
+            endpoint,
+            Some(iface),
+            Some(source_address),
+            #[cfg(target_os = "linux")]
+            so_mark,
+        )
+        .await
+    }
+}
+
 /// Create an outbound dual-stack UDP socket protected from TUN re-entry.
 pub async fn new_protected_dual_stack_udp_socket(
     iface: Option<&OutboundInterface>,
@@ -406,7 +546,10 @@ pub async fn new_protected_dual_stack_udp_socket(
 ) -> std::io::Result<UdpSocket> {
     #[cfg(feature = "tun")]
     {
-        let default_iface = default_outbound_interface().await;
+        #[cfg(target_os = "macos")]
+        let default_iface = effective_interface_for_destination(None, iface).await?;
+        #[cfg(not(target_os = "macos"))]
+        let default_iface = default_outbound_interface().await?;
         #[cfg(target_os = "windows")]
         let automatic_iface = if select_effective_iface(iface, &default_iface)
             .is_none()
@@ -437,8 +580,10 @@ pub async fn new_protected_dual_stack_udp_socket(
         let effective_iface = select_effective_iface(iface, &default_iface)
             .cloned()
             .or(automatic_iface);
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         let effective_iface = select_effective_iface(iface, &default_iface).cloned();
+        #[cfg(target_os = "macos")]
+        let effective_iface = default_iface;
         new_dual_stack_udp_socket(
             effective_iface.as_ref(),
             #[cfg(target_os = "linux")]
@@ -475,6 +620,32 @@ pub async fn new_tcp_stream(
     iface: Option<&OutboundInterface>,
     #[cfg(target_os = "linux")] so_mark: Option<u32>,
 ) -> std::io::Result<TcpStream> {
+    new_tcp_stream_with_source(
+        endpoint,
+        iface,
+        None,
+        #[cfg(target_os = "linux")]
+        so_mark,
+    )
+    .await
+}
+
+async fn new_tcp_stream_with_source(
+    endpoint: SocketAddr,
+    iface: Option<&OutboundInterface>,
+    source_address: Option<SocketAddr>,
+    #[cfg(target_os = "linux")] so_mark: Option<u32>,
+) -> std::io::Result<TcpStream> {
+    #[cfg(feature = "tun")]
+    let current_iface = effective_interface_for_destination(
+        Some(endpoint.ip()),
+        iface,
+        #[cfg(target_os = "linux")]
+        so_mark,
+    )
+    .await?;
+    #[cfg(feature = "tun")]
+    let iface = current_iface.as_ref();
     const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
     #[cfg(target_os = "windows")]
     const MAX_RETRY_ATTEMPTS: usize = 3;
@@ -484,14 +655,17 @@ pub async fn new_tcp_stream(
         let socket = prepare_outbound_tcp_socket(
             endpoint,
             iface,
+            source_address,
             #[cfg(target_os = "linux")]
             so_mark,
         )?;
-        timeout(
+        let stream = timeout(
             TCP_CONNECT_TIMEOUT,
             TcpSocket::from_std_stream(socket.into()).connect(endpoint),
         )
-        .await?
+        .await??;
+        apply_tcp_options(&stream)?;
+        Ok(stream)
     }
 
     #[cfg(target_os = "windows")]
@@ -502,6 +676,7 @@ pub async fn new_tcp_stream(
             let socket = prepare_outbound_tcp_socket(
                 endpoint,
                 iface,
+                source_address,
                 #[cfg(target_os = "linux")]
                 so_mark,
             )?;
@@ -512,7 +687,10 @@ pub async fn new_tcp_stream(
             )
             .await
             {
-                Ok(Ok(stream)) => return Ok(stream),
+                Ok(Ok(stream)) => {
+                    apply_tcp_options(&stream)?;
+                    return Ok(stream);
+                }
                 Ok(Err(err))
                     if should_retry_tcp_connect(&err)
                         && attempt + 1 < MAX_RETRY_ATTEMPTS =>
@@ -546,6 +724,7 @@ pub async fn new_tcp_stream(
 fn prepare_outbound_tcp_socket(
     endpoint: SocketAddr,
     iface: Option<&OutboundInterface>,
+    source_address: Option<SocketAddr>,
     #[cfg(target_os = "linux")] so_mark: Option<u32>,
 ) -> std::io::Result<socket2::Socket> {
     let (socket, family) = match endpoint {
@@ -568,13 +747,26 @@ fn prepare_outbound_tcp_socket(
     };
     debug!("created tcp socket");
 
+    if source_address.is_some_and(|source| source.is_ipv4() != endpoint.is_ipv4()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "selected source and endpoint address families differ",
+        ));
+    }
+
     if let Some(iface) = iface.filter(|_| !endpoint.ip().is_loopback()) {
         must_bind_socket_on_interface(&socket, iface, family)?;
         #[cfg(target_os = "windows")]
-        if let Some(addr) = bind_addr_for_iface(iface, family) {
+        if source_address.is_none()
+            && let Some(addr) = bind_addr_for_iface(iface, family)
+        {
             socket.bind(&addr.into())?;
         }
         trace!(iface = ?iface, "tcp socket prepared for outbound interface");
+    }
+    if let Some(source_address) = source_address {
+        socket.bind(&source_address.into())?;
+        trace!(source_address = %source_address, "tcp socket bound to selected source address");
     }
     #[cfg(target_os = "android")]
     maybe_protect_socket(&socket)?;
