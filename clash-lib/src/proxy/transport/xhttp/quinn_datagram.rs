@@ -22,7 +22,7 @@ use crate::{
 
 const CHANNEL_CAPACITY: usize = 256;
 
-pub(super) struct ConnectorUdpSocket {
+pub(crate) struct ConnectorUdpSocket {
     send_tx: mpsc::Sender<UdpPacket>,
     recv_rx: Mutex<mpsc::Receiver<UdpPacket>>,
     peer_addr: SocketAddr,
@@ -39,7 +39,7 @@ impl fmt::Debug for ConnectorUdpSocket {
 }
 
 impl ConnectorUdpSocket {
-    pub(super) fn new(
+    pub(crate) fn new(
         datagram: AnyOutboundDatagram,
         peer_addr: SocketAddr,
     ) -> Arc<Self> {

@@ -242,6 +242,95 @@ async fn network_recovery_replaces_udp_socket_without_restarting_inbound() {
                     && proof["token"] == status["lastOperation"]["token"]
             })
     );
+    // UDP `/flows` is aggregated across association rebuilds. Its flowIds
+    // must still join the per-association Explain records after network reset.
+    let flows = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let flows_uri: hyper::Uri =
+                format!("http://127.0.0.1:{api_port}/flows?include_closed=true")
+                    .parse()
+                    .unwrap();
+            let flows_request = hyper::Request::builder()
+                .uri(flows_uri.clone())
+                .header("Authorization", "Bearer clash-rs")
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            let flows_response = common::send_http_request(flows_uri, flows_request)
+                .await
+                .unwrap();
+            assert_eq!(flows_response.status(), 200);
+            let flows: serde_json::Value = serde_json::from_slice(
+                &flows_response
+                    .into_body()
+                    .collect()
+                    .await
+                    .unwrap()
+                    .to_bytes(),
+            )
+            .unwrap();
+            if flows.as_array().is_some_and(|records| {
+                records.iter().any(|flow| {
+                    flow["protocol"] == "udp"
+                        && flow["dstPort"].as_u64() == Some(echo_port as u64)
+                        && flow["flowIds"]
+                            .as_array()
+                            .is_some_and(|flow_ids| !flow_ids.is_empty())
+                        && flow["endReasons"]["networkChanged"]
+                            .as_u64()
+                            .unwrap_or_default()
+                            > 0
+                })
+            }) {
+                break flows;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("retired UDP associations were not recorded in /flows");
+    let udp_flow = flows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|flow| {
+            flow["protocol"] == "udp"
+                && flow["dstPort"].as_u64() == Some(echo_port as u64)
+                && flow["flowIds"]
+                    .as_array()
+                    .is_some_and(|flow_ids| !flow_ids.is_empty())
+        })
+        .expect("UDP aggregate should retain tracker IDs");
+    let flow_ids = udp_flow["flowIds"].as_array().unwrap();
+
+    let decisions_uri: hyper::Uri =
+        format!("http://127.0.0.1:{api_port}/runtime/network/path-decisions")
+            .parse()
+            .unwrap();
+    let decisions_request = hyper::Request::builder()
+        .uri(decisions_uri.clone())
+        .header("Authorization", "Bearer clash-rs")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let decisions_response =
+        common::send_http_request(decisions_uri, decisions_request)
+            .await
+            .unwrap();
+    assert_eq!(decisions_response.status(), 200);
+    let decisions: serde_json::Value = serde_json::from_slice(
+        &decisions_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+    )
+    .unwrap();
+    assert!(decisions.as_array().unwrap().iter().any(|decision| {
+        flow_ids
+            .iter()
+            .any(|flow_id| flow_id == &decision["flowId"])
+            && decision["outcome"] == "connected"
+    }));
     assert!(status["generation"].as_u64().unwrap() >= 19);
     assert_eq!(status["failures"], 0);
     echo_task.abort();

@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::{
     Json, Router,
@@ -11,7 +15,11 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::{
-    app::{api::AppState, dispatcher::StatisticsManager},
+    app::{
+        api::AppState,
+        dispatcher::{FlowEndReason, StatisticsManager},
+        flow::NetworkPathId,
+    },
     session::Network,
 };
 
@@ -52,9 +60,20 @@ pub struct FlowRecord {
     pub rule: String,
     pub rule_payload: String,
     pub chains: Vec<String>,
+    /// Tracker IDs folded into this aggregate, allowing callers to join a
+    /// connection-level Explain record without changing the aggregate key.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub flow_ids: Vec<uuid::Uuid>,
+    /// Unique local NIC paths reported by flows folded into this aggregate.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub network_paths: Vec<NetworkPathId>,
     pub country: Option<String>,
     pub asn: Option<String>,
     pub last_seen: DateTime<Utc>,
+    /// Counts of terminal reasons among the closed flows folded into this
+    /// aggregate. Empty when this record only contains active connections.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub end_reasons: HashMap<FlowEndReason, usize>,
 }
 
 #[derive(Hash, PartialEq, Eq)]
@@ -65,16 +84,19 @@ struct FlowKey {
 }
 
 struct ConnEntry {
+    flow_id: uuid::Uuid,
     src_ip: String,
     upload: u64,
     download: u64,
     rule: String,
     rule_payload: String,
     chains: Vec<String>,
+    network_paths: Vec<NetworkPathId>,
     country: Option<String>,
     asn: Option<String>,
     start_time: DateTime<Utc>,
     is_active: bool,
+    end_reason: Option<FlowEndReason>,
 }
 
 struct Acc {
@@ -87,9 +109,12 @@ struct Acc {
     rule: String,
     rule_payload: String,
     chains: Vec<String>,
+    flow_ids: BTreeSet<uuid::Uuid>,
+    network_paths: Vec<NetworkPathId>,
     country: Option<String>,
     asn: Option<String>,
     last_seen: DateTime<Utc>,
+    end_reasons: HashMap<FlowEndReason, usize>,
 }
 
 impl Acc {
@@ -98,10 +123,14 @@ impl Acc {
             self.src_ips.push(entry.src_ip);
         }
         self.conn_count += 1;
+        self.flow_ids.insert(entry.flow_id);
         if entry.is_active {
             self.active_count += 1;
         } else {
             self.closed_count += 1;
+            if let Some(reason) = entry.end_reason {
+                *self.end_reasons.entry(reason).or_default() += 1;
+            }
         }
         self.upload_total += entry.upload;
         self.download_total += entry.download;
@@ -113,6 +142,11 @@ impl Acc {
         }
         if self.chains.is_empty() && !entry.chains.is_empty() {
             self.chains = entry.chains;
+        }
+        for path in entry.network_paths {
+            if !self.network_paths.contains(&path) {
+                self.network_paths.push(path);
+            }
         }
         if self.country.is_none() && entry.country.is_some() {
             self.country = entry.country;
@@ -159,21 +193,27 @@ async fn build_flow_records(
                 rule: String::new(),
                 rule_payload: String::new(),
                 chains: Vec::new(),
+                flow_ids: BTreeSet::new(),
+                network_paths: Vec::new(),
                 country: None,
                 asn: None,
                 last_seen: DateTime::<Utc>::MIN_UTC,
+                end_reasons: HashMap::new(),
             });
             acc.apply(ConnEntry {
+                flow_id: info.uuid,
                 src_ip: info.session_holder.source.ip().to_string(),
                 upload: info.upload_total.load(Ordering::Relaxed),
                 download: info.download_total.load(Ordering::Relaxed),
                 rule: info.rule.clone(),
                 rule_payload: info.rule_payload.clone(),
                 chains: $chains,
+                network_paths: info.network_paths.clone(),
                 country: info.session_holder.country.clone(),
                 asn: info.session_holder.asn.clone(),
                 start_time: info.start_time,
                 is_active: $is_active,
+                end_reason: None,
             });
         }};
     }
@@ -202,21 +242,27 @@ async fn build_flow_records(
                 rule: String::new(),
                 rule_payload: String::new(),
                 chains: Vec::new(),
+                flow_ids: BTreeSet::new(),
+                network_paths: Vec::new(),
                 country: None,
                 asn: None,
                 last_seen: DateTime::<Utc>::MIN_UTC,
+                end_reasons: HashMap::new(),
             });
             acc.apply(ConnEntry {
+                flow_id: info.uuid,
                 src_ip: info.source_ip.clone(),
                 upload: info.upload_total,
                 download: info.download_total,
                 rule: info.rule.clone(),
                 rule_payload: info.rule_payload.clone(),
                 chains: info.proxy_chain.clone(),
+                network_paths: info.network_paths.clone(),
                 country: info.country.clone(),
                 asn: info.asn.clone(),
                 start_time: info.start_time,
                 is_active: false,
+                end_reason: Some(info.end_reason),
             });
         }
     }
@@ -239,9 +285,12 @@ async fn build_flow_records(
                 rule: acc.rule,
                 rule_payload: acc.rule_payload,
                 chains: acc.chains,
+                flow_ids: acc.flow_ids.into_iter().collect(),
+                network_paths: acc.network_paths,
                 country: acc.country,
                 asn: acc.asn,
                 last_seen: acc.last_seen,
+                end_reasons: acc.end_reasons,
             }
         })
         .collect();
@@ -303,4 +352,67 @@ pub async fn ws_handle(
 
     ws.on_failed_upgrade(|err| warn!("ws/flows upgrade error: {}", err))
         .on_upgrade(async move |socket| callback(socket).await)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use crate::{
+        app::dispatcher::{
+            ChainedStreamWrapper, FlowEndReason, StatisticsManager, TrackedStream,
+        },
+        app::flow::{AddressFamily, InterfaceId, NetworkPathId},
+        session::{Network, Session, SocksAddr},
+    };
+
+    use super::build_flow_records;
+
+    #[tokio::test]
+    async fn closed_flow_reason_is_visible_in_aggregate_api_record() {
+        let manager = StatisticsManager::new();
+        let (io, _peer) = tokio::io::duplex(64);
+        let path = NetworkPathId {
+            interface: InterfaceId {
+                name: "wifi0".to_owned(),
+                index: 4,
+            },
+            family: AddressFamily::Ipv4,
+            source_address: Some("192.0.2.10".parse().unwrap()),
+            network_generation: 7,
+        };
+        let stream = TrackedStream::new(
+            Box::new(ChainedStreamWrapper::new_with_network_path_id(
+                io,
+                Some(path.clone()),
+            )),
+            manager.clone(),
+            Session {
+                network: Network::Tcp,
+                source: "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
+                destination: SocksAddr::Domain("test.example".to_owned(), 443),
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        let flow_id = stream.id();
+        assert!(manager.close(flow_id).await);
+        drop(stream);
+
+        let records = build_flow_records(&manager, 20, true).await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0]
+                .end_reasons
+                .get(&FlowEndReason::ControllerRequested),
+            Some(&1)
+        );
+        let json = serde_json::to_value(&records[0]).unwrap();
+        assert_eq!(json["endReasons"]["controllerRequested"], 1);
+        assert_eq!(records[0].network_paths, vec![path]);
+        assert_eq!(records[0].flow_ids, vec![flow_id]);
+        assert_eq!(json["networkPaths"][0]["interface"]["name"], "wifi0");
+        assert_eq!(json["flowIds"][0], flow_id.to_string());
+    }
 }

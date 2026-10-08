@@ -1,6 +1,6 @@
 # 主机网络变化后的可用性迭代计划
 
-日期：2026-10-06。状态：B0–B6 已完成代码级与受控回归；B7 已接入代理端点/DNS socket 路径，为 gRPC/XHTTP H2 池加入逐连接 PathId 选择性退休，并为 VLESS、Trojan、AnyTLS、SOCKS 和 Shadowsocks 的 TCP 流记录最终目标响应路径健康；Trojan/AnyTLS 的 TCP 承载 UDP 也已接入。XHTTP H3 在无法确认物理 PathId 时禁用池复用。Hysteria2/H3、独立 UDP socket 路径及恢复期间过期拨号边界仍待实现或验证。DIRECT 域名/fake-IP UDP 的真实答案族处理已在 B5 覆盖。B8 的 DIRECT TCP 尝试调度、B9 的被动恢复防抖、B10 的有限运行时偏好与 Explain API 已完成相应代码切片。B11 的双网卡物理切换、route-all、休眠、资源趋势及时间预算仍待专用环境验收。
+日期：2026-10-08。状态：B0–B6 已完成代码级与受控回归；B7 已接入代理端点 TCP/UDP 与 DNS socket 路径，为 gRPC/XHTTP H2/H3 池加入逐连接 PathId 选择性退休，并为 VLESS、Trojan、AnyTLS、SOCKS 和 Shadowsocks 的 TCP 流记录最终目标响应路径健康；Trojan/AnyTLS 的 TCP 承载 UDP 也已接入。Hysteria2 普通及 Salamander QUIC 使用 connector 选定路径，QUIC 外层响应和 Hysteria2 UDP 最终目标响应分别记录为代理端点与代理目标证据；独立代理 UDP socket 有有界路径绑定尝试。Hysteria2 端口跳跃复用注册的 connector，已知 PathId 时新 hop socket 固定在建连路径，未知时不改选新观测路径；网络恢复取消令牌也会取消进行中的 hop socket 建立。本轮继续补入 Relay 首跳 PathId 传递、活动/关闭 Flow 的 `networkPaths` 观测和 `/flows.flowIds` 关联字段；它只报告本机实际使用的 NIC，不声称能观察代理服务器之后的远端转发路径。B10 Explain 代码扩展为 TCP/UDP 路径规划、拨号成功/失败、旧网络结果丢弃与配置 reload 版本差异，并提供近期决策列表端点；成功 UDP 关联 ID 可从 `/flows.flowIds` 关联到决策记录。B8 代理端点 TCP 拨号新增有界多 PathId 尝试。UDP 会话退休会把网络代次变化记为 `networkChanged`，空闲清理记为 `idleTimeout`。上述代码及回归用例仍未编译或运行；B7 代理协议服务器端到端覆盖仍待验收。DIRECT 域名/fake-IP UDP 的真实答案族处理已在 B5 覆盖。B8 的 DIRECT/代理端点 TCP 尝试调度、B9 的被动恢复防抖和 B10 的有限运行时偏好已完成相应代码切片。Linux 网络快照与路径绑定观察代码已加入；本轮继续补充关闭流原因和 Linux 观察用例，但均尚未编译或运行。Linux 能力不能标为已验证支持；Windows 仍 unsupported。B11 的双网卡物理切换、route-all、休眠、资源趋势及时间预算仍待专用环境验收。
 
 用户确认的目标：主机切换网卡或网络后，自动恢复新连接；已有连接尽力恢复，无法恢复时明确结束。典型场景包括 Wi-Fi ↔ 有线、同一网卡换 Wi-Fi/DHCP 地址、断网重连和休眠唤醒。服务恢复无需用户重启 Chimera、重新加载配置或手动调用 reset。
 
@@ -47,13 +47,59 @@
 | B4 策略编译与影子决策（已完成） | 纯候选过滤/显式排序、immutable intent、PathPlan、CandidateRejection；影子计算复用实际路由结果 | Require Ethernet/IPv4 无满足项必失败；偏好仅列 v4 不禁 v6；偏好顺序与源地址身份可测试；决策记录 route/rule、拒绝理由和 `shadowOnly`，不改变 socket。实际 socket 路径统一回报由 B5/B7 接入 |
 | B5 非 TUN DIRECT 新 Flow 接入（已完成） | TCP 按解析地址族选路；UDP literal 或可解析域名按真实地址族选路，逐 Flow 决策缓存，NAT socket 按 `NetworkPathId` 隔离 | 实际 source/interface 绑定与决策一致；硬约束失败明确结束 TCP/UDP；fake-IP 不作为远端地址或族提示；同目标复用决策、不同目标/身份隔离；旧网络代际 socket 退休；多目标/多客户端响应归属保持。活动 TUN 仍沿用当前防回环 socket 保护 |
 | B6 非 TUN DIRECT 健康证据（已完成） | TCP、literal/resolved-domain UDP 和 DNS direct 响应/发送错误接入独立健康记录；API 输出有界状态，不改变选路 | 单目标拒绝/超时不判死路径；不同主机网络错误升级；UDP 响应归回实际远端目标；DNS 成功证据绑定上游 PathId；旧版本/重载事件拒绝 |
-| B7 代理 / DNS / 池接入（进行中） | 代理端点与最终目标、DNS 独立意图；接入实际 socket 路径；给可复用连接记录实际 path/network 代际 | 已实现非 TUN 代理端点和 DNS direct socket 路径选择、DNS 响应健康证据、VLESS/Trojan/AnyTLS/SOCKS/Shadowsocks TCP 最终目标响应路径证据、gRPC/XHTTP H2 按 PathId 选择性退休；仍需 Hysteria2/H3、独立 UDP socket 路径证据和并发边界回归 |
-| B8 有界多路径尝试（DIRECT TCP 范围已完成） | 有界 AttemptBudget、错峰启动、单 winner、取消与清理；代理协议握手竞速另作为后续子切片 | DIRECT TCP DNS+拨号总预算 5 秒、最多 3 次/并发 2、120ms hedge，快速失败立即推进；禁止候选不尝试；失败 socket future 随 winner 取消；不竞速 UDP 业务包或重放应用数据。代理端点竞速尚未接入 |
+| B7 代理 / DNS / 池接入（进行中） | 代理端点与最终目标、DNS 独立意图；接入实际 socket 路径；给可复用连接记录实际 path/network 代际 | 已实现非 TUN 代理端点 TCP/UDP 与 DNS direct socket 路径选择、DNS 响应健康证据、VLESS/Trojan/AnyTLS/SOCKS/Shadowsocks TCP 最终目标响应路径证据、gRPC/XHTTP H2/H3 按 PathId 选择性退休、Hysteria2 普通及 Salamander QUIC connector 路径、端口跳跃沿用 connector 并固定到初始 PathId、代理端点 UDP 与 Hysteria2 UDP 最终目标响应证据、Relay 首跳 TCP/UDP 本机 PathId 传递，以及活动/关闭 Flow 的 `/flows` `networkPaths` 字段；该字段不代表代理服务器之后的远端转发 NIC。代理协议服务器端到端与 pooled transport 行为仍待验证 |
+| B8 有界多路径尝试（DIRECT 与代理端点 TCP 代码已接入，待验证） | 有界 AttemptBudget、错峰启动、单 winner、取消与清理；只竞速代理端点 TCP 建连，协议握手不跨连接重放 | DIRECT 与代理端点 DNS+拨号总预算均为 5 秒、最多 3 次/并发 2、120ms hedge，快速失败立即推进；代理端点计划最多纳入 3 个 DNS 地址，跨地址族与候选 PathId 轮次调度；Preference 保留一个 system-route 回退名额，Require 不回退；旧 networkVersion 完成的 socket 丢弃；失败 socket future 随 winner 取消；不竞速 UDP 业务包或重放应用数据。连接与 API 行为待验证 |
 | B9 首选恢复与防抖（被动证据范围已完成） | cooldown、真实流量响应和稳定窗口；只改变新 Flow 候选可用性 | 冷却期排除不可用路径；恢复至少 3 次真实响应且跨越 15 秒；单次成功不恢复；不发送面向猜测目标的合成探测。主动探测与 minimum-dwell 校准不在当前实现范围 |
-| B10 运行时意图与 Explain API（有限范围已完成） | 基于现有鉴权开放偏好更新、effective-paths 和 decision 查询；临时覆盖使用单调时钟及 TTL | 偏好更新校验后在 RuntimeStatus 锁内原子替换并增加 `policyVersion`；临时覆盖到期恢复基础偏好；API 集成测试覆盖写/读/过期/删除；Explain 记录有界且当前只覆盖 DIRECT TCP，代理、失败拨号和重载保留语义尚未完整 |
+| B10 运行时意图与 Explain API（代码范围扩展，待验证） | 基于现有鉴权开放偏好更新、effective-paths 和 decision 查询；临时覆盖使用单调时钟及 TTL | 偏好更新校验后在 RuntimeStatus 锁内原子替换并增加 `policyVersion`；临时覆盖到期恢复基础偏好；Explain 记录有界并覆盖 TCP/UDP 路径规划失败、DIRECT/PROXY 拨号成功与失败、旧网络代次结果丢弃；记录候选 PathId、策略拒绝原因、版本和操作编号；成功 UDP 关联的 `flowId` 出现在 `/flows.flowIds`，可查询 `/runtime/network/path-decision/{flowId}`；记录连接完成时发现的 reload 版本差异，`/runtime/network/path-decisions` 可列出近期结果。物理代理端点 TCP/UDP 拨号错误以结构化 `io::Error` 来源保留候选、实际尝试 PathId 与策略/健康拒绝原因，Dispatcher 将其写入 Explain；协议 TLS/认证阶段错误仍保持现有错误边界，不伪称已逐协议分类。全部代码与 API 行为待验证 |
 | B11 实机与平台验收 | 保留 A4 的专用双网卡验证；DIRECT/代理/DNS、双栈/TUN、资源趋势与时间预算 | 不使用 reset 的物理切换、DHCP、离线/唤醒和抖动有真实响应证据；20 轮资源回收可核查；macOS/Linux/Windows 各自记录编译、受控测试与实机结果 |
 
 依赖：B0 → B1 → B2 → B3 → B4 → B5 → B6；B7 的协议/池子切片继续推进，B8 DIRECT TCP 已基于 B5 的 PathPlan 独立验证，B9 消费 B6 的真实流量健康证据，B10 读取并更新运行时 PathIntent；它们不表示 B7 全部已完成。B11 依赖可达的专用多网卡环境。不得把未验证前置标成完成。可取得专用硬件时，既有 A4 基线验收提前运行，不必等 B11；它不能替代新 scheduler 的实机验收。
+
+### B11 验证安排（计划，尚未执行）
+
+本计划不在当前 Mac 上安装或启动 Linux 虚拟机，也不改动宿主机网络。后续 Linux 测试使用专用 Linux 主机或一次性虚拟机；每轮记录代码提交、内核版本、网络拓扑、配置摘要和完整测试命令，不复制生产凭据、`config-prod.yaml`、缓存或数据库。
+
+| 阶段 | 环境与操作 | 通过条件 / 证据 |
+| --- | --- | --- |
+| V0 环境准备 | 确认隔离 Linux 环境支持 network namespace、veth、`iproute2` 与 `CAP_NET_ADMIN`；在干净检出中构建，测试流量只留在隔离网络 | `uname -a`、`ip -details link`、路由表、代码基线和配置摘要归档；确认不会改宿主机接口或默认路由 |
+| V1 Linux 当前能力基线 | 在 Linux 上编译并运行最小配置，查询 `/network`；本分支已接入 Linux 快照代码，源代码预期报告自动观察支持，但结果尚未验证 | 确认实际启动可采样接口、IPv4/IPv6 地址、main-table 默认路由及可绑定候选；编译失败、快照失败或 API 与观测不一致均退回修复，不进入 V3 |
+| V2 网络观察能力门槛 | Linux rtnetlink observer、默认路由签名、DNS 可见配置签名和本地绑定探测代码已加入；本机可运行的平台无关单测已通过，Linux 专属解析与链路变化验证尚未执行 | 链路/地址/默认路由改变可生成新 network generation，重复快照不重复 reset，shutdown/reload 可取消采样；非 Wi-Fi 接口保持 `unknown`，避免把 sysfs 设备猜成 Ethernet；策略路由表、内核 multipath 和 systemd-resolved 后端差异须记录限制或另行补齐。通过前不进入 V3 |
+| V3 双虚拟路径切换 | 在 namespace 中建立 client、两条独立 gateway 路径和同一测试服务；按顺序执行 A 链路 down/up、A 地址/DHCP 替换、默认路由变化、短暂断网和抖动。每种变化至少 20 轮，记录新 TCP、UDP、DNS 与配置的代理协议结果 | 不调用 `/network/reset`；新连接在路径失效后自动选择合格路径，硬接口/地址族约束仍生效；旧 TCP 不重放应用数据，能存活的流继续运行，传输失败或空闲超时后进入 terminal 状态；检查 `/flows?include_closed=true` 聚合字段 `endReasons`，TCP 仅在网络代次变化与传输错误同时出现时计入 `networkChanged`，UDP 旧 association 因代次切换退休时计入 `networkChanged`，API 主动关闭计入 `controllerRequested`；分别报告检测、资源恢复、新拨号、旧流结束的 P50/P95/max 与失败轮次 |
+| V4 真实平台验收 | 有专用双网卡设备后分别在目标平台执行 Wi-Fi/有线切换、DHCP、断网重连、睡眠唤醒和 TUN 场景；Linux namespace 结果不替代 macOS SystemConfiguration、真实驱动或物理 TUN 验证 | 平台、场景和结果分别登记；保留旧 TCP、真实 DNS/HTTP/代理响应以及 socket/任务资源计数；稳定重复后再校准并批准恢复时限 |
+
+阶段顺序是 V0 → V1 → V2 → V3 → V4。Linux 观察代码已开始实现，但 V1/V2 通过前不把 Linux 自动恢复标为完成；不能用 `ip link` 成功切换代替产品观察能力。Linux 虚拟网络结果也不能替代专用 macOS 双网卡验收。
+
+### 代码与验证增量（2026-10-08）
+
+- Linux observer 代码与解析单测已写入 `app/network.rs`，包含 main-table unicast 默认路由和最小 metric 选择、ECMP 歧义保留、DNS 可见配置签名、链路 down 不被本地 bind 成功掩盖。当前主机为 macOS；Linux 专属解析分支、rtnetlink 实际事件和 namespace 换网仍须在 V0–V3 环境验证。
+- TCP 关闭历史新增 `endReason`，`/flows` 聚合为 `endReasons` 计数。dispatcher 在流建立时保存 network generation；传输异常结束时若观察到 generation 已变化，标记为 `networkChanged`。该字段只表达同时发生的诊断证据，不断言网络变化是唯一原因；半关闭后由 inactivity guard 结束也会单独报告 `idleTimeout`。UDP association 的 session map 保留追踪器句柄，在网络代次切换退休或拒绝过时代次的延迟拨号时标记 `networkChanged`，idle 清理时标记 `idleTimeout`。
+- Controller 单条/全部主动关闭会进入关闭历史，标记 `controllerRequested`。关闭原因、idle-timeout、历史记录和 API 聚合的回归用例已在全量库单测中执行并通过；Linux-only 结果仍须在 V1 环境取得。
+- UDP association 的网络代次退休与空闲过期现在分别写入追踪器的 `networkChanged` / `idleTimeout` 终态。代次切换退休、过时代次拨号拒绝、空闲过期均有定向用例；回环网络恢复集成测试检查 `/flows.endReasons.networkChanged` 与 flow/decision ID 关联，已通过。
+- Relay 首跳 connector 现在复用 OutboundManager 提供的网络观察源；DIRECT、常用代理 TCP/UDP、Hysteria2 与 XHTTP HTTP/3 传输会把连接时实际拿到的本机 `NetworkPathId` 留在 stream/datagram 链中，代理链包装器继续传递该身份。tracker、关闭历史和 `/flows` 聚合提供可选 `networkPaths`，不把远端代理服务器的转发接口伪装成本机事实。
+- 代理端点 TCP dial 改为有界调度：最多 3 个 DNS 地址/PathId 尝试、最多 2 个并发、120ms hedge、5 秒含 DNS 的总预算；Preference 保留 system-route 回退，Require 不回退；完成时再次核对 networkVersion。物理 endpoint dial 错误保留候选、实际尝试路径和拒绝原因，便于 Explain 关联。这里只在原始 TCP socket 层竞速，不会重放或并发执行 TLS/代理认证握手。
+- TCP/UDP 代理 endpoint 物理 socket 拨号错误通过类型化 `io::Error` 来源携带候选路径、实际尝试路径和拒绝原因；TCP Dispatcher Explain 可查询到该信息，UDP 硬约束/尝试失败也可查询候选与拒绝原因。错误来源关联与路径调度单测已在全量库单测中执行并通过；TLS/代理认证失败继续遵循协议当前的错误边界。
+- `/flows` 聚合记录现在包含可选 `flowIds`，让多个连接折叠在同一目标记录时仍能保留 tracker 身份。
+- Explain API 记录 TCP/UDP 路径规划失败、DIRECT/PROXY 拨号结果和旧网络代次连接丢弃；决策携带编译阶段候选 PathId 与策略拒绝原因。物理代理端点错误保留候选、尝试与拒绝详情。成功 UDP 关联复用 tracker 的 `flowId`，可由 `/flows.flowIds` 关联到 path decision。全量库单测和回环集成用例已覆盖相关 ID、候选计划、硬接口 fail-closed 与 UDP 终态关联；后续 Linux/专用环境仍需覆盖真实多路径 bind、5 秒 deadline、hedge loser 取消和切网期间旧 socket 丢弃。协议 TLS/认证阶段错误仍沿现有错误边界，可能没有物理端点 PathId。
+
+本轮实际验证如下：
+
+```bash
+cargo fmt --all -- --check
+cargo check -p clash-lib --all-features --locked
+cargo check -p clash-lib --no-default-features --locked
+cargo check -p clash-lib --locked
+cargo check -p clash-rs --locked
+cargo test -p clash-lib --lib --all-features --locked
+cargo test -p clash-lib --test api_tests --all-features --locked runtime_path_preference_updates_are_versioned_and_temporary -- --nocapture --test-threads=1
+cargo test -p clash-lib --test direct_udp_integration_tests --all-features --locked network_recovery_replaces_udp_socket_without_restarting_inbound -- --nocapture --test-threads=1
+git diff --check
+```
+
+结果：格式检查、core all-features/no-default/default 编译及 CLI 默认编译通过；库单测 831 passed、0 failed、12 ignored；运行时路径偏好 API 测试 1 passed，UDP 网络恢复集成用例 1 passed。测试只使用本地 Controller 和 UDP echo，没有切换宿主机网卡。以上不覆盖 Linux 专属解析、namespace 换网、真实双网卡和平台 TUN。
+
+`app::network::tests::` 中的 Linux parser 用例必须在 Linux 目标执行；在 macOS 上过滤后零个测试运行不构成覆盖。之后再按 V0–V4 执行 namespace 与专用硬件验收。
+
+V3 开始前先冻结测试的时间预算和终止状态定义；现有 2 秒检测、15 秒新连接、30 秒旧连接仍是待校准目标，不能预先当作通过标准或产品承诺。任何最终阈值都由测试结果与用户确认后写入验收标准。
 
 B5 在执行前已检查 OS 明确不可用状态，B6 才加入被动健康推断。B4 影子观察仅为短期迁移验证，不新增 old/new Cargo feature；启用真实调度并完成对照后移除重复影子执行，保留可查询的最终决策。B10 写 API 最后开放，期间可用 fixture 注入 intent 测试，读侧解释记录随各步实现。
 
@@ -255,7 +301,7 @@ cargo test -p clash-lib --test api_reload_tests --locked -- --test-threads=1
 | A2 | 串行恢复、当前接口/DNS/池、独立失败处理已实现 | 实际代理节点在新网络上的端到端响应 |
 | A3 | UDP 网络版本失效、池退休、TCP keepalive、TUN 接口刷新与路由所有权已实现 | route-all 实际出口切换、旧 TCP 失效时限 |
 | A4 | 自动事件受控测试、20 轮 UDP 集成、隔离真实 TUN 回归通过 | 专用环境的物理网卡切换、休眠与资源计数 |
-| Linux / Windows | 自动观察明确标为 unsupported，保留现有平台选路 | 平台实现、交叉编译与实机验证均未完成 |
+| Linux / Windows | Linux 快照与自动观察代码已加入、未验证；Windows 仍 unsupported | Linux 编译、定向用例、namespace 换网和实机验收待后续统一执行；Windows 平台实现与验证未完成 |
 | Core / Router 重构 | 暂缓 | 不属于本轮范围 |
 
 ## 7. 本轮实现与实际验证（2026-10-02）
@@ -298,7 +344,7 @@ cargo test -p clash-lib --test api_reload_tests --locked -- --test-threads=1
 - 2 秒检测 / 15 秒新连接 / 30 秒旧连接仍是待校准目标。实际资源重置最多 15 秒，另有快照与具体协议拨号时间；不能承诺整个新连接 15 秒内成功。TCP keepalive 的实际失败时限受 OS、在途数据和协议驱动影响，不能承诺所有旧流 30 秒结束。
 - 真实 TUN 当前用 `route-all: false`，仅自身 fake-IP 子网；物理 scoped default 的动态环境、IPv6 两张物理接口、长期资源计数与跨平台运行均待专用环境验证。
 
-下一最小代码步骤：让 Hysteria2/H3 与可归属的独立 UDP socket 在确知实际 PathId 后报告最终目标响应；再用受控测试锁定恢复期间已开始但尚未完成的旧路径拨号不能进入池或报告恢复成功。路径身份不明的 SOCKS/SS UDP 不沿用控制 TCP 的 PathId。物理验收仍需专用 macOS 双网卡环境：保留 fake-IP 与一条旧 TCP 流，轮换物理路径 20 次，采集 `/network`、真实 DNS/HTTP/SOCKS 响应及 socket/路由/任务计数，再校准时限与 A4；平台实现/验证另行排期。
+下一最小代码步骤：用受控 Hysteria2 服务端验证端口跳跃跨多轮切换与 reset 取消，再评估代理链逐跳 PathId 的可观测边界。路径身份不明的 SOCKS/SS UDP 不沿用控制 TCP 的 PathId。物理验收仍需专用 macOS 双网卡环境：保留 fake-IP 与一条旧 TCP 流，轮换物理路径 20 次，采集 `/network`、真实 DNS/HTTP/SOCKS 响应及 socket/路由/任务计数，再校准时限与 A4；平台实现/验证另行排期。
 
 ### B7 本轮增量复核（2026-10-02）
 
@@ -310,12 +356,23 @@ cargo test -p clash-lib --test api_reload_tests --locked -- --test-threads=1
 
 - `RemoteConnector::connect_stream_with_pool_context` 返回成功拨号实际获胜的 `NetworkPathId`；DirectConnector 仍保留原 `connect_stream` 接口，并在返回前沿用旧 networkVersion 校验。VLESS 在借池前查询当前网络代次和允许路径，成功新拨号后将实际 PathId 传给 transport。
 - gRPC 与 XHTTP HTTP/2 上传连接条目现在记录 `network_generation + PathId`。借出时同时检查代次与当前候选路径：失效 PathId 被惰性移出，其他仍合格路径的条目可保留；新连接只有实际路径仍在允许集合时才入池。连接路径无法验证时不写入受路径策略管理的池。
-- XHTTP HTTP/3 当前不能从 QUIC connector 获得可靠的物理 PathId。存在显式路径候选上下文时会清除未标记的 H3 缓存，并使用单次连接，避免复用路径不明的旧池；没有路径观察的传统调用继续沿用代次级复用。独立下载池仍按代次隔离，因为其直接拨号目前没有返回物理 PathId。
+- 在该阶段，XHTTP HTTP/3 尚未从 QUIC connector 获得物理 PathId；有路径候选上下文时清除未标记缓存并使用单次连接。此临时限制已由下方 2026-10-06 的 B7 UDP/H3 增量更新：目前 QUIC UDP connector 返回池上下文，按已知 PathId 复用，路径不明时仍不缓存。
 - VLESS、Trojan、AnyTLS、SOCKS 与 Shadowsocks 会在各自协议处理之后观察应用可见的目标响应；证据记录 `proxyTcp` 与最终 destination。Trojan/AnyTLS 的 UDP-over-TCP 使用 `proxyUdp`。VLESS 的代理响应头解析错误不会生成成功证据；代理 endpoint 的先前响应仍单独标为 `proxyEndpointTcp`。SOCKS/SS UDP 使用单独的数据 socket，未把控制 TCP 路径误记到 UDP 流。
 - `grpc_pool_rejects_a_connection_from_an_older_network_generation` 与 `xhttp_h2_pool_rejects_a_connection_from_an_older_network_generation` 增加同代路径变更断言：Path A 建立的池在仅 Path B 合格时不再借出并被移除；两者还验证借池返回原 PathId 元数据。`vless_target_response_reports_the_actual_proxy_path` 驱动完整 VLESS 响应头与目标字节，验证只产生最终目标的路径健康证据。`cargo test -p clash-lib --lib older_network_generation --all-features --locked` 为 2 passed；`cargo test -p clash-lib --lib vless_target_response_reports_the_actual_proxy_path --all-features --locked` 为 1 passed；最终 `cargo test -p clash-lib --lib --all-features --locked` 为 814 passed、0 failed、12 ignored。
 - Trojan、AnyTLS、SOCKS 和 Shadowsocks 复用同一层 PathId-aware 流观察；当前普通库测试没有为这些协议启动真实代理服务，因此其端到端认证与最终目标响应仍未被本轮受控测试证明。未运行 Docker/远端代理测试。
 - 最终验证：`cargo check -p clash-lib --no-default-features --locked`、`cargo check -p clash-rs --locked`、`cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、`cargo fmt --all -- --check` 和 `git diff --check` 均通过。
-- 尚未验证双条真实池并存时保留健康 Path B 的端到端行为、代理协议认证成功证据、最终业务目标响应证据和真实网卡切换。H3 活动路径策略下禁用池复用会增加握手开销，是等待路径身份接入前的安全退化。
+- 本增量当时尚未验证双条真实池并存、代理协议认证成功、最终业务目标响应和真实网卡切换；后续受控测试补充项见下方 B7 UDP/Hysteria2/H3 增量。路径身份仍未知时禁用 H3 池复用会增加握手开销，是保守退化。
+
+### B7 UDP / Hysteria2 / H3 / 端口跳跃增量（2026-10-07）
+
+- 只读对照基线：本地 `ref/` 为 `39d06a4`，`ref-mihomo/` 为 `63bd52e`。`ref/` 的 `UdpHop` 直接创建未受保护的系统 UDP socket，切换 socket 与上一 socket 清理较简单；当前工作树已具有接口/mark 保护、异步预建及 5 秒旧 socket 接收宽限。没有覆盖本地实现，而是在其生命周期上补 connector 与路径约束。
+- `RemoteConnector` 增加携带池上下文的 UDP 拨号入口。DirectConnector 在代理端点 UDP socket 上按当前可选 PathPlan 最多尝试 3 条路径，绑定失败后有限推进；显式接口/Require 无法满足时明确失败，软偏好候选耗尽时保留系统路由回退。socket 只有在实际绑定并通过网络版本复核后才携带 PathId。
+- 代理端点 UDP 使用独立的 `proxyEndpointUdp` 证据类型；只有 QUIC 数据报获得实际响应时才更新路径健康，并归属代理端点与实际绑定路径。受控本地 UDP echo 测试 `proxy_endpoint_udp_response_reports_the_bound_path` 验证此归属。
+- Hysteria2 UDP 隧道在请求与响应之间按目标地址关联证据，使用 `proxyUdp` 记录最终目标的真实回包；待关联目标数有 64 项上限，路径和 reporter 缺失时不生成证据。受控本地 UDP echo 测试 `proxy_target_udp_response_reports_the_bound_path` 验证目标归属，与外层 `proxyEndpointUdp` 证据分开。
+- Hysteria2 普通 QUIC、Salamander QUIC 和端口跳跃都通过注册的 connector 建立 UDP socket，因此仍经过配置的代理链。Hysteria2 可复用连接保存创建时的路径与代次，借出时按当前候选过滤并退休失效连接。端口跳跃的新 socket 限制在初始 QUIC PathId 上；当 connector 只能提供 generation 时，将继续传递该 connector 并要求代次不变，不会私自直连或另选观测路径。network reset 取消正在握手的旧连接构建；连接取消令牌也传给 `UdpHop`，阻止旧连接继续建立 hop socket。`port_hop_sockets_are_pinned_to_the_initial_path`、`unknown_port_hop_path_does_not_select_a_new_observed_path`、`network_reset_cancels_an_inflight_hysteria_dial` 和 `connection_retirement_cancels_a_pending_port_hop_socket` 覆盖路径约束与取消边界。
+- XHTTP H3 的 QUIC connector 现在返回实际 UDP socket 的池上下文；上传/下载 H3 连接按路径和代次复用或退休，握手完成后再次检查路径资格。无法确认物理 PathId 的路径受控连接不进入可复用池。QUIC 层响应仅证明代理端点路径可用，不等于最终网站业务响应已成功。
+- 最终验证：`cargo test -p clash-lib --lib --all-features --locked`（821 passed、0 failed、12 ignored）、`cargo test -p clash-lib --lib --all-features --locked hysteria2::`（10 passed）、`cargo check -p clash-lib --features hysteria --locked`、`cargo check -p clash-lib --no-default-features --locked`、`cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、格式和 diff 检查均通过。此前 `cargo check -p clash-lib --no-default-features --features hysteria --locked` 未通过，错误是精简 feature 组合触发的既有 `dead_code` deny（`dns_client.rs`、`app/net/mod.rs`、`app/network.rs`、`common/tls.rs`），本轮未放宽 lint 或修改无关 feature 边界。
+- 尚未覆盖代理链逐跳 PathId、端口跳跃在真实 Hysteria 服务器上的多轮切换，以及绑定失败后跨多物理 NIC 的真实恢复；Docker Hysteria 服务器、真实双网卡和物理切换均未运行。上述受控状态机测试不替代代理服务端协议验收。
 
 ### 最终复核
 

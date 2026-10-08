@@ -58,6 +58,17 @@ impl From<std::io::Error> for CopyBidirectionalError {
     }
 }
 
+/// Result metadata needed to explain how a relayed TCP flow terminated.
+/// `idle_timeout` means the inactivity guard closed the last half-open
+/// direction after one side had already completed; it does not mean that
+/// either peer sent a TCP reset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BidirectionalCopyReport {
+    pub uploaded: u64,
+    pub downloaded: u64,
+    pub idle_timeout: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShutdownMode {
     HalfClose,
@@ -201,6 +212,7 @@ struct CopyBidirectional<'a, A: ?Sized, B: ?Sized> {
     a_to_b_timeout_duration: Duration,
     b_to_a_timeout_duration: Duration,
     shutdown_mode: ShutdownMode,
+    idle_timeout: bool,
 }
 
 fn reset_idle_timeout(
@@ -217,7 +229,7 @@ where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
-    type Output = Result<(u64, u64), CopyBidirectionalError>;
+    type Output = Result<BidirectionalCopyReport, CopyBidirectionalError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // Unpack self into mut refs to each field to avoid borrow check issues.
@@ -233,6 +245,7 @@ where
             a_to_b_timeout_duration,
             b_to_a_timeout_duration,
             shutdown_mode,
+            idle_timeout,
         } = &mut *self;
 
         let mut a = Pin::new(a);
@@ -274,6 +287,7 @@ where
                                         // half-open stream, not an absolute
                                         // lifetime cap. Progress above refreshes
                                         // the timer.
+                                        *idle_timeout = true;
                                         *a_to_b = TransferState::ShuttingDown(
                                             buf.amount_transferred(),
                                         );
@@ -336,6 +350,7 @@ where
                             if let Some(delay) = b_to_a_delay {
                                 match delay.as_mut().poll(cx) {
                                     Poll::Ready(()) => {
+                                        *idle_timeout = true;
                                         *b_to_a = TransferState::ShuttingDown(
                                             buf.amount_transferred(),
                                         );
@@ -375,18 +390,24 @@ where
             }
         }
 
-        Poll::Ready(Ok((*a_to_b_count, *b_to_a_count)))
+        Poll::Ready(Ok(BidirectionalCopyReport {
+            uploaded: *a_to_b_count,
+            downloaded: *b_to_a_count,
+            idle_timeout: *idle_timeout,
+        }))
     }
 }
 
-pub async fn copy_bidirectional(
+pub async fn copy_bidirectional_with_report(
     mut a: Box<dyn ClientStream>,
-    mut b: TrackedStream,
+    b: &mut TrackedStream,
     size: usize,
     a_to_b_timeout_duration: Duration,
     b_to_a_timeout_duration: Duration,
     shutdown_mode: ShutdownMode,
-) -> Result<(u64, u64), CopyBidirectionalError> {
+) -> Result<BidirectionalCopyReport, CopyBidirectionalError> {
+    // Borrow the tracked stream so the dispatcher can attach a terminal reason
+    // before Drop schedules its closed-history snapshot.
     // zero copy is only available on linux
     #[cfg(all(target_os = "linux", feature = "zero_copy"))]
     {
@@ -416,9 +437,9 @@ pub async fn copy_bidirectional(
                 .await
             }
             _ => {
-                copy_buf_bidirectional_with_timeout(
+                copy_buf_bidirectional_with_report(
                     &mut a,
-                    &mut b,
+                    b,
                     size,
                     a_to_b_timeout_duration,
                     b_to_a_timeout_duration,
@@ -430,9 +451,9 @@ pub async fn copy_bidirectional(
     }
     #[cfg(not(all(target_os = "linux", feature = "zero_copy")))]
     {
-        copy_buf_bidirectional_with_timeout(
+        copy_buf_bidirectional_with_report(
             &mut a,
-            &mut b,
+            b,
             size,
             a_to_b_timeout_duration,
             b_to_a_timeout_duration,
@@ -442,7 +463,8 @@ pub async fn copy_bidirectional(
     }
 }
 
-pub async fn copy_buf_bidirectional_with_timeout<A, B>(
+#[cfg(test)]
+async fn copy_buf_bidirectional_with_timeout<A, B>(
     a: &mut A,
     b: &mut B,
     size: usize,
@@ -450,6 +472,30 @@ pub async fn copy_buf_bidirectional_with_timeout<A, B>(
     b_to_a_timeout_duration: Duration,
     shutdown_mode: ShutdownMode,
 ) -> Result<(u64, u64), CopyBidirectionalError>
+where
+    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+    copy_buf_bidirectional_with_report(
+        a,
+        b,
+        size,
+        a_to_b_timeout_duration,
+        b_to_a_timeout_duration,
+        shutdown_mode,
+    )
+    .await
+    .map(|report| (report.uploaded, report.downloaded))
+}
+
+async fn copy_buf_bidirectional_with_report<A, B>(
+    a: &mut A,
+    b: &mut B,
+    size: usize,
+    a_to_b_timeout_duration: Duration,
+    b_to_a_timeout_duration: Duration,
+    shutdown_mode: ShutdownMode,
+) -> Result<BidirectionalCopyReport, CopyBidirectionalError>
 where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
@@ -466,6 +512,7 @@ where
         a_to_b_timeout_duration,
         b_to_a_timeout_duration,
         shutdown_mode,
+        idle_timeout: false,
     }
     .await
 }
@@ -485,7 +532,47 @@ mod tests {
         time::timeout,
     };
 
-    use super::{ShutdownMode, copy_buf_bidirectional_with_timeout};
+    use super::{
+        ShutdownMode, copy_buf_bidirectional_with_report,
+        copy_buf_bidirectional_with_timeout,
+    };
+
+    #[tokio::test]
+    async fn reports_idle_guard_when_peer_leaves_a_half_closed_flow_open() {
+        let (mut proxy_local, mut local) = duplex(1024);
+        let (mut proxy_remote, mut remote) = duplex(1024);
+
+        let relay = tokio::spawn(async move {
+            copy_buf_bidirectional_with_report(
+                &mut proxy_local,
+                &mut proxy_remote,
+                256,
+                Duration::from_millis(40),
+                Duration::from_millis(40),
+                ShutdownMode::HalfClose,
+            )
+            .await
+        });
+
+        // The client half-closes normally. The remote keeps its write half
+        // open without sending data, so only the relay's idle guard can finish
+        // the remaining direction.
+        local.shutdown().await.expect("client half-close");
+        let mut request = Vec::new();
+        remote
+            .read_to_end(&mut request)
+            .await
+            .expect("remote observes forwarded EOF");
+
+        let report = tokio::time::timeout(Duration::from_secs(1), relay)
+            .await
+            .expect("relay idle guard deadline")
+            .expect("relay task")
+            .expect("relay result");
+        assert!(report.idle_timeout);
+        assert_eq!(report.uploaded, 0);
+        assert_eq!(report.downloaded, 0);
+    }
 
     #[tokio::test]
     async fn half_closed_stream_keeps_running_while_peer_makes_progress() {
@@ -493,7 +580,7 @@ mod tests {
         let (mut proxy_remote, mut remote) = duplex(1024);
 
         let relay = tokio::spawn(async move {
-            copy_buf_bidirectional_with_timeout(
+            copy_buf_bidirectional_with_report(
                 &mut proxy_local,
                 &mut proxy_remote,
                 256,
@@ -541,10 +628,13 @@ mod tests {
             .expect("local io");
         assert_eq!(response, b"chunk-1chunk-2chunk-3");
 
-        relay
+        let report = relay
             .await
             .expect("relay task join")
             .expect("relay should finish cleanly");
+        assert_eq!(report.uploaded, 3);
+        assert_eq!(report.downloaded, 21);
+        assert!(!report.idle_timeout);
     }
 
     struct NoHalfClose<T> {

@@ -5,7 +5,10 @@ mod tls;
 mod ws;
 mod xhttp;
 
-use crate::proxy::utils::NetworkPoolContext;
+#[cfg(any(feature = "hysteria", feature = "xhttp-h3"))]
+pub(crate) use xhttp::quinn_datagram::ConnectorUdpSocket;
+
+use crate::{app::flow::NetworkPathId, proxy::utils::NetworkPoolContext};
 
 pub mod shadow_tls;
 pub mod simple_obfs;
@@ -97,6 +100,23 @@ pub trait Transport: Send + Sync {
         _connector: &dyn crate::proxy::utils::RemoteConnector,
     ) -> std::io::Result<Option<super::AnyStream>> {
         Ok(None)
+    }
+
+    /// As above, with the local NIC paths used by transport-owned sockets.
+    /// The default can only report a path already present in the connector's
+    /// context; transports with their own path-aware pools should override it.
+    async fn connect_stream_with_connector_and_path_ids(
+        &self,
+        sess: &crate::session::Session,
+        resolver: crate::app::dns::ThreadSafeDNSResolver,
+        connector: &dyn crate::proxy::utils::RemoteConnector,
+    ) -> std::io::Result<Option<(super::AnyStream, Vec<NetworkPathId>)>> {
+        let pool_context =
+            connector.connection_pool_context(sess.iface.as_ref()).await;
+        Ok(self
+            .connect_stream_with_connector(sess, resolver, connector)
+            .await?
+            .map(|stream| (stream, pool_context.path_id.into_iter().collect())))
     }
 
     /// Return a logical stream from an already-owned underlying connection.

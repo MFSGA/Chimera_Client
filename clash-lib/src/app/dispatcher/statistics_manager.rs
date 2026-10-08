@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
-        Arc,
+        Arc, RwLock as StdRwLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -11,7 +11,7 @@ use memory_stats::memory_stats;
 use serde::Serialize;
 use tokio::sync::{Mutex, RwLock, oneshot::Sender};
 
-use crate::app::flow::FlowContext;
+use crate::app::flow::{FlowContext, NetworkPathId};
 use crate::{app::dispatcher::tracked::Tracked, session::Session};
 
 #[derive(Serialize, Clone, Debug, Default)]
@@ -36,6 +36,27 @@ impl ProxyChain {
 
 type ConnectionMap = HashMap<uuid::Uuid, (Tracked, Sender<()>)>;
 
+/// Why a tracked flow left the active connection table.
+///
+/// For TCP, `NetworkChanged` is recorded when a transport error coincides with
+/// an observed network-generation change. For UDP, it also records proactive
+/// association retirement or stale-dial rejection at a generation boundary.
+/// It identifies the lifecycle trigger, not proof that the network change was
+/// the sole cause of a transport failure.
+#[derive(Serialize, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum FlowEndReason {
+    Completed,
+    InboundClosed,
+    OutboundClosed,
+    IdleTimeout,
+    NetworkChanged,
+    IoError,
+    ControllerRequested,
+    #[default]
+    Unknown,
+}
+
 /// Lightweight snapshot kept after a connection closes.
 ///
 /// Unlike `TrackerInfo`, this does not retain the full `Session` or
@@ -53,6 +74,9 @@ pub struct ClosedFlowInfo {
     pub start_time: DateTime<Utc>,
     #[serde(rename = "chains")]
     pub proxy_chain: Vec<String>,
+    /// Physical local paths actually reported by the outbound connector.
+    #[serde(rename = "networkPaths", skip_serializing_if = "Vec::is_empty")]
+    pub network_paths: Vec<NetworkPathId>,
     pub rule: String,
     #[serde(rename = "rulePayload")]
     pub rule_payload: String,
@@ -62,6 +86,8 @@ pub struct ClosedFlowInfo {
     pub source_ip: String,
     pub country: Option<String>,
     pub asn: Option<String>,
+    #[serde(rename = "endReason")]
+    pub end_reason: FlowEndReason,
 }
 
 impl ClosedFlowInfo {
@@ -72,6 +98,7 @@ impl ClosedFlowInfo {
             download_total: info.download_total.load(Ordering::Acquire),
             start_time: info.start_time,
             proxy_chain: info.proxy_chain_holder.snapshot().await,
+            network_paths: info.network_paths.clone(),
             rule: info.rule.clone(),
             rule_payload: info.rule_payload.clone(),
             host: info.session_holder.destination.host(),
@@ -83,6 +110,7 @@ impl ClosedFlowInfo {
             source_ip: info.session_holder.source.ip().to_string(),
             country: info.session_holder.country.clone(),
             asn: info.session_holder.asn.clone(),
+            end_reason: info.end_reason(),
         }
     }
 }
@@ -159,6 +187,10 @@ impl StatisticsManager {
             return;
         };
 
+        self.record_closed(tracked).await;
+    }
+
+    async fn record_closed(&self, tracked: Tracked) {
         let info = tracked.tracker_info();
         let upload = info.user_upload.swap(0, Ordering::AcqRel);
         let download = info.user_download.swap(0, Ordering::AcqRel);
@@ -250,6 +282,7 @@ impl StatisticsManager {
                 ),
                 start_time: tracker.start_time,
                 proxy_chain: chain,
+                network_paths: tracker.network_paths.clone(),
                 rule: tracker.rule.clone(),
                 rule_payload: tracker.rule_payload.clone(),
                 ..Default::default()
@@ -265,12 +298,15 @@ impl StatisticsManager {
     }
 
     pub async fn close(&self, id: uuid::Uuid) -> bool {
-        let close_notify =
-            self.connections.lock().await.remove(&id).map(|(_, tx)| tx);
+        let tracked = self.connections.lock().await.remove(&id);
 
-        match close_notify {
-            Some(tx) => {
+        match tracked {
+            Some((tracked, tx)) => {
+                tracked
+                    .tracker_info()
+                    .set_end_reason(FlowEndReason::ControllerRequested);
                 let _ = tx.send(());
+                self.record_closed(tracked).await;
                 true
             }
             None => false,
@@ -278,17 +314,21 @@ impl StatisticsManager {
     }
 
     pub async fn close_all(&self) -> usize {
-        let close_notifiers = {
+        let tracked_connections = {
             let mut connections = self.connections.lock().await;
             connections
                 .drain()
-                .map(|(_, (_, tx))| tx)
+                .map(|(_, (tracked, tx))| (tracked, tx))
                 .collect::<Vec<_>>()
         };
 
-        let count = close_notifiers.len();
-        for tx in close_notifiers {
+        let count = tracked_connections.len();
+        for (tracked, tx) in tracked_connections {
+            tracked
+                .tracker_info()
+                .set_end_reason(FlowEndReason::ControllerRequested);
             let _ = tx.send(());
+            self.record_closed(tracked).await;
         }
         count
     }
@@ -344,6 +384,9 @@ pub struct TrackerInfo {
     pub start_time: DateTime<Utc>,
     #[serde(rename = "chains")]
     pub proxy_chain: Vec<String>,
+    /// Local path identities captured when this stream or datagram was opened.
+    #[serde(rename = "networkPaths", skip_serializing_if = "Vec::is_empty")]
+    pub network_paths: Vec<NetworkPathId>,
     pub rule: String,
     #[serde(rename = "rulePayload")]
     pub rule_payload: String,
@@ -365,6 +408,27 @@ pub struct TrackerInfo {
     pub user_upload: AtomicU64,
     #[serde(skip)]
     pub user_download: AtomicU64,
+
+    /// Updated at the stream boundary and copied into the lightweight closed
+    /// history. Keeping it out of the active connection JSON preserves that
+    /// API's existing shape.
+    #[serde(skip)]
+    pub(super) end_reason: StdRwLock<FlowEndReason>,
+}
+
+impl TrackerInfo {
+    pub fn set_end_reason(&self, reason: FlowEndReason) {
+        if let Ok(mut current) = self.end_reason.write() {
+            *current = reason;
+        }
+    }
+
+    pub fn end_reason(&self) -> FlowEndReason {
+        self.end_reason
+            .read()
+            .map(|reason| *reason)
+            .unwrap_or(FlowEndReason::Unknown)
+    }
 }
 
 #[derive(Serialize, Debug, PartialEq, Eq)]
@@ -390,20 +454,33 @@ mod tests {
 
     use chrono::Utc;
 
-    use crate::session::{Network, Session, SocksAddr};
+    use crate::{
+        app::flow::{AddressFamily, InterfaceId, NetworkPathId},
+        session::{Network, Session, SocksAddr},
+    };
 
-    use super::{ClosedFlowInfo, StatisticsManager, TrackerInfo};
+    use super::{ClosedFlowInfo, FlowEndReason, StatisticsManager, TrackerInfo};
 
     #[tokio::test]
     async fn closed_flow_info_extracts_only_flow_fields() {
         let chain = super::ProxyChain::default();
         chain.push("proxy-a".to_string()).await;
+        let path = NetworkPathId {
+            interface: InterfaceId {
+                name: "wifi0".to_owned(),
+                index: 4,
+            },
+            family: AddressFamily::Ipv4,
+            source_address: Some("192.0.2.10".parse().unwrap()),
+            network_generation: 7,
+        };
         let info = TrackerInfo {
             uuid: uuid::Uuid::new_v4(),
             upload_total: AtomicU64::new(12),
             download_total: AtomicU64::new(34),
             start_time: Utc::now(),
             proxy_chain_holder: chain,
+            network_paths: vec![path.clone()],
             rule: "MATCH".to_string(),
             rule_payload: "payload".to_string(),
             session_holder: Session {
@@ -427,8 +504,34 @@ mod tests {
         assert_eq!(flow.network, "udp");
         assert_eq!(flow.source_ip, "127.0.0.1");
         assert_eq!(flow.proxy_chain, vec!["proxy-a"]);
+        assert_eq!(flow.network_paths, vec![path]);
         assert_eq!(flow.country.as_deref(), Some("US"));
         assert_eq!(flow.asn.as_deref(), Some("AS-example"));
+        assert_eq!(flow.end_reason, FlowEndReason::Unknown);
+    }
+
+    #[tokio::test]
+    async fn controller_close_is_retained_with_an_explicit_reason() {
+        let manager = StatisticsManager::new();
+        let (io, _peer) = tokio::io::duplex(64);
+        let stream = crate::app::dispatcher::TrackedStream::new(
+            Box::new(crate::app::dispatcher::ChainedStreamWrapper::new(io)),
+            manager.clone(),
+            Session::default(),
+            None,
+        )
+        .await;
+        let id = stream.id();
+
+        assert!(manager.close(id).await);
+        drop(stream);
+
+        let closed = manager.closed_flows_snapshot().await;
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].uuid, id);
+        assert_eq!(closed[0].end_reason, FlowEndReason::ControllerRequested);
+        let json = serde_json::to_value(&closed[0]).unwrap();
+        assert_eq!(json["endReason"], "controllerRequested");
     }
 
     #[tokio::test]

@@ -145,7 +145,7 @@ impl Handler {
         sess: &Session,
         is_udp: bool,
         pool_context: &NetworkPoolContext,
-    ) -> io::Result<Option<AnyStream>> {
+    ) -> io::Result<Option<(AnyStream, Vec<crate::app::flow::NetworkPathId>)>> {
         if self.opts.flow.as_deref() == Some("xtls-rprx-vision") {
             return Ok(None);
         }
@@ -160,13 +160,17 @@ impl Handler {
             return Ok(None);
         };
 
-        Ok(Some(self.wrap_vless_stream(
-            stream,
-            sess,
-            is_udp,
-            None,
-            Some(&connected_context),
-        )?))
+        let path_ids = connected_context.path_id.clone().into_iter().collect();
+        Ok(Some((
+            self.wrap_vless_stream(
+                stream,
+                sess,
+                is_udp,
+                None,
+                Some(&connected_context),
+            )?,
+            path_ids,
+        )))
     }
 
     async fn try_transport_owned_stream(
@@ -175,7 +179,7 @@ impl Handler {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
         is_udp: bool,
-    ) -> io::Result<Option<AnyStream>> {
+    ) -> io::Result<Option<(AnyStream, Vec<crate::app::flow::NetworkPathId>)>> {
         if self.opts.flow.as_deref() == Some("xtls-rprx-vision") {
             return Ok(None);
         }
@@ -183,16 +187,17 @@ impl Handler {
         let Some(transport) = self.opts.transport.as_ref() else {
             return Ok(None);
         };
-        let Some(stream) = transport
-            .connect_stream_with_connector(sess, resolver, connector)
+        let Some((stream, path_ids)) = transport
+            .connect_stream_with_connector_and_path_ids(sess, resolver, connector)
             .await?
         else {
             return Ok(None);
         };
 
-        Ok(Some(
+        Ok(Some((
             self.wrap_vless_stream(stream, sess, is_udp, None, None)?,
-        ))
+            path_ids,
+        )))
     }
 
     async fn inner_proxy_stream(
@@ -317,19 +322,21 @@ impl OutboundHandler for Handler {
     ) -> io::Result<BoxedChainedStream> {
         let pool_context =
             connector.connection_pool_context(sess.iface.as_ref()).await;
-        if let Some(stream) = self
+        if let Some((stream, path_ids)) = self
             .try_reuse_transport_stream(sess, false, &pool_context)
             .await?
         {
-            let chained = ChainedStreamWrapper::new(stream);
+            let chained =
+                ChainedStreamWrapper::new_with_network_path_ids(stream, path_ids);
             chained.append_to_chain(self.name()).await;
             return Ok(Box::new(chained));
         }
-        if let Some(stream) = self
+        if let Some((stream, path_ids)) = self
             .try_transport_owned_stream(sess, resolver.clone(), connector, false)
             .await?
         {
-            let chained = ChainedStreamWrapper::new(stream);
+            let chained =
+                ChainedStreamWrapper::new_with_network_path_ids(stream, path_ids);
             chained.append_to_chain(self.name()).await;
             return Ok(Box::new(chained));
         }
@@ -346,10 +353,12 @@ impl OutboundHandler for Handler {
             )
             .await?;
 
+        let network_path_id = connected_pool_context.path_id.clone();
         let s = self
             .inner_proxy_stream(stream, sess, false, connected_pool_context)
             .await?;
-        let chained = ChainedStreamWrapper::new(s);
+        let chained =
+            ChainedStreamWrapper::new_with_network_path_id(s, network_path_id);
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
     }
@@ -362,23 +371,27 @@ impl OutboundHandler for Handler {
     ) -> io::Result<BoxedChainedDatagram> {
         let pool_context =
             connector.connection_pool_context(sess.iface.as_ref()).await;
-        if let Some(stream) = self
+        if let Some((stream, path_ids)) = self
             .try_reuse_transport_stream(sess, true, &pool_context)
             .await?
         {
             let datagram =
                 OutboundDatagramVless::new(stream, sess.destination.clone());
-            let chained = ChainedDatagramWrapper::new(datagram);
+            let chained = ChainedDatagramWrapper::new_with_network_path_ids(
+                datagram, path_ids,
+            );
             chained.append_to_chain(self.name()).await;
             return Ok(Box::new(chained));
         }
-        if let Some(stream) = self
+        if let Some((stream, path_ids)) = self
             .try_transport_owned_stream(sess, resolver.clone(), connector, true)
             .await?
         {
             let datagram =
                 OutboundDatagramVless::new(stream, sess.destination.clone());
-            let chained = ChainedDatagramWrapper::new(datagram);
+            let chained = ChainedDatagramWrapper::new_with_network_path_ids(
+                datagram, path_ids,
+            );
             chained.append_to_chain(self.name()).await;
             return Ok(Box::new(chained));
         }
@@ -395,12 +408,13 @@ impl OutboundHandler for Handler {
             )
             .await?;
 
+        let path_ids = connected_pool_context.path_id.clone().into_iter().collect();
         let stream = self
             .inner_proxy_stream(stream, sess, true, connected_pool_context)
             .await?;
         let d = OutboundDatagramVless::new(stream, sess.destination.clone());
 
-        let chained = ChainedDatagramWrapper::new(d);
+        let chained = ChainedDatagramWrapper::new_with_network_path_ids(d, path_ids);
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
     }

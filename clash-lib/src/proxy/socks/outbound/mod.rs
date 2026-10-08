@@ -279,7 +279,10 @@ impl OutboundHandler for Handler {
             &sess.destination,
             crate::app::runtime_state::TrafficKind::ProxyTcp,
         );
-        let chained = ChainedStreamWrapper::new(stream);
+        let chained = ChainedStreamWrapper::new_with_network_path_id(
+            stream,
+            pool_context.path_id.clone(),
+        );
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
     }
@@ -290,19 +293,25 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
     ) -> std::io::Result<BoxedChainedDatagram> {
-        let stream = connector
-            .connect_stream(
+        let pool_context =
+            connector.connection_pool_context(sess.iface.as_ref()).await;
+        let (stream, pool_context) = connector
+            .connect_stream_with_pool_context(
                 resolver.clone(),
                 self.opts.server.as_str(),
                 self.opts.port,
                 sess.iface.as_ref(),
                 #[cfg(target_os = "linux")]
                 sess.so_mark,
+                pool_context,
             )
             .await?;
 
         let datagram = self.inner_connect_datagram(stream, sess, resolver).await?;
-        let chained = ChainedDatagramWrapper::new(datagram);
+        let chained = ChainedDatagramWrapper::new_with_network_path_id(
+            datagram,
+            pool_context.path_id,
+        );
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
     }

@@ -44,6 +44,10 @@ pub fn status_routes(
             "/network/path-decision/{flow_id}",
             axum::routing::get(path_decision),
         )
+        .route(
+            "/network/path-decisions",
+            axum::routing::get(path_decisions),
+        )
         .with_state(NetworkState { global })
 }
 
@@ -118,6 +122,13 @@ async fn path_decision(
                 "path decision not found or expired".to_owned(),
             )
         })
+}
+
+async fn path_decisions(
+    State(state): State<NetworkState>,
+) -> Json<Vec<crate::app::flow::PathDecisionRecord>> {
+    let status = state.global.lock().await.network_status.clone();
+    Json(status.write().await.path_decisions_snapshot())
 }
 
 async fn reset_network(

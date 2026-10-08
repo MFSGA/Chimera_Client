@@ -1,17 +1,26 @@
 //! Network-change observation shared by automatic and requested recovery.
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use std::{io, net::IpAddr, time::Duration};
 
 use serde::Serialize;
+#[cfg(target_os = "linux")]
+use std::sync::LazyLock;
 use tokio::time::Instant;
 
 use super::flow::{AddressFamily, InterfaceId, InterfaceKind};
 
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) const RECOVERY_TIMEOUT: Duration = Duration::from_secs(15);
-pub(crate) const AUTOMATIC_SUPPORTED: bool = cfg!(target_os = "macos");
+pub(crate) const AUTOMATIC_SUPPORTED: bool =
+    cfg!(any(target_os = "linux", target_os = "macos"));
+
+#[cfg(target_os = "linux")]
+static LINUX_NETLINK_HANDLE: tokio::sync::OnceCell<rtnetlink::Handle> =
+    tokio::sync::OnceCell::const_new();
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -84,6 +93,8 @@ pub(crate) struct NetworkPath {
 pub(crate) enum DefaultRouteEvidence {
     PrimaryDefaultRoute,
     OtherInterface,
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    AmbiguousDefaultRoute,
     NoPrimaryRouteObserved,
 }
 
@@ -108,7 +119,7 @@ pub(crate) enum TunCandidateExclusion {
 }
 
 impl TunCandidateExclusion {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn excludes(&self, interface_name: &str) -> bool {
         match self {
             Self::Disabled => false,
@@ -116,6 +127,9 @@ impl TunCandidateExclusion {
             Self::Unidentified => {
                 interface_name.starts_with("utun")
                     || interface_name.starts_with("tun")
+                    || (cfg!(target_os = "linux")
+                        && (interface_name.starts_with("tap")
+                            || interface_name.starts_with("wg")))
             }
         }
     }
@@ -155,7 +169,7 @@ impl PartialEq for PathCandidateObservation {
 impl Eq for PathCandidateObservation {}
 
 /// The per-address capability list is bounded before it reaches status/API.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const MAX_PATH_CANDIDATES: usize = 128;
 
 #[derive(Clone, Debug, Default)]
@@ -164,6 +178,9 @@ pub(crate) struct NetworkSnapshot {
     pub ipv6: Option<NetworkPath>,
     pub dns: String,
     pub interfaces: Vec<String>,
+    /// Route-table facts that affect candidate selection, including ambiguous
+    /// defaults that cannot be reduced to one primary path.
+    pub route_signatures: Vec<String>,
     pub path_candidates: Vec<PathCandidateObservation>,
     pub path_candidates_truncated: usize,
     pub tun_candidate_exclusion: TunCandidateExclusion,
@@ -175,6 +192,7 @@ impl PartialEq for NetworkSnapshot {
             && self.ipv6 == other.ipv6
             && self.dns == other.dns
             && self.interfaces == other.interfaces
+            && self.route_signatures == other.route_signatures
             && self.path_candidates == other.path_candidates
             && self.path_candidates_truncated == other.path_candidates_truncated
             && self.tun_candidate_exclusion == other.tun_candidate_exclusion
@@ -246,6 +264,7 @@ impl NetworkSnapshot {
         self.ipv4 != previous.ipv4
             || self.ipv6 != previous.ipv6
             || self.interfaces != previous.interfaces
+            || self.route_signatures != previous.route_signatures
             || self.path_candidates != previous.path_candidates
     }
 }
@@ -589,6 +608,17 @@ pub(crate) async fn snapshot_with_tun(
         };
         let ipv4_route = parse_primary_route(&v4, &interfaces);
         let ipv6_route = parse_primary_route(&v6, &interfaces);
+        let route_signatures = [
+            ipv4_route.as_ref().map(|route| {
+                format!("ipv4:{}:{:?}", route.interface_index, route.gateway)
+            }),
+            ipv6_route.as_ref().map(|route| {
+                format!("ipv6:{}:{:?}", route.interface_index, route.gateway)
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         let mut path_candidates = collect_path_candidates(
             &interfaces,
             ipv4_route.as_ref(),
@@ -628,6 +658,7 @@ pub(crate) async fn snapshot_with_tun(
             ipv6: parse_path(&v6, &interfaces, true),
             dns,
             interfaces: physical_interfaces,
+            route_signatures,
             path_candidates,
             path_candidates_truncated,
             tun_candidate_exclusion,
@@ -639,24 +670,746 @@ pub(crate) async fn snapshot_with_tun(
     })?
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LinuxLinkState {
+    admin_up: bool,
+    lower_up: Option<bool>,
+    oper_down: bool,
+    carrier: Option<bool>,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxLinkState {
+    /// A local bind probe alone can succeed on an administratively-down link.
+    /// Reject known-down links before advertising them as selectable paths.
+    fn unavailable_reason(&self) -> Option<String> {
+        if !self.admin_up {
+            Some("interface is administratively down".to_owned())
+        } else if self.oper_down {
+            Some("interface operational state is down".to_owned())
+        } else if self.lower_up == Some(false) || self.carrier == Some(false) {
+            Some("interface has no lower-layer carrier".to_owned())
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LinuxDefaultRoute {
+    interface_index: u32,
+    family: AddressFamily,
+    gateway: Option<IpAddr>,
+    metric: u32,
+}
+
+#[cfg(target_os = "linux")]
+async fn linux_netlink_handle() -> io::Result<&'static rtnetlink::Handle> {
+    LINUX_NETLINK_HANDLE
+        .get_or_try_init(|| async {
+            let (connection, handle, _) =
+                rtnetlink::new_connection().map_err(io::Error::other)?;
+            tokio::spawn(connection);
+            Ok(handle)
+        })
+        .await
+}
+
+#[cfg(target_os = "linux")]
+fn linux_route_address_to_ip(
+    address: &rtnetlink::packet_route::route::RouteAddress,
+) -> Option<IpAddr> {
+    use rtnetlink::packet_route::route::RouteAddress;
+
+    match address {
+        RouteAddress::Inet(address) => Some(IpAddr::V4(*address)),
+        RouteAddress::Inet6(address) => Some(IpAddr::V6(*address)),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_route_table(message: &rtnetlink::packet_route::route::RouteMessage) -> u32 {
+    use rtnetlink::packet_route::route::RouteAttribute;
+
+    message
+        .attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            RouteAttribute::Table(table) => Some(*table),
+            _ => None,
+        })
+        .unwrap_or(u32::from(message.header.table))
+}
+
+/// Keep only effective main-table unicast defaults. Policy-routing rules and
+/// multipath nexthop groups are not flattened into a guessed primary path; the
+/// host snapshot and later Linux acceptance need to preserve that distinction.
+#[cfg(target_os = "linux")]
+fn parse_linux_default_route(
+    message: &rtnetlink::packet_route::route::RouteMessage,
+) -> Option<LinuxDefaultRoute> {
+    use rtnetlink::packet_route::{
+        AddressFamily as NetlinkFamily,
+        route::{RouteAttribute, RouteType},
+    };
+
+    if message.header.destination_prefix_length != 0
+        || message.header.kind != RouteType::Unicast
+    {
+        return None;
+    }
+
+    let family = match message.header.address_family {
+        NetlinkFamily::Inet => AddressFamily::Ipv4,
+        NetlinkFamily::Inet6 => AddressFamily::Ipv6,
+        _ => return None,
+    };
+    let mut interface_index = None;
+    let mut gateway = None;
+    let table = linux_route_table(message);
+    let mut metric = 0;
+    for attribute in &message.attributes {
+        match attribute {
+            RouteAttribute::Destination(address) => {
+                // Linux normally omits RTA_DST for a default route. If it is
+                // present, only accept the family-specific unspecified value.
+                if linux_route_address_to_ip(address)
+                    .is_some_and(|address| !address.is_unspecified())
+                {
+                    return None;
+                }
+            }
+            RouteAttribute::Oif(index) => interface_index = Some(*index),
+            RouteAttribute::Gateway(address) => {
+                gateway = linux_route_address_to_ip(address);
+            }
+            RouteAttribute::Priority(value) => metric = *value,
+            _ => {}
+        }
+    }
+
+    // Table 254 is RT_TABLE_MAIN. Other tables may only apply under an
+    // unobserved policy rule, so treating one as global default would guess.
+    if table != 254 {
+        return None;
+    }
+
+    Some(LinuxDefaultRoute {
+        interface_index: interface_index?,
+        family,
+        gateway,
+        metric,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn select_linux_default_route(
+    routes: &[LinuxDefaultRoute],
+    family: AddressFamily,
+) -> Option<LinuxDefaultRoute> {
+    let minimum_metric = routes
+        .iter()
+        .filter(|route| route.family == family)
+        .map(|route| route.metric)
+        .min()?;
+    let mut best = routes
+        .iter()
+        .filter(|route| route.family == family && route.metric == minimum_metric);
+    let first = best.next()?.clone();
+
+    // Equal-cost defaults on distinct interfaces are real alternatives. Keep
+    // them in the candidate list and avoid labeling either one "primary".
+    best.all(|route| {
+        route.interface_index == first.interface_index
+            && route.gateway == first.gateway
+    })
+    .then_some(first)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_default_route_is_ambiguous(
+    routes: &[LinuxDefaultRoute],
+    family: AddressFamily,
+) -> bool {
+    let Some(minimum_metric) = routes
+        .iter()
+        .filter(|route| route.family == family)
+        .map(|route| route.metric)
+        .min()
+    else {
+        return false;
+    };
+    let mut best = routes
+        .iter()
+        .filter(|route| route.family == family && route.metric == minimum_metric);
+    let Some(first) = best.next() else {
+        return false;
+    };
+    best.any(|route| {
+        route.interface_index != first.interface_index
+            || route.gateway != first.gateway
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_interface_kind(interface_name: &str) -> InterfaceKind {
+    let sysfs_interface = Path::new("/sys/class/net").join(interface_name);
+    if sysfs_interface.join("wireless").exists() {
+        InterfaceKind::Wifi
+    } else {
+        // A sysfs device alone cannot distinguish Ethernet, cellular, and
+        // several virtual drivers. Keep the classification conservative;
+        // route and local-bind evidence still make the path usable.
+        InterfaceKind::Unknown
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_interface_path(
+    interfaces: &[network_interface::NetworkInterface],
+    route: Option<&LinuxDefaultRoute>,
+    tun_exclusion: &TunCandidateExclusion,
+) -> Option<NetworkPath> {
+    let route = route?;
+    let interface = interfaces.iter().find(|interface| {
+        interface.index == route.interface_index
+            && !interface.internal
+            && !tun_exclusion.excludes(&interface.name)
+    })?;
+    let mut addresses = interface
+        .addr
+        .iter()
+        .filter(|address| match route.family {
+            AddressFamily::Ipv4 => matches!(address, network_interface::Addr::V4(_)),
+            AddressFamily::Ipv6 => matches!(address, network_interface::Addr::V6(_)),
+        })
+        .map(|address| format!("{address:?}"))
+        .collect::<Vec<_>>();
+    addresses.sort();
+    if addresses.is_empty() {
+        return None;
+    }
+
+    Some(NetworkPath {
+        interface: interface.name.clone(),
+        index: interface.index,
+        gateway: route.gateway.map_or_else(String::new, |ip| ip.to_string()),
+        addresses,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn collect_linux_path_candidates<F>(
+    interfaces: &[network_interface::NetworkInterface],
+    links: &HashMap<u32, LinuxLinkState>,
+    ipv4_route: Option<&LinuxDefaultRoute>,
+    ipv6_route: Option<&LinuxDefaultRoute>,
+    ipv4_ambiguous: bool,
+    ipv6_ambiguous: bool,
+    tun_exclusion: &TunCandidateExclusion,
+    mut bind_probe: F,
+) -> Vec<PathCandidateObservation>
+where
+    F: FnMut(&str, u32, IpAddr) -> Result<(), String>,
+{
+    let mut candidates = Vec::new();
+    for interface in interfaces.iter().filter(|interface| {
+        !interface.internal
+            && interface.index != 0
+            && !tun_exclusion.excludes(&interface.name)
+    }) {
+        let link_state = links.get(&interface.index);
+        for address in &interface.addr {
+            let ip = address.ip();
+            if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+                continue;
+            }
+            let family = AddressFamily::from(ip);
+            let route = match family {
+                AddressFamily::Ipv4 => ipv4_route,
+                AddressFamily::Ipv6 => ipv6_route,
+            };
+            let route_ambiguous = match family {
+                AddressFamily::Ipv4 => ipv4_ambiguous,
+                AddressFamily::Ipv6 => ipv6_ambiguous,
+            };
+            let default_route = match route {
+                Some(route) if route.interface_index == interface.index => {
+                    DefaultRouteEvidence::PrimaryDefaultRoute
+                }
+                Some(_) => DefaultRouteEvidence::OtherInterface,
+                None if route_ambiguous => {
+                    DefaultRouteEvidence::AmbiguousDefaultRoute
+                }
+                None => DefaultRouteEvidence::NoPrimaryRouteObserved,
+            };
+            let gateway = route
+                .filter(|route| route.interface_index == interface.index)
+                .and_then(|route| route.gateway);
+            let bind_result = match link_state {
+                Some(state) => match state.unavailable_reason() {
+                    Some(reason) => Err(reason),
+                    None => bind_probe(&interface.name, interface.index, ip),
+                },
+                None => Err("link metadata unavailable from rtnetlink".to_owned()),
+            };
+            let (binding, binding_error) = match bind_result {
+                Ok(()) => (BindingStatus::Verified, None),
+                Err(error) => (BindingStatus::Failed, Some(error)),
+            };
+            let scope_id = match ip {
+                IpAddr::V6(address) if address.is_unicast_link_local() => {
+                    Some(interface.index)
+                }
+                _ => None,
+            };
+            candidates.push(PathCandidateObservation {
+                interface: InterfaceId {
+                    name: interface.name.clone(),
+                    index: interface.index,
+                },
+                interface_kind: linux_interface_kind(&interface.name),
+                family,
+                source_address: ip,
+                scope_id,
+                gateway,
+                default_route,
+                binding,
+                binding_error,
+            });
+        }
+    }
+    candidates.sort_by_key(|candidate| {
+        (
+            candidate.interface.name.clone(),
+            candidate.interface.index,
+            candidate.family as u8,
+            candidate.source_address.to_string(),
+        )
+    });
+    candidates
+}
+
+#[cfg(target_os = "linux")]
+fn linux_dns_signature(content: &str) -> String {
+    content
+        .lines()
+        .filter_map(|line| {
+            let line = line.split('#').next()?.trim();
+            let mut fields = line.split_whitespace();
+            let kind = fields.next()?;
+            let value = fields.collect::<Vec<_>>().join(" ");
+            matches!(kind, "nameserver" | "search" | "domain" | "options")
+                .then(|| format!("{kind} {value}"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Sample Linux interface/address state with rtnetlink and compare it to the
+/// main-table default route. This deliberately does no reachability probing;
+/// the existing traffic evidence remains the source of online health.
+#[cfg(target_os = "linux")]
 pub(crate) async fn snapshot() -> io::Result<NetworkSnapshot> {
     snapshot_with_tun(TunCandidateExclusion::Disabled).await
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+pub(crate) async fn snapshot_with_tun(
+    tun_candidate_exclusion: TunCandidateExclusion,
+) -> io::Result<NetworkSnapshot> {
+    use futures::TryStreamExt;
+    use network_interface::NetworkInterfaceConfig;
+    use rtnetlink::packet_route::{
+        link::{LinkAttribute, LinkFlags, State},
+        route::RouteMessage,
+    };
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let handle = linux_netlink_handle().await?;
+        let mut links = HashMap::new();
+        let mut link_messages = handle.link().get().execute();
+        while let Some(message) =
+            link_messages.try_next().await.map_err(io::Error::other)?
+        {
+            let mut name = None;
+            let lower_up = Some(message.header.flags.contains(LinkFlags::LowerUp));
+            let mut oper_down = false;
+            let mut carrier = None;
+            for attribute in &message.attributes {
+                match attribute {
+                    LinkAttribute::IfName(value) => name = Some(value.clone()),
+                    LinkAttribute::OperState(
+                        State::Down | State::LowerLayerDown,
+                    ) => {
+                        oper_down = true;
+                    }
+                    LinkAttribute::OperState(_) => oper_down = false,
+                    LinkAttribute::Carrier(value) => carrier = Some(*value != 0),
+                    _ => {}
+                }
+            }
+            if name.is_some() {
+                links.insert(
+                    message.header.index,
+                    LinuxLinkState {
+                        admin_up: message.header.flags.contains(LinkFlags::Up),
+                        lower_up,
+                        oper_down,
+                        carrier,
+                    },
+                );
+            }
+        }
+
+        let interfaces =
+            network_interface::NetworkInterface::show().map_err(io::Error::other)?;
+        let mut route_messages =
+            handle.route().get(RouteMessage::default()).execute();
+        let mut routes = Vec::new();
+        let mut route_signatures = Vec::new();
+        while let Some(message) =
+            route_messages.try_next().await.map_err(io::Error::other)?
+        {
+            if message.header.destination_prefix_length == 0
+                && message.header.kind
+                    == rtnetlink::packet_route::route::RouteType::Unicast
+                && linux_route_table(&message) == 254
+            {
+                // Retain raw default-route facts as a change signature even
+                // when ECMP/multipath cannot be represented by one interface.
+                route_signatures.push(format!("{message:?}"));
+            }
+            if let Some(route) = parse_linux_default_route(&message) {
+                routes.push(route);
+            }
+        }
+        route_signatures.sort();
+        let ipv4_ambiguous =
+            linux_default_route_is_ambiguous(&routes, AddressFamily::Ipv4);
+        let ipv6_ambiguous =
+            linux_default_route_is_ambiguous(&routes, AddressFamily::Ipv6);
+        let ipv4_route = select_linux_default_route(&routes, AddressFamily::Ipv4);
+        let ipv6_route = select_linux_default_route(&routes, AddressFamily::Ipv6);
+        let mut path_candidates = collect_linux_path_candidates(
+            &interfaces,
+            &links,
+            ipv4_route.as_ref(),
+            ipv6_route.as_ref(),
+            ipv4_ambiguous,
+            ipv6_ambiguous,
+            &tun_candidate_exclusion,
+            |name, index, address| {
+                crate::proxy::utils::socket_helpers::probe_outbound_path_binding(
+                    name, index, address,
+                )
+                .map_err(|error| error.to_string())
+            },
+        );
+        let path_candidates_truncated =
+            path_candidates.len().saturating_sub(MAX_PATH_CANDIDATES);
+        path_candidates.truncate(MAX_PATH_CANDIDATES);
+
+        let mut interface_signatures = interfaces
+            .iter()
+            .filter(|interface| {
+                !interface.internal
+                    && !tun_candidate_exclusion.excludes(&interface.name)
+            })
+            .map(|interface| {
+                let mut addresses = interface
+                    .addr
+                    .iter()
+                    .map(|address| format!("{address:?}"))
+                    .collect::<Vec<_>>();
+                addresses.sort();
+                format!(
+                    "{}:{}:{addresses:?}:{:?}",
+                    interface.name,
+                    interface.index,
+                    links.get(&interface.index)
+                )
+            })
+            .collect::<Vec<_>>();
+        interface_signatures.sort();
+
+        // resolv.conf may point at a local systemd-resolved stub. We record
+        // exactly the visible resolver configuration and keep DNS failures
+        // from disabling link/address observation; backend-specific resolver
+        // changes remain a Linux integration-test item.
+        let dns = match tokio::fs::read_to_string("/etc/resolv.conf").await {
+            Ok(content) => linux_dns_signature(&content),
+            Err(error) => {
+                tracing::debug!(%error, "Linux resolver configuration unavailable");
+                format!("unavailable:{:?}", error.kind())
+            }
+        };
+
+        Ok(NetworkSnapshot {
+            ipv4: linux_interface_path(
+                &interfaces,
+                ipv4_route.as_ref(),
+                &tun_candidate_exclusion,
+            ),
+            ipv6: linux_interface_path(
+                &interfaces,
+                ipv6_route.as_ref(),
+                &tun_candidate_exclusion,
+            ),
+            dns,
+            interfaces: interface_signatures,
+            route_signatures,
+            path_candidates,
+            path_candidates_truncated,
+            tun_candidate_exclusion,
+        })
+    })
+    .await
+    .map_err(|_| {
+        io::Error::new(io::ErrorKind::TimedOut, "Linux network snapshot timed out")
+    })?
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) async fn snapshot() -> io::Result<NetworkSnapshot> {
+    snapshot_with_tun(TunCandidateExclusion::Disabled).await
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) async fn snapshot_with_tun(
     _tun_candidate_exclusion: TunCandidateExclusion,
 ) -> io::Result<NetworkSnapshot> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "automatic network observation is currently supported on macOS",
+        "automatic network observation is currently supported on Linux and macOS",
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    fn linux_default_route(
+        destination: IpAddr,
+        interface_index: u32,
+        gateway: IpAddr,
+        metric: u32,
+    ) -> rtnetlink::packet_route::route::RouteMessage {
+        use rtnetlink::RouteMessageBuilder;
+
+        RouteMessageBuilder::<IpAddr>::new()
+            .destination_prefix(destination, 0)
+            .unwrap()
+            .output_interface(interface_index)
+            .gateway(gateway)
+            .unwrap()
+            .priority(metric)
+            .build()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_default_route_parser_preserves_family_gateway_and_metric() {
+        let message = linux_default_route(
+            "0.0.0.0".parse().unwrap(),
+            12,
+            "192.0.2.1".parse().unwrap(),
+            40,
+        );
+
+        let route = parse_linux_default_route(&message).unwrap();
+        assert_eq!(route.family, AddressFamily::Ipv4);
+        assert_eq!(route.interface_index, 12);
+        assert_eq!(route.gateway, Some("192.0.2.1".parse().unwrap()));
+        assert_eq!(route.metric, 40);
+
+        // A subnet route must never become system-default evidence.
+        let subnet = linux_default_route(
+            "192.0.2.0".parse().unwrap(),
+            12,
+            "192.0.2.1".parse().unwrap(),
+            1,
+        );
+        assert!(parse_linux_default_route(&subnet).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_default_route_selection_uses_metric_and_keeps_ecmp_ambiguous() {
+        let slow = parse_linux_default_route(&linux_default_route(
+            "0.0.0.0".parse().unwrap(),
+            12,
+            "192.0.2.1".parse().unwrap(),
+            100,
+        ))
+        .unwrap();
+        let fast = parse_linux_default_route(&linux_default_route(
+            "0.0.0.0".parse().unwrap(),
+            13,
+            "198.51.100.1".parse().unwrap(),
+            20,
+        ))
+        .unwrap();
+        assert_eq!(
+            select_linux_default_route(
+                &[slow.clone(), fast.clone()],
+                AddressFamily::Ipv4
+            ),
+            Some(fast.clone())
+        );
+
+        let equal_cost = LinuxDefaultRoute {
+            metric: fast.metric,
+            interface_index: 14,
+            ..fast.clone()
+        };
+        let ecmp = [fast.clone(), equal_cost];
+        assert!(linux_default_route_is_ambiguous(&ecmp, AddressFamily::Ipv4));
+        assert_eq!(select_linux_default_route(&ecmp, AddressFamily::Ipv4), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_dns_signature_tracks_resolver_directives_without_comments() {
+        let before = linux_dns_signature(
+            "# generated file\nnameserver 192.0.2.53 # local stub\nsearch corp.example\noptions timeout:2\n",
+        );
+        let after = linux_dns_signature(
+            "nameserver 192.0.2.54\nsearch corp.example\noptions timeout:2\n",
+        );
+
+        assert_ne!(before, after);
+        assert_eq!(linux_dns_signature("# only comments\n\n"), String::new());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_known_link_failure_is_not_overridden_by_local_bind_evidence() {
+        use network_interface::{Addr, NetworkInterface, V4IfAddr};
+
+        let interface = NetworkInterface {
+            name: "offline-test0".to_owned(),
+            index: 12,
+            internal: false,
+            mac_addr: None,
+            addr: vec![Addr::V4(V4IfAddr {
+                ip: "192.0.2.2".parse().unwrap(),
+                broadcast: None,
+                netmask: None,
+            })],
+        };
+        let link = LinuxLinkState {
+            admin_up: true,
+            lower_up: Some(false),
+            oper_down: false,
+            carrier: Some(false),
+        };
+        let links = HashMap::from([(12, link.clone())]);
+        let route = LinuxDefaultRoute {
+            interface_index: 12,
+            family: AddressFamily::Ipv4,
+            gateway: Some("192.0.2.1".parse().unwrap()),
+            metric: 10,
+        };
+        let mut bind_probe_called = false;
+        let candidates = collect_linux_path_candidates(
+            &[interface],
+            &links,
+            Some(&route),
+            None,
+            false,
+            false,
+            &TunCandidateExclusion::Disabled,
+            |_, _, _| {
+                bind_probe_called = true;
+                Ok(())
+            },
+        );
+
+        assert_eq!(
+            link.unavailable_reason().as_deref(),
+            Some("interface has no lower-layer carrier")
+        );
+        assert!(!bind_probe_called);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].binding, BindingStatus::Failed);
+        assert_eq!(
+            candidates[0].binding_error.as_deref(),
+            Some("interface has no lower-layer carrier")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_equal_cost_routes_are_reported_as_ambiguous_candidates() {
+        use network_interface::{Addr, NetworkInterface, V4IfAddr};
+
+        let interfaces = [12, 13].map(|index| NetworkInterface {
+            name: format!("test{index}"),
+            index,
+            internal: false,
+            mac_addr: None,
+            addr: vec![Addr::V4(V4IfAddr {
+                ip: format!("192.0.2.{}", index - 10).parse().unwrap(),
+                broadcast: None,
+                netmask: None,
+            })],
+        });
+        let links = HashMap::from([12, 13].map(|index| {
+            (
+                index,
+                LinuxLinkState {
+                    admin_up: true,
+                    lower_up: Some(true),
+                    oper_down: false,
+                    carrier: Some(true),
+                },
+            )
+        }));
+        let routes = [
+            LinuxDefaultRoute {
+                interface_index: 12,
+                family: AddressFamily::Ipv4,
+                gateway: Some("192.0.2.1".parse().unwrap()),
+                metric: 10,
+            },
+            LinuxDefaultRoute {
+                interface_index: 13,
+                family: AddressFamily::Ipv4,
+                gateway: Some("192.0.2.129".parse().unwrap()),
+                metric: 10,
+            },
+        ];
+        let candidates = collect_linux_path_candidates(
+            &interfaces,
+            &links,
+            None,
+            None,
+            true,
+            false,
+            &TunCandidateExclusion::Disabled,
+            |_, _, _| Ok(()),
+        );
+
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.iter().all(|candidate| {
+            candidate.default_route == DefaultRouteEvidence::AmbiguousDefaultRoute
+                && candidate.binding == BindingStatus::Verified
+                && candidate.gateway.is_none()
+        }));
+        assert!(linux_default_route_is_ambiguous(
+            &routes,
+            AddressFamily::Ipv4
+        ));
+    }
+
+    // These pure parser tests are the contract layer for future `ip netns`
+    // validation. The runtime test must additionally flip each veth and verify
+    // `/network` generations, direct dials, DNS, and service-side responses.
 
     #[tokio::test]
     async fn sampler_publishes_latest_sample_and_stops_on_cancellation() {
@@ -729,6 +1482,21 @@ mod tests {
         let mut observer = NetworkObserver::default();
         observer.applied(first);
         assert_eq!(observer.observe(&next, Instant::now()), Some(true));
+    }
+
+    #[test]
+    fn default_route_table_change_is_a_path_change_even_when_no_primary_is_selected()
+    {
+        let first = NetworkSnapshot {
+            route_signatures: vec!["default via 192.0.2.1 metric 100".to_owned()],
+            ..Default::default()
+        };
+        let next = NetworkSnapshot {
+            route_signatures: vec!["default via 192.0.2.2 metric 100".to_owned()],
+            ..Default::default()
+        };
+
+        assert!(next.path_changed(&first));
     }
 
     #[cfg(target_os = "macos")]

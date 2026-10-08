@@ -15,7 +15,8 @@ use tracing::{Instrument, debug, error, info_span, instrument, trace, warn};
 use crate::{
     app::{
         dispatcher::{
-            TrackedStream, statistics_manager::StatisticsManager,
+            TrackedStream,
+            statistics_manager::{FlowEndReason, StatisticsManager, TrackerInfo},
             tracked::TrackedDatagram,
         },
         dns::{ClashResolver, ThreadSafeDNSResolver},
@@ -23,7 +24,7 @@ use crate::{
         path_policy::compile_path_plan,
         router::ThreadSafeRouter,
     },
-    common::io::{ShutdownMode, copy_bidirectional},
+    common::io::ShutdownMode,
     config::{
         def::RunMode,
         internal::proxy::{PROXY_DIRECT, PROXY_GLOBAL},
@@ -41,6 +42,79 @@ const DEFAULT_BUFFER_SIZE: usize = 64 * 1024;
 const UDP_SESSION_IDLE: Duration = Duration::from_secs(10);
 const UDP_FLOW_DECISION_MAX: usize = 1024;
 const UDP_HEALTH_PROOF_MAX: usize = 256;
+
+#[derive(Clone, Debug)]
+struct DirectPathPlanningError {
+    kind: std::io::ErrorKind,
+    message: String,
+    policy_generation: u64,
+    network_generation: u64,
+    candidate_paths: Vec<crate::app::flow::NetworkPathId>,
+    rejected: Vec<crate::app::flow::CandidateRejection>,
+}
+
+impl DirectPathPlanningError {
+    fn kind(&self) -> std::io::ErrorKind {
+        self.kind
+    }
+}
+
+impl std::fmt::Display for DirectPathPlanningError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DirectPathPlanningError {}
+
+async fn explain_versions_from_status(
+    status: Option<&Arc<RwLock<crate::app::network::NetworkStatus>>>,
+    fallback_network_version: u64,
+) -> (u64, u64, u64, u64) {
+    match status {
+        Some(status) => status.read().await.decision_versions(),
+        None => (0, 0, fallback_network_version, 0),
+    }
+}
+
+async fn store_path_decision(
+    status: Option<&Arc<RwLock<crate::app::network::NetworkStatus>>>,
+    decision: crate::app::flow::PathDecisionRecord,
+) {
+    if let Some(status) = status {
+        let _ = status.write().await.record_path_decision(decision);
+    }
+}
+
+fn classify_flow_end_reason(
+    result: &Result<
+        crate::common::io::BidirectionalCopyReport,
+        crate::common::io::CopyBidirectionalError,
+    >,
+    network_changed: bool,
+) -> FlowEndReason {
+    match result {
+        Ok(report) if report.idle_timeout => FlowEndReason::IdleTimeout,
+        Ok(_) => FlowEndReason::Completed,
+        Err(
+            crate::common::io::CopyBidirectionalError::LeftClosed(error)
+            | crate::common::io::CopyBidirectionalError::RightClosed(error)
+            | crate::common::io::CopyBidirectionalError::Other(error),
+        ) if error.kind() == std::io::ErrorKind::TimedOut => {
+            FlowEndReason::IdleTimeout
+        }
+        Err(_) if network_changed => FlowEndReason::NetworkChanged,
+        Err(crate::common::io::CopyBidirectionalError::LeftClosed(_)) => {
+            FlowEndReason::InboundClosed
+        }
+        Err(crate::common::io::CopyBidirectionalError::RightClosed(_)) => {
+            FlowEndReason::OutboundClosed
+        }
+        Err(crate::common::io::CopyBidirectionalError::Other(_)) => {
+            FlowEndReason::IoError
+        }
+    }
+}
 
 pub struct Dispatcher {
     outbound_manager: ThreadSafeOutboundManager,
@@ -62,6 +136,17 @@ impl Debug for Dispatcher {
 }
 
 impl Dispatcher {
+    async fn explain_versions(&self) -> (u64, u64, u64, u64) {
+        explain_versions_from_status(self.network_status.get(), 0).await
+    }
+
+    async fn record_path_decision(
+        &self,
+        decision: crate::app::flow::PathDecisionRecord,
+    ) {
+        store_path_decision(self.network_status.get(), decision).await;
+    }
+
     pub fn new(
         outbound_manager: ThreadSafeOutboundManager,
         router: ThreadSafeRouter,
@@ -104,7 +189,10 @@ impl Dispatcher {
         outbound_name: &str,
         rule: Option<&dyn crate::app::router::RuleMatcher>,
         connect_sess: &Session,
-    ) -> std::io::Result<Option<(crate::app::flow::DirectPathSelection, u64)>> {
+    ) -> Result<
+        Option<(crate::app::flow::DirectPathSelection, u64)>,
+        DirectPathPlanningError,
+    > {
         let endpoint_family = if outbound_name == PROXY_DIRECT {
             match &connect_sess.destination {
                 SocksAddr::Ip(address) => {
@@ -131,7 +219,10 @@ impl Dispatcher {
         rule: Option<&dyn crate::app::router::RuleMatcher>,
         connect_sess: &Session,
         endpoint_family: Option<crate::app::flow::AddressFamily>,
-    ) -> std::io::Result<Option<(crate::app::flow::DirectPathSelection, u64)>> {
+    ) -> Result<
+        Option<(crate::app::flow::DirectPathSelection, u64)>,
+        DirectPathPlanningError,
+    > {
         if outbound_name == PROXY_DIRECT
             && connect_sess.iface.is_none()
             && matches!(
@@ -242,6 +333,9 @@ impl Dispatcher {
                         }
                     }
                 }
+                selection
+                    .rejected
+                    .extend(family_result.decision.rejected.iter().cloned());
                 family_decisions.push((
                     family,
                     family_result.decision.reason,
@@ -274,10 +368,25 @@ impl Dispatcher {
             "compiled network path plan"
         );
         if can_apply && !has_candidate_path && requires_interface {
-            return Err(std::io::Error::other(format!(
-                "required outbound interface is unavailable for the resolved destination family: {:?}",
-                family_decisions
-            )));
+            let rejected = family_decisions
+                .iter()
+                .flat_map(|(_, _, _, rejected)| rejected.iter().cloned())
+                .collect::<Vec<_>>();
+            let mut candidate_paths = rejected
+                .iter()
+                .map(|rejection| rejection.path.clone())
+                .collect::<Vec<_>>();
+            candidate_paths.dedup();
+            return Err(DirectPathPlanningError {
+                kind: std::io::ErrorKind::NetworkUnreachable,
+                message: format!(
+                    "required outbound interface is unavailable for the resolved destination family: {family_decisions:?}"
+                ),
+                policy_generation: intent.policy_generation,
+                network_generation,
+                candidate_paths,
+                rejected,
+            });
         }
         Ok(has_candidate_path.then_some((selection, network_generation)))
     }
@@ -427,6 +536,12 @@ impl Dispatcher {
         };
 
         let rule_summary = rule_summary(rule.map(Box::as_ref));
+        let explain_flow_id = uuid::Uuid::new_v4();
+        let explain_versions_at_start = self.explain_versions().await;
+        let explain_route = crate::app::flow::RouteDecision {
+            outbound: outbound_name.to_owned(),
+            rule: Some(rule_summary.clone()),
+        };
         debug!("dispatching {} to {}[{}]", sess, outbound_name, mode);
 
         let mgr = self.outbound_manager.clone();
@@ -476,6 +591,34 @@ impl Dispatcher {
         {
             Ok(path) => path,
             Err(err) => {
+                let current_versions = self.explain_versions().await;
+                self.record_path_decision(crate::app::flow::PathDecisionRecord {
+                    flow_id: explain_flow_id,
+                    config_version: explain_versions_at_start.0,
+                    config_version_at_completion: (current_versions.0
+                        != explain_versions_at_start.0)
+                        .then_some(current_versions.0),
+                    policy_version: err.policy_generation,
+                    network_version: current_versions.2,
+                    operation_id: explain_versions_at_start.3,
+                    outcome: if current_versions.2 != err.network_generation {
+                        crate::app::flow::PathExecutionOutcome::StaleNetworkDiscarded
+                    } else {
+                        crate::app::flow::PathExecutionOutcome::PathPlanningFailed
+                    },
+                    route: explain_route.clone(),
+                    candidate_paths: err.candidate_paths.clone(),
+                    selected_path: None,
+                    rejected: err.rejected.clone(),
+                    failure_kind: Some(err.kind().to_string()),
+                    reason: if current_versions.2 != err.network_generation {
+                        "networkChangedDuringPathPlanning".to_owned()
+                    } else {
+                        err.to_string()
+                    },
+                    recorded_at_ms: chrono::Utc::now().timestamp_millis(),
+                })
+                .await;
                 warn!(
                     outbound_name,
                     destination = %connect_sess.destination,
@@ -552,33 +695,57 @@ impl Dispatcher {
         }
         match connect_result {
             Ok(mut rhs) => {
-                if let Some((_, planned_generation)) = &selected_path {
-                    let current_generation =
-                        if let Some(status) = self.network_status.get() {
-                            let status = status.read().await;
-                            status
-                                .shadow_path_snapshot()
-                                .map(|(generation, _, _)| generation)
-                        } else {
-                            None
-                        };
-                    if current_generation != Some(*planned_generation) {
-                        let _ = rhs.shutdown().await;
-                        if let Err(close_error) = lhs.shutdown().await {
-                            warn!(
-                                "error closing stale local connection {}: {}",
-                                sess, close_error
-                            )
-                        }
+                let observed_path_ids = rhs.network_path_ids();
+                let opened_network_generation = observed_path_ids
+                    .first()
+                    .map(|path| path.network_generation)
+                    .or_else(|| {
+                        selected_path.as_ref().map(|(_, generation)| *generation)
+                    });
+                let current_versions = self.explain_versions().await;
+                if opened_network_generation
+                    .is_some_and(|generation| generation != current_versions.2)
+                {
+                    let _ = rhs.shutdown().await;
+                    if let Err(close_error) = lhs.shutdown().await {
                         warn!(
-                            outbound_name,
-                            planned_network_generation = planned_generation,
-                            current_network_generation = ?current_generation,
-                            destination = %connect_sess.destination,
-                            "discarded connection completed on a stale network path"
-                        );
-                        return;
+                            "error closing stale local connection {}: {}",
+                            sess, close_error
+                        )
                     }
+                    self.record_path_decision(
+                        crate::app::flow::PathDecisionRecord {
+                            flow_id: explain_flow_id,
+                            config_version: explain_versions_at_start.0,
+                            config_version_at_completion:
+                                (current_versions.0 != explain_versions_at_start.0)
+                                    .then_some(current_versions.0),
+                            policy_version: selected_path
+                                .as_ref()
+                                .map_or(explain_versions_at_start.1, |(selection, _)| {
+                                    selection.policy_generation
+                                }),
+                            network_version: current_versions.2,
+                            operation_id: explain_versions_at_start.3,
+                            outcome: crate::app::flow::PathExecutionOutcome::StaleNetworkDiscarded,
+                            route: explain_route.clone(),
+                            candidate_paths: Vec::new(),
+                            selected_path: None,
+                            rejected: Vec::new(),
+                            failure_kind: None,
+                            reason: "networkChangedDuringDial".to_owned(),
+                            recorded_at_ms: chrono::Utc::now().timestamp_millis(),
+                        },
+                    )
+                    .await;
+                    warn!(
+                        outbound_name,
+                        opened_network_generation = ?opened_network_generation,
+                        current_network_generation = current_versions.2,
+                        destination = %connect_sess.destination,
+                        "discarded connection completed on a stale network path"
+                    );
+                    return;
                 }
                 debug!(
                     outbound_name,
@@ -588,76 +755,88 @@ impl Dispatcher {
                     destination = %sess.destination,
                     "remote connection established"
                 );
-                let rhs = TrackedStream::new_with_inbound_destination(
+                let connection_network_generation = opened_network_generation
+                    .or_else(|| {
+                        self.network_status.get().map(|_| current_versions.2)
+                    });
+                let rhs = TrackedStream::new_with_inbound_destination_and_id(
                     rhs,
                     self.manager.clone(),
                     sess.clone(),
                     inbound_destination,
                     rule.map(|matcher| matcher.as_ref()),
+                    explain_flow_id,
                 )
+                .await
+                .with_network_generation(connection_network_generation);
+                let tracker_info = rhs.tracker_info();
+                let mut candidate_paths = selected_path
+                    .as_ref()
+                    .map(|(selection, _)| {
+                        selection
+                            .ipv4_candidates
+                            .iter()
+                            .chain(selection.ipv6_candidates.iter())
+                            .map(|path| path.id.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                candidate_paths.dedup();
+                let selected_explain_path = executed_path_id
+                    .clone()
+                    .or_else(|| tracker_info.network_paths.first().cloned());
+                let policy_version = selected_path
+                    .as_ref()
+                    .map_or(explain_versions_at_start.1, |(selection, _)| {
+                        selection.policy_generation
+                    });
+                let network_version =
+                    opened_network_generation.unwrap_or(current_versions.2);
+                let reason = if executed_path_id.is_some() {
+                    "connectedOnBoundPath"
+                } else if selected_explain_path.is_some() {
+                    "connectedOnObservedPath"
+                } else if selected_path.is_some() {
+                    "connectedUsingSystemRouteFallback"
+                } else if outbound_name == PROXY_DIRECT {
+                    "connectedUsingSystemRoute"
+                } else {
+                    "connectedPathUnknown"
+                };
+                self.record_path_decision(crate::app::flow::PathDecisionRecord {
+                    flow_id: rhs.id(),
+                    config_version: explain_versions_at_start.0,
+                    config_version_at_completion: (current_versions.0
+                        != explain_versions_at_start.0)
+                        .then_some(current_versions.0),
+                    policy_version,
+                    network_version,
+                    operation_id: explain_versions_at_start.3,
+                    outcome: crate::app::flow::PathExecutionOutcome::Connected,
+                    route: explain_route.clone(),
+                    candidate_paths,
+                    selected_path: selected_explain_path,
+                    rejected: selected_path
+                        .as_ref()
+                        .map(|(selection, _)| selection.rejected.clone())
+                        .unwrap_or_default(),
+                    failure_kind: None,
+                    reason: reason.to_owned(),
+                    recorded_at_ms: chrono::Utc::now().timestamp_millis(),
+                })
                 .await;
-                if outbound_name == PROXY_DIRECT
-                    && let Some(status) = self.network_status.get()
-                {
-                    let mut candidate_paths = selected_path
-                        .as_ref()
-                        .map(|(selection, _)| {
-                            selection
-                                .ipv4_candidates
-                                .iter()
-                                .chain(selection.ipv6_candidates.iter())
-                                .map(|path| path.id.clone())
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
-                    candidate_paths.dedup();
-                    let mut status = status.write().await;
-                    let (current_policy_version, current_network_version) =
-                        status.policy_and_network_versions();
-                    let policy_version = selected_path
-                        .as_ref()
-                        .map_or(current_policy_version, |(selection, _)| {
-                            selection.policy_generation
-                        });
-                    let network_version = selected_path
-                        .as_ref()
-                        .map_or(current_network_version, |(_, generation)| {
-                            *generation
-                        });
-                    let reason = if executed_path_id.is_some() {
-                        "connectedOnBoundPath"
-                    } else if selected_path.is_some() {
-                        "connectedUsingSystemRouteFallback"
-                    } else {
-                        "connectedUsingSystemRoute"
-                    };
-                    let _ = status.record_path_decision(
-                        crate::app::flow::PathDecisionRecord {
-                            flow_id: rhs.id(),
-                            policy_version,
-                            network_version,
-                            route: crate::app::flow::RouteDecision {
-                                outbound: outbound_name.to_owned(),
-                                rule: Some(rule_summary.clone()),
-                            },
-                            candidate_paths,
-                            selected_path: executed_path_id.clone(),
-                            rejected: Vec::new(),
-                            reason: reason.to_owned(),
-                            recorded_at_ms: chrono::Utc::now().timestamp_millis(),
-                        },
-                    );
-                }
-                let rhs = rhs.with_traffic_proof(traffic_proof);
+                let flow_tracker = rhs.tracker_info();
+                let flow_network_generation = rhs.network_generation();
+                let mut rhs = rhs.with_traffic_proof(traffic_proof);
                 let shutdown_mode = if sess.typ == crate::session::Type::HttpConnect
                 {
                     ShutdownMode::FlushOnly
                 } else {
                     ShutdownMode::HalfClose
                 };
-                match copy_bidirectional(
+                let copy_result = crate::common::io::copy_bidirectional_with_report(
                     lhs,
-                    rhs,
+                    &mut rhs,
                     self.tcp_buffer_size,
                     Duration::from_secs(10),
                     Duration::from_secs(10),
@@ -667,12 +846,31 @@ impl Dispatcher {
                     "copy_bidirectional",
                     outbound_name = outbound_name,
                 ))
-                .await
-                {
-                    Ok((up, down)) => {
+                .await;
+                if flow_tracker.end_reason() == FlowEndReason::Unknown {
+                    let network_changed = if copy_result.is_err()
+                        && let Some(opened_generation) = flow_network_generation
+                        && let Some(status) = self.network_status.get()
+                    {
+                        status.read().await.shadow_path_snapshot().is_some_and(
+                            |(generation, _, _)| generation != opened_generation,
+                        )
+                    } else {
+                        false
+                    };
+                    // The flow could not be resumed at the transport layer.
+                    // A concurrent network-generation change is useful
+                    // diagnostic evidence, not proof of sole causality.
+                    flow_tracker.set_end_reason(classify_flow_end_reason(
+                        &copy_result,
+                        network_changed,
+                    ));
+                }
+                match copy_result {
+                    Ok(report) => {
                         debug!(
                             "connection {} closed with {} bytes up, {} bytes down",
-                            sess, up, down
+                            sess, report.uploaded, report.downloaded
                         );
                     }
                     Err(err) => match err {
@@ -737,6 +935,83 @@ impl Dispatcher {
                 if let Some(proof) = &traffic_proof {
                     proof.failed(err.kind());
                 }
+                let current_versions = self.explain_versions().await;
+                let proxy_endpoint_error = err.get_ref().and_then(|source| {
+                    source.downcast_ref::<
+                            crate::proxy::utils::ProxyEndpointConnectError,
+                        >()
+                });
+                let mut candidate_paths = selected_path
+                    .as_ref()
+                    .map(|(selection, generation)| {
+                        if *generation == current_versions.2 {
+                            selection
+                                .ipv4_candidates
+                                .iter()
+                                .chain(selection.ipv6_candidates.iter())
+                                .map(|path| path.id.clone())
+                                .collect::<Vec<_>>()
+                        } else {
+                            Vec::new()
+                        }
+                    })
+                    .unwrap_or_default();
+                if let Some(failure) = proxy_endpoint_error {
+                    candidate_paths
+                        .extend(failure.candidate_paths().iter().cloned());
+                }
+                candidate_paths.dedup();
+                let mut rejected = selected_path
+                    .as_ref()
+                    .map(|(selection, _)| selection.rejected.clone())
+                    .unwrap_or_default();
+                if let Some(failure) = proxy_endpoint_error {
+                    rejected.extend(failure.rejected().iter().cloned());
+                    rejected.dedup_by(|left, right| left == right);
+                }
+                let stale_network =
+                    current_versions.2 != explain_versions_at_start.2;
+                let reason = if outbound_name == PROXY_DIRECT {
+                    "directDialFailed".to_owned()
+                } else if let Some(failure) = proxy_endpoint_error {
+                    format!(
+                        "proxyEndpointDialFailed; attemptedPaths={:?}; {err}",
+                        failure.attempted_paths(),
+                    )
+                } else {
+                    "proxyDialFailedPathUnknown".to_owned()
+                };
+                self.record_path_decision(crate::app::flow::PathDecisionRecord {
+                    flow_id: explain_flow_id,
+                    config_version: explain_versions_at_start.0,
+                    config_version_at_completion: (current_versions.0
+                        != explain_versions_at_start.0)
+                        .then_some(current_versions.0),
+                    policy_version: selected_path
+                        .as_ref()
+                        .map_or(explain_versions_at_start.1, |(selection, _)| {
+                            selection.policy_generation
+                        }),
+                    network_version: current_versions.2,
+                    operation_id: explain_versions_at_start.3,
+                    outcome: if stale_network {
+                        crate::app::flow::PathExecutionOutcome::StaleNetworkDiscarded
+                    } else {
+                        crate::app::flow::PathExecutionOutcome::DialFailed
+                    },
+                    route: explain_route,
+                    candidate_paths,
+                    selected_path: None,
+                    rejected,
+                    failure_kind: Some(err.kind().to_string()),
+                    reason: if stale_network {
+                        format!("networkChangedDuringDial; {reason}")
+                    } else {
+                        reason
+                    },
+                    recorded_at_ms: chrono::Utc::now().timestamp_millis(),
+                })
+                .await;
                 warn!(
                     outbound_name,
                     rule = %rule_summary,
@@ -845,6 +1120,16 @@ impl Dispatcher {
 
                 let outbound_name = outbound_name.to_string();
 
+                // Explain uses one ID for this UDP association attempt. On a
+                // successful first packet, the same ID is attached to the
+                // TrackedDatagram so `/flows` and Explain can be joined.
+                let explain_flow_id = uuid::Uuid::new_v4();
+                let explain_versions_at_start = explain_versions_from_status(
+                    network_status.as_ref(),
+                    packet_generation,
+                )
+                .await;
+
                 let remote_receiver_w = remote_receiver_w.clone();
 
                 let mgr = outbound_manager.clone();
@@ -888,6 +1173,10 @@ impl Dispatcher {
                     };
 
                 let rule_summary = rule_summary(rule.map(Box::as_ref));
+                let explain_route = crate::app::flow::RouteDecision {
+                    outbound: outbound_name.clone(),
+                    rule: Some(rule_summary.clone()),
+                };
                 let mut connect_sess = sess.clone();
                 Self::maybe_resolve_proxy_destination_locally(
                     &resolver,
@@ -984,6 +1273,7 @@ impl Dispatcher {
                 let source = packet.src_addr.clone().must_into_socket_addr();
                 let mut path_selection = None;
                 let mut path_failure = None;
+                let mut path_failure_details = None;
                 let mut path_decision_cache_hit = false;
                 if let Some(family) = target_family {
                     let decision_key = UdpFlowDecisionKey {
@@ -1021,6 +1311,37 @@ impl Dispatcher {
                                 path_selection = Some(selection);
                             }
                             Ok(Some((_, observed_version))) => {
+                                let current_versions = explain_versions_from_status(
+                                    network_status.as_ref(),
+                                    packet_generation,
+                                )
+                                .await;
+                                store_path_decision(
+                                    network_status.as_ref(),
+                                    crate::app::flow::PathDecisionRecord {
+                                        flow_id: explain_flow_id,
+                                        config_version: explain_versions_at_start.0,
+                                        config_version_at_completion:
+                                            (current_versions.0
+                                                != explain_versions_at_start.0)
+                                                .then_some(current_versions.0),
+                                        policy_version: explain_versions_at_start.1,
+                                        network_version: current_versions.2,
+                                        operation_id: explain_versions_at_start.3,
+                                        outcome: crate::app::flow::PathExecutionOutcome::StaleNetworkDiscarded,
+                                        route: explain_route.clone(),
+                                        candidate_paths: Vec::new(),
+                                        selected_path: None,
+                                        rejected: Vec::new(),
+                                        failure_kind: None,
+                                        reason: format!(
+                                            "networkChangedDuringUdpPathPlanning:{observed_version}"
+                                        ),
+                                        recorded_at_ms: chrono::Utc::now()
+                                            .timestamp_millis(),
+                                    },
+                                )
+                                .await;
                                 warn!(
                                     outbound_name = %outbound_name,
                                     source = %source,
@@ -1034,6 +1355,7 @@ impl Dispatcher {
                             Ok(None) => {}
                             Err(error) => {
                                 path_failure = Some(error.to_string());
+                                path_failure_details = Some(error);
                             }
                         }
                         outbound_handle_guard
@@ -1055,6 +1377,55 @@ impl Dispatcher {
                 }
                 let outbound_dest = connect_sess.destination.clone();
                 if let Some(failure) = path_failure {
+                    let current_versions = explain_versions_from_status(
+                        network_status.as_ref(),
+                        packet_generation,
+                    )
+                    .await;
+                    let planning_error = path_failure_details.as_ref();
+                    let stale_plan = planning_error.is_some_and(|error| {
+                        current_versions.2 != error.network_generation
+                    });
+                    store_path_decision(
+                        network_status.as_ref(),
+                        crate::app::flow::PathDecisionRecord {
+                            flow_id: explain_flow_id,
+                            config_version: explain_versions_at_start.0,
+                            config_version_at_completion:
+                                (current_versions.0 != explain_versions_at_start.0)
+                                    .then_some(current_versions.0),
+                            policy_version: planning_error.map_or_else(
+                                || {
+                                    path_selection.as_ref().map_or(
+                                        explain_versions_at_start.1,
+                                        |selection| selection.policy_generation,
+                                    )
+                                },
+                                |error| error.policy_generation,
+                            ),
+                            network_version: current_versions.2,
+                            operation_id: explain_versions_at_start.3,
+                            outcome: if stale_plan {
+                                crate::app::flow::PathExecutionOutcome::StaleNetworkDiscarded
+                            } else {
+                                crate::app::flow::PathExecutionOutcome::PathPlanningFailed
+                            },
+                            route: explain_route.clone(),
+                            candidate_paths: planning_error
+                                .map_or_else(Vec::new, |error| error.candidate_paths.clone()),
+                            selected_path: None,
+                            rejected: planning_error
+                                .map_or_else(Vec::new, |error| error.rejected.clone()),
+                            failure_kind: planning_error.map(|error| error.kind().to_string()),
+                            reason: if stale_plan {
+                                "networkChangedDuringPathPlanning".to_owned()
+                            } else {
+                                failure.clone()
+                            },
+                            recorded_at_ms: chrono::Utc::now().timestamp_millis(),
+                        },
+                    )
+                    .await;
                     warn!(
                         outbound_name = %outbound_name,
                         source = %source,
@@ -1189,6 +1560,92 @@ impl Dispatcher {
                                 if let Some(proof) = &flow_health_proof {
                                     proof.failed(err.kind());
                                 }
+                                let current_versions = explain_versions_from_status(
+                                    network_status.as_ref(),
+                                    packet_generation,
+                                )
+                                .await;
+                                let proxy_endpoint_error = err
+                                    .get_ref()
+                                    .and_then(|source| {
+                                        source.downcast_ref::<
+                                            crate::proxy::utils::ProxyEndpointConnectError,
+                                        >()
+                                    });
+                                let mut candidate_paths = target_family
+                                    .and_then(|family| {
+                                        path_selection.as_ref().map(|selection| {
+                                            selection
+                                                .candidates_for_family(family)
+                                                .iter()
+                                                .map(|path| path.id.clone())
+                                                .collect::<Vec<_>>()
+                                        })
+                                    })
+                                    .unwrap_or_default();
+                                if let Some(failure) = proxy_endpoint_error {
+                                    candidate_paths.extend(
+                                        failure.candidate_paths().iter().cloned(),
+                                    );
+                                }
+                                candidate_paths.dedup();
+                                let mut rejected = path_selection
+                                    .as_ref()
+                                    .map(|selection| selection.rejected.clone())
+                                    .unwrap_or_default();
+                                if let Some(failure) = proxy_endpoint_error {
+                                    rejected
+                                        .extend(failure.rejected().iter().cloned());
+                                    rejected.dedup_by(|left, right| left == right);
+                                }
+                                let stale_network = current_versions.2
+                                    != explain_versions_at_start.2;
+                                let reason = if outbound_name == PROXY_DIRECT {
+                                    "directUdpDialFailed".to_owned()
+                                } else if let Some(failure) = proxy_endpoint_error {
+                                    format!(
+                                        "proxyUdpEndpointDialFailed; attemptedPaths={:?}; {err}",
+                                        failure.attempted_paths(),
+                                    )
+                                } else {
+                                    "proxyUdpDialFailedPathUnknown".to_owned()
+                                };
+                                store_path_decision(
+                                    network_status.as_ref(),
+                                    crate::app::flow::PathDecisionRecord {
+                                        flow_id: explain_flow_id,
+                                        config_version: explain_versions_at_start.0,
+                                        config_version_at_completion:
+                                            (current_versions.0
+                                                != explain_versions_at_start.0)
+                                                .then_some(current_versions.0),
+                                        policy_version: path_selection
+                                            .as_ref()
+                                            .map_or(explain_versions_at_start.1, |selection| {
+                                                selection.policy_generation
+                                            }),
+                                        network_version: current_versions.2,
+                                        operation_id: explain_versions_at_start.3,
+                                        outcome: if stale_network {
+                                            crate::app::flow::PathExecutionOutcome::StaleNetworkDiscarded
+                                        } else {
+                                            crate::app::flow::PathExecutionOutcome::DialFailed
+                                        },
+                                        route: explain_route.clone(),
+                                        candidate_paths,
+                                        selected_path: path_id.clone(),
+                                        rejected,
+                                        failure_kind: Some(err.kind().to_string()),
+                                        reason: if stale_network {
+                                            format!("networkChangedDuringUdpDial; {reason}")
+                                        } else {
+                                            reason
+                                        },
+                                        recorded_at_ms: chrono::Utc::now()
+                                            .timestamp_millis(),
+                                    },
+                                )
+                                .await;
                                 error!(
                                     outbound_name = %outbound_name,
                                     rule = %rule_summary,
@@ -1227,6 +1684,42 @@ impl Dispatcher {
                             .generation_is_current(packet_generation)
                             || stale_network_path
                         {
+                            let current_versions = explain_versions_from_status(
+                                network_status.as_ref(),
+                                packet_generation,
+                            )
+                            .await;
+                            store_path_decision(
+                                network_status.as_ref(),
+                                crate::app::flow::PathDecisionRecord {
+                                    flow_id: explain_flow_id,
+                                    config_version: explain_versions_at_start.0,
+                                    config_version_at_completion:
+                                        (current_versions.0
+                                            != explain_versions_at_start.0)
+                                            .then_some(current_versions.0),
+                                    policy_version: path_selection
+                                        .as_ref()
+                                        .map_or(explain_versions_at_start.1, |selection| {
+                                            selection.policy_generation
+                                        }),
+                                    network_version: current_versions.2,
+                                    operation_id: explain_versions_at_start.3,
+                                    outcome: crate::app::flow::PathExecutionOutcome::StaleNetworkDiscarded,
+                                    route: explain_route.clone(),
+                                    candidate_paths: Vec::new(),
+                                    selected_path: path_id.clone(),
+                                    rejected: path_selection
+                                        .as_ref()
+                                        .map(|selection| selection.rejected.clone())
+                                        .unwrap_or_default(),
+                                    failure_kind: None,
+                                    reason: "networkChangedWhileOpeningUdpAssociation".to_owned(),
+                                    recorded_at_ms: chrono::Utc::now()
+                                        .timestamp_millis(),
+                                },
+                            )
+                            .await;
                             drop(outbound_datagram);
                             debug!(
                                 source = %source,
@@ -1245,13 +1738,16 @@ impl Dispatcher {
                             "outbound datagram connected"
                         );
 
-                        let outbound_datagram = TrackedDatagram::new(
+                        let outbound_datagram = TrackedDatagram::new_with_id(
                             outbound_datagram,
                             manager.clone(),
                             sess.clone(),
                             rule.map(|matcher| matcher.as_ref()),
+                            explain_flow_id,
                         )
                         .await;
+                        let tracked_flow_id = outbound_datagram.id();
+                        let tracker_info = outbound_datagram.tracker_info();
 
                         let (mut remote_w, mut remote_r) = outbound_datagram.split();
                         let (remote_sender, mut remote_forwarder) =
@@ -1362,12 +1858,107 @@ impl Dispatcher {
                                 path_id.clone(),
                                 rw_handle,
                                 remote_sender.clone(),
+                                tracker_info.clone(),
                                 packet_generation,
                             )
                             .await
                         {
+                            let current_versions = explain_versions_from_status(
+                                network_status.as_ref(),
+                                packet_generation,
+                            )
+                            .await;
+                            store_path_decision(
+                                network_status.as_ref(),
+                                crate::app::flow::PathDecisionRecord {
+                                    flow_id: tracked_flow_id,
+                                    config_version: explain_versions_at_start.0,
+                                    config_version_at_completion:
+                                        (current_versions.0
+                                            != explain_versions_at_start.0)
+                                            .then_some(current_versions.0),
+                                    policy_version: path_selection
+                                        .as_ref()
+                                        .map_or(explain_versions_at_start.1, |selection| {
+                                            selection.policy_generation
+                                        }),
+                                    network_version: current_versions.2,
+                                    operation_id: explain_versions_at_start.3,
+                                    outcome: crate::app::flow::PathExecutionOutcome::StaleNetworkDiscarded,
+                                    route: explain_route.clone(),
+                                    candidate_paths: Vec::new(),
+                                    selected_path: path_id.clone(),
+                                    rejected: path_selection
+                                        .as_ref()
+                                        .map(|selection| selection.rejected.clone())
+                                        .unwrap_or_default(),
+                                    failure_kind: None,
+                                    reason: "networkChangedBeforeUdpAssociationRegistration".to_owned(),
+                                    recorded_at_ms: chrono::Utc::now()
+                                        .timestamp_millis(),
+                                },
+                            )
+                            .await;
                             continue;
                         }
+
+                        let current_versions = explain_versions_from_status(
+                            network_status.as_ref(),
+                            packet_generation,
+                        )
+                        .await;
+                        let mut candidate_paths = target_family
+                            .and_then(|family| {
+                                path_selection.as_ref().map(|selection| {
+                                    selection
+                                        .candidates_for_family(family)
+                                        .iter()
+                                        .map(|path| path.id.clone())
+                                        .collect::<Vec<_>>()
+                                })
+                            })
+                            .unwrap_or_default();
+                        candidate_paths.dedup();
+                        let selected_explain_path = tracker_info
+                            .network_paths
+                            .first()
+                            .cloned()
+                            .or_else(|| path_id.clone());
+                        store_path_decision(
+                            network_status.as_ref(),
+                            crate::app::flow::PathDecisionRecord {
+                                flow_id: tracked_flow_id,
+                                config_version: explain_versions_at_start.0,
+                                config_version_at_completion:
+                                    (current_versions.0
+                                        != explain_versions_at_start.0)
+                                        .then_some(current_versions.0),
+                                policy_version: path_selection
+                                    .as_ref()
+                                    .map_or(explain_versions_at_start.1, |selection| {
+                                        selection.policy_generation
+                                    }),
+                                network_version: current_versions.2,
+                                operation_id: explain_versions_at_start.3,
+                                outcome: crate::app::flow::PathExecutionOutcome::Connected,
+                                route: explain_route.clone(),
+                                candidate_paths,
+                                selected_path: selected_explain_path.clone(),
+                                rejected: path_selection
+                                    .as_ref()
+                                    .map(|selection| selection.rejected.clone())
+                                    .unwrap_or_default(),
+                                failure_kind: None,
+                                reason: if selected_explain_path.is_some() {
+                                    "udpAssociationOpenedOnObservedPath".to_owned()
+                                } else {
+                                    "udpAssociationOpenedWithPathUnknown".to_owned()
+                                },
+                                recorded_at_ms: chrono::Utc::now()
+                                    .timestamp_millis(),
+                            },
+                        )
+                        .await;
 
                         try_queue_outbound_packet(
                             &remote_sender,
@@ -1633,20 +2224,7 @@ impl TimeoutUdpSessionManager {
                 let mut g = map_cloned.write().await;
                 g.refresh_generation(cleaner_generation.load(Ordering::Acquire));
                 g.expire_flow_decisions(Instant::now(), timeout);
-                let mut alived = 0;
-                let mut expired = 0;
-                g.0.retain(|k, val| {
-                    let now = Instant::now();
-                    let alive = now.duration_since(val.last_active) < timeout;
-                    if !alive {
-                        expired += 1;
-                        trace!("udp session expired: {:?}", k);
-                        val.rw_handle.abort();
-                    } else {
-                        alived += 1;
-                    }
-                    alive
-                });
+                let (alived, expired) = g.expire_sessions(Instant::now(), timeout);
                 trace!(
                     "timeout udp session cleaner finished, alived: {}, expired: {}",
                     alived, expired
@@ -1669,16 +2247,18 @@ impl TimeoutUdpSessionManager {
         path_id: Option<crate::app::flow::NetworkPathId>,
         rw_handle: JoinHandle<()>,
         sender: OutboundPacketSender,
+        tracker: Arc<TrackerInfo>,
         generation: u64,
     ) -> bool {
         let mut map = self.map.write().await;
         let current = self.generation.load(Ordering::Acquire);
         map.refresh_generation(current);
         if generation != current {
+            tracker.set_end_reason(FlowEndReason::NetworkChanged);
             rw_handle.abort();
             return false;
         }
-        map.insert(outbound_name, src_addr, path_id, rw_handle, sender);
+        map.insert(outbound_name, src_addr, path_id, rw_handle, sender, tracker);
         true
     }
 
@@ -1755,6 +2335,8 @@ struct OutboundHandleVal {
     /// Handles both local-to-remote and remote-to-local packet forwarding.
     rw_handle: JoinHandle<()>,
     sender: OutboundPacketSender,
+    /// Lets session retirement report why the forwarding task was stopped.
+    tracker: Arc<TrackerInfo>,
     last_active: Instant,
 }
 
@@ -1772,11 +2354,32 @@ impl OutboundHandleMap {
     fn refresh_generation(&mut self, generation: u64) {
         if self.1 != generation {
             for (_, value) in self.0.drain() {
+                // Set the reason before abort: dropping TrackedDatagram
+                // schedules asynchronous untracking, which snapshots it.
+                value.tracker.set_end_reason(FlowEndReason::NetworkChanged);
                 value.rw_handle.abort();
             }
             self.2.clear();
             self.1 = generation;
         }
+    }
+
+    fn expire_sessions(&mut self, now: Instant, idle: Duration) -> (usize, usize) {
+        let mut alived = 0;
+        let mut expired = 0;
+        self.0.retain(|key, value| {
+            let alive = now.duration_since(value.last_active) < idle;
+            if alive {
+                alived += 1;
+            } else {
+                expired += 1;
+                trace!("udp session expired: {:?}", key);
+                value.tracker.set_end_reason(FlowEndReason::IdleTimeout);
+                value.rw_handle.abort();
+            }
+            alive
+        });
+        (alived, expired)
     }
 
     fn insert(
@@ -1786,6 +2389,7 @@ impl OutboundHandleMap {
         path_id: Option<crate::app::flow::NetworkPathId>,
         rw_handle: JoinHandle<()>,
         sender: OutboundPacketSender,
+        tracker: Arc<TrackerInfo>,
     ) {
         self.0.insert(
             OutboundHandleKey {
@@ -1796,6 +2400,7 @@ impl OutboundHandleMap {
             OutboundHandleVal {
                 rw_handle,
                 sender,
+                tracker,
                 last_active: Instant::now(),
             },
         );
@@ -1870,7 +2475,7 @@ mod tests {
     use super::{
         Dispatcher, OutboundDatagramPacket, OutboundHandleMap,
         PendingUdpHealthProofs, UDP_HEALTH_PROOF_MAX, UDP_SESSION_IDLE,
-        UdpFlowDecisionKey, direct_udp_health_destination,
+        UdpFlowDecisionKey, classify_flow_end_reason, direct_udp_health_destination,
         preferred_udp_path_address, reverse_lookup, try_queue_outbound_packet,
     };
     use crate::{
@@ -1888,15 +2493,70 @@ mod tests {
     };
     use tokio::sync::mpsc;
 
+    #[test]
+    fn flow_end_reason_links_transport_failure_to_network_change() {
+        let reset = Err(crate::common::io::CopyBidirectionalError::Other(
+            std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+        ));
+        assert_eq!(
+            classify_flow_end_reason(&reset, true),
+            super::FlowEndReason::NetworkChanged
+        );
+        assert_eq!(
+            classify_flow_end_reason(&reset, false),
+            super::FlowEndReason::IoError
+        );
+
+        let idle_timeout = Err(crate::common::io::CopyBidirectionalError::Other(
+            std::io::Error::from(std::io::ErrorKind::TimedOut),
+        ));
+        assert_eq!(
+            classify_flow_end_reason(&idle_timeout, true),
+            super::FlowEndReason::IdleTimeout,
+            "idle timeout remains distinguishable from a concurrent path change"
+        );
+        assert_eq!(
+            classify_flow_end_reason(
+                &Ok(crate::common::io::BidirectionalCopyReport {
+                    uploaded: 4,
+                    downloaded: 8,
+                    idle_timeout: false,
+                }),
+                true,
+            ),
+            super::FlowEndReason::Completed
+        );
+        assert_eq!(
+            classify_flow_end_reason(
+                &Ok(crate::common::io::BidirectionalCopyReport {
+                    uploaded: 4,
+                    downloaded: 8,
+                    idle_timeout: true,
+                }),
+                false,
+            ),
+            super::FlowEndReason::IdleTimeout
+        );
+    }
+
     #[tokio::test]
     async fn network_change_retires_udp_socket_and_rejects_stale_dial() {
         let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let sessions = super::TimeoutUdpSessionManager::new(generation.clone());
         let source = "127.0.0.1:53000".parse().unwrap();
         let (sender, mut receiver) = mpsc::channel(1);
+        let tracker = Arc::new(super::TrackerInfo::default());
         assert!(
             sessions
-                .insert("DIRECT", source, None, tokio::spawn(pending()), sender, 0)
+                .insert(
+                    "DIRECT",
+                    source,
+                    None,
+                    tokio::spawn(pending()),
+                    sender,
+                    tracker.clone(),
+                    0,
+                )
                 .await
         );
         assert!(
@@ -1912,18 +2572,44 @@ mod tests {
                 .await
                 .is_none()
         );
+        assert_eq!(
+            tracker.end_reason(),
+            super::FlowEndReason::NetworkChanged,
+            "retiring the old UDP association records its terminal cause"
+        );
         assert!(receiver.recv().await.is_none());
         let (sender, mut receiver) = mpsc::channel(1);
+        let stale_tracker = Arc::new(super::TrackerInfo::default());
         assert!(
             !sessions
-                .insert("DIRECT", source, None, tokio::spawn(pending()), sender, 0)
+                .insert(
+                    "DIRECT",
+                    source,
+                    None,
+                    tokio::spawn(pending()),
+                    sender,
+                    stale_tracker.clone(),
+                    0,
+                )
                 .await
+        );
+        assert_eq!(
+            stale_tracker.end_reason(),
+            super::FlowEndReason::NetworkChanged
         );
         assert!(receiver.recv().await.is_none());
         let (sender, _receiver) = mpsc::channel(1);
         assert!(
             sessions
-                .insert("DIRECT", source, None, tokio::spawn(pending()), sender, 1)
+                .insert(
+                    "DIRECT",
+                    source,
+                    None,
+                    tokio::spawn(pending()),
+                    sender,
+                    Arc::new(super::TrackerInfo::default()),
+                    1,
+                )
                 .await
         );
         assert!(
@@ -1932,6 +2618,28 @@ mod tests {
                 .await
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn udp_session_idle_expiry_records_idle_timeout() {
+        let mut map = OutboundHandleMap::new();
+        let source = "127.0.0.1:53000".parse().unwrap();
+        let tracker = Arc::new(super::TrackerInfo::default());
+        let (sender, _receiver) = mpsc::channel(1);
+        map.insert(
+            "DIRECT",
+            source,
+            None,
+            tokio::spawn(pending()),
+            sender,
+            tracker.clone(),
+        );
+
+        let (alive, expired) =
+            map.expire_sessions(Instant::now() + UDP_SESSION_IDLE, UDP_SESSION_IDLE);
+
+        assert_eq!((alive, expired), (0, 1));
+        assert_eq!(tracker.end_reason(), super::FlowEndReason::IdleTimeout);
     }
 
     #[test]
@@ -2095,8 +2803,22 @@ mod tests {
         let (sender_a, mut receiver_a) = mpsc::channel(1);
         let (sender_b, mut receiver_b) = mpsc::channel(1);
 
-        map.insert("DIRECT", src_addr, None, tokio::spawn(pending()), sender_a);
-        map.insert("DIRECT", src_addr, None, tokio::spawn(pending()), sender_b);
+        map.insert(
+            "DIRECT",
+            src_addr,
+            None,
+            tokio::spawn(pending()),
+            sender_a,
+            Arc::new(super::TrackerInfo::default()),
+        );
+        map.insert(
+            "DIRECT",
+            src_addr,
+            None,
+            tokio::spawn(pending()),
+            sender_b,
+            Arc::new(super::TrackerInfo::default()),
+        );
 
         let handle_a = map
             .get_outbound_sender_mut("DIRECT", src_addr, None)
@@ -2158,6 +2880,7 @@ mod tests {
             Some(path_a.clone()),
             tokio::spawn(pending()),
             sender_a,
+            Arc::new(super::TrackerInfo::default()),
         );
         map.insert(
             "DIRECT",
@@ -2165,6 +2888,7 @@ mod tests {
             Some(path_b.clone()),
             tokio::spawn(pending()),
             sender_b,
+            Arc::new(super::TrackerInfo::default()),
         );
 
         map.get_outbound_sender_mut("DIRECT", src_addr, Some(path_a))

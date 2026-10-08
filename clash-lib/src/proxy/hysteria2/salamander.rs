@@ -63,10 +63,14 @@ impl Salamander {
     pub fn new(socket: std::net::UdpSocket, key: Vec<u8>) -> std::io::Result<Self> {
         use quinn::Runtime;
         let inner = TokioRuntime.wrap_udp_socket(socket)?;
-        Ok(Self {
+        Ok(Self::with_inner(inner, key))
+    }
+
+    pub(crate) fn with_inner(inner: Arc<dyn AsyncUdpSocket>, key: Vec<u8>) -> Self {
+        Self {
             inner,
             obfs: SalamanderObfs::new(key),
-        })
+        }
     }
 }
 

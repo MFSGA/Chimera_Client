@@ -424,6 +424,26 @@ async fn runtime_path_preference_updates_are_versioned_and_temporary() {
     .unwrap();
     assert_eq!(initial["policyVersion"], 0);
     assert_eq!(initial["priority"], serde_json::json!([]));
+
+    let decisions_url =
+        format!("http://127.0.0.1:{api_port}/runtime/network/path-decisions");
+    let decisions_request = hyper::Request::builder()
+        .uri(&decisions_url)
+        .header(hyper::header::AUTHORIZATION, "Bearer clash-rs")
+        .method(http::method::Method::GET)
+        .body(http_body_util::Empty::<Bytes>::new())
+        .expect("failed to build path decisions GET");
+    let response =
+        send_http_request(decisions_url.parse().unwrap(), decisions_request)
+            .await
+            .expect("failed to GET path decisions");
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let decisions: serde_json::Value = serde_json::from_reader(
+        response.collect().await.unwrap().aggregate().reader(),
+    )
+    .unwrap();
+    assert!(decisions.is_array());
+
     if initial["automaticSupported"] == false {
         // Platforms without a path observer report the capability explicitly;
         // the runtime preference write is intentionally unavailable there.

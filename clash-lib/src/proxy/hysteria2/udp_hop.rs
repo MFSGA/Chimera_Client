@@ -1,5 +1,7 @@
 use std::{
+    collections::HashSet,
     fmt::Debug,
+    future::Future,
     io,
     net::SocketAddr,
     pin::Pin,
@@ -8,12 +10,101 @@ use std::{
     time::{Duration, Instant},
 };
 
-use quinn::{AsyncUdpSocket, Runtime, TokioRuntime, UdpPoller, udp::Transmit};
+use quinn::{AsyncUdpSocket, UdpPoller, udp::Transmit};
 
 use crate::{
-    app::net::OutboundInterface,
-    proxy::{converters::hysteria2::PortGenerator, utils::new_protected_udp_socket},
+    app::{dns::ThreadSafeDNSResolver, net::OutboundInterface},
+    proxy::{
+        converters::hysteria2::PortGenerator,
+        transport::ConnectorUdpSocket,
+        utils::{NetworkPoolContext, RemoteConnector},
+    },
+    session::SocksAddr,
 };
+
+type HopSocketFuture =
+    Pin<Box<dyn Future<Output = io::Result<Arc<dyn AsyncUdpSocket>>> + Send>>;
+type HopSocketFactory = Arc<dyn Fn() -> HopSocketFuture + Send + Sync>;
+
+pub(super) struct UdpHopOptions {
+    pub(super) server_addr: SocketAddr,
+    pub(super) port_range: PortGenerator,
+    pub(super) resolver: ThreadSafeDNSResolver,
+    pub(super) connector: Arc<dyn RemoteConnector>,
+    pub(super) iface: Option<OutboundInterface>,
+    #[cfg(target_os = "linux")]
+    pub(super) so_mark: Option<u32>,
+    pub(super) requested_context: NetworkPoolContext,
+    pub(super) connection_cancellation: tokio_util::sync::CancellationToken,
+    pub(super) interval: Option<Duration>,
+}
+
+fn pin_hop_context(
+    pool_context: &NetworkPoolContext,
+) -> (NetworkPoolContext, Option<crate::app::flow::NetworkPathId>) {
+    let expected_path_id = pool_context.path_id.clone();
+    let mut hop_context = pool_context.clone();
+    hop_context.path_id = None;
+    match expected_path_id.as_ref() {
+        Some(path_id) => {
+            hop_context.eligible_path_ids = Some(HashSet::from([path_id.clone()]));
+        }
+        None if hop_context.eligible_path_ids.is_some() => {
+            hop_context.eligible_path_ids = Some(HashSet::new());
+        }
+        None => {}
+    }
+    (hop_context, expected_path_id)
+}
+
+fn hop_context_matches(
+    expected: &NetworkPoolContext,
+    expected_path_id: Option<&crate::app::flow::NetworkPathId>,
+    actual: &NetworkPoolContext,
+) -> bool {
+    actual.network_generation == expected.network_generation
+        && actual.path_id.as_ref() == expected_path_id
+}
+
+#[derive(Clone)]
+struct HopSocketDialer {
+    endpoint: SocketAddr,
+    resolver: ThreadSafeDNSResolver,
+    connector: Arc<dyn RemoteConnector>,
+    iface: Option<OutboundInterface>,
+    #[cfg(target_os = "linux")]
+    so_mark: Option<u32>,
+    pool_context: NetworkPoolContext,
+    expected_path_id: Option<crate::app::flow::NetworkPathId>,
+}
+
+impl HopSocketDialer {
+    async fn connect(&self) -> io::Result<Arc<dyn AsyncUdpSocket>> {
+        let (datagram, pool_context) = self
+            .connector
+            .connect_datagram_with_pool_context(
+                self.resolver.clone(),
+                None,
+                SocksAddr::Ip(self.endpoint),
+                self.iface.as_ref(),
+                #[cfg(target_os = "linux")]
+                self.so_mark,
+                self.pool_context.clone(),
+            )
+            .await?;
+        if !hop_context_matches(
+            &self.pool_context,
+            self.expected_path_id.as_ref(),
+            &pool_context,
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Hysteria2 port hop resolved to a different network path",
+            ));
+        }
+        Ok(ConnectorUdpSocket::new(datagram, self.endpoint))
+    }
+}
 
 struct PreviousSocket {
     socket: Arc<dyn AsyncUdpSocket>,
@@ -75,10 +166,8 @@ pub struct UdpHop {
     port_range: PortGenerator,
     /// interval to hop
     interval: Duration,
-    family_hint: SocketAddr,
-    iface: Option<OutboundInterface>,
-    #[cfg(target_os = "linux")]
-    so_mark: Option<u32>,
+    dialer: HopSocketFactory,
+    cancellation: tokio_util::sync::CancellationToken,
 }
 
 impl UdpHop {
@@ -86,25 +175,55 @@ impl UdpHop {
     const PREVIOUS_SOCKET_GRACE: Duration = Duration::from_secs(5);
 
     pub async fn new(
-        server_addr: SocketAddr,
-        port_range: PortGenerator,
-        iface: Option<OutboundInterface>,
-        #[cfg(target_os = "linux")] so_mark: Option<u32>,
-        interval: Option<Duration>,
-    ) -> io::Result<Self> {
-        let socket = new_protected_udp_socket(
-            None,
-            iface.as_ref(),
+        options: UdpHopOptions,
+    ) -> io::Result<(Self, NetworkPoolContext)> {
+        let UdpHopOptions {
+            server_addr,
+            port_range,
+            resolver,
+            connector,
+            iface,
             #[cfg(target_os = "linux")]
             so_mark,
-            Some(server_addr),
-        )
-        .await?
-        .into_std()?;
+            requested_context,
+            connection_cancellation,
+            interval,
+        } = options;
+        let (datagram, pool_context) = connector
+            .connect_datagram_with_pool_context(
+                resolver.clone(),
+                None,
+                SocksAddr::Ip(server_addr),
+                iface.as_ref(),
+                #[cfg(target_os = "linux")]
+                so_mark,
+                requested_context,
+            )
+            .await?;
+        let socket = ConnectorUdpSocket::new(datagram, server_addr);
+
+        // Every hop socket must use the path that established this QUIC
+        // connection. If that path could not be identified, keep subsequent
+        // sockets generation-only instead of silently pinning to a new NIC.
+        let (hop_context, expected_path_id) = pin_hop_context(&pool_context);
+        let dialer = HopSocketDialer {
+            endpoint: server_addr,
+            resolver,
+            connector,
+            iface,
+            #[cfg(target_os = "linux")]
+            so_mark,
+            pool_context: hop_context,
+            expected_path_id,
+        };
+        let dialer: HopSocketFactory = Arc::new(move || {
+            let dialer = dialer.clone();
+            Box::pin(async move { dialer.connect().await })
+        });
 
         let state = HopState {
             prev_conn: None,
-            cur_conn: TokioRuntime.wrap_udp_socket(socket)?,
+            cur_conn: socket,
             generation: 0,
             last: Instant::now(),
             new_hop_port: server_addr.port(),
@@ -112,16 +231,17 @@ impl UdpHop {
         }
         .into();
 
-        Ok(UdpHop {
-            state,
-            init_port: server_addr.port(),
-            port_range,
-            interval: interval.unwrap_or(Self::DEFAULT_INTERVAL),
-            family_hint: server_addr,
-            iface,
-            #[cfg(target_os = "linux")]
-            so_mark,
-        })
+        Ok((
+            UdpHop {
+                state,
+                init_port: server_addr.port(),
+                port_range,
+                interval: interval.unwrap_or(Self::DEFAULT_INTERVAL),
+                dialer,
+                cancellation: connection_cancellation.child_token(),
+            },
+            pool_context,
+        ))
     }
 
     fn lock_state(&self) -> MutexGuard<'_, HopState> {
@@ -196,22 +316,17 @@ impl UdpHop {
         };
 
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        let iface = self.iface.clone();
-        let family_hint = self.family_hint;
-        #[cfg(target_os = "linux")]
-        let so_mark = self.so_mark;
+        let dialer = self.dialer.clone();
+        let cancellation = self.cancellation.clone();
 
         runtime.spawn(async move {
-            let result = new_protected_udp_socket(
-                None,
-                iface.as_ref(),
-                #[cfg(target_os = "linux")]
-                so_mark,
-                Some(family_hint),
-            )
-            .await
-            .and_then(|udp| udp.into_std())
-            .and_then(|udp| TokioRuntime.wrap_udp_socket(udp));
+            let result = tokio::select! {
+                _ = cancellation.cancelled() => Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "Hysteria2 port hop cancelled by connection retirement",
+                )),
+                result = dialer() => result,
+            };
             let _ = result_tx.send(result);
         });
 
@@ -250,6 +365,12 @@ impl UdpHop {
 
     fn drop_prev_conn(&self) {
         self.lock_state().prev_conn.take();
+    }
+}
+
+impl Drop for UdpHop {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
     }
 }
 
@@ -388,6 +509,91 @@ mod tests {
     };
 
     use super::*;
+    use crate::app::flow::{AddressFamily, InterfaceId, NetworkPathId};
+
+    fn path(name: &str, index: u32, address: Ipv4Addr) -> NetworkPathId {
+        NetworkPathId {
+            interface: InterfaceId {
+                name: name.to_owned(),
+                index,
+            },
+            family: AddressFamily::Ipv4,
+            source_address: Some(address.into()),
+            network_generation: 12,
+        }
+    }
+
+    #[test]
+    fn port_hop_sockets_are_pinned_to_the_initial_path() {
+        let wifi = path("wifi0", 4, Ipv4Addr::new(192, 0, 2, 10));
+        let ethernet = path("eth0", 5, Ipv4Addr::new(198, 51, 100, 10));
+        let initial = NetworkPoolContext {
+            network_generation: Some(12),
+            path_id: Some(wifi.clone()),
+            eligible_path_ids: Some([wifi.clone(), ethernet].into_iter().collect()),
+            reporter: None,
+        };
+
+        let (hop_context, expected_path) = pin_hop_context(&initial);
+
+        assert_eq!(expected_path.as_ref(), Some(&wifi));
+        assert_eq!(hop_context.path_id, None);
+        assert_eq!(
+            hop_context.eligible_path_ids,
+            Some([wifi.clone()].into_iter().collect())
+        );
+        assert!(hop_context_matches(
+            &hop_context,
+            Some(&wifi),
+            &NetworkPoolContext {
+                network_generation: Some(12),
+                path_id: Some(wifi.clone()),
+                ..Default::default()
+            }
+        ));
+        assert!(!hop_context_matches(
+            &hop_context,
+            Some(&wifi),
+            &NetworkPoolContext {
+                network_generation: Some(12),
+                path_id: Some(path("eth0", 5, Ipv4Addr::new(198, 51, 100, 10))),
+                ..Default::default()
+            }
+        ));
+    }
+
+    #[test]
+    fn unknown_port_hop_path_does_not_select_a_new_observed_path() {
+        let wifi = path("wifi0", 4, Ipv4Addr::new(192, 0, 2, 10));
+        let initial = NetworkPoolContext {
+            network_generation: Some(12),
+            path_id: None,
+            eligible_path_ids: Some([wifi].into_iter().collect()),
+            reporter: None,
+        };
+
+        let (hop_context, expected_path) = pin_hop_context(&initial);
+
+        assert!(expected_path.is_none());
+        assert_eq!(hop_context.eligible_path_ids, Some(HashSet::new()));
+        assert!(hop_context_matches(
+            &hop_context,
+            None,
+            &NetworkPoolContext {
+                network_generation: Some(12),
+                ..Default::default()
+            }
+        ));
+        assert!(!hop_context_matches(
+            &hop_context,
+            None,
+            &NetworkPoolContext {
+                network_generation: Some(12),
+                path_id: Some(path("wifi0", 4, Ipv4Addr::new(192, 0, 2, 10))),
+                ..Default::default()
+            }
+        ));
+    }
 
     #[derive(Debug)]
     struct FakeSocket {
@@ -465,11 +671,48 @@ mod tests {
             init_port: 443,
             port_range: PortGenerator::new(hop_port),
             interval: Duration::from_secs(60),
-            family_hint: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443),
-            iface: None,
-            #[cfg(target_os = "linux")]
-            so_mark: None,
+            dialer: Arc::new(|| {
+                Box::pin(std::future::ready(Err(io::Error::other(
+                    "test hop socket factory must not be called",
+                ))))
+            }),
+            cancellation: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn connection_retirement_cancels_a_pending_port_hop_socket() {
+        struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let observed_port = Arc::new(AtomicU16::new(0));
+        let polled_socket = Arc::new(AtomicU16::new(0));
+        let mut hop = test_hop(fake_socket(1, observed_port, polled_socket), 8443);
+        hop.interval = Duration::ZERO;
+        hop.state.get_mut().unwrap().last = Instant::now() - Duration::from_secs(1);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        hop.cancellation = cancellation.child_token();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dial_dropped = dropped.clone();
+        hop.dialer = Arc::new(move || {
+            let dial_dropped = dial_dropped.clone();
+            Box::pin(async move {
+                let _drop_flag = DropFlag(dial_dropped);
+                std::future::pending::<io::Result<Arc<dyn AsyncUdpSocket>>>().await
+            })
+        });
+
+        assert_eq!(hop.hop(), 8443);
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+        tokio::task::yield_now().await;
+        assert_eq!(hop.hop(), 8443);
+        assert_eq!(hop.lock_state().generation, 0);
+        assert!(dropped.load(Ordering::SeqCst));
     }
 
     #[test]

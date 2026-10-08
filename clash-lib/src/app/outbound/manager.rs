@@ -956,7 +956,7 @@ impl OutboundManager {
                         &mut providers,
                     )?;
 
-                    let relay = relay::Handler::new(
+                    let relay = relay::Handler::new_with_path_source(
                         relay::HandlerOptions {
                             name: proto.name.clone(),
                             common_opts: crate::proxy::HandlerCommonOptions {
@@ -966,6 +966,7 @@ impl OutboundManager {
                             },
                         },
                         providers,
+                        self.network_path_source.clone(),
                     );
 
                     handlers.insert(proto.name.clone(), relay);

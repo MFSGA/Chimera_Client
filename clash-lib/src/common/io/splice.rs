@@ -16,7 +16,7 @@ use tokio::net::{TcpStream, UnixStream};
 
 use crate::app::dispatcher::TrackCopy;
 
-use super::CopyBidirectionalError;
+use super::{BidirectionalCopyReport, CopyBidirectionalError};
 
 /// the size of PIPE_BUF
 const PIPE_SIZE: usize = 65536;
@@ -377,7 +377,7 @@ pub async fn zero_copy_bidirectional<A, B>(
     write_tracker: std::sync::Arc<dyn TrackCopy + Send + Sync>,
     a_to_b_timeout_duration: Duration,
     b_to_a_timeout_duration: Duration,
-) -> Result<(u64, u64)>
+) -> Result<BidirectionalCopyReport>
 where
     A: Stream + Unpin,
     B: Stream + Unpin,
@@ -436,6 +436,7 @@ struct CopyBidirectional<'a, A, B> {
     b_to_a_timeout_duration: Duration,
     write_tracker: std::sync::Arc<dyn TrackCopy + Send + Sync>,
     read_tracker: std::sync::Arc<dyn TrackCopy + Send + Sync>,
+    idle_timeout: bool,
 }
 
 fn reset_idle_timeout(
@@ -476,6 +477,7 @@ impl<'a, A, B> CopyBidirectional<'a, A, B> {
             b_to_a_timeout_duration,
             write_tracker,
             read_tracker,
+            idle_timeout: false,
         }
     }
 }
@@ -485,7 +487,8 @@ where
     A: Stream + Unpin + Sized,
     B: Stream + Unpin + Sized,
 {
-    type Output = std::result::Result<(u64, u64), CopyBidirectionalError>;
+    type Output =
+        std::result::Result<BidirectionalCopyReport, CopyBidirectionalError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let CopyBidirectional {
@@ -501,6 +504,7 @@ where
             b_to_a_timeout_duration,
             write_tracker,
             read_tracker,
+            idle_timeout,
         } = &mut *self;
 
         loop {
@@ -529,6 +533,7 @@ where
                                         // remaining direction has gone idle
                                         // after the opposite half already
                                         // completed.
+                                        *idle_timeout = true;
                                         *a_to_b = TransferState::ShuttingDown(
                                             buf.amount_transferred(),
                                         );
@@ -587,6 +592,7 @@ where
                             if let Some(delay) = b_to_a_delay {
                                 match delay.as_mut().poll(cx) {
                                     Poll::Ready(()) => {
+                                        *idle_timeout = true;
                                         *b_to_a = TransferState::ShuttingDown(
                                             buf.amount_transferred(),
                                         );
@@ -627,6 +633,10 @@ where
             }
         }
 
-        Poll::Ready(Ok((*a_to_b_count, *b_to_a_count)))
+        Poll::Ready(Ok(BidirectionalCopyReport {
+            uploaded: *a_to_b_count,
+            downloaded: *b_to_a_count,
+            idle_timeout: *idle_timeout,
+        }))
     }
 }

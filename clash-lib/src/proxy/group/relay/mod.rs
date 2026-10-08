@@ -19,7 +19,7 @@ use crate::{
         OutboundHandler, OutboundType,
         group::GroupProxyAPIResponse,
         utils::{
-            DirectConnector, ProxyConnector, RemoteConnector,
+            DirectConnector, NetworkPathSource, ProxyConnector, RemoteConnector,
             provider_helper::get_proxies_from_providers,
         },
     },
@@ -35,6 +35,9 @@ pub struct HandlerOptions {
 pub struct Handler {
     opts: HandlerOptions,
     providers: Vec<ThreadSafeProxyProvider>,
+    /// Shared path observations let relay's first proxy hop use the same
+    /// network-aware connector as ordinary outbound proxies.
+    network_path_source: NetworkPathSource,
 }
 
 impl std::fmt::Debug for Handler {
@@ -47,11 +50,16 @@ impl std::fmt::Debug for Handler {
 
 impl Handler {
     #[allow(clippy::new_ret_no_self)]
-    pub fn new(
+    pub(crate) fn new_with_path_source(
         opts: HandlerOptions,
         providers: Vec<ThreadSafeProxyProvider>,
+        network_path_source: NetworkPathSource,
     ) -> AnyOutboundHandler {
-        Arc::new(Self { opts, providers })
+        Arc::new(Self {
+            opts,
+            providers,
+            network_path_source,
+        })
     }
 
     async fn get_proxies(&self, touch: bool) -> Vec<AnyOutboundHandler> {
@@ -101,7 +109,9 @@ impl OutboundHandler for Handler {
             }
             _ => {
                 let mut connector: Box<dyn RemoteConnector> =
-                    Box::new(DirectConnector::new());
+                    Box::new(DirectConnector::with_path_source(
+                        self.network_path_source.clone(),
+                    ));
                 let (proxies, last) = proxies.split_at(proxies.len() - 1);
                 for proxy in proxies {
                     debug!(
@@ -122,7 +132,12 @@ impl OutboundHandler for Handler {
                     )
                     .await?;
 
-                let chained = ChainedStreamWrapper::new(s);
+                // The relay wrapper must retain the physical NIC chosen for
+                // the first proxy endpoint so flow diagnostics can explain
+                // where this chain was opened.
+                let paths = s.network_path_ids();
+                let chained =
+                    ChainedStreamWrapper::new_with_network_path_ids(s, paths);
                 chained.append_to_chain(self.name()).await;
                 Ok(Box::new(chained))
             }
@@ -146,7 +161,9 @@ impl OutboundHandler for Handler {
             }
             _ => {
                 let mut connector: Box<dyn RemoteConnector> =
-                    Box::new(DirectConnector::new());
+                    Box::new(DirectConnector::with_path_source(
+                        self.network_path_source.clone(),
+                    ));
                 let (proxies, last) = proxies.split_at(proxies.len() - 1);
                 for proxy in proxies {
                     debug!(
@@ -167,7 +184,9 @@ impl OutboundHandler for Handler {
                     )
                     .await?;
 
-                let chained = ChainedDatagramWrapper::new(d);
+                let paths = d.network_path_ids();
+                let chained =
+                    ChainedDatagramWrapper::new_with_network_path_ids(d, paths);
                 chained.append_to_chain(self.name()).await;
                 Ok(Box::new(chained))
             }
