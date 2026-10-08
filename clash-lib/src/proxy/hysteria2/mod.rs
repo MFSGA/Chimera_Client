@@ -49,11 +49,14 @@ use crate::{
     },
     common::tls::{DefaultTlsVerifier, GLOBAL_ROOT_STORE},
     proxy::{
-        DialWithConnector, OutboundHandler, OutboundType,
+        ConnectorType, DialWithConnector, OutboundHandler, OutboundType,
         converters::hysteria2::PortGenerator,
         datagram::UdpPacket,
         hysteria2::datagram::{HysteriaDatagramOutbound, UdpSession},
-        utils::new_protected_udp_socket,
+        transport::ConnectorUdpSocket,
+        utils::{
+            NetworkPoolContext, RemoteConnector, observe_proxy_target_datagram,
+        },
     },
     session::{Session, SocksAddr},
 };
@@ -113,6 +116,8 @@ pub struct Handler {
     next_session_id: AtomicU32,
     /// a send request guard to keep the connection alive
     guard: Mutex<Option<SendRequest<OpenStreams, Bytes>>>,
+    connector: tokio::sync::RwLock<Option<Arc<dyn RemoteConnector>>>,
+    recovery_cancellation: tokio::sync::RwLock<tokio_util::sync::CancellationToken>,
     /// support udp is decided by server
     support_udp: RwLock<bool>,
 }
@@ -250,6 +255,10 @@ impl Handler {
             next_session_id: AtomicU32::new(0),
             conn: Mutex::new(None),
             guard: Mutex::new(None),
+            connector: tokio::sync::RwLock::new(None),
+            recovery_cancellation: tokio::sync::RwLock::new(
+                tokio_util::sync::CancellationToken::new(),
+            ),
             support_udp: RwLock::new(true),
         }
     }
@@ -311,10 +320,14 @@ impl Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
+        connector: &dyn RemoteConnector,
+        hop_connector: Option<Arc<dyn RemoteConnector>>,
+        cancellation: tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<(
         Connection,
         SendRequest<OpenStreams, Bytes>,
         tokio::task::JoinHandle<()>,
+        NetworkPoolContext,
     )> {
         tracing::trace!(
             "hysteria2 new_authed_connection_inner: starting connection to {:?}",
@@ -343,7 +356,14 @@ impl Handler {
         let mut last_error = None;
         for server_socket_addr in server_socket_addrs {
             match self
-                .new_authed_connection_to(sess, server_socket_addr)
+                .new_authed_connection_to(
+                    sess,
+                    resolver.clone(),
+                    connector,
+                    hop_connector.clone(),
+                    cancellation.clone(),
+                    server_socket_addr,
+                )
                 .await
             {
                 Ok(connection) => return Ok(connection),
@@ -366,83 +386,117 @@ impl Handler {
     async fn new_authed_connection_to(
         &self,
         sess: &Session,
+        resolver: ThreadSafeDNSResolver,
+        connector: &dyn RemoteConnector,
+        hop_connector: Option<Arc<dyn RemoteConnector>>,
+        cancellation: tokio_util::sync::CancellationToken,
         server_socket_addr: SocketAddr,
     ) -> anyhow::Result<(
         Connection,
         SendRequest<OpenStreams, Bytes>,
         tokio::task::JoinHandle<()>,
+        NetworkPoolContext,
     )> {
-        // todo: Here maybe we should use a AsyncUdpSocket which implement salamander obfs
-        // and port hopping
-        let create_socket = || async {
-            new_protected_udp_socket(
-                None,
-                sess.iface.as_ref(),
-                #[cfg(target_os = "linux")]
-                sess.so_mark,
-                Some(server_socket_addr),
-            )
-            .await
-        };
-
-        let mut ep = if let Some(obfs) = self.opts.obfs.as_ref() {
-            match obfs {
-                Obfs::Salamander(salamander_obfs) => {
-                    let socket = create_socket().await?;
-                    let obfs = salamander::Salamander::new(
-                        socket.into_std()?,
-                        salamander_obfs.key.to_vec(),
-                    )?;
-
-                    quinn::Endpoint::new_with_abstract_socket(
-                        self.ep_config.clone(),
-                        None,
-                        Arc::new(obfs),
-                        Arc::new(TokioRuntime),
-                    )?
-                }
-            }
-        } else if let Some(port_gen) = self.opts.ports.as_ref() {
-            let udp_hop = udp_hop::UdpHop::new(
-                server_socket_addr,
-                port_gen.clone(),
-                sess.iface.clone(),
-                #[cfg(target_os = "linux")]
-                sess.so_mark,
-                None,
-            )
-            .await?;
-            quinn::Endpoint::new_with_abstract_socket(
-                self.ep_config.clone(),
-                None,
-                Arc::new(udp_hop),
-                Arc::new(TokioRuntime),
-            )?
+        let (udp_socket, mut pool_context): (
+            Arc<dyn quinn::AsyncUdpSocket>,
+            NetworkPoolContext,
+        ) = if self.opts.obfs.is_none()
+            && let Some(port_gen) = self.opts.ports.as_ref()
+        {
+            let hop_connector = hop_connector.ok_or_else(|| {
+                anyhow!("Hysteria2 port hopping requires a registered connector")
+            })?;
+            let requested_context = hop_connector
+                .connection_pool_context(sess.iface.as_ref())
+                .await;
+            let (udp_hop, pool_context) =
+                udp_hop::UdpHop::new(udp_hop::UdpHopOptions {
+                    server_addr: server_socket_addr,
+                    port_range: port_gen.clone(),
+                    resolver,
+                    connector: hop_connector,
+                    iface: sess.iface.clone(),
+                    #[cfg(target_os = "linux")]
+                    so_mark: sess.so_mark,
+                    requested_context,
+                    connection_cancellation: cancellation,
+                    interval: None,
+                })
+                .await?;
+            (Arc::new(udp_hop), pool_context)
         } else {
-            let socket = create_socket().await?;
-
-            quinn::Endpoint::new(
-                self.ep_config.clone(),
-                None,
-                socket.into_std()?,
-                Arc::new(TokioRuntime),
-            )?
+            let requested_context =
+                connector.connection_pool_context(sess.iface.as_ref()).await;
+            let destination = SocksAddr::Ip(server_socket_addr);
+            let (datagram, pool_context) = connector
+                .connect_datagram_with_pool_context(
+                    resolver,
+                    None,
+                    destination,
+                    sess.iface.as_ref(),
+                    #[cfg(target_os = "linux")]
+                    sess.so_mark,
+                    requested_context,
+                )
+                .await?;
+            let socket = ConnectorUdpSocket::new(datagram, server_socket_addr);
+            let socket: Arc<dyn quinn::AsyncUdpSocket> =
+                if let Some(Obfs::Salamander(salamander_obfs)) =
+                    self.opts.obfs.as_ref()
+                {
+                    Arc::new(salamander::Salamander::with_inner(
+                        socket,
+                        salamander_obfs.key.to_vec(),
+                    ))
+                } else {
+                    socket
+                };
+            (socket, pool_context)
         };
+        pool_context.network_generation = pool_context
+            .path_id
+            .as_ref()
+            .map(|path| path.network_generation)
+            .or(pool_context.network_generation);
+        let mut ep = quinn::Endpoint::new_with_abstract_socket(
+            self.ep_config.clone(),
+            None,
+            udp_socket,
+            Arc::new(TokioRuntime),
+        )?;
 
         ep.set_default_client_config(self.client_config.clone());
 
         tracing::trace!("hysteria2 connecting to server: {:?}", server_socket_addr);
-        let session = ep
-            .connect(server_socket_addr, self.opts.sni.as_deref().unwrap_or(""))?
-            .await?;
+        let connecting =
+            ep.connect(server_socket_addr, self.opts.sni.as_deref().unwrap_or(""))?;
+        let session = connecting.await?;
         tracing::trace!("hysteria2 QUIC connection established");
         let (guard, driver_task, cc_rx, udp) =
             Self::auth(&session, &self.opts.password).await?;
+        let current_context =
+            connector.connection_pool_context(sess.iface.as_ref()).await;
+        let stale = match pool_context.path_id.as_ref() {
+            Some(path_id) => !current_context
+                .permits(pool_context.network_generation, Some(path_id)),
+            None => {
+                current_context.network_generation != pool_context.network_generation
+            }
+        };
+        if stale {
+            session.close(
+                quinn::VarInt::from_u32(0),
+                b"network path changed during Hysteria2 setup",
+            );
+            return Err(anyhow!(
+                "network path changed while connecting to Hysteria2 endpoint"
+            ));
+        }
         tracing::trace!("hysteria2 authentication successful, udp={}", udp);
         *self.support_udp.write().unwrap() = udp;
         Self::configure_brutal_cc(&session, self.select_brutal_bps(cc_rx));
 
-        Ok((session, guard, driver_task))
+        Ok((session, guard, driver_task, pool_context))
     }
 
     async fn auth(
@@ -535,7 +589,56 @@ impl Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> std::io::Result<Arc<HysteriaConnection>> {
+        let connector =
+            self.connector.read().await.clone().unwrap_or_else(|| {
+                crate::proxy::utils::GLOBAL_DIRECT_CONNECTOR.clone()
+            });
+        self.new_authed_connection_using_connector(
+            sess,
+            resolver,
+            connector.as_ref(),
+            Some(connector.clone()),
+            self.recovery_cancellation.read().await.clone(),
+        )
+        .await
+    }
+
+    async fn new_authed_connection_with_connector(
+        &self,
+        sess: &Session,
+        resolver: ThreadSafeDNSResolver,
+        connector: &dyn RemoteConnector,
+    ) -> std::io::Result<Arc<HysteriaConnection>> {
+        let hop_connector = self.connector.read().await.clone();
+        let cancellation = self.recovery_cancellation.read().await.clone();
+        self.new_authed_connection_using_connector(
+            sess,
+            resolver,
+            connector,
+            hop_connector,
+            cancellation,
+        )
+        .await
+    }
+
+    async fn new_authed_connection_using_connector(
+        &self,
+        sess: &Session,
+        resolver: ThreadSafeDNSResolver,
+        connector: &dyn RemoteConnector,
+        hop_connector: Option<Arc<dyn RemoteConnector>>,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> std::io::Result<Arc<HysteriaConnection>> {
         let mut quinn_conn_lock = self.conn.lock().await;
+        let pool_connector = if self.opts.obfs.is_none() && self.opts.ports.is_some()
+        {
+            hop_connector.as_deref().unwrap_or(connector)
+        } else {
+            connector
+        };
+        let current_context = pool_connector
+            .connection_pool_context(sess.iface.as_ref())
+            .await;
 
         match (*quinn_conn_lock).as_ref().filter(|s| {
             match s.conn.close_reason() {
@@ -544,26 +647,44 @@ impl Handler {
                     tracing::debug!("old connection closed: {:?}", reason);
                     false
                 }
-                None => true,
+                None => pool_context_is_current(&current_context, &s.pool_context),
             }
         }) {
             Some(s) => Ok(s.clone()),
             None => {
-                let (session, guard, driver_task) = self
-                    .new_authed_connection_inner(sess, resolver)
+                if let Some(stale) = quinn_conn_lock.take() {
+                    stale
+                        .conn
+                        .close(quinn::VarInt::from_u32(0), b"network path retired");
+                    stale.udp_sessions.lock().await.clear();
+                    self.guard.lock().await.take();
+                }
+                let connecting = async {
+                    self.new_authed_connection_inner(
+                        sess,
+                        resolver,
+                        connector,
+                        hop_connector,
+                        cancellation.clone(),
+                    )
                     .await
-                    .map_err(|e| {
-                        std::io::Error::other(format!(
-                            "connect to {} failed: {}",
-                            self.opts.addr, e
+                    .map_err(|error| {
+                        io::Error::other(format!(
+                            "connect to {} failed: {error}",
+                            self.opts.addr
                         ))
-                    })?;
+                    })
+                };
+                let (session, guard, driver_task, pool_context) =
+                    cancel_on_network_change(cancellation.clone(), connecting)
+                        .await?;
 
                 let session = Arc::new(session);
                 let hyst_conn = HysteriaConnection::new_with_task_loop(
                     session,
                     self.opts.udp_mtu,
                     driver_task,
+                    pool_context,
                 );
                 *quinn_conn_lock = Some(hyst_conn.clone());
                 *self.guard.lock().await = Some(guard);
@@ -577,6 +698,7 @@ pub struct HysteriaConnection {
     pub conn: Arc<quinn::Connection>,
     pub udp_sessions: Arc<tokio::sync::Mutex<HashMap<u32, UdpSession>>>,
     h3_driver_task: Option<tokio::task::JoinHandle<()>>,
+    pool_context: NetworkPoolContext,
 
     // config
     pub udp_mtu: Option<usize>,
@@ -587,12 +709,14 @@ impl HysteriaConnection {
         conn: Arc<quinn::Connection>,
         udp_mtu: Option<u32>,
         h3_driver_task: tokio::task::JoinHandle<()>,
+        pool_context: NetworkPoolContext,
     ) -> Arc<Self> {
         let s = Arc::new(Self {
             conn,
             udp_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             udp_mtu: udp_mtu.map(|x| x as usize),
             h3_driver_task: Some(h3_driver_task),
+            pool_context,
         });
         tokio::spawn(Self::spawn_tasks(s.clone()));
 
@@ -699,6 +823,30 @@ impl HysteriaConnection {
     }
 }
 
+fn pool_context_is_current(
+    current: &NetworkPoolContext,
+    cached: &NetworkPoolContext,
+) -> bool {
+    match cached.path_id.as_ref() {
+        Some(path_id) => current.permits(cached.network_generation, Some(path_id)),
+        None => current.network_generation == cached.network_generation,
+    }
+}
+
+async fn cancel_on_network_change<T>(
+    cancellation: tokio_util::sync::CancellationToken,
+    future: impl std::future::Future<Output = io::Result<T>>,
+) -> io::Result<T> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "network changed during Hysteria2 connection setup",
+        )),
+        result = future => result,
+    }
+}
+
 impl Drop for HysteriaConnection {
     fn drop(&mut self) {
         if let Some(driver_task) = self.h3_driver_task.take() {
@@ -707,7 +855,12 @@ impl Drop for HysteriaConnection {
     }
 }
 
-impl DialWithConnector for Handler {}
+#[async_trait::async_trait]
+impl DialWithConnector for Handler {
+    async fn register_connector(&self, connector: Arc<dyn RemoteConnector>) {
+        *self.connector.write().await = Some(connector);
+    }
+}
 
 #[async_trait::async_trait]
 impl OutboundHandler for Handler {
@@ -723,18 +876,27 @@ impl OutboundHandler for Handler {
         OutboundType::Hysteria2
     }
 
+    async fn support_connector(&self) -> ConnectorType {
+        ConnectorType::All
+    }
+
     async fn reset_connection_pool(&self) -> io::Result<u32> {
+        let cancellation = self.recovery_cancellation.read().await.clone();
+        cancellation.cancel();
         let cached = self.conn.lock().await.take();
         self.guard.lock().await.take();
-
-        let Some(cached) = cached else {
-            return Ok(0);
+        let count = if let Some(cached) = cached {
+            cached
+                .conn
+                .close(quinn::VarInt::from_u32(0), b"network changed");
+            cached.udp_sessions.lock().await.clear();
+            1
+        } else {
+            0
         };
-        cached
-            .conn
-            .close(quinn::VarInt::from_u32(0), b"network changed");
-        cached.udp_sessions.lock().await.clear();
-        Ok(1)
+        *self.recovery_cancellation.write().await =
+            tokio_util::sync::CancellationToken::new();
+        Ok(count)
     }
 
     async fn connect_stream(
@@ -744,7 +906,10 @@ impl OutboundHandler for Handler {
     ) -> io::Result<BoxedChainedStream> {
         let conn = self.new_authed_connection(sess, resolver).await?;
         let stream = Self::connect_tcp(&conn.conn, sess).await?;
-        let chained = ChainedStreamWrapper::new(Box::new(stream));
+        let chained = ChainedStreamWrapper::new_with_network_path_id(
+            Box::new(stream),
+            conn.pool_context.path_id.clone(),
+        );
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
     }
@@ -759,10 +924,58 @@ impl OutboundHandler for Handler {
         let next_session_id = self
             .next_session_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pool_context = authed_conn.pool_context.clone();
         let hy_datagram = authed_conn.connect_udp(sess, next_session_id).await;
-        let s = ChainedDatagramWrapper::new(hy_datagram);
+        let hy_datagram =
+            observe_proxy_target_datagram(Box::new(hy_datagram), &pool_context);
+        let s = ChainedDatagramWrapper::new_with_network_path_id(
+            hy_datagram,
+            pool_context.path_id.clone(),
+        );
         s.append_to_chain(self.name()).await;
         Ok(Box::new(s))
+    }
+
+    async fn connect_stream_with_connector(
+        &self,
+        sess: &Session,
+        resolver: ThreadSafeDNSResolver,
+        connector: &dyn RemoteConnector,
+    ) -> io::Result<BoxedChainedStream> {
+        let conn = self
+            .new_authed_connection_with_connector(sess, resolver, connector)
+            .await?;
+        let stream = Self::connect_tcp(&conn.conn, sess).await?;
+        let chained = ChainedStreamWrapper::new_with_network_path_id(
+            Box::new(stream),
+            conn.pool_context.path_id.clone(),
+        );
+        chained.append_to_chain(self.name()).await;
+        Ok(Box::new(chained))
+    }
+
+    async fn connect_datagram_with_connector(
+        &self,
+        sess: &Session,
+        resolver: ThreadSafeDNSResolver,
+        connector: &dyn RemoteConnector,
+    ) -> io::Result<BoxedChainedDatagram> {
+        let conn = self
+            .new_authed_connection_with_connector(sess, resolver, connector)
+            .await?;
+        let next_session_id = self
+            .next_session_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pool_context = conn.pool_context.clone();
+        let datagram = conn.connect_udp(sess, next_session_id).await;
+        let datagram =
+            observe_proxy_target_datagram(Box::new(datagram), &pool_context);
+        let chained = ChainedDatagramWrapper::new_with_network_path_id(
+            datagram,
+            pool_context.path_id.clone(),
+        );
+        chained.append_to_chain(self.name()).await;
+        Ok(Box::new(chained))
     }
 }
 
@@ -1304,5 +1517,94 @@ rules:
                 .map(|_| ())
             })
             .await
+    }
+}
+
+#[cfg(test)]
+mod network_path_tests {
+    use std::{
+        net::Ipv4Addr,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
+
+    use super::*;
+    use crate::app::flow::{AddressFamily, InterfaceId, NetworkPathId};
+
+    fn path(name: &str, index: u32, address: Ipv4Addr) -> NetworkPathId {
+        NetworkPathId {
+            interface: InterfaceId {
+                name: name.to_owned(),
+                index,
+            },
+            family: AddressFamily::Ipv4,
+            source_address: Some(address.into()),
+            network_generation: 7,
+        }
+    }
+
+    #[test]
+    fn hysteria_connection_reuse_requires_a_current_eligible_path() {
+        let wifi = path("wifi0", 4, Ipv4Addr::new(192, 0, 2, 10));
+        let ethernet = path("eth0", 5, Ipv4Addr::new(198, 51, 100, 10));
+        let current = NetworkPoolContext {
+            network_generation: Some(7),
+            path_id: None,
+            eligible_path_ids: Some([ethernet.clone()].into_iter().collect()),
+            reporter: None,
+        };
+
+        assert!(!pool_context_is_current(
+            &current,
+            &NetworkPoolContext {
+                network_generation: Some(7),
+                path_id: Some(wifi),
+                ..Default::default()
+            }
+        ));
+        assert!(pool_context_is_current(
+            &current,
+            &NetworkPoolContext {
+                network_generation: Some(7),
+                path_id: Some(ethernet.clone()),
+                ..Default::default()
+            }
+        ));
+        assert!(!pool_context_is_current(
+            &current,
+            &NetworkPoolContext {
+                network_generation: Some(6),
+                path_id: Some(ethernet),
+                ..Default::default()
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn network_reset_cancels_an_inflight_hysteria_dial() {
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dial_dropped = dropped.clone();
+        let dial = async move {
+            let _drop_flag = DropFlag(dial_dropped);
+            std::future::pending::<io::Result<()>>().await
+        };
+        let task =
+            tokio::spawn(cancel_on_network_change(cancellation.clone(), dial));
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+
+        let error = task.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(dropped.load(Ordering::SeqCst));
     }
 }

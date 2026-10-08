@@ -422,7 +422,10 @@ impl OutboundHandler for Handler {
             &sess.destination,
             crate::app::runtime_state::TrafficKind::ProxyTcp,
         );
-        let chained = ChainedStreamWrapper::new(s);
+        let chained = ChainedStreamWrapper::new_with_network_path_id(
+            s,
+            pool_context.path_id.clone(),
+        );
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
     }
@@ -470,7 +473,11 @@ impl OutboundHandler for Handler {
         );
 
         let datagram = OutboundDatagramAnytls::new(stream, sess.destination.clone());
-        let chained = crate::app::dispatcher::ChainedDatagramWrapper::new(datagram);
+        let chained =
+            crate::app::dispatcher::ChainedDatagramWrapper::new_with_network_path_id(
+                datagram,
+                pool_context.path_id.clone(),
+            );
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
     }

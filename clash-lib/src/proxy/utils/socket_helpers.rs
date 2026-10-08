@@ -1,6 +1,10 @@
-#[cfg(any(target_os = "macos", all(feature = "tun", target_os = "windows")))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    all(feature = "tun", target_os = "windows")
+))]
 use std::net::IpAddr;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::net::SocketAddrV6;
 use std::{
     io,
@@ -36,7 +40,7 @@ use crate::proxy::utils::platform::{
 /// Verify that this process can bind a temporary UDP socket to one reported
 /// source address and its interface. The socket is never connected or used to
 /// send packets.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn probe_outbound_path_binding(
     interface_name: &str,
     interface_index: u32,

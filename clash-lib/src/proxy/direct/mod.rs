@@ -116,7 +116,8 @@ impl OutboundHandler for Handler {
                 sess.so_mark,
             )
             .await?;
-        let stream = ChainedStreamWrapper::new(stream);
+        let stream =
+            ChainedStreamWrapper::new_with_network_path_id(stream, path_id.clone());
         stream.append_to_chain(self.name()).await;
         Ok((Box::new(stream), path_id))
     }
@@ -231,7 +232,10 @@ impl OutboundHandler for Handler {
         }
 
         let datagram = OutboundDatagramImpl::new(socket, resolver);
-        let datagram = ChainedDatagramWrapper::new(datagram);
+        let datagram = ChainedDatagramWrapper::new_with_network_path_id(
+            datagram,
+            Some(path.id.clone()),
+        );
         datagram.append_to_chain(self.name()).await;
         Ok(Box::new(datagram))
     }
@@ -246,17 +250,21 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
     ) -> std::io::Result<BoxedChainedStream> {
-        let s = connector
-            .connect_stream(
+        let pool_context =
+            connector.connection_pool_context(sess.iface.as_ref()).await;
+        let (s, pool_context) = connector
+            .connect_stream_with_pool_context(
                 resolver,
                 sess.destination.host().as_str(),
                 sess.destination.port(),
                 sess.iface.as_ref(),
                 #[cfg(target_os = "linux")]
                 sess.so_mark,
+                pool_context,
             )
             .await?;
-        let s = ChainedStreamWrapper::new(s);
+        let s =
+            ChainedStreamWrapper::new_with_network_path_id(s, pool_context.path_id);
         s.append_to_chain(self.name()).await;
         Ok(Box::new(s))
     }
@@ -267,17 +275,23 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
     ) -> std::io::Result<BoxedChainedDatagram> {
-        let d = connector
-            .connect_datagram(
+        let pool_context =
+            connector.connection_pool_context(sess.iface.as_ref()).await;
+        let (d, pool_context) = connector
+            .connect_datagram_with_pool_context(
                 resolver,
                 None,
                 sess.destination.clone(),
                 sess.iface.as_ref(),
                 #[cfg(target_os = "linux")]
                 sess.so_mark,
+                pool_context,
             )
             .await?;
-        let d = ChainedDatagramWrapper::new(d);
+        let d = ChainedDatagramWrapper::new_with_network_path_id(
+            d,
+            pool_context.path_id,
+        );
         d.append_to_chain(self.name()).await;
         Ok(Box::new(d))
     }

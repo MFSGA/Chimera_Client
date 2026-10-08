@@ -238,7 +238,8 @@ pub enum PathRejectionReason {
 }
 
 /// Explainable path-selection result, kept separate from route and execution
-/// results. The current runtime does not produce this result yet.
+/// results. The pure path-policy compiler produces this intermediate value;
+/// dispatchers may copy its facts into a bounded runtime Explain record.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PathDecision {
@@ -249,17 +250,33 @@ pub struct PathDecision {
     pub rejected: Vec<CandidateRejection>,
 }
 
-/// Bounded, credential-free explanation retained for an established Flow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PathExecutionOutcome {
+    Connected,
+    DialFailed,
+    PathPlanningFailed,
+    StaleNetworkDiscarded,
+}
+
+/// Bounded, credential-free explanation retained for a flow attempt.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PathDecisionRecord {
     pub flow_id: uuid::Uuid,
+    pub config_version: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_version_at_completion: Option<u64>,
     pub policy_version: u64,
     pub network_version: u64,
+    pub operation_id: u64,
+    pub outcome: PathExecutionOutcome,
     pub route: RouteDecision,
     pub candidate_paths: Vec<NetworkPathId>,
     pub selected_path: Option<NetworkPathId>,
     pub rejected: Vec<CandidateRejection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<String>,
     pub reason: String,
     pub recorded_at_ms: i64,
 }
@@ -279,6 +296,11 @@ pub struct DirectPathSelection {
     /// treating interface enumeration order as a preference.
     pub ipv4_candidates: Vec<NetworkPath>,
     pub ipv6_candidates: Vec<NetworkPath>,
+    /// Candidate rejections observed while compiling the per-family plan.
+    /// Kept for local Explain records and omitted from wire serialization of
+    /// the transient socket instruction.
+    #[serde(skip)]
+    pub rejected: Vec<CandidateRejection>,
     pub required: bool,
 }
 

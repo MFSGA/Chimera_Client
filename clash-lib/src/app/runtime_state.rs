@@ -243,6 +243,7 @@ pub(crate) enum TrafficKind {
     DirectUdp,
     ProxyUdp,
     ProxyEndpointTcp,
+    ProxyEndpointUdp,
     Dns,
 }
 #[derive(Clone, Debug, Serialize)]
@@ -468,8 +469,15 @@ impl RuntimeStatus {
         })
     }
 
-    pub(crate) fn policy_and_network_versions(&self) -> (u64, u64) {
-        (self.policy_version, self.network_version)
+    /// Versions captured by Explain records so a dial racing a reload remains
+    /// attributable to the configuration and network snapshot it used.
+    pub(crate) fn decision_versions(&self) -> (u64, u64, u64, u64) {
+        (
+            self.config_version,
+            self.policy_version,
+            self.network_version,
+            self.generation,
+        )
     }
 
     pub(crate) fn path_planning_snapshot(
@@ -800,6 +808,13 @@ impl RuntimeStatus {
             .iter()
             .find(|decision| decision.flow_id == flow_id)
             .cloned()
+    }
+
+    pub(crate) fn path_decisions_snapshot(
+        &mut self,
+    ) -> Vec<crate::app::flow::PathDecisionRecord> {
+        self.expire_path_decisions();
+        self.path_decisions.iter().rev().cloned().collect()
     }
 
     fn expire_path_decisions(&mut self) {
@@ -1874,8 +1889,12 @@ mod tests {
         let flow_id = uuid::Uuid::new_v4();
         let decision = crate::app::flow::PathDecisionRecord {
             flow_id,
+            config_version: state.config_version,
+            config_version_at_completion: None,
             policy_version: 3,
             network_version: state.network_version,
+            operation_id: state.generation,
+            outcome: crate::app::flow::PathExecutionOutcome::Connected,
             route: crate::app::flow::RouteDecision {
                 outbound: "DIRECT".to_owned(),
                 rule: None,
@@ -1883,11 +1902,17 @@ mod tests {
             candidate_paths: vec![test_health_path()],
             selected_path: Some(test_health_path()),
             rejected: Vec::new(),
+            failure_kind: None,
             reason: "connectedOnBoundPath".to_owned(),
             recorded_at_ms: now_ms(),
         };
         assert!(state.record_path_decision(decision.clone()));
         assert_eq!(state.path_decision(flow_id), Some(decision.clone()));
+        assert_eq!(state.path_decisions_snapshot(), vec![decision.clone()]);
+        let json = serde_json::to_value(&decision).unwrap();
+        assert_eq!(json["outcome"], "connected");
+        assert_eq!(json["configVersion"], state.config_version);
+        assert_eq!(json["operationId"], state.generation);
 
         let mut stale = decision;
         stale.flow_id = uuid::Uuid::new_v4();
