@@ -6,3 +6,7 @@
 	path = ref-mihomo
 	url = https://github.com/MetaCubeX/mihomo.git
 	branch = Alpha
+[submodule "ref-meow"]
+	path = ref-meow
+	url = https://github.com/meow-rs/meow-rs.git
+	branch = main

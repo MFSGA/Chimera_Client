@@ -1,12 +1,13 @@
 # Iteration Plan
 
-## 当前迭代：网络变化可用性与多网卡路径（2026-10-06）
+## 当前迭代：网络变化可用性与多网卡路径（2026-10-07）
 
 - 执行入口：[网络变化可用性与路径调度迭代计划](docs/network-availability-iteration-plan.md)，以“当前执行计划”中的 B0–B11 为准。
 - 目标保持：在用户允许的路径内自动恢复新连接；已有连接尽力保留，无法恢复时明确结束。显式接口/地址族约束不能因自动降级被悄悄违反。
 - B0–B6 已完成代码级与受控回归；B8 DIRECT TCP 有界调度、B9 被动恢复防抖、B10 运行时偏好与 Explain API 已完成计划范围内的代码切片。
-- B7 本轮将实际 PathId 传入 gRPC/XHTTP H2 池，并按当前可用候选路径选择性退休条目；VLESS、Trojan、AnyTLS、SOCKS 和 Shadowsocks 的 TCP 最终目标响应均可关联路径健康，Trojan/AnyTLS 的 TCP 承载 UDP 也已接入。XHTTP H3 在无法标记物理 PathId 时对受观测路径禁用池复用。其他代理/UDP 路径证据及并发恢复边界仍待完成，B7 不标为完成。
-- 下一步扩展 Hysteria2/H3 和能确认数据 socket 路径的 UDP 证据，并补恢复期间过期拨号回归；真实双网卡、route-all、休眠、长期资源趋势和恢复时间预算需专用环境验收。平台实现与平台验收分别记录。
+- B7 已将实际 PathId 接入 gRPC/XHTTP H2/H3 池选择性退休，覆盖代理端点 TCP/UDP、DNS 和 VLESS/Trojan/AnyTLS/SOCKS/Shadowsocks TCP 最终目标响应证据；Hysteria2 普通及 Salamander QUIC 已使用 connector 选路，并加入代次/路径池检查和旧拨号取消。
+- B7 已为 Hysteria2 UDP 隧道补充基于最终目标响应的 `proxyUdp` 证据，并与外层 QUIC 代理端点证据区分；端口跳跃现在复用注册 connector，且在 PathId 可用时固定到初始连接路径，网络恢复可取消进行中的 hop socket 建立。仍欠代理链逐跳物理身份和代理服务端端到端测试。
+- 真实双网卡、route-all、休眠、长期资源趋势和恢复时间预算需专用环境验收；平台实现与平台验收分别记录。
 - Flow 为逐会话事实；Route 决定逻辑出口，Path 决定网卡/地址族；Preference 与 Constraint 分开。指南的 Ethernet/IPv4 优先顺序先作为可选策略示例，保留现有默认行为。
 - 两篇设计指南用于确定范围与行为契约；实现仍按本计划小步验证。暂缓完整 [Core / Router 重构](docs/core-router-iteration-plan.md)，仅复用新 Flow/Path 切片所需边界，不实施规则索引、Compiled Engine 或 APP-ID。
 - 现有 A0–A4 和状态机章节继续保存历史证据；专用硬件可用时可提前完成 A4，不从受控注入或 reset 测试推断真实自动切换通过。
