@@ -17,8 +17,7 @@ use crate::{
     config::internal::listener::InboundUser,
     proxy::{
         inbound::{
-            InboundHandlerTrait, InboundReady, is_inbound_client_allowed,
-            report_listener_ready,
+            AllowLanState, InboundHandlerTrait, InboundReady, report_listener_ready,
         },
         shadowsocks::{inbound::datagram::InboundShadowsocksDatagram, map_cipher},
         utils::{
@@ -34,7 +33,7 @@ pub struct ShadowsocksInbound {
     addr: SocketAddr,
     password: String,
     cipher: String,
-    allow_lan: bool,
+    allow_lan: AllowLanState,
     dispatcher: Arc<Dispatcher>,
     fw_mark: Option<u32>,
     users_rx: tokio::sync::watch::Receiver<Vec<InboundUser>>,
@@ -47,7 +46,6 @@ pub struct InboundOptions {
     pub password: String,
     pub cipher: String,
     pub udp: bool,
-    pub allow_lan: bool,
     pub dispatcher: Arc<Dispatcher>,
     pub fw_mark: Option<u32>,
     pub users_rx: tokio::sync::watch::Receiver<Vec<InboundUser>>,
@@ -55,12 +53,12 @@ pub struct InboundOptions {
 }
 
 impl ShadowsocksInbound {
-    pub fn new(opts: InboundOptions) -> Self {
+    pub(crate) fn new(opts: InboundOptions, allow_lan: AllowLanState) -> Self {
         Self {
             addr: opts.addr,
             password: opts.password,
             cipher: opts.cipher,
-            allow_lan: opts.allow_lan,
+            allow_lan,
             dispatcher: opts.dispatcher,
             fw_mark: opts.fw_mark,
             users_rx: opts.users_rx,
@@ -143,11 +141,7 @@ impl InboundHandlerTrait for ShadowsocksInbound {
                 accepted = listener.accept() => {
                     let (stream, source) = accepted?;
                     let source = source.to_canonical();
-                    if !is_inbound_client_allowed(
-                        self.allow_lan,
-                        source,
-                        stream.local_addr()?,
-                    ) {
+                    if !self.allow_lan.permits(source, stream.local_addr()?) {
                         warn!("Connection from {source} is not allowed");
                         continue;
                     }

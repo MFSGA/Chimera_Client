@@ -8,8 +8,7 @@ use crate::{
     common::{auth::ThreadSafeAuthenticator, errors::new_io_error},
     proxy::{
         inbound::{
-            InboundHandlerTrait, InboundReady, is_inbound_client_allowed,
-            report_listener_ready,
+            AllowLanState, InboundHandlerTrait, InboundReady, report_listener_ready,
         },
         utils::{ToCanonical, apply_tcp_options, try_create_dualstack_tcplistener},
     },
@@ -24,7 +23,7 @@ pub use stream::handle_tcp;
 
 pub struct SocksInbound {
     addr: SocketAddr,
-    allow_lan: bool,
+    allow_lan: AllowLanState,
     dispatcher: Arc<Dispatcher>,
     authenticator: ThreadSafeAuthenticator,
     fw_mark: Option<u32>,
@@ -37,9 +36,9 @@ impl Drop for SocksInbound {
 }
 
 impl SocksInbound {
-    pub fn new(
+    pub(crate) fn new(
         addr: SocketAddr,
-        allow_lan: bool,
+        allow_lan: AllowLanState,
         dispatcher: Arc<Dispatcher>,
         authenticator: ThreadSafeAuthenticator,
         fw_mark: Option<u32>,
@@ -95,7 +94,7 @@ impl InboundHandlerTrait for SocksInbound {
                     continue;
                 }
             };
-            if !is_inbound_client_allowed(self.allow_lan, src_addr, local_addr) {
+            if !self.allow_lan.permits(src_addr, local_addr) {
                 warn!("Connection from {} is not allowed", src_addr);
                 continue;
             }

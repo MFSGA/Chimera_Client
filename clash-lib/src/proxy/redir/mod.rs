@@ -8,8 +8,7 @@ use crate::{
     app::dispatcher::Dispatcher,
     proxy::{
         inbound::{
-            InboundHandlerTrait, InboundReady, is_inbound_client_allowed,
-            report_listener_ready,
+            AllowLanState, InboundHandlerTrait, InboundReady, report_listener_ready,
         },
         utils::{ToCanonical, apply_tcp_options, try_create_dualstack_tcplistener},
     },
@@ -18,15 +17,15 @@ use crate::{
 
 pub struct RedirInbound {
     addr: SocketAddr,
-    allow_lan: bool,
+    allow_lan: AllowLanState,
     dispatcher: Arc<Dispatcher>,
     fw_mark: Option<u32>,
 }
 
 impl RedirInbound {
-    pub fn new(
+    pub(crate) fn new(
         addr: SocketAddr,
-        allow_lan: bool,
+        allow_lan: AllowLanState,
         dispatcher: Arc<Dispatcher>,
         fw_mark: Option<u32>,
     ) -> Self {
@@ -65,7 +64,7 @@ impl InboundHandlerTrait for RedirInbound {
             let (socket, _) = listener.accept().await?;
             let source = socket.peer_addr()?.to_canonical();
             let local = socket.local_addr()?.to_canonical();
-            if !is_inbound_client_allowed(self.allow_lan, source, local) {
+            if !self.allow_lan.permits(source, local) {
                 warn!(%source, "redir connection is not allowed");
                 continue;
             }

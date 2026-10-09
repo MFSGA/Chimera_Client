@@ -283,12 +283,11 @@ async fn patch_configs(
     }
 
     let inbound_manager = state.inbound_manager.clone();
-    let listener_snapshot =
-        if payload.rebuild_listeners() || payload.allow_lan.is_some() {
-            Some(inbound_manager.snapshot_options().await)
-        } else {
-            None
-        };
+    let listener_snapshot = if payload.rebuild_listeners() {
+        Some(inbound_manager.snapshot_options().await)
+    } else {
+        None
+    };
     let mut need_restart = false;
     if let Some(bind_address) = payload.bind_address.clone() {
         match bind_address.parse::<BindAddress>() {
@@ -322,9 +321,6 @@ async fn patch_configs(
         && allow_lan != inbound_manager.get_allow_lan().await
     {
         inbound_manager.set_allow_lan(allow_lan).await;
-        // TODO: can be done with AtomicBool in each inbound manager, but requires
-        // more changes
-        need_restart = true;
     }
 
     if let Some(mode) = payload.mode {

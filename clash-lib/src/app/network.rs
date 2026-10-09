@@ -824,7 +824,7 @@ fn select_linux_default_route(
     let mut best = routes
         .iter()
         .filter(|route| route.family == family && route.metric == minimum_metric);
-    let first = best.next()?.clone();
+    let first = *best.next()?;
 
     // Equal-cost defaults on distinct interfaces are real alternatives. Keep
     // them in the candidate list and avoid labeling either one "primary".

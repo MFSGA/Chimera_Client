@@ -13,8 +13,7 @@ use crate::{
     config::internal::listener::InboundUser,
     proxy::{
         inbound::{
-            InboundHandlerTrait, InboundReady, is_inbound_client_allowed,
-            report_listener_ready,
+            AllowLanState, InboundHandlerTrait, InboundReady, report_listener_ready,
         },
         utils::{ToCanonical, try_create_dualstack_tcplistener},
     },
@@ -37,7 +36,6 @@ pub struct InboundOptions {
     /// File path or inline PEM private key (detected by `-----BEGIN`).
     /// When `None`, an ephemeral self-signed certificate is generated.
     pub private_key: Option<String>,
-    pub allow_lan: bool,
     pub dispatcher: Arc<Dispatcher>,
     pub fw_mark: Option<u32>,
     /// Optional fallback address (`host:port`) for unauthenticated connections.
@@ -48,7 +46,7 @@ pub struct InboundOptions {
 
 pub struct AnytlsInbound {
     addr: SocketAddr,
-    allow_lan: bool,
+    allow_lan: AllowLanState,
     dispatcher: Arc<Dispatcher>,
     fw_mark: Option<u32>,
     tls_acceptor: TlsAcceptor,
@@ -64,14 +62,17 @@ impl Drop for AnytlsInbound {
 }
 
 impl AnytlsInbound {
-    pub fn new(opts: InboundOptions) -> std::io::Result<Self> {
+    pub(crate) fn new(
+        opts: InboundOptions,
+        allow_lan: AllowLanState,
+    ) -> std::io::Result<Self> {
         let tls_acceptor = build_tls_acceptor(
             opts.certificate.as_deref(),
             opts.private_key.as_deref(),
         )?;
         Ok(Self {
             addr: opts.addr,
-            allow_lan: opts.allow_lan,
+            allow_lan,
             dispatcher: opts.dispatcher,
             fw_mark: opts.fw_mark,
             tls_acceptor,
@@ -115,11 +116,7 @@ impl InboundHandlerTrait for AnytlsInbound {
 
                     let src_addr = src_addr.to_canonical();
 
-                    if !is_inbound_client_allowed(
-                        self.allow_lan,
-                        src_addr,
-                        stream.local_addr()?,
-                    ) {
+                    if !self.allow_lan.permits(src_addr, stream.local_addr()?) {
                         warn!(
                             "anytls inbound {}: connection from {} rejected (not allowed)",
                             self.addr, src_addr
