@@ -248,6 +248,15 @@ impl GroupProxyAPIResponse for Handler {
         self.fastest(false).await
     }
 
+    async fn select_proxy_for_connection(
+        &self,
+        _session: &Session,
+    ) -> io::Result<AnyOutboundHandler> {
+        self.fastest(false).await.ok_or_else(|| {
+            io::Error::other(format!("url-test `{}` has no proxies", self.name()))
+        })
+    }
+
     fn get_latency_test_url(&self) -> Option<String> {
         self.opts.common_opts.url.clone()
     }

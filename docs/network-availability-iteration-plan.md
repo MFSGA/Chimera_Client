@@ -413,3 +413,75 @@ cargo test -p clash-lib --test api_reload_tests --locked -- --test-threads=1
 - `cargo check -p clash-lib --no-default-features --locked`、`cargo check -p clash-rs --locked`：通过。
 - `cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check`：最终通过。
 - 未再次运行提权 TUN 测试、物理切换或其他平台运行；不改变前述验收缺口。保留用户既有改动，没有提交或推送。
+
+## UDP 路径决策缓存策略版本修复（2026-10-09）
+
+- 基线：Chimera `92c330b`（`master`），工作区初始无未提交改动；参考目录 `ref/` 为本地 `39d06a4`，本轮仅修改本地缓存版本使用，不迁移参考实现。
+- 问题：`Dispatcher::dispatch_datagram` 创建 `UdpFlowDecisionKey` 时将 `policy_generation` 固定为 `0`。当 `/network` 的路径偏好更新而物理网络版本未变化时，同一目标持续复用旧缓存，错误归属旧策略；有界缓存空闲超时不足以处理持续活跃的 UDP 流。
+- 修复：统一取得当前 `network_version` 与 `policy_version` 并使用二者作为缓存键；在读取前刷新临时路径偏好到期状态。网络状态提供不复制完整路径候选的版本读取；路径规划返回时、使用缓存路径前和建立 UDP association 后同时核对策略与网络版本。版本失效时丢弃当前包或新建 association，不使用过期的路径选择。
+- 回归：`udp_flow_decision_cache_invalidates_after_policy_change` 在修复前实际执行 1 个用例并失败（`left: 0, right: 1`），修复后 1 passed；既有 `udp_flow_decision_cache_is_scoped_to_target_and_inbound_user` 1 passed。无默认 feature 的相同新用例 1 passed。
+- 验证：`cargo test -p clash-lib --lib --locked` 为 686 passed、0 failed、12 ignored；`cargo test -p clash-lib --test direct_udp_integration_tests --locked -- --test-threads=1` 为 3 passed；`cargo check -p clash-lib --no-default-features --locked`、`cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、`cargo fmt --all -- --check` 与 `git diff --check` 通过，均在 `nix develop --command` 环境中执行。
+- 未验证：真实双物理网卡的 UDP 路径迁移、活跃 socket 的端到端接管、Linux/Windows 真实平台运行仍待专用环境；本轮不修改网络/TUN 配置、不进行发布或推送。
+
+## DIRECT fallback 出站身份一致性修复（2026-10-09）
+
+- 基线：Chimera `92c330b`（`master`），本轮开始时保留上一切片的 `dispatcher_impl.rs`、`runtime_state.rs` 与本计划未提交改动；本地 `ref/` 为 `39d06a4`，参考行为同样在目标出站缺失时使用 DIRECT 回退，本轮不调整兼容策略。
+- 问题：TCP 取得 DIRECT fallback handler 后仍以原规则出站名选择 DNS resolver、路径规划与健康证据类型；UDP 的 fallback handler 也保留旧名称，导致 DIRECT 路径相关逻辑未执行，且缺少原始/实际目标区别。
+- 修复：TCP/UDP 共用 `select_outbound_with_direct_fallback`，返回真实 handler、有效出站名和是否发生回退；只有查找返回 `None` 时才使用 DIRECT，查找或连接池重置的实际错误仍按错误处理。TCP 后续 DNS、路径和健康分类使用有效名称；UDP 有效名称仍可从 Proxy Group 取得活跃子节点，不改变普通组选路，fallback 的 Explain 保留原规则目标。
+- 回归：新增 `missing_outbound_fallback_uses_direct_network_behavior_for_tcp_and_udp` 和 `outbound_fallback_only_happens_when_target_is_missing`，覆盖 TCP/UDP 缺失出站、DIRECT resolver、禁止 proxy-resolve-local 意外解析域名、存在的节点不触发回退、查找错误不回退、DIRECT 缺失的返回结果。
+- 验证：`cargo test -p clash-lib --lib --locked` 为 688 passed、0 failed、12 ignored；`cargo test -p clash-lib --test direct_udp_integration_tests --test lan_proxy_tests --locked -- --test-threads=1` 分别为 3 和 2 passed；`cargo check -p clash-lib --no-default-features --locked` 通过。以上命令由 `nix develop --command` 在 macOS 上执行。
+- 边界：未对可变更规则集的真实缺失出站场景进行端到端注入；此切片不修改 Proxy Group → DIRECT 的实际路径指令传递、不验证多网卡物理切换、不更改默认 DIRECT fallback 安全策略。未提交、未推送。
+
+## Selector → DIRECT 真实路径证据修复（2026-10-09）
+
+- 基线：本地 `master` `92c330b`，参考 `ref/` 为本地 `39d06a4`；本轮开始时保留前三个文件的前两轮未提交改动。本轮聚焦 Selector/Direct 的 TCP 与 UDP，不改动网络配置或参考仓库。
+- 原问题：TCP 对 Selector 的逻辑名称不识别已选择的 DIRECT 子节点，因而缺少 DIRECT 路径规划；Selector 的 `connect_*_with_path_selection` 没有透传到底层；`OutboundHandler` 默认 TCP 路径返回方法可以把规划候选当作执行结果。UDP 会话键、健康证据与 Explain 曾同时使用未验证的规划路径 ID。
+- 修改：在 TCP 路径规划前读取 Selector 活跃子节点，用其名称选择 DIRECT DNS 与路径策略；Selector 的 TCP/UDP 特殊连接方法把路径指令交给当前选中的子处理器。默认 TCP `connect_stream_with_path_selection_result` 仅从返回流 `network_path_ids()` 获取已报告的执行路径，不再猜测候选。UDP 内部继续用规划路径 ID 区分会话，但 scoped 的响应健康证据只在该 ID 与 Datagram/Tracker 的已观测路径一致时生成；`get_observed_path_id` 从既有 `TrackerInfo.network_paths` 取得信息，不另存冗余状态。已连接 Explain 不再用规划 ID 兜底，失败和取消时也不将规划路径当作已建立连接。日志明确标识 `pathPlanned`。
+- 回归：新增 `selector_forwards_tcp_and_udp_path_selection_and_preserves_observed_path`，用模拟子处理器验证 DIRECT/PROXY 切换后的 TCP/UDP 路径指令及返回路径；新增 `planned_udp_path_is_not_treated_as_observed_socket_path` 验证无实际 ID 或 ID 不符时不能构造 scoped 证据，并检查会话复用。现有 `outbound_handle_map_separates_sockets_by_selected_path` 同时核对已登记的实际路径。
+- 已通过验证（本轮）：`cargo test -p clash-lib --lib --locked` 为 690 passed、0 failed、12 ignored；`cargo test -p clash-lib --lib --no-default-features --locked selector_forwards_tcp_and_udp_path_selection_and_preserves_observed_path` 为 1 passed；`cargo test -p clash-lib --test direct_udp_integration_tests --locked -- --test-threads=1` 为 3 passed；`cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check` 全部通过，均在 Nix 环境执行。
+- 仍需验证：真实双网卡/TUN 的物理路径验证、Selector 正在切换时从读取活跃节点到打开 socket 的并发窗口、嵌套 Selector 及其他代理组类型（Fallback/UrlTest/LoadBalance）均未在本轮覆盖；因此不能宣称所有代理组或竞态均已修复。未提交、未推送。
+
+## Selector 单连接选路快照（2026-10-09）
+
+- 基线：本地 `master` `92c330b`，参考 `ref/` 为本地 `39d06a4`；开始前工作区已有前三轮未提交的五个文件修改，全部保留。本轮不修改参考仓库和系统网络配置。
+- 复现依据：旧 Dispatcher 的 TCP/UDP 流先通过 `get_active_proxy()` 判断 DIRECT 并在异步 DNS/规划后调用原 Selector handler；后者在真正拨号时又调用 `selected_proxy(true)`，用户在这段间隔切换 Selector 会导致规划节点与实际拨号节点不一致。
+- 修复：`PinnedOutbound::capture` 在每个 TCP/UDP 新连接开始规划前，沿 Selector 链固定最终的 `AnyOutboundHandler`，使用与实际拨号相同的 provider-touch 选择方式；DNS、路径规划、拨号共享快照结果。Selector 切换仅影响此后的新连接；成功连接后以由内到外顺序补齐原来的 Selector 链记录。嵌套 Selector 递归捕获，拒绝循环或超过 16 层的异常配置。非 Selector 组仍沿用当前逻辑，未改造 Fallback/UrlTest/LoadBalance。
+- 回归：`pinned_selector_ignores_later_switch_for_tcp_and_udp` 在固定 DIRECT 后切至 PROXY，再验证 TCP/UDP 均使用原节点、新连接选择 PROXY、链记录不丢失；`nested_selectors_pin_leaf_and_preserve_chain_order` 验证嵌套捕获、切换内层后不影响旧连接、链顺序正确。测试为确定性快照/切换场景，非真实多线程竞态或双网卡实验。
+- 验证：`cargo test -p clash-lib --lib --locked` 为 692 passed、0 failed、12 ignored；`cargo test -p clash-lib --test direct_udp_integration_tests --test lan_proxy_tests --locked -- --test-threads=1` 分别为 3 与 2 passed；`cargo test -p clash-lib --lib --no-default-features --locked pinned_selector_ignores_later_switch_for_tcp_and_udp` 为 1 passed；`cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check` 全部通过。以上均在 `nix develop --command` 环境执行。
+- 边界：单次拨号节点固定，不意味热更新的整个配置或 DNS/网络版本原子固定；Proxy Group 的非 Selector 动态组选路、代理链中的 Relay/Fallback、物理双网卡/TUN、其他 OS 实机尚待验证。未提交、未推送。
+
+## Fallback / UrlTest / LoadBalance 单连接选路快照（2026-10-09）
+
+- 基线：`master` `92c330b`，参考仓库本地 `ref/` 为 `39d06a4`；前四轮 6 个文件的未提交修改全部保留，本轮没有提交/推送或改动系统网络配置。
+- 问题：先前 `PinnedOutbound::capture` 只展开 Selector。Fallback 在健康状态变化、UrlTest 在延迟/可用性变化、LoadBalance 的 RoundRobin 在新流到来时都可能重新选择节点。Dispatcher 的 DNS 与路径规划如果依据组名而实际拨号由组内部再选子节点，会导致 DIRECT 物理路径与真实连接错位；LoadBalance 不能在规划与拨号阶段分别消费 RoundRobin 计数。
+- 修复：沿用现有 `PinnedOutbound`，在 TCP/UDP 单次连接开始规划时把 Selector、Fallback、UrlTest、LoadBalance 沿组链展开到同一个最终子处理器。`GroupProxyAPIResponse::select_proxy_for_connection(&Session)` 允许 Session 感知的选路，Fallback 按健康状态调用原 `find_alive_proxy(true)`，UrlTest 沿用普通连接的 `fastest(false)`，LoadBalance 仅调用一次 `selected_proxy(true, session)`；新选出的节点决定 Resolver、DIRECT 路径规划、实际拨号与物理路径证据。连接成功后恢复由内到外的原代理组链顺序。Fallback 无可用子节点时返回明确错误，不再对空列表索引越界。其他类型（如 Relay）保留原逻辑。
+- 确定性回归：`fallback_health_change_does_not_change_captured_tcp_or_udp`、`urltest_latency_change_does_not_change_captured_outbound`、`loadbalance_round_robin_selects_once_per_connection`、`selector_over_fallback_pins_direct_and_preserves_group_chain` 和 `empty_fallback_group_returns_error_not_panic` 均通过，测试覆盖捕获后节点状态变化、TCP/UDP 子节点调用计数、嵌套 Selector → Fallback → DIRECT 与链顺序。
+- 验证：`cargo test -p clash-lib --lib --locked` 为 697 passed、0 failed、12 ignored；`cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check` 通过；`cargo test -p clash-lib --test direct_udp_integration_tests --test lan_proxy_tests --locked -- --test-threads=1` 分别为 3 与 2 passed；`cargo test -p clash-lib --lib --no-default-features --locked path_selection_tests` 为 8 passed，均在 `nix develop --command` 中执行。
+- 边界：这轮的测试是可控的选路快照/状态变化与普通本地 TCP/UDP 转发，**不是**真实 Fallback/UrlTest/LoadBalance 多网卡环境端到端测试；未覆盖 Relay 的多跳链、运行时热重载/Provider 变更的并发交错、真实双网卡/TUN 迁移、跨平台运行和多线程竞争压力测试。特别是策略决策取用的 `Session` 为选路时刻的路由会话（在代理本地 DNS 解析之前），后续需要针对基于地址的负载均衡规则单独确认兼容预期。
+
+## 网络版本与连接池退役竞争（2026-10-09）
+
+- 基线：`master` `92c330b`，本地参考子模块 `ref/` 为 `39d06a4`。开始前保留前五轮九个文件未提交改动。范围仅限 `clash-lib/src/app/outbound/manager.rs` 的新连接池版本检查，不修改系统网络/TUN 或参考仓库。
+- 调用链：运行时的手动网络恢复与配置热重载由控制循环串行处理；但网络观测状态可以异步更新，新连接的 `get_outbound_for_new_flow` 会等待 `pool_reset_gate`（其他流或网络恢复也使用此锁）。旧实现进入锁之前调用 `NetworkPathSource::snapshot()`，因此排队期间网络版本变化会使实际重置目标版本过期；重置过程中变化又会直接返回 `Interrupted`，即使新版本能够立即再清理一次。
+- 修复：先获得 `pool_reset_gate` 和已有的 `pool_network_generation` 锁，再读取网络版本。若重置期间网络版本变化，重新获取最新快照并执行退役，最多三轮；成功仅将稳定的实际版本写入 `pool_network_generation`。持续变化达到上限时返回 `Interrupted`，不错误地把过期版本标记为完成；重置处理器的实际错误保持立即返回。已有失败后重试测试使用可多次调用的 `FnMut` 回调。
+- 可控并发回归：`network_change_during_pool_retirement_retries_new_generation` 验证重置中观测变更时二次执行退役、最终记录版本 2；`queued_flow_uses_latest_generation_after_concurrent_reset` 通过 `Notify` 控制第一个流在退役中暂停，网络变化后第二个排队流不重复执行；`continuously_changing_network_bounds_pool_retirement_retries` 验证三次上限、错误类型和不记录过期版本；原有 `stale_pool_generation_resets_once_and_retries_after_failure` 继续通过。未为热重载启动/回滚的完整数据面执行集成测试。
+- 验证：`cargo test -p clash-lib --lib --locked` 为 700 passed、0 failed、12 ignored；`cargo test -p clash-lib --test direct_udp_integration_tests --test lan_proxy_tests --locked -- --test-threads=1` 分别为 3、2 passed；`cargo test -p clash-lib --lib --no-default-features --locked pool_retirement` 为 2 passed；定向排队及原有失败测试均单独通过；`cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、`cargo fmt --all -- --check` 与 `git diff --check` 均通过。上述命令在 `nix develop --command` 中执行；all-features Clippy 曾因 `clash-lib/build.rs` 调用 Dashboard `npm ci` 花费较长时间，但最终正常退出。
+- 未完成：配置热重载和真实网络切换交错的端到端场景、手动重置和热重载同时由外部控制时的资源切换、某个无关出站池重置失败导致全局新连接失败的故障隔离、Linux/Windows 实机，以及实际多网卡/TUN 长跑压测。此切片不解决这些独立问题。未提交、未推送。
+
+## 出站连接池故障隔离（2026-10-09）
+
+- 基线：本地 `master` `92c330b`、参考子模块 `ref/` 为本地 `39d06a4`。本轮之前保留前六轮 10 个未提交文件修改；未改动参考仓库、依赖或系统网络配置。
+- 问题：旧 `get_outbound_for_new_flow` 在新网络版本首次查询时执行全量连接池退役，任何一个不相关 handler 的错误/超时都会使所有出站查找失败；简单忽略全局错误又可能让失败 handler 复用旧池。
+- 修复：仍对 registry 与 Provider 中的已知 handler 做去重、带超时的全量退役，但按实际 handler 身份记录各自成功或失败；稳定网络版本可标记已完成全量扫描。正常出站不受其他池错误影响，失败或新替换的 handler 在新连接前单独重试池退役，失败则拒绝使用该 handler，不触发 DIRECT fallback。动态 Selector/Fallback/UrlTest/LoadBalance 的最终子节点在 Dispatcher TCP/UDP 捕获后验证；Relay 对其可见子处理器保守验证。按规则选 DNS 出站也捕获最终子节点并检查失败状态。手动网络恢复仍会聚合报告任一池的真实退役错误，但将稳定版本的正常池状态保留，避免后续新连接被无关错误阻断。
+- 对象生命周期：成功集合使用 `Weak<dyn OutboundHandler>`，核对 `Arc::ptr_eq`，避免 Provider 热更新时复用同一内存地址误继承旧安全状态，也不强引用过期代理节点。
+- 回归：`failing_pool_does_not_block_unrelated_outbound_and_stays_fail_closed`、`manual_pool_reset_reports_failed_pool_without_poisoning_healthy_flow`、`failed_pool_recovery_is_scoped_and_not_retried_after_success`、`retirement_bookkeeping_does_not_keep_replaced_provider_handler_alive` 通过；原有重置去重、失败重试及网络版本并发测试继续通过。
+- 验证：`cargo test -p clash-lib --lib --locked` 为 704 passed、0 failed、12 ignored；`cargo test -p clash-lib --test direct_udp_integration_tests --test lan_proxy_tests --locked -- --test-threads=1` 为 3、2 passed；`cargo test -p clash-lib --lib --no-default-features --locked app::outbound::manager::tests::` 为 10 passed；`cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check` 均通过。全部在 Nix 开发环境执行。
+- 限制：本轮只模拟连接池成功/失败/恢复与生命周期；没有启动真实 VLESS/Hysteria2 故障代理或验证热更新时所有 DNS bootstrap 与 Relay 的异步内部出站；未覆盖两个不同 handler 共享同一底层 Transport 实例的特殊配置，也未做物理双网卡/TUN/跨平台运行。API 状态与已有连接对重置错误的反应保持原有逻辑。未提交、未推送。
+
+## Windows GitHub Actions 回归工作流（2026-10-09）
+
+- 现有 `.github/workflows/ci.yml` 的 `quality` 已有 `windows-latest`（Clippy、LAN 代理测试），`compile` 已有 Windows x64/x86/ARM64（PR 中部分目标跑 Cargo 测试）。新增独立的 `.github/workflows/windows-network-regression.yml` 不改变原 CI 或发布过程。
+- 触发：`workflow_dispatch` 手动运行；`master` 的相关源码提交、面向 `master` 的相关 PR 自动运行（按 `clash-lib`、`clash-dns`、`clash-netstack`、Cargo/toolchain/workflow 文件过滤）。GitHub 官方要求 `workflow_dispatch` 工作流先存在于默认分支，才能通过 Actions UI 手动选择运行。
+- 环境：`windows-latest` x64/MSVC、稳定 Rust、NASM、Protoc、PowerShell、依赖缓存。默认 feature 下执行 `clash-lib` 全库单元测试、`direct_udp_integration_tests`、`lan_proxy_tests`；无默认 feature 下分别执行 OutboundManager 故障隔离、Selector 路径与 Dispatcher 路径测试，全部串行指定 `--test-threads=1`。
+- 隔离：只运行普通库测试以及回环 TCP/UDP socket 测试；`direct_udp_integration_tests` 的 `/network/reset` 只调用 Chimera 内部协调器，不更改 Windows 主机物理网卡/TUN/DNS/路由。此工作流不需要管理员权限或真实双网卡，不声称验证了物理 TUN 与网络切换。由于默认 feature 不包含 Dashboard，此专用工作流不调用前端 npm 构建，已有全 feature CI 保持原样。
+- 验证状态：本地已使用 Ruby YAML 解析器校验工作流语法和触发/runner/steps 结构，并通过 `git diff --check`。**尚未推送/合并，不能声称已经在 GitHub Windows runner 上跑过这份新工作流**；下一步通过用户发起 PR，或将工作流加入默认分支后使用 Actions → Windows Network Regression → Run workflow。

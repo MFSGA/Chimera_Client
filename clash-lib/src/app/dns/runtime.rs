@@ -119,9 +119,18 @@ impl DnsRuntimeProvider {
             })?;
         let mut sess = sess.clone();
         let (name, _) = router.match_route(&mut sess).await;
-        mgr.get_outbound_for_new_flow(name).await?.ok_or_else(|| {
-            io::Error::other("DNS rule selected an unavailable outbound")
-        })
+        let outbound =
+            mgr.get_outbound_for_new_flow(name).await?.ok_or_else(|| {
+                io::Error::other("DNS rule selected an unavailable outbound")
+            })?;
+        // DNS rule dials must honor the same fail-closed pool isolation as
+        // Dispatcher, including the leaf selected by a dynamic proxy group.
+        let pinned =
+            crate::proxy::group::selector::PinnedOutbound::capture(outbound, &sess)
+                .await?;
+        mgr.ensure_outbound_ready_for_new_flow(&pinned.handler)
+            .await?;
+        Ok(pinned.handler)
     }
 
     fn session_for(&self, server_addr: SocketAddr, network: Network) -> Session {
