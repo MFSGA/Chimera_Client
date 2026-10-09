@@ -11,6 +11,7 @@ use crate::{
     },
     common::auth::ThreadSafeAuthenticator,
     config::internal::{config::BindAddress, listener::InboundOpts},
+    proxy::inbound::AllowLanState,
     runner::Runner,
 };
 use std::{
@@ -60,6 +61,7 @@ pub struct InboundManager {
     inbound_handlers: ThreadSafeInboundHandlers,
 
     cancellation_token: tokio_util::sync::CancellationToken,
+    allow_lan: AllowLanState,
     task: std::sync::Mutex<Option<JoinHandle<()>>>,
     ready_tx: std::sync::Mutex<Option<oneshot::Sender<Result<(), crate::Error>>>>,
     ready_rx: Mutex<Option<oneshot::Receiver<Result<(), crate::Error>>>>,
@@ -71,6 +73,7 @@ impl Runner for InboundManager {
         let dispatcher = self.dispatcher.clone();
         let authenticator = self.authenticator.clone();
         let cancellation_token = self.cancellation_token.clone();
+        let allow_lan = self.allow_lan.clone();
 
         let ready_tx = self.ready_tx.lock().unwrap().take();
         let task = tokio::spawn(async move {
@@ -79,6 +82,7 @@ impl Runner for InboundManager {
                 authenticator,
                 inbound_handlers,
                 cancellation_token,
+                allow_lan,
             )
             .await;
             match ready_tx {
@@ -181,6 +185,10 @@ impl InboundManager {
         inbounds_opt: HashSet<InboundOpts>,
         cancellation_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Self {
+        let allow_lan = inbounds_opt
+            .iter()
+            .next()
+            .is_some_and(|opts| opts.common_opts().allow_lan);
         let (ready_tx, ready_rx) = oneshot::channel();
         Self {
             inbound_handlers: Arc::new(RwLock::new(
@@ -188,6 +196,7 @@ impl InboundManager {
             )),
             dispatcher,
             authenticator,
+            allow_lan: AllowLanState::new(allow_lan),
             cancellation_token: cancellation_token.unwrap_or_default(),
             task: std::sync::Mutex::new(None),
             ready_tx: std::sync::Mutex::new(Some(ready_tx)),
@@ -238,6 +247,7 @@ impl InboundManager {
         authenticator: ThreadSafeAuthenticator,
         inbound_handlers: ThreadSafeInboundHandlers,
         cancellation_token: tokio_util::sync::CancellationToken,
+        allow_lan: AllowLanState,
     ) -> Result<(), crate::Error> {
         if let Err(err) =
             Self::stop_all_listener_handles(inbound_handlers.clone()).await
@@ -259,6 +269,7 @@ impl InboundManager {
                 &opts,
                 dispatcher.clone(),
                 authenticator.clone(),
+                allow_lan.clone(),
             ) {
                 Ok(listeners) => listeners,
                 Err(err) => {
@@ -329,11 +340,13 @@ impl InboundManager {
         let dispatcher = self.dispatcher.clone();
         let authenticator = self.authenticator.clone();
         let cancellation_token = self.cancellation_token.clone();
+        let allow_lan = self.allow_lan.clone();
         Self::start_all_listeners(
             dispatcher,
             authenticator,
             inbound_handlers,
             cancellation_token,
+            allow_lan,
         )
         .await
     }
@@ -373,12 +386,7 @@ impl InboundManager {
     }
 
     pub async fn get_allow_lan(&self) -> bool {
-        let guard = self.inbound_handlers.read().await;
-        if let Some((opts, _)) = guard.iter().next() {
-            opts.common_opts().allow_lan
-        } else {
-            false
-        }
+        self.allow_lan.enabled()
     }
 
     pub async fn get_bind_address(&self) -> BindAddress {
@@ -407,11 +415,17 @@ impl InboundManager {
     }
 
     pub(crate) async fn restore_options(&self, options: HashSet<InboundOpts>) {
+        let allow_lan = options
+            .iter()
+            .next()
+            .is_some_and(|opts| opts.common_opts().allow_lan);
+        self.allow_lan.set(allow_lan);
         let mut guard = self.inbound_handlers.write().await;
         *guard = options.into_iter().map(|opts| (opts, None)).collect();
     }
 
     pub async fn set_allow_lan(&self, allow_lan: bool) {
+        self.allow_lan.set(allow_lan);
         let mut guard = self.inbound_handlers.write().await;
         let new_map = guard
             .drain()

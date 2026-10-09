@@ -1,4 +1,10 @@
-use std::net::SocketAddr;
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use async_trait::async_trait;
 use tokio::sync::oneshot;
@@ -9,6 +15,34 @@ pub(crate) fn is_inbound_client_allowed(
     local_addr: SocketAddr,
 ) -> bool {
     allow_lan || peer_addr.ip().to_canonical() == local_addr.ip().to_canonical()
+}
+
+/// Shared allow-lan policy lets a runtime config update change access without
+/// closing listeners that may still have accepted connections or be in TCP
+/// `TIME_WAIT`.
+#[derive(Clone)]
+pub(crate) struct AllowLanState(Arc<AtomicBool>);
+
+impl AllowLanState {
+    pub(crate) fn new(allow_lan: bool) -> Self {
+        Self(Arc::new(AtomicBool::new(allow_lan)))
+    }
+
+    pub(crate) fn enabled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set(&self, allow_lan: bool) {
+        self.0.store(allow_lan, Ordering::Relaxed);
+    }
+
+    pub(crate) fn permits(
+        &self,
+        peer_addr: SocketAddr,
+        local_addr: SocketAddr,
+    ) -> bool {
+        is_inbound_client_allowed(self.enabled(), peer_addr, local_addr)
+    }
 }
 
 pub(crate) type InboundReady = oneshot::Sender<Result<(), String>>;

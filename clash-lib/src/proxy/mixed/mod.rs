@@ -8,8 +8,7 @@ use crate::{
 use super::{
     http,
     inbound::{
-        InboundHandlerTrait, InboundReady, is_inbound_client_allowed,
-        report_listener_ready,
+        AllowLanState, InboundHandlerTrait, InboundReady, report_listener_ready,
     },
     socks,
     utils::apply_tcp_options,
@@ -22,7 +21,7 @@ use tracing::warn;
 
 pub struct MixedInbound {
     addr: SocketAddr,
-    allow_lan: bool,
+    allow_lan: AllowLanState,
     dispatcher: Arc<Dispatcher>,
     authenticator: ThreadSafeAuthenticator,
     fw_mark: Option<u32>,
@@ -35,9 +34,9 @@ impl Drop for MixedInbound {
 }
 
 impl MixedInbound {
-    pub fn new(
+    pub(crate) fn new(
         addr: SocketAddr,
-        allow_lan: bool,
+        allow_lan: AllowLanState,
         dispatcher: Arc<Dispatcher>,
         authenticator: ThreadSafeAuthenticator,
         fw_mark: Option<u32>,
@@ -90,7 +89,7 @@ impl InboundHandlerTrait for MixedInbound {
                     continue;
                 }
             };
-            if !is_inbound_client_allowed(self.allow_lan, src_addr, local_addr) {
+            if !self.allow_lan.permits(src_addr, local_addr) {
                 warn!("Connection from {} is not allowed", src_addr);
                 continue;
             }

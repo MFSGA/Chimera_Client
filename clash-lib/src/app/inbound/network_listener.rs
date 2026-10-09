@@ -24,7 +24,10 @@ use crate::{
     app::dispatcher::Dispatcher,
     common::auth::ThreadSafeAuthenticator,
     config::internal::listener::InboundOpts,
-    proxy::{inbound::InboundHandlerTrait, socks::inbound::SocksInbound},
+    proxy::{
+        inbound::{AllowLanState, InboundHandlerTrait},
+        socks::inbound::SocksInbound,
+    },
 };
 
 pub(crate) struct NetworkListeners {
@@ -36,12 +39,13 @@ pub(crate) fn build_network_listeners(
     inbound_opts: &InboundOpts,
     dispatcher: Arc<Dispatcher>,
     authenticator: ThreadSafeAuthenticator,
+    allow_lan: AllowLanState,
 ) -> Result<NetworkListeners, crate::Error> {
     let name = &inbound_opts.common_opts().name;
     let addr = inbound_opts.common_opts().listen.0;
     let port = inbound_opts.common_opts().port;
 
-    let handler = build_handler(inbound_opts, dispatcher, authenticator)?;
+    let handler = build_handler(inbound_opts, dispatcher, authenticator, allow_lan)?;
     let mut runners: Vec<BoxFuture<'static, Result<(), crate::Error>>> = Vec::new();
     let mut ready = Vec::new();
 
@@ -97,12 +101,13 @@ fn build_handler(
     listener: &InboundOpts,
     dispatcher: Arc<Dispatcher>,
     authenticator: ThreadSafeAuthenticator,
+    allow_lan: AllowLanState,
 ) -> Result<Arc<dyn InboundHandlerTrait>, crate::Error> {
     let fw_mark = listener.common_opts().fw_mark;
     match listener {
         InboundOpts::Socks { common_opts, .. } => Ok(Arc::new(SocksInbound::new(
             (common_opts.listen.0, common_opts.port).into(),
-            common_opts.allow_lan,
+            allow_lan,
             dispatcher,
             authenticator,
             fw_mark,
@@ -111,7 +116,7 @@ fn build_handler(
         #[cfg(feature = "http_port")]
         InboundOpts::Http { common_opts, .. } => Ok(Arc::new(HttpInbound::new(
             (common_opts.listen.0, common_opts.port).into(),
-            common_opts.allow_lan,
+            allow_lan,
             dispatcher,
             authenticator,
             fw_mark,
@@ -119,7 +124,7 @@ fn build_handler(
         #[cfg(feature = "mixed_port")]
         InboundOpts::Mixed { common_opts, .. } => Ok(Arc::new(MixedInbound::new(
             (common_opts.listen.0, common_opts.port).into(),
-            common_opts.allow_lan,
+            allow_lan,
             dispatcher,
             authenticator,
             fw_mark,
@@ -130,7 +135,7 @@ fn build_handler(
             {
                 Ok(Arc::new(RedirInbound::new(
                     (common_opts.listen.0, common_opts.port).into(),
-                    common_opts.allow_lan,
+                    allow_lan,
                     dispatcher,
                     common_opts.fw_mark,
                 )))
@@ -177,12 +182,12 @@ fn build_handler(
                     password: password.clone(),
                     cipher: cipher.clone(),
                     udp: *udp,
-                    allow_lan: common_opts.allow_lan,
                     dispatcher,
                     fw_mark: common_opts.fw_mark,
                     users_rx,
                     static_users_tx: Some(users_tx),
                 },
+                allow_lan,
             )))
         }
         #[cfg(feature = "anytls")]
@@ -195,17 +200,19 @@ fn build_handler(
             users,
         } => {
             let (_, users_rx) = tokio::sync::watch::channel(users.clone());
-            AnytlsInbound::new(AnytlsInboundOptions {
-                addr: (common_opts.listen.0, common_opts.port).into(),
-                password: password.clone(),
-                certificate: certificate.clone(),
-                private_key: private_key.clone(),
-                fallback: fallback.clone(),
-                allow_lan: common_opts.allow_lan,
-                dispatcher,
-                fw_mark: common_opts.fw_mark,
-                users_rx,
-            })
+            AnytlsInbound::new(
+                AnytlsInboundOptions {
+                    addr: (common_opts.listen.0, common_opts.port).into(),
+                    password: password.clone(),
+                    certificate: certificate.clone(),
+                    private_key: private_key.clone(),
+                    fallback: fallback.clone(),
+                    dispatcher,
+                    fw_mark: common_opts.fw_mark,
+                    users_rx,
+                },
+                allow_lan,
+            )
             .map(|handler| Arc::new(handler) as Arc<dyn InboundHandlerTrait>)
             .map_err(Into::into)
         }
