@@ -2291,8 +2291,8 @@ mod tests {
             .and_then(|source| source.downcast_ref::<ProxyEndpointConnectError>())
             .expect("typed proxy dial details should survive io::Error propagation");
         assert_eq!(error.kind(), std::io::ErrorKind::NetworkUnreachable);
-        assert_eq!(details.candidate_paths(), &[path.id.clone()]);
-        assert_eq!(details.attempted_paths(), &[path.id]);
+        assert_eq!(details.candidate_paths(), std::slice::from_ref(&path.id));
+        assert_eq!(details.attempted_paths(), std::slice::from_ref(&path.id));
     }
 
     #[tokio::test]

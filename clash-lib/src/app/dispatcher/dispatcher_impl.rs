@@ -1855,11 +1855,13 @@ impl Dispatcher {
                             .insert(
                                 &outbound_name,
                                 source,
-                                path_id.clone(),
                                 rw_handle,
                                 remote_sender.clone(),
-                                tracker_info.clone(),
-                                packet_generation,
+                                OutboundUdpSessionState {
+                                    path_id: path_id.clone(),
+                                    tracker: tracker_info.clone(),
+                                    generation: packet_generation,
+                                },
                             )
                             .await
                         {
@@ -2196,6 +2198,12 @@ struct TimeoutUdpSessionManager {
     cleaner: Option<JoinHandle<()>>,
 }
 
+struct OutboundUdpSessionState {
+    path_id: Option<crate::app::flow::NetworkPathId>,
+    tracker: Arc<TrackerInfo>,
+    generation: u64,
+}
+
 impl Drop for TimeoutUdpSessionManager {
     fn drop(&mut self) {
         trace!("dropping timeout udp session manager");
@@ -2244,21 +2252,28 @@ impl TimeoutUdpSessionManager {
         &self,
         outbound_name: &str,
         src_addr: SocketAddr,
-        path_id: Option<crate::app::flow::NetworkPathId>,
         rw_handle: JoinHandle<()>,
         sender: OutboundPacketSender,
-        tracker: Arc<TrackerInfo>,
-        generation: u64,
+        session: OutboundUdpSessionState,
     ) -> bool {
         let mut map = self.map.write().await;
         let current = self.generation.load(Ordering::Acquire);
         map.refresh_generation(current);
-        if generation != current {
-            tracker.set_end_reason(FlowEndReason::NetworkChanged);
+        if session.generation != current {
+            session
+                .tracker
+                .set_end_reason(FlowEndReason::NetworkChanged);
             rw_handle.abort();
             return false;
         }
-        map.insert(outbound_name, src_addr, path_id, rw_handle, sender, tracker);
+        map.insert(
+            outbound_name,
+            src_addr,
+            session.path_id,
+            rw_handle,
+            sender,
+            session.tracker,
+        );
         true
     }
 
@@ -2551,11 +2566,13 @@ mod tests {
                 .insert(
                     "DIRECT",
                     source,
-                    None,
                     tokio::spawn(pending()),
                     sender,
-                    tracker.clone(),
-                    0,
+                    super::OutboundUdpSessionState {
+                        path_id: None,
+                        tracker: tracker.clone(),
+                        generation: 0,
+                    },
                 )
                 .await
         );
@@ -2585,11 +2602,13 @@ mod tests {
                 .insert(
                     "DIRECT",
                     source,
-                    None,
                     tokio::spawn(pending()),
                     sender,
-                    stale_tracker.clone(),
-                    0,
+                    super::OutboundUdpSessionState {
+                        path_id: None,
+                        tracker: stale_tracker.clone(),
+                        generation: 0,
+                    },
                 )
                 .await
         );
@@ -2604,11 +2623,13 @@ mod tests {
                 .insert(
                     "DIRECT",
                     source,
-                    None,
                     tokio::spawn(pending()),
                     sender,
-                    Arc::new(super::TrackerInfo::default()),
-                    1,
+                    super::OutboundUdpSessionState {
+                        path_id: None,
+                        tracker: Arc::new(super::TrackerInfo::default()),
+                        generation: 1,
+                    },
                 )
                 .await
         );

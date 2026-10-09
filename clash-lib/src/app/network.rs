@@ -7,8 +7,6 @@ use std::path::Path;
 use std::{io, net::IpAddr, time::Duration};
 
 use serde::Serialize;
-#[cfg(target_os = "linux")]
-use std::sync::LazyLock;
 use tokio::time::Instant;
 
 use super::flow::{AddressFamily, InterfaceId, InterfaceKind};
@@ -697,12 +695,20 @@ impl LinuxLinkState {
 }
 
 #[cfg(target_os = "linux")]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LinuxDefaultRoute {
     interface_index: u32,
     family: AddressFamily,
     gateway: Option<IpAddr>,
     metric: u32,
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxPathRouteState<'a> {
+    ipv4_route: Option<&'a LinuxDefaultRoute>,
+    ipv6_route: Option<&'a LinuxDefaultRoute>,
+    ipv4_ambiguous: bool,
+    ipv6_ambiguous: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -905,10 +911,7 @@ fn linux_interface_path(
 fn collect_linux_path_candidates<F>(
     interfaces: &[network_interface::NetworkInterface],
     links: &HashMap<u32, LinuxLinkState>,
-    ipv4_route: Option<&LinuxDefaultRoute>,
-    ipv6_route: Option<&LinuxDefaultRoute>,
-    ipv4_ambiguous: bool,
-    ipv6_ambiguous: bool,
+    route_state: LinuxPathRouteState<'_>,
     tun_exclusion: &TunCandidateExclusion,
     mut bind_probe: F,
 ) -> Vec<PathCandidateObservation>
@@ -929,12 +932,12 @@ where
             }
             let family = AddressFamily::from(ip);
             let route = match family {
-                AddressFamily::Ipv4 => ipv4_route,
-                AddressFamily::Ipv6 => ipv6_route,
+                AddressFamily::Ipv4 => route_state.ipv4_route,
+                AddressFamily::Ipv6 => route_state.ipv6_route,
             };
             let route_ambiguous = match family {
-                AddressFamily::Ipv4 => ipv4_ambiguous,
-                AddressFamily::Ipv6 => ipv6_ambiguous,
+                AddressFamily::Ipv4 => route_state.ipv4_ambiguous,
+                AddressFamily::Ipv6 => route_state.ipv6_ambiguous,
             };
             let default_route = match route {
                 Some(route) if route.interface_index == interface.index => {
@@ -1012,11 +1015,6 @@ fn linux_dns_signature(content: &str) -> String {
 /// Sample Linux interface/address state with rtnetlink and compare it to the
 /// main-table default route. This deliberately does no reachability probing;
 /// the existing traffic evidence remains the source of online health.
-#[cfg(target_os = "linux")]
-pub(crate) async fn snapshot() -> io::Result<NetworkSnapshot> {
-    snapshot_with_tun(TunCandidateExclusion::Disabled).await
-}
-
 #[cfg(target_os = "linux")]
 pub(crate) async fn snapshot_with_tun(
     tun_candidate_exclusion: TunCandidateExclusion,
@@ -1097,10 +1095,12 @@ pub(crate) async fn snapshot_with_tun(
         let mut path_candidates = collect_linux_path_candidates(
             &interfaces,
             &links,
-            ipv4_route.as_ref(),
-            ipv6_route.as_ref(),
-            ipv4_ambiguous,
-            ipv6_ambiguous,
+            LinuxPathRouteState {
+                ipv4_route: ipv4_route.as_ref(),
+                ipv6_route: ipv6_route.as_ref(),
+                ipv4_ambiguous,
+                ipv6_ambiguous,
+            },
             &tun_candidate_exclusion,
             |name, index, address| {
                 crate::proxy::utils::socket_helpers::probe_outbound_path_binding(
@@ -1171,11 +1171,6 @@ pub(crate) async fn snapshot_with_tun(
     .map_err(|_| {
         io::Error::new(io::ErrorKind::TimedOut, "Linux network snapshot timed out")
     })?
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub(crate) async fn snapshot() -> io::Result<NetworkSnapshot> {
-    snapshot_with_tun(TunCandidateExclusion::Disabled).await
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -1255,19 +1250,16 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(
-            select_linux_default_route(
-                &[slow.clone(), fast.clone()],
-                AddressFamily::Ipv4
-            ),
-            Some(fast.clone())
+            select_linux_default_route(&[slow, fast], AddressFamily::Ipv4),
+            Some(fast)
         );
 
         let equal_cost = LinuxDefaultRoute {
             metric: fast.metric,
             interface_index: 14,
-            ..fast.clone()
+            ..fast
         };
-        let ecmp = [fast.clone(), equal_cost];
+        let ecmp = [fast, equal_cost];
         assert!(linux_default_route_is_ambiguous(&ecmp, AddressFamily::Ipv4));
         assert_eq!(select_linux_default_route(&ecmp, AddressFamily::Ipv4), None);
     }
@@ -1319,10 +1311,12 @@ mod tests {
         let candidates = collect_linux_path_candidates(
             &[interface],
             &links,
-            Some(&route),
-            None,
-            false,
-            false,
+            LinuxPathRouteState {
+                ipv4_route: Some(&route),
+                ipv6_route: None,
+                ipv4_ambiguous: false,
+                ipv6_ambiguous: false,
+            },
             &TunCandidateExclusion::Disabled,
             |_, _, _| {
                 bind_probe_called = true;
@@ -1387,10 +1381,12 @@ mod tests {
         let candidates = collect_linux_path_candidates(
             &interfaces,
             &links,
-            None,
-            None,
-            true,
-            false,
+            LinuxPathRouteState {
+                ipv4_route: None,
+                ipv6_route: None,
+                ipv4_ambiguous: true,
+                ipv6_ambiguous: false,
+            },
             &TunCandidateExclusion::Disabled,
             |_, _, _| Ok(()),
         );
