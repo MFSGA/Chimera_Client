@@ -4,6 +4,8 @@ docs/
 !docs/
 docs/*
 !docs/20260928-tun-dns-macos.md
+!docs/core-router-iteration-plan.md
+!docs/network-availability-iteration-plan.md
 start*.*
 release*.*
 
