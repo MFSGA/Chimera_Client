@@ -494,3 +494,17 @@ cargo test -p clash-lib --test api_reload_tests --locked -- --test-threads=1
 - Linux ARM：上游 `sock2proc` 在 NETLINK_SOCK_DIAG 不受内核支持时对 socket 创建失败执行 `unwrap()`。Linux 进程识别结果不应影响数据转发，使用 `catch_unwind` 将异常降级为无进程名；不修改系统内核或配置。后续可考虑修复上游错误处理，避免 panic hook 输出。
 - `/network/reset`：先增强 `api_tests` 的失败报告，输出 HTTP 500 的实际响应正文，用于区分 DNS/Pool 退役失败、网络观测失败、无物理路径和重复网络采样竞态；尚未据此改变 HTTP API 语义，也未降低成功断言要求。
 - 本地验证：修复后 macOS AnyTLS UDP 重复运行 10 次均通过，第一次重试上限单元测试通过；全库/Clippy 等最终结果取后续实际执行日志。以上测试都在 Nix 开发环境运行，未使用管理员 TUN 或真实双网卡。本节的 Linux 根因必须以更新后的 GitHub Actions 日志复核；未完成前不得宣称整个 CI 全绿。
+
+## macOS/Linux 热重载监听端口释放（2026-10-09）
+
+- PR #56 的 CI #571 显示 macOS ARM64 `test_config_reload_via_empty_path_uses_stored_config_path` 中旧 SOCKS listener 已结束、替换监听器仍在旧端口得到 `EADDRINUSE`，API 状态 500；本地重复测试又复现 API Controller 自己的相同端口重绑定错误，严重时回滚后原 API listener 也无法重新绑定。
+- 处理：在共享 TCP inbound socket helper 及 API Controller 上为 *AddrInUse* 增加最多五次有界的异步退避重试（25/50/100/200/400ms，累计不超过 775ms），避免单纯等待 task join 与 OS 端口释放之间的短暂竞争；其他 socket 错误即时返回，持久端口冲突依然不能被忽略。Socks、HTTP、Mixed、Redir、Shadowsocks、AnyTLS 的 TCP listener 统一调用新 helper；UDP/TUN socket 行为没有改动。
+- 新增 `tcp_listener_retries_only_while_previous_bind_is_active`、`api_listener_rebinds_after_old_address_is_released` 可控测试；macOS 配置 reload 集成测试重复 8 次通过，`cargo test -p clash-lib --lib --locked` 707 passed / 12 ignored，完整 API 集成 9 passed，direct_udp 集成 3 passed，all-targets all-features Clippy 与格式检查通过。均在 Nix 开发环境执行。
+- Linux x64 CI #571 已确认 `/network/reset` 在单独 API 集成测试中通过，但随后在正在执行的 `direct_udp_integration_tests` 的第一个网络恢复请求上再次返回 500；该测试已添加响应正文报告以便 CI 明确暴露失败成因。不在原因确认前放松 200 / socket 替换的断言。
+
+## Linux 受限容器的网络观测退路（2026-10-09）
+
+- CI #572 Linux x64/ARM64 的 `/network/reset` HTTP 500 已由测试响应正文定位为 `operation error: observation: A netlink request failed`。不能简单吞掉恢复错误或假装已观察到可用物理路径。
+- 修复：Linux 优先用原有 rtnetlink 链路、地址与主路由证据；仅在 netlink 观测失败时，使用内核只读 `/proc/net/route`、`/proc/net/ipv6_route` 和 `/sys/class/net` 获取主表默认路由、真实链路状态。仍要求命中系统接口索引、route-up 标志、正确的默认目的地和接口地址，不把未知/不可用链路当成 verified；如果 procfs 也不可读取则保留真正错误。运行时会记录回退警告，禁止靠忽略错误满足 API 成功断言。
+- 新增 Linux 特定默认路由解析回归，包含 v4/v6 网关与 metric、错误接口以及非默认/非 up 路由。不改动 Linux 系统路由、DNS、TUN 或容器权限。macOS 端本地全库/API/UDP 回归通过；Linux 平台编译/测试仍需后续 GitHub CI 验证。
+- Windows Shadowsocks UDP 多 session 回包在 CI 曾超时，VLESS gRPC TLS 吞吐量 E2E 曾报告 `tls handshake eof`。本次未跳过或放宽这些测试，两者仍需分别验证真实失败原因。

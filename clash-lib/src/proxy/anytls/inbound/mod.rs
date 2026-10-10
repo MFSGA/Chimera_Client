@@ -15,7 +15,7 @@ use crate::{
         inbound::{
             AllowLanState, InboundHandlerTrait, InboundReady, report_listener_ready,
         },
-        utils::{ToCanonical, try_create_dualstack_tcplistener},
+        utils::{ToCanonical, try_create_dualstack_tcplistener_after_shutdown},
     },
 };
 use async_trait::async_trait;
@@ -96,7 +96,7 @@ impl InboundHandlerTrait for AnytlsInbound {
     async fn listen_tcp(&self, ready: InboundReady) -> std::io::Result<()> {
         let listener = report_listener_ready(
             ready,
-            try_create_dualstack_tcplistener(self.addr),
+            try_create_dualstack_tcplistener_after_shutdown(self.addr).await,
         )?;
 
         let mut users_rx = self.users_rx.clone();

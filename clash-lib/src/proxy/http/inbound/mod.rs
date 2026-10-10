@@ -9,7 +9,10 @@ use crate::{
         inbound::{
             AllowLanState, InboundHandlerTrait, InboundReady, report_listener_ready,
         },
-        utils::{ToCanonical, apply_tcp_options, try_create_dualstack_tcplistener},
+        utils::{
+            ToCanonical, apply_tcp_options,
+            try_create_dualstack_tcplistener_after_shutdown,
+        },
     },
 };
 use async_trait::async_trait;
@@ -64,7 +67,7 @@ impl InboundHandlerTrait for HttpInbound {
     async fn listen_tcp(&self, ready: InboundReady) -> std::io::Result<()> {
         let listener = report_listener_ready(
             ready,
-            try_create_dualstack_tcplistener(self.addr),
+            try_create_dualstack_tcplistener_after_shutdown(self.addr).await,
         )?;
 
         loop {

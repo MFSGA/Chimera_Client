@@ -10,7 +10,10 @@ use crate::{
         inbound::{
             AllowLanState, InboundHandlerTrait, InboundReady, report_listener_ready,
         },
-        utils::{ToCanonical, apply_tcp_options, try_create_dualstack_tcplistener},
+        utils::{
+            ToCanonical, apply_tcp_options,
+            try_create_dualstack_tcplistener_after_shutdown,
+        },
     },
     session::{Network, Session, Type},
 };
@@ -57,7 +60,7 @@ impl InboundHandlerTrait for RedirInbound {
     async fn listen_tcp(&self, ready: InboundReady) -> io::Result<()> {
         let listener = report_listener_ready(
             ready,
-            try_create_dualstack_tcplistener(self.addr),
+            try_create_dualstack_tcplistener_after_shutdown(self.addr).await,
         )?;
 
         loop {
