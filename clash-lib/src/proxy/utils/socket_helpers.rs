@@ -174,6 +174,28 @@ pub fn try_create_dualstack_tcplistener(
     Ok(listener)
 }
 
+/// A runtime reload awaits listener shutdown, but macOS (and some Linux
+/// network stacks) may briefly keep the old TCP port unavailable after the
+/// listener task completes. Retry only EADDRINUSE, never other bind errors.
+/// A genuinely occupied port still fails readiness after a bounded delay.
+pub async fn try_create_dualstack_tcplistener_after_shutdown(
+    addr: SocketAddr,
+) -> io::Result<TcpListener> {
+    const MAX_RETRIES: u32 = 5;
+    for attempt in 0..=MAX_RETRIES {
+        match try_create_dualstack_tcplistener(addr) {
+            Err(error)
+                if error.kind() == io::ErrorKind::AddrInUse
+                    && attempt < MAX_RETRIES =>
+            {
+                tokio::time::sleep(Duration::from_millis(25 * (1 << attempt))).await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("bounded bind retry loop always returns on final attempt")
+}
+
 /// Create a dual-stack UDP socket bound to `[::]`, falling back to an IPv4
 /// socket bound to `0.0.0.0` if IPv6 is unavailable. The socket can be reused
 /// for destinations from different address families.
@@ -959,6 +981,25 @@ pub async fn new_protected_udp_socket(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn tcp_listener_retries_only_while_previous_bind_is_active() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let old_listener = super::try_create_dualstack_tcplistener(address).unwrap();
+        let actual_address = old_listener.local_addr().unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(85)).await;
+            drop(old_listener);
+        });
+        let new_listener =
+            super::try_create_dualstack_tcplistener_after_shutdown(actual_address)
+                .await
+                .expect("released TCP port should be reused after a bounded retry");
+        assert_eq!(new_listener.local_addr().unwrap(), actual_address);
+        release.await.unwrap();
+    }
+
     use std::{
         net::{Ipv4Addr, SocketAddr, SocketAddrV6},
         sync::{

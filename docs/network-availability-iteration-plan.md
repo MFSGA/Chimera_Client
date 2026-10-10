@@ -413,3 +413,185 @@ cargo test -p clash-lib --test api_reload_tests --locked -- --test-threads=1
 - `cargo check -p clash-lib --no-default-features --locked`、`cargo check -p clash-rs --locked`：通过。
 - `cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check`：最终通过。
 - 未再次运行提权 TUN 测试、物理切换或其他平台运行；不改变前述验收缺口。保留用户既有改动，没有提交或推送。
+
+## UDP 路径决策缓存策略版本修复（2026-10-09）
+
+- 基线：Chimera `92c330b`（`master`），工作区初始无未提交改动；参考目录 `ref/` 为本地 `39d06a4`，本轮仅修改本地缓存版本使用，不迁移参考实现。
+- 问题：`Dispatcher::dispatch_datagram` 创建 `UdpFlowDecisionKey` 时将 `policy_generation` 固定为 `0`。当 `/network` 的路径偏好更新而物理网络版本未变化时，同一目标持续复用旧缓存，错误归属旧策略；有界缓存空闲超时不足以处理持续活跃的 UDP 流。
+- 修复：统一取得当前 `network_version` 与 `policy_version` 并使用二者作为缓存键；在读取前刷新临时路径偏好到期状态。网络状态提供不复制完整路径候选的版本读取；路径规划返回时、使用缓存路径前和建立 UDP association 后同时核对策略与网络版本。版本失效时丢弃当前包或新建 association，不使用过期的路径选择。
+- 回归：`udp_flow_decision_cache_invalidates_after_policy_change` 在修复前实际执行 1 个用例并失败（`left: 0, right: 1`），修复后 1 passed；既有 `udp_flow_decision_cache_is_scoped_to_target_and_inbound_user` 1 passed。无默认 feature 的相同新用例 1 passed。
+- 验证：`cargo test -p clash-lib --lib --locked` 为 686 passed、0 failed、12 ignored；`cargo test -p clash-lib --test direct_udp_integration_tests --locked -- --test-threads=1` 为 3 passed；`cargo check -p clash-lib --no-default-features --locked`、`cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、`cargo fmt --all -- --check` 与 `git diff --check` 通过，均在 `nix develop --command` 环境中执行。
+- 未验证：真实双物理网卡的 UDP 路径迁移、活跃 socket 的端到端接管、Linux/Windows 真实平台运行仍待专用环境；本轮不修改网络/TUN 配置、不进行发布或推送。
+
+## DIRECT fallback 出站身份一致性修复（2026-10-09）
+
+- 基线：Chimera `92c330b`（`master`），本轮开始时保留上一切片的 `dispatcher_impl.rs`、`runtime_state.rs` 与本计划未提交改动；本地 `ref/` 为 `39d06a4`，参考行为同样在目标出站缺失时使用 DIRECT 回退，本轮不调整兼容策略。
+- 问题：TCP 取得 DIRECT fallback handler 后仍以原规则出站名选择 DNS resolver、路径规划与健康证据类型；UDP 的 fallback handler 也保留旧名称，导致 DIRECT 路径相关逻辑未执行，且缺少原始/实际目标区别。
+- 修复：TCP/UDP 共用 `select_outbound_with_direct_fallback`，返回真实 handler、有效出站名和是否发生回退；只有查找返回 `None` 时才使用 DIRECT，查找或连接池重置的实际错误仍按错误处理。TCP 后续 DNS、路径和健康分类使用有效名称；UDP 有效名称仍可从 Proxy Group 取得活跃子节点，不改变普通组选路，fallback 的 Explain 保留原规则目标。
+- 回归：新增 `missing_outbound_fallback_uses_direct_network_behavior_for_tcp_and_udp` 和 `outbound_fallback_only_happens_when_target_is_missing`，覆盖 TCP/UDP 缺失出站、DIRECT resolver、禁止 proxy-resolve-local 意外解析域名、存在的节点不触发回退、查找错误不回退、DIRECT 缺失的返回结果。
+- 验证：`cargo test -p clash-lib --lib --locked` 为 688 passed、0 failed、12 ignored；`cargo test -p clash-lib --test direct_udp_integration_tests --test lan_proxy_tests --locked -- --test-threads=1` 分别为 3 和 2 passed；`cargo check -p clash-lib --no-default-features --locked` 通过。以上命令由 `nix develop --command` 在 macOS 上执行。
+- 边界：未对可变更规则集的真实缺失出站场景进行端到端注入；此切片不修改 Proxy Group → DIRECT 的实际路径指令传递、不验证多网卡物理切换、不更改默认 DIRECT fallback 安全策略。未提交、未推送。
+
+## Selector → DIRECT 真实路径证据修复（2026-10-09）
+
+- 基线：本地 `master` `92c330b`，参考 `ref/` 为本地 `39d06a4`；本轮开始时保留前三个文件的前两轮未提交改动。本轮聚焦 Selector/Direct 的 TCP 与 UDP，不改动网络配置或参考仓库。
+- 原问题：TCP 对 Selector 的逻辑名称不识别已选择的 DIRECT 子节点，因而缺少 DIRECT 路径规划；Selector 的 `connect_*_with_path_selection` 没有透传到底层；`OutboundHandler` 默认 TCP 路径返回方法可以把规划候选当作执行结果。UDP 会话键、健康证据与 Explain 曾同时使用未验证的规划路径 ID。
+- 修改：在 TCP 路径规划前读取 Selector 活跃子节点，用其名称选择 DIRECT DNS 与路径策略；Selector 的 TCP/UDP 特殊连接方法把路径指令交给当前选中的子处理器。默认 TCP `connect_stream_with_path_selection_result` 仅从返回流 `network_path_ids()` 获取已报告的执行路径，不再猜测候选。UDP 内部继续用规划路径 ID 区分会话，但 scoped 的响应健康证据只在该 ID 与 Datagram/Tracker 的已观测路径一致时生成；`get_observed_path_id` 从既有 `TrackerInfo.network_paths` 取得信息，不另存冗余状态。已连接 Explain 不再用规划 ID 兜底，失败和取消时也不将规划路径当作已建立连接。日志明确标识 `pathPlanned`。
+- 回归：新增 `selector_forwards_tcp_and_udp_path_selection_and_preserves_observed_path`，用模拟子处理器验证 DIRECT/PROXY 切换后的 TCP/UDP 路径指令及返回路径；新增 `planned_udp_path_is_not_treated_as_observed_socket_path` 验证无实际 ID 或 ID 不符时不能构造 scoped 证据，并检查会话复用。现有 `outbound_handle_map_separates_sockets_by_selected_path` 同时核对已登记的实际路径。
+- 已通过验证（本轮）：`cargo test -p clash-lib --lib --locked` 为 690 passed、0 failed、12 ignored；`cargo test -p clash-lib --lib --no-default-features --locked selector_forwards_tcp_and_udp_path_selection_and_preserves_observed_path` 为 1 passed；`cargo test -p clash-lib --test direct_udp_integration_tests --locked -- --test-threads=1` 为 3 passed；`cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check` 全部通过，均在 Nix 环境执行。
+- 仍需验证：真实双网卡/TUN 的物理路径验证、Selector 正在切换时从读取活跃节点到打开 socket 的并发窗口、嵌套 Selector 及其他代理组类型（Fallback/UrlTest/LoadBalance）均未在本轮覆盖；因此不能宣称所有代理组或竞态均已修复。未提交、未推送。
+
+## Selector 单连接选路快照（2026-10-09）
+
+- 基线：本地 `master` `92c330b`，参考 `ref/` 为本地 `39d06a4`；开始前工作区已有前三轮未提交的五个文件修改，全部保留。本轮不修改参考仓库和系统网络配置。
+- 复现依据：旧 Dispatcher 的 TCP/UDP 流先通过 `get_active_proxy()` 判断 DIRECT 并在异步 DNS/规划后调用原 Selector handler；后者在真正拨号时又调用 `selected_proxy(true)`，用户在这段间隔切换 Selector 会导致规划节点与实际拨号节点不一致。
+- 修复：`PinnedOutbound::capture` 在每个 TCP/UDP 新连接开始规划前，沿 Selector 链固定最终的 `AnyOutboundHandler`，使用与实际拨号相同的 provider-touch 选择方式；DNS、路径规划、拨号共享快照结果。Selector 切换仅影响此后的新连接；成功连接后以由内到外顺序补齐原来的 Selector 链记录。嵌套 Selector 递归捕获，拒绝循环或超过 16 层的异常配置。非 Selector 组仍沿用当前逻辑，未改造 Fallback/UrlTest/LoadBalance。
+- 回归：`pinned_selector_ignores_later_switch_for_tcp_and_udp` 在固定 DIRECT 后切至 PROXY，再验证 TCP/UDP 均使用原节点、新连接选择 PROXY、链记录不丢失；`nested_selectors_pin_leaf_and_preserve_chain_order` 验证嵌套捕获、切换内层后不影响旧连接、链顺序正确。测试为确定性快照/切换场景，非真实多线程竞态或双网卡实验。
+- 验证：`cargo test -p clash-lib --lib --locked` 为 692 passed、0 failed、12 ignored；`cargo test -p clash-lib --test direct_udp_integration_tests --test lan_proxy_tests --locked -- --test-threads=1` 分别为 3 与 2 passed；`cargo test -p clash-lib --lib --no-default-features --locked pinned_selector_ignores_later_switch_for_tcp_and_udp` 为 1 passed；`cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check` 全部通过。以上均在 `nix develop --command` 环境执行。
+- 边界：单次拨号节点固定，不意味热更新的整个配置或 DNS/网络版本原子固定；Proxy Group 的非 Selector 动态组选路、代理链中的 Relay/Fallback、物理双网卡/TUN、其他 OS 实机尚待验证。未提交、未推送。
+
+## Fallback / UrlTest / LoadBalance 单连接选路快照（2026-10-09）
+
+- 基线：`master` `92c330b`，参考仓库本地 `ref/` 为 `39d06a4`；前四轮 6 个文件的未提交修改全部保留，本轮没有提交/推送或改动系统网络配置。
+- 问题：先前 `PinnedOutbound::capture` 只展开 Selector。Fallback 在健康状态变化、UrlTest 在延迟/可用性变化、LoadBalance 的 RoundRobin 在新流到来时都可能重新选择节点。Dispatcher 的 DNS 与路径规划如果依据组名而实际拨号由组内部再选子节点，会导致 DIRECT 物理路径与真实连接错位；LoadBalance 不能在规划与拨号阶段分别消费 RoundRobin 计数。
+- 修复：沿用现有 `PinnedOutbound`，在 TCP/UDP 单次连接开始规划时把 Selector、Fallback、UrlTest、LoadBalance 沿组链展开到同一个最终子处理器。`GroupProxyAPIResponse::select_proxy_for_connection(&Session)` 允许 Session 感知的选路，Fallback 按健康状态调用原 `find_alive_proxy(true)`，UrlTest 沿用普通连接的 `fastest(false)`，LoadBalance 仅调用一次 `selected_proxy(true, session)`；新选出的节点决定 Resolver、DIRECT 路径规划、实际拨号与物理路径证据。连接成功后恢复由内到外的原代理组链顺序。Fallback 无可用子节点时返回明确错误，不再对空列表索引越界。其他类型（如 Relay）保留原逻辑。
+- 确定性回归：`fallback_health_change_does_not_change_captured_tcp_or_udp`、`urltest_latency_change_does_not_change_captured_outbound`、`loadbalance_round_robin_selects_once_per_connection`、`selector_over_fallback_pins_direct_and_preserves_group_chain` 和 `empty_fallback_group_returns_error_not_panic` 均通过，测试覆盖捕获后节点状态变化、TCP/UDP 子节点调用计数、嵌套 Selector → Fallback → DIRECT 与链顺序。
+- 验证：`cargo test -p clash-lib --lib --locked` 为 697 passed、0 failed、12 ignored；`cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check` 通过；`cargo test -p clash-lib --test direct_udp_integration_tests --test lan_proxy_tests --locked -- --test-threads=1` 分别为 3 与 2 passed；`cargo test -p clash-lib --lib --no-default-features --locked path_selection_tests` 为 8 passed，均在 `nix develop --command` 中执行。
+- 边界：这轮的测试是可控的选路快照/状态变化与普通本地 TCP/UDP 转发，**不是**真实 Fallback/UrlTest/LoadBalance 多网卡环境端到端测试；未覆盖 Relay 的多跳链、运行时热重载/Provider 变更的并发交错、真实双网卡/TUN 迁移、跨平台运行和多线程竞争压力测试。特别是策略决策取用的 `Session` 为选路时刻的路由会话（在代理本地 DNS 解析之前），后续需要针对基于地址的负载均衡规则单独确认兼容预期。
+
+## 网络版本与连接池退役竞争（2026-10-09）
+
+- 基线：`master` `92c330b`，本地参考子模块 `ref/` 为 `39d06a4`。开始前保留前五轮九个文件未提交改动。范围仅限 `clash-lib/src/app/outbound/manager.rs` 的新连接池版本检查，不修改系统网络/TUN 或参考仓库。
+- 调用链：运行时的手动网络恢复与配置热重载由控制循环串行处理；但网络观测状态可以异步更新，新连接的 `get_outbound_for_new_flow` 会等待 `pool_reset_gate`（其他流或网络恢复也使用此锁）。旧实现进入锁之前调用 `NetworkPathSource::snapshot()`，因此排队期间网络版本变化会使实际重置目标版本过期；重置过程中变化又会直接返回 `Interrupted`，即使新版本能够立即再清理一次。
+- 修复：先获得 `pool_reset_gate` 和已有的 `pool_network_generation` 锁，再读取网络版本。若重置期间网络版本变化，重新获取最新快照并执行退役，最多三轮；成功仅将稳定的实际版本写入 `pool_network_generation`。持续变化达到上限时返回 `Interrupted`，不错误地把过期版本标记为完成；重置处理器的实际错误保持立即返回。已有失败后重试测试使用可多次调用的 `FnMut` 回调。
+- 可控并发回归：`network_change_during_pool_retirement_retries_new_generation` 验证重置中观测变更时二次执行退役、最终记录版本 2；`queued_flow_uses_latest_generation_after_concurrent_reset` 通过 `Notify` 控制第一个流在退役中暂停，网络变化后第二个排队流不重复执行；`continuously_changing_network_bounds_pool_retirement_retries` 验证三次上限、错误类型和不记录过期版本；原有 `stale_pool_generation_resets_once_and_retries_after_failure` 继续通过。未为热重载启动/回滚的完整数据面执行集成测试。
+- 验证：`cargo test -p clash-lib --lib --locked` 为 700 passed、0 failed、12 ignored；`cargo test -p clash-lib --test direct_udp_integration_tests --test lan_proxy_tests --locked -- --test-threads=1` 分别为 3、2 passed；`cargo test -p clash-lib --lib --no-default-features --locked pool_retirement` 为 2 passed；定向排队及原有失败测试均单独通过；`cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、`cargo fmt --all -- --check` 与 `git diff --check` 均通过。上述命令在 `nix develop --command` 中执行；all-features Clippy 曾因 `clash-lib/build.rs` 调用 Dashboard `npm ci` 花费较长时间，但最终正常退出。
+- 未完成：配置热重载和真实网络切换交错的端到端场景、手动重置和热重载同时由外部控制时的资源切换、某个无关出站池重置失败导致全局新连接失败的故障隔离、Linux/Windows 实机，以及实际多网卡/TUN 长跑压测。此切片不解决这些独立问题。未提交、未推送。
+
+## 出站连接池故障隔离（2026-10-09）
+
+- 基线：本地 `master` `92c330b`、参考子模块 `ref/` 为本地 `39d06a4`。本轮之前保留前六轮 10 个未提交文件修改；未改动参考仓库、依赖或系统网络配置。
+- 问题：旧 `get_outbound_for_new_flow` 在新网络版本首次查询时执行全量连接池退役，任何一个不相关 handler 的错误/超时都会使所有出站查找失败；简单忽略全局错误又可能让失败 handler 复用旧池。
+- 修复：仍对 registry 与 Provider 中的已知 handler 做去重、带超时的全量退役，但按实际 handler 身份记录各自成功或失败；稳定网络版本可标记已完成全量扫描。正常出站不受其他池错误影响，失败或新替换的 handler 在新连接前单独重试池退役，失败则拒绝使用该 handler，不触发 DIRECT fallback。动态 Selector/Fallback/UrlTest/LoadBalance 的最终子节点在 Dispatcher TCP/UDP 捕获后验证；Relay 对其可见子处理器保守验证。按规则选 DNS 出站也捕获最终子节点并检查失败状态。手动网络恢复仍会聚合报告任一池的真实退役错误，但将稳定版本的正常池状态保留，避免后续新连接被无关错误阻断。
+- 对象生命周期：成功集合使用 `Weak<dyn OutboundHandler>`，核对 `Arc::ptr_eq`，避免 Provider 热更新时复用同一内存地址误继承旧安全状态，也不强引用过期代理节点。
+- 回归：`failing_pool_does_not_block_unrelated_outbound_and_stays_fail_closed`、`manual_pool_reset_reports_failed_pool_without_poisoning_healthy_flow`、`failed_pool_recovery_is_scoped_and_not_retried_after_success`、`retirement_bookkeeping_does_not_keep_replaced_provider_handler_alive` 通过；原有重置去重、失败重试及网络版本并发测试继续通过。
+- 验证：`cargo test -p clash-lib --lib --locked` 为 704 passed、0 failed、12 ignored；`cargo test -p clash-lib --test direct_udp_integration_tests --test lan_proxy_tests --locked -- --test-threads=1` 为 3、2 passed；`cargo test -p clash-lib --lib --no-default-features --locked app::outbound::manager::tests::` 为 10 passed；`cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check` 均通过。全部在 Nix 开发环境执行。
+- 限制：本轮只模拟连接池成功/失败/恢复与生命周期；没有启动真实 VLESS/Hysteria2 故障代理或验证热更新时所有 DNS bootstrap 与 Relay 的异步内部出站；未覆盖两个不同 handler 共享同一底层 Transport 实例的特殊配置，也未做物理双网卡/TUN/跨平台运行。API 状态与已有连接对重置错误的反应保持原有逻辑。未提交、未推送。
+
+## Windows GitHub Actions 回归工作流（2026-10-09）
+
+- 现有 `.github/workflows/ci.yml` 的 `quality` 已有 `windows-latest`（Clippy、LAN 代理测试），`compile` 已有 Windows x64/x86/ARM64（PR 中部分目标跑 Cargo 测试）。新增独立的 `.github/workflows/windows-network-regression.yml` 不改变原 CI 或发布过程。
+- 触发：`workflow_dispatch` 手动运行；`master` 的相关源码提交、面向 `master` 的相关 PR 自动运行（按 `clash-lib`、`clash-dns`、`clash-netstack`、Cargo/toolchain/workflow 文件过滤）。GitHub 官方要求 `workflow_dispatch` 工作流先存在于默认分支，才能通过 Actions UI 手动选择运行。
+- 环境：`windows-latest` x64/MSVC、稳定 Rust、NASM、Protoc、PowerShell、依赖缓存。默认 feature 下执行 `clash-lib` 全库单元测试、`direct_udp_integration_tests`、`lan_proxy_tests`；无默认 feature 下分别执行 OutboundManager 故障隔离、Selector 路径与 Dispatcher 路径测试，全部串行指定 `--test-threads=1`。
+- 隔离：只运行普通库测试以及回环 TCP/UDP socket 测试；`direct_udp_integration_tests` 的 `/network/reset` 只调用 Chimera 内部协调器，不更改 Windows 主机物理网卡/TUN/DNS/路由。此工作流不需要管理员权限或真实双网卡，不声称验证了物理 TUN 与网络切换。由于默认 feature 不包含 Dashboard，此专用工作流不调用前端 npm 构建，已有全 feature CI 保持原样。
+- 验证状态：本地已使用 Ruby YAML 解析器校验工作流语法和触发/runner/steps 结构，并通过 `git diff --check`。**尚未推送/合并，不能声称已经在 GitHub Windows runner 上跑过这份新工作流**；下一步通过用户发起 PR，或将工作流加入默认分支后使用 Actions → Windows Network Regression → Run workflow。
+
+## CI 跨平台 UDP 首包恢复与 Linux 诊断（2026-10-09）
+
+- 基线：PR #56 对应 `test/windows-network-reliability-20261009`，Windows Network Regression/Windows Rust Quality 成功，但完整 CI 中 Linux x64 的 `/network/reset` 返回 HTTP 500、macOS AnyTLS UDP 偶发超时、Linux ARM 容器进程查询触发 `sock2proc` NETLINK_SOCK_DIAG panic。
+- 可复现原因：本地 macOS 对 `integration_test_anytls_udp` 重复运行时捕获到 `discarding UDP socket created for a stale network path`，唯一首包在自动网络版本变化后被丢弃；此前的循环只消费新的 UDP datagram，不再处理旧首包。该竞态与真实网络版本切换有关，增加测试超时无法修复。
+- 修复：Dispatcher 为尚未发送成功、因网络版本或路径策略过期而丢弃的 UDP 首包保留最多 3 次重规划机会。再次读取最新生成版本、重新选择路由和出站，避免在旧 Socket 上重发；真正的拨号错误/required 路径失败、已交给活动出站的包均不会盲目重放。补充 `stale_udp_first_packet_is_replayed_with_a_bounded_retry_budget` 测试确保有效载荷保留与有界重试。
+- Linux ARM：上游 `sock2proc` 在 NETLINK_SOCK_DIAG 不受内核支持时对 socket 创建失败执行 `unwrap()`。Linux 进程识别结果不应影响数据转发，使用 `catch_unwind` 将异常降级为无进程名；不修改系统内核或配置。后续可考虑修复上游错误处理，避免 panic hook 输出。
+- `/network/reset`：先增强 `api_tests` 的失败报告，输出 HTTP 500 的实际响应正文，用于区分 DNS/Pool 退役失败、网络观测失败、无物理路径和重复网络采样竞态；尚未据此改变 HTTP API 语义，也未降低成功断言要求。
+- 本地验证：修复后 macOS AnyTLS UDP 重复运行 10 次均通过，第一次重试上限单元测试通过；全库/Clippy 等最终结果取后续实际执行日志。以上测试都在 Nix 开发环境运行，未使用管理员 TUN 或真实双网卡。本节的 Linux 根因必须以更新后的 GitHub Actions 日志复核；未完成前不得宣称整个 CI 全绿。
+
+## macOS/Linux 热重载监听端口释放（2026-10-09）
+
+- PR #56 的 CI #571 显示 macOS ARM64 `test_config_reload_via_empty_path_uses_stored_config_path` 中旧 SOCKS listener 已结束、替换监听器仍在旧端口得到 `EADDRINUSE`，API 状态 500；本地重复测试又复现 API Controller 自己的相同端口重绑定错误，严重时回滚后原 API listener 也无法重新绑定。
+- 处理：在共享 TCP inbound socket helper 及 API Controller 上为 *AddrInUse* 增加最多五次有界的异步退避重试（25/50/100/200/400ms，累计不超过 775ms），避免单纯等待 task join 与 OS 端口释放之间的短暂竞争；其他 socket 错误即时返回，持久端口冲突依然不能被忽略。Socks、HTTP、Mixed、Redir、Shadowsocks、AnyTLS 的 TCP listener 统一调用新 helper；UDP/TUN socket 行为没有改动。
+- 新增 `tcp_listener_retries_only_while_previous_bind_is_active`、`api_listener_rebinds_after_old_address_is_released` 可控测试；macOS 配置 reload 集成测试重复 8 次通过，`cargo test -p clash-lib --lib --locked` 707 passed / 12 ignored，完整 API 集成 9 passed，direct_udp 集成 3 passed，all-targets all-features Clippy 与格式检查通过。均在 Nix 开发环境执行。
+- Linux x64 CI #571 已确认 `/network/reset` 在单独 API 集成测试中通过，但随后在正在执行的 `direct_udp_integration_tests` 的第一个网络恢复请求上再次返回 500；该测试已添加响应正文报告以便 CI 明确暴露失败成因。不在原因确认前放松 200 / socket 替换的断言。
+
+## Linux 受限容器的网络观测退路（2026-10-09）
+
+- CI #572 Linux x64/ARM64 的 `/network/reset` HTTP 500 已由测试响应正文定位为 `operation error: observation: A netlink request failed`。不能简单吞掉恢复错误或假装已观察到可用物理路径。
+- 修复：Linux 优先用原有 rtnetlink 链路、地址与主路由证据；仅在 netlink 观测失败时，使用内核只读 `/proc/net/route`、`/proc/net/ipv6_route` 和 `/sys/class/net` 获取主表默认路由、真实链路状态。仍要求命中系统接口索引、route-up 标志、正确的默认目的地和接口地址，不把未知/不可用链路当成 verified；如果 procfs 也不可读取则保留真正错误。运行时会记录回退警告，禁止靠忽略错误满足 API 成功断言。
+- 新增 Linux 特定默认路由解析回归，包含 v4/v6 网关与 metric、错误接口以及非默认/非 up 路由。不改动 Linux 系统路由、DNS、TUN 或容器权限。macOS 端本地全库/API/UDP 回归通过；Linux 平台编译/测试仍需后续 GitHub CI 验证。
+- Windows Shadowsocks UDP 多 session 回包在 CI 曾超时，VLESS gRPC TLS 吞吐量 E2E 曾报告 `tls handshake eof`。本次未跳过或放宽这些测试，两者仍需分别验证真实失败原因。
+
+## Windows Shadowsocks 双客户端重放与 VLESS gRPC Docker 就绪（2026-10-09）
+
+- Windows x64 全量 Cargo 集成在 `integration_test_shadowsocks_udp_session_isolation` 中第二个客户端超时。日志证明同一 Shadowsocks 2022 客户端源地址 + `client_session_id` + `packet_id=0` 的首包在服务端被解密转发了两次，抢占 UDP echo 的第二次请求机会，第二个独立客户端无法得到响应。这不是提高等待时限能解决的问题。
+- 修复：在 Shadowsocks 2022 UDP inbound 上增加按来源 / 客户端会话隔离的 128 包滑动重放窗口；只接受不重复的新 ID、允许有限乱序和客户端 session 重建；过期包、重复 packet id 直接丢弃，最多保留 2048 个来源的窗口，避免无限占用内存。并不会影响没有 SS 2022 控制信息的旧算法。
+- 回归：`shadowsocks_2022_duplicate_packet_is_not_forwarded_twice` 在启用 all features 的单元测试中通过；本地 macOS 四个 Shadowsocks TCP/UDP 集成用例（包括两个客户端共用目标）均通过，Windows 仍需本轮后续 GitHub CI 复核。
+- VLESS `test_vless_grpc_tls` Docker E2E 曾报告 `tls handshake eof`；原测试只等待 Xray TCP 端口可连接，再 sleep 一秒，不能证明服务端已经完成 TLS/h2 初始化。为测试容器启动增加真正的 TLS 握手加 h2 ALPN 就绪探测，有界 20 秒超时；不重试已发送的应用请求、不影响生产 TLS/GRPC 实现。Docker 运行结果待 CI；未通过前不宣称修复完成。
+
+## Linux ARM64 SOCK_DIAG 与复核补丁（2026-10-09）
+
+- CI #573 Linux ARM64 单独的 SS 2022 TCP 多用户测试出现 `sock2proc` 内部 netlink socket `EPROTONOSUPPORT` panic 记录、以及上层 `early eof`。原 `catch_unwind` 仍会运行不受支持的库调用并触发 panic hook。现在在 Linux 进程归属查询前使用 `libc::socket(AF_NETLINK, SOCK_DGRAM|SOCK_CLOEXEC, NETLINK_SOCK_DIAG)` 探测一次内核支持能力，随即 close；不支持时跳过可选的进程名，阻止调用上游库；后续调用仍保留异常隔离。ARM64 TCP 归属用例还需新 CI 证实。
+- 同轮 macOS ARM64 SS UDP 双客户端测试也出现一次首包超时。新增的 AEAD2022 包去重解决了 Windows 日志中明确的相同客户端 session+packet-id 重复转发，但不宣称已经排除全部启动时序或 UDP 送达故障。下一次 GitHub CI 继续保留相同真实集成测试。
+
+## 合并前 ARMv7/i686-musl CI 闭环（2026-10-09）
+
+- PR #56 commit `5720117` 的 Windows regression、Windows/macOS/Linux quality 和 x86_64 Linux 完整 CI 通过；跨平台测试中 ARMv7 `lan_proxy_tests` 出现 `SOCKS-IN` 与 `MIXED-IN` **同用端口 36325** 的确定性冲突。原因是四次独立的 `bind(0)` 后立即释放，内核可能再次分配相同端口。测试改为同一时间保留四个通配 IPv4 TCP socket，再统一取端口，增加 32 轮互异性检查，绝不吞掉启动失败。
+- 同轮 i686 musl `ss2022_tcp_attributes_traffic_to_authenticated_user` 出现 `UnexpectedEof`，但缺少握手失败证据。原 `ClashInstance::start` 仅等待传入列表的 **首个 API 端口**；在慢速 cross/QEMU runner，不能由 API ready 推断 Shadowsocks server TCP 或 client SOCKS TCP listener ready。本测试增加真实业务监听端口 `wait_port_ready` 的启动同步，且四个测试服务端口同时保留以避免重复分配。这里只消除已知时序隐患，不宣称已定位所有架构兼容问题，需后续 i686 musl 真实运行复核。
+- macOS Nix 验证：`cargo test -p clash-lib --test lan_proxy_tests --all-features --locked -- --test-threads=1`（3 passed）、`cargo test -p clash-lib --test shadowsocks_multiuser_tests --all-features --locked -- --test-threads=1`（2 passed）、all-features Clippy `-D warnings`、fmt/diff check 均通过。绝不因多平台 CI 失败而跳过跨平台测试。
+
+## Shadowsocks 双客户端回显测试生命周期（2026-10-09）
+
+- 在 PR #56 `e308eb3` CI 中，ARMv7 GNU hard-float 的 LAN 代理 Cargo 测试已通过；Linux aarch64 GNU 的 `integration_test_shadowsocks_udp_session_isolation` 仍出现第二客户端超时。该测试的 UDP 回显 target 仅在收到**两个报文**后退出，收到重复报文就会提前关闭，使独立的第二客户端无回包。即使 SS2022 inbound 有自己的包重放过滤，测试不能依赖底层 UDP 网络恰好传输两个报文。
+- 测试修复：回显 UDP socket 在测试生命周期中持续回应，两个独立客户端的完整 payload 回包断言均成功之后才主动 abort 回显任务；超时断言保持不变，绝不跳过或放宽。Shadowsocks E2E pair 也改为同时占有四个随机服务端口作预约，并分别等待真正的 Shadowsocks TCP 与 SOCKS TCP listener ready，避免慢速 cross/QEMU runner 的控制面就绪与代理就绪竞态。
+- 本地 `cargo test -p clash-lib --test shadowsocks_integration_tests --all-features --locked -- --test-threads=1` 4/4 通过；Clippy all-features `-D warnings`、fmt/diff check 通过。跨平台 CI 仍需新提交后复核。
+
+## 跨平台根因复核：区分代码、测试与环境（2026-10-09）
+
+- **不要将跨平台 CI 失败一概归为 Runner 问题。** PR #56 `4a6d8de` 的最新 CI 显示 GNU Linux x86_64、Windows x86_64、macOS ARM64、ARMv7 均通过，但 Linux x86_64-musl 的 SS2022 TCP 用户归属测试报 `UnexpectedEof`，Linux i686-musl 的 AnyTLS UDP 测试在十秒后无回包且 echo 目标未接收包。x86_64-musl (`-F perf`) 与 GNU (`-F plus`) 的有效 feature 等价：`perf = ["plus"]`，因此 feature 开关本身不能解释两者差异；然而 musl libc、cross 容器运行环境和内核网络行为仍可能影响时序。单靠 OS/ABI 对比不能证明是库缺陷或平台缺陷。
+- **测试协议错误，已修复：** `shadowsocks_multiuser_tests` 的 TCP echo 服务器原先只执行一次 `read()`，立即把不一定完整的前缀回写并关闭 TCP 连接；客户端却要求 `read_exact(payload_len)`。TCP byte-stream 不保证一次 read 等于一次 write，分片或读短会直接诱发 `UnexpectedEof`。改成 echo 服务端对明确的 payload 长度 `read_exact()` 后再回写完整消息，所有字节断言保留。这是与平台无关的测试缺陷，在不同 libc/调度下暴露概率可能不同。
+- **生产状态缺陷，失败先行确认：** PR 新增 SS2022 UDP anti-replay 窗口曾只按客户端 SocketAddr 保存当前 session；相同 socket 的 A(0)→B(0)→A(0) 会错误接纳最后的 A(0)。新增测试 `replay_from_previous_session_must_not_be_accepted_after_session_change` 在旧实现实际失败，修复为键 `(source, client_session_id)` 的 128-bit 有界滑窗，仍允许 session 切换与乱序合法包，不跨 session 重置已见过的序号。缓存总项数限制 2048，并以淘汰换取有界内存；不能声称对无限久以前的 session 提供持久抗重放保证。
+- **musl AnyTLS UDP 根因暂未证明：** 当前只有 SOCKS5 UDP 单发 10 秒无回包、目标 echo 未收到的证据，不能由此判定底层 UDP 不支持，也不能只加大超时。测试为 musl 环境开启端到端 debug 日志，并在发出 SOCKS5 UDP datagram 时记录 relay/target 地址。还同时保留四个唯一的监听端口、分别等待 AnyTLS 和 SOCKS 业务端口就绪，以排除已知端口/启动竞态；协议断言和超时阈值未改变。等 Linux i686-musl 的下一轮完整 CI 判断 datagram 卡在 SOCKS、AnyTLS UoT 还是网络规划层。
+- **平台证据边界：** 这里的本地 all-features 单元、Shadowsocks 多用户与 AnyTLS TCP/UDP 集成测试是在 macOS/Nix 运行，不代表 musl 或 i686 真实运行通过。Linux 专用网络采样/sock_diag 检查和实际 ABI 差异仍必须用各 Runner 的日志确认。主分支合并前尤其要求 musl 原失败目标的可复现验证和 CI 结果，不通过 skip、`allow-failure` 或降级断言伪造绿灯。
+
+- **更正 AnyTLS UDP 旧诊断歧义：** 原日志 `echo_server_received_packet={echo_task.is_finished()}` 只检查回显任务是否结束，不能证明报文有没有到达，尤其无法区分目标收到报文后尚未回写与真正没有收到。新测试在 UDP echo `recv_from()` 成功后用 `AtomicBool(Release)` 记录真实到达事实；超时日志分别报告 `echo_server_received_packet` 和 `echo_task_finished`，避免用任务结束状态推断网络丢包。测试成功条件、原有 10s 截止与端到端回包断言保持不变。
+
+## PR #56 CI #579：ARM 回归复核与候选修复（2026-10-09）
+
+- 基线：PR #56 `54a54a2` 的 CI run `38024440994` 中，`aarch64-unknown-linux-musl` 执行 `api_smoke_tests::test_memory_endpoint` 时记录 `qemu-aarch64: QEMU internal SIGSEGV {code=MAPERR, addr=0x20}`；这是 QEMU 报告的内部故障，尚不能归因于 Rust 内存错误或证明 `/memory` 处理函数已经进入。Linux 内存统计库默认解析完整 `/proc/self/smaps`；本轮对 `memory-stats 1.2.0` 显式启用 `always_use_statm`，改用轻量但精度略低的 `/proc/self/statm`。这是收窄潜在触发条件和降低周期性统计开销的候选修复，不是已经由 ARM64 musl 实测确认的 SIGSEGV 根因。
+- `armv7-unknown-linux-gnueabi` 的 `runtime_allow_lan_toggle_changes_access_policy` 在收到真实 LAN TCP 连接后，Dispatcher 明确记录 `network changed while validating outbound pool retirement` 并返回 `early eof`。对 `OutboundManager::ensure_outbound_ready_for_new_flow` 增加至多三轮的**新代次池退休及逐叶 handler 验证**；仅当观察到代次变化才重新尝试，失败池绝不授权，持续抖动仍返回 `Interrupted`。补充一次改变及持续改变时的单元测试。
+- `armv7-unknown-linux-gnueabihf` 的 `integration_test_shadowsocks_udp_session_isolation` 仅有第二客户端单次 UDP 回包超时证据，根因仍未证实。E2E 用例改为两个客户端并行发送，未收到回包则每 400ms 重发各自独立 payload，且整体仍受原 10 秒（Windows 30 秒）截止约束；继续严格验证每个客户端的完整 payload 和回包源地址，持续丢包、错误会话或串包依旧失败。此处修复的是测试对 UDP 单发可靠性的错误假设，不宣称修好了尚未定位的协议缺陷。
+- 本地 Mac 定向单测 `new_observation_during_leaf_validation_retires_pools_again`、`constantly_changing_observation_cannot_authorize_leaf_pool` 已各 1/1 通过；`cargo test -p clash-lib --test shadowsocks_integration_tests -F shadowsocks --locked -- --test-threads=1` 为 4/4 通过；`cargo test -p clash-lib --test lan_proxy_tests --locked -- --test-threads=1` 为 3/3 通过；`cargo test -p clash-lib --test api_smoke_tests --locked -- --test-threads=1` 为 4/4 通过；`cargo test -p clash-lib --test missing_outbound_fails_closed --locked` 为 1/1 通过；`cargo test -p clash-lib --lib --all-features --locked` 为 859 passed、12 ignored、0 failed；`cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check` 均通过。ARM 交叉 CI、musl 实机/QEMU 对照、release 吞吐结果未由本分支验证；PR #56 不包含这些新候选修复，合并前必须在相同目标重跑验证。
+
+## PR #56 CI #580：Linux 32-bit 内存统计溢出（2026-10-10）
+
+- PR #56 commit `4c84457` 的 CI #580（run `38036874574`）中，`armv7-unknown-linux-gnueabi` 的 `api_resource_tests::test_get_connections_rest` 因 `memory-stats 1.2.0/src/linux.rs:81` 的 `attempt to multiply with overflow` 失败。实际溢出的是库为 `virtual_mem` 执行的 `total_size_pages * page_size`；Chimera 的 `/memory`、`/connections` 统计只需要 `physical_mem`（RSS），不消费 `virtual_mem`。不能因此把 LAN 允许策略视为失败。
+- 修复：Linux 内存统计入口改为直接读 `/proc/self/statm` 的 RSS 第二列，页面大小来自 `sysconf(_SC_PAGESIZE)`，`u64` 计算使用 saturating multiplication，转换为 `usize` 时截顶，解析/系统调用失败返回 0（与此前无统计结果的降级契约一致）。不再计算无用的虚拟内存；其余平台继续沿用 `memory-stats`。移除此前为 QEMU 限制启用的 `always_use_statm` feature，因为 Linux 生产路径不再调用该库。
+- 回归：加入覆盖虚拟地址空间超过 32-bit `usize`、缺损输入和 RSS 极值的纯解析单元测试。本地 macOS `cargo test -p clash-lib --lib linux_statm --locked` 2/2、`cargo test -p clash-lib --test api_resource_tests --all-features --locked -- --test-threads=1` 7/7、`cargo test -p clash-lib --test api_smoke_tests --all-features --locked -- --test-threads=1` 4/4 均通过；`cargo test -p clash-lib --lib --all-features --locked` 为 861 passed、12 ignored；all-features Clippy `-D warnings`、fmt、diff check 通过。这些不能代替 ARMv7 native/QEMU 证据。CI #580 的 `aarch64-unknown-linux-musl` 与 `armv7-unknown-linux-gnueabihf` 任务被取消，仍需要在新提交的完整 CI 里重新运行原失败目标。禁止以跳过测试或吞掉失败掩盖问题。
+
+## Missing outbound selection: fail closed
+
+A route, proxy group, or runtime mode must explicitly authorize DIRECT.
+When a rule selects a named outbound that cannot be found at dispatch time,
+TCP is closed and UDP datagrams are dropped rather than transparently falling
+back to DIRECT.
+
+## Why this matters
+
+The configuration validator already rejects references to unknown proxies
+at initial load. A missing handler can nevertheless occur at runtime if
+outbounds or providers are being replaced, or if a route and registry are
+temporarily out of sync. Treating absence as permission to use DIRECT
+can expose destination traffic that the user intended to proxy.
+
+The Dispatcher shares outbound resolution between TCP and UDP; a missing
+handler has no substitute, while genuine lookup/pool errors remain errors.
+Direct mode, an explicit DIRECT rule, and a group that has deliberately
+selected DIRECT continue to use direct networking.
+
+This is an intentional tightening of existing compatibility behavior. A
+configuration that depended on an implicit direct fallback should add an
+explicit MATCH,DIRECT rule (where direct traffic is intended) rather than
+rely on a missing proxy name.
+
+## Verification
+
+- A regression test first demonstrated that a missing named outbound would
+  select the available DIRECT handler; after this change it does not even
+  query that handler.
+- A separate test confirms an explicitly selected DIRECT handler works.
+- An integration test confirms unknown names in static routing rules are
+  rejected during configuration load.
+- Existing composite TCP/UDP DIRECT integration tests and UDP recovery
+  tests verify explicitly allowed traffic remains functional.
+
+This does not claim that every possible dynamic registry race is exercised
+end-to-end: those scenarios still need deterministic injectable runtime
+lifecycle tests.

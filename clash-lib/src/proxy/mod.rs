@@ -124,9 +124,9 @@ pub trait OutboundHandler: Sync + Send + Unpin + DialWithConnector + Debug {
         self.connect_stream(sess, resolver).await
     }
 
-    /// Connect with a selected path and return the path that actually won.
-    /// Composite/protocol handlers that do not own the socket keep their
-    /// existing behavior and report the planned path when it is unambiguous.
+    /// Connect with a selected path and return a path confirmed by the socket
+    /// connector. Handlers without path-aware dialing must not present a
+    /// planned candidate as proof of the interface actually used.
     async fn connect_stream_with_path_selection_result(
         &self,
         sess: &Session,
@@ -134,18 +134,11 @@ pub trait OutboundHandler: Sync + Send + Unpin + DialWithConnector + Debug {
         selection: &crate::app::flow::DirectPathSelection,
     ) -> io::Result<(BoxedChainedStream, Option<crate::app::flow::NetworkPathId>)>
     {
-        let path_id = match &sess.destination {
-            crate::session::SocksAddr::Ip(address) => selection
-                .candidates_for_family(crate::app::flow::AddressFamily::from(
-                    address.ip(),
-                ))
-                .first()
-                .map(|path| path.id.clone()),
-            crate::session::SocksAddr::Domain(_, _) => None,
-        };
-        self.connect_stream_with_path_selection(sess, resolver, selection)
-            .await
-            .map(|stream| (stream, path_id))
+        let stream = self
+            .connect_stream_with_path_selection(sess, resolver, selection)
+            .await?;
+        let path_id = stream.network_path_ids().first().cloned();
+        Ok((stream, path_id))
     }
 
     async fn connect_stream_with_connector(

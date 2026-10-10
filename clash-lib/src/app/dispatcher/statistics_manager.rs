@@ -7,6 +7,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+#[cfg(not(target_os = "linux"))]
 use memory_stats::memory_stats;
 use serde::Serialize;
 use tokio::sync::{Mutex, RwLock, oneshot::Sender};
@@ -365,8 +366,44 @@ impl StatisticsManager {
     }
 
     pub fn memory_usage(&self) -> usize {
-        memory_stats().map(|x| x.physical_mem).unwrap_or(0)
+        #[cfg(target_os = "linux")]
+        {
+            linux_resident_memory_bytes().unwrap_or(0)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            memory_stats().map(|x| x.physical_mem).unwrap_or(0)
+        }
     }
+}
+
+/// The Linux API exposes resident memory only. `memory-stats` also computes
+/// virtual memory with `usize` arithmetic, which overflows on 32-bit Linux
+/// when the process has a large virtual address space (e.g. under QEMU).
+/// Read only the RSS column instead of calculating an unused virtual size.
+#[cfg(target_os = "linux")]
+fn linux_resident_memory_bytes() -> Option<usize> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    // SAFETY: sysconf(_SC_PAGESIZE) reads a process-level OS setting.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return None;
+    }
+    parse_linux_statm_resident_bytes(&statm, page_size as u64)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_statm_resident_bytes(statm: &str, page_size: u64) -> Option<usize> {
+    if page_size == 0 {
+        return None;
+    }
+    let mut columns = statm.split_whitespace();
+    // The first column is virtual pages, which can exceed the size of a
+    // 32-bit usize. We do not need it for the API's RSS measurement.
+    columns.next()?.parse::<u64>().ok()?;
+    let resident_pages = columns.next()?.parse::<u64>().ok()?;
+    let resident_bytes = resident_pages.saturating_mul(page_size);
+    Some(usize::try_from(resident_bytes).unwrap_or(usize::MAX))
 }
 
 #[derive(Serialize, Default)]
@@ -459,7 +496,35 @@ mod tests {
         session::{Network, Session, SocksAddr},
     };
 
-    use super::{ClosedFlowInfo, FlowEndReason, StatisticsManager, TrackerInfo};
+    use super::{
+        ClosedFlowInfo, FlowEndReason, StatisticsManager, TrackerInfo,
+        parse_linux_statm_resident_bytes,
+    };
+
+    #[test]
+    fn linux_statm_ignores_virtual_size_that_overflows_32_bit() {
+        // 2_097_152 virtual pages * 4096 = 8 GiB (> u32::MAX), but
+        // physical RSS is a modest 64 pages. Never multiply virtual pages.
+        assert_eq!(
+            parse_linux_statm_resident_bytes("2097152 64 0 0 0 0 0", 4096),
+            Some(262_144)
+        );
+    }
+
+    #[test]
+    fn linux_statm_rejects_bad_fields_and_clamps_large_rss() {
+        assert_eq!(parse_linux_statm_resident_bytes("123", 4096), None);
+        assert_eq!(parse_linux_statm_resident_bytes("123 nope", 4096), None);
+        assert_eq!(parse_linux_statm_resident_bytes("123 5", 0), None);
+        assert_eq!(parse_linux_statm_resident_bytes("nope 5", 4096), None);
+        assert_eq!(
+            parse_linux_statm_resident_bytes(
+                "18446744073709551615 18446744073709551615",
+                4096
+            ),
+            Some(usize::MAX)
+        );
+    }
 
     #[tokio::test]
     async fn closed_flow_info_extracts_only_flow_fields() {

@@ -97,6 +97,7 @@ socket2 = { version = "0.6", features = ["all"] }
 downcast-rs = "2.0"
 
 rand = "0.10"
+# Linux reads RSS directly from statm; this dependency serves other OSes.
 memory-stats = "1"
 
 chrono = { version = "0.4", features = ["serde"] }

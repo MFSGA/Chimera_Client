@@ -21,12 +21,19 @@ use tokio::{
 const TEST_SECRET: &str = "lan-proxy-test";
 const IO_TIMEOUT: Duration = Duration::from_secs(3);
 
-fn available_port() -> u16 {
-    TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .expect("failed to reserve a test port")
-        .local_addr()
-        .expect("failed to inspect reserved test port")
-        .port()
+/// Hold all four ephemeral port reservations simultaneously, preventing a
+/// bind(0)/close race from selecting the same port for two proxy listeners.
+fn available_listener_ports() -> [u16; 4] {
+    let reservations: [TcpListener; 4] = std::array::from_fn(|_| {
+        TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .expect("failed to reserve LAN proxy listener port")
+    });
+    reservations.map(|listener| {
+        listener
+            .local_addr()
+            .expect("failed to inspect reserved test port")
+            .port()
+    })
 }
 
 fn non_loopback_ipv4_addresses() -> Vec<Ipv4Addr> {
@@ -82,6 +89,19 @@ rules:\n\
         ),
     )
     .expect("failed to write LAN proxy test config");
+}
+
+#[test]
+fn test_proxy_listener_ports_are_distinct() {
+    for _ in 0..32 {
+        let ports = available_listener_ports();
+        let unique = ports.iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            unique.len(),
+            ports.len(),
+            "distinct listeners cannot share ports"
+        );
+    }
 }
 
 async fn spawn_echo_server() -> io::Result<(SocketAddr, JoinHandle<()>)> {
@@ -349,10 +369,7 @@ fn test_config_path(api_port: u16, name: &str) -> PathBuf {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial]
 async fn allow_lan_proxies_tcp_through_socks_http_and_mixed() {
-    let api_port = available_port();
-    let socks_port = available_port();
-    let http_port = available_port();
-    let mixed_port = available_port();
+    let [api_port, socks_port, http_port, mixed_port] = available_listener_ports();
     let config_path = test_config_path(api_port, "lan-proxy");
     write_proxy_config(
         &config_path,
@@ -438,10 +455,7 @@ async fn allow_lan_proxies_tcp_through_socks_http_and_mixed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial]
 async fn runtime_allow_lan_toggle_changes_access_policy() {
-    let api_port = available_port();
-    let socks_port = available_port();
-    let http_port = available_port();
-    let mixed_port = available_port();
+    let [api_port, socks_port, http_port, mixed_port] = available_listener_ports();
     let config_path = test_config_path(api_port, "lan-toggle");
     write_proxy_config(
         &config_path,

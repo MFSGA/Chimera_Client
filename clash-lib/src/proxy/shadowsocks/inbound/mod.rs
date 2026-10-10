@@ -22,7 +22,7 @@ use crate::{
         shadowsocks::{inbound::datagram::InboundShadowsocksDatagram, map_cipher},
         utils::{
             ToCanonical, apply_tcp_options, new_udp_socket,
-            try_create_dualstack_tcplistener,
+            try_create_dualstack_tcplistener_after_shutdown,
         },
     },
     session::{Network, Session, SocksAddr, Type},
@@ -123,12 +123,14 @@ impl InboundHandlerTrait for ShadowsocksInbound {
 
     async fn listen_tcp(&self, ready: InboundReady) -> std::io::Result<()> {
         let context = Context::new_shared(shadowsocks::config::ServerType::Server);
-        let prepared = (|| {
+        let prepared = async {
             let config = self.build_server_config()?;
             let method = map_cipher(&self.cipher)?;
-            let listener = try_create_dualstack_tcplistener(self.addr)?;
+            let listener =
+                try_create_dualstack_tcplistener_after_shutdown(self.addr).await?;
             Ok((config, method, listener))
-        })();
+        }
+        .await;
         let (config, method, listener) = report_listener_ready(ready, prepared)?;
         let server_key = Arc::new(config.key().to_vec());
         let mut users_rx = self.users_rx.clone();
@@ -260,7 +262,9 @@ impl InboundHandlerTrait for ShadowsocksInbound {
                     &config,
                     socket.into(),
                 );
-            let datagram = Box::new(InboundShadowsocksDatagram::new(socket));
+            let replay_protection = map_cipher(&self.cipher)?.is_aead_2022();
+            let datagram =
+                Box::new(InboundShadowsocksDatagram::new(socket, replay_protection));
             let session = Session {
                 network: Network::Udp,
                 typ: Type::Shadowsocks,

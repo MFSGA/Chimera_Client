@@ -401,6 +401,33 @@ impl Session {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn linux_sock_diag_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        // sock2proc currently unwraps the NETLINK_SOCK_DIAG socket. Detect
+        // kernels/containers that do not provide this protocol before
+        // invoking its lookup; avoid a panic hook and a failed forwarding task.
+        // SAFETY: socket() returns a process-local file descriptor, and a
+        // successful descriptor is closed immediately without sharing it.
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_NETLINK,
+                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+                libc::NETLINK_SOCK_DIAG,
+            )
+        };
+        if fd < 0 {
+            tracing::debug!(error = %std::io::Error::last_os_error(), "NETLINK_SOCK_DIAG unavailable; skipping process attribution");
+            return false;
+        }
+        // SAFETY: fd is owned exclusively by this function and was returned
+        // by the successful socket() call above.
+        unsafe { libc::close(fd) };
+        true
+    })
+}
+
 pub fn find_process_name(
     source: SocketAddr,
     destination: Option<SocketAddr>,
@@ -408,14 +435,31 @@ pub fn find_process_name(
 ) -> Option<String> {
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     {
-        sock2proc::find_process_name(
-            Some(source),
-            destination,
-            match network {
-                Network::Tcp => sock2proc::NetworkProtocol::TCP,
-                Network::Udp => sock2proc::NetworkProtocol::UDP,
-            },
-        )
+        let lookup = || {
+            sock2proc::find_process_name(
+                Some(source),
+                destination,
+                match network {
+                    Network::Tcp => sock2proc::NetworkProtocol::TCP,
+                    Network::Udp => sock2proc::NetworkProtocol::UDP,
+                },
+            )
+        };
+        #[cfg(target_os = "linux")]
+        {
+            if !linux_sock_diag_available() {
+                return None;
+            }
+            // sock2proc currently unwraps NETLINK_SOCK_DIAG socket creation.
+            // Minimal Linux containers (including some cross runners) may
+            // return EPROTONOSUPPORT; process attribution must not terminate
+            // an otherwise healthy TCP/UDP forwarding task.
+            std::panic::catch_unwind(lookup).ok().flatten()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            lookup()
+        }
     }
 
     #[cfg(not(any(

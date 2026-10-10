@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     io,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Weak},
     time::Duration,
 };
 
@@ -79,35 +79,69 @@ pub struct OutboundManager {
     network_path_source: NetworkPathSource,
     pool_reset_gate: Mutex<()>,
     pool_network_generation: Mutex<Option<u64>>,
+    pool_retirement: Mutex<PoolRetirementState>,
 }
 
-pub type ThreadSafeOutboundManager = Arc<OutboundManager>;
-static DEFAULT_LATENCY_TEST_URL: &str = "http://www.gstatic.com/generate_204";
+#[derive(Default)]
+struct PoolRetirementState {
+    generation: Option<u64>,
+    ready: HashMap<usize, Weak<dyn crate::proxy::OutboundHandler>>,
+    failed: HashMap<usize, String>,
+}
 
-async fn reset_unique_connection_pools(
+struct PoolResetOutcome {
+    identity: usize,
+    handler: Weak<dyn crate::proxy::OutboundHandler>,
+    result: io::Result<u32>,
+}
+
+fn handler_identity(handler: &AnyOutboundHandler) -> usize {
+    Arc::as_ptr(handler) as *const () as usize
+}
+
+async fn reset_unique_connection_pools_detailed(
     handlers: Vec<AnyOutboundHandler>,
-) -> io::Result<u32> {
+) -> Vec<PoolResetOutcome> {
     let mut seen = HashSet::new();
-    let mut reset = 0_u32;
-    let mut errors = Vec::new();
     let mut pending = futures::stream::FuturesUnordered::new();
     for handler in handlers {
-        let identity = Arc::as_ptr(&handler) as *const () as usize;
+        let identity = handler_identity(&handler);
         if seen.insert(identity) {
+            let weak = Arc::downgrade(&handler);
             pending.push(async move {
-                tokio::time::timeout(
+                let result = tokio::time::timeout(
                     Duration::from_secs(5),
                     handler.reset_connection_pool(),
                 )
                 .await
+                .unwrap_or_else(|_| {
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "outbound pool reset timed out",
+                    ))
+                });
+                PoolResetOutcome {
+                    identity,
+                    handler: weak,
+                    result,
+                }
             });
         }
     }
-    while let Some(result) = pending.next().await {
-        match result {
-            Ok(Ok(count)) => reset = reset.saturating_add(count),
-            Ok(Err(error)) => errors.push(error.to_string()),
-            Err(_) => errors.push("outbound pool reset timed out".to_owned()),
+    let mut outcomes = Vec::new();
+    while let Some(outcome) = pending.next().await {
+        outcomes.push(outcome);
+    }
+    outcomes
+}
+
+fn summarize_pool_resets(outcomes: &[PoolResetOutcome]) -> io::Result<u32> {
+    let mut reset = 0_u32;
+    let mut errors = Vec::new();
+    for outcome in outcomes {
+        match &outcome.result {
+            Ok(count) => reset = reset.saturating_add(*count),
+            Err(error) => errors.push(error.to_string()),
         }
     }
     if errors.is_empty() {
@@ -117,38 +151,73 @@ async fn reset_unique_connection_pools(
     }
 }
 
+pub type ThreadSafeOutboundManager = Arc<OutboundManager>;
+static DEFAULT_LATENCY_TEST_URL: &str = "http://www.gstatic.com/generate_204";
+
+impl PoolRetirementState {
+    fn record(&mut self, generation: u64, outcomes: &[PoolResetOutcome]) {
+        self.generation = Some(generation);
+        self.ready.clear();
+        self.failed.clear();
+        for outcome in outcomes {
+            match &outcome.result {
+                Ok(_) => {
+                    self.ready.insert(outcome.identity, outcome.handler.clone());
+                }
+                Err(error) => {
+                    self.failed.insert(outcome.identity, error.to_string());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+async fn reset_unique_connection_pools(
+    handlers: Vec<AnyOutboundHandler>,
+) -> io::Result<u32> {
+    summarize_pool_resets(&reset_unique_connection_pools_detailed(handlers).await)
+}
+
 async fn ensure_pool_generation_current<F, Fut>(
     network_path_source: &NetworkPathSource,
     reset_gate: &Mutex<()>,
     pool_generation: &Mutex<Option<u64>>,
-    reset_pools: F,
+    mut reset_pools: F,
 ) -> io::Result<bool>
 where
-    F: FnOnce() -> Fut,
+    F: FnMut(u64) -> Fut,
     Fut: std::future::Future<Output = io::Result<()>>,
 {
-    let Some((generation, ..)) = network_path_source.snapshot().await else {
-        return Ok(false);
-    };
     let _reset_gate = reset_gate.lock().await;
     let mut pool_generation = pool_generation.lock().await;
-    if *pool_generation == Some(generation) {
-        return Ok(false);
-    }
+    // A flow can wait behind manual recovery or another flow's pool reset.
+    // Read the observed generation only after acquiring the reset gate.
+    // If a second network change happens during retirement, retry against
+    // the newest generation, but bound the work under a flapping network.
+    const MAX_GENERATION_ATTEMPTS: usize = 3;
+    for _ in 0..MAX_GENERATION_ATTEMPTS {
+        let Some((generation, ..)) = network_path_source.snapshot().await else {
+            return Ok(false);
+        };
+        if *pool_generation == Some(generation) {
+            return Ok(false);
+        }
 
-    reset_pools().await?;
-    let current_generation = network_path_source
-        .snapshot()
-        .await
-        .map(|(current, ..)| current);
-    if current_generation != Some(generation) {
-        return Err(io::Error::new(
-            io::ErrorKind::Interrupted,
-            "network changed while retiring stale outbound pools",
-        ));
+        reset_pools(generation).await?;
+        let current_generation = network_path_source
+            .snapshot()
+            .await
+            .map(|(current, ..)| current);
+        if current_generation == Some(generation) {
+            *pool_generation = Some(generation);
+            return Ok(true);
+        }
     }
-    *pool_generation = Some(generation);
-    Ok(true)
+    Err(io::Error::new(
+        io::ErrorKind::Interrupted,
+        "network changed repeatedly while retiring stale outbound pools",
+    ))
 }
 
 /// Init process:
@@ -225,6 +294,7 @@ impl OutboundManager {
             network_path_source,
             pool_reset_gate: Mutex::new(()),
             pool_network_generation: Mutex::new(None),
+            pool_retirement: Mutex::new(PoolRetirementState::default()),
         };
 
         debug!("initializing proxy providers");
@@ -268,26 +338,170 @@ impl OutboundManager {
         self.registry.read().await.get(name).cloned()
     }
 
-    /// Ensure the first outbound lookup in each observed network generation
-    /// retires any pool created on the previous path before a new flow can use
-    /// it. DNS bootstrap and management lookups keep using `get_outbound`.
-    pub(crate) async fn get_outbound_for_new_flow(
-        &self,
-        name: &str,
-    ) -> io::Result<Option<AnyOutboundHandler>> {
+    /// Retire every known pool for a new network generation, retaining
+    /// handler-specific failures instead of blocking unrelated new flows.
+    async fn ensure_pools_current(&self) -> io::Result<()> {
         ensure_pool_generation_current(
             &self.network_path_source,
             &self.pool_reset_gate,
             &self.pool_network_generation,
-            || async {
-                self.reset_connection_pools_inner()
-                    .await
-                    .map(|_| ())
-                    .map_err(|error| io::Error::other(error.to_string()))
+            |generation| async move {
+                let outcomes = self.reset_connection_pools_inner_detailed().await;
+                {
+                    let mut state = self.pool_retirement.lock().await;
+                    state.record(generation, &outcomes);
+                }
+                for outcome in &outcomes {
+                    if let Err(error) = &outcome.result {
+                        tracing::warn!(
+                            handler_identity = outcome.identity,
+                            generation,
+                            error = %error,
+                            "outbound pool retirement failed; affected handler will retry before dialing"
+                        );
+                    }
+                }
+                Ok(())
             },
         )
         .await?;
-        Ok(self.get_outbound(name).await)
+        Ok(())
+    }
+
+    /// Check the final socket-owning handler after dynamic group selection.
+    /// An independently failed pool may only be used after its own reset
+    /// succeeds. A newly loaded provider handler is also checked once.
+    pub(crate) async fn ensure_outbound_ready_for_new_flow(
+        &self,
+        handler: &AnyOutboundHandler,
+    ) -> io::Result<()> {
+        // Network observation can advance after the first pool retirement
+        // but before this handler's readiness check. Retry only against the
+        // newly observed generation; never authorize a stale pool.
+        const MAX_VALIDATION_ATTEMPTS: usize = 3;
+        for _ in 0..MAX_VALIDATION_ATTEMPTS {
+            self.ensure_pools_current().await?;
+
+            // Relay can dial several proxies; all constituent pools must be safe.
+            // Dynamic group selection is pinned by Dispatcher before this call.
+            let mut pending = vec![handler.clone()];
+            let mut checked = HashSet::new();
+            let mut handles = Vec::new();
+            while let Some(candidate) = pending.pop() {
+                let identity = handler_identity(&candidate);
+                if !checked.insert(identity) {
+                    continue;
+                }
+                if checked.len() > 256 {
+                    return Err(io::Error::other(
+                        "outbound group dependency tree exceeds safe limit",
+                    ));
+                }
+                if let Some(group) = candidate.try_as_group_handler() {
+                    let children = group.get_proxies().await;
+                    pending.extend(children);
+                }
+                handles.push(candidate);
+            }
+
+            let _gate = self.pool_reset_gate.lock().await;
+            let Some((generation, ..)) = self.network_path_source.snapshot().await
+            else {
+                return Ok(());
+            };
+            if *self.pool_network_generation.lock().await != Some(generation) {
+                // A sampler or recovery task advanced the generation while we
+                // were preparing the handler list. Re-retire on the next attempt.
+                continue;
+            }
+
+            for candidate in handles {
+                let identity = handler_identity(&candidate);
+                {
+                    let state = self.pool_retirement.lock().await;
+                    if state.generation == Some(generation)
+                        && state
+                            .ready
+                            .get(&identity)
+                            .and_then(Weak::upgrade)
+                            .is_some_and(|existing| {
+                                Arc::ptr_eq(&existing, &candidate)
+                            })
+                    {
+                        continue;
+                    }
+                }
+
+                // Do not hold the bookkeeping lock across a potentially slow
+                // transport reset. The reset gate serializes callers instead.
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    candidate.reset_connection_pool(),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "outbound pool reset timed out",
+                    ))
+                });
+                let mut state = self.pool_retirement.lock().await;
+                if state.generation != Some(generation) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "pool retirement generation changed during handler reset",
+                    ));
+                }
+                match result {
+                    Ok(_) => {
+                        state.failed.remove(&identity);
+                        state.ready.insert(identity, Arc::downgrade(&candidate));
+                    }
+                    Err(error) => {
+                        state.ready.remove(&identity);
+                        state.failed.insert(identity, error.to_string());
+                        return Err(io::Error::new(
+                            error.kind(),
+                            format!(
+                                "outbound '{}' pool is not safe to reuse: {error}",
+                                candidate.name()
+                            ),
+                        ));
+                    }
+                }
+            }
+            // Do not authorize a newly opened connection on a stale generation.
+            if self
+                .network_path_source
+                .snapshot()
+                .await
+                .map(|(version, ..)| version)
+                != Some(generation)
+            {
+                continue;
+            }
+            return Ok(());
+        }
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "network changed while validating outbound pool retirement",
+        ))
+    }
+
+    pub(crate) async fn get_outbound_for_new_flow(
+        &self,
+        name: &str,
+    ) -> io::Result<Option<AnyOutboundHandler>> {
+        self.ensure_pools_current().await?;
+        let handler = self.get_outbound(name).await;
+        // Group selection is performed by Dispatcher later. Checking all
+        // possible group members here would wrongly reject healthy choices.
+        if let Some(handler) = &handler
+            && handler.try_as_group_handler().is_none()
+        {
+            self.ensure_outbound_ready_for_new_flow(handler).await?;
+        }
+        Ok(handler)
     }
 
     pub(crate) async fn attach_network_status(
@@ -315,21 +529,30 @@ impl OutboundManager {
             .snapshot()
             .await
             .map(|(generation, ..)| generation);
-        let result = self.reset_connection_pools_inner().await;
-        if result.is_ok()
-            && generation_before.is_some()
+        let outcomes = self.reset_connection_pools_inner_detailed().await;
+        let stable = generation_before.is_some()
             && self
                 .network_path_source
                 .snapshot()
                 .await
-                .is_some_and(|(current, ..)| Some(current) == generation_before)
-        {
-            *self.pool_network_generation.lock().await = generation_before;
+                .is_some_and(|(current, ..)| Some(current) == generation_before);
+        if stable {
+            let generation =
+                generation_before.expect("stable generation is present");
+            self.pool_retirement
+                .lock()
+                .await
+                .record(generation, &outcomes);
+            *self.pool_network_generation.lock().await = Some(generation);
         }
-        result
+        summarize_pool_resets(&outcomes).map_err(|error| {
+            Error::Operation(format!(
+                "failed to reset outbound connection pool: {error}"
+            ))
+        })
     }
 
-    async fn reset_connection_pools_inner(&self) -> Result<u32, Error> {
+    async fn reset_connection_pools_inner_detailed(&self) -> Vec<PoolResetOutcome> {
         let mut handlers: Vec<AnyOutboundHandler> =
             self.registry.read().await.values().cloned().collect();
         let providers: Vec<ThreadSafeProxyProvider> =
@@ -337,14 +560,7 @@ impl OutboundManager {
         for provider in providers {
             handlers.extend(provider.read().await.proxies().await);
         }
-
-        reset_unique_connection_pools(handlers)
-            .await
-            .map_err(|error| {
-                Error::Operation(format!(
-                    "failed to reset outbound connection pool: {error}"
-                ))
-            })
+        reset_unique_connection_pools_detailed(handlers).await
     }
 
     /// This does not populate history/liveness information.
@@ -1230,9 +1446,10 @@ mod tests {
 
     use async_trait::async_trait;
 
-    #[cfg(feature = "wireguard")]
-    use super::OutboundManager;
-    use super::{ensure_pool_generation_current, reset_unique_connection_pools};
+    use super::{
+        OutboundManager, PoolRetirementState, ensure_pool_generation_current,
+        reset_unique_connection_pools,
+    };
     use crate::{
         app::{
             dispatcher::{BoxedChainedDatagram, BoxedChainedStream},
@@ -1386,6 +1603,352 @@ ip: not-an-ip
         assert_eq!(second_resets.load(Ordering::SeqCst), 1);
     }
 
+    #[derive(Debug)]
+    struct RecoverableHandler {
+        resets: Arc<AtomicUsize>,
+        should_fail: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl DialWithConnector for RecoverableHandler {}
+
+    #[async_trait]
+    impl OutboundHandler for RecoverableHandler {
+        fn name(&self) -> &str {
+            "recoverable"
+        }
+        fn proto(&self) -> OutboundType {
+            OutboundType::Vless
+        }
+        async fn reset_connection_pool(&self) -> io::Result<u32> {
+            self.resets.fetch_add(1, Ordering::SeqCst);
+            if self.should_fail.load(Ordering::SeqCst) {
+                Err(io::Error::other("temporary pool failure"))
+            } else {
+                Ok(1)
+            }
+        }
+        async fn connect_stream(
+            &self,
+            _: &Session,
+            _: ThreadSafeDNSResolver,
+        ) -> io::Result<BoxedChainedStream> {
+            unreachable!("pool readiness test does not dial")
+        }
+        async fn connect_datagram(
+            &self,
+            _: &Session,
+            _: ThreadSafeDNSResolver,
+        ) -> io::Result<BoxedChainedDatagram> {
+            unreachable!("pool readiness test does not dial")
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_pool_recovery_is_scoped_and_not_retried_after_success() {
+        let failures = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let resets = Arc::new(AtomicUsize::new(0));
+        let recoverable: AnyOutboundHandler = Arc::new(RecoverableHandler {
+            resets: resets.clone(),
+            should_fail: failures.clone(),
+        });
+        let good: AnyOutboundHandler = Arc::new(CountingHandler {
+            name: "DIRECT",
+            resets: Arc::new(AtomicUsize::new(0)),
+            reset_count: 0,
+            fail: false,
+        });
+        let manager = isolated_pool_manager(vec![good, recoverable.clone()]).await;
+        assert!(
+            manager
+                .get_outbound_for_new_flow("DIRECT")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(resets.load(Ordering::SeqCst), 1);
+        assert!(
+            manager
+                .get_outbound_for_new_flow("recoverable")
+                .await
+                .is_err()
+        );
+        assert_eq!(resets.load(Ordering::SeqCst), 2);
+        failures.store(false, Ordering::SeqCst);
+        assert!(
+            manager
+                .get_outbound_for_new_flow("recoverable")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(resets.load(Ordering::SeqCst), 3);
+        assert!(
+            manager
+                .get_outbound_for_new_flow("recoverable")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(resets.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn retirement_bookkeeping_does_not_keep_replaced_provider_handler_alive() {
+        let handler: AnyOutboundHandler = Arc::new(CountingHandler {
+            name: "provider",
+            resets: Arc::new(AtomicUsize::new(0)),
+            reset_count: 0,
+            fail: false,
+        });
+        let weak = Arc::downgrade(&handler);
+        let outcomes =
+            super::reset_unique_connection_pools_detailed(vec![handler.clone()])
+                .await;
+        let mut state = PoolRetirementState::default();
+        state.record(2, &outcomes);
+        assert_eq!(state.ready.len(), 1);
+        drop(handler);
+        assert!(
+            weak.upgrade().is_none(),
+            "retirement status must not pin old provider objects"
+        );
+    }
+
+    async fn isolated_pool_manager(
+        handlers: Vec<AnyOutboundHandler>,
+    ) -> OutboundManager {
+        use crate::{
+            app::{
+                profile::ThreadSafeCacheFile, remote_content_manager::ProxyManager,
+            },
+            proxy::utils::test_utils::noop::NoopResolver,
+        };
+        use std::collections::HashMap;
+        use tokio::sync::{Mutex, RwLock};
+
+        let source = NetworkPathSource::default();
+        let mut status = NetworkStatus::default();
+        status.set_automatic_supported_for_test(true);
+        status.observed(&NetworkSnapshot::default());
+        source.attach(Arc::new(RwLock::new(status))).await;
+        let dns = Arc::new(NoopResolver);
+        let registry = handlers
+            .into_iter()
+            .map(|handler| (handler.name().to_owned(), handler))
+            .collect::<HashMap<_, _>>();
+        OutboundManager {
+            proxy_providers: HashMap::new(),
+            proxy_manager: ProxyManager::new(dns, None),
+            selector_control: HashMap::new(),
+            cache_store: ThreadSafeCacheFile::new(
+                "/tmp/chimera-isolation-test-unused",
+                false,
+            ),
+            registry: Arc::new(RwLock::new(registry)),
+            network_path_source: source,
+            pool_reset_gate: Mutex::new(()),
+            pool_network_generation: Mutex::new(None),
+            pool_retirement: Mutex::new(PoolRetirementState::default()),
+        }
+    }
+
+    /// Simulate a new network observation after initial pool retirement, while
+    /// validating a selected provider/group leaf that was not in the registry.
+    #[derive(Debug)]
+    struct GenerationChangingHandler {
+        status: Arc<tokio::sync::RwLock<NetworkStatus>>,
+        resets: Arc<AtomicUsize>,
+        change_on_every_reset: bool,
+    }
+
+    impl DialWithConnector for GenerationChangingHandler {}
+
+    #[async_trait]
+    impl OutboundHandler for GenerationChangingHandler {
+        fn name(&self) -> &str {
+            "provider-leaf"
+        }
+
+        fn proto(&self) -> OutboundType {
+            OutboundType::Direct
+        }
+
+        async fn reset_connection_pool(&self) -> io::Result<u32> {
+            let attempt = self.resets.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 || self.change_on_every_reset {
+                let mut updated = NetworkSnapshot::default();
+                updated.interfaces.push(format!("network-{attempt}"));
+                self.status.write().await.observed(&updated);
+            }
+            Ok(0)
+        }
+
+        async fn connect_stream(
+            &self,
+            _: &Session,
+            _: ThreadSafeDNSResolver,
+        ) -> io::Result<BoxedChainedStream> {
+            unreachable!("generation-change test does not dial")
+        }
+
+        async fn connect_datagram(
+            &self,
+            _: &Session,
+            _: ThreadSafeDNSResolver,
+        ) -> io::Result<BoxedChainedDatagram> {
+            unreachable!("generation-change test does not dial")
+        }
+    }
+
+    #[tokio::test]
+    async fn new_observation_during_leaf_validation_retires_pools_again() {
+        let direct: AnyOutboundHandler = Arc::new(CountingHandler {
+            name: "DIRECT",
+            resets: Arc::new(AtomicUsize::new(0)),
+            reset_count: 0,
+            fail: false,
+        });
+        let manager = isolated_pool_manager(vec![direct]).await;
+        let status = manager.network_path_source.snapshot().await.unwrap().3;
+        let resets = Arc::new(AtomicUsize::new(0));
+        let leaf: AnyOutboundHandler = Arc::new(GenerationChangingHandler {
+            status,
+            resets: resets.clone(),
+            change_on_every_reset: false,
+        });
+
+        manager
+            .ensure_outbound_ready_for_new_flow(&leaf)
+            .await
+            .unwrap();
+        assert_eq!(resets.load(Ordering::SeqCst), 2);
+        let generation = manager.network_path_source.snapshot().await.unwrap().0;
+        assert_eq!(
+            *manager.pool_network_generation.lock().await,
+            Some(generation)
+        );
+    }
+
+    #[tokio::test]
+    async fn constantly_changing_observation_cannot_authorize_leaf_pool() {
+        let direct: AnyOutboundHandler = Arc::new(CountingHandler {
+            name: "DIRECT",
+            resets: Arc::new(AtomicUsize::new(0)),
+            reset_count: 0,
+            fail: false,
+        });
+        let manager = isolated_pool_manager(vec![direct]).await;
+        let status = manager.network_path_source.snapshot().await.unwrap().3;
+        let resets = Arc::new(AtomicUsize::new(0));
+        let leaf: AnyOutboundHandler = Arc::new(GenerationChangingHandler {
+            status,
+            resets: resets.clone(),
+            change_on_every_reset: true,
+        });
+
+        let error = manager
+            .ensure_outbound_ready_for_new_flow(&leaf)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(resets.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn failing_pool_does_not_block_unrelated_outbound_and_stays_fail_closed() {
+        let good_resets = Arc::new(AtomicUsize::new(0));
+        let broken_resets = Arc::new(AtomicUsize::new(0));
+        let good: AnyOutboundHandler = Arc::new(CountingHandler {
+            name: "DIRECT",
+            resets: good_resets.clone(),
+            reset_count: 0,
+            fail: false,
+        });
+        let broken: AnyOutboundHandler = Arc::new(CountingHandler {
+            name: "VLESS",
+            resets: broken_resets.clone(),
+            reset_count: 0,
+            fail: true,
+        });
+        let manager =
+            isolated_pool_manager(vec![good.clone(), broken.clone()]).await;
+
+        let selected = manager
+            .get_outbound_for_new_flow("DIRECT")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.name(), "DIRECT");
+        assert_eq!(good_resets.load(Ordering::SeqCst), 1);
+        assert_eq!(broken_resets.load(Ordering::SeqCst), 1);
+
+        let error = match manager.get_outbound_for_new_flow("VLESS").await {
+            Ok(_) => panic!("failed pool must not be returned as dial-ready"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("not safe to reuse"));
+        assert_eq!(broken_resets.load(Ordering::SeqCst), 2);
+        manager
+            .get_outbound_for_new_flow("DIRECT")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(good_resets.load(Ordering::SeqCst), 1);
+
+        // Dynamic proxy-group leaves are verified after being selected.
+        let missing_from_registry: AnyOutboundHandler = Arc::new(CountingHandler {
+            name: "dynamic",
+            resets: Arc::new(AtomicUsize::new(0)),
+            reset_count: 0,
+            fail: true,
+        });
+        assert!(
+            manager
+                .ensure_outbound_ready_for_new_flow(&missing_from_registry)
+                .await
+                .is_err()
+        );
+        assert!(
+            manager
+                .ensure_outbound_ready_for_new_flow(&good)
+                .await
+                .is_ok()
+        );
+        assert!(
+            manager
+                .ensure_outbound_ready_for_new_flow(&broken)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_pool_reset_reports_failed_pool_without_poisoning_healthy_flow() {
+        let good: AnyOutboundHandler = Arc::new(CountingHandler {
+            name: "DIRECT",
+            resets: Arc::new(AtomicUsize::new(0)),
+            reset_count: 2,
+            fail: false,
+        });
+        let broken: AnyOutboundHandler = Arc::new(CountingHandler {
+            name: "VLESS",
+            resets: Arc::new(AtomicUsize::new(0)),
+            reset_count: 0,
+            fail: true,
+        });
+        let manager =
+            isolated_pool_manager(vec![good.clone(), broken.clone()]).await;
+        assert!(manager.reset_connection_pools().await.is_err());
+        assert_eq!(manager.pool_retirement.lock().await.failed.len(), 1);
+        assert_eq!(manager.pool_retirement.lock().await.ready.len(), 1);
+        manager
+            .get_outbound_for_new_flow("DIRECT")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(manager.get_outbound_for_new_flow("VLESS").await.is_err());
+    }
+
     #[tokio::test]
     async fn stale_pool_generation_resets_once_and_retries_after_failure() {
         let source = NetworkPathSource::default();
@@ -1405,9 +1968,12 @@ ip: not-an-ip
                 &source,
                 &reset_gate,
                 &pool_generation,
-                move || async move {
-                    reset_counter.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
+                move |_| {
+                    let reset_counter = reset_counter.clone();
+                    async move {
+                        reset_counter.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
                 },
             )
             .await
@@ -1420,9 +1986,12 @@ ip: not-an-ip
                 &source,
                 &reset_gate,
                 &pool_generation,
-                move || async move {
-                    reset_counter.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
+                move |_| {
+                    let reset_counter = reset_counter.clone();
+                    async move {
+                        reset_counter.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
                 },
             )
             .await
@@ -1437,7 +2006,7 @@ ip: not-an-ip
                 &source,
                 &reset_gate,
                 &pool_generation,
-                || async { Err(io::Error::other("injected reset failure")) },
+                |_| async { Err(io::Error::other("injected reset failure")) },
             )
             .await
             .is_err()
@@ -1449,9 +2018,12 @@ ip: not-an-ip
                 &source,
                 &reset_gate,
                 &pool_generation,
-                move || async move {
-                    reset_counter.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
+                move |_| {
+                    let reset_counter = reset_counter.clone();
+                    async move {
+                        reset_counter.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
                 },
             )
             .await
@@ -1459,5 +2031,163 @@ ip: not-an-ip
         );
         assert_eq!(resets.load(Ordering::SeqCst), 2);
         assert_eq!(*pool_generation.lock().await, Some(2));
+    }
+
+    #[tokio::test]
+    async fn network_change_during_pool_retirement_retries_new_generation() {
+        let source = NetworkPathSource::default();
+        let mut status = NetworkStatus::default();
+        status.set_automatic_supported_for_test(true);
+        let initial = NetworkSnapshot::default();
+        status.observed(&initial);
+        let status = Arc::new(tokio::sync::RwLock::new(status));
+        source.attach(status.clone()).await;
+        let gate = tokio::sync::Mutex::new(());
+        let pool_generation = tokio::sync::Mutex::new(None);
+        let resets = Arc::new(AtomicUsize::new(0));
+
+        let reset_count = resets.clone();
+        let status_for_reset = status.clone();
+        let changed = {
+            let mut snapshot = initial;
+            snapshot.interfaces.push("wifi0".to_owned());
+            snapshot
+        };
+        assert!(
+            ensure_pool_generation_current(
+                &source,
+                &gate,
+                &pool_generation,
+                move |_| {
+                    let count = reset_count.clone();
+                    let status = status_for_reset.clone();
+                    let changed = changed.clone();
+                    async move {
+                        if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                            status.write().await.observed(&changed);
+                        }
+                        Ok(())
+                    }
+                },
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(resets.load(Ordering::SeqCst), 2);
+        assert_eq!(*pool_generation.lock().await, Some(2));
+    }
+
+    #[tokio::test]
+    async fn queued_flow_uses_latest_generation_after_concurrent_reset() {
+        let source = Arc::new(NetworkPathSource::default());
+        let mut status = NetworkStatus::default();
+        status.set_automatic_supported_for_test(true);
+        let mut changed = NetworkSnapshot::default();
+        status.observed(&changed);
+        let status = Arc::new(tokio::sync::RwLock::new(status));
+        source.attach(status.clone()).await;
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let pool_generation = Arc::new(tokio::sync::Mutex::new(None));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let resets = Arc::new(AtomicUsize::new(0));
+
+        let first = {
+            let source = source.clone();
+            let gate = gate.clone();
+            let pool_generation = pool_generation.clone();
+            let started = started.clone();
+            let release = release.clone();
+            let resets = resets.clone();
+            tokio::spawn(async move {
+                ensure_pool_generation_current(
+                    &source,
+                    &gate,
+                    &pool_generation,
+                    move |_| {
+                        let started = started.clone();
+                        let release = release.clone();
+                        let resets = resets.clone();
+                        async move {
+                            if resets.fetch_add(1, Ordering::SeqCst) == 0 {
+                                started.notify_one();
+                                release.notified().await;
+                            }
+                            Ok(())
+                        }
+                    },
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+            .await
+            .expect("first pool reset did not begin");
+
+        changed.interfaces.push("wifi0".to_owned());
+        status.write().await.observed(&changed);
+        let second_resets = Arc::new(AtomicUsize::new(0));
+        let queued = {
+            let source = source.clone();
+            let gate = gate.clone();
+            let pool_generation = pool_generation.clone();
+            let resets = second_resets.clone();
+            tokio::spawn(async move {
+                ensure_pool_generation_current(
+                    &source,
+                    &gate,
+                    &pool_generation,
+                    move |_| {
+                        let resets = resets.clone();
+                        async move {
+                            resets.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        }
+                    },
+                )
+                .await
+            })
+        };
+        release.notify_one();
+        assert!(first.await.unwrap().unwrap());
+        assert!(!queued.await.unwrap().unwrap());
+        assert_eq!(second_resets.load(Ordering::SeqCst), 0);
+        assert_eq!(*pool_generation.lock().await, Some(2));
+    }
+
+    #[tokio::test]
+    async fn continuously_changing_network_bounds_pool_retirement_retries() {
+        let source = NetworkPathSource::default();
+        let mut status = NetworkStatus::default();
+        status.set_automatic_supported_for_test(true);
+        status.observed(&NetworkSnapshot::default());
+        let status = Arc::new(tokio::sync::RwLock::new(status));
+        source.attach(status.clone()).await;
+        let gate = tokio::sync::Mutex::new(());
+        let pool_generation = tokio::sync::Mutex::new(None);
+        let resets = Arc::new(AtomicUsize::new(0));
+        let reset_count = resets.clone();
+        let status_for_reset = status.clone();
+        let error = ensure_pool_generation_current(
+            &source,
+            &gate,
+            &pool_generation,
+            move |_| {
+                let resets = reset_count.clone();
+                let status = status_for_reset.clone();
+                async move {
+                    let iteration = resets.fetch_add(1, Ordering::SeqCst);
+                    let mut next = NetworkSnapshot::default();
+                    next.interfaces.push(format!("wifi{iteration}"));
+                    status.write().await.observed(&next);
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(resets.load(Ordering::SeqCst), 3);
+        assert_eq!(*pool_generation.lock().await, None);
     }
 }

@@ -322,8 +322,10 @@ jobs:
           path: ${{ steps.package_macos.outputs.archive || steps.rename_binary.outputs.binary }}
           if-no-files-found: error
 
+      # Do not stall every failing architecture for 15 minutes by default.
+      # Maintainers can opt in to interactive debug with CI_ENABLE_TMATE=true.
       - name: Setup tmate session
-        if: ${{ failure() && github.event_name == 'pull_request' && github.actor != 'dependabot[bot]' }}
+        if: ${{ failure() && github.event_name == 'pull_request' && github.actor != 'dependabot[bot]' && vars.CI_ENABLE_TMATE == 'true' }}
         timeout-minutes: 15
         uses: mxschmitt/action-tmate@v3
         with:

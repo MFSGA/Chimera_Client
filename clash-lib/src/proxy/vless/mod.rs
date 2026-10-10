@@ -912,7 +912,37 @@ mod tests {
             std::time::Duration::from_secs(20),
         )
         .await?;
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        // The TCP listen socket may open before Xray's TLS/h2 stack is
+        // ready. An actual TLS+ALPN probe makes the gRPC E2E deterministic
+        // without retrying application data or suppressing transport errors.
+        let tls_probe = TlsClient::new(
+            true,
+            "example.org".to_owned(),
+            Some(vec!["h2".to_owned()]),
+            Some("h2".to_owned()),
+        );
+        let start = tokio::time::Instant::now();
+        loop {
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    let socket = tokio::net::TcpStream::connect((
+                        LOCAL_ADDR,
+                        server_port(host_port, XRAY_CONTAINER_PORT),
+                    ))
+                    .await?;
+                    tls_probe.proxy_stream(Box::new(socket)).await.map(|_| ())
+                })
+                .await;
+            if matches!(result, Ok(Ok(()))) {
+                break;
+            }
+            if start.elapsed() >= std::time::Duration::from_secs(20) {
+                anyhow::bail!(
+                    "VLESS gRPC server never became TLS/h2 ready: {result:?}"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
 
         Ok(runner)
     }

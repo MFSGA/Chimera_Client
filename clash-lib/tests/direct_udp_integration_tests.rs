@@ -171,8 +171,14 @@ async fn network_recovery_replaces_udp_socket_without_restarting_inbound() {
             .await
             .unwrap()
             .unwrap();
-            assert_eq!(response.status(), 200);
+            let status = response.status();
             let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(
+                status,
+                200,
+                "POST /network/reset round {round} returned: {}",
+                String::from_utf8_lossy(&body)
+            );
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert!(json["dnsTransportsReset"].is_number());
             assert!(json["connectionPoolsReset"].is_number());

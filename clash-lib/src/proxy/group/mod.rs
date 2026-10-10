@@ -1,9 +1,12 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, io};
 
 use async_trait::async_trait;
 use erased_serde::Serialize;
 
-use crate::proxy::{AnyOutboundHandler, OutboundHandler};
+use crate::{
+    proxy::{AnyOutboundHandler, OutboundHandler},
+    session::Session,
+};
 
 pub mod fallback;
 pub mod loadbalance;
@@ -22,6 +25,17 @@ pub trait GroupProxyAPIResponse: OutboundHandler {
     /// e.g. for a selector, it returns the currently selected proxy, and for
     /// urltest, it returns the fastest proxy, etc.
     async fn get_active_proxy(&self) -> Option<AnyOutboundHandler>;
+
+    /// Capture the child used by a new connection, before DNS/path planning.
+    /// Selectors override this to retain the provider-touch behavior of a dial.
+    async fn select_proxy_for_connection(
+        &self,
+        _session: &Session,
+    ) -> io::Result<AnyOutboundHandler> {
+        self.get_active_proxy().await.ok_or_else(|| {
+            io::Error::other(format!("group `{}` has no active proxy", self.name()))
+        })
+    }
 
     /// Returns the latency test URL for the group.
     fn get_latency_test_url(&self) -> Option<String>;

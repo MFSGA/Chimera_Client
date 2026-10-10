@@ -480,6 +480,14 @@ impl RuntimeStatus {
         )
     }
 
+    /// Refresh preference expiry and expose cache generations without copying
+    /// the observed path list on every UDP packet.
+    pub(crate) fn path_cache_versions(&mut self) -> Option<(u64, u64)> {
+        self.expire_temporary_path_priority();
+        self.automatic_supported
+            .then_some((self.network_version, self.policy_version))
+    }
+
     pub(crate) fn path_planning_snapshot(
         &mut self,
     ) -> Option<(
