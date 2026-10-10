@@ -263,23 +263,41 @@ async fn integration_test_shadowsocks_udp_session_isolation() {
     let (_server, _client, socks_port) = start_shadowsocks_pair(true);
     let first = Socks5UdpSession::connect(socks_port).await;
     let second = Socks5UdpSession::connect(socks_port).await;
-    first
-        .send_ipv4(b"first-client", [127, 0, 0, 1], target_port)
-        .await;
-    second
-        .send_ipv4(b"second-client", [127, 0, 0, 1], target_port)
-        .await;
 
-    let (first_response, _) =
-        tokio::time::timeout(udp_roundtrip_timeout(), first.recv())
-            .await
-            .expect("first Shadowsocks UDP client timed out");
-    let (second_response, _) =
-        tokio::time::timeout(udp_roundtrip_timeout(), second.recv())
-            .await
-            .expect("second Shadowsocks UDP client timed out");
+    // UDP may drop a datagram, especially under cross/QEMU. Retry an
+    // unanswered datagram within the existing total timeout instead of
+    // assuming a single send is reliably delivered. Still require each
+    // independent client to receive its own exact payload.
+    async fn roundtrip(
+        session: &Socks5UdpSession,
+        payload: &[u8],
+        target_port: u16,
+    ) -> (Vec<u8>, String) {
+        tokio::time::timeout(udp_roundtrip_timeout(), async {
+            loop {
+                session
+                    .send_ipv4(payload, [127, 0, 0, 1], target_port)
+                    .await;
+                if let Ok(response) =
+                    tokio::time::timeout(Duration::from_millis(400), session.recv())
+                        .await
+                {
+                    return response;
+                }
+            }
+        })
+        .await
+        .expect("Shadowsocks UDP client timed out after bounded retries")
+    }
+
+    let ((first_response, first_source), (second_response, second_source)) = tokio::join!(
+        roundtrip(&first, b"first-client", target_port),
+        roundtrip(&second, b"second-client", target_port),
+    );
     assert_eq!(first_response, b"first-client");
     assert_eq!(second_response, b"second-client");
+    assert_eq!(first_source, format!("127.0.0.1:{target_port}"));
+    assert_eq!(second_source, format!("127.0.0.1:{target_port}"));
     target_task.abort();
     let _ = target_task.await;
 }
