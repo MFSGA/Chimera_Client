@@ -262,7 +262,9 @@ impl InboundHandlerTrait for ShadowsocksInbound {
                     &config,
                     socket.into(),
                 );
-            let datagram = Box::new(InboundShadowsocksDatagram::new(socket));
+            let replay_protection = map_cipher(&self.cipher)?.is_aead_2022();
+            let datagram =
+                Box::new(InboundShadowsocksDatagram::new(socket, replay_protection));
             let session = Session {
                 network: Network::Udp,
                 typ: Type::Shadowsocks,
