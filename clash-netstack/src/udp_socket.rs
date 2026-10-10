@@ -142,8 +142,9 @@ impl SplitRead {
                 Ok(packet) => packet,
                 Err(err) => {
                     error!(
-                        "invalid UDP frame: {err}, src_ip: {src_ip}, dst_ip: {dst_ip}, payload_len: {}",
-                        udp_data.as_ref().len()
+                        "invalid UDP err: {err}, src_ip: {src_ip}, dst_ip: {dst_ip}, \
+                         payload: {:?}",
+                        udp_data.as_ref()
                     );
                     continue;
                 }
