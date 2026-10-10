@@ -13,21 +13,26 @@ use tokio::{
 
 mod common;
 
-use common::ClashInstance;
+use common::{ClashInstance, wait_port_ready};
 
-fn available_port() -> u16 {
-    StdTcpListener::bind("127.0.0.1:0")
-        .expect("failed to reserve test port")
-        .local_addr()
-        .expect("failed to inspect test port")
-        .port()
+fn available_listener_ports() -> [u16; 4] {
+    let reservations: [StdTcpListener; 4] = std::array::from_fn(|_| {
+        StdTcpListener::bind("127.0.0.1:0")
+            .expect("failed to reserve AnyTLS listener port")
+    });
+    reservations.map(|listener| listener.local_addr().unwrap().port())
 }
 
 fn start_anytls_pair() -> (ClashInstance, ClashInstance, u16) {
-    let server_api = available_port();
-    let anytls_port = available_port();
-    let client_api = available_port();
-    let socks_port = available_port();
+    let [server_api, anytls_port, client_api, socks_port] =
+        available_listener_ports();
+    // Keep the strict protocol assertions, but reveal the actual failing stage
+    // on musl cross runners rather than dismissing missing UDP as a timeout.
+    let log_level = if cfg!(all(target_os = "linux", target_env = "musl")) {
+        "debug"
+    } else {
+        "error"
+    };
     let cwd =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
 
@@ -35,7 +40,7 @@ fn start_anytls_pair() -> (ClashInstance, ClashInstance, u16) {
         r#"
 allow-lan: false
 mode: rule
-log-level: error
+log-level: {log_level}
 mmdb: null
 external-controller: 127.0.0.1:{server_api}
 tun:
@@ -61,6 +66,7 @@ rules:
         vec![server_api, anytls_port],
     )
     .expect("failed to start AnyTLS server");
+    wait_port_ready(anytls_port).expect("AnyTLS server listener not ready");
 
     let client_config = format!(
         r#"
@@ -68,7 +74,7 @@ allow-lan: false
 bind-address: 127.0.0.1
 socks-port: {socks_port}
 mode: rule
-log-level: error
+log-level: {log_level}
 mmdb: null
 external-controller: 127.0.0.1:{client_api}
 tun:
@@ -96,6 +102,7 @@ rules:
         vec![client_api, socks_port],
     )
     .expect("failed to start AnyTLS client");
+    wait_port_ready(socks_port).expect("AnyTLS client SOCKS listener not ready");
 
     (server, client, socks_port)
 }
@@ -247,6 +254,11 @@ async fn integration_test_anytls_udp() {
 
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     socket.send_to(&packet, relay_addr).await.unwrap();
+    if cfg!(all(target_os = "linux", target_env = "musl")) {
+        eprintln!(
+            "AnyTLS UoT diagnostic: sent SOCKS5 UDP datagram to relay {relay_addr}, target {echo_addr}"
+        );
+    }
     let mut response = [0u8; 2048];
     let (len, _) = tokio::time::timeout(
         Duration::from_secs(10),

@@ -20,25 +20,19 @@ use crate::{
 /// Accept a small amount of reordering while rejecting retransmitted IDs.
 #[derive(Debug)]
 struct UdpReplayWindow {
-    session_id: u64,
     highest: u64,
     seen: u128,
 }
 
 impl UdpReplayWindow {
-    fn new(session_id: u64, packet_id: u64) -> Self {
+    fn new(packet_id: u64) -> Self {
         Self {
-            session_id,
             highest: packet_id,
             seen: 1,
         }
     }
 
-    fn accept(&mut self, session_id: u64, packet_id: u64) -> bool {
-        if session_id != self.session_id {
-            *self = Self::new(session_id, packet_id);
-            return true;
-        }
+    fn accept(&mut self, packet_id: u64) -> bool {
         if packet_id > self.highest {
             let shift = packet_id - self.highest;
             self.seen = if shift >= 128 {
@@ -58,11 +52,42 @@ impl UdpReplayWindow {
     }
 }
 
+/// A fresh session must not erase the replay history for an earlier
+/// session using the same source IP/port. Bound the cache across *sessions*,
+/// rather than bounding source addresses alone.
+#[derive(Default)]
+struct UdpReplayCache {
+    windows: HashMap<(SocketAddr, u64), UdpReplayWindow>,
+}
+
+impl UdpReplayCache {
+    const MAX_SESSIONS: usize = 2048;
+
+    fn accept(&mut self, source: SocketAddr, session: u64, packet: u64) -> bool {
+        let key = (source, session);
+        if !self.windows.contains_key(&key)
+            && self.windows.len() >= Self::MAX_SESSIONS
+            && let Some(evict) = self.windows.keys().next().copied()
+        {
+            self.windows.remove(&evict);
+        }
+        match self.windows.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().accept(packet)
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(UdpReplayWindow::new(packet));
+                true
+            }
+        }
+    }
+}
+
 pub(crate) struct InboundShadowsocksDatagram {
     socket: ProxySocket<shadowsocks::net::UdpSocket>,
     server_session_id: u64,
     client_controls: HashMap<SocketAddr, UdpSocketControlData>,
-    replay_windows: HashMap<SocketAddr, UdpReplayWindow>,
+    replay_windows: UdpReplayCache,
     replay_protection: bool,
     flushed: bool,
     packet: Option<UdpPacket>,
@@ -87,7 +112,7 @@ impl InboundShadowsocksDatagram {
             socket,
             server_session_id: rand::random(),
             client_controls: HashMap::new(),
-            replay_windows: HashMap::new(),
+            replay_windows: UdpReplayCache::default(),
             replay_protection,
             flushed: true,
             packet: None,
@@ -128,29 +153,11 @@ impl futures::Stream for InboundShadowsocksDatagram {
                         // IDs; legacy ciphers must not be deduplicated using
                         // the default-zero control metadata.
                         if *replay_protection {
-                            const MAX_REPLAY_CLIENTS: usize = 2048;
-                            if !replay_windows.contains_key(&source)
-                                && replay_windows.len() >= MAX_REPLAY_CLIENTS
-                                && let Some(oldest) =
-                                    replay_windows.keys().next().copied()
-                            {
-                                replay_windows.remove(&oldest);
-                            }
-                            let accepted = match replay_windows.entry(source) {
-                                std::collections::hash_map::Entry::Occupied(
-                                    mut entry,
-                                ) => entry.get_mut().accept(
-                                    control.client_session_id,
-                                    control.packet_id,
-                                ),
-                                std::collections::hash_map::Entry::Vacant(entry) => {
-                                    entry.insert(UdpReplayWindow::new(
-                                        control.client_session_id,
-                                        control.packet_id,
-                                    ));
-                                    true
-                                }
-                            };
+                            let accepted = replay_windows.accept(
+                                source,
+                                control.client_session_id,
+                                control.packet_id,
+                            );
                             if !accepted {
                                 debug!(%source, packet_id = control.packet_id, "discarding repeated Shadowsocks UDP packet");
                                 continue;
@@ -293,30 +300,50 @@ impl futures::Sink<UdpPacket> for InboundShadowsocksDatagram {
 
 #[cfg(test)]
 mod tests {
-    use super::UdpReplayWindow;
+    use super::{UdpReplayCache, UdpReplayWindow};
+
+    #[test]
+    fn replay_from_previous_session_must_not_be_accepted_after_session_change() {
+        let source = "127.0.0.1:2345".parse().unwrap();
+        let mut cache = UdpReplayCache::default();
+        assert!(cache.accept(source, 101, 0));
+        assert!(
+            cache.accept(source, 202, 0),
+            "new session may reuse packet 0"
+        );
+        assert!(
+            !cache.accept(source, 101, 0),
+            "repeating session A packet 0 after session B must be rejected"
+        );
+        assert!(!cache.accept(source, 202, 0));
+        assert!(cache.accept(source, 101, 1), "prior session may advance");
+        assert!(!cache.accept(source, 101, 1));
+    }
 
     #[test]
     fn shadowsocks_2022_duplicate_packet_is_not_forwarded_twice() {
-        let mut window = UdpReplayWindow::new(7, 0);
-        // A duplicated first datagram must not consume the next target echo.
-        assert!(!window.accept(7, 0));
-        assert!(window.accept(7, 1));
-        assert!(!window.accept(7, 1));
-        assert!(window.accept(7, 3));
+        let mut window = UdpReplayWindow::new(0);
+        assert!(!window.accept(0));
+        assert!(window.accept(1));
+        assert!(!window.accept(1));
+        assert!(window.accept(3));
+        assert!(window.accept(2), "out-of-order packet in window is valid");
+        assert!(!window.accept(2));
+        assert!(window.accept(150));
         assert!(
-            window.accept(7, 2),
-            "out-of-order packet in window is valid"
-        );
-        assert!(!window.accept(7, 2));
-        assert!(window.accept(7, 150));
-        assert!(
-            !window.accept(7, 1),
+            !window.accept(1),
             "packets outside the replay window are stale"
         );
-        assert!(
-            window.accept(8, 0),
-            "new client session starts its own sequence"
-        );
-        assert!(!window.accept(8, 0));
+    }
+
+    #[test]
+    fn replay_windows_are_isolated_by_client_endpoint() {
+        let mut cache = UdpReplayCache::default();
+        let a = "127.0.0.1:2345".parse().unwrap();
+        let b = "127.0.0.1:2346".parse().unwrap();
+        assert!(cache.accept(a, 3, 0));
+        assert!(cache.accept(b, 3, 0));
+        assert!(!cache.accept(a, 3, 0));
+        assert!(!cache.accept(b, 3, 0));
     }
 }
