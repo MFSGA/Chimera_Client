@@ -12,25 +12,23 @@ use tokio::{
 
 mod common;
 
-use common::{ClashInstance, Socks5UdpSession, send_http_request};
+use common::{ClashInstance, Socks5UdpSession, send_http_request, wait_port_ready};
 
 const SERVER_KEY: &str = "3SYJ/f8nmVuzKvKglykRQDSgg10e/ADilkdRWrrY9HU=";
 const USER1_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 const USER2_KEY: &str = "AQIDAQIDAQIDAQIDAQIDAQIDAQIDAQIDAQIDAQIDAQID";
 
-fn available_port() -> u16 {
-    StdTcpListener::bind("127.0.0.1:0")
-        .expect("failed to reserve test port")
-        .local_addr()
-        .expect("failed to inspect test port")
-        .port()
+fn available_listener_ports() -> [u16; 4] {
+    let reservations: [StdTcpListener; 4] = std::array::from_fn(|_| {
+        StdTcpListener::bind("127.0.0.1:0")
+            .expect("failed to reserve Shadowsocks test port")
+    });
+    reservations.map(|listener| listener.local_addr().unwrap().port())
 }
 
 fn start_multiuser_pair() -> (ClashInstance, ClashInstance, u16, u16) {
-    let server_api = available_port();
-    let server_port = available_port();
-    let client_api = available_port();
-    let socks_port = available_port();
+    let [server_api, server_port, client_api, socks_port] =
+        available_listener_ports();
     let cwd =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
 
@@ -72,6 +70,10 @@ rules:
         vec![server_api, server_port],
     )
     .expect("failed to start multi-user Shadowsocks server");
+    // The test harness waits for the API port; on slower cross runners the
+    // Shadowsocks TCP listener may still be starting at that point.
+    wait_port_ready(server_port)
+        .expect("multi-user Shadowsocks TCP listener not ready");
 
     let client_password = format!("{SERVER_KEY}:{USER1_KEY}");
     let client_config = format!(
@@ -108,6 +110,8 @@ rules:
         vec![client_api, socks_port],
     )
     .expect("failed to start user1 Shadowsocks client");
+    wait_port_ready(socks_port)
+        .expect("Shadowsocks client SOCKS listener not ready");
 
     (server, client, server_api, socks_port)
 }

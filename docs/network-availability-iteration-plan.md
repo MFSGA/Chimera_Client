@@ -520,3 +520,9 @@ cargo test -p clash-lib --test api_reload_tests --locked -- --test-threads=1
 
 - CI #573 Linux ARM64 单独的 SS 2022 TCP 多用户测试出现 `sock2proc` 内部 netlink socket `EPROTONOSUPPORT` panic 记录、以及上层 `early eof`。原 `catch_unwind` 仍会运行不受支持的库调用并触发 panic hook。现在在 Linux 进程归属查询前使用 `libc::socket(AF_NETLINK, SOCK_DGRAM|SOCK_CLOEXEC, NETLINK_SOCK_DIAG)` 探测一次内核支持能力，随即 close；不支持时跳过可选的进程名，阻止调用上游库；后续调用仍保留异常隔离。ARM64 TCP 归属用例还需新 CI 证实。
 - 同轮 macOS ARM64 SS UDP 双客户端测试也出现一次首包超时。新增的 AEAD2022 包去重解决了 Windows 日志中明确的相同客户端 session+packet-id 重复转发，但不宣称已经排除全部启动时序或 UDP 送达故障。下一次 GitHub CI 继续保留相同真实集成测试。
+
+## 合并前 ARMv7/i686-musl CI 闭环（2026-10-09）
+
+- PR #56 commit `5720117` 的 Windows regression、Windows/macOS/Linux quality 和 x86_64 Linux 完整 CI 通过；跨平台测试中 ARMv7 `lan_proxy_tests` 出现 `SOCKS-IN` 与 `MIXED-IN` **同用端口 36325** 的确定性冲突。原因是四次独立的 `bind(0)` 后立即释放，内核可能再次分配相同端口。测试改为同一时间保留四个通配 IPv4 TCP socket，再统一取端口，增加 32 轮互异性检查，绝不吞掉启动失败。
+- 同轮 i686 musl `ss2022_tcp_attributes_traffic_to_authenticated_user` 出现 `UnexpectedEof`，但缺少握手失败证据。原 `ClashInstance::start` 仅等待传入列表的 **首个 API 端口**；在慢速 cross/QEMU runner，不能由 API ready 推断 Shadowsocks server TCP 或 client SOCKS TCP listener ready。本测试增加真实业务监听端口 `wait_port_ready` 的启动同步，且四个测试服务端口同时保留以避免重复分配。这里只消除已知时序隐患，不宣称已定位所有架构兼容问题，需后续 i686 musl 真实运行复核。
+- macOS Nix 验证：`cargo test -p clash-lib --test lan_proxy_tests --all-features --locked -- --test-threads=1`（3 passed）、`cargo test -p clash-lib --test shadowsocks_multiuser_tests --all-features --locked -- --test-threads=1`（2 passed）、all-features Clippy `-D warnings`、fmt/diff check 均通过。绝不因多平台 CI 失败而跳过跨平台测试。
