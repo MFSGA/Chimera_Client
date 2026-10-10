@@ -508,3 +508,15 @@ cargo test -p clash-lib --test api_reload_tests --locked -- --test-threads=1
 - 修复：Linux 优先用原有 rtnetlink 链路、地址与主路由证据；仅在 netlink 观测失败时，使用内核只读 `/proc/net/route`、`/proc/net/ipv6_route` 和 `/sys/class/net` 获取主表默认路由、真实链路状态。仍要求命中系统接口索引、route-up 标志、正确的默认目的地和接口地址，不把未知/不可用链路当成 verified；如果 procfs 也不可读取则保留真正错误。运行时会记录回退警告，禁止靠忽略错误满足 API 成功断言。
 - 新增 Linux 特定默认路由解析回归，包含 v4/v6 网关与 metric、错误接口以及非默认/非 up 路由。不改动 Linux 系统路由、DNS、TUN 或容器权限。macOS 端本地全库/API/UDP 回归通过；Linux 平台编译/测试仍需后续 GitHub CI 验证。
 - Windows Shadowsocks UDP 多 session 回包在 CI 曾超时，VLESS gRPC TLS 吞吐量 E2E 曾报告 `tls handshake eof`。本次未跳过或放宽这些测试，两者仍需分别验证真实失败原因。
+
+## Windows Shadowsocks 双客户端重放与 VLESS gRPC Docker 就绪（2026-10-09）
+
+- Windows x64 全量 Cargo 集成在 `integration_test_shadowsocks_udp_session_isolation` 中第二个客户端超时。日志证明同一 Shadowsocks 2022 客户端源地址 + `client_session_id` + `packet_id=0` 的首包在服务端被解密转发了两次，抢占 UDP echo 的第二次请求机会，第二个独立客户端无法得到响应。这不是提高等待时限能解决的问题。
+- 修复：在 Shadowsocks 2022 UDP inbound 上增加按来源 / 客户端会话隔离的 128 包滑动重放窗口；只接受不重复的新 ID、允许有限乱序和客户端 session 重建；过期包、重复 packet id 直接丢弃，最多保留 2048 个来源的窗口，避免无限占用内存。并不会影响没有 SS 2022 控制信息的旧算法。
+- 回归：`shadowsocks_2022_duplicate_packet_is_not_forwarded_twice` 在启用 all features 的单元测试中通过；本地 macOS 四个 Shadowsocks TCP/UDP 集成用例（包括两个客户端共用目标）均通过，Windows 仍需本轮后续 GitHub CI 复核。
+- VLESS `test_vless_grpc_tls` Docker E2E 曾报告 `tls handshake eof`；原测试只等待 Xray TCP 端口可连接，再 sleep 一秒，不能证明服务端已经完成 TLS/h2 初始化。为测试容器启动增加真正的 TLS 握手加 h2 ALPN 就绪探测，有界 20 秒超时；不重试已发送的应用请求、不影响生产 TLS/GRPC 实现。Docker 运行结果待 CI；未通过前不宣称修复完成。
+
+## Linux ARM64 SOCK_DIAG 与复核补丁（2026-10-09）
+
+- CI #573 Linux ARM64 单独的 SS 2022 TCP 多用户测试出现 `sock2proc` 内部 netlink socket `EPROTONOSUPPORT` panic 记录、以及上层 `early eof`。原 `catch_unwind` 仍会运行不受支持的库调用并触发 panic hook。现在在 Linux 进程归属查询前使用 `libc::socket(AF_NETLINK, SOCK_DGRAM|SOCK_CLOEXEC, NETLINK_SOCK_DIAG)` 探测一次内核支持能力，随即 close；不支持时跳过可选的进程名，阻止调用上游库；后续调用仍保留异常隔离。ARM64 TCP 归属用例还需新 CI 证实。
+- 同轮 macOS ARM64 SS UDP 双客户端测试也出现一次首包超时。新增的 AEAD2022 包去重解决了 Windows 日志中明确的相同客户端 session+packet-id 重复转发，但不宣称已经排除全部启动时序或 UDP 送达故障。下一次 GitHub CI 继续保留相同真实集成测试。
