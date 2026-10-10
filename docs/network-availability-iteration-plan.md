@@ -526,3 +526,9 @@ cargo test -p clash-lib --test api_reload_tests --locked -- --test-threads=1
 - PR #56 commit `5720117` 的 Windows regression、Windows/macOS/Linux quality 和 x86_64 Linux 完整 CI 通过；跨平台测试中 ARMv7 `lan_proxy_tests` 出现 `SOCKS-IN` 与 `MIXED-IN` **同用端口 36325** 的确定性冲突。原因是四次独立的 `bind(0)` 后立即释放，内核可能再次分配相同端口。测试改为同一时间保留四个通配 IPv4 TCP socket，再统一取端口，增加 32 轮互异性检查，绝不吞掉启动失败。
 - 同轮 i686 musl `ss2022_tcp_attributes_traffic_to_authenticated_user` 出现 `UnexpectedEof`，但缺少握手失败证据。原 `ClashInstance::start` 仅等待传入列表的 **首个 API 端口**；在慢速 cross/QEMU runner，不能由 API ready 推断 Shadowsocks server TCP 或 client SOCKS TCP listener ready。本测试增加真实业务监听端口 `wait_port_ready` 的启动同步，且四个测试服务端口同时保留以避免重复分配。这里只消除已知时序隐患，不宣称已定位所有架构兼容问题，需后续 i686 musl 真实运行复核。
 - macOS Nix 验证：`cargo test -p clash-lib --test lan_proxy_tests --all-features --locked -- --test-threads=1`（3 passed）、`cargo test -p clash-lib --test shadowsocks_multiuser_tests --all-features --locked -- --test-threads=1`（2 passed）、all-features Clippy `-D warnings`、fmt/diff check 均通过。绝不因多平台 CI 失败而跳过跨平台测试。
+
+## Shadowsocks 双客户端回显测试生命周期（2026-10-09）
+
+- 在 PR #56 `e308eb3` CI 中，ARMv7 GNU hard-float 的 LAN 代理 Cargo 测试已通过；Linux aarch64 GNU 的 `integration_test_shadowsocks_udp_session_isolation` 仍出现第二客户端超时。该测试的 UDP 回显 target 仅在收到**两个报文**后退出，收到重复报文就会提前关闭，使独立的第二客户端无回包。即使 SS2022 inbound 有自己的包重放过滤，测试不能依赖底层 UDP 网络恰好传输两个报文。
+- 测试修复：回显 UDP socket 在测试生命周期中持续回应，两个独立客户端的完整 payload 回包断言均成功之后才主动 abort 回显任务；超时断言保持不变，绝不跳过或放宽。Shadowsocks E2E pair 也改为同时占有四个随机服务端口作预约，并分别等待真正的 Shadowsocks TCP 与 SOCKS TCP listener ready，避免慢速 cross/QEMU runner 的控制面就绪与代理就绪竞态。
+- 本地 `cargo test -p clash-lib --test shadowsocks_integration_tests --all-features --locked -- --test-threads=1` 4/4 通过；Clippy all-features `-D warnings`、fmt/diff check 通过。跨平台 CI 仍需新提交后复核。
