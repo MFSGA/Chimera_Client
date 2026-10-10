@@ -12,17 +12,18 @@ mod common;
 
 use common::{ClashInstance, Socks5UdpSession, send_http_request};
 
-fn available_port() -> u16 {
-    StdTcpListener::bind("127.0.0.1:0")
-        .expect("failed to reserve test port")
-        .local_addr()
-        .expect("failed to inspect test port")
-        .port()
+fn available_listener_ports() -> [u16; 2] {
+    // Keep the ephemeral reservations alive until both unique ports are
+    // selected. Consecutive bind(0)/close calls may return the same port.
+    let reservations: [StdTcpListener; 2] = std::array::from_fn(|_| {
+        StdTcpListener::bind("127.0.0.1:0")
+            .expect("failed to reserve composite rule test port")
+    });
+    reservations.map(|listener| listener.local_addr().unwrap().port())
 }
 
 fn start_client() -> (ClashInstance, u16, u16) {
-    let api_port = available_port();
-    let socks_port = available_port();
+    let [api_port, socks_port] = available_listener_ports();
     let config = format!(
         r#"
 allow-lan: false
@@ -132,9 +133,11 @@ async fn composite_tcp_rule_routes_matching_traffic() {
     let target_port = target.local_addr().unwrap().port();
     let target_task = tokio::spawn(async move {
         let (mut stream, _) = target.accept().await.unwrap();
-        let mut buf = [0u8; 128];
-        let n = stream.read(&mut buf).await.unwrap();
-        stream.write_all(&buf[..n]).await.unwrap();
+        // TCP delivers bytes rather than messages; read() may return a
+        // prefix on a cross runner even after a full client write_all().
+        let mut buf = vec![0u8; b"composite-tcp-route".len()];
+        stream.read_exact(&mut buf).await.unwrap();
+        stream.write_all(&buf).await.unwrap();
     });
 
     let (_client, _api_port, socks_port) = start_client();
