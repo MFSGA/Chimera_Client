@@ -97,7 +97,9 @@ socket2 = { version = "0.6", features = ["all"] }
 downcast-rs = "2.0"
 
 rand = "0.10"
-memory-stats = "1"
+# Linux /memory polling should not scan the large /proc/self/smaps file.
+# statm avoids that expensive procfs read (including under QEMU linux-user).
+memory-stats = { version = "1", features = ["always_use_statm"] }
 
 chrono = { version = "0.4", features = ["serde"] }
 

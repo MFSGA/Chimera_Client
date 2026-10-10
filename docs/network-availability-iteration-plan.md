@@ -543,6 +543,13 @@ cargo test -p clash-lib --test api_reload_tests --locked -- --test-threads=1
 
 - **更正 AnyTLS UDP 旧诊断歧义：** 原日志 `echo_server_received_packet={echo_task.is_finished()}` 只检查回显任务是否结束，不能证明报文有没有到达，尤其无法区分目标收到报文后尚未回写与真正没有收到。新测试在 UDP echo `recv_from()` 成功后用 `AtomicBool(Release)` 记录真实到达事实；超时日志分别报告 `echo_server_received_packet` 和 `echo_task_finished`，避免用任务结束状态推断网络丢包。测试成功条件、原有 10s 截止与端到端回包断言保持不变。
 
+## PR #56 CI #579：ARM 回归复核与候选修复（2026-10-09）
+
+- 基线：PR #56 `54a54a2` 的 CI run `38024440994` 中，`aarch64-unknown-linux-musl` 执行 `api_smoke_tests::test_memory_endpoint` 时记录 `qemu-aarch64: QEMU internal SIGSEGV {code=MAPERR, addr=0x20}`；这是 QEMU 报告的内部故障，尚不能归因于 Rust 内存错误或证明 `/memory` 处理函数已经进入。Linux 内存统计库默认解析完整 `/proc/self/smaps`；本轮对 `memory-stats 1.2.0` 显式启用 `always_use_statm`，改用轻量但精度略低的 `/proc/self/statm`。这是收窄潜在触发条件和降低周期性统计开销的候选修复，不是已经由 ARM64 musl 实测确认的 SIGSEGV 根因。
+- `armv7-unknown-linux-gnueabi` 的 `runtime_allow_lan_toggle_changes_access_policy` 在收到真实 LAN TCP 连接后，Dispatcher 明确记录 `network changed while validating outbound pool retirement` 并返回 `early eof`。对 `OutboundManager::ensure_outbound_ready_for_new_flow` 增加至多三轮的**新代次池退休及逐叶 handler 验证**；仅当观察到代次变化才重新尝试，失败池绝不授权，持续抖动仍返回 `Interrupted`。补充一次改变及持续改变时的单元测试。
+- `armv7-unknown-linux-gnueabihf` 的 `integration_test_shadowsocks_udp_session_isolation` 仅有第二客户端单次 UDP 回包超时证据，根因仍未证实。E2E 用例改为两个客户端并行发送，未收到回包则每 400ms 重发各自独立 payload，且整体仍受原 10 秒（Windows 30 秒）截止约束；继续严格验证每个客户端的完整 payload 和回包源地址，持续丢包、错误会话或串包依旧失败。此处修复的是测试对 UDP 单发可靠性的错误假设，不宣称修好了尚未定位的协议缺陷。
+- 本地 Mac 定向单测 `new_observation_during_leaf_validation_retires_pools_again`、`constantly_changing_observation_cannot_authorize_leaf_pool` 已各 1/1 通过；`cargo test -p clash-lib --test shadowsocks_integration_tests -F shadowsocks --locked -- --test-threads=1` 为 4/4 通过；`cargo test -p clash-lib --test lan_proxy_tests --locked -- --test-threads=1` 为 3/3 通过；`cargo test -p clash-lib --test api_smoke_tests --locked -- --test-threads=1` 为 4/4 通过；`cargo test -p clash-lib --test missing_outbound_fails_closed --locked` 为 1/1 通过；`cargo test -p clash-lib --lib --all-features --locked` 为 859 passed、12 ignored、0 failed；`cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check` 均通过。ARM 交叉 CI、musl 实机/QEMU 对照、release 吞吐结果未由本分支验证；PR #56 不包含这些新候选修复，合并前必须在相同目标重跑验证。
+
 ## Missing outbound selection: fail closed
 
 A route, proxy group, or runtime mode must explicitly authorize DIRECT.
