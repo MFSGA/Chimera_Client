@@ -1012,6 +1012,192 @@ fn linux_dns_signature(content: &str) -> String {
         .join("\n")
 }
 
+#[cfg(target_os = "linux")]
+fn parse_proc_ipv4_default_routes(
+    text: &str,
+    interfaces: &[network_interface::NetworkInterface],
+) -> Vec<LinuxDefaultRoute> {
+    text.lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields.len() < 8 || fields[1] != "00000000" || fields[7] != "00000000"
+            {
+                return None;
+            }
+            let flags = u32::from_str_radix(fields[3], 16).ok()?;
+            // RTF_UP. A route not installed/up must not establish physical-path evidence.
+            if flags & 1 == 0 {
+                return None;
+            }
+            let interface =
+                interfaces.iter().find(|iface| iface.name == fields[0])?;
+            let gateway = u32::from_str_radix(fields[2], 16).ok()?;
+            let metric = fields[6].parse::<u32>().ok()?;
+            Some(LinuxDefaultRoute {
+                interface_index: interface.index,
+                family: AddressFamily::Ipv4,
+                gateway: (gateway != 0).then(|| {
+                    IpAddr::V4(std::net::Ipv4Addr::from(gateway.to_le_bytes()))
+                }),
+                metric,
+            })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_ipv6_default_routes(
+    text: &str,
+    interfaces: &[network_interface::NetworkInterface],
+) -> Vec<LinuxDefaultRoute> {
+    text.lines()
+        .filter_map(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields.len() < 10 || fields[0] != "0".repeat(32) || fields[1] != "00"
+            {
+                return None;
+            }
+            let interface =
+                interfaces.iter().find(|iface| iface.name == fields[9])?;
+            let flags = u32::from_str_radix(fields[8], 16).ok()?;
+            if flags & 1 == 0 {
+                return None;
+            }
+            let metric = u32::from_str_radix(fields[5], 16).ok()?;
+            let gateway = u128::from_str_radix(fields[4], 16).ok()?;
+            Some(LinuxDefaultRoute {
+                interface_index: interface.index,
+                family: AddressFamily::Ipv6,
+                gateway: (gateway != 0)
+                    .then(|| IpAddr::V6(std::net::Ipv6Addr::from(gateway))),
+                metric,
+            })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+async fn linux_procfs_network_state(
+    interfaces: &[network_interface::NetworkInterface],
+) -> io::Result<(
+    HashMap<u32, LinuxLinkState>,
+    Vec<LinuxDefaultRoute>,
+    Vec<String>,
+)> {
+    // Procfs defaults are read-only kernel routing facts. If they are
+    // unavailable, propagate the observation failure rather than inventing a
+    // physical route (or reporting online based only on interface addresses).
+    let ipv4 = tokio::fs::read_to_string("/proc/net/route").await?;
+    let ipv6 = tokio::fs::read_to_string("/proc/net/ipv6_route").await.ok();
+    let mut routes = parse_proc_ipv4_default_routes(&ipv4, interfaces);
+    if let Some(ipv6) = &ipv6 {
+        routes.extend(parse_proc_ipv6_default_routes(ipv6, interfaces));
+    }
+    let mut signatures = routes
+        .iter()
+        .map(|route| format!("procfs:{route:?}"))
+        .collect::<Vec<_>>();
+    signatures.sort();
+    let mut links = HashMap::new();
+    for interface in interfaces {
+        let dir = Path::new("/sys/class/net").join(&interface.name);
+        let Ok(flags) = tokio::fs::read_to_string(dir.join("flags")).await else {
+            continue;
+        };
+        let Some(flags) = flags
+            .trim()
+            .strip_prefix("0x")
+            .and_then(|value| u32::from_str_radix(value, 16).ok())
+        else {
+            continue;
+        };
+        let oper = tokio::fs::read_to_string(dir.join("operstate")).await.ok();
+        let carrier = tokio::fs::read_to_string(dir.join("carrier")).await.ok();
+        links.insert(
+            interface.index,
+            LinuxLinkState {
+                admin_up: flags & 1 != 0,
+                lower_up: Some(flags & 0x10000 != 0),
+                oper_down: oper.as_deref().is_some_and(|state| {
+                    matches!(state.trim(), "down" | "lowerlayerdown")
+                }),
+                carrier: carrier.as_deref().and_then(|value| match value.trim() {
+                    "1" => Some(true),
+                    "0" => Some(false),
+                    _ => None,
+                }),
+            },
+        );
+    }
+    Ok((links, routes, signatures))
+}
+
+#[cfg(target_os = "linux")]
+async fn linux_netlink_network_state() -> io::Result<(
+    HashMap<u32, LinuxLinkState>,
+    Vec<LinuxDefaultRoute>,
+    Vec<String>,
+)> {
+    use futures::TryStreamExt;
+    use rtnetlink::packet_route::{
+        link::{LinkAttribute, LinkFlags, State},
+        route::RouteMessage,
+    };
+    let handle = linux_netlink_handle().await?;
+    let mut links = HashMap::new();
+    let mut link_messages = handle.link().get().execute();
+    while let Some(message) =
+        link_messages.try_next().await.map_err(io::Error::other)?
+    {
+        let mut name = None;
+        let lower_up = Some(message.header.flags.contains(LinkFlags::LowerUp));
+        let mut oper_down = false;
+        let mut carrier = None;
+        for attribute in &message.attributes {
+            match attribute {
+                LinkAttribute::IfName(value) => name = Some(value.clone()),
+                LinkAttribute::OperState(State::Down | State::LowerLayerDown) => {
+                    oper_down = true
+                }
+                LinkAttribute::OperState(_) => oper_down = false,
+                LinkAttribute::Carrier(value) => carrier = Some(*value != 0),
+                _ => {}
+            }
+        }
+        if name.is_some() {
+            links.insert(
+                message.header.index,
+                LinuxLinkState {
+                    admin_up: message.header.flags.contains(LinkFlags::Up),
+                    lower_up,
+                    oper_down,
+                    carrier,
+                },
+            );
+        }
+    }
+    let mut route_messages = handle.route().get(RouteMessage::default()).execute();
+    let mut routes = Vec::new();
+    let mut signatures = Vec::new();
+    while let Some(message) =
+        route_messages.try_next().await.map_err(io::Error::other)?
+    {
+        if message.header.destination_prefix_length == 0
+            && message.header.kind
+                == rtnetlink::packet_route::route::RouteType::Unicast
+            && linux_route_table(&message) == 254
+        {
+            signatures.push(format!("{message:?}"));
+        }
+        if let Some(route) = parse_linux_default_route(&message) {
+            routes.push(route);
+        }
+    }
+    signatures.sort();
+    Ok((links, routes, signatures))
+}
+
 /// Sample Linux interface/address state with rtnetlink and compare it to the
 /// main-table default route. This deliberately does no reachability probing;
 /// the existing traffic evidence remains the source of online health.
@@ -1019,73 +1205,21 @@ fn linux_dns_signature(content: &str) -> String {
 pub(crate) async fn snapshot_with_tun(
     tun_candidate_exclusion: TunCandidateExclusion,
 ) -> io::Result<NetworkSnapshot> {
-    use futures::TryStreamExt;
     use network_interface::NetworkInterfaceConfig;
-    use rtnetlink::packet_route::{
-        link::{LinkAttribute, LinkFlags, State},
-        route::RouteMessage,
-    };
 
     tokio::time::timeout(Duration::from_secs(2), async {
-        let handle = linux_netlink_handle().await?;
-        let mut links = HashMap::new();
-        let mut link_messages = handle.link().get().execute();
-        while let Some(message) =
-            link_messages.try_next().await.map_err(io::Error::other)?
-        {
-            let mut name = None;
-            let lower_up = Some(message.header.flags.contains(LinkFlags::LowerUp));
-            let mut oper_down = false;
-            let mut carrier = None;
-            for attribute in &message.attributes {
-                match attribute {
-                    LinkAttribute::IfName(value) => name = Some(value.clone()),
-                    LinkAttribute::OperState(
-                        State::Down | State::LowerLayerDown,
-                    ) => {
-                        oper_down = true;
-                    }
-                    LinkAttribute::OperState(_) => oper_down = false,
-                    LinkAttribute::Carrier(value) => carrier = Some(*value != 0),
-                    _ => {}
-                }
-            }
-            if name.is_some() {
-                links.insert(
-                    message.header.index,
-                    LinuxLinkState {
-                        admin_up: message.header.flags.contains(LinkFlags::Up),
-                        lower_up,
-                        oper_down,
-                        carrier,
-                    },
-                );
-            }
-        }
-
         let interfaces =
             network_interface::NetworkInterface::show().map_err(io::Error::other)?;
-        let mut route_messages =
-            handle.route().get(RouteMessage::default()).execute();
-        let mut routes = Vec::new();
-        let mut route_signatures = Vec::new();
-        while let Some(message) =
-            route_messages.try_next().await.map_err(io::Error::other)?
-        {
-            if message.header.destination_prefix_length == 0
-                && message.header.kind
-                    == rtnetlink::packet_route::route::RouteType::Unicast
-                && linux_route_table(&message) == 254
-            {
-                // Retain raw default-route facts as a change signature even
-                // when ECMP/multipath cannot be represented by one interface.
-                route_signatures.push(format!("{message:?}"));
+        let (links, routes, route_signatures) = match linux_netlink_network_state().await {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "rtnetlink observation failed; using read-only procfs/sysfs network facts"
+                );
+                linux_procfs_network_state(&interfaces).await?
             }
-            if let Some(route) = parse_linux_default_route(&message) {
-                routes.push(route);
-            }
-        }
-        route_signatures.sort();
+        };
         let ipv4_ambiguous =
             linux_default_route_is_ambiguous(&routes, AddressFamily::Ipv4);
         let ipv6_ambiguous =
@@ -1262,6 +1396,57 @@ mod tests {
         let ecmp = [fast, equal_cost];
         assert!(linux_default_route_is_ambiguous(&ecmp, AddressFamily::Ipv4));
         assert_eq!(select_linux_default_route(&ecmp, AddressFamily::Ipv4), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn procfs_default_routes_preserve_real_gateway_and_metric() {
+        use network_interface::NetworkInterface;
+        let interfaces = vec![NetworkInterface {
+            name: "eth0".to_owned(),
+            index: 12,
+            internal: false,
+            mac_addr: None,
+            addr: vec![],
+        }];
+        let ipv4 = "Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n\
+eth0 00000000 0102A8C0 0003 0 0 10 00000000 0 0 0\n\
+eth0 0002A8C0 00000000 0001 0 0 0 00FFFFFF 0 0 0\n\
+unknown 00000000 00000000 0001 0 0 0 00000000 0 0 0\n";
+        let routes = parse_proc_ipv4_default_routes(ipv4, &interfaces);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].interface_index, 12);
+        assert_eq!(routes[0].gateway, Some("192.168.2.1".parse().unwrap()));
+        assert_eq!(routes[0].metric, 10);
+
+        let ipv6 = format!(
+            "{} 00 {} 00 {} 00000005 00000000 00000000 00000001 eth0\n",
+            "0".repeat(32),
+            "0".repeat(32),
+            "20010db8000000000000000000000001"
+        );
+        let routes = parse_proc_ipv6_default_routes(&ipv6, &interfaces);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].family, AddressFamily::Ipv6);
+        assert_eq!(routes[0].gateway, Some("2001:db8::1".parse().unwrap()));
+        assert_eq!(routes[0].metric, 5);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn procfs_fallback_rejects_down_and_non_default_routes() {
+        use network_interface::NetworkInterface;
+        let interfaces = vec![NetworkInterface {
+            name: "eth0".to_owned(),
+            index: 12,
+            internal: false,
+            mac_addr: None,
+            addr: vec![],
+        }];
+        let text = "Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n\
+eth0 00000000 00000000 0000 0 0 0 00000000 0 0 0\n\
+eth0 00000000 00000000 0001 0 0 0 00000000 0 0 0\n";
+        assert_eq!(parse_proc_ipv4_default_routes(text, &interfaces).len(), 1);
     }
 
     #[cfg(target_os = "linux")]

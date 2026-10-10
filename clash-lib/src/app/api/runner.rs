@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{io, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     Router, ServiceExt, middleware,
@@ -31,6 +31,27 @@ use crate::{
     config::internal::config::Controller,
     runner::Runner,
 };
+
+/// During reload the old API listener is joined before its replacement is
+/// bound. On some OSes the address can remain briefly unavailable; retry
+/// only EADDRINUSE and retain the original error on a persistent conflict.
+async fn bind_api_tcp_after_shutdown(
+    addr: &str,
+) -> io::Result<tokio::net::TcpListener> {
+    const MAX_RETRIES: u32 = 5;
+    for attempt in 0..=MAX_RETRIES {
+        match tokio::net::TcpListener::bind(addr).await {
+            Err(error)
+                if error.kind() == io::ErrorKind::AddrInUse
+                    && attempt < MAX_RETRIES =>
+            {
+                tokio::time::sleep(Duration::from_millis(25 * (1 << attempt))).await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("bounded API bind retry loop always returns on final attempt")
+}
 
 pub struct ApiRunner {
     controller_cfg: Controller,
@@ -417,7 +438,7 @@ impl Runner for ApiRunner {
                 Some(async move {
                     info!("Starting API server on TCP address {bind_addr}");
                     let listener =
-                        match tokio::net::TcpListener::bind(&bind_addr).await {
+                        match bind_api_tcp_after_shutdown(&bind_addr).await {
                             Ok(listener) => listener,
                             Err(err) => {
                                 tcp_ready_signal.fail(format!(
@@ -643,6 +664,21 @@ mod tests {
         let (_, valid_origin_count) = build_cors_layer(Some(&origins));
 
         assert_eq!(valid_origin_count, 0);
+    }
+
+    #[tokio::test]
+    async fn api_listener_rebinds_after_old_address_is_released() {
+        let old = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = old.local_addr().unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(85)).await;
+            drop(old);
+        });
+        let new_listener = super::bind_api_tcp_after_shutdown(&addr.to_string())
+            .await
+            .expect("API listener should rebind once old socket closes");
+        assert_eq!(new_listener.local_addr().unwrap(), addr);
+        release.await.unwrap();
     }
 
     #[tokio::test]

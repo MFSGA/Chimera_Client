@@ -1,7 +1,7 @@
 use crate::{
     app::dispatcher::Dispatcher,
     common::auth::ThreadSafeAuthenticator,
-    proxy::utils::{ToCanonical, try_create_dualstack_tcplistener},
+    proxy::utils::{ToCanonical, try_create_dualstack_tcplistener_after_shutdown},
     session::{Network, Session},
 };
 
@@ -64,7 +64,7 @@ impl InboundHandlerTrait for MixedInbound {
     async fn listen_tcp(&self, ready: InboundReady) -> std::io::Result<()> {
         let listener = report_listener_ready(
             ready,
-            try_create_dualstack_tcplistener(self.addr),
+            try_create_dualstack_tcplistener_after_shutdown(self.addr).await,
         )?;
 
         loop {
