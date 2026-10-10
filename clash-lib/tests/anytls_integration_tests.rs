@@ -253,7 +253,12 @@ async fn integration_test_anytls_udp() {
         socket.recv_from(&mut response),
     )
     .await
-    .expect("timed out waiting for AnyTLS UDP response")
+    .unwrap_or_else(|error| {
+        panic!(
+            "timed out waiting for AnyTLS UDP response: {error}; echo_server_received_packet={}",
+            echo_task.is_finished()
+        )
+    })
     .expect("failed to receive AnyTLS UDP response");
     echo_task.await.expect("UDP echo task failed");
 

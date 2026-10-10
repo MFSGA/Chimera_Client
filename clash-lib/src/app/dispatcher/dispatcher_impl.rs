@@ -41,6 +41,27 @@ use crate::{
 // encrypt/decrypt overhead.
 const DEFAULT_BUFFER_SIZE: usize = 64 * 1024;
 const UDP_SESSION_IDLE: Duration = Duration::from_secs(10);
+const UDP_STALE_PACKET_MAX_RETRIES: usize = 3;
+
+/// A datagram can be in-flight when automatic network observation retires its
+/// association. Replan the same packet on the new generation instead of
+/// silently losing the only packet in a short-lived flow. Never retry a
+/// packet that was already handed to a live outbound socket.
+fn queue_udp_packet_retry(
+    packet: UdpPacket,
+    pending: &mut Option<UdpPacket>,
+    retries: &mut usize,
+) {
+    if *retries < UDP_STALE_PACKET_MAX_RETRIES {
+        *retries += 1;
+        *pending = Some(packet);
+    } else {
+        warn!(
+            retries = *retries,
+            "dropping UDP packet after repeated concurrent network changes"
+        );
+    }
+}
 const UDP_FLOW_DECISION_MAX: usize = 1024;
 const UDP_HEALTH_PROOF_MAX: usize = 256;
 
@@ -1186,7 +1207,19 @@ impl Dispatcher {
         let s = sess.clone();
         let ss = sess.clone();
         let t1 = tokio::spawn(async move {
-            while let Some(mut packet) = local_r.next().await {
+            let mut pending_retry = None;
+            let mut stale_retries = 0;
+            loop {
+                let mut packet = match pending_retry.take() {
+                    Some(packet) => packet,
+                    None => {
+                        stale_retries = 0;
+                        let Some(packet) = local_r.next().await else {
+                            break;
+                        };
+                        packet
+                    }
+                };
                 let packet_generation =
                     outbound_handle_guard.generation.load(Ordering::Acquire);
                 let mut sess = sess.clone();
@@ -1593,7 +1626,12 @@ impl Dispatcher {
                     debug!(
                         source = %source,
                         destination = %sess.destination,
-                        "dropping UDP packet from a stale network generation"
+                        "replanning UDP packet after stale network generation"
+                    );
+                    queue_udp_packet_retry(
+                        packet,
+                        &mut pending_retry,
+                        &mut stale_retries,
                     );
                     continue;
                 }
@@ -1609,7 +1647,12 @@ impl Dispatcher {
                         destination = %sess.destination,
                         selected_network_version = selection.network_generation,
                         selected_policy_generation = selection.policy_generation,
-                        "dropping UDP packet because selected network or policy version is stale"
+                        "replanning UDP packet after stale network or policy version"
+                    );
+                    queue_udp_packet_retry(
+                        packet,
+                        &mut pending_retry,
+                        &mut stale_retries,
                     );
                     continue;
                 }
@@ -1868,7 +1911,12 @@ impl Dispatcher {
                             debug!(
                                 source = %source,
                                 destination = %sess.destination,
-                                "discarding UDP socket created for a stale network path"
+                                "discarding UDP socket created for a stale network path; replanning packet"
+                            );
+                            queue_udp_packet_retry(
+                                packet,
+                                &mut pending_retry,
+                                &mut stale_retries,
                             );
                             continue;
                         }
@@ -2045,6 +2093,11 @@ impl Dispatcher {
                                 },
                             )
                             .await;
+                            queue_udp_packet_retry(
+                                packet,
+                                &mut pending_retry,
+                                &mut stale_retries,
+                            );
                             continue;
                         }
 
@@ -2117,6 +2170,11 @@ impl Dispatcher {
                         if !outbound_handle_guard
                             .generation_is_current(packet_generation)
                         {
+                            queue_udp_packet_retry(
+                                packet,
+                                &mut pending_retry,
+                                &mut stale_retries,
+                            );
                             continue;
                         }
                         // TODO: need to reset when GLOBAL select is changed
@@ -2677,7 +2735,8 @@ mod tests {
         Dispatcher, OutboundDatagramPacket, OutboundHandleMap,
         PendingUdpHealthProofs, UDP_HEALTH_PROOF_MAX, UDP_SESSION_IDLE,
         UdpFlowDecisionKey, classify_flow_end_reason, confirmed_udp_path,
-        direct_udp_health_destination, preferred_udp_path_address, reverse_lookup,
+        direct_udp_health_destination, preferred_udp_path_address,
+        queue_udp_packet_retry, reverse_lookup,
         select_outbound_with_direct_fallback, try_queue_outbound_packet,
         udp_path_cache_versions, udp_path_selection_is_current,
     };
@@ -2695,6 +2754,25 @@ mod tests {
         time::Instant,
     };
     use tokio::sync::mpsc;
+
+    #[test]
+    fn stale_udp_first_packet_is_replayed_with_a_bounded_retry_budget() {
+        let address = SocksAddr::from_str("127.0.0.1:12345").unwrap();
+        let original = UdpPacket::new(vec![1, 2, 3], address.clone(), address);
+        let mut pending = None;
+        let mut retries = 0;
+        for expected in 1..=super::UDP_STALE_PACKET_MAX_RETRIES {
+            queue_udp_packet_retry(original.clone(), &mut pending, &mut retries);
+            assert_eq!(retries, expected);
+            assert_eq!(pending.take().unwrap().data, original.data);
+        }
+        queue_udp_packet_retry(original, &mut pending, &mut retries);
+        assert!(
+            pending.is_none(),
+            "network flapping must not cause unbounded replay"
+        );
+        assert_eq!(retries, super::UDP_STALE_PACKET_MAX_RETRIES);
+    }
 
     #[test]
     fn flow_end_reason_links_transport_failure_to_network_change() {
