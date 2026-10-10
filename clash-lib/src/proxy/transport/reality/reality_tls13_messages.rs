@@ -8,7 +8,12 @@ use super::common::{
     HANDSHAKE_TYPE_SERVER_HELLO, VERSION_TLS_1_2_MAJOR, VERSION_TLS_1_2_MINOR,
 };
 use aws_lc_rs::signature::Ed25519KeyPair;
-use std::io::Result;
+use std::io::{Error, ErrorKind, Result};
+
+use super::reality_util::{
+    X25519_GROUP, X25519_KEY_SHARE_LEN, X25519_MLKEM768_CLIENT_KEY_SHARE_LEN,
+    X25519_MLKEM768_GROUP,
+};
 
 /// Construct ServerHello message
 ///
@@ -276,7 +281,53 @@ pub fn construct_client_hello(
     cipher_suites: &[u16],
     alpn_protocols: &[&str],
 ) -> Result<Vec<u8>> {
-    let mut hello = Vec::with_capacity(512);
+    construct_client_hello_with_key_share(
+        client_random,
+        session_id,
+        X25519_GROUP,
+        client_public_key,
+        server_name,
+        cipher_suites,
+        alpn_protocols,
+    )
+}
+
+/// Construct a ClientHello offering one validated TLS key share.
+///
+/// The hybrid variant only constructs wire bytes; the Reality runtime must
+/// not select it until it also derives the full hybrid TLS shared secret.
+pub fn construct_client_hello_with_key_share(
+    client_random: &[u8; 32],
+    session_id: &[u8; 32],
+    key_share_group: u16,
+    client_public_key: &[u8],
+    server_name: &str,
+    cipher_suites: &[u16],
+    alpn_protocols: &[&str],
+) -> Result<Vec<u8>> {
+    let expected_len = match key_share_group {
+        X25519_GROUP => X25519_KEY_SHARE_LEN,
+        X25519_MLKEM768_GROUP => X25519_MLKEM768_CLIENT_KEY_SHARE_LEN,
+        _ => {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "unsupported REALITY ClientHello key share group: 0x{key_share_group:04x}"
+                ),
+            ));
+        }
+    };
+    if client_public_key.len() != expected_len {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "invalid REALITY ClientHello key share length for group 0x{key_share_group:04x}: expected {expected_len}, got {}",
+                client_public_key.len()
+            ),
+        ));
+    }
+
+    let mut hello = Vec::with_capacity(512 + client_public_key.len());
 
     // Handshake message type: ClientHello (0x01)
     hello.push(0x01);
@@ -338,7 +389,7 @@ pub fn construct_client_hello(
         extensions.extend_from_slice(&[0x00, 0x0a]); // Extension type: supported_groups
         extensions.extend_from_slice(&[0x00, 0x04]); // Extension length: 4
         extensions.extend_from_slice(&[0x00, 0x02]); // Supported groups length: 2
-        extensions.extend_from_slice(&[0x00, 0x1d]); // x25519
+        extensions.extend_from_slice(&key_share_group.to_be_bytes());
     }
 
     // key_share extension (type 51)
@@ -348,7 +399,7 @@ pub fn construct_client_hello(
         extensions.extend_from_slice(&(key_share_len as u16).to_be_bytes()); // Extension length
         let key_share_list_len = 4 + client_public_key.len();
         extensions.extend_from_slice(&(key_share_list_len as u16).to_be_bytes()); // Key share list length
-        extensions.extend_from_slice(&[0x00, 0x1d]); // Group: x25519
+        extensions.extend_from_slice(&key_share_group.to_be_bytes());
         extensions
             .extend_from_slice(&(client_public_key.len() as u16).to_be_bytes()); // Key length
         extensions.extend_from_slice(client_public_key); // Public key
@@ -483,6 +534,122 @@ mod tests {
         assert_eq!(header[1], 0x03); // TLS 1.2
         assert_eq!(header[2], 0x03);
         assert_eq!(u16::from_be_bytes([header[3], header[4]]), 100);
+    }
+
+    /// Locate an extension in a ClientHello handshake (without record header).
+    fn client_hello_extension(hello: &[u8], wanted: u16) -> Option<&[u8]> {
+        let mut offset = 4 + 2 + 32;
+        let session_len = hello[offset] as usize;
+        offset += 1 + session_len;
+        let suites_len =
+            u16::from_be_bytes([hello[offset], hello[offset + 1]]) as usize;
+        offset += 2 + suites_len;
+        let compression_len = hello[offset] as usize;
+        offset += 1 + compression_len;
+        let extensions_len =
+            u16::from_be_bytes([hello[offset], hello[offset + 1]]) as usize;
+        offset += 2;
+        let end = offset + extensions_len;
+        while offset < end {
+            let kind = u16::from_be_bytes([hello[offset], hello[offset + 1]]);
+            let len =
+                u16::from_be_bytes([hello[offset + 2], hello[offset + 3]]) as usize;
+            offset += 4;
+            if kind == wanted {
+                return Some(&hello[offset..offset + len]);
+            }
+            offset += len;
+        }
+        None
+    }
+
+    #[test]
+    fn client_hello_hybrid_key_share_wire_layout() {
+        let client_random = [0x42; 32];
+        let session_id = [0x23; 32];
+        let hybrid_share = vec![0xa5; X25519_MLKEM768_CLIENT_KEY_SHARE_LEN];
+        let hello = construct_client_hello_with_key_share(
+            &client_random,
+            &session_id,
+            X25519_MLKEM768_GROUP,
+            &hybrid_share,
+            "example.com",
+            &[0x1301],
+            &["h2"],
+        )
+        .unwrap();
+
+        // The supported_groups list and actual key_share must agree.
+        assert_eq!(
+            client_hello_extension(&hello, 10).unwrap(),
+            &[0, 2, 0x11, 0xec]
+        );
+        let share = client_hello_extension(&hello, 51).unwrap();
+        assert_eq!(
+            u16::from_be_bytes([share[0], share[1]]) as usize,
+            4 + hybrid_share.len()
+        );
+        assert_eq!(&share[2..4], &X25519_MLKEM768_GROUP.to_be_bytes());
+        assert_eq!(
+            u16::from_be_bytes([share[4], share[5]]) as usize,
+            hybrid_share.len()
+        );
+        assert_eq!(&share[6..], hybrid_share);
+        assert_eq!(
+            u32::from_be_bytes([0, hello[1], hello[2], hello[3]]) as usize,
+            hello.len() - 4
+        );
+    }
+
+    #[test]
+    fn client_hello_classic_wrapper_keeps_identical_wire() {
+        let random = [0x42; 32];
+        let session_id = [0x23; 32];
+        let public_key = [0x11; 32];
+        let old = construct_client_hello(
+            &random,
+            &session_id,
+            &public_key,
+            "example.com",
+            &[0x1301],
+            &["h2"],
+        )
+        .unwrap();
+        let generic = construct_client_hello_with_key_share(
+            &random,
+            &session_id,
+            X25519_GROUP,
+            &public_key,
+            "example.com",
+            &[0x1301],
+            &["h2"],
+        )
+        .unwrap();
+        assert_eq!(old, generic);
+        assert_eq!(client_hello_extension(&old, 10).unwrap(), &[0, 2, 0, 0x1d]);
+    }
+
+    #[test]
+    fn client_hello_rejects_invalid_key_share_groups_and_lengths() {
+        for (group, len) in [
+            (X25519_GROUP, 31),
+            (X25519_GROUP, 33),
+            (X25519_MLKEM768_GROUP, 1215),
+            (X25519_MLKEM768_GROUP, 1217),
+            (0x9999, 32),
+        ] {
+            let err = construct_client_hello_with_key_share(
+                &[0; 32],
+                &[0; 32],
+                group,
+                &vec![0; len],
+                "example.com",
+                &[0x1301],
+                &["h2"],
+            )
+            .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput, "group=0x{group:04x}");
+        }
     }
 
     #[test]

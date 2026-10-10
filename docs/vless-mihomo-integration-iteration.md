@@ -55,6 +55,25 @@
 - `cargo test -p clash-lib --lib --all-features --locked reality -- --test-threads=1`：136 通过、1 失败。失败项 `crypto_handshake::tests::test_connection_has_required_methods` 因 rustls 同时启用 ring / aws-lc-rs 后未显式安装默认 CryptoProvider 而 panic；在**未修改 master** 的隔离 worktree 上用同一 `--all-features` 组合单独执行该用例，也得到完全相同的失败。此问题为既有测试/feature 组合缺陷，不将其计为本轮引入，也不通过放宽 lint 掩盖。
 - 真实 Xray hybrid 互操作：尚未运行；需要后续完整握手切片。
 
+## 迭代 3：Reality Hybrid ClientHello KeyShare 构造基础
+
+### 范围与行为
+
+- 继续沿用 `master` 的 Reality ClientHello 结构，在不启用 Hybrid runtime 的前提下新增可指定密钥交换组的 ClientHello 构造器。
+- 仅接受 `X25519 (0x001d)` 的 32 字节 key share，或 `X25519MLKEM768 (0x11ec)` 的 1216 字节 key share（1184 字节 ML-KEM 公钥 + 32 字节 X25519 公钥）。未知组或长度错误在序列化之前直接返回 `InvalidInput`，不生成不完整握手。
+- `supported_groups` 与 `key_share` 必须使用同一个协商组；测试断言两处字段、长度和 TLS handshake 长度一致。
+- 既有 `construct_client_hello` 调用保持原样，委托新构造器生成 X25519 格式；默认 Reality 客户端仍仅使用经典 X25519，不会错误协商未实现的 Hybrid TLS secret。
+- 本切片**不包含** ML-KEM 私钥生成/封装、混合共享密钥派生、配置开关或 Xray 互操作；这些仍是后续待办，不能将此切片标为完整 Hybrid 支持。
+
+### 验证（2026-10-10）
+
+- `cargo test -p clash-lib --lib --all-features --locked reality_tls13_messages::tests -- --test-threads=1`：8/8 通过，含 3 项新增回归测试。
+- `cargo test -p clash-lib --lib --locked reality -- --test-threads=1`：139/139 通过。
+- `cargo test -p clash-lib --test vless_transport_contract_tests --locked`：3/3 通过。
+- `cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`：通过。
+- `cargo fmt --all -- --check`：通过。
+- CI：前一提交 `53b811f` 的 GitHub CI 截至检查时仍在运行；Windows 网络回归、吞吐测试、拼写及提交邮箱检查通过，尚未宣称全绿。
+
 ## 待办路线（按可验证的切片推进）
 
 1. **P1 Reality X25519MLKEM768**：提取混合密钥交换，保留普通 X25519 语义，复用并更新 Xray 互操作脚本。
