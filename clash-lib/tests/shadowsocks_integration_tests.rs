@@ -10,7 +10,7 @@ use tokio::{
 
 mod common;
 
-use common::{ClashInstance, Socks5UdpSession};
+use common::{ClashInstance, Socks5UdpSession, wait_port_ready};
 
 const PASSWORD: &str = "3SYJ/f8nmVuzKvKglykRQDSgg10e/ADilkdRWrrY9HU=";
 
@@ -22,19 +22,17 @@ fn udp_roundtrip_timeout() -> Duration {
     }
 }
 
-fn available_port() -> u16 {
-    StdTcpListener::bind("127.0.0.1:0")
-        .expect("failed to reserve test port")
-        .local_addr()
-        .expect("failed to inspect test port")
-        .port()
+fn available_listener_ports() -> [u16; 4] {
+    let reservations: [StdTcpListener; 4] = std::array::from_fn(|_| {
+        StdTcpListener::bind("127.0.0.1:0")
+            .expect("failed to reserve Shadowsocks listener port")
+    });
+    reservations.map(|listener| listener.local_addr().unwrap().port())
 }
 
 fn start_shadowsocks_pair(udp: bool) -> (ClashInstance, ClashInstance, u16) {
-    let server_api = available_port();
-    let server_port = available_port();
-    let client_api = available_port();
-    let socks_port = available_port();
+    let [server_api, server_port, client_api, socks_port] =
+        available_listener_ports();
     let cwd =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
 
@@ -70,6 +68,8 @@ rules:
         vec![server_api, server_port],
     )
     .expect("failed to start Shadowsocks server");
+    // The API listener may start before the Shadowsocks server listener.
+    wait_port_ready(server_port).expect("Shadowsocks server listener not ready");
 
     let client_config = format!(
         r#"
@@ -105,6 +105,7 @@ rules:
         vec![client_api, socks_port],
     )
     .expect("failed to start Shadowsocks client");
+    wait_port_ready(socks_port).expect("Shadowsocks SOCKS listener not ready");
 
     (server, client, socks_port)
 }
@@ -250,7 +251,10 @@ async fn integration_test_shadowsocks_udp_session_isolation() {
     let target_port = target.local_addr().unwrap().port();
     let target_task = tokio::spawn(async move {
         let mut buffer = [0u8; 1024];
-        for _ in 0..2 {
+        // The UDP echo target must remain alive until *both* independent
+        // clients have received their response. Two wire packets is not a
+        // stable termination condition when datagrams can be duplicated.
+        loop {
             let (size, source) = target.recv_from(&mut buffer).await.unwrap();
             target.send_to(&buffer[..size], source).await.unwrap();
         }
@@ -276,5 +280,6 @@ async fn integration_test_shadowsocks_udp_session_isolation() {
             .expect("second Shadowsocks UDP client timed out");
     assert_eq!(first_response, b"first-client");
     assert_eq!(second_response, b"second-client");
-    target_task.await.expect("shared UDP target failed");
+    target_task.abort();
+    let _ = target_task.await;
 }
