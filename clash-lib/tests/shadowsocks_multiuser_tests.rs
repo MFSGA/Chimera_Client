@@ -17,6 +17,7 @@ use common::{ClashInstance, Socks5UdpSession, send_http_request, wait_port_ready
 const SERVER_KEY: &str = "3SYJ/f8nmVuzKvKglykRQDSgg10e/ADilkdRWrrY9HU=";
 const USER1_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 const USER2_KEY: &str = "AQIDAQIDAQIDAQIDAQIDAQIDAQIDAQIDAQIDAQIDAQID";
+const TCP_ATTRIBUTION_PAYLOAD: &[u8] = b"ss2022-user-attribution";
 
 fn available_listener_ports() -> [u16; 4] {
     let reservations: [StdTcpListener; 4] = std::array::from_fn(|_| {
@@ -188,19 +189,20 @@ async fn ss2022_tcp_attributes_traffic_to_authenticated_user() {
     let target_port = target.local_addr().unwrap().port();
     let target_task = tokio::spawn(async move {
         let (mut stream, _) = target.accept().await.unwrap();
-        let mut request = [0u8; 128];
-        let n = stream.read(&mut request).await.unwrap();
-        stream.write_all(&request[..n]).await.unwrap();
+        // TCP is a byte stream: one read may return a prefix rather than
+        // the complete message, especially on different network stacks.
+        let mut request = vec![0u8; TCP_ATTRIBUTION_PAYLOAD.len()];
+        stream.read_exact(&mut request).await.unwrap();
+        stream.write_all(&request).await.unwrap();
         stream.shutdown().await.unwrap();
     });
 
     let (_server, _client, server_api, socks_port) = start_multiuser_pair();
     let mut stream = socks5_connect(socks_port, target_port).await;
-    let payload = b"ss2022-user-attribution";
-    stream.write_all(payload).await.unwrap();
-    let mut echoed = vec![0u8; payload.len()];
+    stream.write_all(TCP_ATTRIBUTION_PAYLOAD).await.unwrap();
+    let mut echoed = vec![0u8; TCP_ATTRIBUTION_PAYLOAD.len()];
     stream.read_exact(&mut echoed).await.unwrap();
-    assert_eq!(echoed, payload);
+    assert_eq!(echoed, TCP_ATTRIBUTION_PAYLOAD);
     stream.shutdown().await.unwrap();
     target_task.await.unwrap();
 
