@@ -556,6 +556,12 @@ cargo test -p clash-lib --test api_reload_tests --locked -- --test-threads=1
 - 修复：Linux 内存统计入口改为直接读 `/proc/self/statm` 的 RSS 第二列，页面大小来自 `sysconf(_SC_PAGESIZE)`，`u64` 计算使用 saturating multiplication，转换为 `usize` 时截顶，解析/系统调用失败返回 0（与此前无统计结果的降级契约一致）。不再计算无用的虚拟内存；其余平台继续沿用 `memory-stats`。移除此前为 QEMU 限制启用的 `always_use_statm` feature，因为 Linux 生产路径不再调用该库。
 - 回归：加入覆盖虚拟地址空间超过 32-bit `usize`、缺损输入和 RSS 极值的纯解析单元测试。本地 macOS `cargo test -p clash-lib --lib linux_statm --locked` 2/2、`cargo test -p clash-lib --test api_resource_tests --all-features --locked -- --test-threads=1` 7/7、`cargo test -p clash-lib --test api_smoke_tests --all-features --locked -- --test-threads=1` 4/4 均通过；`cargo test -p clash-lib --lib --all-features --locked` 为 861 passed、12 ignored；all-features Clippy `-D warnings`、fmt、diff check 通过。这些不能代替 ARMv7 native/QEMU 证据。CI #580 的 `aarch64-unknown-linux-musl` 与 `armv7-unknown-linux-gnueabihf` 任务被取消，仍需要在新提交的完整 CI 里重新运行原失败目标。禁止以跳过测试或吞掉失败掩盖问题。
 
+## PR #56 CI #581：ARM64 musl 的 SS2022 TCP 用户归属回归（2026-10-10）
+
+- GitHub Actions run `38075763254`、job `114283646090` 的 `aarch64-unknown-linux-musl`：`api_smoke_tests` 4/4、普通 Shadowsocks TCP/UDP/双客户端会话隔离 4/4 均通过，`shadowsocks_multiuser_tests::ss2022_udp_attributes_traffic_to_authenticated_user` 也通过；但 `ss2022_tcp_attributes_traffic_to_authenticated_user` 在等待完整回显时发生 `UnexpectedEof`（测试文件 `read_exact`）。单凭该日志无法证明是 SS2022 握手失败、网络代次变化还是 TCP 关闭竞态。
+- 本轮首先消除可控的测试半关闭竞态：TCP echo target 在 `read_exact` 收到完整请求后继续严格核对字节、`write_all` 和 `flush`，等待测试客户端确认完整回显才 `shutdown`。客户端保留 `read_exact`、字节一致、user1 有双向流量及 user2 无归属等全部断言；在 15 秒内没有完整回显仍失败，没有引入连接重试或放宽安全策略。两个代理实例的日志级别提高到 warn，以便 CI 留下真实握手或流量拒绝原因。
+- 本地 macOS 使用 `cargo test -p clash-lib --test shadowsocks_multiuser_tests --all-features --locked -- --test-threads=1` 连续运行 12 轮，每轮 TCP/UDP 2/2 通过；`cargo test -p clash-lib --test shadowsocks_integration_tests --all-features --locked -- --test-threads=1` 4/4 通过。此修改属于对测试生命周期的针对性消歧和候选修复，而不是已经证明的 musl 原因；需在新的 ARM64 musl CI 运行中验证。`wait_port_ready` 会建立并立即关闭一个探测 TCP 连接，因而 warn 日志可能存在独立的探测握手 `early eof`，不可直接据此认定业务连接失败。
+
 ## Missing outbound selection: fail closed
 
 A route, proxy group, or runtime mode must explicitly authorize DIRECT.

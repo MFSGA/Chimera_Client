@@ -37,7 +37,7 @@ fn start_multiuser_pair() -> (ClashInstance, ClashInstance, u16, u16) {
         r#"
 allow-lan: false
 mode: rule
-log-level: error
+log-level: warn
 mmdb: null
 external-controller: 127.0.0.1:{server_api}
 secret: test-secret
@@ -83,7 +83,7 @@ allow-lan: false
 bind-address: 127.0.0.1
 socks-port: {socks_port}
 mode: rule
-log-level: error
+log-level: warn
 mmdb: null
 external-controller: 127.0.0.1:{client_api}
 tun:
@@ -187,13 +187,21 @@ async fn ss2022_tcp_attributes_traffic_to_authenticated_user() {
         .await
         .expect("failed to bind local TCP target");
     let target_port = target.local_addr().unwrap().port();
+    // Keep the TCP echo peer alive until the client receives the complete
+    // response. Closing immediately after write races the encrypted relay's
+    // response flush and half-close, especially under slower QEMU runners.
+    let (echo_received_tx, echo_received_rx) = tokio::sync::oneshot::channel::<()>();
     let target_task = tokio::spawn(async move {
         let (mut stream, _) = target.accept().await.unwrap();
         // TCP is a byte stream: one read may return a prefix rather than
         // the complete message, especially on different network stacks.
         let mut request = vec![0u8; TCP_ATTRIBUTION_PAYLOAD.len()];
         stream.read_exact(&mut request).await.unwrap();
+        assert_eq!(request, TCP_ATTRIBUTION_PAYLOAD);
         stream.write_all(&request).await.unwrap();
+        stream.flush().await.unwrap();
+        // Also unblocks when a failing test drops the sender.
+        let _ = echo_received_rx.await;
         stream.shutdown().await.unwrap();
     });
 
@@ -201,8 +209,12 @@ async fn ss2022_tcp_attributes_traffic_to_authenticated_user() {
     let mut stream = socks5_connect(socks_port, target_port).await;
     stream.write_all(TCP_ATTRIBUTION_PAYLOAD).await.unwrap();
     let mut echoed = vec![0u8; TCP_ATTRIBUTION_PAYLOAD.len()];
-    stream.read_exact(&mut echoed).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(15), stream.read_exact(&mut echoed))
+        .await
+        .expect("timed out waiting for SS2022 TCP echo")
+        .expect("SS2022 TCP relay closed before the full echo arrived");
     assert_eq!(echoed, TCP_ATTRIBUTION_PAYLOAD);
+    echo_received_tx.send(()).unwrap();
     stream.shutdown().await.unwrap();
     target_task.await.unwrap();
 
