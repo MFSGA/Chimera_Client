@@ -31,6 +31,30 @@
 - **既有最小 feature 阻塞**：`cargo check -p clash-lib --no-default-features --features tls --locked` 在 DNS / 网络模块出现 7 个 dead-code 错误；在未修改的 `master`（`229218a`）隔离工作区复验，也出现**完全相同的 7 个错误**，不是本轮引入。后续单独修复，不放宽检查。
 - 完整 CI 和真实服务端互操作尚不能由本地单元测试代替，需在分支推送后验证。
 
+## 迭代 2：Reality 混合密钥交换的 ServerHello KeyShare 解析基础
+
+### 范围与行为
+
+- 源分支 `integration/vless-mihomo-full-v0256` 的 Reality 混合密钥交换代码不能直接替换主线握手；先提取 `0x11ec`（X25519MLKEM768）ServerHello key share 的长度校验和结构化解析。
+- 保留现有普通 X25519（`0x001d`）握手行为。当前实际 TLS secret derivation **仍然只支持 X25519**：即使能解析 hybrid ServerHello，现有 `extract_server_public_key` 也必须明确拒绝 hybrid，不能把其中的 32 字节 X25519 分量误当完整共享密钥。
+- 对 X25519（32 字节）、X25519MLKEM768（1088 字节密文 + 32 字节公钥）、未知 group、长度错误、截断和多余数据新增解析测试。
+- 后续切片再移植 ClientHello hybrid key share、ML-KEM 封装/解封装、TLS 1.3 共享密钥派生和 Reality 真实 Xray 互操作；**本切片不表示 hybrid runtime 已可用**。
+
+### CI 观察（2026-10-10）
+
+- PR #58 的首轮提交 `a66b6a6`：Windows 网络回归、Proxy Throughput Tests、Spelling、Commit Email Check 通过；完整 CI 检查期间 `i686-unknown-linux-musl` 的 `shadowsocks_multiuser_tests::ss2022_tcp_attributes_traffic_to_authenticated_user` 失败，报 `UnexpectedEof`。该用例属于 Shadowsocks 2022，与本轮 Reality 解析修改无直接代码关联；尚未证明是偶发问题，需复跑确认。
+- 其余 CI 和真实 Xray 互操作状态以 GitHub Actions 最终结果为准，不将进行中的任务写作通过。
+
+### 验证
+
+- `cargo test -p clash-lib --lib --all-features --locked reality_util::tests -- --test-threads=1`：5/5 通过（含 2 个新增用例）。
+- `cargo test -p clash-lib --lib --locked reality -- --test-threads=1`：136/136 通过。
+- `cargo test -p clash-lib --test vless_transport_contract_tests --locked`：3/3 通过。
+- `cargo fmt --all -- --check`：通过。
+- `cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`：通过。
+- `cargo test -p clash-lib --lib --all-features --locked reality -- --test-threads=1`：136 通过、1 失败。失败项 `crypto_handshake::tests::test_connection_has_required_methods` 因 rustls 同时启用 ring / aws-lc-rs 后未显式安装默认 CryptoProvider 而 panic；在**未修改 master** 的隔离 worktree 上用同一 `--all-features` 组合单独执行该用例，也得到完全相同的失败。此问题为既有测试/feature 组合缺陷，不将其计为本轮引入，也不通过放宽 lint 掩盖。
+- 真实 Xray hybrid 互操作：尚未运行；需要后续完整握手切片。
+
 ## 待办路线（按可验证的切片推进）
 
 1. **P1 Reality X25519MLKEM768**：提取混合密钥交换，保留普通 X25519 语义，复用并更新 Xray 互操作脚本。
