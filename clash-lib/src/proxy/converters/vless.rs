@@ -175,13 +175,21 @@ fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
         }
     }
 
-    if let Some(client_fingerprint) = s.client_fingerprint.as_deref()
-        && client_fingerprint != "none"
-    {
-        warn!(
-            "vless client-fingerprint '{client_fingerprint}' is not supported yet, ignoring it"
-        );
-    }
+    // XHTTP upload-settings can override the top-level security. Validate
+    // known fingerprint values now, then the effective value at the endpoint.
+    let explicit_upload_security = s.network.as_deref() == Some("xhttp")
+        && s.xhttp_opts
+            .as_ref()
+            .is_some_and(|opts| opts.upload_settings.is_some());
+    validate_vless_client_fingerprint(
+        s.client_fingerprint.as_deref(),
+        if explicit_upload_security {
+            None
+        } else {
+            Some(s.reality_opts.is_some())
+        },
+        "vless",
+    )?;
 
     if matches!(s.network.as_deref(), Some("xhttp")) {
         resolve_xhttp_http_version(s)?;
@@ -216,6 +224,30 @@ fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
         }
     }
 
+    Ok(())
+}
+
+/// Reject unsupported ClientHello impersonation instead of accepting a
+/// configuration that will have no effect on the wire. `None` for `reality`
+/// defers the security decision to explicit XHTTP upload-settings.
+fn validate_vless_client_fingerprint(
+    fingerprint: Option<&str>,
+    reality: Option<bool>,
+    context: &str,
+) -> Result<(), Error> {
+    let supported = matches!(
+        (fingerprint, reality),
+        (None, _)
+            | (Some("chrome"), Some(true) | None)
+            | (Some("none"), Some(false) | None)
+    );
+    if let Some(fingerprint) = fingerprint
+        && !supported
+    {
+        return Err(Error::InvalidConfig(format!(
+            "{context} client-fingerprint '{fingerprint}' is unsupported: Reality requires chrome, non-Reality permits only none"
+        )));
+    }
     Ok(())
 }
 
@@ -765,17 +797,11 @@ fn build_xhttp_upload_endpoint_config(
     let client_fingerprint = upload
         .and_then(|settings| settings.client_fingerprint.as_deref())
         .or(s.client_fingerprint.as_deref());
-    if let Some(client_fingerprint) = client_fingerprint
-        && !matches!(
-            &security,
-            XhttpSecurity::Reality if client_fingerprint == "chrome"
-        )
-        && client_fingerprint != "none"
-    {
-        warn!(
-            "xhttp upload endpoint client-fingerprint '{client_fingerprint}' is not supported yet, ignoring it"
-        );
-    }
+    validate_vless_client_fingerprint(
+        client_fingerprint,
+        Some(matches!(security, XhttpSecurity::Reality)),
+        "xhttp upload endpoint",
+    )?;
 
     let reality = build_xhttp_reality_config(
         upload_reality_opts,
@@ -934,17 +960,11 @@ fn build_xhttp_download_config(
         .client_fingerprint
         .as_deref()
         .or(s.client_fingerprint.as_deref());
-    if let Some(client_fingerprint) = client_fingerprint
-        && !matches!(
-            &security,
-            XhttpSecurity::Reality if client_fingerprint == "chrome"
-        )
-        && client_fingerprint != "none"
-    {
-        warn!(
-            "xhttp download-settings client-fingerprint '{client_fingerprint}' is not supported yet, ignoring it"
-        );
-    }
+    validate_vless_client_fingerprint(
+        client_fingerprint,
+        Some(matches!(security, XhttpSecurity::Reality)),
+        "xhttp download-settings",
+    )?;
 
     let reality = build_xhttp_reality_config(
         download_reality_opts,
@@ -1977,7 +1997,7 @@ mod tests {
 
     #[cfg(feature = "reality")]
     #[test]
-    fn vless_reality_allows_client_fingerprint_configuration_with_warning() {
+    fn vless_reality_rejects_unsupported_client_fingerprint() {
         let outbound = OutboundVless {
             common_opts: CommonConfigOptions {
                 name: "reality-firefox".to_owned(),
@@ -1994,13 +2014,16 @@ mod tests {
             ..Default::default()
         };
 
-        validate_vless_config(&outbound).expect(
-            "Reality client-fingerprint should be accepted for config compatibility",
+        let err = validate_vless_config(&outbound)
+            .expect_err("Reality must reject unsupported browser fingerprints");
+        assert!(
+            err.to_string().contains("client-fingerprint 'firefox'"),
+            "unexpected error: {err}"
         );
     }
 
     #[test]
-    fn vless_non_reality_allows_client_fingerprint_configuration() {
+    fn vless_non_reality_rejects_unsupported_client_fingerprint() {
         let outbound = OutboundVless {
             common_opts: CommonConfigOptions {
                 name: "tls-firefox".to_owned(),
@@ -2014,8 +2037,38 @@ mod tests {
             ..Default::default()
         };
 
-        validate_vless_config(&outbound)
-            .expect("non-Reality TLS client-fingerprint should be accepted for config compatibility");
+        let err = validate_vless_config(&outbound).expect_err(
+            "non-Reality TLS must reject unsupported browser fingerprints",
+        );
+        assert!(
+            err.to_string().contains("client-fingerprint 'firefox'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vless_accepts_explicit_none_client_fingerprint_without_reality() {
+        let outbound = OutboundVless {
+            client_fingerprint: Some("none".to_owned()),
+            ..Default::default()
+        };
+        validate_vless_config(&outbound).expect("none is a no-op for non-Reality");
+    }
+
+    #[cfg(feature = "reality")]
+    #[test]
+    fn vless_reality_rejects_explicit_none_client_fingerprint() {
+        let outbound = OutboundVless {
+            client_fingerprint: Some("none".to_owned()),
+            reality_opts: Some(OutboundTrojanRealityOpts {
+                public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
+                short_id: None,
+            }),
+            ..Default::default()
+        };
+        validate_vless_config(&outbound).expect_err(
+            "explicit none must not silently select the Chrome Reality handshake",
+        );
     }
 
     #[test]
@@ -4474,13 +4527,56 @@ mod tests {
             .expect("xhttp options should be present");
         let metadata =
             build_xhttp_metadata_config(xhttp_opts).expect("metadata should build");
-        build_xhttp_download_config(
+        let err = match build_xhttp_download_config(
             &outbound,
             xhttp_opts,
             &metadata,
             XhttpHttpVersion::Http2,
-        )
-        .expect("non-Reality TLS fingerprint should only warn for compatibility");
+        ) {
+            Ok(_) => {
+                panic!("non-Reality TLS must reject inherited Chrome fingerprint")
+            }
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("client-fingerprint 'chrome'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vless_xhttp_upload_rejects_unsupported_fingerprint() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "upload-tls-fingerprint".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            tls: Some(true),
+            network: Some("xhttp".to_owned()),
+            client_fingerprint: Some("firefox".to_owned()),
+            xhttp_opts: Some(XhttpOpt {
+                upload_settings: Some(XhttpUploadSettings {
+                    security: Some("tls".to_owned()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = match build_xhttp_upload_endpoint_config(&outbound, false) {
+            Ok(_) => {
+                panic!("upload TLS must reject unsupported browser fingerprint")
+            }
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("client-fingerprint 'firefox'"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
