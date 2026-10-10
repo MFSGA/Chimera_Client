@@ -4,6 +4,10 @@ use clash_lib::{Config, Options};
 use std::{
     net::{SocketAddr, TcpListener as StdTcpListener},
     path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -234,9 +238,12 @@ async fn integration_test_anytls_udp() {
         .await
         .expect("failed to start UDP echo target");
     let echo_addr = echo.local_addr().unwrap();
+    let echo_received = Arc::new(AtomicBool::new(false));
+    let echo_received_for_task = Arc::clone(&echo_received);
     let echo_task = tokio::spawn(async move {
         let mut buf = [0u8; 2048];
         let (len, peer) = echo.recv_from(&mut buf).await.unwrap();
+        echo_received_for_task.store(true, Ordering::Release);
         echo.send_to(&buf[..len], peer).await.unwrap();
     });
 
@@ -267,7 +274,8 @@ async fn integration_test_anytls_udp() {
     .await
     .unwrap_or_else(|error| {
         panic!(
-            "timed out waiting for AnyTLS UDP response: {error}; echo_server_received_packet={}",
+            "timed out waiting for AnyTLS UDP response: {error}; echo_server_received_packet={}; echo_task_finished={}",
+            echo_received.load(Ordering::Acquire),
             echo_task.is_finished()
         )
     })
