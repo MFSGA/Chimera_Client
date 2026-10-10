@@ -371,16 +371,20 @@ async fn network_reset_reports_dns_and_connection_pool_counts() {
         .await
         .expect("Failed to send POST /network/reset request");
 
-    assert_eq!(response.status(), http::StatusCode::OK);
-    let json: serde_json::Value = serde_json::from_reader(
-        response
-            .collect()
-            .await
-            .expect("Failed to collect network reset response")
-            .aggregate()
-            .reader(),
-    )
-    .expect("Failed to parse network reset response");
+    let status = response.status();
+    let body = response
+        .collect()
+        .await
+        .expect("Failed to collect network reset response")
+        .to_bytes();
+    assert_eq!(
+        status,
+        http::StatusCode::OK,
+        "POST /network/reset response: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&body)
+        .expect("Failed to parse network reset response");
     assert_eq!(json["dnsTransportsReset"], 0);
     assert_eq!(json["connectionPoolsReset"], 0);
 }

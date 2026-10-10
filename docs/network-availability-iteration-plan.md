@@ -485,3 +485,12 @@ cargo test -p clash-lib --test api_reload_tests --locked -- --test-threads=1
 - 环境：`windows-latest` x64/MSVC、稳定 Rust、NASM、Protoc、PowerShell、依赖缓存。默认 feature 下执行 `clash-lib` 全库单元测试、`direct_udp_integration_tests`、`lan_proxy_tests`；无默认 feature 下分别执行 OutboundManager 故障隔离、Selector 路径与 Dispatcher 路径测试，全部串行指定 `--test-threads=1`。
 - 隔离：只运行普通库测试以及回环 TCP/UDP socket 测试；`direct_udp_integration_tests` 的 `/network/reset` 只调用 Chimera 内部协调器，不更改 Windows 主机物理网卡/TUN/DNS/路由。此工作流不需要管理员权限或真实双网卡，不声称验证了物理 TUN 与网络切换。由于默认 feature 不包含 Dashboard，此专用工作流不调用前端 npm 构建，已有全 feature CI 保持原样。
 - 验证状态：本地已使用 Ruby YAML 解析器校验工作流语法和触发/runner/steps 结构，并通过 `git diff --check`。**尚未推送/合并，不能声称已经在 GitHub Windows runner 上跑过这份新工作流**；下一步通过用户发起 PR，或将工作流加入默认分支后使用 Actions → Windows Network Regression → Run workflow。
+
+## CI 跨平台 UDP 首包恢复与 Linux 诊断（2026-10-09）
+
+- 基线：PR #56 对应 `test/windows-network-reliability-20261009`，Windows Network Regression/Windows Rust Quality 成功，但完整 CI 中 Linux x64 的 `/network/reset` 返回 HTTP 500、macOS AnyTLS UDP 偶发超时、Linux ARM 容器进程查询触发 `sock2proc` NETLINK_SOCK_DIAG panic。
+- 可复现原因：本地 macOS 对 `integration_test_anytls_udp` 重复运行时捕获到 `discarding UDP socket created for a stale network path`，唯一首包在自动网络版本变化后被丢弃；此前的循环只消费新的 UDP datagram，不再处理旧首包。该竞态与真实网络版本切换有关，增加测试超时无法修复。
+- 修复：Dispatcher 为尚未发送成功、因网络版本或路径策略过期而丢弃的 UDP 首包保留最多 3 次重规划机会。再次读取最新生成版本、重新选择路由和出站，避免在旧 Socket 上重发；真正的拨号错误/required 路径失败、已交给活动出站的包均不会盲目重放。补充 `stale_udp_first_packet_is_replayed_with_a_bounded_retry_budget` 测试确保有效载荷保留与有界重试。
+- Linux ARM：上游 `sock2proc` 在 NETLINK_SOCK_DIAG 不受内核支持时对 socket 创建失败执行 `unwrap()`。Linux 进程识别结果不应影响数据转发，使用 `catch_unwind` 将异常降级为无进程名；不修改系统内核或配置。后续可考虑修复上游错误处理，避免 panic hook 输出。
+- `/network/reset`：先增强 `api_tests` 的失败报告，输出 HTTP 500 的实际响应正文，用于区分 DNS/Pool 退役失败、网络观测失败、无物理路径和重复网络采样竞态；尚未据此改变 HTTP API 语义，也未降低成功断言要求。
+- 本地验证：修复后 macOS AnyTLS UDP 重复运行 10 次均通过，第一次重试上限单元测试通过；全库/Clippy 等最终结果取后续实际执行日志。以上测试都在 Nix 开发环境运行，未使用管理员 TUN 或真实双网卡。本节的 Linux 根因必须以更新后的 GitHub Actions 日志复核；未完成前不得宣称整个 CI 全绿。

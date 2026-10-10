@@ -408,14 +408,28 @@ pub fn find_process_name(
 ) -> Option<String> {
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     {
-        sock2proc::find_process_name(
-            Some(source),
-            destination,
-            match network {
-                Network::Tcp => sock2proc::NetworkProtocol::TCP,
-                Network::Udp => sock2proc::NetworkProtocol::UDP,
-            },
-        )
+        let lookup = || {
+            sock2proc::find_process_name(
+                Some(source),
+                destination,
+                match network {
+                    Network::Tcp => sock2proc::NetworkProtocol::TCP,
+                    Network::Udp => sock2proc::NetworkProtocol::UDP,
+                },
+            )
+        };
+        #[cfg(target_os = "linux")]
+        {
+            // sock2proc currently unwraps NETLINK_SOCK_DIAG socket creation.
+            // Minimal Linux containers (including some cross runners) may
+            // return EPROTONOSUPPORT; process attribution must not terminate
+            // an otherwise healthy TCP/UDP forwarding task.
+            std::panic::catch_unwind(lookup).ok().flatten()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            lookup()
+        }
     }
 
     #[cfg(not(any(
