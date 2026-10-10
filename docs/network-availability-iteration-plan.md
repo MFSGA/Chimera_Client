@@ -542,3 +542,43 @@ cargo test -p clash-lib --test api_reload_tests --locked -- --test-threads=1
 - **平台证据边界：** 这里的本地 all-features 单元、Shadowsocks 多用户与 AnyTLS TCP/UDP 集成测试是在 macOS/Nix 运行，不代表 musl 或 i686 真实运行通过。Linux 专用网络采样/sock_diag 检查和实际 ABI 差异仍必须用各 Runner 的日志确认。主分支合并前尤其要求 musl 原失败目标的可复现验证和 CI 结果，不通过 skip、`allow-failure` 或降级断言伪造绿灯。
 
 - **更正 AnyTLS UDP 旧诊断歧义：** 原日志 `echo_server_received_packet={echo_task.is_finished()}` 只检查回显任务是否结束，不能证明报文有没有到达，尤其无法区分目标收到报文后尚未回写与真正没有收到。新测试在 UDP echo `recv_from()` 成功后用 `AtomicBool(Release)` 记录真实到达事实；超时日志分别报告 `echo_server_received_packet` 和 `echo_task_finished`，避免用任务结束状态推断网络丢包。测试成功条件、原有 10s 截止与端到端回包断言保持不变。
+
+## Missing outbound selection: fail closed
+
+A route, proxy group, or runtime mode must explicitly authorize DIRECT.
+When a rule selects a named outbound that cannot be found at dispatch time,
+TCP is closed and UDP datagrams are dropped rather than transparently falling
+back to DIRECT.
+
+## Why this matters
+
+The configuration validator already rejects references to unknown proxies
+at initial load. A missing handler can nevertheless occur at runtime if
+outbounds or providers are being replaced, or if a route and registry are
+temporarily out of sync. Treating absence as permission to use DIRECT
+can expose destination traffic that the user intended to proxy.
+
+The Dispatcher shares outbound resolution between TCP and UDP; a missing
+handler has no substitute, while genuine lookup/pool errors remain errors.
+Direct mode, an explicit DIRECT rule, and a group that has deliberately
+selected DIRECT continue to use direct networking.
+
+This is an intentional tightening of existing compatibility behavior. A
+configuration that depended on an implicit direct fallback should add an
+explicit MATCH,DIRECT rule (where direct traffic is intended) rather than
+rely on a missing proxy name.
+
+## Verification
+
+- A regression test first demonstrated that a missing named outbound would
+  select the available DIRECT handler; after this change it does not even
+  query that handler.
+- A separate test confirms an explicitly selected DIRECT handler works.
+- An integration test confirms unknown names in static routing rules are
+  rejected during configuration load.
+- Existing composite TCP/UDP DIRECT integration tests and UDP recovery
+  tests verify explicitly allowed traffic remains functional.
+
+This does not claim that every possible dynamic registry race is exercised
+end-to-end: those scenarios still need deterministic injectable runtime
+lifecycle tests.

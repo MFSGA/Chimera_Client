@@ -89,37 +89,27 @@ impl std::fmt::Display for DirectPathPlanningError {
 
 impl std::error::Error for DirectPathPlanningError {}
 
-/// Preserve the rule's requested outbound separately from the actual handler.
-/// Missing targets retain the existing compatibility fallback to DIRECT; lookup
-/// errors are never treated as missing targets.
+/// Resolve the outbound selected by routing without silently changing the
+/// user's routing policy. DIRECT is only used when explicitly selected by
+/// a rule, active group member, or Direct mode; missing names fail closed.
 struct SelectedOutbound<H> {
     handler: H,
     effective_name: String,
-    used_direct_fallback: bool,
 }
 
-async fn select_outbound_with_direct_fallback<H, F, Fut>(
+async fn select_outbound_for_flow<H, F, Fut>(
     requested_name: &str,
-    mut lookup: F,
+    lookup: F,
 ) -> std::io::Result<Option<SelectedOutbound<H>>>
 where
-    F: FnMut(String) -> Fut,
+    F: FnOnce(String) -> Fut,
     Fut: std::future::Future<Output = std::io::Result<Option<H>>>,
 {
-    if let Some(handler) = lookup(requested_name.to_owned()).await? {
-        return Ok(Some(SelectedOutbound {
-            handler,
-            effective_name: requested_name.to_owned(),
-            used_direct_fallback: false,
-        }));
-    }
-
-    Ok(lookup(PROXY_DIRECT.to_owned())
+    Ok(lookup(requested_name.to_owned())
         .await?
         .map(|handler| SelectedOutbound {
             handler,
-            effective_name: PROXY_DIRECT.to_owned(),
-            used_direct_fallback: true,
+            effective_name: requested_name.to_owned(),
         }))
 }
 
@@ -633,20 +623,17 @@ impl Dispatcher {
         debug!("dispatching {} to {}[{}]", sess, outbound_name, mode);
 
         let mgr = self.outbound_manager.clone();
-        let selected = match select_outbound_with_direct_fallback(
-            outbound_name,
-            |name| {
-                let mgr = mgr.clone();
-                async move { mgr.get_outbound_for_new_flow(&name).await }
-            },
-        )
+        let selected = match select_outbound_for_flow(outbound_name, |name| {
+            let mgr = mgr.clone();
+            async move { mgr.get_outbound_for_new_flow(&name).await }
+        })
         .await
         {
             Ok(Some(selected)) => selected,
             Ok(None) => {
                 warn!(
                     requested_outbound = outbound_name,
-                    "DIRECT outbound is unavailable; closing flow"
+                    "configured outbound is missing; closing TCP flow without DIRECT fallback"
                 );
                 let _ = lhs.shutdown().await;
                 return;
@@ -657,12 +644,6 @@ impl Dispatcher {
                 return;
             }
         };
-        if selected.used_direct_fallback {
-            debug!(
-                requested_outbound = outbound_name,
-                "unknown outbound; falling back to DIRECT"
-            );
-        }
         let is_dynamic_group = matches!(
             selected.handler.proto(),
             OutboundType::Selector
@@ -1278,7 +1259,7 @@ impl Dispatcher {
                 let remote_receiver_w = remote_receiver_w.clone();
 
                 let mgr = outbound_manager.clone();
-                let selected = match select_outbound_with_direct_fallback(
+                let selected = match select_outbound_for_flow(
                     &requested_outbound_name,
                     |name| {
                         let mgr = mgr.clone();
@@ -1289,7 +1270,7 @@ impl Dispatcher {
                 {
                     Ok(Some(selected)) => selected,
                     Ok(None) => {
-                        warn!(requested_outbound = %requested_outbound_name, "DIRECT outbound unavailable for UDP flow");
+                        warn!(requested_outbound = %requested_outbound_name, "configured outbound is missing; dropping UDP packet without DIRECT fallback");
                         continue;
                     }
                     Err(error) => {
@@ -1297,10 +1278,6 @@ impl Dispatcher {
                         continue;
                     }
                 };
-                if selected.used_direct_fallback {
-                    debug!(requested_outbound = %requested_outbound_name, "unknown outbound; falling back to DIRECT for UDP");
-                }
-                let used_direct_fallback = selected.used_direct_fallback;
                 let is_dynamic_group = matches!(
                     selected.handler.proto(),
                     OutboundType::Selector
@@ -1343,11 +1320,7 @@ impl Dispatcher {
 
                 let rule_summary = rule_summary(rule.map(Box::as_ref));
                 let explain_route = crate::app::flow::RouteDecision {
-                    outbound: if used_direct_fallback {
-                        requested_outbound_name.clone()
-                    } else {
-                        outbound_name.clone()
-                    },
+                    outbound: outbound_name.clone(),
                     rule: Some(rule_summary.clone()),
                 };
                 let mut connect_sess = sess.clone();
@@ -2736,9 +2709,9 @@ mod tests {
         PendingUdpHealthProofs, UDP_HEALTH_PROOF_MAX, UDP_SESSION_IDLE,
         UdpFlowDecisionKey, classify_flow_end_reason, confirmed_udp_path,
         direct_udp_health_destination, preferred_udp_path_address,
-        queue_udp_packet_retry, reverse_lookup,
-        select_outbound_with_direct_fallback, try_queue_outbound_packet,
-        udp_path_cache_versions, udp_path_selection_is_current,
+        queue_udp_packet_retry, reverse_lookup, select_outbound_for_flow,
+        try_queue_outbound_packet, udp_path_cache_versions,
+        udp_path_selection_is_current,
     };
     use crate::{
         app::dns::{ClashResolver, MockClashResolver, ThreadSafeDNSResolver},
@@ -2929,71 +2902,65 @@ mod tests {
         assert_eq!(tracker.end_reason(), super::FlowEndReason::IdleTimeout);
     }
 
+    // Both stream and datagram dispatch use this shared selection function.
     #[tokio::test]
-    async fn missing_outbound_fallback_uses_direct_network_behavior_for_tcp_and_udp()
-    {
-        use crate::proxy::{AnyOutboundHandler, OutboundType, direct};
+    async fn missing_named_outbound_does_not_look_up_direct() {
+        use crate::proxy::{AnyOutboundHandler, direct};
 
-        for network in [Network::Tcp, Network::Udp] {
-            let handler: AnyOutboundHandler =
-                Arc::new(direct::Handler::new(PROXY_DIRECT));
-            let mut lookups = Vec::new();
-            let requested = "REMOVED-PROXY";
-            let selected = select_outbound_with_direct_fallback(requested, |name| {
-                lookups.push(name.clone());
-                let handler = handler.clone();
-                async move { Ok((name == PROXY_DIRECT).then_some(handler)) }
-            })
-            .await
-            .unwrap()
-            .unwrap();
+        let direct_handler: AnyOutboundHandler =
+            Arc::new(direct::Handler::new(PROXY_DIRECT));
+        let mut lookups = Vec::new();
+        let selected = select_outbound_for_flow("REMOVED-PROXY", |name| {
+            lookups.push(name.clone());
+            let direct_handler = direct_handler.clone();
+            async move {
+                Ok::<_, std::io::Error>(
+                    (name == PROXY_DIRECT).then_some(direct_handler),
+                )
+            }
+        })
+        .await
+        .unwrap();
 
-            assert_eq!(lookups, [requested, PROXY_DIRECT]);
-            assert!(selected.used_direct_fallback);
-            assert_eq!(selected.effective_name, PROXY_DIRECT);
-            assert_eq!(selected.handler.name(), PROXY_DIRECT);
-            assert!(matches!(selected.handler.proto(), OutboundType::Direct));
-
-            let direct_resolver: ThreadSafeDNSResolver =
-                Arc::new(MockClashResolver::new());
-            let expected = direct_resolver.clone();
-            let mut primary = MockClashResolver::new();
-            primary
-                .expect_direct_resolver()
-                .once()
-                .returning(move || Some(expected.clone()));
-            let primary: ThreadSafeDNSResolver = Arc::new(primary);
-            let resolved = Dispatcher::resolver_for_outbound(
-                &primary,
-                &selected.effective_name,
-            );
-            assert!(Arc::ptr_eq(&resolved, &direct_resolver));
-
-            // proxy-resolve-local must not turn the final DIRECT target into
-            // a locally resolved proxy destination before path planning.
-            let original = SocksAddr::Domain("example.test".to_owned(), 443);
-            let mut session = Session {
-                network,
-                destination: original.clone(),
-                ..Default::default()
-            };
-            Dispatcher::maybe_resolve_proxy_destination_locally(
-                &primary,
-                true,
-                &selected.effective_name,
-                &mut session,
-            )
-            .await;
-            assert_eq!(session.destination, original);
-        }
+        assert!(
+            selected.is_none(),
+            "missing named proxy must never silently connect DIRECT"
+        );
+        assert_eq!(
+            lookups,
+            ["REMOVED-PROXY"],
+            "DIRECT must not even be queried after a missing proxy"
+        );
     }
 
     #[tokio::test]
-    async fn outbound_fallback_only_happens_when_target_is_missing() {
+    async fn explicit_direct_route_is_unchanged() {
+        use crate::proxy::{AnyOutboundHandler, OutboundType, direct};
+
+        let handler: AnyOutboundHandler =
+            Arc::new(direct::Handler::new(PROXY_DIRECT));
+        let mut lookups = Vec::new();
+        let selected = select_outbound_for_flow(PROXY_DIRECT, |name| {
+            lookups.push(name.clone());
+            let handler = handler.clone();
+            async move {
+                Ok::<_, std::io::Error>((name == PROXY_DIRECT).then_some(handler))
+            }
+        })
+        .await
+        .unwrap()
+        .expect("explicit DIRECT route should still resolve");
+        assert_eq!(lookups, [PROXY_DIRECT]);
+        assert_eq!(selected.handler.name(), PROXY_DIRECT);
+        assert!(matches!(selected.handler.proto(), OutboundType::Direct));
+    }
+
+    #[tokio::test]
+    async fn outbound_lookup_failure_never_falls_back_to_direct() {
         use std::io;
 
         let mut lookups = Vec::new();
-        let selected = select_outbound_with_direct_fallback("PROXY", |name| {
+        let selected = select_outbound_for_flow("PROXY", |name| {
             lookups.push(name.clone());
             async move { Ok::<_, io::Error>(Some(name)) }
         })
@@ -3002,10 +2969,9 @@ mod tests {
         .unwrap();
         assert_eq!(lookups, ["PROXY"]);
         assert_eq!(selected.effective_name, "PROXY");
-        assert!(!selected.used_direct_fallback);
 
         let mut lookups = Vec::new();
-        let failure = select_outbound_with_direct_fallback("BROKEN", |name| {
+        let failure = select_outbound_for_flow("BROKEN", |name| {
             lookups.push(name);
             async { Err::<Option<String>, _>(io::Error::other("pool reset failed")) }
         })
@@ -3013,12 +2979,11 @@ mod tests {
         assert!(failure.is_err());
         assert_eq!(lookups, ["BROKEN"]);
 
-        let missing =
-            select_outbound_with_direct_fallback("UNKNOWN", |_name| async {
-                Ok::<_, io::Error>(None::<String>)
-            })
-            .await
-            .unwrap();
+        let missing = select_outbound_for_flow("UNKNOWN", |_name| async {
+            Ok::<_, io::Error>(None::<String>)
+        })
+        .await
+        .unwrap();
         assert!(missing.is_none());
     }
 
