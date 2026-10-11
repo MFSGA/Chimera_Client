@@ -20,6 +20,7 @@ mod reality_auth;
 mod reality_cipher_suite;
 mod reality_client_connection;
 mod reality_client_verify;
+mod reality_hybrid;
 mod reality_io_state;
 mod reality_reader_writer;
 mod reality_records;

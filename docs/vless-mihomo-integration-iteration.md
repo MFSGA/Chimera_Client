@@ -80,7 +80,15 @@
 - 不截断或预先哈希混合共享密钥，交由现有 TLS 1.3 HKDF-Extract 消费完整输入。
 - 增加 SHA-256 与 SHA-384 回归覆盖：验证混合密钥与单纯 X25519 的结果不同、顺序不能互换、结果可重复、无效长度拒绝。
 - 本轮仍未启用 Reality Hybrid 运行时；ML-KEM 客户端密钥生成、解封装、完整握手与真实 Xray 互操作仍待实现。
-- 本轮变更先留在本地集成分支，远程更新操作受开发工具安全检查限制；CI 不能算作覆盖了本轮代码。
+- 恢复工作区后复验：TLS keys 9/9、Reality 默认 140/140、VLESS transport contract 3/3、严格 Clippy、fmt 全通过；已提交为 `ac1486c` 并与此前 `046ffdd` 一同正常推送到 `integration/vless-mihomo-next`。该远程提交的完整 CI 仍需等待最终结果。
+
+## 迭代 5：Reality X25519MLKEM768 客户端密钥材料与解封装（未启用运行时）
+
+- 使用仓库现有 `aws-lc-rs`（不新增依赖）生成每连接 ML-KEM-768 解封装密钥与 X25519 私钥；按 TLS 组 `0x11ec` 的规范构造 ClientHello 公钥部分：ML-KEM 1184 字节在前，X25519 32 字节在后。
+- 从解析后的 ServerHello hybrid key share 取 1088 字节 ML-KEM ciphertext 与 32 字节 X25519 服务端公钥，分别解封装与 ECDH，再按 ML-KEM|X25519 拼接 64 字节 HKDF 输入。严格拒绝不匹配的组、长度或协商失败；密钥不写日志。
+- 4 项新增回归测试覆盖独立模拟服务端 KEM 封装/X25519 协商所得共享密钥一致、SHA-256/SHA-384 TLS 派生、错误 group/长度、无效 X25519 对端公钥及新鲜密钥。
+- 关键边界：新增 `reality_hybrid.rs` 目前为独立组件，默认 Reality 握手仍只使用普通 X25519。**这不是实际 Hybrid ClientHello/ServerHello 联机握手**；下一切片需将所提供 key share、与之绑定的私钥状态及协商校验接入 `RealityClientConnection`，完成真实 Xray 互操作后才可宣称 Hybrid 功能就绪。
+- **本地验证（2026-10-10）**：`cargo test -p clash-lib --lib --locked reality_hybrid::tests -- --test-threads=1` 4/4；`cargo test -p clash-lib --lib --locked reality -- --test-threads=1` 144/144；`cargo test -p clash-lib --test vless_transport_contract_tests --locked` 3/3；`cargo test -p clash-lib --lib --all-features --locked reality_hybrid::tests -- --test-threads=1` 4/4；`cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check` 均通过。本地测试不能代替真实服务端互操作或跨平台 CI。
 
 ## 待办路线（按可验证的切片推进）
 
