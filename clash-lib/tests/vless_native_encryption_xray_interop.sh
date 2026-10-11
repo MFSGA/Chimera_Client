@@ -5,6 +5,11 @@ ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 CLASH_BIN=${CLASH_BIN:-"$ROOT_DIR/target/debug/clash-rs"}
 XRAY_BIN=${XRAY_BIN:-}
 XRAY_IMAGE=${XRAY_IMAGE:-"teddysun/xray:26.3.27"}
+APPEARANCE=${VLESS_ENCRYPTION_APPEARANCE:-native}
+case "$APPEARANCE" in
+    native|xorpub) ;;
+    *) echo "unsupported VLESS 1-RTT interop appearance: $APPEARANCE" >&2; exit 2 ;;
+esac
 UUID=${VLESS_INTEROP_UUID:-"b831381d-6324-4d53-ad4f-8cda48b30811"}
 KEEP_INTEROP_TMP=${KEEP_INTEROP_TMP:-0}
 
@@ -72,7 +77,9 @@ if [[ -z "$NATIVE_DECRYPTION" || -z "$NATIVE_ENCRYPTION" ]]; then
     echo "failed to parse Xray vlessenc output" >&2
     exit 3
 fi
-CLIENT_ENCRYPTION=${NATIVE_ENCRYPTION/.0rtt./.1rtt.}
+XRAY_DECRYPTION=${NATIVE_DECRYPTION/.native./.${APPEARANCE}.}
+CLIENT_ENCRYPTION=${NATIVE_ENCRYPTION/.native./.${APPEARANCE}.}
+CLIENT_ENCRYPTION=${CLIENT_ENCRYPTION/.0rtt./.1rtt.}
 
 read -r ECHO_PORT XRAY_PORT SOCKS_PORT < <(python3 - <<'PY'
 import socket
@@ -113,13 +120,13 @@ PY
 ECHO_PID=$!
 
 python3 - "$TMP_DIR/xray.json" "$TMP_DIR/chimera.yaml" \
-    "$XRAY_PORT" "$SOCKS_PORT" "$UUID" "$NATIVE_DECRYPTION" \
-    "$CLIENT_ENCRYPTION" <<'PY'
+    "$XRAY_PORT" "$SOCKS_PORT" "$UUID" "$XRAY_DECRYPTION" \
+    "$CLIENT_ENCRYPTION" "$APPEARANCE" <<'PY'
 import json
 import pathlib
 import sys
 
-xray_path, chimera_path, xray_port, socks_port, uuid, decryption, encryption = sys.argv[1:]
+xray_path, chimera_path, xray_port, socks_port, uuid, decryption, encryption, appearance = sys.argv[1:]
 xray = {
     "log": {"loglevel": "error"},
     "inbounds": [{
@@ -128,7 +135,12 @@ xray = {
         "protocol": "vless",
         "settings": {"clients": [{"id": uuid}], "decryption": decryption},
     }],
-    "outbounds": [{"protocol": "freedom", "tag": "direct"}],
+    "outbounds": [{
+        "protocol": "freedom", "tag": "direct",
+        "settings": {"finalRules": [{
+            "action": "allow", "network": "tcp", "ip": ["127.0.0.1"],
+        }]},
+    }],
 }
 pathlib.Path(xray_path).write_text(json.dumps(xray), encoding="utf-8")
 chimera = "\n".join([
@@ -141,7 +153,7 @@ chimera = "\n".join([
     "dns:",
     "  enable: false",
     "proxies:",
-    "  - name: xray-native-1rtt",
+    f"  - name: xray-{appearance}-1rtt",
     "    type: vless",
     "    server: 127.0.0.1",
     f"    port: {xray_port}",
@@ -149,7 +161,7 @@ chimera = "\n".join([
     "    udp: false",
     f'    encryption: "{encryption}"',
     "rules:",
-    "  - MATCH,xray-native-1rtt",
+    f"  - MATCH,xray-{appearance}-1rtt",
 ]) + "\n"
 pathlib.Path(chimera_path).write_text(chimera, encoding="utf-8")
 PY
@@ -235,4 +247,4 @@ with socket.create_connection(("127.0.0.1", socks_port), timeout=3) as sock:
     assert recv_exact(sock, len(payload)) == payload
 PY
 
-echo "PASS native VLESS 1-RTT interop against Xray"
+echo "PASS $APPEARANCE VLESS 1-RTT interop against Xray"

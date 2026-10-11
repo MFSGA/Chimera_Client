@@ -754,6 +754,17 @@ fn encryption_record_codec_continues_after_peer_padding() {
 #[cfg(feature = "vless-encryption")]
 #[tokio::test]
 async fn encryption_stream_native_one_rtt_round_trips_records() {
+    encryption_stream_one_rtt_round_trips_records("native").await;
+}
+
+#[cfg(feature = "vless-encryption")]
+#[tokio::test]
+async fn encryption_stream_xorpub_one_rtt_round_trips_records() {
+    encryption_stream_one_rtt_round_trips_records("xorpub").await;
+}
+
+#[cfg(feature = "vless-encryption")]
+async fn encryption_stream_one_rtt_round_trips_records(appearance: &str) {
     use aws_lc_rs::{
         agreement,
         kem::{EncapsulationKey, ML_KEM_768},
@@ -765,7 +776,7 @@ async fn encryption_stream_native_one_rtt_round_trips_records() {
     let nfs_private = agreement::PrivateKey::generate(&agreement::X25519).unwrap();
     let nfs_public = nfs_private.compute_public_key().unwrap();
     let raw = format!(
-        "{METHOD}.native.1rtt.100-64-64.{}",
+        "{METHOD}.{appearance}.1rtt.100-64-64.{}",
         URL_SAFE_NO_PAD.encode(nfs_public.as_ref()),
     );
     let config = Config::parse(&raw).expect("1rtt config should parse");
@@ -782,6 +793,33 @@ async fn encryption_stream_native_one_rtt_round_trips_records() {
             .await
             .expect("client hello");
         assert_eq!(received_hello, hello.bytes);
+
+        // Recover the NFS relay from the actual ClientHello bytes. xorpub must
+        // be reversible with the configured server public key and transmitted IV.
+        let mut relay = received_hello
+            [CLIENT_HELLO_IV_LEN..CLIENT_HELLO_IV_LEN + X25519_PUBLIC_KEY_LEN]
+            .to_vec();
+        if appearance == "xorpub" {
+            xor_vless_ctr(
+                nfs_public.as_ref(),
+                &server_prepared.nfs_relays.iv,
+                &mut relay,
+            )
+            .expect("unmask xorpub relay");
+        }
+        let peer = agreement::UnparsedPublicKey::new(&agreement::X25519, &relay);
+        let mut recovered_nfs = Vec::new();
+        agreement::agree(
+            &nfs_private,
+            peer,
+            invalid("server NFS agreement failed"),
+            |material| {
+                recovered_nfs.extend_from_slice(material);
+                Ok(())
+            },
+        )
+        .expect("server NFS agreement");
+        assert_eq!(recovered_nfs, server_prepared.nfs_relays.nfs_key);
 
         let client_mlkem_public = EncapsulationKey::new(
             &ML_KEM_768,
