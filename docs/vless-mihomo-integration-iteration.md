@@ -134,3 +134,15 @@
 - **真实 Xray 互操作**：运行 `clash-lib/tests/vless_native_encryption_udp_xray_interop.sh` 对 Xray 26.9.30 macOS arm64；SOCKS5 UDP ASSOCIATE 经 Chimera 加密 VLESS UDP 到 Xray，再转发本机 UDP echo，完整 datagram 往返断言通过。脚本显式禁用 MMDB/CLI compatibility，并仅允许 Xray freedom outbound 访问本机 UDP echo。
 - **验证**：`cargo test -p clash-lib --features vless-encryption --lib encrypted_vless_supports_udp -- --nocapture` 1/1；现有 VLESS datagram framing 测试 2/2；`cargo build -p clash-rs --features vless-encryption --locked` 通过；严格命令 `cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、`cargo fmt --all -- --check`、脚本 `bash -n`、`git diff --check` 通过。CI 待新提交触发并检查。
 - **边界与下一步**：本切片只覆盖 1-RTT Native Encryption 的现有 TCP-carried UDP 数据报；不覆盖 0-RTT UDP、`network: udp` 或 XUDP。后续优先评估能复用现有 UDP packet framing 的低成本兼容缺口，再考虑 random 混淆或 ticket 重放机制。
+
+
+## 迭代 9：VLESS Native Encryption random 1-RTT（2026-10-11）
+
+- **分支与保护**：以 `d8e3d84e32c293bea2085df2c762e5a6c85c7180` 为集成分支基线；检查时 `origin/master` 为 `cc8549c`，主工作树正检出 master 且有用户 README/图片改动。为保留这些修改，单独创建 `/private/tmp/chimera-vless-integration-20261011` worktree，仅在 `integration/vless-mihomo-next` 分支开发。PR #58 继续保持 Draft，不改动 master。
+- **协议实现**：参考 Xray-core `proxy/vless/encryption/xor.go` / `client.go` 的随机外观流程，开放 `mlkem768x25519plus.random.1rtt` 的显式配置。NFS 公钥仍使用既有 xorpub 掩码；1-RTT 握手与服务端 padding 不改变。握手完成后仅以独立 AES-CTR 流掩码双向每条 TLS-shaped 加密 record 的前 5 字节：发送侧使用 `BLAKE3 derive_key("VLESS", united_key)` 与 ClientHello IV，接收侧使用同一 united key 与解密后的服务端 16 字节 ticket。CTR 连续跨记录/16 字节分组计数器边界，正文不掩码，AEAD 仍以解掩码后的原始 record header 为 AAD。
+- **回归测试**：将已有 native/xorpub 模拟 Xray 1-RTT 握手和 AEAD ping/pong 验证扩展至 random，三种外观各进行五轮连续往返；模拟服务端从实际收到的 ClientHello 独立恢复 NFS，且用与运行时不同的整流 AES-CTR 掩码生成方式复核双向 header。五条记录覆盖 CTR 16 字节块边界。converter 验证三种 1-RTT 模式可建构，`native.0rtt` / `random.0rtt` 仍 fail-closed。
+- **已完成检查**：`cargo test -p clash-lib --lib --all-features --locked proxy::vless::encryption::tests -- --test-threads=1` 29/29；all-features VLESS converter 101/101；all-features VLESS transport contract 4/4；`cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check`、`bash -n clash-lib/tests/vless_native_encryption_xray_interop.sh` 均通过，`cargo build -p clash-rs --features vless-encryption --locked` 通过。
+- **真实 Xray 互操作**：Xray **26.3.27**（macOS arm64，工作区现有测试二进制），用现有 `vless_native_encryption_xray_interop.sh` 生成随机临时密钥、服务端/客户端配置，在 127.0.0.1 回环 echo 验证 `random.1rtt` 全程加密 ping/pong 成功；同一新建 CLI 上复测 `native.1rtt` 和 `xorpub.1rtt` 均通过。输出分别为 `PASS random/native/xorpub VLESS 1-RTT interop against Xray`。测试仅限回环地址、无外部代理目的地。
+- **默认配置回归**：`cargo test -p clash-lib --lib --locked proxy::vless::encryption::tests -- --test-threads=1` 29/29；默认 VLESS converter 89/89；默认 VLESS transport contract 3/3，通过。
+- **第二版本真实互操作**：同一 Chimera CLI 在 Xray **26.9.30**（macOS arm64）下执行 `VLESS_ENCRYPTION_APPEARANCE=random`，回环数据往返同样通过，输出 `PASS random VLESS 1-RTT interop against Xray`。两版 Xray 均为工作区已保存的测试程序，无新下载。
+- **尚未验收**：需检查新提交触发的跨平台完整 CI、Mihomo 的实际端到端互操作，并扩大异常/压力场景覆盖。0-RTT ticket 生命周期、过期/重放与回退仍未实现，继续明确拒绝，不扩大到 ECH/ShadowTLS 或其它未经测试组合。

@@ -7,7 +7,7 @@ XRAY_BIN=${XRAY_BIN:-}
 XRAY_IMAGE=${XRAY_IMAGE:-"teddysun/xray:26.3.27"}
 APPEARANCE=${VLESS_ENCRYPTION_APPEARANCE:-native}
 case "$APPEARANCE" in
-    native|xorpub) ;;
+    native|xorpub|random) ;;
     *) echo "unsupported VLESS 1-RTT interop appearance: $APPEARANCE" >&2; exit 2 ;;
 esac
 UUID=${VLESS_INTEROP_UUID:-"b831381d-6324-4d53-ad4f-8cda48b30811"}

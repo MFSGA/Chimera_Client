@@ -18,7 +18,6 @@ use crate::{
         vless::{
             Handler, HandlerOptions,
             encryption::{
-                Appearance as VlessEncryptionAppearance,
                 Config as VlessEncryptionConfig, RttMode as VlessEncryptionRttMode,
             },
         },
@@ -115,12 +114,6 @@ fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
                         "invalid vless encryption config: {err}"
                     ))
                 })?;
-            if parsed.appearance == VlessEncryptionAppearance::Random {
-                return Err(Error::InvalidConfig(
-                    "VLESS encryption random appearance stream masking is TODO"
-                        .to_owned(),
-                ));
-            }
             if parsed.rtt != VlessEncryptionRttMode::OneRtt {
                 return Err(Error::InvalidConfig(
                     "VLESS encryption runtime MVP currently supports only 1rtt; 0rtt ticket reuse is TODO"
@@ -2153,11 +2146,11 @@ mod tests {
 
     #[cfg(feature = "vless-encryption")]
     #[test]
-    fn vless_accepts_native_and_xorpub_one_rtt_encryption_runtime() {
+    fn vless_accepts_native_xorpub_and_random_one_rtt_encryption_runtime() {
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
         let key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
-        for appearance in ["native", "xorpub"] {
+        for appearance in ["native", "xorpub", "random"] {
             let outbound = OutboundVless {
                 common_opts: CommonConfigOptions {
                     name: "encrypted-vless".to_owned(),
@@ -2209,13 +2202,13 @@ mod tests {
     }
 
     #[test]
-    fn vless_encryption_mvp_rejects_zero_rtt_and_random() {
+    fn vless_encryption_mvp_rejects_zero_rtt() {
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
         let key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
         for (mode, expected) in [
             ("native.0rtt", "supports only 1rtt"),
-            ("random.1rtt", "random appearance stream masking is TODO"),
+            ("random.0rtt", "supports only 1rtt"),
         ] {
             let outbound = OutboundVless {
                 common_opts: CommonConfigOptions {

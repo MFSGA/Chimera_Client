@@ -12,7 +12,7 @@ use tokio::{
 };
 
 use super::encryption::{
-    EncryptionRecordCodec, PreparedCrypto, PreparedOneRttSession,
+    EncryptionRecordCodec, PreparedCrypto, PreparedOneRttSession, xor_vless_ctr,
 };
 use crate::proxy::AnyStream;
 
@@ -152,6 +152,51 @@ struct PendingRecordWrite {
     user_len: usize,
 }
 
+// Xray random appearance runs AES-CTR only over the five unencrypted
+// TLS-shaped record header bytes. The counter MUST continue across records;
+// record bodies are untouched and AEAD authenticates the plaintext header.
+struct RecordHeaderMask {
+    united_key: Vec<u8>,
+    counter: [u8; 16],
+    keystream: [u8; 16],
+    next_byte: usize,
+}
+
+impl RecordHeaderMask {
+    fn new(united_key: &[u8], iv: [u8; 16]) -> Self {
+        Self {
+            united_key: united_key.to_vec(),
+            counter: iv,
+            keystream: [0; 16],
+            next_byte: 16,
+        }
+    }
+
+    fn apply(&mut self, header: &mut [u8]) -> io::Result<()> {
+        if header.len() != RECORD_HEADER_LEN {
+            return Err(invalid("invalid VLESS random record header length"));
+        }
+        for byte in header {
+            if self.next_byte == self.keystream.len() {
+                self.keystream.fill(0);
+                xor_vless_ctr(&self.united_key, &self.counter, &mut self.keystream)?;
+                // Go cipher.NewCTR increments the full big-endian 128-bit IV.
+                for counter_byte in self.counter.iter_mut().rev() {
+                    let (next, overflow) = counter_byte.overflowing_add(1);
+                    *counter_byte = next;
+                    if !overflow {
+                        break;
+                    }
+                }
+                self.next_byte = 0;
+            }
+            *byte ^= self.keystream[self.next_byte];
+            self.next_byte += 1;
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct EncryptionStream {
     inner: AnyStream,
     prepared: Option<PreparedCrypto>,
@@ -162,6 +207,8 @@ pub(crate) struct EncryptionStream {
     server_padding_len: PendingIo,
     write_codec: Option<EncryptionRecordCodec>,
     read_codec: Option<EncryptionRecordCodec>,
+    write_header_mask: Option<RecordHeaderMask>,
+    read_header_mask: Option<RecordHeaderMask>,
     peer_padding: Option<PendingIo>,
     handshake_done: bool,
     pending_write: Option<PendingRecordWrite>,
@@ -245,15 +292,6 @@ impl EncryptionStream {
         inner: AnyStream,
         prepared: PreparedCrypto,
     ) -> io::Result<Self> {
-        // xorpub only masks the NFS relay bytes in ClientHello, already
-        // prepared by Config::prepare_nfs_relays. random additionally masks
-        // stream record headers and must remain disabled until that layer is
-        // implemented for both directions.
-        if prepared.xor_mode == 2 {
-            return Err(invalid(
-                "VLESS encryption random appearance stream masking is TODO",
-            ));
-        }
         let hello = prepared.one_rtt_hello.as_ref().ok_or_else(|| {
             invalid("VLESS encryption runtime MVP currently supports only 1rtt")
         })?;
@@ -273,6 +311,8 @@ impl EncryptionStream {
             server_padding_len: PendingIo::with_len(ENCRYPTED_LENGTH_LEN),
             write_codec: None,
             read_codec: None,
+            write_header_mask: None,
+            read_header_mask: None,
             peer_padding: None,
             handshake_done: false,
             pending_write: None,
@@ -343,6 +383,21 @@ impl EncryptionStream {
             &self.server_padding_len.data,
         )?;
         let (write_codec, read_codec) = session.record_codecs(&tail)?;
+        // Only records after the 1-RTT server padding are masked. The
+        // outbound CTR starts with the client hello IV; inbound uses the
+        // decrypted server ticket. The two streams never share a counter.
+        if self.prepared.as_ref().is_some_and(|p| p.xor_mode == 2) {
+            let iv = self
+                .prepared
+                .as_ref()
+                .expect("prepared crypto is present")
+                .nfs_relays
+                .iv;
+            self.write_header_mask =
+                Some(RecordHeaderMask::new(&session.united_key, iv));
+            self.read_header_mask =
+                Some(RecordHeaderMask::new(&session.united_key, tail.ticket));
+        }
 
         self.peer_padding =
             Some(PendingIo::with_len(tail.peer_padding_ciphertext_len));
@@ -430,6 +485,12 @@ impl AsyncWrite for EncryptionStream {
                 Ok(wire) => wire,
                 Err(err) => return Poll::Ready(Err(err)),
             };
+            let mut wire = wire;
+            if let Some(mask) = self.write_header_mask.as_mut()
+                && let Err(err) = mask.apply(&mut wire[..RECORD_HEADER_LEN])
+            {
+                return Poll::Ready(Err(err));
+            }
             self.pending_write = Some(PendingRecordWrite {
                 wire: PendingIo::from_data(wire),
                 user_len: count,
@@ -527,6 +588,12 @@ impl AsyncRead for EncryptionStream {
         }
 
         if self.read_ciphertext.is_none() {
+            let this = self.as_mut().get_mut();
+            if let Some(mask) = this.read_header_mask.as_mut()
+                && let Err(err) = mask.apply(&mut this.read_header.data)
+            {
+                return Poll::Ready(Err(err));
+            }
             let len = match decode_record_len(&self.read_header.data) {
                 Ok(len) => len,
                 Err(err) => return Poll::Ready(Err(err)),
