@@ -195,7 +195,8 @@ pub fn derive_traffic_keys(
 ///
 /// # Arguments
 /// * `cipher_suite` - CipherSuite with HMAC/digest algorithms
-/// * `shared_secret` - ECDH shared secret (32 bytes for X25519)
+/// * `shared_secret` - X25519 shared secret (32 bytes), or the concatenation
+///   of ML-KEM-768 and X25519 shared secrets (64 bytes, in that order).
 /// * `client_hello_hash` - Hash of ClientHello (hash_len bytes)
 /// * `server_hello_hash` - Hash of ClientHello...ServerHello (hash_len bytes)
 ///
@@ -211,12 +212,14 @@ pub fn derive_handshake_keys(
     let hmac_algorithm = cipher_suite.hmac_algorithm();
     let digest_algorithm = cipher_suite.digest_algorithm();
 
-    // Validate input lengths
-    if shared_secret.len() != 32 {
+    // The X25519MLKEM768 TLS group supplies ML-KEM's 32-byte secret first,
+    // followed by X25519's 32-byte secret. Do not hash or truncate this input:
+    // RFC 8446 HKDF-Extract consumes the complete 64-byte shared secret.
+    if !matches!(shared_secret.len(), 32 | 64) {
         return Err(Error::new(
             ErrorKind::InvalidInput,
             format!(
-                "Invalid shared_secret length: {} (expected 32)",
+                "Invalid shared_secret length: {} (expected 32 or 64)",
                 shared_secret.len()
             ),
         ));
@@ -523,6 +526,65 @@ mod tests {
         let (key, iv) = result.unwrap();
         assert_eq!(key.len(), 16);
         assert_eq!(iv.len(), 12);
+    }
+
+    #[test]
+    fn handshake_key_derivation_accepts_hybrid_secret_without_truncation() {
+        for suite in [
+            CipherSuite::AES_128_GCM_SHA256,
+            CipherSuite::AES_256_GCM_SHA384,
+        ] {
+            let transcript = vec![0x31; suite.hash_len()];
+            let mlkem_secret = [0x11; 32];
+            let x25519_secret = [0x22; 32];
+            let mut hybrid_secret = Vec::from(mlkem_secret);
+            hybrid_secret.extend_from_slice(&x25519_secret);
+
+            let derive = |secret: &[u8]| {
+                derive_handshake_keys(suite, secret, &transcript, &transcript)
+                    .expect("valid TLS key exchange secret")
+            };
+            let hybrid = derive(&hybrid_secret);
+            let classic = derive(&x25519_secret);
+            let reversed = derive(
+                &[x25519_secret.as_slice(), mlkem_secret.as_slice()].concat(),
+            );
+
+            assert_eq!(
+                hybrid.client_handshake_traffic_secret.len(),
+                suite.hash_len()
+            );
+            assert_eq!(
+                hybrid.server_handshake_traffic_secret.len(),
+                suite.hash_len()
+            );
+            assert_ne!(
+                hybrid.client_handshake_traffic_secret,
+                classic.client_handshake_traffic_secret,
+                "ML-KEM input must not be discarded"
+            );
+            assert_ne!(
+                hybrid.client_handshake_traffic_secret,
+                reversed.client_handshake_traffic_secret,
+                "hybrid secret ordering matters"
+            );
+            assert_eq!(
+                hybrid.client_handshake_traffic_secret,
+                derive(&hybrid_secret).client_handshake_traffic_secret,
+                "same secret and transcript must be deterministic"
+            );
+
+            for invalid_len in [0, 31, 33, 48, 63, 65] {
+                let error = derive_handshake_keys(
+                    suite,
+                    &vec![0x11; invalid_len],
+                    &transcript,
+                    &transcript,
+                )
+                .expect_err("invalid key exchange length must fail");
+                assert_eq!(error.kind(), ErrorKind::InvalidInput);
+            }
+        }
     }
 
     #[test]
