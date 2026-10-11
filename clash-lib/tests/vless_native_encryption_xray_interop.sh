@@ -150,6 +150,7 @@ chimera = "\n".join([
     "mode: rule",
     "log-level: error",
     "ipv6: false",
+    "mmdb: null",
     "dns:",
     "  enable: false",
     "proxies:",
@@ -203,7 +204,7 @@ else:
 PY
 
 mkdir -p "$TMP_DIR/clash-home"
-"$CLASH_BIN" -d "$TMP_DIR/clash-home" -c "$TMP_DIR/chimera.yaml" \
+"$CLASH_BIN" --compatibility false -d "$TMP_DIR/clash-home" -c "$TMP_DIR/chimera.yaml" \
     >"$TMP_DIR/chimera.log" 2>&1 &
 CLASH_PID=$!
 
