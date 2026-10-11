@@ -153,3 +153,12 @@
 - **问题与修复**：现有 `EncryptionAead::next_nonce` 将 96 位 AES-GCM nonce 视作大端计数器，遇到全 `0xff` 时使用 `wrapping_add` 回绕为全零；可能导致相同流量密钥下重复 nonce。改为先在副本上递增，仅在进位成功结束后更新状态；全部字节溢出时返回 `InvalidInput` 错误 `VLESS AEAD nonce exhausted`，且保留原计数器，让后续所有调用持续拒绝。既有 nonce 派生与正常记录格式不变。
 - **回归验证**：新增测试将客户端与模拟服务端 nonce 设置为 `ff:..:fe`，双方可使用最后一个合法 `ff:..:ff` 完成加解密；此后重复执行 `seal` 与 `open` 均必须报错且 nonce 保持全 `ff`。新测试默认 1/1、all-features 1/1，VLESS Encryption all-features 全组 30/30 均通过。
 - **功能边界**：这是现有 1-RTT 加密通道的 nonce 唯一性安全修复，**不等同于** 0-RTT ticket 缓存、过期/单次使用、抗重放或失败回退；`0rtt` 配置仍 fail-closed。后续继续跟踪 CI 和真实 Mihomo 互操作，再推进完整 0-RTT 状态机。
+
+## 迭代 11：Reality all-features CryptoProvider 测试修复与 0-RTT 前置核对（2026-10-11）
+
+- **起点与保护**：基于已推送的 `9c0212150bf6997677be86b9de34de50a50d856e`，直接在 `/Users/adam/src/Chimera_Client` 的 `integration/vless-mihomo-next` 工作；保留用户未提交的 `README.md`、`README_en.md` 和 `README_logo.png`，不使用独立 worktree，PR #58 保持 Draft。
+- **可复现缺陷**：在 `--all-features` 下，rustls 同时编入 `ring` / `aws-lc-rs`，Reality `crypto_handshake::tests::test_connection_has_required_methods` 调用自动 `ClientConfig::builder()` 之前没有安装默认 CryptoProvider，测试必现 panic `Could not automatically determine the process-level CryptoProvider`。使用现有 `crate::setup_default_crypto_provider()` 对齐生产启动初始化，不修改 TLS 运行时、不放宽 lint；修复前定向测试 0/1，修复后定向 all-features 2/2，完整 Reality all-features 150/150，通过。默认 CryptoHandshake 定向 2/2 亦通过。
+- **0-RTT Mihomo 参考核对**：参考本地 `ref-mihomo/transport/vless/encryption/client.go`、`server.go`、`common.go`：配置 `0rtt` 先以 1-RTT 获取服务端 16 字节 ticket、64 字节 PFS 密钥及 ticket 前两字节编码的有效秒数；之后在有效期内使用新的 NFS relay 与缓存的 PFS/ticket 构造早期发送帧。服务端按 ticket 查找 session，按该 session 的 NFS 密钥防重放，失效票据时返回无效首包迫使客户端重新握手。完整实现还必须解决并发复用与跨连接共享状态、单调计时到期、服务端拒绝时安全回退、读写 AEAD 上下文与 random CTR 同步。参考代码仅用于分析，不等同于已完成的功能。
+- **明确的 fail-closed 契约**：扩展 VLESS converter 配置回归，对 `native.0rtt`、`xorpub.0rtt`、`random.0rtt` 全部要求在配置验证以及实际 handler 构造阶段都明确拒绝，不允许静默回退为 1-RTT；此轮没有启用、持有或复用任何 0-RTT ticket。下一可交付切片是跨连接票据缓存与限时借用的真实运行时接入，再实施记录密钥派生和服务端拒绝重试，并增加 Xray/Mihomo 真实 0-RTT 验收。
+- **本地验证**：Reality all-features 150/150，CryptoHandshake all-features 2/2、默认 2/2；三种 appearance 的 0-RTT fail-closed 配置及 Handler 构造测试默认 1/1、all-features 1/1；VLESS converter all-features 101/101、VLESS transport contract all-features 4/4；严格 `cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check` 均通过。
+- **CI 边界**：此前 `9c02121` 的 Spelling 与 Commit Email Check 成功，主要 CI 与吞吐/Windows 作业仍在运行；提交后需继续追踪新 HEAD 的跨平台最终状态，不能仅凭 macOS 单机 150/150 宣告验收。

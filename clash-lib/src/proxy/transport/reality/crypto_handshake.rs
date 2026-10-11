@@ -333,10 +333,13 @@ mod tests {
 
     #[test]
     fn test_connection_has_required_methods() {
-        // This test ensures rustls::Connection has the methods we need
-        // It won't compile if the methods don't exist
+        // This test ensures rustls::Connection has the methods we need.
+        // When all features are enabled, rustls enables both ring and aws-lc-rs
+        // and cannot choose a default provider automatically. Mirror the
+        // application's startup initialization before building the config.
         use std::sync::Arc;
 
+        crate::setup_default_crypto_provider();
         let config = Arc::new(
             rustls::ClientConfig::builder()
                 .with_root_certificates(rustls::RootCertStore::empty())

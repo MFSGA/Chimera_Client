@@ -2208,6 +2208,7 @@ mod tests {
         let key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
         for (mode, expected) in [
             ("native.0rtt", "supports only 1rtt"),
+            ("xorpub.0rtt", "supports only 1rtt"),
             ("random.0rtt", "supports only 1rtt"),
         ] {
             let outbound = OutboundVless {
@@ -2229,6 +2230,14 @@ mod tests {
             assert!(
                 err.to_string().contains(expected),
                 "unexpected error for {mode}: {err}"
+            );
+            // The actual handler conversion must also refuse 0-RTT rather
+            // than silently falling back to a 1-RTT-only stream.
+            let conversion_error = crate::proxy::vless::Handler::try_from(&outbound)
+                .expect_err("0-RTT handler construction must fail closed");
+            assert!(
+                conversion_error.to_string().contains(expected),
+                "unexpected handler error for {mode}: {conversion_error}"
             );
         }
     }
