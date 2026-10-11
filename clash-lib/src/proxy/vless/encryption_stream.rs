@@ -245,9 +245,13 @@ impl EncryptionStream {
         inner: AnyStream,
         prepared: PreparedCrypto,
     ) -> io::Result<Self> {
-        if prepared.xor_mode != 0 {
+        // xorpub only masks the NFS relay bytes in ClientHello, already
+        // prepared by Config::prepare_nfs_relays. random additionally masks
+        // stream record headers and must remain disabled until that layer is
+        // implemented for both directions.
+        if prepared.xor_mode == 2 {
             return Err(invalid(
-                "VLESS encryption runtime MVP currently supports only native appearance",
+                "VLESS encryption random appearance stream masking is TODO",
             ));
         }
         let hello = prepared.one_rtt_hello.as_ref().ok_or_else(|| {
