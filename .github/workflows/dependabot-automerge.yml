@@ -1,0 +1,87 @@
+name: Dependabot auto-merge
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions:
+  actions: write
+  checks: read
+  contents: write
+  pull-requests: write
+  statuses: read
+
+jobs:
+  auto-merge:
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      startsWith(github.event.workflow_run.head_branch, 'dependabot/') &&
+      github.event.workflow_run.pull_requests[0].base.ref == 'master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    concurrency:
+      group: dependabot-auto-merge-${{ github.event.workflow_run.pull_requests[0].number }}
+      cancel-in-progress: false
+    steps:
+      - name: Wait for every PR check, then rebase-merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_BASE_SHA: ${{ github.event.workflow_run.pull_requests[0].base.sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "Invalid pull request number; refusing to merge."
+            exit 1
+          fi
+
+          is_current_dependabot_pr() {
+            local pr_json author base_ref base_sha head_ref head_sha is_draft state
+            pr_json="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json author,baseRefName,baseRefOid,headRefName,headRefOid,isDraft,state)"
+            author="$(jq -r '.author.login' <<<"$pr_json")"
+            base_ref="$(jq -r '.baseRefName' <<<"$pr_json")"
+            base_sha="$(jq -r '.baseRefOid' <<<"$pr_json")"
+            head_ref="$(jq -r '.headRefName' <<<"$pr_json")"
+            head_sha="$(jq -r '.headRefOid' <<<"$pr_json")"
+            is_draft="$(jq -r '.isDraft' <<<"$pr_json")"
+            state="$(jq -r '.state' <<<"$pr_json")"
+
+            [[ "$author" == "app/dependabot" || "$author" == "dependabot[bot]" ]] &&
+              [[ "$base_ref" == "master" ]] &&
+              [[ "$head_ref" == dependabot/* ]] &&
+              [[ "$head_sha" == "$RUN_HEAD_SHA" ]] &&
+              [[ "$base_sha" == "$RUN_BASE_SHA" ]] &&
+              [[ "$is_draft" == "false" ]] &&
+              [[ "$state" == "OPEN" ]]
+          }
+
+          if ! is_current_dependabot_pr; then
+            echo "PR is no longer an open Dependabot update for the tested revisions; skipping."
+            exit 0
+          fi
+
+          if ! gh pr checks "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --watch --fail-fast --interval 15; then
+            echo "Checks failed, were cancelled, or did not finish; leaving the PR open."
+            exit 1
+          fi
+
+          checks="$(gh pr checks "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json bucket)"
+          if jq -e 'length == 0 or any(.[]; .bucket != "pass" and .bucket != "skipping")' <<<"$checks" >/dev/null; then
+            echo "Not all PR checks passed; leaving the PR open."
+            exit 1
+          fi
+
+          if ! is_current_dependabot_pr; then
+            echo "PR changed while checks were running; skipping the merge."
+            exit 0
+          fi
+
+          gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --rebase
+
+          # Merges made with GITHUB_TOKEN do not start push workflows. Dispatch
+          # CI explicitly so master still gets a release build and refreshed latest tag.
+          gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref master
