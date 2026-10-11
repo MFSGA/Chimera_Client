@@ -97,12 +97,14 @@
 - 新增默认关闭/配置别名测试、模拟 ServerHello Hybrid key-share 与握手 HKDF secret 一致性测试、两种模式下 group mismatch 拒绝测试，以及验证 Hybrid X25519 share 与 REALITY auth 私钥一致的测试。
 - **验证（2026-10-10，本地当前树）**：Reality Hybrid 握手定向测试 1/1、group mismatch 定向测试 1/1、Hybrid 密钥模块测试 5/5、`cargo test -p clash-lib --test vless_transport_contract_tests --locked` 3/3 通过；严格命令 `cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check` 通过。
 - `cargo test -p clash-lib --lib --locked reality -- --test-threads=1` 在 `--all-features` 编译配置中 149 项通过、1 项失败：既有 `crypto_handshake::tests::test_connection_has_required_methods` 因同时启用 rustls ring/aws-lc-rs、未安装默认 CryptoProvider 而 panic；Hybrid 新增测试均通过。尝试用 `--no-default-features --features 'reality tls'` 隔离运行时，编译被该 feature 组合中两处网络模块 dead-code deny 阻断，因此该替代组合未能执行。
-- PR #58 检查时仍为 Draft，head `abc97e6`；GitHub workflow runs 查询没有返回与该 SHA 关联的 PR workflow。本地改动尚未提交或推送。
-- **尚未验收**：当前测试只在本地模拟服务端 KEM/X25519 行为，未证明真实 Xray 互操作；本机没有 Xray 可执行文件或 Docker，无法运行现有 Xray interop harness，跨平台 CI 也未运行。下一步新增 Reality Hybrid Xray E2E 覆盖并运行，随后检查远端 CI；未完成这些验证前，不将 Reality Hybrid 标为验收完成。
+- 新增 `clash-lib/tests/reality_hybrid_xray_interop.sh`：使用临时生成的 REALITY key，在回环地址启动 Xray VLESS/REALITY 服务端、Chimera 和 echo listener，通过 SOCKS5 发送校验 payload，并检查 Xray 明确报告正在使用 `X25519MLKEM768`。脚本为 Xray freedom outbound 配置只允许 `127.0.0.1` 的 TCP `finalRules`，避免较新服务端默认安全策略拦截回环 echo。运行方式：`XRAY_BIN=/path/to/xray CLASH_BIN=/path/to/clash-rs clash-lib/tests/reality_hybrid_xray_interop.sh`。
+- **真实互操作（2026-10-10）**：Xray 26.3.27（macOS arm64）通过；官方发布页当前最新条目为预发布版 Xray 26.9.30，使用同平台官方二进制复测也通过。两版输出 `PASS REALITY X25519MLKEM768 VLESS interop against Xray`，日志确认 `is using X25519MLKEM768 for TLS' communication: true`，VLESS 请求成功转发到本机 echo，响应 payload 完全一致。Xray 测试密钥和临时配置均为本机生成。最初 26.9.30 测试在 TLS Hybrid 握手完成后因服务端默认阻止私网目标而 echo 超时；加入仅限回环测试地址的 freedom `finalRules` 后通过。26.3.27 最初被选中是沿用既有 VLESS interop 脚本默认版本，没有先核查最新发布项；后续已补测较新预发布版。
+- PR #58 检查时仍为 Draft，head `08c9505`；GitHub workflow runs 查询没有返回与该 SHA 关联的 PR workflow。该提交的跨平台 CI 状态尚未从查询结果确认。
+- **尚未验收**：Reality Hybrid 已通过本地真实 Xray 回环互操作，但跨平台 CI 尚未确认；后续仍需复核各平台 CI，并继续推进 VLESS Native Encryption、ECH/ShadowTLS 需求评估及总体回归验收。
 
 ## 待办路线（按可验证的切片推进）
 
-1. **P1 Reality X25519MLKEM768**：完成运行时接入审查，更新并运行真实 Xray 互操作脚本；再覆盖跨平台 CI。
+1. **P1 Reality X25519MLKEM768**：运行时和 Xray 26.3.27 / 26.9.30 回环互操作通过；等待/复核跨平台 CI，并在 Mihomo 当前参考版本上追加互操作覆盖。
 2. **P1 VLESS Encryption**：分开评审 0-RTT ticket/replay 风险及 `xorpub`/`random` 外观模式，不替换现有 1-RTT 实现。
 3. **P2 ECH / ShadowTLS**：按真实兼容性需求决定是否继续移植；不默认扩张所有理论组合。
 4. **独立于 VLESS 的 Netstack 优化**：公平出站队列不混入上述协议提交。
