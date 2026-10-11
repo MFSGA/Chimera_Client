@@ -5,7 +5,7 @@
 - 集成分支：`integration/vless-mihomo-next`，初始基线为 `master` 的 `229218a073b3275b83080dc2940b407ae9656b14`。
 - 历史参考分支：`integration/vless-mihomo-full-v0256`（`b93bf8efc72fe5f9a7beda3b034b391a6313d7a4`）。只读参考，不整体合并其旧代码。
 - 保留现有 XHTTP、gRPC、VLESS native 1-RTT、Reality、网络路径恢复和连接池隔离；优先移植实质缺失的能力。
-- 每个切片单独测试并推送集成分支；只有完整回归与必要的真实服务端互操作检查通过，才考虑对 `master` 做 rebase + fast-forward 合并。
+- 每个切片单独测试并仅推送集成分支；PR #58 始终保持 Draft，本任务不修改 `master`、不强推、不合并 PR。完整回归和真实服务端互操作仍是最终验收前提。
 - 有意保持 Netstack 既有详细调试日志，本集成不引入日志脱敏改动。
 
 ## 迭代 1：VLESS client-fingerprint 显式校验
@@ -90,7 +90,7 @@
 - 关键边界：新增 `reality_hybrid.rs` 目前为独立组件，默认 Reality 握手仍只使用普通 X25519。**这不是实际 Hybrid ClientHello/ServerHello 联机握手**；下一切片需将所提供 key share、与之绑定的私钥状态及协商校验接入 `RealityClientConnection`，完成真实 Xray 互操作后才可宣称 Hybrid 功能就绪。
 - **本地验证（2026-10-10）**：`cargo test -p clash-lib --lib --locked reality_hybrid::tests -- --test-threads=1` 4/4；`cargo test -p clash-lib --lib --locked reality -- --test-threads=1` 144/144；`cargo test -p clash-lib --test vless_transport_contract_tests --locked` 3/3；`cargo test -p clash-lib --lib --all-features --locked reality_hybrid::tests -- --test-threads=1` 4/4；`cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check` 均通过。本地测试不能代替真实服务端互操作或跨平台 CI。
 
-## 迭代 6：Reality Hybrid 握手接入（本地未提交）
+## 迭代 6：Reality Hybrid 握手接入与 Xray 回环互操作（已提交）
 
 - 基于已推送的 `abc97e6`，把 Hybrid 密钥状态接入 `RealityClientConnection`：只有显式设置 `support-x25519mlkem768` / `supportX25519MLKEM768: true` 才发送 `0x11ec`；默认仍发送经典 X25519。XHTTP Reality 上传和下载端点均传递该开关。
 - REALITY 会话认证与 TLS Hybrid key share 共用同一 ephemeral X25519 私钥；ML-KEM 私钥与该 key share 状态绑定。ServerHello 必须与所提供组匹配，否则以无效数据失败，不静默降级。该处理对齐仓库 Mihomo 参考实现 `ref-mihomo/component/tls/reality.go` 中从 handshake key-share 状态导出 REALITY ECDHE key 的路径。
@@ -99,13 +99,24 @@
 - `cargo test -p clash-lib --lib --locked reality -- --test-threads=1` 在 `--all-features` 编译配置中 149 项通过、1 项失败：既有 `crypto_handshake::tests::test_connection_has_required_methods` 因同时启用 rustls ring/aws-lc-rs、未安装默认 CryptoProvider 而 panic；Hybrid 新增测试均通过。尝试用 `--no-default-features --features 'reality tls'` 隔离运行时，编译被该 feature 组合中两处网络模块 dead-code deny 阻断，因此该替代组合未能执行。
 - 新增 `clash-lib/tests/reality_hybrid_xray_interop.sh`：使用临时生成的 REALITY key，在回环地址启动 Xray VLESS/REALITY 服务端、Chimera 和 echo listener，通过 SOCKS5 发送校验 payload，并检查 Xray 明确报告正在使用 `X25519MLKEM768`。脚本为 Xray freedom outbound 配置只允许 `127.0.0.1` 的 TCP `finalRules`，避免较新服务端默认安全策略拦截回环 echo。运行方式：`XRAY_BIN=/path/to/xray CLASH_BIN=/path/to/clash-rs clash-lib/tests/reality_hybrid_xray_interop.sh`。
 - **真实互操作（2026-10-10）**：Xray 26.3.27（macOS arm64）通过；官方发布页当前最新条目为预发布版 Xray 26.9.30，使用同平台官方二进制复测也通过。两版输出 `PASS REALITY X25519MLKEM768 VLESS interop against Xray`，日志确认 `is using X25519MLKEM768 for TLS' communication: true`，VLESS 请求成功转发到本机 echo，响应 payload 完全一致。Xray 测试密钥和临时配置均为本机生成。最初 26.9.30 测试在 TLS Hybrid 握手完成后因服务端默认阻止私网目标而 echo 超时；加入仅限回环测试地址的 freedom `finalRules` 后通过。26.3.27 最初被选中是沿用既有 VLESS interop 脚本默认版本，没有先核查最新发布项；后续已补测较新预发布版。
-- PR #58 检查时仍为 Draft，head `08c9505`；GitHub workflow runs 查询没有返回与该 SHA 关联的 PR workflow。该提交的跨平台 CI 状态尚未从查询结果确认。
+- 当时 PR #58 仍为 Draft，head `08c9505`；随后真实 Xray 回环互操作脚本以提交 `9203815` 推送，PR head 已更新。该切片的跨平台 CI 按后续迭代记录持续跟踪。
 - **尚未验收**：Reality Hybrid 已通过本地真实 Xray 回环互操作，但跨平台 CI 尚未确认；后续仍需复核各平台 CI，并继续推进 VLESS Native Encryption、ECH/ShadowTLS 需求评估及总体回归验收。
+
+## 迭代 7：VLESS Native Encryption xorpub 1-RTT（2026-10-10—11，本地验证通过，真实互操作待验）
+
+- **起点**：本地/远端集成分支 `920381555dde3885d491171ddd816432821a6dde`，`master` / `origin/master` 均为 `229218a073b3275b83080dc2940b407ae9656b14`，工作区起始干净，PR #58 仍 Open / Draft。
+- **实现**：在现有 `Config::prepare_nfs_relays` 已实现的 AES-CTR 公钥掩码基础上，允许 `mlkem768x25519plus.xorpub.1rtt` 进入 VLESS converter 和 `EncryptionStream`。`xorpub` 只对 ClientHello 的 NFS relay 做可逆掩码，后续 AEAD record 不额外掩码；`random` 需要双向 record header 掩码，继续显式拒绝；`0rtt` ticket 缓存/重放风险处理尚未实现，继续拒绝。经典 `native.1rtt` 不变。
+- **测试**：为 `native` 与 `xorpub` 共用 1-RTT duplex 握手和 ping/pong AEAD record 测试；模拟服务端从**实际收到的 ClientHello** 恢复（必要时解掩码）X25519 relay，独立 ECDH 验证 NFS shared secret，而非只复用客户端预计算值。VLESS converter 同时验证两种 1-RTT 模式建构成功、`random`/`0rtt` 仍 fail-closed。
+- **互操作脚本**：`clash-lib/tests/vless_native_encryption_xray_interop.sh` 新增 `VLESS_ENCRYPTION_APPEARANCE=native|xorpub`，同一 Xray `vlessenc` 输出为两端生成匹配的 appearance；测试 freedom outbound 仅允许回环 TCP 目标，以兼容新版本服务端的私网默认限制。脚本语法检查通过，但本轮**未运行真实 xorpub Xray E2E**：本地无 `xray` / `docker`，尝试获取官方 Xray 26.3.27 macOS arm64 测试二进制时开发工具返回 `This tool call was blocked by OpenAI's safety checks`。未重试、未改用其他方式规避；保留现场。
+- **验证**：`cargo test -p clash-lib --lib --all-features --locked proxy::vless::encryption::tests -- --test-threads=1` 28/28；all-features VLESS converter 101/101；all-features VLESS transport contract 4/4；默认 VLESS converter 89/89、默认 encryption 28/28、默认 transport contract 3/3；`cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check`、`bash -n clash-lib/tests/vless_native_encryption_xray_interop.sh` 均通过。最初一次错误的测试过滤器只匹配非测试 helper，结果 0/0；随后改用 `encryption_stream_` 过滤器，2/2 真实测试通过。
+- **CI（2026-10-11 检查 `9203815`）**：Windows Network Regression、Proxy Throughput Tests、Spelling、Commit Email Check 和 Throughput Release #38115990546 均成功；CI #38115988366 仍在进行中。Rust quality Ubuntu/macOS/Windows 和已完成的主要构建作业通过，但不可宣称整套 CI 已通过。
+- **2026-10-11 复验**：从本地 `9203815`、五个未提交文件出发，重新执行 all-features encryption 28/28、VLESS converter 101/101、transport contract 4/4，默认 encryption 28/28、converter 89/89、transport contract 3/3；严格 `cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check` 和互操作脚本 `bash -n` 全部通过。此前 Xray 二进制获取操作触发安全检查，未绕过限制，本轮未进行 xorpub 真实服务端互操作。
+- **后续**：待工具许可时运行 `VLESS_ENCRYPTION_APPEARANCE=xorpub` 对真实 Xray 的 E2E，复核本提交及后续跨平台 CI，再分别推进 `random` 双向 record header 掩码、`0rtt` ticket 生命周期/重放边界与 Mihomo 互操作。
 
 ## 待办路线（按可验证的切片推进）
 
 1. **P1 Reality X25519MLKEM768**：运行时和 Xray 26.3.27 / 26.9.30 回环互操作通过；等待/复核跨平台 CI，并在 Mihomo 当前参考版本上追加互操作覆盖。
-2. **P1 VLESS Encryption**：分开评审 0-RTT ticket/replay 风险及 `xorpub`/`random` 外观模式，不替换现有 1-RTT 实现。
+2. **P1 VLESS Encryption**：`xorpub.1rtt` 本地测试通过、真实 Xray 互操作待测；`random` 的双向 record header 掩码与 `0rtt` ticket/replay 风险分开推进，不替换现有 `native.1rtt` 实现。
 3. **P2 ECH / ShadowTLS**：按真实兼容性需求决定是否继续移植；不默认扩张所有理论组合。
 4. **独立于 VLESS 的 Netstack 优化**：公平出站队列不混入上述协议提交。
 5. **验收**：主要 feature 组合、跨平台构建、旧配置负面校验和真实 Xray/Mihomo E2E。
