@@ -146,3 +146,10 @@
 - **默认配置回归**：`cargo test -p clash-lib --lib --locked proxy::vless::encryption::tests -- --test-threads=1` 29/29；默认 VLESS converter 89/89；默认 VLESS transport contract 3/3，通过。
 - **第二版本真实互操作**：同一 Chimera CLI 在 Xray **26.9.30**（macOS arm64）下执行 `VLESS_ENCRYPTION_APPEARANCE=random`，回环数据往返同样通过，输出 `PASS random VLESS 1-RTT interop against Xray`。两版 Xray 均为工作区已保存的测试程序，无新下载。
 - **尚未验收**：需检查新提交触发的跨平台完整 CI、Mihomo 的实际端到端互操作，并扩大异常/压力场景覆盖。0-RTT ticket 生命周期、过期/重放与回退仍未实现，继续明确拒绝，不扩大到 ECH/ShadowTLS 或其它未经测试组合。
+
+## 迭代 10：VLESS AEAD nonce 耗尽安全边界（2026-10-11）
+
+- **基线与工作目录**：从已推送的 `df88dc509121db61f7114a9446d0b52f1a2b4ca7` 开始，直接使用 `/Users/adam/src/Chimera_Client` 上的 `integration/vless-mihomo-next`；保留且不暂存原有 `README.md`、`README_en.md` 与 `README_logo.png` 用户改动，不使用独立 worktree。
+- **问题与修复**：现有 `EncryptionAead::next_nonce` 将 96 位 AES-GCM nonce 视作大端计数器，遇到全 `0xff` 时使用 `wrapping_add` 回绕为全零；可能导致相同流量密钥下重复 nonce。改为先在副本上递增，仅在进位成功结束后更新状态；全部字节溢出时返回 `InvalidInput` 错误 `VLESS AEAD nonce exhausted`，且保留原计数器，让后续所有调用持续拒绝。既有 nonce 派生与正常记录格式不变。
+- **回归验证**：新增测试将客户端与模拟服务端 nonce 设置为 `ff:..:fe`，双方可使用最后一个合法 `ff:..:ff` 完成加解密；此后重复执行 `seal` 与 `open` 均必须报错且 nonce 保持全 `ff`。新测试默认 1/1、all-features 1/1，VLESS Encryption all-features 全组 30/30 均通过。
+- **功能边界**：这是现有 1-RTT 加密通道的 nonce 唯一性安全修复，**不等同于** 0-RTT ticket 缓存、过期/单次使用、抗重放或失败回退；`0rtt` 配置仍 fail-closed。后续继续跟踪 CI 和真实 Mihomo 互操作，再推进完整 0-RTT 状态机。

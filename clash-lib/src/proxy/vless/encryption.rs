@@ -1089,14 +1089,22 @@ impl EncryptionAead {
     }
 
     fn next_nonce(&mut self) -> io::Result<aws_lc_rs::aead::Nonce> {
-        for index in (0..self.nonce.len()).rev() {
-            self.nonce[index] = self.nonce[index].wrapping_add(1);
-            if self.nonce[index] != 0 {
-                break;
+        // A wrapped AES-GCM nonce would repeat an earlier nonce under the same
+        // traffic key. Reject exhaustion without changing the counter so that
+        // all subsequent attempts also fail closed.
+        let mut next = self.nonce;
+        for index in (0..next.len()).rev() {
+            let (value, carry) = next[index].overflowing_add(1);
+            next[index] = value;
+            if !carry {
+                self.nonce = next;
+                return aws_lc_rs::aead::Nonce::try_assume_unique_for_key(
+                    &self.nonce,
+                )
+                .map_err(|_| invalid("failed to construct VLESS AEAD nonce"));
             }
         }
-        aws_lc_rs::aead::Nonce::try_assume_unique_for_key(&self.nonce)
-            .map_err(|_| invalid("failed to construct VLESS AEAD nonce"))
+        Err(invalid("VLESS AEAD nonce exhausted"))
     }
 
     fn seal(&mut self, plaintext: &[u8]) -> io::Result<Vec<u8>> {
@@ -2205,6 +2213,39 @@ mod tests {
         );
         assert_eq!(writer.nonce(), [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         assert_eq!(reader.nonce(), writer.nonce());
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    #[test]
+    fn encryption_aead_nonce_exhaustion_fails_closed_without_wrapping() {
+        let key = [0x47u8; 32];
+        let mut near_limit = [0xffu8; 12];
+        near_limit[11] = 0xfe;
+        let mut writer =
+            EncryptionAead::new_with_nonce(&key, near_limit).expect("writer");
+        let mut reader =
+            EncryptionAead::new_with_nonce(&key, near_limit).expect("reader");
+
+        // The final unique nonce is still usable in both directions.
+        let ciphertext = writer.seal(b"last valid record").expect("last seal");
+        assert_eq!(
+            reader.open(&ciphertext).expect("last open"),
+            b"last valid record"
+        );
+        assert_eq!(writer.nonce, [0xff; 12]);
+        assert_eq!(reader.nonce, [0xff; 12]);
+
+        // Exhaustion is permanent: repeated failures must not wrap back to 0.
+        for _ in 0..2 {
+            let write_error = writer.seal(b"must not encrypt").unwrap_err();
+            let read_error = reader.open(&ciphertext).unwrap_err();
+            assert_eq!(write_error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(read_error.kind(), io::ErrorKind::InvalidInput);
+            assert!(write_error.to_string().contains("nonce exhausted"));
+            assert!(read_error.to_string().contains("nonce exhausted"));
+            assert_eq!(writer.nonce, [0xff; 12]);
+            assert_eq!(reader.nonce, [0xff; 12]);
+        }
     }
 
     #[cfg(feature = "vless-encryption")]
