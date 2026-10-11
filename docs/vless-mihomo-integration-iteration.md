@@ -90,14 +90,24 @@
 - 关键边界：新增 `reality_hybrid.rs` 目前为独立组件，默认 Reality 握手仍只使用普通 X25519。**这不是实际 Hybrid ClientHello/ServerHello 联机握手**；下一切片需将所提供 key share、与之绑定的私钥状态及协商校验接入 `RealityClientConnection`，完成真实 Xray 互操作后才可宣称 Hybrid 功能就绪。
 - **本地验证（2026-10-10）**：`cargo test -p clash-lib --lib --locked reality_hybrid::tests -- --test-threads=1` 4/4；`cargo test -p clash-lib --lib --locked reality -- --test-threads=1` 144/144；`cargo test -p clash-lib --test vless_transport_contract_tests --locked` 3/3；`cargo test -p clash-lib --lib --all-features --locked reality_hybrid::tests -- --test-threads=1` 4/4；`cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check` 均通过。本地测试不能代替真实服务端互操作或跨平台 CI。
 
+## 迭代 6：Reality Hybrid 握手接入（本地未提交）
+
+- 基于已推送的 `abc97e6`，把 Hybrid 密钥状态接入 `RealityClientConnection`：只有显式设置 `support-x25519mlkem768` / `supportX25519MLKEM768: true` 才发送 `0x11ec`；默认仍发送经典 X25519。XHTTP Reality 上传和下载端点均传递该开关。
+- REALITY 会话认证与 TLS Hybrid key share 共用同一 ephemeral X25519 私钥；ML-KEM 私钥与该 key share 状态绑定。ServerHello 必须与所提供组匹配，否则以无效数据失败，不静默降级。该处理对齐仓库 Mihomo 参考实现 `ref-mihomo/component/tls/reality.go` 中从 handshake key-share 状态导出 REALITY ECDHE key 的路径。
+- 新增默认关闭/配置别名测试、模拟 ServerHello Hybrid key-share 与握手 HKDF secret 一致性测试、两种模式下 group mismatch 拒绝测试，以及验证 Hybrid X25519 share 与 REALITY auth 私钥一致的测试。
+- **验证（2026-10-10，本地当前树）**：Reality Hybrid 握手定向测试 1/1、group mismatch 定向测试 1/1、Hybrid 密钥模块测试 5/5、`cargo test -p clash-lib --test vless_transport_contract_tests --locked` 3/3 通过；严格命令 `cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check` 通过。
+- `cargo test -p clash-lib --lib --locked reality -- --test-threads=1` 在 `--all-features` 编译配置中 149 项通过、1 项失败：既有 `crypto_handshake::tests::test_connection_has_required_methods` 因同时启用 rustls ring/aws-lc-rs、未安装默认 CryptoProvider 而 panic；Hybrid 新增测试均通过。尝试用 `--no-default-features --features 'reality tls'` 隔离运行时，编译被该 feature 组合中两处网络模块 dead-code deny 阻断，因此该替代组合未能执行。
+- PR #58 检查时仍为 Draft，head `abc97e6`；GitHub workflow runs 查询没有返回与该 SHA 关联的 PR workflow。本地改动尚未提交或推送。
+- **尚未验收**：当前测试只在本地模拟服务端 KEM/X25519 行为，未证明真实 Xray 互操作；本机没有 Xray 可执行文件或 Docker，无法运行现有 Xray interop harness，跨平台 CI 也未运行。下一步新增 Reality Hybrid Xray E2E 覆盖并运行，随后检查远端 CI；未完成这些验证前，不将 Reality Hybrid 标为验收完成。
+
 ## 待办路线（按可验证的切片推进）
 
-1. **P1 Reality X25519MLKEM768**：提取混合密钥交换，保留普通 X25519 语义，复用并更新 Xray 互操作脚本。
+1. **P1 Reality X25519MLKEM768**：完成运行时接入审查，更新并运行真实 Xray 互操作脚本；再覆盖跨平台 CI。
 2. **P1 VLESS Encryption**：分开评审 0-RTT ticket/replay 风险及 `xorpub`/`random` 外观模式，不替换现有 1-RTT 实现。
 3. **P2 ECH / ShadowTLS**：按真实兼容性需求决定是否继续移植；不默认扩张所有理论组合。
 4. **独立于 VLESS 的 Netstack 优化**：公平出站队列不混入上述协议提交。
 5. **验收**：主要 feature 组合、跨平台构建、旧配置负面校验和真实 Xray/Mihomo E2E。
 
-## 后续每小时检查记录
+## 后续迭代记录
 
 每次运行应注明：源/目标 SHA、本轮修改、实际测试结果、CI 状态、阻塞项和下一可交付切片；不得把尚未验证的工作标为完成。完成验收前保留集成分支，不更改 `master`。

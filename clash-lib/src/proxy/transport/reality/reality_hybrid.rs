@@ -10,6 +10,7 @@ use aws_lc_rs::{
     agreement,
     kem::{Ciphertext, DecapsulationKey, ML_KEM_768},
 };
+#[cfg(test)]
 use rand::Rng;
 
 use super::reality_auth::perform_ecdh;
@@ -34,8 +35,19 @@ pub(super) struct HybridKeyExchange {
 }
 
 impl HybridKeyExchange {
-    /// Generate an ML-KEM-768 key pair and a fresh X25519 key pair.
+    /// Generate fresh ML-KEM-768 and X25519 key pairs.
+    #[cfg(test)]
     pub(super) fn generate() -> io::Result<Self> {
+        let mut x25519_private_key = [0u8; X25519_KEY_SHARE_LEN];
+        rand::rng().fill_bytes(&mut x25519_private_key);
+        Self::generate_with_x25519_private_key(x25519_private_key)
+    }
+
+    /// Bind the TLS X25519 key share to the same ephemeral key used to derive
+    /// the REALITY authentication secret, as Mihomo's Hybrid path does.
+    pub(super) fn generate_with_x25519_private_key(
+        x25519_private_key: [u8; X25519_KEY_SHARE_LEN],
+    ) -> io::Result<Self> {
         let ml_kem_decapsulation_key = DecapsulationKey::generate(&ML_KEM_768)
             .map_err(|_| io::Error::other("Failed to generate ML-KEM-768 key"))?;
         let ml_kem_public_key = ml_kem_decapsulation_key
@@ -44,13 +56,10 @@ impl HybridKeyExchange {
             .map_err(|_| {
                 io::Error::other("Failed to obtain ML-KEM-768 public key")
             })?;
-
         if ml_kem_public_key.as_ref().len() != ML_KEM_768_PUBLIC_KEY_LEN {
             return Err(io::Error::other("Unexpected ML-KEM-768 public key length"));
         }
 
-        let mut x25519_private_key = [0u8; X25519_KEY_SHARE_LEN];
-        rand::rng().fill_bytes(&mut x25519_private_key);
         let x25519_public_key = agreement::PrivateKey::from_private_key(
             &agreement::X25519,
             &x25519_private_key,
@@ -61,8 +70,8 @@ impl HybridKeyExchange {
             io::Error::other("Failed to compute hybrid X25519 public key")
         })?;
 
-        // TLS X25519MLKEM768 ClientHello: 1184-byte ML-KEM encapsulation
-        // public key first, then the 32-byte ephemeral X25519 public key.
+        // TLS X25519MLKEM768 ClientHello: ML-KEM public key first, followed
+        // by the X25519 public key bound to REALITY authentication.
         let mut client_key_share =
             Vec::with_capacity(X25519_MLKEM768_CLIENT_KEY_SHARE_LEN);
         client_key_share.extend_from_slice(ml_kem_public_key.as_ref());
@@ -259,5 +268,24 @@ mod tests {
         let first = HybridKeyExchange::generate().unwrap();
         let second = HybridKeyExchange::generate().unwrap();
         assert_ne!(first.client_key_share(), second.client_key_share());
+    }
+
+    #[test]
+    fn hybrid_key_exchange_uses_reality_authentication_x25519_key() {
+        let x25519_private_key = [0x33u8; X25519_KEY_SHARE_LEN];
+        let client =
+            HybridKeyExchange::generate_with_x25519_private_key(x25519_private_key)
+                .unwrap();
+        let expected_public = agreement::PrivateKey::from_private_key(
+            &agreement::X25519,
+            &x25519_private_key,
+        )
+        .unwrap()
+        .compute_public_key()
+        .unwrap();
+        assert_eq!(
+            &client.client_key_share()[ML_KEM_768_PUBLIC_KEY_LEN..],
+            expected_public.as_ref()
+        );
     }
 }
