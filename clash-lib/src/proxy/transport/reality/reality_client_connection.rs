@@ -22,6 +22,7 @@ use super::reality_client_verify::{
     extract_ed25519_public_key, verify_certificate_hmac,
     verify_certificate_verify_signature,
 };
+use super::reality_hybrid::HybridKeyExchange;
 use super::reality_io_state::RealityIoState;
 use super::reality_reader_writer::{RealityReader, RealityWriter};
 use super::reality_records::{RecordDecryptor, RecordEncryptor};
@@ -30,10 +31,13 @@ use super::reality_tls13_keys::{
     derive_traffic_keys,
 };
 use super::reality_tls13_messages::{
-    DEFAULT_ALPN_PROTOCOLS, construct_client_hello, construct_finished,
-    write_record_header,
+    DEFAULT_ALPN_PROTOCOLS, construct_client_hello,
+    construct_client_hello_with_key_share, construct_finished, write_record_header,
 };
-use super::reality_util::{extract_server_cipher_suite, extract_server_public_key};
+use super::reality_util::{
+    X25519_GROUP, X25519_MLKEM768_GROUP, extract_server_cipher_suite,
+    extract_server_key_share,
+};
 use super::slide_buffer::SlideBuffer;
 use super::util::allocate_vec;
 
@@ -50,6 +54,14 @@ pub struct RealityClientConfig {
     pub cipher_suites: Vec<CipherSuite>,
     /// ALPN protocols offered in ClientHello (empty = browser-like defaults).
     pub alpn_protocols: Vec<String>,
+    /// Opt in to X25519MLKEM768. The existing X25519 handshake remains default.
+    pub support_x25519mlkem768: bool,
+}
+
+/// TLS key exchange state must correspond to the exact ClientHello KeyShare.
+enum ClientKeyExchange {
+    X25519([u8; 32]),
+    Hybrid(HybridKeyExchange),
 }
 
 /// Handshake state machine for REALITY client
@@ -57,7 +69,7 @@ enum HandshakeState {
     /// ClientHello sent, waiting for ServerHello
     AwaitingServerHello {
         client_hello_bytes: Vec<u8>, // Full ClientHello handshake message (raw bytes for transcript)
-        client_private_key: [u8; 32],
+        key_exchange: ClientKeyExchange,
         auth_key: [u8; 32], // REALITY authentication key for HMAC verification
     },
     /// ServerHello received, processing encrypted handshake messages
@@ -119,7 +131,7 @@ impl RealityClientConnection {
             config,
             handshake_state: HandshakeState::AwaitingServerHello {
                 client_hello_bytes: Vec::new(),
-                client_private_key: [0u8; 32],
+                key_exchange: ClientKeyExchange::X25519([0u8; 32]),
                 auth_key: [0u8; 32],
             },
             app_read_key: None,
@@ -226,14 +238,38 @@ impl RealityClientConnection {
         } else {
             configured_alpn.as_slice()
         };
-        let mut client_hello = construct_client_hello(
-            &client_random,
-            &session_id_for_hello,
-            our_public_key_bytes.as_ref(),
-            &self.config.server_name,
-            &cipher_suite_ids,
-            alpn_protocols,
-        )?;
+        // Keep the X25519 material used for REALITY authentication bound to
+        // the TLS Hybrid share. There is no silent fallback to X25519.
+        let key_exchange = if self.config.support_x25519mlkem768 {
+            ClientKeyExchange::Hybrid(
+                HybridKeyExchange::generate_with_x25519_private_key(
+                    our_private_bytes,
+                )?,
+            )
+        } else {
+            ClientKeyExchange::X25519(our_private_bytes)
+        };
+        let mut client_hello = match &key_exchange {
+            ClientKeyExchange::X25519(_) => construct_client_hello(
+                &client_random,
+                &session_id_for_hello,
+                our_public_key_bytes.as_ref(),
+                &self.config.server_name,
+                &cipher_suite_ids,
+                alpn_protocols,
+            )?,
+            ClientKeyExchange::Hybrid(hybrid) => {
+                construct_client_hello_with_key_share(
+                    &client_random,
+                    &session_id_for_hello,
+                    X25519_MLKEM768_GROUP,
+                    hybrid.client_key_share(),
+                    &self.config.server_name,
+                    &cipher_suite_ids,
+                    alpn_protocols,
+                )?
+            }
+        };
 
         // Now encrypt the SessionId using the ClientHello with zeroed SessionId as AAD
         // Use slice directly from client_random to avoid copying
@@ -279,7 +315,7 @@ impl RealityClientConnection {
         // At this point client_hello contains the encrypted SessionId.
         self.handshake_state = HandshakeState::AwaitingServerHello {
             client_hello_bytes: client_hello, // Save the actual ClientHello bytes
-            client_private_key: our_private_bytes,
+            key_exchange,
             auth_key, // Save auth_key for HMAC certificate verification
         };
 
@@ -372,7 +408,7 @@ impl RealityClientConnection {
     fn process_server_hello(&mut self) -> io::Result<bool> {
         let HandshakeState::AwaitingServerHello {
             client_hello_bytes,
-            client_private_key,
+            key_exchange,
             auth_key,
         } = &self.handshake_state
         else {
@@ -405,7 +441,7 @@ impl RealityClientConnection {
             server_hello
         );
 
-        let server_public_key = extract_server_public_key(&record)?;
+        let server_key_share = extract_server_key_share(&record)?;
         let cipher_suite_id = extract_server_cipher_suite(&record)?;
         let cipher_suite =
             CipherSuite::from_id(cipher_suite_id).ok_or_else(|| {
@@ -446,26 +482,49 @@ impl RealityClientConnection {
             ctx.finish().as_ref().to_vec()
         };
 
-        let peer_public_key = agreement::UnparsedPublicKey::new(
-            &agreement::X25519,
-            &server_public_key,
-        );
-        let my_private_key = agreement::PrivateKey::from_private_key(
-            &agreement::X25519,
-            client_private_key,
-        )
-        .map_err(|_| io::Error::other("Failed to create private key"))?;
-
-        let mut tls_shared_secret = [0u8; 32];
-        agreement::agree(
-            &my_private_key,
-            peer_public_key,
-            io::Error::other("ECDH failed"),
-            |key_material| {
-                tls_shared_secret.copy_from_slice(key_material);
-                Ok(())
-            },
-        )?;
+        // Never accept a ServerHello group different from the sole group
+        // offered in ClientHello. In particular, an opted-in hybrid client
+        // cannot silently derive only the X25519 portion of a hybrid share.
+        let tls_shared_secret = match key_exchange {
+            ClientKeyExchange::X25519(client_private_key) => {
+                if server_key_share.group != X25519_GROUP {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "REALITY ServerHello key share does not match offered X25519 group",
+                    ));
+                }
+                let server_public_key: [u8; 32] =
+                    server_key_share.data.as_slice().try_into().map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Invalid REALITY X25519 ServerHello key share length",
+                        )
+                    })?;
+                let peer_public_key = agreement::UnparsedPublicKey::new(
+                    &agreement::X25519,
+                    &server_public_key,
+                );
+                let my_private_key = agreement::PrivateKey::from_private_key(
+                    &agreement::X25519,
+                    client_private_key,
+                )
+                .map_err(|_| io::Error::other("Failed to create private key"))?;
+                let mut shared = [0u8; 32];
+                agreement::agree(
+                    &my_private_key,
+                    peer_public_key,
+                    io::Error::other("ECDH failed"),
+                    |key_material| {
+                        shared.copy_from_slice(key_material);
+                        Ok(())
+                    },
+                )?;
+                shared.to_vec()
+            }
+            ClientKeyExchange::Hybrid(hybrid) => {
+                hybrid.derive_shared_secret(&server_key_share)?.to_vec()
+            }
+        };
 
         let hs_keys = derive_handshake_keys(
             cipher_suite,
@@ -1128,6 +1187,7 @@ mod tests {
             server_name: "example.com".to_string(),
             cipher_suites: vec![],
             alpn_protocols: vec!["h2".to_owned()],
+            support_x25519mlkem768: false,
         };
 
         let mut conn = RealityClientConnection::new(config).unwrap();
@@ -1152,6 +1212,180 @@ mod tests {
         );
     }
 
+    fn build_test_server_hello(group: u16, share: &[u8]) -> Vec<u8> {
+        use super::super::reality_tls13_messages::construct_server_hello;
+
+        let mut hello =
+            construct_server_hello(&[0x41; 32], &[], 0x1301, share).unwrap();
+        let group_offset = hello.len() - share.len() - 4;
+        hello[group_offset..group_offset + 2].copy_from_slice(&group.to_be_bytes());
+        let mut record =
+            write_record_header(CONTENT_TYPE_HANDSHAKE, hello.len() as u16);
+        record.extend_from_slice(&hello);
+        record
+    }
+
+    fn test_config(hybrid: bool) -> RealityClientConfig {
+        RealityClientConfig {
+            public_key: test_server_public_key(),
+            short_id: vec![0x01, 0x02],
+            server_name: "example.com".to_owned(),
+            cipher_suites: vec![],
+            alpn_protocols: vec!["h2".to_owned()],
+            support_x25519mlkem768: hybrid,
+        }
+    }
+
+    #[test]
+    fn hybrid_client_hello_and_server_hello_derive_matching_keys() {
+        use aws_lc_rs::kem::{EncapsulationKey, ML_KEM_768};
+
+        let mut conn = RealityClientConnection::new(test_config(true)).unwrap();
+        let (client_hello, public_key_share, auth_key) = match &conn.handshake_state
+        {
+            HandshakeState::AwaitingServerHello {
+                client_hello_bytes,
+                key_exchange: ClientKeyExchange::Hybrid(hybrid),
+                auth_key,
+            } => (
+                client_hello_bytes.clone(),
+                hybrid.client_key_share().to_vec(),
+                *auth_key,
+            ),
+            _ => panic!("opt-in REALITY must offer hybrid key exchange"),
+        };
+
+        let mut wire = Vec::new();
+        conn.write_tls(&mut wire).unwrap();
+        assert_eq!(&wire[TLS_RECORD_HEADER_SIZE..], client_hello);
+        assert!(
+            client_hello
+                .windows(public_key_share.len())
+                .any(|slice| slice == public_key_share),
+            "REALITY authentication AAD must include the offered hybrid key share"
+        );
+        assert!(
+            client_hello
+                .windows(2)
+                .any(|slice| slice == X25519_MLKEM768_GROUP.to_be_bytes()),
+            "ClientHello must advertise the hybrid TLS group"
+        );
+        // The REALITY auth key and TLS X25519 share use the same ephemeral key.
+        let client_x25519_public_key: [u8; 32] =
+            public_key_share[1184..].try_into().unwrap();
+        let auth_shared =
+            perform_ecdh(&[0x42; 32], &client_x25519_public_key).unwrap();
+        let expected_auth =
+            derive_auth_key(&auth_shared, &client_hello[6..26], b"REALITY").unwrap();
+        assert_eq!(auth_key, expected_auth);
+
+        let (ciphertext, server_ml_kem_secret) =
+            EncapsulationKey::new(&ML_KEM_768, &public_key_share[..1184])
+                .unwrap()
+                .encapsulate()
+                .unwrap();
+        let server_private = [0x55; 32];
+        let server_public = agreement::PrivateKey::from_private_key(
+            &agreement::X25519,
+            &server_private,
+        )
+        .unwrap()
+        .compute_public_key()
+        .unwrap();
+        let mut server_share = ciphertext.as_ref().to_vec();
+        server_share.extend_from_slice(server_public.as_ref());
+        let record = build_test_server_hello(X25519_MLKEM768_GROUP, &server_share);
+
+        let x25519_secret =
+            perform_ecdh(&server_private, &client_x25519_public_key).unwrap();
+        let mut hybrid_secret = server_ml_kem_secret.as_ref().to_vec();
+        hybrid_secret.extend_from_slice(&x25519_secret);
+        let cipher_suite = CipherSuite::AES_128_GCM_SHA256;
+        let client_hello_hash =
+            digest::digest(cipher_suite.digest_algorithm(), &client_hello);
+        let mut transcript = client_hello;
+        transcript.extend_from_slice(&record[TLS_RECORD_HEADER_SIZE..]);
+        let server_hello_hash =
+            digest::digest(cipher_suite.digest_algorithm(), &transcript);
+        let expected = derive_handshake_keys(
+            cipher_suite,
+            &hybrid_secret,
+            client_hello_hash.as_ref(),
+            server_hello_hash.as_ref(),
+        )
+        .unwrap();
+
+        let mut cursor = record.as_slice();
+        conn.read_tls(&mut cursor).unwrap();
+        assert!(conn.process_server_hello().unwrap());
+        match &conn.handshake_state {
+            HandshakeState::ProcessingHandshake {
+                client_handshake_traffic_secret,
+                server_handshake_traffic_secret,
+                master_secret,
+                ..
+            } => {
+                assert_eq!(
+                    client_handshake_traffic_secret,
+                    &expected.client_handshake_traffic_secret
+                );
+                assert_eq!(
+                    server_handshake_traffic_secret,
+                    &expected.server_handshake_traffic_secret
+                );
+                assert_eq!(master_secret, &expected.master_secret);
+            }
+            _ => {
+                panic!("valid hybrid ServerHello must derive handshake traffic keys")
+            }
+        }
+    }
+
+    #[test]
+    fn reality_rejects_server_hello_group_mismatch_in_both_modes() {
+        let classical_share = test_server_public_key();
+        for hybrid in [false, true] {
+            let mut conn =
+                RealityClientConnection::new(test_config(hybrid)).unwrap();
+            let (group, share) = if hybrid {
+                (X25519_GROUP, classical_share.to_vec())
+            } else {
+                (X25519_MLKEM768_GROUP, vec![0x5a; 1120])
+            };
+            let record = build_test_server_hello(group, &share);
+            let mut cursor = record.as_slice();
+            conn.read_tls(&mut cursor).unwrap();
+            assert_eq!(
+                conn.process_server_hello().unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+    }
+
+    #[test]
+    fn classic_reality_default_still_offers_x25519() {
+        let conn = RealityClientConnection::new(test_config(false)).unwrap();
+        match &conn.handshake_state {
+            HandshakeState::AwaitingServerHello {
+                client_hello_bytes,
+                key_exchange: ClientKeyExchange::X25519(_),
+                ..
+            } => {
+                assert!(
+                    client_hello_bytes
+                        .windows(8)
+                        .any(|slice| slice == [0, 10, 0, 4, 0, 2, 0, 0x1d])
+                );
+                assert!(
+                    !client_hello_bytes
+                        .windows(8)
+                        .any(|slice| slice == [0, 10, 0, 4, 0, 2, 0x11, 0xec])
+                );
+            }
+            _ => panic!("default REALITY must remain classic X25519"),
+        }
+    }
+
     #[test]
     fn client_hello_uses_configured_alpn() {
         let config = RealityClientConfig {
@@ -1160,6 +1394,7 @@ mod tests {
             server_name: "example.com".to_owned(),
             cipher_suites: vec![],
             alpn_protocols: vec!["h3".to_owned()],
+            support_x25519mlkem768: false,
         };
 
         let conn = RealityClientConnection::new(config).unwrap();

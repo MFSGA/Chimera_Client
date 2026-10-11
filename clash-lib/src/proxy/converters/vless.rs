@@ -175,13 +175,21 @@ fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
         }
     }
 
-    if let Some(client_fingerprint) = s.client_fingerprint.as_deref()
-        && client_fingerprint != "none"
-    {
-        warn!(
-            "vless client-fingerprint '{client_fingerprint}' is not supported yet, ignoring it"
-        );
-    }
+    // XHTTP upload-settings can override the top-level security. Validate
+    // known fingerprint values now, then the effective value at the endpoint.
+    let explicit_upload_security = s.network.as_deref() == Some("xhttp")
+        && s.xhttp_opts
+            .as_ref()
+            .is_some_and(|opts| opts.upload_settings.is_some());
+    validate_vless_client_fingerprint(
+        s.client_fingerprint.as_deref(),
+        if explicit_upload_security {
+            None
+        } else {
+            Some(s.reality_opts.is_some())
+        },
+        "vless",
+    )?;
 
     if matches!(s.network.as_deref(), Some("xhttp")) {
         resolve_xhttp_http_version(s)?;
@@ -216,6 +224,30 @@ fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
         }
     }
 
+    Ok(())
+}
+
+/// Reject unsupported ClientHello impersonation instead of accepting a
+/// configuration that will have no effect on the wire. `None` for `reality`
+/// defers the security decision to explicit XHTTP upload-settings.
+fn validate_vless_client_fingerprint(
+    fingerprint: Option<&str>,
+    reality: Option<bool>,
+    context: &str,
+) -> Result<(), Error> {
+    let supported = matches!(
+        (fingerprint, reality),
+        (None, _)
+            | (Some("chrome"), Some(true) | None)
+            | (Some("none"), Some(false) | None)
+    );
+    if let Some(fingerprint) = fingerprint
+        && !supported
+    {
+        return Err(Error::InvalidConfig(format!(
+            "{context} client-fingerprint '{fingerprint}' is unsupported: Reality requires chrome, non-Reality permits only none"
+        )));
+    }
     Ok(())
 }
 
@@ -765,17 +797,11 @@ fn build_xhttp_upload_endpoint_config(
     let client_fingerprint = upload
         .and_then(|settings| settings.client_fingerprint.as_deref())
         .or(s.client_fingerprint.as_deref());
-    if let Some(client_fingerprint) = client_fingerprint
-        && !matches!(
-            &security,
-            XhttpSecurity::Reality if client_fingerprint == "chrome"
-        )
-        && client_fingerprint != "none"
-    {
-        warn!(
-            "xhttp upload endpoint client-fingerprint '{client_fingerprint}' is not supported yet, ignoring it"
-        );
-    }
+    validate_vless_client_fingerprint(
+        client_fingerprint,
+        Some(matches!(security, XhttpSecurity::Reality)),
+        "xhttp upload endpoint",
+    )?;
 
     let reality = build_xhttp_reality_config(
         upload_reality_opts,
@@ -934,17 +960,11 @@ fn build_xhttp_download_config(
         .client_fingerprint
         .as_deref()
         .or(s.client_fingerprint.as_deref());
-    if let Some(client_fingerprint) = client_fingerprint
-        && !matches!(
-            &security,
-            XhttpSecurity::Reality if client_fingerprint == "chrome"
-        )
-        && client_fingerprint != "none"
-    {
-        warn!(
-            "xhttp download-settings client-fingerprint '{client_fingerprint}' is not supported yet, ignoring it"
-        );
-    }
+    validate_vless_client_fingerprint(
+        client_fingerprint,
+        Some(matches!(security, XhttpSecurity::Reality)),
+        "xhttp download-settings",
+    )?;
 
     let reality = build_xhttp_reality_config(
         download_reality_opts,
@@ -1103,7 +1123,8 @@ fn build_reality_transport_from_opts(
         server_name,
         Vec::new(),
         alpn_protocols.unwrap_or_default(),
-    ))
+    )
+    .with_x25519mlkem768(reality_opts.support_x25519mlkem768))
 }
 
 fn build_xhttp_reality_config(
@@ -1133,6 +1154,7 @@ fn build_xhttp_reality_config(
             alpn_protocols: alpn_protocols
                 .map(ToOwned::to_owned)
                 .unwrap_or_else(|| vec!["h2".to_owned()]),
+            support_x25519mlkem768: reality_opts.support_x25519mlkem768,
         }))
     }
     #[cfg(not(feature = "reality"))]
@@ -1923,6 +1945,37 @@ mod tests {
 
     #[cfg(feature = "reality")]
     #[test]
+    fn reality_hybrid_config_requires_explicit_opt_in() {
+        let default_yaml = format!("public-key: {TEST_REALITY_PUBLIC_KEY}\n");
+        let default_opts: OutboundTrojanRealityOpts =
+            serde_yaml::from_str(&default_yaml).unwrap();
+        assert!(!default_opts.support_x25519mlkem768);
+        let default_transport = super::build_reality_transport_from_opts(
+            &default_opts,
+            "example.com".to_owned(),
+            None,
+        )
+        .unwrap();
+        assert!(!default_transport.offers_x25519mlkem768());
+
+        for key in ["support-x25519mlkem768", "supportX25519MLKEM768"] {
+            let hybrid_yaml =
+                format!("public-key: {TEST_REALITY_PUBLIC_KEY}\n{key}: true\n");
+            let hybrid_opts: OutboundTrojanRealityOpts =
+                serde_yaml::from_str(&hybrid_yaml).unwrap();
+            assert!(hybrid_opts.support_x25519mlkem768);
+            let hybrid_transport = super::build_reality_transport_from_opts(
+                &hybrid_opts,
+                "example.com".to_owned(),
+                None,
+            )
+            .unwrap();
+            assert!(hybrid_transport.offers_x25519mlkem768());
+        }
+    }
+
+    #[cfg(feature = "reality")]
+    #[test]
     fn vless_reality_prefers_sni_for_server_name() {
         let outbound = OutboundVless {
             common_opts: CommonConfigOptions {
@@ -1937,6 +1990,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: Some("85144f63".to_owned()),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1960,6 +2014,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1977,7 +2032,7 @@ mod tests {
 
     #[cfg(feature = "reality")]
     #[test]
-    fn vless_reality_allows_client_fingerprint_configuration_with_warning() {
+    fn vless_reality_rejects_unsupported_client_fingerprint() {
         let outbound = OutboundVless {
             common_opts: CommonConfigOptions {
                 name: "reality-firefox".to_owned(),
@@ -1990,17 +2045,21 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
 
-        validate_vless_config(&outbound).expect(
-            "Reality client-fingerprint should be accepted for config compatibility",
+        let err = validate_vless_config(&outbound)
+            .expect_err("Reality must reject unsupported browser fingerprints");
+        assert!(
+            err.to_string().contains("client-fingerprint 'firefox'"),
+            "unexpected error: {err}"
         );
     }
 
     #[test]
-    fn vless_non_reality_allows_client_fingerprint_configuration() {
+    fn vless_non_reality_rejects_unsupported_client_fingerprint() {
         let outbound = OutboundVless {
             common_opts: CommonConfigOptions {
                 name: "tls-firefox".to_owned(),
@@ -2014,8 +2073,39 @@ mod tests {
             ..Default::default()
         };
 
-        validate_vless_config(&outbound)
-            .expect("non-Reality TLS client-fingerprint should be accepted for config compatibility");
+        let err = validate_vless_config(&outbound).expect_err(
+            "non-Reality TLS must reject unsupported browser fingerprints",
+        );
+        assert!(
+            err.to_string().contains("client-fingerprint 'firefox'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vless_accepts_explicit_none_client_fingerprint_without_reality() {
+        let outbound = OutboundVless {
+            client_fingerprint: Some("none".to_owned()),
+            ..Default::default()
+        };
+        validate_vless_config(&outbound).expect("none is a no-op for non-Reality");
+    }
+
+    #[cfg(feature = "reality")]
+    #[test]
+    fn vless_reality_rejects_explicit_none_client_fingerprint() {
+        let outbound = OutboundVless {
+            client_fingerprint: Some("none".to_owned()),
+            reality_opts: Some(OutboundTrojanRealityOpts {
+                public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
+                short_id: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        validate_vless_config(&outbound).expect_err(
+            "explicit none must not silently select the Chrome Reality handshake",
+        );
     }
 
     #[test]
@@ -2164,6 +2254,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -2327,6 +2418,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: Some("85144f63".to_owned()),
+                ..Default::default()
             }),
             xhttp_opts: Some(XhttpOpt {
                 mode: Some("packet-up".to_owned()),
@@ -2627,6 +2719,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: None,
+                ..Default::default()
             }),
             xhttp_opts: Some(XhttpOpt {
                 mode: Some("stream-one".to_owned()),
@@ -2772,6 +2865,7 @@ mod tests {
                 public_key: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
                     .to_owned(),
                 short_id: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -3121,6 +3215,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -4394,6 +4489,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: None,
+                ..Default::default()
             }),
             xhttp_opts: Some(XhttpOpt {
                 path: Some("/xhttp/".to_owned()),
@@ -4403,6 +4499,7 @@ mod tests {
                     reality_opts: Some(OutboundTrojanRealityOpts {
                         public_key: String::new(),
                         short_id: None,
+                        ..Default::default()
                     }),
                     ..Default::default()
                 }),
@@ -4453,6 +4550,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: None,
+                ..Default::default()
             }),
             xhttp_opts: Some(XhttpOpt {
                 download_settings: Some(XhttpDownloadSettings {
@@ -4460,6 +4558,7 @@ mod tests {
                     reality_opts: Some(OutboundTrojanRealityOpts {
                         public_key: String::new(),
                         short_id: None,
+                        ..Default::default()
                     }),
                     ..Default::default()
                 }),
@@ -4474,13 +4573,56 @@ mod tests {
             .expect("xhttp options should be present");
         let metadata =
             build_xhttp_metadata_config(xhttp_opts).expect("metadata should build");
-        build_xhttp_download_config(
+        let err = match build_xhttp_download_config(
             &outbound,
             xhttp_opts,
             &metadata,
             XhttpHttpVersion::Http2,
-        )
-        .expect("non-Reality TLS fingerprint should only warn for compatibility");
+        ) {
+            Ok(_) => {
+                panic!("non-Reality TLS must reject inherited Chrome fingerprint")
+            }
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("client-fingerprint 'chrome'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn vless_xhttp_upload_rejects_unsupported_fingerprint() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "upload-tls-fingerprint".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            tls: Some(true),
+            network: Some("xhttp".to_owned()),
+            client_fingerprint: Some("firefox".to_owned()),
+            xhttp_opts: Some(XhttpOpt {
+                upload_settings: Some(XhttpUploadSettings {
+                    security: Some("tls".to_owned()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = match build_xhttp_upload_endpoint_config(&outbound, false) {
+            Ok(_) => {
+                panic!("upload TLS must reject unsupported browser fingerprint")
+            }
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("client-fingerprint 'firefox'"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -4574,6 +4716,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -4615,6 +4758,7 @@ mod tests {
                     reality_opts: Some(OutboundTrojanRealityOpts {
                         public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                         short_id: None,
+                        support_x25519mlkem768: true,
                     }),
                     ..Default::default()
                 }),
@@ -4632,7 +4776,7 @@ mod tests {
             endpoint.security,
             crate::proxy::transport::XhttpSecurity::Reality
         ));
-        assert!(endpoint.reality.is_some());
+        assert!(endpoint.reality.as_ref().unwrap().support_x25519mlkem768);
 
         let outer_security =
             build_tls_transport(outbound.network.as_deref(), &outbound, false)
@@ -4678,6 +4822,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: None,
+                support_x25519mlkem768: true,
             }),
             ..Default::default()
         };
@@ -4703,13 +4848,9 @@ mod tests {
         )
         .expect("download config should build")
         .expect("download config should be present");
-        assert_eq!(
-            download
-                .reality
-                .expect("reality config should be present")
-                .alpn_protocols,
-            vec!["h2".to_owned()]
-        );
+        let reality = download.reality.expect("reality config should be present");
+        assert!(reality.support_x25519mlkem768);
+        assert_eq!(reality.alpn_protocols, vec!["h2".to_owned()]);
     }
 
     #[cfg(feature = "ws")]

@@ -739,6 +739,10 @@ pub struct OutboundTrojanRealityOpts {
     pub public_key: String,
     #[serde(alias = "shortId")]
     pub short_id: Option<String>,
+    /// Explicit opt-in for hybrid REALITY X25519MLKEM768; disabled by default
+    /// for compatibility with existing REALITY servers.
+    #[serde(default, alias = "supportX25519MLKEM768")]
+    pub support_x25519mlkem768: bool,
 }
 
 #[cfg(feature = "hysteria")]

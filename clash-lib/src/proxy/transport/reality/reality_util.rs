@@ -5,6 +5,21 @@ use rand::Rng;
 use super::buf_reader::BufReader;
 use super::reality_cipher_suite::CipherSuite;
 
+pub(super) const X25519_GROUP: u16 = 0x001d;
+pub(super) const X25519_MLKEM768_GROUP: u16 = 0x11ec;
+pub(super) const X25519_KEY_SHARE_LEN: usize = 32;
+pub(super) const X25519_MLKEM768_CLIENT_KEY_SHARE_LEN: usize =
+    1184 + X25519_KEY_SHARE_LEN;
+const X25519_MLKEM768_SERVER_KEY_SHARE_LEN: usize = 1088 + X25519_KEY_SHARE_LEN;
+
+/// Parsed TLS 1.3 ServerHello key share. Hybrid key exchange is not enabled
+/// until the handshake derives both the ML-KEM and X25519 shared secrets.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RealityKeyShare {
+    pub group: u16,
+    pub data: Vec<u8>,
+}
+
 /// Decodes a base64url-encoded public key
 pub fn decode_public_key(encoded: &str) -> Result<[u8; 32], std::io::Error> {
     let decoded = URL_SAFE_NO_PAD.decode(encoded).map_err(|e| {
@@ -290,6 +305,24 @@ fn parse_keyshare_extension(data: &[u8]) -> Result<[u8; 32], std::io::Error> {
 pub fn extract_server_public_key(
     server_hello: &[u8],
 ) -> Result<[u8; 32], std::io::Error> {
+    let key_share = extract_server_key_share(server_hello)?;
+    // The current handshake only derives X25519. Never treat the X25519
+    // component of a hybrid share as a complete TLS shared secret.
+    if key_share.group != X25519_GROUP {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "REALITY hybrid key share requires hybrid key exchange support",
+        ));
+    }
+    let mut key = [0u8; X25519_KEY_SHARE_LEN];
+    key.copy_from_slice(&key_share.data);
+    Ok(key)
+}
+
+/// Parse the negotiated ServerHello key share without deriving secrets.
+pub fn extract_server_key_share(
+    server_hello: &[u8],
+) -> Result<RealityKeyShare, std::io::Error> {
     const TLS_HEADER_LEN: usize = 5;
 
     if server_hello.len() < TLS_HEADER_LEN {
@@ -342,37 +375,38 @@ pub fn extract_server_public_key(
     ))
 }
 
-/// Parses the ServerHello KeyShare extension to extract X25519 public key
-fn parse_server_keyshare_extension(data: &[u8]) -> Result<[u8; 32], std::io::Error> {
+/// Parse and validate the ServerHello KeyShare extension (RFC 8446).
+fn parse_server_keyshare_extension(
+    data: &[u8],
+) -> Result<RealityKeyShare, std::io::Error> {
     let mut reader = BufReader::new(data);
-
-    // ServerHello KeyShare extension format:
-    // - Group: 2 bytes
-    // - Key Exchange Length: 2 bytes
-    // - Key Exchange Data: variable
-
     let group = reader.read_u16_be()?;
     let key_len = reader.read_u16_be()? as usize;
-
-    if group == 29 {
-        // X25519
-        if key_len != 32 {
+    let expected_len = match group {
+        X25519_GROUP => X25519_KEY_SHARE_LEN,
+        X25519_MLKEM768_GROUP => X25519_MLKEM768_SERVER_KEY_SHARE_LEN,
+        _ => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Invalid X25519 key length: {}", key_len),
+                format!(
+                    "Unsupported REALITY ServerHello key share group: 0x{group:04x}"
+                ),
             ));
         }
-
-        let key_bytes = reader.read_slice(32)?;
-        let mut key = [0u8; 32];
-        key.copy_from_slice(key_bytes);
-        return Ok(key);
+    };
+    if key_len != expected_len || data.len() != 4 + key_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Invalid REALITY ServerHello key share length for group 0x{group:04x}: declared {key_len}, available {}",
+                data.len().saturating_sub(4)
+            ),
+        ));
     }
-
-    Err(std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        "X25519 key share not found in ServerHello KeyShare extension",
-    ))
+    Ok(RealityKeyShare {
+        group,
+        data: reader.read_slice(key_len)?.to_vec(),
+    })
 }
 
 /// Extract the cipher suite selected by the server from ServerHello message
@@ -503,6 +537,67 @@ pub fn generate_keypair() -> std::io::Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reality_server_key_share_accepts_classic_and_hybrid_lengths() {
+        for (group, size) in [
+            (X25519_GROUP, X25519_KEY_SHARE_LEN),
+            (X25519_MLKEM768_GROUP, X25519_MLKEM768_SERVER_KEY_SHARE_LEN),
+        ] {
+            let mut encoded = Vec::from(group.to_be_bytes());
+            encoded.extend_from_slice(&(size as u16).to_be_bytes());
+            encoded.extend(std::iter::repeat_n(0xa5, size));
+            let share = parse_server_keyshare_extension(&encoded).unwrap();
+            assert_eq!(share.group, group);
+            assert_eq!(share.data, vec![0xa5; size]);
+
+            for bad in [size - 1, size + 1] {
+                let mut malformed = Vec::from(group.to_be_bytes());
+                malformed.extend_from_slice(&(bad as u16).to_be_bytes());
+                malformed.extend(std::iter::repeat_n(0xa5, bad));
+                assert!(parse_server_keyshare_extension(&malformed).is_err());
+            }
+            assert!(
+                parse_server_keyshare_extension(&encoded[..encoded.len() - 1])
+                    .is_err()
+            );
+            let mut extra = encoded.clone();
+            extra.push(0);
+            assert!(parse_server_keyshare_extension(&extra).is_err());
+        }
+        assert!(parse_server_keyshare_extension(&[0x12, 0x34, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn reality_server_hello_keeps_classic_runtime_and_rejects_hybrid_until_enabled()
+    {
+        use super::super::reality_tls13_messages::construct_server_hello;
+
+        for (group, size) in [
+            (X25519_GROUP, X25519_KEY_SHARE_LEN),
+            (X25519_MLKEM768_GROUP, X25519_MLKEM768_SERVER_KEY_SHARE_LEN),
+        ] {
+            let data = vec![0x5a; size];
+            let mut hello =
+                construct_server_hello(&[0; 32], &[], 0x1301, &data).unwrap();
+            // construct_server_hello places key_share as the final extension.
+            let group_offset = hello.len() - size - 4;
+            hello[group_offset..group_offset + 2]
+                .copy_from_slice(&group.to_be_bytes());
+            let mut record = vec![0x16, 0x03, 0x03];
+            record.extend_from_slice(&(hello.len() as u16).to_be_bytes());
+            record.extend_from_slice(&hello);
+
+            let parsed = extract_server_key_share(&record).unwrap();
+            assert_eq!(parsed.group, group);
+            assert_eq!(parsed.data, data);
+            if group == X25519_GROUP {
+                assert_eq!(extract_server_public_key(&record).unwrap(), [0x5a; 32]);
+            } else {
+                assert!(extract_server_public_key(&record).is_err());
+            }
+        }
+    }
 
     #[test]
     fn test_decode_short_id() {
