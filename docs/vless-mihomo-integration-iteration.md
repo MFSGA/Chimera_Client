@@ -125,3 +125,12 @@
 ## 后续迭代记录
 
 每次运行应注明：源/目标 SHA、本轮修改、实际测试结果、CI 状态、阻塞项和下一可交付切片；不得把尚未验证的工作标为完成。完成验收前保留集成分支，不更改 `master`。
+
+## 迭代 8：VLESS Native Encryption UDP（2026-10-11，本地及 Xray 互操作通过）
+
+- **基线**：`5fea5a3cb622e56e43bb6cb1cb055b77fd55fe99`；工作区干净，集成分支与远端一致。参考已有 VLESS UDP length+payload framing 和历史切片 `4fef70b`，按当前代码最小移植。
+- **实现**：允许已有 Native Encryption 1-RTT 加密流承载现有 TCP-carried VLESS UDP framing，移除 handler 对加密 UDP 的拒绝；`support_udp()` 恢复以配置的 `udp` 字段为准。未改变 UDP transport 或 packet encoding 行为。
+- **回归测试**：新增 handler 能力测试，确保配置 `udp: true` 且选择 `native.1rtt` 时代理公开 UDP 支持。
+- **真实 Xray 互操作**：运行 `clash-lib/tests/vless_native_encryption_udp_xray_interop.sh` 对 Xray 26.9.30 macOS arm64；SOCKS5 UDP ASSOCIATE 经 Chimera 加密 VLESS UDP 到 Xray，再转发本机 UDP echo，完整 datagram 往返断言通过。脚本显式禁用 MMDB/CLI compatibility，并仅允许 Xray freedom outbound 访问本机 UDP echo。
+- **验证**：`cargo test -p clash-lib --features vless-encryption --lib encrypted_vless_supports_udp -- --nocapture` 1/1；现有 VLESS datagram framing 测试 2/2；`cargo build -p clash-rs --features vless-encryption --locked` 通过；严格命令 `cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、`cargo fmt --all -- --check`、脚本 `bash -n`、`git diff --check` 通过。CI 待新提交触发并检查。
+- **边界与下一步**：本切片只覆盖 1-RTT Native Encryption 的现有 TCP-carried UDP 数据报；不覆盖 0-RTT UDP、`network: udp` 或 XUDP。后续优先评估能复用现有 UDP packet framing 的低成本兼容缺口，再考虑 random 混淆或 ticket 重放机制。
