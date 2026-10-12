@@ -160,6 +160,7 @@ struct RecordHeaderMask {
     counter: [u8; 16],
     keystream: [u8; 16],
     next_byte: usize,
+    counter_exhausted: bool,
 }
 
 impl RecordHeaderMask {
@@ -169,6 +170,7 @@ impl RecordHeaderMask {
             counter: iv,
             keystream: [0; 16],
             next_byte: 16,
+            counter_exhausted: false,
         }
     }
 
@@ -176,17 +178,24 @@ impl RecordHeaderMask {
         if header.len() != RECORD_HEADER_LEN {
             return Err(invalid("invalid VLESS random record header length"));
         }
+        // Refuse an entire header before changing any bytes if it would need
+        // a counter block after the final 128-bit value. In particular, do
+        // not wrap to zero and repeat a keystream block under the same key.
+        if self.counter_exhausted
+            && self.keystream.len() - self.next_byte < header.len()
+        {
+            return Err(invalid("VLESS random header CTR counter exhausted"));
+        }
         for byte in header {
             if self.next_byte == self.keystream.len() {
                 self.keystream.fill(0);
                 xor_vless_ctr(&self.united_key, &self.counter, &mut self.keystream)?;
                 // Go cipher.NewCTR increments the full big-endian 128-bit IV.
-                for counter_byte in self.counter.iter_mut().rev() {
-                    let (next, overflow) = counter_byte.overflowing_add(1);
-                    *counter_byte = next;
-                    if !overflow {
-                        break;
-                    }
+                // Retain the final counter value after overflow so the next
+                // block can never reuse the initial keystream.
+                match u128::from_be_bytes(self.counter).checked_add(1) {
+                    Some(next) => self.counter = next.to_be_bytes(),
+                    None => self.counter_exhausted = true,
                 }
                 self.next_byte = 0;
             }
@@ -696,6 +705,59 @@ mod tests {
             writes: Arc::clone(&writes),
         };
         (Box::new(stream), writes)
+    }
+
+    #[test]
+    fn random_header_mask_rejects_ctr_wrap_without_partial_header_mutation() {
+        let key = [0x5au8; 64];
+        let initial_counter = u128::MAX.to_be_bytes();
+        let mut mask = RecordHeaderMask::new(&key, initial_counter);
+
+        // The final counter block is still legal, including across multiple
+        // five-byte headers. Compare against the independent CTR helper.
+        let mut expected = [0u8; 16];
+        xor_vless_ctr(&key, &initial_counter, &mut expected).unwrap();
+        for chunk in expected.as_chunks::<5>().0.iter().take(3) {
+            let mut header = [0u8; RECORD_HEADER_LEN];
+            mask.apply(&mut header).unwrap();
+            assert_eq!(&header, chunk);
+        }
+        assert_eq!(mask.counter, initial_counter);
+        assert!(mask.counter_exhausted);
+        assert_eq!(mask.next_byte, 15);
+
+        // Only one byte remains in the last block; a complete header must
+        // fail atomically, and retries must never wrap to the first block.
+        for _ in 0..2 {
+            let mut header = [0x42u8; RECORD_HEADER_LEN];
+            let err = mask.apply(&mut header).unwrap_err();
+            assert!(err.to_string().contains("CTR counter exhausted"));
+            assert_eq!(header, [0x42; RECORD_HEADER_LEN]);
+            assert_eq!(mask.counter, initial_counter);
+            assert_eq!(mask.next_byte, 15);
+        }
+    }
+
+    #[test]
+    fn random_header_mask_preserves_final_two_ctr_blocks() {
+        let key = [0x63u8; 64];
+        let initial_counter = (u128::MAX - 1).to_be_bytes();
+        let mut mask = RecordHeaderMask::new(&key, initial_counter);
+        let mut expected = [0u8; 30];
+        xor_vless_ctr(&key, &initial_counter, &mut expected).unwrap();
+
+        let mut actual = [0u8; 30];
+        for header in actual.as_chunks_mut::<RECORD_HEADER_LEN>().0 {
+            mask.apply(header).unwrap();
+        }
+        assert_eq!(actual, expected);
+        assert!(mask.counter_exhausted);
+        assert_eq!(mask.next_byte, 14);
+        assert_eq!(mask.counter, u128::MAX.to_be_bytes());
+
+        let mut header = [0x7fu8; RECORD_HEADER_LEN];
+        assert!(mask.apply(&mut header).is_err());
+        assert_eq!(header, [0x7f; RECORD_HEADER_LEN]);
     }
 
     #[test]

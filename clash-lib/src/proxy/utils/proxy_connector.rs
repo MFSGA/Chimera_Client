@@ -1016,9 +1016,17 @@ fn push_proxy_endpoint_stream_attempt(
                 .await
             };
 
+            // A system-routed loopback socket does not depend on the physical
+            // network snapshot. An unrelated interface update must not discard
+            // a successfully connected local endpoint. Explicitly bound and
+            // non-loopback attempts still require the generation check.
+            let generation_bound = attempt.path.is_some()
+                || iface.is_some()
+                || !attempt.endpoint.ip().is_loopback();
             let result = match (result, generation_status.as_ref()) {
                 (Ok(stream), Some((planned, status)))
-                    if status
+                    if generation_bound
+                        && status
                         .read()
                         .await
                         .shadow_path_snapshot()
@@ -2480,6 +2488,61 @@ mod tests {
             error
                 .to_string()
                 .contains("required proxy endpoint path unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_system_route_survives_unrelated_network_generation_change() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let mut status = NetworkStatus::default();
+        status.set_automatic_supported_for_test(true);
+        status.observed(&NetworkSnapshot {
+            path_candidates: vec![candidate(
+                "wifi0",
+                4,
+                Ipv4Addr::new(192, 0, 2, 10),
+                DefaultRouteEvidence::PrimaryDefaultRoute,
+                BindingStatus::Verified,
+            )],
+            ..Default::default()
+        });
+        let planned_generation = status.shadow_path_snapshot().unwrap().0;
+        status.observed(&NetworkSnapshot {
+            path_candidates: vec![candidate(
+                "wifi1",
+                5,
+                Ipv4Addr::new(198, 51, 100, 10),
+                DefaultRouteEvidence::PrimaryDefaultRoute,
+                BindingStatus::Verified,
+            )],
+            ..Default::default()
+        });
+        assert_ne!(status.shadow_path_snapshot().unwrap().0, planned_generation);
+
+        let mut attempts = futures::stream::FuturesUnordered::new();
+        super::push_proxy_endpoint_stream_attempt(
+            &mut attempts,
+            super::DirectStreamAttempt {
+                endpoint,
+                path: None,
+            },
+            None,
+            Some((
+                planned_generation,
+                Arc::new(tokio::sync::RwLock::new(status)),
+            )),
+            #[cfg(target_os = "linux")]
+            None,
+        );
+        let (_, result) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), attempts.next())
+                .await
+                .expect("loopback TCP attempt should complete")
+                .expect("a TCP attempt should be returned");
+        assert!(
+            result.is_ok(),
+            "loopback system route must not be discarded by an unrelated network update: {result:?}"
         );
     }
 
