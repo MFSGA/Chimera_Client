@@ -708,6 +708,27 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_record_header_rejects_invalid_type_version_and_lengths() {
+        for len in [17u16, MAX_RECORD_CIPHERTEXT_LEN as u16] {
+            let mut header = [23, 3, 3, 0, 0];
+            header[3..].copy_from_slice(&len.to_be_bytes());
+            assert_eq!(decode_record_len(&header).unwrap(), usize::from(len));
+        }
+
+        for len in [0u16, 16, (MAX_RECORD_CIPHERTEXT_LEN + 1) as u16, u16::MAX] {
+            let mut header = [23, 3, 3, 0, 0];
+            header[3..].copy_from_slice(&len.to_be_bytes());
+            assert!(decode_record_len(&header).is_err(), "accepted length {len}");
+        }
+
+        for header in [[22, 3, 3, 0, 17], [23, 3, 2, 0, 17], [23, 2, 3, 0, 17]] {
+            assert!(decode_record_len(&header).is_err(), "accepted {header:?}");
+        }
+        assert!(decode_record_len(&[23, 3, 3, 0]).is_err());
+        assert!(decode_record_len(&[23, 3, 3, 0, 17, 0]).is_err());
+    }
+
+    #[test]
     fn random_header_mask_rejects_ctr_wrap_without_partial_header_mutation() {
         let key = [0x5au8; 64];
         let initial_counter = u128::MAX.to_be_bytes();
