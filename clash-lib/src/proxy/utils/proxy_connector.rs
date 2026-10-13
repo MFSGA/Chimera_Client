@@ -961,6 +961,13 @@ fn build_proxy_endpoint_attempts(
     attempts
 }
 
+fn requires_proxy_endpoint_generation_check(
+    attempt: &DirectStreamAttempt,
+    iface: Option<&OutboundInterface>,
+) -> bool {
+    attempt.path.is_some() || iface.is_some() || !attempt.endpoint.ip().is_loopback()
+}
+
 fn push_proxy_endpoint_stream_attempt(
     attempts: &mut FuturesUnordered<
         futures::future::BoxFuture<
@@ -1016,7 +1023,14 @@ fn push_proxy_endpoint_stream_attempt(
                 .await
             };
 
-            let result = match (result, generation_status.as_ref()) {
+            // An unpinned loopback TCP connection never traverses the observed
+            // outbound network. A concurrent OS route/sampler update must not
+            // invalidate that connection (notably in cross-architecture CI).
+            // Explicitly pinned sockets and non-loopback endpoints still fail
+            // closed if their network generation changes during the dial.
+            let check_generation =
+                requires_proxy_endpoint_generation_check(&attempt, iface.as_ref());
+            let result = match (result, generation_status.as_ref().filter(|_| check_generation)) {
                 (Ok(stream), Some((planned, status)))
                     if status
                         .read()
@@ -1942,7 +1956,7 @@ mod tests {
         sync::Arc,
     };
 
-    use futures::{SinkExt, StreamExt};
+    use futures::{SinkExt, StreamExt, stream::FuturesUnordered};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, UdpSocket},
@@ -1952,9 +1966,11 @@ mod tests {
     #[cfg(feature = "hysteria")]
     use super::observe_proxy_target_datagram;
     use super::{
-        DirectConnector, NetworkPathSource, NetworkPoolContext,
+        DirectConnector, DirectStreamAttempt, NetworkPathSource, NetworkPoolContext,
         ProxyEndpointConnectError, RemoteConnector, build_proxy_endpoint_attempts,
         observe_proxy_endpoint_datagram, observe_proxy_endpoint_stream,
+        push_proxy_endpoint_stream_attempt,
+        requires_proxy_endpoint_generation_check,
     };
     use crate::app::dns::MockClashResolver;
     use crate::{
@@ -1976,6 +1992,62 @@ mod tests {
         },
         session::SocksAddr,
     };
+
+    #[test]
+    fn proxy_endpoint_generation_guard_only_exempts_unpinned_loopback() {
+        let loopback = DirectStreamAttempt {
+            endpoint: "127.0.0.1:443".parse().unwrap(),
+            path: None,
+        };
+        assert!(!requires_proxy_endpoint_generation_check(&loopback, None));
+        assert!(requires_proxy_endpoint_generation_check(
+            &loopback,
+            Some(&outbound_interface("wifi0", 4)),
+        ));
+
+        let remote = DirectStreamAttempt {
+            endpoint: "198.51.100.8:443".parse().unwrap(),
+            path: None,
+        };
+        assert!(requires_proxy_endpoint_generation_check(&remote, None));
+
+        let pinned = DirectStreamAttempt {
+            endpoint: loopback.endpoint,
+            path: Some(observed_path("wifi0", 4, "127.0.0.1".parse().unwrap(), 7)),
+        };
+        assert!(requires_proxy_endpoint_generation_check(&pinned, None));
+    }
+
+    #[tokio::test]
+    async fn unpinned_loopback_proxy_endpoint_ignores_unrelated_network_update() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let mut status = NetworkStatus::default();
+        status.set_automatic_supported_for_test(true);
+        let status = Arc::new(tokio::sync::RwLock::new(status));
+
+        let mut attempts = FuturesUnordered::new();
+        push_proxy_endpoint_stream_attempt(
+            &mut attempts,
+            DirectStreamAttempt {
+                endpoint,
+                path: None,
+            },
+            None,
+            // Deliberately stale: the unpinned loopback dial must not
+            // depend on the OS outbound network snapshot.
+            Some((u64::MAX, status)),
+            #[cfg(target_os = "linux")]
+            None,
+        );
+        let (attempt, result) = attempts.next().await.unwrap();
+        assert_eq!(attempt.endpoint, endpoint);
+        let client =
+            result.expect("loopback TCP must survive unrelated route changes");
+        let (server, _) = listener.accept().await.unwrap();
+        drop(client);
+        drop(server);
+    }
 
     #[test]
     fn pool_context_keeps_unaffected_path_eligible_within_generation() {
