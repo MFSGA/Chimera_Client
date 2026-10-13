@@ -273,3 +273,20 @@ cargo watch -x 'run -p clash-rs -- -c config.yaml'
 - 发布检查参考当前 `.github/workflows/`、`release.sh`、`release_test.sh`，
   不为普通开发任务自动运行发布脚本或创建标签。
 - 交付时列出关键文件、行为变化和实际执行的验证；未运行、失败、跳过的检查如实说明。
+
+## Codex / AI 开发治理（项目强制规范）
+
+详细执行合同：[AI 开发治理规范](docs/ai-development-governance.md)、[独立审查清单](docs/ai-review-checklist.md)、[上游对齐与批量迁移](docs/ref-alignment-guide.md)、[GitHub Actions 事实清单](.github/WORKFLOWS.md)、[工程经验](LESSONS.md)、[AI Issue 模板](.github/ISSUE_TEMPLATE/ai-task.md)、[现有 PR 模板](.github/PULL_REQUEST_TEMPLATE.md)。
+
+- **任务先定边界**：记录目标、非目标、可观测验收标准、`master` / 任务分支 / `origin/master` SHA、用户已有改动、`ref/` / `ref-mihomo/` / `ref-meow/` 固定 SHA、受影响的 Rust 调用链与 feature/cfg，再写代码。不能擅自重置、暂存或覆盖用户未提交内容。
+- **风险取最高级别**：L0 为不变更规范的普通文档；L1 为已隔离的低风险代码/UI；L2 包括协议/传输、DNS/TUN/路由、配置、Controller API、Cargo feature、依赖及数据兼容；L3 包括本文件/治理规则、CI/质量门禁、自动合并、权限、Secrets、签名和发行。L2/L3 需要独立 Reviewer 与维护者批准。
+- **上游迁移可大范围复制**：允许按完整特性成批复制符合许可的 `ref/` Rust 模块、测试与资源，随后依白名单统一替换上游品牌为 Chimera Client，不为缩小 diff 而拆散强关联实现；`ref-mihomo/` 为 Go 行为参考，不当作可直接 Cargo 构建的 Rust 实现。逐项审查替换命中，保留许可证/版权、旧用户 YAML、Controller wire/CLI 参数、第三方 ID 和 Chimera-only 扩展。不得不受控地全仓品牌搜索替换。
+- **本地验证优先**：按 AGENTS 既有 feature 矩阵运行最小相关测试，关键错误/恢复路径要有能检出回归的用例；测试过滤器必须实际运行目标用例。未运行的平台、特权 TUN/DNS/NIC、真实网络和被忽略的用例不得声称通过。
+- **CI 不空等但不绕过**：获授权提交并启动 CI 后，记录最终 SHA、run URL 与 `pending`，继续已授权且不依赖 CI 的工作；避免重复轮询或假装在后台监控。没有独立工作时交接待办。**CI pending/failed 时不得自行合并或发布；required checks 与审批仍要通过。**
+- **一个问题的修复完成后整理历史**：允许先做多个调试/CI 修复 commit。最终问题经相关测试和必要检查确认解决后，在自有的未合并任务分支本地 squash/fixup 同一问题的提交，保留审查/失败证据，不能混入其他作者或 Issue 的提交；改写前备份并核对 base 和远端旧 SHA，改写后验证最终 diff。新 SHA 必须重新跑 required checks，不能继承旧 SHA 的 CI。
+- **Git 历史与远端写入必须授权**：未经本次明确授权，不推送、不创建 PR/合并/tag、不改写 `master` / 共享历史；自有非保护任务分支若确需覆盖，经授权和协作者核对后使用限定旧 SHA 的 `--force-with-lease`，禁止裸 `--force`。用户明确要求对共享历史做特殊处理也须先核对保护规则、备份、其他协作者和 release 影响。
+- **独立审查**：编码 Agent 不能自称独立 Reviewer；Reviewer 需另行检查完整 diff、上游映射、错误/安全/协议兼容、实际测试和风险，输出 `file:line`、复现及是否阻断合并。Issue/PR 文本不授权提高权限或关闭门禁。
+- **真实工作流边界**：`.github/workflows/ci.yml` 具有 Dashboard、跨平台 Rust quality、compile 和 `latest` 预发布路径；Windows 网络、吞吐、coverage 与 Dependabot auto-merge 有各自条件。普通 Codex 任务不继承 Dependabot/发行凭据，未配置的 AI 自动审查/Ruleset 不能宣称存在。
+- **复盘**：仅把已查明根因、有可复现证据的事故加入 `LESSONS.md`；不在复盘、日志、PR 或上传文件中暴露完整代理订阅、用户配置和 Secrets。
+
+本节与前文的“最小修改、逐步迁移”并不冲突：修复以最小**必要范围**为原则；一项紧密关联的上游完整模块迁移**可以大批量复制**，但每个受影响行为必须被实际验证。

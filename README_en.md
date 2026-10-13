@@ -91,6 +91,8 @@ cargo run -p clash-rs -- -t -c config.yaml
 cargo run -p clash-rs -- --version
 ```
 
+Compatibility mode is off by default, and an omitted `mmdb` does not trigger a `Country.mmdb` download. Configure an available `mmdb` file when using `GEOIP` rules or DNS GeoIP fallback. Passing `--compatibility` supplies `Country.mmdb` and `geosite.dat` in compatibility mode and may download missing files.
+
 ## Feature Design
 
 The project uses Cargo features to control optional functionality. Common features include:

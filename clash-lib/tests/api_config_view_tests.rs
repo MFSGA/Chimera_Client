@@ -1,7 +1,10 @@
 use bytes::{Buf, Bytes};
 use clash_lib::{Config, Options};
 use http_body_util::BodyExt;
-use std::{net::TcpListener, path::PathBuf};
+use std::{
+    net::{TcpListener, UdpSocket},
+    path::PathBuf,
+};
 
 mod common;
 
@@ -13,6 +16,21 @@ fn available_port() -> u16 {
         .local_addr()
         .expect("failed to inspect test port")
         .port()
+}
+
+/// DNS listens on TCP and UDP using the same port. Probing only TCP can
+/// select a port already occupied by a UDP service on Windows runners.
+fn available_dns_port() -> u16 {
+    for _ in 0..32 {
+        let tcp = TcpListener::bind("127.0.0.1:0")
+            .expect("failed to reserve candidate DNS TCP port");
+        let port = tcp.local_addr().unwrap().port();
+        if let Ok(udp) = UdpSocket::bind(("127.0.0.1", port)) {
+            drop(udp);
+            return port;
+        }
+    }
+    panic!("failed to find a port free for both DNS TCP and UDP");
 }
 
 fn start_client() -> (ClashInstance, u16, u16) {
@@ -53,7 +71,7 @@ rules:\n\
 fn start_dns_client() -> (ClashInstance, u16, u16) {
     let api_port = available_port();
     let socks_port = available_port();
-    let dns_port = available_port();
+    let dns_port = available_dns_port();
     let config = format!(
         r#"
 allow-lan: false
@@ -118,6 +136,15 @@ async fn get_configs(api_port: u16) -> serde_json::Value {
             .reader(),
     )
     .expect("failed to parse GET /configs response")
+}
+
+#[test]
+fn dns_port_probe_accepts_both_tcp_and_udp() {
+    let port = available_dns_port();
+    let _tcp = TcpListener::bind(("127.0.0.1", port))
+        .expect("selected port should accept DNS TCP");
+    let _udp = UdpSocket::bind(("127.0.0.1", port))
+        .expect("selected port should accept DNS UDP");
 }
 
 #[tokio::test(flavor = "current_thread")]
