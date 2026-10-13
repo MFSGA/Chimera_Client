@@ -177,3 +177,11 @@
 - **本轮测试切片**：针对从网络读取的 VLESS 1-RTT TLS-shaped record header 新增独立长度/类型/版本验证测试，确认最小合法 ciphertext 17 字节、最大 16640 字节可接受，零长度、16、16641、65535、非 application-data、非 TLS 1.2 record 版本以及 4/6 字节畸形 header 全部拒绝。运行时编码/解码路径未修改，0-RTT 仍 fail-closed。
 - **本地验证**：默认 `proxy::vless::encryption_stream::tests` 6/6、all-features 6/6；严格 `cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check` 通过。仅在 `/Users/adam/src/Chimera_Client` 的 `integration/vless-mihomo-next` 工作，继续保护用户未提交的 README/图片；PR #58 保持 Open/Draft。
 - **限制与后续**：磁盘剩余约 1.9GB，不清理用户文件或绕过安全检查。已确认本地仅有 Mihomo v1.19.31 gzip 归档而无可直接使用的 Mihomo 命令；此前解压执行受安全检查限制，故本轮**没有**宣称真实 Mihomo 端到端验收。待许可和资源满足后优先开展真实互操作、再推进完整 0-RTT ticket/PFS 生命周期及抗重放与回退。
+
+## 迭代 14：向现代主线合并并补齐加密流安全测试（2026-10-13）
+
+- **基线**：从 PR #58 的 `b86f2070ca15fa4c1daee09523b00f6554cd5945` 开始，在既有隔离工作区将本地已验证的 `1bb830e`（记录头边界）、`dc877a8`（1-RTT 服务端尾部认证）及 `505b81f`（读取错误后保持终止）依序 cherry-pick；未携带后续 README、Logo 和 `ref/` 子模块更新。整理后的三个等价提交为 `c5ebb0c`、`2db229e`、`5bd9850`。
+- **主线同步**：合并 `master` 的 `36921e8b192d29d5dd8e4d2403a6cbede27e7e3e`，仅 `clash-lib/src/proxy/utils/proxy_connector.rs` 出现内容冲突。该文件完整保留已在主线 CI 验证过的 loopback 代际检查、`requires_proxy_endpoint_generation_check` helper 和两项回归测试；PR 中等价的旧写法不覆盖它。合并提交为 `6c8dfa2`，相对该主线的净改动仅 17 个 VLESS/Reality 功能、互操作脚本与本文相关文件。
+- **合并后 macOS arm64 已执行**：`cargo fmt --all -- --check`、`git diff --check origin/master HEAD`、`cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings` 均通过；all-features VLESS converter 101/101、Reality 129/129、VLESS encryption/stream 38/38、VLESS transport contract 4/4、loopback 过滤器 3/3 通过。曾有一个错误添加 `--exact` 的过滤器实际执行 0 个测试，不纳入通过结果；随后去掉 `--exact` 真实重跑 3/3。三个新增/更新的 Xray 互操作脚本均通过 `bash -n` 语法检查。
+- **需要继续验证**：上述新整合提交的 GitHub 跨平台完整 CI、真实 Xray 与 Mihomo 服务端互操作、与后续 `master` 依赖/CI 变动的合并及独立安全审查，均不以历史测试结果替代。已验证的 Xray 26.3.27/26.9.30 互操作是历史集成分支上的结果，不是本次新 HEAD 的复测。`0rtt` 继续 fail-closed，不包含 ticket 生命周期/抗重放实现。
+- **范围控制**：本轮不增加额外的格式检查、修改 Dashboard、更新参考子模块或发布标签；未修改主工作区的 `master`，也没有为本轮新建重复备份/Worktree。PR #58 在完整验收前继续保持 Draft。
