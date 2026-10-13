@@ -203,7 +203,7 @@ impl TryFrom<HashMap<String, serde_yaml::Value>>
             && let Some(h) = h.as_mapping()
         {
             for (k, v) in h {
-                if let (Some(k), Some(v)) = (k.as_str(), v.as_str()) {
+                if let Some(v) = v.as_str() {
                     headers.insert(k.to_owned(), v.to_owned());
                 }
             }
@@ -409,8 +409,8 @@ mod tests {
         use crate::proxy::transport::V2RayOBFSOption;
 
         let mut headers = serde_yaml::Mapping::new();
-        headers.insert(Value::from("Origin"), Value::from("https://x"));
-        headers.insert(Value::from("User-Agent"), Value::from("v2ray/1.0"));
+        headers.insert("Origin", Value::from("https://x"));
+        headers.insert("User-Agent", Value::from("v2ray/1.0"));
 
         let mut opts = HashMap::new();
         opts.insert("mode".to_owned(), Value::from("websocket"));
