@@ -2188,6 +2188,60 @@ mod tests {
 
     #[cfg(feature = "vless-encryption")]
     #[test]
+    fn one_rtt_server_tail_rejects_tampering_and_wrong_nonce_order() {
+        let session = PreparedOneRttSession {
+            united_key: vec![0u8; 96],
+            write_aead_context: vec![0u8; PFS_PUBLIC_KEY_LEN],
+            read_aead_context: vec![0u8; SERVER_PFS_PUBLIC_KEY_LEN],
+            write_aead_key: [0x23u8; 32],
+            read_aead_key: [0x42u8; 32],
+        };
+        let mut server_aead =
+            EncryptionAead::new(&session.read_aead_key).expect("server AEAD");
+        let ticket = [0x55u8; 16];
+        let encrypted_ticket = server_aead.seal(&ticket).expect("ticket");
+        let encrypted_padding = server_aead
+            .seal(&encode_length(96).expect("padding length"))
+            .expect("padding length ciphertext");
+
+        let valid = session
+            .decrypt_server_tail(&encrypted_ticket, &encrypted_padding)
+            .expect("authenticated server tail");
+        assert_eq!(valid.ticket, ticket);
+        assert_eq!(valid.peer_padding_ciphertext_len, 96);
+
+        let mut corrupted_ticket = encrypted_ticket.clone();
+        corrupted_ticket[0] ^= 1;
+        assert!(
+            session
+                .decrypt_server_tail(&corrupted_ticket, &encrypted_padding)
+                .is_err()
+        );
+
+        let mut corrupted_padding = encrypted_padding;
+        *corrupted_padding.last_mut().expect("authentication tag") ^= 1;
+        assert!(
+            session
+                .decrypt_server_tail(&encrypted_ticket, &corrupted_padding)
+                .is_err()
+        );
+
+        // The padding field must use nonce 1, following the ticket's nonce 0.
+        // Authentic ciphertext encrypted with nonce 0 is not interchangeable.
+        let mut wrong_nonce_aead =
+            EncryptionAead::new(&session.read_aead_key).expect("fresh AEAD");
+        let wrong_nonce_padding = wrong_nonce_aead
+            .seal(&encode_length(96).expect("padding length"))
+            .expect("wrong-nonce padding");
+        assert!(
+            session
+                .decrypt_server_tail(&encrypted_ticket, &wrong_nonce_padding)
+                .is_err()
+        );
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    #[test]
     fn encryption_record_codec_matches_xray_header_and_aad() {
         let key = [0x31u8; 32];
         let mut writer =
