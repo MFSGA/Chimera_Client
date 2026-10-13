@@ -6,6 +6,9 @@ docs/*
 !docs/20260928-tun-dns-macos.md
 !docs/core-router-iteration-plan.md
 !docs/network-availability-iteration-plan.md
+!docs/ai-development-governance.md
+!docs/ai-review-checklist.md
+!docs/ref-alignment-guide.md
 start*.*
 release*.*
 
