@@ -91,6 +91,8 @@ cargo run -p clash-rs -- -t -c config.yaml
 cargo run -p clash-rs -- --version
 ```
 
+默认不启用兼容模式，也不会为未配置的 `mmdb` 下载 `Country.mmdb`。使用 `GEOIP` 规则或 DNS GeoIP fallback 时，请配置可用的 `mmdb` 文件。传入 `--compatibility` 会按兼容模式补齐 `Country.mmdb` 和 `geosite.dat`，缺少文件时可能触发下载。
+
 ## 局域网代理
 
 局域网代理需要同时显式开启访问权限并监听非回环地址：

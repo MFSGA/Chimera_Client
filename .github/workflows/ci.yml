@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   push:
     tags: ["v*"]
     branches: ["master"]
@@ -344,17 +345,14 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Merge binaries
-        uses: actions/upload-artifact/merge@v7
-        with:
-          name: binaries
-          pattern: "binary-*"
-          retention-days: 1
-
+      # Download each compile-job artifact directly. Creating a transient
+      # merged artifact and immediately downloading it has failed with
+      # "No artifacts found for ID" even after a successful merge step.
       - name: Download binaries
         uses: actions/download-artifact@v8
         with:
-          name: binaries
+          pattern: "binary-*"
+          merge-multiple: true
           path: ./packages
 
       - name: Create SHA256Sums.txt and version.txt

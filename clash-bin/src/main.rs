@@ -61,9 +61,10 @@ struct Cli {
     controller_ipc: Option<String>,
     #[clap(
         long,
-        value_parser,
         action = clap::ArgAction::Set,
-        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        default_value_t = false,
         help = "Enable compatibility mode, which make behaviors more consistent \
                 with mihomo but may cause some issues. It is recommended to enable \
                 this if you are using clash verge."
@@ -192,5 +193,31 @@ fn main() {
             eprintln!("Failed to start clash: {e}");
             exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::Parser;
+
+    #[test]
+    fn compatibility_is_opt_in_with_both_flag_forms() {
+        assert!(!Cli::try_parse_from(["clash-rs"]).unwrap().compatibility);
+        assert!(
+            Cli::try_parse_from(["clash-rs", "--compatibility"])
+                .unwrap()
+                .compatibility
+        );
+        assert!(
+            Cli::try_parse_from(["clash-rs", "--compatibility", "true"])
+                .unwrap()
+                .compatibility
+        );
+        assert!(
+            !Cli::try_parse_from(["clash-rs", "--compatibility", "false"])
+                .unwrap()
+                .compatibility
+        );
     }
 }

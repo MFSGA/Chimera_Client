@@ -3,7 +3,7 @@ use std::{
     fmt::{Display, Formatter},
 };
 
-use serde::{Deserialize, de::value::MapDeserializer};
+use serde::Deserialize;
 use serde_yaml::Value;
 
 use crate::{Error, common::utils::default_bool_true, config::utils};
@@ -91,7 +91,11 @@ impl TryFrom<HashMap<String, Value>> for OutboundProxyProtocol {
                 "missing field `name` in outbound proxy protocol".to_owned(),
             ))?
             .to_owned();
-        OutboundProxyProtocol::deserialize(MapDeserializer::new(mapping.into_iter()))
+        let mut yaml_mapping = serde_yaml::Mapping::new();
+        for (key, value) in mapping {
+            yaml_mapping.insert(Value::String(key), value);
+        }
+        serde_yaml::from_value(Value::Mapping(yaml_mapping))
             .map_err(map_serde_error(name))
     }
 }
@@ -780,6 +784,24 @@ pub enum Hysteria2Obfs {
 #[cfg(test)]
 mod tests {
     use super::{HealthCheck, HealthCheckProbe, OutboundProxyProtocol};
+    use std::collections::HashMap;
+
+    #[test]
+    fn yaml_compat_converts_dynamic_proxy_mapping() {
+        let fields = HashMap::from([
+            (
+                "type".to_owned(),
+                serde_yaml::Value::String("direct".to_owned()),
+            ),
+            (
+                "name".to_owned(),
+                serde_yaml::Value::String("yaml-compat-direct".to_owned()),
+            ),
+        ]);
+        let outbound = OutboundProxyProtocol::try_from(fields)
+            .expect("dynamic YAML mapping should deserialize");
+        assert_eq!(outbound.name(), "yaml-compat-direct");
+    }
 
     #[test]
     fn download_health_check_config_parses() {
