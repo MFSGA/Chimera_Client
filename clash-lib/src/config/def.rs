@@ -556,6 +556,32 @@ mod tests {
     use crate::config::internal::proxy::OutboundProxyProtocol;
 
     #[test]
+    fn yaml_compat_merges_aliases_without_overwriting_explicit_values() {
+        let yaml = r#"
+shared: &shared
+  type: direct
+  name: inherited
+proxy:
+  <<: *shared
+  name: override
+"#;
+        let mut value: serde_yaml::Value =
+            serde_yaml::from_str(yaml).expect("YAML aliases should parse");
+        value.apply_merge().expect("YAML merge keys should apply");
+        assert_eq!(value["proxy"]["name"].as_str(), Some("override"));
+        assert_eq!(value["proxy"]["type"].as_str(), Some("direct"));
+    }
+
+    #[test]
+    fn yaml_compat_preserves_leading_zero_strings() {
+        let value: serde_yaml::Value =
+            serde_yaml::from_str("id: 0123\nquoted: 'true'\n")
+                .expect("YAML scalars should parse");
+        assert_eq!(value["id"].as_str(), Some("0123"));
+        assert_eq!(value["quoted"].as_str(), Some("true"));
+    }
+
+    #[test]
     fn missing_mmdb_stays_disabled() {
         let cfg: Config = "port: 7890".parse().expect("config should parse");
 
