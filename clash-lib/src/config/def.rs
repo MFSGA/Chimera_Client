@@ -43,11 +43,6 @@ fn default_route_table_v6() -> u32 {
     DEFAULT_ROUTE_TABLE_V6
 }
 
-/// todo: will support only in gui
-fn default_country_mmdb() -> Option<String> {
-    Some("Country.mmdb".to_string())
-}
-
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum DnsHijack {
@@ -150,7 +145,7 @@ pub struct Config {
     /// 9 Profile settings
     pub profile: Profile,
     /// 10.1 Path to country mmdb file (GeoIP)
-    #[serde(default = "default_country_mmdb")]
+    #[serde(default)]
     pub mmdb: Option<String>,
     /// 10.2 Download URL for country mmdb file
     #[serde(rename = "mmdb-download-url")]
@@ -561,10 +556,10 @@ mod tests {
     use crate::config::internal::proxy::OutboundProxyProtocol;
 
     #[test]
-    fn missing_mmdb_defaults_to_country_mmdb() {
+    fn missing_mmdb_stays_disabled() {
         let cfg: Config = "port: 7890".parse().expect("config should parse");
 
-        assert_eq!(cfg.mmdb.as_deref(), Some("Country.mmdb"));
+        assert_eq!(cfg.mmdb, None);
     }
 
     #[test]
