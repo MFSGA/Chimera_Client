@@ -5,6 +5,7 @@ use std::{
 };
 
 use rand::RngExt;
+use tracing::warn;
 
 use crate::{
     config::internal::proxy::{Hysteria2Obfs, OutboundHysteria2},
@@ -84,6 +85,15 @@ impl TryFrom<OutboundHysteria2> for Handler {
     type Error = crate::Error;
 
     fn try_from(value: OutboundHysteria2) -> Result<Self, Self::Error> {
+        if value
+            .client_fingerprint
+            .as_deref()
+            .is_some_and(|v| !v.is_empty())
+        {
+            warn!(
+                "Hysteria2 client-fingerprint is accepted for Mihomo compatibility but TLS ClientHello impersonation is not implemented"
+            );
+        }
         let addr = if let Ok(ip) = value.server.parse::<IpAddr>() {
             SocksAddr::Ip(SocketAddr::new(ip, value.port))
         } else {
@@ -177,6 +187,7 @@ mod tests {
             port: 443,
             password: "secret".to_owned(),
             skip_cert_verify: true,
+            client_fingerprint: Some("chrome".to_owned()),
             ..Default::default()
         };
 

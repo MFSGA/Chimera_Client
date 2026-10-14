@@ -30,6 +30,14 @@ impl TryFrom<&OutboundTrojan> for Handler {
     type Error = crate::Error;
 
     fn try_from(s: &OutboundTrojan) -> Result<Self, Self::Error> {
+        if s.client_fingerprint
+            .as_deref()
+            .is_some_and(|v| !v.is_empty())
+        {
+            warn!(
+                "Trojan client-fingerprint is accepted for Mihomo compatibility but TLS ClientHello impersonation is not implemented"
+            );
+        }
         let skip_cert_verify = s.skip_cert_verify.unwrap_or_default();
         if skip_cert_verify {
             warn!(
@@ -167,6 +175,14 @@ sni: example.com
 "#
         ))
         .expect("Trojan test config should parse")
+    }
+
+    #[test]
+    fn trojan_chrome_hint_does_not_block_standard_tls() {
+        let config = parse("client-fingerprint: chrome");
+        assert_eq!(config.client_fingerprint.as_deref(), Some("chrome"));
+        Handler::try_from(&config)
+            .expect("Mihomo browser fingerprint hint should not stop Trojan");
     }
 
     #[test]
