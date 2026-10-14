@@ -18,7 +18,6 @@ use crate::{
         vless::{
             Handler, HandlerOptions,
             encryption::{
-                Appearance as VlessEncryptionAppearance,
                 Config as VlessEncryptionConfig, RttMode as VlessEncryptionRttMode,
             },
         },
@@ -115,12 +114,6 @@ fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
                         "invalid vless encryption config: {err}"
                     ))
                 })?;
-            if parsed.appearance != VlessEncryptionAppearance::Native {
-                return Err(Error::InvalidConfig(
-                    "VLESS encryption runtime MVP currently supports only native appearance; xorpub/random are TODO"
-                        .to_owned(),
-                ));
-            }
             if parsed.rtt != VlessEncryptionRttMode::OneRtt {
                 return Err(Error::InvalidConfig(
                     "VLESS encryption runtime MVP currently supports only 1rtt; 0rtt ticket reuse is TODO"
@@ -2153,28 +2146,32 @@ mod tests {
 
     #[cfg(feature = "vless-encryption")]
     #[test]
-    fn vless_accepts_native_one_rtt_encryption_runtime() {
+    fn vless_accepts_native_xorpub_and_random_one_rtt_encryption_runtime() {
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
         let key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
-        let outbound = OutboundVless {
-            common_opts: CommonConfigOptions {
-                name: "encrypted-vless".to_owned(),
-                server: "example.com".to_owned(),
-                port: 443,
-                connect_via: None,
-            },
-            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
-            encryption: Some(format!(
-                "mlkem768x25519plus.native.1rtt.100-200-300.{key}"
-            )),
-            ..Default::default()
-        };
+        for appearance in ["native", "xorpub", "random"] {
+            let outbound = OutboundVless {
+                common_opts: CommonConfigOptions {
+                    name: "encrypted-vless".to_owned(),
+                    server: "example.com".to_owned(),
+                    port: 443,
+                    connect_via: None,
+                },
+                uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+                encryption: Some(format!(
+                    "mlkem768x25519plus.{appearance}.1rtt.100-200-300.{key}"
+                )),
+                ..Default::default()
+            };
 
-        validate_vless_config(&outbound)
-            .expect("native 1rtt encryption runtime should validate");
-        crate::proxy::vless::Handler::try_from(&outbound)
-            .expect("native 1rtt encryption handler should build");
+            validate_vless_config(&outbound).unwrap_or_else(|err| {
+                panic!("{appearance} 1rtt should validate: {err}")
+            });
+            crate::proxy::vless::Handler::try_from(&outbound).unwrap_or_else(
+                |err| panic!("{appearance} 1rtt handler should build: {err}"),
+            );
+        }
     }
 
     #[cfg(not(feature = "vless-encryption"))]
@@ -2205,13 +2202,14 @@ mod tests {
     }
 
     #[test]
-    fn vless_encryption_mvp_rejects_zero_rtt_and_random() {
+    fn vless_encryption_mvp_rejects_zero_rtt() {
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
         let key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
         for (mode, expected) in [
             ("native.0rtt", "supports only 1rtt"),
-            ("random.1rtt", "supports only native appearance"),
+            ("xorpub.0rtt", "supports only 1rtt"),
+            ("random.0rtt", "supports only 1rtt"),
         ] {
             let outbound = OutboundVless {
                 common_opts: CommonConfigOptions {
@@ -2232,6 +2230,14 @@ mod tests {
             assert!(
                 err.to_string().contains(expected),
                 "unexpected error for {mode}: {err}"
+            );
+            // The actual handler conversion must also refuse 0-RTT rather
+            // than silently falling back to a 1-RTT-only stream.
+            let conversion_error = crate::proxy::vless::Handler::try_from(&outbound)
+                .expect_err("0-RTT handler construction must fail closed");
+            assert!(
+                conversion_error.to_string().contains(expected),
+                "unexpected handler error for {mode}: {conversion_error}"
             );
         }
     }

@@ -12,7 +12,7 @@ use tokio::{
 };
 
 use super::encryption::{
-    EncryptionRecordCodec, PreparedCrypto, PreparedOneRttSession,
+    EncryptionRecordCodec, PreparedCrypto, PreparedOneRttSession, xor_vless_ctr,
 };
 use crate::proxy::AnyStream;
 
@@ -152,6 +152,60 @@ struct PendingRecordWrite {
     user_len: usize,
 }
 
+// Xray random appearance runs AES-CTR only over the five unencrypted
+// TLS-shaped record header bytes. The counter MUST continue across records;
+// record bodies are untouched and AEAD authenticates the plaintext header.
+struct RecordHeaderMask {
+    united_key: Vec<u8>,
+    counter: [u8; 16],
+    keystream: [u8; 16],
+    next_byte: usize,
+    counter_exhausted: bool,
+}
+
+impl RecordHeaderMask {
+    fn new(united_key: &[u8], iv: [u8; 16]) -> Self {
+        Self {
+            united_key: united_key.to_vec(),
+            counter: iv,
+            keystream: [0; 16],
+            next_byte: 16,
+            counter_exhausted: false,
+        }
+    }
+
+    fn apply(&mut self, header: &mut [u8]) -> io::Result<()> {
+        if header.len() != RECORD_HEADER_LEN {
+            return Err(invalid("invalid VLESS random record header length"));
+        }
+        // Refuse an entire header before changing any bytes if it would need
+        // a counter block after the final 128-bit value. In particular, do
+        // not wrap to zero and repeat a keystream block under the same key.
+        if self.counter_exhausted
+            && self.keystream.len() - self.next_byte < header.len()
+        {
+            return Err(invalid("VLESS random header CTR counter exhausted"));
+        }
+        for byte in header {
+            if self.next_byte == self.keystream.len() {
+                self.keystream.fill(0);
+                xor_vless_ctr(&self.united_key, &self.counter, &mut self.keystream)?;
+                // Go cipher.NewCTR increments the full big-endian 128-bit IV.
+                // Retain the final counter value after overflow so the next
+                // block can never reuse the initial keystream.
+                match u128::from_be_bytes(self.counter).checked_add(1) {
+                    Some(next) => self.counter = next.to_be_bytes(),
+                    None => self.counter_exhausted = true,
+                }
+                self.next_byte = 0;
+            }
+            *byte ^= self.keystream[self.next_byte];
+            self.next_byte += 1;
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct EncryptionStream {
     inner: AnyStream,
     prepared: Option<PreparedCrypto>,
@@ -162,6 +216,8 @@ pub(crate) struct EncryptionStream {
     server_padding_len: PendingIo,
     write_codec: Option<EncryptionRecordCodec>,
     read_codec: Option<EncryptionRecordCodec>,
+    write_header_mask: Option<RecordHeaderMask>,
+    read_header_mask: Option<RecordHeaderMask>,
     peer_padding: Option<PendingIo>,
     handshake_done: bool,
     pending_write: Option<PendingRecordWrite>,
@@ -169,6 +225,8 @@ pub(crate) struct EncryptionStream {
     read_ciphertext: Option<PendingIo>,
     read_plaintext: Vec<u8>,
     read_plaintext_offset: usize,
+    // Authentication and framing failures permanently terminate the read side.
+    read_terminal_error: Option<(io::ErrorKind, String)>,
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -245,11 +303,6 @@ impl EncryptionStream {
         inner: AnyStream,
         prepared: PreparedCrypto,
     ) -> io::Result<Self> {
-        if prepared.xor_mode != 0 {
-            return Err(invalid(
-                "VLESS encryption runtime MVP currently supports only native appearance",
-            ));
-        }
         let hello = prepared.one_rtt_hello.as_ref().ok_or_else(|| {
             invalid("VLESS encryption runtime MVP currently supports only 1rtt")
         })?;
@@ -269,6 +322,8 @@ impl EncryptionStream {
             server_padding_len: PendingIo::with_len(ENCRYPTED_LENGTH_LEN),
             write_codec: None,
             read_codec: None,
+            write_header_mask: None,
+            read_header_mask: None,
             peer_padding: None,
             handshake_done: false,
             pending_write: None,
@@ -276,6 +331,7 @@ impl EncryptionStream {
             read_ciphertext: None,
             read_plaintext: Vec::new(),
             read_plaintext_offset: 0,
+            read_terminal_error: None,
         })
     }
 
@@ -339,6 +395,21 @@ impl EncryptionStream {
             &self.server_padding_len.data,
         )?;
         let (write_codec, read_codec) = session.record_codecs(&tail)?;
+        // Only records after the 1-RTT server padding are masked. The
+        // outbound CTR starts with the client hello IV; inbound uses the
+        // decrypted server ticket. The two streams never share a counter.
+        if self.prepared.as_ref().is_some_and(|p| p.xor_mode == 2) {
+            let iv = self
+                .prepared
+                .as_ref()
+                .expect("prepared crypto is present")
+                .nfs_relays
+                .iv;
+            self.write_header_mask =
+                Some(RecordHeaderMask::new(&session.united_key, iv));
+            self.read_header_mask =
+                Some(RecordHeaderMask::new(&session.united_key, tail.ticket));
+        }
 
         self.peer_padding =
             Some(PendingIo::with_len(tail.peer_padding_ciphertext_len));
@@ -426,6 +497,12 @@ impl AsyncWrite for EncryptionStream {
                 Ok(wire) => wire,
                 Err(err) => return Poll::Ready(Err(err)),
             };
+            let mut wire = wire;
+            if let Some(mask) = self.write_header_mask.as_mut()
+                && let Err(err) = mask.apply(&mut wire[..RECORD_HEADER_LEN])
+            {
+                return Poll::Ready(Err(err));
+            }
             self.pending_write = Some(PendingRecordWrite {
                 wire: PendingIo::from_data(wire),
                 user_len: count,
@@ -478,93 +555,112 @@ impl AsyncRead for EncryptionStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if buf.remaining() == 0 {
-            return Poll::Ready(Ok(()));
+        if let Some((kind, message)) = &self.read_terminal_error {
+            return Poll::Ready(Err(io::Error::new(*kind, message.clone())));
         }
 
-        match self.poll_handshake(cx) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-            Poll::Pending => return Poll::Pending,
-        }
-        match self.poll_peer_padding(cx) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-            Poll::Pending => return Poll::Pending,
-        }
+        let result = (|| {
+            if buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
 
-        if self.copy_plaintext(buf) {
-            return Poll::Ready(Ok(()));
-        }
-
-        while !self.read_header.complete() {
-            let this = self.as_mut().get_mut();
-            let offset = this.read_header.offset;
-            let inner = &mut this.inner;
-            let header = &mut this.read_header.data;
-            let mut read_buf = ReadBuf::new(&mut header[offset..]);
-            match Pin::new(&mut **inner).poll_read(cx, &mut read_buf) {
-                Poll::Ready(Ok(())) => {
-                    let n = read_buf.filled().len();
-                    if n == 0 {
-                        if offset == 0 {
-                            return Poll::Ready(Ok(()));
-                        }
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "unexpected EOF while reading VLESS encryption record header",
-                        )));
-                    }
-                    this.read_header.offset += n;
-                }
+            match self.poll_handshake(cx) {
+                Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
                 Poll::Pending => return Poll::Pending,
             }
-        }
+            match self.poll_peer_padding(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+            }
 
-        if self.read_ciphertext.is_none() {
-            let len = match decode_record_len(&self.read_header.data) {
-                Ok(len) => len,
+            if self.copy_plaintext(buf) {
+                return Poll::Ready(Ok(()));
+            }
+
+            while !self.read_header.complete() {
+                let this = self.as_mut().get_mut();
+                let offset = this.read_header.offset;
+                let inner = &mut this.inner;
+                let header = &mut this.read_header.data;
+                let mut read_buf = ReadBuf::new(&mut header[offset..]);
+                match Pin::new(&mut **inner).poll_read(cx, &mut read_buf) {
+                    Poll::Ready(Ok(())) => {
+                        let n = read_buf.filled().len();
+                        if n == 0 {
+                            if offset == 0 {
+                                return Poll::Ready(Ok(()));
+                            }
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "unexpected EOF while reading VLESS encryption record header",
+                            )));
+                        }
+                        this.read_header.offset += n;
+                    }
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+
+            if self.read_ciphertext.is_none() {
+                let this = self.as_mut().get_mut();
+                if let Some(mask) = this.read_header_mask.as_mut()
+                    && let Err(err) = mask.apply(&mut this.read_header.data)
+                {
+                    return Poll::Ready(Err(err));
+                }
+                let len = match decode_record_len(&self.read_header.data) {
+                    Ok(len) => len,
+                    Err(err) => return Poll::Ready(Err(err)),
+                };
+                self.read_ciphertext = Some(PendingIo::with_len(len));
+            }
+
+            let mut ciphertext =
+                self.read_ciphertext.take().expect("ciphertext exists");
+            match poll_read_pending(
+                &mut self.inner,
+                cx,
+                &mut ciphertext,
+                "unexpected EOF while reading VLESS encryption record body",
+            ) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => {
+                    self.read_ciphertext = Some(ciphertext);
+                    return Poll::Pending;
+                }
+            }
+
+            let mut record =
+                Vec::with_capacity(RECORD_HEADER_LEN + ciphertext.data.len());
+            record.extend_from_slice(&self.read_header.data);
+            record.extend_from_slice(&ciphertext.data);
+            self.read_header = PendingIo::with_len(RECORD_HEADER_LEN);
+
+            self.read_plaintext = match self
+                .read_codec
+                .as_mut()
+                .ok_or_else(|| {
+                    io::Error::other(
+                        "VLESS encryption read codec is not initialized",
+                    )
+                })
+                .and_then(|codec| codec.open_record(&record))
+            {
+                Ok(plaintext) => plaintext,
                 Err(err) => return Poll::Ready(Err(err)),
             };
-            self.read_ciphertext = Some(PendingIo::with_len(len));
+            self.read_plaintext_offset = 0;
+            self.copy_plaintext(buf);
+            Poll::Ready(Ok(()))
+        })();
+        if let Poll::Ready(Err(ref err)) = result {
+            self.read_terminal_error = Some((err.kind(), err.to_string()));
         }
-
-        let mut ciphertext = self.read_ciphertext.take().expect("ciphertext exists");
-        match poll_read_pending(
-            &mut self.inner,
-            cx,
-            &mut ciphertext,
-            "unexpected EOF while reading VLESS encryption record body",
-        ) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-            Poll::Pending => {
-                self.read_ciphertext = Some(ciphertext);
-                return Poll::Pending;
-            }
-        }
-
-        let mut record =
-            Vec::with_capacity(RECORD_HEADER_LEN + ciphertext.data.len());
-        record.extend_from_slice(&self.read_header.data);
-        record.extend_from_slice(&ciphertext.data);
-        self.read_header = PendingIo::with_len(RECORD_HEADER_LEN);
-
-        self.read_plaintext = match self
-            .read_codec
-            .as_mut()
-            .ok_or_else(|| {
-                io::Error::other("VLESS encryption read codec is not initialized")
-            })
-            .and_then(|codec| codec.open_record(&record))
-        {
-            Ok(plaintext) => plaintext,
-            Err(err) => return Poll::Ready(Err(err)),
-        };
-        self.read_plaintext_offset = 0;
-        self.copy_plaintext(buf);
-        Poll::Ready(Ok(()))
+        result
     }
 }
 
@@ -625,6 +721,128 @@ mod tests {
             writes: Arc::clone(&writes),
         };
         (Box::new(stream), writes)
+    }
+
+    fn handshaken_read_stream(
+        inner: AnyStream,
+        peer_padding_len: usize,
+    ) -> EncryptionStream {
+        EncryptionStream {
+            inner,
+            prepared: None,
+            session: None,
+            hello: PendingHelloWrite::new(Vec::new(), vec![0], Vec::new()).unwrap(),
+            server_pfs: PendingIo::with_len(SERVER_PFS_RESPONSE_LEN),
+            server_ticket: PendingIo::with_len(ENCRYPTED_TICKET_LEN),
+            server_padding_len: PendingIo::with_len(ENCRYPTED_LENGTH_LEN),
+            write_codec: None,
+            read_codec: None,
+            write_header_mask: None,
+            read_header_mask: None,
+            peer_padding: Some(PendingIo::with_len(peer_padding_len)),
+            handshake_done: true,
+            pending_write: None,
+            read_header: PendingIo::with_len(RECORD_HEADER_LEN),
+            read_ciphertext: None,
+            read_plaintext: Vec::new(),
+            read_plaintext_offset: 0,
+            read_terminal_error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_padding_partial_eof_remains_terminal_on_repeated_read() {
+        use tokio::io::AsyncWriteExt;
+
+        let (client, mut server) = tokio::io::duplex(64);
+        server.write_all(&[0x42]).await.unwrap();
+        drop(server);
+        let mut stream = handshaken_read_stream(Box::new(client), 2);
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let mut output = [0u8; 8];
+        for attempt in 0..2 {
+            let mut buf = ReadBuf::new(&mut output);
+            let result = Pin::new(&mut stream).poll_read(&mut cx, &mut buf);
+            let Poll::Ready(Err(err)) = result else {
+                panic!("read {attempt} must fail after truncated peer padding");
+            };
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+            assert!(buf.filled().is_empty());
+        }
+    }
+
+    #[test]
+    fn encrypted_record_header_rejects_invalid_type_version_and_lengths() {
+        for len in [17u16, MAX_RECORD_CIPHERTEXT_LEN as u16] {
+            let mut header = [23, 3, 3, 0, 0];
+            header[3..].copy_from_slice(&len.to_be_bytes());
+            assert_eq!(decode_record_len(&header).unwrap(), usize::from(len));
+        }
+
+        for len in [0u16, 16, (MAX_RECORD_CIPHERTEXT_LEN + 1) as u16, u16::MAX] {
+            let mut header = [23, 3, 3, 0, 0];
+            header[3..].copy_from_slice(&len.to_be_bytes());
+            assert!(decode_record_len(&header).is_err(), "accepted length {len}");
+        }
+
+        for header in [[22, 3, 3, 0, 17], [23, 3, 2, 0, 17], [23, 2, 3, 0, 17]] {
+            assert!(decode_record_len(&header).is_err(), "accepted {header:?}");
+        }
+        assert!(decode_record_len(&[23, 3, 3, 0]).is_err());
+        assert!(decode_record_len(&[23, 3, 3, 0, 17, 0]).is_err());
+    }
+
+    #[test]
+    fn random_header_mask_rejects_ctr_wrap_without_partial_header_mutation() {
+        let key = [0x5au8; 64];
+        let initial_counter = u128::MAX.to_be_bytes();
+        let mut mask = RecordHeaderMask::new(&key, initial_counter);
+
+        // The final counter block is still legal, including across multiple
+        // five-byte headers. Compare against the independent CTR helper.
+        let mut expected = [0u8; 16];
+        xor_vless_ctr(&key, &initial_counter, &mut expected).unwrap();
+        for chunk in expected.as_chunks::<5>().0.iter().take(3) {
+            let mut header = [0u8; RECORD_HEADER_LEN];
+            mask.apply(&mut header).unwrap();
+            assert_eq!(&header, chunk);
+        }
+        assert_eq!(mask.counter, initial_counter);
+        assert!(mask.counter_exhausted);
+        assert_eq!(mask.next_byte, 15);
+
+        // Only one byte remains in the last block; a complete header must
+        // fail atomically, and retries must never wrap to the first block.
+        for _ in 0..2 {
+            let mut header = [0x42u8; RECORD_HEADER_LEN];
+            let err = mask.apply(&mut header).unwrap_err();
+            assert!(err.to_string().contains("CTR counter exhausted"));
+            assert_eq!(header, [0x42; RECORD_HEADER_LEN]);
+            assert_eq!(mask.counter, initial_counter);
+            assert_eq!(mask.next_byte, 15);
+        }
+    }
+
+    #[test]
+    fn random_header_mask_preserves_final_two_ctr_blocks() {
+        let key = [0x63u8; 64];
+        let initial_counter = (u128::MAX - 1).to_be_bytes();
+        let mut mask = RecordHeaderMask::new(&key, initial_counter);
+        let mut expected = [0u8; 30];
+        xor_vless_ctr(&key, &initial_counter, &mut expected).unwrap();
+
+        let mut actual = [0u8; 30];
+        for header in actual.as_chunks_mut::<RECORD_HEADER_LEN>().0 {
+            mask.apply(header).unwrap();
+        }
+        assert_eq!(actual, expected);
+        assert!(mask.counter_exhausted);
+        assert_eq!(mask.next_byte, 14);
+        assert_eq!(mask.counter, u128::MAX.to_be_bytes());
+
+        let mut header = [0x7fu8; RECORD_HEADER_LEN];
+        assert!(mask.apply(&mut header).is_err());
+        assert_eq!(header, [0x7f; RECORD_HEADER_LEN]);
     }
 
     #[test]
