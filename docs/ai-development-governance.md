@@ -82,8 +82,9 @@
 1. **默认要求每个待合入提交为 GitHub `Verified`**。检查本次 PR 引入的全部 commit，以及 squash/rebase 后的新 SHA；以 GitHub commit API 的 `verification.verified == true` / Commit 页面 **Verified** 徽标为准。提交邮箱匹配、Commit Email Check 通过、作者字段为 `MFSGA` 均**不能**代替密码学签名校验。本地 `git log --show-signature` 可辅助诊断，但本机信任链与 GitHub 徽标可能不同。
 2. 签名未验证（包括 `unsigned`、`unverified`、签名失败和 GitHub 暂不可查询）的提交**默认阻断合并和发布**；编码 Agent 应列出完整 SHA、GitHub 验证结果/原因和受影响 PR，先优先建议使用已配置的 GPG/SSH/S/MIME 签名修复，并确保修复后新 SHA 重跑必要检查。
 3. 若确需保留未 Verified 的提交，必须先交由**仓库所有者本人**审核。由其使用可核实的 GitHub 身份在对应 PR 留下 `Unverified commit exception: <SHA 列表>`、原因、审查范围、接受的风险和明确的 `approve` 决定；审查对象改动或 SHA 改变时批准失效。**AI 不得自行批准、代发所有者批准或以自评取代审核。**在无法确认所有者决定时一律保留待审核状态。此例外不能覆盖 GitHub 自身强制签名 Ruleset。
-4. 合并前对 PR 所有待进入目标分支的 SHA 重新核查签名；GitHub Squash and merge 生成的合并后最终 SHA 要再检查。若最终提交意外未 Verified，立刻标记阻断后续发布，交由所有者审查或重新签名处理，不得将其默认为通过。
-5. 本节是**仓库行为规范**；仅修改文字不会自动创建 GitHub Required Check / Ruleset 或自动执行签名审核。自动化执行需要另立 L3 任务并验证权限、异常审批与真实 GitHub 状态。
+4. **最简执行路径**：当前开发环境已经使用 `commit.gpgsign=true` 自动为本地提交签名；每个 PR 的新提交先确认 GitHub Verified。优先通过 GitHub 网页 **Squash and merge**，然后**再次确认 `master` 上生成的新 SHA 是 Verified**（Squash 不保留原提交的 SHA/签名）；不要使用 GitHub 原生 **Rebase and merge**，它会重新创建提交且可能产生 unsigned。无需独立的 Fast-forward 脚本或额外签名检查工作流。
+5. **真正的自动阻断仅需一项 GitHub 设置**：仓库管理员在 `Settings → Rules → Rulesets` 新建针对 `master` 的 Active branch ruleset，勾选 **Require signed commits**，不要配置宽泛的签名绕过。此设置要求进入 `master` 的**新提交**通过 GitHub 签名验证，而不会给既有未签名历史补签。若当前 Dependabot 自动 Rebase 或 `release.yml` 生成无签名 commit，启用后它们可能被 GitHub 拒绝；应另行修复相应发布/自动化路径，不应为让它们通过而关闭签名门禁。
+6. 若最终提交意外未 Verified，停止发布并交所有者审核；不自动改写已发布的 `master`。**本节只是规范文本，不会自动创建或激活 GitHub Ruleset**。管理员必须在 GitHub 界面确认规则真实 Active，不能把这里的要求称为平台已经强制。
 
 ## 8. 同一问题多次修复：验证后再压缩提交
 

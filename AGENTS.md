@@ -286,7 +286,7 @@ cargo watch -x 'run -p clash-rs -- -c config.yaml'
 - **一个问题的修复完成后整理历史**：允许先做多个调试/CI 修复 commit。最终问题经相关测试和必要检查确认解决后，在自有的未合并任务分支本地 squash/fixup 同一问题的提交，保留审查/失败证据，不能混入其他作者或 Issue 的提交；改写前备份并核对 base 和远端旧 SHA，改写后验证最终 diff。新 SHA 必须重新跑 required checks，不能继承旧 SHA 的 CI。
 - **Git 历史与远端写入必须授权**：未经本次明确授权，不推送、不创建 PR/合并/tag、不改写 `master` / 共享历史；自有非保护任务分支若确需覆盖，经授权和协作者核对后使用限定旧 SHA 的 `--force-with-lease`，禁止裸 `--force`。用户明确要求对共享历史做特殊处理也须先核对保护规则、备份、其他协作者和 release 影响。
 - **L2 审查与所有者豁免**：独立 Reviewer 为默认推荐；编码 Agent 不能自称独立 Reviewer。仓库所有者（非任意 PR 作者）可对具体 PR 最终 SHA 明确放行独立审查、真实 Xray/Mihomo 等非必需互操作或非 required 测试缺口；必须由其本人在 PR 留下可核对的批准、豁免项、风险和回滚说明。不得冒充所有者授权，也不得绕过 GitHub required checks；更改 SHA 必须重新确认。L3 仍按严格审批执行。
-- **Verified 提交门禁**：在合入、发布前检查本次引入的每个 commit 的 GitHub `verification.verified`。必须优先使用 **Verified** 的签名提交；Commit Email Check 成功不等于 Verified。任何 `unverified`/`unsigned`/无法确认的 SHA 都必须先交由仓库所有者审核，并由其在 PR 对具体 SHA 留下明确签名例外批准；否则不得自动合并或发布。新 SHA 重新验证，合并后的最终提交也要检查；已有 GitHub 签名保护规则不可用文档豁免绕过。**AI 不得代替所有者批准例外。**
+- **简单 Verified 规则**：作者使用已经配置好的 GPG/SSH/S/MIME **自动签名**提交（可用 `git config commit.gpgsign true`），合并前检查 PR 新提交，合并后检查 `master` 最新 SHA 的 GitHub `verification.verified == true`。推荐在 GitHub 网页使用 **Squash and merge** 并核实新 SHA；**不使用 GitHub 原生 Rebase and merge**（可能生成 unsigned 新 SHA），不需要自建 FF 合并脚本。仓库管理员应为 `master` 启用 GitHub Ruleset **Require signed commits** 才能在平台阻止未签名新提交；启用前只是人工约束。`Commit Email Check` 不等于签名；任何签名例外仍须所有者本人批准，不能绕过平台规则，AI 不代签或代批。
 - **真实工作流边界**：`.github/workflows/ci.yml` 具有 Dashboard、跨平台 Rust quality、compile 和 `latest` 预发布路径；Windows 网络、吞吐、coverage 与 Dependabot auto-merge 有各自条件。普通 Codex 任务不继承 Dependabot/发行凭据，未配置的 AI 自动审查/Ruleset 不能宣称存在。
 - **复盘**：仅把已查明根因、有可复现证据的事故加入 `LESSONS.md`；不在复盘、日志、PR 或上传文件中暴露完整代理订阅、用户配置和 Secrets。
 
