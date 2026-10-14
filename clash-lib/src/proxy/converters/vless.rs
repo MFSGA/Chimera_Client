@@ -78,6 +78,24 @@ impl TryFrom<&OutboundVless> for Handler {
 
         let transport = build_transport(network, s)?;
 
+        // Do not send native VLESS UDP packets to an XUDP-only endpoint.
+        // TCP remains available while XUDP encoding is not implemented.
+        let udp = if s.packet_encoding.as_deref() == Some("xudp") {
+            if s.udp.unwrap_or(true) {
+                warn!(
+                    "VLESS packet-encoding: xudp is not implemented; disabling UDP for this endpoint while preserving TCP"
+                );
+            }
+            false
+        } else {
+            s.udp.unwrap_or(true)
+        };
+        if s.smux.as_ref().and_then(|smux| smux.enabled) == Some(true) {
+            warn!(
+                "VLESS smux.enabled is accepted for compatibility but multiplexing is not implemented"
+            );
+        }
+
         Ok(Handler::new(HandlerOptions {
             name: s.common_opts.name.to_owned(),
             common_opts: HandlerCommonOptions {
@@ -87,7 +105,7 @@ impl TryFrom<&OutboundVless> for Handler {
             server,
             port,
             uuid: s.uuid.clone(),
-            udp: s.udp.unwrap_or(true),
+            udp,
             transport,
             tls: build_tls_transport(network, s, skip_cert_verify)?,
             flow: s.flow.clone(),
@@ -97,6 +115,14 @@ impl TryFrom<&OutboundVless> for Handler {
 }
 
 fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
+    if let Some(encoding) = s.packet_encoding.as_deref()
+        && !matches!(encoding, "xudp" | "none" | "")
+    {
+        return Err(Error::InvalidConfig(format!(
+            "unsupported vless packet-encoding: {encoding}"
+        )));
+    }
+
     match s.flow.as_deref() {
         None | Some("") | Some("xtls-rprx-vision") => {}
         Some(flow) => {
@@ -227,9 +253,10 @@ fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
     Ok(())
 }
 
-/// Reject unsupported ClientHello impersonation instead of accepting a
-/// configuration that will have no effect on the wire. `None` for `reality`
-/// defers the security decision to explicit XHTTP upload-settings.
+/// Accept the common Mihomo `chrome` hint for non-Reality TLS without
+/// pretending to impersonate Chrome; warn explicitly about the no-op.
+/// Unsupported fingerprint values and Reality downgrades remain fail-closed.
+/// `None` for `reality` defers the decision to XHTTP endpoint settings.
 fn validate_vless_client_fingerprint(
     fingerprint: Option<&str>,
     reality: Option<bool>,
@@ -237,16 +264,19 @@ fn validate_vless_client_fingerprint(
 ) -> Result<(), Error> {
     let supported = matches!(
         (fingerprint, reality),
-        (None, _)
-            | (Some("chrome"), Some(true) | None)
-            | (Some("none"), Some(false) | None)
+        (None, _) | (Some("chrome"), _) | (Some("none"), Some(false) | None)
     );
     if let Some(fingerprint) = fingerprint
         && !supported
     {
         return Err(Error::InvalidConfig(format!(
-            "{context} client-fingerprint '{fingerprint}' is unsupported: Reality requires chrome, non-Reality permits only none"
+            "{context} client-fingerprint '{fingerprint}' is unsupported: Reality requires chrome; non-Reality accepts chrome (compatibility only) or none"
         )));
+    }
+    if fingerprint == Some("chrome") && reality == Some(false) {
+        warn!(
+            "{context} client-fingerprint: chrome is a compatibility-only hint for non-Reality TLS; Chrome ClientHello impersonation is not implemented"
+        );
     }
     Ok(())
 }
@@ -2080,6 +2110,60 @@ mod tests {
             err.to_string().contains("client-fingerprint 'firefox'"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn vless_non_reality_accepts_chrome_fingerprint_as_compatibility_hint() {
+        let outbound = OutboundVless {
+            tls: Some(true),
+            client_fingerprint: Some("chrome".to_owned()),
+            ..Default::default()
+        };
+        validate_vless_config(&outbound)
+            .expect("Mihomo Chrome hint must not prevent standard TLS startup");
+    }
+
+    #[tokio::test]
+    async fn vless_xudp_keeps_tcp_but_disables_unsupported_udp() {
+        use crate::proxy::OutboundHandler;
+
+        let outbound: OutboundVless = serde_yaml::from_str(
+            r#"
+name: test-xudp
+server: example.invalid
+port: 443
+uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+packet-encoding: xudp
+smux:
+  enabled: false
+udp: true
+"#,
+        )
+        .expect("common Mihomo fields should deserialize");
+        assert_eq!(outbound.packet_encoding.as_deref(), Some("xudp"));
+        assert_eq!(
+            outbound.smux.as_ref().and_then(|smux| smux.enabled),
+            Some(false)
+        );
+        validate_vless_config(&outbound)
+            .expect("xudp should not block TCP configuration");
+        let handler: crate::proxy::vless::Handler = (&outbound)
+            .try_into()
+            .expect("xudp should preserve VLESS TCP handler");
+        assert!(
+            !handler.support_udp().await,
+            "XUDP must not be sent as native UDP"
+        );
+    }
+
+    #[test]
+    fn vless_rejects_unrecognized_packet_encoding() {
+        let outbound = OutboundVless {
+            packet_encoding: Some("unknown-wire".to_owned()),
+            ..Default::default()
+        };
+        validate_vless_config(&outbound)
+            .expect_err("unknown UDP framing must not silently downgrade");
     }
 
     #[test]
@@ -4534,7 +4618,7 @@ mod tests {
 
     #[cfg(feature = "reality")]
     #[test]
-    fn vless_xhttp_download_tls_requires_fingerprint_override_when_reality_is_cleared()
+    fn vless_xhttp_download_tls_accepts_inherited_chrome_hint_when_reality_is_cleared()
      {
         let outbound = OutboundVless {
             common_opts: CommonConfigOptions {
@@ -4573,21 +4657,19 @@ mod tests {
             .expect("xhttp options should be present");
         let metadata =
             build_xhttp_metadata_config(xhttp_opts).expect("metadata should build");
-        let err = match build_xhttp_download_config(
+        let download = build_xhttp_download_config(
             &outbound,
             xhttp_opts,
             &metadata,
             XhttpHttpVersion::Http2,
-        ) {
-            Ok(_) => {
-                panic!("non-Reality TLS must reject inherited Chrome fingerprint")
-            }
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string().contains("client-fingerprint 'chrome'"),
-            "unexpected error: {err}"
-        );
+        )
+        .expect("non-Reality TLS may accept inherited Chrome compatibility hint")
+        .expect("download config should be present");
+        assert!(matches!(
+            download.security,
+            crate::proxy::transport::XhttpSecurity::Tls
+        ));
+        assert!(download.reality.is_none());
     }
 
     #[test]
