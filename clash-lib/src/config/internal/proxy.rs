@@ -473,12 +473,23 @@ pub struct XhttpOpt {
     pub session_ttl: Option<u64>,
 }
 
+/// Mihomo smux compatibility placeholder; no stream multiplexing is enabled.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct SmuxCompat {
+    pub enabled: Option<bool>,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct OutboundVless {
     #[serde(flatten)]
     pub common_opts: CommonConfigOptions,
     pub uuid: String,
+    /// Mihomo packet-encoding compatibility. The XUDP wire format is not yet implemented.
+    pub packet_encoding: Option<String>,
+    /// Mihomo stream multiplexing settings. Parsed but not applied at runtime.
+    pub smux: Option<SmuxCompat>,
     /// VLESS native encryption client configuration.
     pub encryption: Option<String>,
     pub udp: Option<bool>,
@@ -731,6 +742,8 @@ pub struct OutboundTrojan {
     pub skip_cert_verify: Option<bool>,
     pub udp: Option<bool>,
     pub network: Option<String>,
+    /// Accepted for Mihomo compatibility; ClientHello impersonation is not implemented.
+    pub client_fingerprint: Option<String>,
     pub grpc_opts: Option<GrpcOpt>,
     #[cfg(feature = "ws")]
     pub ws_opts: Option<WsOpt>,
@@ -769,6 +782,8 @@ pub struct OutboundHysteria2 {
     pub ca: Option<String>,
     pub ca_str: Option<String>,
     pub fingerprint: Option<String>,
+    /// Accepted for Mihomo compatibility; ClientHello impersonation is not implemented.
+    pub client_fingerprint: Option<String>,
     pub udp_mtu: Option<u32>,
     pub disable_mtu_discovery: Option<bool>,
     pub cwnd: Option<u64>,
