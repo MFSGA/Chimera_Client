@@ -24,6 +24,9 @@
 - 可用独立 Xray 及 Mihomo 二进制、隔离本机回环环境时，手动执行 `clash-lib/tests/reality_hybrid_xray_interop.sh` 和 `clash-lib/tests/reality_hybrid_mihomo_interop.py`；脚本存在及语法检查**不等于**实际互操作通过。禁止使用真实用户代理凭据或生产配置。
 - 必需 CI 成功、独立 **L2 协议/密码学安全审查**及维护者批准，缺一不得合并；禁止删除/降低测试或质量门禁。
 
-## 本轮环境限制
+## 本轮实际验证与环境限制
 
-- 初始编码工作区磁盘仅剩约 800 MB；同步最新 `master` 时约有 8 GB 余量，是否能运行较大 Cargo 构建需再次核对磁盘空间。不能清理其它工作区或用户已有的约 73 GB 编译缓存；未执行的测试或真实互操作必须如实记为 `not run`。
+- 在同步 PR #63 已合并的 `master` 后，于 macOS arm64 执行 `cargo test -p clash-lib --lib --locked reality -- --test-threads=1`：**149 passed，0 failed，0 ignored**，包括 Reality Hybrid 配置/密钥交换回归。
+- `cargo fmt --all -- --check`、`git diff --check` 均通过。Xray Shell 与 Mihomo Python 测试脚本此前仅做语法检查，**未进行实际服务端互操作**。
+- 尚未在本轮运行 `--all-features` 测试、完整严格 Clippy 和真实 Xray/Mihomo 互操作，也未取得独立 L2 密码学审查与维护者批准；CI 只认可最终提交对应的检查。
+- 初始编码工作区磁盘仅剩约 800 MB，同步最新 `master` 前约 8 GB，本地默认 Reality 单元测试后约 5 GB。不能清理其它工作区或用户已有的约 73 GB 编译缓存；未执行的验证必须如实保留为 `not run`。
