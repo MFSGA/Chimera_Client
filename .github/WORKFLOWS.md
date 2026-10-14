@@ -35,7 +35,7 @@
 - 完成相关本地测试，记录实际命令、平台、运行数量、失败/ignored、最后成功日志或摘要。
 - 只有**得到授权**才能 push、创建 PR、触发手工 release/CI 或系统测试。触发后记录本次 SHA、PR、run URL、`pending/pass/fail/skipped/not run`。
 - 远端 CI 执行时不要长时间反复轮询或原地等待；继续已授权、相互独立的审查/文档/本地检查。没有其他独立工作时如实交接 pending，不虚构后台监控。
-- 合并、打 tag 或发布前，必须针对**当前最终 SHA**核对 required checks、独立 Reviewer、维护者审批；旧 SHA 的绿色不能继承给改写后的提交。
+- 合并、打 tag 或发布前，必须针对**当前最终 SHA**核对 required checks、维护者审批及提交的 GitHub **Verified** 状态；L2 默认独立 Reviewer，但仓库所有者可以对具体 SHA 明确豁免独立审查或非强制验证。未 Verified 的 SHA 必须取得所有者单独审核批准或重签名；旧 SHA 的绿色、签名状态和豁免不能继承给改写后的提交。L3 仍需独立审查和明确批准。
 - CI 失败先诊断问题是否由扩大测试范围、前置环境、cross feature、Dashboard 等引起；不为变绿而禁用失败测试、改权限或删除审查门禁。
 
 ## 4. 同一 Issue 的提交整理与历史改写
