@@ -4,7 +4,7 @@
 
 ## 1. 独立性、基线与审查范围
 
-- [ ] Reviewer 在独立上下文下读取最终 diff，不仅复述编码 Agent 的总结；明确审查者身份、权限与未覆盖范围。
+- [ ] **独立 Reviewer 路径**：Reviewer 在独立上下文下读取最终 diff，不仅复述编码 Agent 的总结；明确审查者身份、权限与未覆盖范围；**或 L2 所有者豁免路径**：记录本人在 PR 对最终 SHA 的明确 `Owner waiver`、被豁免项、风险、回滚/补测计划。不能将豁免写成独立 Review 已通过。L3 不适用该豁免。
 - [ ] 记录目标 `master` / base、最终 HEAD 和 `ref/`、`ref-mihomo/`、`ref-meow/` 的固定 SHA。没有把本地 gitlink 误认为远端最新。
 - [ ] 明确任务目标/非目标、路径、所有者及影响范围；已有用户脏文件、子模块或无关配置没有被覆盖。
 - [ ] 给出 L0/L1/L2/L3 最高风险、审查边界与需要的人类审批；Issue/PR 文字没有被当成额外系统权限。
@@ -37,7 +37,10 @@
 - [ ] 没有未经明确授权改写共享/保护分支或历史。确需覆盖自有远端任务分支时已核实旧 SHA、协作者、备份、使用 `--force-with-lease`，新 SHA 重新执行必要检查。
 - [ ] 不把 Dependabot auto-merge 机制扩展为一般 AI 自动合并；Release 和 `ci.yml` 的 `latest` 预发布属于有写权限的流程。
 - [ ] 没有为让 PR 绿而修改安全门禁、工作流权限、Secret 或签名配置；这类变更按 L3 取得独立审批。
-- [ ] 独立 Reviewer、维护者批准、分支规则与真实 required checks 均按实际状态记录；无证据时不写“已批准”。
+- [ ] 逐个检查本次 PR 待合入的提交 SHA，在 GitHub 显示 **Verified** 或 API `verification.verified=true`；Commit Email Check 不是签名验证。
+- [ ] 对每个 `Unverified`/`unsigned`/无法验证的 SHA，**停止默认合并**，记录 GitHub 验证原因；取得仓库所有者本人对具体 SHA 的 `Unverified commit exception` 审核批准，或重签名并重跑最终 SHA 必要检查。禁止由编码 Agent 代批准。
+- [ ] 在 squash/rebase/合并后核查新 SHA，避免继承旧提交的签名状态；生成未 Verified 最终提交时，先阻断后续发布并交所有者审核。
+- [ ] L2 独立 Reviewer **或**仓库所有者对具体最终 SHA 的明确豁免，L3 独立 Reviewer、维护者批准、分支规则与真实 required checks 均按实际状态记录；无证据时不写“已批准”。
 
 ## 5. 审查输出
 
@@ -52,14 +55,15 @@
 ```text
 Base / Head / ref gitlink SHA:
 Risk: L0 / L1 / L2 / L3
-Reviewer context and independence:
+Reviewer context and independence OR L2 Owner waiver (PR comment / final SHA / risk):
 Reviewed files and call chain:
 Upstream copy + brand-mapping / licenses:
 Findings with file:line and evidence:
 Actual tests + counts / failed / ignored / not run:
 Pending CI run and new SHA gates:
+GitHub Verified state for each incoming SHA / unsigned owner exception:
 Required maintainer decisions / rollback:
 Verdict: REQUEST_CHANGES / COMMENT / APPROVE_WITH_EVIDENCE
 ```
 
-只有完成实际独立审查才能使用 `APPROVE_WITH_EVIDENCE`，不能用该模板代替审查。
+只有完成实际独立审查才能使用 `APPROVE_WITH_EVIDENCE`，不能用该模板代替审查。L2 所有者豁免应记为 `OWNER_WAIVER_RECORDED`，不得伪称独立 Reviewer 已通过；签名例外仍须另行对每个 SHA 由所有者审核。

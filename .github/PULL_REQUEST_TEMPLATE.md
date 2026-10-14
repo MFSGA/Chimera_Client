@@ -2,7 +2,7 @@
 First of all, thank you for your contribution! 😄
 For requesting to pull a new feature or bugfix, please send it from a feature/bugfix branch based on the `master` branch.
 Before submitting your pull request, please make sure the checklist below is confirmed.
-Your pull requests will be merged after one of the collaborators approve.
+Your pull requests follow the current repository governance: L2 may use a recorded owner waiver; required checks and commit verification still apply.
 Thank you!
 -->
 
@@ -54,6 +54,7 @@ Describe changes from the user side, and list all potential break changes or oth
 
 - 任务目标与非目标；关联 Issue：
 - Risk（取最高级别）：L0 / L1 / L2 / L3；风险原因及维护者批准：
+- L2 审查路径：独立 Reviewer / 仓库所有者明确豁免（`Owner waiver` 评论链接、最终 SHA、豁免项、剩余风险、回滚与补测）；L3 不适用豁免：
 - 目标 `master` / 当前任务分支 / `origin/master` SHA；原有用户未提交改动如何保护：
 - `ref/`、`ref-mihomo/`、`ref-meow/` gitlink SHA 和实际参考文件：
 - 上游 → Chimera Client 路径/符号与调用链；需要保留的本地扩展和旧配置/协议/API 兼容：
@@ -79,11 +80,18 @@ Describe changes from the user side, and list all potential break changes or oth
 - 同一问题多个临时提交（如适用）：旧 SHA、最终 squash/fixup 与完整 diff/署名核验：
 - 覆盖远端任务分支的明确授权、旧/新 SHA、备份及 `--force-with-lease` 记录（如适用）：
 - **新 SHA 的 CI/Reviewer/人工审批状态**；旧 SHA 的通过记录不可继承：
-- [ ] 在全部必要检查、独立审查、维护者审批完成前不合并或发布
+- [ ] 在 GitHub required checks、Verified 提交审查及维护者审批完成前不合并或发布；L2 独立审查或非强制验证若缺失，必须有针对最终 SHA 的所有者书面豁免
+
+### ✅ GitHub commit signature verification
+
+- PR 本次引入的全部 SHA 及 GitHub `Verified` 状态 / `verification.reason`：
+- `Commit Email Check` **不等于**签名 Verified；未验证 SHA 列表及其阻断状态：
+- 若存在未验证提交：所有者本人针对具体 SHA 的 `Unverified commit exception` 评论、审核理由与风险接受（无则不得合并）：
+- squash/rebase/合并后新 SHA 的签名复核及发布前确认：
 
 ### 🔒 Security, rollback and independent review
 
 - 真实用户配置/订阅/凭据/个人信息是否脱敏；网络、系统代理、DNS、TUN、NIC 的真实权限与隔离：
 - 回滚/恢复方案，是否涉及 `ci.yml` 在 `master` 上的 `latest` 预发布：
-- Reviewer 身份及独立上下文、审查发现（含 `file:line`）和最终决定：
+- 独立 Reviewer 身份及上下文和审查发现（含 `file:line`），或 L2 所有者豁免的可核查记录和最终决定：
 - 未运行的测试、未覆盖平台与剩余风险：
