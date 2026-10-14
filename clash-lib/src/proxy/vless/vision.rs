@@ -560,15 +560,21 @@ mod tests {
         vs.write_all(payload).await.unwrap();
         vs.flush().await.unwrap();
 
-        let mut received = vec![0u8; 65536];
-        let n = server.read(&mut received).await.unwrap();
-        let received = &received[..n];
+        let mut header = [0u8; 21];
+        server.read_exact(&mut header).await.unwrap();
 
-        assert_eq!(&received[..16], &TEST_UUID);
-        let (cmd, content, padding_len, _) = parse_frame(received, 16);
-        assert_eq!(cmd, CMD_PADDING_END);
-        assert_eq!(content, payload);
-        assert!(padding_len > 0);
+        assert_eq!(&header[..16], &TEST_UUID);
+        assert_eq!(header[16], CMD_PADDING_END);
+        let content_len = u16::from_be_bytes([header[17], header[18]]) as usize;
+        let padding_len = u16::from_be_bytes([header[19], header[20]]) as usize;
+        assert_eq!(content_len, payload.len());
+        // Non-TLS short padding is randomly chosen from 0..256; zero is valid.
+        assert!(padding_len < 256);
+
+        let mut frame_body = vec![0u8; content_len + padding_len];
+        server.read_exact(&mut frame_body).await.unwrap();
+        assert_eq!(&frame_body[..content_len], payload);
+        assert_eq!(vs.write_mode, WriteMode::DirectTls);
     }
 
     #[tokio::test]
