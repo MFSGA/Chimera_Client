@@ -1123,7 +1123,8 @@ fn build_reality_transport_from_opts(
         server_name,
         Vec::new(),
         alpn_protocols.unwrap_or_default(),
-    ))
+    )
+    .with_x25519mlkem768(reality_opts.support_x25519mlkem768))
 }
 
 fn build_xhttp_reality_config(
@@ -1153,6 +1154,7 @@ fn build_xhttp_reality_config(
             alpn_protocols: alpn_protocols
                 .map(ToOwned::to_owned)
                 .unwrap_or_else(|| vec!["h2".to_owned()]),
+            support_x25519mlkem768: reality_opts.support_x25519mlkem768,
         }))
     }
     #[cfg(not(feature = "reality"))]
@@ -1943,6 +1945,37 @@ mod tests {
 
     #[cfg(feature = "reality")]
     #[test]
+    fn reality_hybrid_config_requires_explicit_opt_in() {
+        let default_yaml = format!("public-key: {TEST_REALITY_PUBLIC_KEY}\n");
+        let default_opts: OutboundTrojanRealityOpts =
+            serde_yaml::from_str(&default_yaml).unwrap();
+        assert!(!default_opts.support_x25519mlkem768);
+        let default_transport = super::build_reality_transport_from_opts(
+            &default_opts,
+            "example.com".to_owned(),
+            None,
+        )
+        .unwrap();
+        assert!(!default_transport.offers_x25519mlkem768());
+
+        for key in ["support-x25519mlkem768", "supportX25519MLKEM768"] {
+            let hybrid_yaml =
+                format!("public-key: {TEST_REALITY_PUBLIC_KEY}\n{key}: true\n");
+            let hybrid_opts: OutboundTrojanRealityOpts =
+                serde_yaml::from_str(&hybrid_yaml).unwrap();
+            assert!(hybrid_opts.support_x25519mlkem768);
+            let hybrid_transport = super::build_reality_transport_from_opts(
+                &hybrid_opts,
+                "example.com".to_owned(),
+                None,
+            )
+            .unwrap();
+            assert!(hybrid_transport.offers_x25519mlkem768());
+        }
+    }
+
+    #[cfg(feature = "reality")]
+    #[test]
     fn vless_reality_prefers_sni_for_server_name() {
         let outbound = OutboundVless {
             common_opts: CommonConfigOptions {
@@ -1957,6 +1990,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: Some("85144f63".to_owned()),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1980,6 +2014,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -2010,6 +2045,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -2063,6 +2099,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -2217,6 +2254,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -2380,6 +2418,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: Some("85144f63".to_owned()),
+                ..Default::default()
             }),
             xhttp_opts: Some(XhttpOpt {
                 mode: Some("packet-up".to_owned()),
@@ -2680,6 +2719,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: None,
+                ..Default::default()
             }),
             xhttp_opts: Some(XhttpOpt {
                 mode: Some("stream-one".to_owned()),
@@ -2825,6 +2865,7 @@ mod tests {
                 public_key: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
                     .to_owned(),
                 short_id: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -3174,6 +3215,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -4447,6 +4489,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: None,
+                ..Default::default()
             }),
             xhttp_opts: Some(XhttpOpt {
                 path: Some("/xhttp/".to_owned()),
@@ -4456,6 +4499,7 @@ mod tests {
                     reality_opts: Some(OutboundTrojanRealityOpts {
                         public_key: String::new(),
                         short_id: None,
+                        ..Default::default()
                     }),
                     ..Default::default()
                 }),
@@ -4506,6 +4550,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: None,
+                ..Default::default()
             }),
             xhttp_opts: Some(XhttpOpt {
                 download_settings: Some(XhttpDownloadSettings {
@@ -4513,6 +4558,7 @@ mod tests {
                     reality_opts: Some(OutboundTrojanRealityOpts {
                         public_key: String::new(),
                         short_id: None,
+                        ..Default::default()
                     }),
                     ..Default::default()
                 }),
@@ -4670,6 +4716,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -4711,6 +4758,7 @@ mod tests {
                     reality_opts: Some(OutboundTrojanRealityOpts {
                         public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                         short_id: None,
+                        support_x25519mlkem768: true,
                     }),
                     ..Default::default()
                 }),
@@ -4728,7 +4776,7 @@ mod tests {
             endpoint.security,
             crate::proxy::transport::XhttpSecurity::Reality
         ));
-        assert!(endpoint.reality.is_some());
+        assert!(endpoint.reality.as_ref().unwrap().support_x25519mlkem768);
 
         let outer_security =
             build_tls_transport(outbound.network.as_deref(), &outbound, false)
@@ -4774,6 +4822,7 @@ mod tests {
             reality_opts: Some(OutboundTrojanRealityOpts {
                 public_key: TEST_REALITY_PUBLIC_KEY.to_owned(),
                 short_id: None,
+                support_x25519mlkem768: true,
             }),
             ..Default::default()
         };
@@ -4799,13 +4848,9 @@ mod tests {
         )
         .expect("download config should build")
         .expect("download config should be present");
-        assert_eq!(
-            download
-                .reality
-                .expect("reality config should be present")
-                .alpn_protocols,
-            vec!["h2".to_owned()]
-        );
+        let reality = download.reality.expect("reality config should be present");
+        assert!(reality.support_x25519mlkem768);
+        assert_eq!(reality.alpn_protocols, vec!["h2".to_owned()]);
     }
 
     #[cfg(feature = "ws")]

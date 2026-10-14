@@ -20,6 +20,7 @@ mod reality_auth;
 mod reality_cipher_suite;
 mod reality_client_connection;
 mod reality_client_verify;
+mod reality_hybrid;
 mod reality_io_state;
 mod reality_reader_writer;
 mod reality_records;
@@ -46,6 +47,7 @@ pub struct Client {
     server_name: String,
     cipher_suites: Vec<CipherSuite>,
     alpn_protocols: Vec<String>,
+    support_x25519mlkem768: bool,
 }
 
 impl Client {
@@ -77,7 +79,21 @@ impl Client {
             server_name,
             cipher_suites,
             alpn_protocols,
+            support_x25519mlkem768: false,
         }
+    }
+
+    /// Opt in to X25519MLKEM768 for this REALITY transport.
+    /// Classic X25519 remains the default for older REALITY servers.
+    #[must_use]
+    pub fn with_x25519mlkem768(mut self, enabled: bool) -> Self {
+        self.support_x25519mlkem768 = enabled;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn offers_x25519mlkem768(&self) -> bool {
+        self.support_x25519mlkem768
     }
 
     pub async fn handshake_stream(
@@ -90,6 +106,7 @@ impl Client {
             server_name: self.server_name.clone(),
             cipher_suites: self.cipher_suites.clone(),
             alpn_protocols: self.alpn_protocols.clone(),
+            support_x25519mlkem768: self.support_x25519mlkem768,
         };
         let conn = reality_client_connection::RealityClientConnection::new(config)?;
         let mut connection = CryptoConnection::new_reality_client(conn);

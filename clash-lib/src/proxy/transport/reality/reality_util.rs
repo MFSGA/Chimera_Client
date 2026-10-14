@@ -5,9 +5,11 @@ use rand::Rng;
 use super::buf_reader::BufReader;
 use super::reality_cipher_suite::CipherSuite;
 
-const X25519_GROUP: u16 = 0x001d;
-const X25519_MLKEM768_GROUP: u16 = 0x11ec;
-const X25519_KEY_SHARE_LEN: usize = 32;
+pub(super) const X25519_GROUP: u16 = 0x001d;
+pub(super) const X25519_MLKEM768_GROUP: u16 = 0x11ec;
+pub(super) const X25519_KEY_SHARE_LEN: usize = 32;
+pub(super) const X25519_MLKEM768_CLIENT_KEY_SHARE_LEN: usize =
+    1184 + X25519_KEY_SHARE_LEN;
 const X25519_MLKEM768_SERVER_KEY_SHARE_LEN: usize = 1088 + X25519_KEY_SHARE_LEN;
 
 /// Parsed TLS 1.3 ServerHello key share. Hybrid key exchange is not enabled
