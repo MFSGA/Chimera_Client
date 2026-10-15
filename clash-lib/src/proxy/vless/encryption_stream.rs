@@ -169,6 +169,8 @@ pub(crate) struct EncryptionStream {
     read_ciphertext: Option<PendingIo>,
     read_plaintext: Vec<u8>,
     read_plaintext_offset: usize,
+    // Framing/authentication errors must permanently terminate the read side.
+    read_terminal_error: Option<(io::ErrorKind, String)>,
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -276,6 +278,7 @@ impl EncryptionStream {
             read_ciphertext: None,
             read_plaintext: Vec::new(),
             read_plaintext_offset: 0,
+            read_terminal_error: None,
         })
     }
 
@@ -394,86 +397,8 @@ impl EncryptionStream {
         self.read_plaintext_offset += count;
         true
     }
-}
 
-impl AsyncWrite for EncryptionStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        match self.poll_handshake(cx) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-            Poll::Pending => return Poll::Pending,
-        }
-
-        if self.pending_write.is_none() {
-            let count = buf.len().min(MAX_RECORD_PLAINTEXT_LEN);
-            if count == 0 {
-                return Poll::Ready(Ok(0));
-            }
-            let wire = match self
-                .write_codec
-                .as_mut()
-                .ok_or_else(|| {
-                    io::Error::other(
-                        "VLESS encryption write codec is not initialized",
-                    )
-                })
-                .and_then(|codec| codec.seal_record(&buf[..count]))
-            {
-                Ok(wire) => wire,
-                Err(err) => return Poll::Ready(Err(err)),
-            };
-            self.pending_write = Some(PendingRecordWrite {
-                wire: PendingIo::from_data(wire),
-                user_len: count,
-            });
-        }
-
-        let mut pending = self.pending_write.take().expect("pending write exists");
-        match poll_write_pending(&mut self.inner, cx, &mut pending.wire) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(pending.user_len)),
-            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-            Poll::Pending => {
-                self.pending_write = Some(pending);
-                Poll::Pending
-            }
-        }
-    }
-
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
-        if let Some(mut pending) = self.pending_write.take() {
-            match poll_write_pending(&mut self.inner, cx, &mut pending.wire) {
-                Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                Poll::Pending => {
-                    self.pending_write = Some(pending);
-                    return Poll::Pending;
-                }
-            }
-        }
-        Pin::new(&mut *self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
-        match self.as_mut().poll_flush(cx) {
-            Poll::Ready(Ok(())) => {}
-            other => return other,
-        }
-        Pin::new(&mut *self.inner).poll_shutdown(cx)
-    }
-}
-
-impl AsyncRead for EncryptionStream {
-    fn poll_read(
+    fn poll_read_inner(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
@@ -566,6 +491,102 @@ impl AsyncRead for EncryptionStream {
         self.copy_plaintext(buf);
         Poll::Ready(Ok(()))
     }
+
+}
+
+impl AsyncWrite for EncryptionStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.poll_handshake(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Pending => return Poll::Pending,
+        }
+
+        if self.pending_write.is_none() {
+            let count = buf.len().min(MAX_RECORD_PLAINTEXT_LEN);
+            if count == 0 {
+                return Poll::Ready(Ok(0));
+            }
+            let wire = match self
+                .write_codec
+                .as_mut()
+                .ok_or_else(|| {
+                    io::Error::other(
+                        "VLESS encryption write codec is not initialized",
+                    )
+                })
+                .and_then(|codec| codec.seal_record(&buf[..count]))
+            {
+                Ok(wire) => wire,
+                Err(err) => return Poll::Ready(Err(err)),
+            };
+            self.pending_write = Some(PendingRecordWrite {
+                wire: PendingIo::from_data(wire),
+                user_len: count,
+            });
+        }
+
+        let mut pending = self.pending_write.take().expect("pending write exists");
+        match poll_write_pending(&mut self.inner, cx, &mut pending.wire) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(pending.user_len)),
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => {
+                self.pending_write = Some(pending);
+                Poll::Pending
+            }
+        }
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        if let Some(mut pending) = self.pending_write.take() {
+            match poll_write_pending(&mut self.inner, cx, &mut pending.wire) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => {
+                    self.pending_write = Some(pending);
+                    return Poll::Pending;
+                }
+            }
+        }
+        Pin::new(&mut *self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.as_mut().poll_flush(cx) {
+            Poll::Ready(Ok(())) => {}
+            other => return other,
+        }
+        Pin::new(&mut *self.inner).poll_shutdown(cx)
+    }
+}
+
+
+impl AsyncRead for EncryptionStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if let Some((kind, message)) = &self.read_terminal_error {
+            return Poll::Ready(Err(io::Error::new(*kind, message.clone())));
+        }
+
+        let result = self.as_mut().poll_read_inner(cx, buf);
+        if let Poll::Ready(Err(ref err)) = result {
+            self.read_terminal_error = Some((err.kind(), err.to_string()));
+        }
+        result
+    }
 }
 
 #[cfg(test)]
@@ -579,6 +600,80 @@ mod tests {
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
     use super::*;
+
+    fn handshaken_read_stream(
+        inner: AnyStream,
+        peer_padding_len: usize,
+    ) -> EncryptionStream {
+        EncryptionStream {
+            inner,
+            prepared: None,
+            session: None,
+            hello: PendingHelloWrite::new(Vec::new(), vec![0], Vec::new())
+                .expect("empty hello schedule"),
+            server_pfs: PendingIo::with_len(SERVER_PFS_RESPONSE_LEN),
+            server_ticket: PendingIo::with_len(ENCRYPTED_TICKET_LEN),
+            server_padding_len: PendingIo::with_len(ENCRYPTED_LENGTH_LEN),
+            write_codec: None,
+            read_codec: None,
+            peer_padding: Some(PendingIo::with_len(peer_padding_len)),
+            handshake_done: true,
+            pending_write: None,
+            read_header: PendingIo::with_len(RECORD_HEADER_LEN),
+            read_ciphertext: None,
+            read_plaintext: Vec::new(),
+            read_plaintext_offset: 0,
+            read_terminal_error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_peer_padding_eof_remains_terminal_on_repeated_read() {
+        use tokio::io::AsyncWriteExt;
+
+        let (client, mut server) = tokio::io::duplex(64);
+        server.write_all(&[0x42]).await.expect("write partial padding");
+        drop(server);
+        let mut stream = handshaken_read_stream(Box::new(client), 2);
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let mut output = [0u8; 8];
+        for attempt in 0..2 {
+            let mut buf = ReadBuf::new(&mut output);
+            let result = Pin::new(&mut stream).poll_read(&mut cx, &mut buf);
+            let Poll::Ready(Err(err)) = result else {
+                panic!("read {attempt} must fail after truncated peer padding");
+            };
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+            assert!(buf.filled().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_record_header_remains_terminal_on_repeated_read() {
+        use tokio::io::AsyncWriteExt;
+
+        let (client, mut server) = tokio::io::duplex(64);
+        server
+            .write_all(&[22, 3, 3, 0, 17])
+            .await
+            .expect("write invalid header");
+        drop(server);
+        let mut stream = handshaken_read_stream(Box::new(client), 0);
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let mut output = [0u8; 8];
+        for attempt in 0..2 {
+            let mut buf = ReadBuf::new(&mut output);
+            let result = Pin::new(&mut stream).poll_read(&mut cx, &mut buf);
+            let Poll::Ready(Err(err)) = result else {
+                panic!("read {attempt} must fail after invalid record header");
+            };
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                err.to_string().contains("invalid VLESS encryption record header")
+            );
+            assert!(buf.filled().is_empty());
+        }
+    }
 
     struct RecordingStream {
         writes: Arc<Mutex<Vec<Vec<u8>>>>,
