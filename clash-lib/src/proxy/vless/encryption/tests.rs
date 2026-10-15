@@ -773,6 +773,8 @@ async fn encryption_stream_one_rtt_round_trips_records(appearance: &str) {
 
     use super::super::encryption_stream::EncryptionStream;
 
+    // The spawned server task must own this value ('static future).
+    let appearance = appearance.to_owned();
     let nfs_private = agreement::PrivateKey::generate(&agreement::X25519).unwrap();
     let nfs_public = nfs_private.compute_public_key().unwrap();
     let raw = format!(
