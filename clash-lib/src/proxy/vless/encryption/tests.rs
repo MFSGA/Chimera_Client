@@ -676,6 +676,36 @@ fn one_rtt_server_tail_rejects_wrong_field_lengths() {
 
 #[cfg(feature = "vless-encryption")]
 #[test]
+fn encryption_aead_nonce_exhaustion_fails_closed_without_wrapping() {
+    let key = [0x6du8; 32];
+    let near_limit = [
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
+    ];
+    let mut writer =
+        EncryptionAead::new_with_nonce(&key, near_limit).expect("writer");
+    let mut reader =
+        EncryptionAead::new_with_nonce(&key, near_limit).expect("reader");
+
+    let ciphertext = writer.seal(b"last valid record").expect("last seal");
+    assert_eq!(
+        reader.open(&ciphertext).expect("last open"),
+        b"last valid record"
+    );
+    assert_eq!(writer.nonce, [0xff; 12]);
+    assert_eq!(reader.nonce, [0xff; 12]);
+
+    for _ in 0..2 {
+        let write_error = writer.seal(b"must not reuse nonce").unwrap_err();
+        let read_error = reader.open(&ciphertext).unwrap_err();
+        assert!(write_error.to_string().contains("nonce exhausted"));
+        assert!(read_error.to_string().contains("nonce exhausted"));
+        assert_eq!(writer.nonce, [0xff; 12]);
+        assert_eq!(reader.nonce, [0xff; 12]);
+    }
+}
+
+#[cfg(feature = "vless-encryption")]
+#[test]
 fn encryption_record_codec_matches_xray_header_and_aad() {
     let key = [0x31u8; 32];
     let mut writer =
