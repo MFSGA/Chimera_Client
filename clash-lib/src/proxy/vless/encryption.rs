@@ -1089,14 +1089,21 @@ impl EncryptionAead {
     }
 
     fn next_nonce(&mut self) -> io::Result<aws_lc_rs::aead::Nonce> {
-        for index in (0..self.nonce.len()).rev() {
-            self.nonce[index] = self.nonce[index].wrapping_add(1);
-            if self.nonce[index] != 0 {
-                break;
+        let mut next = self.nonce;
+        for index in (0..next.len()).rev() {
+            let (value, carry) = next[index].overflowing_add(1);
+            next[index] = value;
+            if !carry {
+                let nonce = aws_lc_rs::aead::Nonce::try_assume_unique_for_key(&next)
+                    .map_err(|_| invalid("failed to construct VLESS AEAD nonce"))?;
+                self.nonce = next;
+                return Ok(nonce);
             }
         }
-        aws_lc_rs::aead::Nonce::try_assume_unique_for_key(&self.nonce)
-            .map_err(|_| invalid("failed to construct VLESS AEAD nonce"))
+
+        // Reusing an AES-GCM nonce under the same traffic key is unsafe.
+        // Keep the counter at its final value and fail closed permanently.
+        Err(invalid("VLESS AEAD nonce exhausted"))
     }
 
     fn seal(&mut self, plaintext: &[u8]) -> io::Result<Vec<u8>> {
