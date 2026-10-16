@@ -105,13 +105,14 @@ where
 
     pub async fn initial(&self) -> anyhow::Result<T> {
         let mut is_local = false;
+        let mut recovered_invalid_cache = false;
         let mut immediately_update = false;
 
         let vehicle_path = self.vehicle.path().to_owned();
 
         let mut inner = self.inner.write().await;
 
-        let content = match metadata(&vehicle_path) {
+        let mut content = match metadata(&vehicle_path) {
             Ok(meta) => {
                 let content = fs::read(&vehicle_path)?;
                 is_local = true;
@@ -134,13 +135,20 @@ where
                 if !is_local {
                     return Err(e);
                 }
-                let content = self.vehicle.read().await?;
-                (parser_guard)(&content)?
+                content = self.vehicle.read().await?;
+                let parsed = (parser_guard)(&content)?;
+                recovered_invalid_cache = true;
+                parsed
             }
         };
 
-        if self.vehicle_type() != ProviderVehicleType::File && !is_local {
+        if self.vehicle_type() != ProviderVehicleType::File
+            && (!is_local || recovered_invalid_cache)
+        {
             write_cache_atomically(Path::new(self.vehicle.path()), &content)?;
+            inner.updated_at = SystemTime::now();
+            // A recovered cache has just been refreshed successfully.
+            immediately_update = false;
         }
 
         inner.hash = utils::md5(&content)[..16]
@@ -402,6 +410,98 @@ mod tests {
             modified,
             Duration::from_secs(30)
         ));
+    }
+
+    #[tokio::test]
+    async fn invalid_cached_provider_recovers_remote_content_atomically() {
+        let dir = tempfile::tempdir().expect("temporary provider directory");
+        let path = dir.path().join("cached-provider.yaml");
+        std::fs::write(&path, b"invalid cached content").expect("seed bad cache");
+        filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(10, 0))
+            .expect("set stale cache timestamp");
+
+        let mut vehicle = MockProviderVehicle::new();
+        vehicle
+            .expect_path()
+            .return_const(path.to_str().unwrap().to_owned());
+        vehicle.expect_typ().return_const(ProviderVehicleType::Http);
+        vehicle
+            .expect_read()
+            .times(2)
+            .returning(|| Ok(b"valid remote content".to_vec()));
+
+        let parser = |input: &[u8]| -> anyhow::Result<String> {
+            if input != b"valid remote content" {
+                anyhow::bail!("invalid provider content");
+            }
+            Ok("valid".to_owned())
+        };
+        let updater =
+            |_input: String| -> BoxFuture<'static, ()> { Box::pin(async {}) };
+        let fetcher = Fetcher::new(
+            "cache-recovery".to_owned(),
+            Duration::ZERO,
+            Arc::new(vehicle),
+            parser,
+            Some(updater),
+        );
+
+        assert_eq!(fetcher.initial().await.unwrap(), "valid");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"valid remote content",
+            "a recovered provider must replace its corrupt cache"
+        );
+        assert!(
+            fetcher.updated_at().await.timestamp() > 10,
+            "recovery must replace the stale provider timestamp"
+        );
+        let (parsed, unchanged) = fetcher.update().await.unwrap();
+        assert_eq!(parsed, "valid");
+        assert!(
+            unchanged,
+            "recovered cache and in-memory hash must match remote content"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_remote_recovery_keeps_existing_cache_untouched() {
+        let dir = tempfile::tempdir().expect("temporary provider directory");
+        let path = dir.path().join("cached-provider.yaml");
+        std::fs::write(&path, b"invalid cached content").expect("seed bad cache");
+
+        let mut vehicle = MockProviderVehicle::new();
+        vehicle
+            .expect_path()
+            .return_const(path.to_str().unwrap().to_owned());
+        vehicle.expect_typ().return_const(ProviderVehicleType::Http);
+        vehicle
+            .expect_read()
+            .times(1)
+            .returning(|| Ok(b"invalid remote content".to_vec()));
+
+        let parser = |input: &[u8]| -> anyhow::Result<String> {
+            if input != b"valid remote content" {
+                anyhow::bail!("invalid provider content");
+            }
+            Ok("valid".to_owned())
+        };
+        let updater =
+            |_input: String| -> BoxFuture<'static, ()> { Box::pin(async {}) };
+        let fetcher = Fetcher::new(
+            "cache-recovery-failure".to_owned(),
+            Duration::ZERO,
+            Arc::new(vehicle),
+            parser,
+            Some(updater),
+        );
+
+        assert!(fetcher.initial().await.is_err());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"invalid cached content",
+            "failed validation must not overwrite existing cache"
+        );
     }
 
     #[tokio::test]
