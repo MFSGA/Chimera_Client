@@ -495,7 +495,6 @@ impl EncryptionStream {
         self.copy_plaintext(buf);
         Poll::Ready(Ok(()))
     }
-
 }
 
 impl AsyncWrite for EncryptionStream {
@@ -574,7 +573,6 @@ impl AsyncWrite for EncryptionStream {
     }
 }
 
-
 impl AsyncRead for EncryptionStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -636,7 +634,10 @@ mod tests {
         use tokio::io::AsyncWriteExt;
 
         let (client, mut server) = tokio::io::duplex(64);
-        server.write_all(&[0x42]).await.expect("write partial padding");
+        server
+            .write_all(&[0x42])
+            .await
+            .expect("write partial padding");
         drop(server);
         let mut stream = handshaken_read_stream(Box::new(client), 2);
         let mut cx = Context::from_waker(noop_waker_ref());
@@ -673,7 +674,8 @@ mod tests {
             };
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
             assert!(
-                err.to_string().contains("invalid VLESS encryption record header")
+                err.to_string()
+                    .contains("invalid VLESS encryption record header")
             );
             assert!(buf.filled().is_empty());
         }
