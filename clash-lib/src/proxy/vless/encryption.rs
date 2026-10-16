@@ -1206,7 +1206,9 @@ fn encode_length(length: usize) -> io::Result<[u8; 2]> {
 #[cfg(feature = "vless-encryption")]
 mod blake3_compat;
 #[cfg(feature = "vless-encryption")]
-use blake3_compat::{blake3_derive_key_raw_context, xor_vless_ctr};
+use blake3_compat::blake3_derive_key_raw_context;
+#[cfg(feature = "vless-encryption")]
+pub(super) use blake3_compat::xor_vless_ctr;
 mod padding;
 use padding::parse_padding;
 
