@@ -73,7 +73,10 @@ pub struct ReusePolicy {
 
 impl ReusePolicy {
     pub fn validate(&self) -> io::Result<()> {
-        if self.max_concurrency.is_some() && self.max_connections.is_some() {
+        // Match Xray's XMUX conflict rule: zero is not a positive limit.
+        if self.max_concurrency.is_some_and(|range| range.max > 0)
+            && self.max_connections.is_some_and(|range| range.max > 0)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "xhttp reuse-settings max-concurrency conflicts with max-connections",
@@ -84,7 +87,15 @@ impl ReusePolicy {
     }
 
     pub fn sample_max_connections(&self) -> Option<u64> {
-        self.max_connections.map(ValueRange::sample)
+        let max_connections = self.max_connections?;
+        if max_connections.max == 0
+            && self.max_concurrency.is_some_and(|range| range.max > 0)
+        {
+            // A zero connection limit must not disable pooling when the
+            // concurrency limit is controlling reuse instead.
+            return None;
+        }
+        Some(max_connections.sample())
     }
 
     pub fn sample_limits(&self) -> ReuseLimits {
@@ -151,6 +162,50 @@ mod tests {
 
         let err = policy.validate().expect_err("conflicting limits must fail");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn zero_connections_with_positive_concurrency_uses_concurrency_pooling() {
+        let mut policy = ReusePolicy {
+            max_concurrency: Some(ValueRange { min: 1, max: 1 }),
+            max_connections: Some(ValueRange { min: 0, max: 0 }),
+            c_max_reuse_times: None,
+            h_max_request_times: None,
+            h_max_reusable_secs: None,
+            h_keep_alive_period: 0,
+        };
+
+        policy
+            .validate()
+            .expect("zero connections is not a conflicting limit");
+        assert_eq!(policy.sample_max_connections(), None);
+        assert_eq!(policy.sample_limits().max_concurrency, 1);
+
+        policy.max_concurrency = None;
+        policy
+            .validate()
+            .expect("standalone zero connections is allowed");
+        assert_eq!(policy.sample_max_connections(), Some(0));
+    }
+
+    #[test]
+    fn positive_connection_range_conflicts_with_positive_concurrency() {
+        let policy = ReusePolicy {
+            max_concurrency: Some(ValueRange { min: 1, max: 1 }),
+            max_connections: Some(ValueRange { min: 0, max: 4 }),
+            c_max_reuse_times: None,
+            h_max_request_times: None,
+            h_max_reusable_secs: None,
+            h_keep_alive_period: 0,
+        };
+
+        assert_eq!(
+            policy
+                .validate()
+                .expect_err("positive values may conflict")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     #[test]

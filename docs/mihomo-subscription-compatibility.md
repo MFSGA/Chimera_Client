@@ -41,3 +41,11 @@
 - ✅ `cargo test -p clash-lib --lib --locked proxy::converters::vless::tests -- --test-threads=1`：**92 passed、0 failed**。
 - ⚠️ `cargo test -p clash-lib --lib --features 'trojan hysteria ws' --locked proxy::converters:: -- --test-threads=1`：源码已完成编译，但在链接测试二进制时磁盘空间不足（`No space left on device`），**未执行测试，不能视为通过**；未删除用户已有编译缓存。
 - ⚠️ 尚未运行原订阅真实端到端握手、Windows/Linux 运行、XUDP/SMUX 实现互操作；这些验证必须明确记作 `not run`，不得写成成功。
+
+## 2026-10-16：XHTTP XMUX 显式零值兼容性
+
+- 使用真实 Mihomo 订阅的**字段取值组合**进行只读分析；未将订阅、节点名称或凭据加入仓库、文档或测试。该订阅有一个 XHTTP 代理同时设置了 `reuse-settings.max-concurrency: "1"` 和 `max-connections: "0"`。
+- 旧版 Chimera 在 `ReusePolicy::validate()` 中以两个字段是否都存在为冲突依据；真实启动时因此拒绝该出站，导致代理组引用解析失败。`clash-rs -t` 的基础配置检查未覆盖出站构造，故先前报告通过。
+- Xray 上游 `infra/conf/transport_method.go` 的规则按两者范围上界都**大于零**才报冲突；零值不构成正限制。参见 https://github.com/XTLS/Xray-core/blob/main/infra/conf/transport_method.go 。Mihomo 文档也描述了两个限制的互斥关系（具体的零值判定以 Xray 源码为依据）：https://wiki.metacubex.one/en/config/proxies/transport/ 。
+- 本地修复与测试：只在两个范围上界都为正时拒绝；当正 `max-concurrency` 搭配 `max-connections: "0"` 时，连接池按并发限制复用，避免把零值错误解释成“永不复用”。仍拒绝 `max-concurrency: "1"` + `max-connections: "0-4"`；保留单独 `max-connections: "0"` 的既有行为。
+- 本修复只涉及配置有效性及连接池选择语义，不代表节点握手、真实流量或完整订阅运行通过。测试使用虚构数值，不包含真实订阅的任何敏感内容。
