@@ -84,12 +84,9 @@ impl Handler {
         pool_context: Option<&NetworkPoolContext>,
     ) -> io::Result<AnyStream> {
         let s = if let Some(config) = self.opts.encryption.as_ref() {
-            if is_udp {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "VLESS encryption UDP runtime is TODO",
-                ));
-            }
+            // UDP shares the 1-RTT encrypted byte stream. The outer VLESS
+            // layer selects UDP command 2 and datagram.rs preserves packet
+            // boundaries across the underlying encrypted records.
             #[cfg(feature = "vless-encryption")]
             {
                 let prepared = config.prepare_crypto()?;
@@ -263,7 +260,8 @@ impl OutboundHandler for Handler {
     }
 
     async fn support_udp(&self) -> bool {
-        self.opts.udp && self.opts.encryption.is_none()
+        self.opts.udp
+            && (self.opts.encryption.is_none() || cfg!(feature = "vless-encryption"))
     }
 
     async fn connect_stream(
@@ -427,6 +425,39 @@ mod reuse_tests {
 
     use super::*;
     use crate::{app::dns::MockClashResolver, proxy::utils::DirectConnector};
+
+    #[tokio::test]
+    async fn encrypted_vless_advertises_udp_only_with_crypto_feature() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let key = URL_SAFE_NO_PAD.encode([0x77; 32]);
+        let config = encryption::Config::parse(&format!(
+            "mlkem768x25519plus.native.1rtt.{key}"
+        ))
+        .expect("encryption config should parse");
+        let mut handler = Handler::new(HandlerOptions {
+            name: "udp-encryption".to_owned(),
+            common_opts: HandlerCommonOptions::default(),
+            server: "example.com".to_owned(),
+            port: 443,
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            udp: true,
+            transport: None,
+            tls: None,
+            flow: None,
+            encryption: Some(config),
+        });
+
+        assert_eq!(
+            handler.support_udp().await,
+            cfg!(feature = "vless-encryption")
+        );
+        handler.opts.udp = false;
+        assert!(!handler.support_udp().await);
+        handler.opts.udp = true;
+        handler.opts.encryption = None;
+        assert!(handler.support_udp().await);
+    }
 
     struct ReuseTransport;
 
