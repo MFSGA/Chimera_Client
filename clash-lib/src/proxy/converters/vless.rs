@@ -53,6 +53,14 @@ impl TryFrom<&OutboundVless> for Handler {
 
     fn try_from(s: &OutboundVless) -> Result<Self, Self::Error> {
         validate_vless_config(s)?;
+        // The VLESS stream parses this UUID only on its first dial. Reject
+        // malformed subscription entries while constructing the outbound so
+        // startup does not appear successful until traffic first reaches it.
+        uuid::Uuid::parse_str(&s.uuid).map_err(|_| {
+            Error::InvalidConfig(
+                "invalid VLESS UUID: expected a UUID string".to_owned(),
+            )
+        })?;
         let encryption = s
             .encryption
             .as_deref()
@@ -2146,6 +2154,56 @@ udp: true
         assert!(
             !handler.support_udp().await,
             "XUDP must not be sent as native UDP"
+        );
+    }
+
+    #[test]
+    fn vless_rejects_malformed_uuid_before_outbound_runtime() {
+        // Deserialize a realistic Mihomo entry. A config that constructs an
+        // outbound must not fail only when the first connection is attempted.
+        let source = r#"
+name: invalid-uuid
+server: example.invalid
+port: 443
+uuid: not-a-valid-uuid
+packet-encoding: xudp
+smux:
+  enabled: false
+udp: true
+"#;
+        let outbound: OutboundVless =
+            serde_yaml::from_str(source).expect("Mihomo fields deserialize");
+        let err = match crate::proxy::vless::Handler::try_from(&outbound) {
+            Ok(_) => panic!("malformed UUID must fail at outbound creation"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("invalid VLESS UUID"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(feature = "vless-encryption")]
+    #[tokio::test]
+    async fn vless_mihomo_xudp_with_random_encryption_keeps_tcp_and_disables_udp() {
+        use crate::proxy::OutboundHandler;
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let key = URL_SAFE_NO_PAD.encode([0x77; 32]);
+        let yaml = format!(
+            "name: xudp-encrypted\nserver: example.invalid\nport: 443\n\
+             uuid: b831381d-6324-4d53-ad4f-8cda48b30811\n\
+             packet-encoding: xudp\nsmux:\n  enabled: false\n\
+             encryption: mlkem768x25519plus.random.1rtt.{key}\n\
+             udp: true\n"
+        );
+        let outbound: OutboundVless =
+            serde_yaml::from_str(&yaml).expect("Mihomo config deserialization");
+        let handler = crate::proxy::vless::Handler::try_from(&outbound)
+            .expect("random 1-RTT with XUDP must still create TCP handler");
+        assert!(
+            !handler.support_udp().await,
+            "XUDP must never silently downgrade to native encrypted UDP"
         );
     }
 
