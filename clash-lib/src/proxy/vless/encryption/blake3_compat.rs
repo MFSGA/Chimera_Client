@@ -191,7 +191,7 @@ pub(super) fn blake3_derive_key_raw_context(
 }
 
 #[cfg(feature = "vless-encryption")]
-pub(super) fn xor_vless_ctr(
+pub(in crate::proxy::vless) fn xor_vless_ctr(
     key_material: &[u8],
     iv: &[u8; CLIENT_HELLO_IV_LEN],
     in_out: &mut [u8],

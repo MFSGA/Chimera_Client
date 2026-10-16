@@ -12,7 +12,7 @@ use tokio::{
 };
 
 use super::encryption::{
-    EncryptionRecordCodec, PreparedCrypto, PreparedOneRttSession,
+    EncryptionRecordCodec, PreparedCrypto, PreparedOneRttSession, xor_vless_ctr,
 };
 use crate::proxy::AnyStream;
 
@@ -152,6 +152,56 @@ struct PendingRecordWrite {
     user_len: usize,
 }
 
+// Xray's random appearance masks only TLS-shaped record headers, not their
+// authenticated ciphertext bodies. Preserve AES-CTR byte position across
+// records, and never wrap/reuse a key stream block after counter exhaustion.
+struct RecordHeaderMask {
+    united_key: Vec<u8>,
+    counter: [u8; 16],
+    keystream: [u8; 16],
+    next_byte: usize,
+    counter_exhausted: bool,
+}
+
+impl RecordHeaderMask {
+    fn new(united_key: &[u8], iv: [u8; 16]) -> Self {
+        Self {
+            united_key: united_key.to_vec(),
+            counter: iv,
+            keystream: [0; 16],
+            next_byte: 16,
+            counter_exhausted: false,
+        }
+    }
+
+    fn apply(&mut self, header: &mut [u8]) -> io::Result<()> {
+        if header.len() != RECORD_HEADER_LEN {
+            return Err(invalid("invalid VLESS random record header length"));
+        }
+        // Reject a whole header without modifying it if it needs a block
+        // past the final counter. This also keeps repeated errors fail-closed.
+        if self.counter_exhausted
+            && self.keystream.len() - self.next_byte < header.len()
+        {
+            return Err(invalid("VLESS random header CTR counter exhausted"));
+        }
+        for byte in header {
+            if self.next_byte == self.keystream.len() {
+                self.keystream.fill(0);
+                xor_vless_ctr(&self.united_key, &self.counter, &mut self.keystream)?;
+                match u128::from_be_bytes(self.counter).checked_add(1) {
+                    Some(next) => self.counter = next.to_be_bytes(),
+                    None => self.counter_exhausted = true,
+                }
+                self.next_byte = 0;
+            }
+            *byte ^= self.keystream[self.next_byte];
+            self.next_byte += 1;
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct EncryptionStream {
     inner: AnyStream,
     prepared: Option<PreparedCrypto>,
@@ -162,6 +212,8 @@ pub(crate) struct EncryptionStream {
     server_padding_len: PendingIo,
     write_codec: Option<EncryptionRecordCodec>,
     read_codec: Option<EncryptionRecordCodec>,
+    write_header_mask: Option<RecordHeaderMask>,
+    read_header_mask: Option<RecordHeaderMask>,
     peer_padding: Option<PendingIo>,
     handshake_done: bool,
     pending_write: Option<PendingRecordWrite>,
@@ -247,15 +299,6 @@ impl EncryptionStream {
         inner: AnyStream,
         prepared: PreparedCrypto,
     ) -> io::Result<Self> {
-        // xorpub only masks the NFS relay bytes in ClientHello, already
-        // prepared by Config::prepare_nfs_relays. random additionally masks
-        // stream record headers and must remain disabled until that layer is
-        // implemented for both directions.
-        if prepared.xor_mode == 2 {
-            return Err(invalid(
-                "VLESS encryption random appearance stream masking is TODO",
-            ));
-        }
         let hello = prepared.one_rtt_hello.as_ref().ok_or_else(|| {
             invalid("VLESS encryption runtime MVP currently supports only 1rtt")
         })?;
@@ -275,6 +318,8 @@ impl EncryptionStream {
             server_padding_len: PendingIo::with_len(ENCRYPTED_LENGTH_LEN),
             write_codec: None,
             read_codec: None,
+            write_header_mask: None,
+            read_header_mask: None,
             peer_padding: None,
             handshake_done: false,
             pending_write: None,
@@ -346,6 +391,20 @@ impl EncryptionStream {
             &self.server_padding_len.data,
         )?;
         let (write_codec, read_codec) = session.record_codecs(&tail)?;
+        // Only mask records, after the authenticated 1-RTT server padding.
+        // Upload uses ClientHello's IV; download uses the server ticket.
+        if self.prepared.as_ref().is_some_and(|p| p.xor_mode == 2) {
+            let iv = self
+                .prepared
+                .as_ref()
+                .expect("prepared crypto remains present until handshake completion")
+                .nfs_relays
+                .iv;
+            self.write_header_mask =
+                Some(RecordHeaderMask::new(&session.united_key, iv));
+            self.read_header_mask =
+                Some(RecordHeaderMask::new(&session.united_key, tail.ticket));
+        }
 
         self.peer_padding =
             Some(PendingIo::with_len(tail.peer_padding_ciphertext_len));
@@ -452,6 +511,12 @@ impl EncryptionStream {
         }
 
         if self.read_ciphertext.is_none() {
+            let this = self.as_mut().get_mut();
+            if let Some(mask) = this.read_header_mask.as_mut() {
+                if let Err(err) = mask.apply(&mut this.read_header.data) {
+                    return Poll::Ready(Err(err));
+                }
+            }
             let len = match decode_record_len(&self.read_header.data) {
                 Ok(len) => len,
                 Err(err) => return Poll::Ready(Err(err)),
@@ -527,6 +592,12 @@ impl AsyncWrite for EncryptionStream {
                 Ok(wire) => wire,
                 Err(err) => return Poll::Ready(Err(err)),
             };
+            let mut wire = wire;
+            if let Some(mask) = self.write_header_mask.as_mut() {
+                if let Err(err) = mask.apply(&mut wire[..RECORD_HEADER_LEN]) {
+                    return Poll::Ready(Err(err));
+                }
+            }
             self.pending_write = Some(PendingRecordWrite {
                 wire: PendingIo::from_data(wire),
                 user_len: count,
@@ -618,6 +689,8 @@ mod tests {
             server_padding_len: PendingIo::with_len(ENCRYPTED_LENGTH_LEN),
             write_codec: None,
             read_codec: None,
+            write_header_mask: None,
+            read_header_mask: None,
             peer_padding: Some(PendingIo::with_len(peer_padding_len)),
             handshake_done: true,
             pending_write: None,
@@ -726,6 +799,77 @@ mod tests {
             writes: Arc::clone(&writes),
         };
         (Box::new(stream), writes)
+    }
+
+    #[test]
+    fn random_header_mask_matches_continuous_ctr_across_record_boundaries() {
+        let key = [0x39u8; 64];
+        let iv = [0x57u8; 16];
+        let mut mask = RecordHeaderMask::new(&key, iv);
+        let mut expected = [0u8; 35];
+        xor_vless_ctr(&key, &iv, &mut expected).expect("reference CTR stream");
+
+        let mut actual = [0u8; 35];
+        for header in actual.chunks_exact_mut(RECORD_HEADER_LEN) {
+            mask.apply(header).expect("mask header");
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(mask.next_byte, 3); // seven 5-byte headers span three blocks
+    }
+
+    #[test]
+    fn random_header_mask_rejects_ctr_wrap_without_modifying_a_header() {
+        let key = [0x29u8; 64];
+        let iv = u128::MAX.to_be_bytes();
+        let mut mask = RecordHeaderMask::new(&key, iv);
+        let mut expected = [0u8; 15];
+        xor_vless_ctr(&key, &iv, &mut expected).expect("last CTR block");
+        let mut actual = [0u8; 15];
+        for header in actual.chunks_exact_mut(RECORD_HEADER_LEN) {
+            mask.apply(header).expect("remaining final block");
+        }
+        assert_eq!(actual, expected);
+        assert!(mask.counter_exhausted);
+        assert_eq!(mask.counter, iv);
+        assert_eq!(mask.next_byte, 15);
+
+        for _ in 0..2 {
+            let mut header = [0x42; RECORD_HEADER_LEN];
+            let err = mask.apply(&mut header).expect_err("CTR wrap must fail");
+            assert!(err.to_string().contains("CTR counter exhausted"));
+            assert_eq!(header, [0x42; RECORD_HEADER_LEN]);
+            assert_eq!(mask.next_byte, 15);
+        }
+    }
+
+    #[test]
+    fn random_header_mask_preserves_final_two_ctr_blocks() {
+        let key = [0x63u8; 64];
+        let iv = (u128::MAX - 1).to_be_bytes();
+        let mut mask = RecordHeaderMask::new(&key, iv);
+        let mut expected = [0u8; 30];
+        xor_vless_ctr(&key, &iv, &mut expected).expect("last two CTR blocks");
+        let mut actual = [0u8; 30];
+        for header in actual.chunks_exact_mut(RECORD_HEADER_LEN) {
+            mask.apply(header).expect("header in final two blocks");
+        }
+        assert_eq!(actual, expected);
+        assert!(mask.counter_exhausted);
+        assert_eq!(mask.counter, u128::MAX.to_be_bytes());
+        assert_eq!(mask.next_byte, 14);
+
+        let mut header = [0x7f; RECORD_HEADER_LEN];
+        assert!(mask.apply(&mut header).is_err());
+        assert_eq!(header, [0x7f; RECORD_HEADER_LEN]);
+    }
+
+    #[test]
+    fn random_header_mask_rejects_non_header_lengths() {
+        let mut mask = RecordHeaderMask::new(&[0x25; 64], [0x35; 16]);
+        let mut invalid = [0u8; 4];
+        assert!(mask.apply(&mut invalid).is_err());
+        assert_eq!(invalid, [0; 4]);
+        assert_eq!(mask.next_byte, 16);
     }
 
     #[test]

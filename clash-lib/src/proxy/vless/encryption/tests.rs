@@ -794,6 +794,12 @@ async fn encryption_stream_xorpub_one_rtt_round_trips_records() {
 }
 
 #[cfg(feature = "vless-encryption")]
+#[tokio::test]
+async fn encryption_stream_random_one_rtt_round_trips_records() {
+    encryption_stream_one_rtt_round_trips_records("random").await;
+}
+
+#[cfg(feature = "vless-encryption")]
 async fn encryption_stream_one_rtt_round_trips_records(appearance: &str) {
     use aws_lc_rs::{
         agreement,
@@ -814,6 +820,8 @@ async fn encryption_stream_one_rtt_round_trips_records(appearance: &str) {
     let config = Config::parse(&raw).expect("1rtt config should parse");
     let prepared = config.prepare_crypto().expect("crypto should prepare");
     let server_prepared = prepared.clone();
+    let xorpub = appearance != "native";
+    let random_headers = appearance == "random";
 
     let (client, mut server) = tokio::io::duplex(128);
     let server_task = tokio::spawn(async move {
@@ -826,12 +834,12 @@ async fn encryption_stream_one_rtt_round_trips_records(appearance: &str) {
             .expect("client hello");
         assert_eq!(received_hello, hello.bytes);
 
-        // Recover the NFS relay from the actual ClientHello bytes. xorpub must
-        // be reversible with the configured server public key and transmitted IV.
+        // Recover the NFS relay independently from the actual ClientHello.
+        // Both xorpub and random mask it with the server public key and IV.
         let mut relay = received_hello
             [CLIENT_HELLO_IV_LEN..CLIENT_HELLO_IV_LEN + X25519_PUBLIC_KEY_LEN]
             .to_vec();
-        if appearance == "xorpub" {
+        if xorpub {
             xor_vless_ctr(
                 nfs_public.as_ref(),
                 &server_prepared.nfs_relays.iv,
@@ -906,7 +914,8 @@ async fn encryption_stream_one_rtt_round_trips_records(appearance: &str) {
 
         let mut server_aead =
             EncryptionAead::new(&server_write_key).expect("server AEAD");
-        let ticket = [0u8; 16];
+        let mut ticket = [0u8; 16];
+        ticket[15] = 0x55; // Exercise distinct CTR IVs for each direction.
         let encrypted_ticket = server_aead.seal(&ticket).expect("server ticket");
         let encrypted_padding_len = server_aead
             .seal(&encode_length(48).expect("padding length"))
@@ -922,48 +931,83 @@ async fn encryption_stream_one_rtt_round_trips_records(appearance: &str) {
         server_hello.extend_from_slice(&encrypted_padding);
         server.write_all(&server_hello).await.expect("server hello");
 
-        let mut header = [0u8; RECORD_HEADER_LEN];
-        server
-            .read_exact(&mut header)
-            .await
-            .expect("client record header");
-        let body_len = decode_record_header(&header).expect("client record header");
-        let mut body = vec![0u8; body_len];
-        server
-            .read_exact(&mut body)
-            .await
-            .expect("client record body");
-        let mut record = header.to_vec();
-        record.extend_from_slice(&body);
-
         let mut client_reader =
             EncryptionRecordCodec::new(&client_write_key, [0u8; 12])
                 .expect("client record codec");
-        assert_eq!(
-            client_reader
-                .open_record(&record)
-                .expect("client record decrypt"),
-            b"ping"
-        );
-
         let mut server_writer = EncryptionRecordCodec::new(
             &server_write_key,
             [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3],
         )
         .expect("server record codec");
-        let pong = server_writer
-            .seal_record(b"pong")
-            .expect("server record encrypt");
-        server.write_all(&pong).await.expect("server pong");
+
+        // Five records cross the AES-CTR 16-byte block boundary. Derive
+        // the reference masking bytes independently of the runtime state.
+        for index in 0..5 {
+            let mut header = [0u8; RECORD_HEADER_LEN];
+            server
+                .read_exact(&mut header)
+                .await
+                .expect("client record header");
+            if random_headers {
+                let mut reference = vec![0u8; (index + 1) * RECORD_HEADER_LEN];
+                xor_vless_ctr(
+                    &united_key,
+                    &server_prepared.nfs_relays.iv,
+                    &mut reference,
+                )
+                .expect("reference upload masking");
+                let offset = index * RECORD_HEADER_LEN;
+                for (byte, mask) in header
+                    .iter_mut()
+                    .zip(&reference[offset..offset + RECORD_HEADER_LEN])
+                {
+                    *byte ^= mask;
+                }
+            }
+            let body_len =
+                decode_record_header(&header).expect("client record header");
+            let mut body = vec![0u8; body_len];
+            server
+                .read_exact(&mut body)
+                .await
+                .expect("client record body");
+            let mut record = header.to_vec();
+            record.extend_from_slice(&body);
+            assert_eq!(
+                client_reader
+                    .open_record(&record)
+                    .expect("client record decrypt"),
+                b"ping"
+            );
+
+            let mut pong = server_writer
+                .seal_record(b"pong")
+                .expect("server record encrypt");
+            if random_headers {
+                let mut reference = vec![0u8; (index + 1) * RECORD_HEADER_LEN];
+                xor_vless_ctr(&united_key, &ticket, &mut reference)
+                    .expect("reference download masking");
+                let offset = index * RECORD_HEADER_LEN;
+                for (byte, mask) in pong[..RECORD_HEADER_LEN]
+                    .iter_mut()
+                    .zip(&reference[offset..offset + RECORD_HEADER_LEN])
+                {
+                    *byte ^= mask;
+                }
+            }
+            server.write_all(&pong).await.expect("server pong");
+        }
     });
 
     let mut stream =
         EncryptionStream::new(Box::new(client), prepared).expect("stream");
-    stream.write_all(b"ping").await.expect("encrypted ping");
+    for _ in 0..5 {
+        stream.write_all(b"ping").await.expect("encrypted ping");
 
-    let mut pong = [0u8; 4];
-    stream.read_exact(&mut pong).await.expect("encrypted pong");
-    assert_eq!(&pong, b"pong");
+        let mut pong = [0u8; 4];
+        stream.read_exact(&mut pong).await.expect("encrypted pong");
+        assert_eq!(&pong, b"pong");
+    }
 
     server_task.await.expect("server task");
 }
