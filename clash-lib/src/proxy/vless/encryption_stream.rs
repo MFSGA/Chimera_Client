@@ -512,10 +512,10 @@ impl EncryptionStream {
 
         if self.read_ciphertext.is_none() {
             let this = self.as_mut().get_mut();
-            if let Some(mask) = this.read_header_mask.as_mut() {
-                if let Err(err) = mask.apply(&mut this.read_header.data) {
-                    return Poll::Ready(Err(err));
-                }
+            if let Some(mask) = this.read_header_mask.as_mut()
+                && let Err(err) = mask.apply(&mut this.read_header.data)
+            {
+                return Poll::Ready(Err(err));
             }
             let len = match decode_record_len(&self.read_header.data) {
                 Ok(len) => len,
@@ -593,10 +593,10 @@ impl AsyncWrite for EncryptionStream {
                 Err(err) => return Poll::Ready(Err(err)),
             };
             let mut wire = wire;
-            if let Some(mask) = self.write_header_mask.as_mut() {
-                if let Err(err) = mask.apply(&mut wire[..RECORD_HEADER_LEN]) {
-                    return Poll::Ready(Err(err));
-                }
+            if let Some(mask) = self.write_header_mask.as_mut()
+                && let Err(err) = mask.apply(&mut wire[..RECORD_HEADER_LEN])
+            {
+                return Poll::Ready(Err(err));
             }
             self.pending_write = Some(PendingRecordWrite {
                 wire: PendingIo::from_data(wire),
@@ -810,7 +810,7 @@ mod tests {
         xor_vless_ctr(&key, &iv, &mut expected).expect("reference CTR stream");
 
         let mut actual = [0u8; 35];
-        for header in actual.chunks_exact_mut(RECORD_HEADER_LEN) {
+        for header in actual.as_chunks_mut::<RECORD_HEADER_LEN>().0 {
             mask.apply(header).expect("mask header");
         }
         assert_eq!(actual, expected);
@@ -825,7 +825,7 @@ mod tests {
         let mut expected = [0u8; 15];
         xor_vless_ctr(&key, &iv, &mut expected).expect("last CTR block");
         let mut actual = [0u8; 15];
-        for header in actual.chunks_exact_mut(RECORD_HEADER_LEN) {
+        for header in actual.as_chunks_mut::<RECORD_HEADER_LEN>().0 {
             mask.apply(header).expect("remaining final block");
         }
         assert_eq!(actual, expected);
@@ -850,7 +850,7 @@ mod tests {
         let mut expected = [0u8; 30];
         xor_vless_ctr(&key, &iv, &mut expected).expect("last two CTR blocks");
         let mut actual = [0u8; 30];
-        for header in actual.chunks_exact_mut(RECORD_HEADER_LEN) {
+        for header in actual.as_chunks_mut::<RECORD_HEADER_LEN>().0 {
             mask.apply(header).expect("header in final two blocks");
         }
         assert_eq!(actual, expected);
