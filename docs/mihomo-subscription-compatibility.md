@@ -42,6 +42,14 @@
 - ⚠️ `cargo test -p clash-lib --lib --features 'trojan hysteria ws' --locked proxy::converters:: -- --test-threads=1`：源码已完成编译，但在链接测试二进制时磁盘空间不足（`No space left on device`），**未执行测试，不能视为通过**；未删除用户已有编译缓存。
 - ⚠️ 尚未运行原订阅真实端到端握手、Windows/Linux 运行、XUDP/SMUX 实现互操作；这些验证必须明确记作 `not run`，不得写成成功。
 
+## 2026-10-16：VLESS 出站构建与 XUDP 加密组合回归
+
+- **无效 UUID 提前拒绝**：VLESS handler 的 `TryFrom<OutboundVless>` 现在在 outbound 构建阶段验证 UUID，而不是等待第一次建立 TCP/UDP 连接时才由 `VlessStream::new` 报错。错误提示不会回显原始 UUID；仅 YAML 结构解析成功不代表出站能够正常构建。
+- **XUDP 不降级**：覆盖 `packet-encoding: xudp`、`smux.enabled: false`、`encryption: mlkem768x25519plus.random.1rtt...` 的虚构配置。handler 可用于 TCP，但 `support_udp()` 仍为 `false`，不会把 XUDP 错当作已支持的原生加密 UDP。
+- **验证**：修复前 `vless_rejects_malformed_uuid_before_outbound_runtime` 失败、修复后通过；默认 feature 的 VLESS 转换器测试 **95 passed**；`--no-default-features` 下 UUID 拒绝测试 **1 passed**；`cargo clippy -p clash-lib --lib --locked --offline -- -D warnings` 通过。
+- **相关 CI 修复**：此前主线提交 `43679c3` 的 Rust quality CI 因 `encryption_stream.rs` 中 2 个 `collapsible_if` 和 3 个 `chunks_exact_to_as_chunks` 告警失败（Windows Network Regression 已成功）。修复这些告警后，复用了已有 Dashboard 构建产物运行的本地 `cargo clippy -p clash-lib --all-targets --all-features --locked --offline -- -D warnings` 通过；本地**未重新构建 Dashboard**，新提交的远端 CI 仍需单独验收。
+- **限制**：没有测试真实节点、XUDP wire 协议、真实订阅，亦未验证完整 Mihomo 订阅在所有平台的运行行为；这些仍需后续独立验收。以上测试只使用虚构 UUID、地址和密钥材料。
+
 ## 2026-10-16：XHTTP XMUX 显式零值兼容性
 
 - 使用真实 Mihomo 订阅的**字段取值组合**进行只读分析；未将订阅、节点名称或凭据加入仓库、文档或测试。该订阅有一个 XHTTP 代理同时设置了 `reuse-settings.max-concurrency: "1"` 和 `max-connections: "0"`。
