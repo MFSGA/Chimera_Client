@@ -784,30 +784,47 @@ fn encryption_record_codec_continues_after_peer_padding() {
 #[cfg(feature = "vless-encryption")]
 #[tokio::test]
 async fn encryption_stream_native_one_rtt_round_trips_records() {
-    encryption_stream_one_rtt_round_trips_records("native").await;
+    encryption_stream_one_rtt_round_trips_records("native", false).await;
 }
 
 #[cfg(feature = "vless-encryption")]
 #[tokio::test]
 async fn encryption_stream_xorpub_one_rtt_round_trips_records() {
-    encryption_stream_one_rtt_round_trips_records("xorpub").await;
+    encryption_stream_one_rtt_round_trips_records("xorpub", false).await;
 }
 
 #[cfg(feature = "vless-encryption")]
 #[tokio::test]
 async fn encryption_stream_random_one_rtt_round_trips_records() {
-    encryption_stream_one_rtt_round_trips_records("random").await;
+    encryption_stream_one_rtt_round_trips_records("random", false).await;
 }
 
 #[cfg(feature = "vless-encryption")]
-async fn encryption_stream_one_rtt_round_trips_records(appearance: &str) {
+#[tokio::test]
+async fn encryption_stream_native_one_rtt_round_trips_large_udp_datagram() {
+    encryption_stream_one_rtt_round_trips_records("native", true).await;
+}
+
+#[cfg(feature = "vless-encryption")]
+#[tokio::test]
+async fn encryption_stream_random_one_rtt_round_trips_large_udp_datagram() {
+    encryption_stream_one_rtt_round_trips_records("random", true).await;
+}
+
+#[cfg(feature = "vless-encryption")]
+async fn encryption_stream_one_rtt_round_trips_records(appearance: &str, udp: bool) {
     use aws_lc_rs::{
         agreement,
         kem::{EncapsulationKey, ML_KEM_768},
     };
+    use futures::{SinkExt, StreamExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use super::super::encryption_stream::EncryptionStream;
+    use super::super::{
+        datagram::OutboundDatagramVless, encryption_stream::EncryptionStream,
+        stream::VlessStream,
+    };
+    use crate::{proxy::datagram::UdpPacket, session::SocksAddr};
 
     // The spawned server task must own this value ('static future).
     let appearance = appearance.to_owned();
@@ -940,9 +957,11 @@ async fn encryption_stream_one_rtt_round_trips_records(appearance: &str) {
         )
         .expect("server record codec");
 
-        // Five records cross the AES-CTR 16-byte block boundary. Derive
-        // the reference masking bytes independently of the runtime state.
-        for index in 0..5 {
+        // Five TCP records or two records carrying a >8 KiB framed UDP
+        // packet cross AES-CTR block boundaries. Reference bytes are derived
+        // independently of runtime mask state.
+        let mut received_udp = Vec::new();
+        for index in 0..if udp { 2 } else { 5 } {
             let mut header = [0u8; RECORD_HEADER_LEN];
             server
                 .read_exact(&mut header)
@@ -973,40 +992,107 @@ async fn encryption_stream_one_rtt_round_trips_records(appearance: &str) {
                 .expect("client record body");
             let mut record = header.to_vec();
             record.extend_from_slice(&body);
-            assert_eq!(
-                client_reader
-                    .open_record(&record)
-                    .expect("client record decrypt"),
-                b"ping"
-            );
-
-            let mut pong = server_writer
-                .seal_record(b"pong")
-                .expect("server record encrypt");
-            if random_headers {
-                let mut reference = vec![0u8; (index + 1) * RECORD_HEADER_LEN];
-                xor_vless_ctr(&united_key, &ticket, &mut reference)
-                    .expect("reference download masking");
-                let offset = index * RECORD_HEADER_LEN;
-                for (byte, mask) in pong[..RECORD_HEADER_LEN]
-                    .iter_mut()
-                    .zip(&reference[offset..offset + RECORD_HEADER_LEN])
-                {
-                    *byte ^= mask;
+            let plaintext = client_reader
+                .open_record(&record)
+                .expect("client record decrypt");
+            if udp {
+                received_udp.extend_from_slice(&plaintext);
+            } else {
+                assert_eq!(plaintext, b"ping");
+                let mut pong = server_writer
+                    .seal_record(b"pong")
+                    .expect("server record encrypt");
+                if random_headers {
+                    let mut reference = vec![0u8; (index + 1) * RECORD_HEADER_LEN];
+                    xor_vless_ctr(&united_key, &ticket, &mut reference)
+                        .expect("reference download masking");
+                    let offset = index * RECORD_HEADER_LEN;
+                    for (byte, mask) in pong[..RECORD_HEADER_LEN]
+                        .iter_mut()
+                        .zip(&reference[offset..offset + RECORD_HEADER_LEN])
+                    {
+                        *byte ^= mask;
+                    }
                 }
+                server.write_all(&pong).await.expect("server pong");
             }
-            server.write_all(&pong).await.expect("server pong");
+        }
+        if udp {
+            // Verify the VLESS UDP command and target before datagram data.
+            let mut request_header = vec![0]; // VLESS version 0
+            request_header.extend_from_slice(
+                uuid::Uuid::parse_str("b831381d-6324-4d53-ad4f-8cda48b30811")
+                    .expect("test UUID")
+                    .as_bytes(),
+            );
+            request_header.extend_from_slice(&[0, 2, 0, 53, 1, 1, 1, 1, 1]);
+            assert_eq!(&received_udp[..request_header.len()], request_header);
+            let framed_udp = &received_udp[request_header.len()..];
+            let expected = vec![0x5a; 9 * 1024];
+            assert_eq!(&framed_udp[..2], &(expected.len() as u16).to_be_bytes());
+            assert_eq!(&framed_udp[2..], expected);
+
+            // The VLESS response header precedes the encrypted UDP reply.
+            // The datagram is also larger than one AEAD record.
+            let reply = vec![0x4a; 11 * 1024];
+            let mut framed = vec![0, 0]; // VLESS response version + addon length
+            framed.extend_from_slice(&(reply.len() as u16).to_be_bytes());
+            framed.extend_from_slice(&reply);
+            for (index, chunk) in framed.chunks(8192).enumerate() {
+                let mut wire = server_writer
+                    .seal_record(chunk)
+                    .expect("encrypted UDP reply record");
+                if random_headers {
+                    let mut reference = vec![0u8; (index + 1) * RECORD_HEADER_LEN];
+                    xor_vless_ctr(&united_key, &ticket, &mut reference)
+                        .expect("reference UDP download CTR");
+                    let offset = index * RECORD_HEADER_LEN;
+                    for (byte, mask) in wire[..RECORD_HEADER_LEN]
+                        .iter_mut()
+                        .zip(&reference[offset..offset + RECORD_HEADER_LEN])
+                    {
+                        *byte ^= mask;
+                    }
+                }
+                server.write_all(&wire).await.expect("server UDP reply");
+            }
         }
     });
 
     let mut stream =
         EncryptionStream::new(Box::new(client), prepared).expect("stream");
-    for _ in 0..5 {
-        stream.write_all(b"ping").await.expect("encrypted ping");
+    if udp {
+        let remote: SocksAddr = "1.1.1.1:53".parse().expect("test endpoint");
+        let vless = VlessStream::new(
+            Box::new(stream),
+            "b831381d-6324-4d53-ad4f-8cda48b30811",
+            &remote,
+            true,
+            None,
+        )
+        .expect("VLESS UDP stream");
+        let mut datagram =
+            OutboundDatagramVless::new(Box::new(vless), remote.clone());
+        let packet = UdpPacket {
+            data: vec![0x5a; 9 * 1024],
+            src_addr: remote.clone(),
+            dst_addr: remote,
+            inbound_user: None,
+        };
+        datagram
+            .send(packet)
+            .await
+            .expect("send encrypted large UDP packet");
+        let reply = datagram.next().await.expect("encrypted UDP reply");
+        assert_eq!(reply.data, vec![0x4a; 11 * 1024]);
+    } else {
+        for _ in 0..5 {
+            stream.write_all(b"ping").await.expect("encrypted ping");
 
-        let mut pong = [0u8; 4];
-        stream.read_exact(&mut pong).await.expect("encrypted pong");
-        assert_eq!(&pong, b"pong");
+            let mut pong = [0u8; 4];
+            stream.read_exact(&mut pong).await.expect("encrypted pong");
+            assert_eq!(&pong, b"pong");
+        }
     }
 
     server_task.await.expect("server task");

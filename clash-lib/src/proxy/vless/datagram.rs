@@ -279,8 +279,8 @@ impl Stream for OutboundDatagramVless {
 
 #[cfg(test)]
 mod tests {
-    use futures::SinkExt;
-    use tokio::io::AsyncReadExt;
+    use futures::{SinkExt, StreamExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::{MAX_PACKET_LENGTH, OutboundDatagramVless};
     use crate::{proxy::datagram::UdpPacket, session::SocksAddr};
@@ -317,6 +317,48 @@ mod tests {
             .await
             .expect("full datagram");
         assert_eq!(received, payload);
+    }
+
+    #[tokio::test]
+    async fn truncated_udp_payload_never_emits_a_partial_datagram() {
+        let (client, mut server) = tokio::io::duplex(64);
+        let remote: SocksAddr = "1.1.1.1:53".parse().expect("test address");
+        let mut datagram = OutboundDatagramVless::new(Box::new(client), remote);
+        server
+            .write_all(&[0, 4, 0x11, 0x22])
+            .await
+            .expect("truncated datagram");
+        drop(server);
+
+        assert!(
+            datagram.next().await.is_none(),
+            "a partial UDP datagram must not be forwarded after EOF"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_pending_udp_send_releases_the_owned_stream() {
+        let (client, mut server) = tokio::io::duplex(32);
+        let remote: SocksAddr = "1.1.1.1:53".parse().expect("test address");
+        let mut datagram = OutboundDatagramVless::new(Box::new(client), remote);
+        let send = tokio::spawn(async move {
+            // Without a reader this send cannot finish. Aborting the task
+            // must drop the datagram and its owned transport promptly.
+            datagram.send(packet(vec![0x35; 9 * 1024])).await
+        });
+        tokio::task::yield_now().await;
+        send.abort();
+        let _ = send.await;
+
+        let mut received = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server.read_to_end(&mut received),
+        )
+        .await
+        .expect("cancelled transport must close without hanging")
+        .expect("read remaining pending bytes");
+        assert!(received.len() < 9 * 1024);
     }
 
     #[tokio::test]
