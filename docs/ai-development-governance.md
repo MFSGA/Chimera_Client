@@ -4,13 +4,22 @@
 
 阅读顺序：[AGENTS.md](../AGENTS.md) → 本文 → [ref 对齐与批量迁移](ref-alignment-guide.md) → [独立审查清单](ai-review-checklist.md) → [实际工作流](../.github/WORKFLOWS.md) → [LESSONS](../LESSONS.md)。
 
+## 默认开发/提交路径：本地 `master`，不自动新建 PR
+
+维护者已明确将**本地 `master` 直接迭代并签名提交**设为常规任务的默认工作流：检查基线 → 安全修改 → 定向验证 → `git commit -S` → 本地核验签名 → 报告结果。**不是每完成一个小修复就创建新 PR**，也不自动为常规任务建立任务分支。独立审查可以针对本地 diff/commit 开展，无需虚构 PR 或审查结论。
+
+- **开始条件**：检查工作区是否干净、本地 `master` 所在 Worktree、`master` 与 `origin/master` 的共同基线及 ahead/behind。遇到本地未提交改动、占用或分叉，保护原始状态；不能擅自 reset、stash、rebase、覆盖、丢弃或强制同步。用户明确要求仅本地提交时，可在确认不会覆盖既有改动的本地 `master` 继续，但必须披露分叉状态及远端同步待办。
+- **提交门槛**：代码检查必须如实执行并记录；所有新增提交用 `git commit -S`，完成后运行 `git verify-commit HEAD`、`git log -1 --show-signature`、`git show -s --format='%G?' HEAD`。`G` 是本地可信有效签名，`U` 是有效但本地未建立信任，须说明其差别。签名失败、不存在或无法确认时不得以未签名 commit 替代。推送后另查 GitHub `Verified`；不能把邮箱检查或本地签名等同于 GitHub 验证状态。
+- **远端操作单独授权**：默认止于本地提交。`push`、创建/更新 PR、合并、发布及修改共享历史需要对应任务的明确授权；在已分叉的 `master` 上禁止直接强推。远端规则要求 PR 时才遵照规则走 PR，不通过此约定绕过实际 required checks / branch protection。
+- **例外和审查**：多人协作、高风险、需要隔离的实验及强制 PR 流程可采用独立分支/Worktree，但必须解释原因。L2/L3 的风险评估、独立审查及维护者批准保持有效；本地提交不等于审查、合并或发布批准。已有未合并 PR 不因本约定而自动关闭。
+
 ## 1. 任务开始前固定基线
 
 1. 读取用户目标、可观察的验收标准、非目标、允许修改的文件与环境；必要时使用 [AI Issue 模板](../.github/ISSUE_TEMPLATE/ai-task.md)。
 2. 记录 `git status --short --branch`、当前 `HEAD`、本地 `master` / `origin/master` 的 SHA、相关分支与 Worktree。**已有未提交内容都视作用户资产**，不自动 reset、stash、覆盖或借机格式化。
 3. 上游工作记录 `ref/`（clash-rs）、`ref-mihomo/`、`ref-meow/` 的固定 gitlink SHA 和清洁状态；这些是本地快照，不等于远端最新代码。
 4. 沿“配置 YAML → 内部配置 → inbound/outbound → dispatcher/router → DNS/netstack/TUN → Controller API / CLI / Dashboard”确认实际影响范围；特别记录 Cargo feature、平台 cfg、缓存/热重载、用户目录及配置兼容性。
-5. 风险按变更涉及的**最高级别**确定，明确授权边界。存在互不相关的工作时优先隔离分支/Worktree；用户指定直接在当前工作区修改且安全可行时，不强制创建 PR/Worktree。
+5. 风险按变更涉及的**最高级别**确定，明确授权边界。常规任务遵循上述本地 `master` 默认路径；存在互不相关的工作、强制审查或隔离需求时，可按风险选择独立分支/Worktree，不机械要求每项改动都有 PR。
 
 ## 2. 风险分级和审批
 
