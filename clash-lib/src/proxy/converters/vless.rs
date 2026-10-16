@@ -3466,6 +3466,21 @@ udp: true
     }
 
     #[test]
+    fn vless_xhttp_reuse_policy_accepts_explicit_zero_max_connections() {
+        let settings = XhttpReuseSettings {
+            max_concurrency: Some("1".to_owned()),
+            max_connections: Some("0".to_owned()),
+            ..Default::default()
+        };
+
+        let policy = build_xhttp_reuse_policy(Some(&settings))
+            .expect("zero max-connections must not conflict with max-concurrency")
+            .expect("reuse policy must be present");
+        assert_eq!(policy.sample_limits().max_concurrency, 1);
+        assert_eq!(policy.sample_max_connections(), None);
+    }
+
+    #[test]
     fn vless_xhttp_reuse_settings_build_with_supported_runtime_limits() {
         let outbound = OutboundVless {
             common_opts: CommonConfigOptions {
