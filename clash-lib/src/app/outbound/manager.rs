@@ -41,7 +41,7 @@ use crate::{
         group::{
             fallback, loadbalance, relay,
             selector::{self, ThreadSafeSelectorControl},
-            urltest,
+            smart, urltest,
         },
         reject, socks,
         utils::{
@@ -1012,6 +1012,49 @@ impl OutboundManager {
         // Initialize handlers for each outbound group protocol
         for outbound_group in outbound_groups.iter() {
             match outbound_group {
+                OutboundGroupProtocol::Smart(proto) => {
+                    proto.validate()?;
+                    if check_group_empty(&proto.proxies, &proto.use_provider) {
+                        return Err(Error::InvalidConfig(format!(
+                            "smart proxy group {} has no proxies",
+                            proto.name
+                        )));
+                    }
+                    let mut providers: Vec<ThreadSafeProxyProvider> = vec![];
+                    if let Some(proxies) = &proto.proxies {
+                        providers.push(make_provider_from_proxies(
+                            &proto.name,
+                            proxies,
+                            proto.interval.unwrap_or(300),
+                            proto.lazy.unwrap_or_default(),
+                            handlers,
+                            proxy_manager.clone(),
+                            provider_registry,
+                        )?);
+                    }
+                    maybe_append_use_providers(
+                        &proto.use_provider,
+                        provider_registry,
+                        &mut providers,
+                    )?;
+                    handlers.insert(
+                        proto.name.clone(),
+                        Arc::new(smart::Handler::new(
+                            smart::HandlerOptions {
+                                name: proto.name.clone(),
+                                udp: proto.udp.unwrap_or(true),
+                                common_opts: crate::proxy::HandlerCommonOptions {
+                                    icon: proto.icon.clone(),
+                                    url: proto.url.clone(),
+                                    connector: None,
+                                },
+                            },
+                            proto.tolerance.unwrap_or_default(),
+                            providers,
+                            proxy_manager.clone(),
+                        )),
+                    );
+                }
                 OutboundGroupProtocol::UrlTest(proto) => {
                     if check_group_empty(&proto.proxies, &proto.use_provider) {
                         return Err(Error::InvalidConfig(format!(

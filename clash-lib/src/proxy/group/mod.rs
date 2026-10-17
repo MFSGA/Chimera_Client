@@ -12,6 +12,7 @@ pub mod fallback;
 pub mod loadbalance;
 pub mod relay;
 pub mod selector;
+pub mod smart;
 pub mod urltest;
 
 /// Convenience trait for group proxy serializing API responses.
