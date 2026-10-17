@@ -298,7 +298,9 @@ cargo watch -x 'run -p clash-rs -- -c config.yaml'
 - **CI 不空等但不绕过**：获授权提交并启动 CI 后，记录最终 SHA、run URL 与 `pending`，继续已授权且不依赖 CI 的工作；避免重复轮询或假装在后台监控。没有独立工作时交接待办。**CI pending/failed 不等于通过，不得自行合并或发布；仓库所有者可逐项书面接受 L2 的非 required 检查缺口，实际 GitHub required checks 和分支保护仍须遵守。**
 - **一个问题的修复完成后整理历史**：允许先做多个调试/CI 修复 commit。最终问题经相关测试和必要检查确认解决后，在自有的未合并任务分支本地 squash/fixup 同一问题的提交，保留审查/失败证据，不能混入其他作者或 Issue 的提交；改写前备份并核对 base 和远端旧 SHA，改写后验证最终 diff。新 SHA 必须重新跑 required checks，不能继承旧 SHA 的 CI。
 - **Git 历史与远端写入必须授权**：未经本次明确授权，不推送、不创建 PR/合并/tag、不改写 `master` / 共享历史；自有非保护任务分支若确需覆盖，经授权和协作者核对后使用限定旧 SHA 的 `--force-with-lease`，禁止裸 `--force`。用户明确要求对共享历史做特殊处理也须先核对保护规则、备份、其他协作者和 release 影响。
-- **L2 审查与所有者豁免**：独立 Reviewer 为默认推荐；编码 Agent 不能自称独立 Reviewer。仓库所有者（非任意 PR 作者）可对具体 PR 最终 SHA 明确放行独立审查、真实 Xray/Mihomo 等非必需互操作或非 required 测试缺口；必须由其本人在 PR 留下可核对的批准、豁免项、风险和回滚说明。不得冒充所有者授权，也不得绕过 GitHub required checks；更改 SHA 必须重新确认。L3 仍按严格审批执行。
+- **独立审查要求**：L2 默认需要、L3 必须由未参与编码并使用独立上下文的 Reviewer 按最终 SHA 检查实际 diff 和证据，至少核对验收标准、调用链与 `ref/` 基线/本地差异、受影响接口及 feature/cfg、失败与恢复路径、平台/网络/主机副作用、授权与敏感数据边界、测试覆盖和缺口、回滚方案。编码者自审或 CI 绿灯不能替代独立审查。
+- **L2 所有者豁免**：沿用 Chimera Client 的本地例外（参考项目未规定此豁免）：仓库所有者可对具体 PR 的最终 SHA 书面豁免独立审查，或接受非必需的互操作/非 required 检查缺口；须说明理由、剩余风险和回滚方案，且不免除维护者批准，也不绕过 required checks 或分支保护。该例外不适用于 L3。
+- **审查记录与最终 SHA**：通过 PR 审查时，将 Reviewer 结论、维护者批准和适用的豁免记录在 PR；按默认本地 `master` 流程且没有 PR 时，在任务最终交付中列出 Reviewer 结论与维护者批准。需要 L2 所有者豁免时必须走 PR。L3 不得豁免独立审查或维护者批准，AI 不得代替所有者或维护者授权。最终 SHA 改变后，重新运行适用检查并重新审查、批准。
 - **Verified 提交门禁**：在合入、发布前检查本次引入的每个 commit 的 GitHub `verification.verified`。必须优先使用 **Verified** 的签名提交；Commit Email Check 成功不等于 Verified。任何 `unverified`/`unsigned`/无法确认的 SHA 都必须先交由仓库所有者审核，并由其在 PR 对具体 SHA 留下明确签名例外批准；否则不得自动合并或发布。新 SHA 重新验证，合并后的最终提交也要检查；已有 GitHub 签名保护规则不可用文档豁免绕过。**AI 不得代替所有者批准例外。**
 - **真实工作流边界**：`.github/workflows/ci.yml` 具有 Dashboard、跨平台 Rust quality、compile 和 `latest` 预发布路径；Windows 网络、吞吐、coverage 与 Dependabot auto-merge 有各自条件。普通 Codex 任务不继承 Dependabot/发行凭据，未配置的 AI 自动审查/Ruleset 不能宣称存在。
 - **复盘**：仅把已查明根因、有可复现证据的事故加入 `LESSONS.md`；不在复盘、日志、PR 或上传文件中暴露完整代理订阅、用户配置和 Secrets。
