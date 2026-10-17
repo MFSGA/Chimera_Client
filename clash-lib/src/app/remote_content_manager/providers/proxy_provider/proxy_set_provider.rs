@@ -98,8 +98,9 @@ impl ProxySetProvider {
             let proxies = scheme.proxies.ok_or_else(|| {
                 Error::InvalidConfig(format!("{parser_name}: proxies is empty"))
             })?;
+            let declared_count = proxies.len();
 
-            proxies
+            let accepted: Vec<AnyOutboundHandler> = proxies
                 .into_iter()
                 .filter_map(|mapping| {
                     match OutboundProxyProtocol::try_from(mapping) {
@@ -119,8 +120,18 @@ impl ProxySetProvider {
                         Err(e) => Some(Err(e)),
                     }
                 })
-                .collect::<Result<Vec<_>, Error>>()
-                .map_err(Into::into)
+                .collect::<Result<Vec<_>, Error>>()?;
+
+            // Empty lists may intentionally remove all proxies, but an update
+            // containing only invalid entries must not replace a working
+            // provider with an empty set or overwrite its last good cache.
+            if declared_count != 0 && accepted.is_empty() {
+                return Err(Error::InvalidConfig(format!(
+                    "{parser_name}: no usable proxies in nonempty provider update"
+                ))
+                .into());
+            }
+            Ok(accepted)
         });
 
         let fetcher = Fetcher::new(name, interval, vehicle, parser, Some(updater));
@@ -200,6 +211,125 @@ impl ProxyProvider for ProxySetProvider {
 
     async fn healthcheck(&self) {
         self.hc.check().await;
+    }
+}
+
+#[cfg(test)]
+mod update_reliability_tests {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
+    use super::{ProxyProvider, ProxySetProvider};
+    use crate::app::{
+        dns::MockClashResolver,
+        remote_content_manager::{
+            ProxyManager,
+            healthcheck::HealthCheck,
+            providers::{MockProviderVehicle, Provider, ProviderVehicleType},
+        },
+    };
+
+    const VALID: &[u8] = b"proxies:\n  - name: last-good\n    type: socks5\n    server: 198.51.100.10\n    port: 1080\n";
+    const INVALID: &[u8] =
+        b"proxies:\n  - name: broken\n    type: unsupported-protocol\n";
+    const EMPTY: &[u8] = b"proxies: []\n";
+    const PARTIAL: &[u8] = b"proxies:\n  - name: broken\n    type: unknown-protocol\n  - name: recovered\n    type: socks5\n    server: 198.51.100.11\n    port: 1081\n";
+
+    fn provider_with_refresh(
+        path: String,
+        refreshed_content: &'static [u8],
+    ) -> ProxySetProvider {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut vehicle = MockProviderVehicle::new();
+        vehicle.expect_path().return_const(path);
+        vehicle.expect_typ().return_const(ProviderVehicleType::Http);
+        vehicle.expect_read().times(2).returning(move || {
+            if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(VALID.to_vec())
+            } else {
+                Ok(refreshed_content.to_vec())
+            }
+        });
+        let manager = ProxyManager::new(Arc::new(MockClashResolver::new()), None);
+        let health = HealthCheck::new(
+            vec![],
+            "http://example.invalid/check".to_owned(),
+            0,
+            true,
+            manager,
+        );
+        ProxySetProvider::new(
+            "synthetic-provider".to_owned(),
+            Duration::ZERO,
+            Arc::new(vehicle),
+            health,
+        )
+        .expect("offline provider should construct")
+    }
+
+    #[tokio::test]
+    async fn malformed_refresh_keeps_last_good_proxy_set_and_cache() {
+        let dir = tempfile::tempdir().expect("temporary cache dir");
+        let cache_path = dir.path().join("provider.yaml");
+        let provider = provider_with_refresh(
+            cache_path.to_string_lossy().into_owned(),
+            INVALID,
+        );
+        provider.initialize().await.expect("valid initial provider");
+        assert_eq!(provider.proxies().await[0].name(), "last-good");
+        assert_eq!(std::fs::read(&cache_path).unwrap(), VALID);
+
+        assert!(
+            provider.update().await.is_err(),
+            "a nonempty provider containing no valid proxies must fail closed"
+        );
+        let proxies = provider.proxies().await;
+        assert_eq!(proxies.len(), 1, "last good proxy set must survive");
+        assert_eq!(proxies[0].name(), "last-good");
+        assert_eq!(
+            std::fs::read(&cache_path).unwrap(),
+            VALID,
+            "invalid remote refresh must not poison the cached provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_valid_and_invalid_refresh_keeps_usable_entries() {
+        let dir = tempfile::tempdir().expect("temporary cache dir");
+        let cache_path = dir.path().join("provider.yaml");
+        let provider = provider_with_refresh(
+            cache_path.to_string_lossy().into_owned(),
+            PARTIAL,
+        );
+        provider.initialize().await.expect("valid initial provider");
+        provider
+            .update()
+            .await
+            .expect("usable entries in mixed provider should be accepted");
+        let proxies = provider.proxies().await;
+        assert_eq!(proxies.len(), 1);
+        assert_eq!(proxies[0].name(), "recovered");
+        assert_eq!(std::fs::read(&cache_path).unwrap(), PARTIAL);
+    }
+
+    #[tokio::test]
+    async fn explicitly_empty_refresh_remains_supported() {
+        let dir = tempfile::tempdir().expect("temporary cache dir");
+        let cache_path = dir.path().join("provider.yaml");
+        let provider =
+            provider_with_refresh(cache_path.to_string_lossy().into_owned(), EMPTY);
+        provider.initialize().await.expect("valid initial provider");
+        provider
+            .update()
+            .await
+            .expect("explicit empty list is valid");
+        assert!(provider.proxies().await.is_empty());
+        assert_eq!(std::fs::read(&cache_path).unwrap(), EMPTY);
     }
 }
 
