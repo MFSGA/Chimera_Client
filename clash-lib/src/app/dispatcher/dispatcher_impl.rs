@@ -649,6 +649,7 @@ impl Dispatcher {
             OutboundType::Selector
                 | OutboundType::Fallback
                 | OutboundType::UrlTest
+                | OutboundType::Smart
                 | OutboundType::LoadBalance
         );
         let pinned = match crate::proxy::group::selector::PinnedOutbound::capture(
@@ -1283,6 +1284,7 @@ impl Dispatcher {
                     OutboundType::Selector
                         | OutboundType::Fallback
                         | OutboundType::UrlTest
+                        | OutboundType::Smart
                         | OutboundType::LoadBalance
                 );
                 let pinned =

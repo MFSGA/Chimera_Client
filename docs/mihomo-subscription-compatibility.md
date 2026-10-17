@@ -69,3 +69,11 @@
 - 默认特性加 `trojan hysteria ws` 的转换器回归 **112 passed、0 failed**；相同组合严格 Clippy 通过；无默认特性的 VLESS 测试 **130 passed、0 failed**。默认特性的 macOS TUN 选择器测试 **2/2** 和原生加密密钥校验测试 **1/1** 通过。
 - 新增 `mihomo_mixed_protocol_yaml_parses_and_builds_offline_outbounds`：用**同一份合成 YAML** 解析 VLESS+WS、Trojan+gRPC、Hysteria2+Salamander/端口跳跃参数，并逐一构建 handler、核对协议和重要字段。测试显式复用 `setup_default_crypto_provider()`，否则 Rustls 在多后端构建中可能因未安装默认 provider 而 panic。未拨号、未测试真实代理流量。
 - 上述全部使用外置 APFS `CARGO_TARGET_DIR`、`--locked --offline` 执行。仍未验收真实 Xray/Mihomo wire 互操作、XUDP/SMUX，以及 Windows/Linux 平台运行；这些不得被本地配置构建测试替代。
+
+## 2026-10-16：Smart 代理组保守运行时基线
+
+- 初始本地 `master` 为 `486c40584f55e32983de77f81b178cd96e08c2ac`，远端 `master` 为 `f9c9b9afaeed82c2726be4d43fae561f3bf666b9`。此前只有 `OutboundType::Smart` 和 Profile 占位字段，没有 Smart 组配置或运行时；旧 #58 没有可整包复用的 Smart 实现。
+- `type: smart` 支持 `name`、`proxies`、`use`、`url`、`interval`、`lazy`、`tolerance`、`icon`、`udp`，经现有 Provider/ProxyManager 和新流的嵌套组选择管线组装。
+- 只使用已收集的健康标记和最近延迟，选择可用节点；同等失败数下优先低延迟，但在容差内按节点**名称**保留上次结果，避免 Provider 重排序造成误切换。全部不可用时拒绝自动选择已知失效节点。
+- **未实现**：运行时失败次数统计（当前一律为 0）、LightGBM、ASN 偏好、训练数据、加权选择、Smart 统计持久化。配置中启用 `uselightgbm`、`collectdata`、`prefer-asn` 或提供 `policy-priority`、`sample-rate` 会明确报错；未知 Smart 字段也拒绝，避免默默冒充完整的 fork Smart。
+- 仅以合成配置、内存 Provider 与模拟健康数据执行离线测试；不发起真实节点探测或代理流量。后续仍需针对热更新、失败统计、跨平台和 L2 审核验收。

@@ -542,6 +542,8 @@ pub struct OutboundWireguard {
 pub enum OutboundGroupProtocol {
     #[serde(rename = "url-test")]
     UrlTest(OutboundGroupUrlTest),
+    #[serde(rename = "smart")]
+    Smart(OutboundGroupSmart),
     #[serde(rename = "fallback")]
     Fallback(OutboundGroupFallback),
     #[serde(rename = "load-balance")]
@@ -562,8 +564,7 @@ impl OutboundGroupProtocol {
             OutboundGroupProtocol::Fallback(g) => &g.name,
             OutboundGroupProtocol::LoadBalance(g) => &g.name,
             OutboundGroupProtocol::Relay(g) => &g.name,
-            /* OutboundGroupProtocol::LoadBalance(g) => &g.name,
-            OutboundGroupProtocol::Smart(g) => &g.name, */
+            OutboundGroupProtocol::Smart(g) => &g.name,
             OutboundGroupProtocol::Select(g) => &g.name,
         }
     }
@@ -576,7 +577,46 @@ impl OutboundGroupProtocol {
             OutboundGroupProtocol::UrlTest(g) => g.proxies.as_ref(),
             OutboundGroupProtocol::Fallback(g) => g.proxies.as_ref(),
             OutboundGroupProtocol::LoadBalance(g) => g.proxies.as_ref(),
+            OutboundGroupProtocol::Smart(g) => g.proxies.as_ref(),
         }
+    }
+}
+
+/// Conservative Smart baseline. Advanced ML/ASN policies must not be ignored.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct OutboundGroupSmart {
+    pub name: String,
+    pub proxies: Option<Vec<String>>,
+    #[serde(rename = "use")]
+    pub use_provider: Option<Vec<String>>,
+    pub url: Option<String>,
+    pub interval: Option<u64>,
+    pub lazy: Option<bool>,
+    pub tolerance: Option<u16>,
+    pub icon: Option<String>,
+    pub udp: Option<bool>,
+    pub uselightgbm: Option<bool>,
+    pub collectdata: Option<bool>,
+    pub prefer_asn: Option<bool>,
+    pub policy_priority: Option<String>,
+    pub sample_rate: Option<f64>,
+}
+
+impl OutboundGroupSmart {
+    pub fn validate(&self) -> Result<(), crate::Error> {
+        if self.uselightgbm == Some(true)
+            || self.collectdata == Some(true)
+            || self.prefer_asn == Some(true)
+            || self.policy_priority.is_some()
+            || self.sample_rate.is_some()
+        {
+            return Err(crate::Error::InvalidConfig(format!(
+                "smart group `{}` requires unsupported ML/ASN/weighted selection options",
+                self.name
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -816,6 +856,96 @@ mod tests {
         let outbound = OutboundProxyProtocol::try_from(fields)
             .expect("dynamic YAML mapping should deserialize");
         assert_eq!(outbound.name(), "yaml-compat-direct");
+    }
+
+    #[test]
+    fn smart_group_parses_basic_config_but_rejects_unsupported_advanced_options() {
+        use super::OutboundGroupProtocol;
+
+        let parsed: OutboundGroupProtocol = serde_yaml::from_str(
+            "type: smart\nname: latency-smart\nproxies: [A, B]\nuse: [pool]\ninterval: 120\ntolerance: 30\n",
+        )
+        .expect("basic Smart YAML should parse");
+        let OutboundGroupProtocol::Smart(smart) = parsed else {
+            panic!("Smart group must retain its protocol");
+        };
+        smart
+            .validate()
+            .expect("basic Smart mode should be supported");
+        assert_eq!(
+            smart.proxies.as_deref(),
+            Some(&["A".to_owned(), "B".to_owned()][..])
+        );
+        assert_eq!(
+            smart.use_provider.as_deref(),
+            Some(&["pool".to_owned()][..])
+        );
+        assert_eq!(smart.interval, Some(120));
+
+        for setting in [
+            "uselightgbm: true",
+            "collectdata: true",
+            "prefer-asn: true",
+            "policy-priority: 'premium:1.2'",
+            "sample-rate: 0.5",
+        ] {
+            let yaml =
+                format!("type: smart\nname: unsupported\nproxies: [A]\n{setting}\n");
+            let parsed: OutboundGroupProtocol =
+                serde_yaml::from_str(&yaml).expect("recognized Smart setting");
+            let OutboundGroupProtocol::Smart(smart) = parsed else {
+                panic!("Smart group");
+            };
+            assert!(
+                smart.validate().is_err(),
+                "unsupported option {setting} must not be silently ignored"
+            );
+        }
+
+        let err = serde_yaml::from_str::<OutboundGroupProtocol>(
+            "type: smart\nname: strict\nproxies: [A]\nfuture-ml-setting: true\n",
+        )
+        .expect_err("unknown smart options must not be ignored");
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn smart_group_reaches_internal_config_from_synthetic_yaml() {
+        use super::{OutboundGroupProtocol, OutboundProxy};
+
+        let yaml = r#"
+mixed-port: 0
+mode: rule
+log-level: error
+mmdb: null
+dns:
+  enable: false
+tun:
+  enable: false
+proxies:
+  - {name: child, type: direct}
+proxy-groups:
+  - name: SMART
+    type: smart
+    proxies: [child]
+    tolerance: 25
+rules: []
+"#;
+        let config = crate::Config::Str(yaml.to_owned())
+            .try_parse()
+            .expect("synthetic Smart config should parse offline");
+        let OutboundProxy::ProxyGroup(OutboundGroupProtocol::Smart(smart)) = config
+            .proxy_groups
+            .get("SMART")
+            .expect("Smart group in internal config")
+        else {
+            panic!("Smart type must reach the runtime config");
+        };
+        smart
+            .validate()
+            .expect("basic Smart options should be accepted");
+        assert_eq!(smart.tolerance, Some(25));
+        assert_eq!(smart.proxies.as_deref(), Some(&["child".to_owned()][..]));
     }
 
     #[test]

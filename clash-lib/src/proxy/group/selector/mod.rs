@@ -77,6 +77,7 @@ impl PinnedOutbound {
                 OutboundType::Selector
                     | OutboundType::Fallback
                     | OutboundType::UrlTest
+                    | OutboundType::Smart
                     | OutboundType::LoadBalance
             ) {
                 return Ok(Self {
