@@ -754,6 +754,93 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn truncated_record_body_remains_terminal_on_repeated_read() {
+        use tokio::io::AsyncWriteExt;
+
+        let (client, mut server) = tokio::io::duplex(64);
+        server
+            .write_all(&[23, 3, 3, 0, 17, 0x42])
+            .await
+            .expect("write incomplete encrypted record");
+        drop(server);
+
+        let mut stream = handshaken_read_stream(Box::new(client), 0);
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let mut output = [0u8; 8];
+        for attempt in 0..2 {
+            let mut buf = ReadBuf::new(&mut output);
+            let Poll::Ready(Err(err)) =
+                Pin::new(&mut stream).poll_read(&mut cx, &mut buf)
+            else {
+                panic!("read {attempt} must fail after truncated record body");
+            };
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+            assert!(buf.filled().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_partial_record_header_read_resumes_without_losing_bytes() {
+        use tokio::io::AsyncWriteExt;
+
+        let (client, mut server) = tokio::io::duplex(64);
+        server
+            .write_all(&[23, 3])
+            .await
+            .expect("write partial record header");
+        let mut stream = handshaken_read_stream(Box::new(client), 0);
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let mut output = [0u8; 8];
+        {
+            let mut buf = ReadBuf::new(&mut output);
+            assert!(matches!(
+                Pin::new(&mut stream).poll_read(&mut cx, &mut buf),
+                Poll::Pending
+            ));
+            assert_eq!(stream.read_header.offset, 2);
+        } // Cancel the pending read without losing the buffered header.
+
+        server
+            .write_all(&[3, 0, 0])
+            .await
+            .expect("finish invalid-length record header");
+        let mut buf = ReadBuf::new(&mut output);
+        let Poll::Ready(Err(err)) =
+            Pin::new(&mut stream).poll_read(&mut cx, &mut buf)
+        else {
+            panic!("resumed read must reject the completed zero-length record");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("ciphertext length: 0"));
+        assert!(buf.filled().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropping_pending_encryption_read_closes_underlying_transport() {
+        use tokio::io::AsyncReadExt;
+
+        let (client, mut server) = tokio::io::duplex(64);
+        let mut stream = handshaken_read_stream(Box::new(client), 0);
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let mut output = [0u8; 8];
+        let mut buf = ReadBuf::new(&mut output);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_read(&mut cx, &mut buf),
+            Poll::Pending
+        ));
+        drop(stream);
+
+        let count = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            server.read(&mut output),
+        )
+        .await
+        .expect("dropped encryption stream must close promptly")
+        .expect("read from closed transport");
+        assert_eq!(count, 0);
+    }
+
     struct RecordingStream {
         writes: Arc<Mutex<Vec<Vec<u8>>>>,
     }
