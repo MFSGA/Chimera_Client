@@ -120,6 +120,24 @@ impl Handler {
                 })?;
             }
         }
+        if let Some(allowed_ips) = &opts.allowed_ips {
+            for cidr in allowed_ips {
+                cidr.parse::<IpNet>().map_err(|err| {
+                    Error::InvalidConfig(format!(
+                        "invalid WireGuard allowed IP: {err}"
+                    ))
+                })?;
+            }
+        }
+        if let Some(bits) = &opts.reserved_bits
+            && !bits.is_empty()
+            && bits.len() != 3
+        {
+            return Err(Error::InvalidConfig(
+                "WireGuard reserved-bits must contain exactly three bytes"
+                    .to_owned(),
+            ));
+        }
         Ok(())
     }
 

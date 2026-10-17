@@ -70,6 +70,15 @@
 - 新增 `mihomo_mixed_protocol_yaml_parses_and_builds_offline_outbounds`：用**同一份合成 YAML** 解析 VLESS+WS、Trojan+gRPC、Hysteria2+Salamander/端口跳跃参数，并逐一构建 handler、核对协议和重要字段。测试显式复用 `setup_default_crypto_provider()`，否则 Rustls 在多后端构建中可能因未安装默认 provider 而 panic。未拨号、未测试真实代理流量。
 - 上述全部使用外置 APFS `CARGO_TARGET_DIR`、`--locked --offline` 执行。仍未验收真实 Xray/Mihomo wire 互操作、XUDP/SMUX，以及 Windows/Linux 平台运行；这些不得被本地配置构建测试替代。
 
+## 2026-10-17：WireGuard 配置输入与运行时差异审计（离线）
+
+- 起始本地 `master`：`50cb5d06aa79919ae6eac4a7ff3ac2bc7b1fbf92`；远端 `master`：`f9c9b9afaeed82c2726be4d43fae561f3bf666b9`。只审计主线真正缺失的行为，没有合并旧 PR #58。
+- **已复现**：无效 `ipv6`（包括错误的 IPv4 地址族）此前可能在 `OutboundWireguard` 转换时被 `.ok()` 静默吞掉，导致 handler 构建成功但 IPv6 实际丢失。新增测试在修复前确实失败，修复后改为明确返回配置错误。
+- `allowed-ips` 原先仅在 `initialize_inner` 期间（先执行 endpoint DNS 解析后）验证；现在在 `Handler::try_new` 的配置校验阶段拒绝非法 CIDR，不必启动隧道或解析远端。
+- `reserved-bits` 原先把短数组回退为全零并截断多余字节；现在要求非空数组**恰好 3 个字节**。显式空数组仍按历史行为使用默认全零值，避免无必要的兼容回归。
+- 仅采用合成 IPv4/IPv6（RFC 5737 / RFC 3849）、离线固定测试密钥和不实际连接的 handler 构建。默认功能加 `wireguard`：转换器 **7/7** 通过、后台任务生命周期 **1/1** 通过，库级 `clippy -D warnings` 通过；`--no-default-features --features 'wireguard ring'` 转换器 **7/7** 通过，严格 Clippy 通过；Rustfmt 和 diff 检查通过。
+- **仍未验收**：WireGuard 真实握手、IPv4/IPv6 数据面、路由/MTU、DNS 路径、Windows/Linux 实机兼容、Provider 热更新及 L2 审查。上述离线测试不得替代这些运行时验证。
+
 ## 2026-10-16：Smart 代理组保守运行时基线
 
 - 初始本地 `master` 为 `486c40584f55e32983de77f81b178cd96e08c2ac`，远端 `master` 为 `f9c9b9afaeed82c2726be4d43fae561f3bf666b9`。此前只有 `OutboundType::Smart` 和 Profile 占位字段，没有 Smart 组配置或运行时；旧 #58 没有可整包复用的 Smart 实现。
