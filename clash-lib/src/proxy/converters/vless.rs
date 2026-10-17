@@ -1927,6 +1927,8 @@ fn decode_reality_short_id(short_id: Option<&str>) -> Result<Vec<u8>, Error> {
 
 #[cfg(test)]
 mod tests {
+    use crate::proxy::OutboundHandler;
+
     use crate::config::internal::proxy::{
         CommonConfigOptions, GrpcOpt, OutboundTrojanRealityOpts,
         XhttpDownloadSettings, XhttpDownloadXhttpSettings, XhttpExtra, XhttpOpt,
@@ -1955,8 +1957,95 @@ mod tests {
     use super::{decode_reality_short_id, resolve_reality_server_name};
 
     #[cfg(feature = "reality")]
+    // Base64 of 32 bytes; the previous fixture decoded to only 29 bytes.
     const TEST_REALITY_PUBLIC_KEY: &str =
         "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+
+    #[tokio::test]
+    async fn mihomo_vless_yaml_parses_and_builds_offline_outbounds() {
+        use crate::config::internal::proxy::{OutboundProxy, OutboundProxyProtocol};
+
+        let yaml = r#"
+mixed-port: 0
+mode: rule
+log-level: error
+mmdb: null
+tun:
+  enable: false
+dns:
+  enable: false
+proxies:
+  - name: grpc-contract
+    type: vless
+    server: grpc.example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: true
+    alpn: [h2]
+    network: grpc
+    grpc-opts:
+      grpc-service-name: grpc-service
+      max-connections: 4
+  - name: ws-contract
+    type: vless
+    server: ws.example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: true
+    network: ws
+    ws-opts:
+      path: /ws
+      headers:
+        Host: ws-host.example.com
+      v2ray-http-upgrade: true
+      v2ray-http-upgrade-fast-open: true
+  - name: xhttp-contract
+    type: vless
+    server: upload.example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: true
+    alpn: [h2]
+    network: xhttp
+    xhttp-opts:
+      path: /api
+      mode: stream-one
+  - name: xudp-contract
+    type: vless
+    server: edge.example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    packet-encoding: xudp
+    udp: true
+rules: []
+"#;
+        let config = crate::Config::Str(yaml.to_owned())
+            .try_parse()
+            .expect("synthetic Mihomo VLESS config should parse offline");
+
+        let names = ["grpc-contract", "xhttp-contract", "xudp-contract"]
+            .into_iter()
+            .chain(cfg!(feature = "ws").then_some("ws-contract"));
+        for name in names {
+            let proxy = config.proxies.get(name).expect("proxy should be parsed");
+            let OutboundProxy::ProxyServer(OutboundProxyProtocol::Vless(vless)) =
+                proxy
+            else {
+                panic!("{name} should be a VLESS outbound");
+            };
+            let handler = crate::proxy::vless::Handler::try_from(vless)
+                .unwrap_or_else(|err| {
+                    panic!("{name} failed outbound construction: {err}")
+                });
+            assert_eq!(handler.name(), name);
+            if name == "xudp-contract" {
+                assert!(
+                    !handler.support_udp().await,
+                    "unsupported XUDP must not silently fall back to native UDP"
+                );
+            }
+        }
+    }
 
     #[cfg(feature = "reality")]
     #[test]
@@ -3669,6 +3758,42 @@ udp: true
         );
     }
 
+    #[cfg(not(feature = "tls"))]
+    #[test]
+    fn vless_xhttp_tls_download_fails_closed_without_tls_feature() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp-tls-without-feature".to_owned(),
+                server: "upload.example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            network: Some("xhttp".to_owned()),
+            xhttp_opts: Some(XhttpOpt {
+                download_settings: Some(XhttpDownloadSettings {
+                    address: "download.example.com".to_owned(),
+                    port: 443,
+                    network: "xhttp".to_owned(),
+                    security: Some("tls".to_owned()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = match build_transport(outbound.network.as_deref(), &outbound) {
+            Ok(_) => panic!("TLS download must not build without the tls feature"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("requires tls feature"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(feature = "tls")]
     #[test]
     fn vless_xhttp_download_reuse_settings_build_runtime_policy() {
         let outbound = OutboundVless {
@@ -4359,6 +4484,7 @@ udp: true
         );
     }
 
+    #[cfg(feature = "tls")]
     #[test]
     fn vless_xhttp_download_settings_transport_builds() {
         let outbound = OutboundVless {
@@ -4424,6 +4550,7 @@ udp: true
         );
     }
 
+    #[cfg(feature = "tls")]
     #[test]
     fn vless_xhttp_mihomo_flat_download_settings_reach_runtime_config() {
         let outbound = OutboundVless {
