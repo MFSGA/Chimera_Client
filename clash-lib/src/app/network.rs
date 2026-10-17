@@ -109,25 +109,29 @@ pub(crate) enum BindingStatus {
 pub(crate) enum TunCandidateExclusion {
     #[default]
     Disabled,
+    #[cfg(any(feature = "tun", test))]
     Named(String),
     /// A TUN is enabled but its interface name is unavailable (for example,
     /// an externally-created file-descriptor device). Conservatively exclude
     /// TUN-like names rather than risk selecting the client's own tunnel.
+    #[cfg(any(feature = "tun", test))]
     Unidentified,
 }
 
 impl TunCandidateExclusion {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn excludes(&self, interface_name: &str) -> bool {
+    fn excludes(&self, _interface_name: &str) -> bool {
         match self {
             Self::Disabled => false,
-            Self::Named(name) => name == interface_name,
+            #[cfg(any(feature = "tun", test))]
+            Self::Named(name) => name == _interface_name,
+            #[cfg(any(feature = "tun", test))]
             Self::Unidentified => {
-                interface_name.starts_with("utun")
-                    || interface_name.starts_with("tun")
+                _interface_name.starts_with("utun")
+                    || _interface_name.starts_with("tun")
                     || (cfg!(target_os = "linux")
-                        && (interface_name.starts_with("tap")
-                            || interface_name.starts_with("wg")))
+                        && (_interface_name.starts_with("tap")
+                            || _interface_name.starts_with("wg")))
             }
         }
     }
@@ -575,7 +579,7 @@ async fn macos_hardware_port_kinds() -> io::Result<HashMap<String, InterfaceKind
 }
 
 /// Read system configuration, excluding TUN's own synthetic default routes.
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "tun", target_os = "macos"))]
 pub(crate) async fn snapshot() -> io::Result<NetworkSnapshot> {
     snapshot_with_tun(TunCandidateExclusion::Disabled).await
 }

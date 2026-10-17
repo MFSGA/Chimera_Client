@@ -1202,7 +1202,7 @@ fn prepared_crypto_matches_xray_relay_layout_and_key_hashes() {
     );
 }
 
-#[cfg(any(feature = "aws-lc-rs", feature = "vless-encryption"))]
+#[cfg(feature = "vless-encryption")]
 #[test]
 fn crypto_validation_accepts_generated_x25519_and_mlkem_keys() {
     use aws_lc_rs::{

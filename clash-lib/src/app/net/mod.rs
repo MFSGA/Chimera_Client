@@ -531,7 +531,7 @@ pub async fn init_net_config(
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "tun", target_os = "macos"))]
 fn select_macos_tun_outbound_interface(
     configured: Option<OutboundInterface>,
     tun_enabled: bool,

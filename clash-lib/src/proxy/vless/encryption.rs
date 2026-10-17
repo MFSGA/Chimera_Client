@@ -636,7 +636,7 @@ impl Config {
         })
     }
 
-    #[cfg(any(feature = "aws-lc-rs", feature = "vless-encryption"))]
+    #[cfg(feature = "vless-encryption")]
     pub(crate) fn validate_crypto_keys(&self) -> io::Result<()> {
         use aws_lc_rs::{
             agreement,
