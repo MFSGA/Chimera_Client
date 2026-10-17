@@ -79,6 +79,13 @@
 - 仅采用合成 IPv4/IPv6（RFC 5737 / RFC 3849）、离线固定测试密钥和不实际连接的 handler 构建。默认功能加 `wireguard`：转换器 **7/7** 通过、后台任务生命周期 **1/1** 通过，库级 `clippy -D warnings` 通过；`--no-default-features --features 'wireguard ring'` 转换器 **7/7** 通过，严格 Clippy 通过；Rustfmt 和 diff 检查通过。
 - **仍未验收**：WireGuard 真实握手、IPv4/IPv6 数据面、路由/MTU、DNS 路径、Windows/Linux 实机兼容、Provider 热更新及 L2 审查。上述离线测试不得替代这些运行时验证。
 
+## 2026-10-17：Provider 热更新全无效回退回归
+
+- 继本地已签名的 `8e8deee` 修复“坏缓存恢复后覆盖缓存”之后，本轮另外复现了一个热更新风险：ProxySetProvider 对非空输入逐项跳过无法解析的节点，**如果所有项都无效**，此前仍把结果当成功的空列表，清空活跃代理并覆盖最后可用的缓存。
+- 改动仅在**原始节点列表非空但转换成功的 handler 为零**时返回配置错误，Fetcher's 现有失败传播使本次更新不会覆盖内存和缓存。保留 `proxies: []` 显式清空的既有语义；混合有效/无效输入仍接收可用节点。
+- 离线模拟：使用合成 SOCKS5 地址 `198.51.100.10:1080`、MockProviderVehicle 和临时缓存，分别测试全部无效、显式空列表、混合列表，不进行真实网络操作。默认和无默认特性各 **3/3** 通过；Fetcher 既有回归 **6/6** 通过；两种配置严格库级 Clippy 通过，Rustfmt 和 diff 检查通过。
+- 后续仍应分别检查 Watcher 文件更改事件去抖、取消/回调竞态、Provider 原子注册、Windows/Linux 回归及 L2 审核；这些未因当前测试而自动验收。
+
 ## 2026-10-16：Smart 代理组保守运行时基线
 
 - 初始本地 `master` 为 `486c40584f55e32983de77f81b178cd96e08c2ac`，远端 `master` 为 `f9c9b9afaeed82c2726be4d43fae561f3bf666b9`。此前只有 `OutboundType::Smart` 和 Profile 占位字段，没有 Smart 组配置或运行时；旧 #58 没有可整包复用的 Smart 实现。
