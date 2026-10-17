@@ -57,3 +57,15 @@
 - Xray 上游 `infra/conf/transport_method.go` 的规则按两者范围上界都**大于零**才报冲突；零值不构成正限制。参见 https://github.com/XTLS/Xray-core/blob/main/infra/conf/transport_method.go 。Mihomo 文档也描述了两个限制的互斥关系（具体的零值判定以 Xray 源码为依据）：https://wiki.metacubex.one/en/config/proxies/transport/ 。
 - 本地修复与测试：只在两个范围上界都为正时拒绝；当正 `max-concurrency` 搭配 `max-connections: "0"` 时，连接池按并发限制复用，避免把零值错误解释成“永不复用”。仍拒绝 `max-concurrency: "1"` + `max-connections: "0-4"`；保留单独 `max-connections: "0"` 的既有行为。
 - 本修复只涉及配置有效性及连接池选择语义，不代表节点握手、真实流量或完整订阅运行通过。测试使用虚构数值，不包含真实订阅的任何敏感内容。
+
+## 2026-10-16：外置磁盘上的多协议转换器 feature 回归
+
+- 基线：本地 `master` 为 `5efd5b7d7ac509eca16b10925a1456ee98bb4e5c`；远端 `master` 为 `f9c9b9afaeed82c2726be4d43fae561f3bf666b9`。未修改协议生产代码。
+- 使用外置 APFS 卷作为 `CARGO_TARGET_DIR`，运行 `cargo test -p clash-lib --lib --features 'trojan hysteria ws' --locked --offline proxy::converters:: -- --test-threads=1`：**111 passed、0 failed**。包含 VLESS、Trojan、Hysteria2 转换器及 WebSocket Host 解析的现有离线用例。
+- 同组合的 `cargo clippy -p clash-lib --lib --features 'trojan hysteria ws' --locked --offline -- -D warnings`：**通过**。
+- 最小化组合**修复前**失败：`cargo check -p clash-lib --lib --no-default-features --features 'aws-lc-rs trojan hysteria ws' --locked --offline` 在 macOS 上显示四处 `dead_code`：TUN 默认接口选择器、网络快照入口、仅由 TUN 构造的枚举变体，以及仅由 `vless-encryption` 使用的密钥校验方法。此前未执行该组合测试，不算通过。
+- 本轮限定 TUN 专用入口及枚举变体的编译条件，同时保留 `cfg(test)` 下的枚举行为测试；VLESS 密钥校验函数及其测试只在 `vless-encryption` 启用时编译。没有放宽 warnings/lint，也没有启用真实 TUN。
+- **修复后**：`cargo test -p clash-lib --lib --no-default-features --features 'aws-lc-rs trojan hysteria ws' --locked --offline proxy::converters:: -- --test-threads=1`：**96 passed、0 failed**；相同 feature 组合的 `cargo clippy -p clash-lib --lib --locked --offline -- -D warnings`（带相同 features）通过。
+- 默认特性加 `trojan hysteria ws` 的转换器回归 **112 passed、0 failed**；相同组合严格 Clippy 通过；无默认特性的 VLESS 测试 **130 passed、0 failed**。默认特性的 macOS TUN 选择器测试 **2/2** 和原生加密密钥校验测试 **1/1** 通过。
+- 新增 `mihomo_mixed_protocol_yaml_parses_and_builds_offline_outbounds`：用**同一份合成 YAML** 解析 VLESS+WS、Trojan+gRPC、Hysteria2+Salamander/端口跳跃参数，并逐一构建 handler、核对协议和重要字段。测试显式复用 `setup_default_crypto_provider()`，否则 Rustls 在多后端构建中可能因未安装默认 provider 而 panic。未拨号、未测试真实代理流量。
+- 上述全部使用外置 APFS `CARGO_TARGET_DIR`、`--locked --offline` 执行。仍未验收真实 Xray/Mihomo wire 互操作、XUDP/SMUX，以及 Windows/Linux 平台运行；这些不得被本地配置构建测试替代。

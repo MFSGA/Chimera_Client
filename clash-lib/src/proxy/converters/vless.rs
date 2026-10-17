@@ -2047,6 +2047,113 @@ rules: []
         }
     }
 
+    #[cfg(all(feature = "trojan", feature = "hysteria", feature = "ws"))]
+    #[test]
+    fn mihomo_mixed_protocol_yaml_parses_and_builds_offline_outbounds() {
+        use crate::config::internal::proxy::{
+            Hysteria2Obfs, OutboundProxy, OutboundProxyProtocol,
+        };
+
+        // Follow the application bootstrap before constructing QUIC/TLS
+        // outbounds; no sockets are opened by this test.
+        crate::setup_default_crypto_provider();
+
+        // Synthetic endpoints are only parsed and constructed, never dialed.
+        let yaml = r#"
+mixed-port: 0
+mode: rule
+log-level: error
+mmdb: null
+tun:
+  enable: false
+dns:
+  enable: false
+proxies:
+  - name: vless-ws-contract
+    type: vless
+    server: vless.example.invalid
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: true
+    network: ws
+    ws-opts:
+      path: /ws
+      headers:
+        Host: vless-host.example.invalid
+  - name: trojan-grpc-contract
+    type: trojan
+    server: trojan.example.invalid
+    port: 443
+    password: synthetic-trojan-password
+    sni: trojan-sni.example.invalid
+    network: grpc
+    grpc-opts:
+      grpc-service-name: tunnel
+      max-connections: 3
+  - name: hysteria2-contract
+    type: hysteria2
+    server: hysteria.example.invalid
+    port: 8443
+    ports: "8443,8450-8452"
+    password: synthetic-hysteria-password
+    sni: hysteria-sni.example.invalid
+    alpn: [h3]
+    obfs: salamander
+    obfs-password: synthetic-obfs-password
+rules: []
+"#;
+        let config = crate::Config::Str(yaml.to_owned())
+            .try_parse()
+            .expect("synthetic Mihomo multi-protocol config should parse offline");
+
+        let OutboundProxy::ProxyServer(OutboundProxyProtocol::Vless(vless)) = config
+            .proxies
+            .get("vless-ws-contract")
+            .expect("VLESS should be parsed")
+        else {
+            panic!("VLESS outbound must keep its protocol");
+        };
+        assert_eq!(vless.network.as_deref(), Some("ws"));
+        let vless_handler = crate::proxy::vless::Handler::try_from(vless)
+            .expect("VLESS outbound should construct offline");
+        assert_eq!(vless_handler.name(), "vless-ws-contract");
+
+        let OutboundProxy::ProxyServer(OutboundProxyProtocol::Trojan(trojan)) =
+            config
+                .proxies
+                .get("trojan-grpc-contract")
+                .expect("Trojan should be parsed")
+        else {
+            panic!("Trojan outbound must keep its protocol");
+        };
+        assert_eq!(trojan.network.as_deref(), Some("grpc"));
+        assert_eq!(
+            trojan
+                .grpc_opts
+                .as_ref()
+                .and_then(|opts| opts.grpc_service_name.as_deref()),
+            Some("tunnel")
+        );
+        let trojan_handler = crate::proxy::trojan::Handler::try_from(trojan)
+            .expect("Trojan outbound should construct offline");
+        assert_eq!(trojan_handler.name(), "trojan-grpc-contract");
+
+        let OutboundProxy::ProxyServer(OutboundProxyProtocol::Hysteria2(hysteria)) =
+            config
+                .proxies
+                .get("hysteria2-contract")
+                .expect("Hysteria2 should be parsed")
+        else {
+            panic!("Hysteria2 outbound must keep its protocol");
+        };
+        assert_eq!(hysteria.ports.as_deref(), Some("8443,8450-8452"));
+        assert!(matches!(hysteria.obfs, Some(Hysteria2Obfs::Salamander)));
+        let hysteria_handler =
+            crate::proxy::hysteria2::Handler::try_from(hysteria.clone())
+                .expect("Hysteria2 outbound should construct offline");
+        assert_eq!(hysteria_handler.name(), "hysteria2-contract");
+    }
+
     #[cfg(feature = "reality")]
     #[test]
     fn reality_short_id_accepts_empty_as_empty_short_id() {
