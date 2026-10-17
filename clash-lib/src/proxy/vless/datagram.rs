@@ -337,6 +337,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_partial_udp_length_read_resumes_complete_packet() {
+        let (client, mut server) = tokio::io::duplex(64);
+        let remote: SocksAddr = "1.1.1.1:53".parse().expect("test address");
+        let mut datagram = OutboundDatagramVless::new(Box::new(client), remote);
+
+        server.write_all(&[0]).await.expect("first length byte");
+        assert!(
+            futures::poll!(datagram.next()).is_pending(),
+            "a partial length header must remain pending"
+        );
+
+        // The pending next() future was cancelled; retain the first byte.
+        server
+            .write_all(&[3, 0x11, 0x22, 0x33])
+            .await
+            .expect("complete header and payload");
+        let received = datagram.next().await.expect("complete UDP packet");
+        assert_eq!(received.data, vec![0x11, 0x22, 0x33]);
+    }
+
+    #[tokio::test]
+    async fn truncated_udp_length_header_never_emits_a_packet() {
+        let (client, mut server) = tokio::io::duplex(64);
+        let remote: SocksAddr = "1.1.1.1:53".parse().expect("test address");
+        let mut datagram = OutboundDatagramVless::new(Box::new(client), remote);
+
+        server.write_all(&[0]).await.expect("partial length header");
+        drop(server);
+        assert!(
+            datagram.next().await.is_none(),
+            "EOF mid-header must not emit a UDP packet"
+        );
+        assert!(datagram.next().await.is_none(), "EOF must remain terminal");
+    }
+
+    #[tokio::test]
     async fn cancelled_pending_udp_send_releases_the_owned_stream() {
         let (client, mut server) = tokio::io::duplex(32);
         let remote: SocksAddr = "1.1.1.1:53".parse().expect("test address");
