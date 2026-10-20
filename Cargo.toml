@@ -8,6 +8,7 @@ members = [
     "clash-dns",
     "clash-netstack",
     "vendor/boring-noise",
+    "vendor/sock2proc",
     "xhttp-h2-phaseb"
 ]
 

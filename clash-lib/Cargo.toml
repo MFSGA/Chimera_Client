@@ -250,7 +250,7 @@ windows = { version = "0.62", features = [
 ] }
 
 [target.'cfg(any(target_os="linux", target_os="macos", target_os="windows"))'.dependencies]
-sock2proc = { git = "https://github.com/Watfaq/sock2proc.git", rev = "9f9e630" }
+sock2proc = { path = "../vendor/sock2proc" }
 
 [target.'cfg(target_os="linux")'.dependencies]
 rtnetlink = "0.23"

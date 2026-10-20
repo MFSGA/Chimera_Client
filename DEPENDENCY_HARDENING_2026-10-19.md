@@ -63,3 +63,52 @@
 真实 TUN/路由操作、WireGuard 外部互操作及性能基准。
 不自动推送、强推、改写 `master` 或自动合并。需要按独立逻辑变更
 审查与签名本地提交，之后在适当时机取得远端检查证据。
+
+## 后续专项：`sock2proc` panic=abort 稳定性修复（2026-10-19）
+
+以上“尚未替换”与“未运行 Windows/Linux 编译”的叙述，是首轮提交
+`35ba8f5e01f5b1030d2c0b90157efc968b555ee3` 的历史快照。
+后续同一隔离分支已继续实施以下修复：
+
+- 将 `sock2proc` 的固定 Git 源 `9f9e6304d62285115b2e4fa632527ae563bf0fcc`
+  移至 `vendor/sock2proc`，保留原公开 API 和平台实现；
+  `clash-lib` 使用相对路径依赖，因此正式 `Cargo.lock` 中
+  **不再存在任何 `git+` 来源**（LWIP 独立 benchmark 仍固定 Git SHA）。
+- Linux：Netlink 创建/绑定/连接与接收、畸形报文解析均改为
+  `Option` 失败路径。用 `std::fs::read_link` 代替原有将
+  非 NUL 终止路径指针传给 `libc::readlink` 的不安全调用；
+  跳过竞争期间消失的 procfs 项。添加长度异常 Netlink 报文测试。
+- macOS：`sysctl` 失败、未知 PCB 布局、截断列表与无效
+  进程路径均恢复为正常失败；保留 `proc_info` 返回 0
+  仍可能成功的既有语义，避免识别回归；新增 PCB 合成测试。
+- Windows：使用长度验证和未对齐读取解析 IP Helper 表格，
+  校验进程路径长度；新增畸形表格检查。
+- `clash-lib/src/session.rs` 删除 Linux 的一次性预探测和
+  `catch_unwind`：release `panic = "abort"` 下后者无法阻止
+  abort；错误由已修复的依赖返回 `None`，进程匹配缺失时
+  遵循原有路由行为。删除依赖中未使用的 `rtnetlink`、
+  `byteorder`、旧 benchmark 依赖。
+
+**后续实际验证（macOS arm64，Rust 1.99.0）：**
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo test -p sock2proc --lib --locked` | PASS：4 passed / 0 failed（含本机 TCP、UDP 活体识别） |
+| `cargo check -p sock2proc --target x86_64-pc-windows-gnu --locked` | PASS：仅交叉编译 |
+| `cargo check -p sock2proc --target x86_64-unknown-linux-gnu --locked` | PASS：仅交叉编译 |
+| `cargo check -p sock2proc --tests --target x86_64-pc-windows-gnu --locked` | PASS：测试代码编译，**未执行** |
+| `cargo check -p sock2proc --tests --target x86_64-unknown-linux-gnu --locked` | PASS：测试代码编译，**未执行** |
+| `cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings` | PASS |
+| `cargo check -p clash-rs --locked` | PASS |
+| `cargo test -p clash-lib --lib --all-features --locked` | PASS：934 passed / 0 failed / 12 ignored |
+| `cargo fmt --all -- --check`、`git diff --check` | PASS |
+
+Linux 标准库编译目标于本轮安装以执行交叉编译；
+**不等于在 Linux 上运行通过**。无法据此证明 Windows FFI
+所有不安全内存访问都已覆盖。macOS/Linux 的故障返回路径经过了
+针对性静态与单元检查，但尚无 `panic=abort` 下真实多进程和
+跨平台故障注入实验。还需独立 Reviewer、许可证归属复核、
+维护者批准、真实 CI、性能/进程归属一致性及外部协议互操作。
+
+原主工作区 `master`、原有未提交 VLESS 改动、子模块和远端分支
+均未受本轮专项影响。无 push、无历史重写、无 PR 或合并。
