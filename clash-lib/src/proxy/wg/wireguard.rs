@@ -74,6 +74,7 @@ pub struct Config {
     pub keepalive_seconds: Option<u16>,
     pub allowed_ips: Vec<IpNet>,
     pub reserved_bits: [u8; 3],
+    pub mtu: usize,
 }
 
 impl WireguardTunnel {
@@ -85,7 +86,7 @@ impl WireguardTunnel {
         connector: Option<Arc<dyn RemoteConnector>>,
         sess: &Session,
     ) -> Result<Self, Error> {
-        let peer = Tunn::new(
+        let mut peer = Tunn::new(
             config.private_key,
             config.endpoint_public_key,
             config.pre_shared_key.map(|x| x.to_bytes()),
@@ -93,6 +94,7 @@ impl WireguardTunnel {
             0,
             None,
         );
+        peer.set_padding_mtu(config.mtu);
 
         let remote_endpoint = config.remote_endpoint;
 

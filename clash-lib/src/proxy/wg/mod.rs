@@ -208,6 +208,7 @@ impl Handler {
                         source_peer_ipv6: self.opts.ipv6,
                         keepalive_seconds: Some(10),
                         allowed_ips,
+                        mtu: self.opts.mtu.unwrap_or(1420) as usize,
                         reserved_bits: match &self.opts.reserved_bits {
                             Some(bits) if bits.len() >= 3 => {
                                 [bits[0], bits[1], bits[2]]

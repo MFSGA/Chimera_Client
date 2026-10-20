@@ -18,6 +18,30 @@ use netlink_sys::{protocols::NETLINK_SOCK_DIAG, Socket, SocketAddr};
 
 use crate::{utils::pre_condition, NetworkProtocol};
 
+/// Dump responses are not guaranteed to be filtered by the socket-id
+/// fields of an INET_DIAG request. Never attribute an arbitrary first socket.
+fn socket_id_matches(
+    id: &SocketId,
+    src: Option<std::net::SocketAddr>,
+    dst: Option<std::net::SocketAddr>,
+) -> bool {
+    let local_matches = src.is_none_or(|addr| {
+        addr.port() == id.source_port
+            && (addr.ip() == id.source_address
+                || (id.source_address.is_unspecified()
+                    && addr.is_ipv4() == id.source_address.is_ipv4()))
+    });
+    let remote_matches = dst.is_none_or(|addr| {
+        addr.port() == id.destination_port && addr.ip() == id.destination_address
+    });
+    local_matches && remote_matches
+}
+
+/// Netlink frames are 4-byte aligned; the header length excludes padding.
+fn aligned_message_len(len: usize) -> Option<usize> {
+    len.checked_add(3).map(|len| len & !3)
+}
+
 /// Reject malformed Netlink envelopes before decoding kernel input.
 fn decode_sock_diag_message(
     bytes: &[u8],
@@ -107,11 +131,14 @@ fn resolve_uid_inode(
                 NetlinkPayload::InnerMessage(SockDiagMessage::InetResponse(
                     response,
                 )) => {
-                    return Some((response.header.uid, response.header.inode));
+                    if socket_id_matches(&response.header.socket_id, src, dst) {
+                        return Some((response.header.uid, response.header.inode));
+                    }
                 }
+                NetlinkPayload::Done(_) => return None,
                 _ => return None,
             }
-            offset = offset.checked_add(message_len)?;
+            offset = offset.checked_add(aligned_message_len(message_len)?)?;
         }
     }
     None
@@ -130,6 +157,41 @@ mod malformed_tests {
         assert!(decode_sock_diag_message(&truncated).is_none());
         truncated[..4].copy_from_slice(&0u32.to_ne_bytes());
         assert!(decode_sock_diag_message(&truncated).is_none());
+    }
+
+    #[test]
+    fn netlink_offsets_account_for_padding_and_overflow() {
+        assert_eq!(aligned_message_len(16), Some(16));
+        assert_eq!(aligned_message_len(17), Some(20));
+        assert_eq!(aligned_message_len(19), Some(20));
+        assert_eq!(aligned_message_len(usize::MAX), None);
+    }
+
+    #[test]
+    fn socket_dump_requires_matching_source_and_destination() {
+        let mut id = SocketId::new_v4();
+        id.source_port = 51820;
+        id.source_address = "127.0.0.1".parse().unwrap();
+        id.destination_port = 53;
+        id.destination_address = "127.0.0.2".parse().unwrap();
+        let src = "127.0.0.1:51820".parse().unwrap();
+        let dst = "127.0.0.2:53".parse().unwrap();
+        assert!(socket_id_matches(&id, Some(src), Some(dst)));
+        assert!(!socket_id_matches(
+            &id,
+            Some("127.0.0.1:51821".parse().unwrap()),
+            Some(dst)
+        ));
+        assert!(!socket_id_matches(
+            &id,
+            Some(src),
+            Some("127.0.0.2:54".parse().unwrap())
+        ));
+
+        id.source_address = "0.0.0.0".parse().unwrap();
+        assert!(socket_id_matches(&id, Some(src), Some(dst)));
+        id.source_port = 1;
+        assert!(!socket_id_matches(&id, Some(src), Some(dst)));
     }
 }
 

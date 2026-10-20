@@ -42,6 +42,16 @@ const MAX_QUEUE_DEPTH: usize = 256;
 /// number of sessions in the ring, better keep a PoT
 const N_SESSIONS: usize = 8;
 
+/// WireGuard §5.4.6: pad the inner plaintext to a 16-byte boundary, except
+/// when padding would exceed the configured inner MTU. An unconfigured cap
+/// preserves the pre-existing behavior for general users of this crate.
+fn transport_plaintext_len(src_len: usize, padding_mtu: usize) -> usize {
+    src_len
+        .checked_next_multiple_of(16)
+        .filter(|&len| len <= padding_mtu)
+        .unwrap_or(src_len)
+}
+
 #[derive(Debug)]
 pub enum TunnResult<'a> {
     Done,
@@ -71,6 +81,7 @@ pub struct Tunn {
     timers: timers::Timers,
     tx_bytes: usize,
     rx_bytes: usize,
+    padding_mtu: usize,
     rate_limiter: Arc<RateLimiter>,
 }
 
@@ -228,6 +239,7 @@ impl Tunn {
             current: Default::default(),
             tx_bytes: Default::default(),
             rx_bytes: Default::default(),
+            padding_mtu: usize::MAX,
 
             packet_queue: VecDeque::new(),
             timers: Timers::new(persistent_keepalive, rate_limiter.is_none()),
@@ -256,12 +268,16 @@ impl Tunn {
         }
     }
 
+    /// Limit zero-padding by the tunnel's inner MTU. Packets longer than the
+    /// configured MTU are not enlarged by padding; rejecting them is the
+    /// responsibility of the virtual IP device.
+    pub fn set_padding_mtu(&mut self, mtu: usize) {
+        self.padding_mtu = mtu;
+    }
+
     /// Encapsulate a single packet from the tunnel interface.
-    /// Returns TunnResult.
-    ///
-    /// # Panics
-    /// Panics if dst buffer is too small.
-    /// Size of dst should be at least src.len() + 32, and no less than 148 bytes.
+    /// Returns an error if the destination buffer cannot hold a transport
+    /// packet. Handshake packets still require at least 148 bytes.
     pub fn encapsulate<'a>(
         &mut self,
         src: &[u8],
@@ -269,8 +285,15 @@ impl Tunn {
     ) -> TunnResult<'a> {
         let current = self.current;
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
-            // Send the packet using an established session
-            let packet = session.format_packet_data(src, dst);
+            // Sending an oversized packet must not abort the proxy process.
+            let plaintext_len = transport_plaintext_len(src.len(), self.padding_mtu);
+            if plaintext_len
+                .checked_add(DATA_OVERHEAD_SZ)
+                .is_none_or(|required| dst.len() < required)
+            {
+                return TunnResult::Err(WireGuardError::DestinationBufferTooSmall);
+            }
+            let packet = session.format_packet_data(src, dst, self.padding_mtu);
             self.timer_tick(TimerName::TimeLastPacketSent);
             // Exclude Keepalive packets from timer update.
             if !src.is_empty() {
@@ -374,7 +397,11 @@ impl Tunn {
 
         let session = self.handshake.receive_handshake_response(p)?;
 
-        let keepalive_packet = session.format_packet_data(&[], dst);
+        if dst.len() < DATA_OVERHEAD_SZ {
+            return Err(WireGuardError::DestinationBufferTooSmall);
+        }
+        let keepalive_packet =
+            session.format_packet_data(&[], dst, self.padding_mtu);
         // Store new session in ring buffer
         let l_idx = session.local_index();
         let index = l_idx % N_SESSIONS;
@@ -836,6 +863,55 @@ mod tests {
             panic!("receiver must accept and strip transport padding");
         };
         assert_eq!(decrypted, inner);
+    }
+
+    fn make_unaligned_ipv4_udp_packet() -> Vec<u8> {
+        let header =
+            etherparse::PacketBuilder::ipv4([192, 168, 1, 2], [192, 168, 1, 3], 5)
+                .udp(5678, 23);
+        let mut inner = Vec::new();
+        header.write(&mut inner, &[0, 1, 2, 3, 4]).unwrap();
+        inner
+    }
+
+    #[test]
+    fn transport_padding_does_not_exceed_configured_inner_mtu() {
+        let (mut sender, mut receiver) = create_two_tuns_and_handshake();
+        let inner = make_unaligned_ipv4_udp_packet();
+        assert_ne!(inner.len() % 16, 0, "test packet must be unaligned");
+        sender.set_padding_mtu(inner.len());
+
+        let mut ciphertext = [0u8; 1024];
+        let mut decoded = [0u8; 1024];
+        let TunnResult::WriteToNetwork(encrypted) =
+            sender.encapsulate(&inner, &mut ciphertext)
+        else {
+            panic!("established session should encrypt");
+        };
+        assert_eq!(encrypted.len(), inner.len() + DATA_OVERHEAD_SZ);
+        let TunnResult::WriteToTunnelV4(plaintext, _) =
+            receiver.decapsulate(None, encrypted, &mut decoded)
+        else {
+            panic!("must decrypt without padding");
+        };
+        assert_eq!(plaintext, inner);
+    }
+
+    #[test]
+    fn undersized_transport_output_returns_error_without_panicking() {
+        let (mut sender, _receiver) = create_two_tuns_and_handshake();
+        let inner = make_unaligned_ipv4_udp_packet();
+        let mut too_small = vec![0u8; inner.len() + DATA_OVERHEAD_SZ];
+        assert!(matches!(
+            sender.encapsulate(&inner, &mut too_small),
+            TunnResult::Err(WireGuardError::DestinationBufferTooSmall)
+        ));
+
+        let mut enough = [0u8; 1024];
+        assert!(matches!(
+            sender.encapsulate(&inner, &mut enough),
+            TunnResult::WriteToNetwork(_)
+        ));
     }
 
     #[test]

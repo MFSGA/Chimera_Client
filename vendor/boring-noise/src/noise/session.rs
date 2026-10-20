@@ -202,11 +202,12 @@ impl Session {
         &self,
         src: &[u8],
         dst: &'a mut [u8],
+        padding_mtu: usize,
     ) -> &'a mut [u8] {
-        // WireGuard transport packets must pad their encrypted plaintext to a
-        // 16-byte boundary. This also hides the exact inner packet size from
-        // observers (see WireGuard whitepaper section 5.4.6).
-        let padded_len = src.len().div_ceil(16) * 16;
+        // WireGuard zero-padding is bounded by the tunnel's inner MTU:
+        // padding a maximum-size packet must not exceed the path MTU.
+        // The caller validates that the destination can hold the result.
+        let padded_len = super::transport_plaintext_len(src.len(), padding_mtu);
         if dst.len() < padded_len + super::DATA_OVERHEAD_SZ {
             panic!("The destination buffer is too small");
         }
