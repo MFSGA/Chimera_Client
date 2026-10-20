@@ -4,6 +4,10 @@ use crate::{Error, session::Network};
 
 /// todo: support more rule type
 pub enum RuleType {
+    WithInterface {
+        rule: Box<RuleType>,
+        interface: String,
+    },
     Domain {
         domain: String,
         target: String,
@@ -79,7 +83,36 @@ impl RuleType {
         target: &str,
         params: Option<Vec<&str>>,
     ) -> Result<Self, Error> {
-        match proto {
+        let mut interface: Option<String> = None;
+        let mut no_resolve = false;
+        for param in params.unwrap_or_default() {
+            if param == "no-resolve" {
+                if no_resolve {
+                    return Err(Error::InvalidConfig(
+                        "rule option `no-resolve` can only be specified once"
+                            .to_string(),
+                    ));
+                }
+                no_resolve = true;
+            } else if let Some(name) = param.strip_prefix("interface=") {
+                if name.is_empty() || name.trim() != name {
+                    return Err(Error::InvalidConfig(
+                        "rule interface name must not be empty or padded with whitespace"
+                            .to_string(),
+                    ));
+                }
+                if interface.replace(name.to_string()).is_some() {
+                    return Err(Error::InvalidConfig(
+                        "rule interface can only be specified once".to_string(),
+                    ));
+                }
+            } else {
+                return Err(Error::InvalidConfig(format!(
+                    "unsupported rule option: {param}"
+                )));
+            }
+        }
+        let rule = match proto {
             "DOMAIN" => Ok(RuleType::Domain {
                 domain: payload.to_string(),
                 target: target.to_string(),
@@ -93,18 +126,16 @@ impl RuleType {
                 target: target.to_string(),
             }),
             "DOMAIN-REGEX" => Ok(RuleType::DomainRegex {
-                regex: regex::Regex::new(payload)
+                regex: regex::RegexBuilder::new(payload)
+                    .case_insensitive(true)
+                    .build()
                     .map_err(|err| Error::InvalidConfig(err.to_string()))?,
                 target: target.to_string(),
             }),
             "GEOIP" => Ok(RuleType::GeoIP {
                 target: target.to_string(),
                 country_code: payload.to_string(),
-                no_resolve: if let Some(params) = params {
-                    params.contains(&"no-resolve")
-                } else {
-                    false
-                },
+                no_resolve,
             }),
             "GEOSITE" => Ok(RuleType::GeoSite {
                 target: target.to_string(),
@@ -113,11 +144,7 @@ impl RuleType {
             "IP-CIDR" | "IP-CIDR6" => Ok(RuleType::IpCidr {
                 ipnet: payload.parse()?,
                 target: target.to_string(),
-                no_resolve: if let Some(params) = params {
-                    params.contains(&"no-resolve")
-                } else {
-                    false
-                },
+                no_resolve,
             }),
             "SRC-IP-CIDR" => Ok(RuleType::SrcCidr {
                 ipnet: payload.parse()?,
@@ -172,11 +199,19 @@ impl RuleType {
             _ => Err(Error::InvalidConfig(format!(
                 "unsupported rule type: {proto}"
             ))),
-        }
+        }?;
+        Ok(match interface {
+            Some(interface) => RuleType::WithInterface {
+                rule: Box::new(rule),
+                interface,
+            },
+            None => rule,
+        })
     }
 
     pub fn target(&self) -> &str {
         match self {
+            RuleType::WithInterface { rule, .. } => rule.target(),
             RuleType::Domain { target, .. } => target,
             RuleType::DomainSuffix { target, .. } => target,
             RuleType::DomainKeyword { target, .. } => target,
@@ -237,6 +272,9 @@ impl TryFrom<String> for RuleType {
         let parts = split_rule_tokens(&line)?;
 
         match parts.as_slice() {
+            ["MATCH", target, params @ ..] => {
+                RuleType::new("MATCH", "", target, Some(params.to_vec()))
+            }
             [proto, target] => RuleType::new(proto, "", target, None),
             [proto, payload, target] => RuleType::new(proto, payload, target, None),
             [proto, payload, target, params @ ..] => {
@@ -258,6 +296,71 @@ impl FromStr for RuleType {
 #[cfg(test)]
 mod tests {
     use super::RuleType;
+
+    #[test]
+    fn interface_rule_options_preserve_match_target_and_ip_no_resolve() {
+        let rule = RuleType::try_from("MATCH,DIRECT,interface=en0".to_string())
+            .expect("MATCH rule must treat the third field as an option");
+        match rule {
+            RuleType::WithInterface { rule, interface } => {
+                assert_eq!(interface, "en0");
+                assert_eq!(rule.target(), "DIRECT");
+                assert!(matches!(*rule, RuleType::Match { .. }));
+            }
+            _ => panic!("MATCH interface option was lost"),
+        }
+
+        let rule = RuleType::try_from(
+            "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve,interface=en1".to_string(),
+        )
+        .unwrap();
+        match rule {
+            RuleType::WithInterface { rule, interface } => {
+                assert_eq!(interface, "en1");
+                assert!(matches!(
+                    *rule,
+                    RuleType::IpCidr {
+                        no_resolve: true,
+                        ..
+                    }
+                ));
+            }
+            _ => panic!("IP-CIDR interface option was lost"),
+        }
+    }
+
+    #[test]
+    fn invalid_rule_options_fail_closed_instead_of_being_ignored() {
+        for rule in [
+            "MATCH,DIRECT,unknown=true",
+            "MATCH,DIRECT,interface=",
+            "MATCH,DIRECT,interface=en0,interface=en1",
+            "MATCH,DIRECT,no-resolve,no-resolve",
+            "IP-CIDR,10.0.0.0/8,DIRECT,unexpected",
+            "DOMAIN,example.com,PROXY,interface= en0",
+        ] {
+            assert!(
+                RuleType::try_from(rule.to_string()).is_err(),
+                "invalid rule options must be rejected: {rule}"
+            );
+        }
+    }
+
+    #[test]
+    fn domain_regex_matches_case_insensitively_like_upstream() {
+        let rule = RuleType::try_from(
+            r"DOMAIN-REGEX,^api\.example\.com$,PROXY".to_string(),
+        )
+        .unwrap();
+        match rule {
+            RuleType::DomainRegex { regex, .. } => {
+                assert!(regex.is_match("API.EXAMPLE.COM"));
+                assert!(regex.is_match("api.example.com"));
+                assert!(!regex.is_match("other.example.com"));
+            }
+            _ => panic!("expected domain regex"),
+        }
+    }
 
     #[test]
     fn parse_domain_suffix_rule() {

@@ -118,7 +118,10 @@ impl DnsRuntimeProvider {
                 io::Error::other("DNS rule outbound manager is not ready")
             })?;
         let mut sess = sess.clone();
-        let (name, _) = router.match_route(&mut sess).await;
+        let (name, rule) = router.match_route(&mut sess).await;
+        crate::app::router::apply_rule_interface(&mut sess, rule.map(Box::as_ref))
+            .await
+            .map_err(|err| io::Error::other(err.to_string()))?;
         let outbound =
             mgr.get_outbound_for_new_flow(name).await?.ok_or_else(|| {
                 io::Error::other("DNS rule selected an unavailable outbound")

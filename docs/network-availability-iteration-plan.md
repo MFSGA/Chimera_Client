@@ -601,3 +601,36 @@ rely on a missing proxy name.
 This does not claim that every possible dynamic registry race is exercised
 end-to-end: those scenarios still need deterministic injectable runtime
 lifecycle tests.
+
+## 2026-10-20：规则附加参数与硬网卡约束（P0）
+
+- 依据本地固定上游 `ref/` SHA `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b` 核对规则选项语义。
+- `clash-lib/src/config/internal/rule.rs` 统一识别 `no-resolve` 与
+  `interface=NAME`，重复、空值和未知选项报配置错误；
+  `MATCH,DIRECT,interface=...` 按无 payload 规则解析，不错认代理目标。
+  `DOMAIN-REGEX` 默认大小写不敏感。
+- `app/router/mod.rs` 保留匹配规则的接口约束，
+  `get_all_rules()` 快照仅对有约束的规则附加 `interface` 字段；
+  无该字段时 JSON 形态不变。
+- Dispatcher TCP/UDP 和 DNS `RuleDispatch` 把规则上的硬网卡约束写入
+  `Session.iface`；网卡不存在、不可用或者编译未启用 `tun`
+  时失败关闭/丢弃，而不是回退系统默认出口。明确网卡仍由各协议
+  Connector/PathPlan 现有连接逻辑执行实际绑定。
+- Classical `RULE-SET` 的子规则不可单独携带接口约束；
+  如果子规则出现 `interface=...`，明确报错，要求把选项写在外层
+  `RULE-SET,<provider>,<outbound>,interface=...` 上。
+- 代码验收：macOS `cargo test -p clash-lib --lib --locked`：
+  787 通过，0 失败，12 ignored；规则解析定向测试 14 通过；
+  新 RuleMatcher 约束测试 3 通过；
+  `cargo clippy -p clash-lib --lib --locked -- -D warnings` 通过。
+  最小 feature 编译 `cargo check -p clash-lib --no-default-features --locked`
+  通过。`cargo fmt --all -- --check` 通过。
+- `cargo clippy -p clash-lib --all-targets --locked -- -D warnings`
+  在默认 feature 的旧 `tests/api_protocol_tests.rs` 未使用导入/函数处失败；
+  不是本次路由文件的诊断，尚未修复此测试 feature gate。
+  `--all-features` 会启动 Dashboard 构建脚本的 `npm ci`；
+  本机安装持续无进展后已取消，未把其视为通过。
+- 尚未执行真实多网卡连接验证；特别是各协议对
+  `Session.iface` 的全部路径绑定语义、旧流连接池行为仍按 B11 留待专用
+  网络环境。对嵌套组合规则中的每个子项设置独立接口也不是本次支持范围。
+- 原 `clash-lib/src/proxy/vless/datagram.rs` 未提交修改未纳入本切片。

@@ -465,6 +465,16 @@ fn make_classical_rules(
             _ => Err(Error::InvalidConfig(format!("invalid rule line: {rule}"))),
         }?;
 
+        // Classical provider entries contain match conditions, not egress
+        // decisions. A nested interface constraint cannot be propagated to
+        // the surrounding RULE-SET and must not be silently discarded.
+        if matches!(rule_type, RuleType::WithInterface { .. }) {
+            return Err(Error::InvalidConfig(
+                "interface= is not supported inside classical rule providers; put it on the outer RULE-SET rule"
+                    .to_owned(),
+            ));
+        }
+
         let rule_matcher =
             map_rule_type(rule_type, mmdb.clone(), geodata.clone(), None)?;
         rv.push(rule_matcher);
@@ -487,6 +497,20 @@ mod tests {
     };
     use std::{path::Path, sync::Arc, time::Duration};
     use tokio_test::assert_ok;
+
+    #[test]
+    fn classical_provider_rejects_unenforceable_interface_constraint() {
+        let result = super::make_classical_rules(
+            vec!["DOMAIN-SUFFIX,example.com,interface=en0".to_string()],
+            None,
+            None,
+        );
+        let error = match result {
+            Err(err) => err,
+            Ok(_) => panic!("provider interface constraint was silently ignored"),
+        };
+        assert!(error.to_string().contains("interface="));
+    }
 
     #[tokio::test]
     async fn test_inline_provider() {

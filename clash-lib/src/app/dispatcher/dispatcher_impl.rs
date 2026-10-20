@@ -613,6 +613,17 @@ impl Dispatcher {
             RunMode::Direct => (PROXY_DIRECT, None),
         };
 
+        if let Err(err) = crate::app::router::apply_rule_interface(
+            &mut sess,
+            rule.map(Box::as_ref),
+        )
+        .await
+        {
+            warn!(error = %err, "rule-selected interface unavailable; closing TCP flow");
+            let _ = lhs.shutdown().await;
+            return;
+        }
+
         let rule_summary = rule_summary(rule.map(Box::as_ref));
         let explain_flow_id = uuid::Uuid::new_v4();
         let explain_versions_at_start = self.explain_versions().await;
@@ -1244,6 +1255,16 @@ impl Dispatcher {
                     RunMode::Rule => router.match_route(&mut sess).await,
                     RunMode::Direct => (PROXY_DIRECT, None),
                 };
+
+                if let Err(err) = crate::app::router::apply_rule_interface(
+                    &mut sess,
+                    rule.map(Box::as_ref),
+                )
+                .await
+                {
+                    warn!(error = %err, "rule-selected interface unavailable; ending UDP association");
+                    break;
+                }
 
                 let requested_outbound_name = outbound_name.to_string();
 

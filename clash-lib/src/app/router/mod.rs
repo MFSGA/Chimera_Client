@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod rule_interface_tests;
 mod rules;
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
@@ -26,6 +28,45 @@ use crate::{
 
 const MATCH: &str = "MATCH";
 
+/// Keep optional routing constraints attached to the matched rule without
+/// changing every concrete matcher or the composite rule implementation.
+struct InterfaceRule {
+    inner: Box<dyn RuleMatcher>,
+    interface: String,
+}
+
+impl std::fmt::Display for InterfaceRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{},interface={}", self.inner, self.interface)
+    }
+}
+
+impl RuleMatcher for InterfaceRule {
+    fn target(&self) -> &str {
+        self.inner.target()
+    }
+
+    fn payload(&self) -> String {
+        self.inner.payload()
+    }
+
+    fn apply(&self, sess: &Session) -> bool {
+        self.inner.apply(sess)
+    }
+
+    fn type_name(&self) -> &str {
+        self.inner.type_name()
+    }
+
+    fn should_resolve_ip(&self) -> bool {
+        self.inner.should_resolve_ip()
+    }
+
+    fn interface(&self) -> Option<&str> {
+        Some(&self.interface)
+    }
+}
+
 pub struct Router {
     rules: Vec<Box<dyn RuleMatcher>>,
     dns_resolver: ThreadSafeDNSResolver,
@@ -37,12 +78,46 @@ pub struct Router {
 
 pub type ThreadSafeRouter = Arc<Router>;
 
+/// A rule's interface is a hard egress constraint. Failure must never silently
+/// fall back to a system/default interface, even during DNS rule dispatch.
+pub async fn apply_rule_interface(
+    sess: &mut Session,
+    rule: Option<&dyn RuleMatcher>,
+) -> Result<(), crate::Error> {
+    let Some(interface) = rule.and_then(RuleMatcher::interface) else {
+        return Ok(());
+    };
+
+    #[cfg(feature = "tun")]
+    {
+        let requested = crate::app::net::Interface::Name(interface.to_owned());
+        let iface =
+            crate::app::net::resolve_outbound_interface(Some(&requested)).await?;
+        sess.iface = Some(iface.ok_or_else(|| {
+            crate::Error::InvalidConfig(format!(
+                "rule-selected interface `{interface}` is unavailable"
+            ))
+        })?);
+        Ok(())
+    }
+
+    #[cfg(not(feature = "tun"))]
+    {
+        let _ = sess;
+        Err(crate::Error::InvalidConfig(format!(
+            "rule-selected interface `{interface}` requires the `tun` feature"
+        )))
+    }
+}
+
 #[derive(serde::Serialize)]
 pub struct RuleSnapshot {
     #[serde(rename = "type")]
     pub type_name: String,
     pub proxy: String,
     pub payload: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interface: Option<String>,
 }
 
 impl Router {
@@ -98,6 +173,7 @@ impl Router {
                 type_name: rule.type_name().to_string(),
                 proxy: rule.target().to_string(),
                 payload: rule.payload(),
+                interface: rule.interface().map(str::to_owned),
             })
             .collect()
     }
@@ -310,6 +386,10 @@ pub fn map_rule_type(
     rule_provider_registry: Option<&HashMap<String, ThreadSafeRuleProvider>>,
 ) -> Result<Box<dyn RuleMatcher>, crate::Error> {
     match rule_type {
+        RuleType::WithInterface { rule, interface } => {
+            let inner = map_rule_type(*rule, mmdb, geodata, rule_provider_registry)?;
+            Ok(Box::new(InterfaceRule { inner, interface }))
+        }
         RuleType::Domain { domain, target } => {
             Ok(Box::new(Domain { domain, target }) as Box<dyn RuleMatcher>)
         }

@@ -33,4 +33,9 @@ pub trait RuleMatcher: Send + Sync + Unpin + Display {
     fn should_resolve_ip(&self) -> bool {
         false
     }
+
+    /// Explicit egress-interface constraint carried by the selected rule.
+    fn interface(&self) -> Option<&str> {
+        None
+    }
 }
