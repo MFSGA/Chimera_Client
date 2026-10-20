@@ -2,7 +2,8 @@
 mod macos {
     //! To test this example, you can run the following commands:
     //! ```bash
-    //! cargo run --example with_tun_rs
+    //! # CAUTION: this benchmark changes system TUN/routes; run only on a test host.
+    //! cargo run --manifest-path bench/netstack-lwip/Cargo.toml
     //! ```
     //! TCP with curl:
     //! ```bash

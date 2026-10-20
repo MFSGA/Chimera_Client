@@ -38,7 +38,9 @@ iperf Done.
 ### netstack-lwip
 
 ```
-cargo flamegraph -p watfaq-netstack --example netstack_lwip --root
+# Run from the Chimera Client repository root.
+# CAUTION: this isolated harness creates a TUN and modifies local routes.
+cargo flamegraph --manifest-path bench/netstack-lwip/Cargo.toml --root
 
 
 ➜  ~ iperf3 -c dsm -t 10

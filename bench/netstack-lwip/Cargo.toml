@@ -1,0 +1,22 @@
+[package]
+name = "chimera-netstack-lwip-benchmark"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Keep this comparison harness outside Chimera's production Cargo workspace.
+# It requires a native lwIP build (cc, bindgen and libclang) and may change host
+# TUN/route settings when explicitly run. Never run it as part of regular CI.
+[workspace]
+
+[dependencies]
+netstack-lwip = { git = "https://github.com/eycorsican/netstack-lwip", rev = "f434fefd6c227c9dfbec84c364452ba6c1532779" }
+tun-rs = { version = "2", features = ["async", "async_framed"] }
+futures = "0.3"
+tokio = { version = "1.50", features = ["full"] }
+log = "0.4"
+env_logger = "0.11"
+ipnet = "2"
+socket2 = { version = "0.6", features = ["all"] }
+libc = "0.2"
+bytes = "1.11"
