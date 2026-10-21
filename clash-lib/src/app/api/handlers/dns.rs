@@ -22,7 +22,19 @@ pub fn routes(resolver: ThreadSafeDNSResolver) -> Router<Arc<AppState>> {
     Router::new()
         .route("/query", get(query_dns))
         .route("/reset", post(reset_dns))
+        .route("/health", get(dns_health))
         .with_state(DNSState { resolver })
+}
+
+async fn dns_health(
+    State(state): State<DNSState>,
+) -> Json<crate::app::dns::DnsHealthSnapshot> {
+    Json(
+        state
+            .resolver
+            .dns_health_snapshot()
+            .unwrap_or_else(crate::app::dns::DnsHealthSnapshot::disabled),
+    )
 }
 
 #[derive(Debug, Serialize)]
@@ -147,10 +159,27 @@ async fn query_dns(
 
 #[cfg(test)]
 mod tests {
-    use super::{DNSState, reset_dns};
+    use super::{DNSState, dns_health, reset_dns};
     use crate::app::dns::MockClashResolver;
     use axum::{Json, extract::State};
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn dns_health_returns_disabled_for_system_resolver() {
+        let mut resolver = MockClashResolver::new();
+        resolver
+            .expect_dns_health_snapshot()
+            .once()
+            .returning(|| None);
+        let Json(snapshot) = dns_health(State(DNSState {
+            resolver: Arc::new(resolver),
+        }))
+        .await;
+        assert!(!snapshot.enabled);
+        assert!(snapshot.passive);
+        assert_eq!(snapshot.status, crate::app::dns::DnsHealthStatus::Disabled);
+        assert!(snapshot.groups.is_empty());
+    }
 
     #[tokio::test]
     async fn reset_dns_reports_reset_transport_count() {

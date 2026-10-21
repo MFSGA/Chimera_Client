@@ -14,6 +14,7 @@ use crate::{
             DomainFilter, FallbackDomainFilter, FallbackIPFilter, GeoIPFilter,
             IPNetFilter, PendingMmdb,
         },
+        health::{DnsHealthTracker, observe_clients},
         helper::make_clients,
         parse_ip_literal,
     },
@@ -37,6 +38,7 @@ use tracing::{debug, error, instrument, trace, warn};
 
 pub struct EnhancedResolver {
     ipv6: AtomicBool,
+    health: Arc<DnsHealthTracker>,
     hosts: Option<trie::StringTrie<net::IpAddr>>,
     main: Vec<ThreadSafeDNSClient>,
 
@@ -67,8 +69,13 @@ impl EnhancedResolver {
         fallback: Option<Vec<ThreadSafeDNSClient>>,
         ipv6: bool,
     ) -> Self {
+        let health = Arc::new(DnsHealthTracker::default());
+        let main = observe_clients(main, "main", &health);
+        let fallback =
+            fallback.map(|clients| observe_clients(clients, "fallback", &health));
         Self {
             ipv6: AtomicBool::new(ipv6),
+            health,
             hosts: None,
             main,
             fallback,
@@ -95,6 +102,7 @@ impl EnhancedResolver {
 
         EnhancedResolver {
             ipv6: AtomicBool::new(false),
+            health: Arc::new(DnsHealthTracker::default()),
             hosts: None,
             main: make_clients(
                 vec![NameServer {
@@ -158,8 +166,10 @@ impl EnhancedResolver {
         network_path_source: Option<NetworkPathSource>,
     ) -> Result<Self, Error> {
         let edns_client_subnet = cfg.edns_client_subnet.clone();
+        let health = Arc::new(DnsHealthTracker::default());
         let default_resolver = Arc::new(EnhancedResolver {
             ipv6: AtomicBool::new(false),
+            health: health.clone(),
             hosts: None,
             main: make_clients(
                 cfg.default_nameserver.clone(),
@@ -170,6 +180,8 @@ impl EnhancedResolver {
                 DnsClientNetworkOptions {
                     fw_mark: cfg.fw_mark,
                     network_path_source: network_path_source.clone(),
+                    health: Some(health.clone()),
+                    group: Some("bootstrap"),
                     ..Default::default()
                 },
             )
@@ -201,6 +213,8 @@ impl EnhancedResolver {
                 DnsClientNetworkOptions {
                     fw_mark: cfg.fw_mark,
                     network_path_source: network_path_source.clone(),
+                    health: Some(health.clone()),
+                    group: Some("proxy_server"),
                     ..Default::default()
                 },
             )
@@ -237,6 +251,8 @@ impl EnhancedResolver {
                 fw_mark: cfg.fw_mark,
                 rule_dispatch: rule_dispatch.clone(),
                 network_path_source: network_path_source.clone(),
+                health: Some(health.clone()),
+                group: Some("main"),
             },
         )
         .await?;
@@ -252,6 +268,8 @@ impl EnhancedResolver {
                 DnsClientNetworkOptions {
                     fw_mark: cfg.fw_mark,
                     network_path_source: network_path_source.clone(),
+                    health: Some(health.clone()),
+                    group: Some("direct"),
                     ..Default::default()
                 },
             )
@@ -286,6 +304,7 @@ impl EnhancedResolver {
 
         Ok(Self {
             ipv6: AtomicBool::new(cfg.ipv6),
+            health: health.clone(),
             main,
             hosts: cfg.hosts,
             fallback: if !cfg.fallback.is_empty() {
@@ -300,6 +319,8 @@ impl EnhancedResolver {
                             fw_mark: cfg.fw_mark,
                             rule_dispatch: rule_dispatch.clone(),
                             network_path_source: network_path_source.clone(),
+                            health: Some(health.clone()),
+                            group: Some("fallback"),
                         },
                     )
                     .await?,
@@ -359,6 +380,8 @@ impl EnhancedResolver {
                                     fw_mark: cfg.fw_mark,
                                     rule_dispatch: rule_dispatch.clone(),
                                     network_path_source: network_path_source.clone(),
+                                    health: Some(health.clone()),
+                                    group: Some("policy"),
                                 },
                             )
                             .await?,
@@ -497,6 +520,14 @@ impl EnhancedResolver {
                 }
                 _ = &mut timeout => {
                     timed_out = true;
+                    // The unfinished futures are dropped on return and never
+                    // reach ObservedClient::exchange's normal completion path.
+                    // Record only those that did not already finish.
+                    for (index, client) in clients.iter().enumerate() {
+                        if errors[index].is_none() {
+                            client.mark_query_timeout();
+                        }
+                    }
                     break;
                 }
             }
@@ -981,6 +1012,7 @@ impl ClashResolver for EnhancedResolver {
     }
 
     async fn reset_transports(&self) -> anyhow::Result<u32> {
+        self.health.invalidate();
         let mut clients = self.main.clone();
         if let Some(fallback) = &self.fallback {
             clients.extend(fallback.iter().cloned());
@@ -1044,6 +1076,10 @@ impl ClashResolver for EnhancedResolver {
 
     fn kind(&self) -> ResolverKind {
         ResolverKind::Clash
+    }
+
+    fn dns_health_snapshot(&self) -> Option<crate::app::dns::DnsHealthSnapshot> {
+        Some(self.health.snapshot())
     }
 
     fn fake_ip_enabled(&self) -> bool {
@@ -1213,6 +1249,44 @@ mod tests {
         async fn exchange(&self, _msg: &op::Message) -> anyhow::Result<op::Message> {
             Err(anyhow::anyhow!(self.reason))
         }
+    }
+
+    #[tokio::test]
+    async fn health_only_observes_real_upstream_exchanges() {
+        let resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(FixedClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 88)),
+            })],
+            false,
+        );
+        let health = resolver.dns_health_snapshot().unwrap();
+        assert_eq!(health.status, crate::app::dns::DnsHealthStatus::Unknown);
+        assert_eq!(health.groups[0].upstreams[0].successes, 0);
+
+        resolver.exchange_no_cache(&test_query().0).await.unwrap();
+        let health = resolver.dns_health_snapshot().unwrap();
+        assert_eq!(health.status, crate::app::dns::DnsHealthStatus::Healthy);
+        assert_eq!(health.groups[0].upstreams[0].successes, 1);
+        assert_eq!(health.groups[0].upstreams[0].failures, 0);
+    }
+
+    #[tokio::test]
+    async fn health_records_upstream_failures_but_not_query_cache_hits() {
+        let client = Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 5)),
+            hits: Arc::new(AtomicUsize::new(0)),
+            id: "active-dns",
+        });
+        let hits = client.hits.clone();
+        let mut resolver = EnhancedResolver::from_clients(vec![client], false);
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        let query = test_query().0;
+
+        resolver.exchange(&query).await.unwrap();
+        resolver.exchange(&query).await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let health = resolver.dns_health_snapshot().unwrap();
+        assert_eq!(health.groups[0].upstreams[0].successes, 1);
     }
 
     #[tokio::test]

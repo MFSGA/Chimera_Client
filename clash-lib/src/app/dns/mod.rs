@@ -13,6 +13,7 @@ mod dhcp;
 mod dns_client;
 mod fakeip;
 mod filters;
+pub mod health;
 mod helper;
 pub mod resolver;
 mod rule_dispatch;
@@ -20,6 +21,9 @@ mod runtime;
 mod server;
 
 pub use config::{Config, EdnsClientSubnet};
+pub use health::{
+    DnsGroupHealth, DnsHealthSnapshot, DnsHealthStatus, DnsUpstreamHealth,
+};
 
 pub use filters::PendingMmdb;
 pub use rule_dispatch::{PendingOutboundManager, PendingRouter, RuleDispatch};
@@ -41,6 +45,10 @@ pub trait Client: Sync + Send + Debug {
     async fn reset_transport(&self) -> anyhow::Result<u32> {
         Ok(0)
     }
+
+    /// A batch-level timeout can cancel an in-flight exchange before it has
+    /// returned. Observed clients account for that cancellation explicitly.
+    fn mark_query_timeout(&self) {}
 }
 
 type ThreadSafeDNSClient = Arc<dyn Client>;
@@ -119,6 +127,12 @@ pub trait ClashResolver: Sync + Send {
     }
 
     fn kind(&self) -> ResolverKind;
+
+    /// Passive observations of real upstream exchanges. System DNS has no
+    /// managed upstreams and returns None.
+    fn dns_health_snapshot(&self) -> Option<DnsHealthSnapshot> {
+        None
+    }
 }
 
 /// Returns the IP address if `host` is a valid IP literal, otherwise `None`.

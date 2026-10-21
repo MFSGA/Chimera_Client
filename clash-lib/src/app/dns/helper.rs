@@ -3,6 +3,7 @@ use crate::{
     dns::{
         ClashResolver, EdnsClientSubnet, RuleDispatch, ThreadSafeDNSClient,
         dns_client::{DNSNetMode, DnsClient, Opts},
+        health::{DnsHealthTracker, observe_clients},
     },
     proxy::{
         self,
@@ -20,6 +21,8 @@ pub(crate) struct DnsClientNetworkOptions {
     pub fw_mark: Option<u32>,
     pub rule_dispatch: Option<Arc<RuleDispatch>>,
     pub network_path_source: Option<NetworkPathSource>,
+    pub health: Option<Arc<DnsHealthTracker>>,
+    pub group: Option<&'static str>,
 }
 
 pub async fn make_clients(
@@ -81,6 +84,13 @@ pub async fn make_clients(
             }
             Err(e) => {
                 warn!("initializing DNS client {} with error {}", &s, e);
+                if let Some(tracker) = &network_options.health {
+                    tracker.record_initialization_failure(
+                        network_options.group.unwrap_or("main"),
+                        s.to_string(),
+                        &e.to_string(),
+                    );
+                }
                 initialization_errors.push(format!("{s}: {e}"));
             }
         }
@@ -93,7 +103,11 @@ pub async fn make_clients(
         )));
     }
 
-    Ok(rv)
+    Ok(if let Some(tracker) = network_options.health {
+        observe_clients(rv, network_options.group.unwrap_or("main"), &tracker)
+    } else {
+        rv
+    })
 }
 
 pub fn build_dns_response_message(

@@ -43,3 +43,34 @@
 - **注意**：无法仅凭“请求成功（Fake-IP/hosts/cache 命中）”
   认定上游 DNS 健康；`NXDOMAIN` 是合法负面响应，不代表 DNS
   传输通道已断。当前改动不做此类健康判定。
+
+## 2026-10-21：被动 DNS 健康快照与 Controller API
+
+- 本地基线：`36d330b9584f65d5b18bd0cbe38b2de83c850e04`。
+- 新增 `GET /dns/health`（沿用现有 Controller Bearer 认证），
+  `enabled=false, status=disabled` 表示当前使用系统 DNS；启用内部 DNS
+  时提供 `status`、`passive=true` 和 `groups`。
+- 如果某个普通上游在初始化阶段失败、但其余上游仍成功建立 Client，
+  失败上游也会作为独立记录出现在所属分组中，不会因跳过初始化而消失。
+- `groups[].name` 可为 `main`、`fallback`、`bootstrap`、
+  `proxy_server`、`direct`、`policy`；每组上游包含
+  `server`、`status`、`successes`、`failures`、
+  `consecutiveFailures`、`lastSuccessAt`、`lastFailureAt`、
+  `lastError`。时间是 Unix 秒；错误说明最多 512 字符。
+- 状态仅根据各 DNS Client 最后一次**真实上游请求**计算：
+  `unknown`（还没有充分观测）、`healthy`（近期被动观测成功）、
+  `degraded`（部分上游失败或依靠 fallback）、
+  `unavailable`（已观测的主/fallback 均失败）。
+  `NOERROR` / `NXDOMAIN` 代表 DNS 服务有响应；
+  `SERVFAIL` / `REFUSED` / 传输错误 / 批量超时视为失败。
+  Fake-IP、hosts、命中 DNS 缓存、只创建 DNS Client、不发请求等
+  **不计作 DNS 上游成功**。只读 API 自身也不会发探测包。
+- 没有新请求的被动观测在 300 秒后变回 `unknown`，而非无限期保持健康。
+  `reset_transports` / 网络路径重置也会将实时状态清回 `unknown`，
+  保留历史计数与时间，避免旧路径成功被误认为新路径健康。
+  内存状态与 Resolver 生命周期一致，重建配置即重新登记。
+- **限制**：`unavailable` 表达最后一次有效被动观测，
+  不是实时联网保证；没有请求时保持 `unknown`，不会后台探测。
+  辅助 DNS 的异常不会直接判定主 DNS 全部不可用；各组有单独快照。
+  当前不增加主动探针、阈值报警、长期持久化、Dashboard 页面，
+  不依赖公网互操作。完整测试结果以本轮实际验收日志为准。
