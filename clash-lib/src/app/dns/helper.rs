@@ -32,6 +32,7 @@ pub async fn make_clients(
 ) -> Result<Vec<ThreadSafeDNSClient>, crate::Error> {
     let mut rv = Vec::new();
     let had_configured_servers = !servers.is_empty();
+    let mut initialization_errors = Vec::new();
 
     for s in servers {
         debug!("building nameserver: {}", s);
@@ -78,14 +79,18 @@ pub async fn make_clients(
                     "initializing DHCP DNS client {s}: {e}"
                 )));
             }
-            Err(e) => warn!("initializing DNS client {} with error {}", &s, e),
+            Err(e) => {
+                warn!("initializing DNS client {} with error {}", &s, e);
+                initialization_errors.push(format!("{s}: {e}"));
+            }
         }
     }
 
     if had_configured_servers && rv.is_empty() {
-        return Err(crate::Error::InvalidConfig(
-            "DNS upstream configuration contains no usable clients".into(),
-        ));
+        return Err(crate::Error::InvalidConfig(format!(
+            "DNS upstream configuration contains no usable clients: {}",
+            initialization_errors.join("; ")
+        )));
     }
 
     Ok(rv)
@@ -157,5 +162,47 @@ mod tests {
             Ok(_) => panic!("all unusable upstreams must fail initialization"),
         };
         assert!(error.to_string().contains("no usable clients"));
+        assert!(
+            error.to_string().contains("unresolvable.example"),
+            "bootstrap failure must name the unusable upstream: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_failed_bootstraps_keep_each_upstream_name() {
+        let mut resolver = MockClashResolver::new();
+        resolver.expect_resolve().times(2).returning(|host, _| {
+            if host == "first.invalid" {
+                Err(anyhow::anyhow!("DNS bootstrap timeout"))
+            } else {
+                Ok(None)
+            }
+        });
+        let upstream = |name: &str| NameServer {
+            net: DNSNetMode::Udp,
+            host: url::Host::Domain(name.to_owned()),
+            port: 53,
+            interface: None,
+            proxy: None,
+            doh_path: None,
+        };
+        let result = make_clients(
+            vec![upstream("first.invalid"), upstream("second.invalid")],
+            Some(Arc::new(resolver)),
+            None,
+            Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            None,
+            DnsClientNetworkOptions::default(),
+        )
+        .await;
+        let error = match result {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!(
+                "all unusable bootstrap DNS upstreams must fail initialization"
+            ),
+        };
+        for part in ["first.invalid", "DNS bootstrap timeout", "second.invalid"] {
+            assert!(error.contains(part), "{error} lacks {part}");
+        }
     }
 }

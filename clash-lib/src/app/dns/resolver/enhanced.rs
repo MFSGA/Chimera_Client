@@ -21,7 +21,7 @@ use crate::{
 };
 use anyhow::anyhow;
 use async_trait::async_trait;
-use futures::{FutureExt, StreamExt, TryFutureExt};
+use futures::{FutureExt, StreamExt};
 use hickory_proto::{op, rr};
 use rand::seq::IndexedRandom;
 use std::{
@@ -435,62 +435,89 @@ impl EnhancedResolver {
             .map(|query| query.query_type().to_string())
             .unwrap_or_else(|| "<unknown>".to_string());
 
-        let mut queries = Vec::new();
-        for c in clients {
-            let query_name = query_name.clone();
-            let query_type = query_type.clone();
-            queries.push(
-                async move {
-                    let client_id = c.id();
-                    c.exchange(message)
-                        .inspect_err(|x| {
-                            if x.to_string().contains("receiver was canceled") {
-                                debug!(
-                                    client = %client_id,
-                                    query = %query_name,
-                                    record_type = %query_type,
-                                    "dns upstream query canceled after another response completed"
-                                );
-                            } else {
-                                error!(
-                                    client = %client_id,
-                                    query = %query_name,
-                                    record_type = %query_type,
-                                    err = ?x,
-                                    "resolve error"
-                                );
-                            }
-                        })
-                        .inspect_ok(|response| {
-                            let ips = Self::ip_list_of_message(response)
-                                .into_iter()
-                                .map(|ip| ip.to_string())
-                                .collect::<Vec<_>>()
-                                .join(",");
+        // Preserve the identity and cause of every failed upstream rather than
+        // returning whichever error happens to complete last. A DNS packet
+        // with SERVFAIL/REFUSED is a transport success, but not a valid
+        // resolution result; keep trying other servers in that case.
+        let mut pending = futures::stream::FuturesUnordered::new();
+        let client_ids: Vec<String> =
+            clients.iter().map(|client| client.id()).collect();
+        for (index, client) in clients.iter().enumerate() {
+            pending.push(async move { (index, client.exchange(message).await) });
+        }
+
+        let mut errors = vec![None::<String>; clients.len()];
+        let timeout = tokio::time::sleep(Duration::from_secs(10));
+        tokio::pin!(timeout);
+        let mut timed_out = false;
+        while !pending.is_empty() {
+            tokio::select! {
+                result = pending.next() => {
+                    let Some((index, result)) = result else { break };
+                    let client_id = &client_ids[index];
+                    match result {
+                        Ok(response) if matches!(
+                            response.metadata.response_code,
+                            op::ResponseCode::NoError | op::ResponseCode::NXDomain
+                        ) => {
                             debug!(
                                 client = %client_id,
                                 query = %query_name,
                                 record_type = %query_type,
-                                answers = %ips,
+                                response_code = %response.metadata.response_code,
                                 answer_count = response.answers.len(),
-                                "dns upstream query succeeded"
+                                "dns upstream responded"
                             );
-                        })
-                        .await
+                            return Ok(response);
+                        }
+                        Ok(response) => {
+                            let reason = format!(
+                                "DNS response code {}", response.metadata.response_code
+                            );
+                            warn!(
+                                client = %client_id,
+                                query = %query_name,
+                                record_type = %query_type,
+                                error = %reason,
+                                "dns upstream returned a server error"
+                            );
+                            errors[index] = Some(reason);
+                        }
+                        Err(err) => {
+                            error!(
+                                client = %client_id,
+                                query = %query_name,
+                                record_type = %query_type,
+                                err = %err,
+                                "dns upstream query failed"
+                            );
+                            errors[index] = Some(err.to_string());
+                        }
+                    }
                 }
-                .boxed(),
-            )
+                _ = &mut timeout => {
+                    timed_out = true;
+                    break;
+                }
+            }
         }
 
-        let timeout = tokio::time::sleep(Duration::from_secs(10));
-
-        tokio::select! {
-            result = futures::future::select_ok(queries) => match result {
-                Ok(r) => Ok(r.0),
-                Err(e) => Err(e),
-            },
-            _ = timeout => Err(Error::DNSError("DNS query timeout".into()).into())
-        }
+        let details = client_ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let reason = errors[index]
+                    .as_deref()
+                    .unwrap_or("no response before timeout");
+                format!("{id}: {reason}")
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        Err(Error::DNSError(format!(
+            "all {} DNS upstreams failed for {query_name} ({query_type}){}: {details}",
+            client_ids.len(),
+            if timed_out { " within 10s" } else { "" }
+        )).into())
     }
 
     /// guaranteed to return at least 1 IP address when Ok
@@ -510,9 +537,22 @@ impl EnhancedResolver {
         m.metadata.recursion_desired = true;
 
         let result = self.exchange(&m).await?;
+        match result.metadata.response_code {
+            op::ResponseCode::NoError => {}
+            op::ResponseCode::NXDomain => {
+                return Err(anyhow!(
+                    "DNS NXDomain for hostname: {host} ({record_type})"
+                ));
+            }
+            code => {
+                return Err(anyhow!(
+                    "DNS response code {code} for hostname: {host} ({record_type})"
+                ));
+            }
+        }
         let ip_list = EnhancedResolver::ip_list_of_message(&result);
         if ip_list.is_empty() {
-            return Err(anyhow!("no record for hostname: {}", host));
+            return Err(anyhow!("DNS NODATA for hostname: {host} ({record_type})"));
         }
         Ok(ip_list)
     }
@@ -638,14 +678,23 @@ impl EnhancedResolver {
             message,
         );
 
-        if let Ok(main_result) = main_query.await {
-            let ip_list = EnhancedResolver::ip_list_of_message(&main_result);
+        let main_result = main_query.await;
+        if let Ok(main_response) = &main_result {
+            let ip_list = EnhancedResolver::ip_list_of_message(main_response);
             if !ip_list.is_empty() && !self.should_ip_fallback(&ip_list[0]) {
-                return Ok(main_result);
+                return main_result;
             }
         }
 
-        fallback_query.await
+        fallback_query.await.map_err(|fallback_error| match main_result {
+            Err(main_error) => anyhow!(
+                "main DNS upstreams failed: {main_error}; fallback DNS upstreams failed: {fallback_error}"
+            ),
+            Ok(main_response) => anyhow!(
+                "main DNS returned {} with no acceptable IP; fallback DNS upstreams failed: {fallback_error}",
+                main_response.metadata.response_code
+            ),
+        })
     }
 
     fn should_only_query_fallback(&self, message: &op::Message) -> bool {
@@ -723,20 +772,47 @@ impl ClashResolver for EnhancedResolver {
 
         match self.ipv6.load(Relaxed) {
             true => {
-                let fut1 = self
-                    .resolve_v6(host, enhanced)
-                    .map(|x| x.map(|v6| v6.map(net::IpAddr::from)));
-                let fut2 = self
-                    .resolve_v4(host, enhanced)
-                    .map(|x| x.map(|v4| v4.map(net::IpAddr::from)));
-
-                let futs = vec![fut1.boxed(), fut2.boxed()];
-                let r = futures::future::select_ok(futs).await?;
-                if r.0.is_some() {
-                    return Ok(r.0);
+                // Keep the first usable address without waiting for the
+                // other family; if neither succeeds, preserve both failures.
+                let mut pending = futures::stream::FuturesUnordered::new();
+                pending.push(
+                    async {
+                        (
+                            "AAAA",
+                            self.resolve_v6(host, enhanced)
+                                .await
+                                .map(|ip| ip.map(net::IpAddr::from)),
+                        )
+                    }
+                    .boxed(),
+                );
+                pending.push(
+                    async {
+                        (
+                            "A",
+                            self.resolve_v4(host, enhanced)
+                                .await
+                                .map(|ip| ip.map(net::IpAddr::from)),
+                        )
+                    }
+                    .boxed(),
+                );
+                let mut errors = Vec::new();
+                while let Some((record_type, result)) = pending.next().await {
+                    match result {
+                        Ok(Some(ip)) => return Ok(Some(ip)),
+                        Ok(None) => {}
+                        Err(error) => errors.push(format!("{record_type}: {error}")),
+                    }
                 }
-                let r = futures::future::select_all(r.1).await;
-                r.0
+                if errors.is_empty() {
+                    Ok(None)
+                } else {
+                    Err(anyhow!(
+                        "DNS resolution failed for {host}: {}",
+                        errors.join("; ")
+                    ))
+                }
             }
             false => self
                 .resolve_v4(host, enhanced)
@@ -768,16 +844,23 @@ impl ClashResolver for EnhancedResolver {
         };
         let (ipv4, ipv6) = tokio::join!(ipv4, ipv6);
         let mut addresses = Vec::new();
-        if let Ok(ipv4) = ipv4 {
-            addresses.extend(ipv4);
+        let mut errors = Vec::new();
+        match ipv4 {
+            Ok(ips) => addresses.extend(ips),
+            Err(error) => errors.push(format!("A: {error}")),
         }
-        if let Ok(ipv6) = ipv6 {
-            addresses.extend(ipv6);
+        match ipv6 {
+            Ok(ips) => addresses.extend(ips),
+            Err(error) => errors.push(format!("AAAA: {error}")),
         }
         addresses.sort_unstable();
         addresses.dedup();
         if addresses.is_empty() {
-            return Err(anyhow!("no record for hostname: {}", host));
+            return Err(if errors.is_empty() {
+                anyhow!("no record for hostname: {host}")
+            } else {
+                anyhow!("DNS resolution failed for {host}: {}", errors.join("; "))
+            });
         }
         Ok(addresses)
     }
@@ -1113,6 +1196,217 @@ mod tests {
         query.set_query_type(record_type);
         request.add_query(query);
         request
+    }
+
+    #[derive(Debug)]
+    struct FailingClient {
+        id: &'static str,
+        reason: &'static str,
+    }
+
+    #[async_trait]
+    impl crate::app::dns::Client for FailingClient {
+        fn id(&self) -> String {
+            self.id.to_owned()
+        }
+
+        async fn exchange(&self, _msg: &op::Message) -> anyhow::Result<op::Message> {
+            Err(anyhow::anyhow!(self.reason))
+        }
+    }
+
+    #[tokio::test]
+    async fn all_failed_upstreams_preserve_each_upstream_reason() {
+        let clients: Vec<ThreadSafeDNSClient> = vec![
+            Arc::new(FailingClient {
+                id: "dns-a",
+                reason: "connection refused",
+            }),
+            Arc::new(FailingClient {
+                id: "dns-b",
+                reason: "TLS certificate invalid",
+            }),
+        ];
+        let err = EnhancedResolver::batch_exchange(&clients, &test_query().0)
+            .await
+            .expect_err("all failed upstreams must fail");
+        let message = err.to_string();
+        for part in [
+            "dns-a",
+            "connection refused",
+            "dns-b",
+            "TLS certificate invalid",
+        ] {
+            assert!(message.contains(part), "{message} lacks {part}");
+        }
+    }
+
+    #[tokio::test]
+    async fn server_failure_response_does_not_hide_working_upstream() {
+        let mut servfail = op::Message::response(0, op::OpCode::Query);
+        servfail.metadata.response_code = op::ResponseCode::ServFail;
+        let clients: Vec<ThreadSafeDNSClient> = vec![
+            Arc::new(FixedClient { response: servfail }),
+            Arc::new(FixedClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+            }),
+        ];
+        let result = EnhancedResolver::batch_exchange(&clients, &test_query().0)
+            .await
+            .expect("successful upstream should win");
+        assert_eq!(result.metadata.response_code, op::ResponseCode::NoError);
+        assert_eq!(EnhancedResolver::ip_list_of_message(&result).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn all_servfail_upstreams_are_reported_as_failures() {
+        let mut servfail = op::Message::response(0, op::OpCode::Query);
+        servfail.metadata.response_code = op::ResponseCode::ServFail;
+        let clients: Vec<ThreadSafeDNSClient> =
+            vec![Arc::new(FixedClient { response: servfail })];
+        let err = EnhancedResolver::batch_exchange(&clients, &test_query().0)
+            .await
+            .expect_err("SERVFAIL is not a healthy response");
+        assert!(err.to_string().contains("Server Failure"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn nxdomain_is_preserved_as_dns_negative_answer() {
+        let mut nxdomain = op::Message::response(0, op::OpCode::Query);
+        nxdomain.metadata.response_code = op::ResponseCode::NXDomain;
+        let clients: Vec<ThreadSafeDNSClient> =
+            vec![Arc::new(FixedClient { response: nxdomain })];
+        let answer = EnhancedResolver::batch_exchange(&clients, &test_query().0)
+            .await
+            .expect("NXDOMAIN is a valid DNS negative answer");
+        assert_eq!(answer.metadata.response_code, op::ResponseCode::NXDomain);
+        let resolver = EnhancedResolver::from_clients(clients, true);
+        let err = resolver
+            .resolve_all("example.com", false)
+            .await
+            .expect_err("NXDOMAIN is not a success with an IP");
+        assert!(err.to_string().contains("NXDomain"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn resolve_all_preserves_a_and_aaaa_failures() {
+        let resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(FailingClient {
+                id: "broken-dns",
+                reason: "upstream connection refused",
+            })],
+            true,
+        );
+        let err = resolver
+            .resolve_all("example.com", false)
+            .await
+            .expect_err("dual stack must not conceal upstream failure as NODATA");
+        let message = err.to_string();
+        for part in ["A:", "AAAA:", "broken-dns", "upstream connection refused"] {
+            assert!(message.contains(part), "{message} lacks {part}");
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_preserves_both_address_family_errors() {
+        let resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(FailingClient {
+                id: "all-down",
+                reason: "network unreachable",
+            })],
+            true,
+        );
+        let err = resolver
+            .resolve("example.com", false)
+            .await
+            .expect_err("all DNS address families failed");
+        let message = err.to_string();
+        for part in ["A:", "AAAA:", "all-down", "network unreachable"] {
+            assert!(message.contains(part), "{message} lacks {part}");
+        }
+    }
+
+    #[tokio::test]
+    async fn noerror_without_ip_is_reported_as_nodata_not_server_failure() {
+        let response = op::Message::response(0, op::OpCode::Query);
+        let resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(FixedClient { response })],
+            false,
+        );
+        let err = resolver
+            .resolve_all("example.com", false)
+            .await
+            .expect_err("empty NOERROR response is NODATA, not a valid address");
+        let message = err.to_string();
+        assert!(message.contains("NODATA"), "{message}");
+        assert!(!message.contains("all DNS upstreams failed"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn one_address_family_can_succeed_while_the_other_fails() {
+        #[derive(Debug)]
+        struct OnlyIpv4;
+        #[async_trait]
+        impl crate::app::dns::Client for OnlyIpv4 {
+            fn id(&self) -> String {
+                "ipv4-working".into()
+            }
+            async fn exchange(
+                &self,
+                query: &op::Message,
+            ) -> anyhow::Result<op::Message> {
+                if query
+                    .queries
+                    .first()
+                    .is_some_and(|q| q.query_type() == rr::RecordType::AAAA)
+                {
+                    Err(anyhow::anyhow!("IPv6 DNS path down"))
+                } else {
+                    Ok(response_with_a(Ipv4Addr::new(192, 0, 2, 55)))
+                }
+            }
+        }
+        let resolver =
+            EnhancedResolver::from_clients(vec![Arc::new(OnlyIpv4)], true);
+        assert_eq!(
+            resolver.resolve_all("example.com", false).await.unwrap(),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 55))]
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_rcode_is_reported_as_upstream_failure() {
+        let mut response = op::Message::response(0, op::OpCode::Query);
+        response.metadata.response_code = op::ResponseCode::Refused;
+        let clients: Vec<ThreadSafeDNSClient> =
+            vec![Arc::new(FixedClient { response })];
+        let err = EnhancedResolver::batch_exchange(&clients, &test_query().0)
+            .await
+            .expect_err("REFUSED must not be treated as a healthy response");
+        assert!(err.to_string().contains("Refused"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn main_and_fallback_errors_are_both_reported() {
+        let resolver = EnhancedResolver::from_clients_with_fallback(
+            vec![Arc::new(FailingClient {
+                id: "main-ns",
+                reason: "main refused",
+            })],
+            Some(vec![Arc::new(FailingClient {
+                id: "fallback-ns",
+                reason: "fallback timeout",
+            })]),
+            false,
+        );
+        let err = resolver
+            .exchange_no_cache(&test_query().0)
+            .await
+            .expect_err("both upstream groups failed");
+        let message = err.to_string();
+        for part in ["main-ns", "main refused", "fallback-ns", "fallback timeout"] {
+            assert!(message.contains(part), "{message} lacks {part}");
+        }
     }
 
     fn response_with_a(ip: Ipv4Addr) -> op::Message {
