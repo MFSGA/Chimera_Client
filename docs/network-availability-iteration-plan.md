@@ -634,3 +634,25 @@ lifecycle tests.
   `Session.iface` 的全部路径绑定语义、旧流连接池行为仍按 B11 留待专用
   网络环境。对嵌套组合规则中的每个子项设置独立接口也不是本次支持范围。
 - 原 `clash-lib/src/proxy/vless/datagram.rs` 未提交修改未纳入本切片。
+
+### 2026-10-20 补充：`no-resolve` 适用类型严格校验
+
+- 基线：Chimera 本地 `47114932725cba577cfa234f1acf2e00cc0d746c`；
+  `ref/` 固定 SHA `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`。
+- 回归测试复现：此前 `DOMAIN,example.com,PROXY,no-resolve`
+  会被接受而实际忽略；新增 `no_resolve_is_only_valid_for_ip_and_geo_rules`
+  测试修复前失败（1 failed），修复后通过。
+- `no-resolve` 仅允许 GEOIP、IP-CIDR/IP-CIDR6、SRC-IP-CIDR，
+  其余规则明确报 `InvalidConfig`，同时保留合法的 `interface=`
+  组合。SRC-IP-CIDR 的源地址本身就是 IP，兼容接受 `no-resolve`
+  但无额外 DNS 解析可禁用。
+- `RuleType::new` 是顶层规则与 Classical Provider 子规则的共同入口，
+  校验置于此处，因此无效子规则同样不会静默绕过。
+- macOS 本地已完成 `cargo fmt --all -- --check`；
+  `cargo test -p clash-lib --lib --locked config::internal::rule::tests::`
+  共 16 通过、0 失败；`cargo test -p clash-lib --lib --locked`
+  共 789 通过、0 失败、12 ignored；
+  `cargo clippy -p clash-lib --lib --locked -- -D warnings` 通过；
+  `cargo check -p clash-lib --no-default-features --locked` 通过。
+- 未运行 Dashboard 全 feature、实机多网卡、跨平台网络验证；
+  本切片不变更运行时路由选项或协议 wire 格式。

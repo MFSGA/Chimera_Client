@@ -200,6 +200,23 @@ impl RuleType {
                 "unsupported rule type: {proto}"
             ))),
         }?;
+
+        // Match ref/: no-resolve only makes sense for IP-address/GeoIP
+        // matching. For source CIDR it is accepted for compatibility; source
+        // addresses are already IPs and never require DNS resolution.
+        if no_resolve
+            && !matches!(
+                &rule,
+                RuleType::GeoIP { .. }
+                    | RuleType::IpCidr { .. }
+                    | RuleType::SrcCidr { .. }
+            )
+        {
+            return Err(Error::InvalidConfig(format!(
+                "rule option `no-resolve` is not supported for {proto}"
+            )));
+        }
+
         Ok(match interface {
             Some(interface) => RuleType::WithInterface {
                 rule: Box::new(rule),
@@ -342,6 +359,49 @@ mod tests {
             assert!(
                 RuleType::try_from(rule.to_string()).is_err(),
                 "invalid rule options must be rejected: {rule}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_resolve_is_only_valid_for_ip_and_geo_rules() {
+        for line in [
+            "DOMAIN,example.com,PROXY,no-resolve",
+            "DOMAIN-SUFFIX,example.com,PROXY,no-resolve",
+            "DOMAIN-REGEX,^api\\.example\\.com$,PROXY,no-resolve",
+            "GEOSITE,cn,PROXY,no-resolve",
+            "RULE-SET,provider,PROXY,no-resolve",
+            "PROCESS-NAME,browser,PROXY,no-resolve",
+            "NETWORK,TCP,PROXY,no-resolve",
+            "MATCH,DIRECT,no-resolve",
+            "MATCH,DIRECT,no-resolve,interface=en0",
+            "AND,((DOMAIN,example.com),(NETWORK,TCP)),PROXY,no-resolve",
+        ] {
+            let result = RuleType::try_from(line.to_string());
+            assert!(
+                result.is_err(),
+                "no-resolve must not be silently accepted for {line}"
+            );
+            let error = result.err().unwrap().to_string();
+            assert!(
+                error.contains("no-resolve") && error.contains("not supported"),
+                "unexpected error for {line}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_resolve_preserves_valid_rules_and_explicit_interface() {
+        for line in [
+            "GEOIP,CN,DIRECT,no-resolve",
+            "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
+            "IP-CIDR6,2001:db8::/32,DIRECT,no-resolve",
+            "SRC-IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
+            "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve,interface=en0",
+        ] {
+            assert!(
+                RuleType::try_from(line.to_string()).is_ok(),
+                "valid no-resolve rule should still parse: {line}"
             );
         }
     }
