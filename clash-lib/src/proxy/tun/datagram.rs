@@ -32,6 +32,39 @@ enum FlushState {
     Disconnected,
 }
 
+/// Process the exact DNS payload extracted by the netstack from an IPv4 UDP
+/// packet. This is shared by the real TUN path and offline packet tests.
+async fn exchange_hijacked_udp_dns(
+    resolver: &ThreadSafeDNSResolver,
+    payload: &[u8],
+) -> Option<Vec<u8>> {
+    let msg = match hickory_proto::op::Message::from_vec(payload) {
+        Ok(msg) => msg,
+        Err(error) => {
+            warn!("dropping malformed hijacked UDP DNS message: {error}");
+            return None;
+        }
+    };
+    trace!("hijack dns request: {:?}", msg);
+
+    let mut response = match exchange_with_resolver(resolver, &msg, true).await {
+        Ok(response) => response,
+        Err(error) => {
+            warn!("failed to exchange UDP DNS message: {error}");
+            dns_error_response(&msg, hickory_proto::op::ResponseCode::ServFail)
+        }
+    };
+    response.metadata.id = msg.metadata.id;
+    trace!("hijack dns response: {:?}", response);
+    match response.to_vec() {
+        Ok(bytes) => Some(bytes),
+        Err(error) => {
+            warn!("failed to serialize hijacked UDP DNS response: {error}");
+            None
+        }
+    }
+}
+
 fn should_hijack_udp_dns(
     enabled: bool,
     rules: &[DnsHijackRule],
@@ -139,74 +172,21 @@ pub(crate) async fn handle_inbound_datagram(
             if should_hijack_udp_dns(dns_hijack, &dns_hijack_rules, remote_addr) {
                 trace!("got dns packet: {:?}, returning from Clash DNS server", pkt);
 
-                match hickory_proto::op::Message::from_vec(&pkt.data) {
-                    Ok(msg) => {
-                        let mut send_response =
-                            async |msg: hickory_proto::op::Message,
-                                   pkt: &UdpPacket| {
-                                match msg.to_vec() {
-                                    Ok(data) => {
-                                        if let Err(e) = ls_dns
-                                            .send(
-                                                (
-                                                    data,
-                                                    pkt.dst_addr
-                                                        .clone()
-                                                        .must_into_socket_addr(),
-                                                    pkt.src_addr
-                                                        .clone()
-                                                        .must_into_socket_addr(),
-                                                )
-                                                    .into(),
-                                            )
-                                            .await
-                                        {
-                                            warn!(
-                                                "failed to send udp packet to \
-                                                 netstack: {}",
-                                                e
-                                            );
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            "failed to serialize dns response: {}",
-                                            e
-                                        );
-                                    }
-                                }
-                            };
-
-                        trace!("hijack dns request: {:?}", msg);
-
-                        let mut resp =
-                            match exchange_with_resolver(&resolver_dns, &msg, true)
-                                .await
-                            {
-                                Ok(resp) => resp,
-                                Err(e) => {
-                                    warn!("failed to exchange dns message: {}", e);
-                                    dns_error_response(
-                                        &msg,
-                                        hickory_proto::op::ResponseCode::ServFail,
-                                    )
-                                }
-                            };
-
-                        // TODO: figure out where the message id got lost
-                        resp.metadata.id = msg.metadata.id;
-                        trace!("hijack dns response: {:?}", resp);
-
-                        send_response(resp, &pkt).await;
-                    }
-                    Err(e) => {
-                        warn!(
-                            "failed to parse dns packet: {}, putting it back to \
-                             stack",
-                            e
-                        );
-                    }
-                };
+                if let Some(reply) =
+                    exchange_hijacked_udp_dns(&resolver_dns, &pkt.data).await
+                    && let Err(error) = ls_dns
+                        .send(
+                            (
+                                reply,
+                                pkt.dst_addr.clone().must_into_socket_addr(),
+                                pkt.src_addr.clone().must_into_socket_addr(),
+                            )
+                                .into(),
+                        )
+                        .await
+                {
+                    warn!("failed to send hijacked DNS reply to netstack: {error}");
+                }
 
                 // don't forward dns packet to dispatcher
                 continue 'read_packet;
@@ -388,8 +368,12 @@ impl Sink<UdpPacket> for TunDatagram {
 
 #[cfg(test)]
 mod tests {
-    use super::{TunDatagram, is_noise_datagram, should_hijack_udp_dns};
+    use super::{
+        TunDatagram, exchange_hijacked_udp_dns, is_noise_datagram,
+        should_hijack_udp_dns,
+    };
     use crate::{
+        app::dns::{MockClashResolver, ThreadSafeDNSResolver},
         config::internal::config::{
             DnsHijackAddress, DnsHijackProtocol, DnsHijackRule,
         },
@@ -397,11 +381,189 @@ mod tests {
         session::SocksAddr,
     };
     use futures::{Sink, task::noop_waker_ref};
+    use hickory_proto::{
+        op::{Message, MessageType, OpCode, Query, ResponseCode},
+        rr::{Name, RecordType},
+    };
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
         pin::Pin,
+        sync::Arc,
         task::{Context, Poll},
+        time::Duration,
     };
+    use tokio::sync::mpsc;
+    use watfaq_netstack::{Packet as NetPacket, UdpSocket as NetUdpSocket};
+
+    fn dns_query(name: &str, typ: RecordType, id: u16) -> Message {
+        let mut query = Message::new(id, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(Name::from_ascii(name).unwrap(), typ));
+        query.metadata.recursion_desired = true;
+        query
+    }
+
+    async fn recv_wire(receiver: &mut mpsc::Receiver<NetPacket>) -> NetPacket {
+        tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("timed out waiting for IPv4/UDP packet")
+            .expect("IPv4/UDP channel closed before response")
+    }
+
+    /// Actual IPv4/UDP packet round-trip through netstack SplitWrite and
+    /// SplitRead. Only the kernel TUN device and Dispatcher are bypassed:
+    /// DNS bytes go through the same handler as production TUN hijack.
+    async fn udp_dns_packet_roundtrip(
+        resolver: ThreadSafeDNSResolver,
+        request: &Message,
+    ) -> Message {
+        let src: SocketAddr = "192.0.2.10:43000".parse().unwrap();
+        let dst: SocketAddr = "192.0.2.53:53".parse().unwrap();
+        assert!(should_hijack_udp_dns(true, &[], dst));
+
+        let (_unused_tx, unused_rx) = mpsc::channel::<NetPacket>(2);
+        let (raw_request_tx, mut raw_request_rx) = mpsc::channel::<NetPacket>(2);
+        let (_, mut request_writer) =
+            NetUdpSocket::new(unused_rx, raw_request_tx).split();
+        request_writer
+            .send((request.to_vec().unwrap(), src, dst).into())
+            .await
+            .unwrap();
+
+        let (ingress_tx, ingress_rx) = mpsc::channel::<NetPacket>(2);
+        let (egress_tx, mut egress_rx) = mpsc::channel::<NetPacket>(2);
+        let (mut ingress_reader, mut egress_writer) =
+            NetUdpSocket::new(ingress_rx, egress_tx).split();
+        ingress_tx
+            .send(recv_wire(&mut raw_request_rx).await)
+            .await
+            .unwrap();
+        let received =
+            tokio::time::timeout(Duration::from_secs(2), ingress_reader.recv())
+                .await
+                .expect("netstack failed to parse request IPv4/UDP packet")
+                .expect("request reader closed");
+        assert_eq!(received.local_addr, src);
+        assert_eq!(received.remote_addr, dst);
+
+        let payload = exchange_hijacked_udp_dns(&resolver, received.data())
+            .await
+            .expect("valid DNS request must produce a response");
+        egress_writer
+            .send((payload, received.remote_addr, received.local_addr).into())
+            .await
+            .unwrap();
+
+        // Parse the IPv4 reply using netstack's real checksum and UDP parser.
+        let (reply_tx, reply_rx) = mpsc::channel::<NetPacket>(2);
+        let (unused_reply_tx, _unused_reply_rx) = mpsc::channel::<NetPacket>(2);
+        let (mut reply_reader, _) =
+            NetUdpSocket::new(reply_rx, unused_reply_tx).split();
+        reply_tx
+            .send(recv_wire(&mut egress_rx).await)
+            .await
+            .unwrap();
+        let reply =
+            tokio::time::timeout(Duration::from_secs(2), reply_reader.recv())
+                .await
+                .expect("netstack failed to parse response IPv4/UDP packet")
+                .expect("response reader closed");
+        assert_eq!(reply.local_addr, dst);
+        assert_eq!(reply.remote_addr, src);
+        Message::from_vec(reply.data()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn ipv4_tun_udp_fake_a_is_synthetic_and_preserves_dns_id() {
+        let mut mock = MockClashResolver::new();
+        mock.expect_ipv6().return_const(false);
+        mock.expect_fake_ip_enabled().return_const(true);
+        mock.expect_fake_ip_v6_enabled().return_const(false);
+        mock.expect_exchange().never();
+        mock.expect_resolve_v4()
+            .once()
+            .with(
+                mockall::predicate::eq("fake.example"),
+                mockall::predicate::eq(true),
+            )
+            .returning(|_, _| Ok(Some("198.18.0.9".parse().unwrap())));
+        let request = dns_query("fake.example.", RecordType::A, 0xbee1);
+        let reply = udp_dns_packet_roundtrip(Arc::new(mock), &request).await;
+        assert_eq!(reply.metadata.id, 0xbee1);
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(reply.answers.len(), 1);
+        assert_eq!(reply.answers[0].data.to_string(), "198.18.0.9");
+    }
+
+    #[tokio::test]
+    async fn ipv4_tun_udp_non_a_privacy_and_excluded_forwarding() {
+        for (blocked, typ) in [
+            (true, RecordType::HTTPS),
+            (false, RecordType::TXT),
+            (false, RecordType::SRV),
+        ] {
+            let mut mock = MockClashResolver::new();
+            mock.expect_ipv6().return_const(false);
+            mock.expect_should_fake_ip().once().return_const(blocked);
+            if blocked {
+                mock.expect_exchange().never();
+            } else {
+                mock.expect_fake_ip_enabled().return_const(true);
+                mock.expect_fake_ip_v6_enabled().return_const(false);
+                mock.expect_exchange().once().returning(|message| {
+                    let mut answer = Message::response(
+                        message.metadata.id,
+                        message.metadata.op_code,
+                    );
+                    answer.add_queries(message.queries.iter().cloned());
+                    Ok(answer)
+                });
+            }
+            let request = dns_query("printer.lan.", typ, 0x1001);
+            let reply = udp_dns_packet_roundtrip(Arc::new(mock), &request).await;
+            assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+            assert!(reply.answers.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn ipv4_tun_udp_upstream_error_becomes_servfail_on_wire() {
+        let mut mock = MockClashResolver::new();
+        mock.expect_ipv6().return_const(false);
+        mock.expect_fake_ip_enabled().return_const(false);
+        mock.expect_fake_ip_v6_enabled().return_const(false);
+        mock.expect_exchange()
+            .once()
+            .returning(|_| Err(anyhow::anyhow!("upstream connection refused")));
+        let request = dns_query("down.example.", RecordType::A, 0x1234);
+        let reply = udp_dns_packet_roundtrip(Arc::new(mock), &request).await;
+        assert_eq!(reply.metadata.id, 0x1234);
+        assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+        assert_eq!(reply.queries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ipv4_tun_udp_multi_question_returns_formerr_without_upstream() {
+        let mock = MockClashResolver::new();
+        let mut request = dns_query("one.example.", RecordType::A, 0x55ab);
+        request.add_query(Query::query(
+            Name::from_ascii("two.example.").unwrap(),
+            RecordType::HTTPS,
+        ));
+        let reply = udp_dns_packet_roundtrip(Arc::new(mock), &request).await;
+        assert_eq!(reply.metadata.id, 0x55ab);
+        assert_eq!(reply.metadata.response_code, ResponseCode::FormErr);
+        assert!(reply.queries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_hijacked_udp_dns_is_dropped_without_upstream() {
+        let resolver: ThreadSafeDNSResolver = Arc::new(MockClashResolver::new());
+        assert!(
+            exchange_hijacked_udp_dns(&resolver, &[0x12, 0x34, 0x00])
+                .await
+                .is_none()
+        );
+    }
 
     fn sample_packet(port: u16) -> UdpPacket {
         UdpPacket::new(

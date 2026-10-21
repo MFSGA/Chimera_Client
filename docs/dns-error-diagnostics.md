@@ -102,3 +102,24 @@
   的 TXT/HTTPS/SVCB 等仍按隐私防泄漏策略空答，而不是通用递归 DNS
   全记录兼容。畸形 DNS 消息在 TUN 入口的解码错误仍可能被丢弃，
   尚未新增长时间 TUN 真实设备验收。最终测试结果以交付的构建日志为准。
+
+## 2026-10-21：TUN DNS 劫持离线报文回归（仅 IPv4）
+
+- 测试不创建系统 TUN 设备、不修改路由表，也不向公网 DNS 查询。
+  在 TUN UDP 生产入口提取一小段共用的 `exchange_hijacked_udp_dns`；
+  生产分支和离线测试调用**同一个** DNS 解析/错误转换函数。
+- UDP 测试利用 `watfaq-netstack::UdpSocket` 的 `SplitWrite` 构造
+  真实 IPv4+UDP 数据包，再由 `SplitRead` 检查 IP/UDP 校验和与
+  源/目标端口，送入共用 DNS 劫持处理函数后将答复再次封为
+  IPv4+UDP 数据包，最后再用 `SplitRead` 校验返回报文。
+- 覆盖 Fake IPv4 A 答复、过滤域名 TXT/SRV 真实上游调用、未过滤域名
+  HTTPS 防泄漏、上游报错时 `SERVFAIL`、两个 DNS Question 时
+  `FORMERR`、请求/回复事务 ID 和地址反向、畸形 UDP DNS 负载。
+- TCP 测试让**生产 `handle_tcp_dns` 处理循环**直接接受 Tokio
+  `AsyncRead + AsyncWrite` 双向流，在无设备环境验证两字节
+  DNS-over-TCP 长度前缀、Fake IPv4 A 答复、`SERVFAIL`、`FORMERR`
+  和同一会话多次请求后的可用性；所有响应读取设置超时。
+- **边界**：这验证了生产 DNS 劫持函数及真实 netstack UDP
+  封解包、TCP DNS framing，不等于端到端运行整个
+  `Dispatcher`、smoltcp TCP 建连、内核 TUN 设备和 OS 路由策略。
+  这些环节仍属于实际设备验收范围；IPv6 Fake-IP 不包含在本次变更中。

@@ -25,10 +25,12 @@ fn should_hijack_tcp_dns(
         }
 }
 
-async fn handle_tcp_dns(
-    mut stream: watfaq_netstack::TcpStream,
-    resolver: ThreadSafeDNSResolver,
-) {
+// Accept any Tokio duplex stream so offline framing tests can run the
+// production TCP DNS hijack loop without allocating a kernel TUN device.
+async fn handle_tcp_dns<S>(mut stream: S, resolver: ThreadSafeDNSResolver)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     loop {
         let mut length_prefix = [0; 2];
         match stream.read_exact(&mut length_prefix).await {
@@ -136,13 +138,129 @@ pub(crate) async fn handle_inbound_stream(
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-    use crate::config::internal::config::{
-        DnsHijackAddress, DnsHijackProtocol, DnsHijackRule,
+    use std::{
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        sync::Arc,
+        time::Duration,
     };
 
-    use super::should_hijack_tcp_dns;
+    use crate::{
+        app::dns::{MockClashResolver, ThreadSafeDNSResolver},
+        config::internal::config::{
+            DnsHijackAddress, DnsHijackProtocol, DnsHijackRule,
+        },
+    };
+    use hickory_proto::{
+        op::{Message, MessageType, OpCode, Query, ResponseCode},
+        rr::{Name, RecordType},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+
+    use super::{handle_tcp_dns, should_hijack_tcp_dns};
+
+    fn dns_query(name: &str, typ: RecordType, id: u16) -> Message {
+        let mut query = Message::new(id, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(Name::from_ascii(name).unwrap(), typ));
+        query
+    }
+
+    async fn tcp_roundtrip(peer: &mut DuplexStream, message: &Message) -> Message {
+        let wire = message.to_vec().unwrap();
+        peer.write_all(&(wire.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        peer.write_all(&wire).await.unwrap();
+        let mut length = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(2), peer.read_exact(&mut length))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut response = vec![0; u16::from_be_bytes(length) as usize];
+        tokio::time::timeout(Duration::from_secs(2), peer.read_exact(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        Message::from_vec(&response).unwrap()
+    }
+
+    #[tokio::test]
+    async fn ipv4_tun_tcp_fake_a_and_multi_question_on_same_connection() {
+        let mut mock = MockClashResolver::new();
+        mock.expect_ipv6().return_const(false);
+        mock.expect_fake_ip_enabled().return_const(true);
+        mock.expect_fake_ip_v6_enabled().return_const(false);
+        mock.expect_exchange().never();
+        mock.expect_resolve_v4()
+            .once()
+            .returning(|_, _| Ok(Some("198.18.0.15".parse().unwrap())));
+        let resolver: ThreadSafeDNSResolver = Arc::new(mock);
+
+        let (mut client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(handle_tcp_dns(server, resolver));
+
+        let answer = tcp_roundtrip(
+            &mut client,
+            &dns_query("fake.example.", RecordType::A, 0x1701),
+        )
+        .await;
+        assert_eq!(answer.metadata.id, 0x1701);
+        assert_eq!(answer.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(answer.answers[0].data.to_string(), "198.18.0.15");
+
+        let mut multi = dns_query("first.example.", RecordType::A, 0x1702);
+        multi.add_query(Query::query(
+            Name::from_ascii("second.example.").unwrap(),
+            RecordType::HTTPS,
+        ));
+        let answer = tcp_roundtrip(&mut client, &multi).await;
+        assert_eq!(answer.metadata.id, 0x1702);
+        assert_eq!(answer.metadata.response_code, ResponseCode::FormErr);
+        assert!(answer.queries.is_empty());
+
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ipv4_tun_tcp_servfail_is_framed_and_session_keeps_working() {
+        let mut mock = MockClashResolver::new();
+        mock.expect_ipv6().return_const(false);
+        mock.expect_fake_ip_enabled().return_const(false);
+        mock.expect_fake_ip_v6_enabled().return_const(false);
+        mock.expect_exchange()
+            .once()
+            .returning(|_| Err(anyhow::anyhow!("all upstreams unavailable")));
+        let (mut client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(handle_tcp_dns(server, Arc::new(mock)));
+
+        let answer = tcp_roundtrip(
+            &mut client,
+            &dns_query("down.example.", RecordType::A, 0x1a02),
+        )
+        .await;
+        assert_eq!(answer.metadata.id, 0x1a02);
+        assert_eq!(answer.metadata.response_code, ResponseCode::ServFail);
+
+        // A second malformed multi-question query must receive a response
+        // on the existing TCP connection, not an unexpected EOF.
+        let mut multi = dns_query("one.example.", RecordType::A, 0x1a03);
+        multi.add_query(Query::query(
+            Name::from_ascii("two.example.").unwrap(),
+            RecordType::TXT,
+        ));
+        let next = tcp_roundtrip(&mut client, &multi).await;
+        assert_eq!(next.metadata.response_code, ResponseCode::FormErr);
+        assert_eq!(next.metadata.id, 0x1a03);
+
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
     #[test]
     fn tcp_dns_hijack_uses_rules_and_preserves_empty_list_compatibility() {
