@@ -79,7 +79,11 @@ async fn query_dns(
     let mut message = Message::query();
     message.add_query(hickory_proto::op::Query::query(name, typ));
 
-    match state.resolver.exchange(&message).await {
+    // Keep Controller diagnostics consistent with DNS listeners and TUN:
+    // synthetic A records, fake-ip-filter and non-A privacy policy all apply.
+    match crate::app::dns::exchange_with_resolver(&state.resolver, &message, true)
+        .await
+    {
         Ok(response) => {
             let mut resp = Map::new();
             resp.insert(
@@ -159,9 +163,14 @@ async fn query_dns(
 
 #[cfg(test)]
 mod tests {
-    use super::{DNSState, dns_health, reset_dns};
-    use crate::app::dns::MockClashResolver;
-    use axum::{Json, extract::State};
+    use super::{DNSState, DnsQuery, dns_health, query_dns, reset_dns};
+    use crate::app::dns::{MockClashResolver, ResolverKind};
+    use axum::{
+        Json,
+        body::to_bytes,
+        extract::{Query, State},
+        response::IntoResponse,
+    };
     use std::sync::Arc;
 
     #[tokio::test]
@@ -179,6 +188,41 @@ mod tests {
         assert!(snapshot.passive);
         assert_eq!(snapshot.status, crate::app::dns::DnsHealthStatus::Disabled);
         assert!(snapshot.groups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn controller_dns_query_uses_same_fake_ipv4_path_as_dns_listener() {
+        let mut resolver = MockClashResolver::new();
+        resolver.expect_kind().returning(|| ResolverKind::Clash);
+        resolver.expect_ipv6().return_const(false);
+        resolver.expect_fake_ip_enabled().return_const(true);
+        resolver.expect_fake_ip_v6_enabled().return_const(false);
+        resolver
+            .expect_resolve_v4()
+            .with(
+                mockall::predicate::eq("example.com"),
+                mockall::predicate::eq(true),
+            )
+            .once()
+            .returning(|_, _| Ok(Some("198.18.0.15".parse().unwrap())));
+        resolver.expect_exchange().never();
+
+        let response = query_dns(
+            State(DNSState {
+                resolver: Arc::new(resolver),
+            }),
+            Query(DnsQuery {
+                name: "example.com".into(),
+                typ: "A".into(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["Status"], 0);
+        assert_eq!(json["Answer"][0]["data"], "198.18.0.15");
     }
 
     #[tokio::test]

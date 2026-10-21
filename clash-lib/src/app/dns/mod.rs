@@ -31,7 +31,9 @@ pub use rule_dispatch::{PendingOutboundManager, PendingRouter, RuleDispatch};
 pub use resolver::{EnhancedResolver, SystemResolver, new as new_resolver};
 
 pub use server::DnsRunner;
+// Controller DNS queries also use Fake-IP policy when TUN is not compiled.
 #[cfg(feature = "tun")]
+pub(crate) use server::dns_error_response;
 pub use server::exchange_with_resolver;
 
 #[async_trait]

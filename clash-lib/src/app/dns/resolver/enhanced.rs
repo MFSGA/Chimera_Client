@@ -906,9 +906,11 @@ impl ClashResolver for EnhancedResolver {
             && let Some(hosts) = &self.hosts
             && let Some(v) = hosts.search(host)
         {
-            return Ok(v.get_data().map(|v| match v {
-                net::IpAddr::V4(v4) => *v4,
-                _ => unreachable!("invalid IP family"),
+            return Ok(v.get_data().and_then(|v| match v {
+                net::IpAddr::V4(v4) => Some(*v4),
+                // A hosts override with only an IPv6 address has no A
+                // record; it must not panic a release=abort process.
+                net::IpAddr::V6(_) => None,
             }));
         }
 
@@ -923,7 +925,10 @@ impl ClashResolver for EnhancedResolver {
                 debug!("fake dns lookup: {} -> {:?}", host, ip);
                 match ip {
                     Ok(net::IpAddr::V4(v4)) => return Ok(Some(v4)),
-                    _ => unreachable!("invalid IP family"),
+                    Ok(other) => {
+                        return Err(anyhow!("IPv4 fake-IP pool returned {other}"));
+                    }
+                    Err(error) => return Err(error.into()),
                 }
             }
         }
@@ -1084,6 +1089,13 @@ impl ClashResolver for EnhancedResolver {
 
     fn fake_ip_enabled(&self) -> bool {
         self.fake_dns.is_some()
+    }
+
+    async fn should_fake_ip(&self, host: &str) -> bool {
+        let Some(pool) = &self.fake_dns else {
+            return false;
+        };
+        !pool.read().await.should_skip(host)
     }
 
     fn direct_resolver(&self) -> Option<ThreadSafeDNSResolver> {
@@ -1287,6 +1299,72 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         let health = resolver.dns_health_snapshot().unwrap();
         assert_eq!(health.groups[0].upstreams[0].successes, 1);
+    }
+
+    #[tokio::test]
+    async fn fake_ipv4_pool_exhaustion_returns_error_without_panicking() {
+        let mut resolver = EnhancedResolver::from_clients(vec![], false);
+        resolver.fake_dns = Some(Arc::new(RwLock::new(
+            crate::app::dns::fakeip::FakeDns::new(crate::app::dns::fakeip::Opts {
+                ipnet: "198.18.0.0/30".parse().unwrap(),
+                skipped_hostnames: None,
+                store: Box::new(crate::app::dns::fakeip::InMemStore::new(2)),
+            })
+            .unwrap(),
+        )));
+        assert_eq!(
+            resolver.resolve_v4("first.example", true).await.unwrap(),
+            Some("198.18.0.2".parse().unwrap()),
+        );
+        let error = resolver
+            .resolve_v4("second.example", true)
+            .await
+            .expect_err("a full pool must return a recoverable DNS error");
+        assert!(error.to_string().contains("pool exhausted"), "{error}");
+        assert_eq!(
+            resolver.resolve_v4("first.example", true).await.unwrap(),
+            Some("198.18.0.2".parse().unwrap()),
+            "existing mappings must remain stable",
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_ip_filter_lets_excluded_domains_use_real_ipv4_dns() {
+        let mut filter = crate::common::trie::StringTrie::new();
+        filter.insert("*.lan", Arc::new(true));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(FixedClient {
+                response: response_with_a(Ipv4Addr::new(203, 0, 113, 44)),
+            })],
+            false,
+        );
+        resolver.fake_dns = Some(Arc::new(RwLock::new(
+            crate::app::dns::fakeip::FakeDns::new(crate::app::dns::fakeip::Opts {
+                ipnet: "198.18.0.0/30".parse().unwrap(),
+                skipped_hostnames: Some(filter),
+                store: Box::new(crate::app::dns::fakeip::InMemStore::new(2)),
+            })
+            .unwrap(),
+        )));
+        assert!(!resolver.should_fake_ip("printer.lan").await);
+        assert!(resolver.should_fake_ip("public.example").await);
+        assert_eq!(
+            resolver.resolve_v4("printer.lan", true).await.unwrap(),
+            Some(Ipv4Addr::new(203, 0, 113, 44)),
+        );
+        assert!(resolver.fake_ip_for_host("printer.lan").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn ipv4_hosts_with_other_address_family_do_not_abort() {
+        let mut hosts = crate::common::trie::StringTrie::new();
+        hosts.insert("v6-only.test", Arc::new("2001:db8::1".parse().unwrap()));
+        let mut resolver = EnhancedResolver::from_clients(vec![], false);
+        resolver.hosts = Some(hosts);
+        assert_eq!(
+            resolver.resolve_v4("v6-only.test", true).await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]

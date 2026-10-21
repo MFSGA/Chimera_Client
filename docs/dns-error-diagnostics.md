@@ -74,3 +74,31 @@
   辅助 DNS 的异常不会直接判定主 DNS 全部不可用；各组有单独快照。
   当前不增加主动探针、阈值报警、长期持久化、Dashboard 页面，
   不依赖公网互操作。完整测试结果以本轮实际验收日志为准。
+
+## 2026-10-21：仅 IPv4 Fake-IP DNS 完善
+
+- **范围**：仅完成 IPv4 Fake-IP 地址分配、IPv4 PTR、本地 DNS
+  响应、Controller DNS 查询以及 `fake-ip-filter` 与非 A 查询的兼容性；
+  不接入或修改 IPv6 Fake-IP 池、Fake AAAA、IPv6 路由。
+- IPv4 假地址池耗尽会将 `pool exhausted` 错误返回 DNS 调用方，
+  不再进入 `unreachable!()`；已分配域名/IP 的映射继续保持稳定。
+  `hosts` 仅有非 IPv4 记录时，对 A 查询返回 NODATA
+  (`NOERROR` + 空记录)，避免地址族不匹配导致进程 abort。
+- `EnhancedResolver::should_fake_ip` 按真实的 Fake-IP 过滤器判断：
+  明确被 `fake-ip-filter` 排除的域名，其 TXT/HTTPS/SVCB/MX/SRV 等
+  非地址查询按已有 nameserver-policy/上游规则查询；未被排除的
+  Fake-IP 域名仍返回空的 `NOERROR`，不会为非 A 查询向上游泄漏域名。
+- 对已分配且保存反向映射的 IPv4 假地址，`in-addr.arpa` PTR 查询
+  会在本地生成指向原始域名的 PTR 记录；不为 PTR 请求新分配地址。
+- 统一普通监听器、TUN DNS 劫持和 Controller 查询的 Fake-IP 规则：
+  TUN UDP/TCP 遇到解析器错误返回保留请求 ID 的 `SERVFAIL`，
+  不再静默丢弃查询或关闭 DNS TCP 会话；多个 Question 在入口
+  返回 `FORMERR`，不会向上游请求。Controller `/dns/query` 的
+  Fake-IP A 解析和非 A 拦截语义与普通 DNS 监听器一致。
+- 添加全内存测试覆盖：Fake-IP 池耗尽、已有映射重用、过滤域名
+  A 和非地址查询、已分配地址的 PTR、本地 `SERVFAIL`、多 Question
+  `FORMERR` 与 Controller Fake A 查询；不执行公网 DNS 互操作。
+- **限制**：未实现 Fake AAAA 或 IPv6 PTR；被隔离的 Fake-IP 域名
+  的 TXT/HTTPS/SVCB 等仍按隐私防泄漏策略空答，而不是通用递归 DNS
+  全记录兼容。畸形 DNS 消息在 TUN 入口的解码错误仍可能被丢弃，
+  尚未新增长时间 TUN 真实设备验收。最终测试结果以交付的构建日志为准。

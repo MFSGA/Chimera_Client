@@ -6,7 +6,7 @@ use tracing::{debug, warn};
 use crate::{
     app::{
         dispatcher::Dispatcher,
-        dns::{ThreadSafeDNSResolver, exchange_with_resolver},
+        dns::{ThreadSafeDNSResolver, dns_error_response, exchange_with_resolver},
     },
     config::internal::config::DnsHijackRule,
     session::{Network, Session, Type, find_process_name},
@@ -65,7 +65,10 @@ async fn handle_tcp_dns(
                 Ok(response) => response,
                 Err(error) => {
                     warn!("failed to exchange TCP DNS message: {error}");
-                    break;
+                    dns_error_response(
+                        &request,
+                        hickory_proto::op::ResponseCode::ServFail,
+                    )
                 }
             };
         response.metadata.id = request_id;

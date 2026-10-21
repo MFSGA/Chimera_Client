@@ -12,6 +12,8 @@ use crate::runner::Runner;
 use super::ThreadSafeDNSResolver;
 
 mod handler;
+#[cfg(feature = "tun")]
+pub(crate) use handler::dns_error_response;
 pub use handler::exchange_with_resolver;
 
 static DEFAULT_DNS_SERVER_TTL: u32 = 60;

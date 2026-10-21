@@ -1,7 +1,7 @@
 use crate::{
     app::{
         dispatcher::Dispatcher,
-        dns::{ThreadSafeDNSResolver, exchange_with_resolver},
+        dns::{ThreadSafeDNSResolver, dns_error_response, exchange_with_resolver},
     },
     common::errors::new_io_error,
     config::internal::config::DnsHijackRule,
@@ -186,7 +186,10 @@ pub(crate) async fn handle_inbound_datagram(
                                 Ok(resp) => resp,
                                 Err(e) => {
                                     warn!("failed to exchange dns message: {}", e);
-                                    continue 'read_packet;
+                                    dns_error_response(
+                                        &msg,
+                                        hickory_proto::op::ResponseCode::ServFail,
+                                    )
                                 }
                             };
 
