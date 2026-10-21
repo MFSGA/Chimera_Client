@@ -1,12 +1,22 @@
+// Every test in this integration target exercises a Shadowsocks-only API.
+// Match imports and fixtures to the existing feature gate on the test, so
+// default-feature Clippy does not see unused test-only dependencies.
+#[cfg(feature = "shadowsocks")]
 use bytes::{Buf, Bytes};
+#[cfg(feature = "shadowsocks")]
 use clash_lib::{Config, Options};
+#[cfg(feature = "shadowsocks")]
 use http_body_util::BodyExt;
+#[cfg(feature = "shadowsocks")]
 use std::{net::TcpListener, path::PathBuf};
 
+#[cfg(feature = "shadowsocks")]
 mod common;
 
+#[cfg(feature = "shadowsocks")]
 use common::{ClashInstance, send_http_request};
 
+#[cfg(feature = "shadowsocks")]
 fn available_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .expect("failed to reserve test port")
