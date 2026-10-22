@@ -332,6 +332,115 @@ impl DnsStrictTransport for S04biPausedWire {
     }
 }
 
+#[derive(Debug)]
+struct S04bnTcpPathOutbound {
+    paths: Vec<crate::app::flow::NetworkPathId>,
+    opened: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl DialWithConnector for S04bnTcpPathOutbound {}
+
+#[async_trait]
+impl OutboundHandler for S04bnTcpPathOutbound {
+    fn name(&self) -> &str {
+        "s04bn-dns-tcp"
+    }
+    fn server_name(&self) -> Option<&str> {
+        Some("192.0.2.10")
+    }
+    fn proto(&self) -> OutboundType {
+        OutboundType::Socks5
+    }
+    async fn connect_stream(
+        &self,
+        _: &Session,
+        _: ThreadSafeDNSResolver,
+    ) -> io::Result<BoxedChainedStream> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        self.opened
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (stream, mut server) = tokio::io::duplex(16_384);
+        tokio::spawn(async move {
+            let mut len = [0u8; 2];
+            server.read_exact(&mut len).await?;
+            let mut packet = vec![0u8; u16::from_be_bytes(len) as usize];
+            server.read_exact(&mut packet).await?;
+            let query = Message::from_vec(&packet).map_err(io::Error::other)?;
+            let mut answer =
+                Message::response(query.metadata.id, query.metadata.op_code);
+            answer.add_queries(query.queries.iter().cloned());
+            let bytes = answer.to_vec().map_err(io::Error::other)?;
+            server
+                .write_all(&(bytes.len() as u16).to_be_bytes())
+                .await?;
+            server.write_all(&bytes).await?;
+            Ok::<_, io::Error>(())
+        });
+        Ok(Box::new(
+            crate::app::dispatcher::ChainedStreamWrapper::new_with_network_path_ids(
+                stream,
+                self.paths.clone(),
+            ),
+        ))
+    }
+    async fn connect_datagram(
+        &self,
+        _: &Session,
+        _: ThreadSafeDNSResolver,
+    ) -> io::Result<BoxedChainedDatagram> {
+        Err(io::Error::other("the TCP-only test must not open UDP"))
+    }
+}
+
+#[tokio::test]
+async fn s04bn_real_dns_client_tcp_connection_propagates_reported_socket_ids() {
+    use crate::app::{
+        dns::{
+            bootstrap_socket::DnsStrictSocketPathTransport,
+            execution::DnsStrictWireTransport,
+        },
+        flow::{AddressFamily, InterfaceId, NetworkPathId},
+    };
+    let expected = NetworkPathId {
+        interface: InterfaceId {
+            name: "test-socket0".into(),
+            index: 17,
+        },
+        family: AddressFamily::Ipv4,
+        source_address: Some("192.0.2.77".parse().unwrap()),
+        network_generation: 1,
+    };
+    let server =
+        crate::app::dns::Config::parse_nameserver(&["tcp://192.0.2.53".to_owned()])
+            .unwrap()
+            .remove(0);
+    let query = request("test.example.", RecordType::A);
+    for (paths, accepted) in [(vec![expected.clone()], true), (vec![], false)] {
+        let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let proxy: AnyOutboundHandler = Arc::new(S04bnTcpPathOutbound {
+            paths,
+            opened: opened.clone(),
+        });
+        let result = DnsStrictSocketPathTransport::exchange_with_socket_evidence(
+            &DnsStrictWireTransport,
+            &server,
+            proxy,
+            &query,
+        )
+        .await;
+        if accepted {
+            let (answer, evidence) = result.unwrap();
+            assert_eq!(answer.queries, query.queries);
+            let _ = evidence; // its current-path verification is tested in S04b-m.
+        } else {
+            let error = result.err().expect("missing socket report must fail");
+            assert!(error.to_string().contains("socket path missing"), "{error}");
+        }
+        assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+}
+
 #[tokio::test]
 async fn s04bi_guarded_dns_rejects_stale_leaf_before_any_dial() {
     let cfg = policy_fixture();

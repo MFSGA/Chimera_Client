@@ -37,6 +37,8 @@ use tokio::sync::Mutex;
 pub(super) struct DnsPathUse {
     pub path_id: Option<NetworkPathId>,
     pub endpoint: Option<SocketAddr>,
+    /// IDs reported by the actual chained connection, never planned paths.
+    pub socket_paths: Vec<NetworkPathId>,
 }
 
 pub(super) type SharedDnsPathUse = Arc<Mutex<DnsPathUse>>;
@@ -330,16 +332,21 @@ impl RuntimeProvider for DnsRuntimeProvider {
                         "DNS transport dial completed on a stale network path",
                     ));
                 }
+                let socket_paths = stream.network_path_ids();
                 *provider.selected_path.lock().await = DnsPathUse {
                     path_id: selected_path,
                     endpoint: Some(server_addr),
+                    socket_paths,
                 };
                 Ok(AsyncIoTokioAsStd(stream))
             } else {
-                outbound
-                    .connect_stream(&sess, dns)
-                    .await
-                    .map(AsyncIoTokioAsStd)
+                let stream = outbound.connect_stream(&sess, dns).await?;
+                *provider.selected_path.lock().await = DnsPathUse {
+                    socket_paths: stream.network_path_ids(),
+                    endpoint: Some(server_addr),
+                    ..Default::default()
+                };
+                Ok(AsyncIoTokioAsStd(stream))
             }
         })
     }
@@ -390,13 +397,21 @@ impl RuntimeProvider for DnsRuntimeProvider {
                         "DNS UDP transport dial completed on a stale network path",
                     ));
                 }
+                let socket_paths = datagram.network_path_ids();
                 *provider.selected_path.lock().await = DnsPathUse {
                     path_id: selected_path,
                     endpoint: Some(server_addr),
+                    socket_paths,
                 };
                 datagram
             } else {
-                outbound.connect_datagram(&sess, dns).await?
+                let datagram = outbound.connect_datagram(&sess, dns).await?;
+                *provider.selected_path.lock().await = DnsPathUse {
+                    socket_paths: datagram.network_path_ids(),
+                    endpoint: Some(server_addr),
+                    ..Default::default()
+                };
+                datagram
             };
             Ok(DnsProxyUdpSocket(Mutex::new(datagram)))
         })
@@ -477,6 +492,127 @@ mod tests {
         let mut provider = DnsRuntimeProvider::new_direct(iface, None);
         provider.network_path_source = Some(source);
         provider
+    }
+
+    #[derive(Debug)]
+    struct S04bnPathOutbound {
+        socket_paths: Vec<crate::app::flow::NetworkPathId>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::proxy::DialWithConnector for S04bnPathOutbound {}
+
+    #[async_trait::async_trait]
+    impl crate::proxy::OutboundHandler for S04bnPathOutbound {
+        fn name(&self) -> &str {
+            "s04bn-path"
+        }
+        fn proto(&self) -> crate::proxy::OutboundType {
+            crate::proxy::OutboundType::Socks5
+        }
+        async fn connect_stream(
+            &self,
+            _: &crate::session::Session,
+            _: crate::app::dns::ThreadSafeDNSResolver,
+        ) -> std::io::Result<crate::app::dispatcher::BoxedChainedStream> {
+            let (stream, _) = tokio::io::duplex(128);
+            Ok(Box::new(crate::app::dispatcher::ChainedStreamWrapper::new_with_network_path_ids(
+                stream, self.socket_paths.clone(),
+            )))
+        }
+        async fn connect_datagram(
+            &self,
+            _: &crate::session::Session,
+            _: crate::app::dns::ThreadSafeDNSResolver,
+        ) -> std::io::Result<crate::app::dispatcher::BoxedChainedDatagram> {
+            Ok(Box::new(crate::app::dispatcher::ChainedDatagramWrapper::new_with_network_path_ids(
+                S04bnNoIoDatagram, self.socket_paths.clone(),
+            )))
+        }
+    }
+
+    struct S04bnNoIoDatagram;
+
+    impl futures::Stream for S04bnNoIoDatagram {
+        type Item = crate::proxy::datagram::UdpPacket;
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl futures::Sink<crate::proxy::datagram::UdpPacket> for S04bnNoIoDatagram {
+        type Error = std::io::Error;
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn start_send(
+            self: std::pin::Pin<&mut Self>,
+            _: crate::proxy::datagram::UdpPacket,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn s04bn_dns_tcp_udp_reports_chained_connection_paths_not_planning() {
+        use hickory_net::runtime::RuntimeProvider;
+        use tokio::sync::Mutex;
+        let chosen = crate::app::flow::NetworkPathId {
+            interface: InterfaceId {
+                name: "bound-test0".into(),
+                index: 17,
+            },
+            family: AddressFamily::Ipv4,
+            source_address: Some("192.0.2.70".parse().unwrap()),
+            network_generation: 37,
+        };
+        for paths in [vec![chosen.clone()], vec![]] {
+            let observed = Arc::new(Mutex::new(super::DnsPathUse::default()));
+            let handler = Arc::new(S04bnPathOutbound {
+                socket_paths: paths.clone(),
+            });
+            let resolver =
+                Arc::new(crate::app::dns::SystemResolver::new(false).unwrap());
+            let provider = DnsRuntimeProvider::new(
+                handler,
+                resolver,
+                None,
+                None,
+                None,
+                None,
+                observed.clone(),
+            );
+            let server = "192.0.2.53:53".parse().unwrap();
+            let _tcp = provider.connect_tcp(server, None, None).await.unwrap();
+            let seen = observed.lock().await.clone();
+            assert_eq!(seen.socket_paths, paths);
+            assert!(
+                seen.path_id.is_none(),
+                "a reported socket is not a planned path"
+            );
+            let _udp = provider.bind_udp(server, server).await.unwrap();
+            let seen = observed.lock().await.clone();
+            assert_eq!(seen.socket_paths, paths);
+            assert!(seen.path_id.is_none());
+        }
     }
 
     #[test]

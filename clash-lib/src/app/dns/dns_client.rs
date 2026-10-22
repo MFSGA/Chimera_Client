@@ -290,6 +290,7 @@ mod tests {
                 network_generation: 1,
             }),
             endpoint: Some("1.1.1.1:53".parse().unwrap()),
+            socket_paths: Vec::new(),
         }));
         client.inner.write().await.selected_path = Some(selected_path.clone());
 
@@ -700,7 +701,9 @@ impl DnsClient {
         response: &Message,
         selected_path: &SharedDnsPathUse,
     ) {
-        let DnsPathUse { path_id, endpoint } = selected_path.lock().await.clone();
+        let DnsPathUse {
+            path_id, endpoint, ..
+        } = selected_path.lock().await.clone();
         let Some(path_id) = path_id else {
             return;
         };
@@ -1117,6 +1120,25 @@ impl Client for DnsClient {
 
     #[instrument(skip(msg), level = "trace")]
     async fn exchange(&self, msg: &Message) -> anyhow::Result<Message> {
+        Ok(self.exchange_with_observed_socket_paths(msg).await?.0)
+    }
+
+    async fn exchange_with_socket_paths(
+        &self,
+        msg: &Message,
+    ) -> anyhow::Result<(Message, Vec<crate::app::flow::NetworkPathId>)> {
+        self.exchange_with_observed_socket_paths(msg).await
+    }
+}
+
+impl DnsClient {
+    /// The selected-path holder is unique per freshly constructed strict DNS
+    /// client. On UDP truncation use the *fallback TCP* connection's evidence.
+    /// Normal shared clients still use exchange() and ignore these IDs.
+    async fn exchange_with_observed_socket_paths(
+        &self,
+        msg: &Message,
+    ) -> anyhow::Result<(Message, Vec<crate::app::flow::NetworkPathId>)> {
         let need_initialize = {
             let inner = self.inner.read().await;
             inner.c.is_none()
@@ -1191,14 +1213,16 @@ impl Client for DnsClient {
 
         if !response.metadata.truncation {
             self.report_path_response(&response, &selected_path).await;
-            return Ok(response);
+            let socket_paths = selected_path.lock().await.socket_paths.clone();
+            return Ok((response, socket_paths));
         }
 
         self.report_path_response(&response, &selected_path).await;
 
         let cfg = self.cfg.read().await.clone();
         let DnsConfig::Udp(addr, iface, proxy, fw_mark) = cfg else {
-            return Ok(response);
+            let socket_paths = selected_path.lock().await.socket_paths.clone();
+            return Ok((response, socket_paths));
         };
         warn!(
             upstream = %self.id(),
@@ -1231,7 +1255,8 @@ impl Client for DnsClient {
                 "DNS upstream returned a truncated response over TCP"
             ));
         }
-        Ok(tcp_response)
+        let socket_paths = tcp_selected_path.lock().await.socket_paths.clone();
+        Ok((tcp_response, socket_paths))
     }
 }
 

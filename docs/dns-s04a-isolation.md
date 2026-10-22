@@ -102,8 +102,15 @@ cargo test -p clash-lib --test dns_config_tests --locked
 ## S04b-m：显式 socket 路径证据校验（内部非生产传输）
 
 - 新增 `app/dns/bootstrap_socket.rs`：`StrictDnsSocketPathEvidence` 仅由实际 `BoxedChainedStream` / `BoxedChainedDatagram` 提供的 `network_path_ids()` 捕获物理本地 socket 路径。空集合、过多路径、无效接口/源地址或重复项失败关闭；使用 `OutboundManager` 的相同 `NetworkPathSource`/`SharedNetworkStatus` 复核**当前网络代际**，并逐一比对被观察的 `BindingStatus::Verified` 本地接口、地址族与源 IP。既验证路径来源与请求所属的 Manager 一致，也拒绝不属于当前候选的“貌似有效”路径。此检查不验证代理的远端转发链，也不是操作系统内核的出口证明。
-- `DnsStrictSocketPathTransport` 是**显式 opt-in** 的内部传输能力，返回 DNS 应答及同一物理连接产生的证据。`StrictDnsManagerLeafGuard::exchange_with_socket_evidence` 复用前述 registry 租约、选中叶节点/Provider 版本、网络和配置代际 guard；适配器对任何传输或证据错误**终止本次严格查询**，不可转用第二个 DNS 上游或 legacy/DIRECT fallback。现有 `DnsStrictWireTransport` / `DnsStrictPinnedWireTransport` **没有**此能力，不能从路由规划或传入的服务器配置凭空生成 socket 路径信息。S04b-m 离线测试使用带路径 ID 的假 chained stream 验证正确报告、缺失、过期、接口或源地址不匹配及网络在途切换；测试中的假链路并不证明真实 OS socket 绑定。
-- **未完成：** 真正 DNS client/transport 尚未回传 TCP/UDP 的物理 socket 路径 ID，Connector 与 TLS/DoH 连接池的端到端身份证明、取消压力测试、真实数据面与抓包验证，以及可信 Provider/pin 来源与独立 L2 审查均未完成。生产 `policy-rules` gate 继续关闭；这一切片不得被用作放开生产严格 DNS 的理由。
+- `DnsStrictSocketPathTransport` 是**显式 opt-in** 的内部传输能力，返回 DNS 应答及同一物理连接产生的证据。`StrictDnsManagerLeafGuard::exchange_with_socket_evidence` 复用前述 registry 租约、选中叶节点/Provider 版本、网络和配置代际 guard；适配器对任何传输或证据错误**终止本次严格查询**，不可转用第二个 DNS 上游或 legacy/DIRECT fallback。**S04b-m 当时**的 `DnsStrictWireTransport` / `DnsStrictPinnedWireTransport` 没有此能力；S04b-n 后已为严格 TCP/UDP 补充从实际连接对象回传路径的能力，仍不能从路由规划或服务器配置凭空生成。S04b-m 离线测试使用带路径 ID 的假 chained stream 验证正确报告、缺失、过期、接口或源地址不匹配及网络在途切换；测试中的假链路并不证明真实 OS socket 绑定。
+- **S04b-m 当时未完成：** DNS client/transport 尚未回传 TCP/UDP 的物理 socket 路径 ID（已在 S04b-n 补充 opt-in 路径），Connector 与 TLS/DoH 连接池的端到端身份证明、取消压力测试、真实数据面与抓包验证，以及可信 Provider/pin 来源与独立 L2 审查均未完成。生产 `policy-rules` gate 继续关闭；这一切片不得被用作放开生产严格 DNS 的理由。
+
+## S04b-n：真实 DNS TCP/UDP 客户端的连接路径回传（内部，未启用生产）
+
+- `DnsRuntimeProvider` 在 TCP `connect_tcp` 及 UDP `bind_udp` 建立连接后，从返回的 `BoxedChainedStream` / `BoxedChainedDatagram` 读取 `network_path_ids()`，在 `DnsPathUse.socket_paths` **独立保存实际连接器报告的路径 ID**。它与原用于运行时诊断的 `selected_path.path_id` 明确分离：无法从连接对象证明的路径不会由规划候选填充。包含 DIRECT 选择和指定代理路径；网络/配置代际检查及 legacy DNS 诊断不变。
+- `DnsClient` 增加可选 `exchange_with_socket_paths` 接口：仅新建的真实 `DnsClient` 能提供本次连接的 socket ID，其余 DNS client 默认失败关闭。正常 `exchange` 不改变；DNS UDP 如果因截断回退到 TCP，返回**最终 TCP 连接**的路径而不是先前 UDP 的路径。S03 严格传输为每次请求创建新 client，在读取 ID 后仍按既有流程按时清理客户端，防止继承其他请求的连接池路径。
+- `DnsStrictWireTransport` 与 `DnsStrictPinnedWireTransport` 实现 S04b-m 的 `DnsStrictSocketPathTransport`，**仅 TCP/UDP 可走证据接口**；DoT/DoH 仍不支持这份证据接口，不能降级到明文或虚构路径。缺少实际 socket ID、来源不完整或最终验证不通过时失败关闭并停止上游重试；普通严格交换逻辑和生产 `policy-rules` gate 仍保持原样。S04b-n 离线测试验证 TCP/UDP runtime 只使用连接报告的 ID，以及一条经过 Hickory DNS TCP 编解码的内存连接可将 ID 传至严格传输，缺少 ID 时拒绝。
+- **仍未完成：** 本地 `ChainedStream` 报告的 ID 是连接器侧软件元数据，并非 OS 级 NIC/源地址的最终证明；没有端到端验证实际 proxy connector/UDP socket 绑定、DoT/DoH/连接池行为、真实远端代理和抓包；可信 Provider/bootstrap pin 来源与完整递归依赖图以及独立 L2 审查/维护者批准仍未完成。S04b-n 是内部条件能力，**不可用来解除生产 `policy-rules` 启动保护**。
 
 ## S04b/S04c 待完成的严格准入
 

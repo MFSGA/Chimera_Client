@@ -56,6 +56,16 @@ pub trait Client: Sync + Send + Debug {
     fn id(&self) -> String;
     async fn exchange(&self, msg: &op::Message) -> anyhow::Result<op::Message>;
 
+    /// S04b-n strict-only capability. Return the physical socket IDs reported
+    /// by the connection that carried *this response*, not a planned path.
+    /// Other clients fail closed; the regular exchange method is unchanged.
+    async fn exchange_with_socket_paths(
+        &self,
+        _: &op::Message,
+    ) -> anyhow::Result<(op::Message, Vec<crate::app::flow::NetworkPathId>)> {
+        anyhow::bail!("DNS client cannot report physical socket path evidence")
+    }
+
     /// Drop any network-bound transport so the next query reconnects on the
     /// currently active network. Returns the number of live transports reset.
     async fn reset_transport(&self) -> anyhow::Result<u32> {

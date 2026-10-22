@@ -28,6 +28,14 @@ pub(crate) struct StrictDnsSocketPathEvidence {
 }
 
 impl StrictDnsSocketPathEvidence {
+    /// Only the freshly created S04b-n DNS wire client uses this adapter;
+    /// the runtime captured these IDs from its chained physical connection.
+    pub(in crate::app::dns) fn from_dns_client_socket_paths(
+        paths: Vec<NetworkPathId>,
+    ) -> io::Result<Self> {
+        Self::from_reported(paths)
+    }
+
     pub(crate) fn from_stream(stream: &BoxedChainedStream) -> io::Result<Self> {
         Self::from_reported(stream.network_path_ids())
     }
@@ -107,8 +115,9 @@ impl StrictDnsSocketPathEvidence {
 }
 
 /// A DNS transport that can return the *connection's* local socket path
-/// evidence with every DNS response. No production wire transport implements
-/// this interface yet: lack of evidence is a hard error, not a fallback.
+/// evidence with every DNS response. The S04b-n UDP/TCP wire clients now
+/// implement it when their outbound connector actually reports socket IDs;
+/// absent IDs remain a hard error and production policy-rules stay gated.
 #[async_trait]
 pub(crate) trait DnsStrictSocketPathTransport: DnsStrictTransport {
     async fn exchange_with_socket_evidence(

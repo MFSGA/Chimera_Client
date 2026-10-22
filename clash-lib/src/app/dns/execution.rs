@@ -208,7 +208,29 @@ async fn exchange_strict_wire(
     request: &Message,
     pins: &HashMap<String, IpAddr>,
 ) -> io::Result<Message> {
+    Ok(
+        exchange_strict_wire_observed(server, outbound, request, pins, false)
+            .await?
+            .0,
+    )
+}
+
+async fn exchange_strict_wire_observed(
+    server: &NameServer,
+    outbound: AnyOutboundHandler,
+    request: &Message,
+    pins: &HashMap<String, IpAddr>,
+    require_socket_path: bool,
+) -> io::Result<(Message, Vec<crate::app::flow::NetworkPathId>)> {
     validate_strict_wire_server(server, pins)?;
+    if require_socket_path
+        && !matches!(server.net, DNSNetMode::Udp | DNSNetMode::Tcp)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "strict DNS socket path transport only supports UDP/TCP",
+        ));
+    }
     if let Some(host) = outbound.server_name()
         && host.parse::<IpAddr>().is_err()
     {
@@ -238,8 +260,17 @@ async fn exchange_strict_wire(
     })
     .await
     .map_err(io::Error::other)?;
-    let result =
-        tokio::time::timeout(Duration::from_secs(5), client.exchange(request)).await;
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        if require_socket_path {
+            client.exchange_with_socket_paths(request).await
+        } else {
+            client
+                .exchange(request)
+                .await
+                .map(|answer| (answer, Vec::new()))
+        }
+    })
+    .await;
     let cleanup =
         tokio::time::timeout(Duration::from_secs(1), client.reset_transport()).await;
     match cleanup {
@@ -254,12 +285,12 @@ async fn exchange_strict_wire(
         }
     }
     match result {
-        Ok(Ok(mut message)) => {
+        Ok(Ok((mut message, paths))) => {
             // Hickory TCP/TLS may allocate a fresh per-connection wire ID;
             // it validates that ID before returning, then we restore the
             // original application-request transaction identity.
             message.metadata.id = request.metadata.id;
-            Ok(message)
+            Ok((message, paths))
         }
         Ok(Err(error)) => Err(io::Error::other(error)),
         Err(_) => Err(io::Error::new(
@@ -312,6 +343,59 @@ impl DnsStrictTransport for DnsStrictPinnedWireTransport {
         request: &Message,
     ) -> io::Result<Message> {
         exchange_strict_wire(server, outbound, request, &self.pins).await
+    }
+}
+
+/// S04b-n: only UDP/TCP may enter the explicit attested transport path.
+/// No candidate from route planning is ever substituted for a missing socket
+/// report. A fresh DnsClient is created for each strict attempt, preventing a
+/// previous request's connection path from being misattributed to this reply.
+async fn exchange_strict_socket_wire(
+    server: &NameServer,
+    outbound: AnyOutboundHandler,
+    request: &Message,
+    pins: &HashMap<String, IpAddr>,
+) -> io::Result<(
+    Message,
+    super::bootstrap_socket::StrictDnsSocketPathEvidence,
+)> {
+    let (reply, paths) =
+        exchange_strict_wire_observed(server, outbound, request, pins, true).await?;
+    let evidence = super::bootstrap_socket::StrictDnsSocketPathEvidence::from_dns_client_socket_paths(paths)?;
+    Ok((reply, evidence))
+}
+
+#[async_trait]
+impl super::bootstrap_socket::DnsStrictSocketPathTransport
+    for DnsStrictWireTransport
+{
+    async fn exchange_with_socket_evidence(
+        &self,
+        server: &NameServer,
+        outbound: AnyOutboundHandler,
+        request: &Message,
+    ) -> io::Result<(
+        Message,
+        super::bootstrap_socket::StrictDnsSocketPathEvidence,
+    )> {
+        exchange_strict_socket_wire(server, outbound, request, &HashMap::new()).await
+    }
+}
+
+#[async_trait]
+impl super::bootstrap_socket::DnsStrictSocketPathTransport
+    for DnsStrictPinnedWireTransport
+{
+    async fn exchange_with_socket_evidence(
+        &self,
+        server: &NameServer,
+        outbound: AnyOutboundHandler,
+        request: &Message,
+    ) -> io::Result<(
+        Message,
+        super::bootstrap_socket::StrictDnsSocketPathEvidence,
+    )> {
+        exchange_strict_socket_wire(server, outbound, request, &self.pins).await
     }
 }
 
