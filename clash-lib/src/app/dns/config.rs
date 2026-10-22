@@ -75,6 +75,9 @@ pub struct Config {
     pub edns_client_subnet: Option<EdnsClientSubnet>,
     pub fw_mark: Option<u32>,
     pub respect_rules: bool,
+    /// S01 policy compiler output; deliberately unused by the live resolver
+    /// until the S02 planner has separate golden/egress verification.
+    pub compiled_policy: super::policy::CompiledDnsPolicy,
 }
 
 impl Config {
@@ -364,6 +367,7 @@ impl TryFrom<&crate::config::def::Config> for Config {
 
     fn try_from(c: &crate::config::def::Config) -> Result<Self, Self::Error> {
         let dc = &c.dns;
+        let compiled_policy = super::policy::CompiledDnsPolicy::compile(c)?;
         if dc.enable && dc.nameserver.is_empty() {
             return Err(Error::InvalidConfig(String::from(
                 "dns enabled, no nameserver specified",
@@ -549,6 +553,7 @@ impl TryFrom<&crate::config::def::Config> for Config {
             nameserver_policy,
             edns_client_subnet,
             respect_rules: dc.respect_rules,
+            compiled_policy,
         })
     }
 }

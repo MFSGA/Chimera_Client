@@ -438,6 +438,48 @@ pub struct DNS {
     pub use_hosts: bool,
     /// Route upstream DNS queries from nameserver/fallback/policy through rules.
     pub respect_rules: bool,
+    /// S01: optional compile-only DNS resolver profiles; not used for DNS
+    /// transport until the S02/S03 query-plan implementation is enabled.
+    pub resolver_profiles: HashMap<String, DnsResolverProfileDef>,
+    /// S01: ordered query policy rules; never changes Business Rules.
+    pub policy_rules: Vec<DnsPolicyRuleDef>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct DnsResolverProfileDef {
+    pub servers: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct DnsPolicyRuleDef {
+    pub r#match: DnsPolicyMatchDef,
+    pub action: DnsPolicyActionDef,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct DnsPolicyMatchDef {
+    pub domain: Option<String>,
+    pub domain_suffix: Option<String>,
+    /// One record type or a list. Both scalar SRV and [A, AAAA] are accepted.
+    pub qtype: Option<DnsQtypeDef>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(untagged)]
+pub enum DnsQtypeDef {
+    One(String),
+    Many(Vec<String>),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct DnsPolicyActionDef {
+    pub resolver: Option<String>,
+    pub egress: Option<String>,
+    pub on_failure: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]

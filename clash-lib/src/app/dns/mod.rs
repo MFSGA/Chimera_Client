@@ -15,6 +15,7 @@ mod fakeip;
 mod filters;
 pub mod health;
 mod helper;
+pub mod policy;
 pub mod resolver;
 mod rule_dispatch;
 mod runtime;

@@ -39,6 +39,14 @@ pub(crate) async fn new_with_network_path_source(
     rule_dispatch: Option<Arc<RuleDispatch>>,
     network_path_source: Option<NetworkPathSource>,
 ) -> Result<ThreadSafeDNSResolver, crate::Error> {
+    // S01 only compiles new rules: permitting the runtime to start and ignore
+    // explicit egress/on-failure would promise safeguards that do not exist.
+    // The S02 planner must remove this gate once actual execution is wired.
+    if !cfg.compiled_policy.rules.is_empty() {
+        return Err(crate::Error::InvalidConfig(
+            "dns policy-rules are compiled but not executable yet (S01); remove policy-rules until the S02/S03 DNS planner and egress enforcement are available".to_owned(),
+        ));
+    }
     if cfg.enable {
         match store {
             Some(store) => Ok(Arc::new(

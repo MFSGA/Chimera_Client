@@ -2275,6 +2275,7 @@ async fn build_auxiliary_dns_resolver(
         edns_client_subnet: None,
         fw_mark,
         respect_rules: false,
+        compiled_policy: Default::default(),
     };
 
     dns::resolver::new_with_network_path_source(
