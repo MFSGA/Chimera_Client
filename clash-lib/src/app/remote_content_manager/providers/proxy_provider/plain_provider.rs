@@ -13,7 +13,7 @@ use crate::{
     proxy::AnyOutboundHandler,
 };
 
-use super::ProxyProvider;
+use super::{ProxyProvider, ProxyProviderContentSnapshot};
 
 /// A plain provider that holds a list of outbound handlers (proxies).
 /// No vehicle no background update.
@@ -90,6 +90,13 @@ impl Provider for PlainProvider {
 impl ProxyProvider for PlainProvider {
     async fn proxies(&self) -> Vec<AnyOutboundHandler> {
         self.proxies.clone()
+    }
+
+    async fn strict_content_snapshot(&self) -> Option<ProxyProviderContentSnapshot> {
+        Some(ProxyProviderContentSnapshot {
+            revision: 1, // The plain provider is immutable after construction.
+            proxies: self.proxies.clone(),
+        })
     }
 
     async fn touch(&self) {

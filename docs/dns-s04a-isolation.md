@@ -52,6 +52,12 @@ cargo test -p clash-lib --test dns_config_tests --locked
 - 包含 `use:` Provider 的组不能把动态候选当成空集合或隐式批准：在缺少经过认证的 Provider 候选快照时明确失败关闭。现有 `StrictDnsCache::exchange_planned_pinned_configured` 是**可选的内部配置级预检入口**，先校验配置，再使用 S04b-c 的单请求递归轨迹和 S04b-b 的 pin 快照；它尚未接入生产 resolver。`s04bd_` 离线测试覆盖嵌套静态组、`dialer-proxy` 环、组环、Provider、缺失节点、同名节点和拨号前拦截。
 - **限制：** 尚未获得可信的外部 pin 解析来源，也没有为 Provider 定义经过认证且与运行时代际绑定的候选快照。本轮只完成静态候选拓扑边界，不能证明所有配置端点（尤其动态 Provider）可运行；没有把配置期 graph 自动注入真实代理 Dialer，也不解除 `policy-rules` 启动保护。现有旧 DNS/Fake-IP 缓存与 Business Rules 不受影响。
 
+## S04b-e：动态 Provider 原子候选快照与内容版本（暂不授权真实出口）
+
+- `ProxyProvider::strict_content_snapshot` 新增可选 API：返回**在同一内部锁下读取**的候选 handler 对象及单调 content revision。可更新的 `ProxySetProvider` 在成功替换代理列表时递增版本，初次加载前返回 `None`；失败的更新保持最后一次完整列表和版本，不伪造成功。`PlainProvider` 的候选不可变，固定使用版本 `1`；其他未实现该接口的 Provider 返回 `None`，严格 DNS 观察入口拒绝其使用。
+- 新增内部 `StrictProviderObservation::capture/ensure_current`：由调用者提供命名 Provider 句柄表，并将候选对象、内容版本、Provider 实例、共享 `RuntimeStatus` 实例、实际 network/config generation 绑定为一个短期观察结果。第一次捕获及未来每次复核均核对运行时代际、候选 Arc 对象身份和 Provider content revision；检测查询间版本轮换、相同名字但不同 handler 的替换、配置/网络变化、未知或未初始化 Provider，并拒绝跨运行时使用。拒绝空候选及重复节点名。新增真实 `ProxySetProvider` 离线更新测试验证有效更新、失败保留、过期观察和版本号。
+- **关键安全限制：** 本快照只保证运行时内容版本可比较，**不认证下载/配置的来源或供应链**。命名 Provider 表由未来调用方传入，尚未与实时 Group/Provider 注册表、静态拓扑证明、pin 可信来源、全部 Dialer 链和选中叶节点的最终身份原子绑定。因此 S04b-d 对动态 Provider 的**失败关闭仍有效**：此版本未让动态 Provider 越过生产或内部严格拨号保护；查询开始/结束处的快照复核也尚待显式接线。S04b-e 为后续建立可信 Provider 候选拓扑证明提供版本基础，不能解除 `policy-rules` 运行时 gate。
+
 ## S04b/S04c 待完成的严格准入
 
 1. **真实执行接线与身份来源**：S04b-a 提供共享 RuntimeStatus 读取接口，但**尚未由生产 DNS runtime 自动接入或订阅**；需有可信的 bootstrap pin revision/变更事件来源，而不是由未受验证的调用者提供任意数值。仍需真实数据面验证动态代理在查询中途切换时的失效与回滚；旧 legacy 路径继续完全独立。

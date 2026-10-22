@@ -1,4 +1,4 @@
-use super::ProxyProvider;
+use super::{ProxyProvider, ProxyProviderContentSnapshot};
 use crate::{
     Error,
     app::{
@@ -30,6 +30,7 @@ struct ProviderScheme {
 
 struct Inner {
     proxies: Vec<AnyOutboundHandler>,
+    revision: u64,
 }
 
 type ProxyUpdater = Box<
@@ -65,7 +66,10 @@ impl ProxySetProvider {
             });
         }
 
-        let inner = Arc::new(tokio::sync::RwLock::new(Inner { proxies: vec![] }));
+        let inner = Arc::new(tokio::sync::RwLock::new(Inner {
+            proxies: vec![],
+            revision: 0,
+        }));
         let inner_clone = inner.clone();
 
         let updater_hc = hc.clone();
@@ -78,7 +82,14 @@ impl ProxySetProvider {
                 {
                     let mut inner = inner.write().await;
                     debug!("updating {} proxies for: {}", input.len(), name);
+                    let Some(next_revision) = inner.revision.checked_add(1) else {
+                        warn!(
+                            "proxy provider {name} exhausted content revision; refusing update"
+                        );
+                        return;
+                    };
                     inner.proxies.clone_from(&input);
+                    inner.revision = next_revision;
                 }
                 hc.update(input).await;
                 tokio::spawn(async move {
@@ -205,6 +216,14 @@ impl ProxyProvider for ProxySetProvider {
         self.inner.read().await.proxies.to_vec()
     }
 
+    async fn strict_content_snapshot(&self) -> Option<ProxyProviderContentSnapshot> {
+        let inner = self.inner.read().await;
+        (inner.revision != 0).then(|| ProxyProviderContentSnapshot {
+            revision: inner.revision,
+            proxies: inner.proxies.clone(),
+        })
+    }
+
     async fn touch(&self) {
         self.hc.touch().await;
     }
@@ -226,7 +245,9 @@ mod update_reliability_tests {
 
     use super::{ProxyProvider, ProxySetProvider};
     use crate::app::{
-        dns::MockClashResolver,
+        dns::{MockClashResolver, bootstrap_provider::StrictProviderObservation},
+        network::{NetworkSnapshot, NetworkStatus},
+        remote_content_manager::providers::proxy_provider::ThreadSafeProxyProvider,
         remote_content_manager::{
             ProxyManager,
             healthcheck::HealthCheck,
@@ -238,6 +259,7 @@ mod update_reliability_tests {
     const INVALID: &[u8] =
         b"proxies:\n  - name: broken\n    type: unsupported-protocol\n";
     const EMPTY: &[u8] = b"proxies: []\n";
+    const SAME_NAME_NEW_HOST: &[u8] = b"proxies:\n  - name: last-good\n    type: socks5\n    server: 198.51.100.12\n    port: 1080\n";
     const PARTIAL: &[u8] = b"proxies:\n  - name: broken\n    type: unknown-protocol\n  - name: recovered\n    type: socks5\n    server: 198.51.100.11\n    port: 1081\n";
 
     fn provider_with_refresh(
@@ -280,7 +302,11 @@ mod update_reliability_tests {
             cache_path.to_string_lossy().into_owned(),
             INVALID,
         );
+        assert!(provider.strict_content_snapshot().await.is_none());
         provider.initialize().await.expect("valid initial provider");
+        let before = provider.strict_content_snapshot().await.unwrap();
+        assert_eq!(before.revision, 1);
+        assert_eq!(before.proxies[0].name(), "last-good");
         assert_eq!(provider.proxies().await[0].name(), "last-good");
         assert_eq!(std::fs::read(&cache_path).unwrap(), VALID);
 
@@ -288,6 +314,9 @@ mod update_reliability_tests {
             provider.update().await.is_err(),
             "a nonempty provider containing no valid proxies must fail closed"
         );
+        let after = provider.strict_content_snapshot().await.unwrap();
+        assert_eq!(after.revision, before.revision);
+        assert!(Arc::ptr_eq(&after.proxies[0], &before.proxies[0]));
         let proxies = provider.proxies().await;
         assert_eq!(proxies.len(), 1, "last good proxy set must survive");
         assert_eq!(proxies[0].name(), "last-good");
@@ -307,14 +336,153 @@ mod update_reliability_tests {
             PARTIAL,
         );
         provider.initialize().await.expect("valid initial provider");
+        let initial = provider.strict_content_snapshot().await.unwrap();
         provider
             .update()
             .await
             .expect("usable entries in mixed provider should be accepted");
+        let refreshed = provider.strict_content_snapshot().await.unwrap();
+        assert_eq!(refreshed.revision, initial.revision + 1);
+        assert!(!Arc::ptr_eq(&refreshed.proxies[0], &initial.proxies[0]));
         let proxies = provider.proxies().await;
         assert_eq!(proxies.len(), 1);
         assert_eq!(proxies[0].name(), "recovered");
         assert_eq!(std::fs::read(&cache_path).unwrap(), PARTIAL);
+    }
+
+    #[tokio::test]
+    async fn strict_dns_observation_rejects_live_provider_rotation_and_network_changes()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provider.yaml");
+        let handle: ThreadSafeProxyProvider = Arc::new(tokio::sync::RwLock::new(
+            provider_with_refresh(path.to_string_lossy().into_owned(), PARTIAL),
+        ));
+        let status = Arc::new(tokio::sync::RwLock::new(NetworkStatus::default()));
+        status.write().await.observed(&NetworkSnapshot::default());
+        let source = std::collections::HashMap::from([(
+            "synthetic-provider".to_owned(),
+            handle.clone(),
+        )]);
+        assert!(
+            StrictProviderObservation::capture(&status, &source)
+                .await
+                .is_err(),
+            "uninitialized content must never enter strict DNS"
+        );
+        handle.read().await.initialize().await.unwrap();
+        let original = StrictProviderObservation::capture(&status, &source)
+            .await
+            .unwrap();
+        original.ensure_current(&status).await.unwrap();
+        assert_eq!(
+            original.candidates("synthetic-provider").unwrap()[0].name(),
+            "last-good"
+        );
+
+        handle.read().await.update().await.unwrap();
+        assert!(
+            original
+                .ensure_current(&status)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("changed during")
+        );
+        let refreshed = StrictProviderObservation::capture(&status, &source)
+            .await
+            .unwrap();
+        refreshed.ensure_current(&status).await.unwrap();
+        assert_eq!(
+            refreshed.candidates("synthetic-provider").unwrap()[0].name(),
+            "recovered"
+        );
+        status.write().await.observed(&NetworkSnapshot {
+            dns: "second network".into(),
+            ..NetworkSnapshot::default()
+        });
+        assert!(
+            refreshed
+                .ensure_current(&status)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("stale network/config")
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_dns_observation_rejects_aba_replacement_with_same_candidate_name()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provider.yaml");
+        let handle: ThreadSafeProxyProvider =
+            Arc::new(tokio::sync::RwLock::new(provider_with_refresh(
+                path.to_string_lossy().into_owned(),
+                SAME_NAME_NEW_HOST,
+            )));
+        let status = Arc::new(tokio::sync::RwLock::new(NetworkStatus::default()));
+        status.write().await.observed(&NetworkSnapshot::default());
+        let source = std::collections::HashMap::from([(
+            "synthetic-provider".to_owned(),
+            handle.clone(),
+        )]);
+        handle.read().await.initialize().await.unwrap();
+        let before = StrictProviderObservation::capture(&status, &source)
+            .await
+            .unwrap();
+        handle.read().await.update().await.unwrap();
+        let after = StrictProviderObservation::capture(&status, &source)
+            .await
+            .unwrap();
+        assert_eq!(
+            before.candidates("synthetic-provider").unwrap()[0].name(),
+            after.candidates("synthetic-provider").unwrap()[0].name()
+        );
+        assert!(
+            before
+                .ensure_current(&status)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("changed during")
+        );
+        after.ensure_current(&status).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn strict_dns_observation_keeps_last_good_on_invalid_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provider.yaml");
+        let handle: ThreadSafeProxyProvider = Arc::new(tokio::sync::RwLock::new(
+            provider_with_refresh(path.to_string_lossy().into_owned(), INVALID),
+        ));
+        let status = Arc::new(tokio::sync::RwLock::new(NetworkStatus::default()));
+        status.write().await.observed(&NetworkSnapshot::default());
+        let source = std::collections::HashMap::from([(
+            "synthetic-provider".to_owned(),
+            handle.clone(),
+        )]);
+        handle.read().await.initialize().await.unwrap();
+        let captured = StrictProviderObservation::capture(&status, &source)
+            .await
+            .unwrap();
+        assert!(handle.read().await.update().await.is_err());
+        captured.ensure_current(&status).await.unwrap();
+        let other_status =
+            Arc::new(tokio::sync::RwLock::new(NetworkStatus::default()));
+        other_status
+            .write()
+            .await
+            .observed(&NetworkSnapshot::default());
+        assert!(
+            captured
+                .ensure_current(&other_status)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("another runtime")
+        );
     }
 
     #[tokio::test]
@@ -329,6 +497,9 @@ mod update_reliability_tests {
             .await
             .expect("explicit empty list is valid");
         assert!(provider.proxies().await.is_empty());
+        let revoked = provider.strict_content_snapshot().await.unwrap();
+        assert_eq!(revoked.revision, 2);
+        assert!(revoked.proxies.is_empty());
         assert_eq!(std::fs::read(&cache_path).unwrap(), EMPTY);
     }
 }
