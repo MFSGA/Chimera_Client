@@ -523,3 +523,364 @@ async fn s03_unavailable_resolver_profile_fails_without_proxy_or_direct_dial() {
     };
     assert!(error.contains("unavailable"), "{error}");
 }
+
+// S03b loopback integration: Hickory's real UDP/TCP wire transport crosses
+// the exact pinned outbound, with no public resolver or Internet dependency.
+#[derive(Debug)]
+struct CountingWireProxy {
+    name: &'static str,
+    endpoint: &'static str,
+    tcp: Arc<std::sync::atomic::AtomicUsize>,
+    udp: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl DialWithConnector for CountingWireProxy {}
+
+#[async_trait]
+impl OutboundHandler for CountingWireProxy {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn server_name(&self) -> Option<&str> {
+        Some(self.endpoint)
+    }
+    fn proto(&self) -> OutboundType {
+        OutboundType::Socks5
+    }
+    async fn support_udp(&self) -> bool {
+        true
+    }
+    async fn connect_stream(
+        &self,
+        session: &Session,
+        resolver: ThreadSafeDNSResolver,
+    ) -> io::Result<BoxedChainedStream> {
+        self.tcp.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let direct = crate::proxy::direct::Handler::new("DIRECT");
+        direct.connect_stream(session, resolver).await
+    }
+    async fn connect_datagram(
+        &self,
+        session: &Session,
+        resolver: ThreadSafeDNSResolver,
+    ) -> io::Result<BoxedChainedDatagram> {
+        self.udp.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let direct = crate::proxy::direct::Handler::new("DIRECT");
+        direct.connect_datagram(session, resolver).await
+    }
+}
+
+fn server(addr: std::net::SocketAddr, mode: &str) -> NameServer {
+    crate::app::dns::Config::parse_nameserver(&[format!("{mode}://{addr}")])
+        .unwrap()
+        .remove(0)
+}
+
+fn answer(request: &Message) -> Message {
+    let mut msg = Message::response(request.metadata.id, request.metadata.op_code);
+    msg.add_queries(request.queries.iter().cloned());
+    msg.add_answer(Record::from_rdata(
+        request.queries[0].name().clone(),
+        60,
+        RData::A(A(Ipv4Addr::new(192, 0, 2, 123))),
+    ));
+    msg
+}
+
+async fn local_exchange(mode: &str, use_proxy: bool) {
+    use crate::app::dns::execution::DnsStrictWireTransport;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, UdpSocket},
+    };
+
+    let tcp_hits = Arc::new(AtomicUsize::new(0));
+    let udp_hits = Arc::new(AtomicUsize::new(0));
+    let (addr, task) = if mode == "udp" {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut buffer = [0u8; 4096];
+            let (n, peer) = socket.recv_from(&mut buffer).await.unwrap();
+            let incoming = Message::from_vec(&buffer[..n]).unwrap();
+            let reply = answer(&incoming);
+            socket
+                .send_to(&reply.to_vec().unwrap(), peer)
+                .await
+                .unwrap();
+        });
+        (addr, task)
+    } else {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut length = [0u8; 2];
+            stream.read_exact(&mut length).await.unwrap();
+            let mut bytes = vec![0u8; u16::from_be_bytes(length) as usize];
+            stream.read_exact(&mut bytes).await.unwrap();
+            let incoming = Message::from_vec(&bytes).unwrap();
+            let data = answer(&incoming).to_vec().unwrap();
+            stream
+                .write_all(&(data.len() as u16).to_be_bytes())
+                .await
+                .unwrap();
+            stream.write_all(&data).await.unwrap();
+        });
+        (addr, task)
+    };
+
+    let outbound: AnyOutboundHandler = if use_proxy {
+        Arc::new(CountingWireProxy {
+            name: "DNS-OUT",
+            endpoint: "192.0.2.9",
+            tcp: tcp_hits.clone(),
+            udp: udp_hits.clone(),
+        })
+    } else {
+        Arc::new(crate::proxy::direct::Handler::new("DIRECT"))
+    };
+    let execution = StrictDnsExecution {
+        ordinal: 0,
+        profile: "loopback".into(),
+        egress: if use_proxy {
+            DnsEgress::Proxy("DNS-OUT".into())
+        } else {
+            DnsEgress::Direct
+        },
+        servers: vec![server(addr, mode)],
+        outbound,
+    };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        execution.exchange(
+            &DnsStrictWireTransport,
+            &request("protected.example.", RecordType::A),
+        ),
+    )
+    .await
+    .expect("strict UDP/TCP exchange should be bounded")
+    .expect("loopback DNS reply should be valid");
+    assert_eq!(result.answers.len(), 1);
+    assert_eq!(
+        result.answers[0].data,
+        RData::A(A(Ipv4Addr::new(192, 0, 2, 123)))
+    );
+    task.await.unwrap();
+    if use_proxy {
+        if mode == "udp" {
+            assert_eq!(udp_hits.load(Ordering::SeqCst), 1);
+            assert_eq!(tcp_hits.load(Ordering::SeqCst), 0);
+        } else {
+            assert_eq!(tcp_hits.load(Ordering::SeqCst), 1);
+            assert_eq!(udp_hits.load(Ordering::SeqCst), 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn s03b_udp_direct_wire_uses_local_dns_server() {
+    local_exchange("udp", false).await;
+}
+
+#[tokio::test]
+async fn s03b_tcp_direct_wire_uses_local_dns_server() {
+    local_exchange("tcp", false).await;
+}
+
+#[tokio::test]
+async fn s03b_udp_proxy_wire_invokes_selected_outbound_only() {
+    local_exchange("udp", true).await;
+}
+
+#[tokio::test]
+async fn s03b_tcp_proxy_wire_invokes_selected_outbound_only() {
+    local_exchange("tcp", true).await;
+}
+
+#[tokio::test]
+async fn s03b_hostname_bootstrap_and_unimplemented_wire_fail_closed() {
+    use crate::app::dns::ClashResolver;
+    use crate::app::dns::execution::{DnsStrictWireTransport, LiteralOnlyResolver};
+    let guard = LiteralOnlyResolver::default();
+    assert!(guard.resolve("bootstrap.example", false).await.is_err());
+    assert_eq!(
+        guard.resolve("192.0.2.8", false).await.unwrap(),
+        Some("192.0.2.8".parse().unwrap())
+    );
+    let outbound: AnyOutboundHandler =
+        Arc::new(crate::proxy::direct::Handler::new("DIRECT"));
+    let config = crate::app::dns::Config::parse_nameserver(&[
+        "udp://resolver.example".to_owned(),
+    ])
+    .unwrap()
+    .remove(0);
+    let result = DnsStrictWireTransport
+        .exchange(
+            &config,
+            outbound.clone(),
+            &request("protected.example.", RecordType::A),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        result.to_string().contains("needs explicit bootstrap"),
+        "{result}"
+    );
+
+    let unsupported = crate::app::dns::Config::parse_nameserver(&[
+        "tls://127.0.0.1:853".to_owned(),
+    ])
+    .unwrap()
+    .remove(0);
+    let result = DnsStrictWireTransport
+        .exchange(
+            &unsupported,
+            outbound,
+            &request("protected.example.", RecordType::A),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(result.kind(), io::ErrorKind::Unsupported);
+}
+
+#[tokio::test]
+async fn s03b_proxy_hostname_cannot_resolve_through_system_dns() {
+    use crate::app::dns::execution::DnsStrictWireTransport;
+    let tcp_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let udp_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let outbound: AnyOutboundHandler = Arc::new(CountingWireProxy {
+        name: "DNS-OUT",
+        endpoint: "node.example",
+        tcp: tcp_hits.clone(),
+        udp: udp_hits.clone(),
+    });
+    let result = DnsStrictWireTransport
+        .exchange(
+            &server("127.0.0.1:1".parse().unwrap(), "udp"),
+            outbound,
+            &request("protected.example.", RecordType::A),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        result.to_string().contains("requires unresolved bootstrap"),
+        "{result}"
+    );
+    assert_eq!(tcp_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(udp_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn s03b_truncated_udp_retries_tcp_through_same_pinned_proxy() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, UdpSocket},
+    };
+    let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = tcp_listener.local_addr().unwrap();
+    let udp_socket = UdpSocket::bind(endpoint).await.unwrap();
+
+    let udp_task = tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        let (size, peer) = udp_socket.recv_from(&mut buf).await.unwrap();
+        let query = Message::from_vec(&buf[..size]).unwrap();
+        let mut truncated =
+            Message::response(query.metadata.id, query.metadata.op_code);
+        truncated.metadata.truncation = true;
+        truncated.add_queries(query.queries);
+        udp_socket
+            .send_to(&truncated.to_vec().unwrap(), peer)
+            .await
+            .unwrap();
+    });
+    let tcp_task = tokio::spawn(async move {
+        let (mut stream, _) = tcp_listener.accept().await.unwrap();
+        let mut length = [0u8; 2];
+        stream.read_exact(&mut length).await.unwrap();
+        let mut packet = vec![0u8; u16::from_be_bytes(length) as usize];
+        stream.read_exact(&mut packet).await.unwrap();
+        let query = Message::from_vec(&packet).unwrap();
+        let response = answer(&query).to_vec().unwrap();
+        stream
+            .write_all(&(response.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        stream.write_all(&response).await.unwrap();
+    });
+
+    let tcp_hits = Arc::new(AtomicUsize::new(0));
+    let udp_hits = Arc::new(AtomicUsize::new(0));
+    let outbound: AnyOutboundHandler = Arc::new(CountingWireProxy {
+        name: "DNS-OUT",
+        endpoint: "192.0.2.9",
+        tcp: tcp_hits.clone(),
+        udp: udp_hits.clone(),
+    });
+    let execution = StrictDnsExecution {
+        ordinal: 0,
+        profile: "truncated".into(),
+        egress: DnsEgress::Proxy("DNS-OUT".into()),
+        servers: vec![server(endpoint, "udp")],
+        outbound,
+    };
+    let query = request("protected.example.", RecordType::A);
+    let reply = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        execution
+            .exchange(&crate::app::dns::execution::DnsStrictWireTransport, &query),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(reply.answers.len(), 1);
+    assert_eq!(reply.metadata.id, query.metadata.id);
+    udp_task.await.unwrap();
+    tcp_task.await.unwrap();
+    assert_eq!(udp_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(tcp_hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn s03b_mixed_unsupported_encrypted_profile_is_rejected_before_udp_dial() {
+    use crate::app::dns::execution::DnsStrictWireTransport;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let tcp = Arc::new(AtomicUsize::new(0));
+    let udp = Arc::new(AtomicUsize::new(0));
+    let outbound: AnyOutboundHandler = Arc::new(CountingWireProxy {
+        name: "DNS-OUT",
+        endpoint: "192.0.2.9",
+        tcp: tcp.clone(),
+        udp: udp.clone(),
+    });
+    let execution = StrictDnsExecution {
+        ordinal: 3,
+        profile: "mixed".into(),
+        egress: DnsEgress::Proxy("DNS-OUT".into()),
+        servers: vec![
+            server("127.0.0.1:55335".parse().unwrap(), "udp"),
+            crate::app::dns::Config::parse_nameserver(&[
+                "tls://127.0.0.1:853".to_string()
+            ])
+            .unwrap()
+            .remove(0),
+        ],
+        outbound,
+    };
+    let err = execution
+        .exchange(
+            &DnsStrictWireTransport,
+            &request("protected.example.", RecordType::A),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("cannot be safely executed"),
+        "{err}"
+    );
+    assert_eq!(udp.load(Ordering::SeqCst), 0);
+    assert_eq!(tcp.load(Ordering::SeqCst), 0);
+}

@@ -26,6 +26,6 @@ cargo test -p clash-lib --test dns_legacy_golden_tests --locked
 cargo check -p clash-lib --no-default-features --locked
 ```
 
-**未完成，禁止宣传已经可用**：S03b 尚需给 `DnsStrictTransport` 接入真实 `DnsRuntimeProvider` / hickory UDP、TCP、DoT、DoH 传输；验证 TLS SNI/证书和实际物理网络路径、总 timeout、网络代际与连接池隔离、动态代理组失效处理、代理 DNS 自举及递归深度限制。S04 才处理 profile / egress / ECS / namespace / generation 的缓存严格隔离。
+**S03b 进度说明**：现已新增 [S03b UDP/TCP 严格传输适配](dns-s03b-udp-tcp-wire.md)，通过真实本机 UDP/TCP socket 与固定 handler 的离线测试。尚需实现严格 DoT/DoH、TLS SNI/证书、真实代理网络路径、网络代际与连接池隔离、动态代理组失效处理、代理 DNS 自举及递归深度限制。S04 才处理 profile / egress / ECS / namespace / generation 的缓存严格隔离。**未解除生产 `policy-rules` 的启动拦截。**
 
 尤其注意：当前 `resolver/mod.rs` 对所有非空 `policy-rules` 的运行时启动**仍然拒绝**。完成 S03b/S04 必要隔离、真实 DNS 出口回归之前，绝不能放开这一保护。Mock 证明的是模块级调度意图，不是真实数据包已经通过代理。旧 DNS 配置未受影响。
