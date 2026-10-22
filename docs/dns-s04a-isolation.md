@@ -64,6 +64,11 @@ cargo test -p clash-lib --test dns_config_tests --locked
 - 新增 `validate_observed_selected_provider` 和 `StrictDnsCache::inspect_observed_provider_selection` **内部检查接口**：调用 S03 既有的 `prepare_dns_execution` 重新选择当前 egress 叶节点，沿原配置的嵌套组/`use:` 候选追踪可达 Provider，要求实际选中 handler 与 Provider 观察中的 Arc 身份相同；随后复核版本。未知成员、循环/超过 16 层、未观察 Provider、同名但已替换的叶节点、注册表重绑均失败关闭。它不会进行 DNS 查询、不读写严格答案缓存、不调用 DNS transport 拨号，也不会取代此前完整静态拓扑对未认证 Provider 的**拒绝**。**注意：** S03 在捕获动态组选择时可能触发原有 Provider `touch`，因此检查过程不保证完全无副作用或无其他网络行为。
 - `StrictProviderObservation::validate_during` 增加**只读/无共享缓存副作用**操作的查询前与结束后版本复核辅助，离线测试使用可暂停的操作，在其运行时轮换候选列表并确认旧结果不返回；不得把此辅助当成共享缓存 invalidation 或生产网络拨号隔离。S04b-f 仍缺 Provider 来源认证、所有 `dialer-proxy` 链端点证明、完整 selector/provider 快照与实际拨号的事务性绑定，故生产 `policy-rules` 保持禁用，动态 Provider 的严格执行入口继续失败关闭。
 
+## S04b-g：严格观察专用 Provider 注册表修订号（阻断短暂 A→B→A）
+
+- 将仅供内部严格 DNS 观察使用的 `StrictProviderRegistry` 从可直接写入的 `RwLock<HashMap<...>>` 改为 `StrictProviderRegistryStore`，以**同一个写锁**维护 Provider 句柄表和单调 revision；任何 `replace`（包括相同 Arc 的重置）均推进版本，版本溢出时失败且保持原状态。观察创建时原子捕获版本和对象表，在观察前后的完整性复核里同时检查版本、对象身份和 Provider 内容修订。即使调用方在两次复核间将注册表从 A→B→A 恢复为相同对象，旧观察仍然失败关闭；增加隔离测试同时覆盖一次普通 ABA 和暂停中的只读操作 ABA 轮换。
+- **边界：** 新注册表仅用于 opt-in 严格观察，不取代现有实际 ProxyManager/Group 注册表，也不保证未来真实拨号过程的原子选择及身份约束。要将它接入实际数据面仍需可靠的 Provider 内容来源认证、全部路由/拨号链验证和事务性 epoch 承诺。生产 `policy-rules` 启动拒绝仍保持不变。
+
 ## S04b/S04c 待完成的严格准入
 
 1. **真实执行接线与身份来源**：S04b-a 提供共享 RuntimeStatus 读取接口，但**尚未由生产 DNS runtime 自动接入或订阅**；需有可信的 bootstrap pin revision/变更事件来源，而不是由未受验证的调用者提供任意数值。仍需真实数据面验证动态代理在查询中途切换时的失效与回滚；旧 legacy 路径继续完全独立。

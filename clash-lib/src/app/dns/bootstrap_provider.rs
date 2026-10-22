@@ -14,10 +14,68 @@ use crate::{
     proxy::AnyOutboundHandler, proxy::utils::SharedNetworkStatus,
 };
 
-/// Registry identity matters independently of provider content revisions:
-/// replacing a provider object with a fresh revision=1 is not a safe no-op.
-pub(crate) type StrictProviderRegistry =
-    Arc<tokio::sync::RwLock<HashMap<String, ThreadSafeProxyProvider>>>;
+/// S04b-g opt-in registry for strict observation only. All mutations must go
+/// through this wrapper; the production Provider registry remains untouched.
+/// Its monotonic revision detects short-lived A -> B -> A rebindings even if
+/// the original handler identity is restored before the next read.
+pub(crate) type StrictProviderRegistry = Arc<StrictProviderRegistryStore>;
+
+struct RegistryState {
+    revision: u64,
+    sources: HashMap<String, ThreadSafeProxyProvider>,
+}
+
+pub(crate) struct StrictProviderRegistryStore {
+    inner: tokio::sync::RwLock<RegistryState>,
+}
+
+impl StrictProviderRegistryStore {
+    pub(crate) fn new(sources: HashMap<String, ThreadSafeProxyProvider>) -> Self {
+        Self {
+            inner: tokio::sync::RwLock::new(RegistryState {
+                revision: 1,
+                sources,
+            }),
+        }
+    }
+
+    /// A replacement always advances the revision, including replacements by
+    /// the exact same Arc; callers cannot erase an intervening rebind.
+    pub(crate) async fn replace(
+        &self,
+        name: String,
+        provider: ThreadSafeProxyProvider,
+    ) -> io::Result<u64> {
+        let mut state = self.inner.write().await;
+        let next = state.revision.checked_add(1).ok_or_else(|| {
+            io::Error::other("strict DNS provider registry revision exhausted")
+        })?;
+        state.sources.insert(name, provider);
+        state.revision = next;
+        Ok(next)
+    }
+
+    async fn snapshot(&self) -> (u64, HashMap<String, ThreadSafeProxyProvider>) {
+        let state = self.inner.read().await;
+        (state.revision, state.sources.clone())
+    }
+
+    async fn matches(
+        &self,
+        revision: u64,
+        observed: &HashMap<String, ObservedProvider>,
+    ) -> bool {
+        let state = self.inner.read().await;
+        state.revision == revision
+            && state.sources.len() == observed.len()
+            && observed.iter().all(|(name, source)| {
+                state
+                    .sources
+                    .get(name)
+                    .is_some_and(|current| Arc::ptr_eq(current, &source.handle))
+            })
+    }
+}
 
 struct ObservedProvider {
     handle: ThreadSafeProxyProvider,
@@ -32,7 +90,7 @@ pub(crate) struct StrictProviderObservation {
     runtime: SharedNetworkStatus,
     epoch: (u64, u64),
     sources: HashMap<String, ObservedProvider>,
-    registry: Option<StrictProviderRegistry>,
+    registry: Option<(StrictProviderRegistry, u64)>,
 }
 
 impl StrictProviderObservation {
@@ -100,9 +158,9 @@ impl StrictProviderObservation {
         runtime: &SharedNetworkStatus,
         registry: &StrictProviderRegistry,
     ) -> io::Result<Self> {
-        let handles = registry.read().await.clone();
+        let (revision, handles) = registry.snapshot().await;
         let mut view = Self::capture(runtime, &handles).await?;
-        view.registry = Some(registry.clone());
+        view.registry = Some((registry.clone(), revision));
         view.ensure_current(runtime).await?;
         Ok(view)
     }
@@ -124,19 +182,12 @@ impl StrictProviderObservation {
                 "strict DNS provider snapshot has a stale network/config epoch",
             ));
         }
-        if let Some(registry) = &self.registry {
-            let registered = registry.read().await;
-            if registered.len() != self.sources.len()
-                || self.sources.iter().any(|(name, source)| {
-                    !registered
-                        .get(name)
-                        .is_some_and(|current| Arc::ptr_eq(current, &source.handle))
-                })
-            {
-                return Err(io::Error::other(
-                    "strict DNS provider registry changed during the observed snapshot",
-                ));
-            }
+        if let Some((registry, revision)) = &self.registry
+            && !registry.matches(*revision, &self.sources).await
+        {
+            return Err(io::Error::other(
+                "strict DNS provider registry changed during the observed snapshot",
+            ));
         }
         for (name, source) in &self.sources {
             let provider = source.handle.read().await;
@@ -164,19 +215,12 @@ impl StrictProviderObservation {
                 )));
             }
         }
-        if let Some(registry) = &self.registry {
-            let registered = registry.read().await;
-            if registered.len() != self.sources.len()
-                || self.sources.iter().any(|(name, source)| {
-                    !registered
-                        .get(name)
-                        .is_some_and(|current| Arc::ptr_eq(current, &source.handle))
-                })
-            {
-                return Err(io::Error::other(
-                    "strict DNS provider registry changed during the observed snapshot",
-                ));
-            }
+        if let Some((registry, revision)) = &self.registry
+            && !registry.matches(*revision, &self.sources).await
+        {
+            return Err(io::Error::other(
+                "strict DNS provider registry changed during the observed snapshot",
+            ));
         }
         // A concurrent network change between provider reads and now is also
         // rejected; no attempt is made to heal the snapshot automatically.

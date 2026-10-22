@@ -489,7 +489,9 @@ mod update_reliability_tests {
     async fn s04bf_registry_selection_is_identity_bound_and_rebinding_rejected() {
         use crate::{
             app::dns::{
-                bootstrap_provider::StrictProviderRegistry,
+                bootstrap_provider::{
+                    StrictProviderRegistry, StrictProviderRegistryStore,
+                },
                 isolation::{StrictDnsCache, StrictDnsPlanSelection},
                 plan::{
                     DnsPurpose, DnsQueryContext, EffectiveDnsPlan, EgressChoice,
@@ -517,10 +519,12 @@ mod update_reliability_tests {
         source.read().await.initialize().await.unwrap();
         let runtime = Arc::new(tokio::sync::RwLock::new(NetworkStatus::default()));
         runtime.write().await.observed(&NetworkSnapshot::default());
-        let provider_registry: StrictProviderRegistry =
-            Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::from([
-                ("synthetic-provider".into(), source.clone()),
-            ])));
+        let provider_registry: StrictProviderRegistry = Arc::new(
+            StrictProviderRegistryStore::new(std::collections::HashMap::from([(
+                "synthetic-provider".into(),
+                source.clone(),
+            )])),
+        );
         let observation = StrictProviderObservation::capture_registered(
             &runtime,
             &provider_registry,
@@ -612,9 +616,9 @@ proxy-groups:
         );
 
         provider_registry
-            .write()
+            .replace("synthetic-provider".into(), second)
             .await
-            .insert("synthetic-provider".into(), second);
+            .unwrap();
         let error = observation
             .ensure_current(&runtime)
             .await
@@ -624,6 +628,95 @@ proxy-groups:
         // Consume this fixture's expected second fetch without affecting the
         // already verified, stale provider observation.
         source.read().await.update().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn s04bg_registry_aba_replacement_invalidates_observation_even_if_restored()
+     {
+        use crate::app::dns::bootstrap_provider::{
+            StrictProviderRegistry, StrictProviderRegistryStore,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let provider = |name: &str| -> ThreadSafeProxyProvider {
+            Arc::new(tokio::sync::RwLock::new(provider_with_refresh(
+                dir.path().join(name).to_string_lossy().into_owned(),
+                SAME_NAME_NEW_HOST,
+            )))
+        };
+        let original = provider("original.yaml");
+        let replacement = provider("replacement.yaml");
+        original.read().await.initialize().await.unwrap();
+        replacement.read().await.initialize().await.unwrap();
+        let status = Arc::new(tokio::sync::RwLock::new(NetworkStatus::default()));
+        status.write().await.observed(&NetworkSnapshot::default());
+        let registry: StrictProviderRegistry = Arc::new(
+            StrictProviderRegistryStore::new(std::collections::HashMap::from([(
+                "synthetic-provider".to_owned(),
+                original.clone(),
+            )])),
+        );
+        let initial =
+            StrictProviderObservation::capture_registered(&status, &registry)
+                .await
+                .unwrap();
+        registry
+            .replace("synthetic-provider".into(), replacement.clone())
+            .await
+            .unwrap();
+        registry
+            .replace("synthetic-provider".into(), original.clone())
+            .await
+            .unwrap();
+        // The complete registry appears unchanged, including every Arc.
+        // Monotonic revision still rejects the old snapshot.
+        let err = initial
+            .ensure_current(&status)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("provider registry changed"), "{err}");
+        let current =
+            StrictProviderObservation::capture_registered(&status, &registry)
+                .await
+                .unwrap();
+        current.ensure_current(&status).await.unwrap();
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel::<()>();
+        let observed_status = status.clone();
+        let job = tokio::spawn(async move {
+            current
+                .validate_during(&observed_status, async {
+                    entered_tx.send(()).unwrap();
+                    proceed_rx.await.unwrap();
+                    42
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        registry
+            .replace("synthetic-provider".into(), replacement.clone())
+            .await
+            .unwrap();
+        registry
+            .replace("synthetic-provider".into(), original.clone())
+            .await
+            .unwrap();
+        proceed_tx.send(()).unwrap();
+        assert!(
+            job.await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("provider registry changed")
+        );
+
+        // Complete both synthetic Provider fixtures' scheduled reads.
+        original.read().await.update().await.unwrap();
+        replacement.read().await.update().await.unwrap();
     }
 
     #[tokio::test]
