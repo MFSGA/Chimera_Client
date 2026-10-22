@@ -17,6 +17,7 @@ use hickory_proto::{
 };
 
 use crate::{
+    config::def::Config as ConfigDef,
     proxy::{
         AnyOutboundHandler,
         utils::{OutboundHandlerRegistry, SharedNetworkStatus},
@@ -26,6 +27,7 @@ use crate::{
 
 use super::{
     bootstrap::{StrictBootstrapPinSnapshot, StrictBootstrapPinStore},
+    bootstrap_topology::validate_configured_strict_egress,
     execution::{
         DnsStrictTransport, PreparedDnsExecution, StrictDnsExecution,
         prepare_dns_execution,
@@ -345,6 +347,44 @@ impl StrictDnsCache {
             &BootstrapTrace::default(),
         )
         .await
+    }
+
+    /// S04b-d additive config-graph gate. This is a deliberately conservative
+    /// offline guard for *all configured candidates*, including dialer-proxy
+    /// chains. Dynamic providers without an authenticated immutable snapshot
+    /// are rejected rather than treated as a safe empty candidate set.
+    /// No live resolver calls this until its config-generation ownership and
+    /// bootstrap source have been reviewed and connected.
+    #[allow(dead_code)]
+    pub(crate) async fn exchange_planned_pinned_configured(
+        &self,
+        selection: StrictDnsPlanSelection<'_>,
+        config: &ConfigDef,
+        request: &Message,
+        status: &SharedNetworkStatus,
+        pins: &StrictBootstrapPinStore,
+        parent: &BootstrapTrace,
+    ) -> io::Result<Message> {
+        if let super::plan::EgressChoice::Explicit(DnsEgress::Proxy(name)) =
+            &selection.plan.egress
+        {
+            let super::plan::ResolverChoice::Profile(profile) =
+                &selection.plan.resolver
+            else {
+                return Err(io::Error::other(
+                    "strict DNS configured bootstrap needs an explicit profile",
+                ));
+            };
+            let upstreams =
+                selection.profiles.profiles.get(profile).ok_or_else(|| {
+                    io::Error::other(
+                        "strict DNS configured bootstrap profile is missing",
+                    )
+                })?;
+            validate_configured_strict_egress(config, name, upstreams)?;
+        }
+        self.exchange_planned_pinned_traced(selection, request, status, pins, parent)
+            .await
     }
 
     /// Nested bootstrap callers must propagate their ancestry. A repeated

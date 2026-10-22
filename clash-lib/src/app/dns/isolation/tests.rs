@@ -1172,6 +1172,74 @@ async fn s04bc_nested_bootstrap_recursion_and_depth_fail_before_dial() {
     assert_eq!(cache.len(), 0);
 }
 
+#[tokio::test]
+async fn s04bd_configured_preflight_rejects_dynamic_provider_before_network() {
+    use crate::{
+        app::dns::{
+            bootstrap::StrictBootstrapPinStore,
+            plan::{
+                EffectiveDnsPlan, EgressChoice, FailureChoice, LegacyDnsPlan,
+                LegacyDnsRoute, ResolverChoice,
+            },
+            policy::{CompiledDnsPolicy, DnsFailure},
+        },
+        proxy::utils::OutboundHandlerRegistry,
+        session::Session,
+    };
+
+    let config: crate::config::def::Config = serde_yaml::from_str(
+        r#"
+proxies:
+  - {name: static-node, type: socks5, server: 192.0.2.20, port: 1080}
+proxy-groups:
+  - {name: DNS-OUT, type: select, proxies: [static-node], use: [remote-nodes]}
+"#,
+    )
+    .unwrap();
+    let req = question("www.example.com.", RecordType::A, 12);
+    let plan = EffectiveDnsPlan {
+        context: ctx(&req),
+        legacy: LegacyDnsPlan::new(LegacyDnsRoute::Main),
+        matched_rule: Some(0),
+        resolver: ResolverChoice::Profile("trusted".into()),
+        egress: EgressChoice::Explicit(DnsEgress::Proxy("DNS-OUT".into())),
+        failure: FailureChoice::Explicit(DnsFailure::Fail),
+    };
+    let profiles = CompiledDnsPolicy {
+        profiles: std::collections::HashMap::from([(
+            "trusted".into(),
+            crate::app::dns::Config::parse_nameserver(&["udp://192.0.2.53".into()])
+                .unwrap(),
+        )]),
+        rules: Vec::new(),
+    };
+    let registry: OutboundHandlerRegistry =
+        Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let session = Session::default();
+    let status = runtime_status(); // No network observation or dial available.
+    let pins = StrictBootstrapPinStore::default(); // No bootstrap pins installed.
+    let cache = StrictDnsCache::new(4, 0, 0, 0);
+    let error = cache
+        .exchange_planned_pinned_configured(
+            StrictDnsPlanSelection {
+                plan: &plan,
+                profiles: &profiles,
+                registry: &registry,
+                session: &session,
+            },
+            &config,
+            &req,
+            &status,
+            &pins,
+            &BootstrapTrace::default(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("unverified dynamic provider"), "{error}");
+    assert_eq!(cache.len(), 0);
+}
+
 #[test]
 fn s04_bootstrap_static_graph_catches_indirect_cycles_and_depth() {
     let mut graph = BootstrapGraph::default();

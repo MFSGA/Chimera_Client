@@ -46,6 +46,12 @@ cargo test -p clash-lib --test dns_config_tests --locked
 - 新增 `exchange_planned_pinned_traced` 内部入口：调用者可显式携带每请求不可变的 `BootstrapTrace` 父级路径，按 profile / 上游 / 选定叶节点检查重复节点和深度上限 16；并发请求没有共享的全局递归栈。原 `exchange_planned_pinned` 只在顶层查询使用空轨迹，仍以同一 pin 快照和网络/配置代际完成调用。`s04bc_` 离线测试覆盖动态选中叶节点导致的依赖环、无独立 pin 的代理节点失败关闭、递归入口和超过深度预算的拨号前拒绝。
 - **范围限制：** 这是基于已准备好的单次严格执行计划的图，不是完整的配置期 provider 全节点遍历，也没有自动追踪代理节点经哪个独立 bootstrap resolver 解析、没有将父级轨迹注入所有真实 Dialer 调用链。不存在可信代理域名引导来源时，即使 upstream 主机名已有 pin，代理节点域名仍不允许通过此切片自动解析。完整静态依赖图、真实 bootstrap 解析源、生产接线和数据面测试继续属于后续准入前置条件。
 
+## S04b-d：配置级静态候选依赖预检（内部、失败关闭）
+
+- 新增 `app/dns/bootstrap_topology.rs` 的 `validate_configured_strict_egress`：从原始配置读取静态 `proxy-groups` / `proxies`、所有组成员、节点的 `dialer-proxy` / `connect-via` 链以及所用 resolver profile 的 upstream 主机名。以深度上限 16 的遍历验证依赖，拒绝循环、缺失成员、歧义名称、DIRECT/REJECT 候选以及代理节点必须通过自身 upstream 解析的情况。只要任一静态候选需要尚不存在的独立可信域名 bootstrap，就保守拒绝整组。
+- 包含 `use:` Provider 的组不能把动态候选当成空集合或隐式批准：在缺少经过认证的 Provider 候选快照时明确失败关闭。现有 `StrictDnsCache::exchange_planned_pinned_configured` 是**可选的内部配置级预检入口**，先校验配置，再使用 S04b-c 的单请求递归轨迹和 S04b-b 的 pin 快照；它尚未接入生产 resolver。`s04bd_` 离线测试覆盖嵌套静态组、`dialer-proxy` 环、组环、Provider、缺失节点、同名节点和拨号前拦截。
+- **限制：** 尚未获得可信的外部 pin 解析来源，也没有为 Provider 定义经过认证且与运行时代际绑定的候选快照。本轮只完成静态候选拓扑边界，不能证明所有配置端点（尤其动态 Provider）可运行；没有把配置期 graph 自动注入真实代理 Dialer，也不解除 `policy-rules` 启动保护。现有旧 DNS/Fake-IP 缓存与 Business Rules 不受影响。
+
 ## S04b/S04c 待完成的严格准入
 
 1. **真实执行接线与身份来源**：S04b-a 提供共享 RuntimeStatus 读取接口，但**尚未由生产 DNS runtime 自动接入或订阅**；需有可信的 bootstrap pin revision/变更事件来源，而不是由未受验证的调用者提供任意数值。仍需真实数据面验证动态代理在查询中途切换时的失效与回滚；旧 legacy 路径继续完全独立。
