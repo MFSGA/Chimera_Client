@@ -27,9 +27,16 @@ cargo test -p clash-lib --test dns_config_tests --locked
 
 新增离线测试验证：同域名不同出口/profile/代理叶节点/上游地址绝不串用；Host/Gateway tenant/purpose/网络代际分桶；transport pin 快照不同与 revision 更新不串用；无 transport fingerprint 不缓存；ECS/EDNS/DNSSEC 保守绕过；RFC 2308 SOA 负缓存保留 RCODE 并递减 SOA TTL；正缓存过期、容量约束；多层依赖 DAG 循环和深度上限；每请求 trace 并发互不干扰；网络切换时**在途旧应答不回传或污染缓存**。以上均为离线逻辑验证，没有用真实系统 DNS、真实 SOCKS5/VLESS 远端、Gateway 分设备抓包。
 
+## S04b-a：运行时代际与动态出口预检（仅内部可调用，未启用生产规则）
+
+- `StrictDnsCache::exchange_observed` 从现有共享 `RuntimeStatus::decision_versions()` 读取**真实 config/network generation**，不用 S02 请求上下文里尚未接线的默认 `0`。当前运行时没有有效网络观测（含成功配置重载后观测被清空）、网络代际或配置版本为零时直接拒绝；调用方需明确提供单调递增的 `bootstrap_revision`。在锁内禁止把 cache epoch 回滚；发生代际切换时清除旧条目，并在上游返回后复核 RuntimeStatus，改变则丢弃应答和旧缓存。
+- `StrictDnsCache::exchange_planned_observed` 是**未接入生产解析器的 opt-in 内部入口**，每次先核对真实 DNS Question 与已编译计划，再调用 S03 的 `prepare_dns_execution` 从真实 registry **重新捕获当前 selector/provider 叶节点**。实际叶节点以 Arc 身份分桶，而非只按组名复用；显式 DIRECT 使用同一个严格缓存专属的 DIRECT handler 身份，并仍受 config/network/pin 分区约束。未命中策略、本地 Fake-IP/hosts、缺失代理和不完整的严格动作不借此入口偷偷回退；由 legacy 解析器保持现有行为。
+- 对代理叶节点服务器域名尚无独立可信 bootstrap 来源，内部入口在缓存命中前仍明确拒绝该路径，不允许靠系统 DNS 补洞。**这不是完整的 bootstrap DAG 或实际动态 Provider 递归保护**，也没有自动订阅网络状态、pin 轮换或在变更中重新捕获正在使用的动态选择器；现有每查询身份分桶不等于中途切换的真实数据面证明。
+- S04b-a 离线验证命令：`cargo test -p clash-lib --lib s04b_ --locked`，包括无网络快照失败、真实 network/config 变更、pin 回滚拒绝、动态叶节点分桶、在途结果丢弃、错误 Question/缺失代理 fail-closed 和显式 DIRECT 缓存复用。本次严格 `policy-rules` 运行时拦截仍保留；未修改生产 `EnhancedResolver`、Fake-IP、legacy 缓存和连接池。
+
 ## S04b/S04c 待完成的严格准入
 
-1. **真实执行接线与身份来源**：由可靠配置/网络变化信号驱动网络代际、配置代际、bootstrap revision，而不能假定 S02 context 默认值 `0` 代表稳定网络。缓存入口的各维度须由真实调用方提供，并监测动态代理叶节点变化；旧 legacy 路径继续完全独立。
+1. **真实执行接线与身份来源**：S04b-a 提供共享 RuntimeStatus 读取接口，但**尚未由生产 DNS runtime 自动接入或订阅**；需有可信的 bootstrap pin revision/变更事件来源，而不是由未受验证的调用者提供任意数值。仍需真实数据面验证动态代理在查询中途切换时的失效与回滚；旧 legacy 路径继续完全独立。
 2. **引导依赖图完整性**：构建代理组/动态 provider/代理节点自身域名和 DoT/DoH upstream 的真实依赖关系，验证先有稳定可信 bootstrap 再开始拨号，加入运行时强制深度 guard。当前仅显式 pin 传输和工具层拒绝，不接受未审查的隐式系统 DNS。
 3. **严格连接/缓存作用域**：若未来为了性能引入连接池，须以与本缓存同样的实际代理叶节点、profile、source-scope、network/config/pin generation 进行独立池化和释放验证。本轮维持**不共享连接池**以保证安全。
 4. **扩充 DNS 复杂应答和 ECS/DNSSEC**：在可以正确识别 EDNS 选项及作用域、CNAME、多 Question、CD/DO 与签名相关字段前继续保守不缓存；正负缓存策略不替代已有 legacy RFC 2308 语义。

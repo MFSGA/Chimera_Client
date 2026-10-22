@@ -487,6 +487,326 @@ fn s04_expired_cached_answer_not_reused_and_capacity_is_bounded() {
     assert_eq!(cache.len(), 1);
 }
 
+fn runtime_status() -> SharedNetworkStatus {
+    Arc::new(tokio::sync::RwLock::new(
+        crate::app::network::NetworkStatus::default(),
+    ))
+}
+
+#[tokio::test]
+async fn s04b_unobserved_runtime_rejects_before_network_or_cache_access() {
+    let req = question("www.example.com.", RecordType::A, 12);
+    let cache = StrictDnsCache::new(4, 0, 0, 0);
+    let wire = FakeWire::new(positive(&req), Some("pins"));
+    let exec = execution(
+        "main",
+        DnsEgress::Direct,
+        leaf("direct"),
+        "udp://192.0.2.53",
+    );
+    let err = cache
+        .exchange_observed(&exec, &wire, &req, &ctx(&req), &runtime_status(), 0)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("observed network"));
+    assert_eq!(wire.hits(), 0);
+    assert_eq!(cache.len(), 0);
+}
+
+#[tokio::test]
+async fn s04b_runtime_network_config_pin_and_leaf_versions_partition_cache() {
+    use crate::app::{network::NetworkSnapshot, runtime_state::Lifecycle};
+
+    let status = runtime_status();
+    let original = NetworkSnapshot::default();
+    status.write().await.observed(&original);
+    let req = question("www.example.com.", RecordType::A, 12);
+    let cache = StrictDnsCache::new(12, 0, 0, 0);
+    let wire = FakeWire::new(positive(&req), Some("pins"));
+    let leaf_a = leaf("same-name");
+    let exec = execution("main", DnsEgress::Direct, leaf_a, "udp://192.0.2.53");
+    // S02 defaults are not authoritative: live RuntimeStatus supplies 1/1.
+    let mut legacy_context = ctx(&req);
+    legacy_context.network_generation = 0;
+    legacy_context.config_generation = 0;
+    for _ in 0..2 {
+        cache
+            .exchange_observed(&exec, &wire, &req, &legacy_context, &status, 0)
+            .await
+            .unwrap();
+    }
+    assert_eq!(wire.hits(), 1);
+    assert_eq!(cache.len(), 1);
+
+    // A new dynamic-selected handler object cannot share the old leaf's cache.
+    let new_leaf = execution(
+        "main",
+        DnsEgress::Direct,
+        leaf("same-name"),
+        "udp://192.0.2.53",
+    );
+    cache
+        .exchange_observed(&new_leaf, &wire, &req, &legacy_context, &status, 0)
+        .await
+        .unwrap();
+    assert_eq!(wire.hits(), 2);
+    assert_eq!(cache.len(), 2);
+
+    status.write().await.observed(&NetworkSnapshot {
+        dns: "new interface DNS".into(),
+        ..original
+    });
+    cache
+        .exchange_observed(&exec, &wire, &req, &legacy_context, &status, 0)
+        .await
+        .unwrap();
+    assert_eq!(wire.hits(), 3);
+    assert_eq!(cache.len(), 1);
+
+    {
+        let mut runtime = status.write().await;
+        assert!(runtime.lifecycle(Lifecycle::Running, "testReady"));
+        assert!(runtime.lifecycle(Lifecycle::Reloading, "configReload"));
+        runtime.reload_finished(None);
+    }
+    let stale = cache
+        .exchange_observed(&exec, &wire, &req, &legacy_context, &status, 0)
+        .await
+        .unwrap_err();
+    assert!(stale.to_string().contains("current observed network"));
+    assert_eq!(wire.hits(), 3, "reload must not dial before reobservation");
+    status.write().await.observed(&NetworkSnapshot {
+        dns: "reobserved after reload".into(),
+        ..NetworkSnapshot::default()
+    });
+    cache
+        .exchange_observed(&exec, &wire, &req, &legacy_context, &status, 0)
+        .await
+        .unwrap();
+    assert_eq!(wire.hits(), 4);
+    assert_eq!(cache.len(), 1);
+
+    cache
+        .exchange_observed(&exec, &wire, &req, &legacy_context, &status, 1)
+        .await
+        .unwrap();
+    assert_eq!(wire.hits(), 5);
+    assert_eq!(cache.len(), 1);
+    assert!(
+        cache
+            .exchange_observed(&exec, &wire, &req, &legacy_context, &status, 0)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("regressed")
+    );
+    assert_eq!(wire.hits(), 5);
+}
+
+#[tokio::test]
+async fn s04b_inflight_runtime_generation_change_discards_answer() {
+    use crate::app::network::NetworkSnapshot;
+
+    let status = runtime_status();
+    let first = NetworkSnapshot::default();
+    status.write().await.observed(&first);
+    let req = question("www.example.com.", RecordType::A, 17);
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let wire = PausedWire {
+        entered: Mutex::new(Some(entered_tx)),
+        release: tokio::sync::Mutex::new(Some(release_rx)),
+        reply: positive(&req),
+    };
+    let cache = Arc::new(StrictDnsCache::new(8, 0, 0, 0));
+    let active = cache.clone();
+    let observed = status.clone();
+    let job = tokio::spawn(async move {
+        let exec = execution(
+            "main",
+            DnsEgress::Direct,
+            leaf("direct"),
+            "udp://192.0.2.53",
+        );
+        let mut context = ctx(&req);
+        context.network_generation = 0;
+        context.config_generation = 0;
+        active
+            .exchange_observed(&exec, &wire, &req, &context, &observed, 0)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), entered_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    status.write().await.observed(&NetworkSnapshot {
+        dns: "new path".into(),
+        ..first
+    });
+    release_tx.send(()).unwrap();
+    let err = job.await.unwrap().unwrap_err().to_string();
+    assert!(err.contains("generation changed"), "{err}");
+    assert_eq!(cache.len(), 0); // Stale entry must be removed before returning.
+}
+
+#[tokio::test]
+async fn s04b_prepared_entrypoint_recaptures_egress_and_rejects_mismatched_plans() {
+    use crate::{
+        app::dns::{
+            plan::{
+                EffectiveDnsPlan, EgressChoice, FailureChoice, LegacyDnsPlan,
+                LegacyDnsRoute, ResolverChoice,
+            },
+            policy::{CompiledDnsPolicy, DnsFailure},
+        },
+        proxy::utils::OutboundHandlerRegistry,
+        session::Session,
+    };
+
+    let status = runtime_status();
+    status
+        .write()
+        .await
+        .observed(&crate::app::network::NetworkSnapshot::default());
+    let req = question("www.example.com.", RecordType::A, 12);
+    let wire = FakeWire::new(positive(&req), Some("pins"));
+    let cache = StrictDnsCache::new(4, 0, 0, 0);
+    let profiles = CompiledDnsPolicy {
+        profiles: std::collections::HashMap::from([(
+            "trusted".into(),
+            crate::app::dns::Config::parse_nameserver(&["udp://192.0.2.53".into()])
+                .unwrap(),
+        )]),
+        rules: Vec::new(),
+    };
+    let registry: OutboundHandlerRegistry =
+        Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let session = Session::default();
+    let plan = EffectiveDnsPlan {
+        context: ctx(&req),
+        legacy: LegacyDnsPlan::new(LegacyDnsRoute::Main),
+        matched_rule: Some(0),
+        resolver: ResolverChoice::Profile("trusted".into()),
+        egress: EgressChoice::Explicit(DnsEgress::Direct),
+        failure: FailureChoice::Explicit(DnsFailure::Fail),
+    };
+    cache
+        .exchange_planned_observed(
+            StrictDnsPlanSelection {
+                plan: &plan,
+                profiles: &profiles,
+                registry: &registry,
+                session: &session,
+            },
+            &wire,
+            &req,
+            &status,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(wire.hits(), 1);
+    let next = question("www.example.com.", RecordType::A, 13);
+    let mut same_policy = plan.clone();
+    same_policy.context = ctx(&next);
+    let cached = cache
+        .exchange_planned_observed(
+            StrictDnsPlanSelection {
+                plan: &same_policy,
+                profiles: &profiles,
+                registry: &registry,
+                session: &session,
+            },
+            &wire,
+            &next,
+            &status,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(cached.metadata.id, 13);
+    assert_eq!(
+        wire.hits(),
+        1,
+        "explicit DIRECT should share its cache identity"
+    );
+    assert_eq!(cache.len(), 1);
+
+    let mismatch = question("different.example.com.", RecordType::A, 20);
+    assert!(
+        cache
+            .exchange_planned_observed(
+                StrictDnsPlanSelection {
+                    plan: &plan,
+                    profiles: &profiles,
+                    registry: &registry,
+                    session: &session,
+                },
+                &wire,
+                &mismatch,
+                &status,
+                0,
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("no longer matches")
+    );
+    let mut proxy_plan = plan.clone();
+    proxy_plan.egress = EgressChoice::Explicit(DnsEgress::Proxy("missing".into()));
+    assert!(
+        cache
+            .exchange_planned_observed(
+                StrictDnsPlanSelection {
+                    plan: &proxy_plan,
+                    profiles: &profiles,
+                    registry: &registry,
+                    session: &session,
+                },
+                &wire,
+                &req,
+                &status,
+                0,
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("refusing DIRECT fallback")
+    );
+    let mut legacy = plan;
+    legacy.matched_rule = None;
+    assert!(
+        cache
+            .exchange_planned_observed(
+                StrictDnsPlanSelection {
+                    plan: &legacy,
+                    profiles: &profiles,
+                    registry: &registry,
+                    session: &session,
+                },
+                &wire,
+                &req,
+                &status,
+                0,
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("legacy or local-answer")
+    );
+    assert_eq!(wire.hits(), 1, "preflight errors must not dial");
+}
+
+#[test]
+fn s04b_observed_epoch_refuses_out_of_order_updates() {
+    let cache = StrictDnsCache::new(2, 1, 1, 0);
+    cache.advance_observed_epoch((2, 2, 1)).unwrap();
+    assert!(cache.advance_observed_epoch((1, 2, 1)).is_err());
+    assert!(cache.advance_observed_epoch((2, 1, 1)).is_err());
+    assert!(cache.advance_observed_epoch((2, 2, 0)).is_err());
+    cache.advance_observed_epoch((3, 2, 1)).unwrap();
+}
+
 #[test]
 fn s04_bootstrap_static_graph_catches_indirect_cycles_and_depth() {
     let mut graph = BootstrapGraph::default();

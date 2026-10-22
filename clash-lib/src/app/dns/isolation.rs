@@ -6,6 +6,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     hash::{Hash, Hasher},
     io,
+    net::IpAddr,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -15,12 +16,23 @@ use hickory_proto::{
     rr::{DNSClass, RData, RecordType},
 };
 
-use crate::proxy::AnyOutboundHandler;
+use crate::{
+    proxy::{
+        AnyOutboundHandler,
+        utils::{OutboundHandlerRegistry, SharedNetworkStatus},
+    },
+    session::Session,
+};
 
 use super::{
-    execution::{DnsStrictTransport, StrictDnsExecution},
-    plan::{DnsPurpose, DnsQueryContext, DnsQueryFlags, DnsSourceScope},
-    policy::DnsEgress,
+    execution::{
+        DnsStrictTransport, PreparedDnsExecution, StrictDnsExecution,
+        prepare_dns_execution,
+    },
+    plan::{
+        DnsPurpose, DnsQueryContext, DnsQueryFlags, DnsSourceScope, EffectiveDnsPlan,
+    },
+    policy::{CompiledDnsPolicy, DnsEgress},
 };
 
 /// Keep a strong reference in every cache key. Unlike a bare Arc pointer,
@@ -82,6 +94,18 @@ struct CacheInner {
 pub struct StrictDnsCache {
     limit: usize,
     inner: Mutex<CacheInner>,
+    // Explicit DIRECT is not a dynamic group. Retain one handler identity
+    // per cache so S03's fresh direct handler does not make every lookup miss.
+    direct_outbound: AnyOutboundHandler,
+}
+
+/// Immutable inputs needed to prepare a strict DNS rule against the current
+/// outbound registry. Do not cache this selection across requests.
+pub(crate) struct StrictDnsPlanSelection<'a> {
+    pub plan: &'a EffectiveDnsPlan,
+    pub profiles: &'a CompiledDnsPolicy,
+    pub registry: &'a OutboundHandlerRegistry,
+    pub session: &'a Session,
 }
 
 impl StrictDnsCache {
@@ -98,6 +122,9 @@ impl StrictDnsCache {
         Self {
             limit,
             inner: Mutex::new(inner),
+            direct_outbound: Arc::new(crate::proxy::direct::Handler::new(
+                crate::config::internal::proxy::PROXY_DIRECT,
+            )),
         }
     }
 
@@ -116,6 +143,154 @@ impl StrictDnsCache {
             inner.order.clear();
             inner.epoch = epoch;
         }
+    }
+
+    /// S04b: advance from observed runtime epochs without allowing a delayed
+    /// query to move the cache backwards to an earlier config/network/pin.
+    /// Each source must supply monotonically increasing generations.
+    fn advance_observed_epoch(&self, next: (u64, u64, u64)) -> io::Result<()> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if next.0 < inner.epoch.0 || next.1 < inner.epoch.1 || next.2 < inner.epoch.2
+        {
+            return Err(io::Error::other(
+                "strict DNS runtime epoch regressed; refusing stale DNS cache snapshot",
+            ));
+        }
+        if inner.epoch != next {
+            inner.values.clear();
+            inner.order.clear();
+            inner.epoch = next;
+        }
+        Ok(())
+    }
+
+    /// The existing RuntimeStatus, not a caller-defaulted S02 context, owns
+    /// config and network generations. Network version zero has never been
+    /// observed and is not a trustworthy strict-cache identity.
+    async fn observed_generations(
+        status: &SharedNetworkStatus,
+    ) -> io::Result<(u64, u64)> {
+        let (network, config) = status
+            .read()
+            .await
+            .strict_dns_generations()
+            .ok_or_else(|| io::Error::other(
+                "strict DNS requires a current observed network and committed configuration",
+            ))?;
+        if network == 0 || config == 0 {
+            return Err(io::Error::other(
+                "strict DNS requires an observed network and committed configuration generation",
+            ));
+        }
+        Ok((network, config))
+    }
+
+    /// S04b opt-in entrypoint. Read real runtime generations before a lookup
+    /// and after the answer. The caller must recapture the current strict
+    /// outbound leaf for *each* query and supply a trusted, monotonic pin
+    /// revision; this does not enable production `policy-rules`.
+    pub(crate) async fn exchange_observed<T: DnsStrictTransport>(
+        &self,
+        execution: &StrictDnsExecution,
+        transport: &T,
+        request: &Message,
+        context: &DnsQueryContext,
+        status: &SharedNetworkStatus,
+        bootstrap_revision: u64,
+    ) -> io::Result<Message> {
+        let (network, config) = Self::observed_generations(status).await?;
+        let epoch = (network, config, bootstrap_revision);
+        self.advance_observed_epoch(epoch)?;
+        let mut scoped = context.clone();
+        scoped.network_generation = network;
+        scoped.config_generation = config;
+        let response = self
+            .exchange_scoped(
+                execution,
+                transport,
+                request,
+                &scoped,
+                bootstrap_revision,
+            )
+            .await?;
+        let (current_network, current_config) =
+            Self::observed_generations(status).await?;
+        if (current_network, current_config) != (network, config) {
+            self.advance_observed_epoch((
+                current_network,
+                current_config,
+                bootstrap_revision,
+            ))?;
+            return Err(io::Error::other(
+                "strict DNS runtime generation changed while querying; discarding stale answer",
+            ));
+        }
+        Ok(response)
+    }
+
+    /// Opt-in S04b orchestration for already compiled strict rules. Re-run
+    /// S03 preflight for every query so mutable selector/provider state cannot
+    /// leave a cached *group name* standing in for the selected leaf. The
+    /// production resolver still rejects nonempty `policy-rules`.
+    #[allow(dead_code)]
+    pub(crate) async fn exchange_planned_observed<T: DnsStrictTransport>(
+        &self,
+        selection: StrictDnsPlanSelection<'_>,
+        transport: &T,
+        request: &Message,
+        status: &SharedNetworkStatus,
+        bootstrap_revision: u64,
+    ) -> io::Result<Message> {
+        let StrictDnsPlanSelection {
+            plan,
+            profiles,
+            registry,
+            session,
+        } = selection;
+        let question = DnsQueryContext::from_message(request, plan.context.purpose)
+            .map_err(io::Error::other)?;
+        if question.qname != plan.context.qname
+            || question.qtype != plan.context.qtype
+            || question.qclass != plan.context.qclass
+            || question.flags != plan.context.flags
+        {
+            return Err(io::Error::other(
+                "strict DNS request no longer matches its prepared query plan",
+            ));
+        }
+        let PreparedDnsExecution::Strict(mut execution) =
+            prepare_dns_execution(plan, profiles, registry, session).await?
+        else {
+            return Err(io::Error::other(
+                "strict DNS cache cannot execute legacy or local-answer paths",
+            ));
+        };
+        if matches!(execution.egress, DnsEgress::Direct) {
+            // The newly prepared explicit-DIRECT handler has no mutable
+            // selection state. Preserve its identity across queries while
+            // still invalidating on network/config/bootstrap epoch changes.
+            execution.outbound = self.direct_outbound.clone();
+        }
+        // A cache hit must not bypass bootstrap eligibility. S04b still has
+        // no trusted resolver for proxy-node hostnames; reject them *before*
+        // a potentially cached answer instead of silently using system DNS.
+        if let Some(host) = execution.outbound.server_name()
+            && host.parse::<IpAddr>().is_err()
+        {
+            return Err(io::Error::other(format!(
+                "strict DNS proxy '{}' requires a trusted bootstrap pin for '{host}'",
+                execution.outbound.name()
+            )));
+        }
+        self.exchange_observed(
+            &execution,
+            transport,
+            request,
+            &plan.context,
+            status,
+            bootstrap_revision,
+        )
+        .await
     }
 
     pub fn is_empty(&self) -> bool {

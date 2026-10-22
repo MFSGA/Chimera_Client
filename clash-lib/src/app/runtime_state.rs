@@ -480,6 +480,15 @@ impl RuntimeStatus {
         )
     }
 
+    /// Only expose strict-DNS epochs after a current network observation.
+    /// A successful config reload clears `observed` but retains the last
+    /// network version; that old number must not authorize new DNS cache hits.
+    pub(crate) fn strict_dns_generations(&self) -> Option<(u64, u64)> {
+        self.observed
+            .as_ref()
+            .map(|_| (self.network_version, self.config_version))
+    }
+
     /// Refresh preference expiry and expose cache generations without copying
     /// the observed path list on every UDP packet.
     pub(crate) fn path_cache_versions(&mut self) -> Option<(u64, u64)> {
