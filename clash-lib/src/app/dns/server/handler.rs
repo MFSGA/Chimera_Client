@@ -299,6 +299,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn s00_legacy_srv_is_preserved_only_for_fake_ip_excluded_domains() {
+        // S00 golden: SRV records contain service-discovery identity and
+        // priority/weight/port. Preserve existing privacy behavior and
+        // upstream-provided SRV RDATA; never silently rewrite its target.
+        let qname = Name::from_ascii("_minecraft._tcp.play.example.").unwrap();
+        let target = Name::from_ascii("node1.game.example.").unwrap();
+        let mut request = Message::new(0x1414, MessageType::Query, OpCode::Query);
+        request.add_query(Query::query(qname.clone(), RecordType::SRV));
+        let srv = hickory_proto::rr::RData::SRV(hickory_proto::rr::rdata::SRV::new(
+            7, 21, 25565, target,
+        ));
+
+        for (excluded, expected_answers) in [(true, 1), (false, 0)] {
+            let mut resolver = MockClashResolver::new();
+            resolver.expect_ipv6().return_const(false);
+            resolver
+                .expect_should_fake_ip()
+                .once()
+                .return_const(!excluded);
+            if excluded {
+                resolver.expect_fake_ip_enabled().return_const(true);
+                resolver.expect_fake_ip_v6_enabled().return_const(false);
+                let record = hickory_proto::rr::Record::from_rdata(
+                    qname.clone(),
+                    60,
+                    srv.clone(),
+                );
+                resolver.expect_exchange().once().returning(move |query| {
+                    let mut answer =
+                        Message::response(query.metadata.id, query.metadata.op_code);
+                    answer.add_queries(query.queries.iter().cloned());
+                    answer.add_answer(record.clone());
+                    Ok(answer)
+                });
+            } else {
+                resolver.expect_exchange().never();
+            }
+            let resolver: ThreadSafeDNSResolver = Arc::new(resolver);
+            let response = exchange_with_resolver(&resolver, &request, true)
+                .await
+                .unwrap();
+            assert_eq!(
+                response.metadata.response_code,
+                hickory_proto::op::ResponseCode::NoError
+            );
+            assert_eq!(response.answers.len(), expected_answers);
+            if excluded {
+                assert_eq!(response.answers[0].data, srv);
+                assert_eq!(response.answers[0].ttl, 60);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn filtered_domain_non_address_queries_reach_upstream() {
         // The actual resolver's should_fake_ip implementation consults the
         // fake-ip-filter. In this test false denotes an explicitly excluded
