@@ -17,6 +17,7 @@ use hickory_proto::{
 };
 
 use crate::{
+    app::outbound::manager::OutboundManager,
     config::def::Config as ConfigDef,
     proxy::{
         AnyOutboundHandler,
@@ -431,6 +432,32 @@ impl StrictDnsCache {
         .await?;
         observed.ensure_current(status).await?;
         Ok(owner)
+    }
+
+    /// S04b-h read-only bridge to the real OutboundManager. The manager's
+    /// provider table and outbound registry are checked against the exact
+    /// same owner before preparing a leaf. No network or answer-cache access
+    /// is authorized by a successful inspection.
+    #[allow(dead_code)]
+    pub(crate) async fn inspect_manager_provider_selection(
+        selection: StrictDnsPlanSelection<'_>,
+        config: &ConfigDef,
+        manager: &Arc<OutboundManager>,
+        status: &SharedNetworkStatus,
+    ) -> io::Result<String> {
+        if !manager.owns_outbound_registry(selection.registry) {
+            return Err(io::Error::other(
+                "strict DNS proxy registry does not belong to the observed outbound manager",
+            ));
+        }
+        let observed =
+            StrictProviderObservation::capture_manager(status, manager).await?;
+        let provider = Self::inspect_observed_provider_selection(
+            selection, config, &observed, status,
+        )
+        .await?;
+        observed.ensure_current_manager(status, manager).await?;
+        Ok(provider)
     }
 
     /// Nested bootstrap callers must propagate their ancestry. A repeated

@@ -69,6 +69,12 @@ cargo test -p clash-lib --test dns_config_tests --locked
 - 将仅供内部严格 DNS 观察使用的 `StrictProviderRegistry` 从可直接写入的 `RwLock<HashMap<...>>` 改为 `StrictProviderRegistryStore`，以**同一个写锁**维护 Provider 句柄表和单调 revision；任何 `replace`（包括相同 Arc 的重置）均推进版本，版本溢出时失败且保持原状态。观察创建时原子捕获版本和对象表，在观察前后的完整性复核里同时检查版本、对象身份和 Provider 内容修订。即使调用方在两次复核间将注册表从 A→B→A 恢复为相同对象，旧观察仍然失败关闭；增加隔离测试同时覆盖一次普通 ABA 和暂停中的只读操作 ABA 轮换。
 - **边界：** 新注册表仅用于 opt-in 严格观察，不取代现有实际 ProxyManager/Group 注册表，也不保证未来真实拨号过程的原子选择及身份约束。要将它接入实际数据面仍需可靠的 Provider 内容来源认证、全部路由/拨号链验证和事务性 epoch 承诺。生产 `policy-rules` 启动拒绝仍保持不变。
 
+## S04b-h：真实 OutboundManager 身份绑定（只读检查，无生产接线）
+
+- `StrictProviderObservation::capture_manager` 直接从已经完成初始化的真实 `OutboundManager::get_proxy_providers()` 读取实际 Provider 句柄，并保留所属 `Arc<OutboundManager>`。`ensure_current_manager` 要求同一 Manager 对象、同一 Provider 句柄集合、当前 network/config 代际及各 Provider 的内容版本仍有效。即使重载后的 Manager 复用相同名称和相同 Provider Arc，旧观察也不能交由新 Manager 使用。
+- 新增 `OutboundManager::owns_outbound_registry` 和 `StrictDnsCache::inspect_manager_provider_selection`：选定叶节点的 **registry Arc 必须与被观察的 Manager 所有的 registry 相同**；否则即使其中装有完全相同的 handler 对象也拒绝。通过这项检查后才使用已有 S04b-f 的选定叶节点和 Provider 可达性核对，并再次确认 Manager 观察没有变化。离线 `s04bh_` 测试覆盖正确绑定、伪造的另一份 registry、另一 Manager 实例和网络代际变化。
+- **限制：** `OutboundManager` 在构造后不再修改其 Provider 句柄映射，真实 Provider 的内容更新仍使用上一阶段的单 Provider revision 检测。该方法只是内部只读检查；实际 selector `touch` 仍可能有附带行为。尚未把完整 provider 来源认证、选定叶节点→最终 dialer 链、真实网络拨号和答案缓存的事务性一致性联结起来；`policy-rules` 生产启动保护保持不变。
+
 ## S04b/S04c 待完成的严格准入
 
 1. **真实执行接线与身份来源**：S04b-a 提供共享 RuntimeStatus 读取接口，但**尚未由生产 DNS runtime 自动接入或订阅**；需有可信的 bootstrap pin revision/变更事件来源，而不是由未受验证的调用者提供任意数值。仍需真实数据面验证动态代理在查询中途切换时的失效与回滚；旧 legacy 路径继续完全独立。

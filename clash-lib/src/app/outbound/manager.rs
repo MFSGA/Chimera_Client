@@ -685,6 +685,15 @@ impl OutboundManager {
         self.proxy_providers.clone()
     }
 
+    /// S04b-h read-only identity check: strict DNS preflight must not prepare
+    /// a leaf using a registry unrelated to the observed outbound manager.
+    pub(crate) fn owns_outbound_registry(
+        &self,
+        registry: &OutboundHandlerRegistry,
+    ) -> bool {
+        Arc::ptr_eq(&self.registry, registry)
+    }
+
     /// Load handlers from the provided outbound protocols and groups.
     /// handlers in proxy_providers are not loaded here as they are stored in
     /// the provider separately.
@@ -1793,6 +1802,200 @@ ip: not-an-ip
             pool_network_generation: Mutex::new(None),
             pool_retirement: Mutex::new(PoolRetirementState::default()),
         }
+    }
+
+    #[derive(Debug)]
+    struct StrictDnsProviderLeaf;
+
+    impl DialWithConnector for StrictDnsProviderLeaf {}
+
+    #[async_trait]
+    impl OutboundHandler for StrictDnsProviderLeaf {
+        fn name(&self) -> &str {
+            "provider-leaf"
+        }
+        fn server_name(&self) -> Option<&str> {
+            Some("192.0.2.10")
+        }
+        fn proto(&self) -> OutboundType {
+            OutboundType::Socks5
+        }
+        async fn connect_stream(
+            &self,
+            _: &Session,
+            _: ThreadSafeDNSResolver,
+        ) -> io::Result<BoxedChainedStream> {
+            unreachable!("strict DNS manager inspection does not dial")
+        }
+        async fn connect_datagram(
+            &self,
+            _: &Session,
+            _: ThreadSafeDNSResolver,
+        ) -> io::Result<BoxedChainedDatagram> {
+            unreachable!("strict DNS manager inspection does not dial")
+        }
+    }
+
+    #[tokio::test]
+    async fn s04bh_observation_uses_real_outbound_manager_and_rejects_foreign_registry()
+     {
+        use crate::{
+            app::{
+                dns::{
+                    bootstrap_provider::StrictProviderObservation,
+                    isolation::{StrictDnsCache, StrictDnsPlanSelection},
+                    plan::{
+                        DnsPurpose, DnsQueryContext, EffectiveDnsPlan, EgressChoice,
+                        FailureChoice, LegacyDnsPlan, LegacyDnsRoute,
+                        ResolverChoice,
+                    },
+                    policy::{CompiledDnsPolicy, DnsEgress, DnsFailure},
+                },
+                remote_content_manager::{
+                    healthcheck::HealthCheck,
+                    providers::proxy_provider::{
+                        ThreadSafeProxyProvider, plain_provider::PlainProvider,
+                    },
+                },
+            },
+            config::def::Config as RawConfig,
+            proxy::utils::OutboundHandlerRegistry,
+        };
+        use hickory_proto::{
+            op::{Message, MessageType, OpCode, Query},
+            rr::{Name, RecordType},
+        };
+        use std::collections::HashMap;
+        use tokio::sync::RwLock;
+
+        let leaf: AnyOutboundHandler = Arc::new(StrictDnsProviderLeaf);
+        let mut manager = isolated_pool_manager(vec![]).await;
+        manager
+            .registry
+            .write()
+            .await
+            .insert("DNS-OUT".into(), leaf.clone());
+        let provider = PlainProvider::new(
+            "remote".into(),
+            vec![leaf.clone()],
+            HealthCheck::new(
+                vec![],
+                "http://example.invalid/health".into(),
+                0,
+                true,
+                manager.proxy_manager.clone(),
+            ),
+        )
+        .unwrap();
+        let handle: ThreadSafeProxyProvider = Arc::new(RwLock::new(provider));
+        manager
+            .proxy_providers
+            .insert("remote".into(), handle.clone());
+        let manager = Arc::new(manager);
+        let status = Arc::new(RwLock::new(NetworkStatus::default()));
+        status.write().await.observed(&NetworkSnapshot::default());
+        let observed = StrictProviderObservation::capture_manager(&status, &manager)
+            .await
+            .unwrap();
+        observed
+            .ensure_current_manager(&status, &manager)
+            .await
+            .unwrap();
+
+        let config: RawConfig = serde_yaml::from_str(
+            "proxy-groups:\n  - {name: DNS-OUT, type: select, use: [remote]}\n",
+        )
+        .unwrap();
+        let mut req = Message::new(7, MessageType::Query, OpCode::Query);
+        req.add_query(Query::query(
+            Name::from_ascii("www.example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let plan = EffectiveDnsPlan {
+            context: DnsQueryContext::from_message(
+                &req,
+                DnsPurpose::ClientRealAnswer,
+            )
+            .unwrap(),
+            legacy: LegacyDnsPlan::new(LegacyDnsRoute::Main),
+            matched_rule: Some(0),
+            resolver: ResolverChoice::Profile("trusted".into()),
+            egress: EgressChoice::Explicit(DnsEgress::Proxy("DNS-OUT".into())),
+            failure: FailureChoice::Explicit(DnsFailure::Fail),
+        };
+        let profiles = CompiledDnsPolicy {
+            profiles: HashMap::from([(
+                "trusted".into(),
+                crate::app::dns::Config::parse_nameserver(&[
+                    "udp://192.0.2.53".into()
+                ])
+                .unwrap(),
+            )]),
+            rules: vec![],
+        };
+        let session = Session::default();
+        let selected_registry = manager.registry.clone();
+        fn selection<'a>(
+            registry: &'a OutboundHandlerRegistry,
+            plan: &'a EffectiveDnsPlan,
+            profiles: &'a CompiledDnsPolicy,
+            session: &'a Session,
+        ) -> StrictDnsPlanSelection<'a> {
+            StrictDnsPlanSelection {
+                plan,
+                profiles,
+                registry,
+                session,
+            }
+        }
+        assert_eq!(
+            StrictDnsCache::inspect_manager_provider_selection(
+                selection(&selected_registry, &plan, &profiles, &session),
+                &config,
+                &manager,
+                &status,
+            )
+            .await
+            .unwrap(),
+            "remote",
+        );
+
+        // An unrelated registry containing the *same exact handler Arc* is
+        // still not authorized to act on behalf of this OutboundManager.
+        let cloned_registry: OutboundHandlerRegistry = Arc::new(RwLock::new(
+            HashMap::from([("DNS-OUT".into(), leaf.clone())]),
+        ));
+        let err = StrictDnsCache::inspect_manager_provider_selection(
+            selection(&cloned_registry, &plan, &profiles, &session),
+            &config,
+            &manager,
+            &status,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("does not belong"), "{err}");
+
+        let mut other = isolated_pool_manager(vec![]).await;
+        other.proxy_providers.insert("remote".into(), handle);
+        let other = Arc::new(other);
+        let err = observed
+            .ensure_current_manager(&status, &other)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("different outbound manager"), "{err}");
+
+        status.write().await.observed(&NetworkSnapshot {
+            dns: "changed network".into(),
+            ..NetworkSnapshot::default()
+        });
+        let err = observed
+            .ensure_current_manager(&status, &manager)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("stale network/config"), "{err}");
     }
 
     /// Simulate a new network observation after initial pool retirement, while

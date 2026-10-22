@@ -10,8 +10,12 @@ use std::{
 };
 
 use crate::{
-    app::remote_content_manager::providers::proxy_provider::ThreadSafeProxyProvider,
-    proxy::AnyOutboundHandler, proxy::utils::SharedNetworkStatus,
+    app::{
+        outbound::manager::OutboundManager,
+        remote_content_manager::providers::proxy_provider::ThreadSafeProxyProvider,
+    },
+    proxy::AnyOutboundHandler,
+    proxy::utils::SharedNetworkStatus,
 };
 
 /// S04b-g opt-in registry for strict observation only. All mutations must go
@@ -91,6 +95,7 @@ pub(crate) struct StrictProviderObservation {
     epoch: (u64, u64),
     sources: HashMap<String, ObservedProvider>,
     registry: Option<(StrictProviderRegistry, u64)>,
+    manager: Option<Arc<OutboundManager>>,
 }
 
 impl StrictProviderObservation {
@@ -147,6 +152,7 @@ impl StrictProviderObservation {
             epoch,
             sources: observed,
             registry: None,
+            manager: None,
         };
         snapshot.ensure_current(runtime).await?;
         Ok(snapshot)
@@ -163,6 +169,55 @@ impl StrictProviderObservation {
         view.registry = Some((registry.clone(), revision));
         view.ensure_current(runtime).await?;
         Ok(view)
+    }
+
+    /// Observe the handles actually owned by an initialized OutboundManager,
+    /// not a caller-assembled map. The manager is immutable after construction;
+    /// provider content versions are checked separately on every validation.
+    /// Keeping its Arc identity prevents confusing a hot-reloaded manager with
+    /// the old instance even when all proxy names match.
+    pub(crate) async fn capture_manager(
+        runtime: &SharedNetworkStatus,
+        manager: &Arc<OutboundManager>,
+    ) -> io::Result<Self> {
+        let sources = manager.get_proxy_providers();
+        let mut view = Self::capture(runtime, &sources).await?;
+        view.manager = Some(manager.clone());
+        view.ensure_current_manager(runtime, manager).await?;
+        Ok(view)
+    }
+
+    /// A manager-bound observation is valid only for that same Manager and the
+    /// very same provider handles. This method does not authorize dialing or
+    /// replace the S04b-d configuration/topology fail-closed policy.
+    pub(crate) async fn ensure_current_manager(
+        &self,
+        runtime: &SharedNetworkStatus,
+        manager: &Arc<OutboundManager>,
+    ) -> io::Result<()> {
+        if !self
+            .manager
+            .as_ref()
+            .is_some_and(|owner| Arc::ptr_eq(owner, manager))
+        {
+            return Err(io::Error::other(
+                "strict DNS provider observation belongs to a different outbound manager",
+            ));
+        }
+        self.ensure_current(runtime).await?;
+        let handles = manager.get_proxy_providers();
+        if handles.len() != self.sources.len()
+            || self.sources.iter().any(|(name, source)| {
+                !handles
+                    .get(name)
+                    .is_some_and(|handle| Arc::ptr_eq(handle, &source.handle))
+            })
+        {
+            return Err(io::Error::other(
+                "strict DNS outbound manager provider handles changed",
+            ));
+        }
+        self.ensure_current(runtime).await
     }
 
     /// Check again immediately before cache access and after upstream I/O.
