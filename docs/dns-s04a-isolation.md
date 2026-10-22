@@ -144,6 +144,13 @@ cargo test -p clash-lib --test dns_config_tests --locked
 - `s04bs_` 离线测试覆盖 64 次异步取消时守卫不泄漏计数、gRPC 服务端不回应时丢弃应用流并重复复用、gRPC 非法请求与多次失败复用不发生双减、XHTTP H2 在复用请求已发出且服务端挂起期间取消任务并释放预留名额。保留原有 `s04br_` 网络重置时交付拒绝机制，原有生产 `policy-rules` gate 不变。
 - **仍未完成：** gRPC/XHTTP 真正网络连接后台任务与计数的持续高负载压力测试、XHTTP H3 自建 QUIC 链及上传/下载双端全生命周期、系统级物理出口证明、可信 Provider/bootstrap pin、完整 dialer 递归保护、独立 L2 审查与维护者批准。以上不能视作生产严格 DNS 已可开放。
 
+## S04b-t：XHTTP HTTP/3 上传/下载 sender 租约与 QUIC 建立期间取消
+
+- HTTP/3 以前从 QUIC 池取出上传或独立下载 sender 时，会增加 `active`，但仅把 `Option<Arc<AtomicU64>>` 随 sender 返回。若在随后获取另一端 QUIC 连接、等待 H3 请求/响应或逻辑流交付前取消 future，普通错误分支和成功转交路径未必运行，导致活跃名额泄漏。现将 `H3UploadSender.active` 和 `H3DownlinkSender.active` 改为已有的 **RAII `H3ActiveLease`**：任意 await/取消/错误导致其所有权 Drop 时恰好释放一次，成功交付后通过 `into_stream` 转交给实际应用持有的 `ReuseLeaseStream`。同时把 StreamUp/PacketUp 的独立下载活跃计数从可能无限等待的后台下行任务转交给应用流，应用流 Drop 即释放，防止把后台等待时长误当作应用活跃并发。
+- `connect_h3_stream` 的上传预留名额在下载端连接或协议建立失败时由租约释放；H3 下载复用和 H3 上传复用都不会因两端分别创建/取消而双减。仅当显式成功封装成应用逻辑流时才转移租约；原有池退休、网络代际与 S04b-r/s 的交付取消检查保持不变。QUIC UDP socket 和 h3 driver 的**真实异步生命周期还需单独证明**：复用池持有的物理 socket 允许在用户逻辑流 Drop 后按池策略继续存活，不能声称此改动立即释放所有网络句柄。
+- 新增 `s04bt_` 离线本地 QUIC 端到端测试：实际建立上传和独立下载两个 H3 sender 后，在逻辑流交付前 abort，检查两端 `active` 都归零并可以退休池；实际建立上传后刻意使下载端使用不支持的 TLS 模式而失败，确认上传名额归还。既有本地 HTTP/3 StreamUp 测试加断言：上传/下载池在应用释放逻辑流后均立即归零，不依赖服务端结束后台等待。同时显式以 `--features xhttp-h3` 单独编译和测试，调整仅供 Hysteria2 使用的共享 UDP socket reexport Feature 门禁，避免 XHTTP/3 单独启用触发未使用警告。
+- **仍未完成：** QUIC 连接/driver 关闭时机及 OS socket 占用的长期压力、所有 H3 建立阶段的系统级取消路径、物理出口抓包、可信 Provider/bootstrap pin、完整递归 dialer 保护和独立 L2 审查。生产 `policy-rules` 继续严格禁用，不能以这些测试作为上线许可。
+
 ## S04b/S04c 待完成的严格准入
 
 1. **真实执行接线与身份来源**：S04b-a 提供共享 RuntimeStatus 读取接口，但**尚未由生产 DNS runtime 自动接入或订阅**；需有可信的 bootstrap pin revision/变更事件来源，而不是由未受验证的调用者提供任意数值。仍需真实数据面验证动态代理在查询中途切换时的失效与回滚；旧 legacy 路径继续完全独立。

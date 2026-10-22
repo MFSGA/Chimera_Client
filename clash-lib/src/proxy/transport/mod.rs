@@ -5,7 +5,9 @@ mod tls;
 mod ws;
 mod xhttp;
 
-#[cfg(any(feature = "hysteria", feature = "xhttp-h3"))]
+// The xhttp module accesses its QUIC adapter directly; only Hysteria2
+// needs this cross-transport reexport.
+#[cfg(feature = "hysteria")]
 pub(crate) use xhttp::quinn_datagram::ConnectorUdpSocket;
 
 use crate::{app::flow::NetworkPathId, proxy::utils::NetworkPoolContext};

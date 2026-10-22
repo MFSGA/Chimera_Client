@@ -164,7 +164,9 @@ impl ReusableH3 {
 #[cfg(feature = "xhttp-h3")]
 struct H3UploadSender {
     sender: H3SendRequest,
-    active: Option<Arc<AtomicU64>>,
+    /// Owned until handoff to the returned application stream. Dropping this
+    /// sender during downstream dial / HTTP request creation frees capacity.
+    active: H3ActiveLease,
     request_count: Option<Arc<AtomicU64>>,
     network_path_ids: Vec<crate::app::flow::NetworkPathId>,
 }
@@ -172,13 +174,28 @@ struct H3UploadSender {
 #[cfg(feature = "xhttp-h3")]
 struct H3DownlinkSender {
     sender: H3SendRequest,
-    active: Option<Arc<AtomicU64>>,
+    /// Owned across all awaits before the downlink is handed to the caller.
+    active: H3ActiveLease,
     request_count: Option<Arc<AtomicU64>>,
     network_path_ids: Vec<crate::app::flow::NetworkPathId>,
 }
 
 #[cfg(feature = "xhttp-h3")]
 struct H3ActiveLease(Option<Arc<AtomicU64>>);
+
+#[cfg(feature = "xhttp-h3")]
+impl H3ActiveLease {
+    fn take(&mut self) -> Option<Arc<AtomicU64>> {
+        self.0.take()
+    }
+
+    fn into_stream(mut self, stream: AnyStream) -> AnyStream {
+        match self.take() {
+            Some(active) => leased_stream(stream, active),
+            None => stream,
+        }
+    }
+}
 
 #[cfg(feature = "xhttp-h3")]
 impl Drop for H3ActiveLease {
@@ -1073,11 +1090,9 @@ async fn proxy_stream_up_h3(
 
     let (mut downlink_sender, downlink_active, downlink_request_count) =
         match downlink_sender {
-            Some(downlink) => (
-                downlink.sender,
-                H3ActiveLease(downlink.active),
-                downlink.request_count,
-            ),
+            Some(downlink) => {
+                (downlink.sender, downlink.active, downlink.request_count)
+            }
             None => (sender.clone(), H3ActiveLease(None), request_count.clone()),
         };
     let (
@@ -1209,7 +1224,6 @@ async fn proxy_stream_up_h3(
 
     tokio::spawn(async move {
         let _downlink_sender = downlink_sender;
-        let _downlink_active = downlink_active;
         loop {
             match downlink.recv_data().await {
                 Ok(Some(mut data)) => {
@@ -1227,7 +1241,7 @@ async fn proxy_stream_up_h3(
         let _ = transport_writer.shutdown().await;
     });
 
-    Ok(Box::new(app_stream))
+    Ok(downlink_active.into_stream(Box::new(app_stream)))
 }
 
 #[cfg(feature = "xhttp-h3")]
@@ -1240,11 +1254,9 @@ async fn proxy_packet_up_h3(
     let session_id = client.session.generate();
     let (mut downlink_sender, downlink_active, downlink_request_count) =
         match downlink_sender {
-            Some(downlink) => (
-                downlink.sender,
-                H3ActiveLease(downlink.active),
-                downlink.request_count,
-            ),
+            Some(downlink) => {
+                (downlink.sender, downlink.active, downlink.request_count)
+            }
             None => (sender.clone(), H3ActiveLease(None), request_count.clone()),
         };
     let (
@@ -1402,7 +1414,6 @@ async fn proxy_packet_up_h3(
 
     tokio::spawn(async move {
         let _downlink_sender = downlink_sender;
-        let _downlink_active = downlink_active;
         loop {
             match downlink.recv_data().await {
                 Ok(Some(mut data)) => {
@@ -1420,7 +1431,7 @@ async fn proxy_packet_up_h3(
         let _ = transport_writer.shutdown().await;
     });
 
-    Ok(Box::new(app_stream))
+    Ok(downlink_active.into_stream(Box::new(app_stream)))
 }
 
 #[cfg(feature = "xhttp-h3")]
@@ -1618,7 +1629,7 @@ async fn acquire_h3_upload_sender(
         .await?;
         return Ok(H3UploadSender {
             sender,
-            active: None,
+            active: H3ActiveLease(None),
             request_count: None,
             network_path_ids: connected_context.path_id.into_iter().collect(),
         });
@@ -1646,7 +1657,7 @@ async fn acquire_h3_upload_sender(
             connection.active.fetch_add(1, Ordering::AcqRel);
             return Ok(H3UploadSender {
                 sender: connection.sender.clone(),
-                active: Some(connection.active.clone()),
+                active: H3ActiveLease(Some(connection.active.clone())),
                 request_count: Some(connection.request_count.clone()),
                 network_path_ids: connection.path_id.clone().into_iter().collect(),
             });
@@ -1667,7 +1678,7 @@ async fn acquire_h3_upload_sender(
     {
         return Ok(H3UploadSender {
             sender,
-            active: None,
+            active: H3ActiveLease(None),
             request_count: None,
             network_path_ids: connected_context
                 .path_id
@@ -1691,7 +1702,7 @@ async fn acquire_h3_upload_sender(
     });
     Ok(H3UploadSender {
         sender,
-        active: Some(active),
+        active: H3ActiveLease(Some(active)),
         request_count: Some(request_count),
         network_path_ids: connected_context.path_id.clone().into_iter().collect(),
     })
@@ -1718,7 +1729,7 @@ async fn acquire_h3_download_sender(
         .await?;
         return Ok(H3DownlinkSender {
             sender,
-            active: None,
+            active: H3ActiveLease(None),
             request_count: None,
             network_path_ids: connected_context.path_id.into_iter().collect(),
         });
@@ -1747,7 +1758,7 @@ async fn acquire_h3_download_sender(
             connection.active.fetch_add(1, Ordering::AcqRel);
             return Ok(H3DownlinkSender {
                 sender: connection.sender.clone(),
-                active: Some(connection.active.clone()),
+                active: H3ActiveLease(Some(connection.active.clone())),
                 request_count: Some(connection.request_count.clone()),
                 network_path_ids: connection.path_id.clone().into_iter().collect(),
             });
@@ -1768,7 +1779,7 @@ async fn acquire_h3_download_sender(
     {
         return Ok(H3DownlinkSender {
             sender,
-            active: None,
+            active: H3ActiveLease(None),
             request_count: None,
             network_path_ids: connected_context
                 .path_id
@@ -1792,7 +1803,7 @@ async fn acquire_h3_download_sender(
     });
     Ok(H3DownlinkSender {
         sender,
-        active: Some(active),
+        active: H3ActiveLease(Some(active)),
         request_count: Some(request_count),
         network_path_ids: connected_context.path_id.clone().into_iter().collect(),
     })
@@ -1910,7 +1921,7 @@ async fn connect_h3_stream(
             "xhttp HTTP/3 requires transport-owned TLS endpoint security",
         )
     })?;
-    let mut upload = acquire_h3_upload_sender(
+    let upload = acquire_h3_upload_sender(
         client,
         endpoint_config,
         sess,
@@ -1950,17 +1961,15 @@ async fn connect_h3_stream(
     {
         Ok(logical) => logical,
         Err(err) => {
-            if let Some(active) = upload.active.take() {
-                active.fetch_sub(1, Ordering::AcqRel);
+            // Upload/downlink sender leases release their own reservations,
+            // even when cancelled before the error branch can execute.
+            if upload.active.0.is_some() {
                 client.h3_reuse_pool.lock().await.clear();
             }
             return Err(err);
         }
     };
-    let stream = match upload.active.take() {
-        Some(active) => leased_stream(logical, active),
-        None => logical,
-    };
+    let stream = upload.active.into_stream(logical);
     Ok((stream, network_path_ids))
 }
 
@@ -2767,6 +2776,8 @@ mod tests {
         server::conn::auto,
     };
     use std::convert::Infallible;
+    #[cfg(feature = "xhttp-h3")]
+    use std::sync::atomic::Ordering;
     use std::{collections::HashMap, sync::Arc};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -3662,6 +3673,217 @@ mod tests {
 
     #[cfg(feature = "xhttp-h3")]
     #[tokio::test]
+    async fn s04bt_abort_between_h3_sender_acquisition_and_handoff_releases_both_slots()
+     {
+        let (upload_addr, download_addr, _unused_capture) =
+            spawn_h3_download_settings_servers().await;
+        let endpoint = XhttpEndpointConfig {
+            server: "127.0.0.1".to_owned(),
+            port: upload_addr.port(),
+            security: XhttpSecurity::Tls,
+            server_name: "xhttp.example.com".to_owned(),
+            alpn_protocols: vec!["h3".to_owned()],
+            skip_cert_verify: true,
+            fingerprint: None,
+            verify_name: None,
+            tls_cert: None,
+            tls_key: None,
+            reality: None,
+        };
+        let reuse_policy = XhttpReusePolicy {
+            max_concurrency: Some(XhttpReuseValueRange { min: 1, max: 1 }),
+            max_connections: None,
+            c_max_reuse_times: Some(XhttpReuseValueRange { min: 0, max: 0 }),
+            h_max_request_times: Some(XhttpReuseValueRange { min: 0, max: 0 }),
+            h_max_reusable_secs: Some(XhttpReuseValueRange { min: 0, max: 0 }),
+            h_keep_alive_period: 0,
+        };
+        let download = XhttpDownloadConfig {
+            server: "127.0.0.1".to_owned(),
+            port: download_addr.port(),
+            path: "/download/".to_owned(),
+            host: None,
+            headers: HashMap::new(),
+            security: XhttpSecurity::Tls,
+            server_name: "xhttp.example.com".to_owned(),
+            alpn_protocols: vec!["h3".to_owned()],
+            skip_cert_verify: true,
+            fingerprint: None,
+            verify_name: None,
+            tls_cert: None,
+            tls_key: None,
+            reality: None,
+            reuse_policy: Some(reuse_policy.clone()),
+        };
+        let client = Arc::new(
+            Client::new(
+                "127.0.0.1".to_owned(),
+                upload_addr.port(),
+                "/upload/".to_owned(),
+                None,
+                HashMap::new(),
+                true,
+                XhttpMode::StreamUp,
+                1_000_000,
+                false,
+                None,
+                Some(download.clone()),
+            )
+            .with_upload_endpoint(Some(endpoint.clone()))
+            .with_http_version(XhttpHttpVersion::Http3)
+            .with_reuse_policy(Some(reuse_policy)),
+        );
+        let resolver = Arc::new(MockClashResolver::new());
+        let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel();
+        let borrower = client.clone();
+        let task = tokio::spawn(async move {
+            let connector = DirectConnector::new();
+            let sess = Session::default();
+            let upload = super::acquire_h3_upload_sender(
+                &borrower,
+                &endpoint,
+                &sess,
+                resolver.clone(),
+                &connector,
+                NetworkPoolContext::default(),
+            )
+            .await
+            .unwrap();
+            let downlink = super::acquire_h3_download_sender(
+                &borrower,
+                &download,
+                &sess,
+                resolver,
+                &connector,
+                NetworkPoolContext::default(),
+            )
+            .await
+            .unwrap();
+            // Both physical QUIC connections are acquired, but neither
+            // logical HTTP/3 stream has been delivered to a caller.
+            acquired_tx.send(()).unwrap();
+            let _upload = upload;
+            let _download = downlink;
+            std::future::pending::<()>().await;
+        });
+        timeout(Duration::from_secs(5), acquired_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let upload_active = client.h3_reuse_pool.lock().await[0].active.clone();
+        let download_active =
+            client.h3_download_reuse_pool.lock().await[0].active.clone();
+        assert_eq!(upload_active.load(Ordering::Acquire), 1);
+        assert_eq!(download_active.load(Ordering::Acquire), 1);
+        task.abort();
+        let err = timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .expect_err("borrower must be cancelled");
+        assert!(err.is_cancelled());
+        assert_eq!(
+            upload_active.load(Ordering::Acquire),
+            0,
+            "abort must release upload slot before logical handoff"
+        );
+        assert_eq!(
+            download_active.load(Ordering::Acquire),
+            0,
+            "abort must release download slot before logical handoff"
+        );
+        // Explicit pool retirement still owns socket/driver cleanup.
+        assert_eq!(client.reset_connection_pool().await.unwrap(), 2);
+    }
+
+    #[cfg(feature = "xhttp-h3")]
+    #[tokio::test]
+    async fn s04bt_failed_h3_downlink_setup_releases_previously_acquired_upload() {
+        let upload_addr = spawn_h3_stream_one_echo_server(0).await;
+        let endpoint = XhttpEndpointConfig {
+            server: "127.0.0.1".to_owned(),
+            port: upload_addr.port(),
+            security: XhttpSecurity::Tls,
+            server_name: "xhttp.example.com".to_owned(),
+            alpn_protocols: vec!["h3".to_owned()],
+            skip_cert_verify: true,
+            fingerprint: None,
+            verify_name: None,
+            tls_cert: None,
+            tls_key: None,
+            reality: None,
+        };
+        let reuse_policy = XhttpReusePolicy {
+            max_concurrency: Some(XhttpReuseValueRange { min: 1, max: 1 }),
+            max_connections: None,
+            c_max_reuse_times: Some(XhttpReuseValueRange { min: 0, max: 0 }),
+            h_max_request_times: Some(XhttpReuseValueRange { min: 0, max: 0 }),
+            h_max_reusable_secs: Some(XhttpReuseValueRange { min: 0, max: 0 }),
+            h_keep_alive_period: 0,
+        };
+        let download = XhttpDownloadConfig {
+            server: "127.0.0.1".to_owned(),
+            port: 443,
+            path: "/download/".to_owned(),
+            host: None,
+            headers: HashMap::new(),
+            // Downlink must fail synchronously *after* successful upload dial.
+            security: XhttpSecurity::None,
+            server_name: "xhttp.example.com".to_owned(),
+            alpn_protocols: vec!["h3".to_owned()],
+            skip_cert_verify: true,
+            fingerprint: None,
+            verify_name: None,
+            tls_cert: None,
+            tls_key: None,
+            reality: None,
+            reuse_policy: Some(reuse_policy.clone()),
+        };
+        let client = Client::new(
+            "127.0.0.1".to_owned(),
+            upload_addr.port(),
+            "/upload/".to_owned(),
+            None,
+            HashMap::new(),
+            true,
+            XhttpMode::StreamUp,
+            1_000_000,
+            false,
+            None,
+            Some(download),
+        )
+        .with_upload_endpoint(Some(endpoint))
+        .with_http_version(XhttpHttpVersion::Http3)
+        .with_reuse_policy(Some(reuse_policy));
+        let result = timeout(
+            Duration::from_secs(5),
+            client.connect_stream_with_connector(
+                &Session::default(),
+                Arc::new(MockClashResolver::new()),
+                &DirectConnector::new(),
+            ),
+        )
+        .await
+        .unwrap();
+        let err = result
+            .err()
+            .expect("invalid HTTP/3 download must fail closed");
+        assert!(
+            err.to_string().contains("standard TLS security only"),
+            "{err}"
+        );
+        let pool = client.h3_reuse_pool.lock().await;
+        assert_eq!(pool.len(), 1, "upload QUIC sender was actually acquired");
+        assert_eq!(
+            pool[0].active.load(Ordering::Acquire),
+            0,
+            "failed second endpoint cannot strand upload capacity"
+        );
+        drop(pool);
+        assert_eq!(client.reset_connection_pool().await.unwrap(), 1);
+    }
+
+    #[cfg(feature = "xhttp-h3")]
+    #[tokio::test]
     async fn xhttp_http3_reuses_separate_download_connection() {
         let addr = spawn_h3_stream_one_echo_server(2).await;
         let reuse_policy = XhttpReusePolicy {
@@ -3861,6 +4083,33 @@ mod tests {
             .expect("HTTP/3 upload capture timed out")
             .expect("HTTP/3 upload capture sender dropped");
         assert_eq!(uploaded, b"up-h3");
+        assert_eq!(
+            client.h3_reuse_pool.lock().await[0]
+                .active
+                .load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(
+            client.h3_download_reuse_pool.lock().await[0]
+                .active
+                .load(Ordering::Acquire),
+            1
+        );
+        drop(proxied);
+        assert_eq!(
+            client.h3_reuse_pool.lock().await[0]
+                .active
+                .load(Ordering::Acquire),
+            0,
+            "upload reservation must end when application releases stream"
+        );
+        assert_eq!(
+            client.h3_download_reuse_pool.lock().await[0]
+                .active
+                .load(Ordering::Acquire),
+            0,
+            "download reservation must not remain owned by a stalled QUIC task"
+        );
     }
 
     #[cfg(feature = "xhttp-h3")]
