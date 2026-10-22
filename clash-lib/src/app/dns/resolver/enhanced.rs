@@ -25,13 +25,21 @@ use rand::seq::IndexedRandom;
 use std::{
     net,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering::Relaxed},
     },
     time::{Duration, Instant},
 };
 use tokio::sync::RwLock;
 use tracing::{debug, error, instrument, trace, warn};
+
+/// RFC 2308 negative answer, bounded by the authoritative SOA lifetime.
+#[derive(Clone)]
+struct NegativeEntry {
+    response: op::Message,
+    inserted: Instant,
+    expires: Instant,
+}
 
 pub struct EnhancedResolver {
     ipv6: AtomicBool,
@@ -44,6 +52,10 @@ pub struct EnhancedResolver {
     fallback_ip_filters: Option<Vec<Box<dyn FallbackIPFilter>>>,
 
     lru_cache: Option<hickory_resolver::ResponseCache>,
+    // The positive cache keys only by Question and cannot cache a negative
+    // Message with a per-response SOA TTL. Keep a bounded negative cache
+    // alongside it, activated only when the positive cache is enabled.
+    negative_cache: Mutex<lru_time_cache::LruCache<String, NegativeEntry>>,
     policy: Option<trie::StringTrie<Vec<ThreadSafeDNSClient>>>,
 
     proxy_resolver: Option<Vec<ThreadSafeDNSClient>>,
@@ -57,6 +69,114 @@ pub struct EnhancedResolver {
 }
 
 impl EnhancedResolver {
+    fn negative_cache_key(query: &op::Query) -> String {
+        format!(
+            "{}|{}|{}",
+            query.name().to_ascii().to_ascii_lowercase(),
+            query.query_class(),
+            query.query_type()
+        )
+    }
+
+    fn negative_ttl(query: &op::Query, message: &op::Message) -> Option<u32> {
+        if !matches!(
+            message.metadata.response_code,
+            op::ResponseCode::NXDomain | op::ResponseCode::NoError
+        ) || !message.answers.is_empty()
+            || message.metadata.truncation
+            || message.edns.is_some()
+            || message.signature.is_some()
+        {
+            return None;
+        }
+        // The SOA must belong to an ancestor zone of QNAME, not be an
+        // unrelated authority record included in a response.
+        message
+            .authorities
+            .iter()
+            .filter_map(|record| {
+                if !record.name.zone_of(query.name())
+                    || record.dns_class != query.query_class()
+                {
+                    return None;
+                }
+                match &record.data {
+                    rr::RData::SOA(soa) => {
+                        let ttl = record.ttl.min(soa.minimum);
+                        (ttl > 0).then_some(ttl)
+                    }
+                    _ => None,
+                }
+            })
+            .min()
+    }
+
+    fn cached_negative(
+        &self,
+        query: &op::Query,
+        request: &op::Message,
+        now: Instant,
+    ) -> Option<op::Message> {
+        let key = Self::negative_cache_key(query);
+        let mut entries = self
+            .negative_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = entries.get(&key)?.clone();
+        if now >= entry.expires {
+            entries.remove(&key);
+            return None;
+        }
+        let elapsed =
+            u32::try_from(now.saturating_duration_since(entry.inserted).as_secs())
+                .unwrap_or(u32::MAX);
+        let mut response = entry.response;
+        for record in response
+            .answers
+            .iter_mut()
+            .chain(response.authorities.iter_mut())
+            .chain(response.additionals.iter_mut())
+        {
+            record.decrement_ttl(elapsed);
+        }
+        response.metadata.id = request.metadata.id;
+        response.metadata.recursion_desired = request.metadata.recursion_desired;
+        response.metadata.checking_disabled = request.metadata.checking_disabled;
+        response.queries = request.queries.clone();
+        Some(response)
+    }
+
+    fn cache_negative(
+        &self,
+        query: &op::Query,
+        response: &op::Message,
+        now: Instant,
+    ) {
+        let Some(ttl) = Self::negative_ttl(query, response) else {
+            return;
+        };
+        let mut response = response.clone();
+        // The SOA TTL in a cached negative response cannot exceed
+        // min(SOA RR TTL, SOA.MINIMUM), per RFC 2308.
+        for record in &mut response.authorities {
+            if matches!(record.data, rr::RData::SOA(_)) {
+                record.ttl = record.ttl.min(ttl);
+            }
+        }
+        let mut entries = self
+            .negative_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        entries.insert(
+            Self::negative_cache_key(query),
+            NegativeEntry {
+                response,
+                inserted: now,
+                expires: now + Duration::from_secs(u64::from(ttl)),
+            },
+        );
+    }
+
     // DNS responses can vary with EDNS, DNSSEC or per-query options, while
     // Hickory's ResponseCache uses only the Question as its key. Restrict
     // caching to ordinary, unsigned queries until those variants have
@@ -104,6 +224,9 @@ impl EnhancedResolver {
             fallback_domain_filters: None,
             fallback_ip_filters: None,
             lru_cache: None,
+            negative_cache: Mutex::new(lru_time_cache::LruCache::with_capacity(
+                1024,
+            )),
             policy: None,
             proxy_resolver: None,
             proxy_server_domains: None,
@@ -149,6 +272,9 @@ impl EnhancedResolver {
             fallback_domain_filters: None,
             fallback_ip_filters: None,
             lru_cache: None,
+            negative_cache: Mutex::new(lru_time_cache::LruCache::with_capacity(
+                1024,
+            )),
             policy: None,
 
             proxy_resolver: None,
@@ -212,6 +338,9 @@ impl EnhancedResolver {
             fallback_domain_filters: None,
             fallback_ip_filters: None,
             lru_cache: None,
+            negative_cache: Mutex::new(lru_time_cache::LruCache::with_capacity(
+                1024,
+            )),
             policy: None,
 
             proxy_resolver: None,
@@ -382,6 +511,9 @@ impl EnhancedResolver {
             } else {
                 None
             },
+            negative_cache: Mutex::new(lru_time_cache::LruCache::with_capacity(
+                1024,
+            )),
             lru_cache: Some(hickory_resolver::ResponseCache::new(
                 4096,
                 hickory_resolver::TtlConfig::default(),
@@ -669,6 +801,13 @@ impl EnhancedResolver {
             cached.queries = message.queries.clone();
             return Ok(cached);
         }
+        if Self::cache_safe_request(message)
+            && self.lru_cache.is_some()
+            && let Some(cached) = self.cached_negative(q, message, Instant::now())
+        {
+            trace!(q = q.to_string(), "negative DNS cache hit");
+            return Ok(cached);
+        }
         trace!(q = q.to_string(), "querying resolver");
         let res = self.exchange_no_cache(message).await.map(|mut r| {
             if let Some(edns) = r.edns.as_mut() {
@@ -703,6 +842,13 @@ impl EnhancedResolver {
 
         if let Ok(msg) = &rv
             && Self::cache_safe_request(message)
+            && self.lru_cache.is_some()
+        {
+            self.cache_negative(q, msg, Instant::now());
+        }
+
+        if let Ok(msg) = &rv
+            && Self::cache_safe_request(message)
             && Self::cache_safe_response(msg)
             && let Some(lru) = &self.lru_cache
             && !(q.query_type() == rr::RecordType::TXT
@@ -712,6 +858,13 @@ impl EnhancedResolver {
                 ips.is_empty() || ips.iter().any(|ip| !ip.is_unspecified())
             }
         {
+            // A subsequent real positive answer invalidates a previously
+            // observed negative for the same Question. Otherwise an older
+            // NXDOMAIN could reappear after the positive TTL expires.
+            self.negative_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&Self::negative_cache_key(q));
             lru.insert(q.clone(), Ok(msg.clone()), Instant::now());
         }
 
@@ -1076,6 +1229,11 @@ impl ClashResolver for EnhancedResolver {
 
     async fn reset_transports(&self) -> anyhow::Result<u32> {
         self.health.invalidate();
+        // A changed network path can expose a different split-DNS zone.
+        self.negative_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         let mut clients = self.main.clone();
         if let Some(fallback) = &self.fallback {
             clients.extend(fallback.iter().cloned());
@@ -2052,6 +2210,222 @@ mod tests {
         );
     }
 
+    fn negative_response(
+        code: op::ResponseCode,
+        soa_zone: &str,
+        soa_ttl: u32,
+        minimum: u32,
+    ) -> op::Message {
+        let (request, query) = test_query();
+        let mut response =
+            op::Message::response(request.metadata.id, request.metadata.op_code);
+        response.metadata.response_code = code;
+        response.metadata.recursion_available = true;
+        response.add_query(query);
+        let zone = rr::Name::from_ascii(soa_zone).unwrap();
+        response.add_authority(rr::Record::from_rdata(
+            zone.clone(),
+            soa_ttl,
+            rr::RData::SOA(rr::rdata::SOA::new(
+                zone,
+                rr::Name::from_ascii("hostmaster.example.com.").unwrap(),
+                42,
+                60,
+                60,
+                60,
+                minimum,
+            )),
+        ));
+        response
+    }
+
+    #[tokio::test]
+    async fn soa_based_nxdomain_is_cached_with_code_and_transaction_id() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let response =
+            negative_response(op::ResponseCode::NXDomain, "example.com.", 300, 60);
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response,
+                hits: hits.clone(),
+                id: "authoritative-ns",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        let (mut request, _) = test_query();
+        request.metadata.recursion_desired = true;
+        request.metadata.id = 0x1234;
+        let first = resolver.exchange(&request).await.unwrap();
+        assert_eq!(first.metadata.response_code, op::ResponseCode::NXDomain);
+        request.metadata.id = 0x4321;
+        let second = resolver.exchange(&request).await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(second.metadata.id, 0x4321);
+        assert_eq!(second.metadata.response_code, op::ResponseCode::NXDomain);
+        assert_eq!(second.authorities.len(), 1);
+        assert_eq!(second.authorities[0].ttl, 60);
+        assert_eq!(second.authorities[0].data, first.authorities[0].data);
+    }
+
+    #[tokio::test]
+    async fn soa_based_nodata_is_cached_per_question_type() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let response =
+            negative_response(op::ResponseCode::NoError, "example.com.", 120, 30);
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response,
+                hits: hits.clone(),
+                id: "nodata-ns",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        let (mut request, _) = test_query();
+        request.metadata.recursion_desired = true;
+        resolver.exchange(&request).await.unwrap();
+        resolver.exchange(&request).await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        request.queries[0].set_query_type(rr::RecordType::TXT);
+        resolver.exchange(&request).await.unwrap();
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "different QTYPE must not reuse NODATA"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_negative_cache_does_not_hide_upstream_failure() {
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(FailingClient {
+                id: "offline",
+                reason: "network unavailable",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        let (mut request, query) = test_query();
+        request.metadata.recursion_desired = true;
+        let response =
+            negative_response(op::ResponseCode::NXDomain, "example.com.", 200, 2);
+        resolver.cache_negative(
+            &query,
+            &response,
+            Instant::now() - Duration::from_secs(5),
+        );
+        assert!(
+            resolver.exchange(&request).await.is_err(),
+            "expired negative cache must re-query"
+        );
+    }
+
+    #[tokio::test]
+    async fn negative_ttl_uses_lower_of_soa_rr_ttl_and_soa_minimum() {
+        let resolver = EnhancedResolver::from_clients(vec![], false);
+        let (mut request, query) = test_query();
+        request.metadata.recursion_desired = true;
+        let response =
+            negative_response(op::ResponseCode::NXDomain, "example.com.", 10, 300);
+        let now = Instant::now();
+        resolver.cache_negative(&query, &response, now - Duration::from_secs(3));
+        let cached = resolver.cached_negative(&query, &request, now).unwrap();
+        assert!(cached.authorities[0].ttl <= 7);
+        assert_eq!(cached.metadata.response_code, op::ResponseCode::NXDomain);
+        assert!(
+            resolver
+                .cached_negative(&query, &request, now + Duration::from_secs(8))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn no_soa_wrong_zone_zero_ttl_and_servfail_are_not_negative_cached() {
+        let resolver = EnhancedResolver::from_clients(vec![], false);
+        let (mut request, query) = test_query();
+        request.metadata.recursion_desired = true;
+        let now = Instant::now();
+        for response in [
+            op::Message::error_msg(0, op::OpCode::Query, op::ResponseCode::NXDomain),
+            negative_response(
+                op::ResponseCode::NXDomain,
+                "unrelated.org.",
+                120,
+                100,
+            ),
+            negative_response(op::ResponseCode::NXDomain, "example.com.", 120, 0),
+            {
+                let mut mismatch = negative_response(
+                    op::ResponseCode::NXDomain,
+                    "example.com.",
+                    120,
+                    100,
+                );
+                mismatch.authorities[0].dns_class = rr::DNSClass::CH;
+                mismatch
+            },
+            negative_response(op::ResponseCode::NoError, "example.com.", 0, 100),
+            negative_response(op::ResponseCode::ServFail, "example.com.", 120, 100),
+        ] {
+            resolver.cache_negative(&query, &response, now);
+            assert!(
+                resolver.cached_negative(&query, &request, now).is_none(),
+                "invalid negative response must not be cached: {:?}",
+                response.metadata.response_code
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn positive_answer_invalidates_older_negative_for_same_question() {
+        let mut resolver = EnhancedResolver::from_clients(vec![], false);
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        let (mut request, query) = test_query();
+        request.metadata.recursion_desired = true;
+        let negative =
+            negative_response(op::ResponseCode::NXDomain, "example.com.", 120, 60);
+        resolver.cache_negative(&query, &negative, Instant::now());
+        assert!(
+            resolver
+                .cached_negative(&query, &request, Instant::now())
+                .is_some()
+        );
+
+        resolver.main = vec![Arc::new(FixedClient {
+            response: {
+                let mut answer = response_with_a(Ipv4Addr::new(192, 0, 2, 50));
+                answer.answers[0].ttl = 30;
+                answer
+            },
+        })];
+        let positive = resolver.exchange_no_cache(&request).await.unwrap();
+        assert_eq!(EnhancedResolver::ip_list_of_message(&positive).len(), 1);
+        assert!(
+            resolver
+                .cached_negative(&query, &request, Instant::now())
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn network_reset_flushes_negative_cache() {
+        let resolver = EnhancedResolver::from_clients(vec![], false);
+        let (mut request, query) = test_query();
+        request.metadata.recursion_desired = true;
+        let now = Instant::now();
+        let response =
+            negative_response(op::ResponseCode::NXDomain, "example.com.", 120, 60);
+        resolver.cache_negative(&query, &response, now);
+        assert!(resolver.cached_negative(&query, &request, now).is_some());
+        resolver.reset_transports().await.unwrap();
+        assert!(
+            resolver
+                .cached_negative(&query, &request, Instant::now())
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn test_lru_skips_nxdomain_response() {
         let mut resolver = EnhancedResolver::new_default().await;
@@ -2120,6 +2494,143 @@ mod tests {
             .expect("TXT query should resolve through main nameserver");
         assert_eq!(proxy_hits.load(Ordering::SeqCst), 1);
         assert_eq!(main_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn policy_negative_cache_does_not_leak_to_main_or_fallback() {
+        let mut resolver = EnhancedResolver::from_clients_with_fallback(
+            vec![],
+            Some(vec![]),
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        let policy_hits = Arc::new(AtomicUsize::new(0));
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        let fallback_hits = Arc::new(AtomicUsize::new(0));
+        let mut policy = crate::common::trie::StringTrie::new();
+        policy.insert(
+            "proxy.example.com",
+            Arc::new(vec![Arc::new(CountingClient {
+                response: negative_response(
+                    op::ResponseCode::NXDomain,
+                    "example.com.",
+                    120,
+                    60,
+                ),
+                hits: policy_hits.clone(),
+                id: "private-policy",
+            }) as ThreadSafeDNSClient]),
+        );
+        resolver.policy = Some(policy);
+        resolver.main = vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 77)),
+            hits: main_hits.clone(),
+            id: "public-main",
+        })];
+        resolver.fallback = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 78)),
+            hits: fallback_hits.clone(),
+            id: "public-fallback",
+        })]);
+        let mut request = test_query_with_type(rr::RecordType::A);
+        request.metadata.recursion_desired = true;
+        for _ in 0..2 {
+            let response = resolver.exchange(&request).await.unwrap();
+            assert_eq!(response.metadata.response_code, op::ResponseCode::NXDomain);
+        }
+        assert_eq!(policy_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(main_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn policy_upstream_failure_fails_closed_without_public_fallback() {
+        let mut resolver = EnhancedResolver::from_clients_with_fallback(
+            vec![],
+            Some(vec![]),
+            false,
+        );
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        let fallback_hits = Arc::new(AtomicUsize::new(0));
+        let mut policy = crate::common::trie::StringTrie::new();
+        policy.insert(
+            "proxy.example.com",
+            Arc::new(vec![Arc::new(FailingClient {
+                id: "private-policy",
+                reason: "private DNS offline",
+            }) as ThreadSafeDNSClient]),
+        );
+        resolver.policy = Some(policy);
+        resolver.main = vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 77)),
+            hits: main_hits.clone(),
+            id: "public-main",
+        })];
+        resolver.fallback = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 78)),
+            hits: fallback_hits.clone(),
+            id: "public-fallback",
+        })]);
+        let error = resolver
+            .exchange_no_cache(&test_query_with_type(rr::RecordType::A))
+            .await
+            .expect_err("private policy errors must not switch to public upstreams");
+        assert!(error.to_string().contains("private DNS offline"));
+        assert_eq!(main_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn proxy_server_nameserver_precedes_nameserver_policy_without_leaking() {
+        let mut resolver = EnhancedResolver::from_clients(vec![], false);
+        let proxy_hits = Arc::new(AtomicUsize::new(0));
+        let policy_hits = Arc::new(AtomicUsize::new(0));
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        let mut domains = crate::common::trie::StringTrie::new();
+        domains.insert("proxy.example.com", Arc::new(true));
+        resolver.proxy_server_domains = Some(domains);
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: negative_response(
+                op::ResponseCode::NXDomain,
+                "example.com.",
+                120,
+                60,
+            ),
+            hits: proxy_hits.clone(),
+            id: "proxy-server-ns",
+        })]);
+        let mut policy = crate::common::trie::StringTrie::new();
+        policy.insert(
+            "proxy.example.com",
+            Arc::new(vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 77)),
+                hits: policy_hits.clone(),
+                id: "private-policy",
+            }) as ThreadSafeDNSClient]),
+        );
+        resolver.policy = Some(policy);
+        resolver.main = vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 78)),
+            hits: main_hits.clone(),
+            id: "public-main",
+        })];
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        let mut request = test_query_with_type(rr::RecordType::A);
+        request.metadata.recursion_desired = true;
+        for _ in 0..2 {
+            assert_eq!(
+                resolver
+                    .exchange(&request)
+                    .await
+                    .unwrap()
+                    .metadata
+                    .response_code,
+                op::ResponseCode::NXDomain
+            );
+        }
+        assert_eq!(proxy_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(policy_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(main_hits.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

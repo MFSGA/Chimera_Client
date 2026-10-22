@@ -152,3 +152,36 @@
   不缓存、快速 NXDOMAIN/NODATA 与稍慢 IPv4 正答冲突，以及两个
   否定答复选择的配置顺序。未进行公网递归 DNS 互操作；完整结果
   以本地质量门禁日志为准。
+
+## 2026-10-21：RFC 2308 负缓存及 DNS 策略防泄漏回归
+
+- **范围**：在既有 `ResponseCache` 正缓存旁，为符合条件的
+  `NXDOMAIN` / `NODATA` 增加独立、有容量限制的内存负缓存（每个
+  EnhancedResolver 最多 1024 项）；不修改 Fake-IP v6、UDP/TCP
+  传输协议、nameserver-policy 的解析规则、自动 fallback 路由。
+- **缓存准入**：只对与查询域名有祖先区关系的 SOA 权威记录建立
+  负缓存。所用 TTL 是 `min(SOA RR TTL, SOA.MINIMUM)`；为 0、
+  没有 SOA、SOA 所属区域不相关、截断、SERVFAIL 等响应不缓存。
+  SOA 的 DNS Class 还必须匹配 Query 的 DNS Class。
+  为避免对 CNAME 链进行过度推断，当前只缓存空 Answer 的
+  `NXDOMAIN` 或 `NOERROR`（NODATA），不会将所有无 A 的响应
+  误认为 NODATA。
+- **查询隔离**：负缓存的键包含规范化 QNAME、QCLASS 和 QTYPE；
+  即使 NXDOMAIN 从协议语义上可以跨 QTYPE 使用，目前也保守地
+  不跨类型复用。只对满足既有 `cache_safe_request` 的普通递归
+  查询启用缓存；EDNS、DNSSEC 和非普通查询不会命中此缓存。
+- **应答**：命中负缓存时保留原始 RCODE、Authority（含 SOA）、
+  Additional 与必要标志，重写本次事务 ID / Question，递减各区段
+  TTL。过期立即重新请求上游；同一 Question 收到真实正答时
+  清除旧的负缓存，避免较早的 NXDOMAIN 在正缓存过期后重新出现。
+  网络路径重置时清除已有负缓存，避免在切换内网 / 分流 DNS 后
+  继续使用旧路径的否定应答。
+- **防泄漏验证**：全内存计数客户端检查 policy 指定的私有 DNS
+  发生 NXDOMAIN 或连接失败时，普通 main/fallback 没有被调用；
+  对代理服务端域名，proxy-server-nameserver 优先于 policy/main；
+  同时验证 SOA TTL、过期、无效/错误区域 SOA、零 TTL、不同 QTYPE
+  和网络重置。以上是 DNS 客户端选择层面的确定性测试，尚未
+  通过抓包证明 OS 级别的实际网络出口；不等同真实公网/内网测试。
+- **限制**：负缓存没有跨 QTYPE 优化，主要为了保守隔离；容量
+  和 TTL 规则是内部实现，不公开新的控制器设置。配置热重载通过
+  新 Resolver 生命周期重建缓存。测试结果以本次运行日志为准。
