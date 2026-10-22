@@ -27,7 +27,10 @@ use crate::{
 
 use super::{
     bootstrap::{StrictBootstrapPinSnapshot, StrictBootstrapPinStore},
-    bootstrap_topology::validate_configured_strict_egress,
+    bootstrap_provider::StrictProviderObservation,
+    bootstrap_topology::{
+        validate_configured_strict_egress, validate_observed_selected_provider,
+    },
     execution::{
         DnsStrictTransport, PreparedDnsExecution, StrictDnsExecution,
         prepare_dns_execution,
@@ -385,6 +388,49 @@ impl StrictDnsCache {
         }
         self.exchange_planned_pinned_traced(selection, request, status, pins, parent)
             .await
+    }
+
+    /// S04b-f read-only integration: capture the *currently* selected leaf
+    /// using S03 preflight, then prove its identity is present in the observed
+    /// provider registry and reachable from configured proxy groups. This is
+    /// deliberately NOT a DNS exchange/caching API: source provenance,
+    /// dialer-proxy attestation, and in-flight transport binding are pending.
+    #[allow(dead_code)]
+    pub(crate) async fn inspect_observed_provider_selection(
+        selection: StrictDnsPlanSelection<'_>,
+        config: &ConfigDef,
+        observed: &StrictProviderObservation,
+        status: &SharedNetworkStatus,
+    ) -> io::Result<String> {
+        observed.ensure_current(status).await?;
+        let PreparedDnsExecution::Strict(execution) = prepare_dns_execution(
+            selection.plan,
+            selection.profiles,
+            selection.registry,
+            selection.session,
+        )
+        .await?
+        else {
+            return Err(io::Error::other(
+                "strict DNS provider preflight refuses legacy or local-answer paths",
+            ));
+        };
+        let DnsEgress::Proxy(egress) = &execution.egress else {
+            return Err(io::Error::other(
+                "strict DNS provider inspection requires a proxy egress",
+            ));
+        };
+        Self::validate_execution_bootstrap(&execution, &BootstrapTrace::default())?;
+        let owner = validate_observed_selected_provider(
+            config,
+            egress,
+            observed,
+            status,
+            &execution.outbound,
+        )
+        .await?;
+        observed.ensure_current(status).await?;
+        Ok(owner)
     }
 
     /// Nested bootstrap callers must propagate their ancestry. A repeated

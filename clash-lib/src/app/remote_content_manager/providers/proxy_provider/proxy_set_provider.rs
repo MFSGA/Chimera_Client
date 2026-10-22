@@ -486,6 +486,190 @@ mod update_reliability_tests {
     }
 
     #[tokio::test]
+    async fn s04bf_registry_selection_is_identity_bound_and_rebinding_rejected() {
+        use crate::{
+            app::dns::{
+                bootstrap_provider::StrictProviderRegistry,
+                isolation::{StrictDnsCache, StrictDnsPlanSelection},
+                plan::{
+                    DnsPurpose, DnsQueryContext, EffectiveDnsPlan, EgressChoice,
+                    FailureChoice, LegacyDnsPlan, LegacyDnsRoute, ResolverChoice,
+                },
+                policy::{CompiledDnsPolicy, DnsEgress, DnsFailure},
+            },
+            config::def::Config as RawConfig,
+            proxy::utils::OutboundHandlerRegistry,
+            session::Session,
+        };
+        use hickory_proto::{
+            op::{Message, MessageType, OpCode, Query},
+            rr::{Name, RecordType},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let make = |name: &str| {
+            Arc::new(tokio::sync::RwLock::new(provider_with_refresh(
+                dir.path().join(name).to_string_lossy().into_owned(),
+                SAME_NAME_NEW_HOST,
+            ))) as ThreadSafeProxyProvider
+        };
+        let source = make("first.yaml");
+        source.read().await.initialize().await.unwrap();
+        let runtime = Arc::new(tokio::sync::RwLock::new(NetworkStatus::default()));
+        runtime.write().await.observed(&NetworkSnapshot::default());
+        let provider_registry: StrictProviderRegistry =
+            Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::from([
+                ("synthetic-provider".into(), source.clone()),
+            ])));
+        let observation = StrictProviderObservation::capture_registered(
+            &runtime,
+            &provider_registry,
+        )
+        .await
+        .unwrap();
+        let selected =
+            observation.candidates("synthetic-provider").unwrap()[0].clone();
+
+        let config: RawConfig = serde_yaml::from_str(
+            r#"
+proxy-groups:
+  - {name: DNS-OUT, type: select, use: [synthetic-provider]}
+"#,
+        )
+        .unwrap();
+        let mut request = Message::new(23, MessageType::Query, OpCode::Query);
+        request.add_query(Query::query(
+            Name::from_ascii("www.example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let plan = EffectiveDnsPlan {
+            context: DnsQueryContext::from_message(
+                &request,
+                DnsPurpose::ClientRealAnswer,
+            )
+            .unwrap(),
+            legacy: LegacyDnsPlan::new(LegacyDnsRoute::Main),
+            matched_rule: Some(0),
+            resolver: ResolverChoice::Profile("trusted".into()),
+            egress: EgressChoice::Explicit(DnsEgress::Proxy("DNS-OUT".into())),
+            failure: FailureChoice::Explicit(DnsFailure::Fail),
+        };
+        let profiles = CompiledDnsPolicy {
+            profiles: std::collections::HashMap::from([(
+                "trusted".into(),
+                crate::app::dns::Config::parse_nameserver(&[
+                    "udp://192.0.2.53".into()
+                ])
+                .unwrap(),
+            )]),
+            rules: Vec::new(),
+        };
+        let outbound_registry: OutboundHandlerRegistry =
+            Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::from([
+                ("DNS-OUT".into(), selected.clone()),
+            ])));
+        let session = Session::default();
+        let selection = || StrictDnsPlanSelection {
+            plan: &plan,
+            profiles: &profiles,
+            registry: &outbound_registry,
+            session: &session,
+        };
+
+        assert_eq!(
+            StrictDnsCache::inspect_observed_provider_selection(
+                selection(),
+                &config,
+                &observation,
+                &runtime,
+            )
+            .await
+            .unwrap(),
+            "synthetic-provider",
+        );
+
+        let second = make("second.yaml");
+        second.read().await.initialize().await.unwrap();
+        second.read().await.update().await.unwrap();
+        let foreign = second.read().await.proxies().await[0].clone();
+        assert_eq!(foreign.name(), selected.name());
+        outbound_registry
+            .write()
+            .await
+            .insert("DNS-OUT".into(), foreign);
+        let error = StrictDnsCache::inspect_observed_provider_selection(
+            selection(),
+            &config,
+            &observation,
+            &runtime,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("not in configured provider candidates"),
+            "{error}"
+        );
+
+        provider_registry
+            .write()
+            .await
+            .insert("synthetic-provider".into(), second);
+        let error = observation
+            .ensure_current(&runtime)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("provider registry changed"), "{error}");
+        // Consume this fixture's expected second fetch without affecting the
+        // already verified, stale provider observation.
+        source.read().await.update().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn s04bf_provider_rotation_during_read_only_operation_discards_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle: ThreadSafeProxyProvider =
+            Arc::new(tokio::sync::RwLock::new(provider_with_refresh(
+                dir.path()
+                    .join("provider.yaml")
+                    .to_string_lossy()
+                    .into_owned(),
+                SAME_NAME_NEW_HOST,
+            )));
+        handle.read().await.initialize().await.unwrap();
+        let runtime = Arc::new(tokio::sync::RwLock::new(NetworkStatus::default()));
+        runtime.write().await.observed(&NetworkSnapshot::default());
+        let sources = std::collections::HashMap::from([(
+            "synthetic-provider".to_owned(),
+            handle.clone(),
+        )]);
+        let snapshot = StrictProviderObservation::capture(&runtime, &sources)
+            .await
+            .unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (continue_tx, continue_rx) = tokio::sync::oneshot::channel::<()>();
+        let observed_runtime = runtime.clone();
+        let job = tokio::spawn(async move {
+            snapshot
+                .validate_during(&observed_runtime, async {
+                    entered_tx.send(()).unwrap();
+                    continue_rx.await.unwrap();
+                    42
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        handle.read().await.update().await.unwrap();
+        continue_tx.send(()).unwrap();
+        let error = job.await.unwrap().unwrap_err().to_string();
+        assert!(error.contains("changed during"), "{error}");
+    }
+
+    #[tokio::test]
     async fn explicitly_empty_refresh_remains_supported() {
         let dir = tempfile::tempdir().expect("temporary cache dir");
         let cache_path = dir.path().join("provider.yaml");

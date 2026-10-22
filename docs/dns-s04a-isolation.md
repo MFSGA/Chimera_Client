@@ -58,6 +58,12 @@ cargo test -p clash-lib --test dns_config_tests --locked
 - 新增内部 `StrictProviderObservation::capture/ensure_current`：由调用者提供命名 Provider 句柄表，并将候选对象、内容版本、Provider 实例、共享 `RuntimeStatus` 实例、实际 network/config generation 绑定为一个短期观察结果。第一次捕获及未来每次复核均核对运行时代际、候选 Arc 对象身份和 Provider content revision；检测查询间版本轮换、相同名字但不同 handler 的替换、配置/网络变化、未知或未初始化 Provider，并拒绝跨运行时使用。拒绝空候选及重复节点名。新增真实 `ProxySetProvider` 离线更新测试验证有效更新、失败保留、过期观察和版本号。
 - **关键安全限制：** 本快照只保证运行时内容版本可比较，**不认证下载/配置的来源或供应链**。命名 Provider 表由未来调用方传入，尚未与实时 Group/Provider 注册表、静态拓扑证明、pin 可信来源、全部 Dialer 链和选中叶节点的最终身份原子绑定。因此 S04b-d 对动态 Provider 的**失败关闭仍有效**：此版本未让动态 Provider 越过生产或内部严格拨号保护；查询开始/结束处的快照复核也尚待显式接线。S04b-e 为后续建立可信 Provider 候选拓扑证明提供版本基础，不能解除 `policy-rules` 运行时 gate。
 
+## S04b-f：Provider 注册表身份与实际选定叶节点检查（不授权 DNS 拨号）
+
+- `StrictProviderObservation::capture_registered` 绑定**命名 Provider 注册表的 Arc 实例及其中每一个 Provider 句柄**，除上一阶段的 network/config generation、单个 Provider 内容修订与候选 Arc 身份外，在检查前后还对比注册表名称集合和每个句柄身份；同名 Provider 被另一个对象替换会令旧观察失效。它仍不能检测读取窗口外的瞬时 A→B→A 注册表变更：尚无注册表级单调版本号与原子拨号承诺。
+- 新增 `validate_observed_selected_provider` 和 `StrictDnsCache::inspect_observed_provider_selection` **内部检查接口**：调用 S03 既有的 `prepare_dns_execution` 重新选择当前 egress 叶节点，沿原配置的嵌套组/`use:` 候选追踪可达 Provider，要求实际选中 handler 与 Provider 观察中的 Arc 身份相同；随后复核版本。未知成员、循环/超过 16 层、未观察 Provider、同名但已替换的叶节点、注册表重绑均失败关闭。它不会进行 DNS 查询、不读写严格答案缓存、不调用 DNS transport 拨号，也不会取代此前完整静态拓扑对未认证 Provider 的**拒绝**。**注意：** S03 在捕获动态组选择时可能触发原有 Provider `touch`，因此检查过程不保证完全无副作用或无其他网络行为。
+- `StrictProviderObservation::validate_during` 增加**只读/无共享缓存副作用**操作的查询前与结束后版本复核辅助，离线测试使用可暂停的操作，在其运行时轮换候选列表并确认旧结果不返回；不得把此辅助当成共享缓存 invalidation 或生产网络拨号隔离。S04b-f 仍缺 Provider 来源认证、所有 `dialer-proxy` 链端点证明、完整 selector/provider 快照与实际拨号的事务性绑定，故生产 `policy-rules` 保持禁用，动态 Provider 的严格执行入口继续失败关闭。
+
 ## S04b/S04c 待完成的严格准入
 
 1. **真实执行接线与身份来源**：S04b-a 提供共享 RuntimeStatus 读取接口，但**尚未由生产 DNS runtime 自动接入或订阅**；需有可信的 bootstrap pin revision/变更事件来源，而不是由未受验证的调用者提供任意数值。仍需真实数据面验证动态代理在查询中途切换时的失效与回滚；旧 legacy 路径继续完全独立。

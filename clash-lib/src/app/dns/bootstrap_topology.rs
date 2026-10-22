@@ -6,14 +6,18 @@ use std::{
     collections::{HashMap, HashSet},
     io,
     net::IpAddr,
+    sync::Arc,
 };
 
-use crate::config::{
-    def::Config as ConfigDef,
-    internal::proxy::{OutboundGroupProtocol, OutboundProxyProtocol},
+use crate::{
+    config::{
+        def::Config as ConfigDef,
+        internal::proxy::{OutboundGroupProtocol, OutboundProxyProtocol},
+    },
+    proxy::{AnyOutboundHandler, utils::SharedNetworkStatus},
 };
 
-use super::config::NameServer;
+use super::{bootstrap_provider::StrictProviderObservation, config::NameServer};
 
 fn proxy_endpoints(proxy: &OutboundProxyProtocol) -> Option<(&str, Option<&str>)> {
     match proxy {
@@ -170,6 +174,95 @@ pub(crate) fn validate_configured_strict_egress(
         &mut HashSet::new(),
         0,
     )
+}
+
+/// S04b-f read-only membership check against an observed provider registry.
+/// Walk all reachable configured groups and their `use:` providers. This never
+/// substitutes for `validate_configured_strict_egress`: that guard still
+/// refuses unauthenticated dynamic providers before any cache/dial access.
+#[allow(dead_code)]
+pub(crate) async fn validate_observed_selected_provider(
+    config: &ConfigDef,
+    egress: &str,
+    observed: &StrictProviderObservation,
+    runtime: &SharedNetworkStatus,
+    selected: &AnyOutboundHandler,
+) -> io::Result<String> {
+    observed.ensure_current(runtime).await?;
+    let groups: HashMap<&str, &OutboundGroupProtocol> = config
+        .proxy_group
+        .iter()
+        .flatten()
+        .map(|g| (g.name(), g))
+        .collect();
+    let proxy_names: HashSet<&str> =
+        config.proxy.iter().flatten().map(|p| p.name()).collect();
+
+    fn collect(
+        name: &str,
+        groups: &HashMap<&str, &OutboundGroupProtocol>,
+        proxies: &HashSet<&str>,
+        active: &mut HashSet<String>,
+        providers: &mut HashSet<String>,
+        depth: usize,
+    ) -> io::Result<()> {
+        if depth >= 16 || !active.insert(name.to_owned()) {
+            return Err(io::Error::other(format!(
+                "strict DNS provider topology cycle or depth exceeded at '{name}'"
+            )));
+        }
+        if let Some(group) = groups.get(name) {
+            if let Some(names) = provider_names(group) {
+                providers.extend(names.iter().cloned());
+            }
+            if let Some(members) = group.proxies() {
+                for member in members {
+                    collect(member, groups, proxies, active, providers, depth + 1)?;
+                }
+            }
+        } else if !proxies.contains(name) {
+            return Err(io::Error::other(format!(
+                "strict DNS provider topology missing configured candidate '{name}'"
+            )));
+        }
+        active.remove(name);
+        Ok(())
+    }
+
+    let mut reachable = HashSet::new();
+    collect(
+        egress,
+        &groups,
+        &proxy_names,
+        &mut HashSet::new(),
+        &mut reachable,
+        0,
+    )?;
+    let mut matched = None;
+    for provider in reachable {
+        let entries = observed.candidates(&provider).ok_or_else(|| {
+            io::Error::other(format!(
+                "strict DNS provider '{provider}' not included in observed registry"
+            ))
+        })?;
+        if entries.iter().any(|entry| Arc::ptr_eq(entry, selected))
+            && matched.replace(provider).is_some()
+        {
+            return Err(io::Error::other(
+                "strict DNS selected leaf belongs to multiple provider names",
+            ));
+        }
+    }
+    let provider = matched.ok_or_else(|| {
+        io::Error::other(format!(
+            "strict DNS selected leaf '{}' is not in configured provider candidates",
+            selected.name()
+        ))
+    })?;
+    observed
+        .require_selected(runtime, &provider, selected)
+        .await?;
+    Ok(provider)
 }
 
 #[cfg(test)]
