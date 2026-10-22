@@ -81,6 +81,12 @@ cargo test -p clash-lib --test dns_config_tests --locked
 - `StrictDnsManagerLeafGuard::bind` 绑定此前观测的真实 `OutboundManager`、其 outbound registry、Provider 所属名称以及**选中的 handler Arc**。每次执行边界复核都会拒绝不同 handler 对象（即使同名）、不同 registry/Manager、Provider 版本轮换及网络/配置代际变更；复用既有 S04b-h 观察，不偷偷重新选择另一片叶节点。离线 `s04bi_` 测试验证拨号前阻断、请求进行中变化时即使首个 upstream 成功/失败也不触发第二次拨号，以及版本稳定时正常的同叶节点重试。新增真实 Manager guard 的身份/网络变更回归断言。
 - **限制：** 这是可离线测试的**检查前/后**模型，不能禁止两次检查之间已经产生的网络副作用；也尚未在实际 Connector 内部的 `dialer-proxy` 每个递归跳点做事务性保护。Provider 下载/配置内容仍无可信来源认证，不存在受认可的动态 Provider 完整拓扑证明或安全的真实 strict DNS 调用链。**不得将此接口视为生产拨号授权，也不把它接入 DNS 答案缓存或 `policy-rules` 运行时**；必须保留 S04b-d 的动态 Provider 失败关闭以及独立数据面验证和 L2 门禁。
 
+## S04b-j：实际命名 `dialer-proxy` 单跳身份预检（内部实验入口）
+
+- 新增 `app/dns/bootstrap_dialer.rs` 的 `StrictDnsConnectorChain`：沿已固定的出站叶节点 `support_dialer()` 读取真实 `OutboundManager` 的命名 handler，严格要求共享同一 outbound registry Arc、节点确实为固定非 DIRECT/REJECT/动态组代理、两端服务器均为 IP 字面量。保存实际引用的 handler Arc，每次严格执行 guard 复核其身份；若单跳 handler 被同名新对象替换，即使服务器地址相同也立即失败关闭。自依赖、缺失 hop、缺少独立 bootstrap 的域名和动态组全部拒绝。
+- 当前 `OutboundManager::init_handler_connectors` 为 `dialer-proxy` 注册的是 `ProxyConnector(named_proxy, DirectConnector)`，并未安装任意递归多跳连接器。因此 S04b-j **主动拒绝第二级 `dialer-proxy`**，不能把配置中写出的链误认作受到逐跳保护。`StrictDnsManagerLeafGuard::bind/ensure_current` 在既有 Provider、Manager、网络代际检查的前后增加此单跳关系复核，不使用共享 DNS 缓存、不解除生产保护。新增 `s04bj_` 离线测试覆盖同名 hop 替换、缺失/循环/不可信端点/多跳/动态组以及 guard 执行边界。
+- **限制：** 身份检查仅在 I/O 前后发生，不可撤销两次检查之间的网络副作用；真实 Connector 内部仍未绑定原子代际承诺及防 ABA 的注册表版本，也没有对正在使用的连接池进行端到端认证。Provider 下载内容与代理端点 bootstrap 来源尚未认证，完整动态拓扑证明、实际数据面抓包、独立 L2 审查及维护者批准仍为前置条件。`policy-rules` 生产 gate 继续保持关闭。
+
 ## S04b/S04c 待完成的严格准入
 
 1. **真实执行接线与身份来源**：S04b-a 提供共享 RuntimeStatus 读取接口，但**尚未由生产 DNS runtime 自动接入或订阅**；需有可信的 bootstrap pin revision/变更事件来源，而不是由未受验证的调用者提供任意数值。仍需真实数据面验证动态代理在查询中途切换时的失效与回滚；旧 legacy 路径继续完全独立。

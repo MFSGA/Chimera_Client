@@ -1836,6 +1836,236 @@ ip: not-an-ip
         }
     }
 
+    #[derive(Debug)]
+    struct StrictConnectorTestNode {
+        name: &'static str,
+        host: &'static str,
+        via: Option<&'static str>,
+        proto: OutboundType,
+    }
+
+    #[async_trait]
+    impl DialWithConnector for StrictConnectorTestNode {
+        fn support_dialer(&self) -> Option<&str> {
+            self.via
+        }
+    }
+
+    #[async_trait]
+    impl OutboundHandler for StrictConnectorTestNode {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn server_name(&self) -> Option<&str> {
+            Some(self.host)
+        }
+        fn proto(&self) -> OutboundType {
+            self.proto
+        }
+        async fn connect_stream(
+            &self,
+            _: &Session,
+            _: ThreadSafeDNSResolver,
+        ) -> io::Result<BoxedChainedStream> {
+            unreachable!("strict connector dependency inspection never dials")
+        }
+        async fn connect_datagram(
+            &self,
+            _: &Session,
+            _: ThreadSafeDNSResolver,
+        ) -> io::Result<BoxedChainedDatagram> {
+            unreachable!("strict connector dependency inspection never dials")
+        }
+    }
+
+    #[tokio::test]
+    async fn s04bj_connector_dependency_checks_actual_named_hop_identity() {
+        use crate::app::dns::bootstrap_dialer::StrictDnsConnectorChain;
+
+        let node = |name, host, via, proto| -> AnyOutboundHandler {
+            Arc::new(StrictConnectorTestNode {
+                name,
+                host,
+                via,
+                proto,
+            })
+        };
+        let leaf = node("leaf", "192.0.2.10", Some("via"), OutboundType::Socks5);
+        let via = node("via", "198.51.100.20", None, OutboundType::Socks5);
+        let manager = Arc::new(isolated_pool_manager(vec![via.clone()]).await);
+        let registry = manager.registry.clone();
+
+        let chain = StrictDnsConnectorChain::capture(&manager, &registry, &leaf)
+            .await
+            .unwrap();
+        chain
+            .ensure_current(&manager, &registry, &leaf)
+            .await
+            .unwrap();
+        let impostor = node("leaf", "192.0.2.10", Some("via"), OutboundType::Socks5);
+        let err = chain
+            .ensure_current(&manager, &registry, &impostor)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("leaf identity changed"), "{err}");
+
+        // Same configured name, new handler Arc: no silent dialer-proxy reroute.
+        let replacement = node("via", "198.51.100.20", None, OutboundType::Socks5);
+        registry.write().await.insert("via".into(), replacement);
+        let err = chain
+            .ensure_current(&manager, &registry, &leaf)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("dependency 'via' identity changed"), "{err}");
+
+        // The verification does not accept an unrelated handler registry even
+        // if it contains an identical handler.
+        let fake_registry =
+            Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::from([
+                ("via".into(), via),
+            ])));
+        assert!(
+            StrictDnsConnectorChain::capture(&manager, &fake_registry, &leaf)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("does not belong")
+        );
+    }
+
+    #[tokio::test]
+    async fn s04bj_connector_dependency_rejects_unproven_chains() {
+        use crate::app::dns::bootstrap_dialer::StrictDnsConnectorChain;
+        let node = |name, host, via, proto| -> AnyOutboundHandler {
+            Arc::new(StrictConnectorTestNode {
+                name,
+                host,
+                via,
+                proto,
+            })
+        };
+        let via = node("via", "192.0.2.20", None, OutboundType::Socks5);
+        let manager = Arc::new(isolated_pool_manager(vec![via]).await);
+        let registry = manager.registry.clone();
+        for (leaf, marker) in [
+            (
+                node("leaf", "192.0.2.10", Some("missing"), OutboundType::Socks5),
+                "missing",
+            ),
+            (
+                node("leaf", "192.0.2.10", Some("leaf"), OutboundType::Socks5),
+                "cycles",
+            ),
+            (
+                node("leaf", "proxy.example", Some("via"), OutboundType::Socks5),
+                "trusted bootstrap",
+            ),
+            (
+                node("leaf", "192.0.2.10", None, OutboundType::Direct),
+                "fixed proxy leaf",
+            ),
+        ] {
+            let err = StrictDnsConnectorChain::capture(&manager, &registry, &leaf)
+                .await
+                .expect_err("invalid connector chain must fail")
+                .to_string();
+            assert!(err.contains(marker), "{err}");
+        }
+        registry.write().await.insert(
+            "via".into(),
+            node("via", "192.0.2.20", Some("next"), OutboundType::Socks5),
+        );
+        let leaf = node("leaf", "192.0.2.10", Some("via"), OutboundType::Socks5);
+        let err = StrictDnsConnectorChain::capture(&manager, &registry, &leaf)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("nested dialer-proxy"), "{err}");
+        registry.write().await.insert(
+            "via".into(),
+            node("via", "192.0.2.20", None, OutboundType::Selector),
+        );
+        let err = StrictDnsConnectorChain::capture(&manager, &registry, &leaf)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("fixed proxy leaf"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn s04bj_manager_guard_rechecks_named_dialer_on_attempt_boundary() {
+        use crate::app::{
+            dns::{
+                bootstrap_provider::{
+                    StrictDnsManagerLeafGuard, StrictProviderObservation,
+                },
+                execution::DnsStrictAttemptGuard,
+            },
+            remote_content_manager::{
+                healthcheck::HealthCheck,
+                providers::proxy_provider::{
+                    ThreadSafeProxyProvider, plain_provider::PlainProvider,
+                },
+            },
+        };
+        use tokio::sync::RwLock;
+        let node = |name, host, via| -> AnyOutboundHandler {
+            Arc::new(StrictConnectorTestNode {
+                name,
+                host,
+                via,
+                proto: OutboundType::Socks5,
+            })
+        };
+        let leaf = node("leaf", "192.0.2.10", Some("via"));
+        let via = node("via", "192.0.2.20", None);
+        let mut manager = isolated_pool_manager(vec![via.clone()]).await;
+        let provider: ThreadSafeProxyProvider = Arc::new(RwLock::new(
+            PlainProvider::new(
+                "remote".into(),
+                vec![leaf.clone()],
+                HealthCheck::new(
+                    vec![],
+                    "http://example.invalid/health".into(),
+                    0,
+                    true,
+                    manager.proxy_manager.clone(),
+                ),
+            )
+            .unwrap(),
+        ));
+        manager.proxy_providers.insert("remote".into(), provider);
+        let manager = Arc::new(manager);
+        let registry = manager.registry.clone();
+        let status = Arc::new(RwLock::new(NetworkStatus::default()));
+        status.write().await.observed(&NetworkSnapshot::default());
+        let observed = StrictProviderObservation::capture_manager(&status, &manager)
+            .await
+            .unwrap();
+        let guard = StrictDnsManagerLeafGuard::bind(
+            observed,
+            &manager,
+            &status,
+            &registry,
+            "remote",
+            leaf.clone(),
+        )
+        .await
+        .unwrap();
+        guard.ensure_current(&leaf).await.unwrap();
+
+        registry
+            .write()
+            .await
+            .insert("via".into(), node("via", "192.0.2.20", None));
+        let err = guard.ensure_current(&leaf).await.unwrap_err().to_string();
+        assert!(err.contains("dependency 'via' identity changed"), "{err}");
+    }
+
     #[tokio::test]
     async fn s04bh_observation_uses_real_outbound_manager_and_rejects_foreign_registry()
      {

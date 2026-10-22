@@ -11,7 +11,11 @@ use std::{
 
 use crate::{
     app::{
-        dns::execution::DnsStrictAttemptGuard, outbound::manager::OutboundManager,
+        dns::{
+            bootstrap_dialer::StrictDnsConnectorChain,
+            execution::DnsStrictAttemptGuard,
+        },
+        outbound::manager::OutboundManager,
         remote_content_manager::providers::proxy_provider::ThreadSafeProxyProvider,
     },
     proxy::{
@@ -94,6 +98,7 @@ pub(crate) struct StrictDnsManagerLeafGuard {
     registry: OutboundHandlerRegistry,
     provider: String,
     selected: AnyOutboundHandler,
+    connector: StrictDnsConnectorChain,
 }
 
 impl StrictDnsManagerLeafGuard {
@@ -105,8 +110,11 @@ impl StrictDnsManagerLeafGuard {
         provider: &str,
         selected: AnyOutboundHandler,
     ) -> io::Result<Self> {
+        let connector =
+            StrictDnsConnectorChain::capture(manager, registry, &selected).await?;
         let guard = Self {
             observed,
+            connector,
             manager: manager.clone(),
             status: status.clone(),
             registry: registry.clone(),
@@ -134,8 +142,14 @@ impl DnsStrictAttemptGuard for StrictDnsManagerLeafGuard {
         self.observed
             .ensure_current_manager(&self.status, &self.manager)
             .await?;
+        self.connector
+            .ensure_current(&self.manager, &self.registry, &self.selected)
+            .await?;
         self.observed
             .require_selected(&self.status, &self.provider, &self.selected)
+            .await?;
+        self.connector
+            .ensure_current(&self.manager, &self.registry, &self.selected)
             .await?;
         self.observed
             .ensure_current_manager(&self.status, &self.manager)

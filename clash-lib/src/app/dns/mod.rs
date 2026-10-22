@@ -9,6 +9,8 @@ use std::sync::Arc;
 use mockall::automock;
 
 pub(crate) mod bootstrap;
+#[allow(dead_code)]
+pub(crate) mod bootstrap_dialer;
 pub(crate) mod bootstrap_topology;
 // This preparatory observation API has no production consumer while
 // policy-rules remain gated and provider provenance is unauthenticated.
