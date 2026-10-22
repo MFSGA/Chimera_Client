@@ -93,6 +93,12 @@ cargo test -p clash-lib --test dns_config_tests --locked
 - `s04bk_` 离线回归：正在执行假 DNS I/O 时启动同名 hop 的 A→B→A writer，验证写者被阻塞；独立地更改网络代际后，DNS 旧应答失败关闭，租约释放后 writer 才完成。另覆盖开始租约前 hop 已被同名替换时必须拒绝。仅触及内部 `bootstrap_dialer.rs`、`bootstrap_provider.rs` 和测试，原有生产代理流量/业务 registry 使用方式不变。
 - **关键限制：** 只读租约阻塞真实 registry 的写者直至内部请求结束（包括失败和超时）；会产生潜在写锁延迟，不可未经性能、取消与死锁审查接入生产。它**不是全局单调 registry revision**，对捕获快照之前发生且已恢复的 A→B→A、Provider 内部自身变化、Connector 构造时持有的私有 handler、socket 打开期间的系统级流量副作用，均不能单凭这个锁给出证明。真实 socket path generation / Connector 内部逐跳事务验证及经过认证的 Provider/pin 来源仍未完成；`policy-rules` 生产 gate 继续关闭，不能视为用户可用功能。
 
+## S04b-l：租约超时/取消释放与 socket 路径规划代际一致性（仅内部）
+
+- `StrictDnsManagerLeafGuard::exchange_with_leased_connector` 新增**整个内部操作 11 秒总时限**（含等待实际 registry 读租约、每次上游请求及其前后身份校验）；超时取消作用域中的 future，利用 owned 读租约的 RAII `Drop` 释放锁，避免由于不可达或停滞的上游长期阻塞 registry 写者。`exchange_with_lease_budget` 仅作为共享实现和定向测试的小预算入口；生产尚无调用方。主动取消该 future 也会释放同一租约，未继续重试或返回旧应答。
+- 新增 `OutboundManager::strict_dns_path_generation`，从实际 Manager 的 `NetworkPathSource::snapshot` 核对**所绑定的 SharedNetworkStatus Arc 与严格 DNS 所见为同一运行时**，且 socket **路径规划网络代际** 与当前严格 DNS 观察的 network generation 一致。租约内每次网络 I/O 前后都会复核；缺失 path 观察、已换绑 RuntimeStatus 或代际不符均失败关闭。`s04bl_` 四项离线测试覆盖请求进行中的超时释放、任务 abort 释放、尚未拿到读租约时超时（不得触发网络或遗留等待者），以及切换 socket path source 后的拨号前拒绝。旧 `s04bk_` 同时验证共享真实观测对象时在途网络切换仍拒绝。
+- **边界：** 这是**路径规划代际的身份复核**，不是网络 socket 返回的已验证 `NetworkPathId` 或 NIC/源地址证明，也不持有操作系统网络路由锁。检查后到实际打开 socket 之间的网络变化、Connector 私有连接池、当前读租约的写入延迟和性能风险仍有待真实数据面、抓包及取消压测确认；不能凭此开放动态 Provider / 真实严格 DNS 运行入口。可信 pin 来源、完整递归拨号/缓存隔离、L2 独立审查与维护者批准均未完成。**生产 `policy-rules` gate 仍保持关闭。**
+
 ## S04b/S04c 待完成的严格准入
 
 1. **真实执行接线与身份来源**：S04b-a 提供共享 RuntimeStatus 读取接口，但**尚未由生产 DNS runtime 自动接入或订阅**；需有可信的 bootstrap pin revision/变更事件来源，而不是由未受验证的调用者提供任意数值。仍需真实数据面验证动态代理在查询中途切换时的失效与回滚；旧 legacy 路径继续完全独立。

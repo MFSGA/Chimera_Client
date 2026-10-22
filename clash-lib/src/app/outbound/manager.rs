@@ -685,6 +685,43 @@ impl OutboundManager {
         self.proxy_providers.clone()
     }
 
+    /// S04b-l: prove that this manager's *socket path planning* source
+    /// observes the same RuntimeStatus and generation as the strict DNS
+    /// transaction. This is not a claim about the path that a socket won;
+    /// actual dial-time path attestation remains a separate prerequisite.
+    pub(crate) async fn strict_dns_path_generation(
+        &self,
+        status: &crate::proxy::utils::SharedNetworkStatus,
+    ) -> io::Result<u64> {
+        let (path_generation, _, _, attached, _) =
+            self.network_path_source.snapshot().await.ok_or_else(|| {
+                io::Error::other(
+                    "strict DNS manager has no observed socket path source",
+                )
+            })?;
+        if !Arc::ptr_eq(&attached, status) {
+            return Err(io::Error::other(
+                "strict DNS socket path belongs to a different runtime",
+            ));
+        }
+        let observed =
+            status
+                .read()
+                .await
+                .strict_dns_generations()
+                .ok_or_else(|| {
+                    io::Error::other(
+                        "strict DNS socket path has no current network observation",
+                    )
+                })?;
+        if observed.0 != path_generation {
+            return Err(io::Error::other(
+                "strict DNS socket path generation differs from DNS observation",
+            ));
+        }
+        Ok(path_generation)
+    }
+
     /// S04b-h read-only identity check: strict DNS preflight must not prepare
     /// a leaf using a registry unrelated to the observed outbound manager.
     pub(crate) fn owns_outbound_registry(
@@ -2094,6 +2131,268 @@ ip: not-an-ip
         }
     }
 
+    /// The transport is deliberately inert: cancellation/timeout exercises
+    /// lease ownership without opening sockets or mutating answer caches.
+    async fn s04bl_fixture() -> (
+        Arc<OutboundManager>,
+        crate::proxy::utils::SharedNetworkStatus,
+        crate::app::dns::bootstrap_provider::StrictDnsManagerLeafGuard,
+        crate::app::dns::execution::StrictDnsExecution,
+        hickory_proto::op::Message,
+    ) {
+        use crate::app::{
+            dns::{
+                bootstrap_provider::{
+                    StrictDnsManagerLeafGuard, StrictProviderObservation,
+                },
+                execution::StrictDnsExecution,
+                policy::DnsEgress,
+            },
+            remote_content_manager::{
+                healthcheck::HealthCheck,
+                providers::proxy_provider::{
+                    ThreadSafeProxyProvider, plain_provider::PlainProvider,
+                },
+            },
+        };
+        use hickory_proto::{
+            op::{Message, MessageType, OpCode, Query},
+            rr::{Name, RecordType},
+        };
+        use tokio::sync::RwLock;
+
+        let leaf: AnyOutboundHandler = Arc::new(StrictConnectorTestNode {
+            name: "leaf",
+            host: "192.0.2.10",
+            via: Some("via"),
+            proto: OutboundType::Socks5,
+        });
+        let hop: AnyOutboundHandler = Arc::new(StrictConnectorTestNode {
+            name: "via",
+            host: "192.0.2.20",
+            via: None,
+            proto: OutboundType::Socks5,
+        });
+        let mut manager = isolated_pool_manager(vec![hop]).await;
+        let provider: ThreadSafeProxyProvider = Arc::new(RwLock::new(
+            PlainProvider::new(
+                "remote".into(),
+                vec![leaf.clone()],
+                HealthCheck::new(
+                    vec![],
+                    "http://example.invalid/health".into(),
+                    0,
+                    true,
+                    manager.proxy_manager.clone(),
+                ),
+            )
+            .unwrap(),
+        ));
+        manager.proxy_providers.insert("remote".into(), provider);
+        let manager = Arc::new(manager);
+        let status = Arc::new(RwLock::new(NetworkStatus::default()));
+        {
+            let mut state = status.write().await;
+            state.set_automatic_supported_for_test(true);
+            state.observed(&NetworkSnapshot::default());
+        }
+        manager.attach_network_status(status.clone()).await;
+        let observed = StrictProviderObservation::capture_manager(&status, &manager)
+            .await
+            .unwrap();
+        let guard = StrictDnsManagerLeafGuard::bind(
+            observed,
+            &manager,
+            &status,
+            &manager.registry,
+            "remote",
+            leaf.clone(),
+        )
+        .await
+        .unwrap();
+        let execution = StrictDnsExecution {
+            ordinal: 0,
+            egress: DnsEgress::Proxy("DNS-OUT".into()),
+            profile: "trusted".into(),
+            servers: crate::app::dns::Config::parse_nameserver(&[
+                "udp://192.0.2.53".into(),
+                "udp://192.0.2.54".into(),
+            ])
+            .unwrap(),
+            outbound: leaf,
+        };
+        let mut query = Message::new(45, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(
+            Name::from_ascii("www.example.com.").unwrap(),
+            RecordType::A,
+        ));
+        (manager, status, guard, execution, query)
+    }
+
+    #[tokio::test]
+    async fn s04bl_leased_exchange_timeout_releases_writer() {
+        use std::time::Duration;
+        let (manager, _, guard, execution, query) = s04bl_fixture().await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (_release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let wire = S04bkPausedTransport {
+            entered: std::sync::Mutex::new(Some(entered_tx)),
+            release: tokio::sync::Mutex::new(Some(release_rx)),
+        };
+        let job = tokio::spawn(async move {
+            guard
+                .exchange_with_lease_budget(
+                    &execution,
+                    &wire,
+                    &query,
+                    Duration::from_millis(200),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let registry = manager.registry.clone();
+        let mut writer = tokio::spawn(async move {
+            registry.write().await.insert(
+                "via".into(),
+                Arc::new(StrictConnectorTestNode {
+                    name: "via",
+                    host: "192.0.2.21",
+                    via: None,
+                    proto: OutboundType::Socks5,
+                }) as AnyOutboundHandler,
+            );
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), &mut writer)
+                .await
+                .is_err(),
+            "registry writer must block during DNS I/O"
+        );
+        let error = tokio::time::timeout(Duration::from_secs(3), job)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        tokio::time::timeout(Duration::from_secs(3), writer)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn s04bl_aborting_leased_exchange_releases_writer() {
+        use std::time::Duration;
+        let (manager, _, guard, execution, query) = s04bl_fixture().await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (_release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let wire = S04bkPausedTransport {
+            entered: std::sync::Mutex::new(Some(entered_tx)),
+            release: tokio::sync::Mutex::new(Some(release_rx)),
+        };
+        let job = tokio::spawn(async move {
+            guard
+                .exchange_with_leased_connector(&execution, &wire, &query)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let registry = manager.registry.clone();
+        let mut writer = tokio::spawn(async move {
+            registry.write().await.clear();
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), &mut writer)
+                .await
+                .is_err(),
+            "writer must await active lease"
+        );
+        job.abort();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), job)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+        tokio::time::timeout(Duration::from_secs(3), writer)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn s04bl_waiting_for_registry_lease_times_out_without_leaking_waiter() {
+        use std::time::Duration;
+        let (manager, _, guard, execution, query) = s04bl_fixture().await;
+        let writer_lease = manager.registry.write().await;
+        let (entered_tx, mut entered_rx) = tokio::sync::oneshot::channel();
+        let (_release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let wire = S04bkPausedTransport {
+            entered: std::sync::Mutex::new(Some(entered_tx)),
+            release: tokio::sync::Mutex::new(Some(release_rx)),
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            guard.exchange_with_lease_budget(
+                &execution,
+                &wire,
+                &query,
+                Duration::from_millis(60),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(
+            entered_rx.try_recv().is_err(),
+            "no transport call before lease"
+        );
+        drop(writer_lease);
+        // An abandoned read waiter must not lock out a subsequent write.
+        let new_writer =
+            tokio::time::timeout(Duration::from_secs(3), manager.registry.write())
+                .await
+                .unwrap();
+        drop(new_writer);
+    }
+
+    #[tokio::test]
+    async fn s04bl_socket_path_generation_rejects_foreign_or_detached_runtime() {
+        use tokio::sync::RwLock;
+        let (manager, status, guard, execution, query) = s04bl_fixture().await;
+        assert!(manager.strict_dns_path_generation(&status).await.is_ok());
+        let other = Arc::new(RwLock::new(NetworkStatus::default()));
+        other.write().await.observed(&NetworkSnapshot::default());
+        let error = manager
+            .strict_dns_path_generation(&other)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("different runtime"), "{error}");
+
+        // Simulate a manager whose socket path source was swapped after
+        // successful bind. Guard must reject before it enters any transport.
+        manager.attach_network_status(other).await;
+        let (entered_tx, _entered_rx) = tokio::sync::oneshot::channel();
+        let (_release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let wire = S04bkPausedTransport {
+            entered: std::sync::Mutex::new(Some(entered_tx)),
+            release: tokio::sync::Mutex::new(Some(release_rx)),
+        };
+        let error = guard
+            .exchange_with_leased_connector(&execution, &wire, &query)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("different runtime"), "{error}");
+    }
+
     #[tokio::test]
     async fn s04bk_registry_lease_blocks_inflight_aba_and_network_change_still_fails()
      {
@@ -2152,7 +2451,12 @@ ip: not-an-ip
         let manager = Arc::new(manager);
         let registry = manager.registry.clone();
         let status = Arc::new(RwLock::new(NetworkStatus::default()));
-        status.write().await.observed(&NetworkSnapshot::default());
+        {
+            let mut state = status.write().await;
+            state.set_automatic_supported_for_test(true);
+            state.observed(&NetworkSnapshot::default());
+        }
+        manager.attach_network_status(status.clone()).await;
         let observed = StrictProviderObservation::capture_manager(&status, &manager)
             .await
             .unwrap();

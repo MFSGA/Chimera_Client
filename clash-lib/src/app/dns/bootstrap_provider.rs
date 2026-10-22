@@ -128,17 +128,51 @@ impl StrictDnsManagerLeafGuard {
         transport: &T,
         request: &Message,
     ) -> io::Result<Message> {
-        let lease = self
-            .connector
-            .lease_for_exchange(&self.manager, &self.registry, &execution.outbound)
-            .await?;
-        self.ensure_current_leased(&execution.outbound, &lease)
-            .await?;
-        let check = LeasedStrictAttempt {
-            owner: self,
-            lease: &lease,
-        };
-        execution.exchange_guarded(transport, request, &check).await
+        self.exchange_with_lease_budget(
+            execution,
+            transport,
+            request,
+            std::time::Duration::from_secs(11),
+        )
+        .await
+    }
+
+    /// The budget is also passed by deterministic failure tests; production
+    /// callers use the fixed upper bound above, not a user-configurable value.
+    pub(crate) async fn exchange_with_lease_budget<T: DnsStrictTransport>(
+        &self,
+        execution: &StrictDnsExecution,
+        transport: &T,
+        request: &Message,
+        budget: std::time::Duration,
+    ) -> io::Result<Message> {
+        // Include waiting for the registry lease and all pre/post guards in
+        // a hard overall budget. Cancellation of this future drops the owned
+        // read guard, so a queued writer cannot be blocked indefinitely.
+        tokio::time::timeout(budget, async {
+            let lease = self
+                .connector
+                .lease_for_exchange(
+                    &self.manager,
+                    &self.registry,
+                    &execution.outbound,
+                )
+                .await?;
+            self.ensure_current_leased(&execution.outbound, &lease)
+                .await?;
+            let check = LeasedStrictAttempt {
+                owner: self,
+                lease: &lease,
+            };
+            execution.exchange_guarded(transport, request, &check).await
+        })
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "strict DNS leased connector exchange exceeded total budget",
+            )
+        })?
     }
 
     async fn ensure_current_leased(
@@ -158,6 +192,9 @@ impl StrictDnsManagerLeafGuard {
         }
         self.observed
             .ensure_current_manager(&self.status, &self.manager)
+            .await?;
+        self.manager
+            .strict_dns_path_generation(&self.status)
             .await?;
         self.connector.ensure_leased(lease, outbound)?;
         self.observed
