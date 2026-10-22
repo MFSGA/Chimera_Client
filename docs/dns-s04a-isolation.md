@@ -137,6 +137,13 @@ cargo test -p clash-lib --test dns_config_tests --locked
 - 新增 `s04br_` 四项离线测试：刻意在异步成功分支内触发取消，验证最后交付检查拒绝并 `Drop` 成功结果；未取消时成功/错误原样传递；gRPC、XHTTP 各自把池借用者停在恢复读锁前，模拟并发 reset，验证旧令牌取消后借用失败，池重置完成并提供未取消的新令牌。仍使用各自已有 recovery_gate 与 pool reset 机制，无需改变实际网络连接方式。
 - **范围限制：** 检查保证的是软件层面交付边界，不能撤销已发出的 HTTP/2/HTTP/3 请求、已建立的底层 TCP/QUIC socket，也不能原子证明最终 NIC/源地址；`tokio::select!` 取消/任务释放与活跃计数仍需大负载下的真实数据面观测。不得据此放开动态 Provider 或生产严格 DNS。可信 Provider/bootstrap pin 来源、完整多跳拨号、真实出口抓包以及独立 L2 审查与维护者批准依然待完成。生产 `policy-rules` gate 保持关闭。
 
+## S04b-s：gRPC/XHTTP 活跃流计数与异步取消释放（内部连接池）
+
+- gRPC 以前仅在 downlink 后台任务完成时减少 `ReusableGrpc.active`；若应用已丢弃逻辑流但服务端一直不返回，计数可能长期占用。新 `GrpcActiveStream` 将活跃名额绑定到**调用者实际持有的逻辑流生命周期**，`Drop` 恰好递减一次，并触发 cancellation token 使 uplink/downlink 后台任务主动退出；不再把递减责任交给可能无限等待的下行任务。gRPC 请求构造失败的分支继续自行归还名额，外层复用错误分支不再重复递减，避免 `AtomicU64` 下溢。注意 Drop 只取消软件任务，不能收回已经发往网络的请求。
+- 新增 `PoolActiveReservation` 作用域守卫：XHTTP H2/H3 复用路径在异步构建逻辑流前就已增加活跃计数，若任务在 `await` 期间被 reset/abort，普通的 `Err` 分支不会执行。现在守卫在取消、失败与 future Drop 时自动回退计数；只有成功封装为既有 `ReuseLeaseStream` 后才转交名额所有权。覆盖 XHTTP H2 `try_reuse_stream_with_pool_metadata` 与 H3 `try_reuse_h3_stream`；H3 上传/下载自建连接分支的全部取消所有权仍需后续单独审查。
+- `s04bs_` 离线测试覆盖 64 次异步取消时守卫不泄漏计数、gRPC 服务端不回应时丢弃应用流并重复复用、gRPC 非法请求与多次失败复用不发生双减、XHTTP H2 在复用请求已发出且服务端挂起期间取消任务并释放预留名额。保留原有 `s04br_` 网络重置时交付拒绝机制，原有生产 `policy-rules` gate 不变。
+- **仍未完成：** gRPC/XHTTP 真正网络连接后台任务与计数的持续高负载压力测试、XHTTP H3 自建 QUIC 链及上传/下载双端全生命周期、系统级物理出口证明、可信 Provider/bootstrap pin、完整 dialer 递归保护、独立 L2 审查与维护者批准。以上不能视作生产严格 DNS 已可开放。
+
 ## S04b/S04c 待完成的严格准入
 
 1. **真实执行接线与身份来源**：S04b-a 提供共享 RuntimeStatus 读取接口，但**尚未由生产 DNS runtime 自动接入或订阅**；需有可信的 bootstrap pin revision/变更事件来源，而不是由未受验证的调用者提供任意数值。仍需真实数据面验证动态代理在查询中途切换时的失效与回滚；旧 legacy 路径继续完全独立。

@@ -51,6 +51,32 @@ pub struct VisionOptions {
 #[allow(unused_imports)]
 pub use v2ray::{V2RayOBFSOption, V2rayWsClient};
 
+/// RAII reservation for pooled logical-stream capacity while an awaited
+/// HTTP/2 or HTTP/3 request is being created. A task cancellation must undo
+/// the increment even if the explicit Err branch is never executed.
+pub(super) struct PoolActiveReservation(
+    Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+);
+
+impl PoolActiveReservation {
+    pub(super) fn new(active: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
+        Self(Some(active))
+    }
+
+    /// Ownership moves to the returned stream's Drop lease.
+    pub(super) fn transfer(mut self) {
+        self.0.take();
+    }
+}
+
+impl Drop for PoolActiveReservation {
+    fn drop(&mut self) {
+        if let Some(active) = self.0.take() {
+            active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+}
+
 /// S04b-r: a pool reset can cancel an operation just as its async
 /// construction becomes ready. Recheck after the biased select, before the
 /// resulting logical stream crosses the caller boundary. Dropping a successful
@@ -107,6 +133,43 @@ mod s04br_tests {
             .expect("cancelled stream must not be delivered");
         assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
         assert!(discarded.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn s04bs_pool_reservation_released_under_repeated_abort() {
+        use std::sync::atomic::AtomicU64;
+        use tokio::time::{Duration, timeout};
+        let active = Arc::new(AtomicU64::new(0));
+        for _ in 0..64 {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let count = active.clone();
+            let task = tokio::spawn(async move {
+                count.fetch_add(1, Ordering::AcqRel);
+                let _reservation = super::PoolActiveReservation::new(count);
+                entered_tx.send(()).unwrap();
+                std::future::pending::<()>().await;
+            });
+            timeout(Duration::from_secs(2), entered_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            task.abort();
+            assert!(
+                timeout(Duration::from_secs(2), task)
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .is_cancelled()
+            );
+            assert_eq!(active.load(Ordering::Acquire), 0);
+        }
+
+        active.fetch_add(1, Ordering::AcqRel);
+        let lease = super::PoolActiveReservation::new(active.clone());
+        lease.transfer();
+        assert_eq!(active.load(Ordering::Acquire), 1);
+        active.fetch_sub(1, Ordering::AcqRel); // returned stream's Drop
+        assert_eq!(active.load(Ordering::Acquire), 0);
     }
 
     #[test]

@@ -1865,17 +1865,22 @@ async fn try_reuse_h3_stream(
     else {
         return Ok(None);
     };
+    let reservation = super::PoolActiveReservation::new(active.clone());
     match open_h3_logical_stream(client, sender, None, Some(request_count)).await {
-        Ok(stream) => Ok(Some((
-            leased_stream(stream, active),
-            NetworkPoolContext {
-                network_generation,
-                path_id,
-                ..pool_context
-            },
-        ))),
+        Ok(stream) => {
+            let stream = leased_stream(stream, active);
+            reservation.transfer();
+            Ok(Some((
+                stream,
+                NetworkPoolContext {
+                    network_generation,
+                    path_id,
+                    ..pool_context
+                },
+            )))
+        }
         Err(err) => {
-            active.fetch_sub(1, Ordering::AcqRel);
+            // Reservation releases the counter, including on cancellation.
             client.h3_reuse_pool.lock().await.clear();
             Err(err)
         }
@@ -2237,6 +2242,7 @@ impl Transport for Client {
                     return Ok(None);
                 };
 
+                let reservation = super::PoolActiveReservation::new(active.clone());
                 match open_xhttp_logical_stream(
                     self,
                     sender,
@@ -2246,15 +2252,14 @@ impl Transport for Client {
                 .await
                 {
                     Ok(stream) => {
+                        let stream = leased_stream(stream, active);
+                        reservation.transfer();
                         let mut connected_context = pool_context;
                         connected_context.network_generation = stored_generation;
                         connected_context.path_id = path_id;
-                        Ok(Some((leased_stream(stream, active), connected_context)))
+                        Ok(Some((stream, connected_context)))
                     }
-                    Err(err) => {
-                        active.fetch_sub(1, Ordering::AcqRel);
-                        Err(err)
-                    }
+                    Err(err) => Err(err)
                 }
             } => result,
         };
@@ -4195,6 +4200,89 @@ mod tests {
                 .expect("third reuse lookup should succeed")
                 .is_none(),
             "c-max-reuse-times=1 must retire the connection after one reuse"
+        );
+    }
+
+    #[tokio::test]
+    async fn s04bs_xhttp_aborted_h2_reuse_releases_active_capacity() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicU64::new(0));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered = Arc::new(std::sync::Mutex::new(Some(entered_tx)));
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let service = hyper::service::service_fn(move |request| {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                let entered = entered.clone();
+                async move {
+                    if n == 0 {
+                        handle_stream_one(request).await
+                    } else {
+                        if let Some(tx) = entered.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                        // Hold the HTTP response open after the client has
+                        // already reserved an active pooled stream slot.
+                        std::future::pending::<
+                            Result<Response<BoxBody<Bytes, Infallible>>, Infallible>,
+                        >()
+                        .await
+                    }
+                }
+            });
+            let _ = auto::Builder::new(TokioExecutor::new())
+                .http2_only()
+                .serve_connection(TokioIo::new(tcp), service)
+                .await;
+        });
+        let client = Arc::new(
+            Client::new(
+                "127.0.0.1".into(),
+                addr.port(),
+                "/xhttp/".into(),
+                None,
+                HashMap::new(),
+                false,
+                XhttpMode::StreamOne,
+                1_000_000,
+                false,
+                None,
+                None,
+            )
+            .with_reuse_policy(Some(XhttpReusePolicy {
+                max_concurrency: Some(XhttpReuseValueRange { min: 2, max: 2 }),
+                max_connections: None,
+                c_max_reuse_times: Some(XhttpReuseValueRange { min: 0, max: 0 }),
+                h_max_request_times: Some(XhttpReuseValueRange { min: 0, max: 0 }),
+                h_max_reusable_secs: Some(XhttpReuseValueRange { min: 0, max: 0 }),
+                h_keep_alive_period: 0,
+            })),
+        );
+        let raw = TcpStream::connect(addr).await.unwrap();
+        let first = client.proxy_stream(Box::new(raw)).await.unwrap();
+        drop(first);
+        let active = client.reuse_pool.lock().await[0].active.clone();
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        let borrower = client.clone();
+        let task = tokio::spawn(async move { borrower.try_reuse_stream().await });
+        timeout(Duration::from_secs(2), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.load(Ordering::Acquire), 1);
+        task.abort();
+        let cancelled = timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .err()
+            .expect("aborted pool borrow must not return a logical stream");
+        assert!(cancelled.is_cancelled());
+        assert_eq!(
+            active.load(Ordering::Acquire),
+            0,
+            "cancelled HTTP/2 stream construction must release reserved capacity"
         );
     }
 

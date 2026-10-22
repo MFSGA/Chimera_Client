@@ -1,10 +1,12 @@
 use std::{
     convert::Infallible,
     fmt, io,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -16,7 +18,7 @@ use hyper::body::{Frame, Incoming};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use prost::encoding::{decode_varint, encode_varint};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     sync::{Mutex, mpsc},
 };
 use tokio_stream::wrappers::ReceiverStream;
@@ -35,6 +37,56 @@ const DEFAULT_GRPC_USER_AGENT: &str = "tonic/0.10";
 
 type H2SendRequest =
     hyper::client::conn::http2::SendRequest<BoxBody<Bytes, Infallible>>;
+
+/// The application-owned logical stream owns the active slot. A background
+/// downlink can wait indefinitely for a remote response after the app has
+/// dropped its stream, so the downlink task must never own that counter.
+struct GrpcActiveStream {
+    inner: AnyStream,
+    active: Arc<AtomicU64>,
+    cancelled: tokio_util::sync::CancellationToken,
+}
+
+impl AsyncRead for GrpcActiveStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for GrpcActiveStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut *self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_shutdown(cx)
+    }
+}
+
+impl Drop for GrpcActiveStream {
+    fn drop(&mut self) {
+        self.cancelled.cancel();
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 #[derive(Clone)]
 struct ReusableGrpc {
@@ -421,7 +473,13 @@ impl Client {
         let (mut transport_reader, mut transport_writer) =
             tokio::io::split(transport_stream);
 
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        let uplink_cancelled = cancelled.clone();
         tokio::spawn(async move {
+            let _ = tokio::select! {
+                biased;
+                _ = uplink_cancelled.cancelled() => Ok::<(), io::Error>(()),
+                result = async {
             let mut buf = vec![0; READ_CHUNK_SIZE];
             loop {
                 match transport_reader.read(&mut buf).await {
@@ -441,27 +499,37 @@ impl Client {
                     }
                 }
             }
+            Ok::<(), io::Error>(())
+                } => result,
+            };
         });
 
+        let downlink_cancelled = cancelled.clone();
         tokio::spawn(async move {
-            let result = async {
+            let result = tokio::select! {
+                biased;
+                _ = downlink_cancelled.cancelled() => Ok(()),
+                result = async {
                 let response =
                     sender.send_request(request).await.map_err(map_io_error)?;
                 validate_grpc_response(&response)?;
 
                 forward_grpc_response(response.into_body(), &mut transport_writer)
                     .await
-            }
-            .await;
+            } => result,
+            };
 
             if let Err(err) = result {
                 warn!("grpc downlink failed: {err}");
             }
             let _ = transport_writer.shutdown().await;
-            active.fetch_sub(1, Ordering::AcqRel);
         });
 
-        Ok(Box::new(app_stream))
+        Ok(Box::new(GrpcActiveStream {
+            inner: Box::new(app_stream),
+            active,
+            cancelled,
+        }))
     }
 }
 
@@ -562,10 +630,9 @@ impl Transport for Client {
                         connected_context.path_id = path_id;
                         Ok(Some((stream, connected_context)))
                     }
-                    Err(error) => {
-                        active.fetch_sub(1, Ordering::AcqRel);
-                        Err(error)
-                    }
+                    // open_logical_stream already releases the reservation
+                    // on a request-build failure; never decrement twice.
+                    Err(error) => Err(error)
                 }
             } => result,
         };
@@ -835,6 +902,80 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!client.recovery_cancellation.lock().await.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn s04bs_grpc_drop_releases_active_even_when_server_never_replies() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let service = service_fn(|_request: Request<Incoming>| async move {
+                std::future::pending::<Result<http::Response<Full<Bytes>>, Infallible>>()
+                    .await
+            });
+            let _ = auto::Builder::new(TokioExecutor::new())
+                .http2_only()
+                .serve_connection(TokioIo::new(tcp), service)
+                .await;
+        });
+        let client =
+            Client::new("grpc.example.com".into(), "/service".try_into().unwrap());
+        let raw = TcpStream::connect(addr).await.unwrap();
+        let stream = client.proxy_stream(Box::new(raw)).await.unwrap();
+        let active = client.pool.lock().await[0].active.clone();
+        assert_eq!(active.load(Ordering::Acquire), 1);
+        drop(stream);
+        assert_eq!(
+            active.load(Ordering::Acquire),
+            0,
+            "application stream Drop releases active slot even with stalled downlink"
+        );
+        for _ in 0..16 {
+            let stream = timeout(Duration::from_secs(2), client.try_reuse_stream())
+                .await
+                .unwrap()
+                .unwrap()
+                .expect("same H2 sender should remain reusable");
+            assert_eq!(active.load(Ordering::Acquire), 1);
+            drop(stream);
+            assert_eq!(active.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn s04bs_grpc_failed_request_never_double_decrements_capacity() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let service = service_fn(grpc_echo_handler);
+            let _ = auto::Builder::new(TokioExecutor::new())
+                .http2_only()
+                .serve_connection(TokioIo::new(tcp), service)
+                .await;
+        });
+        let client = Client::new(
+            "invalid host with spaces".into(),
+            "/service".try_into().unwrap(),
+        );
+        let raw = TcpStream::connect(addr).await.unwrap();
+        let error = client
+            .proxy_stream(Box::new(raw))
+            .await
+            .err()
+            .expect("malformed authority must fail request construction");
+        assert!(error.kind() != io::ErrorKind::TimedOut);
+        let active = client.pool.lock().await[0].active.clone();
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        for _ in 0..8 {
+            assert!(client.try_reuse_stream().await.is_err());
+            assert_eq!(
+                active.load(Ordering::Acquire),
+                0,
+                "each failed reuse must decrement exactly once, never underflow"
+            );
+        }
     }
 
     #[tokio::test]
