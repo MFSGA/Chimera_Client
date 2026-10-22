@@ -103,20 +103,19 @@ pub trait Transport: Send + Sync {
     }
 
     /// As above, with the local NIC paths used by transport-owned sockets.
-    /// The default can only report a path already present in the connector's
-    /// context; transports with their own path-aware pools should override it.
+    /// The default has NO physical-socket evidence. A pre-dial connector
+    /// context is routing intent, never proof of a transport-owned socket.
+    /// Path-aware transports must override and return completed connection IDs.
     async fn connect_stream_with_connector_and_path_ids(
         &self,
         sess: &crate::session::Session,
         resolver: crate::app::dns::ThreadSafeDNSResolver,
         connector: &dyn crate::proxy::utils::RemoteConnector,
     ) -> std::io::Result<Option<(super::AnyStream, Vec<NetworkPathId>)>> {
-        let pool_context =
-            connector.connection_pool_context(sess.iface.as_ref()).await;
         Ok(self
             .connect_stream_with_connector(sess, resolver, connector)
             .await?
-            .map(|stream| (stream, pool_context.path_id.into_iter().collect())))
+            .map(|stream| (stream, Vec::new())))
     }
 
     /// Return a logical stream from an already-owned underlying connection.

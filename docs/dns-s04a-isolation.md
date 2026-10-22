@@ -118,6 +118,13 @@ cargo test -p clash-lib --test dns_config_tests --locked
 - `s04bo_proxy_connector_context_uses_completed_tcp_udp_paths_only` 离线回归让真实 `ProxyConnector` 驱动模拟内层出站，分别测试 TCP/UDP 无连接证据与有不同于原计划的实际证据，确认两者都不会泄漏事前候选。`s04bo_udp_truncation_uses_final_tcp_socket_path_not_udp_path` 通过完整的 DNS UDP 截断应答和随后 Hickory TCP DNS 编解码、分别返回不同的连接路径 ID，验证最终应答仅绑定 TCP 连接路径，而非第一阶段 UDP 路径；不打开外网或更改系统路由。
 - **限制：** 这些是可离线复现的路径元数据来源/归属测试，并非真实 OS NIC/源 IP 抓包、套接字最终出口证明、动态代理递归拨号证明或并发复用压测。尚需真实 Connector/本地 UDP/TCP 与加密 DNS 池的网络切换压力测试、可信 bootstrap Provider/pin 来源及独立 L2 审查。**生产 `policy-rules` 继续禁用。**
 
+## S04b-p：连接池出借后的网络代际复核与默认连接器证据污染隔离
+
+- `NetworkPoolContext::permits` 增加路径 ID 内部 `network_generation` 与连接所声称代际的一致性要求；新增 `verify_reused_path`，对出借后的连接路径使用**当时重新读取**的可用候选集合及网络代际再次验证。VLESS `try_reuse_transport_stream` 在任何池化 transport 的 `try_reuse_stream_with_pool_metadata` 异步操作返回之后，立即重新询问实际 connector 的 `connection_pool_context`；代际切换、路径不一致、路径已不在可用集合或缺乏所需路径证据时返回 `Interrupted`，不向 DNS/上层交付旧逻辑流，也不偷偷转向其他出口。没有网络观察来源时，仍保留旧的 generation-only 兼容行为；这不是原子性的数据面网络路径承诺。
+- 收紧两个通用默认边界：未实现物理路径报告的 `RemoteConnector` 在默认 TCP/UDP `connect_*_with_pool_context` 中抹去 caller 传来的**规划 `path_id`**（代际记录用于已有兼容逻辑），防止上层把它当成拨号后证据；未覆盖 `Transport::connect_stream_with_connector_and_path_ids` 的自建连接传输返回空的物理路径 ID，而不是从连接器调用前的规划上下文复制一份。实现自己的路径证明的 XHTTP 等专用实现仍可覆盖此默认行为。严格 DNS 需要物理证据的接口遇到空集合仍然失败关闭，不开放 `policy-rules`。
+- 新增 4 项 `s04bp_` 离线测试：TCP/UDP VLESS 池化流异步取出期间 generation 从 7→8 时拒绝、未变化时允许；不一致的物理路径代际失败关闭；旧式未观测 Connector 的 TCP/UDP 默认方法拒绝规划路径冒充已完成连接；自建连接传输默认报告空 ID，不能从已规划路径生成假的物理证据。另验证既有 VLESS reuse 8 项、gRPC 13 项与 XHTTP 52 项全通过；当前 feature 下 Hysteria2 筛选未命中用例，不能视为完成 Hysteria2 压测。
+- **限制：** 重读网络上下文是在归还逻辑流之前进行的复核，不是 socket 建立与物理使用期间的不可中断锁或 OS 级出口证明；旧流建立过程的网络副作用不能撤销。gRPC/XHTTP/Hysteria2 等其他连接池的建立、重用、取消并发仍需独立压力测试，真实网卡/源 IP 抓包、可信 Provider/bootstrap pin、完整逐跳证明、独立 L2 审查和维护者批准仍未完成；生产 `policy-rules` 继续禁用。
+
 ## S04b/S04c 待完成的严格准入
 
 1. **真实执行接线与身份来源**：S04b-a 提供共享 RuntimeStatus 读取接口，但**尚未由生产 DNS runtime 自动接入或订阅**；需有可信的 bootstrap pin revision/变更事件来源，而不是由未受验证的调用者提供任意数值。仍需真实数据面验证动态代理在查询中途切换时的失效与回滚；旧 legacy 路径继续完全独立。

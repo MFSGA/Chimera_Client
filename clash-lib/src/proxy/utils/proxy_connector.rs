@@ -113,9 +113,29 @@ impl NetworkPoolContext {
         path_id: Option<&NetworkPathId>,
     ) -> bool {
         self.network_generation == network_generation
+            && path_id
+                .is_none_or(|id| Some(id.network_generation) == network_generation)
             && self.eligible_path_ids.as_ref().is_none_or(|eligible| {
                 path_id.is_some_and(|path_id| eligible.contains(path_id))
             })
+    }
+
+    /// A pooled stream may be selected with a previously observed path and
+    /// then delivered after an awaited handshake. Recheck its recorded socket
+    /// generation and eligibility at the point it crosses the caller boundary.
+    /// Missing path proof stays compatible with unobserved legacy connectors,
+    /// but never passes a connector that has an explicit eligible path set.
+    pub(crate) fn verify_reused_path(
+        &self,
+        connected: &Self,
+    ) -> std::io::Result<()> {
+        if !self.permits(connected.network_generation, connected.path_id.as_ref()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "network path changed while borrowing a pooled transport",
+            ));
+        }
+        Ok(())
     }
 
     /// Replace pre-dial planning identity with the *completed chain's*
@@ -513,7 +533,8 @@ pub trait RemoteConnector: Send + Sync + Debug {
     ) -> std::io::Result<AnyStream>;
 
     /// Establish a stream and return the path that actually won the dial.
-    /// The default keeps compatibility for connectors that cannot expose it.
+    /// Connectors that cannot expose physical socket IDs must not propagate
+    /// a caller-supplied *planned* path as evidence.
     async fn connect_stream_with_pool_context(
         &self,
         resolver: ThreadSafeDNSResolver,
@@ -521,7 +542,7 @@ pub trait RemoteConnector: Send + Sync + Debug {
         port: u16,
         iface: Option<&OutboundInterface>,
         #[cfg(target_os = "linux")] packet_mark: Option<u32>,
-        pool_context: NetworkPoolContext,
+        mut pool_context: NetworkPoolContext,
     ) -> std::io::Result<(AnyStream, NetworkPoolContext)> {
         let stream = self
             .connect_stream(
@@ -533,6 +554,7 @@ pub trait RemoteConnector: Send + Sync + Debug {
                 packet_mark,
             )
             .await?;
+        pool_context.path_id = None;
         Ok((stream, pool_context))
     }
 
@@ -545,9 +567,9 @@ pub trait RemoteConnector: Send + Sync + Debug {
         #[cfg(target_os = "linux")] packet_mark: Option<u32>,
     ) -> std::io::Result<AnyOutboundDatagram>;
 
-    /// Establish a datagram socket and return the network path that actually
-    /// backs it. Connectors that cannot observe physical paths retain the
-    /// supplied generation-only context.
+    /// Establish a datagram socket and return its physical path. Connectors
+    /// without path awareness may retain generation-only planning metadata,
+    /// but must clear caller-supplied planned path IDs.
     async fn connect_datagram_with_pool_context(
         &self,
         resolver: ThreadSafeDNSResolver,
@@ -555,7 +577,7 @@ pub trait RemoteConnector: Send + Sync + Debug {
         destination: SocksAddr,
         iface: Option<&OutboundInterface>,
         #[cfg(target_os = "linux")] packet_mark: Option<u32>,
-        pool_context: NetworkPoolContext,
+        mut pool_context: NetworkPoolContext,
     ) -> std::io::Result<(AnyOutboundDatagram, NetworkPoolContext)> {
         let datagram = self
             .connect_datagram(
@@ -567,6 +589,7 @@ pub trait RemoteConnector: Send + Sync + Debug {
                 packet_mark,
             )
             .await?;
+        pool_context.path_id = None;
         Ok((datagram, pool_context))
     }
 }
@@ -2177,6 +2200,106 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[derive(Debug)]
+    struct S04bpUnawareConnector;
+
+    #[async_trait::async_trait]
+    impl RemoteConnector for S04bpUnawareConnector {
+        async fn connect_stream(
+            &self,
+            _: crate::app::dns::ThreadSafeDNSResolver,
+            _: &str,
+            _: u16,
+            _: Option<&crate::app::net::OutboundInterface>,
+            #[cfg(target_os = "linux")] _: Option<u32>,
+        ) -> std::io::Result<crate::proxy::AnyStream> {
+            let (stream, _peer) = tokio::io::duplex(64);
+            Ok(Box::new(stream))
+        }
+
+        async fn connect_datagram(
+            &self,
+            resolver: crate::app::dns::ThreadSafeDNSResolver,
+            _: Option<SocketAddr>,
+            _: SocksAddr,
+            _: Option<&crate::app::net::OutboundInterface>,
+            #[cfg(target_os = "linux")] _: Option<u32>,
+        ) -> std::io::Result<AnyOutboundDatagram> {
+            let socket = UdpSocket::bind("127.0.0.1:0").await?;
+            Ok(Box::new(OutboundDatagramImpl::new(socket, resolver)))
+        }
+    }
+
+    #[tokio::test]
+    async fn s04bp_unaware_connector_never_relabels_a_planned_path_as_connected() {
+        let plan =
+            observed_path("planned0", 7, "192.0.2.10".parse().unwrap(), 31).id;
+        let candidate = NetworkPoolContext {
+            network_generation: Some(31),
+            path_id: Some(plan),
+            ..Default::default()
+        };
+        let connector = S04bpUnawareConnector;
+        let resolver = Arc::new(MockClashResolver::new());
+        let (_, tcp) = connector
+            .connect_stream_with_pool_context(
+                resolver.clone(),
+                "192.0.2.53",
+                53,
+                None,
+                #[cfg(target_os = "linux")]
+                None,
+                candidate.clone(),
+            )
+            .await
+            .unwrap();
+        let (_, udp) = connector
+            .connect_datagram_with_pool_context(
+                resolver,
+                None,
+                SocksAddr::Ip("192.0.2.53:53".parse().unwrap()),
+                None,
+                #[cfg(target_os = "linux")]
+                None,
+                candidate,
+            )
+            .await
+            .unwrap();
+        for context in [tcp, udp] {
+            assert!(
+                context.path_id.is_none(),
+                "default connectors must not forward planned path evidence"
+            );
+            assert_eq!(
+                context.network_generation,
+                Some(31),
+                "generation-only compatibility remains supported"
+            );
+        }
+    }
+
+    #[test]
+    fn s04bp_pool_eligibility_rejects_mismatched_reported_path_generation() {
+        let path =
+            observed_path("physical0", 9, "192.0.2.10".parse().unwrap(), 7).id;
+        let requested = NetworkPoolContext::for_generation(Some(8));
+        let connected = NetworkPoolContext {
+            network_generation: Some(8),
+            path_id: Some(path.clone()),
+            ..Default::default()
+        };
+        assert!(!requested.permits(Some(8), Some(&path)));
+        let err = requested.verify_reused_path(&connected).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+        let same = NetworkPoolContext::for_generation(Some(7));
+        let actual = NetworkPoolContext {
+            network_generation: Some(7),
+            path_id: Some(path),
+            ..Default::default()
+        };
+        same.verify_reused_path(&actual).unwrap();
     }
 
     #[test]

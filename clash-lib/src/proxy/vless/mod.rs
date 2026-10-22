@@ -142,6 +142,7 @@ impl Handler {
         sess: &Session,
         is_udp: bool,
         pool_context: &NetworkPoolContext,
+        connector: &dyn RemoteConnector,
     ) -> io::Result<Option<(AnyStream, Vec<crate::app::flow::NetworkPathId>)>> {
         if self.opts.flow.as_deref() == Some("xtls-rprx-vision") {
             return Ok(None);
@@ -157,6 +158,10 @@ impl Handler {
             return Ok(None);
         };
 
+        // The transport may await a pooled logical stream while the network
+        // changes. Never deliver a stale stream or fall back to another route.
+        let now = connector.connection_pool_context(sess.iface.as_ref()).await;
+        now.verify_reused_path(&connected_context)?;
         let path_ids = connected_context.path_id.clone().into_iter().collect();
         Ok(Some((
             self.wrap_vless_stream(
@@ -321,7 +326,7 @@ impl OutboundHandler for Handler {
         let pool_context =
             connector.connection_pool_context(sess.iface.as_ref()).await;
         if let Some((stream, path_ids)) = self
-            .try_reuse_transport_stream(sess, false, &pool_context)
+            .try_reuse_transport_stream(sess, false, &pool_context, connector)
             .await?
         {
             let chained =
@@ -370,7 +375,7 @@ impl OutboundHandler for Handler {
         let pool_context =
             connector.connection_pool_context(sess.iface.as_ref()).await;
         if let Some((stream, path_ids)) = self
-            .try_reuse_transport_stream(sess, true, &pool_context)
+            .try_reuse_transport_stream(sess, true, &pool_context, connector)
             .await?
         {
             let datagram =
@@ -566,6 +571,171 @@ mod reuse_tests {
         );
     }
 
+    #[derive(Debug)]
+    struct S04bpEpochConnector {
+        epoch: Arc<std::sync::atomic::AtomicU64>,
+        planned: Option<crate::app::flow::NetworkPathId>,
+    }
+
+    #[async_trait]
+    impl RemoteConnector for S04bpEpochConnector {
+        async fn network_generation(&self) -> Option<u64> {
+            Some(self.epoch.load(std::sync::atomic::Ordering::SeqCst))
+        }
+
+        async fn connection_pool_context(
+            &self,
+            _: Option<&crate::app::net::OutboundInterface>,
+        ) -> NetworkPoolContext {
+            NetworkPoolContext {
+                network_generation: self.network_generation().await,
+                path_id: self.planned.clone(),
+                ..Default::default()
+            }
+        }
+
+        async fn connect_stream(
+            &self,
+            _: ThreadSafeDNSResolver,
+            _: &str,
+            _: u16,
+            _: Option<&crate::app::net::OutboundInterface>,
+            #[cfg(target_os = "linux")] _: Option<u32>,
+        ) -> io::Result<AnyStream> {
+            panic!("stale pooled VLESS must not dial another path")
+        }
+
+        async fn connect_datagram(
+            &self,
+            _: ThreadSafeDNSResolver,
+            _: Option<std::net::SocketAddr>,
+            _: crate::session::SocksAddr,
+            _: Option<&crate::app::net::OutboundInterface>,
+            #[cfg(target_os = "linux")] _: Option<u32>,
+        ) -> io::Result<crate::proxy::AnyOutboundDatagram> {
+            panic!("stale pooled VLESS must not dial another path")
+        }
+    }
+
+    struct S04bpEpochReuse {
+        epoch: Arc<std::sync::atomic::AtomicU64>,
+        switch_epoch: bool,
+    }
+
+    #[async_trait]
+    impl Transport for S04bpEpochReuse {
+        async fn proxy_stream(&self, stream: AnyStream) -> io::Result<AnyStream> {
+            Ok(stream)
+        }
+
+        async fn try_reuse_stream_with_pool_metadata(
+            &self,
+            requested: NetworkPoolContext,
+        ) -> io::Result<Option<(AnyStream, NetworkPoolContext)>> {
+            let (stream, peer) = tokio::io::duplex(1024);
+            tokio::spawn(async move {
+                let _peer = peer;
+                std::future::pending::<()>().await;
+            });
+            if self.switch_epoch {
+                self.epoch.store(8, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(Some((Box::new(stream), requested)))
+        }
+    }
+
+    #[tokio::test]
+    async fn s04bp_vless_rechecks_pool_epoch_after_borrow_for_tcp_and_udp() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        for udp in [false, true] {
+            for switch_epoch in [false, true] {
+                let epoch = Arc::new(AtomicU64::new(7));
+                let connector = S04bpEpochConnector {
+                    epoch: epoch.clone(),
+                    planned: None,
+                };
+                let handler = Handler::new(HandlerOptions {
+                    name: "s04bp-epoch".into(),
+                    common_opts: HandlerCommonOptions::default(),
+                    server: "192.0.2.42".into(),
+                    port: 443,
+                    uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".into(),
+                    udp: true,
+                    transport: Some(Box::new(S04bpEpochReuse {
+                        epoch: epoch.clone(),
+                        switch_epoch,
+                    })),
+                    tls: None,
+                    flow: None,
+                    encryption: None,
+                });
+                let before = connector.connection_pool_context(None).await;
+                assert_eq!(before.network_generation, Some(7));
+                let outcome = handler
+                    .try_reuse_transport_stream(
+                        &Session::default(),
+                        udp,
+                        &before,
+                        &connector,
+                    )
+                    .await;
+                if switch_epoch {
+                    let err = outcome
+                        .err()
+                        .expect("stale pooled stream must not be delivered");
+                    assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+                    assert!(err.to_string().contains("network path changed"));
+                    assert_eq!(epoch.load(Ordering::SeqCst), 8);
+                } else {
+                    assert!(
+                        outcome.unwrap().is_some(),
+                        "unchanged epoch remains reusable"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn s04bp_transport_owned_socket_does_not_inherit_planned_path_ids() {
+        use crate::app::flow::{AddressFamily, InterfaceId, NetworkPathId};
+        use std::sync::atomic::AtomicU64;
+
+        let planned = NetworkPathId {
+            interface: InterfaceId {
+                name: "pre-dial0".into(),
+                index: 11,
+            },
+            family: AddressFamily::Ipv4,
+            source_address: Some("192.0.2.10".parse().unwrap()),
+            network_generation: 7,
+        };
+        let connector = S04bpEpochConnector {
+            epoch: Arc::new(AtomicU64::new(7)),
+            planned: Some(planned),
+        };
+        assert!(
+            connector
+                .connection_pool_context(None)
+                .await
+                .path_id
+                .is_some()
+        );
+        let result = OwnedDialTransport
+            .connect_stream_with_connector_and_path_ids(
+                &Session::default(),
+                Arc::new(MockClashResolver::new()),
+                &connector,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.1.is_empty(),
+            "transport-owned sockets must report their own NIC path, never a pre-dial plan"
+        );
+    }
+
     #[tokio::test]
     async fn vless_can_wrap_transport_reuse_stream_before_dialing() {
         let handler = Handler::new(HandlerOptions {
@@ -586,6 +756,7 @@ mod reuse_tests {
                 &Session::default(),
                 false,
                 &NetworkPoolContext::default(),
+                &DirectConnector::new(),
             )
             .await
             .expect("reuse lookup should succeed");
@@ -616,6 +787,7 @@ mod reuse_tests {
                 &Session::default(),
                 false,
                 &NetworkPoolContext::default(),
+                &DirectConnector::new(),
             )
             .await
             .expect("reuse lookup should succeed");
