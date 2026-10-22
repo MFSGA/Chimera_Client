@@ -2131,6 +2131,19 @@ ip: not-an-ip
         }
     }
 
+    fn s04bm_path(generation: u64) -> crate::app::flow::NetworkPathId {
+        use crate::app::flow::{AddressFamily, InterfaceId, NetworkPathId};
+        NetworkPathId {
+            interface: InterfaceId {
+                name: "fake-en0".into(),
+                index: 17,
+            },
+            family: AddressFamily::Ipv4,
+            source_address: Some("192.0.2.77".parse().unwrap()),
+            network_generation: generation,
+        }
+    }
+
     /// The transport is deliberately inert: cancellation/timeout exercises
     /// lease ownership without opening sockets or mutating answer caches.
     async fn s04bl_fixture() -> (
@@ -2193,8 +2206,27 @@ ip: not-an-ip
         let status = Arc::new(RwLock::new(NetworkStatus::default()));
         {
             let mut state = status.write().await;
+            use crate::app::{
+                flow::InterfaceKind,
+                network::{
+                    BindingStatus, DefaultRouteEvidence, PathCandidateObservation,
+                },
+            };
             state.set_automatic_supported_for_test(true);
-            state.observed(&NetworkSnapshot::default());
+            state.observed(&NetworkSnapshot {
+                path_candidates: vec![PathCandidateObservation {
+                    interface: s04bm_path(0).interface,
+                    interface_kind: InterfaceKind::Ethernet,
+                    family: crate::app::flow::AddressFamily::Ipv4,
+                    source_address: "192.0.2.77".parse().unwrap(),
+                    scope_id: None,
+                    gateway: Some("192.0.2.1".parse().unwrap()),
+                    default_route: DefaultRouteEvidence::PrimaryDefaultRoute,
+                    binding: BindingStatus::Verified,
+                    binding_error: None,
+                }],
+                ..NetworkSnapshot::default()
+            });
         }
         manager.attach_network_status(status.clone()).await;
         let observed = StrictProviderObservation::capture_manager(&status, &manager)
@@ -2227,6 +2259,182 @@ ip: not-an-ip
             RecordType::A,
         ));
         (manager, status, guard, execution, query)
+    }
+
+    struct S04bmEvidenceWire {
+        reported: Option<crate::app::flow::NetworkPathId>,
+        calls: Arc<AtomicUsize>,
+        flip_network: Option<crate::proxy::utils::SharedNetworkStatus>,
+    }
+
+    #[async_trait]
+    impl crate::app::dns::execution::DnsStrictTransport for S04bmEvidenceWire {
+        async fn exchange(
+            &self,
+            _: &crate::app::dns::config::NameServer,
+            _: AnyOutboundHandler,
+            _: &hickory_proto::op::Message,
+        ) -> io::Result<hickory_proto::op::Message> {
+            panic!(
+                "the ordinary DNS transport must never bypass the attested entrypoint"
+            )
+        }
+    }
+
+    #[async_trait]
+    impl crate::app::dns::bootstrap_socket::DnsStrictSocketPathTransport
+        for S04bmEvidenceWire
+    {
+        async fn exchange_with_socket_evidence(
+            &self,
+            _: &crate::app::dns::config::NameServer,
+            _: AnyOutboundHandler,
+            query: &hickory_proto::op::Message,
+        ) -> io::Result<(
+            hickory_proto::op::Message,
+            crate::app::dns::bootstrap_socket::StrictDnsSocketPathEvidence,
+        )> {
+            use crate::app::{
+                dispatcher::{BoxedChainedStream, ChainedStreamWrapper},
+                dns::bootstrap_socket::StrictDnsSocketPathEvidence,
+            };
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let (physical_stream, _other_end) = tokio::io::duplex(64);
+            // Production must derive these identities from the connector
+            // which opened this socket. This synthetic socket only tests
+            // the proof boundary, not OS routing or interface binding.
+            let stream: BoxedChainedStream =
+                Box::new(ChainedStreamWrapper::new_with_network_path_ids(
+                    physical_stream,
+                    self.reported.clone().into_iter().collect(),
+                ));
+            let evidence = StrictDnsSocketPathEvidence::from_stream(&stream)?;
+            if let Some(status) = &self.flip_network {
+                status.write().await.observed(&NetworkSnapshot {
+                    dns: "changed-in-flight".into(),
+                    ..NetworkSnapshot::default()
+                });
+            }
+            let mut answer = hickory_proto::op::Message::response(
+                query.metadata.id,
+                hickory_proto::op::OpCode::Query,
+            );
+            answer.add_queries(query.queries.iter().cloned());
+            Ok((answer, evidence))
+        }
+    }
+
+    #[tokio::test]
+    async fn s04bm_attested_socket_path_accepts_current_connector_report() {
+        let (manager, status, guard, execution, request) = s04bl_fixture().await;
+        let version = manager.strict_dns_path_generation(&status).await.unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let wire = S04bmEvidenceWire {
+            reported: Some(s04bm_path(version)),
+            calls: count.clone(),
+            flip_network: None,
+        };
+        let answer = guard
+            .exchange_with_socket_evidence(&execution, &wire, &request)
+            .await
+            .unwrap();
+        assert_eq!(answer.queries, request.queries);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn s04bm_missing_stale_or_wrong_socket_paths_abort_without_retry() {
+        for invalid in 0..4 {
+            let (manager, status, guard, execution, request) = s04bl_fixture().await;
+            let generation =
+                manager.strict_dns_path_generation(&status).await.unwrap();
+            let reported = match invalid {
+                0 => None,
+                1 => Some(s04bm_path(generation + 1)),
+                2 => {
+                    let mut other = s04bm_path(generation);
+                    other.interface.name = "other-nic".into();
+                    Some(other)
+                }
+                3 => {
+                    let mut other = s04bm_path(generation);
+                    other.source_address = Some("198.51.100.21".parse().unwrap());
+                    Some(other)
+                }
+                _ => unreachable!(),
+            };
+            let calls = Arc::new(AtomicUsize::new(0));
+            let wire = S04bmEvidenceWire {
+                reported,
+                calls: calls.clone(),
+                flip_network: None,
+            };
+            let error = guard
+                .exchange_with_socket_evidence(&execution, &wire, &request)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("strict DNS socket path"),
+                "case {invalid}: {error}",
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "no second upstream after unverified path"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn s04bm_inflight_network_switch_rejects_attested_answer_without_retry() {
+        let (manager, status, guard, execution, request) = s04bl_fixture().await;
+        let generation = manager.strict_dns_path_generation(&status).await.unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let wire = S04bmEvidenceWire {
+            reported: Some(s04bm_path(generation)),
+            calls: calls.clone(),
+            flip_network: Some(status),
+        };
+        let err = guard
+            .exchange_with_socket_evidence(&execution, &wire, &request)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("strict DNS"), "{err}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn s04bm_socket_evidence_rejects_unlabelled_or_invalid_streams() {
+        use crate::app::{
+            dispatcher::{BoxedChainedStream, ChainedStreamWrapper},
+            dns::bootstrap_socket::StrictDnsSocketPathEvidence,
+        };
+        let (raw, _) = tokio::io::duplex(64);
+        let unlabelled: BoxedChainedStream =
+            Box::new(ChainedStreamWrapper::new(raw));
+        assert!(
+            StrictDnsSocketPathEvidence::from_stream(&unlabelled)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("missing")
+        );
+
+        let (raw, _) = tokio::io::duplex(64);
+        let mut bad = s04bm_path(1);
+        bad.source_address = None;
+        let bad_stream: BoxedChainedStream = Box::new(
+            ChainedStreamWrapper::new_with_network_path_ids(raw, vec![bad]),
+        );
+        assert!(
+            StrictDnsSocketPathEvidence::from_stream(&bad_stream)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("invalid")
+        );
     }
 
     #[tokio::test]

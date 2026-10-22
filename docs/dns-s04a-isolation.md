@@ -99,6 +99,12 @@ cargo test -p clash-lib --test dns_config_tests --locked
 - 新增 `OutboundManager::strict_dns_path_generation`，从实际 Manager 的 `NetworkPathSource::snapshot` 核对**所绑定的 SharedNetworkStatus Arc 与严格 DNS 所见为同一运行时**，且 socket **路径规划网络代际** 与当前严格 DNS 观察的 network generation 一致。租约内每次网络 I/O 前后都会复核；缺失 path 观察、已换绑 RuntimeStatus 或代际不符均失败关闭。`s04bl_` 四项离线测试覆盖请求进行中的超时释放、任务 abort 释放、尚未拿到读租约时超时（不得触发网络或遗留等待者），以及切换 socket path source 后的拨号前拒绝。旧 `s04bk_` 同时验证共享真实观测对象时在途网络切换仍拒绝。
 - **边界：** 这是**路径规划代际的身份复核**，不是网络 socket 返回的已验证 `NetworkPathId` 或 NIC/源地址证明，也不持有操作系统网络路由锁。检查后到实际打开 socket 之间的网络变化、Connector 私有连接池、当前读租约的写入延迟和性能风险仍有待真实数据面、抓包及取消压测确认；不能凭此开放动态 Provider / 真实严格 DNS 运行入口。可信 pin 来源、完整递归拨号/缓存隔离、L2 独立审查与维护者批准均未完成。**生产 `policy-rules` gate 仍保持关闭。**
 
+## S04b-m：显式 socket 路径证据校验（内部非生产传输）
+
+- 新增 `app/dns/bootstrap_socket.rs`：`StrictDnsSocketPathEvidence` 仅由实际 `BoxedChainedStream` / `BoxedChainedDatagram` 提供的 `network_path_ids()` 捕获物理本地 socket 路径。空集合、过多路径、无效接口/源地址或重复项失败关闭；使用 `OutboundManager` 的相同 `NetworkPathSource`/`SharedNetworkStatus` 复核**当前网络代际**，并逐一比对被观察的 `BindingStatus::Verified` 本地接口、地址族与源 IP。既验证路径来源与请求所属的 Manager 一致，也拒绝不属于当前候选的“貌似有效”路径。此检查不验证代理的远端转发链，也不是操作系统内核的出口证明。
+- `DnsStrictSocketPathTransport` 是**显式 opt-in** 的内部传输能力，返回 DNS 应答及同一物理连接产生的证据。`StrictDnsManagerLeafGuard::exchange_with_socket_evidence` 复用前述 registry 租约、选中叶节点/Provider 版本、网络和配置代际 guard；适配器对任何传输或证据错误**终止本次严格查询**，不可转用第二个 DNS 上游或 legacy/DIRECT fallback。现有 `DnsStrictWireTransport` / `DnsStrictPinnedWireTransport` **没有**此能力，不能从路由规划或传入的服务器配置凭空生成 socket 路径信息。S04b-m 离线测试使用带路径 ID 的假 chained stream 验证正确报告、缺失、过期、接口或源地址不匹配及网络在途切换；测试中的假链路并不证明真实 OS socket 绑定。
+- **未完成：** 真正 DNS client/transport 尚未回传 TCP/UDP 的物理 socket 路径 ID，Connector 与 TLS/DoH 连接池的端到端身份证明、取消压力测试、真实数据面与抓包验证，以及可信 Provider/pin 来源与独立 L2 审查均未完成。生产 `policy-rules` gate 继续关闭；这一切片不得被用作放开生产严格 DNS 的理由。
+
 ## S04b/S04c 待完成的严格准入
 
 1. **真实执行接线与身份来源**：S04b-a 提供共享 RuntimeStatus 读取接口，但**尚未由生产 DNS runtime 自动接入或订阅**；需有可信的 bootstrap pin revision/变更事件来源，而不是由未受验证的调用者提供任意数值。仍需真实数据面验证动态代理在查询中途切换时的失效与回滚；旧 legacy 路径继续完全独立。

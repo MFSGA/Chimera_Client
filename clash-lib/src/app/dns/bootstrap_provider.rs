@@ -15,6 +15,9 @@ use crate::{
     app::{
         dns::{
             bootstrap_dialer::{StrictDnsConnectorChain, StrictDnsConnectorLease},
+            bootstrap_socket::{
+                DnsStrictSocketPathTransport, StrictDnsEvidenceCheckedTransport,
+            },
             execution::{
                 DnsStrictAttemptGuard, DnsStrictTransport, StrictDnsExecution,
             },
@@ -135,6 +138,27 @@ impl StrictDnsManagerLeafGuard {
             std::time::Duration::from_secs(11),
         )
         .await
+    }
+
+    /// S04b-m opt-in path-evidence boundary: a result can only be returned if
+    /// the transport provides local socket paths from its actual chained
+    /// connection. The standard DNS wire transport does not provide them and
+    /// cannot silently enter this stricter interface.
+    pub(crate) async fn exchange_with_socket_evidence<
+        T: DnsStrictSocketPathTransport,
+    >(
+        &self,
+        execution: &StrictDnsExecution,
+        transport: &T,
+        request: &Message,
+    ) -> io::Result<Message> {
+        let checked = StrictDnsEvidenceCheckedTransport::new(
+            transport,
+            &self.manager,
+            &self.status,
+        );
+        self.exchange_with_leased_connector(execution, &checked, request)
+            .await
     }
 
     /// The budget is also passed by deterministic failure tests; production

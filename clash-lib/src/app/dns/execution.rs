@@ -326,6 +326,13 @@ pub trait DnsStrictTransport: Send + Sync {
         None
     }
 
+    /// Attested transports may make any exchange failure terminal, including
+    /// missing or unverifiable local socket path evidence. The legacy strict
+    /// mock/wire behavior remains retryable unless explicitly opted in.
+    fn terminal_on_exchange_error(&self) -> bool {
+        false
+    }
+
     /// Validate every configured server before the first network attempt to
     /// prevent silent downgrade from unsupported TLS DNS to plaintext UDP.
     fn validate_server(&self, _server: &NameServer) -> io::Result<()> {
@@ -474,6 +481,9 @@ impl StrictDnsExecution {
                     answer.queries == request.queries,
                     answer.metadata.truncation
                 )),
+                Ok(Err(error)) if transport.terminal_on_exchange_error() => {
+                    return Err(error);
+                }
                 Ok(Err(error)) => failures.push(format!("{server}: {error}")),
                 Err(_) => {
                     failures.push(format!("{server}: strict DNS total deadline exceeded"));
