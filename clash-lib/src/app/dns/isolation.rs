@@ -109,6 +109,12 @@ pub(crate) struct StrictDnsPlanSelection<'a> {
     pub session: &'a Session,
 }
 
+struct StrictDnsBootstrapAttempt<'a> {
+    pins: &'a StrictBootstrapPinStore,
+    snapshot: StrictBootstrapPinSnapshot,
+    parent: &'a BootstrapTrace,
+}
+
 impl StrictDnsCache {
     pub fn new(
         limit: usize,
@@ -242,6 +248,28 @@ impl StrictDnsCache {
         status: &SharedNetworkStatus,
         bootstrap_revision: u64,
     ) -> io::Result<Message> {
+        self.exchange_planned_observed_traced(
+            selection,
+            transport,
+            request,
+            status,
+            bootstrap_revision,
+            &BootstrapTrace::default(),
+        )
+        .await
+    }
+
+    /// Carry the caller's immutable bootstrap ancestry into nested strict DNS
+    /// work. An empty trace is only suitable for a new top-level request.
+    async fn exchange_planned_observed_traced<T: DnsStrictTransport>(
+        &self,
+        selection: StrictDnsPlanSelection<'_>,
+        transport: &T,
+        request: &Message,
+        status: &SharedNetworkStatus,
+        bootstrap_revision: u64,
+        parent: &BootstrapTrace,
+    ) -> io::Result<Message> {
         let StrictDnsPlanSelection {
             plan,
             profiles,
@@ -266,6 +294,9 @@ impl StrictDnsCache {
                 "strict DNS cache cannot execute legacy or local-answer paths",
             ));
         };
+        // The preflight has selected the *actual* dynamic group leaf. Validate
+        // dependencies and recursion before consulting any cached response.
+        Self::validate_execution_bootstrap(&execution, parent)?;
         if matches!(execution.egress, DnsEgress::Direct) {
             // The newly prepared explicit-DIRECT handler has no mutable
             // selection state. Preserve its identity across queries while
@@ -306,10 +337,39 @@ impl StrictDnsCache {
         status: &SharedNetworkStatus,
         pins: &StrictBootstrapPinStore,
     ) -> io::Result<Message> {
+        self.exchange_planned_pinned_traced(
+            selection,
+            request,
+            status,
+            pins,
+            &BootstrapTrace::default(),
+        )
+        .await
+    }
+
+    /// Nested bootstrap callers must propagate their ancestry. A repeated
+    /// profile or selected proxy leaf is rejected even when pin data exists.
+    #[allow(dead_code)]
+    pub(crate) async fn exchange_planned_pinned_traced(
+        &self,
+        selection: StrictDnsPlanSelection<'_>,
+        request: &Message,
+        status: &SharedNetworkStatus,
+        pins: &StrictBootstrapPinStore,
+        parent: &BootstrapTrace,
+    ) -> io::Result<Message> {
         let snapshot = pins.snapshot_current(status).await?;
         let transport = snapshot.transport()?;
         self.exchange_bound_snapshot(
-            selection, &transport, request, status, pins, snapshot,
+            selection,
+            &transport,
+            request,
+            status,
+            StrictDnsBootstrapAttempt {
+                pins,
+                snapshot,
+                parent,
+            },
         )
         .await
     }
@@ -322,21 +382,26 @@ impl StrictDnsCache {
         transport: &T,
         request: &Message,
         status: &SharedNetworkStatus,
-        pins: &StrictBootstrapPinStore,
-        snapshot: StrictBootstrapPinSnapshot,
+        attempt: StrictDnsBootstrapAttempt<'_>,
     ) -> io::Result<Message> {
+        let StrictDnsBootstrapAttempt {
+            pins,
+            snapshot,
+            parent,
+        } = attempt;
         if !pins.still_current(status, &snapshot).await? {
             return Err(io::Error::other(
                 "strict DNS bootstrap pin snapshot changed before dispatch",
             ));
         }
         let response = self
-            .exchange_planned_observed(
+            .exchange_planned_observed_traced(
                 selection,
                 transport,
                 request,
                 status,
                 snapshot.revision(),
+                parent,
             )
             .await;
         // This check also runs after upstream errors: a rotation must not be
@@ -353,6 +418,55 @@ impl StrictDnsCache {
             ));
         }
         response
+    }
+
+    /// Build a bounded dependency graph from the already selected DNS egress
+    /// leaf and every upstream in the strict profile. A hostname shared by
+    /// the proxy's own bootstrap and its DNS upstream is a forced cycle unless
+    /// an independent bootstrap source is proven; such proof is not available
+    /// to S04b-c. Unknown proxy hostnames remain rejected by the caller.
+    fn validate_execution_bootstrap(
+        execution: &StrictDnsExecution,
+        parent: &BootstrapTrace,
+    ) -> io::Result<()> {
+        const MAX_BOOTSTRAP_DEPTH: usize = 16;
+        let root = BootstrapNode::Profile(execution.profile.clone());
+        let proxy = matches!(execution.egress, DnsEgress::Proxy(_))
+            .then(|| BootstrapNode::Proxy(execution.outbound.name().to_owned()));
+        let proxy_host = execution.outbound.server_name().and_then(|host| {
+            (host.parse::<IpAddr>().is_err())
+                .then(|| host.trim_end_matches('.').to_ascii_lowercase())
+        });
+        let mut graph = BootstrapGraph::default();
+        for server in &execution.servers {
+            let upstream = BootstrapNode::Upstream(server.to_string());
+            graph.require(root.clone(), upstream.clone());
+            if let Some(proxy_node) = &proxy {
+                graph.require(upstream.clone(), proxy_node.clone());
+                let upstream_host = server
+                    .host
+                    .to_string()
+                    .trim_end_matches('.')
+                    .to_ascii_lowercase();
+                if proxy_host.as_deref() == Some(upstream_host.as_str()) {
+                    graph.require(proxy_node.clone(), upstream.clone());
+                }
+            }
+        }
+        graph.validate(MAX_BOOTSTRAP_DEPTH)?;
+        // Each upstream is an alternative retry path, not an additional
+        // recursive nesting level. Never use a shared global recursion stack.
+        for server in &execution.servers {
+            let ancestry = parent.enter(root.clone(), MAX_BOOTSTRAP_DEPTH)?;
+            let ancestry = ancestry.enter(
+                BootstrapNode::Upstream(server.to_string()),
+                MAX_BOOTSTRAP_DEPTH,
+            )?;
+            if let Some(proxy_node) = &proxy {
+                ancestry.enter(proxy_node.clone(), MAX_BOOTSTRAP_DEPTH)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn is_empty(&self) -> bool {

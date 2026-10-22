@@ -940,8 +940,11 @@ async fn s04bb_pin_rotation_while_query_is_inflight_discards_old_answer() {
                 &wire,
                 &original_request,
                 &observed,
-                &pin_store,
-                stale,
+                StrictDnsBootstrapAttempt {
+                    pins: &pin_store,
+                    snapshot: stale,
+                    parent: &BootstrapTrace::default(),
+                },
             )
             .await
     });
@@ -964,6 +967,209 @@ fn s04b_observed_epoch_refuses_out_of_order_updates() {
     assert!(cache.advance_observed_epoch((2, 1, 1)).is_err());
     assert!(cache.advance_observed_epoch((2, 2, 0)).is_err());
     cache.advance_observed_epoch((3, 2, 1)).unwrap();
+}
+
+#[derive(Debug)]
+struct S04bcSelectedLeaf {
+    name: String,
+    endpoint: String,
+}
+
+#[async_trait]
+impl crate::proxy::DialWithConnector for S04bcSelectedLeaf {}
+
+#[async_trait]
+impl crate::proxy::OutboundHandler for S04bcSelectedLeaf {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn server_name(&self) -> Option<&str> {
+        Some(&self.endpoint)
+    }
+    fn proto(&self) -> crate::proxy::OutboundType {
+        crate::proxy::OutboundType::Socks5
+    }
+    async fn connect_stream(
+        &self,
+        _: &crate::session::Session,
+        _: crate::app::dns::ThreadSafeDNSResolver,
+    ) -> io::Result<crate::app::dispatcher::BoxedChainedStream> {
+        Err(io::Error::other("offline bootstrap mock cannot dial"))
+    }
+    async fn connect_datagram(
+        &self,
+        _: &crate::session::Session,
+        _: crate::app::dns::ThreadSafeDNSResolver,
+    ) -> io::Result<crate::app::dispatcher::BoxedChainedDatagram> {
+        Err(io::Error::other("offline bootstrap mock cannot dial"))
+    }
+    async fn support_connector(&self) -> crate::proxy::ConnectorType {
+        crate::proxy::ConnectorType::None
+    }
+}
+
+#[tokio::test]
+async fn s04bc_selected_dynamic_leaf_cycle_fails_before_cache_or_dial() {
+    use crate::{
+        app::dns::{
+            plan::{
+                EffectiveDnsPlan, EgressChoice, FailureChoice, LegacyDnsPlan,
+                LegacyDnsRoute, ResolverChoice,
+            },
+            policy::{CompiledDnsPolicy, DnsFailure},
+        },
+        proxy::utils::OutboundHandlerRegistry,
+        session::Session,
+    };
+    let status = runtime_status();
+    status
+        .write()
+        .await
+        .observed(&crate::app::network::NetworkSnapshot::default());
+    let req = question("www.example.com.", RecordType::A, 12);
+    let wire = FakeWire::new(positive(&req), Some("pins"));
+    let cache = StrictDnsCache::new(4, 0, 0, 0);
+    let profiles = CompiledDnsPolicy {
+        profiles: std::collections::HashMap::from([(
+            "trusted".into(),
+            crate::app::dns::Config::parse_nameserver(&["tls://dns.example".into()])
+                .unwrap(),
+        )]),
+        rules: Vec::new(),
+    };
+    let registry: OutboundHandlerRegistry =
+        Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let session = Session::default();
+    let plan = EffectiveDnsPlan {
+        context: ctx(&req),
+        legacy: LegacyDnsPlan::new(LegacyDnsRoute::Main),
+        matched_rule: Some(0),
+        resolver: ResolverChoice::Profile("trusted".into()),
+        egress: EgressChoice::Explicit(DnsEgress::Proxy("DNS-OUT".into())),
+        failure: FailureChoice::Explicit(DnsFailure::Fail),
+    };
+    let leaf = |endpoint: &str| -> AnyOutboundHandler {
+        Arc::new(S04bcSelectedLeaf {
+            name: "selected-leaf".into(),
+            endpoint: endpoint.into(),
+        })
+    };
+    registry
+        .write()
+        .await
+        .insert("DNS-OUT".into(), leaf("DNS.EXAMPLE."));
+    let selected = || StrictDnsPlanSelection {
+        plan: &plan,
+        profiles: &profiles,
+        registry: &registry,
+        session: &session,
+    };
+    let error = cache
+        .exchange_planned_observed(selected(), &wire, &req, &status, 0)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("bootstrap cycle"), "{error}");
+    assert_eq!(wire.hits(), 0);
+
+    registry
+        .write()
+        .await
+        .insert("DNS-OUT".into(), leaf("other.example"));
+    let error = cache
+        .exchange_planned_observed(selected(), &wire, &req, &status, 0)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("trusted bootstrap pin"), "{error}");
+    assert_eq!(wire.hits(), 0);
+
+    // Replacing the live registry's selected leaf with an IP endpoint is safe
+    // for this offline fake-wire path and must not reuse the refused result.
+    registry
+        .write()
+        .await
+        .insert("DNS-OUT".into(), leaf("192.0.2.18"));
+    cache
+        .exchange_planned_observed(selected(), &wire, &req, &status, 0)
+        .await
+        .unwrap();
+    assert_eq!(wire.hits(), 1);
+}
+
+#[tokio::test]
+async fn s04bc_nested_bootstrap_recursion_and_depth_fail_before_dial() {
+    use crate::{
+        app::dns::{
+            bootstrap::StrictBootstrapPinStore,
+            plan::{
+                EffectiveDnsPlan, EgressChoice, FailureChoice, LegacyDnsPlan,
+                LegacyDnsRoute, ResolverChoice,
+            },
+            policy::{CompiledDnsPolicy, DnsFailure},
+        },
+        proxy::utils::OutboundHandlerRegistry,
+        session::Session,
+    };
+    let status = runtime_status();
+    status
+        .write()
+        .await
+        .observed(&crate::app::network::NetworkSnapshot::default());
+    let pins = StrictBootstrapPinStore::default();
+    pins.install_explicit(&status, std::collections::HashMap::new())
+        .await
+        .unwrap();
+    let req = question("www.example.com.", RecordType::A, 12);
+    let cache = StrictDnsCache::new(4, 0, 0, 0);
+    let profiles = CompiledDnsPolicy {
+        profiles: std::collections::HashMap::from([(
+            "trusted".into(),
+            crate::app::dns::Config::parse_nameserver(&["udp://192.0.2.53".into()])
+                .unwrap(),
+        )]),
+        rules: Vec::new(),
+    };
+    let registry: OutboundHandlerRegistry =
+        Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let session = Session::default();
+    let plan = EffectiveDnsPlan {
+        context: ctx(&req),
+        legacy: LegacyDnsPlan::new(LegacyDnsRoute::Main),
+        matched_rule: Some(0),
+        resolver: ResolverChoice::Profile("trusted".into()),
+        egress: EgressChoice::Explicit(DnsEgress::Direct),
+        failure: FailureChoice::Explicit(DnsFailure::Fail),
+    };
+    let selected = || StrictDnsPlanSelection {
+        plan: &plan,
+        profiles: &profiles,
+        registry: &registry,
+        session: &session,
+    };
+    let ancestor = BootstrapTrace::default()
+        .enter(BootstrapNode::Profile("trusted".into()), 16)
+        .unwrap();
+    let cycle = cache
+        .exchange_planned_pinned_traced(selected(), &req, &status, &pins, &ancestor)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(cycle.contains("recursion cycle"), "{cycle}");
+
+    let mut deep = BootstrapTrace::default();
+    for i in 0..15 {
+        deep = deep
+            .enter(BootstrapNode::Proxy(format!("parent-{i}")), 16)
+            .unwrap();
+    }
+    let depth = cache
+        .exchange_planned_pinned_traced(selected(), &req, &status, &pins, &deep)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(depth.contains("depth exceeded"), "{depth}");
+    assert_eq!(cache.len(), 0);
 }
 
 #[test]

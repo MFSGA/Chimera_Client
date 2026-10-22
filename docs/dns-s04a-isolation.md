@@ -40,6 +40,12 @@ cargo test -p clash-lib --test dns_config_tests --locked
 - 内部 `StrictDnsCache::exchange_planned_pinned` 使用当前 pin 快照构建真正的 S03c `DnsStrictPinnedWireTransport`，保留 DoT/DoH 的 TLS 主机名/SNI 校验和 `prepare_dns_execution` 选择的固定出口。发送前、请求完成后比较 pin 快照；在途轮换会丢弃结果并清除旧 cache epoch，且不会以旧 pin 继续缓存。无 pin 的加密 DNS 在拨号之前拒绝。
 - 此接口**不证明 pin 来源已可信**。项目仍没有从独立可信解析器/签名配置加载 pin、也没有自动订阅 provider/网络事件、更没有对代理节点域名的独立 bootstrap；这些输入仍需未来的受审查生产绑定来提供。`BootstrapGraph`/`BootstrapTrace` 仍未接入真实代理依赖，因此本切片不能解除 `policy-rules` 拦截。新增 `s04bb_` 离线测试检验轮换、撤销、过期代际、配置重载、查询中途 pin 更改及缺少加密服务器 pin 的失败关闭。
 
+## S04b-c：已选择代理叶节点的依赖环与递归防护（内部入口）
+
+- 严格查询每次经 `prepare_dns_execution` 捕获当前动态 selector/provider 的实际叶节点后，根据其**实际 server_name、出口类型及选定 profile 的全部 upstream** 构建 `BootstrapGraph`：`Profile → Upstream → Proxy`；若代理节点自身必须解析的域名与该 upstream 的主机名相同，再加入 `Proxy → Upstream`，在**读取缓存或拨号前**拒绝强制循环。代理组叶节点切换后重新构图，不使用旧的组名作依赖证明；无法证明独立 bootstrap 的其他代理节点域名仍严格拒绝，不会隐式使用系统 DNS。
+- 新增 `exchange_planned_pinned_traced` 内部入口：调用者可显式携带每请求不可变的 `BootstrapTrace` 父级路径，按 profile / 上游 / 选定叶节点检查重复节点和深度上限 16；并发请求没有共享的全局递归栈。原 `exchange_planned_pinned` 只在顶层查询使用空轨迹，仍以同一 pin 快照和网络/配置代际完成调用。`s04bc_` 离线测试覆盖动态选中叶节点导致的依赖环、无独立 pin 的代理节点失败关闭、递归入口和超过深度预算的拨号前拒绝。
+- **范围限制：** 这是基于已准备好的单次严格执行计划的图，不是完整的配置期 provider 全节点遍历，也没有自动追踪代理节点经哪个独立 bootstrap resolver 解析、没有将父级轨迹注入所有真实 Dialer 调用链。不存在可信代理域名引导来源时，即使 upstream 主机名已有 pin，代理节点域名仍不允许通过此切片自动解析。完整静态依赖图、真实 bootstrap 解析源、生产接线和数据面测试继续属于后续准入前置条件。
+
 ## S04b/S04c 待完成的严格准入
 
 1. **真实执行接线与身份来源**：S04b-a 提供共享 RuntimeStatus 读取接口，但**尚未由生产 DNS runtime 自动接入或订阅**；需有可信的 bootstrap pin revision/变更事件来源，而不是由未受验证的调用者提供任意数值。仍需真实数据面验证动态代理在查询中途切换时的失效与回滚；旧 legacy 路径继续完全独立。
