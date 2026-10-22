@@ -993,6 +993,36 @@ fn build_proxy_endpoint_attempts(
     attempts
 }
 
+/// Local UDP forwarders must not fail because an unrelated external
+/// network changed. Explicit interface binding and all other destinations
+/// must be checked against the same observed epoch used to plan the dial.
+fn requires_proxy_udp_generation_check(
+    target: Option<SocketAddr>,
+    iface: Option<&OutboundInterface>,
+) -> bool {
+    iface.is_some()
+        || target.is_none_or(|addr| !uses_local_or_group_route(addr.ip()))
+}
+
+async fn ensure_proxy_udp_generation(
+    status: &SharedNetworkStatus,
+    planned: u64,
+) -> std::io::Result<()> {
+    if status
+        .read()
+        .await
+        .shadow_path_snapshot()
+        .map(|snapshot| snapshot.0)
+        != Some(planned)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "proxy UDP network changed while opening a socket",
+        ));
+    }
+    Ok(())
+}
+
 fn requires_proxy_endpoint_generation_check(
     attempt: &DirectStreamAttempt,
     iface: Option<&OutboundInterface>,
@@ -1588,6 +1618,23 @@ impl RemoteConnector for DirectConnector {
         let target = destination
             .ip()
             .map(|ip| SocketAddr::new(ip, destination.port()));
+        let check_epoch = requires_proxy_udp_generation_check(target, iface);
+        if check_epoch
+            && let Some((planned, _, _, status, _)) = path_snapshot.as_ref()
+        {
+            // A caller's pre-dial pool context is not a lease on an epoch.
+            // Reject an out-of-date context before trying any physical NIC.
+            if pool_context
+                .network_generation
+                .is_some_and(|value| value != *planned)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "proxy UDP pool context changed before socket creation",
+                ));
+            }
+            ensure_proxy_udp_generation(status, *planned).await?;
+        }
         let mut selected_path = None;
         let socket = if let (Some(path_snapshot), Some(target)) =
             (path_snapshot.as_ref(), target)
@@ -1676,18 +1723,7 @@ impl RemoteConnector for DirectConnector {
                             source.ip()
                         )));
                     }
-                    if status
-                        .read()
-                        .await
-                        .shadow_path_snapshot()
-                        .map(|snapshot| snapshot.0)
-                        != Some(*generation)
-                    {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Interrupted,
-                            "proxy UDP dial completed on a stale network path",
-                        ));
-                    }
+                    ensure_proxy_udp_generation(status, *generation).await?;
                     Ok::<_, std::io::Error>(socket)
                 }
                 .await;
@@ -1698,6 +1734,7 @@ impl RemoteConnector for DirectConnector {
                         break;
                     }
                     Err(error) => {
+                        ensure_proxy_udp_generation(status, *generation).await?;
                         last_error_kind = Some(error.kind());
                         if let Some(reporter) = pool_context.reporter.as_ref() {
                             reporter
@@ -1761,6 +1798,15 @@ impl RemoteConnector for DirectConnector {
             )
             .await?
         };
+        // The selected-socket attempt checks the epoch after bind, but a
+        // preference fallback, OS-routed socket or a failed candidate path
+        // can also span a network update. Fail closed *before* publishing
+        // either the datagram or its reported path identity.
+        if check_epoch
+            && let Some((planned, _, _, status, _)) = path_snapshot.as_ref()
+        {
+            ensure_proxy_udp_generation(status, *planned).await?;
+        }
         let dgram = OutboundDatagramImpl::new(socket, resolver);
         pool_context.path_id = selected_path.as_ref().map(|path| path.id.clone());
         pool_context.network_generation = selected_path
@@ -2018,6 +2064,187 @@ mod tests {
         },
         session::SocksAddr,
     };
+
+    fn s04by_observed_status() -> Arc<tokio::sync::RwLock<NetworkStatus>> {
+        let mut status = NetworkStatus::default();
+        status.set_automatic_supported_for_test(true);
+        status.observed(&NetworkSnapshot {
+            path_candidates: vec![candidate(
+                "test-nic",
+                7,
+                Ipv4Addr::new(192, 0, 2, 10),
+                DefaultRouteEvidence::PrimaryDefaultRoute,
+                BindingStatus::Verified,
+            )],
+            ..Default::default()
+        });
+        Arc::new(tokio::sync::RwLock::new(status))
+    }
+
+    #[test]
+    fn s04by_udp_epoch_guard_exempts_only_unpinned_local_or_group_routes() {
+        let remote = "198.51.100.23:53".parse().unwrap();
+        let localhost = "127.0.0.1:53".parse().unwrap();
+        assert!(super::requires_proxy_udp_generation_check(
+            Some(remote),
+            None
+        ));
+        assert!(super::requires_proxy_udp_generation_check(None, None));
+        assert!(!super::requires_proxy_udp_generation_check(
+            Some(localhost),
+            None
+        ));
+        assert!(super::requires_proxy_udp_generation_check(
+            Some(localhost),
+            Some(&outbound_interface("lo0", 1))
+        ));
+    }
+
+    #[tokio::test]
+    async fn s04by_udp_inflight_epoch_switch_rejects_and_releases_real_socket() {
+        let status = s04by_observed_status();
+        let planned = status.read().await.shadow_path_snapshot().unwrap().0;
+        super::ensure_proxy_udp_generation(&status, planned)
+            .await
+            .unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bound = socket.local_addr().unwrap();
+        let mut write = status.write().await;
+        let reading = status.clone();
+        let dial = tokio::spawn(async move {
+            // Real socket has already been created; publication waits for the
+            // same status read lock used by the runtime's generation guard.
+            super::ensure_proxy_udp_generation(&reading, planned).await?;
+            Ok::<_, std::io::Error>(socket)
+        });
+        tokio::task::yield_now().await;
+        write.observed(&NetworkSnapshot {
+            path_candidates: vec![candidate(
+                "switched-nic",
+                9,
+                Ipv4Addr::new(198, 51, 100, 10),
+                DefaultRouteEvidence::PrimaryDefaultRoute,
+                BindingStatus::Verified,
+            )],
+            ..Default::default()
+        });
+        let updated = write.shadow_path_snapshot().unwrap().0;
+        assert_ne!(planned, updated);
+        drop(write);
+        let err = tokio::time::timeout(std::time::Duration::from_secs(2), dial)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect_err("stale UDP socket cannot be delivered");
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+        let rebinding =
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if let Ok(socket) = UdpSocket::bind(bound).await {
+                        break socket;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("stale socket must be closed by failed publication");
+        assert_eq!(rebinding.local_addr().unwrap(), bound);
+        super::ensure_proxy_udp_generation(&status, updated)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn s04by_direct_udp_rejects_pre_dial_stale_context_before_system_fallback()
+    {
+        let status = s04by_observed_status();
+        let stale_generation = status.read().await.shadow_path_snapshot().unwrap().0;
+        {
+            let mut status = status.write().await;
+            status.observed(&NetworkSnapshot {
+                path_candidates: vec![candidate(
+                    "new-nic",
+                    13,
+                    Ipv4Addr::new(203, 0, 113, 10),
+                    DefaultRouteEvidence::PrimaryDefaultRoute,
+                    BindingStatus::Verified,
+                )],
+                ..Default::default()
+            });
+        }
+        let source = NetworkPathSource::default();
+        source.attach(status).await;
+        let connector = DirectConnector::with_path_source(source);
+        let result = connector
+            .connect_datagram_with_pool_context(
+                Arc::new(MockClashResolver::new()),
+                None,
+                SocksAddr::Ip("198.51.100.53:53".parse().unwrap()),
+                None,
+                #[cfg(target_os = "linux")]
+                None,
+                NetworkPoolContext::for_generation(Some(stale_generation)),
+            )
+            .await;
+        let Err(err) = result else {
+            panic!("pre-dial stale epoch must not fall back to system route");
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+    }
+
+    #[tokio::test]
+    async fn s04by_unpinned_loopback_udp_survives_unrelated_network_epoch() {
+        let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let status = s04by_observed_status();
+        let stale = status.read().await.shadow_path_snapshot().unwrap().0;
+        {
+            let mut write = status.write().await;
+            write.observed(&NetworkSnapshot {
+                path_candidates: vec![candidate(
+                    "changed-external-nic",
+                    14,
+                    Ipv4Addr::new(203, 0, 113, 11),
+                    DefaultRouteEvidence::PrimaryDefaultRoute,
+                    BindingStatus::Verified,
+                )],
+                ..Default::default()
+            });
+        }
+        let source = NetworkPathSource::default();
+        source.attach(status).await;
+        let connector = DirectConnector::with_path_source(source);
+        let (mut datagram, observed_context) = connector
+            .connect_datagram_with_pool_context(
+                Arc::new(MockClashResolver::new()),
+                None,
+                SocksAddr::Ip(address),
+                None,
+                #[cfg(target_os = "linux")]
+                None,
+                NetworkPoolContext::for_generation(Some(stale)),
+            )
+            .await
+            .expect("unpinned loopback UDP must not depend on external NIC epoch");
+        assert_eq!(observed_context.path_id, None);
+        datagram
+            .send(UdpPacket {
+                data: b"loopback survives".to_vec(),
+                dst_addr: SocksAddr::Ip(address),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut data = [0u8; 64];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            listener.recv_from(&mut data),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&data[..len], b"loopback survives");
+    }
 
     #[test]
     fn proxy_endpoint_generation_guard_only_exempts_unpinned_loopback() {

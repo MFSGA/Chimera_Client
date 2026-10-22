@@ -178,6 +178,12 @@ cargo test -p clash-lib --test dns_config_tests --locked
 - 3 项 `s04bx_` 本地离线测试验证：(1) 使用真实 loopback NIC 让 UDP 建立函数同时执行网卡和 `127.0.0.1` 源地址绑定，32 次独立创建、收发和释放，核对 socket 的 `local_addr` 与接收端真实看到的 UDP 来源完全一致；family hint 指向测试专用非 loopback 地址，仅用于触发平台网卡绑定，**实际数据报只发给 localhost**；(2) 指定本机不存在的测试用源 IP 时，即使 NIC 绑定成功也必须失败，不能悄悄采用系统默认来源；(3) macOS 动态查找当前已配置的非 loopback IPv4 网卡及其实际地址，确认 socket 同时接受该网卡索引与选定源 IP，并检查 `local_addr`，**不对外网发包**。Linux 若 `SO_BINDTODEVICE` 无权限或运行环境没有对应网卡，相关测试有明确条件跳过。
 - **仍未完成：** 没有在两个真实物理网卡之间修改路由、进行网络切换或外网抓包，因此本轮不能证明任意远端代理的实际出接口、数据面源地址长期不变或系统内核出口路由。连接器报告的 `NetworkPathId` 仍是软件元数据，真实路径抓包、NetworkPathSource 中途换代及安全故障恢复、可信 Provider/bootstrap pin、完整逐跳拨号图、独立 L2 审查与维护者批准均为生产门禁前置事项。**生产 `policy-rules` 继续拒绝启用。**
 
+## S04b-y：UDP 拨号前后网络代际失效与失败关闭（本地竞态切片）
+
+- 进一步收紧 `DirectConnector::connect_datagram_with_pool_context` 的网络换代交付边界：旧实现只在**路径候选 UDP socket 单次 bind 成功之后**读 `NetworkStatus.shadow_path_snapshot`；在调用方已取得旧 `NetworkPoolContext` 后网络切换、候选失败后进入旧系统路由 fallback，或没有选中候选路径的普通 UDP 创建中，可能缺少统一的最后代际复核。现在对非本地目标/显式网卡路径，在 socket 创建前核对 caller 的代际与最新规划快照一致，并以 `ensure_proxy_udp_generation` 对同一已附着 `SharedNetworkStatus` 检查当前观测代际；在任何成功 UDP datagram **包装、写入 `NetworkPathId` 并交付之前**再次复核。若候选创建失败时网络已切换，立即 `Interrupted`，既不继续旧路径候选，也不静默采用系统路由 fallback；中途创建的 socket 随失败结果被销毁。保留未指定网卡的 loopback、unspecified 和 multicast 本地流量既有豁免，避免外部网卡变化误伤本地 DNS 转发。
+- 新增 4 项 `s04by_` 离线测试：核对本地/远端及显式网卡代际检查范围；对**已实际绑定的 UDP socket**，由测试持有共享网络状态写锁并在等待交付状态读取时切换观测 generation，要求返回 `Interrupted` 且 socket 本地端口可以重新绑定，当前新 generation 可以通过；旧 `NetworkPoolContext` 面对新观测 generation 时，真实 `DirectConnector` 必须在系统路由 fallback 之前失败；普通 localhost UDP 面对无关外部 generation 更换仍可实际发送数据包。无外网发包、系统路由变更或真实物理网卡断连。相关 DNS、Proxy Connector、socket helpers、XHTTP/H3、gRPC/Hysteria2 与旧配置兼容回归继续检查。
+- **边界：** 此处完成的是交付前的共享状态**软件代际校验**，不是整个 socket 建立到长期运行的原子网络锁；检查结束之后立刻发生的新换代仍需要上层连接/流生命周期的 reset、DNS 严格执行前后校验。`NetworkPathId` 是连接器软件路径身份，不能代替内核真实出口抓包。可信 Provider/bootstrap pin、递归代理拨号闭环、实际多网卡切换/数据面源 IP、独立 L2 审查及维护者批准仍未完成；生产 `policy-rules` 启动门禁原样关闭。
+
 ## S04b/S04c 待完成的严格准入
 
 1. **真实执行接线与身份来源**：S04b-a 提供共享 RuntimeStatus 读取接口，但**尚未由生产 DNS runtime 自动接入或订阅**；需有可信的 bootstrap pin revision/变更事件来源，而不是由未受验证的调用者提供任意数值。仍需真实数据面验证动态代理在查询中途切换时的失效与回滚；旧 legacy 路径继续完全独立。
