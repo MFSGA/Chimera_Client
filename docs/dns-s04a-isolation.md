@@ -34,6 +34,12 @@ cargo test -p clash-lib --test dns_config_tests --locked
 - 对代理叶节点服务器域名尚无独立可信 bootstrap 来源，内部入口在缓存命中前仍明确拒绝该路径，不允许靠系统 DNS 补洞。**这不是完整的 bootstrap DAG 或实际动态 Provider 递归保护**，也没有自动订阅网络状态、pin 轮换或在变更中重新捕获正在使用的动态选择器；现有每查询身份分桶不等于中途切换的真实数据面证明。
 - S04b-a 离线验证命令：`cargo test -p clash-lib --lib s04b_ --locked`，包括无网络快照失败、真实 network/config 变更、pin 回滚拒绝、动态叶节点分桶、在途结果丢弃、错误 Question/缺失代理 fail-closed 和显式 DIRECT 缓存复用。本次严格 `policy-rules` 运行时拦截仍保留；未修改生产 `EnhancedResolver`、Fake-IP、legacy 缓存和连接池。
 
+## S04b-b：显式 bootstrap pin 快照与版本轮换（仍为内部实验入口）
+
+- 新增 `app/dns/bootstrap.rs` 的 `StrictBootstrapPinStore`：只有在当前 `RuntimeStatus` 已有网络观测时才能通过 `install_explicit` 安装一套**由调用者在外部验证后提供**的 hostname→IP 映射。相同代际和相同映射不增加 revision；pin 变化、网络代际或配置代际变化时 revision 单调递增；重载后观测未恢复，或新网络还没有重新安装映射时，严格失败关闭。pin store 还固定其首次安装的 `RuntimeStatus` 实例身份，拒绝其他运行时即使代际数字碰巧相同的快照。空映射可以撤销现有的主机名 pin，不会自动读取系统 DNS 或旧缓存。
+- 内部 `StrictDnsCache::exchange_planned_pinned` 使用当前 pin 快照构建真正的 S03c `DnsStrictPinnedWireTransport`，保留 DoT/DoH 的 TLS 主机名/SNI 校验和 `prepare_dns_execution` 选择的固定出口。发送前、请求完成后比较 pin 快照；在途轮换会丢弃结果并清除旧 cache epoch，且不会以旧 pin 继续缓存。无 pin 的加密 DNS 在拨号之前拒绝。
+- 此接口**不证明 pin 来源已可信**。项目仍没有从独立可信解析器/签名配置加载 pin、也没有自动订阅 provider/网络事件、更没有对代理节点域名的独立 bootstrap；这些输入仍需未来的受审查生产绑定来提供。`BootstrapGraph`/`BootstrapTrace` 仍未接入真实代理依赖，因此本切片不能解除 `policy-rules` 拦截。新增 `s04bb_` 离线测试检验轮换、撤销、过期代际、配置重载、查询中途 pin 更改及缺少加密服务器 pin 的失败关闭。
+
 ## S04b/S04c 待完成的严格准入
 
 1. **真实执行接线与身份来源**：S04b-a 提供共享 RuntimeStatus 读取接口，但**尚未由生产 DNS runtime 自动接入或订阅**；需有可信的 bootstrap pin revision/变更事件来源，而不是由未受验证的调用者提供任意数值。仍需真实数据面验证动态代理在查询中途切换时的失效与回滚；旧 legacy 路径继续完全独立。

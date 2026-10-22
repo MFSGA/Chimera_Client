@@ -25,6 +25,7 @@ use crate::{
 };
 
 use super::{
+    bootstrap::{StrictBootstrapPinSnapshot, StrictBootstrapPinStore},
     execution::{
         DnsStrictTransport, PreparedDnsExecution, StrictDnsExecution,
         prepare_dns_execution,
@@ -291,6 +292,67 @@ impl StrictDnsCache {
             bootstrap_revision,
         )
         .await
+    }
+
+    /// S04b-b opt-in: use only a single coherent explicit-pin snapshot for
+    /// this strict attempt. The pinned S03c transport is constructed from
+    /// that snapshot; callers cannot substitute an arbitrary resolver.
+    /// The production `policy-rules` startup gate is unchanged.
+    #[allow(dead_code)]
+    pub(crate) async fn exchange_planned_pinned(
+        &self,
+        selection: StrictDnsPlanSelection<'_>,
+        request: &Message,
+        status: &SharedNetworkStatus,
+        pins: &StrictBootstrapPinStore,
+    ) -> io::Result<Message> {
+        let snapshot = pins.snapshot_current(status).await?;
+        let transport = snapshot.transport()?;
+        self.exchange_bound_snapshot(
+            selection, &transport, request, status, pins, snapshot,
+        )
+        .await
+    }
+
+    /// Keep this small transport-injected boundary for deterministic offline
+    /// tests; only `exchange_planned_pinned` constructs a real pinned wire.
+    async fn exchange_bound_snapshot<T: DnsStrictTransport>(
+        &self,
+        selection: StrictDnsPlanSelection<'_>,
+        transport: &T,
+        request: &Message,
+        status: &SharedNetworkStatus,
+        pins: &StrictBootstrapPinStore,
+        snapshot: StrictBootstrapPinSnapshot,
+    ) -> io::Result<Message> {
+        if !pins.still_current(status, &snapshot).await? {
+            return Err(io::Error::other(
+                "strict DNS bootstrap pin snapshot changed before dispatch",
+            ));
+        }
+        let response = self
+            .exchange_planned_observed(
+                selection,
+                transport,
+                request,
+                status,
+                snapshot.revision(),
+            )
+            .await;
+        // This check also runs after upstream errors: a rotation must not be
+        // masked as an ordinary failure eligible for a lower-trust fallback.
+        let current = pins.snapshot_current(status).await?;
+        if current != snapshot {
+            self.advance_observed_epoch((
+                current.epoch().0,
+                current.epoch().1,
+                current.revision(),
+            ))?;
+            return Err(io::Error::other(
+                "strict DNS bootstrap pin revision changed while querying; discarding stale answer",
+            ));
+        }
+        response
     }
 
     pub fn is_empty(&self) -> bool {

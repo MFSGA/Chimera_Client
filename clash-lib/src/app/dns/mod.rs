@@ -8,6 +8,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use mockall::automock;
 
+pub(crate) mod bootstrap;
 pub mod config;
 mod dhcp;
 mod dns_client;

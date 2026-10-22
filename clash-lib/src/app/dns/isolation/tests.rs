@@ -797,6 +797,165 @@ async fn s04b_prepared_entrypoint_recaptures_egress_and_rejects_mismatched_plans
     assert_eq!(wire.hits(), 1, "preflight errors must not dial");
 }
 
+#[tokio::test]
+async fn s04bb_bound_wire_refuses_missing_encrypted_pin_before_dial() {
+    use crate::{
+        app::dns::{
+            bootstrap::StrictBootstrapPinStore,
+            plan::{
+                EffectiveDnsPlan, EgressChoice, FailureChoice, LegacyDnsPlan,
+                LegacyDnsRoute, ResolverChoice,
+            },
+            policy::{CompiledDnsPolicy, DnsFailure},
+        },
+        proxy::utils::OutboundHandlerRegistry,
+        session::Session,
+    };
+
+    let status = runtime_status();
+    status
+        .write()
+        .await
+        .observed(&crate::app::network::NetworkSnapshot::default());
+    let pins = StrictBootstrapPinStore::default();
+    pins.install_explicit(&status, std::collections::HashMap::new())
+        .await
+        .unwrap();
+    let req = question("www.example.com.", RecordType::A, 12);
+    let cache = StrictDnsCache::new(4, 0, 0, 0);
+    let profiles = CompiledDnsPolicy {
+        profiles: std::collections::HashMap::from([(
+            "trusted".into(),
+            crate::app::dns::Config::parse_nameserver(&["tls://dns.example".into()])
+                .unwrap(),
+        )]),
+        rules: Vec::new(),
+    };
+    let registry: OutboundHandlerRegistry =
+        Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let session = Session::default();
+    let plan = EffectiveDnsPlan {
+        context: ctx(&req),
+        legacy: LegacyDnsPlan::new(LegacyDnsRoute::Main),
+        matched_rule: Some(0),
+        resolver: ResolverChoice::Profile("trusted".into()),
+        egress: EgressChoice::Explicit(DnsEgress::Direct),
+        failure: FailureChoice::Explicit(DnsFailure::Fail),
+    };
+    let error = cache
+        .exchange_planned_pinned(
+            StrictDnsPlanSelection {
+                plan: &plan,
+                profiles: &profiles,
+                registry: &registry,
+                session: &session,
+            },
+            &req,
+            &status,
+            &pins,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("bootstrap pin")
+            || error.contains("needs the aws-lc-rs or ring feature"),
+        "{error}"
+    );
+    assert_eq!(cache.len(), 0);
+}
+
+#[tokio::test]
+async fn s04bb_pin_rotation_while_query_is_inflight_discards_old_answer() {
+    use crate::{
+        app::dns::{
+            bootstrap::StrictBootstrapPinStore,
+            plan::{
+                EffectiveDnsPlan, EgressChoice, FailureChoice, LegacyDnsPlan,
+                LegacyDnsRoute, ResolverChoice,
+            },
+            policy::{CompiledDnsPolicy, DnsFailure},
+        },
+        proxy::utils::OutboundHandlerRegistry,
+        session::Session,
+    };
+
+    let status = runtime_status();
+    status
+        .write()
+        .await
+        .observed(&crate::app::network::NetworkSnapshot::default());
+    let pins = Arc::new(StrictBootstrapPinStore::default());
+    let pin = |octet| {
+        std::collections::HashMap::from([(
+            "dns.example".into(),
+            std::net::IpAddr::from([192, 0, 2, octet]),
+        )])
+    };
+    pins.install_explicit(&status, pin(1)).await.unwrap();
+    let stale = pins.snapshot_current(&status).await.unwrap();
+    let req = question("www.example.com.", RecordType::A, 12);
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let wire = PausedWire {
+        entered: Mutex::new(Some(entered_tx)),
+        release: tokio::sync::Mutex::new(Some(release_rx)),
+        reply: positive(&req),
+    };
+    let cache = Arc::new(StrictDnsCache::new(4, 0, 0, 0));
+    let active = cache.clone();
+    let observed = status.clone();
+    let pin_store = pins.clone();
+    let original_request = req.clone();
+    let job = tokio::spawn(async move {
+        let profiles = CompiledDnsPolicy {
+            profiles: std::collections::HashMap::from([(
+                "trusted".into(),
+                crate::app::dns::Config::parse_nameserver(&[
+                    "udp://192.0.2.53".into()
+                ])
+                .unwrap(),
+            )]),
+            rules: Vec::new(),
+        };
+        let registry: OutboundHandlerRegistry =
+            Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let session = Session::default();
+        let plan = EffectiveDnsPlan {
+            context: ctx(&original_request),
+            legacy: LegacyDnsPlan::new(LegacyDnsRoute::Main),
+            matched_rule: Some(0),
+            resolver: ResolverChoice::Profile("trusted".into()),
+            egress: EgressChoice::Explicit(DnsEgress::Direct),
+            failure: FailureChoice::Explicit(DnsFailure::Fail),
+        };
+        active
+            .exchange_bound_snapshot(
+                StrictDnsPlanSelection {
+                    plan: &plan,
+                    profiles: &profiles,
+                    registry: &registry,
+                    session: &session,
+                },
+                &wire,
+                &original_request,
+                &observed,
+                &pin_store,
+                stale,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), entered_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    pins.install_explicit(&status, pin(2)).await.unwrap();
+    release_tx.send(()).unwrap();
+    let error = job.await.unwrap().unwrap_err().to_string();
+    assert!(error.contains("pin revision changed"), "{error}");
+    assert_eq!(cache.len(), 0, "rotated pins must clear stale response");
+}
+
 #[test]
 fn s04b_observed_epoch_refuses_out_of_order_updates() {
     let cache = StrictDnsCache::new(2, 1, 1, 0);
