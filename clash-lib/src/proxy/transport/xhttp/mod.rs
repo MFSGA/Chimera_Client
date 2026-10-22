@@ -1449,6 +1449,56 @@ fn h3_keep_alive_interval(period: Option<i64>) -> io::Result<Option<Duration>> {
     }
 }
 
+/// Own the freshly handshaken QUIC socket until the HTTP/3 driver takes it.
+/// A cancelled future or H3 setup error must not leave a live socket that is
+/// untracked by either a returned sender or its background driver.
+#[cfg(feature = "xhttp-h3")]
+struct PendingH3Socket {
+    endpoint: Option<Endpoint>,
+    connection: Option<quinn::Connection>,
+}
+
+#[cfg(feature = "xhttp-h3")]
+impl PendingH3Socket {
+    fn new(endpoint: Endpoint, connection: quinn::Connection) -> Self {
+        Self {
+            endpoint: Some(endpoint),
+            connection: Some(connection),
+        }
+    }
+
+    fn connection(&self) -> &quinn::Connection {
+        self.connection.as_ref().expect("uncommitted HTTP/3 socket")
+    }
+
+    fn handoff(mut self) -> (Endpoint, quinn::Connection) {
+        let endpoint = self
+            .endpoint
+            .take()
+            .expect("HTTP/3 endpoint not handed off twice");
+        let connection = self
+            .connection
+            .take()
+            .expect("HTTP/3 connection not handed off twice");
+        (endpoint, connection)
+    }
+}
+
+#[cfg(feature = "xhttp-h3")]
+impl Drop for PendingH3Socket {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            connection.close(
+                quinn::VarInt::from_u32(0),
+                b"HTTP/3 setup cancelled before driver handoff",
+            );
+        }
+        if let Some(endpoint) = self.endpoint.take() {
+            endpoint.close(quinn::VarInt::from_u32(0), b"HTTP/3 setup cancelled");
+        }
+    }
+}
+
 #[cfg(feature = "xhttp-h3")]
 async fn connect_h3_sender(
     endpoint_config: &XhttpEndpointConfig,
@@ -1559,33 +1609,28 @@ async fn connect_h3_sender(
                 continue;
             }
         };
+        let pending = PendingH3Socket::new(endpoint, connection);
         let current_context =
             connector.connection_pool_context(sess.iface.as_ref()).await;
-        let stale = match connected_context.path_id.as_ref() {
-            Some(path_id) => !current_context
-                .permits(connected_context.network_generation, Some(path_id)),
-            None => {
-                current_context.network_generation
-                    != connected_context.network_generation
-            }
-        };
-        if stale {
-            connection.close(
-                quinn::VarInt::from_u32(0),
-                b"network path changed during HTTP/3 setup",
-            );
-            errors.push(format!(
-                "{peer_addr}: network path changed during QUIC handshake"
+        if !current_context.permits(
+            connected_context.network_generation,
+            connected_context.path_id.as_ref(),
+        ) {
+            // The PendingH3Socket Drop closes both handles, even when the
+            // connector supplies an unlabelled path but eligible NICs exist.
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "network path changed during HTTP/3 handshake",
             ));
-            continue;
         }
-        let h3_connection = h3_quinn::Connection::new(connection.clone());
+        let h3_connection = h3_quinn::Connection::new(pending.connection().clone());
         let (mut driver, sender) = h3::client::builder()
             .build::<_, _, Bytes>(h3_connection)
             .await
             .map_err(|err| {
                 io::Error::other(format!("HTTP/3 setup failed: {err}"))
             })?;
+        let (endpoint, connection) = pending.handoff();
         tokio::spawn(async move {
             let _endpoint = endpoint;
             let _connection = connection;
@@ -3668,6 +3713,118 @@ mod tests {
                 .expect("retired H3 reuse lookup should succeed")
                 .is_none(),
             "c-max-reuse-times=1 must retire the H3 connection"
+        );
+    }
+
+    #[cfg(feature = "xhttp-h3")]
+    #[tokio::test]
+    async fn s04bu_abort_after_quic_handshake_closes_uncommitted_socket() {
+        use super::{PendingH3Socket, TlsClient};
+        use quinn::{Endpoint, crypto::rustls::QuicClientConfig};
+        use tokio::sync::oneshot;
+
+        crate::setup_default_crypto_provider();
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["xhttp.example.com".to_owned()])
+                .unwrap();
+        let cert = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+        let key =
+            rustls::pki_types::PrivateKeyDer::try_from(signing_key.serialize_der())
+                .unwrap();
+        let mut server_tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        server_tls.alpn_protocols = vec![b"h3".to_vec()];
+        let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(server_tls).unwrap(),
+        ));
+        let server =
+            Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let remote = server.local_addr().unwrap();
+        let (closed_tx, closed_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let incoming = server.accept().await.expect("QUIC connection expected");
+            let connection = incoming.await.expect("QUIC handshake expected");
+            let error = connection.closed().await;
+            closed_tx.send(error).ok();
+        });
+
+        let tls = TlsClient::new_with_fingerprint(
+            true,
+            "xhttp.example.com".to_owned(),
+            Some(vec!["h3".to_owned()]),
+            Some("h3".to_owned()),
+            None,
+        );
+        let mut client_tls = tls.rustls_client_config().unwrap();
+        client_tls.alpn_protocols = vec![b"h3".to_vec()];
+        let quic_crypto = QuicClientConfig::try_from(client_tls).unwrap();
+        let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+            quic_crypto,
+        )));
+        let connection = timeout(
+            Duration::from_secs(3),
+            endpoint.connect(remote, "xhttp.example.com").unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _setup = PendingH3Socket::new(endpoint, connection);
+            ready_tx.send(()).unwrap();
+            // Simulate HTTP/3 driver construction suspended after TLS/QUIC
+            // completed. Cancelling this task must close the real UDP socket.
+            std::future::pending::<()>().await;
+        });
+        timeout(Duration::from_secs(2), ready_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        assert!(
+            timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .expect_err("cancelled setup must not finish")
+                .is_cancelled()
+        );
+        let closed = timeout(Duration::from_secs(3), closed_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            closed.to_string().contains("closed")
+                || closed.to_string().contains("application"),
+            "QUIC server should observe cancellation: {closed}"
+        );
+    }
+
+    #[cfg(feature = "xhttp-h3")]
+    #[test]
+    fn s04bu_h3_unreported_socket_does_not_bypass_explicit_path_candidates() {
+        use crate::app::flow::{AddressFamily, InterfaceId, NetworkPathId};
+        let path = NetworkPathId {
+            interface: InterfaceId {
+                name: "expected0".into(),
+                index: 7,
+            },
+            family: AddressFamily::Ipv4,
+            source_address: Some("192.0.2.70".parse().unwrap()),
+            network_generation: 12,
+        };
+        let current = NetworkPoolContext {
+            network_generation: Some(12),
+            eligible_path_ids: Some([path].into_iter().collect()),
+            ..Default::default()
+        };
+        // A QUIC socket without reported network_path_id is not equivalent
+        // to a verified candidate, even if the generation number matches.
+        assert!(!current.permits(Some(12), None));
+        assert!(
+            NetworkPoolContext::for_generation(Some(12)).permits(Some(12), None)
         );
     }
 

@@ -151,6 +151,13 @@ cargo test -p clash-lib --test dns_config_tests --locked
 - 新增 `s04bt_` 离线本地 QUIC 端到端测试：实际建立上传和独立下载两个 H3 sender 后，在逻辑流交付前 abort，检查两端 `active` 都归零并可以退休池；实际建立上传后刻意使下载端使用不支持的 TLS 模式而失败，确认上传名额归还。既有本地 HTTP/3 StreamUp 测试加断言：上传/下载池在应用释放逻辑流后均立即归零，不依赖服务端结束后台等待。同时显式以 `--features xhttp-h3` 单独编译和测试，调整仅供 Hysteria2 使用的共享 UDP socket reexport Feature 门禁，避免 XHTTP/3 单独启用触发未使用警告。
 - **仍未完成：** QUIC 连接/driver 关闭时机及 OS socket 占用的长期压力、所有 H3 建立阶段的系统级取消路径、物理出口抓包、可信 Provider/bootstrap pin、完整递归 dialer 保护和独立 L2 审查。生产 `policy-rules` 继续严格禁用，不能以这些测试作为上线许可。
 
+## S04b-u：HTTP/3 QUIC 握手到 driver 交接的资源所有权（内部、未启用生产严格 DNS）
+
+- XHTTP H3 `connect_h3_sender` 在 QUIC 握手成功后增加 **`PendingH3Socket` 作用域租约**。租约同时拥有本地 `Endpoint` 和已建立的 `quinn::Connection`，覆盖后续异步读取 Connector 当前网络上下文、验证路由资格及 `h3::client::builder().build` 的全过程。若 future 在任一 await 被取消，或者 HTTP/3 初始化错误，`Drop` 会**主动关闭 QUIC connection 和 Endpoint**；直到 H3 driver 成功建立时才以 `handoff()` 明确转移所有权给现有后台 driver 任务。已完成 driver 交付的健康流及连接池仍按旧生命周期运行，不在普通 pool reset 时强制切断。
+- 收紧握手后的网络变化判断：从 `current_context.permits(connected_context.network_generation, connected_context.path_id.as_ref())` 统一验证完成连接代际及当前候选物理路径。即使连接未返回物理路径 ID，在运行时有明确候选路径限制时也不得仅凭同一 network generation 放行；失败时直接返回 `Interrupted`，不改换备用地址重新拨号，租约自动清理该连接。
+- `s04bu_` 两项离线本地 QUIC 测试：使用本地 QUIC 服务端和真实 TLS/ALPN 握手，模拟握手后、driver 交付前取消任务，要求远端实际观察到 QUIC 连接关闭；另外验证当前有明确候选集合时，无物理路径报告的 H3 链路不能通过认证。保持独立 `xhttp-h3` Feature 的可构建性，补跑现有 HTTP/3 双端和正常回声测试。
+- **限制：** 当前保护覆盖**握手已建立但尚未交接 driver 的资源**。已交付 sender/活跃流后，QUIC driver 的自然退出、连接池退休、可能悬挂的上传/下载后台任务及 OS UDP socket 关闭仍未得到全生命周期压力或抓包证明；关闭连接亦不能撤销此前的 UDP 发包。真实 NIC/源 IP 验证、可信 Provider/bootstrap pin、完整递归 dialer、独立 L2 审查与维护者批准仍待完成。生产 `policy-rules` gate 继续关闭。
+
 ## S04b/S04c 待完成的严格准入
 
 1. **真实执行接线与身份来源**：S04b-a 提供共享 RuntimeStatus 读取接口，但**尚未由生产 DNS runtime 自动接入或订阅**；需有可信的 bootstrap pin revision/变更事件来源，而不是由未受验证的调用者提供任意数值。仍需真实数据面验证动态代理在查询中途切换时的失效与回滚；旧 legacy 路径继续完全独立。
