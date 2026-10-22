@@ -29,6 +29,7 @@ pub struct OutboundDatagramVless {
     remaining_bytes: usize,
     length_buf: [u8; 2],
     header_read: usize,
+    read_terminated: bool,
 
     // State tracking
     flushed: bool,
@@ -45,6 +46,7 @@ impl OutboundDatagramVless {
             remaining_bytes: 0,
             length_buf: [0; 2],
             header_read: 0,
+            read_terminated: false,
             flushed: true,
         }
     }
@@ -186,6 +188,9 @@ impl Stream for OutboundDatagramVless {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        if this.read_terminated {
+            return Poll::Ready(None);
+        }
         let mut inner = Pin::new(&mut this.inner);
 
         loop {
@@ -200,6 +205,7 @@ impl Stream for OutboundDatagramVless {
                     Ok(()) => {
                         let n = header_read_buf.filled().len();
                         if n == 0 {
+                            this.read_terminated = true;
                             return Poll::Ready(None); // connection closed
                         }
                         this.header_read += n;
@@ -218,6 +224,7 @@ impl Stream for OutboundDatagramVless {
 
                         if packet_len > MAX_PACKET_LENGTH {
                             debug!("packet too large: {} bytes", packet_len);
+                            this.read_terminated = true;
                             return Poll::Ready(None);
                         }
 
@@ -228,6 +235,7 @@ impl Stream for OutboundDatagramVless {
                     }
                     Err(e) => {
                         debug!("failed to read length header: {}", e);
+                        this.read_terminated = true;
                         return Poll::Ready(None);
                     }
                 }
@@ -247,12 +255,14 @@ impl Stream for OutboundDatagramVless {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(Err(e)) => {
                             debug!("failed to read packet data: {}", e);
+                            this.read_terminated = true;
                             return Poll::Ready(None);
                         }
                         Poll::Ready(Ok(())) => read_buf.filled().len(),
                     }
                 };
                 if n == 0 {
+                    this.read_terminated = true;
                     return Poll::Ready(None); // connection closed
                 }
                 // SAFETY: poll_read initialized exactly n bytes starting at
@@ -279,11 +289,79 @@ impl Stream for OutboundDatagramVless {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
     use futures::{SinkExt, StreamExt};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
     use super::{MAX_PACKET_LENGTH, OutboundDatagramVless};
     use crate::{proxy::datagram::UdpPacket, session::SocksAddr};
+
+    struct FailNthRead {
+        inner: tokio::io::DuplexStream,
+        fail_on_read: usize,
+        read_calls: usize,
+        max_read_bytes: usize,
+    }
+
+    impl AsyncRead for FailNthRead {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let call = self.read_calls;
+            self.read_calls += 1;
+            if call == self.fail_on_read {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "simulated read failure",
+                )));
+            }
+
+            // Bound each successful read so an injected failure reliably lands
+            // after a partial header or payload, independent of duplex batching.
+            let mut bytes = [0u8; 8];
+            let len = buf.remaining().min(self.max_read_bytes).min(bytes.len());
+            let mut bounded = ReadBuf::new(&mut bytes[..len]);
+            match Pin::new(&mut self.inner).poll_read(cx, &mut bounded) {
+                Poll::Ready(Ok(())) => {
+                    buf.put_slice(bounded.filled());
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    impl AsyncWrite for FailNthRead {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
 
     fn packet(data: Vec<u8>) -> UdpPacket {
         let addr: SocksAddr = "1.1.1.1:53".parse().expect("test address");
@@ -334,6 +412,7 @@ mod tests {
             datagram.next().await.is_none(),
             "a partial UDP datagram must not be forwarded after EOF"
         );
+        assert!(datagram.next().await.is_none(), "EOF must remain terminal");
     }
 
     #[tokio::test]
@@ -395,6 +474,84 @@ mod tests {
         .expect("cancelled transport must close without hanging")
         .expect("read remaining pending bytes");
         assert!(received.len() < 9 * 1024);
+    }
+
+    #[tokio::test]
+    async fn udp_read_errors_are_terminal_for_header_and_partial_frames() {
+        let cases: &[(&str, &[u8], usize, usize)] = &[
+            ("before header", &[0, 1, 0x42], 0, 2),
+            ("after one header byte", &[0, 1, 0x42], 1, 1),
+            (
+                "after two payload bytes",
+                &[0, 4, 0x11, 0x22, 0x33, 0x44],
+                2,
+                2,
+            ),
+        ];
+        for &(phase, wire, fail_on_read, max_read_bytes) in cases {
+            let (client, mut server) = tokio::io::duplex(64);
+            server.write_all(wire).await.expect("synthetic UDP frame");
+            let remote: SocksAddr = "1.1.1.1:53".parse().expect("test address");
+            let stream = FailNthRead {
+                inner: client,
+                fail_on_read,
+                read_calls: 0,
+                max_read_bytes,
+            };
+            let mut datagram = OutboundDatagramVless::new(Box::new(stream), remote);
+
+            assert!(
+                datagram.next().await.is_none(),
+                "read failure {phase} must terminate the stream"
+            );
+            assert!(
+                datagram.next().await.is_none(),
+                "read failure {phase} must not resume decoding"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_read_error_after_complete_packet_is_terminal() {
+        let (client, mut server) = tokio::io::duplex(64);
+        server
+            .write_all(&[0, 1, 0x42, 0, 1, 0x43])
+            .await
+            .expect("two complete UDP frames");
+        let remote: SocksAddr = "1.1.1.1:53".parse().expect("test address");
+        let stream = FailNthRead {
+            inner: client,
+            fail_on_read: 2, // First packet's header and payload were read successfully.
+            read_calls: 0,
+            max_read_bytes: 2,
+        };
+        let mut datagram = OutboundDatagramVless::new(Box::new(stream), remote);
+
+        assert_eq!(datagram.next().await.expect("first packet").data, [0x42]);
+        assert!(
+            datagram.next().await.is_none(),
+            "next header read must fail"
+        );
+        assert!(
+            datagram.next().await.is_none(),
+            "failure must stay terminal"
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_eof_after_complete_packet_is_terminal() {
+        let (client, mut server) = tokio::io::duplex(64);
+        server
+            .write_all(&[0, 1, 0x42])
+            .await
+            .expect("one complete UDP frame");
+        drop(server);
+        let remote: SocksAddr = "1.1.1.1:53".parse().expect("test address");
+        let mut datagram = OutboundDatagramVless::new(Box::new(client), remote);
+
+        assert_eq!(datagram.next().await.expect("first packet").data, [0x42]);
+        assert!(datagram.next().await.is_none(), "EOF after frame");
+        assert!(datagram.next().await.is_none(), "EOF must stay terminal");
     }
 
     #[tokio::test]
