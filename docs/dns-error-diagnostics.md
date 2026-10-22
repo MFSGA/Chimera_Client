@@ -123,3 +123,32 @@
   封解包、TCP DNS framing，不等于端到端运行整个
   `Dispatcher`、smoltcp TCP 建连、内核 TUN 设备和 OS 路由策略。
   这些环节仍属于实际设备验收范围；IPv6 Fake-IP 不包含在本次变更中。
+
+## 2026-10-21：DNS 缓存和多上游否定应答的正确性
+
+- **缓存应答完整性**：修复 ResponseCache 命中后只复制 Answer 的问题；
+  现在保留上游成功应答中的 RCODE、AA/RA 标记、Authority、Additional
+  以及 hickory 已递减的 TTL，只替换当前请求的事务 ID、Question 和
+  RD/CD 标志。不复用旧客户端的 DNS 事务 ID。
+- **缓存请求适用性**：hickory ResponseCache 的键仅包含 DNS Question，
+  不包含 RD/CD、DNSSEC/EDNS 的上下文。因此目前仅缓存普通 RD=1、
+  没有 EDNS/签名和 DNSSEC 请求标志的单 Question 查询及其安全应答。
+  EDNS、DNSSEC、RD=0 等请求直接查询上游，避免不同网络/安全上下文
+  共享应答。拒绝缓存截断响应、零 TTL 记录及不完整否定响应。
+  这些条件侧重正确性，会降低某些高级查询的缓存命中率。
+- **否定响应**：NXDOMAIN、NODATA 及 SERVFAIL 不能通过普通正缓存
+  保存。NXDOMAIN 和空 NOERROR 仍由上游确定；后续若引入负缓存，
+  必须根据 SOA MINIMUM 和 SOA RR TTL 计算 TTL、区分域名不存在与
+  特定记录不存在（RFC 2308），不得用通用正缓存默认 TTL 替代。
+- **多上游应答冲突**：多个已选定的 DNS 并发查询时，拥有真实 Answer
+  的 NOERROR 响应优先于尚在等待的 NXDOMAIN/NODATA。收到首个
+  否定应答后给予最多 200ms 的候选响应等待期；如果仍无正答，
+  选择配置顺序最靠前的否定答复，避免纯调度竞态。如果只有失败或
+  服务器错误，继续按照已有上游错误聚合机制报告。这个有限等待
+  是兼顾短暂上游差异和尾部延迟的策略，不保证等待期之后到达的
+  正答会被采用；不更改 nameserver-policy/fallback 的路径优先级。
+- **验证**：全内存用例覆盖缓存 Authority/Additional/AA/RA/ID、TTL
+  递减与过期、EDNS 复用隔离、零 TTL 与 NODATA 不缓存、NXDOMAIN
+  不缓存、快速 NXDOMAIN/NODATA 与稍慢 IPv4 正答冲突，以及两个
+  否定答复选择的配置顺序。未进行公网递归 DNS 互操作；完整结果
+  以本地质量门禁日志为准。

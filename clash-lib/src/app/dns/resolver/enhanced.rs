@@ -1,9 +1,6 @@
 use crate::{
     Error,
-    app::{
-        dns::helper::{DnsClientNetworkOptions, build_dns_response_message},
-        profile::ThreadSafeCacheFile,
-    },
+    app::{dns::helper::DnsClientNetworkOptions, profile::ThreadSafeCacheFile},
     common::trie,
     config::def::DNSMode,
     dns::{
@@ -60,6 +57,31 @@ pub struct EnhancedResolver {
 }
 
 impl EnhancedResolver {
+    // DNS responses can vary with EDNS, DNSSEC or per-query options, while
+    // Hickory's ResponseCache uses only the Question as its key. Restrict
+    // caching to ordinary, unsigned queries until those variants have
+    // distinct cache keys.
+    fn cache_safe_request(message: &op::Message) -> bool {
+        message.queries.len() == 1
+            && message.metadata.message_type == op::MessageType::Query
+            && message.metadata.op_code == op::OpCode::Query
+            && message.metadata.recursion_desired
+            && !message.metadata.checking_disabled
+            && !message.metadata.authentic_data
+            && message.edns.is_none()
+            && message.signature.is_none()
+    }
+
+    fn cache_safe_response(message: &op::Message) -> bool {
+        message.metadata.response_code == op::ResponseCode::NoError
+            && !message.answers.is_empty()
+            && message.all_sections().all(|record| record.ttl > 0)
+            && !message.metadata.truncation
+            && !message.metadata.authentic_data
+            && message.edns.is_none()
+            && message.signature.is_none()
+    }
+
     fn from_clients(main: Vec<ThreadSafeDNSClient>, ipv6: bool) -> Self {
         Self::from_clients_with_fallback(main, None, ipv6)
     }
@@ -470,6 +492,15 @@ impl EnhancedResolver {
         }
 
         let mut errors = vec![None::<String>; clients.len()];
+        // A fast NXDOMAIN/NODATA should not mask an already-in-flight,
+        // slightly slower positive answer from another configured upstream.
+        // Bound this grace period so a stalled peer does not turn negative
+        // lookups into a 10-second wait.
+        const NEGATIVE_GRACE: Duration = Duration::from_millis(200);
+        let mut negatives = vec![None::<op::Message>; clients.len()];
+        let negative_timer = tokio::time::sleep(NEGATIVE_GRACE);
+        tokio::pin!(negative_timer);
+        let mut negative_pending = false;
         let timeout = tokio::time::sleep(Duration::from_secs(10));
         tokio::pin!(timeout);
         let mut timed_out = false;
@@ -479,6 +510,17 @@ impl EnhancedResolver {
                     let Some((index, result)) = result else { break };
                     let client_id = &client_ids[index];
                     match result {
+                        Ok(response) if response.metadata.response_code == op::ResponseCode::NoError
+                            && !response.answers.is_empty() => {
+                            debug!(
+                                client = %client_id,
+                                query = %query_name,
+                                record_type = %query_type,
+                                answer_count = response.answers.len(),
+                                "dns upstream returned a positive answer"
+                            );
+                            return Ok(response);
+                        }
                         Ok(response) if matches!(
                             response.metadata.response_code,
                             op::ResponseCode::NoError | op::ResponseCode::NXDomain
@@ -488,10 +530,15 @@ impl EnhancedResolver {
                                 query = %query_name,
                                 record_type = %query_type,
                                 response_code = %response.metadata.response_code,
-                                answer_count = response.answers.len(),
-                                "dns upstream responded"
+                                "dns upstream returned a negative response"
                             );
-                            return Ok(response);
+                            negatives[index] = Some(response);
+                            if !negative_pending {
+                                negative_pending = true;
+                                negative_timer.as_mut().reset(
+                                    tokio::time::Instant::now() + NEGATIVE_GRACE
+                                );
+                            }
                         }
                         Ok(response) => {
                             let reason = format!(
@@ -518,6 +565,9 @@ impl EnhancedResolver {
                         }
                     }
                 }
+                _ = &mut negative_timer, if negative_pending => {
+                    break;
+                }
                 _ = &mut timeout => {
                     timed_out = true;
                     // The unfinished futures are dropped on return and never
@@ -531,6 +581,13 @@ impl EnhancedResolver {
                     break;
                 }
             }
+        }
+
+        // For conflicting negative responses, choose the first configured
+        // upstream rather than whichever task happened to win the race.
+        // Policy-selected upstreams are still isolated before batch_exchange.
+        if let Some(response) = negatives.into_iter().flatten().next() {
+            return Ok(response);
         }
 
         let details = client_ids
@@ -596,18 +653,21 @@ impl EnhancedResolver {
             .ok_or_else(|| anyhow!("invalid query"))?;
 
         trace!(q = q.to_string(), "start");
-        if let Some(lru) = &self.lru_cache
-            && let Some(Ok(cached)) = lru.get(q, Instant::now()).map(|c| {
+        if Self::cache_safe_request(message)
+            && let Some(lru) = &self.lru_cache
+            && let Some(Ok(mut cached)) = lru.get(q, Instant::now()).map(|c| {
                 c.inspect_err(|x| warn!("failed to get cached message: {}", x))
             })
         {
-            trace!(
-                q = q.to_string(),
-                "cache hit for DNS query, returning cached response",
-            );
-            let mut reply = build_dns_response_message(message, true, false);
-            reply.add_answers(cached.answers.iter().cloned());
-            return Ok(reply);
+            trace!(q = q.to_string(), "cache hit for DNS query");
+            // Keep the already aged Answer, Authority and Additional sections,
+            // RCODE and response flags. Only transaction-specific fields are
+            // taken from the current request.
+            cached.metadata.id = message.metadata.id;
+            cached.metadata.recursion_desired = message.metadata.recursion_desired;
+            cached.metadata.checking_disabled = message.metadata.checking_disabled;
+            cached.queries = message.queries.clone();
+            return Ok(cached);
         }
         trace!(q = q.to_string(), "querying resolver");
         let res = self.exchange_no_cache(message).await.map(|mut r| {
@@ -642,13 +702,11 @@ impl EnhancedResolver {
         let rv = query.await;
 
         if let Ok(msg) = &rv
+            && Self::cache_safe_request(message)
+            && Self::cache_safe_response(msg)
             && let Some(lru) = &self.lru_cache
             && !(q.query_type() == rr::RecordType::TXT
                 && q.name().to_ascii().starts_with("_acme-challenge."))
-            && !matches!(
-                msg.metadata.response_code,
-                op::ResponseCode::NXDomain | op::ResponseCode::ServFail
-            )
             && {
                 let ips = EnhancedResolver::ip_list_of_message(msg);
                 ips.is_empty() || ips.iter().any(|ip| !ip.is_unspecified())
@@ -1147,7 +1205,7 @@ mod tests {
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
-        time::Instant,
+        time::{Duration, Instant},
     };
     use tokio::sync::RwLock;
 
@@ -1292,7 +1350,8 @@ mod tests {
         let hits = client.hits.clone();
         let mut resolver = EnhancedResolver::from_clients(vec![client], false);
         resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
-        let query = test_query().0;
+        let mut query = test_query().0;
+        query.metadata.recursion_desired = true;
 
         resolver.exchange(&query).await.unwrap();
         resolver.exchange(&query).await.unwrap();
@@ -1365,6 +1424,91 @@ mod tests {
             resolver.resolve_v4("v6-only.test", true).await.unwrap(),
             None
         );
+    }
+
+    #[derive(Debug)]
+    struct DelayedClient {
+        response: op::Message,
+        delay: Duration,
+        name: &'static str,
+    }
+
+    #[async_trait]
+    impl crate::app::dns::Client for DelayedClient {
+        fn id(&self) -> String {
+            self.name.to_owned()
+        }
+        async fn exchange(
+            &self,
+            _message: &op::Message,
+        ) -> anyhow::Result<op::Message> {
+            tokio::time::sleep(self.delay).await;
+            Ok(self.response.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn fast_nxdomain_must_not_mask_later_positive_address() {
+        let mut negative = op::Message::response(0, op::OpCode::Query);
+        negative.metadata.response_code = op::ResponseCode::NXDomain;
+        let clients: Vec<ThreadSafeDNSClient> = vec![
+            Arc::new(DelayedClient {
+                response: negative,
+                delay: Duration::ZERO,
+                name: "fast-negative",
+            }),
+            Arc::new(DelayedClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 60)),
+                delay: Duration::from_millis(35),
+                name: "slower-address",
+            }),
+        ];
+        let answer = EnhancedResolver::batch_exchange(&clients, &test_query().0)
+            .await
+            .expect("valid address should win over early NXDOMAIN");
+        assert_eq!(EnhancedResolver::ip_list_of_message(&answer).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fast_nodata_must_not_mask_later_positive_address() {
+        let clients: Vec<ThreadSafeDNSClient> = vec![
+            Arc::new(DelayedClient {
+                response: op::Message::response(0, op::OpCode::Query),
+                delay: Duration::ZERO,
+                name: "fast-nodata",
+            }),
+            Arc::new(DelayedClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 61)),
+                delay: Duration::from_millis(35),
+                name: "slower-address",
+            }),
+        ];
+        let answer = EnhancedResolver::batch_exchange(&clients, &test_query().0)
+            .await
+            .expect("valid address should win over empty NOERROR");
+        assert_eq!(EnhancedResolver::ip_list_of_message(&answer).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn all_negative_dns_answers_preserve_negative_rcode() {
+        let mut negative = op::Message::response(0, op::OpCode::Query);
+        negative.metadata.response_code = op::ResponseCode::NXDomain;
+        let clients: Vec<ThreadSafeDNSClient> = vec![
+            Arc::new(DelayedClient {
+                response: negative,
+                delay: Duration::from_millis(25),
+                name: "preferred-nxdomain",
+            }),
+            Arc::new(DelayedClient {
+                response: op::Message::response(0, op::OpCode::Query),
+                delay: Duration::ZERO,
+                name: "secondary-nodata",
+            }),
+        ];
+        let answer = EnhancedResolver::batch_exchange(&clients, &test_query().0)
+            .await
+            .expect("negative DNS response is not a transport failure");
+        assert_eq!(answer.metadata.response_code, op::ResponseCode::NXDomain);
     }
 
     #[tokio::test]
@@ -1739,6 +1883,173 @@ mod tests {
             .await
             .expect("should be served from cache");
         assert_eq!(response.metadata.message_type, op::MessageType::Response);
+    }
+
+    #[tokio::test]
+    async fn cached_response_preserves_authority_additional_and_metadata() {
+        let mut resolver = EnhancedResolver::new_default().await;
+        resolver.main.clear();
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+
+        let (mut request, query) = test_query();
+        request.metadata.id = 0x2727;
+        request.metadata.recursion_desired = true;
+        let mut original = op::Message::response(0x1111, request.metadata.op_code);
+        original.metadata.authoritative = true;
+        original.metadata.recursion_available = true;
+        original.add_query(query.clone());
+        original.add_answer(rr::Record::from_rdata(
+            query.name().clone(),
+            240,
+            rr::RData::A(rr::rdata::A(Ipv4Addr::new(192, 0, 2, 5))),
+        ));
+        original.add_authority(rr::Record::from_rdata(
+            query.name().clone(),
+            150,
+            rr::RData::A(rr::rdata::A(Ipv4Addr::new(192, 0, 2, 9))),
+        ));
+        original.add_additional(rr::Record::from_rdata(
+            query.name().clone(),
+            150,
+            rr::RData::A(rr::rdata::A(Ipv4Addr::new(192, 0, 2, 10))),
+        ));
+        resolver.lru_cache.as_ref().unwrap().insert(
+            query.clone(),
+            Ok(original),
+            Instant::now() - Duration::from_secs(8),
+        );
+
+        let cached = resolver.exchange(&request).await.unwrap();
+        assert_eq!(cached.metadata.id, 0x2727);
+        assert!(cached.metadata.authoritative);
+        assert!(cached.metadata.recursion_available);
+        assert!(cached.metadata.recursion_desired);
+        assert_eq!(cached.queries, vec![query]);
+        assert_eq!(cached.answers.len(), 1);
+        assert_eq!(cached.authorities.len(), 1);
+        assert_eq!(cached.additionals.len(), 1);
+        assert!(cached.answers[0].ttl <= 232, "cached TTL must age");
+        assert_eq!(
+            op::Message::from_vec(&cached.to_vec().unwrap())
+                .unwrap()
+                .authorities
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn request_specific_edns_never_uses_question_only_cache() {
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(FailingClient {
+                id: "not-cached",
+                reason: "upstream unavailable",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        let (mut request, query) = test_query();
+        request.metadata.recursion_desired = true;
+        let mut response = response_with_a(Ipv4Addr::new(192, 0, 2, 1));
+        response.add_query(query.clone());
+        resolver.lru_cache.as_ref().unwrap().insert(
+            query,
+            Ok(response),
+            Instant::now(),
+        );
+        request.set_edns(op::Edns::new());
+        assert!(
+            resolver.exchange(&request).await.is_err(),
+            "request-specific EDNS cannot reuse a query-only cached response"
+        );
+    }
+
+    #[tokio::test]
+    async fn noerror_nodata_without_safe_negative_ttl_is_not_cached() {
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(FixedClient {
+                response: op::Message::response(0, op::OpCode::Query),
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        let (mut request, query) = test_query();
+        request.metadata.recursion_desired = true;
+        let answer = resolver.exchange_no_cache(&request).await.unwrap();
+        assert!(answer.answers.is_empty());
+        assert_eq!(answer.metadata.response_code, op::ResponseCode::NoError);
+        assert!(
+            resolver
+                .lru_cache
+                .as_ref()
+                .unwrap()
+                .get(&query, Instant::now())
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_ttl_answer_is_not_cached() {
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(FixedClient {
+                response: {
+                    let (request, query) = test_query();
+                    let mut response = op::Message::response(
+                        request.metadata.id,
+                        request.metadata.op_code,
+                    );
+                    response.add_query(query.clone());
+                    response.add_answer(rr::Record::from_rdata(
+                        query.name().clone(),
+                        0,
+                        rr::RData::A(rr::rdata::A(Ipv4Addr::new(192, 0, 2, 2))),
+                    ));
+                    response
+                },
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        let (mut request, query) = test_query();
+        request.metadata.recursion_desired = true;
+        assert_eq!(
+            resolver.exchange_no_cache(&request).await.unwrap().answers[0].ttl,
+            0
+        );
+        assert!(
+            resolver
+                .lru_cache
+                .as_ref()
+                .unwrap()
+                .get(&query, Instant::now())
+                .is_none(),
+            "zero-TTL DNS answer must not be cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_cached_address_is_not_used_as_stale_success() {
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(FailingClient {
+                id: "expired",
+                reason: "upstream unreachable",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        let (mut request, query) = test_query();
+        request.metadata.recursion_desired = true;
+        let mut response = response_with_a(Ipv4Addr::new(192, 0, 2, 3));
+        response.answers[0].ttl = 5;
+        resolver.lru_cache.as_ref().unwrap().insert(
+            query,
+            Ok(response),
+            Instant::now() - Duration::from_secs(10),
+        );
+        assert!(
+            resolver.exchange(&request).await.is_err(),
+            "expired cached records must not hide DNS outage"
+        );
     }
 
     #[tokio::test]
