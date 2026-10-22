@@ -2066,6 +2066,218 @@ ip: not-an-ip
         assert!(err.contains("dependency 'via' identity changed"), "{err}");
     }
 
+    struct S04bkPausedTransport {
+        entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait]
+    impl crate::app::dns::execution::DnsStrictTransport for S04bkPausedTransport {
+        async fn exchange(
+            &self,
+            _: &crate::app::dns::config::NameServer,
+            _: AnyOutboundHandler,
+            query: &hickory_proto::op::Message,
+        ) -> io::Result<hickory_proto::op::Message> {
+            if let Some(entered) = self.entered.lock().unwrap().take() {
+                entered.send(()).unwrap();
+            }
+            if let Some(release) = self.release.lock().await.take() {
+                release.await.unwrap();
+            }
+            let mut answer = hickory_proto::op::Message::response(
+                query.metadata.id,
+                hickory_proto::op::OpCode::Query,
+            );
+            answer.add_queries(query.queries.iter().cloned());
+            Ok(answer)
+        }
+    }
+
+    #[tokio::test]
+    async fn s04bk_registry_lease_blocks_inflight_aba_and_network_change_still_fails()
+     {
+        use crate::app::{
+            dns::{
+                bootstrap_provider::{
+                    StrictDnsManagerLeafGuard, StrictProviderObservation,
+                },
+                execution::StrictDnsExecution,
+                policy::DnsEgress,
+            },
+            remote_content_manager::{
+                healthcheck::HealthCheck,
+                providers::proxy_provider::{
+                    ThreadSafeProxyProvider, plain_provider::PlainProvider,
+                },
+            },
+        };
+        use hickory_proto::{
+            op::{Message, MessageType, OpCode, Query},
+            rr::{Name, RecordType},
+        };
+        use tokio::sync::RwLock;
+
+        let node = |host| -> AnyOutboundHandler {
+            Arc::new(StrictConnectorTestNode {
+                name: "via",
+                host,
+                via: None,
+                proto: OutboundType::Socks5,
+            })
+        };
+        let leaf: AnyOutboundHandler = Arc::new(StrictConnectorTestNode {
+            name: "leaf",
+            host: "192.0.2.10",
+            via: Some("via"),
+            proto: OutboundType::Socks5,
+        });
+        let original_hop = node("192.0.2.20");
+        let mut manager = isolated_pool_manager(vec![original_hop.clone()]).await;
+        let provider: ThreadSafeProxyProvider = Arc::new(RwLock::new(
+            PlainProvider::new(
+                "remote".into(),
+                vec![leaf.clone()],
+                HealthCheck::new(
+                    vec![],
+                    "http://example.invalid/health".into(),
+                    0,
+                    true,
+                    manager.proxy_manager.clone(),
+                ),
+            )
+            .unwrap(),
+        ));
+        manager.proxy_providers.insert("remote".into(), provider);
+        let manager = Arc::new(manager);
+        let registry = manager.registry.clone();
+        let status = Arc::new(RwLock::new(NetworkStatus::default()));
+        status.write().await.observed(&NetworkSnapshot::default());
+        let observed = StrictProviderObservation::capture_manager(&status, &manager)
+            .await
+            .unwrap();
+        let guard = StrictDnsManagerLeafGuard::bind(
+            observed,
+            &manager,
+            &status,
+            &registry,
+            "remote",
+            leaf.clone(),
+        )
+        .await
+        .unwrap();
+        let execution = StrictDnsExecution {
+            ordinal: 0,
+            egress: DnsEgress::Proxy("DNS-OUT".into()),
+            profile: "trusted".into(),
+            servers: crate::app::dns::Config::parse_nameserver(&[
+                "udp://192.0.2.53".into(),
+                "udp://192.0.2.54".into(),
+            ])
+            .unwrap(),
+            outbound: leaf,
+        };
+        let mut query = Message::new(33, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(
+            Name::from_ascii("www.example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let wire = S04bkPausedTransport {
+            entered: std::sync::Mutex::new(Some(entered_tx)),
+            release: tokio::sync::Mutex::new(Some(release_rx)),
+        };
+        let job = tokio::spawn(async move {
+            guard
+                .exchange_with_leased_connector(&execution, &wire, &query)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // A writer starts *after* the fake DNS request reaches its transport.
+        // It cannot install B, then A, until the scoped registry lease drops.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let writer_registry = registry.clone();
+        let restored = original_hop.clone();
+        let replacement = node("192.0.2.21");
+        let mut writer = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            let mut entries = writer_registry.write().await;
+            entries.insert("via".into(), replacement);
+            entries.insert("via".into(), restored);
+        });
+        started_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut writer)
+                .await
+                .is_err(),
+            "named-hop mutation must not complete during a leased DNS attempt",
+        );
+
+        // Network observation still changes independently of the registry
+        // read lease. The stale DNS result must be discarded.
+        status.write().await.observed(&NetworkSnapshot {
+            dns: "new network".into(),
+            ..NetworkSnapshot::default()
+        });
+        release_tx.send(()).unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(3), job)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("stale network/config"), "{error}");
+        tokio::time::timeout(std::time::Duration::from_secs(3), writer)
+            .await
+            .unwrap()
+            .unwrap();
+        let current = registry.read().await.get("via").cloned().unwrap();
+        assert!(Arc::ptr_eq(&current, &original_hop));
+    }
+
+    #[tokio::test]
+    async fn s04bk_acquiring_registry_lease_rejects_a_stale_named_hop() {
+        use crate::app::dns::bootstrap_dialer::StrictDnsConnectorChain;
+        let leaf: AnyOutboundHandler = Arc::new(StrictConnectorTestNode {
+            name: "leaf",
+            host: "192.0.2.10",
+            via: Some("via"),
+            proto: OutboundType::Socks5,
+        });
+        let original: AnyOutboundHandler = Arc::new(StrictConnectorTestNode {
+            name: "via",
+            host: "192.0.2.20",
+            via: None,
+            proto: OutboundType::Socks5,
+        });
+        let manager = Arc::new(isolated_pool_manager(vec![original]).await);
+        let registry = manager.registry.clone();
+        let observed = StrictDnsConnectorChain::capture(&manager, &registry, &leaf)
+            .await
+            .unwrap();
+        registry.write().await.insert(
+            "via".into(),
+            Arc::new(StrictConnectorTestNode {
+                name: "via",
+                host: "192.0.2.20",
+                via: None,
+                proto: OutboundType::Socks5,
+            }),
+        );
+        let error = observed
+            .lease_for_exchange(&manager, &registry, &leaf)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("identity changed"), "{error}");
+    }
+
     #[tokio::test]
     async fn s04bh_observation_uses_real_outbound_manager_and_rejects_foreign_registry()
      {

@@ -9,11 +9,15 @@ use std::{
     sync::Arc,
 };
 
+use hickory_proto::op::Message;
+
 use crate::{
     app::{
         dns::{
-            bootstrap_dialer::StrictDnsConnectorChain,
-            execution::DnsStrictAttemptGuard,
+            bootstrap_dialer::{StrictDnsConnectorChain, StrictDnsConnectorLease},
+            execution::{
+                DnsStrictAttemptGuard, DnsStrictTransport, StrictDnsExecution,
+            },
         },
         outbound::manager::OutboundManager,
         remote_content_manager::providers::proxy_provider::ThreadSafeProxyProvider,
@@ -101,7 +105,70 @@ pub(crate) struct StrictDnsManagerLeafGuard {
     connector: StrictDnsConnectorChain,
 }
 
+struct LeasedStrictAttempt<'a> {
+    owner: &'a StrictDnsManagerLeafGuard,
+    lease: &'a StrictDnsConnectorLease,
+}
+
+#[async_trait::async_trait]
+impl DnsStrictAttemptGuard for LeasedStrictAttempt<'_> {
+    async fn ensure_current(&self, outbound: &AnyOutboundHandler) -> io::Result<()> {
+        self.owner.ensure_current_leased(outbound, self.lease).await
+    }
+}
+
 impl StrictDnsManagerLeafGuard {
+    /// The read lease spans all upstream attempts and their I/O. A writer to
+    /// the actual manager registry cannot complete a transient A->B->A while
+    /// the exchange is in flight. This is internal and deliberately unconnected
+    /// to production DNS and the shared answer cache.
+    pub(crate) async fn exchange_with_leased_connector<T: DnsStrictTransport>(
+        &self,
+        execution: &StrictDnsExecution,
+        transport: &T,
+        request: &Message,
+    ) -> io::Result<Message> {
+        let lease = self
+            .connector
+            .lease_for_exchange(&self.manager, &self.registry, &execution.outbound)
+            .await?;
+        self.ensure_current_leased(&execution.outbound, &lease)
+            .await?;
+        let check = LeasedStrictAttempt {
+            owner: self,
+            lease: &lease,
+        };
+        execution.exchange_guarded(transport, request, &check).await
+    }
+
+    async fn ensure_current_leased(
+        &self,
+        outbound: &AnyOutboundHandler,
+        lease: &StrictDnsConnectorLease,
+    ) -> io::Result<()> {
+        if !Arc::ptr_eq(&self.selected, outbound) {
+            return Err(io::Error::other(
+                "strict DNS attempt selected leaf identity changed",
+            ));
+        }
+        if !self.manager.owns_outbound_registry(&self.registry) {
+            return Err(io::Error::other(
+                "strict DNS attempt registry belongs to a different outbound manager",
+            ));
+        }
+        self.observed
+            .ensure_current_manager(&self.status, &self.manager)
+            .await?;
+        self.connector.ensure_leased(lease, outbound)?;
+        self.observed
+            .require_selected(&self.status, &self.provider, &self.selected)
+            .await?;
+        self.connector.ensure_leased(lease, outbound)?;
+        self.observed
+            .ensure_current_manager(&self.status, &self.manager)
+            .await
+    }
+
     pub(crate) async fn bind(
         observed: StrictProviderObservation,
         manager: &Arc<OutboundManager>,

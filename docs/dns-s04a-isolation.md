@@ -87,6 +87,12 @@ cargo test -p clash-lib --test dns_config_tests --locked
 - 当前 `OutboundManager::init_handler_connectors` 为 `dialer-proxy` 注册的是 `ProxyConnector(named_proxy, DirectConnector)`，并未安装任意递归多跳连接器。因此 S04b-j **主动拒绝第二级 `dialer-proxy`**，不能把配置中写出的链误认作受到逐跳保护。`StrictDnsManagerLeafGuard::bind/ensure_current` 在既有 Provider、Manager、网络代际检查的前后增加此单跳关系复核，不使用共享 DNS 缓存、不解除生产保护。新增 `s04bj_` 离线测试覆盖同名 hop 替换、缺失/循环/不可信端点/多跳/动态组以及 guard 执行边界。
 - **限制：** 身份检查仅在 I/O 前后发生，不可撤销两次检查之间的网络副作用；真实 Connector 内部仍未绑定原子代际承诺及防 ABA 的注册表版本，也没有对正在使用的连接池进行端到端认证。Provider 下载内容与代理端点 bootstrap 来源尚未认证，完整动态拓扑证明、实际数据面抓包、独立 L2 审查及维护者批准仍为前置条件。`policy-rules` 生产 gate 继续保持关闭。
 
+## S04b-k：真实 outbound registry 作用域租约（仅内部无缓存严格执行）
+
+- 对当前真实 `OutboundHandlerRegistry = Arc<RwLock<...>>` 新增 `StrictDnsConnectorChain::lease_for_exchange`：获取**持有所有权的 RwLock 只读租约**，在同一锁内验证 S04b-j 捕获的命名 hop 与选中叶节点。新增 `StrictDnsManagerLeafGuard::exchange_with_leased_connector`，将该租约保持至 `StrictDnsExecution::exchange_guarded` 全部上游尝试结束，期间任何 registry 写锁替换都必须等待；不会发生请求进行中的可见 A→B→A 命名 hop 更新。每个上游 I/O 前后复核 Provider 内容、Manager 身份、network/config 代际及固定叶节点。租约内的复核不重入获取 registry 的 RwLock，以防等待中的写者导致读者死锁。
+- `s04bk_` 离线回归：正在执行假 DNS I/O 时启动同名 hop 的 A→B→A writer，验证写者被阻塞；独立地更改网络代际后，DNS 旧应答失败关闭，租约释放后 writer 才完成。另覆盖开始租约前 hop 已被同名替换时必须拒绝。仅触及内部 `bootstrap_dialer.rs`、`bootstrap_provider.rs` 和测试，原有生产代理流量/业务 registry 使用方式不变。
+- **关键限制：** 只读租约阻塞真实 registry 的写者直至内部请求结束（包括失败和超时）；会产生潜在写锁延迟，不可未经性能、取消与死锁审查接入生产。它**不是全局单调 registry revision**，对捕获快照之前发生且已恢复的 A→B→A、Provider 内部自身变化、Connector 构造时持有的私有 handler、socket 打开期间的系统级流量副作用，均不能单凭这个锁给出证明。真实 socket path generation / Connector 内部逐跳事务验证及经过认证的 Provider/pin 来源仍未完成；`policy-rules` 生产 gate 继续关闭，不能视为用户可用功能。
+
 ## S04b/S04c 待完成的严格准入
 
 1. **真实执行接线与身份来源**：S04b-a 提供共享 RuntimeStatus 读取接口，但**尚未由生产 DNS runtime 自动接入或订阅**；需有可信的 bootstrap pin revision/变更事件来源，而不是由未受验证的调用者提供任意数值。仍需真实数据面验证动态代理在查询中途切换时的失效与回滚；旧 legacy 路径继续完全独立。
