@@ -11,6 +11,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "xhttp-h3")]
+use std::sync::atomic::AtomicBool;
+
 use async_trait::async_trait;
 #[cfg(feature = "xhttp-h3")]
 use bytes::Buf;
@@ -125,9 +128,65 @@ impl ReusableH2 {
     }
 }
 
+/// A pooled HTTP/3 connection is retired when its last pool entry is
+/// removed. Existing application streams remain usable until their own Drop;
+/// after the last stream leaves, explicitly close the QUIC socket so a
+/// long-lived downlink task cannot keep its driver alive indefinitely.
+#[cfg(feature = "xhttp-h3")]
+struct H3PooledSocket {
+    endpoint: Endpoint,
+    connection: quinn::Connection,
+    active: Arc<AtomicU64>,
+    retired: AtomicBool,
+    driver_finished: AtomicBool,
+}
+
+#[cfg(feature = "xhttp-h3")]
+impl H3PooledSocket {
+    fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
+        self.close_if_idle();
+    }
+
+    fn close_if_idle(&self) {
+        if self.retired.load(Ordering::Acquire)
+            && self.active.load(Ordering::Acquire) == 0
+        {
+            self.connection.close(
+                quinn::VarInt::from_u32(0),
+                b"retired HTTP/3 connection has no active streams",
+            );
+            self.endpoint
+                .close(quinn::VarInt::from_u32(0), b"retired HTTP/3 endpoint");
+        }
+    }
+}
+
+/// Prevent cancellation while waiting for a reuse-pool lock from leaving
+/// an unregistered QUIC driver and UDP socket running.
+#[cfg(feature = "xhttp-h3")]
+struct H3PoolRegistration(Option<Arc<H3PooledSocket>>);
+
+#[cfg(feature = "xhttp-h3")]
+impl H3PoolRegistration {
+    fn complete(mut self) {
+        self.0.take();
+    }
+}
+
+#[cfg(feature = "xhttp-h3")]
+impl Drop for H3PoolRegistration {
+    fn drop(&mut self) {
+        if let Some(socket) = self.0.take() {
+            socket.retire();
+        }
+    }
+}
+
 #[cfg(feature = "xhttp-h3")]
 struct ReusableH3 {
     sender: H3SendRequest,
+    socket: Arc<H3PooledSocket>,
     created_at: Instant,
     active: Arc<AtomicU64>,
     reuse_count: u64,
@@ -138,8 +197,18 @@ struct ReusableH3 {
 }
 
 #[cfg(feature = "xhttp-h3")]
+impl Drop for ReusableH3 {
+    fn drop(&mut self) {
+        self.socket.retire();
+    }
+}
+
+#[cfg(feature = "xhttp-h3")]
 impl ReusableH3 {
     fn retired(&self) -> bool {
+        if self.socket.retired.load(Ordering::Acquire) {
+            return true;
+        }
         if self.limits.c_max_reuse_times != 0
             && self.reuse_count >= self.limits.c_max_reuse_times
         {
@@ -181,17 +250,35 @@ struct H3DownlinkSender {
 }
 
 #[cfg(feature = "xhttp-h3")]
-struct H3ActiveLease(Option<Arc<AtomicU64>>);
+struct H3ActiveLease {
+    active: Option<Arc<AtomicU64>>,
+    socket: Option<Arc<H3PooledSocket>>,
+}
 
 #[cfg(feature = "xhttp-h3")]
 impl H3ActiveLease {
-    fn take(&mut self) -> Option<Arc<AtomicU64>> {
-        self.0.take()
+    fn none() -> Self {
+        Self {
+            active: None,
+            socket: None,
+        }
+    }
+
+    fn pooled(socket: Arc<H3PooledSocket>) -> Self {
+        Self {
+            active: Some(socket.active.clone()),
+            socket: Some(socket),
+        }
     }
 
     fn into_stream(mut self, stream: AnyStream) -> AnyStream {
-        match self.take() {
-            Some(active) => leased_stream(stream, active),
+        match self.active.take() {
+            Some(active) => Box::new(ReuseLeaseStream {
+                inner: stream,
+                active,
+                #[cfg(feature = "xhttp-h3")]
+                h3_socket: self.socket.take(),
+            }),
             None => stream,
         }
     }
@@ -200,8 +287,11 @@ impl H3ActiveLease {
 #[cfg(feature = "xhttp-h3")]
 impl Drop for H3ActiveLease {
     fn drop(&mut self) {
-        if let Some(active) = self.0.take() {
+        if let Some(active) = self.active.take() {
             active.fetch_sub(1, Ordering::AcqRel);
+            if let Some(socket) = &self.socket {
+                socket.close_if_idle();
+            }
         }
     }
 }
@@ -209,6 +299,8 @@ impl Drop for H3ActiveLease {
 struct ReuseLeaseStream {
     inner: AnyStream,
     active: Arc<AtomicU64>,
+    #[cfg(feature = "xhttp-h3")]
+    h3_socket: Option<Arc<H3PooledSocket>>,
 }
 
 impl AsyncRead for ReuseLeaseStream {
@@ -248,6 +340,10 @@ impl AsyncWrite for ReuseLeaseStream {
 impl Drop for ReuseLeaseStream {
     fn drop(&mut self) {
         self.active.fetch_sub(1, Ordering::AcqRel);
+        #[cfg(feature = "xhttp-h3")]
+        if let Some(socket) = &self.h3_socket {
+            socket.close_if_idle();
+        }
     }
 }
 
@@ -979,6 +1075,8 @@ fn leased_stream(stream: AnyStream, active: Arc<AtomicU64>) -> AnyStream {
     Box::new(ReuseLeaseStream {
         inner: stream,
         active,
+        #[cfg(feature = "xhttp-h3")]
+        h3_socket: None,
     })
 }
 
@@ -1093,7 +1191,7 @@ async fn proxy_stream_up_h3(
             Some(downlink) => {
                 (downlink.sender, downlink.active, downlink.request_count)
             }
-            None => (sender.clone(), H3ActiveLease(None), request_count.clone()),
+            None => (sender.clone(), H3ActiveLease::none(), request_count.clone()),
         };
     let (
         downlink_server,
@@ -1257,7 +1355,7 @@ async fn proxy_packet_up_h3(
             Some(downlink) => {
                 (downlink.sender, downlink.active, downlink.request_count)
             }
-            None => (sender.clone(), H3ActiveLease(None), request_count.clone()),
+            None => (sender.clone(), H3ActiveLease::none(), request_count.clone()),
         };
     let (
         downlink_server,
@@ -1507,7 +1605,7 @@ async fn connect_h3_sender(
     connector: &dyn RemoteConnector,
     keep_alive_period: Option<i64>,
     pool_context: NetworkPoolContext,
-) -> io::Result<(H3SendRequest, NetworkPoolContext)> {
+) -> io::Result<(H3SendRequest, NetworkPoolContext, Arc<H3PooledSocket>)> {
     if !matches!(endpoint_config.security, XhttpSecurity::Tls) {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -1631,11 +1729,28 @@ async fn connect_h3_sender(
                 io::Error::other(format!("HTTP/3 setup failed: {err}"))
             })?;
         let (endpoint, connection) = pending.handoff();
+        let socket = Arc::new(H3PooledSocket {
+            endpoint,
+            connection,
+            active: Arc::new(AtomicU64::new(0)),
+            retired: AtomicBool::new(false),
+            driver_finished: AtomicBool::new(false),
+        });
+        let driver_socket = socket.clone();
         tokio::spawn(async move {
-            let _endpoint = endpoint;
-            let _connection = connection;
-            let err = driver.wait_idle().await;
-            tracing::debug!(error = %err, "xhttp HTTP/3 driver ended");
+            tokio::select! {
+                biased;
+                result = driver.wait_idle() => {
+                    tracing::debug!(error = %result, "xhttp HTTP/3 driver ended");
+                }
+                _ = driver_socket.connection.closed() => {
+                    tracing::debug!("xhttp HTTP/3 connection closed; driver stopping");
+                }
+            }
+            // A finished driver must never be reused, even if its sender is
+            // still held by an old pool entry.
+            driver_socket.driver_finished.store(true, Ordering::Release);
+            driver_socket.retire();
         });
         let mut connected_context = connected_context;
         connected_context.network_generation = connected_context
@@ -1644,7 +1759,7 @@ async fn connect_h3_sender(
             .map(|path| path.network_generation)
             .or(connected_context.network_generation)
             .or(current_context.network_generation);
-        return Ok((sender, connected_context));
+        return Ok((sender, connected_context, socket));
     }
 
     Err(io::Error::other(format!(
@@ -1663,7 +1778,7 @@ async fn acquire_h3_upload_sender(
     pool_context: NetworkPoolContext,
 ) -> io::Result<H3UploadSender> {
     let Some(reuse_policy) = client.reuse_policy.as_ref() else {
-        let (sender, connected_context) = connect_h3_sender(
+        let (sender, connected_context, socket) = connect_h3_sender(
             endpoint_config,
             sess,
             resolver,
@@ -1672,9 +1787,10 @@ async fn acquire_h3_upload_sender(
             pool_context,
         )
         .await?;
+        let _ = socket; // Unpooled HTTP/3 sender; driver retains its socket.
         return Ok(H3UploadSender {
             sender,
-            active: H3ActiveLease(None),
+            active: H3ActiveLease::none(),
             request_count: None,
             network_path_ids: connected_context.path_id.into_iter().collect(),
         });
@@ -1702,14 +1818,14 @@ async fn acquire_h3_upload_sender(
             connection.active.fetch_add(1, Ordering::AcqRel);
             return Ok(H3UploadSender {
                 sender: connection.sender.clone(),
-                active: H3ActiveLease(Some(connection.active.clone())),
+                active: H3ActiveLease::pooled(connection.socket.clone()),
                 request_count: Some(connection.request_count.clone()),
                 network_path_ids: connection.path_id.clone().into_iter().collect(),
             });
         }
     }
 
-    let (sender, connected_context) = connect_h3_sender(
+    let (sender, connected_context, socket) = connect_h3_sender(
         endpoint_config,
         sess,
         resolver,
@@ -1718,12 +1834,14 @@ async fn acquire_h3_upload_sender(
         pool_context,
     )
     .await?;
+    let registration = H3PoolRegistration(Some(socket.clone()));
     if client.reuse_max_connections == Some(0)
         || !connected_context.can_pool_connected_path()
     {
+        registration.complete(); // This unpooled sender is not a pool entry.
         return Ok(H3UploadSender {
             sender,
-            active: H3ActiveLease(None),
+            active: H3ActiveLease::none(),
             request_count: None,
             network_path_ids: connected_context
                 .path_id
@@ -1733,10 +1851,13 @@ async fn acquire_h3_upload_sender(
         });
     }
 
-    let active = Arc::new(AtomicU64::new(1));
+    let active = socket.active.clone();
     let request_count = Arc::new(AtomicU64::new(0));
-    client.h3_reuse_pool.lock().await.push(ReusableH3 {
+    let mut pool = client.h3_reuse_pool.lock().await;
+    socket.active.fetch_add(1, Ordering::AcqRel);
+    pool.push(ReusableH3 {
         sender: sender.clone(),
+        socket: socket.clone(),
         created_at: Instant::now(),
         active: active.clone(),
         reuse_count: 0,
@@ -1745,9 +1866,10 @@ async fn acquire_h3_upload_sender(
         network_generation: connected_context.network_generation,
         path_id: connected_context.path_id.clone(),
     });
+    registration.complete();
     Ok(H3UploadSender {
         sender,
-        active: H3ActiveLease(Some(active)),
+        active: H3ActiveLease::pooled(socket.clone()),
         request_count: Some(request_count),
         network_path_ids: connected_context.path_id.clone().into_iter().collect(),
     })
@@ -1763,7 +1885,7 @@ async fn acquire_h3_download_sender(
     pool_context: NetworkPoolContext,
 ) -> io::Result<H3DownlinkSender> {
     let Some(reuse_policy) = download.reuse_policy.as_ref() else {
-        let (sender, connected_context) = connect_h3_sender(
+        let (sender, connected_context, socket) = connect_h3_sender(
             &XhttpEndpointConfig::from(download),
             sess,
             resolver,
@@ -1772,9 +1894,10 @@ async fn acquire_h3_download_sender(
             pool_context,
         )
         .await?;
+        let _ = socket; // Unpooled HTTP/3 sender; driver retains its socket.
         return Ok(H3DownlinkSender {
             sender,
-            active: H3ActiveLease(None),
+            active: H3ActiveLease::none(),
             request_count: None,
             network_path_ids: connected_context.path_id.into_iter().collect(),
         });
@@ -1803,14 +1926,14 @@ async fn acquire_h3_download_sender(
             connection.active.fetch_add(1, Ordering::AcqRel);
             return Ok(H3DownlinkSender {
                 sender: connection.sender.clone(),
-                active: H3ActiveLease(Some(connection.active.clone())),
+                active: H3ActiveLease::pooled(connection.socket.clone()),
                 request_count: Some(connection.request_count.clone()),
                 network_path_ids: connection.path_id.clone().into_iter().collect(),
             });
         }
     }
 
-    let (sender, connected_context) = connect_h3_sender(
+    let (sender, connected_context, socket) = connect_h3_sender(
         &XhttpEndpointConfig::from(download),
         sess,
         resolver,
@@ -1819,12 +1942,14 @@ async fn acquire_h3_download_sender(
         pool_context,
     )
     .await?;
+    let registration = H3PoolRegistration(Some(socket.clone()));
     if client.download_reuse_max_connections == Some(0)
         || !connected_context.can_pool_connected_path()
     {
+        registration.complete(); // This unpooled sender is not a pool entry.
         return Ok(H3DownlinkSender {
             sender,
-            active: H3ActiveLease(None),
+            active: H3ActiveLease::none(),
             request_count: None,
             network_path_ids: connected_context
                 .path_id
@@ -1834,10 +1959,13 @@ async fn acquire_h3_download_sender(
         });
     }
 
-    let active = Arc::new(AtomicU64::new(1));
+    let active = socket.active.clone();
     let request_count = Arc::new(AtomicU64::new(0));
-    client.h3_download_reuse_pool.lock().await.push(ReusableH3 {
+    let mut pool = client.h3_download_reuse_pool.lock().await;
+    socket.active.fetch_add(1, Ordering::AcqRel);
+    pool.push(ReusableH3 {
         sender: sender.clone(),
+        socket: socket.clone(),
         created_at: Instant::now(),
         active: active.clone(),
         reuse_count: 0,
@@ -1846,9 +1974,10 @@ async fn acquire_h3_download_sender(
         network_generation: connected_context.network_generation,
         path_id: connected_context.path_id.clone(),
     });
+    registration.complete();
     Ok(H3DownlinkSender {
         sender,
-        active: H3ActiveLease(Some(active)),
+        active: H3ActiveLease::pooled(socket.clone()),
         request_count: Some(request_count),
         network_path_ids: connected_context.path_id.clone().into_iter().collect(),
     })
@@ -1909,23 +2038,22 @@ async fn try_reuse_h3_stream(
         connection.active.fetch_add(1, Ordering::AcqRel);
         Some((
             connection.sender.clone(),
-            connection.active.clone(),
+            connection.socket.clone(),
             connection.request_count.clone(),
             connection.network_generation,
             connection.path_id.clone(),
         ))
     };
 
-    let Some((sender, active, request_count, network_generation, path_id)) =
+    let Some((sender, socket, request_count, network_generation, path_id)) =
         selected
     else {
         return Ok(None);
     };
-    let reservation = super::PoolActiveReservation::new(active.clone());
+    let reservation = H3ActiveLease::pooled(socket);
     match open_h3_logical_stream(client, sender, None, Some(request_count)).await {
         Ok(stream) => {
-            let stream = leased_stream(stream, active);
-            reservation.transfer();
+            let stream = reservation.into_stream(stream);
             Ok(Some((
                 stream,
                 NetworkPoolContext {
@@ -2008,7 +2136,7 @@ async fn connect_h3_stream(
         Err(err) => {
             // Upload/downlink sender leases release their own reservations,
             // even when cancelled before the error branch can execute.
-            if upload.active.0.is_some() {
+            if upload.active.active.is_some() {
                 client.h3_reuse_pool.lock().await.clear();
             }
             return Err(err);
@@ -3717,6 +3845,251 @@ mod tests {
     }
 
     #[cfg(feature = "xhttp-h3")]
+    async fn spawn_s04bv_observed_h3_server() -> (
+        std::net::SocketAddr,
+        tokio::sync::oneshot::Receiver<quinn::ConnectionError>,
+    ) {
+        crate::setup_default_crypto_provider();
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["xhttp.example.com".to_owned()])
+                .unwrap();
+        let cert = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+        let key =
+            rustls::pki_types::PrivateKeyDer::try_from(signing_key.serialize_der())
+                .unwrap();
+        let mut tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+        let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap(),
+        ));
+        let endpoint =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap())
+                .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let incoming = endpoint.accept().await.unwrap();
+            let conn = incoming.await.unwrap();
+            let watcher = conn.clone();
+            tokio::spawn(async move {
+                let _ = closed_tx.send(watcher.closed().await);
+            });
+            let h3_conn = h3_quinn::Connection::new(conn);
+            let mut h3_server = h3::server::builder().build(h3_conn).await.unwrap();
+            while let Ok(Some(resolver)) = h3_server.accept().await {
+                let (_, mut stream) = resolver.resolve_request().await.unwrap();
+                stream
+                    .send_response(
+                        Response::builder().status(StatusCode::OK).body(()).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                while let Some(mut data) = stream.recv_data().await.unwrap() {
+                    stream
+                        .send_data(data.copy_to_bytes(data.remaining()))
+                        .await
+                        .unwrap();
+                }
+                let _ = stream.finish().await;
+            }
+        });
+        (addr, closed_rx)
+    }
+
+    #[cfg(feature = "xhttp-h3")]
+    #[tokio::test]
+    async fn s04bv_h3_pool_registration_abort_closes_unpublished_driver() {
+        let (addr, closed_rx) = spawn_s04bv_observed_h3_server().await;
+        let endpoint = XhttpEndpointConfig {
+            server: "127.0.0.1".into(),
+            port: addr.port(),
+            security: XhttpSecurity::Tls,
+            server_name: "xhttp.example.com".into(),
+            alpn_protocols: vec!["h3".into()],
+            skip_cert_verify: true,
+            fingerprint: None,
+            verify_name: None,
+            tls_cert: None,
+            tls_key: None,
+            reality: None,
+        };
+        let (sender, _, socket) = timeout(
+            Duration::from_secs(3),
+            super::connect_h3_sender(
+                &endpoint,
+                &Session::default(),
+                Arc::new(MockClashResolver::new()),
+                &DirectConnector::new(),
+                Some(0),
+                NetworkPoolContext::default(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let socket_state = socket.clone();
+        let client = Arc::new(Client::new(
+            "127.0.0.1".into(),
+            addr.port(),
+            "/xhttp/".into(),
+            None,
+            HashMap::new(),
+            true,
+            XhttpMode::StreamOne,
+            1_000_000,
+            false,
+            None,
+            None,
+        ));
+        let gate = client.h3_reuse_pool.lock().await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let pool_owner = client.clone();
+        let registration = tokio::spawn(async move {
+            let _sender = sender;
+            let pending = super::H3PoolRegistration(Some(socket));
+            entered_tx.send(()).unwrap();
+            let _write = pool_owner.h3_reuse_pool.lock().await;
+            pending.complete();
+        });
+        timeout(Duration::from_secs(2), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        registration.abort();
+        assert!(
+            timeout(Duration::from_secs(3), registration)
+                .await
+                .unwrap()
+                .expect_err("pending pool write should be cancelled")
+                .is_cancelled()
+        );
+        drop(gate);
+        assert!(client.h3_reuse_pool.lock().await.is_empty());
+        assert!(socket_state.retired.load(Ordering::Acquire));
+        assert_eq!(socket_state.active.load(Ordering::Acquire), 0);
+        timeout(Duration::from_secs(3), closed_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(3), async {
+            while !socket_state.driver_finished.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled registration must also stop the HTTP/3 driver");
+    }
+
+    #[cfg(feature = "xhttp-h3")]
+    #[tokio::test]
+    async fn s04bv_h3_pool_retirement_closes_udp_after_last_active_stream() {
+        for keep_active_at_reset in [true, false] {
+            let (addr, mut remote_closed) = spawn_s04bv_observed_h3_server().await;
+            let endpoint = XhttpEndpointConfig {
+                server: "127.0.0.1".into(),
+                port: addr.port(),
+                security: XhttpSecurity::Tls,
+                server_name: "xhttp.example.com".into(),
+                alpn_protocols: vec!["h3".into()],
+                skip_cert_verify: true,
+                fingerprint: None,
+                verify_name: None,
+                tls_cert: None,
+                tls_key: None,
+                reality: None,
+            };
+            let client = Client::new(
+                "127.0.0.1".into(),
+                addr.port(),
+                "/xhttp/".into(),
+                None,
+                HashMap::new(),
+                true,
+                XhttpMode::StreamOne,
+                1_000_000,
+                false,
+                None,
+                None,
+            )
+            .with_upload_endpoint(Some(endpoint))
+            .with_http_version(XhttpHttpVersion::Http3)
+            .with_reuse_policy(Some(XhttpReusePolicy {
+                max_concurrency: Some(XhttpReuseValueRange { min: 2, max: 2 }),
+                max_connections: None,
+                c_max_reuse_times: Some(XhttpReuseValueRange { min: 0, max: 0 }),
+                h_max_request_times: Some(XhttpReuseValueRange { min: 0, max: 0 }),
+                h_max_reusable_secs: Some(XhttpReuseValueRange { min: 0, max: 0 }),
+                h_keep_alive_period: 0,
+            }));
+            let mut app = timeout(
+                Duration::from_secs(3),
+                client.connect_stream_with_connector(
+                    &Session::default(),
+                    Arc::new(MockClashResolver::new()),
+                    &DirectConnector::new(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            app.write_all(b"start").await.unwrap();
+            app.flush().await.unwrap();
+            let mut reply = [0; 5];
+            timeout(Duration::from_secs(3), app.read_exact(&mut reply))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&reply, b"start");
+            let socket = client.h3_reuse_pool.lock().await[0].socket.clone();
+            assert_eq!(socket.active.load(Ordering::Acquire), 1);
+            let mut app = Some(app);
+            if !keep_active_at_reset {
+                drop(app.take());
+                assert_eq!(socket.active.load(Ordering::Acquire), 0);
+            }
+            assert_eq!(client.reset_connection_pool().await.unwrap(), 1);
+            assert!(socket.retired.load(Ordering::Acquire));
+            assert!(client.h3_reuse_pool.lock().await.is_empty());
+            if keep_active_at_reset {
+                // Retirement is only a future-reuse barrier, not permission
+                // to break an application stream still in use.
+                assert!(
+                    timeout(Duration::from_millis(50), &mut remote_closed)
+                        .await
+                        .is_err(),
+                    "healthy active stream closed during retirement"
+                );
+                let stream = app.as_mut().expect("active app stream exists");
+                stream.write_all(b"live!").await.unwrap();
+                stream.flush().await.unwrap();
+                let mut next = [0; 5];
+                timeout(Duration::from_secs(3), stream.read_exact(&mut next))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(&next, b"live!");
+                drop(app.take());
+            }
+            let _closed = timeout(Duration::from_secs(3), remote_closed)
+                .await
+                .expect("remote QUIC connection must close after retirement")
+                .expect("remote closure observer must report");
+            timeout(Duration::from_secs(3), async {
+                while !socket.driver_finished.load(Ordering::Acquire) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("H3 driver task must finish after idle pool retirement");
+            assert_eq!(socket.active.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[cfg(feature = "xhttp-h3")]
     #[tokio::test]
     async fn s04bu_abort_after_quic_handshake_closes_uncommitted_socket() {
         use super::{PendingH3Socket, TlsClient};
@@ -4088,7 +4461,7 @@ mod tests {
         async fn roundtrip(
             mut lease: super::H3DownlinkSender,
             addr: std::net::SocketAddr,
-        ) -> Option<Arc<std::sync::atomic::AtomicU64>> {
+        ) {
             super::count_h3_request(lease.request_count.as_ref());
             let request = Request::builder()
                 .method(Method::POST)
@@ -4116,7 +4489,7 @@ mod tests {
                 .expect("pooled H3 response body should drain")
                 .is_some()
             {}
-            lease.active.take()
+            // The sender's H3ActiveLease is released with the sender here.
         }
 
         let first = super::acquire_h3_download_sender(
@@ -4129,8 +4502,7 @@ mod tests {
         )
         .await
         .expect("first H3 download sender should connect");
-        let first_active = roundtrip(first, addr).await;
-        drop(super::H3ActiveLease(first_active));
+        roundtrip(first, addr).await;
 
         let second = super::acquire_h3_download_sender(
             &client,
@@ -4142,8 +4514,7 @@ mod tests {
         )
         .await
         .expect("second H3 download sender should reuse");
-        let second_active = roundtrip(second, addr).await;
-        drop(super::H3ActiveLease(second_active));
+        roundtrip(second, addr).await;
 
         let pool = client.h3_download_reuse_pool.lock().await;
         assert_eq!(pool.len(), 1);

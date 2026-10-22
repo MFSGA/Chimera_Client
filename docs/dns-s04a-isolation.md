@@ -158,6 +158,13 @@ cargo test -p clash-lib --test dns_config_tests --locked
 - `s04bu_` 两项离线本地 QUIC 测试：使用本地 QUIC 服务端和真实 TLS/ALPN 握手，模拟握手后、driver 交付前取消任务，要求远端实际观察到 QUIC 连接关闭；另外验证当前有明确候选集合时，无物理路径报告的 H3 链路不能通过认证。保持独立 `xhttp-h3` Feature 的可构建性，补跑现有 HTTP/3 双端和正常回声测试。
 - **限制：** 当前保护覆盖**握手已建立但尚未交接 driver 的资源**。已交付 sender/活跃流后，QUIC driver 的自然退出、连接池退休、可能悬挂的上传/下载后台任务及 OS UDP socket 关闭仍未得到全生命周期压力或抓包证明；关闭连接亦不能撤销此前的 UDP 发包。真实 NIC/源 IP 验证、可信 Provider/bootstrap pin、完整递归 dialer、独立 L2 审查与维护者批准仍待完成。生产 `policy-rules` gate 继续关闭。
 
+## S04b-v：池化 HTTP/3 退休、在途流与 QUIC driver 退出（内部非生产）
+
+- XHTTP HTTP/3 池化连接新增 `H3PooledSocket` 共享生命周期：记录 QUIC `Connection`/`Endpoint`、活跃应用逻辑流计数、退休状态和 driver 完成状态。`ReusableH3` 从池中移除（显式 `reset_connection_pool`、失效的网络路径、时间/重用限额）时标记为 `retired`，不允许再次作为新流的复用来源。若 `active == 0`，立即对 QUIC 连接及 Endpoint 发出关闭；若还有应用流，则允许它继续工作，等**最后一个 `H3ActiveLease` 或 `ReuseLeaseStream` Drop** 后再关闭。后台 driver 同时等待 HTTP/3 空闲和底层 QUIC 关闭，结束时记录状态，防止已退出 driver 的旧 entry 再被复用。注意此实现不能撤回已经开始的请求或系统网络包。
+- 新增 `H3PoolRegistration` 作用域守卫，覆盖 driver 已创建、但新上传/下载 sender **正在等待复用池互斥锁登记** 的取消窗口。登记前发生 future Drop 时，自动退休尚未发布的连接；只有实际插入 pool 后才撤销守卫。首次增加 `active` 计数也延迟到持有池锁时，防止因等待锁而留下虚假的活跃计数；不入池的旧式直连行为保持不变。
+- `s04bv_` 两项**真实本地 QUIC/TLS+HTTP/3** 离线测试验证：(1) 先退休池后释放活跃逻辑流，以及先释放后退休，均在最后一次 Drop 后使远端观察到 QUIC 关闭并确认 driver 任务完成；活跃逻辑流在池退休后仍可正常读写。(2) 成功创建 driver 后停在新池登记锁，abort 等待者，确认无池 entry、无活跃名额、远端 QUIC 已关闭且 driver 完成。既有 H3 上传/下载、并发限额及网络切换回归继续运行。
+- **边界：** 本轮证明有明确池生命周期的 H3 QUIC 连接会在**退休且最后一个逻辑流释放后**关闭并结束后台 driver；不是对任意未池化 H3 socket、操作系统 UDP 文件描述符何时实际回收、强制取消网络副作用、真实 NIC/源 IP 或高负载/系统重连压力的端到端证明。未纳入池的 H3 sender 自有生命周期仍待审查。可信 Provider/bootstrap pin 来源、递归 dialer 全链路及独立 L2 审查与维护者批准尚未完成。**生产 `policy-rules` gate 不变且继续禁用。**
+
 ## S04b/S04c 待完成的严格准入
 
 1. **真实执行接线与身份来源**：S04b-a 提供共享 RuntimeStatus 读取接口，但**尚未由生产 DNS runtime 自动接入或订阅**；需有可信的 bootstrap pin revision/变更事件来源，而不是由未受验证的调用者提供任意数值。仍需真实数据面验证动态代理在查询中途切换时的失效与回滚；旧 legacy 路径继续完全独立。
