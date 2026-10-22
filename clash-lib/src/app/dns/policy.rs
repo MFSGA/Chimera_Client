@@ -77,7 +77,7 @@ fn invalid(message: impl Into<String>) -> Error {
     Error::InvalidConfig(format!("dns policy-rules: {}", message.into()))
 }
 
-fn canonical_domain(input: &str, field: &str) -> Result<String, Error> {
+pub(super) fn canonical_domain(input: &str, field: &str) -> Result<String, Error> {
     if input.is_empty() || input.trim() != input || input.contains('*') {
         return Err(invalid(format!(
             "{field}: domain must be nonempty, unpadded and non-wildcard"
