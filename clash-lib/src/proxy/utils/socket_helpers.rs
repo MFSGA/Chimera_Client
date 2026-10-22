@@ -874,51 +874,35 @@ pub async fn new_udp_socket(
         let dst_is_loopback = family_hint
             .map(|addr| addr.ip().is_loopback())
             .unwrap_or(false);
-        match (src, iface) {
-            (_, Some(iface)) if !dst_is_loopback => {
-                must_bind_socket_on_interface(&socket, iface, family).inspect_err(
-                    |x| {
-                        error!("failed to bind socket to interface: {}", x);
-                    },
-                )?;
-                // binding is not necessary for linux but is required on windows
-                // Without binding local_addr can't be obtained by system call
-                // which is required on quinn.
-                #[cfg(target_os = "windows")]
-                {
-                    let bind_addr =
-                        src.or_else(|| bind_addr_for_iface(iface, family));
-                    if let Some(addr) = bind_addr {
-                        socket.bind(&socket2::SockAddr::from(addr))?;
-                    }
-                }
+        // Interface and source binding are independent guarantees. A selected
+        // NIC must not silently suppress the caller's requested source IP.
+        if let Some(iface) = iface.filter(|_| !dst_is_loopback) {
+            must_bind_socket_on_interface(&socket, iface, family).inspect_err(
+                |error| error!("failed to bind socket to interface: {error}"),
+            )?;
+            trace!(iface = ?iface, "udp socket bound to outbound interface");
+        }
 
-                trace!(iface = ?iface, "udp socket bound: {socket:?}");
+        if let Some(src) = src {
+            socket.bind(&src.into())?;
+            trace!(src = ?src, "udp socket bound to selected source address");
+        } else {
+            // Windows requires a bind for local_addr()/QUIC. Preserve the
+            // interface-address fallback only when no source was requested.
+            #[cfg(target_os = "windows")]
+            {
+                let bind_addr = iface
+                    .filter(|_| !dst_is_loopback)
+                    .and_then(|iface| bind_addr_for_iface(iface, family))
+                    .unwrap_or_else(|| match family {
+                        socket2::Domain::IPV6 => "[::]:0".parse().unwrap(),
+                        _ => "0.0.0.0:0".parse().unwrap(),
+                    });
+                socket.bind(&socket2::SockAddr::from(bind_addr))?;
+                trace!(addr = ?bind_addr, "udp socket bound to default address");
             }
-            (Some(src), _) => {
-                socket.bind(&src.into())?;
-                trace!(src = ?src, "udp socket bound: {socket:?}");
-            }
-            (None, _) => {
-                // On Windows, UDP sockets must be bound to get a valid local_addr
-                // which is required for some operations (e.g., quinn/QUIC)
-                #[cfg(target_os = "windows")]
-                {
-                    let bind_addr = match family {
-                        socket2::Domain::IPV4 => {
-                            "0.0.0.0:0".parse::<SocketAddr>().unwrap()
-                        }
-                        socket2::Domain::IPV6 => {
-                            "[::]:0".parse::<SocketAddr>().unwrap()
-                        }
-                        _ => "0.0.0.0:0".parse::<SocketAddr>().unwrap(),
-                    };
-                    socket.bind(&socket2::SockAddr::from(bind_addr))?;
-                    trace!(addr = ?bind_addr, "udp socket bound to default address on Windows: {socket:?}");
-                }
-                #[cfg(not(target_os = "windows"))]
-                trace!("udp socket not bound to any specific address: {socket:?}");
-            }
+            #[cfg(not(target_os = "windows"))]
+            trace!("udp socket not bound to any specific address");
         }
     }
 
@@ -1164,6 +1148,154 @@ mod tests {
             broadcast_v6: None,
             mac_addr: None,
         })
+    }
+
+    /// A non-loopback family hint forces the explicit NIC-binding branch,
+    /// while the actual packets stay entirely on localhost. This checks
+    /// both socket operations without modifying any system route.
+    #[tokio::test]
+    async fn s04bx_udp_explicit_nic_also_binds_source_and_sends_with_that_source() {
+        let Some(iface) = find_loopback_iface() else {
+            eprintln!("skipping S04b-x: loopback interface unavailable");
+            return;
+        };
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = echo.local_addr().unwrap();
+        let hint: SocketAddr = "198.51.100.20:53".parse().unwrap();
+        let src: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        for iteration in 0u8..32 {
+            let socket = new_udp_socket(
+                Some(src),
+                Some(&iface),
+                #[cfg(target_os = "linux")]
+                None,
+                Some(hint),
+            )
+            .await;
+            #[cfg(target_os = "linux")]
+            let socket = match socket {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::PermissionDenied =>
+                {
+                    eprintln!(
+                        "skipping S04b-x: Linux SO_BINDTODEVICE needs privilege"
+                    );
+                    return;
+                }
+                result => result,
+            };
+            let socket = socket.expect("explicit NIC and source must both bind");
+            let selected_source = socket.local_addr().unwrap();
+            assert_eq!(selected_source.ip(), src.ip());
+            assert_ne!(selected_source.port(), 0);
+            socket.send_to(&[iteration], target).await.unwrap();
+            let mut packet = [0u8; 8];
+            let (length, actual_sender) = tokio::time::timeout(
+                Duration::from_secs(2),
+                echo.recv_from(&mut packet),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(&packet[..length], &[iteration]);
+            assert_eq!(
+                actual_sender, selected_source,
+                "kernel UDP packet source must equal explicitly bound socket address"
+            );
+            drop(socket);
+        }
+    }
+
+    /// Platform-specific observed NIC/source test. No packets are sent to
+    /// the nonlocal hint; it is only used to select the socket family and
+    /// exercise actual IP_BOUND_IF plus bind(source) on macOS.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn s04bx_macos_real_nic_binds_its_current_ipv4_source_without_egress() {
+        use network_interface::{Addr, NetworkInterface, NetworkInterfaceConfig};
+        let available = NetworkInterface::show().unwrap();
+        let selected =
+            available
+                .iter()
+                .filter(|iface| iface.index != 0)
+                .find_map(|iface| {
+                    iface.addr.iter().find_map(|address| match address {
+                        Addr::V4(v4)
+                            if !v4.ip.is_loopback()
+                                && !v4.ip.is_link_local()
+                                && !v4.ip.is_unspecified()
+                                && !v4.ip.is_multicast() =>
+                        {
+                            Some((iface, v4.ip))
+                        }
+                        _ => None,
+                    })
+                });
+        let Some((iface, observed_ip)) = selected else {
+            eprintln!("skipping S04b-x: no configured non-loopback IPv4 NIC");
+            return;
+        };
+        let bound_iface = OutboundInterface {
+            name: iface.name.clone(),
+            index: iface.index,
+            addr_v4: Some(observed_ip),
+            addr_v6: None,
+            netmask_v4: None,
+            broadcast_v4: None,
+            netmask_v6: None,
+            broadcast_v6: None,
+            mac_addr: None,
+        };
+        let source = SocketAddr::from((observed_ip, 0));
+        let family_hint = "198.51.100.43:53".parse().unwrap();
+        let socket =
+            new_udp_socket(Some(source), Some(&bound_iface), Some(family_hint))
+                .await
+                .expect(
+                    "observed interface and observed source should bind together",
+                );
+        assert_eq!(socket.local_addr().unwrap().ip(), observed_ip);
+        assert_ne!(socket.local_addr().unwrap().port(), 0);
+        // An actual packet to the documentation-only hint is intentionally
+        // NOT sent: this test proves socket configuration, not physical egress.
+    }
+
+    #[tokio::test]
+    async fn s04bx_invalid_source_must_fail_even_when_nic_binding_succeeds() {
+        let Some(iface) = find_loopback_iface() else {
+            eprintln!("skipping S04b-x: loopback interface unavailable");
+            return;
+        };
+        let source: SocketAddr = "192.0.2.231:0".parse().unwrap();
+        let target: SocketAddr = "198.51.100.20:53".parse().unwrap();
+        let result = new_udp_socket(
+            Some(source),
+            Some(&iface),
+            #[cfg(target_os = "linux")]
+            None,
+            Some(target),
+        )
+        .await;
+        #[cfg(target_os = "linux")]
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
+        {
+            eprintln!("skipping S04b-x: Linux SO_BINDTODEVICE needs privilege");
+            return;
+        }
+        let error = result.expect_err(
+            "NIC selection must never mask failure to bind nonexistent source IP",
+        );
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::AddrNotAvailable
+                    | std::io::ErrorKind::PermissionDenied
+            ),
+            "unexpected selected-source binding failure: {error}"
+        );
     }
 
     #[tokio::test]

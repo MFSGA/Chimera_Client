@@ -172,6 +172,12 @@ cargo test -p clash-lib --test dns_config_tests --locked
 - `s04bw_` 新增五项本地离线测试：未池化的无复用策略和明确禁止连接池两种 StreamOne 应用流 `Drop` 后远端观察 QUIC 关闭；单独上传、下载两条 QUIC 连接均在流释放后关闭；上传已建立而下载 TLS 配置不支持时失败并关闭上传；取得未池化 sender 后在交付前 `abort`，检查 driver 完成、远端关闭；用真实绑定的 OS UDP socket 验证适配器存活时端口无法重复绑定、销毁后短时内可重新绑定。继续验证现有 QUIC 数据收发及池化 H3 退休测试。
 - **限制：** 重绑定是本地 UDP 描述符生命周期的实证测试，非多系统、多接口、真实代理链或长期高并发资源压力验证；关闭已建立的连接不能撤销已发送的数据包，也不能推导真实 NIC/源 IP 是否符合 strict DNS 的宣称。可信 Provider/bootstrap pin 来源、完整逐跳拨号证明、网络切换抓包、独立 L2 审查与维护者批准仍未完成。生产 `policy-rules` 启动门禁原样关闭。
 
+## S04b-x：UDP 真实 socket 的网卡和源地址双重绑定（本机可验证切片）
+
+- 修复 `new_udp_socket` 的原有 `match (src, iface)` 互斥分支：以前非 loopback 目标同时提供指定源 IP 与网卡时，只执行 `must_bind_socket_on_interface`，**漏掉 `socket.bind(src)`**；由此可能让规划的源 IP 与真实 UDP socket 来源不一致，甚至让严格路径选择在 `local_addr` 检查前因未绑定而失败。现在非 Android 路径依次执行所要求的 NIC 绑定与独立的显式源地址绑定，两项操作任何一个失败都传播错误；保留 loopback 目的地跳过**物理网卡**限制、Android 保护处理和 Windows 在没有 `src` 时按接口/通配地址绑定的既有兼容逻辑。没有从路由规划补写物理路径 ID，也未改变 DNS `policy-rules` gate。
+- 3 项 `s04bx_` 本地离线测试验证：(1) 使用真实 loopback NIC 让 UDP 建立函数同时执行网卡和 `127.0.0.1` 源地址绑定，32 次独立创建、收发和释放，核对 socket 的 `local_addr` 与接收端真实看到的 UDP 来源完全一致；family hint 指向测试专用非 loopback 地址，仅用于触发平台网卡绑定，**实际数据报只发给 localhost**；(2) 指定本机不存在的测试用源 IP 时，即使 NIC 绑定成功也必须失败，不能悄悄采用系统默认来源；(3) macOS 动态查找当前已配置的非 loopback IPv4 网卡及其实际地址，确认 socket 同时接受该网卡索引与选定源 IP，并检查 `local_addr`，**不对外网发包**。Linux 若 `SO_BINDTODEVICE` 无权限或运行环境没有对应网卡，相关测试有明确条件跳过。
+- **仍未完成：** 没有在两个真实物理网卡之间修改路由、进行网络切换或外网抓包，因此本轮不能证明任意远端代理的实际出接口、数据面源地址长期不变或系统内核出口路由。连接器报告的 `NetworkPathId` 仍是软件元数据，真实路径抓包、NetworkPathSource 中途换代及安全故障恢复、可信 Provider/bootstrap pin、完整逐跳拨号图、独立 L2 审查与维护者批准均为生产门禁前置事项。**生产 `policy-rules` 继续拒绝启用。**
+
 ## S04b/S04c 待完成的严格准入
 
 1. **真实执行接线与身份来源**：S04b-a 提供共享 RuntimeStatus 读取接口，但**尚未由生产 DNS runtime 自动接入或订阅**；需有可信的 bootstrap pin revision/变更事件来源，而不是由未受验证的调用者提供任意数值。仍需真实数据面验证动态代理在查询中途切换时的失效与回滚；旧 legacy 路径继续完全独立。
