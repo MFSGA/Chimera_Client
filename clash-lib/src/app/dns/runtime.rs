@@ -683,6 +683,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn s04bz_direct_dns_runtime_invalidates_planned_path_after_network_switch()
+    {
+        let provider = provider_with_paths(
+            None,
+            vec![path_candidate(
+                "old-nic",
+                7,
+                "192.0.2.10",
+                DefaultRouteEvidence::PrimaryDefaultRoute,
+            )],
+        )
+        .await;
+        let server = "192.0.2.53:53".parse().unwrap();
+        let (first, old_epoch, status) = provider
+            .direct_path_selection(&provider.outbound, server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.ipv4.unwrap().id.interface.name, "old-nic");
+        assert!(
+            DnsRuntimeProvider::selected_path_is_current(&status, old_epoch).await
+        );
+        status.write().await.observed(&NetworkSnapshot {
+            path_candidates: vec![path_candidate(
+                "new-nic",
+                9,
+                "198.51.100.10",
+                DefaultRouteEvidence::PrimaryDefaultRoute,
+            )],
+            ..Default::default()
+        });
+        assert!(
+            !DnsRuntimeProvider::selected_path_is_current(&status, old_epoch).await,
+            "DIRECT DNS socket must never be handed off using its old plan"
+        );
+        let (current, new_epoch, _) = provider
+            .direct_path_selection(&provider.outbound, server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(new_epoch, old_epoch);
+        assert_eq!(current.ipv4.unwrap().id.interface.name, "new-nic");
+    }
+
+    #[tokio::test]
     async fn direct_dns_fails_closed_when_required_interface_is_missing() {
         let provider = provider_with_paths(
             Some(interface("gone0", 9)),

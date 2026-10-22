@@ -401,6 +401,238 @@ mod tests {
         assert_eq!(tcp_calls.load(Ordering::SeqCst), 1);
     }
 
+    #[derive(Debug)]
+    struct S04bzControlledDnsOutbound {
+        paths: Vec<crate::app::flow::NetworkPathId>,
+        started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait]
+    impl DialWithConnector for S04bzControlledDnsOutbound {}
+
+    #[async_trait]
+    impl OutboundHandler for S04bzControlledDnsOutbound {
+        fn name(&self) -> &str {
+            "s04bz-controlled"
+        }
+        fn proto(&self) -> OutboundType {
+            OutboundType::Socks5
+        }
+        async fn connect_stream(
+            &self,
+            _: &Session,
+            _: Arc<dyn ClashResolver>,
+        ) -> std::io::Result<BoxedChainedStream> {
+            let (stream, mut peer) = tokio::io::duplex(16_384);
+            let started = self.started.lock().unwrap().take();
+            let release = self.release.lock().unwrap().take();
+            tokio::spawn(async move {
+                let mut length = [0u8; 2];
+                peer.read_exact(&mut length).await?;
+                let mut wire = vec![0u8; u16::from_be_bytes(length) as usize];
+                peer.read_exact(&mut wire).await?;
+                let request =
+                    Message::from_vec(&wire).map_err(std::io::Error::other)?;
+                if let Some(started) = started {
+                    let _ = started.send(());
+                }
+                if let Some(release) = release {
+                    let _ = release.await;
+                }
+                let mut response =
+                    Message::response(request.metadata.id, request.metadata.op_code);
+                response.add_queries(request.queries.iter().cloned());
+                let bytes = response.to_vec().map_err(std::io::Error::other)?;
+                peer.write_all(&(bytes.len() as u16).to_be_bytes()).await?;
+                peer.write_all(&bytes).await?;
+                Ok::<_, std::io::Error>(())
+            });
+            Ok(Box::new(
+                crate::app::dispatcher::ChainedStreamWrapper::new_with_network_path_ids(
+                    stream, self.paths.clone(),
+                ),
+            ))
+        }
+        async fn connect_datagram(
+            &self,
+            _: &Session,
+            _: Arc<dyn ClashResolver>,
+        ) -> std::io::Result<BoxedChainedDatagram> {
+            let (send, receive) = tokio::sync::mpsc::unbounded_channel();
+            Ok(Box::new(
+                crate::app::dispatcher::ChainedDatagramWrapper::new_with_network_path_ids(
+                    S04boTruncatingUdp { send, receive }, self.paths.clone(),
+                ),
+            ))
+        }
+    }
+
+    async fn s04bz_setup(
+        udp_fallback: bool,
+        reported_generation_offset: u64,
+    ) -> (
+        DnsClient,
+        crate::proxy::utils::NetworkPathSource,
+        crate::proxy::utils::SharedNetworkStatus,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+        crate::app::flow::NetworkPathId,
+    ) {
+        use crate::app::{
+            flow::{AddressFamily, InterfaceId},
+            network::{NetworkSnapshot, NetworkStatus},
+        };
+        let mut status = NetworkStatus::default();
+        status.set_automatic_supported_for_test(true);
+        status.observed(&NetworkSnapshot::default());
+        let generation = status.path_planning_snapshot().unwrap().0;
+        let status = Arc::new(RwLock::new(status));
+        let source = NetworkPathSource::default();
+        source.attach(status.clone()).await;
+        let physical = crate::app::flow::NetworkPathId {
+            interface: InterfaceId {
+                name: "s04bz-nic".into(),
+                index: 7,
+            },
+            family: AddressFamily::Ipv4,
+            source_address: Some("192.0.2.77".parse().unwrap()),
+            network_generation: generation + reported_generation_offset,
+        };
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let outbound: Arc<dyn OutboundHandler> =
+            Arc::new(S04bzControlledDnsOutbound {
+                paths: vec![physical.clone()],
+                started: std::sync::Mutex::new(Some(started_tx)),
+                release: std::sync::Mutex::new(Some(release_rx)),
+            });
+        let mut client = client_with_ecs(None);
+        let server = "192.0.2.53:53".parse().unwrap();
+        client.net = if udp_fallback {
+            DNSNetMode::Udp
+        } else {
+            DNSNetMode::Tcp
+        };
+        client.proxy = outbound.clone();
+        client.cfg = RwLock::new(if udp_fallback {
+            DnsConfig::Udp(server, None, outbound, None)
+        } else {
+            DnsConfig::Tcp(server, None, outbound, None)
+        });
+        client.network_path_source = Some(source.clone());
+        (client, source, status, started_rx, release_tx, physical)
+    }
+
+    #[tokio::test]
+    async fn s04bz_tcp_and_udp_to_tcp_reject_network_switch_before_dns_response() {
+        use crate::app::network::NetworkSnapshot;
+        for udp_fallback in [false, true] {
+            for switched in [false, true] {
+                let (client, _source, status, started, release, physical) =
+                    s04bz_setup(udp_fallback, 0).await;
+                let task = tokio::spawn(async move {
+                    client
+                        .exchange_with_socket_paths(&build_message(RecordType::A))
+                        .await
+                });
+                tokio::time::timeout(Duration::from_secs(3), started)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if switched {
+                    status.write().await.observed(&NetworkSnapshot {
+                        path_candidates_truncated: 1,
+                        ..Default::default()
+                    });
+                }
+                release.send(()).unwrap();
+                let result = tokio::time::timeout(Duration::from_secs(3), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if switched {
+                    let err = result.expect_err(
+                        "network switch must invalidate DNS response evidence",
+                    );
+                    assert!(err.to_string().contains("generation changed"), "{err}");
+                } else {
+                    let (response, paths) = result.unwrap();
+                    assert!(!response.metadata.truncation);
+                    assert_eq!(paths, vec![physical]);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn s04bz_rejects_dns_socket_ids_from_old_epoch_without_network_switch() {
+        for udp_fallback in [false, true] {
+            let (client, _source, _status, started, release, _physical) =
+                s04bz_setup(udp_fallback, 1).await;
+            let task = tokio::spawn(async move {
+                client
+                    .exchange_with_socket_paths(&build_message(RecordType::A))
+                    .await
+            });
+            if udp_fallback {
+                // The truncated UDP reply already has a stale physical path.
+                // Fail closed *before* starting the TCP fallback connection.
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(3), started)
+                        .await
+                        .unwrap()
+                        .is_err()
+                );
+                drop(release);
+            } else {
+                tokio::time::timeout(Duration::from_secs(3), started)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                release.send(()).unwrap();
+            }
+            let err = tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .expect_err("socket path from the wrong epoch must not be accepted");
+            assert!(err.to_string().contains("generation changed"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn s04bz_network_observer_aba_replacement_invalidates_socket_proof() {
+        let (client, source, status, started, release, _physical) =
+            s04bz_setup(false, 0).await;
+        let task = tokio::spawn(async move {
+            client
+                .exchange_with_socket_paths(&build_message(RecordType::A))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), started)
+            .await
+            .unwrap()
+            .unwrap();
+        // Same generation, but a different attached runtime observer. The
+        // old socket evidence must not be re-attributed to the new instance.
+        let mut replacement = crate::app::network::NetworkStatus::default();
+        replacement.set_automatic_supported_for_test(true);
+        replacement.observed(&crate::app::network::NetworkSnapshot::default());
+        assert_eq!(
+            replacement.path_planning_snapshot().unwrap().0,
+            status.write().await.path_planning_snapshot().unwrap().0
+        );
+        source.attach(Arc::new(RwLock::new(replacement))).await;
+        release.send(()).unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect_err("observer ABA replacement must invalidate proof");
+        assert!(err.to_string().contains("generation changed"), "{err}");
+    }
+
     #[tokio::test]
     async fn dns_response_reports_the_selected_network_path() {
         use crate::app::{
@@ -1280,25 +1512,89 @@ impl Client for DnsClient {
 
     #[instrument(skip(msg), level = "trace")]
     async fn exchange(&self, msg: &Message) -> anyhow::Result<Message> {
-        Ok(self.exchange_with_observed_socket_paths(msg).await?.0)
+        Ok(self
+            .exchange_with_observed_socket_paths(msg, false)
+            .await?
+            .0)
     }
 
     async fn exchange_with_socket_paths(
         &self,
         msg: &Message,
     ) -> anyhow::Result<(Message, Vec<crate::app::flow::NetworkPathId>)> {
-        self.exchange_with_observed_socket_paths(msg).await
+        self.exchange_with_observed_socket_paths(msg, true).await
     }
 }
 
 impl DnsClient {
+    /// Strict-only: lock in both the attached observer identity and its
+    /// network epoch *before* opening a DNS connection. Each reported socket
+    /// identity must match this epoch, even across UDP-to-TCP fallback.
+    /// Non-strict legacy exchange intentionally does not impose this rule.
+    async fn strict_query_epoch(
+        &self,
+        require_socket_path: bool,
+    ) -> anyhow::Result<Option<(u64, crate::proxy::utils::SharedNetworkStatus)>>
+    {
+        if !require_socket_path {
+            return Ok(None);
+        }
+        let Some(source) = self.network_path_source.as_ref() else {
+            // Strict manager-leased transports independently verify before
+            // and after I/O when the wire client has no local path source.
+            return Ok(None);
+        };
+        let (generation, _, _, status, _) =
+            source.snapshot().await.ok_or_else(|| {
+                anyhow!("strict DNS network observer unavailable before query")
+            })?;
+        Ok(Some((generation, status)))
+    }
+
+    async fn response_socket_paths(
+        &self,
+        selected_path: &SharedDnsPathUse,
+        epoch: &Option<(u64, crate::proxy::utils::SharedNetworkStatus)>,
+    ) -> anyhow::Result<Vec<crate::app::flow::NetworkPathId>> {
+        let observed = selected_path.lock().await.clone();
+        if let Some((planned_generation, planned_status)) = epoch {
+            let (current_generation, _, _, current_status, _) = self
+                .network_path_source
+                .as_ref()
+                .expect("strict query epoch requires path source")
+                .snapshot()
+                .await
+                .ok_or_else(|| {
+                    anyhow!("strict DNS network observer unavailable after response")
+                })?;
+            if current_generation != *planned_generation
+                || !Arc::ptr_eq(&current_status, planned_status)
+                || observed
+                    .path_id
+                    .as_ref()
+                    .is_some_and(|id| id.network_generation != *planned_generation)
+                || observed
+                    .socket_paths
+                    .iter()
+                    .any(|id| id.network_generation != *planned_generation)
+            {
+                anyhow::bail!(
+                    "strict DNS socket path generation changed during query"
+                );
+            }
+        }
+        Ok(observed.socket_paths)
+    }
+
     /// The selected-path holder is unique per freshly constructed strict DNS
     /// client. On UDP truncation use the *fallback TCP* connection's evidence.
-    /// Normal shared clients still use exchange() and ignore these IDs.
+    /// Normal shared clients still use exchange() without epoch enforcement.
     async fn exchange_with_observed_socket_paths(
         &self,
         msg: &Message,
+        require_socket_path: bool,
     ) -> anyhow::Result<(Message, Vec<crate::app::flow::NetworkPathId>)> {
+        let epoch = self.strict_query_epoch(require_socket_path).await?;
         let need_initialize = {
             let inner = self.inner.read().await;
             inner.c.is_none()
@@ -1372,16 +1668,20 @@ impl DnsClient {
             .map(|x: op::DnsResponse| x.into_message())?;
 
         if !response.metadata.truncation {
+            let socket_paths =
+                self.response_socket_paths(&selected_path, &epoch).await?;
             self.report_path_response(&response, &selected_path).await;
-            let socket_paths = selected_path.lock().await.socket_paths.clone();
             return Ok((response, socket_paths));
         }
 
+        // Do not count a stale truncated UDP reply as healthy or initiate
+        // TCP fallback after its observed network generation has changed.
+        let socket_paths =
+            self.response_socket_paths(&selected_path, &epoch).await?;
         self.report_path_response(&response, &selected_path).await;
 
         let cfg = self.cfg.read().await.clone();
         let DnsConfig::Udp(addr, iface, proxy, fw_mark) = cfg else {
-            let socket_paths = selected_path.lock().await.socket_paths.clone();
             return Ok((response, socket_paths));
         };
         warn!(
@@ -1408,6 +1708,9 @@ impl DnsClient {
         let tcp_response: op::DnsResponse =
             tcp_result.map_err(|error| Error::DNSError(error.to_string()))?;
         let tcp_response = tcp_response.into_message();
+        let socket_paths = self
+            .response_socket_paths(&tcp_selected_path, &epoch)
+            .await?;
         self.report_path_response(&tcp_response, &tcp_selected_path)
             .await;
         if tcp_response.metadata.truncation {
@@ -1415,7 +1718,6 @@ impl DnsClient {
                 "DNS upstream returned a truncated response over TCP"
             ));
         }
-        let socket_paths = tcp_selected_path.lock().await.socket_paths.clone();
         Ok((tcp_response, socket_paths))
     }
 }

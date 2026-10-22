@@ -184,6 +184,13 @@ cargo test -p clash-lib --test dns_config_tests --locked
 - 新增 4 项 `s04by_` 离线测试：核对本地/远端及显式网卡代际检查范围；对**已实际绑定的 UDP socket**，由测试持有共享网络状态写锁并在等待交付状态读取时切换观测 generation，要求返回 `Interrupted` 且 socket 本地端口可以重新绑定，当前新 generation 可以通过；旧 `NetworkPoolContext` 面对新观测 generation 时，真实 `DirectConnector` 必须在系统路由 fallback 之前失败；普通 localhost UDP 面对无关外部 generation 更换仍可实际发送数据包。无外网发包、系统路由变更或真实物理网卡断连。相关 DNS、Proxy Connector、socket helpers、XHTTP/H3、gRPC/Hysteria2 与旧配置兼容回归继续检查。
 - **边界：** 此处完成的是交付前的共享状态**软件代际校验**，不是整个 socket 建立到长期运行的原子网络锁；检查结束之后立刻发生的新换代仍需要上层连接/流生命周期的 reset、DNS 严格执行前后校验。`NetworkPathId` 是连接器软件路径身份，不能代替内核真实出口抓包。可信 Provider/bootstrap pin、递归代理拨号闭环、实际多网卡切换/数据面源 IP、独立 L2 审查及维护者批准仍未完成；生产 `policy-rules` 启动门禁原样关闭。
 
+## S04b-z：DNS 查询期间网络代际和观察者身份复核（严格证据切片）
+
+- 对 `DnsClient::exchange_with_socket_paths` 增加**严格证据专属**查询前后网络约束。若运行时附着 `NetworkPathSource`，在建立连接、发送请求之前捕获其观测 generation 与 `SharedNetworkStatus` 对象身份，收到任何 DNS 应答后读取当前快照，并检查**同一观察者实例、相同 generation、实际连接上报的每一个 `NetworkPathId` 与选定 DIRECT 路径的代际**均一致。失效返回错误，绝不输出旧 `socket_paths`；网络观察源在查询前或结束时丢失也失败关闭。与此分离的普通 `DnsClient::exchange` 继续原样传输，不新增严格路径校验而破坏旧 DNS 行为；严格 wire 入口没有附着源时仍由既有 `StrictDnsEvidenceCheckedTransport`/管理器的前后 epoch 和候选身份校验负责，不能据此声称无源模式自带完整物理证明。
+- UDP 截断回复在发起 TCP fallback **之前**先验证 UDP 证据，防止已换代的 UDP 回复触发另一条新拨号；正常 fallback 完成后再次验证最终 **TCP 连接自身**的 `socket_paths`，不沿用先前 UDP 身份。验证先于记录路径成功的健康事件，避免将明显过期的 DNS 应答记作健康；正常无截断 TCP/UDP 同理。
+- 4 项新增 `s04bz_` 离线测试：假出站通过真实 Hickory TCP DNS 编解码等待回复，分别验证 TCP 和 UDP→TCP 在应答被阻塞期间网络换代会拒绝旧证据、未换代则正常返回最终 TCP 路径；核对仅 socket 证据的代际错误，即使网络未切换也拒绝，UDP 阶段早期拒绝且不会开启 TCP fallback；观测源以**相同 generation** 替换成另一 `SharedNetworkStatus` 对象（ABA）仍拒绝；DIRECT DNS Runtime 原规划快照换代后，原计划被判定无效，重新规划只使用新网卡。无需真实改变路由或向外网发包。
+- **限制：** 此处证明的是严格客户端已附着的网络观察源在 DNS 查询窗口内的软件 epoch、对象身份和路径 ID 一致性，并非查询全生命周期的原子路由锁、真实出口网卡抓包或跨代理节点的端到端证明。上层独立 L2 审核、可信 Provider/bootstrap pin、完整递归 dialer 验证、真实多网卡切换与数据面捕获仍未完成。生产 `policy-rules` 启动门禁不变且继续禁用。
+
 ## S04b/S04c 待完成的严格准入
 
 1. **真实执行接线与身份来源**：S04b-a 提供共享 RuntimeStatus 读取接口，但**尚未由生产 DNS runtime 自动接入或订阅**；需有可信的 bootstrap pin revision/变更事件来源，而不是由未受验证的调用者提供任意数值。仍需真实数据面验证动态代理在查询中途切换时的失效与回滚；旧 legacy 路径继续完全独立。
