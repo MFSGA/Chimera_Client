@@ -500,7 +500,7 @@ impl Transport for Client {
         context: NetworkPoolContext,
     ) -> io::Result<AnyStream> {
         let cancellation = self.recovery_cancellation.lock().await.clone();
-        tokio::select! {
+        let outcome = tokio::select! {
             biased;
             _ = cancellation.cancelled() => Err(io::Error::new(io::ErrorKind::ConnectionAborted, "network changed during transport construction")),
             result = async {
@@ -511,7 +511,8 @@ impl Transport for Client {
                     .await;
                 self.open_logical_stream(sender, active).await
             } => result,
-        }
+        };
+        super::finish_pool_delivery(&cancellation, outcome)
     }
 
     async fn try_reuse_stream(&self) -> io::Result<Option<AnyStream>> {
@@ -543,7 +544,7 @@ impl Transport for Client {
         context: NetworkPoolContext,
     ) -> io::Result<Option<(AnyStream, NetworkPoolContext)>> {
         let cancellation = self.recovery_cancellation.lock().await.clone();
-        tokio::select! {
+        let outcome = tokio::select! {
             biased;
             _ = cancellation.cancelled() => Err(io::Error::new(io::ErrorKind::ConnectionAborted, "network changed during transport construction")),
             result = async {
@@ -567,7 +568,8 @@ impl Transport for Client {
                     }
                 }
             } => result,
-        }
+        };
+        super::finish_pool_delivery(&cancellation, outcome)
     }
 }
 
@@ -798,6 +800,41 @@ mod tests {
         .with_pool_limits(None, None, Some(8));
         assert!(max_streams.should_reuse(1, 7));
         assert!(!max_streams.should_reuse(1, 8));
+    }
+
+    #[tokio::test]
+    async fn s04br_grpc_pool_waiter_is_cancelled_on_network_reset() {
+        let client = Arc::new(Client::new(
+            "grpc.example.com".into(),
+            "/service".try_into().unwrap(),
+        ));
+        // Deterministically park the borrower before it gets the recovery
+        // read lock. A reset must cancel it before the old pool is reused.
+        let gate = client.recovery_gate.write().await;
+        let old = client.recovery_cancellation.lock().await.clone();
+        let borrowing = client.clone();
+        let task = tokio::spawn(async move { borrowing.try_reuse_stream().await });
+        tokio::task::yield_now().await;
+        let resetting = client.clone();
+        let reset =
+            tokio::spawn(async move { resetting.reset_connection_pool().await });
+        timeout(Duration::from_secs(2), old.cancelled())
+            .await
+            .expect("reset must cancel outstanding borrows");
+        drop(gate);
+        let error = timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .err()
+            .expect("cancelled pool borrow must fail");
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        timeout(Duration::from_secs(2), reset)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!client.recovery_cancellation.lock().await.is_cancelled());
     }
 
     #[tokio::test]

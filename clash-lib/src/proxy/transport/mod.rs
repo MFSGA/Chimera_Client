@@ -51,6 +51,78 @@ pub struct VisionOptions {
 #[allow(unused_imports)]
 pub use v2ray::{V2RayOBFSOption, V2rayWsClient};
 
+/// S04b-r: a pool reset can cancel an operation just as its async
+/// construction becomes ready. Recheck after the biased select, before the
+/// resulting logical stream crosses the caller boundary. Dropping a successful
+/// result on cancellation prevents delivery; it cannot undo prior I/O.
+pub(super) fn finish_pool_delivery<T>(
+    cancellation: &tokio_util::sync::CancellationToken,
+    result: std::io::Result<T>,
+) -> std::io::Result<T> {
+    if cancellation.is_cancelled() {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "network changed before transport stream delivery",
+        ))
+    } else {
+        result
+    }
+}
+
+#[cfg(test)]
+mod s04br_tests {
+    use super::finish_pool_delivery;
+    use std::{
+        io,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
+    use tokio_util::sync::CancellationToken;
+
+    struct DropFlag(Arc<AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn s04br_cancel_when_stream_construction_becomes_ready_discards_result() {
+        let cancellation = CancellationToken::new();
+        let discarded = Arc::new(AtomicBool::new(false));
+        let result: io::Result<DropFlag> = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(io::Error::other("unexpected pre-construction cancellation")),
+            value = async {
+                // Make the result ready on the very poll that signals reset.
+                // The biased select has already polled the cancellation arm.
+                cancellation.cancel();
+                Ok(DropFlag(discarded.clone()))
+            } => value,
+        };
+        let err = finish_pool_delivery(&cancellation, result)
+            .err()
+            .expect("cancelled stream must not be delivered");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(discarded.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn s04br_uncancelled_result_preserves_success_and_upstream_errors() {
+        let cancellation = CancellationToken::new();
+        assert_eq!(finish_pool_delivery(&cancellation, Ok(7)).unwrap(), 7);
+        let error: io::Result<u32> = Err(io::Error::other("real handshake failure"));
+        assert!(
+            finish_pool_delivery(&cancellation, error)
+                .unwrap_err()
+                .to_string()
+                .contains("handshake failure")
+        );
+    }
+}
+
 #[async_trait::async_trait]
 pub trait Transport: Send + Sync {
     /// Retire cached underlying connections after the physical path changes.

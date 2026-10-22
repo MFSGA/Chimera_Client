@@ -131,6 +131,12 @@ cargo test -p clash-lib --test dns_config_tests --locked
 - 在 Hysteria2 单例 QUIC 池锁取得之后才采集当前网络上下文，避免排队等待期间先前的观测被误用于池内对象；取出旧连接前确认取消令牌未触发。新连接完成认证后、发布到池之前重新采集当前 connector 的路径上下文，并与实际完成连接记录的 `NetworkPoolContext` 及取消令牌复核。若网络已变化，关闭新建的 QUIC 连接并中止 driver task，返回 `Interrupted`，不缓存旧身份。检查不能撤销已发生的握手/网络包，也不是系统级网卡/源地址证明。
 - `s04bq_` Feature 专属离线测试覆盖未报告路径而候选集合明确时的失败关闭、连接期间 generation 更新/取消、重复 32 轮在途取消与 future 释放；保留 Hysteria2 既有取消回归。gRPC/XHTTP 在当前切片只做既有回归，不声称已完成其所有网络切换压测。生产 `policy-rules` gate 继续关闭；可信 Provider/pin 来源、实际出口抓包、端到端递归拨号证明以及独立 L2 审查与维护者批准仍待完成。
 
+## S04b-r：gRPC/XHTTP 逻辑流交付边界的取消复核（内部连接池）
+
+- gRPC 的 `proxy_stream_with_pool_context` 与 `try_reuse_stream_with_pool_metadata`、XHTTP 的 `connect_stream_with_connector_and_path_ids`（含启用 H3 时的自建连接分支）、`proxy_stream_with_pool_context`、`try_reuse_stream_with_pool_metadata` 都已有 biased `select!` 监听连接池网络重置的 cancellation token。S04b-r 增加共享的 `finish_pool_delivery`：**在异步 `select!` 返回之后、把逻辑流交给调用者之前** 再检查同一 token。避免流刚好构造完成、同一 poll 内取消已触发时走完成分支而交付过期连接。已取消则返回 `ConnectionAborted`、丢弃成功结果；未取消则保留成功值或真实上游错误，不改重试路径与业务配置。
+- 新增 `s04br_` 四项离线测试：刻意在异步成功分支内触发取消，验证最后交付检查拒绝并 `Drop` 成功结果；未取消时成功/错误原样传递；gRPC、XHTTP 各自把池借用者停在恢复读锁前，模拟并发 reset，验证旧令牌取消后借用失败，池重置完成并提供未取消的新令牌。仍使用各自已有 recovery_gate 与 pool reset 机制，无需改变实际网络连接方式。
+- **范围限制：** 检查保证的是软件层面交付边界，不能撤销已发出的 HTTP/2/HTTP/3 请求、已建立的底层 TCP/QUIC socket，也不能原子证明最终 NIC/源地址；`tokio::select!` 取消/任务释放与活跃计数仍需大负载下的真实数据面观测。不得据此放开动态 Provider 或生产严格 DNS。可信 Provider/bootstrap pin 来源、完整多跳拨号、真实出口抓包以及独立 L2 审查与维护者批准依然待完成。生产 `policy-rules` gate 保持关闭。
+
 ## S04b/S04c 待完成的严格准入
 
 1. **真实执行接线与身份来源**：S04b-a 提供共享 RuntimeStatus 读取接口，但**尚未由生产 DNS runtime 自动接入或订阅**；需有可信的 bootstrap pin revision/变更事件来源，而不是由未受验证的调用者提供任意数值。仍需真实数据面验证动态代理在查询中途切换时的失效与回滚；旧 legacy 路径继续完全独立。

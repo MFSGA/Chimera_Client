@@ -2000,7 +2000,7 @@ impl Transport for Client {
         connector: &dyn crate::proxy::utils::RemoteConnector,
     ) -> io::Result<Option<(AnyStream, Vec<crate::app::flow::NetworkPathId>)>> {
         let cancellation = self.recovery_cancellation.lock().await.clone();
-        tokio::select! {
+        let outcome = tokio::select! {
             biased;
             _ = cancellation.cancelled() => Err(io::Error::new(io::ErrorKind::ConnectionAborted, "network changed during transport construction")),
             result = async {
@@ -2025,7 +2025,8 @@ impl Transport for Client {
                     ))
                 }
             } => result,
-        }
+        };
+        super::finish_pool_delivery(&cancellation, outcome)
     }
 
     async fn proxy_stream(&self, stream: AnyStream) -> io::Result<AnyStream> {
@@ -2051,7 +2052,7 @@ impl Transport for Client {
     ) -> io::Result<AnyStream> {
         let network_generation = pool_context.network_generation;
         let cancellation = self.recovery_cancellation.lock().await.clone();
-        tokio::select! {
+        let outcome = tokio::select! {
             biased;
             _ = cancellation.cancelled() => Err(io::Error::new(io::ErrorKind::ConnectionAborted, "network changed during transport construction")),
             result = async {
@@ -2141,7 +2142,8 @@ impl Transport for Client {
 
                 Ok(leased_stream(logical, active))
             } => result,
-        }
+        };
+        super::finish_pool_delivery(&cancellation, outcome)
     }
 
     async fn try_reuse_stream(&self) -> io::Result<Option<AnyStream>> {
@@ -2174,7 +2176,7 @@ impl Transport for Client {
     ) -> io::Result<Option<(AnyStream, NetworkPoolContext)>> {
         let network_generation = pool_context.network_generation;
         let cancellation = self.recovery_cancellation.lock().await.clone();
-        tokio::select! {
+        let outcome = tokio::select! {
             biased;
             _ = cancellation.cancelled() => Err(io::Error::new(io::ErrorKind::ConnectionAborted, "network changed during transport construction")),
             result = async {
@@ -2255,7 +2257,8 @@ impl Transport for Client {
                     }
                 }
             } => result,
-        }
+        };
+        super::finish_pool_delivery(&cancellation, outcome)
     }
 }
 
@@ -3959,6 +3962,48 @@ mod tests {
             .expect("HTTP/3 packet-up echo timed out")
             .expect("HTTP/3 packet-up read failed");
         assert_eq!(&buf, b"packet-h3");
+    }
+
+    #[tokio::test]
+    async fn s04br_xhttp_pool_waiter_is_cancelled_on_network_reset() {
+        let client = Arc::new(Client::new(
+            "localhost".into(),
+            80,
+            "/xhttp/".into(),
+            None,
+            HashMap::new(),
+            false,
+            XhttpMode::StreamOne,
+            1_000_000,
+            false,
+            None,
+            None,
+        ));
+        let gate = client.recovery_gate.write().await;
+        let old = client.recovery_cancellation.lock().await.clone();
+        let borrowing = client.clone();
+        let task = tokio::spawn(async move { borrowing.try_reuse_stream().await });
+        tokio::task::yield_now().await;
+        let resetting = client.clone();
+        let reset =
+            tokio::spawn(async move { resetting.reset_connection_pool().await });
+        timeout(Duration::from_secs(2), old.cancelled())
+            .await
+            .expect("reset must cancel outstanding borrows");
+        drop(gate);
+        let error = timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .err()
+            .expect("cancelled pool borrow must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+        timeout(Duration::from_secs(2), reset)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!client.recovery_cancellation.lock().await.is_cancelled());
     }
 
     #[tokio::test]
