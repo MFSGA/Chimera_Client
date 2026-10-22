@@ -730,20 +730,26 @@ async fn s03b_hostname_bootstrap_and_unimplemented_wire_fail_closed() {
         "{result}"
     );
 
-    let unsupported = crate::app::dns::Config::parse_nameserver(&[
+    // S03c no longer treats DoT as entirely unsupported; an IP
+    // hostname is rejected because it cannot provide a safe DNS TLS
+    // identity under the strict DoT/DoH policy.
+    let unsafe_ip_tls = crate::app::dns::Config::parse_nameserver(&[
         "tls://127.0.0.1:853".to_owned(),
     ])
     .unwrap()
     .remove(0);
     let result = DnsStrictWireTransport
         .exchange(
-            &unsupported,
+            &unsafe_ip_tls,
             outbound,
             &request("protected.example.", RecordType::A),
         )
         .await
         .unwrap_err();
-    assert_eq!(result.kind(), io::ErrorKind::Unsupported);
+    assert!(
+        result.to_string().contains("IP-hostname bypass forbidden"),
+        "{result}"
+    );
 }
 
 #[tokio::test]
@@ -883,4 +889,219 @@ async fn s03b_mixed_unsupported_encrypted_profile_is_rejected_before_udp_dial() 
     );
     assert_eq!(udp.load(Ordering::SeqCst), 0);
     assert_eq!(tcp.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+async fn s03c_self_signed_tls_listener()
+-> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
+
+    crate::setup_default_crypto_provider();
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["dns.strict.example".into()])
+            .unwrap();
+    let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+    let key_der =
+        rustls::pki_types::PrivateKeyDer::try_from(signing_key.serialize_der())
+            .unwrap();
+    let server = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .unwrap();
+    let acceptor = TlsAcceptor::from(Arc::new(server));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        // A rejected certificate can cause the client to retry, but it must
+        // never complete the TLS handshake successfully.
+        for _ in 0..8 {
+            let Ok(Ok((stream, _))) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                listener.accept(),
+            )
+            .await
+            else {
+                break;
+            };
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                acceptor.accept(stream),
+            )
+            .await;
+        }
+    });
+    (address, handle)
+}
+
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+#[tokio::test]
+async fn s03c_encrypted_dns_rejects_untrusted_tls_cert_even_with_pinned_ip() {
+    use crate::app::dns::execution::DnsStrictPinnedWireTransport;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    for scheme in ["tls", "https"] {
+        let (address, task) = s03c_self_signed_tls_listener().await;
+        let url = if scheme == "https" {
+            format!(
+                "https://dns.strict.example:{}/dns-query?custom=1",
+                address.port()
+            )
+        } else {
+            format!("tls://dns.strict.example:{}", address.port())
+        };
+        let server = crate::app::dns::Config::parse_nameserver(&[url])
+            .unwrap()
+            .remove(0);
+        if scheme == "https" {
+            assert_eq!(server.doh_path.as_deref(), Some("/dns-query?custom=1"));
+        }
+        let wire = DnsStrictPinnedWireTransport::new(HashMap::from([(
+            "dns.strict.example".to_owned(),
+            address.ip(),
+        )]))
+        .unwrap();
+        let tcp = Arc::new(AtomicUsize::new(0));
+        let udp = Arc::new(AtomicUsize::new(0));
+        let outbound: AnyOutboundHandler = Arc::new(CountingWireProxy {
+            name: "DNS-OUT",
+            endpoint: "192.0.2.9",
+            tcp: tcp.clone(),
+            udp: udp.clone(),
+        });
+        let execution = StrictDnsExecution {
+            ordinal: 1,
+            profile: "trusted".to_owned(),
+            egress: DnsEgress::Proxy("DNS-OUT".to_owned()),
+            servers: vec![server],
+            outbound,
+        };
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(14),
+            execution.exchange(&wire, &request("protected.example.", RecordType::A)),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        let reason = err.to_string();
+        assert!(
+            reason.contains("no DIRECT/legacy fallback permitted"),
+            "{reason}"
+        );
+        assert!(
+            reason.to_ascii_lowercase().contains("certificate")
+                || reason.to_ascii_lowercase().contains("cert"),
+            "expected real rustls certificate-verification error: {reason}"
+        );
+        assert!(
+            tcp.load(Ordering::SeqCst) > 0,
+            "verified TLS must use pinned outbound"
+        );
+        assert_eq!(udp.load(Ordering::SeqCst), 0, "must not fall back to UDP");
+        task.abort();
+    }
+}
+
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+#[tokio::test]
+async fn s03c_tls_hostname_without_ip_pin_is_rejected_before_network() {
+    use crate::app::dns::execution::DnsStrictPinnedWireTransport;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    for scheme in ["tls", "https"] {
+        let server = crate::app::dns::Config::parse_nameserver(&[format!(
+            "{scheme}://dns.strict.example:853"
+        )])
+        .unwrap()
+        .remove(0);
+        let wire = DnsStrictPinnedWireTransport::default();
+        let tcp = Arc::new(AtomicUsize::new(0));
+        let udp = Arc::new(AtomicUsize::new(0));
+        let outbound: AnyOutboundHandler = Arc::new(CountingWireProxy {
+            name: "DNS-OUT",
+            endpoint: "192.0.2.9",
+            tcp: tcp.clone(),
+            udp: udp.clone(),
+        });
+        let execution = StrictDnsExecution {
+            ordinal: 0,
+            profile: "trusted".into(),
+            egress: DnsEgress::Proxy("DNS-OUT".into()),
+            servers: vec![server],
+            outbound,
+        };
+        let err = execution
+            .exchange(&wire, &request("protected.example.", RecordType::A))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("explicit IP bootstrap pin"),
+            "{err}"
+        );
+        assert_eq!(tcp.load(Ordering::SeqCst), 0);
+        assert_eq!(udp.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+#[tokio::test]
+async fn s03c_doh_ip_host_and_mixed_plaintext_profile_fail_pre_dial() {
+    use crate::app::dns::execution::DnsStrictPinnedWireTransport;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let wire = DnsStrictPinnedWireTransport::new(HashMap::from([(
+        "dns.strict.example".to_owned(),
+        "127.0.0.1".parse().unwrap(),
+    )]))
+    .unwrap();
+    let tcp = Arc::new(AtomicUsize::new(0));
+    let udp = Arc::new(AtomicUsize::new(0));
+    let outbound: AnyOutboundHandler = Arc::new(CountingWireProxy {
+        name: "DNS-OUT",
+        endpoint: "192.0.2.9",
+        tcp: tcp.clone(),
+        udp: udp.clone(),
+    });
+    for urls in [
+        vec!["https://127.0.0.1:443/dns-query".to_owned()],
+        vec![
+            "udp://127.0.0.1:5353".to_owned(),
+            "https://dns.strict.example:443/dns-query".to_owned(),
+        ],
+    ] {
+        let servers = crate::app::dns::Config::parse_nameserver(&urls).unwrap();
+        let execution = StrictDnsExecution {
+            ordinal: 2,
+            profile: "encrypted".into(),
+            egress: DnsEgress::Proxy("DNS-OUT".into()),
+            servers,
+            outbound: outbound.clone(),
+        };
+        let err = execution
+            .exchange(&wire, &request("protected.example.", RecordType::A))
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("IP-hostname bypass forbidden")
+                || message.contains("cannot mix encrypted"),
+            "{message}"
+        );
+    }
+    assert_eq!(tcp.load(Ordering::SeqCst), 0);
+    assert_eq!(udp.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn s03c_pinned_host_names_reject_noncanonical_input() {
+    use crate::app::dns::execution::DnsStrictPinnedWireTransport;
+    for key in ["", " DNS.example", "DNS.example", "dns.example."] {
+        assert!(
+            DnsStrictPinnedWireTransport::new(HashMap::from([(
+                key.to_owned(),
+                "127.0.0.1".parse().unwrap()
+            )]))
+            .is_err()
+        );
+    }
 }

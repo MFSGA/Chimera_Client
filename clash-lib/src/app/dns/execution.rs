@@ -4,6 +4,7 @@
 //! through to the legacy path when explicit DNS egress cannot be enforced.
 
 use std::{
+    collections::HashMap,
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::{
@@ -43,12 +44,14 @@ use super::{
 /// S04 supplies a separately verified bootstrap dependency graph.
 struct LiteralOnlyResolver {
     ipv6: AtomicBool,
+    pins: HashMap<String, IpAddr>,
 }
 
 impl Default for LiteralOnlyResolver {
     fn default() -> Self {
         Self {
             ipv6: AtomicBool::new(true),
+            pins: HashMap::new(),
         }
     }
 }
@@ -56,11 +59,13 @@ impl Default for LiteralOnlyResolver {
 #[async_trait]
 impl ClashResolver for LiteralOnlyResolver {
     async fn resolve(&self, host: &str, _: bool) -> anyhow::Result<Option<IpAddr>> {
-        host.parse::<IpAddr>()
-            .map(Some)
-            .map_err(|_| anyhow::anyhow!(
-                "strict DNS bootstrap refused to resolve domain '{host}' via system/legacy DNS"
-            ))
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            return Ok(Some(ip));
+        }
+        let key = host.trim_end_matches('.').to_ascii_lowercase();
+        self.pins.get(&key).copied().map(Some).ok_or_else(|| anyhow::anyhow!(
+            "strict DNS bootstrap refused to resolve unpinned domain '{host}' via system/legacy DNS"
+        ))
     }
 
     async fn resolve_v4(
@@ -114,34 +119,160 @@ impl ClashResolver for LiteralOnlyResolver {
     }
 }
 
-/// Strict UDP/TCP implementation using Chimera's existing Hickory client,
-/// DNS runtime provider, and an already pinned outbound handler. A fresh
-/// client per attempt prevents cross-profile/egress pool reuse in S03b.
+/// Strict wire transport with no implicit bootstrap. UDP/TCP require an IP
+/// literal endpoint; DoT/DoH need a separately pinned endpoint (S03c).
 pub struct DnsStrictWireTransport;
+
+/// Explicit, caller-supplied hostname -> IP bindings. This is an internal
+/// S03c transport option, NOT a configuration parser or bootstrap resolver.
+/// Only the exact upstream DNS identity is allowed; no OS DNS calls occur.
+#[derive(Default)]
+pub struct DnsStrictPinnedWireTransport {
+    pins: HashMap<String, IpAddr>,
+}
+
+impl DnsStrictPinnedWireTransport {
+    pub fn new(pins: HashMap<String, IpAddr>) -> io::Result<Self> {
+        if pins.keys().any(|key| {
+            key.is_empty()
+                || key.trim() != key
+                || key.ends_with('.')
+                || key != &key.to_ascii_lowercase()
+        }) {
+            return Err(io::Error::other(
+                "strict DNS bootstrap pin names must be lowercase, canonical, nonempty and without trailing dot",
+            ));
+        }
+        Ok(Self { pins })
+    }
+}
+
+fn validate_strict_wire_server(
+    server: &NameServer,
+    _pins: &HashMap<String, IpAddr>,
+) -> io::Result<()> {
+    if server.interface.is_some() || server.proxy.is_some() {
+        return Err(io::Error::other(
+            "strict DNS forbids a second #proxy/#interface override",
+        ));
+    }
+    match server.net {
+        DNSNetMode::Udp | DNSNetMode::Tcp => {
+            if !matches!(server.host, url::Host::Ipv4(_) | url::Host::Ipv6(_)) {
+                return Err(io::Error::other(format!(
+                    "strict DNS upstream '{}' needs explicit bootstrap; refusing system DNS",
+                    server.host
+                )));
+            }
+        }
+        DNSNetMode::DoT | DNSNetMode::DoH => {
+            #[cfg(not(any(feature = "aws-lc-rs", feature = "ring")))]
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "strict encrypted DNS needs the aws-lc-rs or ring feature",
+            ));
+            #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+            {
+                // Crucial: legacy DoH has an IP-hostname TLS bypass. For a
+                // strict policy, always require a real, separately verified
+                // DNS hostname and an explicit static IP pin.
+                let url::Host::Domain(host) = &server.host else {
+                    return Err(io::Error::other(
+                        "strict DoT/DoH requires DNS hostname for verified TLS identity; IP-hostname bypass forbidden",
+                    ));
+                };
+                if !_pins.contains_key(&host.to_ascii_lowercase()) {
+                    return Err(io::Error::other(format!(
+                        "strict encrypted DNS upstream '{host}' needs explicit IP bootstrap pin"
+                    )));
+                }
+                rustls::pki_types::ServerName::try_from(host.to_owned())
+                    .map_err(|error| io::Error::other(format!(
+                        "strict encrypted DNS invalid TLS server identity '{host}': {error}"
+                    )))?;
+            }
+        }
+        DNSNetMode::Dhcp => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "strict DNS does not support DHCP transport",
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn exchange_strict_wire(
+    server: &NameServer,
+    outbound: AnyOutboundHandler,
+    request: &Message,
+    pins: &HashMap<String, IpAddr>,
+) -> io::Result<Message> {
+    validate_strict_wire_server(server, pins)?;
+    if let Some(host) = outbound.server_name()
+        && host.parse::<IpAddr>().is_err()
+    {
+        return Err(io::Error::other(format!(
+            "strict DNS proxy '{}' requires unresolved bootstrap '{}' (S04 pending)",
+            outbound.name(),
+            host
+        )));
+    }
+    let restricted_resolver = Arc::new(LiteralOnlyResolver {
+        ipv6: AtomicBool::new(true),
+        pins: pins.clone(),
+    });
+    let client = DnsClient::new_client(Opts {
+        father: Some(restricted_resolver.clone()),
+        outbound_resolver: Some(restricted_resolver),
+        host: server.host.clone(),
+        port: server.port,
+        net: server.net.clone(),
+        iface: None,
+        proxy: outbound,
+        ecs: None,
+        doh_path: server.doh_path.clone(),
+        fw_mark: None,
+        rule_dispatch: None,
+        network_path_source: None,
+    })
+    .await
+    .map_err(io::Error::other)?;
+    let result =
+        tokio::time::timeout(Duration::from_secs(5), client.exchange(request)).await;
+    let cleanup =
+        tokio::time::timeout(Duration::from_secs(1), client.reset_transport()).await;
+    match cleanup {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            return Err(io::Error::other(format!(
+                "strict DNS cleanup failed: {error}"
+            )));
+        }
+        Err(_) => {
+            return Err(io::Error::other("strict DNS transport cleanup timed out"));
+        }
+    }
+    match result {
+        Ok(Ok(mut message)) => {
+            // Hickory TCP/TLS may allocate a fresh per-connection wire ID;
+            // it validates that ID before returning, then we restore the
+            // original application-request transaction identity.
+            message.metadata.id = request.metadata.id;
+            Ok(message)
+        }
+        Ok(Err(error)) => Err(io::Error::other(error)),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "strict DNS transport attempt timed out",
+        )),
+    }
+}
 
 #[async_trait]
 impl DnsStrictTransport for DnsStrictWireTransport {
     fn validate_server(&self, server: &NameServer) -> io::Result<()> {
-        if !matches!(server.net, DNSNetMode::Udp | DNSNetMode::Tcp) {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "strict DNS transport supports only UDP/TCP in S03b: {server}"
-                ),
-            ));
-        }
-        if !matches!(server.host, url::Host::Ipv4(_) | url::Host::Ipv6(_)) {
-            return Err(io::Error::other(format!(
-                "strict DNS upstream '{}' needs explicit bootstrap; refusing system DNS",
-                server.host
-            )));
-        }
-        if server.interface.is_some() || server.proxy.is_some() {
-            return Err(io::Error::other(
-                "strict DNS forbids a second #proxy/#interface override",
-            ));
-        }
-        Ok(())
+        validate_strict_wire_server(server, &HashMap::new())
     }
 
     async fn exchange(
@@ -150,69 +281,23 @@ impl DnsStrictTransport for DnsStrictWireTransport {
         outbound: AnyOutboundHandler,
         request: &Message,
     ) -> io::Result<Message> {
-        self.validate_server(server)?;
-        if let Some(host) = outbound.server_name()
-            && host.parse::<IpAddr>().is_err()
-        {
-            return Err(io::Error::other(format!(
-                "strict DNS proxy '{}' requires unresolved bootstrap '{}' (S04 pending)",
-                outbound.name(),
-                host
-            )));
-        }
-        let client = DnsClient::new_client(Opts {
-            father: None,
-            outbound_resolver: Some(Arc::new(LiteralOnlyResolver::default())),
-            host: server.host.clone(),
-            port: server.port,
-            net: server.net.clone(),
-            iface: None,
-            proxy: outbound,
-            ecs: None,
-            doh_path: None,
-            fw_mark: None,
-            rule_dispatch: None,
-            network_path_source: None,
-        })
-        .await
-        .map_err(io::Error::other)?;
-        // Force cancellation and cleanup before S03a's whole-profile 10s
-        // deadline. In particular, abort Hickory's per-attempt background
-        // task even on a failed or timed-out exchange.
-        let result =
-            tokio::time::timeout(Duration::from_secs(5), client.exchange(request))
-                .await;
-        let cleanup =
-            tokio::time::timeout(Duration::from_secs(1), client.reset_transport())
-                .await;
-        match cleanup {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                return Err(io::Error::other(format!(
-                    "strict DNS cleanup failed: {error}"
-                )));
-            }
-            Err(_) => {
-                return Err(io::Error::other(
-                    "strict DNS transport cleanup timed out",
-                ));
-            }
-        }
-        match result {
-            Ok(Ok(mut message)) => {
-                // Hickory generates a fresh per-connection DNS transaction
-                // ID on TCP and validates the wire reply against that ID.
-                // Return the caller's original transaction ID so S03a's
-                // end-to-end request/response contract remains correct.
-                message.metadata.id = request.metadata.id;
-                Ok(message)
-            }
-            Ok(Err(error)) => Err(io::Error::other(error)),
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "strict DNS transport attempt timed out",
-            )),
-        }
+        exchange_strict_wire(server, outbound, request, &HashMap::new()).await
+    }
+}
+
+#[async_trait]
+impl DnsStrictTransport for DnsStrictPinnedWireTransport {
+    fn validate_server(&self, server: &NameServer) -> io::Result<()> {
+        validate_strict_wire_server(server, &self.pins)
+    }
+
+    async fn exchange(
+        &self,
+        server: &NameServer,
+        outbound: AnyOutboundHandler,
+        request: &Message,
+    ) -> io::Result<Message> {
+        exchange_strict_wire(server, outbound, request, &self.pins).await
     }
 }
 
@@ -224,6 +309,26 @@ pub trait DnsStrictTransport: Send + Sync {
     /// Validate every configured server before the first network attempt to
     /// prevent silent downgrade from unsupported TLS DNS to plaintext UDP.
     fn validate_server(&self, _server: &NameServer) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn validate_profile(&self, servers: &[NameServer]) -> io::Result<()> {
+        // If an encrypted endpoint cannot return an answer, do not quietly
+        // retry on a plaintext protocol in the same declared profile.
+        let encrypted = servers
+            .iter()
+            .any(|s| matches!(s.net, DNSNetMode::DoT | DNSNetMode::DoH));
+        let plaintext = servers
+            .iter()
+            .any(|s| matches!(s.net, DNSNetMode::Udp | DNSNetMode::Tcp));
+        if encrypted && plaintext {
+            return Err(io::Error::other(
+                "strict DNS profile cannot mix encrypted DoT/DoH with plaintext UDP/TCP",
+            ));
+        }
+        for server in servers {
+            self.validate_server(server)?;
+        }
         Ok(())
     }
 
@@ -261,14 +366,12 @@ impl StrictDnsExecution {
         transport: &T,
         request: &Message,
     ) -> io::Result<Message> {
-        for server in &self.servers {
-            transport.validate_server(server).map_err(|error| {
-                io::Error::other(format!(
-                    "strict DNS rule[{}] profile '{}' cannot be safely executed: {error}",
-                    self.ordinal, self.profile
-                ))
-            })?;
-        }
+        transport.validate_profile(&self.servers).map_err(|error| {
+            io::Error::other(format!(
+                "strict DNS rule[{}] profile '{}' cannot be safely executed: {error}",
+                self.ordinal, self.profile
+            ))
+        })?;
 
         // Keep the WHOLE strict attempt bounded, including retries among
         // servers in the same declared profile. No network dial can remain
