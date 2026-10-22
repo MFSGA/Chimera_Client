@@ -141,6 +141,7 @@ impl StrictDnsCache {
             || request.metadata.op_code != OpCode::Query
             || request.queries.len() != 1
             || request.edns.is_some()
+            || request.signature.is_some()
             || context.qclass != DNSClass::IN
             || context.flags.has_edns
             || context.flags.dnssec_ok
@@ -209,6 +210,7 @@ impl StrictDnsCache {
             || response.metadata.truncation
             || response.metadata.authentic_data
             || response.edns.is_some()
+            || response.signature.is_some()
             || !response.additionals.is_empty()
         {
             return None;

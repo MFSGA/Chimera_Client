@@ -10,7 +10,7 @@ use hickory_proto::{
     op::{Message, MessageType, OpCode, Query, ResponseCode},
     rr::{
         DNSClass, Name, RData, Record, RecordType,
-        rdata::{A, SOA},
+        rdata::{A, SOA, TSIG, tsig::TsigAlgorithm},
     },
 };
 
@@ -103,6 +103,24 @@ fn negative(req: &Message) -> Message {
     ));
     msg
 }
+fn add_test_signature(message: &mut Message) {
+    // The MAC is intentionally synthetic: the cache must bypass all TSIG
+    // messages, not try to validate or replay transaction-specific signatures.
+    message.signature = Some(Box::new(Record::from_rdata(
+        Name::from_ascii("test-key.example.").unwrap(),
+        0,
+        TSIG::new(
+            TsigAlgorithm::HmacSha256,
+            0,
+            300,
+            vec![0xa5; 16],
+            message.metadata.id,
+            None,
+            Vec::new(),
+        ),
+    )));
+}
+
 fn execution(
     profile: &str,
     egress: DnsEgress,
@@ -336,6 +354,69 @@ async fn s04_edns_dnssec_ecs_and_non_in_query_bypass_cache() {
     }
     assert_eq!(wire.hits(), 4);
     assert_eq!(cache.len(), 0);
+}
+
+#[tokio::test]
+async fn s04_signed_requests_bypass_existing_positive_and_negative_cache_entries() {
+    let req = question("www.example.com.", RecordType::A, 12);
+    for (kind, answer) in
+        [("positive", positive(&req)), ("negative", negative(&req))]
+    {
+        let wire = FakeWire::new(answer, Some("pins"));
+        let cache = StrictDnsCache::new(4, 7, 9, 0);
+        let exec = execution(
+            "main",
+            DnsEgress::Direct,
+            leaf("direct"),
+            "udp://192.0.2.53",
+        );
+
+        cache
+            .exchange_scoped(&exec, &wire, &req, &ctx(&req), 0)
+            .await
+            .unwrap();
+        assert_eq!(cache.len(), 1, "{kind} baseline must be cacheable");
+
+        let mut signed = question("www.example.com.", RecordType::A, 55);
+        add_test_signature(&mut signed);
+        cache
+            .exchange_scoped(&exec, &wire, &signed, &ctx(&signed), 0)
+            .await
+            .unwrap();
+        assert_eq!(wire.hits(), 2, "{kind} signed request must bypass hit");
+        assert_eq!(cache.len(), 1, "{kind} bypass must not alter cache");
+    }
+}
+
+#[tokio::test]
+async fn s04_signed_positive_and_negative_responses_are_never_cached() {
+    let req = question("www.example.com.", RecordType::A, 12);
+    for (kind, mut answer) in
+        [("positive", positive(&req)), ("negative", negative(&req))]
+    {
+        add_test_signature(&mut answer);
+        let wire = FakeWire::new(answer, Some("pins"));
+        let cache = StrictDnsCache::new(4, 7, 9, 0);
+        let exec = execution(
+            "main",
+            DnsEgress::Direct,
+            leaf("direct"),
+            "udp://192.0.2.53",
+        );
+
+        for _ in 0..2 {
+            let response = cache
+                .exchange_scoped(&exec, &wire, &req, &ctx(&req), 0)
+                .await
+                .unwrap();
+            assert!(
+                response.signature.is_some(),
+                "signed response must pass through"
+            );
+        }
+        assert_eq!(wire.hits(), 2, "{kind} signed reply must not be replayed");
+        assert_eq!(cache.len(), 0, "{kind} signed reply must not be stored");
+    }
 }
 
 #[tokio::test]

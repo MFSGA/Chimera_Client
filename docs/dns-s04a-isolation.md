@@ -7,7 +7,7 @@
 
 - `app/dns/isolation.rs` 新增 `StrictDnsCache`，只可经显式 `exchange_scoped` 调用；现有 `EnhancedResolver::exchange` 不访问此状态。默认不创建缓存、不改变 legacy 缓存行为。严格执行仍使用 S03 原有 `DnsClient` **每服务器尝试独立建连并主动清理**的连接策略，当前没有共享的严格连接池，也没有跨出口复用。
 - 严格缓存键包含：规范化 QNAME、QCLASS、QTYPE、`DnsPurpose`、Host/Gateway namespace、查询标志、ECS 描述、resolver-profile、显式 DNS 出口、**固定代理叶节点的 Arc 实体身份**、有序 upstream 完整网络端点/协议/DoH path、transport 的 bootstrap pin 快照 fingerprint，以及网络/配置代际与 bootstrap revision。持有叶节点强引用避免仅凭地址/名称判断时的内存指针复用风险。相同 DNS 服务器经 DIRECT 与 PROXY 不共享状态；代理组切换后即使叶节点名称相同，只要是不同 handler 对象就会隔离。
-- 缓存只接纳可逐项证明的普通 IN/A 或 IN/AAAA、无 EDNS/ECS/CD/DO/AD 的递归查询，且只支持对应 QTYPE 的简单正 RRset 或空 Answer 且 SOA 区域/class 正确的 NXDOMAIN/NODATA。**EDNS、ECS、DNSSEC、非 IN/其他 QTYPE/复杂 CNAME、异常上游应答不缓存**。如果传输没有可验证的 bootstrap/config 快照身份，也不缓存。没有实现 serve-stale 或跨 QTYPE NXDOMAIN 复用。
+- 缓存只接纳可逐项证明的普通 IN/A 或 IN/AAAA、无 EDNS/ECS/CD/DO/AD 的递归查询，且只支持对应 QTYPE 的简单正 RRset 或空 Answer 且 SOA 区域/class 正确的 NXDOMAIN/NODATA。**EDNS、ECS、DNSSEC、TSIG 签名请求/响应、非 IN/其他 QTYPE/复杂 CNAME、异常上游应答不缓存**。即使已有相同 Question 的普通缓存条目，TSIG 请求也必须绕过命中并重新查询；带 TSIG 的上游应答不得写入严格缓存。如果传输没有可验证的 bootstrap/config 快照身份，也不缓存。没有实现 serve-stale 或跨 QTYPE NXDOMAIN 复用。
 - 正缓存 TTL 取所有答案 RR 的最小 TTL；负缓存 TTL 取 `min(SOA RR TTL, SOA.MINIMUM)`。命中时递减 TTL，并以本次 DNS transaction ID、Question 和请求元数据重写响应；超时后重新执行。可配置内部容量上限，本切片没有向 YAML 暴露缓存调参。
 - `advance_epoch(network,config,bootstrap)` 原子清空旧分区。旧代际请求不得查询或存储新分区；当**在途请求**返回时发现 epoch 变动，直接返回错误并丢弃结果，防止旧网络响应覆盖新网络的真实结果。调用方必须在网络/配置/pin 变化时通知该缓存，之后才能使用新代际。
 - `DnsStrictTransport::isolation_fingerprint` 由 S03b 普通严格传输提供固定 ID，由 S03c 显式 pin 传输提供**排序后的 hostname→IP 快照**。这只表明传输选项的身份，**不是实际 OS 出口 IP 检测**。身份未知则安全绕过缓存。
