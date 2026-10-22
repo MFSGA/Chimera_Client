@@ -112,6 +112,12 @@ cargo test -p clash-lib --test dns_config_tests --locked
 - `DnsStrictWireTransport` 与 `DnsStrictPinnedWireTransport` 实现 S04b-m 的 `DnsStrictSocketPathTransport`，**仅 TCP/UDP 可走证据接口**；DoT/DoH 仍不支持这份证据接口，不能降级到明文或虚构路径。缺少实际 socket ID、来源不完整或最终验证不通过时失败关闭并停止上游重试；普通严格交换逻辑和生产 `policy-rules` gate 仍保持原样。S04b-n 离线测试验证 TCP/UDP runtime 只使用连接报告的 ID，以及一条经过 Hickory DNS TCP 编解码的内存连接可将 ID 传至严格传输，缺少 ID 时拒绝。
 - **仍未完成：** 本地 `ChainedStream` 报告的 ID 是连接器侧软件元数据，并非 OS 级 NIC/源地址的最终证明；没有端到端验证实际 proxy connector/UDP socket 绑定、DoT/DoH/连接池行为、真实远端代理和抓包；可信 Provider/bootstrap pin 来源与完整递归依赖图以及独立 L2 审查/维护者批准仍未完成。S04b-n 是内部条件能力，**不可用来解除生产 `policy-rules` 启动保护**。
 
+## S04b-o：ProxyConnector 完成路径来源约束与 UDP→TCP 最终连接归属
+
+- 修复 `ProxyConnector::connect_stream_with_pool_context` 和 `connect_datagram_with_pool_context` 的**规划路径残留风险**：过去只有在内层代理报告非空 `network_path_ids` 时才更新 `NetworkPoolContext.path_id`；如果下层连接实际上未报告物理路径，旧的拨号前规划 ID/网络代际会残留，并可能经由上层 wrapper 误当作完成连接证据。现在两个协议统一调用 `record_connected_paths`，使用最终完成链条的首个报告 ID 和其网络代际**覆盖**上下文；若连接链没有物理路径报告，清空这两个字段，不使用规划候选或上一次连接的信息补足。候选集合仍保留供既有池化资格逻辑检查，业务 DNS 和动态 Provider 生产门禁没有变动。
+- `s04bo_proxy_connector_context_uses_completed_tcp_udp_paths_only` 离线回归让真实 `ProxyConnector` 驱动模拟内层出站，分别测试 TCP/UDP 无连接证据与有不同于原计划的实际证据，确认两者都不会泄漏事前候选。`s04bo_udp_truncation_uses_final_tcp_socket_path_not_udp_path` 通过完整的 DNS UDP 截断应答和随后 Hickory TCP DNS 编解码、分别返回不同的连接路径 ID，验证最终应答仅绑定 TCP 连接路径，而非第一阶段 UDP 路径；不打开外网或更改系统路由。
+- **限制：** 这些是可离线复现的路径元数据来源/归属测试，并非真实 OS NIC/源 IP 抓包、套接字最终出口证明、动态代理递归拨号证明或并发复用压测。尚需真实 Connector/本地 UDP/TCP 与加密 DNS 池的网络切换压力测试、可信 bootstrap Provider/pin 来源及独立 L2 审查。**生产 `policy-rules` 继续禁用。**
+
 ## S04b/S04c 待完成的严格准入
 
 1. **真实执行接线与身份来源**：S04b-a 提供共享 RuntimeStatus 读取接口，但**尚未由生产 DNS runtime 自动接入或订阅**；需有可信的 bootstrap pin revision/变更事件来源，而不是由未受验证的调用者提供任意数值。仍需真实数据面验证动态代理在查询中途切换时的失效与回滚；旧 legacy 路径继续完全独立。

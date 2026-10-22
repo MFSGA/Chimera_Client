@@ -241,6 +241,166 @@ mod tests {
         Ok(())
     }
 
+    #[derive(Debug)]
+    struct S04boTaggedDnsOutbound {
+        udp_path: crate::app::flow::NetworkPathId,
+        tcp_path: crate::app::flow::NetworkPathId,
+        udp_calls: Arc<std::sync::atomic::AtomicUsize>,
+        tcp_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl DialWithConnector for S04boTaggedDnsOutbound {}
+
+    #[async_trait]
+    impl OutboundHandler for S04boTaggedDnsOutbound {
+        fn name(&self) -> &str {
+            "s04bo-tagged"
+        }
+        fn proto(&self) -> OutboundType {
+            OutboundType::Socks5
+        }
+        async fn connect_stream(
+            &self,
+            _: &Session,
+            _: Arc<dyn ClashResolver>,
+        ) -> std::io::Result<BoxedChainedStream> {
+            self.tcp_calls.fetch_add(1, Ordering::SeqCst);
+            let (stream, mut dns) = tokio::io::duplex(16_384);
+            tokio::spawn(async move {
+                let mut length = [0u8; 2];
+                dns.read_exact(&mut length).await?;
+                let mut wire = vec![0u8; u16::from_be_bytes(length) as usize];
+                dns.read_exact(&mut wire).await?;
+                let query =
+                    Message::from_vec(&wire).map_err(std::io::Error::other)?;
+                let mut response =
+                    Message::response(query.metadata.id, query.metadata.op_code);
+                response.add_queries(query.queries.iter().cloned());
+                let bytes = response.to_vec().map_err(std::io::Error::other)?;
+                dns.write_all(&(bytes.len() as u16).to_be_bytes()).await?;
+                dns.write_all(&bytes).await?;
+                Ok::<_, std::io::Error>(())
+            });
+            Ok(Box::new(
+                crate::app::dispatcher::ChainedStreamWrapper::new_with_network_path_ids(
+                    stream, vec![self.tcp_path.clone()],
+                ),
+            ))
+        }
+        async fn connect_datagram(
+            &self,
+            _: &Session,
+            _: Arc<dyn ClashResolver>,
+        ) -> std::io::Result<BoxedChainedDatagram> {
+            self.udp_calls.fetch_add(1, Ordering::SeqCst);
+            let (send, receive) = tokio::sync::mpsc::unbounded_channel();
+            Ok(Box::new(
+                crate::app::dispatcher::ChainedDatagramWrapper::new_with_network_path_ids(
+                    S04boTruncatingUdp { send, receive }, vec![self.udp_path.clone()],
+                ),
+            ))
+        }
+    }
+
+    struct S04boTruncatingUdp {
+        send: tokio::sync::mpsc::UnboundedSender<crate::proxy::datagram::UdpPacket>,
+        receive:
+            tokio::sync::mpsc::UnboundedReceiver<crate::proxy::datagram::UdpPacket>,
+    }
+
+    impl futures::Stream for S04boTruncatingUdp {
+        type Item = crate::proxy::datagram::UdpPacket;
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            self.receive.poll_recv(cx)
+        }
+    }
+
+    impl futures::Sink<crate::proxy::datagram::UdpPacket> for S04boTruncatingUdp {
+        type Error = std::io::Error;
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn start_send(
+            self: std::pin::Pin<&mut Self>,
+            packet: crate::proxy::datagram::UdpPacket,
+        ) -> Result<(), Self::Error> {
+            let request =
+                Message::from_vec(&packet.data).map_err(std::io::Error::other)?;
+            let mut answer =
+                Message::response(request.metadata.id, request.metadata.op_code);
+            answer.metadata.truncation = true;
+            answer.add_queries(request.queries.iter().cloned());
+            self.send
+                .send(crate::proxy::datagram::UdpPacket {
+                    data: answer.to_vec().map_err(std::io::Error::other)?,
+                    src_addr: packet.dst_addr,
+                    dst_addr: packet.src_addr,
+                    inbound_user: None,
+                })
+                .map_err(std::io::Error::other)
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn s04bo_udp_truncation_uses_final_tcp_socket_path_not_udp_path() {
+        use crate::app::flow::{AddressFamily, InterfaceId, NetworkPathId};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let path = |name: &str, generation: u64| NetworkPathId {
+            interface: InterfaceId {
+                name: name.to_owned(),
+                index: 17,
+            },
+            family: AddressFamily::Ipv4,
+            source_address: Some("192.0.2.77".parse().unwrap()),
+            network_generation: generation,
+        };
+        let udp = path("udp0", 7);
+        let tcp = path("tcp0", 8);
+        let udp_calls = Arc::new(AtomicUsize::new(0));
+        let tcp_calls = Arc::new(AtomicUsize::new(0));
+        let handler: Arc<dyn OutboundHandler> = Arc::new(S04boTaggedDnsOutbound {
+            udp_path: udp.clone(),
+            tcp_path: tcp.clone(),
+            udp_calls: udp_calls.clone(),
+            tcp_calls: tcp_calls.clone(),
+        });
+        let mut client = client_with_ecs(None);
+        let server = "192.0.2.53:53".parse().unwrap();
+        client.proxy = handler.clone();
+        client.cfg = RwLock::new(DnsConfig::Udp(server, None, handler, None));
+        let (reply, paths) = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.exchange_with_socket_paths(&build_message(RecordType::A)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!reply.metadata.truncation);
+        assert_eq!(paths, vec![tcp]);
+        assert!(!paths.contains(&udp));
+        assert_eq!(udp_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(tcp_calls.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn dns_response_reports_the_selected_network_path() {
         use crate::app::{

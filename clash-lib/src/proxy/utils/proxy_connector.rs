@@ -118,6 +118,15 @@ impl NetworkPoolContext {
             })
     }
 
+    /// Replace pre-dial planning identity with the *completed chain's*
+    /// reported socket path. If no hop reports a physical path, clear any
+    /// stale planned path AND generation; neither may be forwarded as proof.
+    pub(crate) fn record_connected_paths(&mut self, paths: &[NetworkPathId]) {
+        self.path_id = paths.first().cloned();
+        self.network_generation =
+            self.path_id.as_ref().map(|path| path.network_generation);
+    }
+
     pub fn can_pool_connected_path(&self) -> bool {
         self.eligible_path_ids.as_ref().is_none_or(|eligible| {
             self.path_id
@@ -1895,12 +1904,9 @@ impl RemoteConnector for ProxyConnector {
                 so_mark,
             )
             .await?;
-        if let Some(path_id) = path_ids.first() {
-            // The completed chain is the source of truth. An input context
-            // describes eligible paths before dialing, not the winning NIC.
-            pool_context.path_id = Some(path_id.clone());
-            pool_context.network_generation = Some(path_id.network_generation);
-        }
+        // Never retain a pre-dial candidate when the completed physical
+        // chain supplied no path evidence.
+        pool_context.record_connected_paths(&path_ids);
         Ok((stream, pool_context))
     }
 
@@ -1941,10 +1947,7 @@ impl RemoteConnector for ProxyConnector {
                 so_mark,
             )
             .await?;
-        if let Some(path_id) = path_ids.first() {
-            pool_context.path_id = Some(path_id.clone());
-            pool_context.network_generation = Some(path_id.network_generation);
-        }
+        pool_context.record_connected_paths(&path_ids);
         Ok((datagram, pool_context))
     }
 }
@@ -2047,6 +2050,133 @@ mod tests {
         let (server, _) = listener.accept().await.unwrap();
         drop(client);
         drop(server);
+    }
+
+    #[derive(Debug)]
+    struct S04boNestedProxy {
+        reported_paths: Vec<NetworkPathId>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::proxy::DialWithConnector for S04boNestedProxy {}
+
+    #[async_trait::async_trait]
+    impl crate::proxy::OutboundHandler for S04boNestedProxy {
+        fn name(&self) -> &str {
+            "s04bo-nested"
+        }
+        fn proto(&self) -> crate::proxy::OutboundType {
+            crate::proxy::OutboundType::Socks5
+        }
+        async fn connect_stream(
+            &self,
+            sess: &crate::session::Session,
+            resolver: crate::app::dns::ThreadSafeDNSResolver,
+        ) -> std::io::Result<crate::app::dispatcher::BoxedChainedStream> {
+            self.connect_stream_with_connector(
+                sess,
+                resolver,
+                &DirectConnector::new(),
+            )
+            .await
+        }
+        async fn connect_datagram(
+            &self,
+            sess: &crate::session::Session,
+            resolver: crate::app::dns::ThreadSafeDNSResolver,
+        ) -> std::io::Result<crate::app::dispatcher::BoxedChainedDatagram> {
+            self.connect_datagram_with_connector(
+                sess,
+                resolver,
+                &DirectConnector::new(),
+            )
+            .await
+        }
+        async fn connect_stream_with_connector(
+            &self,
+            _: &crate::session::Session,
+            _: crate::app::dns::ThreadSafeDNSResolver,
+            _: &dyn RemoteConnector,
+        ) -> std::io::Result<crate::app::dispatcher::BoxedChainedStream> {
+            let (stream, _peer) = tokio::io::duplex(64);
+            Ok(Box::new(
+                crate::app::dispatcher::ChainedStreamWrapper::new_with_network_path_ids(
+                    stream, self.reported_paths.clone(),
+                ),
+            ))
+        }
+        async fn connect_datagram_with_connector(
+            &self,
+            _: &crate::session::Session,
+            resolver: crate::app::dns::ThreadSafeDNSResolver,
+            _: &dyn RemoteConnector,
+        ) -> std::io::Result<crate::app::dispatcher::BoxedChainedDatagram> {
+            let socket = UdpSocket::bind("127.0.0.1:0").await?;
+            let udp = OutboundDatagramImpl::new(socket, resolver);
+            Ok(Box::new(
+                crate::app::dispatcher::ChainedDatagramWrapper::new_with_network_path_ids(
+                    udp, self.reported_paths.clone(),
+                ),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn s04bo_proxy_connector_context_uses_completed_tcp_udp_paths_only() {
+        let planned =
+            observed_path("planned0", 7, "192.0.2.10".parse().unwrap(), 41).id;
+        let physical =
+            observed_path("actual0", 8, "198.51.100.10".parse().unwrap(), 42).id;
+        for paths in [vec![], vec![physical.clone()]] {
+            let connector = super::ProxyConnector::new(
+                Arc::new(S04boNestedProxy {
+                    reported_paths: paths.clone(),
+                }),
+                Box::new(DirectConnector::new()),
+            );
+            let context = NetworkPoolContext {
+                path_id: Some(planned.clone()),
+                network_generation: Some(planned.network_generation),
+                ..Default::default()
+            };
+            let resolver = Arc::new(MockClashResolver::new());
+            let (_, tcp_context) = connector
+                .connect_stream_with_pool_context(
+                    resolver.clone(),
+                    "192.0.2.53",
+                    53,
+                    None,
+                    #[cfg(target_os = "linux")]
+                    None,
+                    context.clone(),
+                )
+                .await
+                .unwrap();
+            let (_, udp_context) = connector
+                .connect_datagram_with_pool_context(
+                    resolver,
+                    None,
+                    SocksAddr::Ip("192.0.2.53:53".parse().unwrap()),
+                    None,
+                    #[cfg(target_os = "linux")]
+                    None,
+                    context,
+                )
+                .await
+                .unwrap();
+            for actual in [tcp_context, udp_context] {
+                assert_eq!(actual.path_id, paths.first().cloned());
+                assert_eq!(
+                    actual.network_generation,
+                    paths.first().map(|path| path.network_generation),
+                );
+                assert_ne!(
+                    actual.path_id,
+                    Some(planned.clone()),
+                    "pre-dial plan must never masquerade as completed socket evidence"
+                );
+            }
+        }
     }
 
     #[test]
