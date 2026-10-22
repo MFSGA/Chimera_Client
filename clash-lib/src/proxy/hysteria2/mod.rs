@@ -629,6 +629,9 @@ impl Handler {
         hop_connector: Option<Arc<dyn RemoteConnector>>,
         cancellation: tokio_util::sync::CancellationToken,
     ) -> std::io::Result<Arc<HysteriaConnection>> {
+        // Acquire the per-handler pool lock *before* observing the network.
+        // A waiting borrower must not authorize reuse using a snapshot taken
+        // before another task finished (or retired) its QUIC connection.
         let mut quinn_conn_lock = self.conn.lock().await;
         let pool_connector = if self.opts.obfs.is_none() && self.opts.ports.is_some()
         {
@@ -639,6 +642,12 @@ impl Handler {
         let current_context = pool_connector
             .connection_pool_context(sess.iface.as_ref())
             .await;
+        if cancellation.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "network changed before Hysteria2 pool checkout",
+            ));
+        }
 
         match (*quinn_conn_lock).as_ref().filter(|s| {
             match s.conn.close_reason() {
@@ -650,7 +659,14 @@ impl Handler {
                 None => pool_context_is_current(&current_context, &s.pool_context),
             }
         }) {
-            Some(s) => Ok(s.clone()),
+            Some(s) => {
+                ensure_hysteria_connection_current(
+                    &current_context,
+                    &s.pool_context,
+                    &cancellation,
+                )?;
+                Ok(s.clone())
+            }
             None => {
                 if let Some(stale) = quinn_conn_lock.take() {
                     stale
@@ -664,7 +680,7 @@ impl Handler {
                         sess,
                         resolver,
                         connector,
-                        hop_connector,
+                        hop_connector.clone(),
                         cancellation.clone(),
                     )
                     .await
@@ -678,6 +694,30 @@ impl Handler {
                 let (session, guard, driver_task, pool_context) =
                     cancel_on_network_change(cancellation.clone(), connecting)
                         .await?;
+
+                // The QUIC dial (including authentication) can span a path
+                // change that is observed before the cancellation signal.
+                // Do not publish a stale connection into the reusable pool.
+                let latest_context = pool_connector
+                    .connection_pool_context(sess.iface.as_ref())
+                    .await;
+                if ensure_hysteria_connection_current(
+                    &latest_context,
+                    &pool_context,
+                    &cancellation,
+                )
+                .is_err()
+                {
+                    session.close(
+                        quinn::VarInt::from_u32(0),
+                        b"network path changed during QUIC dial",
+                    );
+                    driver_task.abort();
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "network path changed before Hysteria2 pool publication",
+                    ));
+                }
 
                 let session = Arc::new(session);
                 let hyst_conn = HysteriaConnection::new_with_task_loop(
@@ -823,14 +863,28 @@ impl HysteriaConnection {
     }
 }
 
+fn ensure_hysteria_connection_current(
+    current: &NetworkPoolContext,
+    connected: &NetworkPoolContext,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> io::Result<()> {
+    if cancellation.is_cancelled() || !pool_context_is_current(current, connected) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "network path changed before Hysteria2 pool publication",
+        ));
+    }
+    Ok(())
+}
+
 fn pool_context_is_current(
     current: &NetworkPoolContext,
     cached: &NetworkPoolContext,
 ) -> bool {
-    match cached.path_id.as_ref() {
-        Some(path_id) => current.permits(cached.network_generation, Some(path_id)),
-        None => current.network_generation == cached.network_generation,
-    }
+    // A missing physical path is NOT permission to bypass an explicit set of
+    // eligible interfaces. Generation-only reuse remains valid solely for
+    // connectors without an observed candidate set.
+    current.permits(cached.network_generation, cached.path_id.as_ref())
 }
 
 async fn cancel_on_network_change<T>(
@@ -1580,6 +1634,104 @@ mod network_path_tests {
                 ..Default::default()
             }
         ));
+    }
+
+    #[test]
+    fn s04bq_hysteria_unreported_path_must_not_bypass_observed_candidates() {
+        let reported = path("actual0", 3, Ipv4Addr::new(192, 0, 2, 10));
+        let current = NetworkPoolContext {
+            network_generation: Some(7),
+            path_id: None,
+            eligible_path_ids: Some([reported.clone()].into_iter().collect()),
+            reporter: None,
+        };
+        let unreported = NetworkPoolContext {
+            network_generation: Some(7),
+            path_id: None,
+            ..Default::default()
+        };
+        assert!(!pool_context_is_current(&current, &unreported));
+        // Older, non-path-aware connectors remain generation-only.
+        let generation_only = NetworkPoolContext::for_generation(Some(7));
+        assert!(pool_context_is_current(&generation_only, &unreported));
+        assert!(pool_context_is_current(
+            &current,
+            &NetworkPoolContext {
+                network_generation: Some(7),
+                path_id: Some(reported),
+                ..Default::default()
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn s04bq_hysteria_dial_epoch_and_cancellation_checked_before_publication()
+    {
+        use std::sync::atomic::AtomicU64;
+        let epoch = Arc::new(AtomicU64::new(7));
+        let epoch_on_wire = epoch.clone();
+        let token = tokio_util::sync::CancellationToken::new();
+        let (started, arrived) = tokio::sync::oneshot::channel();
+        let (release, go) = tokio::sync::oneshot::channel::<()>();
+        let dial = tokio::spawn(async move {
+            started.send(()).unwrap();
+            go.await.unwrap();
+            NetworkPoolContext::for_generation(Some(
+                epoch_on_wire.load(Ordering::SeqCst),
+            ))
+        });
+        arrived.await.unwrap();
+        // A dial was already in flight when the network generation changed.
+        epoch.store(8, Ordering::SeqCst);
+        release.send(()).unwrap();
+        let connected = NetworkPoolContext::for_generation(Some(7));
+        let latest = dial.await.unwrap();
+        let err = ensure_hysteria_connection_current(&latest, &connected, &token)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        assert!(
+            ensure_hysteria_connection_current(&connected, &connected, &token)
+                .is_ok()
+        );
+        token.cancel();
+        let err = ensure_hysteria_connection_current(&connected, &connected, &token)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[tokio::test]
+    async fn s04bq_repeated_inflight_cancellation_releases_pending_dials() {
+        for _ in 0..32 {
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            let dropped = Arc::new(AtomicBool::new(false));
+            let witness = dropped.clone();
+            let (entered, started) = tokio::sync::oneshot::channel::<()>();
+            let dial = async move {
+                struct Witness(Arc<AtomicBool>);
+                impl Drop for Witness {
+                    fn drop(&mut self) {
+                        self.0.store(true, Ordering::SeqCst);
+                    }
+                }
+                let _witness = Witness(witness);
+                let _ = entered.send(());
+                std::future::pending::<io::Result<()>>().await
+            };
+            let cancel = cancellation.clone();
+            let task =
+                tokio::spawn(
+                    async move { cancel_on_network_change(cancel, dial).await },
+                );
+            started.await.unwrap();
+            cancellation.cancel();
+            let err = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+            assert!(dropped.load(Ordering::SeqCst));
+        }
     }
 
     #[tokio::test]

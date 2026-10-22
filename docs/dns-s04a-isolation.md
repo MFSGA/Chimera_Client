@@ -125,6 +125,12 @@ cargo test -p clash-lib --test dns_config_tests --locked
 - 新增 4 项 `s04bp_` 离线测试：TCP/UDP VLESS 池化流异步取出期间 generation 从 7→8 时拒绝、未变化时允许；不一致的物理路径代际失败关闭；旧式未观测 Connector 的 TCP/UDP 默认方法拒绝规划路径冒充已完成连接；自建连接传输默认报告空 ID，不能从已规划路径生成假的物理证据。另验证既有 VLESS reuse 8 项、gRPC 13 项与 XHTTP 52 项全通过；当前 feature 下 Hysteria2 筛选未命中用例，不能视为完成 Hysteria2 压测。
 - **限制：** 重读网络上下文是在归还逻辑流之前进行的复核，不是 socket 建立与物理使用期间的不可中断锁或 OS 级出口证明；旧流建立过程的网络副作用不能撤销。gRPC/XHTTP/Hysteria2 等其他连接池的建立、重用、取消并发仍需独立压力测试，真实网卡/源 IP 抓包、可信 Provider/bootstrap pin、完整逐跳证明、独立 L2 审查和维护者批准仍未完成；生产 `policy-rules` 继续禁用。
 
+## S04b-q：Hysteria2 QUIC 池化复用与建立完成后的代际复核（Feature 显式测试）
+
+- 确认 `proxy::hysteria2` 受 `hysteria` Feature 控制，旧的默认 Feature 测试过滤条件未真正执行其用例。新 `pool_context_is_current` 不再对 `cached.path_id=None` 无条件退化成 generation-only：若当前网络明确提供候选物理路径集合，无报告路径的旧 QUIC 池连接必须拒绝；没有候选集合的遗留连接器仍允许同代际复用。
+- 在 Hysteria2 单例 QUIC 池锁取得之后才采集当前网络上下文，避免排队等待期间先前的观测被误用于池内对象；取出旧连接前确认取消令牌未触发。新连接完成认证后、发布到池之前重新采集当前 connector 的路径上下文，并与实际完成连接记录的 `NetworkPoolContext` 及取消令牌复核。若网络已变化，关闭新建的 QUIC 连接并中止 driver task，返回 `Interrupted`，不缓存旧身份。检查不能撤销已发生的握手/网络包，也不是系统级网卡/源地址证明。
+- `s04bq_` Feature 专属离线测试覆盖未报告路径而候选集合明确时的失败关闭、连接期间 generation 更新/取消、重复 32 轮在途取消与 future 释放；保留 Hysteria2 既有取消回归。gRPC/XHTTP 在当前切片只做既有回归，不声称已完成其所有网络切换压测。生产 `policy-rules` gate 继续关闭；可信 Provider/pin 来源、实际出口抓包、端到端递归拨号证明以及独立 L2 审查与维护者批准仍待完成。
+
 ## S04b/S04c 待完成的严格准入
 
 1. **真实执行接线与身份来源**：S04b-a 提供共享 RuntimeStatus 读取接口，但**尚未由生产 DNS runtime 自动接入或订阅**；需有可信的 bootstrap pin revision/变更事件来源，而不是由未受验证的调用者提供任意数值。仍需真实数据面验证动态代理在查询中途切换时的失效与回滚；旧 legacy 路径继续完全独立。
