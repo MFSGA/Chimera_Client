@@ -1986,6 +1986,35 @@ ip: not-an-ip
             .to_string();
         assert!(err.contains("different outbound manager"), "{err}");
 
+        let pinned =
+            crate::app::dns::bootstrap_provider::StrictDnsManagerLeafGuard::bind(
+                StrictProviderObservation::capture_manager(&status, &manager)
+                    .await
+                    .unwrap(),
+                &manager,
+                &status,
+                &selected_registry,
+                "remote",
+                leaf.clone(),
+            )
+            .await
+            .unwrap();
+        crate::app::dns::execution::DnsStrictAttemptGuard::ensure_current(
+            &pinned, &leaf,
+        )
+        .await
+        .unwrap();
+        let impostor: AnyOutboundHandler = Arc::new(StrictDnsProviderLeaf);
+        assert!(
+            crate::app::dns::execution::DnsStrictAttemptGuard::ensure_current(
+                &pinned, &impostor,
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("leaf identity changed")
+        );
+
         status.write().await.observed(&NetworkSnapshot {
             dns: "changed network".into(),
             ..NetworkSnapshot::default()
@@ -1996,6 +2025,15 @@ ip: not-an-ip
             .unwrap_err()
             .to_string();
         assert!(err.contains("stale network/config"), "{err}");
+        assert!(
+            crate::app::dns::execution::DnsStrictAttemptGuard::ensure_current(
+                &pinned, &leaf,
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("stale network/config")
+        );
     }
 
     /// Simulate a new network observation after initial pool retirement, while

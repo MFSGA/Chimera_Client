@@ -360,6 +360,24 @@ pub trait DnsStrictTransport: Send + Sync {
     ) -> io::Result<Message>;
 }
 
+/// S04b-i verification hook around the *exact* selected leaf's I/O. A
+/// version change is fatal, never a retryable upstream error. This is an
+/// internal building block; it does not authenticate Provider provenance or
+/// authorize production strict-DNS traffic.
+#[async_trait]
+pub(crate) trait DnsStrictAttemptGuard: Send + Sync {
+    async fn ensure_current(&self, outbound: &AnyOutboundHandler) -> io::Result<()>;
+}
+
+struct UncheckedStrictAttempt;
+
+#[async_trait]
+impl DnsStrictAttemptGuard for UncheckedStrictAttempt {
+    async fn ensure_current(&self, _: &AnyOutboundHandler) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 pub enum PreparedDnsExecution {
     /// The legacy resolver owns local Fake-IP/hosts responses.
     LocalAnswer,
@@ -386,6 +404,33 @@ impl StrictDnsExecution {
         transport: &T,
         request: &Message,
     ) -> io::Result<Message> {
+        self.exchange_with_guard(transport, request, &UncheckedStrictAttempt)
+            .await
+    }
+
+    /// S04b-i internal non-caching strict exchange. Verify a pinned selected
+    /// leaf before every upstream attempt and again after its I/O (success,
+    /// failure, or timeout). Stale identity aborts immediately: NEVER retry
+    /// against another upstream, DIRECT, or the legacy resolver.
+    #[allow(dead_code)]
+    pub(crate) async fn exchange_guarded<
+        T: DnsStrictTransport,
+        G: DnsStrictAttemptGuard,
+    >(
+        &self,
+        transport: &T,
+        request: &Message,
+        guard: &G,
+    ) -> io::Result<Message> {
+        self.exchange_with_guard(transport, request, guard).await
+    }
+
+    async fn exchange_with_guard<T: DnsStrictTransport, G: DnsStrictAttemptGuard>(
+        &self,
+        transport: &T,
+        request: &Message,
+        guard: &G,
+    ) -> io::Result<Message> {
         transport.validate_profile(&self.servers).map_err(|error| {
             io::Error::other(format!(
                 "strict DNS rule[{}] profile '{}' cannot be safely executed: {error}",
@@ -399,11 +444,15 @@ impl StrictDnsExecution {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let mut failures = Vec::with_capacity(self.servers.len());
         for server in &self.servers {
+            guard.ensure_current(&self.outbound).await?;
             let result = tokio::time::timeout_at(
                 deadline,
                 transport.exchange(server, self.outbound.clone(), request),
             )
             .await;
+            // Even a failed attempt must be checked before retrying; stale
+            // Provider state is a terminal error, not an upstream failure.
+            guard.ensure_current(&self.outbound).await?;
             match result {
                 Ok(Ok(answer))
                     if answer.metadata.message_type == MessageType::Response

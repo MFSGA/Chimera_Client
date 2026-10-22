@@ -16,8 +16,8 @@ use crate::{
             ThreadSafeDNSResolver,
             config::NameServer,
             execution::{
-                DnsStrictTransport, PreparedDnsExecution, StrictDnsExecution,
-                prepare_dns_execution,
+                DnsStrictAttemptGuard, DnsStrictTransport, PreparedDnsExecution,
+                StrictDnsExecution, prepare_dns_execution,
             },
             plan::{
                 DnsPurpose, DnsQueryContext, EgressChoice, FailureChoice,
@@ -280,6 +280,170 @@ async fn strict(
         PreparedDnsExecution::Strict(strict) => strict,
         _ => panic!("expected an explicit DNS execution"),
     }
+}
+
+struct S04biGuard {
+    leaf: AnyOutboundHandler,
+    valid: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl DnsStrictAttemptGuard for S04biGuard {
+    async fn ensure_current(&self, outbound: &AnyOutboundHandler) -> io::Result<()> {
+        if !Arc::ptr_eq(&self.leaf, outbound)
+            || !self.valid.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(io::Error::other(
+                "strict DNS provider generation/leaf changed during exchange",
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct S04biPausedWire {
+    calls: std::sync::atomic::AtomicUsize,
+    entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    fail: bool,
+}
+
+#[async_trait]
+impl DnsStrictTransport for S04biPausedWire {
+    async fn exchange(
+        &self,
+        _: &NameServer,
+        _: AnyOutboundHandler,
+        request: &Message,
+    ) -> io::Result<Message> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(tx) = self.entered.lock().unwrap().take() {
+            tx.send(()).unwrap();
+        }
+        if let Some(rx) = self.release.lock().await.take() {
+            rx.await.unwrap();
+        }
+        if self.fail {
+            return Err(io::Error::other("injected upstream timeout/failure"));
+        }
+        let mut answer = Message::response(request.metadata.id, OpCode::Query);
+        answer.add_queries(request.queries.iter().cloned());
+        Ok(answer)
+    }
+}
+
+#[tokio::test]
+async fn s04bi_guarded_dns_rejects_stale_leaf_before_any_dial() {
+    let cfg = policy_fixture();
+    let registry = registry(true, OutboundType::Socks5);
+    let exec = strict(&cfg, "protected.example", RecordType::A, &registry).await;
+    let guard = S04biGuard {
+        leaf: exec.outbound.clone(),
+        valid: std::sync::atomic::AtomicBool::new(false),
+    };
+    let fake = FakeDnsTransport::with_replies(vec![Reply::Ok]);
+    let error = exec
+        .exchange_guarded(
+            &fake,
+            &request("protected.example.", RecordType::A),
+            &guard,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("provider generation/leaf changed"),
+        "{error}"
+    );
+    assert!(fake.calls().is_empty());
+
+    let foreign = S04biGuard {
+        leaf: Arc::new(MockProxy {
+            name: exec.outbound.name().into(),
+            ty: OutboundType::Socks5,
+        }),
+        valid: std::sync::atomic::AtomicBool::new(true),
+    };
+    assert!(
+        exec.exchange_guarded(
+            &fake,
+            &request("protected.example.", RecordType::A),
+            &foreign,
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("leaf changed")
+    );
+    assert!(fake.calls().is_empty());
+}
+
+#[tokio::test]
+async fn s04bi_guarded_dns_inflight_change_fails_without_upstream_retry() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    for failure in [false, true] {
+        let cfg = policy_fixture();
+        let registry = registry(true, OutboundType::Socks5);
+        let exec = strict(&cfg, "protected.example", RecordType::A, &registry).await;
+        let guard = Arc::new(S04biGuard {
+            leaf: exec.outbound.clone(),
+            valid: AtomicBool::new(true),
+        });
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let wire = Arc::new(S04biPausedWire {
+            calls: AtomicUsize::new(0),
+            entered: Mutex::new(Some(entered_tx)),
+            release: tokio::sync::Mutex::new(Some(release_rx)),
+            fail: failure,
+        });
+        let active_wire = wire.clone();
+        let active_guard = guard.clone();
+        let job = tokio::spawn(async move {
+            exec.exchange_guarded(
+                &*active_wire,
+                &request("protected.example.", RecordType::A),
+                &*active_guard,
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        guard.valid.store(false, Ordering::SeqCst);
+        release_tx.send(()).unwrap();
+        let err = job.await.unwrap().unwrap_err().to_string();
+        assert!(err.contains("provider generation/leaf changed"), "{err}");
+        assert_eq!(
+            wire.calls.load(Ordering::SeqCst),
+            1,
+            "stale generation must not retry the second upstream"
+        );
+    }
+}
+
+#[tokio::test]
+async fn s04bi_unchanged_guard_retries_with_same_pinned_leaf() {
+    let cfg = policy_fixture();
+    let registry = registry(true, OutboundType::Socks5);
+    let exec = strict(&cfg, "protected.example", RecordType::A, &registry).await;
+    let guard = S04biGuard {
+        leaf: exec.outbound.clone(),
+        valid: std::sync::atomic::AtomicBool::new(true),
+    };
+    let wire = FakeDnsTransport::with_replies(vec![Reply::Fail, Reply::Ok]);
+    exec.exchange_guarded(
+        &wire,
+        &request("protected.example.", RecordType::A),
+        &guard,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        wire.calls(),
+        ["DNS-OUT|192.0.2.53|53", "DNS-OUT|192.0.2.54|53"]
+    );
 }
 
 #[tokio::test]

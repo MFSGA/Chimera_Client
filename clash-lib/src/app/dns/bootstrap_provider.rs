@@ -11,11 +11,13 @@ use std::{
 
 use crate::{
     app::{
-        outbound::manager::OutboundManager,
+        dns::execution::DnsStrictAttemptGuard, outbound::manager::OutboundManager,
         remote_content_manager::providers::proxy_provider::ThreadSafeProxyProvider,
     },
-    proxy::AnyOutboundHandler,
-    proxy::utils::SharedNetworkStatus,
+    proxy::{
+        AnyOutboundHandler,
+        utils::{OutboundHandlerRegistry, SharedNetworkStatus},
+    },
 };
 
 /// S04b-g opt-in registry for strict observation only. All mutations must go
@@ -78,6 +80,66 @@ impl StrictProviderRegistryStore {
                     .get(name)
                     .is_some_and(|current| Arc::ptr_eq(current, &source.handle))
             })
+    }
+}
+
+/// Pinned identity guard for S04b-i's internal non-caching DNS exchange.
+/// It is deliberately NOT a trusted-source certificate or a permit to dial.
+/// The exact selected handler object must belong to an observed real Manager
+/// and Provider. The transport must use the pinned execution's own outbound.
+pub(crate) struct StrictDnsManagerLeafGuard {
+    observed: StrictProviderObservation,
+    manager: Arc<OutboundManager>,
+    status: SharedNetworkStatus,
+    registry: OutboundHandlerRegistry,
+    provider: String,
+    selected: AnyOutboundHandler,
+}
+
+impl StrictDnsManagerLeafGuard {
+    pub(crate) async fn bind(
+        observed: StrictProviderObservation,
+        manager: &Arc<OutboundManager>,
+        status: &SharedNetworkStatus,
+        registry: &OutboundHandlerRegistry,
+        provider: &str,
+        selected: AnyOutboundHandler,
+    ) -> io::Result<Self> {
+        let guard = Self {
+            observed,
+            manager: manager.clone(),
+            status: status.clone(),
+            registry: registry.clone(),
+            provider: provider.to_owned(),
+            selected,
+        };
+        guard.ensure_current(&guard.selected).await?;
+        Ok(guard)
+    }
+}
+
+#[async_trait::async_trait]
+impl DnsStrictAttemptGuard for StrictDnsManagerLeafGuard {
+    async fn ensure_current(&self, outbound: &AnyOutboundHandler) -> io::Result<()> {
+        if !Arc::ptr_eq(&self.selected, outbound) {
+            return Err(io::Error::other(
+                "strict DNS attempt selected leaf identity changed",
+            ));
+        }
+        if !self.manager.owns_outbound_registry(&self.registry) {
+            return Err(io::Error::other(
+                "strict DNS attempt registry belongs to a different outbound manager",
+            ));
+        }
+        self.observed
+            .ensure_current_manager(&self.status, &self.manager)
+            .await?;
+        self.observed
+            .require_selected(&self.status, &self.provider, &self.selected)
+            .await?;
+        self.observed
+            .ensure_current_manager(&self.status, &self.manager)
+            .await
     }
 }
 

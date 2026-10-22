@@ -75,6 +75,12 @@ cargo test -p clash-lib --test dns_config_tests --locked
 - 新增 `OutboundManager::owns_outbound_registry` 和 `StrictDnsCache::inspect_manager_provider_selection`：选定叶节点的 **registry Arc 必须与被观察的 Manager 所有的 registry 相同**；否则即使其中装有完全相同的 handler 对象也拒绝。通过这项检查后才使用已有 S04b-f 的选定叶节点和 Provider 可达性核对，并再次确认 Manager 观察没有变化。离线 `s04bh_` 测试覆盖正确绑定、伪造的另一份 registry、另一 Manager 实例和网络代际变化。
 - **限制：** `OutboundManager` 在构造后不再修改其 Provider 句柄映射，真实 Provider 的内容更新仍使用上一阶段的单 Provider revision 检测。该方法只是内部只读检查；实际 selector `touch` 仍可能有附带行为。尚未把完整 provider 来源认证、选定叶节点→最终 dialer 链、真实网络拨号和答案缓存的事务性一致性联结起来；`policy-rules` 生产启动保护保持不变。
 
+## S04b-i：每上游尝试前后的固定叶节点复核（内部无缓存执行边界）
+
+- `StrictDnsExecution::exchange_guarded` 为 S03 既有严格执行增加可选 `DnsStrictAttemptGuard`：在每个 upstream 的**首次拨号前及网络调用返回后**（包括失败、成功和超时）检查当前绑定的 outbound。任一检查失败立即以错误终止，不再尝试 profile 中的第二个上游、DIRECT 或 legacy resolver；在检查持续有效时，仍允许使用**同一固定叶节点**按原 profile 顺序重试。原有 `exchange` 语义保留。此接口本身**不读写严格缓存**，也没有生产调用点。
+- `StrictDnsManagerLeafGuard::bind` 绑定此前观测的真实 `OutboundManager`、其 outbound registry、Provider 所属名称以及**选中的 handler Arc**。每次执行边界复核都会拒绝不同 handler 对象（即使同名）、不同 registry/Manager、Provider 版本轮换及网络/配置代际变更；复用既有 S04b-h 观察，不偷偷重新选择另一片叶节点。离线 `s04bi_` 测试验证拨号前阻断、请求进行中变化时即使首个 upstream 成功/失败也不触发第二次拨号，以及版本稳定时正常的同叶节点重试。新增真实 Manager guard 的身份/网络变更回归断言。
+- **限制：** 这是可离线测试的**检查前/后**模型，不能禁止两次检查之间已经产生的网络副作用；也尚未在实际 Connector 内部的 `dialer-proxy` 每个递归跳点做事务性保护。Provider 下载/配置内容仍无可信来源认证，不存在受认可的动态 Provider 完整拓扑证明或安全的真实 strict DNS 调用链。**不得将此接口视为生产拨号授权，也不把它接入 DNS 答案缓存或 `policy-rules` 运行时**；必须保留 S04b-d 的动态 Provider 失败关闭以及独立数据面验证和 L2 门禁。
+
 ## S04b/S04c 待完成的严格准入
 
 1. **真实执行接线与身份来源**：S04b-a 提供共享 RuntimeStatus 读取接口，但**尚未由生产 DNS runtime 自动接入或订阅**；需有可信的 bootstrap pin revision/变更事件来源，而不是由未受验证的调用者提供任意数值。仍需真实数据面验证动态代理在查询中途切换时的失效与回滚；旧 legacy 路径继续完全独立。
