@@ -271,15 +271,25 @@ impl H3ActiveLease {
         }
     }
 
+    /// Unlike a pooled sender, an unpooled sender owns the physical QUIC
+    /// connection itself. Its Drop must close the driver even without an
+    /// active counter or pool entry.
+    fn unpooled(socket: Arc<H3PooledSocket>) -> Self {
+        Self {
+            active: None,
+            socket: Some(socket),
+        }
+    }
+
     fn into_stream(mut self, stream: AnyStream) -> AnyStream {
-        match self.active.take() {
-            Some(active) => Box::new(ReuseLeaseStream {
+        if self.active.is_some() || self.socket.is_some() {
+            Box::new(ReuseLeaseStream {
                 inner: stream,
-                active,
-                #[cfg(feature = "xhttp-h3")]
+                active: self.active.take(),
                 h3_socket: self.socket.take(),
-            }),
-            None => stream,
+            })
+        } else {
+            stream
         }
     }
 }
@@ -287,10 +297,19 @@ impl H3ActiveLease {
 #[cfg(feature = "xhttp-h3")]
 impl Drop for H3ActiveLease {
     fn drop(&mut self) {
-        if let Some(active) = self.active.take() {
+        let counted = if let Some(active) = self.active.take() {
             active.fetch_sub(1, Ordering::AcqRel);
-            if let Some(socket) = &self.socket {
+            true
+        } else {
+            false
+        };
+        if let Some(socket) = self.socket.take() {
+            if counted {
                 socket.close_if_idle();
+            } else {
+                // No pool owns this sender: cancel setup / failed response
+                // creation must retire its QUIC driver and UDP endpoint.
+                socket.retire();
             }
         }
     }
@@ -298,7 +317,7 @@ impl Drop for H3ActiveLease {
 
 struct ReuseLeaseStream {
     inner: AnyStream,
-    active: Arc<AtomicU64>,
+    active: Option<Arc<AtomicU64>>,
     #[cfg(feature = "xhttp-h3")]
     h3_socket: Option<Arc<H3PooledSocket>>,
 }
@@ -339,10 +358,21 @@ impl AsyncWrite for ReuseLeaseStream {
 
 impl Drop for ReuseLeaseStream {
     fn drop(&mut self) {
-        self.active.fetch_sub(1, Ordering::AcqRel);
+        let counted = if let Some(active) = self.active.take() {
+            active.fetch_sub(1, Ordering::AcqRel);
+            true
+        } else {
+            false
+        };
+        #[cfg(not(feature = "xhttp-h3"))]
+        let _ = counted;
         #[cfg(feature = "xhttp-h3")]
-        if let Some(socket) = &self.h3_socket {
-            socket.close_if_idle();
+        if let Some(socket) = self.h3_socket.take() {
+            if counted {
+                socket.close_if_idle();
+            } else {
+                socket.retire();
+            }
         }
     }
 }
@@ -1074,7 +1104,7 @@ async fn open_xhttp_logical_stream(
 fn leased_stream(stream: AnyStream, active: Arc<AtomicU64>) -> AnyStream {
     Box::new(ReuseLeaseStream {
         inner: stream,
-        active,
+        active: Some(active),
         #[cfg(feature = "xhttp-h3")]
         h3_socket: None,
     })
@@ -1787,10 +1817,10 @@ async fn acquire_h3_upload_sender(
             pool_context,
         )
         .await?;
-        let _ = socket; // Unpooled HTTP/3 sender; driver retains its socket.
+        // The sender lease owns this QUIC connection until app-stream handoff.
         return Ok(H3UploadSender {
             sender,
-            active: H3ActiveLease::none(),
+            active: H3ActiveLease::unpooled(socket),
             request_count: None,
             network_path_ids: connected_context.path_id.into_iter().collect(),
         });
@@ -1841,7 +1871,7 @@ async fn acquire_h3_upload_sender(
         registration.complete(); // This unpooled sender is not a pool entry.
         return Ok(H3UploadSender {
             sender,
-            active: H3ActiveLease::none(),
+            active: H3ActiveLease::unpooled(socket.clone()),
             request_count: None,
             network_path_ids: connected_context
                 .path_id
@@ -1894,10 +1924,10 @@ async fn acquire_h3_download_sender(
             pool_context,
         )
         .await?;
-        let _ = socket; // Unpooled HTTP/3 sender; driver retains its socket.
+        // The sender lease owns this QUIC connection until app-stream handoff.
         return Ok(H3DownlinkSender {
             sender,
-            active: H3ActiveLease::none(),
+            active: H3ActiveLease::unpooled(socket),
             request_count: None,
             network_path_ids: connected_context.path_id.into_iter().collect(),
         });
@@ -1949,7 +1979,7 @@ async fn acquire_h3_download_sender(
         registration.complete(); // This unpooled sender is not a pool entry.
         return Ok(H3DownlinkSender {
             sender,
-            active: H3ActiveLease::none(),
+            active: H3ActiveLease::unpooled(socket.clone()),
             request_count: None,
             network_path_ids: connected_context
                 .path_id
@@ -3887,16 +3917,321 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                while let Some(mut data) = stream.recv_data().await.unwrap() {
-                    stream
+                while let Ok(Some(mut data)) = stream.recv_data().await {
+                    if stream
                         .send_data(data.copy_to_bytes(data.remaining()))
                         .await
-                        .unwrap();
+                        .is_err()
+                    {
+                        break; // a cancelled QUIC stream is expected in teardown tests
+                    }
                 }
                 let _ = stream.finish().await;
             }
         });
         (addr, closed_rx)
+    }
+
+    #[cfg(feature = "xhttp-h3")]
+    #[tokio::test]
+    async fn s04bw_unpooled_h3_stream_drop_closes_quic_driver() {
+        for explicitly_disabled_pool in [false, true] {
+            let (addr, closed_rx) = spawn_s04bv_observed_h3_server().await;
+            let endpoint = XhttpEndpointConfig {
+                server: "127.0.0.1".into(),
+                port: addr.port(),
+                security: XhttpSecurity::Tls,
+                server_name: "xhttp.example.com".into(),
+                alpn_protocols: vec!["h3".into()],
+                skip_cert_verify: true,
+                fingerprint: None,
+                verify_name: None,
+                tls_cert: None,
+                tls_key: None,
+                reality: None,
+            };
+            let mut client = Client::new(
+                "127.0.0.1".into(),
+                addr.port(),
+                "/xhttp/".into(),
+                None,
+                HashMap::new(),
+                true,
+                XhttpMode::StreamOne,
+                1_000_000,
+                false,
+                None,
+                None,
+            )
+            .with_upload_endpoint(Some(endpoint))
+            .with_http_version(XhttpHttpVersion::Http3);
+            if explicitly_disabled_pool {
+                client = client.with_reuse_policy(Some(XhttpReusePolicy {
+                    // No concurrency policy: max-connections=0 genuinely
+                    // disables pooling rather than enabling concurrency pooling.
+                    max_concurrency: None,
+                    max_connections: Some(XhttpReuseValueRange { min: 0, max: 0 }),
+                    c_max_reuse_times: Some(XhttpReuseValueRange { min: 0, max: 0 }),
+                    h_max_request_times: Some(XhttpReuseValueRange {
+                        min: 0,
+                        max: 0,
+                    }),
+                    h_max_reusable_secs: Some(XhttpReuseValueRange {
+                        min: 0,
+                        max: 0,
+                    }),
+                    h_keep_alive_period: 0,
+                }));
+            }
+            let mut stream = timeout(
+                Duration::from_secs(3),
+                client.connect_stream_with_connector(
+                    &Session::default(),
+                    Arc::new(MockClashResolver::new()),
+                    &DirectConnector::new(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            stream.write_all(b"probe").await.unwrap();
+            stream.flush().await.unwrap();
+            let mut response = [0; 5];
+            timeout(Duration::from_secs(3), stream.read_exact(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&response, b"probe");
+            assert!(client.h3_reuse_pool.lock().await.is_empty());
+            drop(stream);
+            timeout(Duration::from_secs(3), closed_rx)
+                .await
+                .expect("unpooled QUIC must close on last app stream Drop")
+                .expect("server must see QUIC close");
+            assert_eq!(client.reset_connection_pool().await.unwrap(), 0);
+        }
+    }
+
+    #[cfg(feature = "xhttp-h3")]
+    #[tokio::test]
+    async fn s04bw_cancel_unpooled_h3_after_sender_acquisition_closes_driver() {
+        let (addr, remote_closed) = spawn_s04bv_observed_h3_server().await;
+        let endpoint = XhttpEndpointConfig {
+            server: "127.0.0.1".into(),
+            port: addr.port(),
+            security: XhttpSecurity::Tls,
+            server_name: "xhttp.example.com".into(),
+            alpn_protocols: vec!["h3".into()],
+            skip_cert_verify: true,
+            fingerprint: None,
+            verify_name: None,
+            tls_cert: None,
+            tls_key: None,
+            reality: None,
+        };
+        let client = Client::new(
+            "127.0.0.1".into(),
+            addr.port(),
+            "/xhttp/".into(),
+            None,
+            HashMap::new(),
+            true,
+            XhttpMode::StreamOne,
+            1_000_000,
+            false,
+            None,
+            None,
+        );
+        let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let sender = super::acquire_h3_upload_sender(
+                &client,
+                &endpoint,
+                &Session::default(),
+                Arc::new(MockClashResolver::new()),
+                &DirectConnector::new(),
+                NetworkPoolContext::default(),
+            )
+            .await
+            .unwrap();
+            let socket = sender.active.socket.as_ref().unwrap().clone();
+            assert!(acquired_tx.send(socket).is_ok());
+            let _sender = sender;
+            std::future::pending::<()>().await;
+        });
+        let socket = timeout(Duration::from_secs(3), acquired_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!socket.retired.load(Ordering::Acquire));
+        task.abort();
+        assert!(
+            timeout(Duration::from_secs(3), task)
+                .await
+                .unwrap()
+                .expect_err("cancelled H3 sender task must be dropped")
+                .is_cancelled()
+        );
+        assert!(socket.retired.load(Ordering::Acquire));
+        assert_eq!(socket.active.load(Ordering::Acquire), 0);
+        timeout(Duration::from_secs(3), remote_closed)
+            .await
+            .expect("unpooled sender cancellation must close real QUIC")
+            .expect("server should observe connection close");
+        timeout(Duration::from_secs(3), async {
+            while !socket.driver_finished.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("unpooled sender cancellation must stop driver");
+    }
+
+    #[cfg(feature = "xhttp-h3")]
+    #[tokio::test]
+    async fn s04bw_unpooled_separate_h3_upload_download_close_after_stream_drop() {
+        let (upload_addr, upload_closed) = spawn_s04bv_observed_h3_server().await;
+        let (download_addr, download_closed) =
+            spawn_s04bv_observed_h3_server().await;
+        let upload = XhttpEndpointConfig {
+            server: "127.0.0.1".into(),
+            port: upload_addr.port(),
+            security: XhttpSecurity::Tls,
+            server_name: "xhttp.example.com".into(),
+            alpn_protocols: vec!["h3".into()],
+            skip_cert_verify: true,
+            fingerprint: None,
+            verify_name: None,
+            tls_cert: None,
+            tls_key: None,
+            reality: None,
+        };
+        let download = XhttpDownloadConfig {
+            server: "127.0.0.1".into(),
+            port: download_addr.port(),
+            path: "/download/".into(),
+            host: None,
+            headers: HashMap::new(),
+            security: XhttpSecurity::Tls,
+            server_name: "xhttp.example.com".into(),
+            alpn_protocols: vec!["h3".into()],
+            skip_cert_verify: true,
+            fingerprint: None,
+            verify_name: None,
+            tls_cert: None,
+            tls_key: None,
+            reality: None,
+            reuse_policy: None,
+        };
+        let client = Client::new(
+            "127.0.0.1".into(),
+            upload_addr.port(),
+            "/upload/".into(),
+            None,
+            HashMap::new(),
+            true,
+            XhttpMode::StreamUp,
+            1_000_000,
+            false,
+            None,
+            Some(download),
+        )
+        .with_upload_endpoint(Some(upload))
+        .with_http_version(XhttpHttpVersion::Http3);
+        let stream = timeout(
+            Duration::from_secs(3),
+            client.connect_stream_with_connector(
+                &Session::default(),
+                Arc::new(MockClashResolver::new()),
+                &DirectConnector::new(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert!(client.h3_reuse_pool.lock().await.is_empty());
+        assert!(client.h3_download_reuse_pool.lock().await.is_empty());
+        drop(stream);
+        for closed in [upload_closed, download_closed] {
+            timeout(Duration::from_secs(3), closed)
+                .await
+                .expect("each physical QUIC path must be closed")
+                .expect("remote must observe QUIC close");
+        }
+    }
+
+    #[cfg(feature = "xhttp-h3")]
+    #[tokio::test]
+    async fn s04bw_unpooled_upload_closes_if_download_endpoint_rejects_tls() {
+        let (upload_addr, upload_closed) = spawn_s04bv_observed_h3_server().await;
+        let endpoint = XhttpEndpointConfig {
+            server: "127.0.0.1".into(),
+            port: upload_addr.port(),
+            security: XhttpSecurity::Tls,
+            server_name: "xhttp.example.com".into(),
+            alpn_protocols: vec!["h3".into()],
+            skip_cert_verify: true,
+            fingerprint: None,
+            verify_name: None,
+            tls_cert: None,
+            tls_key: None,
+            reality: None,
+        };
+        let invalid_download = XhttpDownloadConfig {
+            server: "127.0.0.1".into(),
+            port: 443,
+            path: "/download/".into(),
+            host: None,
+            headers: HashMap::new(),
+            security: XhttpSecurity::None,
+            server_name: "xhttp.example.com".into(),
+            alpn_protocols: vec!["h3".into()],
+            skip_cert_verify: true,
+            fingerprint: None,
+            verify_name: None,
+            tls_cert: None,
+            tls_key: None,
+            reality: None,
+            reuse_policy: None,
+        };
+        let client = Client::new(
+            "127.0.0.1".into(),
+            upload_addr.port(),
+            "/upload/".into(),
+            None,
+            HashMap::new(),
+            true,
+            XhttpMode::StreamUp,
+            1_000_000,
+            false,
+            None,
+            Some(invalid_download),
+        )
+        .with_upload_endpoint(Some(endpoint))
+        .with_http_version(XhttpHttpVersion::Http3);
+        let err = timeout(
+            Duration::from_secs(3),
+            client.connect_stream_with_connector(
+                &Session::default(),
+                Arc::new(MockClashResolver::new()),
+                &DirectConnector::new(),
+            ),
+        )
+        .await
+        .unwrap()
+        .err()
+        .expect("download setup must fail closed");
+        assert!(
+            err.to_string().contains("standard TLS security only"),
+            "{err}"
+        );
+        timeout(Duration::from_secs(3), upload_closed)
+            .await
+            .expect("failed downlink must close already-opened upload QUIC")
+            .expect("remote upload must observe QUIC close");
+        assert!(client.h3_reuse_pool.lock().await.is_empty());
     }
 
     #[cfg(feature = "xhttp-h3")]

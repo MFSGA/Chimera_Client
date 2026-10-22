@@ -13,7 +13,7 @@ use quinn::{
     AsyncUdpSocket, UdpPoller,
     udp::{RecvMeta, Transmit},
 };
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::{
     proxy::{AnyOutboundDatagram, datagram::UdpPacket},
@@ -25,6 +25,10 @@ const CHANNEL_CAPACITY: usize = 256;
 pub(crate) struct ConnectorUdpSocket {
     send_tx: mpsc::Sender<UdpPacket>,
     recv_rx: Mutex<mpsc::Receiver<UdpPacket>>,
+    /// The receive pump can wait on UDP forever after the endpoint is gone.
+    /// Own both tasks so dropping Quinn's socket aborts their datagram halves.
+    send_pump: JoinHandle<()>,
+    recv_pump: JoinHandle<()>,
     peer_addr: SocketAddr,
     local_addr: SocketAddr,
 }
@@ -51,7 +55,7 @@ impl ConnectorUdpSocket {
         let (recv_tx, recv_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (mut sink, mut stream) = datagram.split();
 
-        tokio::spawn(async move {
+        let send_pump = tokio::spawn(async move {
             while let Some(packet) = send_rx.recv().await {
                 if sink.send(packet).await.is_err() {
                     break;
@@ -60,7 +64,7 @@ impl ConnectorUdpSocket {
             let _ = sink.close().await;
         });
 
-        tokio::spawn(async move {
+        let recv_pump = tokio::spawn(async move {
             while let Some(packet) = stream.next().await {
                 if recv_tx.send(packet).await.is_err() {
                     break;
@@ -71,9 +75,21 @@ impl ConnectorUdpSocket {
         Arc::new(Self {
             send_tx,
             recv_rx: Mutex::new(recv_rx),
+            send_pump,
+            recv_pump,
             peer_addr,
             local_addr,
         })
+    }
+}
+
+impl Drop for ConnectorUdpSocket {
+    fn drop(&mut self) {
+        // Sender closure by itself cannot wake an indefinitely blocked UDP
+        // read. Abort both halves of the split outbound datagram so its
+        // underlying OS UDP socket is actually released.
+        self.send_pump.abort();
+        self.recv_pump.abort();
     }
 }
 
@@ -233,6 +249,37 @@ mod tests {
         app::dns::MockClashResolver,
         proxy::utils::{DirectConnector, RemoteConnector},
     };
+
+    #[tokio::test]
+    async fn s04bw_dropped_quinn_adapter_releases_bound_os_udp_port() {
+        use crate::proxy::direct::datagram::OutboundDatagramImpl;
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = udp.local_addr().unwrap();
+        let peer = "127.0.0.1:53".parse().unwrap();
+        let datagram: AnyOutboundDatagram = Box::new(OutboundDatagramImpl::new(
+            udp,
+            Arc::new(MockClashResolver::new()),
+        ));
+        let adapter = ConnectorUdpSocket::new(datagram, peer);
+        assert!(
+            UdpSocket::bind(local_addr).await.is_err(),
+            "the original OS UDP port must still be exclusively bound"
+        );
+        // The receiver pump is actively blocked on UDP recv here. Closing
+        // only send_tx would not release the underlying socket.
+        drop(adapter);
+        let rebound = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(socket) = UdpSocket::bind(local_addr).await {
+                    break socket;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("OS UDP descriptor must be released after adapter Drop");
+        assert_eq!(rebound.local_addr().unwrap(), local_addr);
+    }
 
     #[tokio::test]
     async fn connector_udp_socket_round_trips_datagram() {

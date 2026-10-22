@@ -165,6 +165,13 @@ cargo test -p clash-lib --test dns_config_tests --locked
 - `s04bv_` 两项**真实本地 QUIC/TLS+HTTP/3** 离线测试验证：(1) 先退休池后释放活跃逻辑流，以及先释放后退休，均在最后一次 Drop 后使远端观察到 QUIC 关闭并确认 driver 任务完成；活跃逻辑流在池退休后仍可正常读写。(2) 成功创建 driver 后停在新池登记锁，abort 等待者，确认无池 entry、无活跃名额、远端 QUIC 已关闭且 driver 完成。既有 H3 上传/下载、并发限额及网络切换回归继续运行。
 - **边界：** 本轮证明有明确池生命周期的 H3 QUIC 连接会在**退休且最后一个逻辑流释放后**关闭并结束后台 driver；不是对任意未池化 H3 socket、操作系统 UDP 文件描述符何时实际回收、强制取消网络副作用、真实 NIC/源 IP 或高负载/系统重连压力的端到端证明。未纳入池的 H3 sender 自有生命周期仍待审查。可信 Provider/bootstrap pin 来源、递归 dialer 全链路及独立 L2 审查与维护者批准尚未完成。**生产 `policy-rules` gate 不变且继续禁用。**
 
+## S04b-w：未池化 HTTP/3 sender 与 Quinn UDP pump 的资源回收（内部、未启用生产 DNS）
+
+- 之前只有进入连接池的 H3 sender 具有 `H3ActiveLease` 和连接所属 `H3PooledSocket`；不配置复用策略或明确禁止建池时使用 `H3ActiveLease::none()`，会在取消请求、单独下载初始化失败、以及应用流释放后丢失唯一应用侧 socket 生命周期信号。现在未池化 sender 持有 `H3ActiveLease::unpooled(socket)`：建立请求期间被取消/失败时，租约 `Drop` 立即退休 QUIC `Connection`/`Endpoint`；正常构建成功则将连接所有权转交应用流，应用流最后一次 `Drop` 触发退休。独立上传与独立下载 sender 各自持有租约并分别关闭，池化连接则保持原有 active 计数、池退休后等待最后一个应用流的行为。复用参数必须按既有语义解释：`max-connections=0` 与正数 `max-concurrency` 并存代表由并发数管理连接池，**不是**禁用池。
+- `ConnectorUdpSocket` 以前把拆分的 UDP datagram 收发两半放在两个独立 `tokio::spawn` pump 中，而接收任务可以无限等待 `recv` 并继续持有原 OS UDP socket。现在适配器直接拥有 `send_pump` / `recv_pump` 两个 `JoinHandle`，`Drop` 时明确 abort 两者，使分离的 `Sink`/`Stream` 被释放，不再留下悬挂接收任务和底层 UDP 端口占用。
+- `s04bw_` 新增五项本地离线测试：未池化的无复用策略和明确禁止连接池两种 StreamOne 应用流 `Drop` 后远端观察 QUIC 关闭；单独上传、下载两条 QUIC 连接均在流释放后关闭；上传已建立而下载 TLS 配置不支持时失败并关闭上传；取得未池化 sender 后在交付前 `abort`，检查 driver 完成、远端关闭；用真实绑定的 OS UDP socket 验证适配器存活时端口无法重复绑定、销毁后短时内可重新绑定。继续验证现有 QUIC 数据收发及池化 H3 退休测试。
+- **限制：** 重绑定是本地 UDP 描述符生命周期的实证测试，非多系统、多接口、真实代理链或长期高并发资源压力验证；关闭已建立的连接不能撤销已发送的数据包，也不能推导真实 NIC/源 IP 是否符合 strict DNS 的宣称。可信 Provider/bootstrap pin 来源、完整逐跳拨号证明、网络切换抓包、独立 L2 审查与维护者批准仍未完成。生产 `policy-rules` 启动门禁原样关闭。
+
 ## S04b/S04c 待完成的严格准入
 
 1. **真实执行接线与身份来源**：S04b-a 提供共享 RuntimeStatus 读取接口，但**尚未由生产 DNS runtime 自动接入或订阅**；需有可信的 bootstrap pin revision/变更事件来源，而不是由未受验证的调用者提供任意数值。仍需真实数据面验证动态代理在查询中途切换时的失效与回滚；旧 legacy 路径继续完全独立。
