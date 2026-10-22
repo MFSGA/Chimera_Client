@@ -15,7 +15,7 @@ use crate::Error;
 use super::policy::{CompiledDnsPolicy, DnsEgress, DnsFailure, canonical_domain};
 
 /// Why a real DNS answer may be needed. Not an outbound/business target.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum DnsPurpose {
     ClientRealAnswer,
     RouteClassification,
@@ -26,14 +26,14 @@ pub enum DnsPurpose {
     Diagnostic,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum DnsSourceScope {
     Host,
     Gateway { namespace: String },
 }
 
 /// Relevant request metadata is carried forward for future S04 cache keys.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct DnsQueryFlags {
     pub recursion_desired: bool,
     pub checking_disabled: bool,
@@ -52,6 +52,9 @@ pub struct DnsQueryContext {
     pub network_generation: u64,
     pub config_generation: u64,
     pub flags: DnsQueryFlags,
+    /// S04: explicit ECS partition, not inferred from the QNAME. EDNS wire
+    /// options remain uncached until fully decoded and verified.
+    pub ecs: Option<ipnet::IpNet>,
 }
 
 impl DnsQueryContext {
@@ -70,6 +73,7 @@ impl DnsQueryContext {
             network_generation: 0,
             config_generation: 0,
             flags: DnsQueryFlags::default(),
+            ecs: None,
         })
     }
 

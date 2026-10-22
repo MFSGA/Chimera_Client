@@ -16,6 +16,7 @@ mod fakeip;
 mod filters;
 pub mod health;
 mod helper;
+pub mod isolation;
 pub mod plan;
 pub mod policy;
 pub mod resolver;

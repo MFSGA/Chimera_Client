@@ -271,6 +271,10 @@ async fn exchange_strict_wire(
 
 #[async_trait]
 impl DnsStrictTransport for DnsStrictWireTransport {
+    fn isolation_fingerprint(&self) -> Option<String> {
+        Some("strict-literal-only-v1".to_owned())
+    }
+
     fn validate_server(&self, server: &NameServer) -> io::Result<()> {
         validate_strict_wire_server(server, &HashMap::new())
     }
@@ -287,6 +291,16 @@ impl DnsStrictTransport for DnsStrictWireTransport {
 
 #[async_trait]
 impl DnsStrictTransport for DnsStrictPinnedWireTransport {
+    fn isolation_fingerprint(&self) -> Option<String> {
+        let mut pins = self
+            .pins
+            .iter()
+            .map(|(host, ip)| format!("{host}={ip}"))
+            .collect::<Vec<_>>();
+        pins.sort_unstable();
+        Some(format!("strict-pinned-v1:{}", pins.join(",")))
+    }
+
     fn validate_server(&self, server: &NameServer) -> io::Result<()> {
         validate_strict_wire_server(server, &self.pins)
     }
@@ -306,6 +320,12 @@ impl DnsStrictTransport for DnsStrictPinnedWireTransport {
 /// interface. S03a tests use fake implementations; no DNS socket is created.
 #[async_trait]
 pub trait DnsStrictTransport: Send + Sync {
+    /// Unique identity of DNS bootstrap pin set / transport configuration.
+    /// Without a verifiable fingerprint strict caching is disabled.
+    fn isolation_fingerprint(&self) -> Option<String> {
+        None
+    }
+
     /// Validate every configured server before the first network attempt to
     /// prevent silent downgrade from unsupported TLS DNS to plaintext UDP.
     fn validate_server(&self, _server: &NameServer) -> io::Result<()> {
