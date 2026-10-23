@@ -211,6 +211,6 @@ cargo test -p clash-lib --test dns_config_tests --locked
 2. **引导依赖图完整性**：构建代理组/动态 provider/代理节点自身域名和 DoT/DoH upstream 的真实依赖关系，验证先有稳定可信 bootstrap 再开始拨号，加入运行时强制深度 guard。当前仅显式 pin 传输和工具层拒绝，不接受未审查的隐式系统 DNS。
 3. **严格连接/缓存作用域**：若未来为了性能引入连接池，须以与本缓存同样的实际代理叶节点、profile、source-scope、network/config/pin generation 进行独立池化和释放验证。本轮维持**不共享连接池**以保证安全。
 4. **扩充 DNS 复杂应答和 ECS/DNSSEC**：在可以正确识别 EDNS 选项及作用域、CNAME、多 Question、CD/DO 与签名相关字段前继续保守不缓存；正负缓存策略不替代已有 legacy RFC 2308 语义。
-5. **真实数据面**：可信证书下 DoT/DoH 成功路径、真实远端代理 fail-closed、DNS 出口实际抓包和网络切换/并发压测，依然是撤销 `policy-rules` 运行时 gate 的硬前置条件；独立审查与维护者批准也尚未完成。
+5. **真实数据面**：本机受信任证书下的 DoT DNS 成功应答已有离线测试；可信 DoH 成功路径、真实远端代理 fail-closed、DNS 出口实际抓包和网络切换/并发压测，依然是撤销 `policy-rules` 运行时 gate 的硬前置条件；独立审查与维护者批准也尚未完成。
 
 **行为承诺**：本阶段没有更改 Business Rules 顺序、业务最终出口、旧 DNS fallback、Fake-IP 处理、旧缓存或默认加密 DNS 行为；不能把 S04a 内部隔离能力写成正式用户可用的下一代 DNS。

@@ -151,6 +151,7 @@ mod tests {
             Some(Arc::new(resolver)),
             None,
             None,
+            None,
             Arc::new(Mutex::new(DnsPathUse::default())),
         )
         .await;
@@ -178,6 +179,8 @@ mod tests {
             ecs,
             rule_dispatch: None,
             network_path_source: None,
+            #[cfg(test)]
+            tls_root_store: None,
         }
     }
 
@@ -1045,6 +1048,8 @@ pub struct DnsClient {
     ecs: Option<EdnsClientSubnet>,
     rule_dispatch: Option<Arc<RuleDispatch>>,
     network_path_source: Option<NetworkPathSource>,
+    #[cfg(test)]
+    tls_root_store: Option<Arc<rustls::RootCertStore>>,
 }
 
 impl DnsClient {
@@ -1082,6 +1087,8 @@ impl DnsClient {
             self.outbound_resolver.clone(),
             self.rule_dispatch.clone(),
             self.network_path_source.clone(),
+            #[cfg(test)]
+            self.tls_root_store.clone(),
             selected_path.clone(),
         )
         .await?;
@@ -1238,6 +1245,26 @@ impl DnsClient {
     }
 
     pub async fn new_client(opts: Opts) -> anyhow::Result<ThreadSafeDNSClient> {
+        Self::new_client_inner(
+            opts,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn new_client_with_tls_root_store(
+        opts: Opts,
+        tls_root_store: Arc<rustls::RootCertStore>,
+    ) -> anyhow::Result<ThreadSafeDNSClient> {
+        Self::new_client_inner(opts, Some(tls_root_store)).await
+    }
+
+    async fn new_client_inner(
+        opts: Opts,
+        #[cfg(test)] tls_root_store: Option<Arc<rustls::RootCertStore>>,
+    ) -> anyhow::Result<ThreadSafeDNSClient> {
         // TODO: use proxy to connect?
 
         if matches!(opts.net, DNSNetMode::Dhcp) {
@@ -1321,6 +1348,8 @@ impl DnsClient {
                     ecs: opts.ecs.clone(),
                     rule_dispatch: opts.rule_dispatch.clone(),
                     network_path_source: opts.network_path_source.clone(),
+                    #[cfg(test)]
+                    tls_root_store: tls_root_store.clone(),
                 }))
             }
             DNSNetMode::Tcp => {
@@ -1349,6 +1378,8 @@ impl DnsClient {
                     ecs: opts.ecs.clone(),
                     rule_dispatch: opts.rule_dispatch.clone(),
                     network_path_source: opts.network_path_source.clone(),
+                    #[cfg(test)]
+                    tls_root_store: tls_root_store.clone(),
                 }))
             }
             DNSNetMode::DoT => {
@@ -1377,6 +1408,8 @@ impl DnsClient {
                     ecs: opts.ecs.clone(),
                     rule_dispatch: opts.rule_dispatch.clone(),
                     network_path_source: opts.network_path_source.clone(),
+                    #[cfg(test)]
+                    tls_root_store: tls_root_store.clone(),
                 }))
             }
             DNSNetMode::DoH => {
@@ -1407,6 +1440,8 @@ impl DnsClient {
                     ecs: opts.ecs.clone(),
                     rule_dispatch: opts.rule_dispatch.clone(),
                     network_path_source: opts.network_path_source.clone(),
+                    #[cfg(test)]
+                    tls_root_store: tls_root_store.clone(),
                 }))
             }
             DNSNetMode::Dhcp => unreachable!("."),
@@ -1696,6 +1731,8 @@ impl DnsClient {
             self.outbound_resolver.clone(),
             self.rule_dispatch.clone(),
             self.network_path_source.clone(),
+            #[cfg(test)]
+            self.tls_root_store.clone(),
             tcp_selected_path.clone(),
         )
         .await
@@ -1727,6 +1764,7 @@ async fn dns_stream_builder(
     outbound_resolver: Option<Arc<dyn ClashResolver>>,
     rule_dispatch: Option<Arc<RuleDispatch>>,
     network_path_source: Option<NetworkPathSource>,
+    #[cfg(test)] tls_root_store: Option<Arc<rustls::RootCertStore>>,
     selected_path: SharedDnsPathUse,
 ) -> Result<(client::Client<DnsRuntimeProvider>, JoinHandle<()>), Error> {
     let dns_resolver: Arc<dyn ClashResolver> = match outbound_resolver {
@@ -1777,8 +1815,13 @@ async fn dns_stream_builder(
         }
         #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
         DnsConfig::Tls(addr, host, iface, proxy, fw_mark) => {
+            #[cfg(test)]
+            let tls_root_store =
+                tls_root_store.unwrap_or_else(|| GLOBAL_ROOT_STORE.clone());
+            #[cfg(not(test))]
+            let tls_root_store = GLOBAL_ROOT_STORE.clone();
             let mut tls_config = ClientConfig::builder()
-                .with_root_certificates(GLOBAL_ROOT_STORE.clone())
+                .with_root_certificates(tls_root_store)
                 .with_no_client_auth();
             tls_config.alpn_protocols = vec!["dot".into(), "h2".into()];
 
@@ -1814,8 +1857,13 @@ async fn dns_stream_builder(
         }
         #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
         DnsConfig::Https(addr, host, path, iface, proxy, fw_mark) => {
+            #[cfg(test)]
+            let tls_root_store =
+                tls_root_store.unwrap_or_else(|| GLOBAL_ROOT_STORE.clone());
+            #[cfg(not(test))]
+            let tls_root_store = GLOBAL_ROOT_STORE.clone();
             let mut tls_config = ClientConfig::builder()
-                .with_root_certificates(GLOBAL_ROOT_STORE.clone())
+                .with_root_certificates(tls_root_store)
                 .with_no_client_auth();
             tls_config.alpn_protocols = vec!["h2".into()];
 

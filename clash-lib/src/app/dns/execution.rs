@@ -129,6 +129,8 @@ pub struct DnsStrictWireTransport;
 #[derive(Default)]
 pub struct DnsStrictPinnedWireTransport {
     pins: HashMap<String, IpAddr>,
+    #[cfg(test)]
+    tls_root_store: Option<Arc<rustls::RootCertStore>>,
 }
 
 impl DnsStrictPinnedWireTransport {
@@ -143,7 +145,20 @@ impl DnsStrictPinnedWireTransport {
                 "strict DNS bootstrap pin names must be lowercase, canonical, nonempty and without trailing dot",
             ));
         }
-        Ok(Self { pins })
+        Ok(Self {
+            pins,
+            #[cfg(test)]
+            tls_root_store: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_tls_root_store(
+        mut self,
+        tls_root_store: Arc<rustls::RootCertStore>,
+    ) -> Self {
+        self.tls_root_store = Some(tls_root_store);
+        self
     }
 }
 
@@ -208,11 +223,17 @@ async fn exchange_strict_wire(
     request: &Message,
     pins: &HashMap<String, IpAddr>,
 ) -> io::Result<Message> {
-    Ok(
-        exchange_strict_wire_observed(server, outbound, request, pins, false)
-            .await?
-            .0,
+    Ok(exchange_strict_wire_observed(
+        server,
+        outbound,
+        request,
+        pins,
+        #[cfg(test)]
+        None,
+        false,
     )
+    .await?
+    .0)
 }
 
 async fn exchange_strict_wire_observed(
@@ -220,6 +241,7 @@ async fn exchange_strict_wire_observed(
     outbound: AnyOutboundHandler,
     request: &Message,
     pins: &HashMap<String, IpAddr>,
+    #[cfg(test)] tls_root_store: Option<Arc<rustls::RootCertStore>>,
     require_socket_path: bool,
 ) -> io::Result<(Message, Vec<crate::app::flow::NetworkPathId>)> {
     validate_strict_wire_server(server, pins)?;
@@ -244,7 +266,7 @@ async fn exchange_strict_wire_observed(
         ipv6: AtomicBool::new(true),
         pins: pins.clone(),
     });
-    let client = DnsClient::new_client(Opts {
+    let opts = Opts {
         father: Some(restricted_resolver.clone()),
         outbound_resolver: Some(restricted_resolver),
         host: server.host.clone(),
@@ -257,9 +279,17 @@ async fn exchange_strict_wire_observed(
         fw_mark: None,
         rule_dispatch: None,
         network_path_source: None,
-    })
-    .await
-    .map_err(io::Error::other)?;
+    };
+    #[cfg(test)]
+    let client = match tls_root_store {
+        Some(tls_root_store) => {
+            DnsClient::new_client_with_tls_root_store(opts, tls_root_store).await
+        }
+        None => DnsClient::new_client(opts).await,
+    };
+    #[cfg(not(test))]
+    let client = DnsClient::new_client(opts).await;
+    let client = client.map_err(io::Error::other)?;
     let result = tokio::time::timeout(Duration::from_secs(5), async {
         if require_socket_path {
             client.exchange_with_socket_paths(request).await
@@ -342,7 +372,17 @@ impl DnsStrictTransport for DnsStrictPinnedWireTransport {
         outbound: AnyOutboundHandler,
         request: &Message,
     ) -> io::Result<Message> {
-        exchange_strict_wire(server, outbound, request, &self.pins).await
+        Ok(exchange_strict_wire_observed(
+            server,
+            outbound,
+            request,
+            &self.pins,
+            #[cfg(test)]
+            self.tls_root_store.clone(),
+            false,
+        )
+        .await?
+        .0)
     }
 }
 
@@ -359,8 +399,16 @@ async fn exchange_strict_socket_wire(
     Message,
     super::bootstrap_socket::StrictDnsSocketPathEvidence,
 )> {
-    let (reply, paths) =
-        exchange_strict_wire_observed(server, outbound, request, pins, true).await?;
+    let (reply, paths) = exchange_strict_wire_observed(
+        server,
+        outbound,
+        request,
+        pins,
+        #[cfg(test)]
+        None,
+        true,
+    )
+    .await?;
     let evidence = super::bootstrap_socket::StrictDnsSocketPathEvidence::from_dns_client_socket_paths(paths)?;
     Ok((reply, evidence))
 }

@@ -1208,6 +1208,180 @@ async fn s03c_self_signed_tls_listener()
 }
 
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+async fn s03c_trusted_dot_listener() -> (
+    std::net::SocketAddr,
+    Arc<rustls::RootCertStore>,
+    tokio::task::JoinHandle<()>,
+) {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+    use tokio_rustls::TlsAcceptor;
+
+    crate::setup_default_crypto_provider();
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["dns.strict.example".into()])
+            .unwrap();
+    let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert_der.clone()).unwrap();
+    let key_der =
+        rustls::pki_types::PrivateKeyDer::try_from(signing_key.serialize_der())
+            .unwrap();
+    let server = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .unwrap();
+    let acceptor = TlsAcceptor::from(Arc::new(server));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        for _ in 0..8 {
+            let Ok(Ok((stream, _))) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                listener.accept(),
+            )
+            .await
+            else {
+                return;
+            };
+            let Ok(Ok(mut stream)) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                acceptor.accept(stream),
+            )
+            .await
+            else {
+                continue;
+            };
+            let mut length = [0_u8; 2];
+            stream.read_exact(&mut length).await.unwrap();
+            let mut bytes = vec![0_u8; u16::from_be_bytes(length) as usize];
+            stream.read_exact(&mut bytes).await.unwrap();
+            let incoming = Message::from_vec(&bytes).unwrap();
+            let data = answer(&incoming).to_vec().unwrap();
+            stream
+                .write_all(&(data.len() as u16).to_be_bytes())
+                .await
+                .unwrap();
+            stream.write_all(&data).await.unwrap();
+            return;
+        }
+    });
+    (address, Arc::new(roots), handle)
+}
+
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+#[tokio::test]
+async fn s03c_pinned_dot_accepts_trusted_certificate_and_returns_dns_answer() {
+    use crate::app::dns::execution::DnsStrictPinnedWireTransport;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (address, roots, task) = s03c_trusted_dot_listener().await;
+    let server = crate::app::dns::Config::parse_nameserver(&[format!(
+        "tls://dns.strict.example:{}",
+        address.port()
+    )])
+    .unwrap()
+    .remove(0);
+    let wire = DnsStrictPinnedWireTransport::new(HashMap::from([(
+        "dns.strict.example".to_owned(),
+        address.ip(),
+    )]))
+    .unwrap()
+    .with_test_tls_root_store(roots);
+    let tcp = Arc::new(AtomicUsize::new(0));
+    let udp = Arc::new(AtomicUsize::new(0));
+    let outbound: AnyOutboundHandler = Arc::new(CountingWireProxy {
+        name: "DNS-OUT",
+        endpoint: "192.0.2.9",
+        tcp: tcp.clone(),
+        udp: udp.clone(),
+    });
+    let execution = StrictDnsExecution {
+        ordinal: 1,
+        profile: "trusted-dot".to_owned(),
+        egress: DnsEgress::Proxy("DNS-OUT".to_owned()),
+        servers: vec![server],
+        outbound,
+    };
+    let query = request("protected.example.", RecordType::A);
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        execution.exchange(&wire, &query),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(response.metadata.id, query.metadata.id);
+    assert_eq!(response.answers.len(), 1);
+    assert!(tcp.load(Ordering::SeqCst) > 0);
+    assert_eq!(
+        udp.load(Ordering::SeqCst),
+        0,
+        "DoT must not downgrade to UDP"
+    );
+    task.await.unwrap();
+}
+
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+#[tokio::test]
+async fn s03c_pinned_dot_rejects_trusted_certificate_for_wrong_hostname() {
+    use crate::app::dns::execution::DnsStrictPinnedWireTransport;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (address, roots, task) = s03c_trusted_dot_listener().await;
+    let server = crate::app::dns::Config::parse_nameserver(&[format!(
+        "tls://wrong.strict.example:{}",
+        address.port()
+    )])
+    .unwrap()
+    .remove(0);
+    let wire = DnsStrictPinnedWireTransport::new(HashMap::from([(
+        "wrong.strict.example".to_owned(),
+        address.ip(),
+    )]))
+    .unwrap()
+    .with_test_tls_root_store(roots);
+    let tcp = Arc::new(AtomicUsize::new(0));
+    let udp = Arc::new(AtomicUsize::new(0));
+    let outbound: AnyOutboundHandler = Arc::new(CountingWireProxy {
+        name: "DNS-OUT",
+        endpoint: "192.0.2.9",
+        tcp: tcp.clone(),
+        udp: udp.clone(),
+    });
+    let execution = StrictDnsExecution {
+        ordinal: 1,
+        profile: "trusted-dot-wrong-host".to_owned(),
+        egress: DnsEgress::Proxy("DNS-OUT".to_owned()),
+        servers: vec![server],
+        outbound,
+    };
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        execution.exchange(&wire, &request("protected.example.", RecordType::A)),
+    )
+    .await
+    .unwrap()
+    .unwrap_err()
+    .to_string();
+
+    assert!(
+        error.to_ascii_lowercase().contains("certificate"),
+        "expected certificate hostname verification failure, got: {error}"
+    );
+    assert!(tcp.load(Ordering::SeqCst) > 0);
+    assert_eq!(
+        udp.load(Ordering::SeqCst),
+        0,
+        "DoT must not downgrade to UDP"
+    );
+    task.await.unwrap();
+}
+
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 #[tokio::test]
 async fn s03c_encrypted_dns_rejects_untrusted_tls_cert_even_with_pinned_ip() {
     use crate::app::dns::execution::DnsStrictPinnedWireTransport;
