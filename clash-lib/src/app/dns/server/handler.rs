@@ -75,30 +75,99 @@ fn should_filter_aaaa(req: &Message, ipv6_enabled: bool) -> bool {
             == Some(hickory_proto::rr::RecordType::AAAA)
 }
 
-async fn should_skip_fake_ip_upstream(
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FakeIpQueryHandling {
+    Normal,
+    Suppress,
+    SafeSrv,
+}
+
+fn fake_ip_filter_name(query: &hickory_proto::op::Query) -> String {
+    let name = query.name().to_ascii().trim_end_matches('.').to_string();
+    if query.query_type() != hickory_proto::rr::RecordType::SRV {
+        return name;
+    }
+
+    let mut labels = name.splitn(3, '.');
+    let Some(service) = labels.next() else {
+        return name;
+    };
+    let Some(protocol) = labels.next() else {
+        return name;
+    };
+    let Some(domain) = labels.next() else {
+        return name;
+    };
+
+    // SRV owner names prepend _service._protocol to the domain whose
+    // Fake-IP filter should govern service discovery.
+    if service.starts_with('_') && protocol.starts_with('_') {
+        domain.to_string()
+    } else {
+        name
+    }
+}
+
+async fn fake_ip_query_handling(
     req: &Message,
     resolver: &ThreadSafeDNSResolver,
-) -> bool {
+) -> FakeIpQueryHandling {
     // HTTPS/SVCB and other record types also reveal the queried hostname.
     // DNS messages can contain multiple questions. Check all of them so a
     // later non-A question cannot leak merely because the first question is A.
     for query in &req.queries {
         let query_type = query.query_type();
+        let safe_srv_request = query_type == hickory_proto::rr::RecordType::SRV
+            && resolver.safe_srv_enabled();
         if query_type == hickory_proto::rr::RecordType::A
             || (query_type == hickory_proto::rr::RecordType::AAAA
                 && resolver.fake_ip_v6_enabled())
         {
             continue;
         }
-        if resolver
-            .should_fake_ip(query.name().to_ascii().trim_end_matches('.'))
-            .await
-        {
-            return true;
+        let filter_name = if safe_srv_request {
+            fake_ip_filter_name(query)
+        } else {
+            query.name().to_ascii().trim_end_matches('.').to_string()
+        };
+        if resolver.should_fake_ip(&filter_name).await {
+            if safe_srv_request {
+                return FakeIpQueryHandling::SafeSrv;
+            }
+            return FakeIpQueryHandling::Suppress;
         }
     }
 
-    false
+    FakeIpQueryHandling::Normal
+}
+
+fn strip_unsafe_srv_additionals(req: &Message, mut response: Message) -> Message {
+    use hickory_proto::rr::RecordType;
+
+    let has_address_additional = response.additionals.iter().any(|record| {
+        matches!(record.record_type(), RecordType::A | RecordType::AAAA)
+    });
+    if !has_address_additional {
+        return response;
+    }
+
+    let dnssec_requested = req.metadata.authentic_data
+        || req.metadata.checking_disabled
+        || req.signature.is_some()
+        || req.edns.as_ref().is_some_and(|edns| edns.flags().dnssec_ok);
+    let dnssec_response = response.metadata.authentic_data
+        || response.signature.is_some()
+        || response
+            .all_sections()
+            .any(|record| record.record_type() == RecordType::RRSIG);
+    if dnssec_requested || dnssec_response {
+        return dns_error_response(req, ResponseCode::ServFail);
+    }
+
+    response.additionals.retain(|record| {
+        !matches!(record.record_type(), RecordType::A | RecordType::AAAA)
+    });
+    response
 }
 
 fn should_resolve_fake_ip(
@@ -128,18 +197,25 @@ pub async fn exchange_with_resolver<'a>(
         return Ok(answer);
     }
 
-    if should_filter_aaaa(req, resolver.ipv6())
-        || should_skip_fake_ip_upstream(req, resolver).await
-    {
+    if should_filter_aaaa(req, resolver.ipv6()) {
         return Ok(build_dns_response_message(req, false, false));
     }
 
-    if !should_resolve_fake_ip(
-        req,
-        resolver.fake_ip_enabled(),
-        resolver.fake_ip_v6_enabled(),
-    ) {
+    let fake_ip_handling = fake_ip_query_handling(req, resolver).await;
+    if fake_ip_handling == FakeIpQueryHandling::Suppress {
+        return Ok(build_dns_response_message(req, false, false));
+    }
+
+    let safe_srv_request = fake_ip_handling == FakeIpQueryHandling::SafeSrv;
+    if safe_srv_request
+        || !should_resolve_fake_ip(
+            req,
+            resolver.fake_ip_enabled(),
+            resolver.fake_ip_v6_enabled(),
+        )
+    {
         return match resolver.exchange(req).await {
+            Ok(m) if safe_srv_request => Ok(strip_unsafe_srv_additionals(req, m)),
             Ok(m) => Ok(m),
             Err(e) => {
                 debug!("dns resolve error: {}", e);
@@ -200,14 +276,20 @@ pub async fn exchange_with_resolver<'a>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use hickory_proto::{
-        op::{Message, MessageType, OpCode, Query},
+        op::{Message, MessageType, OpCode, Query, ResponseCode},
         rr::{Name, RecordType},
     };
 
-    use crate::app::dns::{MockClashResolver, ThreadSafeDNSResolver};
+    use crate::{
+        app::dns::{
+            MockClashResolver, ThreadSafeDNSResolver,
+            fakeip::{FakeDns, InMemStore, Opts},
+        },
+        common::trie,
+    };
 
     use super::{
         dns_error_response, exchange_with_resolver, should_filter_aaaa,
@@ -221,6 +303,17 @@ mod tests {
             record_type,
         ));
         message
+    }
+
+    fn fake_dns_with_filter(rule: &str) -> FakeDns {
+        let mut skipped_hostnames = trie::StringTrie::new();
+        skipped_hostnames.insert(rule, Arc::new(true));
+        FakeDns::new(Opts {
+            ipnet: "198.18.0.0/16".parse().unwrap(),
+            skipped_hostnames: Some(skipped_hostnames),
+            store: Box::new(InMemStore::new(1)),
+        })
+        .unwrap()
     }
 
     #[test]
@@ -314,6 +407,7 @@ mod tests {
         for (excluded, expected_answers) in [(true, 1), (false, 0)] {
             let mut resolver = MockClashResolver::new();
             resolver.expect_ipv6().return_const(false);
+            resolver.expect_safe_srv_enabled().return_const(false);
             resolver
                 .expect_should_fake_ip()
                 .once()
@@ -352,6 +446,363 @@ mod tests {
         }
     }
 
+    fn srv_response(request: &Message) -> Message {
+        use hickory_proto::rr::{RData, Record};
+        use std::net::{Ipv4Addr, Ipv6Addr};
+
+        let target = Name::from_ascii("node1.game.example.").unwrap();
+        let query = &request.queries[0];
+        let mut response = Message::response(request.metadata.id, OpCode::Query);
+        response.add_query(query.clone());
+        response.add_answer(Record::from_rdata(
+            query.name().clone(),
+            60,
+            RData::SRV(hickory_proto::rr::rdata::SRV::new(
+                7,
+                21,
+                25565,
+                target.clone(),
+            )),
+        ));
+        response.add_additional(Record::from_rdata(
+            target.clone(),
+            30,
+            RData::A(hickory_proto::rr::rdata::A(Ipv4Addr::new(192, 0, 2, 45))),
+        ));
+        response.add_additional(Record::from_rdata(
+            target,
+            30,
+            RData::AAAA(hickory_proto::rr::rdata::AAAA(Ipv6Addr::LOCALHOST)),
+        ));
+        response
+    }
+
+    #[tokio::test]
+    async fn safe_srv_mode_preserves_srv_answer_and_removes_address_additionals() {
+        let request = query(RecordType::SRV);
+        let mut resolver = MockClashResolver::new();
+        resolver.expect_ipv6().return_const(false);
+        resolver.expect_safe_srv_enabled().return_const(true);
+        resolver.expect_fake_ip_enabled().return_const(true);
+        resolver
+            .expect_should_fake_ip()
+            .with(mockall::predicate::eq("example.com"))
+            .once()
+            .return_const(true);
+        resolver
+            .expect_exchange()
+            .once()
+            .returning(|request| Ok(srv_response(request)));
+
+        let resolver: ThreadSafeDNSResolver = Arc::new(resolver);
+        let response = exchange_with_resolver(&resolver, &request, true)
+            .await
+            .expect("safe SRV query should reach the configured resolver");
+
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(response.answers.len(), 1);
+        assert_eq!(response.answers[0].record_type(), RecordType::SRV);
+        assert_eq!(
+            response.answers[0].data,
+            hickory_proto::rr::RData::SRV(hickory_proto::rr::rdata::SRV::new(
+                7,
+                21,
+                25565,
+                Name::from_ascii("node1.game.example.").unwrap(),
+            ))
+        );
+        assert!(response.additionals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn safe_srv_mode_fails_closed_when_dnssec_additionals_need_sanitizing() {
+        let mut request = query(RecordType::SRV);
+        let mut edns = hickory_proto::op::Edns::new();
+        edns.set_dnssec_ok(true);
+        request.set_edns(edns);
+
+        let mut resolver = MockClashResolver::new();
+        resolver.expect_ipv6().return_const(false);
+        resolver.expect_safe_srv_enabled().return_const(true);
+        resolver.expect_fake_ip_enabled().return_const(true);
+        resolver
+            .expect_should_fake_ip()
+            .with(mockall::predicate::eq("example.com"))
+            .once()
+            .return_const(true);
+        resolver
+            .expect_exchange()
+            .once()
+            .returning(|request| Ok(srv_response(request)));
+
+        let resolver: ThreadSafeDNSResolver = Arc::new(resolver);
+        let response = exchange_with_resolver(&resolver, &request, true)
+            .await
+            .expect("unsafe DNSSEC response should become SERVFAIL");
+
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert!(response.answers.is_empty());
+        assert!(response.additionals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn safe_srv_mode_fails_closed_for_cd_ad_and_signed_requests() {
+        for request_signal in ["checking-disabled", "authenticated-data", "tsig"] {
+            let mut request = query(RecordType::SRV);
+            match request_signal {
+                "checking-disabled" => request.metadata.checking_disabled = true,
+                "authenticated-data" => request.metadata.authentic_data = true,
+                "tsig" => {
+                    request.signature = Some(Box::new(
+                        hickory_proto::rr::Record::from_rdata(
+                            Name::from_ascii("key.example.").unwrap(),
+                            0,
+                            hickory_proto::rr::rdata::TSIG::new(
+                                hickory_proto::rr::rdata::tsig::TsigAlgorithm::HmacSha256,
+                                1,
+                                300,
+                                vec![1],
+                                request.metadata.id,
+                                None,
+                                vec![],
+                            ),
+                        ),
+                    ));
+                }
+                _ => unreachable!("test case is defined in the fixed list"),
+            }
+
+            let mut resolver = MockClashResolver::new();
+            resolver.expect_ipv6().return_const(false);
+            resolver.expect_safe_srv_enabled().return_const(true);
+            resolver.expect_fake_ip_enabled().return_const(true);
+            resolver
+                .expect_should_fake_ip()
+                .with(mockall::predicate::eq("example.com"))
+                .once()
+                .return_const(true);
+            resolver
+                .expect_exchange()
+                .once()
+                .returning(|request| Ok(srv_response(request)));
+
+            let resolver: ThreadSafeDNSResolver = Arc::new(resolver);
+            let response = exchange_with_resolver(&resolver, &request, true)
+                .await
+                .expect("request authentication signals should fail closed");
+
+            assert_eq!(
+                response.metadata.response_code,
+                ResponseCode::ServFail,
+                "unexpected response for {request_signal}"
+            );
+            assert!(response.answers.is_empty());
+            assert!(response.additionals.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn safe_srv_mode_fails_closed_for_authenticated_dnssec_responses() {
+        let request = query(RecordType::SRV);
+        let mut resolver = MockClashResolver::new();
+        resolver.expect_ipv6().return_const(false);
+        resolver.expect_safe_srv_enabled().return_const(true);
+        resolver.expect_fake_ip_enabled().return_const(true);
+        resolver
+            .expect_should_fake_ip()
+            .with(mockall::predicate::eq("example.com"))
+            .once()
+            .return_const(true);
+        resolver.expect_exchange().once().returning(|request| {
+            let mut response = srv_response(request);
+            response.metadata.authentic_data = true;
+            Ok(response)
+        });
+
+        let resolver: ThreadSafeDNSResolver = Arc::new(resolver);
+        let response = exchange_with_resolver(&resolver, &request, true)
+            .await
+            .expect("authenticated DNSSEC response should fail closed");
+
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert!(response.answers.is_empty());
+        assert!(response.additionals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn safe_srv_mode_fails_closed_for_rrsig_and_message_signatures() {
+        for use_message_signature in [false, true] {
+            let request = query(RecordType::SRV);
+            let mut resolver = MockClashResolver::new();
+            resolver.expect_ipv6().return_const(false);
+            resolver.expect_safe_srv_enabled().return_const(true);
+            resolver.expect_fake_ip_enabled().return_const(true);
+            resolver
+                .expect_should_fake_ip()
+                .with(mockall::predicate::eq("example.com"))
+                .once()
+                .return_const(true);
+            resolver
+                .expect_exchange()
+                .once()
+                .returning(move |request| {
+                    let mut response = srv_response(request);
+                    if use_message_signature {
+                        response.signature = Some(Box::new(
+                            hickory_proto::rr::Record::from_rdata(
+                                Name::from_ascii("key.example.").unwrap(),
+                                0,
+                                hickory_proto::rr::rdata::TSIG::new(
+                                    hickory_proto::rr::rdata::tsig::TsigAlgorithm::HmacSha256,
+                                    1,
+                                    300,
+                                    vec![1],
+                                    request.metadata.id,
+                                    None,
+                                    vec![],
+                                ),
+                            ),
+                        ));
+                    } else {
+                        response.add_additional(
+                            hickory_proto::rr::Record::from_rdata(
+                                request.queries[0].name().clone(),
+                                60,
+                                hickory_proto::rr::RData::Unknown {
+                                    code: RecordType::RRSIG,
+                                    rdata: hickory_proto::rr::rdata::NULL::with(vec![1]),
+                                },
+                            ),
+                        );
+                    }
+                    Ok(response)
+                });
+
+            let resolver: ThreadSafeDNSResolver = Arc::new(resolver);
+            let response = exchange_with_resolver(&resolver, &request, true)
+                .await
+                .expect("signed response requiring sanitization should fail closed");
+
+            assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+            assert!(response.answers.is_empty());
+            assert!(response.additionals.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn safe_srv_mode_keeps_filtered_domains_on_the_legacy_wire_path() {
+        let request = query(RecordType::SRV);
+        let mut resolver = MockClashResolver::new();
+        resolver.expect_ipv6().return_const(false);
+        resolver.expect_safe_srv_enabled().return_const(true);
+        resolver.expect_fake_ip_enabled().return_const(true);
+        resolver
+            .expect_should_fake_ip()
+            .with(mockall::predicate::eq("example.com"))
+            .once()
+            .return_const(false);
+        resolver.expect_fake_ip_v6_enabled().return_const(false);
+        resolver
+            .expect_exchange()
+            .once()
+            .returning(|request| Ok(srv_response(request)));
+
+        let resolver: ThreadSafeDNSResolver = Arc::new(resolver);
+        let response = exchange_with_resolver(&resolver, &request, true)
+            .await
+            .expect("Fake-IP-excluded SRV query should retain legacy behavior");
+
+        assert_eq!(response.additionals.len(), 2);
+        assert_eq!(response.additionals[0].record_type(), RecordType::A);
+        assert_eq!(response.additionals[1].record_type(), RecordType::AAAA);
+    }
+
+    #[tokio::test]
+    async fn safe_srv_mode_applies_fake_ip_filter_to_service_domain() {
+        let mut request = Message::new(0, MessageType::Query, OpCode::Query);
+        request.add_query(Query::query(
+            Name::from_ascii("_minecraft._tcp.printer.lan.").unwrap(),
+            RecordType::SRV,
+        ));
+        let fake_dns = Arc::new(Mutex::new(fake_dns_with_filter("*.lan")));
+
+        let mut resolver = MockClashResolver::new();
+        resolver.expect_ipv6().return_const(false);
+        resolver.expect_safe_srv_enabled().return_const(true);
+        resolver.expect_fake_ip_enabled().return_const(true);
+        resolver
+            .expect_should_fake_ip()
+            .with(mockall::predicate::eq("printer.lan"))
+            .once()
+            .returning(move |host| !fake_dns.lock().unwrap().should_skip(host));
+        resolver.expect_fake_ip_v6_enabled().return_const(false);
+        resolver
+            .expect_exchange()
+            .once()
+            .returning(|request| Ok(srv_response(request)));
+
+        let resolver: ThreadSafeDNSResolver = Arc::new(resolver);
+        let response = exchange_with_resolver(&resolver, &request, true)
+            .await
+            .expect("excluded SRV domain should retain its upstream additionals");
+
+        assert_eq!(response.answers.len(), 1);
+        assert_eq!(response.additionals.len(), 2);
+        assert_eq!(response.additionals[0].record_type(), RecordType::A);
+        assert_eq!(response.additionals[1].record_type(), RecordType::AAAA);
+    }
+
+    #[tokio::test]
+    async fn legacy_srv_mode_keeps_original_fake_ip_filter_lookup() {
+        let mut request = Message::new(0, MessageType::Query, OpCode::Query);
+        request.add_query(Query::query(
+            Name::from_ascii("_minecraft._tcp.printer.lan.").unwrap(),
+            RecordType::SRV,
+        ));
+        let fake_dns = Arc::new(Mutex::new(fake_dns_with_filter("*.lan")));
+
+        let mut resolver = MockClashResolver::new();
+        resolver.expect_ipv6().return_const(false);
+        resolver.expect_safe_srv_enabled().return_const(false);
+        resolver
+            .expect_should_fake_ip()
+            .with(mockall::predicate::eq("_minecraft._tcp.printer.lan"))
+            .once()
+            .returning(move |host| !fake_dns.lock().unwrap().should_skip(host));
+        resolver.expect_exchange().never();
+
+        let resolver: ThreadSafeDNSResolver = Arc::new(resolver);
+        let response = exchange_with_resolver(&resolver, &request, true)
+            .await
+            .expect("legacy SRV filtering should remain unchanged");
+
+        assert!(response.answers.is_empty());
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    }
+
+    #[tokio::test]
+    async fn https_and_svcb_queries_remain_suppressed_for_fake_ip_domains() {
+        for record_type in [RecordType::HTTPS, RecordType::SVCB] {
+            let mut resolver = MockClashResolver::new();
+            resolver.expect_ipv6().return_const(true);
+            resolver
+                .expect_should_fake_ip()
+                .with(mockall::predicate::eq("example.com"))
+                .once()
+                .return_const(true);
+            resolver.expect_exchange().never();
+
+            let resolver: ThreadSafeDNSResolver = Arc::new(resolver);
+            let response =
+                exchange_with_resolver(&resolver, &query(record_type), true)
+                    .await
+                    .expect("unsafe service-discovery records stay suppressed");
+
+            assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+            assert!(response.answers.is_empty());
+        }
+    }
+
     #[tokio::test]
     async fn filtered_domain_non_address_queries_reach_upstream() {
         // The actual resolver's should_fake_ip implementation consults the
@@ -367,6 +818,9 @@ mod tests {
         ] {
             let mut resolver = MockClashResolver::new();
             resolver.expect_ipv6().return_const(false);
+            if record_type == RecordType::SRV {
+                resolver.expect_safe_srv_enabled().return_const(false);
+            }
             resolver.expect_should_fake_ip().once().return_const(false);
             resolver.expect_fake_ip_enabled().return_const(true);
             resolver.expect_fake_ip_v6_enabled().return_const(false);

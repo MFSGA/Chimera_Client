@@ -76,4 +76,22 @@ S00 **没有**实现新路径，也不能凭单测声称已有可执行的“leg
 - 尚未实现 `dns.resolver-profiles`、`dns.policy-rules`；旧对象对未知字段可能静默忽略，这是 S01 的严格新对象解析必须消除的风险，不能在文档里写成已支持。
 - S01/S02 对 RuleEngine 规则顺序的保证目前是**配置/解析级 Golden**，不是端到端路由选择的新的实际网络执行测试。
 
+## S06a：可选安全 SRV 转发
+
+`dns.service-discovery-mode: safe` 是新加的 opt-in 设置，仅改变 Fake-IP 范围内的 SRV 查询：保留上游返回的 SRV answer（包括 target、priority、weight 和 port），移除 Additional section 中的 A/AAAA 地址。请求要求 DNSSEC、携带签名，或响应带认证/签名标志且需要移除地址时返回 SERVFAIL，避免修改已签名数据。HTTPS/SVCB 等其他非 A/AAAA 查询继续沿用原有过滤行为。
+
+默认值 `legacy` 保留 S00 行为：Fake-IP 范围内的非 A/AAAA 查询返回空答复，Fake-IP filter 排除的域名仍走原上游路径。`safe` 模式对标准 SRV QNAME `_service._protocol.domain` 使用 `domain` 匹配 Fake-IP filter，使 `*.lan` 这类规则能正确应用于服务发现；`legacy` 仍按完整 QNAME 匹配，以保留旧行为。此切片只处理 SRV response 的附加地址泄漏；它不启用 `policy-rules`，也不做 SRV/GeoDNS 自动选择。回归用例位于 `app/dns/server/handler.rs` 与 `tests/dns_config_tests.rs`。
+
+本轮验证记录（2026-10-23）：
+
+| 命令 | 结果 |
+|---|---|
+| `cargo fmt --all -- --check`、`git diff --check` | 通过 |
+| `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo test -p clash-lib --lib app::dns::server::handler::tests --locked --offline` | 24 passed |
+| `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo test -p clash-lib --test dns_config_tests --locked --offline` | 17 passed |
+| `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo test -p clash-lib --test dns_legacy_golden_tests --locked --offline` | 11 passed |
+| `CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 cargo check -p clash-lib --no-default-features --locked --offline` | 通过 |
+
+DNSSEC 回归用例覆盖 DO/CD/AD 与 TSIG 请求，以及 AD、RRSIG 和 TSIG 响应在需要清理附加地址时返回 SERVFAIL。通用 DNS 错误应答目前没有 TSIG 密钥，因此这类 SERVFAIL 不带 TSIG；TSIG 客户端可能无法认证错误答复，但带地址的签名响应仍会被阻止。配置兼容测试确认 YAML 缺省为 `legacy`、显式 `safe` 可解析。外部 Rust 调用方若直接构造公开 `app::dns::Config` 结构体，需要为新增字段补值；YAML 用户配置保持兼容。该增量不表示下一代 DNS 已完成：`dns.policy-rules` 仍未接入生产执行路径，S01–S06 的剩余验收项保持待办。
+
 S00 原则：不改变任何 DNS 运行时决策，不删除/重命名旧字段；保护用户未提交文件。提交、审查和 CI 状态必须根据实际执行结果记录，而不是预先标成 pass。

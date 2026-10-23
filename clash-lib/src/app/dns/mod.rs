@@ -130,6 +130,13 @@ pub trait ClashResolver: Sync + Send {
         false
     }
 
+    /// Whether SRV queries for Fake-IP domains may be forwarded with unsafe
+    /// address additionals removed. Other service-discovery types retain the
+    /// existing Fake-IP privacy behavior.
+    fn safe_srv_enabled(&self) -> bool {
+        false
+    }
+
     /// Whether this hostname should receive synthetic DNS answers in fake-IP
     /// mode. Implementations with a fake-IP filter can override this to keep
     /// explicitly skipped hostnames on real DNS answers.

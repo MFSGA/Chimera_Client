@@ -63,6 +63,7 @@ pub struct EnhancedResolver {
     direct_resolver: Option<ThreadSafeDNSResolver>,
 
     fake_dns: Option<ThreadSafeFakeDns>,
+    safe_srv: bool,
 
     reverse_lookup_cache:
         Option<Arc<RwLock<lru_time_cache::LruCache<net::IpAddr, String>>>>,
@@ -232,6 +233,7 @@ impl EnhancedResolver {
             proxy_server_domains: None,
             direct_resolver: None,
             fake_dns: None,
+            safe_srv: false,
             reverse_lookup_cache: None,
         }
     }
@@ -282,6 +284,7 @@ impl EnhancedResolver {
             direct_resolver: None,
 
             fake_dns: None,
+            safe_srv: false,
 
             reverse_lookup_cache: None,
         }
@@ -348,6 +351,7 @@ impl EnhancedResolver {
             direct_resolver: None,
 
             fake_dns: None,
+            safe_srv: false,
 
             reverse_lookup_cache: None,
         });
@@ -574,6 +578,9 @@ impl EnhancedResolver {
                 }
                 _ => None,
             },
+
+            safe_srv: cfg.service_discovery_mode
+                == crate::config::def::DnsServiceDiscoveryMode::Safe,
 
             proxy_resolver,
             proxy_server_domains: proxy_server_domains_trie,
@@ -1305,6 +1312,10 @@ impl ClashResolver for EnhancedResolver {
 
     fn fake_ip_enabled(&self) -> bool {
         self.fake_dns.is_some()
+    }
+
+    fn safe_srv_enabled(&self) -> bool {
+        self.safe_srv
     }
 
     async fn should_fake_ip(&self, host: &str) -> bool {

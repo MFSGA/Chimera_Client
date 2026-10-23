@@ -263,8 +263,31 @@ fn full_dns_fixture_parses_expected_runtime_shape() {
     assert_eq!(dns.fake_ip_range6.unwrap().to_string(), "fd00:198:18::/96");
     assert_eq!(dns.fake_ip_filter, vec!["*.lan", "+.local"]);
     assert_eq!(
+        dns.service_discovery_mode,
+        clash_lib::config::def::DnsServiceDiscoveryMode::Legacy
+    );
+    assert_eq!(
         dns.edns_client_subnet.unwrap().ipv4.unwrap().to_string(),
         "1.2.3.0/24"
+    );
+}
+
+#[test]
+fn service_discovery_safe_mode_is_opt_in_and_parsed() {
+    let dns = parse_dns(&base_config(
+        r#"  enable: true
+  enhanced-mode: fake-ip
+  service-discovery-mode: safe
+  nameserver:
+    - 1.1.1.1
+  default-nameserver:
+    - 1.1.1.1
+"#,
+    ));
+
+    assert_eq!(
+        dns.service_discovery_mode,
+        clash_lib::config::def::DnsServiceDiscoveryMode::Safe
     );
 }
 

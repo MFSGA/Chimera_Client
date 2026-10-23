@@ -424,6 +424,9 @@ pub struct DNS {
     pub fake_ip_range6: Option<String>,
     /// Fake IP addresses filter
     pub fake_ip_filter: Vec<String>,
+    /// Opt-in safe forwarding for SRV service-discovery queries in Fake-IP mode.
+    /// The default preserves the legacy empty-answer behavior.
+    pub service_discovery_mode: DnsServiceDiscoveryMode,
     /// Enable IPv6 DNS responses (AAAA)
     pub ipv6: bool,
     /// DNS server listening address. If not present, the DNS server will be
@@ -443,6 +446,14 @@ pub struct DNS {
     pub resolver_profiles: HashMap<String, DnsResolverProfileDef>,
     /// S01: ordered query policy rules; never changes Business Rules.
     pub policy_rules: Vec<DnsPolicyRuleDef>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DnsServiceDiscoveryMode {
+    #[default]
+    Legacy,
+    Safe,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

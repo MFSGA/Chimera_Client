@@ -4,7 +4,7 @@ use crate::{
     app::net::{OutboundInterface, get_interface_by_name},
     common::trie,
     config::def::{
-        DNSListen, DNSMode, DohListenDef, DotListenDef,
+        DNSListen, DNSMode, DnsServiceDiscoveryMode, DohListenDef, DotListenDef,
         EdnsClientSubnet as DefEdnsClientSubnet,
     },
 };
@@ -68,6 +68,7 @@ pub struct Config {
     pub fake_ip_range: ipnet::IpNet,
     pub fake_ip_range6: Option<ipnet::IpNet>,
     pub fake_ip_filter: Vec<String>,
+    pub service_discovery_mode: DnsServiceDiscoveryMode,
     pub store_fake_ip: bool,
     pub store_smart_stats: bool,
     pub hosts: Option<trie::StringTrie<IpAddr>>,
@@ -547,6 +548,7 @@ impl TryFrom<&crate::config::def::Config> for Config {
                 })
                 .transpose()?,
             fake_ip_filter: dc.fake_ip_filter.clone(),
+            service_discovery_mode: dc.service_discovery_mode,
             store_fake_ip: c.profile.store_fake_ip,
             store_smart_stats: c.profile.store_smart_stats,
             hosts: Some(hosts),
