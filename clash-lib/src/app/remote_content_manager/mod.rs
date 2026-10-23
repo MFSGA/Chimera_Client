@@ -37,6 +37,27 @@ use crate::{
     session::{Network, Session, SocksAddr, Type},
 };
 
+const MAX_DELAY_HISTORY_TARGETS: usize = 16;
+const MAX_DELAY_HISTORY_PER_TARGET: usize = 20;
+
+fn sanitize_delay_history_url(value: &str) -> String {
+    let Ok(mut url) = url::Url::parse(value) else {
+        return "<invalid-url>".to_owned();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_fragment(None);
+    if url.query().is_some() {
+        let redacted_query = url
+            .query_pairs()
+            .map(|(name, _)| format!("{name}=[redacted]"))
+            .collect::<Vec<_>>()
+            .join("&");
+        url.set_query(Some(&redacted_query));
+    }
+    url.to_string()
+}
+
 pub mod healthcheck;
 pub mod providers;
 
@@ -61,12 +82,14 @@ pub struct TrafficStats {
 #[derive(Default)]
 struct ProxyState {
     alive: AtomicBool,
-    delay_history: VecDeque<DelayHistory>,
+    delay_history: HashMap<Option<String>, VecDeque<DelayHistory>>,
 }
 
 #[derive(Clone, Serialize)]
 pub struct DelayHistory {
     time: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
     #[serde(serialize_with = "serialize_duration")]
     delay: Duration,
 }
@@ -106,9 +129,14 @@ impl ProxyManager {
             .await
             .get(name)
             .map_or((true, None), |state| {
+                let latest = state
+                    .delay_history
+                    .values()
+                    .filter_map(|history| history.back())
+                    .max_by_key(|history| history.time);
                 (
                     state.alive.load(Ordering::Relaxed),
-                    state.delay_history.back().map(|history| history.delay),
+                    latest.map(|history| history.delay),
                 )
             })
     }
@@ -120,13 +148,35 @@ impl ProxyManager {
     }
 
     pub async fn delay_history(&self, name: &str) -> Vec<DelayHistory> {
+        let mut history: Vec<_> = self
+            .proxy_state
+            .read()
+            .await
+            .get(name)
+            .map(|state| {
+                state
+                    .delay_history
+                    .values()
+                    .flat_map(|history| history.iter().cloned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        history.sort_by_key(|record| record.time);
+        history
+    }
+
+    pub async fn delay_history_for_url(
+        &self,
+        name: &str,
+        url: &str,
+    ) -> Vec<DelayHistory> {
         self.proxy_state
             .read()
             .await
             .get(name)
-            .map(|state| state.delay_history.clone())
+            .and_then(|state| state.delay_history.get(&Some(url.to_owned())))
+            .map(|history| history.iter().cloned().collect())
             .unwrap_or_default()
-            .into()
     }
 
     pub async fn last_delay(&self, name: &str) -> Option<Duration> {
@@ -140,17 +190,53 @@ impl ProxyManager {
         alive: bool,
         delay: Option<Duration>,
     ) {
+        self.report_delay_for_target(name, None, alive, delay).await;
+    }
+
+    pub async fn report_delay_for_url(
+        &self,
+        name: &str,
+        url: &str,
+        alive: bool,
+        delay: Option<Duration>,
+    ) {
+        self.report_delay_for_target(name, Some(url.to_owned()), alive, delay)
+            .await;
+    }
+
+    async fn report_delay_for_target(
+        &self,
+        name: &str,
+        url: Option<String>,
+        alive: bool,
+        delay: Option<Duration>,
+    ) {
         let mut states = self.proxy_state.write().await;
         let state = states.entry(name.to_owned()).or_default();
         state.alive.store(alive, Ordering::Relaxed);
 
         if let Some(delay) = delay {
-            state.delay_history.push_back(DelayHistory {
+            let history = state.delay_history.entry(url.clone()).or_default();
+            history.push_back(DelayHistory {
                 time: Utc::now(),
+                url: url.as_deref().map(sanitize_delay_history_url),
                 delay,
             });
-            while state.delay_history.len() > 20 {
-                let _ = state.delay_history.pop_front();
+            while history.len() > MAX_DELAY_HISTORY_PER_TARGET {
+                let _ = history.pop_front();
+            }
+            if state.delay_history.len() > MAX_DELAY_HISTORY_TARGETS {
+                let oldest_target = state
+                    .delay_history
+                    .iter()
+                    .filter_map(|(target, records)| {
+                        records.front().map(|record| (target.clone(), record.time))
+                    })
+                    .min_by_key(|(_, time)| *time)
+                    .map(|(target, _)| target);
+                if let Some(target) = oldest_target {
+                    state.delay_history.remove(&target);
+                }
             }
         }
     }
@@ -385,8 +471,9 @@ impl ProxyManager {
 
         let probe_delay = probe_started.elapsed();
         let ok = result.is_ok();
-        self.report_delay(
+        self.report_delay_for_url(
             &name,
+            url,
             ok,
             Some(if ok { probe_delay } else { Duration::default() }),
         )
@@ -623,8 +710,9 @@ impl ProxyManager {
 
         let ok = probe_result.is_ok();
         self.report_alive(&name, ok).await;
-        self.report_delay(
+        self.report_delay_for_url(
             &name,
+            url,
             ok,
             Some(if ok {
                 request_delay
@@ -738,6 +826,68 @@ mod tests {
         let manager = ProxyManager::new(resolver, None);
         let outbound = Arc::new(direct::Handler::new(PROXY_DIRECT));
         (manager, outbound)
+    }
+
+    #[tokio::test]
+    async fn client_capability_delay_history_is_scoped_by_url() {
+        let (manager, _) = direct_manager();
+        manager
+            .report_delay_for_url(
+                "proxy",
+                "https://one.example/generate_204",
+                true,
+                Some(Duration::from_millis(40)),
+            )
+            .await;
+        manager
+            .report_delay_for_url(
+                "proxy",
+                "https://two.example/generate_204",
+                true,
+                Some(Duration::from_millis(90)),
+            )
+            .await;
+
+        let first = manager
+            .delay_history_for_url("proxy", "https://one.example/generate_204")
+            .await;
+        let second = manager
+            .delay_history_for_url("proxy", "https://two.example/generate_204")
+            .await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(manager.delay_history("proxy").await.len(), 2);
+        assert_eq!(
+            serde_json::to_value(&first[0]).unwrap()["url"],
+            "https://one.example/generate_204"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_capability_delay_history_redacts_url_credentials() {
+        let (manager, _) = direct_manager();
+        let target = "https://user:password@one.example/check?access_token=secret&region=west#fragment-secret";
+        manager
+            .report_delay_for_url(
+                "proxy",
+                target,
+                true,
+                Some(Duration::from_millis(40)),
+            )
+            .await;
+
+        let history = manager.delay_history("proxy").await;
+        let serialized = serde_json::to_value(&history[0]).unwrap();
+        assert_eq!(
+            serialized["url"],
+            "https://one.example/check?access_token=[redacted]&region=[redacted]"
+        );
+        assert!(!serialized.to_string().contains("password"));
+        assert!(!serialized.to_string().contains("secret"));
+        assert_eq!(
+            manager.delay_history_for_url("proxy", target).await.len(),
+            1
+        );
     }
 
     #[tokio::test]

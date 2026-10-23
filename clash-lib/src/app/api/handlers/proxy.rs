@@ -43,6 +43,7 @@ pub fn routes(
             "/{name}",
             Router::new()
                 .route("/", get(get_proxy).put(update_proxy))
+                .route("/history", get(get_proxy_history))
                 .route("/delay", get(get_proxy_delay))
                 .route_layer(middleware::from_fn_with_state(
                     state.clone(),
@@ -84,6 +85,23 @@ async fn get_proxy(
 ) -> impl IntoResponse {
     let outbound_manager = state.outbound_manager.clone();
     axum::response::Json(outbound_manager.get_proxy(&proxy).await)
+}
+
+#[derive(Deserialize)]
+struct ProxyHistoryQuery {
+    url: Option<String>,
+}
+
+async fn get_proxy_history(
+    Extension(proxy): Extension<AnyOutboundHandler>,
+    State(state): State<ProxyState>,
+    Query(query): Query<ProxyHistoryQuery>,
+) -> impl IntoResponse {
+    let history = state
+        .outbound_manager
+        .delay_history(proxy.name(), query.url.as_deref())
+        .await;
+    axum::response::Json(history)
 }
 
 #[derive(Deserialize)]

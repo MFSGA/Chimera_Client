@@ -58,6 +58,25 @@ pub enum OutboundProxyProtocol {
 }
 
 impl OutboundProxyProtocol {
+    pub(crate) fn type_name(&self) -> &'static str {
+        match self {
+            OutboundProxyProtocol::Direct(_) => "direct",
+            OutboundProxyProtocol::Reject(_) => "reject",
+            #[cfg(feature = "shadowsocks")]
+            OutboundProxyProtocol::Ss(_) => "ss",
+            OutboundProxyProtocol::Socks5(_) => "socks5",
+            #[cfg(feature = "anytls")]
+            OutboundProxyProtocol::Anytls(_) => "anytls",
+            OutboundProxyProtocol::Vless(_) => "vless",
+            #[cfg(feature = "wireguard")]
+            OutboundProxyProtocol::Wireguard(_) => "wireguard",
+            #[cfg(feature = "trojan")]
+            OutboundProxyProtocol::Trojan(_) => "trojan",
+            #[cfg(feature = "hysteria")]
+            OutboundProxyProtocol::Hysteria2(_) => "hysteria2",
+        }
+    }
+
     pub(crate) fn name(&self) -> &str {
         match &self {
             OutboundProxyProtocol::Direct(direct) => &direct.name,
@@ -76,6 +95,38 @@ impl OutboundProxyProtocol {
             OutboundProxyProtocol::Trojan(trojan) => &trojan.common_opts.name,
             #[cfg(feature = "hysteria")]
             OutboundProxyProtocol::Hysteria2(hysteria2) => &hysteria2.name,
+        }
+    }
+
+    pub(crate) fn connect_via(&self) -> Option<&str> {
+        match self {
+            OutboundProxyProtocol::Direct(_) | OutboundProxyProtocol::Reject(_) => {
+                None
+            }
+            #[cfg(feature = "shadowsocks")]
+            OutboundProxyProtocol::Ss(outbound) => {
+                outbound.common_opts.connect_via.as_deref()
+            }
+            OutboundProxyProtocol::Socks5(outbound) => {
+                outbound.common_opts.connect_via.as_deref()
+            }
+            #[cfg(feature = "anytls")]
+            OutboundProxyProtocol::Anytls(outbound) => {
+                outbound.common_opts.connect_via.as_deref()
+            }
+            OutboundProxyProtocol::Vless(outbound) => {
+                outbound.common_opts.connect_via.as_deref()
+            }
+            #[cfg(feature = "wireguard")]
+            OutboundProxyProtocol::Wireguard(outbound) => {
+                outbound.common_opts.connect_via.as_deref()
+            }
+            #[cfg(feature = "trojan")]
+            OutboundProxyProtocol::Trojan(outbound) => {
+                outbound.common_opts.connect_via.as_deref()
+            }
+            #[cfg(feature = "hysteria")]
+            OutboundProxyProtocol::Hysteria2(_) => None,
         }
     }
 }
@@ -578,6 +629,18 @@ impl OutboundGroupProtocol {
             OutboundGroupProtocol::Fallback(g) => g.proxies.as_ref(),
             OutboundGroupProtocol::LoadBalance(g) => g.proxies.as_ref(),
             OutboundGroupProtocol::Smart(g) => g.proxies.as_ref(),
+        }
+    }
+
+    /// Returns the proxy providers referenced by the group, if any.
+    pub fn use_providers(&self) -> Option<&Vec<String>> {
+        match self {
+            OutboundGroupProtocol::Relay(g) => g.use_provider.as_ref(),
+            OutboundGroupProtocol::Select(g) => g.use_provider.as_ref(),
+            OutboundGroupProtocol::UrlTest(g) => g.use_provider.as_ref(),
+            OutboundGroupProtocol::Fallback(g) => g.use_provider.as_ref(),
+            OutboundGroupProtocol::LoadBalance(g) => g.use_provider.as_ref(),
+            OutboundGroupProtocol::Smart(g) => g.use_provider.as_ref(),
         }
     }
 }

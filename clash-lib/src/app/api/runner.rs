@@ -333,6 +333,7 @@ impl Runner for ApiRunner {
             info!("Starting API server");
             let mut router = Router::new()
                 .route("/", get(handlers::hello::handle))
+                .route("/capabilities", get(handlers::capabilities::get))
                 .route("/traffic", get(handlers::traffic::handle))
                 .route("/user-stats", get(handlers::user_stats::handle))
                 .route("/version", get(handlers::version::handle))
@@ -348,6 +349,7 @@ impl Runner for ApiRunner {
                     "/configs",
                     handlers::config::routes(
                         inbound_manager.clone(),
+                        outbound_manager.clone(),
                         dispatcher.clone(),
                         global_state.clone(),
                         dns_resolver.clone(),

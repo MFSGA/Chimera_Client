@@ -200,11 +200,29 @@ pub struct Dispatcher {
     manager: Arc<StatisticsManager>,
     tcp_buffer_size: usize,
     proxy_resolve_local: bool,
-    mode: Arc<RwLock<RunMode>>,
+    mode: Arc<RwLock<RuntimeModeState>>,
+    configured_mode: RunMode,
     router: ThreadSafeRouter,
     network_generation: Arc<AtomicU64>,
     traffic_reporter: OnceLock<crate::app::runtime_state::TrafficReporter>,
     network_status: OnceLock<Arc<RwLock<crate::app::network::NetworkStatus>>>,
+}
+
+struct RuntimeModeState {
+    effective: RunMode,
+    override_mode: Option<RunMode>,
+}
+
+impl RuntimeModeState {
+    fn apply_override(&mut self, mode: RunMode) {
+        self.effective = mode;
+        self.override_mode = Some(mode);
+    }
+
+    fn clear_override(&mut self, configured_mode: RunMode) {
+        self.effective = configured_mode;
+        self.override_mode = None;
+    }
 }
 
 impl Debug for Dispatcher {
@@ -240,7 +258,11 @@ impl Dispatcher {
             manager: statistics_manager,
             tcp_buffer_size: tcp_buffer_size.unwrap_or(DEFAULT_BUFFER_SIZE),
             proxy_resolve_local,
-            mode: Arc::new(RwLock::new(mode)),
+            mode: Arc::new(RwLock::new(RuntimeModeState {
+                effective: mode,
+                override_mode: None,
+            })),
+            configured_mode: mode,
             router,
             network_generation: Arc::new(AtomicU64::new(0)),
             traffic_reporter: OnceLock::new(),
@@ -570,11 +592,24 @@ impl Dispatcher {
     }
 
     pub async fn get_mode(&self) -> RunMode {
-        *self.mode.read().await
+        self.mode.read().await.effective
+    }
+
+    pub fn configured_mode(&self) -> RunMode {
+        self.configured_mode
     }
 
     pub async fn set_mode(&self, mode: RunMode) {
-        *self.mode.write().await = mode;
+        self.mode.write().await.apply_override(mode);
+    }
+
+    pub async fn mode_override(&self) -> Option<RunMode> {
+        self.mode.read().await.override_mode
+    }
+
+    pub async fn clear_mode_override(&self) -> RunMode {
+        self.mode.write().await.clear_override(self.configured_mode);
+        self.configured_mode
     }
 
     #[instrument(skip(self, sess, lhs))]
@@ -606,7 +641,7 @@ impl Dispatcher {
             );
         }
 
-        let mode = *self.mode.read().await;
+        let mode = self.mode.read().await.effective;
         let (outbound_name, rule) = match mode {
             RunMode::Global => (PROXY_GLOBAL, None),
             RunMode::Rule => self.router.match_route(&mut sess).await,
@@ -1248,7 +1283,7 @@ impl Dispatcher {
                     sess.network,
                 );
 
-                let mode = *mode.read().await;
+                let mode = mode.read().await.effective;
 
                 let (outbound_name, rule) = match mode {
                     RunMode::Global => (PROXY_GLOBAL, None),
@@ -2729,19 +2764,21 @@ impl OutboundHandleMap {
 mod tests {
     use super::{
         Dispatcher, OutboundDatagramPacket, OutboundHandleMap,
-        PendingUdpHealthProofs, UDP_HEALTH_PROOF_MAX, UDP_SESSION_IDLE,
-        UdpFlowDecisionKey, classify_flow_end_reason, confirmed_udp_path,
-        direct_udp_health_destination, preferred_udp_path_address,
-        queue_udp_packet_retry, reverse_lookup, select_outbound_for_flow,
-        try_queue_outbound_packet, udp_path_cache_versions,
-        udp_path_selection_is_current,
+        PendingUdpHealthProofs, RuntimeModeState, UDP_HEALTH_PROOF_MAX,
+        UDP_SESSION_IDLE, UdpFlowDecisionKey, classify_flow_end_reason,
+        confirmed_udp_path, direct_udp_health_destination,
+        preferred_udp_path_address, queue_udp_packet_retry, reverse_lookup,
+        select_outbound_for_flow, try_queue_outbound_packet,
+        udp_path_cache_versions, udp_path_selection_is_current,
     };
     use crate::{
         app::dns::{ClashResolver, MockClashResolver, ThreadSafeDNSResolver},
+        config::def::RunMode,
         config::internal::proxy::PROXY_DIRECT,
         proxy::datagram::UdpPacket,
         session::{Network, Session, SocksAddr, Type},
     };
+
     use std::{
         future::pending,
         net::{IpAddr, SocketAddr},
@@ -2750,6 +2787,22 @@ mod tests {
         time::Instant,
     };
     use tokio::sync::mpsc;
+
+    #[test]
+    fn client_capability_clearing_mode_override_restores_configured_mode() {
+        let mut state = RuntimeModeState {
+            effective: RunMode::Rule,
+            override_mode: None,
+        };
+
+        state.apply_override(RunMode::Direct);
+        assert!(matches!(state.effective, RunMode::Direct));
+        assert!(matches!(state.override_mode, Some(RunMode::Direct)));
+
+        state.clear_override(RunMode::Global);
+        assert!(matches!(state.effective, RunMode::Global));
+        assert!(state.override_mode.is_none());
+    }
 
     #[test]
     fn stale_udp_first_packet_is_replayed_with_a_bounded_retry_budget() {

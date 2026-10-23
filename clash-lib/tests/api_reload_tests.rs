@@ -143,6 +143,30 @@ async fn put_configs_reloads_runtime_from_file() {
         .expect("failed to parse initial response");
     assert_eq!(initial_json["mode"], "global");
 
+    let mode_url = format!("http://127.0.0.1:{api_port}/configs/mode");
+    let mode_override_request = hyper::Request::builder()
+        .uri(&mode_url)
+        .method(http::Method::PUT)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(r#"{"mode":"direct"}"#)))
+        .expect("failed to build mode override request");
+    let mode_override_response =
+        send_http_request(mode_url.parse().unwrap(), mode_override_request)
+            .await
+            .expect("failed to set mode override");
+    assert_eq!(mode_override_response.status(), http::StatusCode::OK);
+    let mode_override_body = mode_override_response
+        .collect()
+        .await
+        .expect("failed to read mode override response")
+        .to_bytes();
+    let mode_override_json: serde_json::Value =
+        serde_json::from_slice(&mode_override_body)
+            .expect("failed to parse mode override response");
+    assert_eq!(mode_override_json["configuredMode"], "global");
+    assert_eq!(mode_override_json["effectiveMode"], "direct");
+    assert_eq!(mode_override_json["overrideMode"], "direct");
+
     let put_request = hyper::Request::builder()
         .uri(&configs_url)
         .method(http::Method::PUT)
@@ -168,6 +192,27 @@ async fn put_configs_reloads_runtime_from_file() {
     let reloaded_json: serde_json::Value = serde_json::from_slice(&reloaded_body)
         .expect("failed to parse reloaded response");
     assert_eq!(reloaded_json["mode"], "rule");
+
+    let reloaded_mode_request = hyper::Request::builder()
+        .uri(&mode_url)
+        .method(http::Method::GET)
+        .body(http_body_util::Empty::<Bytes>::new())
+        .expect("failed to build GET mode request after reload");
+    let reloaded_mode_response =
+        send_http_request(mode_url.parse().unwrap(), reloaded_mode_request)
+            .await
+            .expect("failed to get mode after reload");
+    let reloaded_mode_body = reloaded_mode_response
+        .collect()
+        .await
+        .expect("failed to read mode after reload")
+        .to_bytes();
+    let reloaded_mode_json: serde_json::Value =
+        serde_json::from_slice(&reloaded_mode_body)
+            .expect("failed to parse mode after reload");
+    assert_eq!(reloaded_mode_json["configuredMode"], "rule");
+    assert_eq!(reloaded_mode_json["effectiveMode"], "rule");
+    assert_eq!(reloaded_mode_json["overrideMode"], serde_json::Value::Null);
 
     assert!(clash_lib::shutdown());
     runtime.join().expect("runtime thread panicked");

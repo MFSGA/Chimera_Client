@@ -1,3 +1,4 @@
+pub mod capabilities;
 pub mod config;
 pub mod connection;
 pub mod dns;

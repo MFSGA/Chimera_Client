@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -19,8 +19,19 @@ use crate::{
         dispatcher,
         dns::{ThreadSafeDNSResolver, config::DNSListenAddr},
         inbound::manager::{InboundEndpoint, InboundManager, Ports},
+        outbound::manager::{OutboundValidationResult, ThreadSafeOutboundManager},
     },
-    config::{def, internal::config::BindAddress},
+    config::{
+        def,
+        internal::{
+            InternalConfig,
+            config::BindAddress,
+            proxy::{
+                OutboundGroupProtocol, OutboundProxy, PROXY_DIRECT, PROXY_GLOBAL,
+                PROXY_REJECT,
+            },
+        },
+    },
 };
 
 #[derive(Serialize)]
@@ -40,6 +51,7 @@ struct DnsListenInfo {
 #[derive(Clone)]
 struct ConfigState {
     inbound_manager: Arc<InboundManager>,
+    outbound_manager: ThreadSafeOutboundManager,
     dispatcher: Arc<dispatcher::Dispatcher>,
     global_state: Arc<Mutex<GlobalState>>,
     dns_resolver: ThreadSafeDNSResolver,
@@ -48,8 +60,10 @@ struct ConfigState {
     ipv6_allowed: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn routes(
     inbound_manager: Arc<InboundManager>,
+    outbound_manager: ThreadSafeOutboundManager,
     dispatcher: Arc<dispatcher::Dispatcher>,
     global_state: Arc<Mutex<GlobalState>>,
     dns_resolver: ThreadSafeDNSResolver,
@@ -62,8 +76,14 @@ pub fn routes(
             "/",
             get(get_configs).put(update_configs).patch(patch_configs),
         )
+        .route("/validate", axum::routing::post(validate_config))
+        .route(
+            "/mode",
+            get(get_mode).put(put_mode).delete(clear_mode_override),
+        )
         .with_state(ConfigState {
             inbound_manager,
+            outbound_manager,
             dispatcher,
             global_state,
             dns_resolver,
@@ -139,6 +159,351 @@ async fn get_configs(State(state): State<ConfigState>) -> impl IntoResponse {
         lan_ips,
         dns_listen,
     })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModeView {
+    configured_mode: def::RunMode,
+    effective_mode: def::RunMode,
+    override_mode: Option<def::RunMode>,
+}
+
+#[derive(Deserialize)]
+struct ModeRequest {
+    mode: def::RunMode,
+}
+
+async fn get_mode(State(state): State<ConfigState>) -> Json<ModeView> {
+    Json(ModeView {
+        configured_mode: state.dispatcher.configured_mode(),
+        effective_mode: state.dispatcher.get_mode().await,
+        override_mode: state.dispatcher.mode_override().await,
+    })
+}
+
+async fn put_mode(
+    State(state): State<ConfigState>,
+    Json(request): Json<ModeRequest>,
+) -> Json<ModeView> {
+    state.dispatcher.set_mode(request.mode).await;
+    get_mode(State(state)).await
+}
+
+async fn clear_mode_override(State(state): State<ConfigState>) -> Json<ModeView> {
+    state.dispatcher.clear_mode_override().await;
+    get_mode(State(state)).await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct ValidateConfigRequest {
+    payload: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ValidationIssue {
+    code: &'static str,
+    node: Option<String>,
+    field_path: Option<String>,
+    message: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ValidateConfigResponse {
+    valid: bool,
+    validation_scope: &'static str,
+    errors: Vec<ValidationIssue>,
+    outbounds: Vec<OutboundValidationResult>,
+}
+
+async fn validate_config(
+    State(state): State<ConfigState>,
+    Json(request): Json<ValidateConfigRequest>,
+) -> Json<ValidateConfigResponse> {
+    let definition = match parse_config_definition(&request.payload) {
+        Ok(definition) => definition,
+        Err(issue) => return invalid_config_response(issue),
+    };
+
+    let internal: InternalConfig = match definition.try_into() {
+        Ok(config) => config,
+        Err(error) => {
+            return invalid_config_response(ValidationIssue {
+                code: "config_conversion",
+                node: None,
+                field_path: None,
+                message: error.to_string(),
+            });
+        }
+    };
+    let internal = match internal.validate() {
+        Ok(config) => config,
+        Err(error) => {
+            return invalid_config_response(ValidationIssue {
+                code: "config_validation",
+                node: None,
+                field_path: None,
+                message: error.to_string(),
+            });
+        }
+    };
+
+    let groups: Vec<_> = internal
+        .proxy_groups
+        .values()
+        .filter_map(|group| match group {
+            OutboundProxy::ProxyGroup(group) => Some(group.clone()),
+            OutboundProxy::ProxyServer(_) => None,
+        })
+        .collect();
+    let provider_names: HashSet<_> =
+        internal.proxy_providers.keys().cloned().collect();
+    let declared_plain_names: HashSet<_> = internal
+        .proxies
+        .values()
+        .filter_map(|proxy| match proxy {
+            OutboundProxy::ProxyServer(outbound) => Some(outbound.name().to_owned()),
+            OutboundProxy::ProxyGroup(_) => None,
+        })
+        .collect();
+    let mut outbound_connectors = Vec::new();
+    for proxy in internal.proxies.values() {
+        if let OutboundProxy::ProxyServer(outbound) = proxy
+            && let Some(connector) = outbound.connect_via()
+        {
+            outbound_connectors
+                .push((outbound.name().to_owned(), connector.to_owned()));
+        }
+    }
+    let outbounds = internal
+        .proxies
+        .into_values()
+        .filter_map(|proxy| match proxy {
+            OutboundProxy::ProxyServer(outbound)
+                if outbound.name() != "DIRECT" && outbound.name() != "REJECT" =>
+            {
+                Some(outbound)
+            }
+            _ => None,
+        })
+        .collect();
+    let mut outbounds = state.outbound_manager.validate_plain_outbounds(outbounds);
+    outbounds.sort_by(|left, right| left.name.cmp(&right.name));
+    let valid_plain_names = outbounds
+        .iter()
+        .filter(|outbound| outbound.valid)
+        .map(|outbound| outbound.name.clone())
+        .collect::<HashSet<_>>();
+    let mut errors = outbounds
+        .iter()
+        .filter_map(|outbound| {
+            outbound.error.as_ref().map(|message| ValidationIssue {
+                code: "outbound_conversion",
+                node: Some(outbound.name.clone()),
+                field_path: None,
+                message: message.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    if declared_plain_names.contains(PROXY_GLOBAL) {
+        errors.push(ValidationIssue {
+            code: "proxy_name_reserved",
+            node: Some(PROXY_GLOBAL.to_owned()),
+            field_path: Some(format!("proxies.{PROXY_GLOBAL}.name")),
+            message: format!("proxy name `{PROXY_GLOBAL}` is reserved"),
+        });
+    }
+    let available_connector_names: HashSet<_> = valid_plain_names
+        .iter()
+        .cloned()
+        .chain(groups.iter().map(|group| group.name().to_owned()))
+        .chain([
+            PROXY_DIRECT.to_owned(),
+            PROXY_REJECT.to_owned(),
+            PROXY_GLOBAL.to_owned(),
+        ])
+        .collect();
+    errors.extend(outbound_connectors.into_iter().filter_map(
+        |(node, connector)| {
+            (!available_connector_names.contains(&connector)).then(|| {
+                ValidationIssue {
+                    code: "outbound_connector_reference",
+                    node: Some(node.clone()),
+                    field_path: Some(format!("proxies.{node}.dialer-proxy")),
+                    message: format!("connector {connector} not found"),
+                }
+            })
+        },
+    ));
+    errors.extend(validate_proxy_groups(
+        &groups,
+        &declared_plain_names,
+        &valid_plain_names,
+        &provider_names,
+    ));
+
+    Json(ValidateConfigResponse {
+        valid: errors.is_empty(),
+        validation_scope: "offline-config-outbound-connector-and-group-validation",
+        errors,
+        outbounds,
+    })
+}
+
+fn validate_proxy_groups(
+    groups: &[OutboundGroupProtocol],
+    declared_plain_names: &HashSet<String>,
+    valid_plain_names: &HashSet<String>,
+    provider_names: &HashSet<String>,
+) -> Vec<ValidationIssue> {
+    let group_names: HashSet<_> =
+        groups.iter().map(|group| group.name().to_owned()).collect();
+    let mut issues = Vec::new();
+
+    for group in groups {
+        let name = group.name();
+        if matches!(name, PROXY_DIRECT | PROXY_REJECT | PROXY_GLOBAL) {
+            issues.push(ValidationIssue {
+                code: "proxy_group_name",
+                node: Some(name.to_owned()),
+                field_path: Some(format!("proxy-groups.{name}.name")),
+                message: format!("proxy group name `{name}` is reserved"),
+            });
+        }
+        if declared_plain_names.contains(name) {
+            issues.push(ValidationIssue {
+                code: "proxy_group_name",
+                node: Some(name.to_owned()),
+                field_path: Some(format!("proxy-groups.{name}.name")),
+                message: format!(
+                    "proxy group name `{name}` duplicates a proxy name"
+                ),
+            });
+        }
+
+        let proxies = group.proxies().map_or(&[][..], Vec::as_slice);
+        let providers = group.use_providers().map_or(&[][..], Vec::as_slice);
+        if proxies.is_empty() && providers.is_empty() {
+            issues.push(ValidationIssue {
+                code: "proxy_group_empty",
+                node: Some(name.to_owned()),
+                field_path: Some(format!("proxy-groups.{name}")),
+                message: format!("proxy group {name} has no proxies or providers"),
+            });
+        }
+
+        if let OutboundGroupProtocol::Smart(smart) = group
+            && let Err(error) = smart.validate()
+        {
+            issues.push(ValidationIssue {
+                code: "proxy_group_config",
+                node: Some(name.to_owned()),
+                field_path: Some(format!("proxy-groups.{name}")),
+                message: error.to_string(),
+            });
+        }
+
+        for (index, proxy_name) in proxies.iter().enumerate() {
+            if !valid_plain_names.contains(proxy_name)
+                && !matches!(proxy_name.as_str(), PROXY_DIRECT | PROXY_REJECT)
+                && !group_names.contains(proxy_name)
+            {
+                issues.push(ValidationIssue {
+                    code: "proxy_group_reference",
+                    node: Some(name.to_owned()),
+                    field_path: Some(format!(
+                        "proxy-groups.{name}.proxies[{index}]"
+                    )),
+                    message: format!("proxy {proxy_name} not found"),
+                });
+            }
+        }
+
+        for (index, provider_name) in providers.iter().enumerate() {
+            if !provider_names.contains(provider_name) {
+                issues.push(ValidationIssue {
+                    code: "proxy_provider_reference",
+                    node: Some(name.to_owned()),
+                    field_path: Some(format!("proxy-groups.{name}.use[{index}]")),
+                    message: format!("provider {provider_name} not found"),
+                });
+            }
+        }
+    }
+
+    if let Err(error) =
+        crate::app::outbound::manager::OutboundManager::validate_proxy_group_dependencies(
+            groups,
+        )
+    {
+        issues.push(ValidationIssue {
+            code: "proxy_group_graph",
+            node: None,
+            field_path: Some("proxy-groups".to_owned()),
+            message: error.to_string(),
+        });
+    }
+
+    issues.sort_by(|left, right| {
+        left.node
+            .cmp(&right.node)
+            .then_with(|| left.field_path.cmp(&right.field_path))
+            .then_with(|| left.code.cmp(right.code))
+    });
+    issues
+}
+
+fn parse_config_definition(payload: &str) -> Result<def::Config, ValidationIssue> {
+    let mut value: serde_yaml::Value =
+        serde_yaml::from_str(payload).map_err(|error| ValidationIssue {
+            code: "yaml_syntax",
+            node: None,
+            field_path: None,
+            message: error.to_string(),
+        })?;
+    value.apply_merge().map_err(|error| ValidationIssue {
+        code: "yaml_merge",
+        node: None,
+        field_path: None,
+        message: error.to_string(),
+    })?;
+    serde_path_to_error::deserialize(value.clone()).map_err(|error| {
+        let path = error.path().to_string();
+        ValidationIssue {
+            code: "config_deserialization",
+            node: node_for_config_path(&value, &path),
+            field_path: (!path.is_empty()).then_some(path),
+            message: error.inner().to_string(),
+        }
+    })
+}
+
+fn invalid_config_response(issue: ValidationIssue) -> Json<ValidateConfigResponse> {
+    Json(ValidateConfigResponse {
+        valid: false,
+        validation_scope: "offline-config-outbound-connector-and-group-validation",
+        errors: vec![issue],
+        outbounds: Vec::new(),
+    })
+}
+
+fn node_for_config_path(value: &serde_yaml::Value, path: &str) -> Option<String> {
+    let index = path
+        .strip_prefix("proxies[")?
+        .split_once(']')?
+        .0
+        .parse::<usize>()
+        .ok()?;
+    value
+        .get("proxies")?
+        .as_sequence()?
+        .get(index)?
+        .get("name")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -365,7 +730,9 @@ async fn patch_configs(
 
 #[cfg(test)]
 mod tests {
-    use super::validate_ipv6_update;
+    use super::{
+        node_for_config_path, parse_config_definition, validate_ipv6_update,
+    };
 
     #[test]
     fn blocks_enabling_ipv6_for_ipv4_only_tun() {
@@ -373,5 +740,33 @@ mod tests {
         assert!(validate_ipv6_update(Some(false), false).is_ok());
         assert!(validate_ipv6_update(None, false).is_ok());
         assert!(validate_ipv6_update(Some(true), true).is_ok());
+    }
+
+    #[test]
+    fn client_capability_validation_path_identifies_outbound_name() {
+        let value: serde_yaml::Value = serde_yaml::from_str(
+            "proxies:\n  - name: edge-a\n    type: vless\n    uuid: invalid\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            node_for_config_path(&value, "proxies[0].uuid"),
+            Some("edge-a".to_owned())
+        );
+    }
+
+    #[test]
+    fn client_capability_validation_reports_field_and_node() {
+        let error = match parse_config_definition(
+            "proxies:\n  - name: edge-a\n    type: not-supported\n",
+        ) {
+            Ok(_) => panic!("unsupported outbound type should fail deserialization"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.node.as_deref(), Some("edge-a"));
+        assert_eq!(error.field_path.as_deref(), Some("proxies[0].type"));
+        assert_eq!(error.code, "config_deserialization");
+        assert!(!error.message.is_empty());
     }
 }

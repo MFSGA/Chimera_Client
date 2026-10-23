@@ -99,6 +99,346 @@ async fn get_allow_lan(port: u16) -> bool {
         .expect("'allow-lan' not found or not a bool")
 }
 
+async fn capability_api_request(
+    port: u16,
+    path: &str,
+    method: http::Method,
+    body: Option<String>,
+) -> (http::StatusCode, Bytes) {
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let request = hyper::Request::builder()
+        .uri(&url)
+        .header(hyper::header::AUTHORIZATION, "Bearer clash-rs")
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .method(method)
+        .body(http_body_util::Full::new(Bytes::from(
+            body.unwrap_or_default(),
+        )))
+        .expect("failed to build client capability request");
+    let response = send_http_request(url.parse().unwrap(), request)
+        .await
+        .expect("failed to send client capability request");
+    let status = response.status();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("failed to collect client capability response")
+        .to_bytes();
+    (status, body)
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn client_capability_controller_endpoints_expose_validation_and_mode_override()
+{
+    let api_port = available_port();
+    let (config_path, socks_port) = isolated_config(api_port);
+    let config_payload = std::fs::read_to_string(&config_path)
+        .expect("failed to read isolated test configuration");
+    let wd =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
+    let _clash = ClashInstance::start(
+        Options {
+            config: Config::File(config_path.to_string_lossy().to_string()),
+            cwd: Some(wd.to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            config_path: Some(config_path.to_string_lossy().to_string()),
+        },
+        vec![api_port, socks_port],
+    )
+    .expect("failed to start isolated client");
+
+    let (status, body) =
+        capability_api_request(api_port, "/capabilities", http::Method::GET, None)
+            .await;
+    assert_eq!(status, http::StatusCode::OK);
+    let capabilities: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(capabilities["outboundProtocols"].as_array().is_some());
+
+    let (status, body) =
+        capability_api_request(api_port, "/runtime", http::Method::GET, None).await;
+    assert_eq!(status, http::StatusCode::OK);
+    let runtime: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(runtime["application"]["phase"], "running");
+    assert_eq!(runtime["application"]["health"], "healthy");
+    assert!(
+        runtime["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| { item["name"] == "api" && item["phase"] == "ready" })
+    );
+
+    let (status, body) = capability_api_request(
+        api_port,
+        "/configs/validate",
+        http::Method::POST,
+        Some(serde_json::json!({ "payload": config_payload }).to_string()),
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::OK);
+    let validation: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(validation["valid"], true);
+    assert_eq!(
+        validation["validationScope"],
+        "offline-config-outbound-connector-and-group-validation"
+    );
+
+    let valid_connector_payload = r#"
+proxies:
+  - name: edge-a
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+    dialer-proxy: DIRECT
+  - name: edge-b
+    type: socks5
+    server: 127.0.0.1
+    port: 1081
+    dialer-proxy: GLOBAL
+  - name: edge-c
+    type: socks5
+    server: 127.0.0.1
+    port: 1082
+    dialer-proxy: relay-group
+proxy-groups:
+  - name: relay-group
+    type: select
+    proxies: [DIRECT]
+"#;
+    let (status, body) = capability_api_request(
+        api_port,
+        "/configs/validate",
+        http::Method::POST,
+        Some(serde_json::json!({ "payload": valid_connector_payload }).to_string()),
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::OK);
+    let validation: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(validation["valid"], true);
+
+    let valid_group_payload = r#"
+proxy-groups:
+  - name: group-a
+    type: select
+    proxies: [DIRECT, REJECT]
+rules:
+  - MATCH,group-a
+"#;
+    let (status, body) = capability_api_request(
+        api_port,
+        "/configs/validate",
+        http::Method::POST,
+        Some(serde_json::json!({ "payload": valid_group_payload }).to_string()),
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::OK);
+    let validation: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(validation["valid"], true);
+
+    let invalid_payload = "proxies:\n  - name: edge-a\n    type: not-supported\n";
+    let (status, body) = capability_api_request(
+        api_port,
+        "/configs/validate",
+        http::Method::POST,
+        Some(serde_json::json!({ "payload": invalid_payload }).to_string()),
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::OK);
+    let validation: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(validation["valid"], false);
+    assert_eq!(validation["errors"][0]["node"], "edge-a");
+    assert_eq!(validation["errors"][0]["fieldPath"], "proxies[0].type");
+
+    let missing_connector_payload = r#"
+proxies:
+  - name: edge-a
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+    dialer-proxy: missing-node
+"#;
+    let (status, body) = capability_api_request(
+        api_port,
+        "/configs/validate",
+        http::Method::POST,
+        Some(
+            serde_json::json!({ "payload": missing_connector_payload }).to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::OK);
+    let validation: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(validation["valid"], false);
+    assert!(
+        validation["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| {
+                issue["code"] == "outbound_connector_reference"
+                    && issue["node"] == "edge-a"
+                    && issue["fieldPath"] == "proxies.edge-a.dialer-proxy"
+            })
+    );
+
+    let reserved_global_payload = r#"
+proxies:
+  - name: GLOBAL
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+"#;
+    let (status, body) = capability_api_request(
+        api_port,
+        "/configs/validate",
+        http::Method::POST,
+        Some(serde_json::json!({ "payload": reserved_global_payload }).to_string()),
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::OK);
+    let validation: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(validation["valid"], false);
+    assert!(
+        validation["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| {
+                issue["code"] == "proxy_name_reserved" && issue["node"] == "GLOBAL"
+            })
+    );
+
+    let reserved_global_group_payload = r#"
+proxy-groups:
+  - name: GLOBAL
+    type: select
+    proxies: [DIRECT]
+"#;
+    let (status, body) = capability_api_request(
+        api_port,
+        "/configs/validate",
+        http::Method::POST,
+        Some(
+            serde_json::json!({ "payload": reserved_global_group_payload })
+                .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::OK);
+    let validation: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(validation["valid"], false);
+    assert!(
+        validation["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| {
+                issue["code"] == "proxy_group_name" && issue["node"] == "GLOBAL"
+            })
+    );
+
+    let invalid_group_payload = r#"
+proxy-groups:
+  - name: group-a
+    type: select
+    proxies: [missing-node]
+rules:
+  - MATCH,group-a
+"#;
+    let (status, body) = capability_api_request(
+        api_port,
+        "/configs/validate",
+        http::Method::POST,
+        Some(serde_json::json!({ "payload": invalid_group_payload }).to_string()),
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::OK);
+    let validation: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(validation["valid"], false);
+    assert_eq!(validation["errors"][0]["node"], "group-a");
+    assert_eq!(
+        validation["errors"][0]["fieldPath"],
+        "proxy-groups.group-a.proxies[0]"
+    );
+
+    let cyclic_group_payload = r#"
+proxy-groups:
+  - name: group-a
+    type: select
+    proxies: [group-b]
+  - name: group-b
+    type: select
+    proxies: [group-a]
+rules:
+  - MATCH,group-a
+"#;
+    let (status, body) = capability_api_request(
+        api_port,
+        "/configs/validate",
+        http::Method::POST,
+        Some(serde_json::json!({ "payload": cyclic_group_payload }).to_string()),
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::OK);
+    let validation: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(validation["valid"], false);
+    assert!(
+        validation["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|error| {
+                error["code"] == "proxy_group_graph"
+                    && error["fieldPath"] == "proxy-groups"
+            })
+    );
+
+    let (status, body) = capability_api_request(
+        api_port,
+        "/proxies/DIRECT/history?url=https%3A%2F%2Fhealth.example%2Fcheck",
+        http::Method::GET,
+        None,
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!([])
+    );
+
+    let (status, body) =
+        capability_api_request(api_port, "/configs/mode", http::Method::GET, None)
+            .await;
+    assert_eq!(status, http::StatusCode::OK);
+    let mode: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(mode["configuredMode"], "direct");
+    assert_eq!(mode["overrideMode"], serde_json::Value::Null);
+
+    let (status, _) = capability_api_request(
+        api_port,
+        "/configs/mode",
+        http::Method::PUT,
+        Some(serde_json::json!({ "mode": "rule" }).to_string()),
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::OK);
+
+    let (status, body) = capability_api_request(
+        api_port,
+        "/configs/mode",
+        http::Method::DELETE,
+        None,
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::OK);
+    let mode: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(mode["effectiveMode"], "direct");
+    assert_eq!(mode["overrideMode"], serde_json::Value::Null);
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
 async fn test_wildcard_cors_returns_any_origin_header() {
