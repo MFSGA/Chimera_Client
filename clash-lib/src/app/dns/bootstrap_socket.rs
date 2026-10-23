@@ -109,7 +109,14 @@ impl StrictDnsSocketPathEvidence {
                 )));
             }
         }
-        manager.strict_dns_path_generation(status).await?;
+        let completed_generation =
+            manager.strict_dns_path_generation(status).await?;
+        if completed_generation != generation {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "strict DNS socket path generation changed during evidence verification",
+            ));
+        }
         Ok(())
     }
 }
@@ -175,10 +182,26 @@ impl<T: DnsStrictSocketPathTransport> DnsStrictTransport
         outbound: AnyOutboundHandler,
         request: &Message,
     ) -> io::Result<Message> {
-        let (answer, evidence) = self
+        // The wire DNS client may not have its own NetworkPathSource.
+        // Bind this *attempt* to the manager's observed epoch before sending
+        // packets, not just the network that exists when the reply arrives.
+        let started_generation =
+            self.manager.strict_dns_path_generation(self.status).await?;
+        let result = self
             .transport
             .exchange_with_socket_evidence(server, outbound, request)
-            .await?;
+            .await;
+        // Check even after an upstream error: an epoch change must never
+        // be mistaken for a normal DNS failure eligible for another server.
+        let completed_generation =
+            self.manager.strict_dns_path_generation(self.status).await?;
+        if completed_generation != started_generation {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "strict DNS network changed during socket-evidence exchange",
+            ));
+        }
+        let (answer, evidence) = result?;
         evidence.verify(self.manager, self.status).await?;
         Ok(answer)
     }

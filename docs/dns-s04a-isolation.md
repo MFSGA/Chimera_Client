@@ -191,6 +191,13 @@ cargo test -p clash-lib --test dns_config_tests --locked
 - 4 项新增 `s04bz_` 离线测试：假出站通过真实 Hickory TCP DNS 编解码等待回复，分别验证 TCP 和 UDP→TCP 在应答被阻塞期间网络换代会拒绝旧证据、未换代则正常返回最终 TCP 路径；核对仅 socket 证据的代际错误，即使网络未切换也拒绝，UDP 阶段早期拒绝且不会开启 TCP fallback；观测源以**相同 generation** 替换成另一 `SharedNetworkStatus` 对象（ABA）仍拒绝；DIRECT DNS Runtime 原规划快照换代后，原计划被判定无效，重新规划只使用新网卡。无需真实改变路由或向外网发包。
 - **限制：** 此处证明的是严格客户端已附着的网络观察源在 DNS 查询窗口内的软件 epoch、对象身份和路径 ID 一致性，并非查询全生命周期的原子路由锁、真实出口网卡抓包或跨代理节点的端到端证明。上层独立 L2 审核、可信 Provider/bootstrap pin、完整递归 dialer 验证、真实多网卡切换与数据面捕获仍未完成。生产 `policy-rules` 启动门禁不变且继续禁用。
 
+## S04b-aa：无客户端观察源的严格 DNS 证据查询跨代际与取消边界（仅内部）
+
+- `StrictDnsEvidenceCheckedTransport` 不再只在收到响应后检查“当前有效的 socket 路径”。即使 Hickory/DnsClient 本身没有附着 `NetworkPathSource`，该内部管理器适配器也会在**开始每一次上游 I/O 之前**以实际 `OutboundManager` 和同一 `SharedNetworkStatus` 捕获路径 generation；待该次 `exchange_with_socket_evidence` 返回后，**即使底层返回错误**，也重新验证 Manager 关联和 generation 必须与起点相同。若中途切换网络而 DNS 返回的是新代际的有效路径，仍返回 `Interrupted` 并丢弃应答，不能把跨代际请求当作同一个完整可信查询；本适配器 `terminal_on_exchange_error()` 始终为 `true`，不触发第二 DNS 上游或 DIRECT/legacy fallback。Manager 断开原 status、查询完成后状态观察缺失等继续直接失败关闭。
+- `StrictDnsSocketPathEvidence::verify` 原本在检查候选路径后再调用 `strict_dns_path_generation()` 却只检查调用是否成功，没有将最后一次返回的 generation 与本轮开始的值比较。现在显式要求二者一致，防止验证过程中的网络变化被忽略。管理器的 Provider/registry 租约与 DNS 总预算保持不变；取消未来时仍释放注册表读租约。两次检查都不是不可分割的内核路由锁，也不能阻止检查完成后瞬间发生新的网络更新。
+- 两项新 `s04baa_` 离线回归：其一**刻意不通过外层 leased guard**，以合成连接路径模拟无客户端观察源的普通响应、网络在 I/O 中更新却返回“新代际有效路径”、以及更新后底层返回普通上游错误，确保跨代际两种情形都终止且仅调用一次；其二通过真实 `StrictDnsManagerLeafGuard` 暂停证据 I/O，分别用查询超时和 `abort()` 取消，验证任务被取消后此前阻塞的注册表 writer 可获得锁，且没有尝试第二个上游。合成路径仅测试软件校验边界，并非真实 OS socket 数据面证明。原有 S04b-m 路径验证、S04b-z 查询证据、配置与其他代理连接池回归保持覆盖。
+- **生产边界：** 不解除 `policy-rules` 启动门禁，不推送、不配置生产执行。可信 Provider/bootstrap pin 来源、完整递归代理链、真实多网卡切换/出接口抓包、核验链路中的硬件路由身份以及独立 L2 审查与维护者批准仍是必要前置条件。
+
 ## S04b/S04c 待完成的严格准入
 
 1. **真实执行接线与身份来源**：S04b-a 提供共享 RuntimeStatus 读取接口，但**尚未由生产 DNS runtime 自动接入或订阅**；需有可信的 bootstrap pin revision/变更事件来源，而不是由未受验证的调用者提供任意数值。仍需真实数据面验证动态代理在查询中途切换时的失效与回滚；旧 legacy 路径继续完全独立。

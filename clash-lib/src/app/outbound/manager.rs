@@ -2324,6 +2324,212 @@ ip: not-an-ip
         }
     }
 
+    /// This wire mock deliberately has no client-side NetworkPathSource.
+    /// Its path IDs are synthetic and only exercise the manager/transport
+    /// guard; they do not claim any OS socket egress or DNS wire activity.
+    struct S04baaObservedWire {
+        status: crate::proxy::utils::SharedNetworkStatus,
+        calls: Arc<AtomicUsize>,
+        switch_epoch: bool,
+        fail_after_switch: bool,
+        entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        resume: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait]
+    impl crate::app::dns::execution::DnsStrictTransport for S04baaObservedWire {
+        async fn exchange(
+            &self,
+            _: &crate::app::dns::config::NameServer,
+            _: AnyOutboundHandler,
+            _: &hickory_proto::op::Message,
+        ) -> io::Result<hickory_proto::op::Message> {
+            panic!("evidence-required DNS cannot downgrade to unchecked exchange")
+        }
+    }
+
+    #[async_trait]
+    impl crate::app::dns::bootstrap_socket::DnsStrictSocketPathTransport
+        for S04baaObservedWire
+    {
+        async fn exchange_with_socket_evidence(
+            &self,
+            _: &crate::app::dns::config::NameServer,
+            _: AnyOutboundHandler,
+            request: &hickory_proto::op::Message,
+        ) -> io::Result<(
+            hickory_proto::op::Message,
+            crate::app::dns::bootstrap_socket::StrictDnsSocketPathEvidence,
+        )> {
+            use crate::app::dns::bootstrap_socket::StrictDnsSocketPathEvidence;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(entered) = self.entered.lock().unwrap().take() {
+                let _ = entered.send(());
+            }
+            if let Some(resume) = self.resume.lock().await.take() {
+                let _ = resume.await;
+            }
+            if self.switch_epoch {
+                let mut network = self.status.write().await;
+                let (_, candidates, _, _) = network
+                    .path_planning_snapshot()
+                    .expect("fixture must have observed candidates");
+                network.observed(&NetworkSnapshot {
+                    dns: "s04baa-network-switch".into(),
+                    path_candidates: candidates,
+                    ..Default::default()
+                });
+            }
+            if self.fail_after_switch {
+                return Err(io::Error::other(
+                    "synthetic upstream transport failure",
+                ));
+            }
+            let current =
+                self.status.read().await.strict_dns_generations().unwrap().0;
+            let (raw, _) = tokio::io::duplex(64);
+            let stream: crate::app::dispatcher::BoxedChainedStream = Box::new(
+                crate::app::dispatcher::ChainedStreamWrapper::new_with_network_path_ids(
+                    raw, vec![s04bm_path(current)],
+                ),
+            );
+            let evidence = StrictDnsSocketPathEvidence::from_stream(&stream)?;
+            let mut response = hickory_proto::op::Message::response(
+                request.metadata.id,
+                hickory_proto::op::OpCode::Query,
+            );
+            response.add_queries(request.queries.iter().cloned());
+            Ok((response, evidence))
+        }
+    }
+
+    #[tokio::test]
+    async fn s04baa_manager_evidence_adapter_binds_begin_and_end_epoch_without_client_observer()
+     {
+        use crate::app::dns::bootstrap_socket::StrictDnsEvidenceCheckedTransport;
+        for (switch_epoch, fail_after_switch) in
+            [(false, false), (true, false), (true, true)]
+        {
+            let (manager, status, _guard, execution, request) =
+                s04bl_fixture().await;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let wire = S04baaObservedWire {
+                status: status.clone(),
+                calls: calls.clone(),
+                switch_epoch,
+                fail_after_switch,
+                entered: std::sync::Mutex::new(None),
+                resume: tokio::sync::Mutex::new(None),
+            };
+            let checked =
+                StrictDnsEvidenceCheckedTransport::new(&wire, &manager, &status);
+            // No outer leased guard in this focused test: the adapter must
+            // independently detect in-flight changes, even when the wire
+            // returns valid *new-epoch* socket IDs.
+            let result = execution.exchange(&checked, &request).await;
+            if switch_epoch {
+                let error =
+                    result.expect_err("network update must prevent proof handoff");
+                assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+                assert!(
+                    error
+                        .to_string()
+                        .contains("during socket-evidence exchange")
+                );
+            } else {
+                assert_eq!(result.unwrap().queries, request.queries);
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "never retry with another DNS server after epoch mismatch"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn s04baa_cancelled_evidence_exchange_releases_registry_lease() {
+        for abort_directly in [false, true] {
+            let (manager, status, guard, execution, request) = s04bl_fixture().await;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (_release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let wire = S04baaObservedWire {
+                status,
+                calls: calls.clone(),
+                switch_epoch: false,
+                fail_after_switch: false,
+                entered: std::sync::Mutex::new(Some(entered_tx)),
+                resume: tokio::sync::Mutex::new(Some(release_rx)),
+            };
+            let task = tokio::spawn(async move {
+                if abort_directly {
+                    guard
+                        .exchange_with_socket_evidence(&execution, &wire, &request)
+                        .await
+                } else {
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(70),
+                        guard.exchange_with_socket_evidence(
+                            &execution, &wire, &request,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "strict DNS test deadline expired",
+                        )
+                    })?
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(3), entered_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            let registry = manager.registry.clone();
+            let mut writer = tokio::spawn(async move {
+                registry.write().await.clear();
+            });
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(25),
+                    &mut writer
+                )
+                .await
+                .is_err(),
+                "active evidence attempt must hold the registry lease"
+            );
+            if abort_directly {
+                task.abort();
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_secs(3), task)
+                        .await
+                        .unwrap()
+                        .unwrap_err()
+                        .is_cancelled()
+                );
+            } else {
+                let error =
+                    tokio::time::timeout(std::time::Duration::from_secs(3), task)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(3), writer)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "timeout or abort must never initiate another server attempt"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn s04bm_attested_socket_path_accepts_current_connector_report() {
         let (manager, status, guard, execution, request) = s04bl_fixture().await;
