@@ -93,6 +93,6 @@ S00 **没有**实现新路径，也不能凭单测声称已有可执行的“leg
 
 默认 feature 的 handler 单测重跑在 `rustc` 连续数分钟无 CPU 活动、占用约 3.4 GB 后中断；no-default 首次尝试使用共享 `target` 时遇到旧 `displaydoc` 元数据与 Rust 1.99 不兼容及卷空间耗尽，未清理共享构建缓存。改用 `/tmp` 临时 target 后，handler 定向测试通过。`dns_config_tests` 不带 TLS provider 的 no-default 组合有 4 项依赖加密 provider 的既有测试失败；改用 `ring,port` 后 17 项通过。
 
-DNSSEC 回归用例覆盖 DO/CD/AD 与 TSIG 请求，以及 AD、RRSIG 和 TSIG 响应在需要清理附加地址时返回 SERVFAIL。若上游签名响应没有需要清理的 A/AAAA 附加地址，则保持响应不变透传。通用 DNS 错误应答目前没有 TSIG 密钥，因此需要清理时返回的 SERVFAIL 不带 TSIG；TSIG 客户端可能无法认证该错误答复，但带地址的签名响应仍会被阻止。配置兼容测试确认 YAML 缺省为 `legacy`、显式 `safe` 可解析。外部 Rust 调用方若直接构造公开 `app::dns::Config` 结构体，需要为新增字段补值；YAML 用户配置保持兼容。该增量不表示下一代 DNS 已完成：`dns.policy-rules` 仍未接入生产执行路径，S01–S06 的剩余验收项保持待办。
+DNSSEC 单元回归在 `exchange_with_resolver` helper 层覆盖 DO/CD/AD 与 TSIG 请求，以及 AD、RRSIG 和 TSIG 响应在需要清理附加地址时返回 SERVFAIL。helper 收到的签名响应若没有需要清理的 A/AAAA 附加地址，会保持 Hickory `Message` 的 wire 编码不变；该测试使用示例 TSIG 字段，不验证 MAC，也不证明生产 listener 的端到端透传。当前普通 DNS listener 会重建请求和响应，不保留 TSIG；TUN 路径虽然直接序列化 Message，resolver 仍可能改写请求 ID、ECS 或响应 EDNS Padding，且项目没有 TSIG MAC 验证或重签。因此目前不承诺端到端 TSIG 支持。通用 DNS 错误应答目前没有 TSIG 密钥，因此需要清理时返回的 SERVFAIL 不带 TSIG；TSIG 客户端可能无法认证该错误答复，但带地址的签名响应仍会被阻止。配置兼容测试确认 YAML 缺省为 `legacy`、显式 `safe` 可解析。外部 Rust 调用方若直接构造公开 `app::dns::Config` 结构体，需要为新增字段补值；YAML 用户配置保持兼容。该增量不表示下一代 DNS 已完成：`dns.policy-rules` 仍未接入生产执行路径，S01–S06 的剩余验收项保持待办。
 
 S00 原则：不改变任何 DNS 运行时决策，不删除/重命名旧字段；保护用户未提交文件。提交、审查和 CI 状态必须根据实际执行结果记录，而不是预先标成 pass。

@@ -499,7 +499,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn safe_srv_mode_preserves_signed_responses_without_glue() {
+    async fn safe_srv_exchange_helper_preserves_signed_response_without_glue() {
         let mut request = query(RecordType::SRV);
         request.signature = Some(tsig_signature(request.metadata.id));
 
@@ -526,6 +526,10 @@ mod tests {
                 "a signed response without unsafe additionals should pass through",
             );
 
+        let mut expected = srv_response(&request);
+        expected.additionals.clear();
+        expected.signature = Some(tsig_signature(request.metadata.id));
+        assert_eq!(response.to_vec().unwrap(), expected.to_vec().unwrap());
         assert_eq!(response.metadata.response_code, ResponseCode::NoError);
         assert_eq!(response.answers.len(), 1);
         assert_eq!(response.answers[0].record_type(), RecordType::SRV);
