@@ -325,6 +325,10 @@ pub(crate) struct RuntimeStatus {
     components: Vec<RuntimeComponentStatus>,
     config_version: u64,
     network_version: u64,
+    /// Strict DNS socket-proof fence. Binding probe changes intentionally do
+    /// not bump network_version, but must invalidate an in-flight DNS proof.
+    #[serde(skip)]
+    strict_dns_path_revision: u64,
     phase_since_ms: i64,
     last_observed_at_ms: Option<i64>,
     last_sample_sequence: Option<u64>,
@@ -420,6 +424,7 @@ impl Default for RuntimeStatus {
             .collect(),
             config_version: 1,
             network_version: 0,
+            strict_dns_path_revision: 0,
             phase_since_ms: now,
             last_observed_at_ms: None,
             last_sample_sequence: None,
@@ -487,6 +492,14 @@ impl RuntimeStatus {
         self.observed
             .as_ref()
             .map(|_| (self.network_version, self.config_version))
+    }
+
+    /// Monotonic strict-evidence revision, independent of `networkVersion`.
+    /// Network candidate bind probes can change without changing path
+    /// identity, so networkVersion is deliberately insufficient for proofs.
+    pub(crate) fn strict_dns_path_revision(&self) -> Option<u64> {
+        self.strict_dns_generations()
+            .map(|_| self.strict_dns_path_revision)
     }
 
     /// Refresh preference expiry and expose cache generations without copying
@@ -1010,16 +1023,34 @@ impl RuntimeStatus {
         self.lifecycle(Lifecycle::Running, "reloadFinished");
     }
     pub fn observed(&mut self, snapshot: &NetworkSnapshot) {
+        let binding_changed = self.observed.as_ref().is_some_and(|previous| {
+            previous.path_candidates.len() != snapshot.path_candidates.len()
+                || previous
+                    .path_candidates
+                    .iter()
+                    .zip(&snapshot.path_candidates)
+                    .any(|(left, right)| left.binding != right.binding)
+        });
+        let changed_network = self.observed.as_ref() != Some(snapshot);
+        if changed_network || binding_changed {
+            self.strict_dns_path_revision =
+                self.strict_dns_path_revision.saturating_add(1);
+        }
         self.path_candidates = snapshot.path_candidates.clone();
         self.path_candidates_truncated = snapshot.path_candidates_truncated;
         self.tun_candidate_exclusion = snapshot.tun_candidate_exclusion.clone();
-        if self.observed.as_ref() != Some(snapshot) {
+        if changed_network {
             self.network_version = self.network_version.saturating_add(1);
             self.observed = Some(snapshot.clone());
             self.traffic_evidence.clear();
             self.path_health.clear();
             self.destination_path_health.clear();
             self.publish_epoch();
+        } else if binding_changed {
+            // Record the new diagnostic bind state even though its physical
+            // path identity (and networkVersion) is unchanged. Replaying the
+            // same failed probe must not keep advancing strict proof revisions.
+            self.observed = Some(snapshot.clone());
         }
         self.last_observed_at_ms = Some(now_ms());
         let was_failed = self.observation_error.take().is_some();

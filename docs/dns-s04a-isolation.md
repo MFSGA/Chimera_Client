@@ -198,6 +198,13 @@ cargo test -p clash-lib --test dns_config_tests --locked
 - 两项新 `s04baa_` 离线回归：其一**刻意不通过外层 leased guard**，以合成连接路径模拟无客户端观察源的普通响应、网络在 I/O 中更新却返回“新代际有效路径”、以及更新后底层返回普通上游错误，确保跨代际两种情形都终止且仅调用一次；其二通过真实 `StrictDnsManagerLeafGuard` 暂停证据 I/O，分别用查询超时和 `abort()` 取消，验证任务被取消后此前阻塞的注册表 writer 可获得锁，且没有尝试第二个上游。合成路径仅测试软件校验边界，并非真实 OS socket 数据面证明。原有 S04b-m 路径验证、S04b-z 查询证据、配置与其他代理连接池回归保持覆盖。
 - **生产边界：** 不解除 `policy-rules` 启动门禁，不推送、不配置生产执行。可信 Provider/bootstrap pin 来源、完整递归代理链、真实多网卡切换/出接口抓包、核验链路中的硬件路由身份以及独立 L2 审查与维护者批准仍是必要前置条件。
 
+## S04b-ab：严格 DNS 绑定探测 ABA 的独立证据修订号（内部、生产门禁不变）
+
+- 识别了 `NetworkSnapshot`/`PathCandidateObservation` 的一项有意兼容语义：`binding: Verified/Failed` 与绑定诊断信息**不会改变** `networkVersion`，以避免仅因探测波动触发普通业务 TCP/UDP 连接恢复；但严格 DNS 不能据相同版本接受在查询中途经历过 `Verified → Failed → Verified` 的“恢复后”证据。`RuntimeStatus` 因此新增只在内存中保留的 `strict_dns_path_revision`：观测网络快照的路径/网络事实发生变化，或者任一候选的绑定成功/失败状态发生变化时推进；重复完全相同的观测不推进。对于仅绑定诊断变动，更新内部最近观测副本但不推进公开 `networkVersion`、不触发普通连接池重置或改变序列化 API。
+- `StrictDnsEvidenceCheckedTransport` 的**每次上游查询**现在在 Manager 代际验证之外，还在查询前后捕获并比较严格路径证据修订号；跨代际、候选变化或绑定探测 ABA 都返回 `Interrupted`，不执行第二 DNS 上游，也不降级到 DIRECT/legacy。`StrictDnsSocketPathEvidence::verify` 在验证真实 socket ID、已验证的候选路径之后再次比较同一 `(networkVersion, strict_dns_path_revision)`，防止仅凭开始/结束时相同的候选 ID 绕过曾发生的绑定失败。观察源缺失、Manager 关联不一致等仍是硬错误。普通非严格 DNS 与网络恢复代际策略不变。
+- 新增 `s04bab_` 确定性离线测试：暂停一笔合成 socket-ID 的 DNS 查询，令单个网卡候选的绑定结果先 `Verified → Failed`，重复观察同一失败结果，再恢复 `Verified`；每一步确认公开 `networkVersion` 未变化、严格修订号在**状态真实变化**时单调推进。即使上游随后返回再次有效的 socket ID，也必须被拒绝，且两台 DNS 上游仅调用首台一次。既有 S04b-aa/m 的查询前后网络换代、Provider 观察及路径证据回归同步重跑。合成的网卡身份与 socket-ID 不等于实际物理接口/出站抓包证明。
+- **限制：** 这是软件状态的证据防 ABA 检查，不能把观察器采样之间的未报告短暂链路变化视为已捕捉，也不是内核网络路径的原子锁。可信 Provider/bootstrap pin、完整逐跳拨号、真实多网卡切换/外网数据面捕获以及独立 L2 审查和维护者批准仍未完成；**生产 `policy-rules` 启动门禁继续关闭**。
+
 ## S04b/S04c 待完成的严格准入
 
 1. **真实执行接线与身份来源**：S04b-a 提供共享 RuntimeStatus 读取接口，但**尚未由生产 DNS runtime 自动接入或订阅**；需有可信的 bootstrap pin revision/变更事件来源，而不是由未受验证的调用者提供任意数值。仍需真实数据面验证动态代理在查询中途切换时的失效与回滚；旧 legacy 路径继续完全独立。

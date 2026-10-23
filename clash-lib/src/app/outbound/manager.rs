@@ -2448,6 +2448,96 @@ ip: not-an-ip
     }
 
     #[tokio::test]
+    async fn s04bab_binding_probe_aba_rejects_attested_dns_without_network_version_bump()
+     {
+        use crate::{
+            app::dns::bootstrap_socket::StrictDnsEvidenceCheckedTransport,
+            app::network::BindingStatus,
+        };
+        let (manager, status, _guard, execution, request) = s04bl_fixture().await;
+        let network_version =
+            manager.strict_dns_path_generation(&status).await.unwrap();
+        let original_revision =
+            status.read().await.strict_dns_path_revision().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let wire = S04baaObservedWire {
+            status: status.clone(),
+            calls: calls.clone(),
+            switch_epoch: false,
+            fail_after_switch: false,
+            entered: std::sync::Mutex::new(Some(entered_tx)),
+            resume: tokio::sync::Mutex::new(Some(resume_rx)),
+        };
+        let observed_manager = manager.clone();
+        let observed_status = status.clone();
+        let query = tokio::spawn(async move {
+            let checked = StrictDnsEvidenceCheckedTransport::new(
+                &wire,
+                &observed_manager,
+                &observed_status,
+            );
+            execution.exchange(&checked, &request).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut state = status.write().await;
+        let (_, mut candidates, _, _) = state.path_planning_snapshot().unwrap();
+        assert_eq!(candidates.len(), 1);
+        candidates[0].binding = BindingStatus::Failed;
+        candidates[0].binding_error = Some("transient bind error".into());
+        state.observed(&NetworkSnapshot {
+            path_candidates: candidates.clone(),
+            ..Default::default()
+        });
+        let failed_revision = state.strict_dns_path_revision().unwrap();
+        assert!(failed_revision > original_revision);
+        assert_eq!(
+            state.strict_dns_generations().unwrap().0,
+            network_version,
+            "diagnostic bind failure must not force global transport recovery"
+        );
+        state.observed(&NetworkSnapshot {
+            path_candidates: candidates.clone(),
+            ..Default::default()
+        });
+        assert_eq!(
+            state.strict_dns_path_revision().unwrap(),
+            failed_revision,
+            "an unchanged failed probe must not spuriously advance the proof revision"
+        );
+        candidates[0].binding = BindingStatus::Verified;
+        candidates[0].binding_error = None;
+        state.observed(&NetworkSnapshot {
+            path_candidates: candidates,
+            ..Default::default()
+        });
+        assert!(state.strict_dns_path_revision().unwrap() > failed_revision);
+        assert_eq!(
+            state.strict_dns_generations().unwrap().0,
+            network_version,
+            "A->B->A bind probes retain the public network version"
+        );
+        drop(state);
+        resume_tx.send(()).unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(3), query)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(error.to_string().contains("proof changed"), "{error}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a strict proof ABA violation is terminal, never a DNS retry"
+        );
+    }
+
+    #[tokio::test]
     async fn s04baa_cancelled_evidence_exchange_releases_registry_lease() {
         for abort_directly in [false, true] {
             let (manager, status, guard, execution, request) = s04bl_fixture().await;

@@ -27,6 +27,34 @@ pub(crate) struct StrictDnsSocketPathEvidence {
     paths: Vec<NetworkPathId>,
 }
 
+/// Network version intentionally ignores changing interface bind probes.
+/// Bind a strict proof to both that version and the monotonic proof revision,
+/// and verify that the manager still owns the same observed runtime. This
+/// does not make later OS routing decisions atomic with the proof check.
+async fn strict_dns_proof_epoch(
+    manager: &Arc<OutboundManager>,
+    status: &SharedNetworkStatus,
+) -> io::Result<(u64, u64)> {
+    let generation = manager.strict_dns_path_generation(status).await?;
+    let revision =
+        status
+            .read()
+            .await
+            .strict_dns_path_revision()
+            .ok_or_else(|| {
+                io::Error::other(
+                    "strict DNS proof has no active network observation",
+                )
+            })?;
+    if manager.strict_dns_path_generation(status).await? != generation {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "strict DNS network changed while capturing proof epoch",
+        ));
+    }
+    Ok((generation, revision))
+}
+
 impl StrictDnsSocketPathEvidence {
     /// Only the freshly created S04b-n DNS wire client uses this adapter;
     /// the runtime captured these IDs from its chained physical connection.
@@ -76,7 +104,8 @@ impl StrictDnsSocketPathEvidence {
         manager: &Arc<OutboundManager>,
         status: &SharedNetworkStatus,
     ) -> io::Result<()> {
-        let generation = manager.strict_dns_path_generation(status).await?;
+        let (generation, proof_revision) =
+            strict_dns_proof_epoch(manager, status).await?;
         let (snapshot_generation, observed, _, _) = status
             .write()
             .await
@@ -109,12 +138,12 @@ impl StrictDnsSocketPathEvidence {
                 )));
             }
         }
-        let completed_generation =
-            manager.strict_dns_path_generation(status).await?;
-        if completed_generation != generation {
+        if strict_dns_proof_epoch(manager, status).await?
+            != (generation, proof_revision)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
-                "strict DNS socket path generation changed during evidence verification",
+                "strict DNS path candidates or binding state changed during evidence verification",
             ));
         }
         Ok(())
@@ -185,20 +214,20 @@ impl<T: DnsStrictSocketPathTransport> DnsStrictTransport
         // The wire DNS client may not have its own NetworkPathSource.
         // Bind this *attempt* to the manager's observed epoch before sending
         // packets, not just the network that exists when the reply arrives.
-        let started_generation =
-            self.manager.strict_dns_path_generation(self.status).await?;
+        let started_epoch =
+            strict_dns_proof_epoch(self.manager, self.status).await?;
         let result = self
             .transport
             .exchange_with_socket_evidence(server, outbound, request)
             .await;
         // Check even after an upstream error: an epoch change must never
         // be mistaken for a normal DNS failure eligible for another server.
-        let completed_generation =
-            self.manager.strict_dns_path_generation(self.status).await?;
-        if completed_generation != started_generation {
+        let completed_epoch =
+            strict_dns_proof_epoch(self.manager, self.status).await?;
+        if completed_epoch != started_epoch {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
-                "strict DNS network changed during socket-evidence exchange",
+                "strict DNS network or binding proof changed during socket-evidence exchange",
             ));
         }
         let (answer, evidence) = result?;
