@@ -107,6 +107,6 @@ DNSSEC 单元回归在 `exchange_with_resolver` helper 层覆盖 DO/CD/AD 与 TS
 | `CARGO_TARGET_DIR=/Volumes/ChimeraBuild/Chimera_Client_dns_s03c_target CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo test -p clash-lib --lib --features aws-lc-rs --locked --offline app::dns::server::handler::tests` | 25 passed |
 | `cargo fmt --all -- --check`、`git diff --check` | 通过 |
 
-本地未跟踪文件和 `ref-meow` submodule 的既有改动均保持原样；本轮尚未推送。独立审查、提交 SHA 与签名核验在审查/提交阶段补记。
+本地未跟踪文件和 `ref-meow` submodule 的既有改动均保持原样。实现提交 `8e055f5e9d3bb519f0973d36430c41bf248313e4` 已通过独立 L2 审查（APPROVE，无阻断发现）；审查指出 safe SRV 请求同时带 AD 且上游返回需清理的地址附加记录时会按既有策略返回 SERVFAIL，这是已记录的 fail-closed 行为。该提交位于本地 `master`，提交时相对 `origin/master` ahead 2，尚未推送。`git verify-commit HEAD` 通过，GPG 签名有效但本地信任级别未知（`%G? = U`）；GitHub Verified 和远端 CI 未核实。
 
 S00 原则：不改变任何 DNS 运行时决策，不删除/重命名旧字段；保护用户未提交文件。提交、审查和 CI 状态必须根据实际执行结果记录，而不是预先标成 pass。
