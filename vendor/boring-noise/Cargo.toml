@@ -21,28 +21,28 @@ parking_lot = "0.12"
 tracing = "0.1.40"
 aws-lc-rs = { version = "1", optional = true }
 ring = { version = "0.17", optional = true }
-constant_time_eq = { version = "0.4", optional = true }
+constant_time_eq = { version = "0.6", optional = true }
 
-x25519-dalek = { version = "2.0.0", features = [
+x25519-dalek = { version = "3.0.0", features = [
     "reusable_secrets",
     "static_secrets",
 ] }
 rand_core = { version = "0.6.4", features = ["getrandom"] }
-chacha20poly1305 = "0.10.0-pre.1"
-aead = "0.5.0-pre.2"
-blake2 = "0.10"
-hmac = "0.12"
+chacha20poly1305 = "0.11.0"
+aead = "0.6.1"
+blake2 = "0.11"
+hmac = "0.13"
 mock_instant = { version = "0.6.0", optional = true }
 portable-atomic = "1"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.30.1", default-features = false, features = [
+nix = { version = "0.31.3", default-features = false, features = [
     "time",
     "user",
 ] }
 
 [dev-dependencies]
-etherparse = "0.13"
+etherparse = "0.21"
 
 [lib]
 crate-type = ["rlib"]
