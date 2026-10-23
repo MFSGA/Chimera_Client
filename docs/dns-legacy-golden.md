@@ -78,7 +78,7 @@ S00 **没有**实现新路径，也不能凭单测声称已有可执行的“leg
 
 ## S06a：可选安全 SRV 转发
 
-`dns.service-discovery-mode: safe` 是新加的 opt-in 设置，仅改变 Fake-IP 范围内的 SRV 查询：保留上游返回的 SRV answer（包括 target、priority、weight 和 port），移除 Additional section 中的 A/AAAA 地址。`exchange_with_resolver` helper 收到的完整请求若要求 DNSSEC、携带签名，或响应带认证/签名标志且需要移除地址时返回 SERVFAIL，避免修改已签名数据。普通 DNS listener 会转发 DO/CD，但不复制 AD/TSIG 请求字段，因此 AD-only 或 TSIG 标志不会通过该 listener 触发 helper 的请求侧检查。HTTPS/SVCB 等其他非 A/AAAA 查询继续沿用原有过滤行为。
+`dns.service-discovery-mode: safe` 是新加的 opt-in 设置，仅改变 Fake-IP 范围内的 SRV 查询：保留上游返回的 SRV answer（包括 target、priority、weight 和 port），移除 Additional section 中的 A/AAAA 地址。`exchange_with_resolver` helper 收到的完整请求若要求 DNSSEC、携带签名，或响应带认证/签名标志且需要移除地址时返回 SERVFAIL，避免修改已签名数据。普通 DNS listener 转发 DO/CD/AD 请求标志；AD-only SRV 请求需要清理地址附加记录时也会触发 SERVFAIL 保护。listener 尚未实现 TSIG 端到端透传或校验。HTTPS/SVCB 等其他非 A/AAAA 查询继续沿用原有过滤行为。
 
 默认值 `legacy` 保留 S00 行为：Fake-IP 范围内的非 A/AAAA 查询返回空答复，Fake-IP filter 排除的域名仍走原上游路径。`safe` 模式对标准 SRV QNAME `_service._protocol.domain` 使用 `domain` 匹配 Fake-IP filter，使 `*.lan` 这类规则能正确应用于服务发现；`legacy` 仍按完整 QNAME 匹配，以保留旧行为。此切片只处理 SRV response 的附加地址泄漏；它不启用 `policy-rules`，也不做 SRV/GeoDNS 自动选择。回归用例位于 `app/dns/server/handler.rs` 与 `tests/dns_config_tests.rs`。
 
@@ -93,6 +93,20 @@ S00 **没有**实现新路径，也不能凭单测声称已有可执行的“leg
 
 默认 feature 的 handler 单测重跑在 `rustc` 连续数分钟无 CPU 活动、占用约 3.4 GB 后中断；no-default 首次尝试使用共享 `target` 时遇到旧 `displaydoc` 元数据与 Rust 1.99 不兼容及卷空间耗尽，未清理共享构建缓存。改用 `/tmp` 临时 target 后，handler 定向测试通过。`dns_config_tests` 不带 TLS provider 的 no-default 组合有 4 项依赖加密 provider 的既有测试失败；改用 `ring,port` 后 17 项通过。
 
-DNSSEC 单元回归在 `exchange_with_resolver` helper 层覆盖 DO/CD/AD 与 TSIG 请求，以及 AD、RRSIG 和 TSIG 响应在需要清理附加地址时返回 SERVFAIL。helper 收到的签名响应若没有需要清理的 A/AAAA 附加地址，会保持 Hickory `Message` 的 wire 编码不变；该测试使用示例 TSIG 字段，不验证 MAC，也不证明生产 listener 的端到端透传。当前普通 DNS listener 会重建请求和响应，不保留 AD 查询位或 TSIG；TUN 路径虽然直接序列化 Message，resolver 仍可能改写请求 ID、ECS 或响应 EDNS Padding，且项目没有 TSIG MAC 验证或重签。因此目前不承诺端到端 TSIG 支持。通用 DNS 错误应答目前没有 TSIG 密钥，因此需要清理时返回的 SERVFAIL 不带 TSIG；TSIG 客户端可能无法认证该错误答复，但带地址的签名响应仍会被阻止。配置兼容测试确认 YAML 缺省为 `legacy`、显式 `safe` 可解析。外部 Rust 调用方若直接构造公开 `app::dns::Config` 结构体，需要为新增字段补值；YAML 用户配置保持兼容。该增量不表示下一代 DNS 已完成：`dns.policy-rules` 仍未接入生产执行路径，S01–S06 的剩余验收项保持待办。
+DNSSEC 单元回归在 `exchange_with_resolver` helper 层覆盖 DO/CD/AD 与 TSIG 请求，以及 AD、RRSIG 和 TSIG 响应在需要清理附加地址时返回 SERVFAIL。helper 收到的签名响应若没有需要清理的 A/AAAA 附加地址，会保持 Hickory `Message` 的 wire 编码不变；该测试使用示例 TSIG 字段，不验证 MAC。DNS listener 的回归测试通过真实 UDP 请求确认 AD-only SRV 请求位会送达 exchanger；响应清理仍由 helper 单测覆盖。listener 和 TUN 路径均未实现 TSIG MAC 验证或重签，也不承诺端到端 TSIG 支持。通用 DNS 错误应答目前没有 TSIG 密钥，因此需要清理时返回的 SERVFAIL 不带 TSIG；TSIG 客户端可能无法认证该错误答复，但带地址的签名响应仍会被阻止。配置兼容测试确认 YAML 缺省为 `legacy`、显式 `safe` 可解析。外部 Rust 调用方若直接构造公开 `app::dns::Config` 结构体，需要为新增字段补值；YAML 用户配置保持兼容。该增量不表示下一代 DNS 已完成：`dns.policy-rules` 仍未接入生产执行路径，S01–S06 的剩余验收项保持待办。
+
+## S06b：普通 DNS listener 保留 AD 请求位
+
+**基线与范围**：本地 `master` 开工于 `493bd400a2b89cd2c354406fce7890490a353bb9`，`origin/master` 为 `0f498f6add689196b7623bd5cfe0131477c4d1fe`；`ref/` 为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`，`ref-mihomo/` 为 `63bd52ec794b7051569b76ede2f6cdbf4c091fda`。目标是让普通 UDP/TCP listener 重建请求时保留 AD 位，使 S06a safe SRV 的 DNSSEC fail-closed 判定覆盖 AD-only 客户端请求。仅调整 `clash-dns` 请求元数据转发和相应回归，不改变 `legacy` 默认、SRV 数据或上游选择；TSIG 端到端支持不在本切片范围内。
+
+**结果**：`DnsHandler` 现在将 `request.metadata.authentic_data` 复制到交给 resolver 的 `Message`。真实 UDP 回归发送 AD-only SRV 问题，并验证 exchanger 收到该位后返回的 SERVFAIL 被传给客户端。底层 helper 的 25 项 DNS handler 用例继续验证：存在需要清理的 A/AAAA 附加地址时，DNSSEC/签名请求和响应均 fail closed。
+
+| 验证命令 | 结果 |
+|---|---|
+| `CARGO_TARGET_DIR=/Volumes/ChimeraBuild/Chimera_Client_dns_s03c_target CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo test -p chimera-dns --no-default-features --locked --offline` | 4 passed；含 AD-only SRV UDP listener 回归 |
+| `CARGO_TARGET_DIR=/Volumes/ChimeraBuild/Chimera_Client_dns_s03c_target CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo test -p clash-lib --lib --features aws-lc-rs --locked --offline app::dns::server::handler::tests` | 25 passed |
+| `cargo fmt --all -- --check`、`git diff --check` | 通过 |
+
+本地未跟踪文件和 `ref-meow` submodule 的既有改动均保持原样；本轮尚未推送。独立审查、提交 SHA 与签名核验在审查/提交阶段补记。
 
 S00 原则：不改变任何 DNS 运行时决策，不删除/重命名旧字段；保护用户未提交文件。提交、审查和 CI 状态必须根据实际执行结果记录，而不是预先标成 pass。

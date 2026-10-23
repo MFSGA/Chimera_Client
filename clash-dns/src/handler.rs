@@ -168,6 +168,7 @@ where
             request.metadata.op_code,
         );
         m.metadata.recursion_desired = request.metadata.recursion_desired;
+        m.metadata.authentic_data = request.metadata.authentic_data;
         m.metadata.checking_disabled = request.metadata.checking_disabled;
         m.add_query(query.original().clone());
         m.add_additionals(request.additionals.iter().cloned());
@@ -709,6 +710,69 @@ mod plain_tests {
         let tcp_edns = tcp_response.edns.as_ref().expect("EDNS should be echoed");
         assert_eq!(tcp_edns.max_payload(), 1232);
         assert!(tcp_edns.flags().dnssec_ok);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn srv_dnssec_ad_bit_is_forwarded_to_exchanger() -> anyhow::Result<()> {
+        let mut mock_exchanger = MockDnsMessageExchanger::new();
+        mock_exchanger.expect_ipv6().returning(|| false);
+        mock_exchanger
+            .expect_exchange()
+            .once()
+            .returning(|request| {
+                let mut response =
+                    Message::response(request.metadata.id, request.metadata.op_code);
+                response.metadata.response_code = if request.metadata.authentic_data
+                {
+                    ResponseCode::ServFail
+                } else {
+                    ResponseCode::NoError
+                };
+                response.add_queries(request.queries.iter().cloned());
+                async move { Ok(response) }.boxed()
+            });
+
+        let udp_sock = UdpSocket::bind("127.0.0.1:0").await?;
+        let udp_addr = udp_sock.local_addr()?;
+        drop(udp_sock);
+
+        let listener = super::get_dns_listener(
+            DNSListenAddr {
+                udp: Some(udp_addr),
+                ..Default::default()
+            },
+            mock_exchanger,
+            std::path::Path::new("."),
+        )
+        .await
+        .expect("UDP DNS listener should start");
+        let handle: JoinHandle<Result<(), crate::DNSError>> = tokio::spawn(listener);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let request_id = 0x5a06;
+        let mut query = Message::new(request_id, MessageType::Query, OpCode::Query);
+        query.metadata.authentic_data = true;
+        query.add_query(Query::query(
+            Name::from_ascii("_minecraft._tcp.play.example.")?,
+            RecordType::SRV,
+        ));
+        let query = query.to_vec()?;
+
+        let udp_client = UdpSocket::bind("127.0.0.1:0").await?;
+        udp_client.send_to(&query, udp_addr).await?;
+        let mut udp_response = [0; 512];
+        let (udp_len, _) = tokio::time::timeout(
+            Duration::from_secs(2),
+            udp_client.recv_from(&mut udp_response),
+        )
+        .await??;
+        let udp_response = Message::from_vec(&udp_response[..udp_len])?;
+
+        assert_eq!(udp_response.metadata.id, request_id);
+        assert_eq!(udp_response.metadata.response_code, ResponseCode::ServFail);
 
         handle.abort();
         Ok(())
