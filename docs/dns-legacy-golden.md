@@ -87,11 +87,12 @@ S00 **没有**实现新路径，也不能凭单测声称已有可执行的“leg
 | 命令 | 结果 |
 |---|---|
 | `cargo fmt --all -- --check`、`git diff --check` | 通过 |
-| `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo test -p clash-lib --lib app::dns::server::handler::tests --locked --offline` | 24 passed |
-| `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo test -p clash-lib --test dns_config_tests --locked --offline` | 17 passed |
-| `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo test -p clash-lib --test dns_legacy_golden_tests --locked --offline` | 11 passed |
-| `CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 cargo check -p clash-lib --no-default-features --locked --offline` | 通过 |
+| `CARGO_TARGET_DIR=/tmp/chimera-dns-review-target CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo test -p clash-lib --lib --no-default-features --locked --offline app::dns::server::handler::tests` | 25 passed |
+| `CARGO_TARGET_DIR=/tmp/chimera-dns-review-target CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo test -p clash-lib --no-default-features --features ring,port --test dns_config_tests --locked --offline` | 17 passed |
+| `CARGO_TARGET_DIR=/tmp/chimera-dns-review-target CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo test -p clash-lib --no-default-features --features ring,port --test dns_legacy_golden_tests --locked --offline` | 11 passed |
 
-DNSSEC 回归用例覆盖 DO/CD/AD 与 TSIG 请求，以及 AD、RRSIG 和 TSIG 响应在需要清理附加地址时返回 SERVFAIL。通用 DNS 错误应答目前没有 TSIG 密钥，因此这类 SERVFAIL 不带 TSIG；TSIG 客户端可能无法认证错误答复，但带地址的签名响应仍会被阻止。配置兼容测试确认 YAML 缺省为 `legacy`、显式 `safe` 可解析。外部 Rust 调用方若直接构造公开 `app::dns::Config` 结构体，需要为新增字段补值；YAML 用户配置保持兼容。该增量不表示下一代 DNS 已完成：`dns.policy-rules` 仍未接入生产执行路径，S01–S06 的剩余验收项保持待办。
+默认 feature 的 handler 单测重跑在 `rustc` 连续数分钟无 CPU 活动、占用约 3.4 GB 后中断；no-default 首次尝试使用共享 `target` 时遇到旧 `displaydoc` 元数据与 Rust 1.99 不兼容及卷空间耗尽，未清理共享构建缓存。改用 `/tmp` 临时 target 后，handler 定向测试通过。`dns_config_tests` 不带 TLS provider 的 no-default 组合有 4 项依赖加密 provider 的既有测试失败；改用 `ring,port` 后 17 项通过。
+
+DNSSEC 回归用例覆盖 DO/CD/AD 与 TSIG 请求，以及 AD、RRSIG 和 TSIG 响应在需要清理附加地址时返回 SERVFAIL。若上游签名响应没有需要清理的 A/AAAA 附加地址，则保持响应不变透传。通用 DNS 错误应答目前没有 TSIG 密钥，因此需要清理时返回的 SERVFAIL 不带 TSIG；TSIG 客户端可能无法认证该错误答复，但带地址的签名响应仍会被阻止。配置兼容测试确认 YAML 缺省为 `legacy`、显式 `safe` 可解析。外部 Rust 调用方若直接构造公开 `app::dns::Config` 结构体，需要为新增字段补值；YAML 用户配置保持兼容。该增量不表示下一代 DNS 已完成：`dns.policy-rules` 仍未接入生产执行路径，S01–S06 的剩余验收项保持待办。
 
 S00 原则：不改变任何 DNS 运行时决策，不删除/重命名旧字段；保护用户未提交文件。提交、审查和 CI 状态必须根据实际执行结果记录，而不是预先标成 pass。

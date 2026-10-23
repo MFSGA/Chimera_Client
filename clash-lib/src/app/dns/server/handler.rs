@@ -148,6 +148,8 @@ fn strip_unsafe_srv_additionals(req: &Message, mut response: Message) -> Message
         matches!(record.record_type(), RecordType::A | RecordType::AAAA)
     });
     if !has_address_additional {
+        // Signed messages must pass through untouched when there is nothing
+        // to sanitize; changing their sections would invalidate signatures.
         return response;
     }
 
@@ -477,6 +479,60 @@ mod tests {
         response
     }
 
+    // These fixtures exercise TSIG-message preservation, not MAC verification.
+    fn tsig_signature(
+        id: u16,
+    ) -> Box<hickory_proto::rr::Record<hickory_proto::rr::rdata::TSIG>> {
+        Box::new(hickory_proto::rr::Record::from_rdata(
+            Name::from_ascii("key.example.").unwrap(),
+            0,
+            hickory_proto::rr::rdata::TSIG::new(
+                hickory_proto::rr::rdata::tsig::TsigAlgorithm::HmacSha256,
+                1,
+                300,
+                vec![1],
+                id,
+                None,
+                vec![],
+            ),
+        ))
+    }
+
+    #[tokio::test]
+    async fn safe_srv_mode_preserves_signed_responses_without_glue() {
+        let mut request = query(RecordType::SRV);
+        request.signature = Some(tsig_signature(request.metadata.id));
+
+        let mut resolver = MockClashResolver::new();
+        resolver.expect_ipv6().return_const(false);
+        resolver.expect_safe_srv_enabled().return_const(true);
+        resolver.expect_fake_ip_enabled().return_const(true);
+        resolver
+            .expect_should_fake_ip()
+            .with(mockall::predicate::eq("example.com"))
+            .once()
+            .return_const(true);
+        resolver.expect_exchange().once().returning(|request| {
+            let mut response = srv_response(request);
+            response.additionals.clear();
+            response.signature = Some(tsig_signature(request.metadata.id));
+            Ok(response)
+        });
+
+        let resolver: ThreadSafeDNSResolver = Arc::new(resolver);
+        let response = exchange_with_resolver(&resolver, &request, true)
+            .await
+            .expect(
+                "a signed response without unsafe additionals should pass through",
+            );
+
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(response.answers.len(), 1);
+        assert_eq!(response.answers[0].record_type(), RecordType::SRV);
+        assert!(response.additionals.is_empty());
+        assert!(response.signature.is_some());
+    }
+
     #[tokio::test]
     async fn safe_srv_mode_preserves_srv_answer_and_removes_address_additionals() {
         let request = query(RecordType::SRV);
@@ -553,21 +609,7 @@ mod tests {
                 "checking-disabled" => request.metadata.checking_disabled = true,
                 "authenticated-data" => request.metadata.authentic_data = true,
                 "tsig" => {
-                    request.signature = Some(Box::new(
-                        hickory_proto::rr::Record::from_rdata(
-                            Name::from_ascii("key.example.").unwrap(),
-                            0,
-                            hickory_proto::rr::rdata::TSIG::new(
-                                hickory_proto::rr::rdata::tsig::TsigAlgorithm::HmacSha256,
-                                1,
-                                300,
-                                vec![1],
-                                request.metadata.id,
-                                None,
-                                vec![],
-                            ),
-                        ),
-                    ));
+                    request.signature = Some(tsig_signature(request.metadata.id));
                 }
                 _ => unreachable!("test case is defined in the fixed list"),
             }
@@ -642,41 +684,22 @@ mod tests {
                 .with(mockall::predicate::eq("example.com"))
                 .once()
                 .return_const(true);
-            resolver
-                .expect_exchange()
-                .once()
-                .returning(move |request| {
-                    let mut response = srv_response(request);
-                    if use_message_signature {
-                        response.signature = Some(Box::new(
-                            hickory_proto::rr::Record::from_rdata(
-                                Name::from_ascii("key.example.").unwrap(),
-                                0,
-                                hickory_proto::rr::rdata::TSIG::new(
-                                    hickory_proto::rr::rdata::tsig::TsigAlgorithm::HmacSha256,
-                                    1,
-                                    300,
-                                    vec![1],
-                                    request.metadata.id,
-                                    None,
-                                    vec![],
-                                ),
-                            ),
-                        ));
-                    } else {
-                        response.add_additional(
-                            hickory_proto::rr::Record::from_rdata(
-                                request.queries[0].name().clone(),
-                                60,
-                                hickory_proto::rr::RData::Unknown {
-                                    code: RecordType::RRSIG,
-                                    rdata: hickory_proto::rr::rdata::NULL::with(vec![1]),
-                                },
-                            ),
-                        );
-                    }
-                    Ok(response)
-                });
+            resolver.expect_exchange().once().returning(move |request| {
+                let mut response = srv_response(request);
+                if use_message_signature {
+                    response.signature = Some(tsig_signature(request.metadata.id));
+                } else {
+                    response.add_additional(hickory_proto::rr::Record::from_rdata(
+                        request.queries[0].name().clone(),
+                        60,
+                        hickory_proto::rr::RData::Unknown {
+                            code: RecordType::RRSIG,
+                            rdata: hickory_proto::rr::rdata::NULL::with(vec![1]),
+                        },
+                    ));
+                }
+                Ok(response)
+            });
 
             let resolver: ThreadSafeDNSResolver = Arc::new(resolver);
             let response = exchange_with_resolver(&resolver, &request, true)
