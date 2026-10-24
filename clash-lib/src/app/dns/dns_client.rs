@@ -1764,7 +1764,7 @@ async fn dns_stream_builder(
     outbound_resolver: Option<Arc<dyn ClashResolver>>,
     rule_dispatch: Option<Arc<RuleDispatch>>,
     network_path_source: Option<NetworkPathSource>,
-    #[cfg(test)] tls_root_store: Option<Arc<rustls::RootCertStore>>,
+    #[cfg(test)] _tls_root_store: Option<Arc<rustls::RootCertStore>>,
     selected_path: SharedDnsPathUse,
 ) -> Result<(client::Client<DnsRuntimeProvider>, JoinHandle<()>), Error> {
     let dns_resolver: Arc<dyn ClashResolver> = match outbound_resolver {
@@ -1817,7 +1817,7 @@ async fn dns_stream_builder(
         DnsConfig::Tls(addr, host, iface, proxy, fw_mark) => {
             #[cfg(test)]
             let tls_root_store =
-                tls_root_store.unwrap_or_else(|| GLOBAL_ROOT_STORE.clone());
+                _tls_root_store.unwrap_or_else(|| GLOBAL_ROOT_STORE.clone());
             #[cfg(not(test))]
             let tls_root_store = GLOBAL_ROOT_STORE.clone();
             let mut tls_config = ClientConfig::builder()
@@ -1859,7 +1859,7 @@ async fn dns_stream_builder(
         DnsConfig::Https(addr, host, path, iface, proxy, fw_mark) => {
             #[cfg(test)]
             let tls_root_store =
-                tls_root_store.unwrap_or_else(|| GLOBAL_ROOT_STORE.clone());
+                _tls_root_store.unwrap_or_else(|| GLOBAL_ROOT_STORE.clone());
             #[cfg(not(test))]
             let tls_root_store = GLOBAL_ROOT_STORE.clone();
             let mut tls_config = ClientConfig::builder()

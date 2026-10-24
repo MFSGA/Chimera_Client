@@ -764,5 +764,12 @@ lifecycle tests.
 
 - 基线：本地 `master` `4716c6f81365b0076e11d99c5d7f7709edbdc62b`。本项仅增加单元测试与测试专用时间推进辅助，不改变生产 handler/API 行为。
 - 新增 `expired_path_decision_is_not_found_and_absent_from_list`：先写入有效 Explain 记录，再通过测试辅助将其单调存储时刻推进到 TTL 之外；直接调用单条 Controller handler 断言返回 404 和过期说明，再调用列表 handler 确认该记录已被清理。测试分别覆盖过期后的单条和列表语义，但未通过完整 HTTP router 请求。
-- 默认 `clash-lib` 库测试为 977 passed、0 failed、12 ignored；显式全 Rust feature 库测试为 1150 passed、0 failed、12 ignored；Dashboard 外全目标严格 Clippy `-D warnings` 通过；`cargo fmt --all -- --check` 与 `git diff --check` 通过。`--no-default-features` 的单测构建被既有 `dns_client.rs` 测试参数 `unused_variables`（warnings deny）阻断；无默认 feature 的非测试 `cargo check` 已在前一切片通过，此处仍待单独处理该测试构建问题。
+- 默认 `clash-lib` 库测试为 977 passed、0 failed、12 ignored；显式全 Rust feature 库测试为 1150 passed、0 failed、12 ignored；Dashboard 外全目标严格 Clippy `-D warnings` 通过；`cargo fmt --all -- --check` 与 `git diff --check` 通过。初次 `--no-default-features` 单测构建被既有 `dns_client.rs` 测试参数 `unused_variables`（warnings deny）阻断；后续修复和受支持最小 feature 组合验证见下节。
 - 这补足过期条目清理后的 handler 错误映射和列表排除证据；没有更改 Controller wire/API 结构，完整 HTTP router 的 TTL 过期请求仍待验证。
+
+### 2026-10-24：DNS 测试最小 feature 组合
+
+- 基线：本地 `master` `64f881cd509bfefc2841675a4c28b6989b0f1cf1`。`dns_stream_builder` 的测试根证书参数只会在 `aws-lc-rs` 或 `ring` 启用的 TLS 分支中读取；将参数命名为 `_tls_root_store` 保留原分支行为，同时让无 TLS backend 的 `cfg(test)` 编译通过。没有改变生产逻辑。
+- 定向 `--no-default-features` Explain 过期 handler 测试为 1 passed。完整的零 feature 库测试可编译，但 22 个既有测试失败：它们无条件要求加密 DNS/TLS provider 或 TUN 能力；该组合不能代表功能测试的有效最小支持集。显式 `ring,tun,port` 组合的完整库单测为 786 passed、0 failed、12 ignored。
+- 验证使用独立 `/tmp` target（本仓库 `target` 链接到的测试盘只剩 33 MiB，第一次编译因盘满退出；未清理或改动该用户 target）。复现命令：`CARGO_TARGET_DIR=/tmp/chimera-client-no-default-target CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo test -p clash-lib --lib --no-default-features --features ring,tun,port --locked -j 6`。格式检查及 `git diff --check` 通过。
+- 尚未做完整零 feature 测试分支的 cfg 整理；下一步应按 TLS、TUN 等 feature 为依赖这些能力的测试加精确条件，或清楚记录其不属于受支持的测试组合，避免把功能被关闭误报成运行时回归。
