@@ -1,6 +1,7 @@
 #![cfg(feature = "anytls")]
 
 use clash_lib::{Config, Options};
+use http_body_util::BodyExt;
 use std::{
     net::{SocketAddr, TcpListener as StdTcpListener},
     path::PathBuf,
@@ -27,7 +28,7 @@ fn available_listener_ports() -> [u16; 4] {
     reservations.map(|listener| listener.local_addr().unwrap().port())
 }
 
-fn start_anytls_pair() -> (ClashInstance, ClashInstance, u16) {
+fn start_anytls_pair() -> (ClashInstance, ClashInstance, u16, u16) {
     let [server_api, anytls_port, client_api, socks_port] =
         available_listener_ports();
     // Keep the strict protocol assertions, but reveal the actual failing stage
@@ -108,7 +109,86 @@ rules:
     .expect("failed to start AnyTLS client");
     wait_port_ready(socks_port).expect("AnyTLS client SOCKS listener not ready");
 
-    (server, client, socks_port)
+    (server, client, socks_port, client_api)
+}
+
+async fn get_api_json(api_port: u16, path: &str) -> serde_json::Value {
+    let url = format!("http://127.0.0.1:{api_port}{path}");
+    let request = hyper::Request::builder()
+        .uri(&url)
+        .header(http::header::AUTHORIZATION, "Bearer clash-rs")
+        .method(http::Method::GET)
+        .body(http_body_util::Empty::<bytes::Bytes>::new())
+        .expect("failed to build API GET request");
+    let response = common::send_http_request(url.parse().unwrap(), request)
+        .await
+        .expect("failed to send API GET request");
+    assert_eq!(response.status(), http::StatusCode::OK, "GET {path}");
+    let body = response
+        .collect()
+        .await
+        .expect("failed to collect API GET response")
+        .to_bytes();
+    serde_json::from_slice(&body).expect("failed to parse API GET JSON")
+}
+
+async fn assert_connected_flow_explain(
+    api_port: u16,
+    protocol: &str,
+    target_port: u16,
+    outbound: &str,
+) {
+    let (flow, decision) = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let flows = get_api_json(api_port, "/flows?include_closed=true").await;
+            if let Some(flow) = flows.as_array().and_then(|records| {
+                records.iter().find(|flow| {
+                    flow["protocol"] == protocol
+                        && flow["dstPort"].as_u64() == Some(u64::from(target_port))
+                        && flow["flowIds"]
+                            .as_array()
+                            .is_some_and(|ids| !ids.is_empty())
+                })
+            }) {
+                let flow = flow.clone();
+                let flow_ids = flow["flowIds"]
+                    .as_array()
+                    .expect("tracked AnyTLS flow should expose IDs");
+                let decisions =
+                    get_api_json(api_port, "/runtime/network/path-decisions").await;
+                if let Some(decision) = decisions.as_array().and_then(|records| {
+                    records.iter().find(|decision| {
+                        flow_ids.iter().any(|id| id == &decision["flowId"])
+                            && decision["outcome"] == "connected"
+                            && decision["route"]["outbound"] == outbound
+                    })
+                }) {
+                    break (flow, decision.clone());
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("AnyTLS Flow did not produce a connected Explain record");
+
+    let flow_ids = flow["flowIds"]
+        .as_array()
+        .expect("tracked AnyTLS flow should expose IDs");
+    assert!(
+        flow_ids
+            .iter()
+            .any(|flow_id| flow_id == &decision["flowId"])
+    );
+    let flow_id = decision["flowId"]
+        .as_str()
+        .expect("AnyTLS Explain record should expose a flow ID");
+    let detail = get_api_json(
+        api_port,
+        &format!("/runtime/network/path-decision/{flow_id}"),
+    )
+    .await;
+    assert_eq!(detail, decision);
 }
 
 async fn socks5_connect(proxy_port: u16, target_port: u16) -> TcpStream {
@@ -212,7 +292,7 @@ async fn integration_test_anytls_tcp() {
         stream.shutdown().await.unwrap();
     });
 
-    let (_server, _client, socks_port) = start_anytls_pair();
+    let (_server, _client, socks_port, api_port) = start_anytls_pair();
     let mut stream = socks5_connect(socks_port, target_port).await;
     stream
         .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
@@ -229,6 +309,8 @@ async fn integration_test_anytls_tcp() {
     let response = String::from_utf8_lossy(&response);
     assert!(response.starts_with("HTTP/1.1 200 OK"));
     assert!(response.ends_with("anytls-roundtrip"));
+    assert_connected_flow_explain(api_port, "tcp", target_port, "anytls-simple")
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -247,7 +329,7 @@ async fn integration_test_anytls_udp() {
         echo.send_to(&buf[..len], peer).await.unwrap();
     });
 
-    let (_server, _client, socks_port) = start_anytls_pair();
+    let (_server, _client, socks_port, api_port) = start_anytls_pair();
     let (_control, relay_addr) = socks5_udp_associate(socks_port).await;
     let payload = b"anytls-udp-roundtrip";
     let echo_ip = match echo_addr.ip() {
@@ -284,4 +366,11 @@ async fn integration_test_anytls_udp() {
 
     assert!(len >= 10, "SOCKS5 UDP response header is truncated");
     assert_eq!(&response[10..len], payload);
+    assert_connected_flow_explain(
+        api_port,
+        "udp",
+        echo_addr.port(),
+        "anytls-simple",
+    )
+    .await;
 }
