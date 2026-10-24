@@ -349,7 +349,7 @@ pub(crate) struct RuntimeStatus {
     #[serde(skip)]
     temporary_path_priority: Option<TemporaryPathPriority>,
     #[serde(skip)]
-    path_decisions: VecDeque<crate::app::flow::PathDecisionRecord>,
+    path_decisions: VecDeque<StoredPathDecision>,
     rejected_stale_results: u64,
     #[serde(serialize_with = "serialize_counter")]
     dropped_evidence: Arc<AtomicU64>,
@@ -368,6 +368,12 @@ struct TemporaryPathPriority {
     created_at_ms: i64,
     expires_at_ms: i64,
     expires_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct StoredPathDecision {
+    decision: crate::app::flow::PathDecisionRecord,
+    stored_at: Instant,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -821,11 +827,14 @@ impl RuntimeStatus {
             return false;
         }
         self.path_decisions
-            .retain(|existing| existing.flow_id != decision.flow_id);
+            .retain(|existing| existing.decision.flow_id != decision.flow_id);
         if self.path_decisions.len() >= 256 {
             self.path_decisions.pop_front();
         }
-        self.path_decisions.push_back(decision);
+        self.path_decisions.push_back(StoredPathDecision {
+            decision,
+            stored_at: Instant::now(),
+        });
         true
     }
 
@@ -836,22 +845,25 @@ impl RuntimeStatus {
         self.expire_path_decisions();
         self.path_decisions
             .iter()
-            .find(|decision| decision.flow_id == flow_id)
-            .cloned()
+            .find(|stored| stored.decision.flow_id == flow_id)
+            .map(|stored| stored.decision.clone())
     }
 
     pub(crate) fn path_decisions_snapshot(
         &mut self,
     ) -> Vec<crate::app::flow::PathDecisionRecord> {
         self.expire_path_decisions();
-        self.path_decisions.iter().rev().cloned().collect()
+        self.path_decisions
+            .iter()
+            .rev()
+            .map(|stored| stored.decision.clone())
+            .collect()
     }
 
     fn expire_path_decisions(&mut self) {
-        let now = now_ms();
-        self.path_decisions.retain(|decision| {
-            now.saturating_sub(decision.recorded_at_ms)
-                < HEALTH_ENTRY_TTL.as_millis() as i64
+        let now = Instant::now();
+        self.path_decisions.retain(|stored| {
+            now.saturating_duration_since(stored.stored_at) < HEALTH_ENTRY_TTL
         });
     }
 
@@ -1962,14 +1974,27 @@ mod tests {
         assert_eq!(json["configVersion"], state.config_version);
         assert_eq!(json["operationId"], state.generation);
 
-        let mut stale = decision;
+        let mut stale = decision.clone();
         stale.flow_id = uuid::Uuid::new_v4();
         stale.network_version += 1;
         assert!(!state.record_path_decision(stale));
 
-        state.path_decisions[0].recorded_at_ms =
-            now_ms() - HEALTH_ENTRY_TTL.as_millis() as i64 - 1;
+        state.path_decisions[0].decision.recorded_at_ms =
+            now_ms() + HEALTH_ENTRY_TTL.as_millis() as i64 * 2;
+        state.path_decisions[0].stored_at =
+            Instant::now() - HEALTH_ENTRY_TTL - Duration::from_millis(1);
         assert!(state.path_decision(flow_id).is_none());
+
+        let mut clock_skewed = decision;
+        clock_skewed.flow_id = uuid::Uuid::new_v4();
+        clock_skewed.recorded_at_ms =
+            now_ms() - HEALTH_ENTRY_TTL.as_millis() as i64 * 2;
+        clock_skewed.network_version = state.network_version;
+        assert!(state.record_path_decision(clock_skewed.clone()));
+        assert_eq!(
+            state.path_decision(clock_skewed.flow_id),
+            Some(clock_skewed)
+        );
     }
 
     #[test]
