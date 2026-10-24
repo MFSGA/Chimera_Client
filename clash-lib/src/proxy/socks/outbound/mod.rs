@@ -317,6 +317,251 @@ impl OutboundHandler for Handler {
     }
 }
 
+#[cfg(all(test, feature = "tun", any(target_os = "linux", target_os = "macos")))]
+mod path_health_tests {
+    use std::{net::Ipv4Addr, sync::Arc, time::Duration};
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::mpsc,
+        time::timeout,
+    };
+
+    use super::{Handler, HandlerOptions};
+    use crate::{
+        app::{
+            dns::MockClashResolver,
+            flow::{AddressFamily, InterfaceId, InterfaceKind, NetworkPathId},
+            net::{OutboundInterface, get_interface_by_name},
+            network::{
+                BindingStatus, DefaultRouteEvidence, NetworkSnapshot, NetworkStatus,
+                PathCandidateObservation,
+            },
+            runtime_state::Lifecycle,
+        },
+        proxy::{
+            HandlerCommonOptions, OutboundHandler,
+            utils::{DirectConnector, NetworkPathSource},
+        },
+        session::{Session, SocksAddr},
+    };
+
+    #[tokio::test]
+    async fn socks5_handshake_and_target_response_keep_the_dialed_path() {
+        let loopback_name = if cfg!(target_os = "macos") {
+            "lo0"
+        } else {
+            "lo"
+        };
+        let interface = get_interface_by_name(loopback_name)
+            .expect("loopback interface should be discoverable");
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("failed to bind local SOCKS5 endpoint");
+        let endpoint = listener.local_addr().unwrap();
+
+        let mut status = NetworkStatus::default();
+        status.set_automatic_supported_for_test(true);
+        assert!(status.lifecycle(Lifecycle::Running, "test"));
+        status.observed(&NetworkSnapshot {
+            path_candidates: vec![
+                path_candidate(
+                    &interface.name,
+                    interface.index,
+                    Ipv4Addr::UNSPECIFIED,
+                    DefaultRouteEvidence::PrimaryDefaultRoute,
+                ),
+                path_candidate(
+                    &interface.name,
+                    interface.index,
+                    Ipv4Addr::LOCALHOST,
+                    DefaultRouteEvidence::OtherInterface,
+                ),
+            ],
+            ..Default::default()
+        });
+        let generation = status
+            .shadow_path_snapshot()
+            .expect("test status should expose observed loopback candidates")
+            .0;
+        let selected_path = NetworkPathId {
+            interface: InterfaceId {
+                name: interface.name.clone(),
+                index: interface.index,
+            },
+            family: AddressFamily::Ipv4,
+            source_address: Some(Ipv4Addr::LOCALHOST.into()),
+            network_generation: generation,
+        };
+
+        let (events_tx, mut events_rx) = mpsc::channel(4);
+        let reporter = status.traffic_reporter(events_tx);
+        let status = Arc::new(tokio::sync::RwLock::new(status));
+        let source = NetworkPathSource::default();
+        source.attach(status.clone()).await;
+        source.attach_traffic_reporter(reporter).await;
+        let connector = DirectConnector::with_path_source(source);
+
+        let target: SocksAddr = "203.0.113.19:443".parse().unwrap();
+        let server = tokio::spawn(async move {
+            let (rejected, _) = timeout(Duration::from_secs(3), listener.accept())
+                .await
+                .expect("timed out accepting the rejected wildcard-source attempt")
+                .expect("failed to accept the first local dial attempt");
+            drop(rejected);
+
+            let (mut stream, _) = timeout(Duration::from_secs(3), listener.accept())
+                .await
+                .expect("timed out accepting the selected-path SOCKS5 session")
+                .expect("failed to accept the selected local dial");
+            let mut greeting = [0; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.write_all(&[5, 0]).await.unwrap();
+
+            let mut request = [0; 10];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request[..4], &[5, 1, 0, 1]);
+            assert_eq!(&request[4..8], &[203, 0, 113, 19]);
+            assert_eq!(u16::from_be_bytes([request[8], request[9]]), 443);
+
+            stream
+                .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])
+                .await
+                .unwrap();
+            let mut request = [0; 14];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"target-request");
+            stream.write_all(b"R").await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let mut session = Session::default();
+        session.destination = target.clone();
+        session.iface = Some(OutboundInterface {
+            name: interface.name,
+            addr_v4: None,
+            netmask_v4: None,
+            broadcast_v4: None,
+            addr_v6: None,
+            netmask_v6: None,
+            broadcast_v6: None,
+            index: interface.index,
+            mac_addr: None,
+        });
+        let handler = Handler::new(HandlerOptions {
+            name: "local-socks5".to_owned(),
+            common_opts: HandlerCommonOptions::default(),
+            server: endpoint.ip().to_string(),
+            port: endpoint.port(),
+            user: None,
+            password: None,
+            udp: false,
+            tls_client: None,
+        });
+        let resolver = Arc::new(MockClashResolver::new());
+        let mut chained = timeout(
+            Duration::from_secs(5),
+            handler.connect_stream_with_connector(&session, resolver, &connector),
+        )
+        .await
+        .expect("SOCKS5 endpoint path and handshake exceeded the deadline")
+        .expect("SOCKS5 handshake should complete on the fallback path");
+        assert_eq!(chained.network_path_ids(), vec![selected_path.clone()]);
+        chained.write_all(b"target-request").await.unwrap();
+
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(3), chained.read_to_end(&mut response))
+            .await
+            .expect("timed out reading the SOCKS5 target response")
+            .expect("failed to read SOCKS5 target response");
+        assert_eq!(response, b"R");
+        timeout(Duration::from_secs(3), server)
+            .await
+            .expect("local SOCKS5 server did not finish")
+            .expect("local SOCKS5 server task failed");
+
+        let mut reported_kinds = Vec::new();
+        for _ in 0..3 {
+            let event = timeout(Duration::from_secs(2), events_rx.recv())
+                .await
+                .expect("expected dial-failure, endpoint, and target evidence")
+                .expect("traffic reporter stopped before all path results");
+            status.write().await.record_traffic(event);
+        }
+        let snapshot = {
+            let status = status.read().await;
+            serde_json::to_value(&*status).unwrap()
+        };
+        let traffic_evidence = snapshot["trafficEvidence"].as_array().unwrap();
+        reported_kinds.extend(
+            traffic_evidence
+                .iter()
+                .map(|event| event["kind"].as_str().unwrap().to_owned()),
+        );
+        assert!(reported_kinds.contains(&"proxyEndpointTcp".to_owned()));
+        assert!(reported_kinds.contains(&"proxyTcp".to_owned()));
+        let endpoint_evidence = traffic_evidence
+            .iter()
+            .find(|event| event["kind"] == "proxyEndpointTcp")
+            .expect("SOCKS5 endpoint handshake should produce endpoint evidence");
+        assert_eq!(endpoint_evidence["receivedBytes"], 2);
+        let target_evidence = traffic_evidence
+            .iter()
+            .find(|event| event["kind"] == "proxyTcp")
+            .expect("tunneled target response should produce proxy evidence");
+        assert_eq!(target_evidence["receivedBytes"], 1);
+
+        let selected_path_json = serde_json::to_value(&selected_path).unwrap();
+        let selected_path_health = snapshot["pathHealth"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["path"] == selected_path_json)
+            .expect("the successful local NIC should have path health");
+        assert_eq!(selected_path_health["state"], "available");
+        let selected_destination_health = snapshot["destinationPathHealth"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["path"] == selected_path_json)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selected_destination_health.len(),
+            2,
+            "the SOCKS endpoint and tunneled target should have distinct health entries"
+        );
+        assert!(
+            selected_destination_health
+                .iter()
+                .all(|entry| entry["state"] == "available")
+        );
+    }
+
+    fn path_candidate(
+        name: &str,
+        index: u32,
+        source_address: Ipv4Addr,
+        default_route: DefaultRouteEvidence,
+    ) -> PathCandidateObservation {
+        PathCandidateObservation {
+            interface: InterfaceId {
+                name: name.to_owned(),
+                index,
+            },
+            interface_kind: InterfaceKind::Unknown,
+            family: AddressFamily::Ipv4,
+            source_address: source_address.into(),
+            scope_id: None,
+            gateway: None,
+            default_route,
+            binding: BindingStatus::Verified,
+            binding_error: None,
+        }
+    }
+}
+
 #[cfg(all(test, docker_test, throughput_test))]
 mod e2e {
     use crate::{
