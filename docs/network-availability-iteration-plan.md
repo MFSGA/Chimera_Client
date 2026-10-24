@@ -778,7 +778,7 @@ lifecycle tests.
 
 - 基线：本地 `master` `78c78f6b90bcda3b03326bbbecd14554c9d63a47`。将过期 Explain 测试从直接调用两个 handler 改为对 `/runtime/network/path-decisions` 与 `/runtime/network/path-decision/{flowId}` 的 Axum `oneshot` 请求。
 - 列表请求先于详情请求执行，独立验证列表路由会排除并清理过期记录；随后详情路由返回 404 和过期说明。测试使用生产同一 `status_routes` 和 `/runtime` 挂载路径，但没有启动 TCP listener，也没有经过生产鉴权/CORS/trace middleware；listener 的真实 HTTP 测试仍待补。
-- 验证：定向 `expired_path_decision_is_not_found_and_absent_from_list` 在 `--no-default-features --features ring,tun,port` 配置下 1 passed；`cargo fmt --all -- --check` 与 `git diff --check` 通过。该构建缓存位于 `/tmp/chimera-client-no-default-target`。同 feature 组合的 strict all-target Clippy 被既有 `clash-lib/src/proxy/transport/mod.rs:101` `items_after_test_module` lint 阻断，与本项改动无关；本项的测试编译和运行均通过。
+- 验证：定向 `expired_path_decision_is_not_found_and_absent_from_list` 在 `--no-default-features --features ring,tun,port` 配置下 1 passed；`cargo fmt --all -- --check` 与 `git diff --check` 通过。该构建缓存位于 `/tmp/chimera-client-no-default-target`。同 feature 组合的首次 strict all-target Clippy 被既有 `clash-lib/src/proxy/transport/mod.rs:101` `items_after_test_module` lint 阻断；该测试模块位置已在后续小切片修正，见下文。
 
 ### 2026-10-24：B10 Shadowsocks TCP 单条路径 Explain 查询
 
@@ -796,4 +796,9 @@ lifecycle tests.
 
 - 基线：本地 `master` `2db9bb41099b70dddfa3ac97b13adc6b482ba29d`。在已有过期 Explain 用例中，用本机 TCP listener 和 Hyper HTTP/1 client 替换 Axum `oneshot` 调用；服务端仍挂载生产 `status_routes` 于 `/runtime`，测试通过同一 keep-alive 连接先 GET 列表，再 GET 单条详情。
 - 过期列表通过真实 HTTP 请求返回空数组，随后过期 flow 详情通过真实 HTTP 请求返回 404 和过期说明。该测试覆盖本机 socket → Hyper → Axum route/extractor → handler 的链路；测试没有构造完整 `ApiRunner`，所以生产鉴权/CORS/trace middleware 的组合行为仍待验证。
-- 默认 feature 完整过滤名测试为 1 passed；`--no-default-features --features ring,tun,port` 的同一测试也为 1 passed。第一次使用不完整 `--exact` 测试名执行了 0 项，未计入通过数；随后使用完整模块路径重跑并通过。`cargo clippy -p clash-lib --lib --locked -- -D warnings`、`cargo fmt --all -- --check` 与 `git diff --check` 通过；测试 target 的 all-target Clippy 仍受前节记录的既有 `items_after_test_module` lint 阻断。
+- 默认 feature 完整过滤名测试为 1 passed；`--no-default-features --features ring,tun,port` 的同一测试也为 1 passed。第一次使用不完整 `--exact` 测试名执行了 0 项，未计入通过数；随后使用完整模块路径重跑并通过。`cargo clippy -p clash-lib --lib --locked -- -D warnings`、`cargo fmt --all -- --check` 与 `git diff --check` 通过；测试 target 的 all-target Clippy 当时仍受前节记录的既有 lint 阻断，随后在下一小切片修复。
+
+### 2026-10-24：修复 feature 组合下的测试 Clippy 阻断
+
+- 基线：本地 `master` `f7616356ff3ebd5923eb626e2d93af2db43a1470`。将 `s04br_tests` 从 `Transport` trait 定义之前移到 `clash-lib/src/proxy/transport/mod.rs` 文件末尾，消除 `items_after_test_module`。只调整测试模块位置，不改传输 trait、网络池实现或运行时行为。
+- `s04b` 相关单测为 66 passed；受支持最小 `ring,tun,port` feature 组合的完整 `clash-lib` 库测试为 786 passed、0 failed、12 ignored。Dashboard 外 strict all-target Clippy 命令 `CARGO_TARGET_DIR=/tmp/chimera-client-no-default-target CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo clippy -p clash-lib --all-targets --no-default-features --features ring,tun,port --locked -j 6 -- -D warnings -D unused-variables` 通过；格式与 diff 检查通过。

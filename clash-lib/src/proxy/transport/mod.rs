@@ -97,97 +97,6 @@ pub(super) fn finish_pool_delivery<T>(
     }
 }
 
-#[cfg(test)]
-mod s04br_tests {
-    use super::finish_pool_delivery;
-    use std::{
-        io,
-        sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        },
-    };
-    use tokio_util::sync::CancellationToken;
-
-    struct DropFlag(Arc<AtomicBool>);
-    impl Drop for DropFlag {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::SeqCst);
-        }
-    }
-
-    #[tokio::test]
-    async fn s04br_cancel_when_stream_construction_becomes_ready_discards_result() {
-        let cancellation = CancellationToken::new();
-        let discarded = Arc::new(AtomicBool::new(false));
-        let result: io::Result<DropFlag> = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => Err(io::Error::other("unexpected pre-construction cancellation")),
-            value = async {
-                // Make the result ready on the very poll that signals reset.
-                // The biased select has already polled the cancellation arm.
-                cancellation.cancel();
-                Ok(DropFlag(discarded.clone()))
-            } => value,
-        };
-        let err = finish_pool_delivery(&cancellation, result)
-            .err()
-            .expect("cancelled stream must not be delivered");
-        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
-        assert!(discarded.load(Ordering::SeqCst));
-    }
-
-    #[tokio::test]
-    async fn s04bs_pool_reservation_released_under_repeated_abort() {
-        use std::sync::atomic::AtomicU64;
-        use tokio::time::{Duration, timeout};
-        let active = Arc::new(AtomicU64::new(0));
-        for _ in 0..64 {
-            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-            let count = active.clone();
-            let task = tokio::spawn(async move {
-                count.fetch_add(1, Ordering::AcqRel);
-                let _reservation = super::PoolActiveReservation::new(count);
-                entered_tx.send(()).unwrap();
-                std::future::pending::<()>().await;
-            });
-            timeout(Duration::from_secs(2), entered_rx)
-                .await
-                .unwrap()
-                .unwrap();
-            task.abort();
-            assert!(
-                timeout(Duration::from_secs(2), task)
-                    .await
-                    .unwrap()
-                    .unwrap_err()
-                    .is_cancelled()
-            );
-            assert_eq!(active.load(Ordering::Acquire), 0);
-        }
-
-        active.fetch_add(1, Ordering::AcqRel);
-        let lease = super::PoolActiveReservation::new(active.clone());
-        lease.transfer();
-        assert_eq!(active.load(Ordering::Acquire), 1);
-        active.fetch_sub(1, Ordering::AcqRel); // returned stream's Drop
-        assert_eq!(active.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    fn s04br_uncancelled_result_preserves_success_and_upstream_errors() {
-        let cancellation = CancellationToken::new();
-        assert_eq!(finish_pool_delivery(&cancellation, Ok(7)).unwrap(), 7);
-        let error: io::Result<u32> = Err(io::Error::other("real handshake failure"));
-        assert!(
-            finish_pool_delivery(&cancellation, error)
-                .unwrap_err()
-                .to_string()
-                .contains("handshake failure")
-        );
-    }
-}
-
 #[async_trait::async_trait]
 pub trait Transport: Send + Sync {
     /// Retire cached underlying connections after the physical path changes.
@@ -315,3 +224,94 @@ pub use reality::{
     Client as RealityClient, DEFAULT_REALITY_SHORT_ID, decode_public_key,
     decode_short_id,
 };
+
+#[cfg(test)]
+mod s04br_tests {
+    use super::finish_pool_delivery;
+    use std::{
+        io,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
+    use tokio_util::sync::CancellationToken;
+
+    struct DropFlag(Arc<AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn s04br_cancel_when_stream_construction_becomes_ready_discards_result() {
+        let cancellation = CancellationToken::new();
+        let discarded = Arc::new(AtomicBool::new(false));
+        let result: io::Result<DropFlag> = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(io::Error::other("unexpected pre-construction cancellation")),
+            value = async {
+                // Make the result ready on the very poll that signals reset.
+                // The biased select has already polled the cancellation arm.
+                cancellation.cancel();
+                Ok(DropFlag(discarded.clone()))
+            } => value,
+        };
+        let err = finish_pool_delivery(&cancellation, result)
+            .err()
+            .expect("cancelled stream must not be delivered");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(discarded.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn s04bs_pool_reservation_released_under_repeated_abort() {
+        use std::sync::atomic::AtomicU64;
+        use tokio::time::{Duration, timeout};
+        let active = Arc::new(AtomicU64::new(0));
+        for _ in 0..64 {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let count = active.clone();
+            let task = tokio::spawn(async move {
+                count.fetch_add(1, Ordering::AcqRel);
+                let _reservation = super::PoolActiveReservation::new(count);
+                entered_tx.send(()).unwrap();
+                std::future::pending::<()>().await;
+            });
+            timeout(Duration::from_secs(2), entered_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            task.abort();
+            assert!(
+                timeout(Duration::from_secs(2), task)
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .is_cancelled()
+            );
+            assert_eq!(active.load(Ordering::Acquire), 0);
+        }
+
+        active.fetch_add(1, Ordering::AcqRel);
+        let lease = super::PoolActiveReservation::new(active.clone());
+        lease.transfer();
+        assert_eq!(active.load(Ordering::Acquire), 1);
+        active.fetch_sub(1, Ordering::AcqRel); // returned stream's Drop
+        assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn s04br_uncancelled_result_preserves_success_and_upstream_errors() {
+        let cancellation = CancellationToken::new();
+        assert_eq!(finish_pool_delivery(&cancellation, Ok(7)).unwrap(), 7);
+        let error: io::Result<u32> = Err(io::Error::other("real handshake failure"));
+        assert!(
+            finish_pool_delivery(&cancellation, error)
+                .unwrap_err()
+                .to_string()
+                .contains("handshake failure")
+        );
+    }
+}
