@@ -281,7 +281,7 @@ async fn integration_test_shadowsocks_udp() {
         target.send_to(&buffer[..size], source).await.unwrap();
     });
 
-    let (_server, _client, socks_port, _) = start_shadowsocks_pair(true);
+    let (_server, _client, socks_port, api_port) = start_shadowsocks_pair(true);
     let session = Socks5UdpSession::connect(socks_port).await;
     session
         .send_ipv4(b"shadowsocks-udp-roundtrip", [127, 0, 0, 1], target_port)
@@ -294,6 +294,64 @@ async fn integration_test_shadowsocks_udp() {
     assert_eq!(response, b"shadowsocks-udp-roundtrip");
     assert_eq!(source, format!("127.0.0.1:{target_port}"));
     target_task.await.expect("UDP echo target failed");
+
+    let (udp_flow, connected_decision) =
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let flows =
+                    get_api_json(api_port, "/flows?include_closed=true").await;
+                if let Some(flow) = flows.as_array().and_then(|records| {
+                    records.iter().find(|flow| {
+                        flow["protocol"] == "udp"
+                            && flow["dstPort"].as_u64()
+                                == Some(u64::from(target_port))
+                            && flow["flowIds"]
+                                .as_array()
+                                .is_some_and(|ids| !ids.is_empty())
+                    })
+                }) {
+                    let flow = flow.clone();
+                    let flow_ids = flow["flowIds"]
+                        .as_array()
+                        .expect("tracked Shadowsocks UDP flow should expose IDs");
+                    let decisions =
+                        get_api_json(api_port, "/runtime/network/path-decisions")
+                            .await;
+                    if let Some(decision) =
+                        decisions.as_array().and_then(|records| {
+                            records.iter().find(|decision| {
+                                flow_ids.iter().any(|id| id == &decision["flowId"])
+                                    && decision["outcome"] == "connected"
+                                    && decision["route"]["outbound"]
+                                        == "shadowsocks-out"
+                            })
+                        })
+                    {
+                        break (flow, decision.clone());
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("Shadowsocks UDP flow did not produce a connected Explain record");
+    let flow_ids = udp_flow["flowIds"]
+        .as_array()
+        .expect("tracked Shadowsocks UDP flow should expose IDs");
+    assert!(
+        flow_ids
+            .iter()
+            .any(|flow_id| flow_id == &connected_decision["flowId"])
+    );
+    let flow_id = connected_decision["flowId"]
+        .as_str()
+        .expect("Shadowsocks UDP Explain record should expose a flow ID");
+    let detail = get_api_json(
+        api_port,
+        &format!("/runtime/network/path-decision/{flow_id}"),
+    )
+    .await;
+    assert_eq!(detail, connected_decision);
 }
 
 #[tokio::test(flavor = "current_thread")]
