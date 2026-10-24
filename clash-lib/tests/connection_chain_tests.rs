@@ -513,3 +513,146 @@ rules:
     upstream_task.abort();
     leaf_task.abort();
 }
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn proxy_handshake_failure_is_queryable_from_path_explain() {
+    let upstream = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind local failing SOCKS5 endpoint");
+    let upstream_port = upstream.local_addr().unwrap().port();
+    let upstream_task = tokio::spawn(async move {
+        let (stream, _) =
+            tokio::time::timeout(Duration::from_secs(5), upstream.accept())
+                .await
+                .expect("timed out waiting for proxy endpoint connection")
+                .expect("failed to accept proxy endpoint connection");
+        drop(stream);
+    });
+
+    let api_port = available_port();
+    let socks_port = available_port();
+    let config = format!(
+        r#"allow-lan: false
+bind-address: 127.0.0.1
+socks-port: {socks_port}
+mode: rule
+log-level: error
+mmdb: null
+external-controller: 127.0.0.1:{api_port}
+secret: clash-rs
+tun:
+  enable: false
+proxies:
+  - name: failing-proxy
+    type: socks5
+    server: 127.0.0.1
+    port: {upstream_port}
+    udp: false
+rules:
+  - MATCH,failing-proxy
+"#
+    );
+    let cwd =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
+    let _clash = ClashInstance::start(
+        Options {
+            config: Config::Str(config),
+            cwd: Some(cwd.to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            config_path: None,
+        },
+        vec![api_port, socks_port],
+    )
+    .expect("failed to start proxy Explain integration client");
+
+    let _stream =
+        tokio::time::timeout(Duration::from_secs(5), socks5_connect(socks_port, 80))
+            .await
+            .expect("timed out during local SOCKS5 CONNECT");
+    upstream_task
+        .await
+        .expect("local failing SOCKS5 endpoint task failed");
+
+    let failure = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let decisions_url = format!(
+                "http://127.0.0.1:{api_port}/runtime/network/path-decisions"
+            );
+            let request = hyper::Request::builder()
+                .uri(&decisions_url)
+                .header(http::header::AUTHORIZATION, "Bearer clash-rs")
+                .method(http::Method::GET)
+                .body(http_body_util::Empty::<Bytes>::new())
+                .expect("failed to build failure path decisions query");
+            let response =
+                send_http_request(decisions_url.parse().unwrap(), request)
+                    .await
+                    .expect("failed to query failure path decisions");
+            assert_eq!(response.status(), http::StatusCode::OK);
+            let decisions: serde_json::Value = serde_json::from_reader(
+                response
+                    .collect()
+                    .await
+                    .expect("failed to collect failure path decisions")
+                    .aggregate()
+                    .reader(),
+            )
+            .expect("failed to parse failure path decisions");
+            if let Some(decision) = decisions.as_array().and_then(|records| {
+                records.iter().find(|decision| {
+                    decision["outcome"] == "dialFailed"
+                        && decision["route"]["outbound"] == "failing-proxy"
+                })
+            }) {
+                break decision.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("proxy SOCKS handshake failure was not recorded in Explain");
+    assert!(
+        failure["failureKind"]
+            .as_str()
+            .is_some_and(|kind| !kind.is_empty())
+    );
+    assert!(
+        failure["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("proxyDialFailed"))
+    );
+
+    let detail: serde_json::Value =
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let decision_url = format!(
+                "http://127.0.0.1:{api_port}/runtime/network/path-decision/{}",
+                failure["flowId"]
+                    .as_str()
+                    .expect("failure Explain record should have a flow ID")
+            );
+            let request = hyper::Request::builder()
+                .uri(&decision_url)
+                .header(http::header::AUTHORIZATION, "Bearer clash-rs")
+                .method(http::Method::GET)
+                .body(http_body_util::Empty::<Bytes>::new())
+                .expect("failed to build failure path decision detail query");
+            let response = send_http_request(decision_url.parse().unwrap(), request)
+                .await
+                .expect("failed to query failure path decision detail");
+            assert_eq!(response.status(), http::StatusCode::OK);
+            serde_json::from_reader(
+                response
+                    .collect()
+                    .await
+                    .expect("failed to collect failure path decision detail")
+                    .aggregate()
+                    .reader(),
+            )
+            .expect("failed to parse failure path decision detail")
+        })
+        .await
+        .expect("timed out querying failure path decision detail");
+    assert_eq!(detail, failure);
+}
