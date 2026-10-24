@@ -47,7 +47,7 @@
 | B4 策略编译与影子决策（已完成） | 纯候选过滤/显式排序、immutable intent、PathPlan、CandidateRejection；影子计算复用实际路由结果 | Require Ethernet/IPv4 无满足项必失败；偏好仅列 v4 不禁 v6；偏好顺序与源地址身份可测试；决策记录 route/rule、拒绝理由和 `shadowOnly`，不改变 socket。实际 socket 路径统一回报由 B5/B7 接入 |
 | B5 非 TUN DIRECT 新 Flow 接入（已完成） | TCP 按解析地址族选路；UDP literal 或可解析域名按真实地址族选路，逐 Flow 决策缓存，NAT socket 按 `NetworkPathId` 隔离 | 实际 source/interface 绑定与决策一致；硬约束失败明确结束 TCP/UDP；fake-IP 不作为远端地址或族提示；同目标复用决策、不同目标/身份隔离；旧网络代际 socket 退休；多目标/多客户端响应归属保持。活动 TUN 仍沿用当前防回环 socket 保护 |
 | B6 非 TUN DIRECT 健康证据（已完成） | TCP、literal/resolved-domain UDP 和 DNS direct 响应/发送错误接入独立健康记录；API 输出有界状态，不改变选路 | 单目标拒绝/超时不判死路径；不同主机网络错误升级；UDP 响应归回实际远端目标；DNS 成功证据绑定上游 PathId；旧版本/重载事件拒绝 |
-| B7 代理 / DNS / 池接入（进行中） | 代理端点与最终目标、DNS 独立意图；接入实际 socket 路径；给可复用连接记录实际 path/network 代际 | 已实现非 TUN 代理端点 TCP/UDP 与 DNS direct socket 路径选择、DNS 响应健康证据、VLESS/Trojan/AnyTLS/SOCKS/Shadowsocks TCP 最终目标响应路径证据、gRPC/XHTTP H2/H3 按 PathId 选择性退休、Hysteria2 普通及 Salamander QUIC connector 路径、端口跳跃沿用 connector 并固定到初始 PathId、代理端点 UDP 与 Hysteria2 UDP 最终目标响应证据、Relay 首跳 TCP/UDP 本机 PathId 传递，以及活动/关闭 Flow 的 `/flows` `networkPaths` 字段；该字段不代表代理服务器之后的远端转发 NIC。本地 SOCKS5、in-process Shadowsocks、TLS Trojan、AnyTLS UoT 与 VLESS TLS 服务端现覆盖握手、应用请求/响应、获胜 PathId 及相应 TCP/UDP 健康证据关联。其他代理远端互操作与完整 pooled transport 行为仍待验证 |
+| B7 代理 / DNS / 池接入（进行中） | 代理端点与最终目标、DNS 独立意图；接入实际 socket 路径；给可复用连接记录实际 path/network 代际 | 已实现非 TUN 代理端点 TCP/UDP 与 DNS direct socket 路径选择、DNS 响应健康证据、VLESS/Trojan/AnyTLS/SOCKS/Shadowsocks TCP 最终目标响应路径证据、gRPC/XHTTP H2/H3 按 PathId 选择性退休、Hysteria2 普通及 Salamander QUIC connector 路径、端口跳跃沿用 connector 并固定到初始 PathId、代理端点 UDP 与 Hysteria2 UDP 最终目标响应证据、Relay 首跳 TCP/UDP 本机 PathId 传递，以及活动/关闭 Flow 的 `/flows` `networkPaths` 字段；该字段不代表代理服务器之后的远端转发 NIC。本地 SOCKS5、in-process Shadowsocks、TLS Trojan、AnyTLS UoT 与 VLESS TLS 服务端现覆盖握手、应用请求/响应、获胜 PathId 及相应 TCP/UDP 健康证据关联；Hysteria2 端口跳跃现有多轮 fake-socket 状态机与取消单测。其他代理远端互操作、端口跳跃真实服务端互操作与完整 pooled transport 行为仍待验证 |
 | B8 有界多路径尝试（代码已接入；DIRECT 调度与代理端点源地址不匹配后的候选回退已受控验证） | 有界 AttemptBudget、错峰启动、单 winner、取消与清理；只竞速代理端点 TCP 建连，协议握手不跨连接重放 | DIRECT 与代理端点 DNS+拨号总预算均为 5 秒、最多 3 次/并发 2、120ms hedge，快速失败立即推进；代理端点计划最多纳入 3 个 DNS 地址，跨地址族与候选 PathId 轮次调度；Preference 保留一个 system-route 回退名额，Require 不回退；旧 networkVersion 完成的 socket 丢弃；失败 socket future 随 winner 取消；不竞速 UDP 业务包或重放应用数据。本轮 loopback 验证源地址不匹配后经 SOCKS5 握手和请求/响应成功回退；代理服务器互操作、连接池与其他网络拓扑仍待验证 |
 | B9 首选恢复与防抖（被动证据范围已完成） | cooldown、真实流量响应和稳定窗口；只改变新 Flow 候选可用性 | 冷却期排除不可用路径；恢复至少 3 次真实响应且跨越 15 秒；单次成功不恢复；不发送面向猜测目标的合成探测。主动探测与 minimum-dwell 校准不在当前实现范围 |
 | B10 运行时意图与 Explain API（偏好 API、本机 UDP 恢复、成功 UDP/TCP 代理连接、SOCKS 握手失败及 flowId 错误状态均有定向验证，其余范围继续补验） | 基于现有鉴权开放偏好更新、effective-paths 和 decision 查询；临时覆盖使用单调时钟及 TTL | 偏好更新校验后在 RuntimeStatus 锁内原子替换并增加 `policyVersion`；临时覆盖到期恢复基础偏好；Explain 记录有界并覆盖 TCP/UDP 路径规划失败、DIRECT/PROXY 拨号成功与失败、旧网络代次结果丢弃；记录候选 PathId、策略拒绝原因、版本和操作编号；成功 UDP 关联的 `flowId` 出现在 `/flows.flowIds`，可查询 `/runtime/network/path-decision/{flowId}`；记录连接完成时发现的 reload 版本差异，`/runtime/network/path-decisions` 可列出近期结果。Explain 记录 TTL 使用单调时钟，避免系统墙钟调整延长或缩短保留期。物理代理端点 TCP/UDP 拨号错误以结构化 `io::Error` 来源保留候选、实际尝试 PathId 与策略/健康拒绝原因，Dispatcher 将其写入 Explain；协议 TLS/认证阶段错误仍保持现有错误边界，不伪称已逐协议分类。偏好更新/临时覆写、有效路径查询、本机 UDP 恢复、成功 DIRECT TCP/UDP、SOCKS5 多跳 TCP、Shadowsocks TCP/UDP、AnyTLS TCP/UDP、Trojan TCP、VLESS TLS TCP、生产 `ApiRunner` listener 对 Explain 列表无 token 请求返回 401、SOCKS 握手失败详情及格式错误 `flowId` 返回 400、未知 `flowId` 返回 404、过期 Explain 的真实 TCP listener + 认证 Axum route-level 测试（无 token 为 401，有效 token 下列表排除且详情为 404）均已有定向回归；完整生产 `ApiRunner` 的过期时间行为与 CORS/trace 组合、其他代理协议路径 Explain 和跨平台行为仍待验证 |
@@ -344,7 +344,7 @@ cargo test -p clash-lib --test api_reload_tests --locked -- --test-threads=1
 - 2 秒检测 / 15 秒新连接 / 30 秒旧连接仍是待校准目标。实际资源重置最多 15 秒，另有快照与具体协议拨号时间；不能承诺整个新连接 15 秒内成功。TCP keepalive 的实际失败时限受 OS、在途数据和协议驱动影响，不能承诺所有旧流 30 秒结束。
 - 真实 TUN 当前用 `route-all: false`，仅自身 fake-IP 子网；物理 scoped default 的动态环境、IPv6 两张物理接口、长期资源计数与跨平台运行均待专用环境验证。
 
-下一最小代码步骤：用受控 Hysteria2 服务端验证端口跳跃跨多轮切换与 reset 取消，再评估代理链逐跳 PathId 的可观测边界。路径身份不明的 SOCKS/SS UDP 不沿用控制 TCP 的 PathId。物理验收仍需专用 macOS 双网卡环境：保留 fake-IP 与一条旧 TCP 流，轮换物理路径 20 次，采集 `/network`、真实 DNS/HTTP/SOCKS 响应及 socket/路由/任务计数，再校准时限与 A4；平台实现/验证另行排期。
+下一最小验收步骤：在 Docker 可用环境运行受控 Hysteria2 服务端，验证端口跳跃跨多轮实际 QUIC 流量、服务端端口映射与 reset 期间取消；本轮只补了 fake-socket 状态机多轮与取消验证，不能替代服务端互操作。当前 macOS 缺少 `docker` 命令。随后评估代理链逐跳 PathId 的可观测边界；路径身份不明的 SOCKS/SS UDP 不沿用控制 TCP 的 PathId。物理验收仍需专用 macOS 双网卡环境：保留 fake-IP 与一条旧 TCP 流，轮换物理路径 20 次，采集 `/network`、真实 DNS/HTTP/SOCKS 响应及 socket/路由/任务计数，再校准时限与 A4；平台实现/验证另行排期。
 
 ### B7 本轮增量复核（2026-10-02）
 
@@ -830,6 +830,12 @@ lifecycle tests.
 
 - 基线：本地 `master` `7ac8ca3c1cf18726420d89e7a7fc8cb32d14ff05`。增强过期决策回归：在生产同款 `AuthMiddlewareLayer` 外安装 `status_routes`，通过同一 keep-alive TCP/HTTP 连接先请求无 token 的列表并确认 401，再用正确 Bearer token 读取空列表和过期详情 404。
 - 该用例把过期缓存清理、认证层、Axum 路由/提取器、handler 与真实本机 socket 放进同一序列；没有构造完整 `ApiRunner`，因此生产 CORS/trace 和 runner 组装组合仍未覆盖。`cargo test -p clash-lib --lib --no-default-features --features ring,tun,port expired_path_decision_is_not_found_and_absent_from_list --locked -j 6` 为 1 passed；`cargo clippy -p clash-lib --lib --no-default-features --features ring,tun,port --locked -j 6 -- -D warnings`、格式与 diff 检查通过。
+
+### 2026-10-24：B7 Hysteria2 端口跳跃多轮状态机
+
+- 基线：本地 `master` `6318ac6573ab8172318675ed6beee381d1ef4f9c`。新增 `port_hopping_rotates_udp_sockets_across_multiple_rounds`：用 `AsyncUdpSocket` fake dialer 连续发布三代 UDP socket，检查初始端口和后续候选端口范围、generation 递增、每轮安装新 socket，并确认写入使用 transmit 副本、不改调用方目标。既有连接退休取消未完成 hop 的用例继续保留。
+- `cargo test -p clash-lib --lib --no-default-features --features hysteria,ring,tun,port proxy::hysteria2::udp_hop::tests --locked -j 6` 为 6 passed、0 failed；`cargo clippy -p clash-lib --all-targets --no-default-features --features hysteria,ring,tun,port --locked -j 6 -- -D warnings`、格式与 diff 检查通过。
+- 完整 `e2e_network_reset_reauthenticates_hysteria2` 位于 `docker_test + throughput_test` 条件下。本机 `docker info` 返回 `command not found`，因此未运行容器端到端用例；真实服务器端端口映射、QUIC 多轮切换和 reset 互操作仍待 Docker 可用环境验证。
 
 ### 2026-10-24：修复 feature 组合下的测试 Clippy 阻断
 

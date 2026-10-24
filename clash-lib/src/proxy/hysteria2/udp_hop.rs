@@ -507,6 +507,7 @@ mod tests {
         net::{IpAddr, Ipv4Addr},
         sync::atomic::{AtomicU16, Ordering},
     };
+    use tokio::time::timeout;
 
     use super::*;
     use crate::app::flow::{AddressFamily, InterfaceId, NetworkPathId};
@@ -642,7 +643,7 @@ mod tests {
         }
 
         fn local_addr(&self) -> io::Result<SocketAddr> {
-            Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), self.id))
         }
     }
 
@@ -713,6 +714,79 @@ mod tests {
         assert_eq!(hop.hop(), 8443);
         assert_eq!(hop.lock_state().generation, 0);
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn port_hopping_rotates_udp_sockets_across_multiple_rounds() {
+        let observed_port = Arc::new(AtomicU16::new(0));
+        let polled_socket = Arc::new(AtomicU16::new(0));
+        let mut hop = test_hop(
+            fake_socket(1, observed_port.clone(), polled_socket.clone()),
+            443,
+        );
+        let mut port_range = PortGenerator::new(8443);
+        port_range.add_single(8444);
+        port_range.add_single(8445);
+        hop.port_range = port_range;
+
+        let next_socket_id = Arc::new(AtomicU16::new(2));
+        let dial_observed_port = observed_port.clone();
+        let dial_polled_socket = polled_socket.clone();
+        let dial_next_socket_id = next_socket_id.clone();
+        hop.dialer = Arc::new(move || {
+            let id = dial_next_socket_id.fetch_add(1, Ordering::SeqCst);
+            let observed_port = dial_observed_port.clone();
+            let polled_socket = dial_polled_socket.clone();
+            Box::pin(
+                async move { Ok(fake_socket(id, observed_port, polled_socket)) },
+            )
+        });
+
+        let transmit = Transmit {
+            destination: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443),
+            ecn: None,
+            contents: b"hop-roundtrip",
+            segment_size: None,
+            src_ip: None,
+        };
+
+        for expected_generation in 1..=3 {
+            hop.interval = Duration::ZERO;
+            hop.lock_state().last = Instant::now() - Duration::from_secs(1);
+            hop.try_send(&transmit)
+                .expect("port hop send should succeed");
+
+            let sent_port = observed_port.load(Ordering::SeqCst);
+            if expected_generation == 1 {
+                assert_eq!(sent_port, 443);
+            } else {
+                assert!((8443..=8445).contains(&sent_port));
+            }
+
+            // Stop scheduling the next round while the current socket future
+            // completes, then let the normal hop state machine publish it.
+            hop.interval = Duration::from_secs(60);
+            timeout(Duration::from_secs(1), async {
+                loop {
+                    let _ = hop.hop();
+                    if hop.lock_state().generation == expected_generation {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("port hop socket was not published");
+
+            let current_socket = hop.get_current_conn().1;
+            assert_eq!(
+                current_socket.local_addr().unwrap().port(),
+                u16::try_from(expected_generation + 1).unwrap(),
+                "each completed hop should publish its newly dialed socket"
+            );
+        }
+        assert_eq!(next_socket_id.load(Ordering::SeqCst), 5);
+        assert_eq!(transmit.destination.port(), 443);
     }
 
     #[test]
