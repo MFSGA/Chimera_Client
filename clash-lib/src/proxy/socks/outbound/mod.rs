@@ -437,19 +437,21 @@ mod path_health_tests {
             stream.shutdown().await.unwrap();
         });
 
-        let mut session = Session::default();
-        session.destination = target.clone();
-        session.iface = Some(OutboundInterface {
-            name: interface.name,
-            addr_v4: None,
-            netmask_v4: None,
-            broadcast_v4: None,
-            addr_v6: None,
-            netmask_v6: None,
-            broadcast_v6: None,
-            index: interface.index,
-            mac_addr: None,
-        });
+        let session = Session {
+            destination: target.clone(),
+            iface: Some(OutboundInterface {
+                name: interface.name,
+                addr_v4: None,
+                netmask_v4: None,
+                broadcast_v4: None,
+                addr_v6: None,
+                netmask_v6: None,
+                broadcast_v6: None,
+                index: interface.index,
+                mac_addr: None,
+            }),
+            ..Default::default()
+        };
         let handler = Handler::new(HandlerOptions {
             name: "local-socks5".to_owned(),
             common_opts: HandlerCommonOptions::default(),
