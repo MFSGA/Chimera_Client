@@ -443,16 +443,17 @@ rules:
 #[serial_test::serial]
 async fn test_wildcard_cors_returns_any_origin_header() {
     let (_clash, api_port) = start_wildcard_cors_client();
-    let version_url = format!("http://127.0.0.1:{api_port}/version");
+    let decisions_url =
+        format!("http://127.0.0.1:{api_port}/runtime/network/path-decisions");
     let req = hyper::Request::builder()
-        .uri(&version_url)
+        .uri(&decisions_url)
         .header(hyper::header::AUTHORIZATION, "Bearer clash-rs")
         .header(http::header::ORIGIN, "https://example.com")
         .method(http::method::Method::GET)
         .body(http_body_util::Empty::<Bytes>::new())
         .expect("failed to build CORS request");
 
-    let res = send_http_request(version_url.parse().unwrap(), req)
+    let res = send_http_request(decisions_url.parse().unwrap(), req)
         .await
         .expect("failed to send CORS request");
 
