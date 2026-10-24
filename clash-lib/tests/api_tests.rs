@@ -788,6 +788,27 @@ async fn runtime_path_preference_updates_are_versioned_and_temporary() {
     .unwrap();
     assert!(decisions.is_array());
 
+    let unknown_flow = uuid::Uuid::new_v4();
+    for (flow_id, expected_status) in [
+        ("not-a-uuid".to_owned(), http::StatusCode::BAD_REQUEST),
+        (unknown_flow.to_string(), http::StatusCode::NOT_FOUND),
+    ] {
+        let decision_url = format!(
+            "http://127.0.0.1:{api_port}/runtime/network/path-decision/{flow_id}"
+        );
+        let decision_request = hyper::Request::builder()
+            .uri(&decision_url)
+            .header(hyper::header::AUTHORIZATION, "Bearer clash-rs")
+            .method(http::method::Method::GET)
+            .body(http_body_util::Empty::<Bytes>::new())
+            .expect("failed to build path decision GET");
+        let response =
+            send_http_request(decision_url.parse().unwrap(), decision_request)
+                .await
+                .expect("failed to GET path decision");
+        assert_eq!(response.status(), expected_status);
+    }
+
     if initial["automaticSupported"] == false {
         // Platforms without a path observer report the capability explicitly;
         // the runtime preference write is intentionally unavailable there.
@@ -877,22 +898,6 @@ async fn runtime_path_preference_updates_are_versioned_and_temporary() {
     assert_eq!(restored["policyVersion"], 3);
     assert_eq!(restored["source"], "runtime");
     assert_eq!(restored["priority"][0]["interface"], "ethernet");
-
-    let unknown_flow = uuid::Uuid::new_v4();
-    let decision_url = format!(
-        "http://127.0.0.1:{api_port}/runtime/network/path-decision/{unknown_flow}"
-    );
-    let decision_request = hyper::Request::builder()
-        .uri(&decision_url)
-        .header(hyper::header::AUTHORIZATION, "Bearer clash-rs")
-        .method(http::method::Method::GET)
-        .body(http_body_util::Empty::<Bytes>::new())
-        .expect("failed to build path decision GET");
-    let response =
-        send_http_request(decision_url.parse().unwrap(), decision_request)
-            .await
-            .expect("failed to GET path decision");
-    assert_eq!(response.status(), http::StatusCode::NOT_FOUND);
 }
 
 #[tokio::test(flavor = "current_thread")]
