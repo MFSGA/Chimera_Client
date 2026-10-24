@@ -935,6 +935,8 @@ mod tests {
 mod path_health_tests {
     use std::{net::Ipv4Addr, sync::Arc, time::Duration};
 
+    use bytes::{BufMut, BytesMut};
+    use futures::{SinkExt, StreamExt};
     use sha2::{Digest, Sha256};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -960,6 +962,7 @@ mod path_health_tests {
         },
         proxy::{
             HandlerCommonOptions, OutboundHandler,
+            datagram::UdpPacket,
             transport::TlsClient,
             utils::{DirectConnector, NetworkPathSource},
         },
@@ -1195,6 +1198,282 @@ mod path_health_tests {
             selected_destination_health.len(),
             2,
             "AnyTLS endpoint and tunneled target should have distinct health entries"
+        );
+        assert!(
+            selected_destination_health
+                .iter()
+                .all(|entry| entry["state"] == "available")
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_over_tcp_echo_keeps_the_dialed_path_and_health_evidence() {
+        crate::setup_default_crypto_provider();
+        let loopback_name = if cfg!(target_os = "macos") {
+            "lo0"
+        } else {
+            "lo"
+        };
+        let interface = get_interface_by_name(loopback_name)
+            .expect("loopback interface should be discoverable");
+
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+                .expect("test certificate should generate");
+        let cert = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+        let key =
+            rustls::pki_types::PrivateKeyDer::try_from(signing_key.serialize_der())
+                .expect("test private key should serialize");
+        let tls_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .expect("test TLS config should build");
+        let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("failed to bind local AnyTLS UDP endpoint");
+        let endpoint = listener.local_addr().unwrap();
+
+        let mut status = NetworkStatus::default();
+        status.set_automatic_supported_for_test(true);
+        assert!(status.lifecycle(Lifecycle::Running, "test"));
+        status.observed(&NetworkSnapshot {
+            path_candidates: vec![
+                path_candidate(
+                    &interface.name,
+                    interface.index,
+                    Ipv4Addr::UNSPECIFIED,
+                    DefaultRouteEvidence::PrimaryDefaultRoute,
+                ),
+                path_candidate(
+                    &interface.name,
+                    interface.index,
+                    Ipv4Addr::LOCALHOST,
+                    DefaultRouteEvidence::OtherInterface,
+                ),
+            ],
+            ..Default::default()
+        });
+        let generation = status
+            .shadow_path_snapshot()
+            .expect("test status should expose observed loopback candidates")
+            .0;
+        let selected_path = NetworkPathId {
+            interface: InterfaceId {
+                name: interface.name.clone(),
+                index: interface.index,
+            },
+            family: AddressFamily::Ipv4,
+            source_address: Some(Ipv4Addr::LOCALHOST.into()),
+            network_generation: generation,
+        };
+
+        let (events_tx, mut events_rx) = mpsc::channel(4);
+        let reporter = status.traffic_reporter(events_tx);
+        let status = Arc::new(tokio::sync::RwLock::new(status));
+        let source = NetworkPathSource::default();
+        source.attach(status.clone()).await;
+        source.attach_traffic_reporter(reporter).await;
+        let connector = DirectConnector::with_path_source(source);
+
+        let target: SocksAddr = "198.51.100.29:5353".parse().unwrap();
+        let payload = b"anytls-uot-echo";
+        let server_target = target.clone();
+        let acceptor = acceptor.clone();
+        let server = tokio::spawn(async move {
+            let (rejected, _) = timeout(Duration::from_secs(3), listener.accept())
+                .await
+                .expect("timed out accepting the rejected wildcard-source attempt")
+                .expect("failed to accept the first local dial attempt");
+            drop(rejected);
+
+            let (tcp, _) = timeout(Duration::from_secs(3), listener.accept())
+                .await
+                .expect("timed out accepting the selected-path TLS session")
+                .expect("failed to accept the selected local dial");
+            let mut tls = timeout(Duration::from_secs(3), acceptor.accept(tcp))
+                .await
+                .expect("timed out completing the TLS handshake")
+                .expect("TLS handshake should succeed");
+
+            let mut auth = [0; 32];
+            tls.read_exact(&mut auth)
+                .await
+                .expect("read AnyTLS password hash");
+            assert_eq!(auth, Sha256::digest(TEST_PASSWORD.as_bytes()).as_slice());
+            assert_eq!(tls.read_u16().await.expect("read padding length"), 0);
+
+            let (command, stream_id, settings) = Handler::read_frame(&mut tls)
+                .await
+                .expect("read AnyTLS SETTINGS frame");
+            assert_eq!((command, stream_id), (CMD_SETTINGS, 0));
+            let settings =
+                String::from_utf8(settings).expect("settings should be UTF-8");
+            assert!(settings.starts_with("v=2\nclient=clash-rs/"));
+            assert!(settings.contains(super::CLIENT_PADDING_SCHEME_MD5));
+
+            let (command, stream_id, syn) = Handler::read_frame(&mut tls)
+                .await
+                .expect("read AnyTLS SYN frame");
+            assert_eq!((command, stream_id), (CMD_SYN, STREAM_ID));
+            assert!(syn.is_empty());
+
+            let (command, stream_id, encoded_magic_target) =
+                Handler::read_frame(&mut tls)
+                    .await
+                    .expect("read AnyTLS UDP-over-TCP stream target");
+            assert_eq!((command, stream_id), (CMD_PSH, STREAM_ID));
+            let magic_target =
+                SocksAddr::try_from(("sp.v2.udp-over-tcp.arpa".to_owned(), 0))
+                    .unwrap();
+            assert_eq!(
+                SocksAddr::peek_read(&encoded_magic_target).unwrap(),
+                magic_target
+            );
+
+            let mut encoded_target = BytesMut::new();
+            server_target.write_buf(&mut encoded_target);
+            let expected_request_len = 1 + encoded_target.len() + 2 + payload.len();
+            let mut request = Vec::with_capacity(expected_request_len);
+            while request.len() < expected_request_len {
+                let (command, stream_id, data) =
+                    timeout(Duration::from_secs(3), Handler::read_frame(&mut tls))
+                        .await
+                        .expect(
+                            "timed out reading AnyTLS UDP-over-TCP application data",
+                        )
+                        .expect(
+                            "failed to read AnyTLS UDP-over-TCP application data",
+                        );
+                assert_eq!((command, stream_id), (CMD_PSH, STREAM_ID));
+                request.extend_from_slice(&data);
+            }
+            assert_eq!(request[0], 1, "UoT v2 must use connect mode");
+            let target_end = 1 + encoded_target.len();
+            assert_eq!(&request[1..target_end], encoded_target.as_ref());
+            assert_eq!(
+                u16::from_be_bytes([request[target_end], request[target_end + 1]])
+                    as usize,
+                payload.len()
+            );
+            assert_eq!(&request[target_end + 2..], payload);
+
+            let mut response = BytesMut::new();
+            response.put_u16(payload.len() as u16);
+            response.extend_from_slice(payload);
+            let frame =
+                Handler::encode_frame(CMD_PSH, STREAM_ID, &response).unwrap();
+            tls.write_all(&frame)
+                .await
+                .expect("write AnyTLS UDP-over-TCP echo response");
+            tls.flush().await.expect("flush AnyTLS UDP echo response");
+            (magic_target, server_target)
+        });
+
+        let session = Session {
+            destination: target.clone(),
+            iface: Some(OutboundInterface {
+                name: interface.name,
+                addr_v4: None,
+                netmask_v4: None,
+                broadcast_v4: None,
+                addr_v6: None,
+                netmask_v6: None,
+                broadcast_v6: None,
+                index: interface.index,
+                mac_addr: None,
+            }),
+            ..Default::default()
+        };
+        let handler = Handler::new(HandlerOptions {
+            name: "local-anytls-udp".to_owned(),
+            common_opts: HandlerCommonOptions::default(),
+            server: endpoint.ip().to_string(),
+            port: endpoint.port(),
+            password: TEST_PASSWORD.to_owned(),
+            udp: true,
+            tls: Some(Box::new(TlsClient::new(
+                true,
+                "localhost".to_owned(),
+                None,
+                None,
+            ))),
+            transport: None,
+        });
+        let resolver = Arc::new(MockClashResolver::new());
+        let mut datagram = timeout(
+            Duration::from_secs(5),
+            handler.connect_datagram_with_connector(&session, resolver, &connector),
+        )
+        .await
+        .expect("AnyTLS UDP path selection and handshake exceeded the deadline")
+        .expect("AnyTLS UDP-over-TCP should connect on the fallback path");
+        assert_eq!(datagram.network_path_ids(), vec![selected_path.clone()]);
+        datagram
+            .send(UdpPacket {
+                data: payload.to_vec(),
+                src_addr: SocksAddr::any_ipv4(),
+                dst_addr: target.clone(),
+                inbound_user: None,
+            })
+            .await
+            .expect("send AnyTLS UDP-over-TCP datagram");
+        let packet = timeout(Duration::from_secs(3), datagram.next())
+            .await
+            .expect("timed out reading AnyTLS UDP-over-TCP echo")
+            .expect("AnyTLS UDP-over-TCP stream ended before echo");
+        assert_eq!(packet.data, payload);
+        assert_eq!(packet.src_addr, target);
+        assert_eq!(packet.dst_addr, target);
+
+        let (magic_target, server_target) = timeout(Duration::from_secs(3), server)
+            .await
+            .expect("local AnyTLS UDP server did not finish")
+            .expect("local AnyTLS UDP server task failed");
+        assert_eq!(magic_target.port(), 0);
+        assert_eq!(server_target, packet.src_addr);
+
+        for _ in 0..3 {
+            let event = timeout(Duration::from_secs(2), events_rx.recv())
+                .await
+                .expect("expected dial-failure, endpoint, and target evidence")
+                .expect("traffic reporter stopped before all path results");
+            status.write().await.record_traffic(event);
+        }
+        let snapshot = {
+            let status = status.read().await;
+            serde_json::to_value(&*status).unwrap()
+        };
+        let traffic_evidence = snapshot["trafficEvidence"].as_array().unwrap();
+        let endpoint_evidence = traffic_evidence
+            .iter()
+            .find(|event| event["kind"] == "proxyEndpointTcp")
+            .expect("TLS endpoint response should produce endpoint evidence");
+        assert!(endpoint_evidence["receivedBytes"].as_u64().unwrap() > 0);
+        let target_evidence = traffic_evidence
+            .iter()
+            .find(|event| event["kind"] == "proxyUdp")
+            .expect("AnyTLS UDP echo should produce proxy UDP evidence");
+        assert!(target_evidence["receivedBytes"].as_u64().unwrap() > 0);
+
+        let selected_path_json = serde_json::to_value(&selected_path).unwrap();
+        let selected_path_health = snapshot["pathHealth"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["path"] == selected_path_json)
+            .expect("the successful local NIC should have path health");
+        assert_eq!(selected_path_health["state"], "available");
+        let selected_destination_health = snapshot["destinationPathHealth"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["path"] == selected_path_json)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selected_destination_health.len(),
+            2,
+            "AnyTLS endpoint and UDP target should have distinct health entries"
         );
         assert!(
             selected_destination_health
