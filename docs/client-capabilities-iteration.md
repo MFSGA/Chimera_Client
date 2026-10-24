@@ -36,6 +36,7 @@ TLS 指纹模拟明确排除。Android FFI、页面交互以及本地 gRPC 旧�
 - 最终复审补出 `dialer-proxy` 目标校验、自动注册的 `GLOBAL` 目标及 URL fragment 脱敏缺口；实现后再次运行 Controller 集成测试，覆盖 `DIRECT`/`GLOBAL`/有效代理组目标、缺失目标、保留名冲突和就绪状态查询，通过。6 个能力定向单测也通过。fragment、userinfo 和 query 值均不会出现在测速历史响应中。
 - `CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo check -p clash-lib`、`--no-default-features`、`--all-features`：均通过。
 - `CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo clippy -p clash-lib --all-targets --no-default-features --features zero_copy,tls,extended-health-check,aws-lc-rs,ring,ws,anytls,shadowsocks,wireguard,trojan,hysteria,xhttp-h3,tun,tproxy,redir,http_port,mixed_port,tracing,port,reality,vless-encryption -- -D warnings`：通过。
+- 后续补跑本机端到端行为用例：`cargo test -p clash-lib --test direct_udp_integration_tests`（3 项）、`cargo test -p clash-lib --test shadowsocks_integration_tests --features shadowsocks`（4 项）、`cargo test -p clash-lib --test anytls_integration_tests --features anytls`（2 项）、`cargo test -p clash-lib --test connection_chain_tests`（1 项）、`cargo test -p clash-lib --test vless_transport_contract_tests --features ws`（4 项），全部通过。这些测试使用本地 loopback 服务；Direct UDP 恢复用例调用本地 `/network/reset`，不修改宿主机网卡、路由或 DNS。
 - `git diff --check`：通过。
 - 初次使用仓库默认 `target` 软链接构建时，目标卷仅剩 33 MiB，写入失败；改用主卷临时目录后完成上述编译和测试。没有删除原构建缓存。
 - 带 `--all-features` 的定向测试被 Dashboard 构建脚本的 `npm ci` 阻断：现有 `node_modules/lucide-react` 清理返回 `ENOTEMPTY`。Rust `--all-features` 编译已通过；未删除或重装前端依赖。
@@ -45,5 +46,5 @@ TLS 指纹模拟明确排除。Android FFI、页面交互以及本地 gRPC 旧�
 ## 剩余边界
 
 - 本轮实现的是 `Chimera_Client` 核心 API；Android 仓库的 FFI 模型、gRPC 旧校验及配置覆写页面仍需另一个仓库接入这些接口。
-- 完整 `clash-lib` 测试、跨平台运行、真实代理节点握手/UDP 与真实网络切换未执行。带 `--all-features` 的测试仍被 Dashboard `npm ci` 的 `ENOTEMPTY` 环境错误阻断；不能据此声明这些验证通过。
+- 完整 `clash-lib` 测试、跨平台运行、外部真实代理节点互操作与操作系统级网络切换未执行。本机 loopback 握手、TCP/UDP 往返及恢复 API 已按上面的定向用例验证。带 `--all-features` 的测试仍被 Dashboard `npm ci` 的 `ENOTEMPTY` 环境错误阻断；不能据此声明这些验证通过。
 - TLS 指纹模拟按用户要求排除。
