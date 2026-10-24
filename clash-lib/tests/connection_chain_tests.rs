@@ -392,6 +392,124 @@ rules:
             .expect("leaf SOCKS5 relay stopped");
     assert_eq!(leaf_target, SocketAddr::from(([127, 0, 0, 1], target_port)));
 
+    let tracked_flow = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let flows_url =
+                format!("http://127.0.0.1:{api_port}/flows?include_closed=true");
+            let request = hyper::Request::builder()
+                .uri(&flows_url)
+                .header(http::header::AUTHORIZATION, "Bearer clash-rs")
+                .method(http::Method::GET)
+                .body(http_body_util::Empty::<Bytes>::new())
+                .expect("failed to build closed flow query");
+            let response = send_http_request(flows_url.parse().unwrap(), request)
+                .await
+                .expect("failed to query closed flows");
+            assert_eq!(response.status(), http::StatusCode::OK);
+            let flows: serde_json::Value = serde_json::from_reader(
+                response
+                    .collect()
+                    .await
+                    .expect("failed to collect closed flows")
+                    .aggregate()
+                    .reader(),
+            )
+            .expect("failed to parse closed flows");
+            if let Some(flow) = flows.as_array().and_then(|records| {
+                records.iter().find(|flow| {
+                    flow["protocol"] == "tcp"
+                        && flow["dstPort"].as_u64() == Some(u64::from(target_port))
+                        && flow["flowIds"]
+                            .as_array()
+                            .is_some_and(|flow_ids| !flow_ids.is_empty())
+                })
+            }) {
+                break flow.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("proxy TCP flow was not recorded in /flows");
+    let flow_ids = tracked_flow["flowIds"]
+        .as_array()
+        .expect("tracked proxy TCP flow should expose flow IDs");
+    let decisions: serde_json::Value =
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let decisions_url = format!(
+                "http://127.0.0.1:{api_port}/runtime/network/path-decisions"
+            );
+            let decisions_request = hyper::Request::builder()
+                .uri(&decisions_url)
+                .header(http::header::AUTHORIZATION, "Bearer clash-rs")
+                .method(http::Method::GET)
+                .body(http_body_util::Empty::<Bytes>::new())
+                .expect("failed to build path decisions query");
+            let decisions_response =
+                send_http_request(decisions_url.parse().unwrap(), decisions_request)
+                    .await
+                    .expect("failed to query path decisions");
+            assert_eq!(decisions_response.status(), http::StatusCode::OK);
+            serde_json::from_reader(
+                decisions_response
+                    .collect()
+                    .await
+                    .expect("failed to collect path decisions")
+                    .aggregate()
+                    .reader(),
+            )
+            .expect("failed to parse path decisions")
+        })
+        .await
+        .expect("timed out querying path decisions");
+    let connected_proxy_decision = decisions
+        .as_array()
+        .expect("path decisions should be an array")
+        .iter()
+        .find(|decision| {
+            flow_ids
+                .iter()
+                .any(|flow_id| flow_id == &decision["flowId"])
+                && decision["outcome"] == "connected"
+                && decision["route"]["outbound"] == "leaf-proxy"
+        })
+        .expect("proxy TCP flow should have a connected proxy Explain record");
+    let decision_detail: serde_json::Value =
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let decision_url = format!(
+                "http://127.0.0.1:{api_port}/runtime/network/path-decision/{}",
+                connected_proxy_decision["flowId"]
+                    .as_str()
+                    .expect("Explain record should have a flow ID")
+            );
+            let decision_request = hyper::Request::builder()
+                .uri(&decision_url)
+                .header(http::header::AUTHORIZATION, "Bearer clash-rs")
+                .method(http::Method::GET)
+                .body(http_body_util::Empty::<Bytes>::new())
+                .expect("failed to build proxy path decision query");
+            let decision_response =
+                send_http_request(decision_url.parse().unwrap(), decision_request)
+                    .await
+                    .expect("failed to query proxy path decision");
+            assert_eq!(decision_response.status(), http::StatusCode::OK);
+            serde_json::from_reader(
+                decision_response
+                    .collect()
+                    .await
+                    .expect("failed to collect proxy path decision")
+                    .aggregate()
+                    .reader(),
+            )
+            .expect("failed to parse proxy path decision")
+        })
+        .await
+        .expect("timed out querying proxy path decision");
+    assert_eq!(
+        &decision_detail, connected_proxy_decision,
+        "single-flow Explain should match the successful proxy connection record"
+    );
+
     upstream_task.abort();
     leaf_task.abort();
 }
