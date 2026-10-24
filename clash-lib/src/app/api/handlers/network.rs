@@ -220,6 +220,11 @@ mod tests {
         });
         let app = Router::new()
             .nest("/runtime", status_routes(global))
+            .route_layer(
+                crate::app::api::middlewares::auth::AuthMiddlewareLayer::new(
+                    "test-secret".to_owned(),
+                ),
+            )
             .with_state(app_state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -238,10 +243,22 @@ mod tests {
                 .expect("test API HTTP connection should remain usable");
         });
 
+        let unauthorized_list = sender
+            .send_request(
+                http::Request::builder()
+                    .uri("/runtime/network/path-decisions")
+                    .body(http_body_util::Empty::<bytes::Bytes>::new())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized_list.status(), StatusCode::UNAUTHORIZED);
+
         let list = sender
             .send_request(
                 http::Request::builder()
                     .uri("/runtime/network/path-decisions")
+                    .header(http::header::AUTHORIZATION, "Bearer test-secret")
                     .body(http_body_util::Empty::<bytes::Bytes>::new())
                     .unwrap(),
             )
@@ -259,6 +276,7 @@ mod tests {
             .send_request(
                 http::Request::builder()
                     .uri(format!("/runtime/network/path-decision/{flow_id}"))
+                    .header(http::header::AUTHORIZATION, "Bearer test-secret")
                     .body(http_body_util::Empty::<bytes::Bytes>::new())
                     .unwrap(),
             )
