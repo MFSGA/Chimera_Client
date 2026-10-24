@@ -164,6 +164,43 @@ fn confirmed_udp_path(
     observed.filter(|actual| Some(*actual) == planned).cloned()
 }
 
+/// DIRECT has a planned path to compare against the socket's reported path.
+/// Proxy outbounds have no DIRECT PathPlan here, so only their connector's
+/// observed local socket path can scope proxy-UDP health evidence.
+fn udp_health_path(
+    outbound_name: &str,
+    planned: Option<&crate::app::flow::NetworkPathId>,
+    observed: Option<&crate::app::flow::NetworkPathId>,
+) -> Option<crate::app::flow::NetworkPathId> {
+    if outbound_name == PROXY_DIRECT {
+        confirmed_udp_path(planned, observed)
+    } else {
+        observed.cloned()
+    }
+}
+
+fn capture_udp_health_proof(
+    reporter: &crate::app::runtime_state::TrafficReporter,
+    outbound_name: &str,
+    planned: Option<&crate::app::flow::NetworkPathId>,
+    observed: Option<&crate::app::flow::NetworkPathId>,
+    destination: &SocksAddr,
+) -> Option<crate::app::runtime_state::TrafficProof> {
+    let path = udp_health_path(outbound_name, planned, observed)?;
+    let direct = outbound_name == PROXY_DIRECT;
+    let kind = if direct {
+        crate::app::runtime_state::TrafficKind::DirectUdp
+    } else {
+        crate::app::runtime_state::TrafficKind::ProxyUdp
+    };
+    // A proxied response proves the local path used to reach the proxy, not a
+    // direct path to the remote UDP target.
+    let health_destination = direct
+        .then(|| direct_udp_health_destination(destination))
+        .flatten();
+    Some(reporter.capture_scoped(kind, Some(path), health_destination))
+}
+
 fn classify_flow_end_reason(
     result: &Result<
         crate::common::io::BidirectionalCopyReport,
@@ -1874,19 +1911,16 @@ impl Dispatcher {
                         pinned.append_datagram_chain(&outbound_datagram).await;
                         let observed_path_id =
                             outbound_datagram.network_path_ids().first().cloned();
-                        let confirmed_path = confirmed_udp_path(
-                            path_id.as_ref(),
-                            observed_path_id.as_ref(),
-                        );
-                        let flow_health_proof = confirmed_path.as_ref().and_then(|path| {
-                            traffic_reporter.as_ref().map(|reporter| {
-                                reporter.capture_scoped(
-                                    crate::app::runtime_state::TrafficKind::DirectUdp,
-                                    Some(path.clone()),
-                                    direct_udp_health_destination(&outbound_dest),
+                        let flow_health_proof =
+                            traffic_reporter.as_ref().and_then(|reporter| {
+                                capture_udp_health_proof(
+                                    reporter,
+                                    &outbound_name,
+                                    path_id.as_ref(),
+                                    observed_path_id.as_ref(),
+                                    &outbound_dest,
                                 )
-                            })
-                        });
+                            });
 
                         let stale_network_path =
                             if let Some(selection) = path_selection.as_ref() {
@@ -2112,7 +2146,11 @@ impl Dispatcher {
                                     outcome: crate::app::flow::PathExecutionOutcome::StaleNetworkDiscarded,
                                     route: explain_route.clone(),
                                     candidate_paths: Vec::new(),
-                                    selected_path: confirmed_path.clone(),
+                                    selected_path: udp_health_path(
+                                        &outbound_name,
+                                        path_id.as_ref(),
+                                        observed_path_id.as_ref(),
+                                    ),
                                     rejected: path_selection
                                         .as_ref()
                                         .map(|selection| selection.rejected.clone())
@@ -2216,15 +2254,18 @@ impl Dispatcher {
                                 path_id.clone(),
                             )
                             .await;
-                        let flow_health_proof = observed_path.and_then(|path| {
-                            traffic_reporter.as_ref().map(|reporter| {
-                                reporter.capture_scoped(
-                                    crate::app::runtime_state::TrafficKind::DirectUdp,
-                                    Some(path),
-                                    direct_udp_health_destination(&outbound_dest),
-                                )
-                            })
-                        });
+                        let flow_health_proof =
+                            observed_path.as_ref().and_then(|path| {
+                                traffic_reporter.as_ref().and_then(|reporter| {
+                                    capture_udp_health_proof(
+                                        reporter,
+                                        &outbound_name,
+                                        path_id.as_ref(),
+                                        Some(path),
+                                        &outbound_dest,
+                                    )
+                                })
+                            });
                         try_queue_outbound_packet(
                             &handle,
                             packet,
@@ -2710,7 +2751,8 @@ impl OutboundHandleMap {
             path_id,
         };
         self.0.get(&key).and_then(|entry| {
-            confirmed_udp_path(
+            udp_health_path(
+                outbound_name,
                 key.path_id.as_ref(),
                 entry.tracker.network_paths.first(),
             )
@@ -2765,10 +2807,10 @@ mod tests {
     use super::{
         Dispatcher, OutboundDatagramPacket, OutboundHandleMap,
         PendingUdpHealthProofs, RuntimeModeState, UDP_HEALTH_PROOF_MAX,
-        UDP_SESSION_IDLE, UdpFlowDecisionKey, classify_flow_end_reason,
-        confirmed_udp_path, direct_udp_health_destination,
+        UDP_SESSION_IDLE, UdpFlowDecisionKey, capture_udp_health_proof,
+        classify_flow_end_reason, confirmed_udp_path, direct_udp_health_destination,
         preferred_udp_path_address, queue_udp_packet_retry, reverse_lookup,
-        select_outbound_for_flow, try_queue_outbound_packet,
+        select_outbound_for_flow, try_queue_outbound_packet, udp_health_path,
         udp_path_cache_versions, udp_path_selection_is_current,
     };
     use crate::{
@@ -3398,6 +3440,24 @@ mod tests {
             cache.get_observed_path_id("DIRECT", source, Some(planned)),
             None
         );
+
+        let (proxy_sender, _proxy_receiver) = mpsc::channel(1);
+        cache.insert(
+            "proxy-outbound",
+            source,
+            None,
+            tokio::spawn(pending()),
+            proxy_sender,
+            Arc::new(super::TrackerInfo {
+                network_paths: vec![observed.clone()],
+                ..Default::default()
+            }),
+        );
+        assert_eq!(
+            cache.get_observed_path_id("proxy-outbound", source, None),
+            Some(observed),
+            "proxy associations may scope health to the connector-observed socket path"
+        );
     }
 
     #[test]
@@ -3547,6 +3607,56 @@ mod tests {
             Some(resolved_endpoint)
         );
         assert_eq!(direct_udp_health_destination(&logical_domain), None);
+    }
+
+    #[tokio::test]
+    async fn proxy_udp_health_uses_observed_path_without_attributing_target_health()
+    {
+        let mut status = crate::app::network::NetworkStatus::default();
+        status.lifecycle(crate::app::runtime_state::Lifecycle::Running, "test");
+        let (tx, mut rx) = mpsc::channel(1);
+        let reporter = status.traffic_reporter(tx);
+        let path_id = crate::app::flow::NetworkPathId {
+            interface: crate::app::flow::InterfaceId {
+                name: "en0".to_owned(),
+                index: 4,
+            },
+            family: crate::app::flow::AddressFamily::Ipv4,
+            source_address: Some("192.0.2.2".parse().unwrap()),
+            network_generation: 0,
+        };
+        let target = SocksAddr::from_str("203.0.113.20:443").unwrap();
+
+        assert_eq!(
+            udp_health_path("proxy-outbound", None, Some(&path_id)),
+            Some(path_id.clone())
+        );
+        assert_eq!(
+            udp_health_path(PROXY_DIRECT, None, Some(&path_id)),
+            None,
+            "DIRECT health requires a planned path to match the observed socket path"
+        );
+
+        let proof = capture_udp_health_proof(
+            &reporter,
+            "proxy-outbound",
+            None,
+            Some(&path_id),
+            &target,
+        )
+        .expect("proxy socket path should scope its UDP response proof");
+        proof.received(24);
+        status
+            .record_traffic(rx.recv().await.expect("proof event should be queued"));
+
+        let value = serde_json::to_value(status).unwrap();
+        assert_eq!(value["trafficEvidence"][0]["kind"], "proxyUdp");
+        assert_eq!(
+            value["pathHealth"][0]["path"],
+            serde_json::to_value(path_id).unwrap()
+        );
+        assert_eq!(value["pathHealth"][0]["state"], "available");
+        assert_eq!(value["destinationPathHealth"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]

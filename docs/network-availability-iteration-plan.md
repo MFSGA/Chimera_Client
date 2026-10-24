@@ -1,6 +1,6 @@
 # 主机网络变化后的可用性迭代计划
 
-日期：2026-10-24。状态：B0–B6 已完成代码级与受控回归；B7 已接入代理端点 TCP/UDP、DNS socket 路径、多个代理协议的路径健康证据及连接池网络代际/PathId 管理，但远端代理互操作与完整 pooled transport 行为仍待验收。本轮以本机 SOCKS5、in-process Shadowsocks、TLS Trojan、AnyTLS 与 VLESS 服务端验证真实握手、应用请求/响应、回退获胜 PathId 及端点/目标健康证据关联。Hysteria2 QUIC/端口跳跃沿用 connector 选定路径；Relay 首跳 PathId 与活动/关闭 Flow 的本机 `networkPaths` 观测已接入，不代表代理服务器之后的远端转发路径。B8 的 DIRECT 与代理端点 TCP 有界多路径调度代码已接入；loopback 测试验证了首选源地址不匹配后的候选回退。B9 被动恢复防抖代码已完成。B10 Explain 覆盖 TCP/UDP 路径决策、拨号结果、旧网络结果丢弃与配置 reload 版本差异；运行时偏好/临时覆写 API 和本机 UDP 恢复已有定向回归，其他代理路径 Explain 与完整 API 面仍待补充验证。默认 `clash-lib` 单元测试为 974 通过、12 忽略；全 Rust feature 单元测试为 1148 通过、12 忽略；Dashboard 外全 feature Clippy、格式与 diff 检查通过。Linux 网络快照与路径绑定观察代码尚未在 Linux 上验证；Windows 自动观察仍不支持。B11 的物理双网卡切换、route-all、休眠、资源趋势及恢复时间预算仍待专用环境验收。
+日期：2026-10-24。状态：B0–B6 已完成代码级与受控回归；B7 已接入代理端点 TCP/UDP、DNS socket 路径、多个代理协议的路径健康证据及连接池网络代际/PathId 管理，但远端代理互操作与完整 pooled transport 行为仍待验收。本轮以本机 SOCKS5、in-process Shadowsocks、TLS Trojan、AnyTLS 与 VLESS 服务端验证真实握手、应用请求/响应、回退获胜 PathId 及端点/目标健康证据关联。Hysteria2 QUIC/端口跳跃沿用 connector 选定路径；Relay 首跳 PathId 与活动/关闭 Flow 的本机 `networkPaths` 观测已接入，不代表代理服务器之后的远端转发路径。B8 的 DIRECT 与代理端点 TCP 有界多路径调度代码已接入；loopback 测试验证了首选源地址不匹配后的候选回退。B9 被动恢复防抖代码已完成。B10 Explain 覆盖 TCP/UDP 路径决策、拨号结果、旧网络结果丢弃与配置 reload 版本差异；运行时偏好/临时覆写 API 和本机 UDP 恢复已有定向回归，其他代理路径 Explain 与完整 API 面仍待补充验证。默认 `clash-lib` 单元测试为 976 通过、12 忽略；全 Rust feature 单元测试为 1149 通过、12 忽略；Dashboard 外全 feature Clippy、格式与 diff 检查通过。Linux 网络快照与路径绑定观察代码尚未在 Linux 上验证；Windows 自动观察仍不支持。B11 的物理双网卡切换、route-all、休眠、资源趋势及恢复时间预算仍待专用环境验收。
 
 用户确认的目标：主机切换网卡或网络后，自动恢复新连接；已有连接尽力恢复，无法恢复时明确结束。典型场景包括 Wi-Fi ↔ 有线、同一网卡换 Wi-Fi/DHCP 地址、断网重连和休眠唤醒。服务恢复无需用户重启 Chimera、重新加载配置或手动调用 reset。
 
@@ -743,3 +743,11 @@ lifecycle tests.
 - 扩展 `runtime_path_preference_updates_are_versioned_and_temporary`：在自动路径观察器不支持平台的早退之前，对 `/runtime/network/path-decision/{flowId}` 分别发送格式错误的 UUID 与格式正确但不存在的 UUID，确认返回 `400 Bad Request` 和 `404 Not Found`。
 - 定向命令 `CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo test -p clash-lib --test api_tests --no-default-features --features zero_copy,tls,aws-lc-rs,tun,port,reality,vless-encryption,extended-health-check,ring,ws,anytls,shadowsocks,wireguard,trojan,hysteria,xhttp-h3,tproxy,redir,http_port,mixed_port,tracing --locked runtime_path_preference_updates_are_versioned_and_temporary -- --exact --nocapture`：1 passed。`cargo fmt --all -- --check` 与 `git diff --check` 通过。
 - 这验证参数解析错误与缺失记录的 HTTP 状态；没有构造已过期但曾存在的记录，因此过期清理后的 API 行为仍未单独覆盖。
+
+### 2026-10-24：B7 Dispatcher 代理 UDP 路径健康证据
+
+- 基线：本地 `master` `634601ad25987cadc2b6bb1f5bf555ad5ccc42b6`；实现限定于代理 UDP association 的健康证据，不改变代理选路、DNS 或网络设置。
+- 新 association 与复用 association 现在都可将连接器实际报告的首个本地 `NetworkPathId` 作为 `ProxyUdp` 健康证据路径。DIRECT 仍要求所选计划 PathId 与 socket 观测完全相等；缺少实际 PathId 时两类 outbound 都不产生路径级证据。`TrafficReporter` 继续按当前 operation/network token 丢弃旧代事件。
+- 代理 UDP 回包仅更新其本机承载路径健康，不将经代理的远端目标登记为 DIRECT 目的地健康。成功响应可以证明承载路径有响应；该证据不携带目标，因此发送失败至多更新路径错误诊断字段，不增加独立失败计数，也不会据此将路径标为 `unavailable`。
+- 新增 `proxy_udp_health_uses_observed_path_without_attributing_target_health`，并扩展 association cache 回归：代理无计划 PathId 时保留 connector 观测路径；DIRECT 的 planned/observed 不匹配仍拒绝证据。定向用例在默认和所有 Rust feature 组合下均通过。`cargo test -p clash-lib --lib --locked` 为 976 passed、0 failed、12 ignored；Dashboard 外全 Rust feature 库测试为 1149 passed、0 failed、12 ignored；`cargo test -p clash-lib --test direct_udp_integration_tests --locked -- --test-threads=1` 为 3 passed；Dashboard 外全 Rust feature 严格 Clippy、格式与 `git diff --check` 通过。
+- 此切片的新增回归覆盖 Dispatcher 选用证据的 helper → `TrafficReporter` → `NetworkStatus` 记录链，以及 session cache 复用选择；测试注入 PathId，尚未在有物理网卡 PathId 的真实代理 UDP 服务端上跑完整端到端数据包。loopback connector 不会伪造物理路径，因此远端代理 UDP 互操作、非 loopback 实网与 B11 仍待验收。
