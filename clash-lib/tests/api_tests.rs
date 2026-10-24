@@ -788,6 +788,21 @@ async fn runtime_path_preference_updates_are_versioned_and_temporary() {
     .unwrap();
     assert!(decisions.is_array());
 
+    let unauthenticated_decision_url =
+        format!("http://127.0.0.1:{api_port}/runtime/network/path-decisions");
+    let unauthenticated_request = hyper::Request::builder()
+        .uri(&unauthenticated_decision_url)
+        .method(http::method::Method::GET)
+        .body(http_body_util::Empty::<Bytes>::new())
+        .expect("failed to build unauthenticated path decisions GET");
+    let response = send_http_request(
+        unauthenticated_decision_url.parse().unwrap(),
+        unauthenticated_request,
+    )
+    .await
+    .expect("failed to GET path decisions without authentication");
+    assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED);
+
     let unknown_flow = uuid::Uuid::new_v4();
     for (flow_id, expected_status) in [
         ("not-a-uuid".to_owned(), http::StatusCode::BAD_REQUEST),
