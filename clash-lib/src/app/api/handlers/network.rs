@@ -158,6 +158,7 @@ mod tests {
     use super::*;
     use crate::{GlobalState, runner::Runner};
     use futures::future::BoxFuture;
+    use tower::ServiceExt;
 
     struct NoopRunner;
 
@@ -200,34 +201,60 @@ mod tests {
         );
         status.expire_path_decisions_for_test();
 
-        let (reload_tx, _) = tokio::sync::mpsc::channel(1);
         let (network_reset_tx, _) = tokio::sync::mpsc::channel(1);
         let global = Arc::new(tokio::sync::Mutex::new(GlobalState {
             log_level: crate::config::def::LogLevel::Info,
             #[cfg(feature = "tun")]
             tunnel_runner: Arc::new(NoopRunner),
             dns_listener: Arc::new(NoopRunner),
-            reload_tx,
+            reload_tx: tokio::sync::mpsc::channel(1).0,
             network_reset_tx,
             network_status: Arc::new(tokio::sync::RwLock::new(status)),
             cwd: String::new(),
             config_path: None,
         }));
+        let (log_source_tx, _) = tokio::sync::broadcast::channel(1);
+        let app_state = Arc::new(crate::app::api::AppState {
+            log_source_tx,
+            statistics_manager: crate::app::dispatcher::StatisticsManager::new(),
+        });
+        let app = Router::new()
+            .nest("/runtime", status_routes(global))
+            .with_state(app_state);
 
-        let detail = path_decision(
-            State(NetworkState {
-                global: global.clone(),
-            }),
-            axum::extract::Path(flow_id.to_string()),
-        )
-        .await;
-        let (status_code, message) =
-            detail.expect_err("expired record should be missing");
-        assert_eq!(status_code, StatusCode::NOT_FOUND);
-        assert!(message.contains("expired"));
+        let list = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .uri("/runtime/network/path-decisions")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+        let list_body = axum::body::to_bytes(list.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&list_body).unwrap(),
+            serde_json::json!([])
+        );
 
-        let list = path_decisions(State(NetworkState { global })).await;
-        assert!(list.0.is_empty());
+        let detail = app
+            .oneshot(
+                http::Request::builder()
+                    .uri(format!("/runtime/network/path-decision/{flow_id}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail.status(), StatusCode::NOT_FOUND);
+        let detail_body = axum::body::to_bytes(detail.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&detail_body).contains("expired"));
     }
 
     #[test]
