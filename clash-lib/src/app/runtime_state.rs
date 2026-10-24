@@ -463,6 +463,14 @@ impl RuntimeStatus {
         self.automatic_supported = supported;
     }
 
+    #[cfg(test)]
+    pub(crate) fn expire_path_decisions_for_test(&mut self) {
+        let expired_at = Instant::now() - HEALTH_ENTRY_TTL;
+        for stored in &mut self.path_decisions {
+            stored.stored_at = expired_at;
+        }
+    }
+
     /// Clone the bounded OS path observations for shadow planning without
     /// exposing the mutable runtime status lock to the planner.
     pub(crate) fn shadow_path_snapshot(

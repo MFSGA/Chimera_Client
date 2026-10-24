@@ -155,7 +155,80 @@ fn internal_error(error: impl ToString) -> (StatusCode, String) {
 
 #[cfg(test)]
 mod tests {
-    use super::NetworkResetResponse;
+    use super::*;
+    use crate::{GlobalState, runner::Runner};
+    use futures::future::BoxFuture;
+
+    struct NoopRunner;
+
+    impl Runner for NoopRunner {
+        fn run_async(&self) {}
+
+        fn shutdown(&self) {}
+
+        fn join(&self) -> BoxFuture<'_, crate::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_path_decision_is_not_found_and_absent_from_list() {
+        let flow_id = uuid::Uuid::new_v4();
+        let mut status = NetworkStatus::default();
+        let (config_version, policy_version, network_version, operation_id) =
+            status.decision_versions();
+        assert!(
+            status.record_path_decision(crate::app::flow::PathDecisionRecord {
+                flow_id,
+                config_version,
+                config_version_at_completion: None,
+                policy_version,
+                network_version,
+                operation_id,
+                outcome: crate::app::flow::PathExecutionOutcome::Connected,
+                route: crate::app::flow::RouteDecision {
+                    outbound: "DIRECT".to_owned(),
+                    rule: None,
+                },
+                candidate_paths: Vec::new(),
+                selected_path: None,
+                rejected: Vec::new(),
+                failure_kind: None,
+                reason: "connectedOnBoundPath".to_owned(),
+                recorded_at_ms: chrono::Utc::now().timestamp_millis(),
+            })
+        );
+        status.expire_path_decisions_for_test();
+
+        let (reload_tx, _) = tokio::sync::mpsc::channel(1);
+        let (network_reset_tx, _) = tokio::sync::mpsc::channel(1);
+        let global = Arc::new(tokio::sync::Mutex::new(GlobalState {
+            log_level: crate::config::def::LogLevel::Info,
+            #[cfg(feature = "tun")]
+            tunnel_runner: Arc::new(NoopRunner),
+            dns_listener: Arc::new(NoopRunner),
+            reload_tx,
+            network_reset_tx,
+            network_status: Arc::new(tokio::sync::RwLock::new(status)),
+            cwd: String::new(),
+            config_path: None,
+        }));
+
+        let detail = path_decision(
+            State(NetworkState {
+                global: global.clone(),
+            }),
+            axum::extract::Path(flow_id.to_string()),
+        )
+        .await;
+        let (status_code, message) =
+            detail.expect_err("expired record should be missing");
+        assert_eq!(status_code, StatusCode::NOT_FOUND);
+        assert!(message.contains("expired"));
+
+        let list = path_decisions(State(NetworkState { global })).await;
+        assert!(list.0.is_empty());
+    }
 
     #[test]
     fn response_uses_stable_camel_case_fields() {
