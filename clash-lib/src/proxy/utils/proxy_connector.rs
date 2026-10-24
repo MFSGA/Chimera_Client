@@ -2826,6 +2826,137 @@ mod tests {
         assert!(attempts[2].path.is_none());
     }
 
+    #[cfg(all(feature = "tun", any(target_os = "linux", target_os = "macos")))]
+    #[tokio::test]
+    async fn proxy_endpoint_dial_uses_next_path_when_actual_source_mismatches() {
+        #[cfg(target_os = "linux")]
+        let loopback_name = "lo";
+        #[cfg(target_os = "macos")]
+        let loopback_name = "lo0";
+        let iface = crate::app::net::get_interface_by_name(loopback_name)
+            .expect("loopback interface should be discoverable");
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("failed to bind local proxy endpoint");
+        let endpoint = listener.local_addr().unwrap();
+
+        let observations = vec![
+            candidate(
+                &iface.name,
+                iface.index,
+                Ipv4Addr::UNSPECIFIED,
+                DefaultRouteEvidence::PrimaryDefaultRoute,
+                BindingStatus::Verified,
+            ),
+            candidate(
+                &iface.name,
+                iface.index,
+                Ipv4Addr::LOCALHOST,
+                DefaultRouteEvidence::OtherInterface,
+                BindingStatus::Verified,
+            ),
+        ];
+        let mut status = NetworkStatus::default();
+        status.set_automatic_supported_for_test(true);
+        status.observed(&NetworkSnapshot {
+            path_candidates: observations.clone(),
+            ..Default::default()
+        });
+        let generation = status
+            .path_planning_snapshot()
+            .expect("observed loopback candidates should be available")
+            .0;
+        let (planned_paths, selected, _) =
+            DirectConnector::endpoint_paths_with_selection(
+                Some(&iface),
+                AddressFamily::Ipv4,
+                &observations,
+                generation,
+                &NetworkIntentSnapshot::default(),
+            )
+            .expect("loopback candidates should compile into a path plan");
+        let first_path = planned_paths
+            .first()
+            .expect("the preferred path should be present");
+        let second_path = planned_paths
+            .get(1)
+            .expect("the fallback loopback path should be present");
+        assert_eq!(selected.as_ref(), Some(&first_path.id));
+        assert_eq!(
+            first_path.source_address,
+            Some(Ipv4Addr::UNSPECIFIED.into())
+        );
+        assert_eq!(second_path.source_address, Some(Ipv4Addr::LOCALHOST.into()));
+
+        let source = NetworkPathSource::default();
+        source
+            .attach(Arc::new(tokio::sync::RwLock::new(status)))
+            .await;
+        let connector = DirectConnector::with_path_source(source);
+        let pool_context = connector.connection_pool_context(Some(&iface)).await;
+        assert!(
+            pool_context
+                .eligible_path_ids
+                .as_ref()
+                .is_some_and(|paths| paths.contains(&first_path.id)
+                    && paths.contains(&second_path.id))
+        );
+
+        let resolver = Arc::new(MockClashResolver::new());
+        let dial = async {
+            #[cfg(target_os = "linux")]
+            {
+                connector
+                    .connect_stream_with_pool_context(
+                        resolver,
+                        &endpoint.ip().to_string(),
+                        endpoint.port(),
+                        Some(&iface),
+                        None,
+                        pool_context,
+                    )
+                    .await
+            }
+            #[cfg(target_os = "macos")]
+            {
+                connector
+                    .connect_stream_with_pool_context(
+                        resolver,
+                        &endpoint.ip().to_string(),
+                        endpoint.port(),
+                        Some(&iface),
+                        pool_context,
+                    )
+                    .await
+            }
+        };
+        let (stream, connected_context) =
+            tokio::time::timeout(std::time::Duration::from_secs(8), dial)
+                .await
+                .expect("proxy endpoint path attempts exceeded the test deadline")
+                .expect("fallback loopback path should connect");
+        assert_eq!(
+            connected_context.path_id.as_ref(),
+            Some(&second_path.id),
+            "the wildcard-source attempt must be discarded in favor of the concrete source"
+        );
+
+        // The rejected wildcard-source attempt has connected before its actual
+        // local address is checked; accept it and the winning connection so
+        // neither remains queued on the local listener.
+        for _ in 0..2 {
+            let (accepted, _) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                listener.accept(),
+            )
+            .await
+            .expect("expected both local path attempts to reach the listener")
+            .expect("failed to accept local path attempt");
+            drop(accepted);
+        }
+        drop(stream);
+    }
+
     #[test]
     fn proxy_endpoint_failure_keeps_structured_path_details_in_io_error() {
         let path = observed_path("wifi0", 4, "192.0.2.10".parse().unwrap(), 7);
