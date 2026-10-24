@@ -656,3 +656,10 @@ lifecycle tests.
   `cargo check -p clash-lib --no-default-features --locked` 通过。
 - 未运行 Dashboard 全 feature、实机多网卡、跨平台网络验证；
   本切片不变更运行时路由选项或协议 wire 格式。
+
+### 2026-10-24：B10 API 与本地 UDP 恢复回归
+
+- 基线：本地 `master` `8a057f4bd5d450a958a3fe8677ea30ad4bf0b428`；在 Darwin 上按默认 `clash-lib` feature 运行，不启用 Dashboard `--all-features`。
+- `CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo test -p clash-lib --test api_tests --locked runtime_path_preference_updates_are_versioned_and_temporary -- --exact --nocapture`：1 项通过，覆盖偏好读取/更新、临时覆写、清除恢复、版本递增、effective-paths 与未知 Flow 决策查询。
+- `CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo test -p clash-lib --test direct_udp_integration_tests --locked network_recovery_replaces_udp_socket_without_restarting_inbound -- --exact --nocapture --test-threads=1`：1 项通过；仅使用 loopback UDP echo 和本地 `/network/reset`，验证 socket 更换、runtime readiness、恢复证据及 UDP Flow 到 Explain 记录的关联，不修改宿主机网卡、路由、DNS 或 TUN。
+- 这两项使 B10 的偏好 API/临时覆写和本机恢复链路有了实际测试证据；不代表 B8 代理端点多路径竞速、B7 全协议池行为或 B11 专用网络验收已完成。`--all-features`、其他平台及真实多网卡仍未验证。
