@@ -158,7 +158,7 @@ mod tests {
     use super::*;
     use crate::{GlobalState, runner::Runner};
     use futures::future::BoxFuture;
-    use tower::ServiceExt;
+    use http_body_util::BodyExt;
 
     struct NoopRunner;
 
@@ -221,40 +221,56 @@ mod tests {
         let app = Router::new()
             .nest("/runtime", status_routes(global))
             .with_state(app_state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test API listener should serve requests");
+        });
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let io = hyper_util::rt::TokioIo::new(stream);
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake(io).await.unwrap();
+        let connection_task = tokio::spawn(async move {
+            connection
+                .await
+                .expect("test API HTTP connection should remain usable");
+        });
 
-        let list = app
-            .clone()
-            .oneshot(
+        let list = sender
+            .send_request(
                 http::Request::builder()
                     .uri("/runtime/network/path-decisions")
-                    .body(axum::body::Body::empty())
+                    .body(http_body_util::Empty::<bytes::Bytes>::new())
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(list.status(), StatusCode::OK);
-        let list_body = axum::body::to_bytes(list.into_body(), usize::MAX)
-            .await
-            .unwrap();
+        let list_body = list.into_body().collect().await.unwrap();
+        let list_body = list_body.to_bytes();
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&list_body).unwrap(),
             serde_json::json!([])
         );
 
-        let detail = app
-            .oneshot(
+        let detail = sender
+            .send_request(
                 http::Request::builder()
                     .uri(format!("/runtime/network/path-decision/{flow_id}"))
-                    .body(axum::body::Body::empty())
+                    .body(http_body_util::Empty::<bytes::Bytes>::new())
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(detail.status(), StatusCode::NOT_FOUND);
-        let detail_body = axum::body::to_bytes(detail.into_body(), usize::MAX)
-            .await
-            .unwrap();
+        let detail_body = detail.into_body().collect().await.unwrap();
+        let detail_body = detail_body.to_bytes();
         assert!(String::from_utf8_lossy(&detail_body).contains("expired"));
+        drop(sender);
+        connection_task.abort();
+        server_task.abort();
     }
 
     #[test]
