@@ -3,6 +3,7 @@
 use std::{net::TcpListener as StdTcpListener, path::PathBuf, time::Duration};
 
 use clash_lib::{Config, Options};
+use http_body_util::BodyExt;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -10,7 +11,7 @@ use tokio::{
 
 mod common;
 
-use common::{ClashInstance, Socks5UdpSession, wait_port_ready};
+use common::{ClashInstance, Socks5UdpSession, send_http_request, wait_port_ready};
 
 const PASSWORD: &str = "3SYJ/f8nmVuzKvKglykRQDSgg10e/ADilkdRWrrY9HU=";
 
@@ -30,7 +31,7 @@ fn available_listener_ports() -> [u16; 4] {
     reservations.map(|listener| listener.local_addr().unwrap().port())
 }
 
-fn start_shadowsocks_pair(udp: bool) -> (ClashInstance, ClashInstance, u16) {
+fn start_shadowsocks_pair(udp: bool) -> (ClashInstance, ClashInstance, u16, u16) {
     let [server_api, server_port, client_api, socks_port] =
         available_listener_ports();
     let cwd =
@@ -107,7 +108,27 @@ rules:
     .expect("failed to start Shadowsocks client");
     wait_port_ready(socks_port).expect("Shadowsocks SOCKS listener not ready");
 
-    (server, client, socks_port)
+    (server, client, socks_port, client_api)
+}
+
+async fn get_api_json(api_port: u16, path: &str) -> serde_json::Value {
+    let url = format!("http://127.0.0.1:{api_port}{path}");
+    let request = hyper::Request::builder()
+        .uri(&url)
+        .header(http::header::AUTHORIZATION, "Bearer clash-rs")
+        .method(http::Method::GET)
+        .body(http_body_util::Empty::<bytes::Bytes>::new())
+        .expect("failed to build API GET request");
+    let response = send_http_request(url.parse().unwrap(), request)
+        .await
+        .expect("failed to send API GET request");
+    assert_eq!(response.status(), http::StatusCode::OK, "GET {path}");
+    let body = response
+        .collect()
+        .await
+        .expect("failed to collect API GET response")
+        .to_bytes();
+    serde_json::from_slice(&body).expect("failed to parse API GET JSON")
 }
 
 async fn spawn_udp_echo() -> (u16, tokio::task::JoinHandle<()>) {
@@ -170,7 +191,7 @@ async fn integration_test_shadowsocks_tcp() {
         stream.shutdown().await.unwrap();
     });
 
-    let (_server, _client, socks_port) = start_shadowsocks_pair(false);
+    let (_server, _client, socks_port, api_port) = start_shadowsocks_pair(false);
     let mut stream = socks5_connect(socks_port, target_port).await;
     stream
         .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
@@ -187,6 +208,64 @@ async fn integration_test_shadowsocks_tcp() {
     let response = String::from_utf8_lossy(&response);
     assert!(response.starts_with("HTTP/1.1 200 OK"));
     assert!(response.ends_with("shadowsocks-roundtrip"));
+
+    let (tracked_flow, connected_decision) =
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let flows =
+                    get_api_json(api_port, "/flows?include_closed=true").await;
+                if let Some(flow) = flows.as_array().and_then(|records| {
+                    records.iter().find(|flow| {
+                        flow["protocol"] == "tcp"
+                            && flow["dstPort"].as_u64()
+                                == Some(u64::from(target_port))
+                            && flow["flowIds"]
+                                .as_array()
+                                .is_some_and(|ids| !ids.is_empty())
+                    })
+                }) {
+                    let flow = flow.clone();
+                    let flow_ids = flow["flowIds"]
+                        .as_array()
+                        .expect("tracked Shadowsocks flow should expose IDs");
+                    let decisions =
+                        get_api_json(api_port, "/runtime/network/path-decisions")
+                            .await;
+                    if let Some(decision) =
+                        decisions.as_array().and_then(|records| {
+                            records.iter().find(|decision| {
+                                flow_ids.iter().any(|id| id == &decision["flowId"])
+                                    && decision["outcome"] == "connected"
+                                    && decision["route"]["outbound"]
+                                        == "shadowsocks-out"
+                            })
+                        })
+                    {
+                        break (flow, decision.clone());
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("Shadowsocks flow did not produce a connected Explain record");
+    let flow_ids = tracked_flow["flowIds"]
+        .as_array()
+        .expect("tracked Shadowsocks flow should expose IDs");
+    assert!(
+        flow_ids
+            .iter()
+            .any(|flow_id| flow_id == &connected_decision["flowId"])
+    );
+    let flow_id = connected_decision["flowId"]
+        .as_str()
+        .expect("Shadowsocks Explain record should expose a flow ID");
+    let detail = get_api_json(
+        api_port,
+        &format!("/runtime/network/path-decision/{flow_id}"),
+    )
+    .await;
+    assert_eq!(detail, connected_decision);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -202,7 +281,7 @@ async fn integration_test_shadowsocks_udp() {
         target.send_to(&buffer[..size], source).await.unwrap();
     });
 
-    let (_server, _client, socks_port) = start_shadowsocks_pair(true);
+    let (_server, _client, socks_port, _) = start_shadowsocks_pair(true);
     let session = Socks5UdpSession::connect(socks_port).await;
     session
         .send_ipv4(b"shadowsocks-udp-roundtrip", [127, 0, 0, 1], target_port)
@@ -222,7 +301,7 @@ async fn integration_test_shadowsocks_udp() {
 async fn integration_test_shadowsocks_udp_multi_target() {
     let (first_port, first_task) = spawn_udp_echo().await;
     let (second_port, second_task) = spawn_udp_echo().await;
-    let (_server, _client, socks_port) = start_shadowsocks_pair(true);
+    let (_server, _client, socks_port, _) = start_shadowsocks_pair(true);
     let session = Socks5UdpSession::connect(socks_port).await;
 
     for (payload, port) in [
@@ -260,7 +339,7 @@ async fn integration_test_shadowsocks_udp_session_isolation() {
         }
     });
 
-    let (_server, _client, socks_port) = start_shadowsocks_pair(true);
+    let (_server, _client, socks_port, _) = start_shadowsocks_pair(true);
     let first = Socks5UdpSession::connect(socks_port).await;
     let second = Socks5UdpSession::connect(socks_port).await;
 
