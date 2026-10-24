@@ -331,12 +331,46 @@ async fn network_recovery_replaces_udp_socket_without_restarting_inbound() {
             .to_bytes(),
     )
     .unwrap();
-    assert!(decisions.as_array().unwrap().iter().any(|decision| {
-        flow_ids
-            .iter()
-            .any(|flow_id| flow_id == &decision["flowId"])
-            && decision["outcome"] == "connected"
-    }));
+    let connected_decision = decisions
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|decision| {
+            flow_ids
+                .iter()
+                .any(|flow_id| flow_id == &decision["flowId"])
+                && decision["outcome"] == "connected"
+        })
+        .expect("UDP flow should have a connected Explain record");
+    let decision_uri: hyper::Uri = format!(
+        "http://127.0.0.1:{api_port}/runtime/network/path-decision/{}",
+        connected_decision["flowId"].as_str().unwrap()
+    )
+    .parse()
+    .unwrap();
+    let decision_request = hyper::Request::builder()
+        .uri(decision_uri.clone())
+        .header("Authorization", "Bearer clash-rs")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let decision_response =
+        common::send_http_request(decision_uri, decision_request)
+            .await
+            .unwrap();
+    assert_eq!(decision_response.status(), 200);
+    let decision_detail: serde_json::Value = serde_json::from_slice(
+        &decision_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+    )
+    .unwrap();
+    assert_eq!(
+        &decision_detail, connected_decision,
+        "single-flow Explain endpoint should return the matching list record"
+    );
     assert!(status["generation"].as_u64().unwrap() >= 19);
     assert_eq!(status["failures"], 0);
     echo_task.abort();
