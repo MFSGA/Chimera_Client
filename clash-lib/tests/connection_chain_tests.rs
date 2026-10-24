@@ -72,6 +72,60 @@ rules:
     (clash, api_port, socks_port)
 }
 
+fn start_direct_client() -> (ClashInstance, u16, u16) {
+    let api_port = available_port();
+    let socks_port = available_port();
+    let config = format!(
+        r#"allow-lan: false
+bind-address: 127.0.0.1
+socks-port: {socks_port}
+mode: direct
+log-level: error
+mmdb: null
+external-controller: 127.0.0.1:{api_port}
+secret: clash-rs
+tun:
+  enable: false
+rules:
+  - MATCH,DIRECT
+"#
+    );
+    let cwd =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
+    let clash = ClashInstance::start(
+        Options {
+            config: Config::Str(config),
+            cwd: Some(cwd.to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            config_path: None,
+        },
+        vec![api_port, socks_port],
+    )
+    .expect("failed to start DIRECT Explain client");
+    (clash, api_port, socks_port)
+}
+
+async fn get_api_json(api_port: u16, path: &str) -> serde_json::Value {
+    let url = format!("http://127.0.0.1:{api_port}{path}");
+    let request = hyper::Request::builder()
+        .uri(&url)
+        .header(http::header::AUTHORIZATION, "Bearer clash-rs")
+        .method(http::Method::GET)
+        .body(http_body_util::Empty::<Bytes>::new())
+        .expect("failed to build API GET request");
+    let response = send_http_request(url.parse().unwrap(), request)
+        .await
+        .expect("failed to send API GET request");
+    assert_eq!(response.status(), http::StatusCode::OK, "GET {path}");
+    let body = response
+        .collect()
+        .await
+        .expect("failed to collect API GET response")
+        .to_bytes();
+    serde_json::from_slice(&body).expect("failed to parse API GET JSON")
+}
+
 async fn socks5_connect(proxy_port: u16, target_port: u16) -> TcpStream {
     let mut stream = TcpStream::connect(("127.0.0.1", proxy_port))
         .await
@@ -264,6 +318,109 @@ async fn ref_compat_connections_report_proxy_chain_names() {
 
     request_task.await.expect("proxy request task failed");
     target_task.await.expect("HTTP target task failed");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn direct_tcp_flow_is_queryable_from_path_explain() {
+    let target = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind local HTTP target");
+    let target_port = target.local_addr().unwrap().port();
+    let target_task = tokio::spawn(async move {
+        let (mut stream, _) = target.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0; 512];
+        loop {
+            let length = stream.read(&mut chunk).await.unwrap();
+            if length == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..length]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        assert!(request.starts_with(b"GET / HTTP/1.1\r\n"));
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\ndirect-ok",
+            )
+            .await
+            .unwrap();
+    });
+
+    let (_clash, api_port, socks_port) = start_direct_client();
+    let mut stream = socks5_connect(socks_port, target_port).await;
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("failed to send request through DIRECT");
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+        .await
+        .expect("timed out reading DIRECT response")
+        .expect("failed to read DIRECT response");
+    target_task.await.expect("HTTP target task failed");
+    assert!(response.starts_with(b"HTTP/1.1 200 OK"));
+    assert!(response.ends_with(b"direct-ok"));
+
+    let (tracked_flow, connected_decision) =
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let flows =
+                    get_api_json(api_port, "/flows?include_closed=true").await;
+                if let Some(flow) = flows.as_array().and_then(|records| {
+                    records.iter().find(|flow| {
+                        flow["protocol"] == "tcp"
+                            && flow["dstPort"].as_u64()
+                                == Some(u64::from(target_port))
+                            && flow["flowIds"]
+                                .as_array()
+                                .is_some_and(|ids| !ids.is_empty())
+                    })
+                }) {
+                    let flow = flow.clone();
+                    let flow_ids = flow["flowIds"]
+                        .as_array()
+                        .expect("tracked DIRECT flow should expose IDs");
+                    let decisions =
+                        get_api_json(api_port, "/runtime/network/path-decisions")
+                            .await;
+                    if let Some(decision) =
+                        decisions.as_array().and_then(|records| {
+                            records.iter().find(|decision| {
+                                flow_ids.iter().any(|id| id == &decision["flowId"])
+                                    && decision["outcome"] == "connected"
+                                    && decision["route"]["outbound"] == "DIRECT"
+                            })
+                        })
+                    {
+                        break (flow, decision.clone());
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("DIRECT flow did not produce a connected Explain record");
+    let flow_ids = tracked_flow["flowIds"]
+        .as_array()
+        .expect("tracked DIRECT flow should expose IDs");
+    assert!(
+        flow_ids
+            .iter()
+            .any(|flow_id| flow_id == &connected_decision["flowId"])
+    );
+    let flow_id = connected_decision["flowId"]
+        .as_str()
+        .expect("DIRECT Explain record should expose a flow ID");
+    let detail = get_api_json(
+        api_port,
+        &format!("/runtime/network/path-decision/{flow_id}"),
+    )
+    .await;
+    assert_eq!(detail, connected_decision);
 }
 
 #[tokio::test(flavor = "current_thread")]
