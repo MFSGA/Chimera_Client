@@ -43,6 +43,13 @@ TLS 指纹模拟明确排除。Android FFI、页面交互以及本地 gRPC 旧�
 - 完整 `clash-lib` 测试、跨平台构建和真实 API 客户端互操作尚未执行。
 - 独立 Reviewer 在最终 diff 上未发现阻塞问题；Reviewer 为只读审查，未独立重跑测试。没有创建 PR 或推送；本轮按本地 `master` 迭代流程提交，提交签名与 SHA 在交付信息中核验。
 
+## 2026-10-24 追加验证
+
+- 本次续接基线为本地 `master` `718495497864f4451a26061e0c18aaf3a2d18fe0`；增加 `dialer_proxy_connects_through_a_local_socks5_hop`，通过两个 loopback SOCKS5 中继和本地 HTTP 目标验证真实 TCP `dialer-proxy` 链。测试解析并断言 upstream 到 leaf、leaf 到目标的 CONNECT 地址，检查 HTTP 请求头和响应体，并为连接、读取及目标任务设置超时；不操作宿主机网卡、路由、DNS 或 TUN。
+- `CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo test -p clash-lib --test connection_chain_tests`：2 项通过。
+- `CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo clippy -p clash-lib --test connection_chain_tests -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check`：通过。
+- 独立 Reviewer 只读复核本次最终测试 diff，未发现阻塞问题；Reviewer 未独立重跑测试。残余小风险是测试端口“释放后再绑定”的竞争窗口；本测试实际路径全程使用 loopback。
+
 ## 剩余边界
 
 - 本轮实现的是 `Chimera_Client` 核心 API；Android 仓库的 FFI 模型、gRPC 旧校验及配置覆写页面仍需另一个仓库接入这些接口。
