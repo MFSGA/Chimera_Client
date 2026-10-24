@@ -503,6 +503,7 @@ mod tests {
         ] {
             let mut mock = MockClashResolver::new();
             mock.expect_ipv6().return_const(false);
+            mock.expect_safe_srv_enabled().return_const(false);
             mock.expect_should_fake_ip().once().return_const(blocked);
             if blocked {
                 mock.expect_exchange().never();
