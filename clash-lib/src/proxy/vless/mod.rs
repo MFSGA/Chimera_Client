@@ -864,6 +864,304 @@ mod reuse_tests {
     }
 }
 
+#[cfg(all(
+    test,
+    feature = "tls",
+    feature = "tun",
+    any(target_os = "linux", target_os = "macos")
+))]
+mod path_health_tests {
+    use std::{net::Ipv4Addr, sync::Arc, time::Duration};
+
+    use bytes::BytesMut;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::mpsc,
+        time::timeout,
+    };
+    use tokio_rustls::TlsAcceptor;
+
+    use super::{Handler, HandlerOptions};
+    use crate::{
+        app::{
+            dns::MockClashResolver,
+            flow::{AddressFamily, InterfaceId, InterfaceKind, NetworkPathId},
+            net::{OutboundInterface, get_interface_by_name},
+            network::{
+                BindingStatus, DefaultRouteEvidence, NetworkSnapshot, NetworkStatus,
+                PathCandidateObservation,
+            },
+            runtime_state::Lifecycle,
+        },
+        proxy::{
+            HandlerCommonOptions, OutboundHandler,
+            transport::TlsClient,
+            utils::{DirectConnector, NetworkPathSource},
+        },
+        session::{Session, SocksAddr},
+    };
+
+    const TEST_UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
+
+    #[tokio::test]
+    async fn tls_handshake_and_target_response_keep_the_dialed_path() {
+        crate::setup_default_crypto_provider();
+        let loopback_name = if cfg!(target_os = "macos") {
+            "lo0"
+        } else {
+            "lo"
+        };
+        let interface = get_interface_by_name(loopback_name)
+            .expect("loopback interface should be discoverable");
+
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+                .expect("test certificate should generate");
+        let cert = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+        let key =
+            rustls::pki_types::PrivateKeyDer::try_from(signing_key.serialize_der())
+                .expect("test private key should serialize");
+        let tls_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .expect("test TLS config should build");
+        let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("failed to bind local VLESS endpoint");
+        let endpoint = listener.local_addr().unwrap();
+
+        let mut status = NetworkStatus::default();
+        status.set_automatic_supported_for_test(true);
+        assert!(status.lifecycle(Lifecycle::Running, "test"));
+        status.observed(&NetworkSnapshot {
+            path_candidates: vec![
+                path_candidate(
+                    &interface.name,
+                    interface.index,
+                    Ipv4Addr::UNSPECIFIED,
+                    DefaultRouteEvidence::PrimaryDefaultRoute,
+                ),
+                path_candidate(
+                    &interface.name,
+                    interface.index,
+                    Ipv4Addr::LOCALHOST,
+                    DefaultRouteEvidence::OtherInterface,
+                ),
+            ],
+            ..Default::default()
+        });
+        let generation = status
+            .shadow_path_snapshot()
+            .expect("test status should expose observed loopback candidates")
+            .0;
+        let selected_path = NetworkPathId {
+            interface: InterfaceId {
+                name: interface.name.clone(),
+                index: interface.index,
+            },
+            family: AddressFamily::Ipv4,
+            source_address: Some(Ipv4Addr::LOCALHOST.into()),
+            network_generation: generation,
+        };
+
+        let (events_tx, mut events_rx) = mpsc::channel(4);
+        let reporter = status.traffic_reporter(events_tx);
+        let status = Arc::new(tokio::sync::RwLock::new(status));
+        let source = NetworkPathSource::default();
+        source.attach(status.clone()).await;
+        source.attach_traffic_reporter(reporter).await;
+        let connector = DirectConnector::with_path_source(source);
+
+        let target: SocksAddr = "203.0.113.39:443".parse().unwrap();
+        let server_target = target.clone();
+        let acceptor = acceptor.clone();
+        let server = tokio::spawn(async move {
+            let (rejected, _) = timeout(Duration::from_secs(3), listener.accept())
+                .await
+                .expect("timed out accepting the rejected wildcard-source attempt")
+                .expect("failed to accept the first local dial attempt");
+            drop(rejected);
+
+            let (tcp, _) = timeout(Duration::from_secs(3), listener.accept())
+                .await
+                .expect("timed out accepting the selected-path TLS session")
+                .expect("failed to accept the selected local dial");
+            let mut tls = timeout(Duration::from_secs(3), acceptor.accept(tcp))
+                .await
+                .expect("timed out completing the TLS handshake")
+                .expect("TLS handshake should succeed");
+
+            let mut request_header = [0; 19];
+            tls.read_exact(&mut request_header)
+                .await
+                .expect("read VLESS request header");
+            assert_eq!(request_header[0], 0, "VLESS version must be zero");
+            let expected_uuid = uuid::Uuid::parse_str(TEST_UUID).unwrap();
+            assert_eq!(&request_header[1..17], expected_uuid.as_bytes());
+            assert_eq!(request_header[17], 0, "request add-ons should be empty");
+            assert_eq!(request_header[18], 1, "VLESS command must be TCP");
+
+            let mut expected_target = BytesMut::new();
+            server_target.write_to_buf_vmess(&mut expected_target);
+            let mut encoded_target = vec![0; expected_target.len()];
+            tls.read_exact(&mut encoded_target)
+                .await
+                .expect("read VLESS destination");
+            assert_eq!(encoded_target, expected_target.as_ref());
+
+            let mut request = [0; 14];
+            timeout(Duration::from_secs(3), tls.read_exact(&mut request))
+                .await
+                .expect("timed out reading tunneled VLESS request")
+                .expect("failed to read tunneled VLESS request");
+            assert_eq!(&request, b"target-request");
+
+            // Write the response header fields separately before the payload.
+            // TLS may coalesce them for the client, so this does not assert a
+            // short read; it verifies that the complete response is accepted.
+            tls.write_all(&[0])
+                .await
+                .expect("write VLESS response version");
+            tls.write_all(&[0])
+                .await
+                .expect("write VLESS response add-on length");
+            tls.write_all(b"R")
+                .await
+                .expect("write tunneled VLESS target response");
+            tls.flush().await.expect("flush VLESS target response");
+            (server_target, request)
+        });
+
+        let session = Session {
+            destination: target.clone(),
+            iface: Some(OutboundInterface {
+                name: interface.name,
+                addr_v4: None,
+                netmask_v4: None,
+                broadcast_v4: None,
+                addr_v6: None,
+                netmask_v6: None,
+                broadcast_v6: None,
+                index: interface.index,
+                mac_addr: None,
+            }),
+            ..Default::default()
+        };
+        let handler = Handler::new(HandlerOptions {
+            name: "local-vless".to_owned(),
+            common_opts: HandlerCommonOptions::default(),
+            server: endpoint.ip().to_string(),
+            port: endpoint.port(),
+            uuid: TEST_UUID.to_owned(),
+            udp: false,
+            transport: None,
+            tls: Some(Box::new(TlsClient::new(
+                true,
+                "localhost".to_owned(),
+                None,
+                None,
+            ))),
+            flow: None,
+            encryption: None,
+        });
+        let resolver = Arc::new(MockClashResolver::new());
+        let mut chained = timeout(
+            Duration::from_secs(5),
+            handler.connect_stream_with_connector(&session, resolver, &connector),
+        )
+        .await
+        .expect("VLESS path selection and TLS handshake exceeded the deadline")
+        .expect("VLESS TLS and request handshake should succeed on fallback path");
+        assert_eq!(chained.network_path_ids(), vec![selected_path.clone()]);
+        chained.write_all(b"target-request").await.unwrap();
+
+        let mut response = [0; 1];
+        timeout(Duration::from_secs(3), chained.read_exact(&mut response))
+            .await
+            .expect("timed out reading VLESS target response")
+            .expect("failed to read VLESS target response");
+        assert_eq!(&response, b"R");
+        let (server_target, request) = timeout(Duration::from_secs(3), server)
+            .await
+            .expect("local VLESS server did not finish")
+            .expect("local VLESS server task failed");
+        assert_eq!(server_target, target);
+        assert_eq!(&request, b"target-request");
+
+        for _ in 0..3 {
+            let event = timeout(Duration::from_secs(2), events_rx.recv())
+                .await
+                .expect("expected dial-failure, endpoint, and target evidence")
+                .expect("traffic reporter stopped before all path results");
+            status.write().await.record_traffic(event);
+        }
+        let snapshot = {
+            let status = status.read().await;
+            serde_json::to_value(&*status).unwrap()
+        };
+        let traffic_evidence = snapshot["trafficEvidence"].as_array().unwrap();
+        let endpoint_evidence = traffic_evidence
+            .iter()
+            .find(|event| event["kind"] == "proxyEndpointTcp")
+            .expect("TLS endpoint response should produce endpoint evidence");
+        assert!(endpoint_evidence["receivedBytes"].as_u64().unwrap() > 0);
+        let target_evidence = traffic_evidence
+            .iter()
+            .find(|event| event["kind"] == "proxyTcp")
+            .expect("VLESS target response should produce proxy evidence");
+        assert_eq!(target_evidence["receivedBytes"], 1);
+
+        let selected_path_json = serde_json::to_value(&selected_path).unwrap();
+        let selected_path_health = snapshot["pathHealth"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["path"] == selected_path_json)
+            .expect("the successful local NIC should have path health");
+        assert_eq!(selected_path_health["state"], "available");
+        let selected_destination_health = snapshot["destinationPathHealth"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["path"] == selected_path_json)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selected_destination_health.len(),
+            2,
+            "VLESS endpoint and tunneled target should have distinct health entries"
+        );
+        assert!(
+            selected_destination_health
+                .iter()
+                .all(|entry| entry["state"] == "available")
+        );
+    }
+
+    fn path_candidate(
+        name: &str,
+        index: u32,
+        source_address: Ipv4Addr,
+        default_route: DefaultRouteEvidence,
+    ) -> PathCandidateObservation {
+        PathCandidateObservation {
+            interface: InterfaceId {
+                name: name.to_owned(),
+                index,
+            },
+            interface_kind: InterfaceKind::Unknown,
+            family: AddressFamily::Ipv4,
+            source_address: source_address.into(),
+            scope_id: None,
+            gateway: None,
+            default_route,
+            binding: BindingStatus::Verified,
+            binding_error: None,
+        }
+    }
+}
+
 #[cfg(all(test, docker_test))]
 mod tests {
     use std::{collections::HashMap, io::Write as _};
