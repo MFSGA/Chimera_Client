@@ -154,7 +154,8 @@ Cargo 的 `-p` 参数使用 package 名称，不一定等于目录名。
 - 原生依赖按目标和 feature 确认；`flake.nix` 提供 clang/libclang、CMake、nasm、
   pkg-config、protobuf、OpenSSL 等开发工具。不要在无诊断依据时批量安装或升级工具。
 - Nix 环境可用 `nix develop --command cargo check --workspace`。当前 flake 的
-  nixpkgs 输入是本机 `/nix/store/` 路径，换机使用前需核对可用性。
+  nixpkgs 输入来自 GitHub flake 并由 `flake.lock` 固定 revision；换机时需确认
+  flakes 可用且锁定源码可以从本地缓存或网络获取。
 - CLI 默认启用 `dashboard`。`clash-lib/build.rs` 只校验并追踪
   `clash-dashboard/dist/` 中已构建的静态资源，不运行 `npm ci` 或 `npm run build`。
   普通 Cargo 构建 Dashboard-enabled CLI 前，需在 `clash-dashboard/` 显式运行
