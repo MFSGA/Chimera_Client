@@ -3,8 +3,16 @@ import { getApiUrl, getSecret } from './settings';
 // Types
 export interface Version {
   version: string;
-  premium: boolean;
   meta: boolean;
+}
+
+export interface Capabilities {
+  platform: {
+    os: string;
+    architecture: string;
+  };
+  outboundProtocols: string[];
+  features: string[];
 }
 
 export interface InboundEndpoint {
@@ -186,6 +194,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 
 // Version
 export const getVersion = () => request<Version>('/version');
+export const getCapabilities = () => request<Capabilities>('/capabilities');
 
 // Config
 export const getConfigs = () => request<ClashConfig>('/configs');

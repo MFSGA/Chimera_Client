@@ -100,7 +100,31 @@ async fn test_version_endpoint() {
     let (_clash, api_port) = start_client();
     let response = get(api_port, "/version", true).await;
     assert_eq!(response.status(), http::StatusCode::OK);
-    assert!(response_json(response).await["version"].is_string());
+    let json = response_json(response).await;
+    assert!(json["version"].is_string());
+    assert!(json["meta"].is_boolean());
+    assert!(json.get("premium").is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn test_capabilities_endpoint_matches_dashboard_contract() {
+    let (_clash, api_port) = start_client();
+    let response = get(api_port, "/capabilities", true).await;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let json = response_json(response).await;
+    assert!(json["platform"]["os"].is_string());
+    assert!(json["platform"]["architecture"].is_string());
+    assert!(
+        json["outboundProtocols"]
+            .as_array()
+            .is_some_and(|items| items.iter().all(serde_json::Value::is_string))
+    );
+    assert!(
+        json["features"]
+            .as_array()
+            .is_some_and(|items| items.iter().all(serde_json::Value::is_string))
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { getVersion } from '../lib/api';
+import { getCapabilities, getVersion } from '../lib/api';
 import { getApiUrl, getSecret, setApiUrl, setSecret } from '../lib/settings';
 import { Save, AlertTriangle, CheckCircle, XCircle } from 'lucide-react';
 
@@ -31,6 +31,14 @@ export function Settings() {
 
   const isConnected = !!data && !error;
   const showDevPrompt = isDevMode() && !isConnected && !localStorage.getItem('clash-api-url');
+
+  const { data: capabilities } = useQuery({
+    queryKey: ['capabilities'],
+    queryFn: getCapabilities,
+    enabled: isConnected,
+    retry: 0,
+    refetchInterval: 30000,
+  });
 
   useEffect(() => {
     if (isDevMode() && !localStorage.getItem('clash-api-url')) {
@@ -112,6 +120,43 @@ export function Settings() {
           )}
         </div>
       </div>
+
+      {capabilities && (
+        <section className="liquid-glass-card rounded-xl p-4 space-y-3">
+          <div>
+            <h2 className="text-[14px] font-semibold" style={{ color: 'var(--color-text-primary)' }}>
+              Runtime capabilities
+            </h2>
+            <p className="text-[12px]" style={{ color: 'var(--color-text-secondary)' }}>
+              {capabilities.platform.os} · {capabilities.platform.architecture}
+            </p>
+          </div>
+          <div className="space-y-2">
+            <p className="text-[11px] font-semibold uppercase tracking-[0.06em]" style={{ color: 'var(--color-text-secondary)' }}>
+              Outbound protocols
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {capabilities.outboundProtocols.map((protocol) => (
+                <span key={protocol} className="rounded-full px-2.5 py-1 text-[12px]" style={{ background: 'var(--color-fill-subtle)', color: 'var(--color-text-primary)' }}>
+                  {protocol}
+                </span>
+              ))}
+            </div>
+          </div>
+          <div className="space-y-2">
+            <p className="text-[11px] font-semibold uppercase tracking-[0.06em]" style={{ color: 'var(--color-text-secondary)' }}>
+              Compiled features
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {capabilities.features.map((feature) => (
+                <span key={feature} className="rounded-full px-2.5 py-1 text-[12px]" style={{ background: 'var(--color-fill-subtle)', color: 'var(--color-text-primary)' }}>
+                  {feature}
+                </span>
+              ))}
+            </div>
+          </div>
+        </section>
+      )}
 
       {/* API URL InsetGroup */}
       <div>
