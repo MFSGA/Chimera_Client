@@ -7,17 +7,24 @@ mod common;
 
 use common::{ClashInstance, send_http_request};
 
-fn available_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("failed to reserve test port")
+fn available_ports() -> (u16, u16) {
+    let api_listener =
+        TcpListener::bind("127.0.0.1:0").expect("failed to reserve API test port");
+    let socks_listener =
+        TcpListener::bind("127.0.0.1:0").expect("failed to reserve SOCKS test port");
+    let api_port = api_listener
         .local_addr()
-        .expect("failed to inspect test port")
-        .port()
+        .expect("failed to inspect API test port")
+        .port();
+    let socks_port = socks_listener
+        .local_addr()
+        .expect("failed to inspect SOCKS test port")
+        .port();
+    (api_port, socks_port)
 }
 
 fn start_client() -> (ClashInstance, u16) {
-    let api_port = available_port();
-    let socks_port = available_port();
+    let (api_port, socks_port) = available_ports();
     let config = format!(
         "allow-lan: false\n\
 bind-address: 127.0.0.1\n\
@@ -115,11 +122,19 @@ async fn test_capabilities_endpoint_matches_dashboard_contract() {
     let json = response_json(response).await;
     assert!(json["platform"]["os"].is_string());
     assert!(json["platform"]["architecture"].is_string());
+    let outbound_protocols = json["outboundProtocols"]
+        .as_array()
+        .expect("outboundProtocols should be an array");
     assert!(
-        json["outboundProtocols"]
-            .as_array()
-            .is_some_and(|items| items.iter().all(serde_json::Value::is_string))
+        outbound_protocols.iter().all(serde_json::Value::is_string),
+        "outboundProtocols should contain only strings"
     );
+    for protocol in ["direct", "reject", "socks5", "vless"] {
+        assert!(
+            outbound_protocols.iter().any(|item| item == protocol),
+            "outboundProtocols should include {protocol}"
+        );
+    }
     assert!(
         json["features"]
             .as_array()

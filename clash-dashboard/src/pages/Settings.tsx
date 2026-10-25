@@ -11,6 +11,7 @@ function isDevMode(): boolean {
 
 export function Settings() {
   const [apiUrl, setApiUrlState] = useState(getApiUrl);
+  const [configuredApiUrl, setConfiguredApiUrl] = useState(getApiUrl);
   const [secret, setSecretState] = useState(getSecret);
   const [saved, setSaved] = useState(false);
   const saveTimersRef = useRef<number[]>([]);
@@ -23,7 +24,7 @@ export function Settings() {
   }, []);
 
   const { data, error, refetch } = useQuery({
-    queryKey: ['version'],
+    queryKey: ['version', configuredApiUrl],
     queryFn: getVersion,
     retry: 0,
     refetchInterval: 5000,
@@ -33,7 +34,7 @@ export function Settings() {
   const showDevPrompt = isDevMode() && !isConnected && !localStorage.getItem('clash-api-url');
 
   const { data: capabilities } = useQuery({
-    queryKey: ['capabilities'],
+    queryKey: ['capabilities', configuredApiUrl],
     queryFn: getCapabilities,
     enabled: isConnected,
     retry: 0,
@@ -47,11 +48,15 @@ export function Settings() {
   }, []);
 
   function handleSave() {
+    const apiUrlChanged = apiUrl !== configuredApiUrl;
     setApiUrl(apiUrl);
     setSecret(secret);
+    setConfiguredApiUrl(apiUrl);
     setSaved(true);
     saveTimersRef.current.push(window.setTimeout(() => setSaved(false), 2000));
-    saveTimersRef.current.push(window.setTimeout(() => void refetch(), 100));
+    if (!apiUrlChanged) {
+      saveTimersRef.current.push(window.setTimeout(() => void refetch(), 100));
+    }
   }
 
   const inputStyle: React.CSSProperties = {
@@ -121,7 +126,7 @@ export function Settings() {
         </div>
       </div>
 
-      {capabilities && (
+      {isConnected && capabilities && (
         <section className="liquid-glass-card rounded-xl p-4 space-y-3">
           <div>
             <h2 className="text-[14px] font-semibold" style={{ color: 'var(--color-text-primary)' }}>
