@@ -67,7 +67,10 @@ rules:
     assert_eq!(response.status(), http::StatusCode::SWITCHING_PROTOCOLS);
 
     for _ in 0..20 {
-        tracing::warn!(target: "dashboard_contract_test", "dashboard_contract_log_event");
+        tracing::warn!(
+            target: "clash::dashboard_contract_test",
+            "dashboard_contract_log_event"
+        );
         match tokio::time::timeout(Duration::from_millis(100), socket.next()).await {
             Err(_) => continue,
             Ok(Some(Ok(Message::Text(body)))) => {

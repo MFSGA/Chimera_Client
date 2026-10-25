@@ -61,6 +61,10 @@ compatibility change is intended.
   log WebSocket, and 3 Clash-compatibility tests (37 passed total). The
   WebSocket tests reserve both test ports together, and the proxy provider
   assertion verifies a real file-backed provider and its returned proxy list.
+- The log WebSocket test runs as a separate integration-test process because
+  runtime logging is initialized once per process. Its synthetic event target
+  matches the Linux CI filter `RUST_LOG=clash=TRACE`; the focused test passed
+  under that exact filter.
 - A first runtime assertion exposed that the HTTP smoke fixture's escaped Rust
   string had stripped indentation from nested YAML. The fixture now uses a raw
   multiline string, and the rule-provider response assertions pass against a
