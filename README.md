@@ -44,7 +44,7 @@ Chimera Client 是一个使用 Rust 重新实现 Clash 网络代理栈的客户�
 - **兼容 Clash 配置体验**：继续支持用户熟悉的 YAML 配置方式，并逐步覆盖代理、代理组、规则、DNS、TUN、Profile 和外部控制接口。
 - **Rust 原生运行时**：基于 `tokio` 构建异步网络运行时，使用强类型、结构化错误和 `tracing` 日志提升可靠性与可维护性。
 - **模块化代理核心**：将 DNS、路由、Dispatcher、Inbound、Outbound、Profile、API 等能力拆分为独立模块，便于分阶段开发和测试。
-- **跨平台与可嵌入方向**：`clash-netstack` 提供基于 smoltcp 的网络栈；`clash-ffi` 目前仍是脚手架，不提供可用的 FFI 接口。GUI 与移动端集成仍属于后续方向。
+- **跨平台与可嵌入方向**：`clash-netstack` 提供基于 smoltcp 的网络栈，但其 README 明确注明不面向生产使用；`clash-ffi` 目前仍是脚手架，不提供可用的 FFI 接口。GUI 与移动端集成仍属于后续方向。工作区各包的成熟度与支持边界见[工作区包成熟度表](docs/workspace-package-maturity.md)。
 
 ## 当前支持与开发中的能力
 

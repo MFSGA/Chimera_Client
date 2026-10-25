@@ -44,7 +44,7 @@ This is a snapshot of the current repository implementation. Platform, Cargo fea
 - **Clash-compatible configuration experience**: keep the familiar YAML workflow and continue expanding support for proxies, proxy groups, rules, DNS, TUN, profiles, and external controller APIs.
 - **Rust-native runtime**: build on `tokio`, strong typing, structured error handling, and `tracing` to improve reliability and maintainability.
 - **Modular proxy core**: keep DNS, router, dispatcher, inbound, outbound, profile, and API responsibilities separated so they can be developed and tested independently.
-- **Cross-platform and embeddable direction**: `clash-netstack` provides a smoltcp-based network stack; `clash-ffi` is still a scaffold and does not expose a usable FFI. GUI and mobile integrations remain future work.
+- **Cross-platform and embeddable direction**: `clash-netstack` provides a smoltcp-based network stack, but its README says it is not intended for production use; `clash-ffi` is still a scaffold and does not expose a usable FFI. GUI and mobile integrations remain future work. See the [workspace package maturity table](docs/workspace-package-maturity.md) for current product, scaffold, experimental, and vendored-support boundaries.
 
 ## Current and In-Progress Capabilities
 

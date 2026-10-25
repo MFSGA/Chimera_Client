@@ -52,3 +52,17 @@ that CLI feature aliases refer to existing core features. The `perf` CLI feature
 is an aggregate alias and does not enable jemalloc. Cross-target jobs that use
 `plus` verify compilation for those targets; they do not constitute real-device,
 TUN privilege, DNS, or network interoperability testing.
+
+## Local validation record
+
+On 2026-10-25, `ci/check-feature-profiles.sh` passed on macOS with:
+
+```bash
+CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 \
+  CARGO_TARGET_DIR=/Volumes/ChimeraBuild/chimera-feature-profiles-target \
+  ci/check-feature-profiles.sh
+```
+
+All four checks completed: core without default features, core defaults, the
+headless standard CLI, and the default CLI with prebuilt Dashboard assets. This
+local result does not replace the Linux CI job or cross-platform runtime tests.

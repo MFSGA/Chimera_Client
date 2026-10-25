@@ -11,6 +11,7 @@ docs/*
 !docs/ref-alignment-guide.md
 !docs/supported-feature-profiles.md
 !docs/dashboard-api-contract.md
+!docs/workspace-package-maturity.md
 start*.*
 release*.*
 
