@@ -2957,6 +2957,96 @@ mod tests {
         drop(stream);
     }
 
+    #[cfg(all(feature = "tun", any(target_os = "linux", target_os = "macos")))]
+    #[tokio::test]
+    async fn proxy_endpoint_tcp_refusal_reports_attempted_path_ids() {
+        #[cfg(target_os = "linux")]
+        let loopback_name = "lo";
+        #[cfg(target_os = "macos")]
+        let loopback_name = "lo0";
+        let iface = crate::app::net::get_interface_by_name(loopback_name)
+            .expect("loopback interface should be discoverable");
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("failed to reserve a local endpoint port");
+        let endpoint = listener.local_addr().unwrap();
+        drop(listener);
+
+        let observations = vec![
+            candidate(
+                &iface.name,
+                iface.index,
+                Ipv4Addr::UNSPECIFIED,
+                DefaultRouteEvidence::PrimaryDefaultRoute,
+                BindingStatus::Verified,
+            ),
+            candidate(
+                &iface.name,
+                iface.index,
+                Ipv4Addr::LOCALHOST,
+                DefaultRouteEvidence::OtherInterface,
+                BindingStatus::Verified,
+            ),
+        ];
+        let mut status = NetworkStatus::default();
+        status.set_automatic_supported_for_test(true);
+        status.observed(&NetworkSnapshot {
+            path_candidates: observations,
+            ..Default::default()
+        });
+        let source = NetworkPathSource::default();
+        source
+            .attach(Arc::new(tokio::sync::RwLock::new(status)))
+            .await;
+        let connector = DirectConnector::with_path_source(source);
+        let pool_context = connector.connection_pool_context(Some(&iface)).await;
+        let expected_paths = pool_context
+            .eligible_path_ids
+            .as_ref()
+            .expect("observed loopback paths should be eligible")
+            .clone();
+        assert_eq!(expected_paths.len(), 2);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            connector.connect_stream_with_pool_context(
+                Arc::new(MockClashResolver::new()),
+                &endpoint.ip().to_string(),
+                endpoint.port(),
+                Some(&iface),
+                #[cfg(target_os = "linux")]
+                None,
+                pool_context,
+            ),
+        )
+        .await
+        .expect("refused endpoint dial should stay within its local test deadline");
+        let error = match result {
+            Err(error) => error,
+            Ok((_stream, _)) => {
+                panic!("closed loopback port must reject every candidate")
+            }
+        };
+
+        let details = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<ProxyEndpointConnectError>())
+            .expect("failed endpoint dial should retain structured path details");
+        let candidate_paths = details
+            .candidate_paths()
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let attempted_paths = details
+            .attempted_paths()
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(candidate_paths, expected_paths);
+        assert_eq!(attempted_paths, expected_paths);
+        assert_eq!(details.attempted_paths().len(), 2);
+    }
+
     #[test]
     fn proxy_endpoint_failure_keeps_structured_path_details_in_io_error() {
         let path = observed_path("wifi0", 4, "192.0.2.10".parse().unwrap(), 7);
