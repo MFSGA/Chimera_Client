@@ -494,10 +494,15 @@ rustPlatform.buildRustPackage {
 
 ## 6. Flake 输出契约
 
-当前仓库的 `flake.nix` 只提供本机开发 shell，并把 nixpkgs 输入绑定到
-本机 `/nix/store` 路径。这种写法不可发布。
+当前仓库的 `flake.nix` 已使用由 `flake.lock` 固定 revision 的 GitHub nixpkgs
+输入，并提供 `packages`、`nixosModules` 和 `devShells` 输出。当前声明的输出系统是
+`aarch64-darwin` 和 `x86_64-linux`。因此下面的结构是发布或后续整理时的参考示意，
+不是当前缺少这些输出的说明。
 
-公开发布时应将输入改为可复现的远端引用，例如：
+当前包表达式仍使用 `allowBuiltinFetchGit`，尚未达到提交到 nixpkgs 的依赖固定要求；
+发布前仍需按上文补齐 Cargo git 依赖的 Nix output hash，并完成包和模块检查。
+如果重新整理 flake 输出，nixpkgs 输入应继续使用可复现且由 lock file 固定的远端引用，
+例如：
 
 ```nix
 inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -553,9 +558,9 @@ inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 }
 ```
 
-这里展示的是输出契约，不应未经 `nix flake check` 就直接视为最终
-实现。实际实现还需要把 `pkgs` 的作用域正确传入 module wrapper，并
-加入 checks 和 devShell。
+这里展示的是精简的输出契约，不应未经 `nix flake check` 就直接视为最终实现或替换
+当前 flake。实际实现还需要把 `pkgs` 的作用域正确传入 module wrapper，并验证
+packages、NixOS module、checks 和 devShell 的目标系统组合。
 
 ## 7. 下游使用示例
 
