@@ -97,14 +97,7 @@ if [[ "$mode" == full ]]; then
   run "Minimal core feature compilation" cargo check -p clash-lib --no-default-features --locked
 
   # npm's immutable install and the Dashboard's lint/build are the same gates
-  # used by CI. The build-script's prebuilt marker is created only afterwards.
-  # Remove ONLY a marker this script created; otherwise stale Dashboard output
-  # could inadvertently be reused by a later build.
-  marker="$ROOT/clash-dashboard/dist/chimera-prebuilt.marker"
-  if [[ -f "$marker" ]]; then
-    echo "Existing dashboard prebuilt marker must be removed/validated by its owner: $marker" >&2
-    exit 2
-  fi
+  # used by CI. Rust consumes the generated dist/ files but never invokes npm.
   if ((reinstall_dashboard)); then
     run "Dashboard clean dependency install" npm --prefix clash-dashboard ci "${npm_network[@]}"
   else
@@ -119,11 +112,8 @@ if [[ "$mode" == full ]]; then
   [[ -s "$ROOT/clash-dashboard/dist/index.html" ]] || {
     echo "Dashboard did not produce dist/index.html" >&2; exit 1;
   }
-  touch "$marker"
-  trap 'rm -f -- "$marker"' EXIT
-
-  # Cargo all-feature checks will consume this just-built Dashboard. Unlike a
-  # bare --all-features invocation they do not repeat npm ci in build.rs.
+  # Cargo checks consume the build produced above. Dashboard source validation
+  # remains an explicit frontend step, separate from Rust compilation.
   run "Default CLI compilation" cargo check -p clash-rs --locked
   run "All-feature all-target strict Clippy" cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings
   run "LAN proxy integration" cargo test -p clash-lib --test lan_proxy_tests --all-features --locked

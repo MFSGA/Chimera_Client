@@ -49,6 +49,16 @@ The dashboard is served by clash-rs when the `dashboard` feature flag is enabled
 
 The app uses `base: './'` in Vite config to support being served from any path prefix.
 
-Normal Cargo builds install and build the dashboard automatically. CI builds it
-once, adds `dist/chimera-prebuilt.marker`, and shares that directory with every Rust
-target so cross-compilation containers do not need Node.js.
+Cargo builds with the `dashboard` feature embed the existing `dist/` output; they
+do not install Node.js dependencies or invoke npm. Build the frontend before a
+dashboard-enabled CLI build:
+
+```bash
+npm ci
+npm run build
+cargo build -p clash-rs
+```
+
+CI builds and validates the Dashboard in its own job, then shares the resulting
+static assets with Rust jobs. This keeps frontend tooling out of core Rust builds
+and cross-compilation containers.
