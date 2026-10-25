@@ -17,7 +17,7 @@ and the Dashboard TypeScript build.
 | Proxy and rule providers | `/providers/proxies`, `/providers/rules` and their detail routes | `ProxyProvider`, `RuleProvider` | `api_smoke_tests`, `api_provider_tests` |
 | Rules and connections | `GET /rules`, `GET /connections` | `Rule[]`, `ConnectionsData`, `Connection` | `api_smoke_tests`, `connection_chain_tests` |
 | DNS lookup | `GET /dns/query` | `DNSQueryResult` | DNS handler tests |
-| Live traffic, connections, logs, and flows | `/ws/traffic`, `/ws/connections`, `/ws/logs`, `/ws/flows` | `TrafficData`, `ConnectionsData`, `LogEntry`, `FlowRecord` | WebSocket contract tests, logging and flow handler tests |
+| Live traffic, connections, logs, and flows | `/ws/traffic`, `/ws/connections`, `/ws/logs`, `/ws/flows` | `TrafficData`, `ConnectionsData`, `LogEntry`, `FlowRecord` | WebSocket contract tests, log WebSocket integration test, logging and flow handler tests |
 
 `ci/test-dashboard-api-contract.sh` runs these focused checks on Linux CI. The
 Dashboard job runs `npm run lint` and `npm run build`, which type-check the
@@ -57,8 +57,10 @@ compatibility change is intended.
   (with temporary debug-info/incremental overrides). The complete focused Rust
   script passed locally on macOS using a dedicated build volume: 6 HTTP smoke,
   3 selector, 2 delay, 1 proxy-provider, 1 provider-delay, 1 config-validation,
-  1 reload, 11 DNS/API handler, 1 logging, 4 connection/flow, 2 WebSocket, and
-  3 Clash-compatibility tests (36 passed total).
+  1 reload, 11 DNS/API handler, 1 logging, 4 connection/flow, 2 WebSocket, 1
+  log WebSocket, and 3 Clash-compatibility tests (37 passed total). The
+  WebSocket tests reserve both test ports together, and the proxy provider
+  assertion verifies a real file-backed provider and its returned proxy list.
 - A first runtime assertion exposed that the HTTP smoke fixture's escaped Rust
   string had stripped indentation from nested YAML. The fixture now uses a raw
   multiline string, and the rule-provider response assertions pass against a

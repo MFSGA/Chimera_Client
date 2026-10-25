@@ -24,7 +24,24 @@ fn available_ports() -> (u16, u16) {
 }
 
 fn start_client() -> (ClashInstance, u16) {
+    start_client_with_proxy_provider(false)
+}
+
+fn start_client_with_proxy_provider(
+    include_proxy_provider: bool,
+) -> (ClashInstance, u16) {
     let (api_port, socks_port) = available_ports();
+    let proxy_provider = if include_proxy_provider {
+        r#"proxy-providers:
+  api-contract:
+    type: file
+    path: api-contract-proxies.yaml
+    health-check:
+      enable: false
+"#
+    } else {
+        ""
+    };
     let config = format!(
         r#"allow-lan: false
 bind-address: 127.0.0.1
@@ -45,6 +62,7 @@ rule-providers:
     behavior: domain
     payload:
       - DOMAIN,example.com
+{proxy_provider}
 rules:
   - MATCH,DIRECT
 "#
@@ -163,7 +181,7 @@ async fn test_memory_endpoint() {
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
 async fn test_dashboard_controller_response_shapes() {
-    let (_clash, api_port) = start_client();
+    let (_clash, api_port) = start_client_with_proxy_provider(true);
 
     let response = get(api_port, "/configs", true).await;
     assert_eq!(response.status(), http::StatusCode::OK);
@@ -188,7 +206,17 @@ async fn test_dashboard_controller_response_shapes() {
 
     let response = get(api_port, "/providers/proxies", true).await;
     assert_eq!(response.status(), http::StatusCode::OK);
-    assert!(response_json(response).await["providers"].is_object());
+    let proxy_providers = response_json(response).await;
+    let providers = proxy_providers["providers"]
+        .as_object()
+        .expect("proxy providers should be an object");
+    let provider = &providers["api-contract"];
+    assert_eq!(provider["name"], "api-contract");
+    assert_eq!(provider["type"], "Proxy");
+    assert_eq!(provider["vehicleType"], "File");
+    assert_eq!(provider["proxies"].as_array().unwrap().len(), 1);
+    assert_eq!(provider["proxies"][0]["name"], "DIRECT");
+    assert!(provider["proxies"][0]["type"].is_string());
 
     let response = get(api_port, "/providers/rules", true).await;
     assert_eq!(response.status(), http::StatusCode::OK);

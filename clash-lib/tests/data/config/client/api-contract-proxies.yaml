@@ -1,0 +1,3 @@
+proxies:
+  - name: API_PROVIDER_DIRECT
+    type: direct

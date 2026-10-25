@@ -9,17 +9,24 @@ mod common;
 
 use common::ClashInstance;
 
-fn available_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("failed to reserve API test port")
+fn available_ports() -> (u16, u16) {
+    let api_listener =
+        TcpListener::bind("127.0.0.1:0").expect("failed to reserve API test port");
+    let socks_listener =
+        TcpListener::bind("127.0.0.1:0").expect("failed to reserve SOCKS test port");
+    let api_port = api_listener
         .local_addr()
         .expect("failed to inspect API test port")
-        .port()
+        .port();
+    let socks_port = socks_listener
+        .local_addr()
+        .expect("failed to inspect SOCKS test port")
+        .port();
+    (api_port, socks_port)
 }
 
 fn start_client() -> (ClashInstance, u16) {
-    let api_port = available_port();
-    let socks_port = available_port();
+    let (api_port, socks_port) = available_ports();
     let config = format!(
         r#"
 allow-lan: false

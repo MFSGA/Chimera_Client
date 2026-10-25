@@ -40,5 +40,8 @@ run "Dashboard connection and flow response contract" \
 run "Dashboard WebSocket payload and token contract" \
   cargo test -p clash-lib --features ws \
     --test dashboard_websocket_contract_tests --locked
+run "Dashboard log WebSocket route and event contract" \
+  cargo test -p clash-lib --features ws \
+    --test dashboard_logs_websocket_contract_tests --locked
 run "Clash-compatible proxy response contract" \
   cargo test -p clash-lib --test ref_api_compat_tests --locked
