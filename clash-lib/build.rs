@@ -22,6 +22,8 @@ fn emit_rerun_if_changed(dir: &std::path::Path) {
         return;
     }
 
+    println!("cargo:rerun-if-changed={}", dir.display());
+
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };

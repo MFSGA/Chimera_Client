@@ -34,8 +34,6 @@ jobs:
       - name: Build dashboard
         working-directory: clash-dashboard
         run: npm run build
-      - name: Mark dashboard as prebuilt
-        run: touch clash-dashboard/dist/chimera-prebuilt.marker
       - uses: actions/upload-artifact@v7
         with:
           name: dashboard-dist

@@ -8,7 +8,7 @@
 
 | 文件                                 | 现有触发器                                                   | 实际重点与限制                                                                                                                                                                                |
 | ------------------------------------ | ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ci.yml` — CI                        | push/PR 到 `master`；`v*` tag push；手工 `workflow_dispatch` | Dashboard 先在 Ubuntu 跑 `npm ci`、lint、build；Rust quality 依赖 Dashboard 产物，在 Ubuntu/Windows/macOS 跑 Clippy 与 LAN proxy；compile 依赖 dashboard+quality，按目标平台交叉编译；release 依赖 compile |
+| `ci.yml` — CI                        | push/PR 到 `master`；`v*` tag push；手工 `workflow_dispatch` | Dashboard 先在 Ubuntu 跑 `npm ci`、lint、build 并上传 `dist/`；Rust quality 下载产物后在 Ubuntu/Windows/macOS 跑 Clippy 与 LAN proxy；compile 依赖 dashboard+quality，按目标平台交叉编译；release 依赖 compile |
 | `coverage.yml`                       | 以 YAML 为准的 push/PR                                       | 覆盖率独立作业；并不等价于全功能/全平台验证                                                                                                                                                   |
 | `windows-network-regression.yml`     | `master` 上相关路径 push/PR、手动                            | Windows 上的 TCP/UDP loopback、pool/selector/dispatcher 回归；代码明确不做特权 TUN/NIC 真实变更                                                                                               |
 | `proxy-throughput.yml`               | 指定路径 PR/push、手工                                       | 性能/吞吐专用验证；与普通 Rust 单元测试边界不同                                                                                                                                               |
@@ -24,7 +24,7 @@
 
 ## 2. 项目事实与检查范围
 
-- **Dashboard**：当前 `ci.yml` 设有 `npm ci`、`npm run lint`、`npm run build`；Dashboard job 完成后把带构建标记的 `dist/` 交给 quality / compile，Rust 构建脚本据此不重复 `npm ci`。只代表构建阶段通过，不能证明与真实 Proxy/TUN 交互。
+- **Dashboard**：当前 `ci.yml` 设有 `npm ci`、`npm run lint`、`npm run build`；Dashboard job 完成后把 `dist/` 交给 quality / compile。`clash-lib/build.rs` 只校验并追踪已构建资源，不运行 Node.js/npm；未启用 `dashboard` 时不需要前端产物。只代表构建阶段通过，不能证明与真实 Proxy/TUN 交互。
 - **Rust quality**：`cargo fmt --all -- --check` 与 CLI feature 转发检查（均仅 Linux），`cargo clippy -p clash-lib --all-targets --all-features -- -D warnings`（Linux、Windows、macOS）及 LAN proxy 集成测试。查 job 时同时确认平台与选中的 feature。
 - **Compile**：多个 Linux/Windows/macOS 目标、部分 `cross`/不同 feature，`no-test` 与 PR 条件使某些目标不会运行测试。构建成功不等于真实运行或网卡/TUN 权限验证通过。
 - **Windows network**：测试明确使用本地 loopback；不覆盖真实 NIC 修改、安装网络驱动或生产路由权限。
@@ -52,8 +52,8 @@
   `--full` 再验证无默认 feature、Dashboard 已安装依赖、lint/build、
   CLI、全 feature 的全 target Clippy 与 LAN 集成。需要验证纯净安装时显式使用
   `--reinstall-dashboard` 执行 `npm ci`；CI 每次均运行 `npm ci`。
-  `--full` 的 Dashboard 标记仅在成功构建之后创建，脚本结束移除
-  自己创建的标记；不会为绕过 Dashboard 检查创建假产物。
+  Dashboard 构建是 Cargo 之外的显式步骤，`--full` 只将成功生成的 `dist/`
+  提供给后续 Rust 检查，不生成或依赖构建标记。
 - 默认 `CARGO_TARGET_DIR` 指向
   `/Volumes/ChimeraClientVlessTests/Chimera_Client_master_target`：
   这是外接 Ventoy USB 上的 APFS sparsebundle 挂载卷（不是原始
