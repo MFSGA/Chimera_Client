@@ -1,5 +1,5 @@
 use crate::{
-    dns::{
+    app::dns::{
         Client, EnhancedResolver, ThreadSafeDNSClient,
         dns_client::DNSNetMode,
         helper::{DnsClientNetworkOptions, make_clients},
