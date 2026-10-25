@@ -42,9 +42,10 @@ use crate::{
     runner::Runner,
 };
 
+#[cfg(feature = "tun")]
+use crate::install_default_socket_protector;
 use crate::{
     Config, Error, GlobalState, Options, Result, TokioRuntime, app, config,
-    install_default_socket_protector,
 };
 
 pub fn start_scaffold(opts: Options) -> Result<()> {
