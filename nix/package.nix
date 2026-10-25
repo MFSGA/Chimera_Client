@@ -60,8 +60,11 @@ rustPlatform.buildRustPackage {
   ];
 
   LIBCLANG_PATH = "${llvmPackages.libclang.lib}/lib";
-  CHIMERA_DASHBOARD_DEPS_READY = "1";
   npmRoot = "clash-dashboard";
+
+  preBuild = ''
+    npm --prefix clash-dashboard run build
+  '';
 
   cargoBuildFlags = [
     "--package"

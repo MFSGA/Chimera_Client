@@ -20,6 +20,9 @@ npm --prefix clash-dashboard ci
 npm --prefix clash-dashboard run build
 ```
 
+The Nix package prepares dependencies from `fetchNpmDeps` and runs the Dashboard
+build in its pre-build phase before invoking Cargo.
+
 `clash-lib` has its own default feature set. It is a library build profile, not
 the CLI's standard protocol bundle; its defaults include TUN, Reality, and
 VLESS encryption, which imply AWS-LC. A minimal `clash-lib --no-default-features`

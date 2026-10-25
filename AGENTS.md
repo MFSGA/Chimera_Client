@@ -157,8 +157,10 @@ Cargo 的 `-p` 参数使用 package 名称，不一定等于目录名。
   nixpkgs 输入是本机 `/nix/store/` 路径，换机使用前需核对可用性。
 - CLI 默认启用 `dashboard`。`clash-lib/build.rs` 只校验并追踪
   `clash-dashboard/dist/` 中已构建的静态资源，不运行 `npm ci` 或 `npm run build`。
-  构建 Dashboard-enabled CLI 前，需在 `clash-dashboard/` 显式运行 `npm ci` 和
-  `npm run build`；这一步需要 Node.js/npm 和依赖可用。未启用 `dashboard` 的 Rust
+  普通 Cargo 构建 Dashboard-enabled CLI 前，需在 `clash-dashboard/` 显式运行
+  `npm ci` 和 `npm run build`；这一步需要 Node.js/npm 和依赖可用。Nix package
+  使用 `fetchNpmDeps`/`npmConfigHook` 准备依赖，并在 Cargo 构建前运行 Dashboard build。
+  未启用 `dashboard` 的 Rust
   构建不依赖这些前端资源。CI 使用 Node.js 22，在独立 Dashboard job 中构建资源，
   再把 `dist/` 交给 Rust jobs。
 
