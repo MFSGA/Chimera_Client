@@ -27,6 +27,7 @@ use crate::{
 
 /// 2
 pub mod app;
+pub(crate) use app::dispatcher::Dispatcher;
 pub(crate) use app::dns;
 /// 4
 mod common;
