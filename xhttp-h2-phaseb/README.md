@@ -1,5 +1,9 @@
 # xhttp-h2-phaseb (tokio + hyper, H2C)
 
+**Maturity: experimental protocol demo.** This standalone H2C prototype is a
+workspace experiment, not the production XHTTP transport used by `clash-lib`.
+Its behavior and configuration are not a supported client capability.
+
 Runnable minimal demo implementing:
 - **stream-one**: single HTTP/2 request carries duplex stream (POST body uplink, response body downlink)
 - **Phase B**: **stream-down + packet-up** with sessionId + seq reorder (UploadQueue)
