@@ -9,6 +9,7 @@ docs/*
 !docs/ai-development-governance.md
 !docs/ai-review-checklist.md
 !docs/ref-alignment-guide.md
+!docs/supported-feature-profiles.md
 start*.*
 release*.*
 

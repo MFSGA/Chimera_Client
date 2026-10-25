@@ -49,8 +49,9 @@
   `LIMITATION`，不伪称已支持 Tor/jemallocator。
 - `ci/verify-quality-gates.sh --quick` 验证格式、转发、
   默认 feature 的全 target 严格 Clippy 和核心单元测试；
-  `--full` 再验证无默认 feature、Dashboard 已安装依赖、lint/build、
-  CLI、全 feature 的全 target Clippy 与 LAN 集成。需要验证纯净安装时显式使用
+  `--full` 再验证 Dashboard 已安装依赖、lint/build、
+  `ci/check-feature-profiles.sh` 定义的最小/默认 core 与 headless/Dashboard CLI 档位、
+  全 feature 的全 target Clippy 与 LAN 集成。需要验证纯净安装时显式使用
   `--reinstall-dashboard` 执行 `npm ci`；CI 每次均运行 `npm ci`。
   Dashboard 构建是 Cargo 之外的显式步骤，`--full` 只将成功生成的 `dist/`
   提供给后续 Rust 检查，不生成或依赖构建标记。
@@ -67,7 +68,7 @@
   quality 和 compile 从 Dashboard artifact 读取真实构建产物，
   Rust `--all-features` 不重复运行 `npm ci`。
   原有 Rust Clippy 的 `--all-targets --all-features -- -D warnings`
-  **保留不变**，并在 Linux 额外运行转发检查。
+  **保留不变**，并在 Linux 额外运行转发检查与四档支持 feature 编译矩阵。
 - 本轮包含 CI YAML 的 L3 调整：本地验证和源码审查
   不等于独立 Reviewer 结论或远端 CI green；
   在获得相应审查及维护者批准前，不自动推送、触发发布或认定已过门禁。

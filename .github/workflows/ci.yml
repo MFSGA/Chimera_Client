@@ -103,6 +103,9 @@ jobs:
       - name: CLI feature forwarding contract
         if: runner.os == 'Linux'
         run: python3 ci/check-feature-forwarding.py
+      - name: Supported Cargo feature profiles
+        if: runner.os == 'Linux'
+        run: ci/check-feature-profiles.sh
       - name: Cargo clippy
         run: cargo clippy -p clash-lib --all-targets --all-features -- -D warnings
       - name: Test LAN proxy

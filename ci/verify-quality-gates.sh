@@ -94,8 +94,6 @@ run "Default-feature all-target strict Clippy" cargo clippy -p clash-lib --all-t
 run "Core library unit tests" cargo test -p clash-lib --lib --locked
 
 if [[ "$mode" == full ]]; then
-  run "Minimal core feature compilation" cargo check -p clash-lib --no-default-features --locked
-
   # npm's immutable install and the Dashboard's lint/build are the same gates
   # used by CI. Rust consumes the generated dist/ files but never invokes npm.
   if ((reinstall_dashboard)); then
@@ -112,9 +110,9 @@ if [[ "$mode" == full ]]; then
   [[ -s "$ROOT/clash-dashboard/dist/index.html" ]] || {
     echo "Dashboard did not produce dist/index.html" >&2; exit 1;
   }
-  # Cargo checks consume the build produced above. Dashboard source validation
-  # remains an explicit frontend step, separate from Rust compilation.
-  run "Default CLI compilation" cargo check -p clash-rs --locked
+  # The documented Cargo feature profiles cover the minimal/core/CLI variants,
+  # including the Dashboard CLI consuming the build produced above.
+  run "Supported Cargo feature profiles" ci/check-feature-profiles.sh
   run "All-feature all-target strict Clippy" cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings
   run "LAN proxy integration" cargo test -p clash-lib --test lan_proxy_tests --all-features --locked
 fi

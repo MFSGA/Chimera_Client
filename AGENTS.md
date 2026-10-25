@@ -124,6 +124,9 @@ Cargo 的 `-p` 参数使用 package 名称，不一定等于目录名。
   测试过滤后确认实际执行了目标用例，零个测试通过不算覆盖。
 - 每步先跑相关矩阵子集；每次更新参考基线或完成一个能力对齐时，扩大相关回归范围。
   将稳定、可重复的组合逐步纳入 CI，避免只依赖 `--all-features`，也不盲目枚举全部组合。
+- 当前 CLI 发布档位及其可重复编译矩阵见
+  `docs/supported-feature-profiles.md`；`ci/check-feature-profiles.sh` 是 CI 和本地
+  quality gate 共用的具体命令集合，修改 feature 默认值或支持范围时同步更新两处。
 - 平台交叉编译仅证明编译覆盖，不等于在目标系统上运行通过；两者分别记录。
 
 ### 上游错误的发现与处理
@@ -152,11 +155,12 @@ Cargo 的 `-p` 参数使用 package 名称，不一定等于目录名。
   pkg-config、protobuf、OpenSSL 等开发工具。不要在无诊断依据时批量安装或升级工具。
 - Nix 环境可用 `nix develop --command cargo check --workspace`。当前 flake 的
   nixpkgs 输入是本机 `/nix/store/` 路径，换机使用前需核对可用性。
-- CLI 默认启用 `dashboard`。`clash-lib/build.rs` 通常会运行 `npm ci` 和
-  `npm run build`，因此 Rust 构建也可能需要 Node.js/npm 和网络；CI 使用 Node.js 22。
-  当前开发 shell 未显式列入 Node.js，不要假定进入 Nix 就一定满足前端依赖。
-- CI 预构建标记为 `clash-dashboard/dist/chimera-prebuilt.marker`，须同时有
-  `dist/index.html`；不要用手工伪造标记来掩盖前端构建失败。
+- CLI 默认启用 `dashboard`。`clash-lib/build.rs` 只校验并追踪
+  `clash-dashboard/dist/` 中已构建的静态资源，不运行 `npm ci` 或 `npm run build`。
+  构建 Dashboard-enabled CLI 前，需在 `clash-dashboard/` 显式运行 `npm ci` 和
+  `npm run build`；这一步需要 Node.js/npm 和依赖可用。未启用 `dashboard` 的 Rust
+  构建不依赖这些前端资源。CI 使用 Node.js 22，在独立 Dashboard job 中构建资源，
+  再把 `dist/` 交给 Rust jobs。
 
 ## 验证命令与选择
 
