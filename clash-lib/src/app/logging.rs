@@ -235,3 +235,22 @@ impl tracing::field::Visit for EventVisitor<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::LogEvent;
+    use crate::config::def::LogLevel;
+
+    #[test]
+    fn log_event_serializes_to_dashboard_field_names() {
+        let event = LogEvent {
+            level: LogLevel::Warning,
+            msg: "contract test".to_owned(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(event).unwrap(),
+            serde_json::json!({ "type": "warning", "payload": "contract test" })
+        );
+    }
+}

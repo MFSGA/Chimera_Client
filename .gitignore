@@ -10,6 +10,7 @@ docs/*
 !docs/ai-review-checklist.md
 !docs/ref-alignment-guide.md
 !docs/supported-feature-profiles.md
+!docs/dashboard-api-contract.md
 start*.*
 release*.*
 

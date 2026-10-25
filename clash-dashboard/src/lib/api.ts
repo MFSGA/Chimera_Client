@@ -74,8 +74,8 @@ export interface Connection {
     type: string;
     host: string;
     sourceIP: string;
-    sourcePort: string;
-    destinationPort: string;
+    sourcePort: number;
+    destinationPort: number;
     destinationIP?: string;
     inboundIP?: string;
     inboundPort?: string;
@@ -113,12 +113,23 @@ export interface MemoryData {
 export interface DNSQueryResult {
   Answer?: Array<{
     TTL: number;
-    MXPreference: number;
     data: string;
     name: string;
     type: number;
   }>;
-  Question: Array<{ name: string; type: number }>;
+  Authority?: Array<{
+    TTL: number;
+    data: string;
+    name: string;
+    type: number;
+  }>;
+  Additional?: Array<{
+    TTL: number;
+    data: string;
+    name: string;
+    type: number;
+  }>;
+  Question: Array<{ name: string; qtype: number; qclass: number }>;
   Status: number;
   TC: boolean;
   RD: boolean;
@@ -213,12 +224,11 @@ export const selectProxy = (groupName: string, proxyName: string) =>
     body: JSON.stringify({ name: proxyName }),
   });
 export const getProxyDelay = (name: string, url: string, timeout: number) =>
-  request<{ delay: number }>(
+  request<{ delay: number; overall: number }>(
     `/proxies/${encodeURIComponent(name)}/delay?url=${encodeURIComponent(url)}&timeout=${timeout}`
   );
 
 // Groups
-export const getGroup = (name: string) => request<Proxy>(`/group/${encodeURIComponent(name)}`);
 export const getGroupDelay = (name: string, url: string, timeout: number) =>
   request<Record<string, number>>(
     `/group/${encodeURIComponent(name)}/delay?url=${encodeURIComponent(url)}&timeout=${timeout}`
@@ -232,7 +242,7 @@ export const updateProxyProvider = (name: string) =>
 export const healthcheckProvider = (name: string) =>
   request<void>(`/providers/proxies/${encodeURIComponent(name)}/healthcheck`);
 export const getProviderProxyDelay = (providerName: string, proxyName: string, url: string, timeout: number) =>
-  request<{ delay: number }>(
+  request<{ delay: number; overall: number }>(
     `/providers/proxies/${encodeURIComponent(providerName)}/${encodeURIComponent(proxyName)}/healthcheck?url=${encodeURIComponent(url)}&timeout=${timeout}`
   );
 

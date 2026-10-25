@@ -16,6 +16,14 @@ export interface FlowRecord {
   rule: string;
   rulePayload: string;
   chains: string[];
+  flowIds?: string[];
+  networkPaths?: Array<{
+    interface: { name: string; index: number };
+    family: 'ipv4' | 'ipv6';
+    sourceAddress: string | null;
+    networkGeneration: number;
+  }>;
+  endReasons?: Record<string, number>;
   asn: string | null;
   country: string | null;
   lastSeen: string;

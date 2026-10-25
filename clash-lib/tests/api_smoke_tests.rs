@@ -26,21 +26,28 @@ fn available_ports() -> (u16, u16) {
 fn start_client() -> (ClashInstance, u16) {
     let (api_port, socks_port) = available_ports();
     let config = format!(
-        "allow-lan: false\n\
-bind-address: 127.0.0.1\n\
-socks-port: {socks_port}\n\
-mode: direct\n\
-log-level: info\n\
-mmdb: null\n\
-external-controller: 127.0.0.1:{api_port}\n\
-secret: clash-rs\n\
-tun:\n\
-  enable: false\n\
-proxies:\n\
-  - {{name: DIRECT_alias, type: direct}}\n\
-  - {{name: REJECT_alias, type: reject}}\n\
-rules:\n\
-  - MATCH,DIRECT\n"
+        r#"allow-lan: false
+bind-address: 127.0.0.1
+socks-port: {socks_port}
+mode: direct
+log-level: info
+mmdb: null
+external-controller: 127.0.0.1:{api_port}
+secret: clash-rs
+tun:
+  enable: false
+proxies:
+  - {{name: DIRECT_alias, type: direct}}
+  - {{name: REJECT_alias, type: reject}}
+rule-providers:
+  api-contract:
+    type: inline
+    behavior: domain
+    payload:
+      - DOMAIN,example.com
+rules:
+  - MATCH,DIRECT
+"#
     );
     let cwd =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
@@ -151,6 +158,83 @@ async fn test_memory_endpoint() {
     let json = response_json(response).await;
     assert!(json["inuse"].is_u64());
     assert_eq!(json["oslimit"], 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn test_dashboard_controller_response_shapes() {
+    let (_clash, api_port) = start_client();
+
+    let response = get(api_port, "/configs", true).await;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let config = response_json(response).await;
+    assert!(config["socks-port"].is_u64());
+    assert!(config["bind-address"].is_string());
+    assert!(config["mode"].is_string());
+    assert!(config["log-level"].is_string());
+    assert!(config["ipv6"].is_boolean());
+    assert!(config["allow-lan"].is_boolean());
+    assert!(config["listeners"].is_array());
+
+    let response = get(api_port, "/proxies", true).await;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let proxies = response_json(response).await;
+    let direct = &proxies["proxies"]["DIRECT"];
+    assert!(direct["name"].is_string());
+    assert!(direct["type"].is_string());
+    assert!(direct["udp"].is_boolean());
+    assert!(direct["alive"].is_boolean());
+    assert!(direct["history"].is_array());
+
+    let response = get(api_port, "/providers/proxies", true).await;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert!(response_json(response).await["providers"].is_object());
+
+    let response = get(api_port, "/providers/rules", true).await;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let rule_providers = response_json(response).await;
+    assert!(rule_providers["providers"].is_object());
+    let provider = &rule_providers["providers"]["api-contract"];
+    assert!(
+        provider["name"].is_string(),
+        "rule provider response: {rule_providers}"
+    );
+    assert!(provider["type"].is_string());
+    assert!(provider["vehicleType"].is_string());
+    assert!(provider["behavior"].is_string());
+    assert!(provider["format"].is_string());
+
+    let response = get(api_port, "/rules", true).await;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let rules_response = response_json(response).await;
+    let rules = rules_response["rules"]
+        .as_array()
+        .expect("rules should be an array");
+    assert!(!rules.is_empty());
+    assert!(rules[0]["type"].is_string());
+    assert!(rules[0]["payload"].is_string());
+    assert!(rules[0]["proxy"].is_string());
+
+    let response = get(api_port, "/connections", true).await;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let connections = response_json(response).await;
+    assert!(connections["connections"].is_array());
+    assert!(connections["downloadTotal"].is_u64());
+    assert!(connections["uploadTotal"].is_u64());
+    assert!(connections["memory"].is_u64());
+
+    let response = get(api_port, "/proxies/missing", true).await;
+    assert_eq!(response.status(), http::StatusCode::NOT_FOUND);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("failed to collect error response")
+        .to_bytes();
+    assert!(String::from_utf8_lossy(&body).contains("not found"));
+
+    let response = get(api_port, "/configs", false).await;
+    assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test(flavor = "current_thread")]

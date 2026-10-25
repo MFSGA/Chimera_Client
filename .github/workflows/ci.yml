@@ -106,6 +106,9 @@ jobs:
       - name: Supported Cargo feature profiles
         if: runner.os == 'Linux'
         run: ci/check-feature-profiles.sh
+      - name: Built-in Dashboard API contract
+        if: runner.os == 'Linux'
+        run: ci/test-dashboard-api-contract.sh
       - name: Cargo clippy
         run: cargo clippy -p clash-lib --all-targets --all-features -- -D warnings
       - name: Test LAN proxy

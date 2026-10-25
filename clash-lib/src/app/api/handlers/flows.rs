@@ -409,10 +409,29 @@ mod tests {
             Some(&1)
         );
         let json = serde_json::to_value(&records[0]).unwrap();
+        assert!(json["dstHost"].is_string());
+        assert!(json["dstPort"].is_u64());
+        assert!(json["protocol"].is_string());
+        assert!(json["srcIps"].is_array());
+        assert!(json["connCount"].is_u64());
+        assert!(json["activeCount"].is_u64());
+        assert!(json["closedCount"].is_u64());
+        assert!(json["uploadTotal"].is_u64());
+        assert!(json["downloadTotal"].is_u64());
+        assert!(json["bytesTotal"].is_u64());
+        assert!(json["rule"].is_string());
+        assert!(json["rulePayload"].is_string());
+        assert!(json["chains"].is_array());
+        assert!(json["lastSeen"].is_string());
         assert_eq!(json["endReasons"]["controllerRequested"], 1);
         assert_eq!(records[0].network_paths, vec![path]);
         assert_eq!(records[0].flow_ids, vec![flow_id]);
-        assert_eq!(json["networkPaths"][0]["interface"]["name"], "wifi0");
+        let network_path = &json["networkPaths"][0];
+        assert_eq!(network_path["interface"]["name"], "wifi0");
+        assert_eq!(network_path["interface"]["index"], 4);
+        assert_eq!(network_path["family"], "ipv4");
+        assert_eq!(network_path["sourceAddress"], "192.0.2.10");
+        assert_eq!(network_path["networkGeneration"], 7);
         assert_eq!(json["flowIds"][0], flow_id.to_string());
     }
 }

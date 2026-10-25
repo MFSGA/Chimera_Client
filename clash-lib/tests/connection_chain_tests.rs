@@ -315,6 +315,8 @@ async fn ref_compat_connections_report_proxy_chain_names() {
         connection["chains"],
         serde_json::json!(["DIRECT", "url-test", "selector"])
     );
+    assert!(connection["metadata"]["sourcePort"].is_u64());
+    assert!(connection["metadata"]["destinationPort"].is_u64());
 
     request_task.await.expect("proxy request task failed");
     target_task.await.expect("HTTP target task failed");

@@ -127,7 +127,7 @@ async fn query_dns(
                 let mut data = Map::new();
                 data.insert("name".to_owned(), rr.name.to_string().into());
                 data.insert("type".to_owned(), u16::from(rr.record_type()).into());
-                data.insert("ttl".to_owned(), rr.ttl.into());
+                data.insert("TTL".to_owned(), rr.ttl.into());
                 data.insert("data".to_owned(), rr.data.to_string().into());
                 data.into()
             };
@@ -222,6 +222,9 @@ mod tests {
         let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["Status"], 0);
+        assert_eq!(json["Question"][0]["qtype"], 1);
+        assert_eq!(json["Question"][0]["qclass"], 1);
+        assert!(json["Answer"][0]["TTL"].is_u64());
         assert_eq!(json["Answer"][0]["data"], "198.18.0.15");
     }
 
