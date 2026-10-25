@@ -495,9 +495,12 @@ rustPlatform.buildRustPackage {
 ## 6. Flake 输出契约
 
 当前仓库的 `flake.nix` 已使用由 `flake.lock` 固定 revision 的 GitHub nixpkgs
-输入，并提供 `packages`、`nixosModules` 和 `devShells` 输出。当前声明的输出系统是
-`aarch64-darwin` 和 `x86_64-linux`。因此下面的结构是发布或后续整理时的参考示意，
-不是当前缺少这些输出的说明。
+输入，并提供 `packages`、`nixosModules` 和 `devShells` 输出。`packages` 和
+`devShells` 当前声明的系统键是 `aarch64-darwin` 和 `x86_64-linux`。包元数据仅声明
+Linux 平台；NixOS module 是全局输出，但通过 `pkgs.system` 查找对应 package，因此
+当前只有 `x86_64-linux` 有声明的 NixOS 包输出。`aarch64-linux` 尚未列入系统键，不能
+据此宣称该平台的 NixOS module 可用。下面的结构是发布或后续整理时的参考示意，
+不是当前缺少 `packages` 或 `nixosModules` 输出的说明。
 
 当前包表达式仍使用 `allowBuiltinFetchGit`，尚未达到提交到 nixpkgs 的依赖固定要求；
 发布前仍需按上文补齐 Cargo git 依赖的 Nix output hash，并完成包和模块检查。
