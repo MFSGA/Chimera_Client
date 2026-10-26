@@ -127,7 +127,7 @@ smoltcp = { version = "0.14", default-features = false, features = [
 etherparse = { version = "0.21", optional = true }
 
 # WireGuard
-boringtun = { version = "=0.2.0", path = "../vendor/boring-noise", package = "boring-noise", optional = true, default-features = false }
+boringtun = { version = "=0.2.1", path = "../vendor/boring-noise", package = "boring-noise", optional = true, default-features = false }
 
 base64 = "0.23"
 
