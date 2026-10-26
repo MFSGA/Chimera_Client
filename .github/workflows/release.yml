@@ -46,20 +46,67 @@ jobs:
           git fetch origin master
           git rebase origin/master
 
+      - name: Verify clean checkout before version bump
+        run: |
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "::error::Release checkout must be clean before the version bump"
+            git status --short
+            exit 1
+          fi
+
       - name: Bump version
-        run: cargo set-version --bump ${{ github.event.inputs.version_type }}
+        run: cargo set-version --bump "${{ github.event.inputs.version_type }}"
 
       - name: Get new version
         id: version
         run: |
           VERSION=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "clash-rs") | .version')
-          echo "version=v$VERSION" >> $GITHUB_OUTPUT
+          echo "version=v$VERSION" >> "$GITHUB_OUTPUT"
           echo "New version: v$VERSION"
 
       - name: Commit version bump
         run: |
-          git add Cargo.toml clash-bin/Cargo.toml clash-dns/Cargo.toml clash-doc/Cargo.toml clash-ffi/Cargo.toml clash-lib/Cargo.toml Cargo.lock
+          set -euo pipefail
+
+          changed_files="$(git diff --name-only)"
+          if [[ -z "$changed_files" ]]; then
+            echo "::error::Version bump did not modify any tracked files"
+            exit 1
+          fi
+
+          unexpected_files="$(printf '%s\n' "$changed_files" | grep -Ev '(^|/)Cargo\.toml$|^Cargo\.lock$' || true)"
+          if [[ -n "$unexpected_files" ]]; then
+            echo "::error::Version bump modified files outside Cargo manifests and Cargo.lock:"
+            printf '%s\n' "$unexpected_files"
+            exit 1
+          fi
+
+          untracked_files="$(git ls-files --others --exclude-standard)"
+          if [[ -n "$untracked_files" ]]; then
+            echo "::error::Version bump created unexpected untracked files:"
+            printf '%s\n' "$untracked_files"
+            exit 1
+          fi
+
+          # cargo set-version can update path dependencies under vendor/ as well as workspace manifests.
+          git add -u -- ':(glob)**/Cargo.toml' Cargo.lock
+          if git diff --cached --quiet; then
+            echo "::error::No Cargo version changes were staged"
+            exit 1
+          fi
+          if ! git diff --quiet; then
+            echo "::error::Cargo version changes remain unstaged:"
+            git diff --name-only
+            exit 1
+          fi
+          git diff --cached --check
           git commit -m "chore: bump version to ${{ steps.version.outputs.version }}"
+
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "::error::Release checkout is not clean after committing the version bump:"
+            git status --short
+            exit 1
+          fi
 
       - name: Push release atomically
         env:
@@ -73,6 +120,11 @@ jobs:
             # The branch may have advanced while this release job was running.
             # Rebase the version bump onto the latest master before publishing.
             git fetch origin master
+            if [[ -n "$(git status --porcelain)" ]]; then
+              echo "::error::Release checkout must be clean before rebasing:"
+              git status --short
+              exit 1
+            fi
             git rebase origin/master
             git update-ref "refs/tags/$VERSION" HEAD
 

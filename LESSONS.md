@@ -18,7 +18,24 @@
 
 | 编号 | 发现日期 | 模块 | 关联证据                             | 状态 |
 | ---- | -------- | ---- | ------------------------------------ | ---- |
-| —    | —        | —    | 本次建立规范，尚未收录经核实的新事故 | —    |
+| LESSON-20261025-001 | 2026-10-25 | CI / 发布 | [Release run 40272290504](https://github.com/MFSGA/Chimera_Client/actions/runs/40272290504) | 已修工作流；新发布尚未触发 |
+
+### LESSON-20261025-001：Release 版本提升会修改 vendor Cargo 清单
+
+- 日期 / 时区：2026-10-25 / America/Los_Angeles（GitHub Actions 日志为 2026-10-26 UTC）
+- 状态：Mitigated；本地工作流修复待维护者批准，未重新触发 Release
+- 严重度：Medium
+- 模块：CI / 发布
+- 本地 HEAD / master：诊断基线 `4fb25ce087c190210c2c869c6de1e7727368fb9e`；失败运行使用旧 HEAD `041de8eca78bf59785510ebdc15806c77535c056`；ref SHA 不适用
+- Issue / PR / CI / Commit / 日志（脱敏）：[Release run 40272290504](https://github.com/MFSGA/Chimera_Client/actions/runs/40272290504)，计划版本 `v0.28.0`
+- 输入、初始状态与预期：手动运行 `release.yml`，选择 `minor`；预期提升 Cargo 版本、创建版本提交并原子推送 `master` 与版本 tag
+- 实际异常与最小复现：`cargo set-version --bump minor` 更新 `vendor/boring-noise/Cargo.toml` 和 `vendor/sock2proc/Cargo.toml`。固定的 `git add` 清单遗漏两者；临时提交 `e043382` 后仍有未暂存改动，`git rebase origin/master` 立即报错。提交和 tag 均未推送。
+- 已确认根因与已排除项：根因为发布工作流只暂存列出的 Cargo 文件，没有覆盖版本工具修改的全部 manifest；失败发生在发布原子推送前，与构建、测试或 GitHub 拒绝写入无关。
+- 修复文件、回滚条件：`.github/workflows/release.yml` 校验变更范围，只暂存所有修改的 `Cargo.toml` 与 `Cargo.lock`，并在提交后和 rebase 前检查工作区干净；`.github/WORKFLOWS.md` 同步记录。回滚时恢复版本提交步骤和发布事实清单的原版本。
+- 旧实现失败 / 新实现通过的真实回归测试与 runner 注册入口：旧流程失败证据为上述 GitHub Actions run；新暂存逻辑在临时 Git fixture 中验证，覆盖 root/vendor manifests、`Cargo.lock` 及提交后工作区清洁。未实际重新运行 Release。
+- 验证命令、feature 组合、平台、通过/失败/跳过数量：`actionlint .github/workflows/release.yml` 通过；临时 Git fixture 通过；未运行完整 CI 或真实 Release。
+- 受影响的兼容性、系统权限、TUN/网卡恢复检查：仅影响版本发布工作流；未操作 TUN、网卡或生产服务。Release 使用 `contents: write`，新发布仍需单独维护者批准。
+- 后续防复发措施：保持 manifest 动态暂存及提交/rebase 前 clean-tree 检查；完成独立审查和维护者批准后，另行授权运行 Release。
 
 ## 记录模板
 

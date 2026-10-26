@@ -16,7 +16,7 @@
 | `macos-build.yml`                    | 手工                                                         | 独立 macOS 构建入口                                                                                                                                                                           |
 | `spell-check.yml`、`email-check.yml` | PR                                                           | 拼写与 Commit 邮箱检查，检查结果不得忽略                                                                                                                                                      |
 | `dependabot-automerge.yml`           | CI `workflow_run: completed`                                 | **只处理通过 CI 的 Dependabot PR**；二次核对作者、HEAD SHA、base、所有 PR checks，然后 rebase merge 并手工 dispatch CI                                                                        |
-| `release.yml`                        | 手动 `workflow_dispatch`                                     | `contents: write`；版本提升，重试 rebase 并原子推送 `master` 与版本 tag，可能变更共享 Git 历史                                                                                                |
+| `release.yml`                        | 手动 `workflow_dispatch`                                     | `contents: write`；版本提升后校验并暂存所有变更的 Cargo manifest 与锁文件，提交后及 rebase 前检查工作区干净，再重试 rebase 并原子推送 `master` 与版本 tag；可能变更共享 Git 历史 |
 
 **重要事实**：`ci.yml` 的 `release` job 会在 `master` 构建链通过后处理 **`latest` 预发布/tag**，在 `v*` tag 构建后处理稳定 Release。因此 **push 到 `master` 不应被描述为只有只读测试**；推送和 workflow_dispatch 必须先获得明确授权，发行链按 L3 处理。
 
