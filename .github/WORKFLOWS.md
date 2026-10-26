@@ -11,8 +11,8 @@
 | `ci.yml` — CI                        | push/PR 到 `master`；`v*` tag push；手工 `workflow_dispatch` | Dashboard 先在 Ubuntu 跑 `npm ci`、lint、build 并上传 `dist/`；Rust quality 下载产物后在 Ubuntu/Windows/macOS 跑 Clippy 与 LAN proxy；compile 依赖 dashboard+quality，按目标平台交叉编译；release 依赖 compile |
 | `coverage.yml`                       | 以 YAML 为准的 push/PR                                       | 覆盖率独立作业；并不等价于全功能/全平台验证                                                                                                                                                   |
 | `windows-network-regression.yml`     | `master` 上相关路径 push/PR、手动                            | Windows 上的 TCP/UDP loopback、pool/selector/dispatcher 回归；代码明确不做特权 TUN/NIC 真实变更                                                                                               |
-| `proxy-throughput.yml`               | 指定路径 PR/push、手工                                       | 性能/吞吐专用验证；与普通 Rust 单元测试边界不同                                                                                                                                               |
-| `proxy-throughput-release.yml`       | PR、手工                                                     | release 优化吞吐测试；不是自动批准发行                                                                                                                                                        |
+| `proxy-throughput.yml`               | 指定路径 PR、`throughput` 分支 push、`v*` tag push、手工      | 性能/吞吐专用验证；独立安装 Node.js 22 并构建 Dashboard 资源后再构建测试子进程；与普通 Rust 单元测试边界不同                                                                                |
+| `proxy-throughput-release.yml`       | 指定路径 PR、手工                                             | release 优化吞吐测试；同样先构建 Dashboard 资源；不是自动批准发行                                                                                                                             |
 | `macos-build.yml`                    | 手工                                                         | 独立 macOS 构建入口                                                                                                                                                                           |
 | `spell-check.yml`、`email-check.yml` | PR                                                           | 拼写与 Commit 邮箱检查，检查结果不得忽略                                                                                                                                                      |
 | `dependabot-automerge.yml`           | CI `workflow_run: completed`                                 | **只处理通过 CI 的 Dependabot PR**；二次核对作者、HEAD SHA、base、所有 PR checks，然后 rebase merge 并手工 dispatch CI                                                                        |
@@ -24,7 +24,7 @@
 
 ## 2. 项目事实与检查范围
 
-- **Dashboard**：当前 `ci.yml` 设有 `npm ci`、`npm run lint`、`npm run build`；Dashboard job 完成后把 `dist/` 交给 quality / compile。`clash-lib/build.rs` 只校验并追踪已构建资源，不运行 Node.js/npm；未启用 `dashboard` 时不需要前端产物。只代表构建阶段通过，不能证明与真实 Proxy/TUN 交互。
+- **Dashboard**：当前 `ci.yml` 设有 `npm ci`、`npm run lint`、`npm run build`；Dashboard job 完成后把 `dist/` 交给 quality / compile。独立触发的两个吞吐工作流也各自执行 Node.js 22、`npm ci` 和 `npm run build`，再构建启用 Dashboard 的 `clash-rs` 测试子进程。`clash-lib/build.rs` 只校验并追踪已构建资源，不运行 Node.js/npm；未启用 `dashboard` 时不需要前端产物。只代表构建阶段通过，不能证明与真实 Proxy/TUN 交互。
 - **Rust quality**：`cargo fmt --all -- --check` 与 CLI feature 转发检查（均仅 Linux），`cargo clippy -p clash-lib --all-targets --all-features -- -D warnings`（Linux、Windows、macOS）及 LAN proxy 集成测试。查 job 时同时确认平台与选中的 feature。
 - **Compile**：多个 Linux/Windows/macOS 目标、部分 `cross`/不同 feature，`no-test` 与 PR 条件使某些目标不会运行测试。构建成功不等于真实运行或网卡/TUN 权限验证通过。
 - **Windows network**：测试明确使用本地 loopback；不覆盖真实 NIC 修改、安装网络驱动或生产路由权限。

@@ -46,6 +46,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake libclang-dev protobuf-compiler
 
+      - name: Set up Node.js for Dashboard
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: clash-dashboard/package-lock.json
+
+      - name: Install Dashboard dependencies
+        working-directory: clash-dashboard
+        run: npm ci
+
+      - name: Build Dashboard assets
+        working-directory: clash-dashboard
+        run: npm run build
+
       # Build the binary that the tests will spawn as a subprocess.
       # Do NOT use --all-features here: the `telemetry` feature enables
       # console_subscriber and OpenTelemetry threads that deadlock with the
