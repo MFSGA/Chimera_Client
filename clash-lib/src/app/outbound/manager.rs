@@ -2900,7 +2900,13 @@ ip: not-an-ip
         let (manager, status, guard, execution, query) = s04bl_fixture().await;
         assert!(manager.strict_dns_path_generation(&status).await.is_ok());
         let other = Arc::new(RwLock::new(NetworkStatus::default()));
-        other.write().await.observed(&NetworkSnapshot::default());
+        {
+            let mut other_status = other.write().await;
+            // Windows defaults to unsupported; keep this case on the
+            // runtime-identity check path.
+            other_status.set_automatic_supported_for_test(true);
+            other_status.observed(&NetworkSnapshot::default());
+        }
         let error = manager
             .strict_dns_path_generation(&other)
             .await
