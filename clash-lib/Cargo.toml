@@ -146,7 +146,6 @@ erased-serde = "0.4"
 log = { version = "0.4", optional = true }
 memchr = { version = "2", optional = true }
 subtle = { version = "2", optional = true }
-ring-compat = { version = "0.8", features = ["aead"] }
 x509-parser = { version = "0.18", default-features = false, optional = true }
 
 blake3 = { version = "1", optional = true }

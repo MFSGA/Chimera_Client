@@ -12,6 +12,7 @@ docs/*
 !docs/supported-feature-profiles.md
 !docs/dashboard-api-contract.md
 !docs/workspace-package-maturity.md
+!docs/dependency-security-iteration.md
 start*.*
 release*.*
 
