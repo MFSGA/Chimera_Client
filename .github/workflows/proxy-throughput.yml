@@ -50,6 +50,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake libclang-dev protobuf-compiler
 
+      - name: Set up Node.js for Dashboard
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: clash-dashboard/package-lock.json
+
+      - name: Install Dashboard dependencies
+        working-directory: clash-dashboard
+        run: npm ci
+
+      - name: Build Dashboard assets
+        working-directory: clash-dashboard
+        run: npm run build
+
       # Build the binary that the tests will spawn as a subprocess.
       # clash-bin's `standard` feature (enabled by default) governs which
       # protocol features are compiled into the binary.  Add new protocol
