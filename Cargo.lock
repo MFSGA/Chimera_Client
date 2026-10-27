@@ -504,7 +504,7 @@ dependencies = [
 
 [[package]]
 name = "boring-noise"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aead 0.5.2",
  "aws-lc-rs",
@@ -645,7 +645,7 @@ dependencies = [
 
 [[package]]
 name = "chimera-dns"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -742,15 +742,15 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "clash-doc"
-version = "0.28.0"
+version = "0.28.1"
 
 [[package]]
 name = "clash-ffi"
-version = "0.28.0"
+version = "0.28.1"
 
 [[package]]
 name = "clash-lib"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "anyhow",
  "async-recursion",
@@ -849,7 +849,7 @@ dependencies = [
 
 [[package]]
 name = "clash-rs"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "aws-lc-rs",
  "clap",
@@ -4073,7 +4073,7 @@ dependencies = [
 
 [[package]]
 name = "sock2proc"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "libc",
  "netlink-packet-core 0.7.0",
@@ -4890,7 +4890,7 @@ dependencies = [
 
 [[package]]
 name = "watfaq-netstack"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "bytes",
  "env_logger",
@@ -5385,7 +5385,7 @@ dependencies = [
 
 [[package]]
 name = "xhttp-h2-phaseb"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "anyhow",
  "bytes",
