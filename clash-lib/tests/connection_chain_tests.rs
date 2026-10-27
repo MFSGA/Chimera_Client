@@ -761,8 +761,10 @@ rules:
             .expect("failed to parse failure path decisions");
             if let Some(decision) = decisions.as_array().and_then(|records| {
                 records.iter().find(|decision| {
-                    decision["outcome"] == "dialFailed"
-                        && decision["route"]["outbound"] == "failing-proxy"
+                    matches!(
+                        decision["outcome"].as_str(),
+                        Some("dialFailed" | "staleNetworkDiscarded")
+                    ) && decision["route"]["outbound"] == "failing-proxy"
                 })
             }) {
                 break decision.clone();
