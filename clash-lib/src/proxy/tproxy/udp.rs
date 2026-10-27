@@ -32,7 +32,11 @@ pub(super) async fn listen(
     fw_mark: Option<u32>,
     ready: InboundReady,
 ) -> io::Result<()> {
-    let socket = create_listener(addr).and_then(AsyncFd::new);
+    let socket = create_listener(addr).and_then(|socket| {
+        // SAFETY: `Socket` owns the file descriptor and is moved into `AsyncFd`.
+        // No other handle can close or replace it while `AsyncFd` is alive.
+        unsafe { AsyncFd::register(socket) }.map_err(io::Error::from)
+    });
     let socket = Arc::new(report_listener_ready(ready, socket)?);
     let (response_tx, response_rx) = tokio::sync::mpsc::channel(32);
     let (request_tx, request_rx) = tokio::sync::mpsc::channel(32);
