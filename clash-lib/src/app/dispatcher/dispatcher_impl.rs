@@ -231,6 +231,11 @@ fn classify_flow_end_reason(
     }
 }
 
+fn should_track_global_selector(mode: RunMode, outbound_type: OutboundType) -> bool {
+    matches!(mode, RunMode::Global)
+        && matches!(outbound_type, OutboundType::Selector)
+}
+
 pub struct Dispatcher {
     outbound_manager: ThreadSafeOutboundManager,
     resolver: ThreadSafeDNSResolver,
@@ -1372,6 +1377,8 @@ impl Dispatcher {
                         continue;
                     }
                 };
+                let track_global_selector =
+                    should_track_global_selector(mode, selected.handler.proto());
                 let is_dynamic_group = matches!(
                     selected.handler.proto(),
                     OutboundType::Selector
@@ -1393,6 +1400,18 @@ impl Dispatcher {
                             continue;
                         }
                     };
+                if track_global_selector {
+                    let selection_identity = pinned.selection_identity();
+                    if outbound_handle_guard
+                        .observe_global_selector_selection(selection_identity)
+                        .await
+                    {
+                        debug!(
+                            outbound_name = %pinned.handler.name(),
+                            "retired UDP associations after GLOBAL selector change"
+                        );
+                    }
+                }
                 if let Err(error) = mgr
                     .ensure_outbound_ready_for_new_flow(&pinned.handler)
                     .await
@@ -2605,6 +2624,15 @@ impl TimeoutUdpSessionManager {
         map.get_observed_path_id(outbound_name, src_addr, path_id)
     }
 
+    async fn observe_global_selector_selection(
+        &self,
+        selection_identity: Vec<String>,
+    ) -> bool {
+        let mut map = self.map.write().await;
+        map.refresh_generation(self.generation.load(Ordering::Acquire));
+        map.observe_global_selector_selection(selection_identity)
+    }
+
     fn generation_is_current(&self, generation: u64) -> bool {
         self.generation.load(Ordering::Acquire) == generation
     }
@@ -2656,11 +2684,31 @@ struct OutboundHandleMap(
     HashMap<OutboundHandleKey, OutboundHandleVal>,
     u64,
     HashMap<UdpFlowDecisionKey, CachedUdpPathDecision>,
+    Option<Vec<String>>,
 );
 
 impl OutboundHandleMap {
     fn new() -> Self {
-        Self(HashMap::new(), 0, HashMap::new())
+        Self(HashMap::new(), 0, HashMap::new(), None)
+    }
+
+    fn observe_global_selector_selection(
+        &mut self,
+        selection_identity: Vec<String>,
+    ) -> bool {
+        let changed = self
+            .3
+            .as_ref()
+            .is_some_and(|current| current != &selection_identity);
+        if changed {
+            for (_, value) in self.0.drain() {
+                value.tracker.set_end_reason(FlowEndReason::OutboundChanged);
+                value.rw_handle.abort();
+            }
+            self.2.clear();
+        }
+        self.3 = Some(selection_identity);
+        changed
     }
 
     fn refresh_generation(&mut self, generation: u64) {
@@ -2810,8 +2858,9 @@ mod tests {
         UDP_SESSION_IDLE, UdpFlowDecisionKey, capture_udp_health_proof,
         classify_flow_end_reason, confirmed_udp_path, direct_udp_health_destination,
         preferred_udp_path_address, queue_udp_packet_retry, reverse_lookup,
-        select_outbound_for_flow, try_queue_outbound_packet, udp_health_path,
-        udp_path_cache_versions, udp_path_selection_is_current,
+        select_outbound_for_flow, should_track_global_selector,
+        try_queue_outbound_packet, udp_health_path, udp_path_cache_versions,
+        udp_path_selection_is_current,
     };
     use crate::{
         app::dns::{ClashResolver, MockClashResolver, ThreadSafeDNSResolver},
@@ -2996,6 +3045,129 @@ mod tests {
                 .await
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn global_selector_change_retires_udp_association_and_path_cache() {
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sessions = super::TimeoutUdpSessionManager::new(generation);
+        let source = "127.0.0.1:53000".parse().unwrap();
+        let destination = SocksAddr::from_str("8.8.8.8:53").unwrap();
+        let decision_key = UdpFlowDecisionKey {
+            outbound_name: "PROXY-A".to_owned(),
+            inbound: Type::Socks5,
+            source,
+            process_name: None,
+            inbound_user: None,
+            original_destination: destination.clone(),
+            logical_destination: destination,
+            target_family: None,
+            session_generation: 0,
+            network_version: 0,
+            policy_generation: 0,
+        };
+
+        assert!(
+            !sessions
+                .observe_global_selector_selection(vec![
+                    "GLOBAL".to_owned(),
+                    "PROXY-A".to_owned(),
+                ])
+                .await,
+            "the initial selection must not retire sessions"
+        );
+        sessions
+            .insert_flow_decision(decision_key.clone(), None, None)
+            .await;
+
+        let (sender, mut receiver) = mpsc::channel(1);
+        let tracker = Arc::new(super::TrackerInfo::default());
+        assert!(
+            sessions
+                .insert(
+                    "PROXY-A",
+                    source,
+                    tokio::spawn(pending()),
+                    sender,
+                    super::OutboundUdpSessionState {
+                        path_id: None,
+                        tracker: tracker.clone(),
+                        generation: 0,
+                    },
+                )
+                .await
+        );
+        assert!(
+            sessions
+                .get_outbound_sender_mut("PROXY-A", source, None)
+                .await
+                .is_some()
+        );
+        assert!(sessions.get_flow_decision(&decision_key).await.is_some());
+
+        assert!(
+            !sessions
+                .observe_global_selector_selection(vec![
+                    "GLOBAL".to_owned(),
+                    "PROXY-A".to_owned(),
+                ])
+                .await,
+            "an unchanged selector must keep its active association"
+        );
+        assert!(
+            sessions
+                .get_outbound_sender_mut("PROXY-A", source, None)
+                .await
+                .is_some()
+        );
+
+        assert!(
+            sessions
+                .observe_global_selector_selection(vec![
+                    "GLOBAL".to_owned(),
+                    "PROXY-B".to_owned(),
+                ])
+                .await
+        );
+        assert_eq!(tracker.end_reason(), super::FlowEndReason::OutboundChanged);
+        assert!(receiver.recv().await.is_none());
+        assert!(
+            sessions
+                .get_outbound_sender_mut("PROXY-A", source, None)
+                .await
+                .is_none()
+        );
+        assert!(
+            sessions.get_flow_decision(&decision_key).await.is_none(),
+            "path decisions tied to the old outbound must be cleared"
+        );
+
+        assert_eq!(
+            serde_json::to_value(super::FlowEndReason::OutboundChanged).unwrap(),
+            "outboundChanged"
+        );
+    }
+
+    #[test]
+    fn only_global_manual_selectors_track_selection_changes() {
+        use crate::proxy::OutboundType;
+
+        assert!(should_track_global_selector(
+            RunMode::Global,
+            OutboundType::Selector
+        ));
+        assert!(!should_track_global_selector(
+            RunMode::Rule,
+            OutboundType::Selector
+        ));
+        assert!(!should_track_global_selector(
+            RunMode::Global,
+            OutboundType::Fallback
+        ));
+        assert!(!should_track_global_selector(
+            RunMode::Global,
+            OutboundType::LoadBalance
+        ));
     }
 
     #[tokio::test]

@@ -859,11 +859,20 @@ lifecycle tests.
 - 同一 master push 还触发 `ci.yml` 的 `Release` job：稳定版步骤跳过，`latest` 预发布被重建并指向 `57c7336ada6b9a7e0e802f32d994b379d011b8cc`。这属于 push 工作流行为，不代表完成真实换网验收。
 - Windows 自动网络观察仍未实现，`AUTOMATIC_SUPPORTED` 保持关闭；Windows loopback reset 测试不等于 Windows 主机网络切换验收。下一步需要 Linux Runner 实际执行快照测试，再在隔离 Linux namespace 验证换网恢复；Windows 需另行补齐路由、接口状态和 DNS 观察后才适合开启自动支持。
 
-### 2026-10-30：在主 CI 实际运行 Linux/macOS 实时快照测试（待 CI 验证）
+### 2026-10-30：在主 CI 实际运行 Linux/macOS 实时快照测试（CI 已通过）
 
 - `.github/workflows/ci.yml` 的 Linux 与 macOS quality job 新增精确测试步骤，执行 `app::network::tests::live_supported_platform_snapshot_reports_local_bind_capabilities`。这使 master push 不再只通过 Clippy 编译该测试目标，也会实际运行该只读快照用例。
 - 本次仅调整 CI 执行范围，不增加网络操作；该用例读取本机网络元数据并绑定临时 UDP socket，不发送数据、不改主机网络。
-- 该改动尚未推送，Linux/macOS Runner 的首次执行结果待后续 CI；它不替代 Linux namespace 换网、Windows 网络观察或专用双网卡实机验收。
+- GitHub Actions run `41052184434` 在 Linux 和 macOS 实际执行该测试并通过；Dashboard、三平台质量检查、12 个跨平台编译和 Release job 均成功。`latest` 预发布更新到 `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`，包含 15 个资产。
+- 这只验证 Linux/macOS 的只读快照采集与本地绑定探测，不替代 Linux namespace 换网、Windows 网络观察或专用双网卡实机验收。
+
+### 2026-10-30：GLOBAL 手动选择器切换时退休旧 UDP association
+
+- 基线：本地 `master` 与 `origin/master` 均为 `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`。原 Dispatcher 每个数据报都会重新捕获 GLOBAL selector 的当前叶节点；叶节点变化后，新数据走新出站，但旧 NAT association 的后台转发任务仍可继续收发，直到 10 秒空闲过期。
+- `PinnedOutbound` 现在提供捕获到的 selector 链和最终出站身份。GLOBAL 模式的顶层手动 `Selector` 在下一次数据报观察到身份变化时，立即退休该入站的旧 UDP associations，记录 `endReason: outboundChanged` 并清除旧路径决策缓存；Rule 模式及 Fallback、URLTest、LoadBalance 等自动组不触发此逻辑。
+- 新增 loopback 集成回归：DIRECT 首包得到 echo 响应，Controller 将 GLOBAL 切到 REJECT 后发送下一包，旧 association 必须出现在 `/flows?include_closed=true` 的 `outboundChanged` 计数中。临时关闭选择变化检测时，该用例按预期在 5 秒内因未退休而失败；恢复实现后通过。
+- 已通过：`cargo test -p clash-lib --lib --locked`（982 passed、11 ignored）、`cargo test -p clash-lib --test direct_udp_integration_tests --locked -- --test-threads=1`（4 passed）、定向 selector 单元测试（8 passed）、`cargo clippy -p clash-lib --lib --test direct_udp_integration_tests --locked -- -D warnings`、格式和 diff 检查。测试只使用本机 loopback，不修改系统网络。
+- 边界：选择变化在该 UDP 入站收到下一包时被观察；本轮未增加 selector 事件订阅来主动唤醒所有空闲中的 UDP 入站，也未覆盖真实代理服务器 UDP 互操作或跨平台网络切换。
 
 ### 2026-10-24：修复 feature 组合下的测试 Clippy 阻断
 

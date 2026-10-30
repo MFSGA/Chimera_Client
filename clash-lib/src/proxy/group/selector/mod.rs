@@ -106,6 +106,16 @@ impl PinnedOutbound {
         }
     }
 
+    /// Identifies the captured selector traversal and final outbound.
+    ///
+    /// UDP association owners can compare this value across packets and
+    /// retire associations when an explicit selector changes its selection.
+    pub(crate) fn selection_identity(&self) -> Vec<String> {
+        let mut identity = self.selector_chain.clone();
+        identity.push(self.handler.name().to_owned());
+        identity
+    }
+
     pub(crate) async fn append_stream_chain(&self, stream: &BoxedChainedStream) {
         for name in self.selector_chain.iter().rev() {
             stream.append_to_chain(name).await;
@@ -685,6 +695,7 @@ mod path_selection_tests {
                 .unwrap();
         assert_eq!(pinned_tcp.handler.name(), "DIRECT");
         assert_eq!(pinned_udp.handler.name(), "DIRECT");
+        assert_eq!(pinned_udp.selection_identity(), ["SELECT", "DIRECT"]);
         selector.select("PROXY").await.unwrap();
 
         let session = Session {
@@ -724,6 +735,7 @@ mod path_selection_tests {
             .await
             .unwrap();
         assert_eq!(next.handler.name(), "PROXY");
+        assert_eq!(next.selection_identity(), ["SELECT", "PROXY"]);
         let (stream, _) = next
             .handler
             .connect_stream_with_path_selection_result(
@@ -777,6 +789,7 @@ mod path_selection_tests {
         let pinned = PinnedOutbound::capture(outer, &Session::default())
             .await
             .unwrap();
+        assert_eq!(pinned.selection_identity(), ["OUTER", "INNER", "DIRECT"]);
         inner.select("PROXY").await.unwrap();
         assert_eq!(pinned.handler.name(), "DIRECT");
         let session = Session::default();
