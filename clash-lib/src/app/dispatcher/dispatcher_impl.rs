@@ -2265,7 +2265,6 @@ impl Dispatcher {
                             );
                             continue;
                         }
-                        // TODO: need to reset when GLOBAL select is changed
                         let observed_path = outbound_handle_guard
                             .get_observed_path_id(
                                 &outbound_name,
@@ -2626,7 +2625,7 @@ impl TimeoutUdpSessionManager {
 
     async fn observe_global_selector_selection(
         &self,
-        selection_identity: Vec<String>,
+        selection_identity: Vec<(String, String)>,
     ) -> bool {
         let mut map = self.map.write().await;
         map.refresh_generation(self.generation.load(Ordering::Acquire));
@@ -2684,7 +2683,7 @@ struct OutboundHandleMap(
     HashMap<OutboundHandleKey, OutboundHandleVal>,
     u64,
     HashMap<UdpFlowDecisionKey, CachedUdpPathDecision>,
-    Option<Vec<String>>,
+    Option<Vec<(String, String)>>,
 );
 
 impl OutboundHandleMap {
@@ -2694,7 +2693,7 @@ impl OutboundHandleMap {
 
     fn observe_global_selector_selection(
         &mut self,
-        selection_identity: Vec<String>,
+        selection_identity: Vec<(String, String)>,
     ) -> bool {
         let changed = self
             .3
@@ -3069,10 +3068,10 @@ mod tests {
 
         assert!(
             !sessions
-                .observe_global_selector_selection(vec![
+                .observe_global_selector_selection(vec![(
                     "GLOBAL".to_owned(),
-                    "PROXY-A".to_owned(),
-                ])
+                    "PROXY-A".to_owned()
+                ),])
                 .await,
             "the initial selection must not retire sessions"
         );
@@ -3107,10 +3106,10 @@ mod tests {
 
         assert!(
             !sessions
-                .observe_global_selector_selection(vec![
+                .observe_global_selector_selection(vec![(
                     "GLOBAL".to_owned(),
-                    "PROXY-A".to_owned(),
-                ])
+                    "PROXY-A".to_owned()
+                ),])
                 .await,
             "an unchanged selector must keep its active association"
         );
@@ -3123,10 +3122,10 @@ mod tests {
 
         assert!(
             sessions
-                .observe_global_selector_selection(vec![
+                .observe_global_selector_selection(vec![(
                     "GLOBAL".to_owned(),
-                    "PROXY-B".to_owned(),
-                ])
+                    "PROXY-B".to_owned()
+                ),])
                 .await
         );
         assert_eq!(tracker.end_reason(), super::FlowEndReason::OutboundChanged);
