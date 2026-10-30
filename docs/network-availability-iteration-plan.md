@@ -1,6 +1,6 @@
 # 主机网络变化后的可用性迭代计划
 
-日期：2026-10-24。状态：B0–B6 已完成代码级与受控回归；B7 已接入代理端点 TCP/UDP、DNS socket 路径、多个代理协议的路径健康证据及连接池网络代际/PathId 管理，但远端代理互操作与完整 pooled transport 行为仍待验收。本轮以本机 SOCKS5、in-process Shadowsocks、TLS Trojan、AnyTLS 与 VLESS 服务端验证真实握手、应用请求/响应、回退获胜 PathId 及端点/目标健康证据关联。Hysteria2 QUIC/端口跳跃沿用 connector 选定路径；Relay 首跳 PathId 与活动/关闭 Flow 的本机 `networkPaths` 观测已接入，不代表代理服务器之后的远端转发路径。B8 的 DIRECT 与代理端点 TCP 有界多路径调度代码已接入；loopback 测试验证了首选源地址不匹配后的候选回退。B9 被动恢复防抖代码已完成。B10 Explain 覆盖 TCP/UDP 路径决策、拨号结果、旧网络结果丢弃与配置 reload 版本差异；运行时偏好/临时覆写 API、本机 UDP 恢复、Explain 记录单调时钟过期及过期查询处理已有定向回归，其他代理路径 Explain 与完整 API 面仍待补充验证。默认 `clash-lib` 单元测试为 977 通过、12 忽略；全 Rust feature 单元测试为 1150 通过、12 忽略；Dashboard 外全 feature Clippy、格式与 diff 检查通过。Linux 网络快照与路径绑定观察代码尚未在 Linux 上验证；Windows 自动观察仍不支持。B11 的物理双网卡切换、route-all、休眠、资源趋势及恢复时间预算仍待专用环境验收。
+日期：2026-10-24。状态：B0–B6 已完成代码级与受控回归；B7 已接入代理端点 TCP/UDP、DNS socket 路径、多个代理协议的路径健康证据及连接池网络代际/PathId 管理，但远端代理互操作与完整 pooled transport 行为仍待验收。本轮以本机 SOCKS5、in-process Shadowsocks、TLS Trojan、AnyTLS 与 VLESS 服务端验证真实握手、应用请求/响应、回退获胜 PathId 及端点/目标健康证据关联。Hysteria2 QUIC/端口跳跃沿用 connector 选定路径；Relay 首跳 PathId 与活动/关闭 Flow 的本机 `networkPaths` 观测已接入，不代表代理服务器之后的远端转发路径。B8 的 DIRECT 与代理端点 TCP 有界多路径调度代码已接入；loopback 测试验证了首选源地址不匹配后的候选回退。B9 被动恢复防抖代码已完成。B10 Explain 覆盖 TCP/UDP 路径决策、拨号结果、旧网络结果丢弃与配置 reload 版本差异；运行时偏好/临时覆写 API、本机 UDP 恢复、Explain 记录单调时钟过期及过期查询处理已有定向回归，其他代理路径 Explain 与完整 API 面仍待补充验证。默认 `clash-lib` 单元测试为 977 通过、12 忽略；全 Rust feature 单元测试为 1150 通过、12 忽略；Dashboard 外全 feature Clippy、格式与 diff 检查通过。Linux 快照与路径绑定观察尚未在 Linux 上验证；Windows IP Helper 自动观察代码已实现，但尚未完成完整 Windows target 构建、live snapshot 或实机换网验收。B11 的物理双网卡切换、route-all、休眠、资源趋势及恢复时间预算仍待专用环境验收。
 
 用户确认的目标：主机切换网卡或网络后，自动恢复新连接；已有连接尽力恢复，无法恢复时明确结束。典型场景包括 Wi-Fi ↔ 有线、同一网卡换 Wi-Fi/DHCP 地址、断网重连和休眠唤醒。服务恢复无需用户重启 Chimera、重新加载配置或手动调用 reset。
 
@@ -301,7 +301,7 @@ cargo test -p clash-lib --test api_reload_tests --locked -- --test-threads=1
 | A2 | 串行恢复、当前接口/DNS/池、独立失败处理已实现 | 实际代理节点在新网络上的端到端响应 |
 | A3 | UDP 网络版本失效、池退休、TCP keepalive、TUN 接口刷新与路由所有权已实现 | route-all 实际出口切换、旧 TCP 失效时限 |
 | A4 | 自动事件受控测试、20 轮 UDP 集成、隔离真实 TUN 回归通过 | 专用环境的物理网卡切换、休眠与资源计数 |
-| Linux / Windows | Linux 快照与自动观察代码已加入、未验证；Windows 仍 unsupported | Linux 编译、定向用例、namespace 换网和实机验收待后续统一执行；Windows 平台实现与验证未完成 |
+| Linux / Windows | Linux 快照与自动观察代码已加入、未验证；Windows IP Helper 快照已实现并开启自动观察，但完整目标构建与 live snapshot 尚未验证 | Linux 编译、定向用例、namespace 换网和实机验收待后续统一执行；Windows CI、live snapshot 和实机换网验收待完成 |
 | Core / Router 重构 | 暂缓 | 不属于本轮范围 |
 
 ## 7. 本轮实现与实际验证（2026-10-02）
@@ -921,18 +921,26 @@ lifecycle tests.
 - `npm run lint`、`npm run build` 通过。用本地 fixture 验证 DNS 失败、其他必需组件 ready、TUN 未配置且可选的状态能分别呈现；未连接实际运行核心。
 - 最终主 JS 637.62 kB，按需加载的 Network chunk 48.21 kB；原有主包体积警告仍在。
 
-### 2026-10-30：Dashboard 编辑运行时路径偏好（L2，待验收）
+### 2026-10-30：Dashboard 编辑运行时路径偏好（L2，本地已验收）
 
 - 基线：本地 `master` `7cb55506692c09085d821d704b17308ae768cef7`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。只使用已有 `/runtime/network/path-preference` API。
 - Network 页面可按接口类型和地址族增删、调整软偏好顺序，选择运行时有效期或 15 分钟/1 小时/24 小时临时覆写；可清除临时覆写并恢复原运行时偏好，也可用空列表回到核心默认规则。偏好仅影响使用自动选路的新连接，不改系统路由、不移动已有连接、不写回 YAML；显式 `Require` 仍由核心优先处理。
 - `npm run lint`、`npm run build` 通过。受控本地 HTTP fixture 手动验证添加、排序、15 分钟覆写、应用、清除和恢复默认；选择 15 分钟后点击“Use core default”，GET 返回 `source=runtime`、空 `priority`、`createdAtMs=null` 和 `expiresAtMs=null`，确认不会留下临时 TTL；没有连接真实核心或改变真实网络。
-- 最终构建 Network chunk 55.30 kB、主 JS 637.94 kB；主包原有的 500 kB 体积提示仍存在。此 L2 切片需要独立 Reviewer 检查，并待维护者验收最终 SHA。
-- 独立审查发现手动刷新按钮未立即刷新偏好查询；已将偏好查询加入同一刷新流程并纳入忙碌状态，最终 SHA 将重新审查。
+- 最终构建 Network chunk 55.30 kB、主 JS 637.94 kB；主包原有的 500 kB 体积提示仍存在。维护者已批准本地 SHA `7402e680ae41bb40a4301580310715f51a37e1a7`；该批准仅针对当时的路径偏好页面切片。
+- 独立审查发现手动刷新按钮未立即刷新偏好查询；偏好查询现加入同一刷新流程并纳入忙碌状态，独立复审通过。
 
 ### 2026-10-30：HTTP 入站转发 WebSocket Upgrade（L2，待审查）
 
 - 基线：本地 `master` `7402e680ae41bb40a4301580310715f51a37e1a7`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。本轮不迁移参考实现。
 - HTTP 入站在既有 `CONNECT` 和普通请求之外，现识别含 `Upgrade` 且 `Connection` token 含 `upgrade` 的请求。使用启用 Hyper upgrade 的 HTTP/1.1 client connection 经 Dispatcher 建立上游连接；代理 absolute-form URI 转为 origin-form，并始终按 URI authority 重建 `Host`。代理认证头只用于本地认证，不会发给目标；升级请求/响应会移除 `Connection` 指定的逐跳头并重建 `Connection: Upgrade`。上游返回 101 后双向复制升级流；TCP 连接被拒绝时返回 502。
 - 新增 loopback WebSocket 回归：有效 101 握手、上游提前发送的未掩码文本帧、客户端掩码文本帧、服务端回帧，以及认证通过后代理凭据不外泄、伪造 Host 被 URI authority 覆盖、请求/响应逐跳字段清除和 TCP 拨号被拒时返回 502。`cargo test -p clash-lib --test connection_chain_tests --locked -- --test-threads=1` 为 5 passed；该 target 严格 Clippy、格式和 diff 检查通过。未访问公网或修改宿主网络。
-- TLS WebSocket 仍经现有 CONNECT 路径，本轮未新增其实现；未验证第三方服务端、长时升级连接或跨平台运行。L2 独立审查与维护者验收待最终 SHA。
-- 初次独立审查发现代理认证、Host 权威性和逐跳头边界问题；已在后续修复中逐项加入实现与回归检查，当前最终 SHA 仍需重新独立审查。
+- TLS WebSocket 仍经现有 CONNECT 路径，本轮未新增其实现；未验证第三方服务端、长时升级连接或跨平台运行。独立 Reviewer 对修复后的最终 HTTP Upgrade diff 通过；该 L2 切片的维护者验收仍待确认最终 SHA。
+- 初次独立审查发现代理认证、Host 权威性和逐跳头边界问题；已在后续修复中逐项加入实现与回归检查。修复后的最终 diff 已由独立 Reviewer 复审通过。
+
+### 2026-10-30：Windows 网络恢复只读观察器（L2，待平台验收）
+
+- 基线：本地 `master` `be68f4ea80383dc9bdf39f96e6c6e3296acf7ab3`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；参考检出 `ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。本切片没有迁移参考代码。
+- Windows 现在用 IP Helper 读取适配器地址、运行状态、按优先顺序排列的 DNS 服务器、连接/搜索后缀，以及 IPv4/IPv6 默认路由；按“路由 metric + 接口 metric”挑选主路由，等价路由保留为 ambiguous 证据。候选路径按 family interface index 绑定临时 UDP socket，仅证明本地地址/接口可以绑定，不发送探测包。每次快照最多绑定探测 128 个候选；阻塞采集使用单一 permit，若超过 2 秒，后续轮询等待该任务释放 permit，不再并行堆积工作。现有 TUN interface index/名称用于排除虚拟隧道路径。自动网络恢复状态因此在 Windows 也会进入观察阶段。
+- 新增 Windows 路由选择、等价路由、TUN/断开接口过滤、IPv6 interface index、默认路由解析、DNS 顺序/后缀变化和候选探测上限用例，以及只读实时快照用例。macOS 上 `app::network::tests::` 定向测试 17 passed；核心库无默认 feature 的 `ring,tun,port` 严格 Clippy、`cargo fmt --all` 和 `git diff --check` 通过。Windows GNU target 的最小独立 harness 使用 `windows 0.62` 对新增模块与测试做 `cargo check --tests`，通过；该 harness 不等同于完整 `clash-lib` target 构建。
+- 完整 `cargo check -p clash-lib --lib --tests --target x86_64-pc-windows-gnu --no-default-features --locked` 被本机缺少 MinGW C 工具链/Windows C 标准头文件阻断于 `zstd-sys`，尚未编译到完整 workspace 的 Windows target。Windows 代码没有在 Windows runner 或真实 Windows 机器运行；新增 live snapshot 测试也尚未执行。因此当前切片尚不能称为 Windows 跨平台验收完成，合入/推送前仍需完整 Windows CI，后续还需在真实多网卡/TUN 环境确认恢复行为。
+- 网络观察为 L2；最终 SHA 需要独立 Reviewer 和维护者验收。回滚方式是撤回本切片提交，恢复 Windows `AUTOMATIC_SUPPORTED=false` 及旧的 unsupported snapshot 路径；没有执行 push、release 或系统网络改动。
