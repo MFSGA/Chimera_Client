@@ -35,8 +35,8 @@ pub struct V2rayWsClient {
     pub ws_client: transport::WsClient,
 }
 
-// The plain WebSocket handshake is covered locally; TLS and third-party
-// V2Ray plugin interoperability remain unverified.
+// Loopback WebSocket handshakes are covered locally; third-party V2Ray plugin
+// interoperability remains unverified.
 impl V2rayWsClient {
     pub fn try_new(
         host: String,
@@ -124,6 +124,7 @@ mod tests {
     };
 
     use tokio::net::{TcpListener, TcpStream};
+    use tokio_rustls::TlsAcceptor;
     use tokio_tungstenite::{
         accept_hdr_async,
         tungstenite::handshake::server::{Request, Response},
@@ -194,6 +195,96 @@ mod tests {
                 1,
                 Some("cdn.example".to_owned()),
                 Some("/ws?token=1".to_owned())
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn tls_websocket_uses_http11_and_preserves_custom_host() {
+        crate::setup_default_crypto_provider();
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+                .expect("test certificate should generate");
+        let cert = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+        let key =
+            rustls::pki_types::PrivateKeyDer::try_from(signing_key.serialize_der())
+                .expect("test private key should serialize");
+        let mut tls_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .expect("test TLS config should build");
+        tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("TLS WebSocket fixture should bind");
+        let address = listener
+            .local_addr()
+            .expect("TLS WebSocket fixture should have an address");
+        let observed = Arc::new(Mutex::new(None));
+        let observed_request = Arc::clone(&observed);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("TLS WebSocket fixture should accept");
+            let stream = acceptor
+                .accept(stream)
+                .await
+                .expect("TLS handshake should succeed");
+            let alpn = stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+            let websocket = accept_hdr_async(
+                stream,
+                move |request: &Request, response: Response| {
+                    let host_values = request.headers().get_all("host");
+                    let value_count = host_values.iter().count();
+                    let host = host_values
+                        .iter()
+                        .next()
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    let path =
+                        request.uri().path_and_query().map(ToString::to_string);
+                    *observed_request.lock().expect("request observation lock") =
+                        Some((value_count, host, path));
+                    Ok(response)
+                },
+            )
+            .await
+            .expect("TLS WebSocket upgrade should succeed");
+            drop(websocket);
+            alpn
+        });
+
+        let client = V2rayWsClient::try_new(
+            "localhost".to_owned(),
+            address.port(),
+            "/secure?token=1".to_owned(),
+            HashMap::from([("host".to_owned(), "cdn.example".to_owned())]),
+            true,
+            true,
+            false,
+        )
+        .expect("TLS V2Ray WebSocket client should be created");
+        let stream = TcpStream::connect(address)
+            .await
+            .expect("TLS WebSocket fixture should accept TCP");
+        let client_stream = client
+            .proxy_stream(Box::new(stream))
+            .await
+            .expect("TLS WebSocket handshake should succeed");
+
+        drop(client_stream);
+        assert_eq!(
+            server.await.expect("TLS fixture task should not panic"),
+            Some(b"http/1.1".to_vec())
+        );
+        assert_eq!(
+            *observed.lock().expect("request observation lock"),
+            Some((
+                1,
+                Some("cdn.example".to_owned()),
+                Some("/secure?token=1".to_owned())
             ))
         );
     }

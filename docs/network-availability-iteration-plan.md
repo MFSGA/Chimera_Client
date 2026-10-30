@@ -949,5 +949,5 @@ lifecycle tests.
 
 - 基线：本地 `master` `325d65c3dad44c8a86b44d671559643828613c9e`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；参考检出 `ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。仅修复本地 V2Ray WebSocket 插件 Host 默认逻辑，不迁移参考代码。
 - 原逻辑只识别大小写恰为 `Host` 的自定义头；使用合法的小写 `host` 时，又额外插入默认 Host，导致实际 WebSocket 握手带两个 Host 头。现按大小写不敏感识别单个自定义 Host；若配置同时有 `Host` 与 `host` 等多项大小写等价字段，则在握手前以 `InvalidInput` 拒绝，避免根据 HashMap 顺序选择不确定的 authority。回归用例用本机 TCP 和 WebSocket 握手复现：修复前服务端收到两个 Host 值；修复后保留单个配置值，并保留配置路径和 query。
-- 定向明文握手测试修复前 1 failed（服务端观察到 2 个 Host），修复后 1 passed；重复大小写 Host 配置用例修复前 1 failed、修复后 1 passed。`cargo test -p clash-lib --lib --no-default-features --features ring,ws,shadowsocks v2ray_plugin_ --locked -j 6 -- --nocapture`：7 passed；相同 feature 下库级严格 Clippy、格式和 diff 检查通过。
-- 测试只覆盖明文本机 WebSocket 握手；TLS 和第三方 V2Ray 插件互操作仍未验证。无外网访问、无系统网络修改。
+- 定向明文握手测试修复前 1 failed（服务端观察到 2 个 Host），修复后 1 passed；重复大小写 Host 配置用例修复前 1 failed、修复后 1 passed；TLS WebSocket 握手 1 passed。`cargo test -p clash-lib --lib --no-default-features --features ring,ws,shadowsocks v2ray_plugin_ --locked -j 6 -- --nocapture`：7 passed；相同 feature 下库级严格 Clippy、格式和 diff 检查通过。
+- 明文和 TLS 均使用本机 WebSocket 服务端覆盖实际握手；TLS 测试确认 ALPN 为 `http/1.1`，并检查唯一 Host 与路径/query。没有验证第三方 V2Ray 插件互操作或生产证书链。无外网访问、无系统网络修改。
