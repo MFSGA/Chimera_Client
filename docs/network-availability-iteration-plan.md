@@ -932,6 +932,7 @@ lifecycle tests.
 ### 2026-10-30：HTTP 入站转发 WebSocket Upgrade（L2，待审查）
 
 - 基线：本地 `master` `7402e680ae41bb40a4301580310715f51a37e1a7`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。本轮不迁移参考实现。
-- HTTP 入站在既有 `CONNECT` 和普通请求之外，现识别含 `Upgrade` 且 `Connection` token 含 `upgrade` 的请求。使用启用 Hyper upgrade 的 HTTP/1.1 client connection 经 Dispatcher 建立上游连接；代理 absolute-form URI 转为 origin-form 并保留或补齐 `Host`。上游返回 101 后双向复制升级流；建立上游失败返回 502。请求认证仍在转发前执行。
-- 新增 loopback WebSocket 回归：有效 101 握手、上游提前发送的未掩码文本帧、客户端掩码文本帧、服务端回帧，以及上游拒绝时的 502。`cargo test -p clash-lib --test connection_chain_tests --locked -- --test-threads=1` 为 5 passed；该 target 严格 Clippy、格式和 diff 检查通过。未访问公网或修改宿主网络。
+- HTTP 入站在既有 `CONNECT` 和普通请求之外，现识别含 `Upgrade` 且 `Connection` token 含 `upgrade` 的请求。使用启用 Hyper upgrade 的 HTTP/1.1 client connection 经 Dispatcher 建立上游连接；代理 absolute-form URI 转为 origin-form，并始终按 URI authority 重建 `Host`。代理认证头只用于本地认证，不会发给目标；升级请求/响应会移除 `Connection` 指定的逐跳头并重建 `Connection: Upgrade`。上游返回 101 后双向复制升级流；TCP 连接被拒绝时返回 502。
+- 新增 loopback WebSocket 回归：有效 101 握手、上游提前发送的未掩码文本帧、客户端掩码文本帧、服务端回帧，以及认证通过后代理凭据不外泄、伪造 Host 被 URI authority 覆盖、请求/响应逐跳字段清除和 TCP 拨号被拒时返回 502。`cargo test -p clash-lib --test connection_chain_tests --locked -- --test-threads=1` 为 5 passed；该 target 严格 Clippy、格式和 diff 检查通过。未访问公网或修改宿主网络。
 - TLS WebSocket 仍经现有 CONNECT 路径，本轮未新增其实现；未验证第三方服务端、长时升级连接或跨平台运行。L2 独立审查与维护者验收待最终 SHA。
+- 初次独立审查发现代理认证、Host 权威性和逐跳头边界问题；已在后续修复中逐项加入实现与回归检查，当前最终 SHA 仍需重新独立审查。

@@ -10,7 +10,9 @@ use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
 use hyper::{
     Method, Request, Response, Uri,
     body::Incoming,
-    header::{CONNECTION, HOST, HeaderValue, UPGRADE},
+    header::{
+        CONNECTION, HOST, HeaderName, HeaderValue, PROXY_AUTHORIZATION, UPGRADE,
+    },
     server::conn::http1,
 };
 
@@ -41,6 +43,23 @@ fn requests_protocol_upgrade(req: &Request<Incoming>) -> bool {
         })
 }
 
+fn remove_connection_nominated_headers(
+    headers: &mut http::HeaderMap<HeaderValue>,
+    preserve_upgrade: bool,
+) {
+    let nominated = headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|token| HeaderName::from_bytes(token.trim().as_bytes()).ok())
+        .filter(|name| !preserve_upgrade || name != UPGRADE)
+        .collect::<Vec<_>>();
+    for name in nominated {
+        headers.remove(name);
+    }
+}
+
 async fn proxy_protocol_upgrade(
     mut req: Request<Incoming>,
     src: SocketAddr,
@@ -48,6 +67,10 @@ async fn proxy_protocol_upgrade(
     fw_mark: Option<u32>,
 ) -> Result<Response<BoxBody<Bytes, std::io::Error>>, ProxyError> {
     let downstream_upgrade = hyper::upgrade::on(&mut req);
+    remove_connection_nominated_headers(req.headers_mut(), true);
+    req.headers_mut().remove(PROXY_AUTHORIZATION);
+    req.headers_mut()
+        .insert(CONNECTION, HeaderValue::from_static("Upgrade"));
     let mut connector = Connector::new(src, dispatcher, fw_mark);
     let destination = req.uri().clone();
     let outbound = connector.call(destination.clone()).await?;
@@ -61,18 +84,16 @@ async fn proxy_protocol_upgrade(
                 .map_err(|error: http::uri::InvalidUri| {
                     ProxyError::General(error.to_string())
                 })?;
-        if !req.headers().contains_key(HOST) {
-            let host = destination
-                .host()
-                .ok_or_else(|| ProxyError::InvalidUrl(destination.to_string()))?;
-            let host = match destination.port() {
-                Some(port) => format!("{host}:{}", port.as_str()),
-                None => host.to_owned(),
-            };
-            let host = HeaderValue::from_str(&host)
-                .map_err(|error| ProxyError::General(error.to_string()))?;
-            req.headers_mut().insert(HOST, host);
-        }
+        let host = destination
+            .host()
+            .ok_or_else(|| ProxyError::InvalidUrl(destination.to_string()))?;
+        let host = match destination.port() {
+            Some(port) => format!("{host}:{}", port.as_str()),
+            None => host.to_owned(),
+        };
+        let host = HeaderValue::from_str(&host)
+            .map_err(|error| ProxyError::General(error.to_string()))?;
+        req.headers_mut().insert(HOST, host);
     }
     let (mut sender, connection) = hyper::client::conn::http1::handshake(outbound)
         .await
@@ -87,7 +108,14 @@ async fn proxy_protocol_upgrade(
         .send_request(req)
         .await
         .map_err(|error| ProxyError::General(error.to_string()))?;
-    if response.status() == hyper::StatusCode::SWITCHING_PROTOCOLS {
+    let switching_protocols =
+        response.status() == hyper::StatusCode::SWITCHING_PROTOCOLS;
+    remove_connection_nominated_headers(response.headers_mut(), switching_protocols);
+    response.headers_mut().remove(CONNECTION);
+    if switching_protocols {
+        response
+            .headers_mut()
+            .insert(CONNECTION, HeaderValue::from_static("Upgrade"));
         let upstream_upgrade = hyper::upgrade::on(&mut response);
         tokio::spawn(async move {
             let (downstream, upstream) =
@@ -106,6 +134,8 @@ async fn proxy_protocol_upgrade(
                 warn!("HTTP protocol upgrade tunnel failed: {error}");
             }
         });
+    } else {
+        response.headers_mut().remove(UPGRADE);
     }
 
     Ok(response.map(|body| body.map_err(map_io_error).boxed()))
@@ -130,7 +160,7 @@ pub fn maybe_socks_addr(r: &Uri) -> Option<SocksAddr> {
 }
 
 async fn proxy(
-    req: Request<hyper::body::Incoming>,
+    mut req: Request<hyper::body::Incoming>,
     src: SocketAddr,
     dispatcher: Arc<Dispatcher>,
     authenticator: ThreadSafeAuthenticator,
@@ -140,6 +170,13 @@ async fn proxy(
         && let Some(res) = authenticate_req(&req, authenticator)
     {
         return Ok(res);
+    }
+
+    if req.method() != Method::CONNECT {
+        // Proxy credentials authenticate this inbound proxy only and must not
+        // be forwarded to the requested origin, even when authentication is
+        // disabled locally.
+        req.headers_mut().remove(PROXY_AUTHORIZATION);
     }
 
     let client = Client::builder(TokioExecutor::new())

@@ -841,6 +841,7 @@ async fn http_inbound_forwards_websocket_upgrade_bidirectionally() {
         .await
         .expect("failed to bind websocket fixture");
     let origin_port = origin.local_addr().unwrap().port();
+    let (request_tx, request_rx) = tokio::sync::oneshot::channel();
     let origin_task = tokio::spawn(async move {
         let (mut stream, _) = origin
             .accept()
@@ -848,24 +849,14 @@ async fn http_inbound_forwards_websocket_upgrade_bidirectionally() {
             .expect("websocket fixture should accept connection");
         let request = read_headers(&mut stream).await;
         let request = String::from_utf8_lossy(&request);
-        assert!(request.starts_with("GET /socket HTTP/1.1\r\n"));
-        let request_lower = request.to_ascii_lowercase();
-        let connection = request_lower
-            .lines()
-            .find_map(|line| line.strip_prefix("connection:"))
-            .expect("upgrade request should include Connection header");
-        assert!(
-            connection.split(',').any(|token| token.trim() == "upgrade"),
-            "Connection header should contain upgrade token: {request}"
-        );
-        assert!(request_lower.contains("upgrade: websocket"));
-        assert!(request.contains("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=="));
+        let _ = request_tx.send(request.into_owned());
 
         stream
             .write_all(
                 b"HTTP/1.1 101 Switching Protocols\r\n\
-                  Connection: Upgrade\r\n\
+                  Connection: Upgrade, X-Upstream-Private\r\n\
                   Upgrade: websocket\r\n\
+                  X-Upstream-Private: secret\r\n\
                   Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\
                   \r\n\x81\x05hello",
             )
@@ -907,6 +898,8 @@ async fn http_inbound_forwards_websocket_upgrade_bidirectionally() {
          mmdb: null\n\
          external-controller: 127.0.0.1:{api_port}\n\
          secret: clash-rs\n\
+         authentication:\n\
+           - test-user:test-password\n\
          tun:\n\
            enable: false\n\
          rules:\n\
@@ -944,8 +937,10 @@ async fn http_inbound_forwards_websocket_upgrade_bidirectionally() {
             .write_all(
                 format!(
                     "GET http://127.0.0.1:{origin_port}/socket HTTP/1.1\r\n\
-                     Host: 127.0.0.1:{origin_port}\r\n\
-                     Connection: keep-alive, Upgrade\r\n\
+                     Host: wrong.example\r\n\
+                     Connection: keep-alive, Upgrade, X-Hop-Private\r\n\
+                     X-Hop-Private: secret\r\n\
+                     Proxy-Authorization: Basic dGVzdC11c2VyOnRlc3QtcGFzc3dvcmQ=\r\n\
                      Upgrade: websocket\r\n\
                      Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
                      Sec-WebSocket-Version: 13\r\n\
@@ -956,10 +951,30 @@ async fn http_inbound_forwards_websocket_upgrade_bidirectionally() {
             .await
             .expect("failed to send websocket upgrade request");
 
+        let request = tokio::time::timeout(Duration::from_secs(2), request_rx)
+            .await
+            .expect("origin should receive upgrade request")
+            .expect("origin request channel should remain open");
+        assert!(request.starts_with("GET /socket HTTP/1.1\r\n"));
+        let request_lower = request.to_ascii_lowercase();
+        let connection = request_lower
+            .lines()
+            .find_map(|line| line.strip_prefix("connection:"))
+            .expect("upgrade request should include Connection header");
+        assert_eq!(connection.trim(), "upgrade");
+        assert!(request_lower.contains("upgrade: websocket"));
+        assert!(request.contains("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=="));
+        assert!(request_lower.contains(&format!("host: 127.0.0.1:{origin_port}")));
+        assert!(!request_lower.contains("proxy-authorization:"));
+        assert!(!request_lower.contains("x-hop-private:"));
+
         let response = read_headers(&mut client).await;
         let response = String::from_utf8_lossy(&response);
         assert!(response.starts_with("HTTP/1.1 101 Switching Protocols"));
-        assert!(response.to_ascii_lowercase().contains("upgrade: websocket"));
+        let response_lower = response.to_ascii_lowercase();
+        assert!(response_lower.contains("upgrade: websocket"));
+        assert!(response_lower.contains("connection: upgrade"));
+        assert!(!response_lower.contains("x-upstream-private:"));
 
         let mut server_frame = [0u8; 7];
         client
@@ -1006,6 +1021,7 @@ async fn http_inbound_forwards_websocket_upgrade_bidirectionally() {
                     "GET http://127.0.0.1:{refused_port}/socket HTTP/1.1\r\n\
                      Host: 127.0.0.1:{refused_port}\r\n\
                      Connection: Upgrade\r\n\
+                     Proxy-Authorization: Basic dGVzdC11c2VyOnRlc3QtcGFzc3dvcmQ=\r\n\
                      Upgrade: websocket\r\n\
                      Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
                      Sec-WebSocket-Version: 13\r\n\
