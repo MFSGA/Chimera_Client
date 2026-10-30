@@ -854,7 +854,9 @@ lifecycle tests.
 - 基线：本地 `master` `9f4f19fa388edc8117695e3633d299fede09c054`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。本轮不迁移或改变参考实现。
 - 将原本仅限 macOS 且默认忽略的实时快照用例扩展为 Linux/macOS 共用、默认执行的测试。它读取本机接口、路由和 DNS 元数据，并绑定临时 UDP socket 采集本地源地址绑定结果；不发送数据、不改系统网络。断言覆盖快照边界、地址族和 IPv6 scope 一致性，不要求任一候选的绑定状态为 `Verified`。Linux 专属路由解析用例仍由 Linux cfg 门控。
 - 本机 macOS：新实时快照用例 1 passed；`app::network::tests::` 为 17 passed；`runtime::tests::` 为 16 passed；`cargo clippy -p clash-lib --lib --tests --locked -- -D warnings`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。实际网卡切换、DNS 服务器变更和断网恢复未在本机复现。
-- Linux 目标编译尝试 `cargo check -p clash-lib --lib --tests --target x86_64-unknown-linux-gnu --locked` 在 `zstd-sys` 构建阶段被环境阻断：缺少 `x86_64-linux-gnu-gcc`。因此 Linux 测试尚未编译或运行，不能声称 Linux 验收通过。仓库 coverage workflow 的 Ubuntu job 会运行 workspace 测试，待本改动进入该 Runner 后确认结果。
+- Linux 目标编译尝试 `cargo check -p clash-lib --lib --tests --target x86_64-unknown-linux-gnu --locked` 在 `zstd-sys` 构建阶段被环境阻断：缺少 `x86_64-linux-gnu-gcc`。之后 GitHub 上的 CI run `41029993056` 在 Ubuntu all-target Clippy 中编译了测试目标，但 push 事件不会执行该 workflow 中受 PR 条件限制的 `cargo test` 步骤；Coverage workflow 在 2026-10-30 的 GitHub 状态为 `disabled_manually`，本次没有运行。因此 Linux 实时快照测试仍未在 Linux 上执行。
+- 本次 push 触发的 Windows Network Regression run `41029993059` 成功，执行了 Windows 库单测、loopback UDP recovery、LAN proxy 和最小 feature 路径测试；新快照测试按 cfg 不会在 Windows 编译或运行。主 CI `41029993056` 的 Linux/macOS/Windows quality 与全部多架构编译 job 均成功。
+- 同一 master push 还触发 `ci.yml` 的 `Release` job：稳定版步骤跳过，`latest` 预发布被重建并指向 `57c7336ada6b9a7e0e802f32d994b379d011b8cc`。这属于 push 工作流行为，不代表完成真实换网验收。
 - Windows 自动网络观察仍未实现，`AUTOMATIC_SUPPORTED` 保持关闭；Windows loopback reset 测试不等于 Windows 主机网络切换验收。下一步需要 Linux Runner 实际执行快照测试，再在隔离 Linux namespace 验证换网恢复；Windows 需另行补齐路由、接口状态和 DNS 观察后才适合开启自动支持。
 
 ### 2026-10-24：修复 feature 组合下的测试 Clippy 阻断
