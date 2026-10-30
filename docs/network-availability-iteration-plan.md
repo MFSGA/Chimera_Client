@@ -899,3 +899,10 @@ lifecycle tests.
 - 为避免诊断页面增加首屏下载体积，该路由改为按需加载。最终 `npm run build` 生成独立 `Network` chunk 44.92 kB，主 JS 637.62 kB；主包原有的 500 kB 体积提示仍存在。`npm run lint`、`npm run build` 均通过。
 - 使用本地受控 HTTP fixture 手动打开 Dashboard 页面，验证恢复卡片、路径表、优选标记、冷却时间和最近决策均渲染正常；未连接正在运行的实际核心，也未进行实机换网或跨平台运行验证。页面明确说明本地 socket 绑定只证明源地址可绑定，不证明互联网可达。
 - 本切片仅改 Dashboard 与本迭代记录；核心网络行为、Controller wire 格式、网络偏好及主机网络状态均未改变。
+
+### 2026-10-30：展开查看连接的候选路径与拒绝原因
+
+- 基线：本地 `master` `f9084b1699a8b2070b7e8a14d61763bdf5995b55`。沿用已存在的 `/runtime/network/path-decisions` 数据，不新增核心 API。
+- Explain 表格新增可展开的路径说明：列出记录中的候选 PathId，以及因强制偏好不匹配、路径不可用、地址族不符或平台不支持而被拒绝的路径；保留 Flow 的出站、规则、结果、选中路径和具体原因。
+- `npm run lint`、`npm run build` 通过。用本地 HTTP fixture 实际展开行内说明，确认候选接口、被拒接口、拒绝原因和偏好序号可见；没有接入实际运行中的核心。
+- 最终 Dashboard 主 JS 为 637.62 kB，按需加载的 Network chunk 为 46.38 kB；主包已有的 500 kB 体积提示仍在。该页面使用的路径名和本地源地址属于网络诊断信息，只通过本地 Controller 提供给已访问 Dashboard 的用户。

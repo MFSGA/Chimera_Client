@@ -176,7 +176,13 @@ export interface NetworkPathDecisionRecord {
   operationId: number;
   outcome: string;
   route: { outbound: string; rule: string | null };
+  candidatePaths: NetworkPathIdView[];
   selectedPath: NetworkPathIdView | null;
+  rejected: Array<{
+    path: NetworkPathIdView;
+    reason: string;
+    intentIndex: number | null;
+  }>;
   failureKind?: string;
   reason: string;
   recordedAtMs: number;
