@@ -804,6 +804,12 @@ lifecycle tests.
 - 该用例执行了客户端真实 TLS/Trojan 编码和认证及应用请求/响应，但服务端是同进程 loopback fixture，不代表第三方 Trojan 实现互操作，也不覆盖 Trojan UDP、WebSocket/gRPC、认证失败 Explain、真实多 NIC 或跨平台网络切换。
 - `cargo test -p clash-lib --test trojan_integration_tests --features trojan,ring,tun,port --locked -j 6` 为 1 passed、0 failed；`cargo clippy -p clash-lib --test trojan_integration_tests --features trojan,ring,tun,port --locked -j 6 -- -D warnings`、格式与 diff 检查通过。
 
+### 2026-10-30：B10 Trojan UDP 单条路径 Explain 查询
+
+- 基线：本地 `master` `281f86e9bc7e8493eac297f00e2411d327317b80`。扩展 `trojan_integration_tests`：loopback TLS/Trojan fixture 校验 SHA-224 认证、UDP 命令、目标地址和数据帧；fixture 将负载转发到本机 UDP echo，再经 Trojan UDP 帧返回客户端。
+- 客户端通过 SOCKS5 UDP ASSOCIATE 完成真实请求/响应后，从运行中 Controller `/flows?include_closed=true` 查找目标 UDP Flow，并关联同一 `flowId`、`route.outbound=trojan-udp-out`、`outcome=connected` 的 Explain 列表记录；最后查询单条详情并核对 JSON 一致。
+- `cargo test -p clash-lib --features 'trojan aws-lc-rs anytls' --test trojan_integration_tests --locked -- --test-threads=1` 为 2 passed、0 failed。测试服务端是同进程 loopback fixture；本项不代表第三方 Trojan 服务端互操作、WebSocket/gRPC、远端代理认证失败 Explain、多 PathId UDP 实网切换或跨平台网络恢复已验收。
+
 ### 2026-10-24：B10 VLESS TLS TCP 单条路径 Explain 查询
 
 - 基线：本地 `master` `8d2541a16b7ca6795a5081fe1b6ef3ea8ef344a5`。新增 `vless_explain_integration_tests`，本机 TLS/VLESS fixture 校验 UUID、TCP 命令、VMess 地址字段顺序与目标地址，返回 tunneled HTTP 响应；随后从实际 `/flows` 关联 `vless-out` 成功 Explain 记录并校验单条详情与列表一致。
