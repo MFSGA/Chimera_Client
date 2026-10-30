@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import type { UseQueryResult } from '@tanstack/react-query';
 import { AlertTriangle, Clock3, RefreshCw, Route, Wifi } from 'lucide-react';
 import { Badge } from '../components/ui/badge';
 import { Button } from '../components/ui/button';
@@ -149,14 +150,14 @@ function ErrorNotice({ message }: { message: string }) {
   );
 }
 
-function PathPreferenceEditor({ paths }: { paths: EffectiveNetworkPaths | undefined }) {
+function PathPreferenceEditor({
+  paths,
+  preference,
+}: {
+  paths: EffectiveNetworkPaths | undefined;
+  preference: UseQueryResult<PathPreferenceView, Error>;
+}) {
   const queryClient = useQueryClient();
-  const preference = useQuery({
-    queryKey: PATH_PREFERENCE_QUERY_KEY,
-    queryFn: getNetworkPathPreference,
-    refetchInterval: 5000,
-    retry: 0,
-  });
   const [draft, setDraft] = useState<PathPreferencePriority[]>([]);
   const [lifetime, setLifetime] = useState('unchanged');
   const [candidateKey, setCandidateKey] = useState('');
@@ -523,9 +524,12 @@ export function Network() {
   const status = useQuery({ queryKey: ['network-status'], queryFn: getNetworkStatus, refetchInterval: 5000, retry: 0 });
   const paths = useQuery({ queryKey: ['network-effective-paths'], queryFn: getEffectiveNetworkPaths, refetchInterval: 5000, retry: 0 });
   const decisions = useQuery({ queryKey: ['network-path-decisions'], queryFn: getNetworkPathDecisions, refetchInterval: 5000, retry: 0 });
+  const preference = useQuery({ queryKey: PATH_PREFERENCE_QUERY_KEY, queryFn: getNetworkPathPreference, refetchInterval: 5000, retry: 0 });
+
+  const refreshing = status.isFetching || paths.isFetching || decisions.isFetching || preference.isFetching;
 
   async function refresh() {
-    await Promise.all([status.refetch(), paths.refetch(), decisions.refetch()]);
+    await Promise.all([status.refetch(), paths.refetch(), decisions.refetch(), preference.refetch()]);
   }
 
   return (
@@ -535,8 +539,8 @@ export function Network() {
           <h1 className="text-2xl font-bold tracking-tight" style={{ color: 'var(--color-text-primary)' }}>Network</h1>
           <p className="mt-1 text-[13px]" style={{ color: 'var(--color-text-secondary)' }}>Recovery status, available local paths, and recent connection decisions.</p>
         </div>
-        <Button variant="outline" onClick={() => void refresh()} disabled={status.isFetching || paths.isFetching || decisions.isFetching}>
-          <RefreshCw size={14} className={status.isFetching || paths.isFetching || decisions.isFetching ? 'animate-spin' : ''} />
+        <Button variant="outline" onClick={() => void refresh()} disabled={refreshing}>
+          <RefreshCw size={14} className={refreshing ? 'animate-spin' : ''} />
           Refresh
         </Button>
       </div>
@@ -567,7 +571,7 @@ export function Network() {
           {(status.data.observationError || status.data.lastError) && <ErrorNotice message={status.data.observationError ?? status.data.lastError ?? ''} />}
           <RecoverySummary status={status.data} />
           <RuntimeComponents components={status.data.components ?? []} />
-          <PathPreferenceEditor paths={paths.data} />
+          <PathPreferenceEditor paths={paths.data} preference={preference} />
 
           <section className="liquid-glass-card rounded-xl overflow-hidden">
             <div className="flex items-center gap-2 border-b px-4 py-3" style={{ borderColor: 'var(--color-separator)' }}>
