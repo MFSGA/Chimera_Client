@@ -35,7 +35,8 @@ pub struct V2rayWsClient {
     pub ws_client: transport::WsClient,
 }
 
-// TODO: temporarily untested
+// The plain WebSocket handshake is covered locally; TLS and third-party
+// V2Ray plugin interoperability remain unverified.
 impl V2rayWsClient {
     pub fn try_new(
         host: String,
@@ -61,7 +62,7 @@ impl V2rayWsClient {
             None
         };
 
-        if !headers.contains_key("Host") {
+        if !headers.keys().any(|name| name.eq_ignore_ascii_case("host")) {
             headers.insert("Host".to_owned(), host.clone());
         }
         let ws_client = WsClient::new(
@@ -102,5 +103,88 @@ impl V2rayWsClient {
 impl Transport for V2rayWsClient {
     async fn proxy_stream(&self, stream: AnyStream) -> std::io::Result<AnyStream> {
         self.new_v2ray_websocket_stream(stream).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
+
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_tungstenite::{
+        accept_hdr_async,
+        tungstenite::handshake::server::{Request, Response},
+    };
+
+    use super::{Transport, V2rayWsClient};
+
+    #[tokio::test]
+    async fn lowercase_host_header_is_preserved_without_duplicate() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("WebSocket fixture should bind");
+        let address = listener
+            .local_addr()
+            .expect("WebSocket fixture should have an address");
+        let observed = Arc::new(Mutex::new(None));
+        let observed_request = Arc::clone(&observed);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("WebSocket fixture should accept");
+            accept_hdr_async(stream, move |request: &Request, response: Response| {
+                let host_values = request.headers().get_all("host");
+                let value_count = host_values.iter().count();
+                let host = host_values
+                    .iter()
+                    .next()
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                let path = request.uri().path_and_query().map(ToString::to_string);
+                *observed_request.lock().expect("request observation lock") =
+                    Some((value_count, host, path));
+                Ok(response)
+            })
+            .await
+            .expect("WebSocket upgrade should succeed")
+        });
+
+        let client = V2rayWsClient::try_new(
+            "127.0.0.1".to_owned(),
+            address.port(),
+            "/ws?token=1".to_owned(),
+            HashMap::from([("host".to_owned(), "cdn.example".to_owned())]),
+            false,
+            false,
+            false,
+        )
+        .expect("V2Ray WebSocket client should be created");
+        let stream = TcpStream::connect(address)
+            .await
+            .expect("WebSocket fixture should accept TCP");
+        let client_stream = client
+            .proxy_stream(Box::new(stream))
+            .await
+            .expect("V2Ray WebSocket handshake should succeed");
+
+        drop(client_stream);
+        drop(
+            server
+                .await
+                .expect("WebSocket fixture task should not panic"),
+        );
+
+        assert_eq!(
+            *observed.lock().expect("request observation lock"),
+            Some((
+                1,
+                Some("cdn.example".to_owned()),
+                Some("/ws?token=1".to_owned())
+            ))
+        );
     }
 }
