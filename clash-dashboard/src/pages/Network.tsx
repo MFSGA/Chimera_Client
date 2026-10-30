@@ -16,7 +16,7 @@ import type {
 function phaseLabel(value: string): string {
   const labels: Record<string, string> = {
     observing: 'Monitoring',
-    unsupported: 'Not available',
+    unsupported: 'Unsupported',
     recovering: 'Recovering',
     awaitingTraffic: 'Waiting for traffic',
     trafficVerified: 'Traffic verified',
@@ -31,7 +31,7 @@ function phaseLabel(value: string): string {
     healthy: 'Healthy',
     unknown: 'Not yet verified',
     available: 'Traffic observed',
-    unavailable: 'Repeated failures',
+    unavailable: 'Unavailable after repeated failures',
     networkChanged: 'Network changed',
     manualReset: 'Manual refresh',
     retry: 'Retry',
@@ -54,6 +54,8 @@ function phaseLabel(value: string): string {
     virtual: 'Virtual',
     loopback: 'Loopback',
     other: 'Other',
+    requiredIntentMismatch: 'Does not match a required preference',
+    endpointFamilyMismatch: 'Address family does not match',
   };
   return labels[value] ?? value;
 }
@@ -91,6 +93,16 @@ function samePath(left: NetworkPathIdView | null | undefined, right: NetworkPath
     && left.family === right.family
     && left.sourceAddress === right.sourceAddress
     && left.networkGeneration === right.networkGeneration);
+}
+
+function pathKey(path: NetworkPathIdView): string {
+  return JSON.stringify([
+    path.interface.name,
+    path.interface.index,
+    path.family,
+    path.sourceAddress,
+    path.networkGeneration,
+  ]);
 }
 
 function ErrorNotice({ message }: { message: string }) {
@@ -198,6 +210,36 @@ function DecisionsTable({ records }: { records: NetworkPathDecisionRecord[] }) {
               <td className="min-w-56 px-4 py-3" style={{ color: 'var(--color-text-primary)' }}>{pathLabel(record.selectedPath)}</td>
               <td className="max-w-md px-4 py-3" style={{ color: record.failureKind ? '#ff3b30' : 'var(--color-text-secondary)' }}>
                 {record.failureKind ? `${record.failureKind}: ` : ''}{record.reason}
+                {((record.candidatePaths?.length ?? 0) > 0 || (record.rejected?.length ?? 0) > 0) && (
+                  <details className="mt-2">
+                    <summary className="cursor-pointer select-none text-[12px]" style={{ color: '#0071e3' }}>
+                      Path explanation ({record.candidatePaths?.length ?? 0} candidates, {record.rejected?.length ?? 0} rejected)
+                    </summary>
+                    <div className="mt-2 space-y-2 rounded-lg p-3" style={{ background: 'var(--color-fill-subtle)' }}>
+                      <div>
+                        <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide">Candidate paths</div>
+                        {record.candidatePaths?.length ? (
+                          <ul className="space-y-1">
+                            {(record.candidatePaths ?? []).map((path) => <li key={pathKey(path)}>{pathLabel(path)}</li>)}
+                          </ul>
+                        ) : <div>No path candidate was recorded.</div>}
+                      </div>
+                      {(record.rejected?.length ?? 0) > 0 && (
+                        <div>
+                          <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide">Rejected paths</div>
+                          <ul className="space-y-1">
+                            {(record.rejected ?? []).map((rejection) => (
+                              <li key={`${pathKey(rejection.path)}-${rejection.reason}-${rejection.intentIndex ?? 'none'}`}>
+                                {pathLabel(rejection.path)} — {phaseLabel(rejection.reason)}
+                                {rejection.intentIndex == null ? '' : ` (preference ${rejection.intentIndex + 1})`}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                    </div>
+                  </details>
+                )}
               </td>
             </tr>
           ))}
