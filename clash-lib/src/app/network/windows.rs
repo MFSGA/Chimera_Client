@@ -21,7 +21,8 @@ use windows::Win32::{
             IF_TYPE_IEEE80211, IF_TYPE_PPP, IF_TYPE_PPPMULTILINKBUNDLE,
             IF_TYPE_PROP_VIRTUAL, IF_TYPE_SOFTWARE_LOOPBACK, IF_TYPE_TUNNEL,
             IF_TYPE_WWANPP, IF_TYPE_WWANPP2, IP_ADAPTER_ADDRESSES_LH,
-            IP_ADDRESS_PREFIX, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
+            IP_ADAPTER_DNS_SUFFIX, IP_ADDRESS_PREFIX, MIB_IPFORWARD_ROW2,
+            MIB_IPFORWARD_TABLE2,
         },
         Ndis::IfOperStatusUp,
     },
@@ -50,6 +51,8 @@ struct WindowsAdapter {
     ipv6_metric: u32,
     addresses: Vec<WindowsAddress>,
     dns_servers: Vec<IpAddr>,
+    dns_suffix: Option<String>,
+    search_suffixes: Vec<String>,
 }
 
 impl WindowsAdapter {
@@ -174,34 +177,22 @@ pub(super) fn snapshot(
         .collect::<Vec<_>>();
     interfaces.sort();
 
-    let mut dns_servers = adapters
-        .iter()
-        .filter(|adapter| adapter.operational_up)
-        .flat_map(|adapter| {
-            adapter
-                .dns_servers
-                .iter()
-                .map(|server| format!("{}:{}", adapter.name, server))
-        })
-        .collect::<Vec<_>>();
-    dns_servers.sort();
-    dns_servers.dedup();
+    let dns = dns_signature(&adapters);
 
-    let mut path_candidates = collect_path_candidates(
+    let (path_candidates, path_candidates_truncated) = collect_path_candidates(
         &adapters,
         &ipv4_routes,
         &ipv6_routes,
         &tun_exclusion,
         tun_interface_index,
+        MAX_PATH_CANDIDATES,
+        crate::proxy::utils::socket_helpers::probe_outbound_path_binding,
     );
-    let path_candidates_truncated =
-        path_candidates.len().saturating_sub(MAX_PATH_CANDIDATES);
-    path_candidates.truncate(MAX_PATH_CANDIDATES);
 
     Ok(NetworkSnapshot {
         ipv4: path_for_route(&adapters, &ipv4_routes.primary),
         ipv6: path_for_route(&adapters, &ipv6_routes.primary),
-        dns: dns_servers.join("\n"),
+        dns,
         interfaces,
         route_signatures,
         path_candidates,
@@ -241,6 +232,33 @@ fn windows_adapters() -> io::Result<Vec<WindowsAdapter>> {
     Err(io::Error::other(
         "GetAdaptersAddresses exceeded the bounded buffer retry count",
     ))
+}
+
+fn dns_signature(adapters: &[WindowsAdapter]) -> String {
+    let mut settings = adapters
+        .iter()
+        .filter(|adapter| adapter.operational_up)
+        .map(|adapter| {
+            let servers = adapter
+                .dns_servers
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let suffixes = adapter.search_suffixes.join(",");
+            format!(
+                "{}:{}:{}:servers=[{}]:suffix={}:search=[{}]",
+                adapter.name,
+                adapter.ipv4_index,
+                adapter.ipv6_index,
+                servers,
+                adapter.dns_suffix.as_deref().unwrap_or_default(),
+                suffixes
+            )
+        })
+        .collect::<Vec<_>>();
+    settings.sort();
+    settings.join("\n")
 }
 
 /// `GetAdaptersAddresses` returns an OS-owned linked list embedded in the
@@ -301,12 +319,32 @@ unsafe fn parse_adapters(
             }
             raw_dns = dns.Next;
         }
+
+        let dns_suffix = if raw.DnsSuffix.0.is_null() {
+            None
+        } else {
+            let suffix = unsafe { wide_string(raw.DnsSuffix.0)? };
+            (!suffix.is_empty()).then_some(suffix)
+        };
+        let mut search_suffixes = Vec::new();
+        let mut raw_suffix = raw.FirstDnsSuffix;
+        while !raw_suffix.is_null() {
+            let suffix = unsafe { &*raw_suffix };
+            let length = suffix
+                .String
+                .iter()
+                .position(|unit| *unit == 0)
+                .unwrap_or(suffix.String.len());
+            let value = String::from_utf16_lossy(&suffix.String[..length]);
+            if !value.is_empty() {
+                search_suffixes.push(value);
+            }
+            raw_suffix = suffix.Next;
+        }
         addresses.sort_by_key(|address| {
             (address.interface_index, address.address.to_string())
         });
         addresses.dedup();
-        dns_servers.sort();
-        dns_servers.dedup();
         adapters.push(WindowsAdapter {
             name,
             ipv4_index,
@@ -317,6 +355,8 @@ unsafe fn parse_adapters(
             ipv6_metric: raw.Ipv6Metric,
             addresses,
             dns_servers,
+            dns_suffix,
+            search_suffixes,
         });
         current = raw.Next;
     }
@@ -558,87 +598,95 @@ fn collect_path_candidates(
     ipv6_routes: &WindowsRouteSelection,
     tun_exclusion: &TunCandidateExclusion,
     tun_interface_index: Option<u32>,
-) -> Vec<PathCandidateObservation> {
-    let mut candidates = Vec::new();
-    for adapter in adapters.iter().filter(|adapter| {
-        adapter.interface_type != IF_TYPE_SOFTWARE_LOOPBACK
-            && !adapter.excluded(tun_exclusion, tun_interface_index)
-    }) {
-        for address in &adapter.addresses {
-            let ip = address.address;
-            if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
-                continue;
-            }
-            let family = AddressFamily::from(ip);
-            let selection = match family {
-                AddressFamily::Ipv4 => ipv4_routes,
-                AddressFamily::Ipv6 => ipv6_routes,
-            };
-            let default_route = if selection.primary.is_some_and(|route| {
-                route.interface_index == address.interface_index
-            }) {
-                DefaultRouteEvidence::PrimaryDefaultRoute
-            } else if selection.ambiguous
-                && selection
-                    .best_routes
-                    .iter()
-                    .any(|route| route.interface_index == address.interface_index)
-            {
-                DefaultRouteEvidence::AmbiguousDefaultRoute
-            } else if selection.primary.is_some() || selection.ambiguous {
-                DefaultRouteEvidence::OtherInterface
-            } else {
-                DefaultRouteEvidence::NoPrimaryRouteObserved
-            };
-            let gateway = selection
-                .primary
-                .filter(|route| route.interface_index == address.interface_index)
-                .and_then(|route| route.gateway);
-            let bind_result = if adapter.operational_up {
-                crate::proxy::utils::socket_helpers::probe_outbound_path_binding(
-                    &adapter.name,
-                    address.interface_index,
-                    ip,
-                )
-                .map_err(|error| error.to_string())
-            } else {
-                Err("interface operational state is not up".to_owned())
-            };
-            let (binding, binding_error) = match bind_result {
-                Ok(()) => (BindingStatus::Verified, None),
-                Err(error) => (BindingStatus::Failed, Some(error)),
-            };
-            let scope_id = match ip {
-                IpAddr::V6(ipv6) if ipv6.is_unicast_link_local() => {
-                    Some(address.interface_index)
-                }
-                _ => None,
-            };
-            candidates.push(PathCandidateObservation {
-                interface: InterfaceId {
-                    name: adapter.name.clone(),
-                    index: address.interface_index,
-                },
-                interface_kind: windows_interface_kind(adapter.interface_type),
-                family,
-                source_address: ip,
-                scope_id,
-                gateway,
-                default_route,
-                binding,
-                binding_error,
-            });
-        }
-    }
-    candidates.sort_by_key(|candidate| {
+    max_candidates: usize,
+    mut bind_probe: impl FnMut(&str, u32, IpAddr) -> io::Result<()>,
+) -> (Vec<PathCandidateObservation>, usize) {
+    let mut addresses = adapters
+        .iter()
+        .filter(|adapter| {
+            adapter.interface_type != IF_TYPE_SOFTWARE_LOOPBACK
+                && !adapter.excluded(tun_exclusion, tun_interface_index)
+        })
+        .flat_map(|adapter| {
+            adapter.addresses.iter().filter_map(move |address| {
+                let ip = address.address;
+                (!ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast())
+                    .then_some((adapter, address))
+            })
+        })
+        .collect::<Vec<_>>();
+    addresses.sort_by_key(|(adapter, address)| {
         (
-            candidate.interface.name.clone(),
-            candidate.interface.index,
-            candidate.family as u8,
-            candidate.source_address.to_string(),
+            adapter.name.clone(),
+            address.interface_index,
+            AddressFamily::from(address.address) as u8,
+            address.address.to_string(),
         )
     });
-    candidates
+    let path_candidates_truncated = addresses.len().saturating_sub(max_candidates);
+    addresses.truncate(max_candidates);
+
+    let mut candidates = Vec::with_capacity(addresses.len());
+    for (adapter, address) in addresses {
+        let ip = address.address;
+        let family = AddressFamily::from(ip);
+        let selection = match family {
+            AddressFamily::Ipv4 => ipv4_routes,
+            AddressFamily::Ipv6 => ipv6_routes,
+        };
+        let default_route = if selection
+            .primary
+            .is_some_and(|route| route.interface_index == address.interface_index)
+        {
+            DefaultRouteEvidence::PrimaryDefaultRoute
+        } else if selection.ambiguous
+            && selection
+                .best_routes
+                .iter()
+                .any(|route| route.interface_index == address.interface_index)
+        {
+            DefaultRouteEvidence::AmbiguousDefaultRoute
+        } else if selection.primary.is_some() || selection.ambiguous {
+            DefaultRouteEvidence::OtherInterface
+        } else {
+            DefaultRouteEvidence::NoPrimaryRouteObserved
+        };
+        let gateway = selection
+            .primary
+            .filter(|route| route.interface_index == address.interface_index)
+            .and_then(|route| route.gateway);
+        let bind_result = if adapter.operational_up {
+            bind_probe(&adapter.name, address.interface_index, ip)
+                .map_err(|error| error.to_string())
+        } else {
+            Err("interface operational state is not up".to_owned())
+        };
+        let (binding, binding_error) = match bind_result {
+            Ok(()) => (BindingStatus::Verified, None),
+            Err(error) => (BindingStatus::Failed, Some(error)),
+        };
+        let scope_id = match ip {
+            IpAddr::V6(ipv6) if ipv6.is_unicast_link_local() => {
+                Some(address.interface_index)
+            }
+            _ => None,
+        };
+        candidates.push(PathCandidateObservation {
+            interface: InterfaceId {
+                name: adapter.name.clone(),
+                index: address.interface_index,
+            },
+            interface_kind: windows_interface_kind(adapter.interface_type),
+            family,
+            source_address: ip,
+            scope_id,
+            gateway,
+            default_route,
+            binding,
+            binding_error,
+        });
+    }
+    (candidates, path_candidates_truncated)
 }
 
 fn windows_interface_kind(interface_type: u32) -> InterfaceKind {
@@ -676,6 +724,8 @@ mod tests {
             ipv6_metric: ipv4_metric,
             addresses: Vec::new(),
             dns_servers: Vec::new(),
+            dns_suffix: None,
+            search_suffixes: Vec::new(),
         }
     }
 
@@ -779,6 +829,59 @@ mod tests {
         );
 
         assert_eq!(selection.primary, Some(route));
+    }
+
+    #[test]
+    fn dns_signature_tracks_server_order_and_search_suffixes() {
+        let mut adapter = test_adapter("wifi", 4, 14, 10, true);
+        adapter.dns_servers =
+            vec!["192.0.2.53".parse().unwrap(), "192.0.2.54".parse().unwrap()];
+        adapter.dns_suffix = Some("lan.example".to_owned());
+        adapter.search_suffixes =
+            vec!["corp.example".to_owned(), "example".to_owned()];
+        let original = dns_signature(std::slice::from_ref(&adapter));
+
+        adapter.dns_servers.reverse();
+        assert_ne!(dns_signature(std::slice::from_ref(&adapter)), original);
+
+        adapter.dns_servers.reverse();
+        adapter.search_suffixes.reverse();
+        assert_ne!(dns_signature(std::slice::from_ref(&adapter)), original);
+
+        adapter.search_suffixes.reverse();
+        adapter.dns_suffix = Some("guest.example".to_owned());
+        assert_ne!(dns_signature(&[adapter]), original);
+    }
+
+    #[test]
+    fn path_candidate_socket_probes_stop_at_the_output_bound() {
+        use std::cell::Cell;
+
+        let mut adapter = test_adapter("wifi", 4, 14, 10, true);
+        adapter.addresses = (1..=MAX_PATH_CANDIDATES + 2)
+            .map(|octet| WindowsAddress {
+                address: IpAddr::V4(Ipv4Addr::new(10, 1, 0, octet as u8)),
+                interface_index: 4,
+            })
+            .collect();
+        let calls = Cell::new(0);
+
+        let (candidates, truncated) = collect_path_candidates(
+            &[adapter],
+            &WindowsRouteSelection::default(),
+            &WindowsRouteSelection::default(),
+            &TunCandidateExclusion::Disabled,
+            None,
+            MAX_PATH_CANDIDATES,
+            |_, _, _| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+        );
+
+        assert_eq!(candidates.len(), MAX_PATH_CANDIDATES);
+        assert_eq!(truncated, 2);
+        assert_eq!(calls.get(), MAX_PATH_CANDIDATES);
     }
 
     #[test]

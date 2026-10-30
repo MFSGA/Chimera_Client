@@ -22,6 +22,10 @@ pub(crate) const AUTOMATIC_SUPPORTED: bool = cfg!(any(
 #[cfg(target_os = "windows")]
 mod windows;
 
+#[cfg(target_os = "windows")]
+static WINDOWS_SNAPSHOT_PERMIT: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(1);
+
 #[cfg(target_os = "linux")]
 static LINUX_NETLINK_HANDLE: tokio::sync::OnceCell<rtnetlink::Handle> =
     tokio::sync::OnceCell::const_new();
@@ -1348,12 +1352,18 @@ pub(crate) async fn snapshot_with_tun(
     #[cfg(not(feature = "tun"))]
     let tun_interface_index = None;
 
-    tokio::time::timeout(
-        Duration::from_secs(2),
+    tokio::time::timeout(Duration::from_secs(2), async move {
+        let permit = WINDOWS_SNAPSHOT_PERMIT
+            .acquire()
+            .await
+            .map_err(io::Error::other)?;
         tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             windows::snapshot(tun_candidate_exclusion, tun_interface_index)
-        }),
-    )
+        })
+        .await
+        .map_err(io::Error::other)?
+    })
     .await
     .map_err(|_| {
         io::Error::new(
@@ -1361,7 +1371,6 @@ pub(crate) async fn snapshot_with_tun(
             "Windows network snapshot timed out",
         )
     })?
-    .map_err(io::Error::other)?
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -1370,7 +1379,7 @@ pub(crate) async fn snapshot_with_tun(
 ) -> io::Result<NetworkSnapshot> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "automatic network observation is currently supported on Linux and macOS",
+        "automatic network observation is currently supported on Linux, macOS, and Windows",
     ))
 }
 
