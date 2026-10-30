@@ -4,17 +4,21 @@ use bytes::Bytes;
 use clash_lib::{Config, Options};
 use http_body_util::BodyExt;
 use sha2::{Digest, Sha224};
-use std::{net::TcpListener as StdTcpListener, path::PathBuf, time::Duration};
+use std::{
+    net::{SocketAddr, TcpListener as StdTcpListener},
+    path::PathBuf,
+    time::Duration,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, UdpSocket},
     time::timeout,
 };
 use tokio_rustls::TlsAcceptor;
 
 mod common;
 
-use common::{ClashInstance, send_http_request};
+use common::{ClashInstance, Socks5UdpSession, send_http_request};
 
 const PASSWORD: &str = "local-trojan-explain-test-password";
 
@@ -171,6 +175,94 @@ async fn trojan_server(
     tls.flush().await.expect("failed to flush HTTP response");
 }
 
+async fn read_trojan_ipv4_addr<R: tokio::io::AsyncRead + Unpin>(
+    stream: &mut R,
+) -> SocketAddr {
+    assert_eq!(stream.read_u8().await.unwrap(), 0x01);
+    let mut ip = [0; 4];
+    stream.read_exact(&mut ip).await.unwrap();
+    let port = stream.read_u16().await.unwrap();
+    SocketAddr::from((ip, port))
+}
+
+async fn trojan_udp_server(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    target_addr: SocketAddr,
+) {
+    let (tcp, _) = timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .expect("timed out accepting Trojan UDP connection")
+        .expect("failed to accept Trojan UDP connection");
+    let mut tls = timeout(Duration::from_secs(5), acceptor.accept(tcp))
+        .await
+        .expect("timed out completing Trojan UDP TLS handshake")
+        .expect("Trojan UDP TLS handshake failed");
+
+    let mut auth = [0; 56];
+    tls.read_exact(&mut auth)
+        .await
+        .expect("failed to read Trojan UDP password hash");
+    let expected_auth = Sha224::digest(PASSWORD.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join("");
+    assert_eq!(std::str::from_utf8(&auth).unwrap(), expected_auth);
+    let mut separator = [0; 2];
+    tls.read_exact(&mut separator).await.unwrap();
+    assert_eq!(&separator, b"\r\n");
+    assert_eq!(
+        tls.read_u8().await.unwrap(),
+        0x03,
+        "expected Trojan UDP command"
+    );
+    assert_eq!(read_trojan_ipv4_addr(&mut tls).await, target_addr);
+    tls.read_exact(&mut separator).await.unwrap();
+    assert_eq!(&separator, b"\r\n");
+
+    let framed_target = read_trojan_ipv4_addr(&mut tls).await;
+    assert_eq!(framed_target, target_addr);
+    let payload_len = usize::from(tls.read_u16().await.unwrap());
+    tls.read_exact(&mut separator).await.unwrap();
+    assert_eq!(&separator, b"\r\n");
+    let mut payload = vec![0; payload_len];
+    tls.read_exact(&mut payload).await.unwrap();
+
+    let relay = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind Trojan UDP relay socket");
+    relay
+        .send_to(&payload, target_addr)
+        .await
+        .expect("failed to forward Trojan UDP payload");
+    let mut response = [0; 2048];
+    let (response_len, source_addr) =
+        timeout(Duration::from_secs(5), relay.recv_from(&mut response))
+            .await
+            .expect("timed out waiting for UDP target response")
+            .expect("failed to receive UDP target response");
+    assert_eq!(source_addr, target_addr);
+
+    let source_ip = match source_addr.ip() {
+        std::net::IpAddr::V4(ip) => ip.octets(),
+        std::net::IpAddr::V6(_) => panic!("expected IPv4 UDP target"),
+    };
+    let mut frame = Vec::with_capacity(9 + response_len);
+    frame.push(0x01);
+    frame.extend_from_slice(&source_ip);
+    frame.extend_from_slice(&source_addr.port().to_be_bytes());
+    frame.extend_from_slice(&(response_len as u16).to_be_bytes());
+    frame.extend_from_slice(b"\r\n");
+    frame.extend_from_slice(&response[..response_len]);
+    tls.write_all(&frame)
+        .await
+        .expect("failed to write Trojan UDP response frame");
+    tls.flush()
+        .await
+        .expect("failed to flush Trojan UDP response");
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
 async fn integration_test_trojan_tcp_flow_is_queryable_from_path_explain() {
@@ -289,6 +381,146 @@ rules:
     let flow_id = decision["flowId"]
         .as_str()
         .expect("Trojan Explain record should expose a flow ID");
+    assert!(
+        flow["flowIds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|id| id == flow_id)
+    );
+    let detail = get_api_json(
+        client_api,
+        &format!("/runtime/network/path-decision/{flow_id}"),
+    )
+    .await;
+    assert_eq!(detail, decision);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn integration_test_trojan_udp_flow_is_queryable_from_path_explain() {
+    clash_lib::setup_default_crypto_provider();
+
+    let client_api = available_port();
+    let socks_port = available_port();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind local Trojan UDP server");
+    let trojan_port = listener.local_addr().unwrap().port();
+    let echo = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("failed to start local UDP echo target");
+    let echo_addr = echo.local_addr().unwrap();
+    let echo_task = tokio::spawn(async move {
+        let mut buffer = [0; 2048];
+        let (len, peer) = echo.recv_from(&mut buffer).await.unwrap();
+        echo.send_to(&buffer[..len], peer).await.unwrap();
+    });
+
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("test certificate should generate");
+    let cert = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+    let key =
+        rustls::pki_types::PrivateKeyDer::try_from(signing_key.serialize_der())
+            .expect("test private key should serialize");
+    let tls_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .expect("test TLS config should build");
+    let acceptor = TlsAcceptor::from(std::sync::Arc::new(tls_config));
+    let server_task = tokio::spawn(trojan_udp_server(listener, acceptor, echo_addr));
+
+    let cwd =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
+    let config = format!(
+        r#"
+allow-lan: false
+bind-address: 127.0.0.1
+socks-port: {socks_port}
+mode: rule
+log-level: error
+mmdb: null
+external-controller: 127.0.0.1:{client_api}
+secret: clash-rs
+tun:
+  enable: false
+proxies:
+  - name: trojan-udp-out
+    type: trojan
+    server: 127.0.0.1
+    port: {trojan_port}
+    password: {PASSWORD}
+    sni: localhost
+    skip-cert-verify: true
+    udp: true
+rules:
+  - MATCH,trojan-udp-out
+"#
+    );
+    let _client = ClashInstance::start(
+        Options {
+            config: Config::Str(config),
+            cwd: Some(cwd.to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            config_path: None,
+        },
+        vec![client_api, socks_port],
+    )
+    .expect("failed to start Trojan UDP client");
+
+    let session = Socks5UdpSession::connect(socks_port).await;
+    let payload = b"trojan-udp-roundtrip";
+    session
+        .send_ipv4(payload, [127, 0, 0, 1], echo_addr.port())
+        .await;
+    let (response, source) = timeout(Duration::from_secs(10), session.recv())
+        .await
+        .expect("timed out waiting for Trojan UDP response");
+    assert_eq!(response, payload);
+    assert_eq!(source, echo_addr.to_string());
+    echo_task.await.expect("UDP echo task failed");
+    server_task.await.expect("Trojan UDP server task failed");
+
+    let (flow, decision) = timeout(Duration::from_secs(5), async {
+        loop {
+            let flows = get_api_json(client_api, "/flows?include_closed=true").await;
+            if let Some(flow) = flows.as_array().and_then(|records| {
+                records.iter().find(|flow| {
+                    flow["protocol"] == "udp"
+                        && flow["dstPort"].as_u64()
+                            == Some(u64::from(echo_addr.port()))
+                        && flow["flowIds"]
+                            .as_array()
+                            .is_some_and(|ids| !ids.is_empty())
+                })
+            }) {
+                let flow = flow.clone();
+                let flow_ids = flow["flowIds"]
+                    .as_array()
+                    .expect("tracked Trojan UDP flow should expose IDs");
+                let decisions =
+                    get_api_json(client_api, "/runtime/network/path-decisions")
+                        .await;
+                if let Some(decision) = decisions.as_array().and_then(|records| {
+                    records.iter().find(|decision| {
+                        flow_ids.iter().any(|id| id == &decision["flowId"])
+                            && decision["outcome"] == "connected"
+                            && decision["route"]["outbound"] == "trojan-udp-out"
+                    })
+                }) {
+                    break (flow, decision.clone());
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("Trojan UDP flow did not produce a connected Explain record");
+    let flow_id = decision["flowId"]
+        .as_str()
+        .expect("Trojan UDP Explain record should expose a flow ID");
     assert!(
         flow["flowIds"]
             .as_array()
