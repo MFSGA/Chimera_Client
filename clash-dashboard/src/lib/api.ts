@@ -196,6 +196,29 @@ export interface NetworkPathDecisionRecord {
   recordedAtMs: number;
 }
 
+export type PathPreferenceInterface =
+  | 'ethernet'
+  | 'wifi'
+  | 'cellular'
+  | 'vpn'
+  | 'virtual'
+  | 'loopback'
+  | 'other';
+
+export interface PathPreferencePriority {
+  interface: PathPreferenceInterface;
+  family: 'ipv4' | 'ipv6';
+}
+
+export interface PathPreferenceView {
+  automaticSupported: boolean;
+  policyVersion: number;
+  source: string;
+  priority: PathPreferencePriority[];
+  createdAtMs: number | null;
+  expiresAtMs: number | null;
+}
+
 export interface DNSQueryResult {
   Answer?: Array<{
     TTL: number;
@@ -374,6 +397,17 @@ export const getEffectiveNetworkPaths = () =>
   request<EffectiveNetworkPaths>('/runtime/network/effective-paths');
 export const getNetworkPathDecisions = () =>
   request<NetworkPathDecisionRecord[]>('/runtime/network/path-decisions');
+export const getNetworkPathPreference = () =>
+  request<PathPreferenceView>('/runtime/network/path-preference');
+export const updateNetworkPathPreference = (
+  priority: PathPreferencePriority[],
+  ttlMs?: number,
+) => request<PathPreferenceView>('/runtime/network/path-preference', {
+  method: 'PUT',
+  body: JSON.stringify({ priority, ...(ttlMs == null ? {} : { ttlMs }) }),
+});
+export const clearTemporaryNetworkPathPreference = () =>
+  request<PathPreferenceView>('/runtime/network/path-preference', { method: 'DELETE' });
 
 // Restart
 export const restart = () => request<void>('/restart', { method: 'POST' });

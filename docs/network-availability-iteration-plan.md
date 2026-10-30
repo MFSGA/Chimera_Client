@@ -920,3 +920,10 @@ lifecycle tests.
 - Network 页面新增 Control、Controller API、DNS、入站和 TUN 组件卡片，展示是否必需、当前阶段、阶段开始时间和错误。这样可以区分进程整体 `running` 与某个必需组件尚未就绪或失败。
 - `npm run lint`、`npm run build` 通过。用本地 fixture 验证 DNS 失败、其他必需组件 ready、TUN 未配置且可选的状态能分别呈现；未连接实际运行核心。
 - 最终主 JS 637.62 kB，按需加载的 Network chunk 48.21 kB；原有主包体积警告仍在。
+
+### 2026-10-30：Dashboard 编辑运行时路径偏好（L2，待验收）
+
+- 基线：本地 `master` `7cb55506692c09085d821d704b17308ae768cef7`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。只使用已有 `/runtime/network/path-preference` API。
+- Network 页面可按接口类型和地址族增删、调整软偏好顺序，选择运行时有效期或 15 分钟/1 小时/24 小时临时覆写；可清除临时覆写并恢复原运行时偏好，也可用空列表回到核心默认规则。偏好仅影响使用自动选路的新连接，不改系统路由、不移动已有连接、不写回 YAML；显式 `Require` 仍由核心优先处理。
+- `npm run lint`、`npm run build` 通过。受控本地 HTTP fixture 手动验证添加、排序、15 分钟覆写、应用、清除和恢复默认；选择 15 分钟后点击“Use core default”，GET 返回 `source=runtime`、空 `priority`、`createdAtMs=null` 和 `expiresAtMs=null`，确认不会留下临时 TTL；没有连接真实核心或改变真实网络。
+- 最终构建 Network chunk 55.28 kB、主 JS 637.94 kB；主包原有的 500 kB 体积提示仍存在。此 L2 切片需要独立 Reviewer 检查，并待维护者验收最终 SHA。
