@@ -1990,10 +1990,11 @@ eth0 00000000 00000000 0001 0 0 0 00000000 0 0 0\n";
         assert_ne!(recreated, first);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
-    #[ignore = "reads local interfaces and binds temporary UDP sockets; sends no traffic"]
-    async fn live_macos_snapshot_reports_local_bind_capabilities() {
+    async fn live_supported_platform_snapshot_reports_local_bind_capabilities() {
+        // This reads local interface, route, and resolver metadata and binds
+        // temporary UDP sockets. It never sends packets or changes host state.
         let snapshot = snapshot_with_tun(TunCandidateExclusion::Unidentified)
             .await
             .unwrap();

@@ -849,6 +849,14 @@ lifecycle tests.
 - 验证：定向测试 1 passed；`ring,tun,port` 下完整 `clash-lib` 库测试 787 passed、0 failed、12 ignored；Dashboard 外同 feature 组合的 all-target strict Clippy（`-D warnings -D unused-variables`）、`cargo fmt --all -- --check`、`git diff --check` 通过。测试使用 `CARGO_TARGET_DIR=/private/tmp/chimera-client-no-default-target CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0`；仓库 `target` 卷及默认测试缓存卷空间不足，未清理既有缓存，改用已有低体积缓存完成验证。
 - 此项证明 loopback 上的连接拒绝仍能返回逐候选 PathId 诊断；不覆盖非 loopback 实际网络错误、完整 Dispatcher Explain 返回、代理认证阶段错误或跨平台行为。
 
+### 2026-10-30：Linux/macOS 只读实时快照纳入常规测试
+
+- 基线：本地 `master` `9f4f19fa388edc8117695e3633d299fede09c054`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。本轮不迁移或改变参考实现。
+- 将原本仅限 macOS 且默认忽略的实时快照用例扩展为 Linux/macOS 共用、默认执行的测试。它读取本机接口、路由和 DNS 元数据，并绑定临时 UDP socket 采集本地源地址绑定结果；不发送数据、不改系统网络。断言覆盖快照边界、地址族和 IPv6 scope 一致性，不要求任一候选的绑定状态为 `Verified`。Linux 专属路由解析用例仍由 Linux cfg 门控。
+- 本机 macOS：新实时快照用例 1 passed；`app::network::tests::` 为 17 passed；`runtime::tests::` 为 16 passed；`cargo clippy -p clash-lib --lib --tests --locked -- -D warnings`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。实际网卡切换、DNS 服务器变更和断网恢复未在本机复现。
+- Linux 目标编译尝试 `cargo check -p clash-lib --lib --tests --target x86_64-unknown-linux-gnu --locked` 在 `zstd-sys` 构建阶段被环境阻断：缺少 `x86_64-linux-gnu-gcc`。因此 Linux 测试尚未编译或运行，不能声称 Linux 验收通过。仓库 coverage workflow 的 Ubuntu job 会运行 workspace 测试，待本改动进入该 Runner 后确认结果。
+- Windows 自动网络观察仍未实现，`AUTOMATIC_SUPPORTED` 保持关闭；Windows loopback reset 测试不等于 Windows 主机网络切换验收。下一步需要 Linux Runner 实际执行快照测试，再在隔离 Linux namespace 验证换网恢复；Windows 需另行补齐路由、接口状态和 DNS 观察后才适合开启自动支持。
+
 ### 2026-10-24：修复 feature 组合下的测试 Clippy 阻断
 
 - 基线：本地 `master` `f7616356ff3ebd5923eb626e2d93af2db43a1470`。将 `s04br_tests` 从 `Transport` trait 定义之前移到 `clash-lib/src/proxy/transport/mod.rs` 文件末尾，消除 `items_after_test_module`。只调整测试模块位置，不改传输 trait、网络池实现或运行时行为。
