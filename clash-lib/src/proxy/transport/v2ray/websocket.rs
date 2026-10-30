@@ -121,6 +121,7 @@ mod tests {
     use std::{
         collections::HashMap,
         sync::{Arc, Mutex},
+        time::Duration,
     };
 
     use tokio::net::{TcpListener, TcpStream};
@@ -131,6 +132,8 @@ mod tests {
     };
 
     use super::{Transport, V2rayWsClient};
+
+    const FIXTURE_TIMEOUT: Duration = Duration::from_secs(5);
 
     #[tokio::test]
     async fn lowercase_host_header_is_preserved_without_duplicate() {
@@ -174,18 +177,24 @@ mod tests {
             false,
         )
         .expect("V2Ray WebSocket client should be created");
-        let stream = TcpStream::connect(address)
-            .await
-            .expect("WebSocket fixture should accept TCP");
-        let client_stream = client
-            .proxy_stream(Box::new(stream))
-            .await
-            .expect("V2Ray WebSocket handshake should succeed");
+        let stream =
+            tokio::time::timeout(FIXTURE_TIMEOUT, TcpStream::connect(address))
+                .await
+                .expect("WebSocket TCP connect should finish before timeout")
+                .expect("WebSocket fixture should accept TCP");
+        let client_stream = tokio::time::timeout(
+            FIXTURE_TIMEOUT,
+            client.proxy_stream(Box::new(stream)),
+        )
+        .await
+        .expect("WebSocket handshake should finish before timeout")
+        .expect("V2Ray WebSocket handshake should succeed");
 
         drop(client_stream);
         drop(
-            server
+            tokio::time::timeout(FIXTURE_TIMEOUT, server)
                 .await
+                .expect("WebSocket fixture should finish before timeout")
                 .expect("WebSocket fixture task should not panic"),
         );
 
@@ -266,17 +275,25 @@ mod tests {
             false,
         )
         .expect("TLS V2Ray WebSocket client should be created");
-        let stream = TcpStream::connect(address)
-            .await
-            .expect("TLS WebSocket fixture should accept TCP");
-        let client_stream = client
-            .proxy_stream(Box::new(stream))
-            .await
-            .expect("TLS WebSocket handshake should succeed");
+        let stream =
+            tokio::time::timeout(FIXTURE_TIMEOUT, TcpStream::connect(address))
+                .await
+                .expect("TLS TCP connect should finish before timeout")
+                .expect("TLS WebSocket fixture should accept TCP");
+        let client_stream = tokio::time::timeout(
+            FIXTURE_TIMEOUT,
+            client.proxy_stream(Box::new(stream)),
+        )
+        .await
+        .expect("TLS WebSocket handshake should finish before timeout")
+        .expect("TLS WebSocket handshake should succeed");
 
         drop(client_stream);
         assert_eq!(
-            server.await.expect("TLS fixture task should not panic"),
+            tokio::time::timeout(FIXTURE_TIMEOUT, server)
+                .await
+                .expect("TLS fixture should finish before timeout")
+                .expect("TLS fixture task should not panic"),
             Some(b"http/1.1".to_vec())
         );
         assert_eq!(
