@@ -137,6 +137,7 @@ export interface RuntimeNetworkStatus {
     finishedAtMs: number | null;
     durationMs: number | null;
     report: {
+      interface: { phase: string; count: number; error: string | null };
       dns: { phase: string; count: number; error: string | null };
       pools: { phase: string; count: number; error: string | null };
       observationError: string | null;
