@@ -124,6 +124,13 @@ export interface RuntimeNetworkStatus {
   failures: number;
   lastError: string | null;
   application: { phase: string; health: string; reason: string };
+  components: Array<{
+    name: string;
+    required: boolean;
+    phase: string;
+    sinceMs: number;
+    error: string | null;
+  }>;
   configVersion: number;
   networkVersion: number;
   lastObservedAtMs: number | null;

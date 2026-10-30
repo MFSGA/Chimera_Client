@@ -29,6 +29,8 @@ function phaseLabel(value: string): string {
     stopped: 'Stopped',
     failed: 'Failed',
     healthy: 'Healthy',
+    ready: 'Ready',
+    notConfigured: 'Not configured',
     unknown: 'Not yet verified',
     available: 'Traffic observed',
     unavailable: 'Unavailable after repeated failures',
@@ -54,6 +56,11 @@ function phaseLabel(value: string): string {
     virtual: 'Virtual',
     loopback: 'Loopback',
     other: 'Other',
+    control: 'Control plane',
+    api: 'Controller API',
+    dns: 'DNS',
+    inbound: 'Inbound listeners',
+    tun: 'TUN',
     requiredIntentMismatch: 'Does not match a required preference',
     endpointFamilyMismatch: 'Address family does not match',
   };
@@ -61,7 +68,7 @@ function phaseLabel(value: string): string {
 }
 
 function phaseVariant(value: string): 'green' | 'amber' | 'red' | 'gray' | 'blue' {
-  if (['healthy', 'running', 'observing', 'trafficVerified', 'succeeded', 'connected'].includes(value)) {
+  if (['healthy', 'running', 'ready', 'observing', 'trafficVerified', 'succeeded', 'connected'].includes(value)) {
     return 'green';
   }
   if (['recovering', 'awaitingTraffic', 'waitingForNetwork', 'starting', 'reloading'].includes(value)) {
@@ -70,7 +77,7 @@ function phaseVariant(value: string): 'green' | 'amber' | 'red' | 'gray' | 'blue
   if (['degraded', 'failed', 'dialFailed', 'pathPlanningFailed', 'staleNetworkDiscarded'].includes(value)) {
     return 'red';
   }
-  if (['unsupported', 'stopped'].includes(value)) return 'gray';
+  if (['unsupported', 'notConfigured', 'stopped'].includes(value)) return 'gray';
   return 'blue';
 }
 
@@ -176,6 +183,35 @@ function RecoverySummary({ status }: { status: RuntimeNetworkStatus }) {
               )}
             </div>
           )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function RuntimeComponents({ components }: { components: RuntimeNetworkStatus['components'] }) {
+  return (
+    <section className="liquid-glass-card rounded-xl overflow-hidden">
+      <div className="border-b px-4 py-3" style={{ borderColor: 'var(--color-separator)' }}>
+        <h2 className="text-[15px] font-semibold" style={{ color: 'var(--color-text-primary)' }}>Runtime components</h2>
+        <p className="text-[12px]" style={{ color: 'var(--color-text-secondary)' }}>A running process does not mean every configured component is ready.</p>
+      </div>
+      {components.length === 0 ? (
+        <div className="px-4 py-5 text-[13px]" style={{ color: 'var(--color-text-secondary)' }}>No component readiness details were reported.</div>
+      ) : (
+        <div className="grid gap-3 p-4 sm:grid-cols-2 lg:grid-cols-3">
+          {components.map((component) => (
+            <div key={component.name} className="rounded-xl p-3" style={{ background: 'var(--color-fill-subtle)' }}>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="text-[13px] font-medium" style={{ color: 'var(--color-text-primary)' }}>{phaseLabel(component.name)}</div>
+                <Badge variant={phaseVariant(component.phase)}>{phaseLabel(component.phase)}</Badge>
+              </div>
+              <div className="mt-1 text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
+                {component.required ? 'Required' : 'Optional'} · since {formatTimestamp(component.sinceMs)}
+              </div>
+              {component.error && <div className="mt-2 break-words text-[12px]" style={{ color: '#ff3b30' }}>{component.error}</div>}
+            </div>
+          ))}
         </div>
       )}
     </section>
@@ -297,6 +333,7 @@ export function Network() {
 
           {(status.data.observationError || status.data.lastError) && <ErrorNotice message={status.data.observationError ?? status.data.lastError ?? ''} />}
           <RecoverySummary status={status.data} />
+          <RuntimeComponents components={status.data.components ?? []} />
 
           <section className="liquid-glass-card rounded-xl overflow-hidden">
             <div className="flex items-center gap-2 border-b px-4 py-3" style={{ borderColor: 'var(--color-separator)' }}>

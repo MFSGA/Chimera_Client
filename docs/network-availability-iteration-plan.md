@@ -913,3 +913,10 @@ lifecycle tests.
 - 最近一次恢复摘要现在同时展示接口刷新、DNS transport 和连接池的结果及错误文本，避免只看 DNS/连接池时遗漏默认出口接口刷新失败。
 - `npm run lint`、`npm run build` 通过。使用本地 fixture 注入接口刷新失败、DNS 成功和连接池跳过的组合，Dashboard 正确显示三项结果与接口错误；没有调用实际网络恢复。
 - 最终 Network chunk 为 46.57 kB，主 JS 637.62 kB；原有主包体积警告仍在。
+
+### 2026-10-30：展示核心组件就绪状态
+
+- 基线：本地 `master` `60b4cc1ddbb12096db2378332914b00fa9065992`。使用 `/runtime` 已有的 `components` 字段，未改运行时生命周期或 API。
+- Network 页面新增 Control、Controller API、DNS、入站和 TUN 组件卡片，展示是否必需、当前阶段、阶段开始时间和错误。这样可以区分进程整体 `running` 与某个必需组件尚未就绪或失败。
+- `npm run lint`、`npm run build` 通过。用本地 fixture 验证 DNS 失败、其他必需组件 ready、TUN 未配置且可选的状态能分别呈现；未连接实际运行核心。
+- 最终主 JS 637.62 kB，按需加载的 Network chunk 48.21 kB；原有主包体积警告仍在。
