@@ -129,7 +129,9 @@ impl ApiReadySignal {
     }
 }
 
-fn build_cors_layer(configured_origins: Option<&[String]>) -> (CorsLayer, usize) {
+pub(super) fn build_cors_layer(
+    configured_origins: Option<&[String]>,
+) -> (CorsLayer, usize) {
     let mut allow_any_origin = false;
     let mut valid_origins = Vec::new();
 
@@ -198,6 +200,30 @@ fn build_cors_layer(configured_origins: Option<&[String]>) -> (CorsLayer, usize)
             valid_origin_count,
         )
     }
+}
+
+pub(super) fn add_shared_http_layers(
+    router: Router<Arc<AppState>>,
+    app_state: Arc<AppState>,
+    cors: CorsLayer,
+) -> Router {
+    router
+        .layer(middleware::from_fn(
+            middlewares::fix_json_content_type::fix_content_type,
+        ))
+        .route_layer(cors)
+        .with_state(app_state)
+        .layer(ServiceBuilder::new().layer(
+            TraceLayer::new_for_http().make_span_with(
+                |request: &http::Request<axum::body::Body>| {
+                    tracing::debug_span!(
+                        "http_request",
+                        method = %request.method(),
+                        path = %request.uri().path()
+                    )
+                },
+            ),
+        ))
 }
 
 impl ApiRunner {
@@ -331,7 +357,7 @@ impl Runner for ApiRunner {
 
         let handle = tokio::spawn(async move {
             info!("Starting API server");
-            let mut router = Router::new()
+            let router = Router::new()
                 .route("/", get(handlers::hello::handle))
                 .route("/capabilities", get(handlers::capabilities::get))
                 .route("/traffic", get(handlers::traffic::handle))
@@ -378,23 +404,8 @@ impl Runner for ApiRunner {
                     "/runtime",
                     handlers::network::status_routes(global_state.clone()),
                 )
-                .nest("/rules", handlers::rule::routes(router))
-                .layer(middleware::from_fn(
-                    middlewares::fix_json_content_type::fix_content_type,
-                ))
-                .route_layer(cors)
-                .with_state(app_state.clone())
-                .layer(ServiceBuilder::new().layer(
-                    TraceLayer::new_for_http().make_span_with(
-                        |request: &http::Request<axum::body::Body>| {
-                            tracing::debug_span!(
-                                "http_request",
-                                method = %request.method(),
-                                path = %request.uri().path()
-                            )
-                        },
-                    ),
-                ));
+                .nest("/rules", handlers::rule::routes(router));
+            let mut router = add_shared_http_layers(router, app_state.clone(), cors);
 
             if let Some(external_ui) = controller_cfg.external_ui.clone() {
                 router = router
