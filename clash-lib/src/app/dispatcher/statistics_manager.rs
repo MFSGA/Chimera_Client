@@ -42,8 +42,9 @@ type ConnectionMap = HashMap<uuid::Uuid, (Tracked, Sender<()>)>;
 /// For TCP, `NetworkChanged` is recorded when a transport error coincides with
 /// an observed network-generation change. For UDP, it also records proactive
 /// association retirement or stale-dial rejection at a generation boundary.
-/// It identifies the lifecycle trigger, not proof that the network change was
-/// the sole cause of a transport failure.
+/// `OutboundChanged` identifies a UDP association retired after an explicit
+/// selector change. These values identify the lifecycle trigger, not proof
+/// that it was the sole cause of a transport failure.
 #[derive(Serialize, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub enum FlowEndReason {
@@ -52,6 +53,7 @@ pub enum FlowEndReason {
     OutboundClosed,
     IdleTimeout,
     NetworkChanged,
+    OutboundChanged,
     IoError,
     ControllerRequested,
     #[default]
