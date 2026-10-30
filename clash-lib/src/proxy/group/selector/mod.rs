@@ -72,6 +72,7 @@ impl PinnedOutbound {
     ) -> io::Result<Self> {
         let mut selector_chain = Vec::new();
         let mut selector_selection_identity = Vec::new();
+        let mut track_selector_selections = true;
         let mut visited = Vec::<AnyOutboundHandler>::new();
         loop {
             if !matches!(
@@ -103,9 +104,15 @@ impl PinnedOutbound {
                 ))
             })?;
             let selected = group.select_proxy_for_connection(session).await?;
-            if matches!(handler.proto(), OutboundType::Selector) {
+            if track_selector_selections
+                && matches!(handler.proto(), OutboundType::Selector)
+            {
                 selector_selection_identity
                     .push((handler.name().to_owned(), selected.name().to_owned()));
+            } else {
+                // Once an automatic group chooses a branch, downstream
+                // selectors are not part of the user's direct selection path.
+                track_selector_selections = false;
             }
             selector_chain.push(handler.name().to_owned());
             visited.push(handler);
@@ -1037,11 +1044,36 @@ mod path_selection_tests {
     }
 
     #[tokio::test]
-    async fn manual_selector_identity_ignores_loadbalance_leaf_rotation() {
+    async fn manual_selector_identity_ignores_loadbalance_rotation_between_selectors()
+     {
         let a = mock_node("A");
         let b = mock_node("B");
         let resolver: ThreadSafeDNSResolver = Arc::new(NoopResolver);
         let manager = ProxyManager::new(resolver, None);
+        let selector_a: AnyOutboundHandler = Arc::new(
+            Handler::new(
+                HandlerOptions {
+                    name: "SELECT-A".to_owned(),
+                    udp: true,
+                    ..Default::default()
+                },
+                vec![provider_for(vec![a])],
+                Some("A".to_owned()),
+            )
+            .await,
+        );
+        let selector_b: AnyOutboundHandler = Arc::new(
+            Handler::new(
+                HandlerOptions {
+                    name: "SELECT-B".to_owned(),
+                    udp: true,
+                    ..Default::default()
+                },
+                vec![provider_for(vec![b])],
+                Some("B".to_owned()),
+            )
+            .await,
+        );
         let balance: AnyOutboundHandler =
             Arc::new(crate::proxy::group::loadbalance::Handler::new(
                 crate::proxy::group::loadbalance::HandlerOptions {
@@ -1050,7 +1082,7 @@ mod path_selection_tests {
                     strategy: LoadBalanceStrategy::RoundRobin,
                     ..Default::default()
                 },
-                vec![provider_for(vec![a, b])],
+                vec![provider_for(vec![selector_a, selector_b])],
                 manager,
             ));
         let selector: AnyOutboundHandler = Arc::new(

@@ -869,9 +869,9 @@ lifecycle tests.
 ### 2026-10-30：GLOBAL 手动选择器切换时退休旧 UDP association
 
 - 基线：本地 `master` 与 `origin/master` 均为 `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`。原 Dispatcher 每个数据报都会重新捕获 GLOBAL selector 的当前叶节点；叶节点变化后，新数据走新出站，但旧 NAT association 的后台转发任务仍可继续收发，直到 10 秒空闲过期。
-- `PinnedOutbound` 现在提供捕获到的手动 `Selector` 直接选择身份，不把 Fallback、URLTest、LoadBalance 等自动组的叶节点轮换纳入比较。GLOBAL 模式的顶层手动 `Selector` 在下一次数据报观察到直接选择变化时，退休该入站的旧 UDP associations，记录 `endReason: outboundChanged` 并清除旧路径决策缓存；Rule 模式和自动组内部变化不触发此逻辑。嵌套手动 `Selector` 的直接选择仍会反映在身份中。
+- `PinnedOutbound` 现在只记录在自动组之前捕获到的手动 `Selector` 直接选择，不把 Fallback、URLTest、LoadBalance、Smart 等自动组或其下游 Selector 分支纳入比较。GLOBAL 模式的顶层手动 `Selector` 在下一次数据报观察到直接选择变化时，退休该入站的旧 UDP associations，记录 `endReason: outboundChanged` 并清除旧路径决策缓存；Rule 模式和自动组内部变化不触发此逻辑。纯手动的嵌套 Selector 链仍保留各层直接选择身份。
 - 新增 loopback 集成回归：DIRECT 首包得到 echo 响应，Controller 将 GLOBAL 切到 REJECT 后发送下一包，旧 association 必须出现在 `/flows?include_closed=true` 的 `outboundChanged` 计数中。临时关闭选择变化检测时，该用例按预期在 5 秒内因未退休而失败；恢复实现后通过。
-- 首轮独立审查发现：GLOBAL 手动 Selector 包含自动组时，按最终叶节点比较会把 LoadBalance 轮换误判为手动切换。修正后，身份只保留手动 Selector 的直接选择；新增 LoadBalance 叶节点轮换保持 identity 稳定、嵌套手动 Selector 改变 identity 的测试。
+- 独立审查发现并推动修复两类误判：最初按最终叶节点比较会把自动组轮换误判为手动切换；随后发现自动组可能在多个内层 Selector 间轮换。最终 identity 只保留自动组之前的手动 Selector 直接选择；新增 Fallback 叶节点轮换、LoadBalance 在两个内层 Selector 间轮换保持 identity 稳定，以及纯手动嵌套 Selector 改变 identity 的测试。
 - 已通过：`cargo test -p clash-lib --lib --locked`（983 passed、11 ignored）、`cargo test -p clash-lib --test direct_udp_integration_tests --locked -- --test-threads=1`（4 passed）、定向 selector 单元测试（9 passed）、`cargo clippy -p clash-lib --lib --test direct_udp_integration_tests --locked -- -D warnings`、格式和 diff 检查。测试只使用本机 loopback，不修改系统网络。
 - 边界：选择变化在该 UDP 入站收到下一包时被观察；本轮未增加 selector 事件订阅来主动唤醒所有空闲中的 UDP 入站，也未覆盖真实代理服务器 UDP 互操作或跨平台网络切换。
 
