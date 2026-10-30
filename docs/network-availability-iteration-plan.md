@@ -928,3 +928,10 @@ lifecycle tests.
 - `npm run lint`、`npm run build` 通过。受控本地 HTTP fixture 手动验证添加、排序、15 分钟覆写、应用、清除和恢复默认；选择 15 分钟后点击“Use core default”，GET 返回 `source=runtime`、空 `priority`、`createdAtMs=null` 和 `expiresAtMs=null`，确认不会留下临时 TTL；没有连接真实核心或改变真实网络。
 - 最终构建 Network chunk 55.30 kB、主 JS 637.94 kB；主包原有的 500 kB 体积提示仍存在。此 L2 切片需要独立 Reviewer 检查，并待维护者验收最终 SHA。
 - 独立审查发现手动刷新按钮未立即刷新偏好查询；已将偏好查询加入同一刷新流程并纳入忙碌状态，最终 SHA 将重新审查。
+
+### 2026-10-30：HTTP 入站转发 WebSocket Upgrade（L2，待审查）
+
+- 基线：本地 `master` `7402e680ae41bb40a4301580310715f51a37e1a7`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。本轮不迁移参考实现。
+- HTTP 入站在既有 `CONNECT` 和普通请求之外，现识别含 `Upgrade` 且 `Connection` token 含 `upgrade` 的请求。使用启用 Hyper upgrade 的 HTTP/1.1 client connection 经 Dispatcher 建立上游连接；代理 absolute-form URI 转为 origin-form 并保留或补齐 `Host`。上游返回 101 后双向复制升级流；建立上游失败返回 502。请求认证仍在转发前执行。
+- 新增 loopback WebSocket 回归：有效 101 握手、上游提前发送的未掩码文本帧、客户端掩码文本帧、服务端回帧，以及上游拒绝时的 502。`cargo test -p clash-lib --test connection_chain_tests --locked -- --test-threads=1` 为 5 passed；该 target 严格 Clippy、格式和 diff 检查通过。未访问公网或修改宿主网络。
+- TLS WebSocket 仍经现有 CONNECT 路径，本轮未新增其实现；未验证第三方服务端、长时升级连接或跨平台运行。L2 独立审查与维护者验收待最终 SHA。

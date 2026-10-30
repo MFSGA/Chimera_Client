@@ -817,3 +817,210 @@ rules:
         .expect("timed out querying failure path decision detail");
     assert_eq!(detail, failure);
 }
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn http_inbound_forwards_websocket_upgrade_bidirectionally() {
+    async fn read_headers(stream: &mut TcpStream) -> Vec<u8> {
+        let mut headers = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            stream
+                .read_exact(&mut byte)
+                .await
+                .expect("HTTP upgrade headers should be complete");
+            headers.push(byte[0]);
+            assert!(headers.len() <= 16 * 1024, "HTTP headers exceeded limit");
+            if headers.ends_with(b"\r\n\r\n") {
+                return headers;
+            }
+        }
+    }
+
+    let origin = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind websocket fixture");
+    let origin_port = origin.local_addr().unwrap().port();
+    let origin_task = tokio::spawn(async move {
+        let (mut stream, _) = origin
+            .accept()
+            .await
+            .expect("websocket fixture should accept connection");
+        let request = read_headers(&mut stream).await;
+        let request = String::from_utf8_lossy(&request);
+        assert!(request.starts_with("GET /socket HTTP/1.1\r\n"));
+        let request_lower = request.to_ascii_lowercase();
+        let connection = request_lower
+            .lines()
+            .find_map(|line| line.strip_prefix("connection:"))
+            .expect("upgrade request should include Connection header");
+        assert!(
+            connection.split(',').any(|token| token.trim() == "upgrade"),
+            "Connection header should contain upgrade token: {request}"
+        );
+        assert!(request_lower.contains("upgrade: websocket"));
+        assert!(request.contains("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=="));
+
+        stream
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\n\
+                  Connection: Upgrade\r\n\
+                  Upgrade: websocket\r\n\
+                  Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\
+                  \r\n\x81\x05hello",
+            )
+            .await
+            .expect("websocket fixture should accept the upgrade");
+
+        let mut client_frame_header = [0u8; 2];
+        stream
+            .read_exact(&mut client_frame_header)
+            .await
+            .expect("websocket fixture should receive client data");
+        assert_eq!(client_frame_header, [0x81, 0x84]);
+        let mut client_masked_frame = [0u8; 8];
+        stream
+            .read_exact(&mut client_masked_frame)
+            .await
+            .expect("websocket fixture should receive masked client frame");
+        let mask = &client_masked_frame[..4];
+        let payload: Vec<u8> = client_masked_frame[4..]
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| *byte ^ mask[index % 4])
+            .collect();
+        assert_eq!(payload, b"ping");
+        stream
+            .write_all(b"\x81\x04pong")
+            .await
+            .expect("websocket fixture should return client data");
+    });
+
+    let api_port = available_port();
+    let http_port = available_port();
+    let config = format!(
+        "allow-lan: false\n\
+         bind-address: 127.0.0.1\n\
+         port: {http_port}\n\
+         mode: rule\n\
+         log-level: error\n\
+         mmdb: null\n\
+         external-controller: 127.0.0.1:{api_port}\n\
+         secret: clash-rs\n\
+         tun:\n\
+           enable: false\n\
+         rules:\n\
+           - MATCH,DIRECT\n"
+    );
+    let cwd =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
+    let _clash = ClashInstance::start(
+        Options {
+            config: Config::Str(config),
+            cwd: Some(cwd.to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            config_path: None,
+        },
+        vec![api_port, http_port],
+    )
+    .expect("failed to start HTTP proxy client");
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match TcpStream::connect(("127.0.0.1", http_port)).await {
+                Ok(stream) => {
+                    drop(stream);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+
+        let mut client = TcpStream::connect(("127.0.0.1", http_port))
+            .await
+            .expect("failed to connect to HTTP inbound");
+        client
+            .write_all(
+                format!(
+                    "GET http://127.0.0.1:{origin_port}/socket HTTP/1.1\r\n\
+                     Host: 127.0.0.1:{origin_port}\r\n\
+                     Connection: keep-alive, Upgrade\r\n\
+                     Upgrade: websocket\r\n\
+                     Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                     Sec-WebSocket-Version: 13\r\n\
+                     \r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("failed to send websocket upgrade request");
+
+        let response = read_headers(&mut client).await;
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 101 Switching Protocols"));
+        assert!(response.to_ascii_lowercase().contains("upgrade: websocket"));
+
+        let mut server_frame = [0u8; 7];
+        client
+            .read_exact(&mut server_frame)
+            .await
+            .expect("HTTP inbound should forward early upstream upgrade data");
+        assert_eq!(&server_frame, b"\x81\x05hello");
+
+        let client_payload = b"ping";
+        let mask = [0x13, 0x57, 0x9b, 0xdf];
+        let mut client_frame = vec![0x81, 0x80 | client_payload.len() as u8];
+        client_frame.extend_from_slice(&mask);
+        client_frame.extend(
+            client_payload
+                .iter()
+                .enumerate()
+                .map(|(index, byte)| *byte ^ mask[index % mask.len()]),
+        );
+        client
+            .write_all(&client_frame)
+            .await
+            .expect("HTTP inbound should forward client upgrade data");
+        let mut acknowledgement = [0u8; 6];
+        client
+            .read_exact(&mut acknowledgement)
+            .await
+            .expect("HTTP inbound should forward upstream upgrade data");
+        assert_eq!(&acknowledgement, b"\x81\x04pong");
+    })
+    .await
+    .expect("HTTP websocket upgrade tunnel timed out");
+    origin_task
+        .await
+        .expect("websocket fixture task should complete");
+
+    let refused_port = available_port();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let mut client = TcpStream::connect(("127.0.0.1", http_port))
+            .await
+            .expect("failed to reconnect to HTTP inbound");
+        client
+            .write_all(
+                format!(
+                    "GET http://127.0.0.1:{refused_port}/socket HTTP/1.1\r\n\
+                     Host: 127.0.0.1:{refused_port}\r\n\
+                     Connection: Upgrade\r\n\
+                     Upgrade: websocket\r\n\
+                     Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                     Sec-WebSocket-Version: 13\r\n\
+                     \r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("failed to send refused websocket upgrade request");
+        let response = read_headers(&mut client).await;
+        assert!(
+            String::from_utf8_lossy(&response)
+                .starts_with("HTTP/1.1 502 Bad Gateway")
+        );
+    })
+    .await
+    .expect("HTTP upgrade connection failure response timed out");
+}
