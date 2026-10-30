@@ -859,6 +859,12 @@ lifecycle tests.
 - 同一 master push 还触发 `ci.yml` 的 `Release` job：稳定版步骤跳过，`latest` 预发布被重建并指向 `57c7336ada6b9a7e0e802f32d994b379d011b8cc`。这属于 push 工作流行为，不代表完成真实换网验收。
 - Windows 自动网络观察仍未实现，`AUTOMATIC_SUPPORTED` 保持关闭；Windows loopback reset 测试不等于 Windows 主机网络切换验收。下一步需要 Linux Runner 实际执行快照测试，再在隔离 Linux namespace 验证换网恢复；Windows 需另行补齐路由、接口状态和 DNS 观察后才适合开启自动支持。
 
+### 2026-10-30：在主 CI 实际运行 Linux/macOS 实时快照测试（待 CI 验证）
+
+- `.github/workflows/ci.yml` 的 Linux 与 macOS quality job 新增精确测试步骤，执行 `app::network::tests::live_supported_platform_snapshot_reports_local_bind_capabilities`。这使 master push 不再只通过 Clippy 编译该测试目标，也会实际运行该只读快照用例。
+- 本次仅调整 CI 执行范围，不增加网络操作；该用例读取本机网络元数据并绑定临时 UDP socket，不发送数据、不改主机网络。
+- 该改动尚未推送，Linux/macOS Runner 的首次执行结果待后续 CI；它不替代 Linux namespace 换网、Windows 网络观察或专用双网卡实机验收。
+
 ### 2026-10-24：修复 feature 组合下的测试 Clippy 阻断
 
 - 基线：本地 `master` `f7616356ff3ebd5923eb626e2d93af2db43a1470`。将 `s04br_tests` 从 `Transport` trait 定义之前移到 `clash-lib/src/proxy/transport/mod.rs` 文件末尾，消除 `items_after_test_module`。只调整测试模块位置，不改传输 trait、网络池实现或运行时行为。

@@ -113,6 +113,12 @@ jobs:
         run: cargo clippy -p clash-lib --all-targets --all-features -- -D warnings
       - name: Test LAN proxy
         run: cargo test -p clash-lib --test lan_proxy_tests --all-features
+      - name: Test live network snapshot (Linux/macOS)
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        run: >-
+          cargo test -p clash-lib --lib --locked
+          app::network::tests::live_supported_platform_snapshot_reports_local_bind_capabilities
+          -- --exact
 
   compile:
     name: ${{ matrix.release-name || matrix.target || 'Unknown' }}
