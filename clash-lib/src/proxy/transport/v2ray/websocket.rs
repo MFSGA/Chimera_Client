@@ -62,7 +62,17 @@ impl V2rayWsClient {
             None
         };
 
-        if !headers.keys().any(|name| name.eq_ignore_ascii_case("host")) {
+        let host_header_count = headers
+            .keys()
+            .filter(|name| name.eq_ignore_ascii_case("host"))
+            .count();
+        if host_header_count > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "v2ray plugin cannot send multiple Host headers",
+            ));
+        }
+        if host_header_count == 0 {
             headers.insert("Host".to_owned(), host.clone());
         }
         let ws_client = WsClient::new(
@@ -186,5 +196,26 @@ mod tests {
                 Some("/ws?token=1".to_owned())
             ))
         );
+    }
+
+    #[test]
+    fn duplicate_host_headers_with_different_case_are_rejected() {
+        let result = V2rayWsClient::try_new(
+            "127.0.0.1".to_owned(),
+            80,
+            "/ws".to_owned(),
+            HashMap::from([
+                ("Host".to_owned(), "cdn.example".to_owned()),
+                ("host".to_owned(), "other.example".to_owned()),
+            ]),
+            false,
+            false,
+            false,
+        );
+
+        assert!(matches!(
+            result,
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
     }
 }
