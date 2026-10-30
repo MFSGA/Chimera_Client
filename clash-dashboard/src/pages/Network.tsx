@@ -162,13 +162,14 @@ function RecoverySummary({ status }: { status: RuntimeNetworkStatus }) {
           {operation.report && (
             <div className="sm:col-span-2 lg:col-span-4">
               <div className="flex flex-wrap gap-2">
+                <Badge variant={phaseVariant(operation.report.interface.phase)}>Interface: {phaseLabel(operation.report.interface.phase)} · {operation.report.interface.count}</Badge>
                 <Badge variant={phaseVariant(operation.report.dns.phase)}>DNS: {phaseLabel(operation.report.dns.phase)} · {operation.report.dns.count}</Badge>
                 <Badge variant={phaseVariant(operation.report.pools.phase)}>Connection pools: {phaseLabel(operation.report.pools.phase)} · {operation.report.pools.count}</Badge>
                 {operation.report.offline && <Badge variant="red">No usable network path</Badge>}
               </div>
-              {(operation.report.dns.error || operation.report.pools.error || operation.report.observationError) && (
+              {(operation.report.interface.error || operation.report.dns.error || operation.report.pools.error || operation.report.observationError) && (
                 <div className="mt-3 space-y-1">
-                  {[operation.report.dns.error, operation.report.pools.error, operation.report.observationError]
+                  {[operation.report.interface.error, operation.report.dns.error, operation.report.pools.error, operation.report.observationError]
                     .filter((error): error is string => Boolean(error))
                     .map((error) => <div key={error} className="text-[12px]" style={{ color: '#ff3b30' }}>{error}</div>)}
                 </div>
