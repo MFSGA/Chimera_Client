@@ -891,3 +891,11 @@ lifecycle tests.
 
 - 基线：本地 `master` `f7616356ff3ebd5923eb626e2d93af2db43a1470`。将 `s04br_tests` 从 `Transport` trait 定义之前移到 `clash-lib/src/proxy/transport/mod.rs` 文件末尾，消除 `items_after_test_module`。只调整测试模块位置，不改传输 trait、网络池实现或运行时行为。
 - `s04b` 相关单测为 66 passed；受支持最小 `ring,tun,port` feature 组合的完整 `clash-lib` 库测试为 786 passed、0 failed、12 ignored。Dashboard 外 strict all-target Clippy 命令 `CARGO_TARGET_DIR=/tmp/chimera-client-no-default-target CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo clippy -p clash-lib --all-targets --no-default-features --features ring,tun,port --locked -j 6 -- -D warnings -D unused-variables` 通过；格式与 diff 检查通过。
+
+### 2026-10-30：Dashboard 网络恢复诊断页
+
+- 基线：本地 `master` `1249f6121878002f2a045753943bce3e9858f8d3`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；参考检出 `ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。本切片只消费当前 Controller API，不迁移参考实现。
+- Dashboard 新增只读 Network 页面，展示恢复状态与最近操作、有效本地路径、当前 DIRECT 优选候选、接口偏好顺序、冷却到期时间，以及最近的 Flow 路径决策。页面每 5 秒刷新，保留现有 Controller 认证；不提供修改偏好或重置网络的控制。
+- 为避免诊断页面增加首屏下载体积，该路由改为按需加载。最终 `npm run build` 生成独立 `Network` chunk 44.92 kB，主 JS 637.62 kB；主包原有的 500 kB 体积提示仍存在。`npm run lint`、`npm run build` 均通过。
+- 使用本地受控 HTTP fixture 手动打开 Dashboard 页面，验证恢复卡片、路径表、优选标记、冷却时间和最近决策均渲染正常；未连接正在运行的实际核心，也未进行实机换网或跨平台运行验证。页面明确说明本地 socket 绑定只证明源地址可绑定，不证明互联网可达。
+- 本切片仅改 Dashboard 与本迭代记录；核心网络行为、Controller wire 格式、网络偏好及主机网络状态均未改变。
