@@ -110,6 +110,78 @@ export interface MemoryData {
   oslimit: number;
 }
 
+export interface NetworkPathIdView {
+  interface: { name: string; index: number };
+  family: 'ipv4' | 'ipv6';
+  sourceAddress: string | null;
+  networkGeneration: number;
+}
+
+export interface RuntimeNetworkStatus {
+  automaticSupported: boolean;
+  phase: string;
+  generation: number;
+  failures: number;
+  lastError: string | null;
+  application: { phase: string; health: string; reason: string };
+  configVersion: number;
+  networkVersion: number;
+  lastObservedAtMs: number | null;
+  observationError: string | null;
+  nextRetryAtMs: number | null;
+  policyVersion: number;
+  lastOperation: {
+    cause: string;
+    outcome: string;
+    startedAtMs: number;
+    finishedAtMs: number | null;
+    durationMs: number | null;
+    report: {
+      dns: { phase: string; count: number; error: string | null };
+      pools: { phase: string; count: number; error: string | null };
+      observationError: string | null;
+      offline: boolean;
+    } | null;
+  } | null;
+}
+
+export interface EffectiveNetworkPaths {
+  automaticSupported: boolean;
+  policyVersion: number;
+  networkVersion: number;
+  effectivePreferredPath: {
+    ipv4: NetworkPathIdView | null;
+    ipv6: NetworkPathIdView | null;
+  };
+  paths: Array<{
+    path: NetworkPathIdView;
+    interfaceKind: string;
+    family: 'ipv4' | 'ipv6';
+    sourceAddress: string;
+    defaultRouteEvidence: string;
+    binding: string;
+    bindingError: string | null;
+    health: string;
+    preferenceRank: number | null;
+    cooldownUntilMs: number | null;
+  }>;
+}
+
+export interface NetworkPathDecisionRecord {
+  flowId: string;
+  configVersion: number;
+  configVersionAtCompletion?: number;
+  policyVersion: number;
+  networkVersion: number;
+  operationId: number;
+  outcome: string;
+  route: { outbound: string; rule: string | null };
+  selectedPath: NetworkPathIdView | null;
+  failureKind?: string;
+  reason: string;
+  recordedAtMs: number;
+}
+
 export interface DNSQueryResult {
   Answer?: Array<{
     TTL: number;
@@ -281,6 +353,13 @@ export const queryDNS = (name: string, type: string) =>
 
 // Memory
 export const getMemory = () => request<MemoryData>('/memory');
+
+// Network recovery diagnostics
+export const getNetworkStatus = () => request<RuntimeNetworkStatus>('/runtime');
+export const getEffectiveNetworkPaths = () =>
+  request<EffectiveNetworkPaths>('/runtime/network/effective-paths');
+export const getNetworkPathDecisions = () =>
+  request<NetworkPathDecisionRecord[]>('/runtime/network/path-decisions');
 
 // Restart
 export const restart = () => request<void>('/restart', { method: 'POST' });
