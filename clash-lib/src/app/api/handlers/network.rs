@@ -218,14 +218,20 @@ mod tests {
             log_source_tx,
             statistics_manager: crate::app::dispatcher::StatisticsManager::new(),
         });
-        let app = Router::new()
-            .nest("/runtime", status_routes(global))
-            .route_layer(
-                crate::app::api::middlewares::auth::AuthMiddlewareLayer::new(
-                    "test-secret".to_owned(),
-                ),
-            )
-            .with_state(app_state);
+        let cors_origins = vec!["https://network-test.example".to_owned()];
+        let (cors, valid_origin_count) =
+            crate::app::api::runner::build_cors_layer(Some(&cors_origins));
+        assert_eq!(valid_origin_count, 1);
+        let app = crate::app::api::runner::add_shared_http_layers(
+            Router::new().nest("/runtime", status_routes(global)),
+            app_state,
+            cors,
+        )
+        .route_layer(
+            crate::app::api::middlewares::auth::AuthMiddlewareLayer::new(
+                "test-secret".to_owned(),
+            ),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server_task = tokio::spawn(async move {
@@ -286,6 +292,31 @@ mod tests {
         let detail_body = detail.into_body().collect().await.unwrap();
         let detail_body = detail_body.to_bytes();
         assert!(String::from_utf8_lossy(&detail_body).contains("expired"));
+
+        let preflight = sender
+            .send_request(
+                http::Request::builder()
+                    .method(http::Method::OPTIONS)
+                    .uri("/runtime/network/path-decision/test-flow")
+                    .header(http::header::ORIGIN, "https://network-test.example")
+                    .header(http::header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                    .header(
+                        http::header::ACCESS_CONTROL_REQUEST_HEADERS,
+                        "authorization",
+                    )
+                    .body(http_body_util::Empty::<bytes::Bytes>::new())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preflight.status(), StatusCode::OK);
+        assert_eq!(
+            preflight
+                .headers()
+                .get(http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|value| value.to_str().ok()),
+            Some("https://network-test.example")
+        );
         drop(sender);
         connection_task.abort();
         server_task.abort();
