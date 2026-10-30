@@ -13,8 +13,14 @@ use super::flow::{AddressFamily, InterfaceId, InterfaceKind};
 
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) const RECOVERY_TIMEOUT: Duration = Duration::from_secs(15);
-pub(crate) const AUTOMATIC_SUPPORTED: bool =
-    cfg!(any(target_os = "linux", target_os = "macos"));
+pub(crate) const AUTOMATIC_SUPPORTED: bool = cfg!(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "windows"
+));
+
+#[cfg(target_os = "windows")]
+mod windows;
 
 #[cfg(target_os = "linux")]
 static LINUX_NETLINK_HANDLE: tokio::sync::OnceCell<rtnetlink::Handle> =
@@ -119,7 +125,7 @@ pub(crate) enum TunCandidateExclusion {
 }
 
 impl TunCandidateExclusion {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn excludes(&self, _interface_name: &str) -> bool {
         match self {
             Self::Disabled => false,
@@ -127,12 +133,34 @@ impl TunCandidateExclusion {
             Self::Named(name) => name == _interface_name,
             #[cfg(any(feature = "tun", test))]
             Self::Unidentified => {
-                _interface_name.starts_with("utun")
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                let unix_tun_name = _interface_name.starts_with("utun")
                     || _interface_name.starts_with("tun")
                     || (cfg!(target_os = "linux")
                         && (_interface_name.starts_with("tap")
-                            || _interface_name.starts_with("wg")))
+                            || _interface_name.starts_with("wg")));
+                #[cfg(target_os = "windows")]
+                let unix_tun_name = {
+                    let name = _interface_name.to_ascii_lowercase();
+                    name.starts_with("tun")
+                        || name.starts_with("tap")
+                        || name.contains("wintun")
+                        || name.contains("tunnel")
+                };
+                unix_tun_name
             }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn is_unidentified(&self) -> bool {
+        #[cfg(any(feature = "tun", test))]
+        {
+            matches!(self, Self::Unidentified)
+        }
+        #[cfg(not(any(feature = "tun", test)))]
+        {
+            false
         }
     }
 }
@@ -171,7 +199,7 @@ impl PartialEq for PathCandidateObservation {
 impl Eq for PathCandidateObservation {}
 
 /// The per-address capability list is bounded before it reaches status/API.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 const MAX_PATH_CANDIDATES: usize = 128;
 
 #[derive(Clone, Debug, Default)]
@@ -1311,7 +1339,32 @@ pub(crate) async fn snapshot_with_tun(
     })?
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "windows")]
+pub(crate) async fn snapshot_with_tun(
+    tun_candidate_exclusion: TunCandidateExclusion,
+) -> io::Result<NetworkSnapshot> {
+    #[cfg(feature = "tun")]
+    let tun_interface_index = crate::app::net::windows_tun_interface_index().await;
+    #[cfg(not(feature = "tun"))]
+    let tun_interface_index = None;
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || {
+            windows::snapshot(tun_candidate_exclusion, tun_interface_index)
+        }),
+    )
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "Windows network snapshot timed out",
+        )
+    })?
+    .map_err(io::Error::other)?
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub(crate) async fn snapshot_with_tun(
     _tun_candidate_exclusion: TunCandidateExclusion,
 ) -> io::Result<NetworkSnapshot> {
