@@ -929,12 +929,12 @@ lifecycle tests.
 - 最终构建 Network chunk 55.30 kB、主 JS 637.94 kB；主包原有的 500 kB 体积提示仍存在。维护者已批准本地 SHA `7402e680ae41bb40a4301580310715f51a37e1a7`；该批准仅针对当时的路径偏好页面切片。
 - 独立审查发现手动刷新按钮未立即刷新偏好查询；偏好查询现加入同一刷新流程并纳入忙碌状态，独立复审通过。
 
-### 2026-10-30：HTTP 入站转发 WebSocket Upgrade（L2，待审查）
+### 2026-10-30：HTTP 入站转发 WebSocket Upgrade（L2，待维护者验收）
 
 - 基线：本地 `master` `7402e680ae41bb40a4301580310715f51a37e1a7`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。本轮不迁移参考实现。
 - HTTP 入站在既有 `CONNECT` 和普通请求之外，现识别含 `Upgrade` 且 `Connection` token 含 `upgrade` 的请求。使用启用 Hyper upgrade 的 HTTP/1.1 client connection 经 Dispatcher 建立上游连接；代理 absolute-form URI 转为 origin-form，并始终按 URI authority 重建 `Host`。代理认证头只用于本地认证，不会发给目标；升级请求/响应会移除 `Connection` 指定的逐跳头并重建 `Connection: Upgrade`。上游返回 101 后双向复制升级流；TCP 连接被拒绝时返回 502。
 - 新增 loopback WebSocket 回归：有效 101 握手、上游提前发送的未掩码文本帧、客户端掩码文本帧、服务端回帧，以及认证通过后代理凭据不外泄、伪造 Host 被 URI authority 覆盖、请求/响应逐跳字段清除和 TCP 拨号被拒时返回 502。`cargo test -p clash-lib --test connection_chain_tests --locked -- --test-threads=1` 为 5 passed；该 target 严格 Clippy、格式和 diff 检查通过。未访问公网或修改宿主网络。
-- TLS WebSocket 仍经现有 CONNECT 路径，本轮未新增其实现；未验证第三方服务端、长时升级连接或跨平台运行。独立 Reviewer 对修复后的最终 HTTP Upgrade diff 通过；该 L2 切片的维护者验收仍待确认最终 SHA。
+- TLS WebSocket 仍经现有 CONNECT 路径，本轮未新增其实现；未验证第三方服务端、长时升级连接或跨平台运行。独立 Reviewer 对修复后的最终 HTTP Upgrade diff 通过；维护者验收仍待确认最终 SHA `be68f4ea80383dc9bdf39f96e6c6e3296acf7ab3`。
 - 初次独立审查发现代理认证、Host 权威性和逐跳头边界问题；已在后续修复中逐项加入实现与回归检查。修复后的最终 diff 已由独立 Reviewer 复审通过。
 
 ### 2026-10-30：Windows 网络恢复只读观察器（L2，待平台验收）
@@ -943,4 +943,11 @@ lifecycle tests.
 - Windows 现在用 IP Helper 读取适配器地址、运行状态、按优先顺序排列的 DNS 服务器、连接/搜索后缀，以及 IPv4/IPv6 默认路由；按“路由 metric + 接口 metric”挑选主路由，等价路由保留为 ambiguous 证据。候选路径按 family interface index 绑定临时 UDP socket，仅证明本地地址/接口可以绑定，不发送探测包。每次快照最多绑定探测 128 个候选；阻塞采集使用单一 permit，若超过 2 秒，后续轮询等待该任务释放 permit，不再并行堆积工作。现有 TUN interface index/名称用于排除虚拟隧道路径。自动网络恢复状态因此在 Windows 也会进入观察阶段。
 - 新增 Windows 路由选择、等价路由、TUN/断开接口过滤、IPv6 interface index、默认路由解析、DNS 顺序/后缀变化和候选探测上限用例，以及只读实时快照用例。macOS 上 `app::network::tests::` 定向测试 17 passed；核心库无默认 feature 的 `ring,tun,port` 严格 Clippy、`cargo fmt --all` 和 `git diff --check` 通过。Windows GNU target 的最小独立 harness 使用 `windows 0.62` 对新增模块与测试做 `cargo check --tests`，通过；该 harness 不等同于完整 `clash-lib` target 构建。
 - 完整 `cargo check -p clash-lib --lib --tests --target x86_64-pc-windows-gnu --no-default-features --locked` 被本机缺少 MinGW C 工具链/Windows C 标准头文件阻断于 `zstd-sys`，尚未编译到完整 workspace 的 Windows target。Windows 代码没有在 Windows runner 或真实 Windows 机器运行；新增 live snapshot 测试也尚未执行。因此当前切片尚不能称为 Windows 跨平台验收完成，合入/推送前仍需完整 Windows CI，后续还需在真实多网卡/TUN 环境确认恢复行为。
-- 网络观察为 L2；最终 SHA 需要独立 Reviewer 和维护者验收。回滚方式是撤回本切片提交，恢复 Windows `AUTOMATIC_SUPPORTED=false` 及旧的 unsupported snapshot 路径；没有执行 push、release 或系统网络改动。
+- 网络观察为 L2；独立 Reviewer 已对最终 SHA `325d65c3dad44c8a86b44d671559643828613c9e` 复审通过，维护者验收仍待确认。回滚方式是撤回本切片提交，恢复 Windows `AUTOMATIC_SUPPORTED=false` 及旧的 unsupported snapshot 路径；没有执行 push、release 或系统网络改动。
+
+### 2026-10-30：V2Ray WebSocket 插件 Host 头大小写（L2）
+
+- 基线：本地 `master` `325d65c3dad44c8a86b44d671559643828613c9e`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；参考检出 `ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。仅修复本地 V2Ray WebSocket 插件 Host 默认逻辑，不迁移参考代码。
+- 原逻辑只识别大小写恰为 `Host` 的自定义头；使用合法的小写 `host` 时，又额外插入默认 Host，导致实际 WebSocket 握手带两个 Host 头。回归用例用本机 TCP 和 WebSocket 握手复现：修复前服务端收到两个 Host 值；修复后保留配置值、只发送一个 Host，并保留配置路径和 query。
+- `cargo test -p clash-lib --lib --no-default-features --features ring,ws proxy::transport::v2ray::websocket::tests::lowercase_host_header_is_preserved_without_duplicate --locked -j 6 -- --exact --nocapture`：修复前 1 failed，断言服务端观察到 2 个 Host；修复后 1 passed。`cargo test -p clash-lib --lib --no-default-features --features ring,ws,shadowsocks v2ray_plugin_ --locked -j 6 -- --nocapture`：7 passed；相同 feature 下库级严格 Clippy、格式和 diff 检查通过。
+- 测试只覆盖明文本机 WebSocket 握手；TLS 和第三方 V2Ray 插件互操作仍未验证。无外网访问、无系统网络修改。
