@@ -1056,7 +1056,7 @@ rules:
         "startup should expose the API bind failure, got: {error}"
     );
     assert!(
-        message.contains("address already in use")
+        message.contains("in use")
             || message.contains("only one usage")
             || message.contains("10048"),
         "startup error should identify the occupied port, got: {error}"

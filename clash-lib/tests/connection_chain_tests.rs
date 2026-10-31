@@ -1775,6 +1775,7 @@ rules:
         vec![api_port, socks_port],
     )
     .expect("failed to start SOCKS5 UDP refusal Explain client");
+    wait_for_initial_network_observation(api_port).await;
 
     // Snapshot prior decisions while keeping the proxy endpoint reserved.
     let existing_decisions = tokio::time::timeout(
