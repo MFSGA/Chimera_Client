@@ -65,7 +65,7 @@ fn queue_udp_packet_retry(
 const UDP_FLOW_DECISION_MAX: usize = 1024;
 const UDP_HEALTH_PROOF_MAX: usize = 256;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct DirectPathPlanningError {
     kind: std::io::ErrorKind,
     message: String,
@@ -1532,7 +1532,6 @@ impl Dispatcher {
                 let source = packet.src_addr.clone().must_into_socket_addr();
                 let mut path_selection = None;
                 let mut path_failure = None;
-                let mut path_failure_details = None;
                 let mut path_decision_cache_hit = false;
                 if let Some(family) = target_family {
                     let decision_key = UdpFlowDecisionKey {
@@ -1619,8 +1618,7 @@ impl Dispatcher {
                             }
                             Ok(None) => {}
                             Err(error) => {
-                                path_failure = Some(error.to_string());
-                                path_failure_details = Some(error);
+                                path_failure = Some(error);
                             }
                         }
                         outbound_handle_guard
@@ -1641,16 +1639,14 @@ impl Dispatcher {
                     connect_sess.destination = sess.destination.clone();
                 }
                 let outbound_dest = connect_sess.destination.clone();
-                if let Some(failure) = path_failure {
+                if let Some(planning_error) = path_failure {
                     let current_versions = explain_versions_from_status(
                         network_status.as_ref(),
                         packet_generation,
                     )
                     .await;
-                    let planning_error = path_failure_details.as_ref();
-                    let stale_plan = planning_error.is_some_and(|error| {
-                        current_versions.2 != error.network_generation
-                    });
+                    let stale_plan =
+                        current_versions.2 != planning_error.network_generation;
                     store_path_decision(
                         network_status.as_ref(),
                         crate::app::flow::PathDecisionRecord {
@@ -1659,15 +1655,7 @@ impl Dispatcher {
                             config_version_at_completion:
                                 (current_versions.0 != explain_versions_at_start.0)
                                     .then_some(current_versions.0),
-                            policy_version: planning_error.map_or_else(
-                                || {
-                                    path_selection.as_ref().map_or(
-                                        explain_versions_at_start.1,
-                                        |selection| selection.policy_generation,
-                                    )
-                                },
-                                |error| error.policy_generation,
-                            ),
+                            policy_version: planning_error.policy_generation,
                             network_version: current_versions.2,
                             operation_id: explain_versions_at_start.3,
                             outcome: if stale_plan {
@@ -1677,16 +1665,14 @@ impl Dispatcher {
                             },
                             route: explain_route.clone(),
                             destination: Some(sess.destination.to_string()),
-                            candidate_paths: planning_error
-                                .map_or_else(Vec::new, |error| error.candidate_paths.clone()),
+                            candidate_paths: planning_error.candidate_paths.clone(),
                             selected_path: None,
-                            rejected: planning_error
-                                .map_or_else(Vec::new, |error| error.rejected.clone()),
-                            failure_kind: planning_error.map(|error| error.kind().to_string()),
+                            rejected: planning_error.rejected.clone(),
+                            failure_kind: Some(planning_error.kind().to_string()),
                             reason: if stale_plan {
                                 "networkChangedDuringPathPlanning".to_owned()
                             } else {
-                                failure.clone()
+                                planning_error.to_string()
                             },
                             recorded_at_ms: chrono::Utc::now().timestamp_millis(),
                         },
@@ -1697,7 +1683,7 @@ impl Dispatcher {
                         source = %source,
                         orig_dest = %orig_dest,
                         resolved_dest = %sess.destination,
-                        error = %failure,
+                        error = %planning_error,
                         "dropping UDP packet because required network path is unavailable"
                     );
                     // A hard interface requirement is a property of the UDP
@@ -2616,7 +2602,7 @@ impl TimeoutUdpSessionManager {
         &self,
         key: UdpFlowDecisionKey,
         selection: Option<crate::app::flow::DirectPathSelection>,
-        failure: Option<String>,
+        failure: Option<DirectPathPlanningError>,
     ) {
         let mut map = self.map.write().await;
         map.refresh_generation(self.generation.load(Ordering::Acquire));
@@ -2676,7 +2662,7 @@ struct UdpFlowDecisionKey {
 #[derive(Clone, Debug)]
 struct CachedUdpPathDecision {
     selection: Option<crate::app::flow::DirectPathSelection>,
-    failure: Option<String>,
+    failure: Option<DirectPathPlanningError>,
     last_active: Instant,
 }
 
@@ -2830,7 +2816,7 @@ impl OutboundHandleMap {
         &mut self,
         key: UdpFlowDecisionKey,
         selection: Option<crate::app::flow::DirectPathSelection>,
-        failure: Option<String>,
+        failure: Option<DirectPathPlanningError>,
     ) {
         if self.2.len() >= UDP_FLOW_DECISION_MAX
             && !self.2.contains_key(&key)
@@ -2862,14 +2848,14 @@ impl OutboundHandleMap {
 #[cfg(test)]
 mod tests {
     use super::{
-        Dispatcher, OutboundDatagramPacket, OutboundHandleMap,
-        PendingUdpHealthProofs, RuntimeModeState, UDP_HEALTH_PROOF_MAX,
-        UDP_SESSION_IDLE, UdpFlowDecisionKey, capture_udp_health_proof,
-        classify_flow_end_reason, confirmed_udp_path, direct_udp_health_destination,
-        preferred_udp_path_address, queue_udp_packet_retry, reverse_lookup,
-        select_outbound_for_flow, should_track_global_selector,
-        try_queue_outbound_packet, udp_health_path, udp_path_cache_versions,
-        udp_path_selection_is_current,
+        DirectPathPlanningError, Dispatcher, OutboundDatagramPacket,
+        OutboundHandleMap, PendingUdpHealthProofs, RuntimeModeState,
+        UDP_HEALTH_PROOF_MAX, UDP_SESSION_IDLE, UdpFlowDecisionKey,
+        capture_udp_health_proof, classify_flow_end_reason, confirmed_udp_path,
+        direct_udp_health_destination, preferred_udp_path_address,
+        queue_udp_packet_retry, reverse_lookup, select_outbound_for_flow,
+        should_track_global_selector, try_queue_outbound_packet, udp_health_path,
+        udp_path_cache_versions, udp_path_selection_is_current,
     };
     use crate::{
         app::dns::{ClashResolver, MockClashResolver, ThreadSafeDNSResolver},
@@ -3668,22 +3654,38 @@ mod tests {
         other_family.target_family = Some(crate::app::flow::AddressFamily::Ipv6);
 
         map.insert_flow_decision(base.clone(), None, None);
-        map.insert_flow_decision(
-            other_user.clone(),
-            None,
-            Some("user-specific path rejection".to_string()),
-        );
+        let rejected_path = crate::app::flow::NetworkPathId {
+            interface: crate::app::flow::InterfaceId {
+                name: "en0".to_owned(),
+                index: 4,
+            },
+            family: crate::app::flow::AddressFamily::Ipv4,
+            source_address: Some("192.0.2.10".parse().unwrap()),
+            network_generation: 7,
+        };
+        let failure = DirectPathPlanningError {
+            kind: std::io::ErrorKind::PermissionDenied,
+            message: "required path is unavailable".to_owned(),
+            policy_generation: 3,
+            network_generation: 7,
+            candidate_paths: vec![rejected_path.clone()],
+            rejected: vec![crate::app::flow::CandidateRejection {
+                path: rejected_path,
+                reason:
+                    crate::app::flow::PathRejectionReason::RequiredIntentMismatch,
+                intent_index: Some(0),
+            }],
+        };
+        map.insert_flow_decision(other_user.clone(), None, Some(failure.clone()));
         map.insert_flow_decision(other_target.clone(), None, None);
         map.insert_flow_decision(other_family.clone(), None, None);
 
         assert_eq!(map.2.len(), 4);
         assert!(map.get_flow_decision(&base).unwrap().failure.is_none());
         assert_eq!(
-            map.get_flow_decision(&other_user)
-                .unwrap()
-                .failure
-                .as_deref(),
-            Some("user-specific path rejection")
+            map.get_flow_decision(&other_user).unwrap().failure,
+            Some(failure),
+            "cache hits must retain the Explain metadata and error kind"
         );
         assert!(map.get_flow_decision(&other_target).is_some());
         assert!(map.get_flow_decision(&other_family).is_some());
