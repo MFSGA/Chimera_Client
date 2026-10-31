@@ -807,6 +807,7 @@ impl Dispatcher {
                         crate::app::flow::PathExecutionOutcome::PathPlanningFailed
                     },
                     route: explain_route.clone(),
+                    destination: Some(sess.destination.to_string()),
                     candidate_paths: err.candidate_paths.clone(),
                     selected_path: None,
                     rejected: err.rejected.clone(),
@@ -932,6 +933,7 @@ impl Dispatcher {
                             operation_id: explain_versions_at_start.3,
                             outcome: crate::app::flow::PathExecutionOutcome::StaleNetworkDiscarded,
                             route: explain_route.clone(),
+                            destination: Some(sess.destination.to_string()),
                             candidate_paths: Vec::new(),
                             selected_path: None,
                             rejected: Vec::new(),
@@ -1017,6 +1019,7 @@ impl Dispatcher {
                     operation_id: explain_versions_at_start.3,
                     outcome: crate::app::flow::PathExecutionOutcome::Connected,
                     route: explain_route.clone(),
+                    destination: Some(sess.destination.to_string()),
                     candidate_paths,
                     selected_path: selected_explain_path,
                     rejected: selected_path
@@ -1203,6 +1206,7 @@ impl Dispatcher {
                         crate::app::flow::PathExecutionOutcome::DialFailed
                     },
                     route: explain_route,
+                    destination: Some(sess.destination.to_string()),
                     candidate_paths,
                     selected_path: None,
                     rejected,
@@ -1587,6 +1591,7 @@ impl Dispatcher {
                                         operation_id: explain_versions_at_start.3,
                                         outcome: crate::app::flow::PathExecutionOutcome::StaleNetworkDiscarded,
                                         route: explain_route.clone(),
+                                        destination: Some(sess.destination.to_string()),
                                         candidate_paths: Vec::new(),
                                         selected_path: None,
                                         rejected: Vec::new(),
@@ -1671,6 +1676,7 @@ impl Dispatcher {
                                 crate::app::flow::PathExecutionOutcome::PathPlanningFailed
                             },
                             route: explain_route.clone(),
+                            destination: Some(sess.destination.to_string()),
                             candidate_paths: planning_error
                                 .map_or_else(Vec::new, |error| error.candidate_paths.clone()),
                             selected_path: None,
@@ -1894,6 +1900,7 @@ impl Dispatcher {
                                             crate::app::flow::PathExecutionOutcome::DialFailed
                                         },
                                         route: explain_route.clone(),
+                                        destination: Some(sess.destination.to_string()),
                                         candidate_paths,
                                         selected_path: None,
                                         rejected,
@@ -1978,6 +1985,7 @@ impl Dispatcher {
                                     operation_id: explain_versions_at_start.3,
                                     outcome: crate::app::flow::PathExecutionOutcome::StaleNetworkDiscarded,
                                     route: explain_route.clone(),
+                                    destination: Some(sess.destination.to_string()),
                                     candidate_paths: Vec::new(),
                                     selected_path: observed_path_id.clone(),
                                     rejected: path_selection
@@ -2164,6 +2172,7 @@ impl Dispatcher {
                                     operation_id: explain_versions_at_start.3,
                                     outcome: crate::app::flow::PathExecutionOutcome::StaleNetworkDiscarded,
                                     route: explain_route.clone(),
+                                    destination: Some(sess.destination.to_string()),
                                     candidate_paths: Vec::new(),
                                     selected_path: udp_health_path(
                                         &outbound_name,
@@ -2226,6 +2235,7 @@ impl Dispatcher {
                                 operation_id: explain_versions_at_start.3,
                                 outcome: crate::app::flow::PathExecutionOutcome::Connected,
                                 route: explain_route.clone(),
+                                destination: Some(sess.destination.to_string()),
                                 candidate_paths,
                                 selected_path: selected_explain_path.clone(),
                                 rejected: path_selection

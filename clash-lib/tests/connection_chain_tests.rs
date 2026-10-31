@@ -406,6 +406,10 @@ async fn direct_tcp_flow_is_queryable_from_path_explain() {
         })
         .await
         .expect("DIRECT flow did not produce a connected Explain record");
+    assert_eq!(
+        connected_decision["destination"].as_str(),
+        Some(format!("127.0.0.1:{target_port}").as_str())
+    );
     let flow_ids = tracked_flow["flowIds"]
         .as_array()
         .expect("tracked DIRECT flow should expose IDs");
@@ -484,6 +488,10 @@ async fn direct_tcp_dial_failure_is_queryable_from_path_explain() {
     })
     .await
     .expect("DIRECT refusal did not produce a failed Explain record");
+    assert_eq!(
+        failed_decision["destination"].as_str(),
+        Some(format!("127.0.0.1:{target_port}").as_str())
+    );
     assert_eq!(failed_decision["selectedPath"], serde_json::Value::Null);
     assert!(
         failed_decision["failureKind"]

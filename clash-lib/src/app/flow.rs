@@ -272,6 +272,9 @@ pub struct PathDecisionRecord {
     pub operation_id: u64,
     pub outcome: PathExecutionOutcome,
     pub route: RouteDecision,
+    /// Logical destination associated with this connection attempt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
     pub candidate_paths: Vec<NetworkPathId>,
     pub selected_path: Option<NetworkPathId>,
     pub rejected: Vec<CandidateRejection>,
