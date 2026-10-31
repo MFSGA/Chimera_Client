@@ -1,6 +1,6 @@
 # 主机网络变化后的可用性迭代计划
 
-日期：2026-10-30。状态：B0–B6 已完成代码级与受控回归；B7 已接入代理端点 TCP/UDP、DNS socket 路径、多个代理协议的路径健康证据及连接池网络代际/PathId 管理，但远端代理互操作与完整 pooled transport 行为仍待验收。本轮以本机 SOCKS5、in-process Shadowsocks、TLS Trojan、AnyTLS 与 VLESS 服务端验证真实握手、应用请求/响应、回退获胜 PathId 及端点/目标健康证据关联。Hysteria2 QUIC/端口跳跃沿用 connector 选定路径；Relay 首跳 PathId 与活动/关闭 Flow 的本机 `networkPaths` 观测已接入，不代表代理服务器之后的远端转发路径。B8 的 DIRECT 与代理端点 TCP 有界多路径调度代码已接入；loopback 测试验证了首选源地址不匹配后的候选回退。B9 被动恢复防抖代码已完成。B10 Explain 覆盖 TCP/UDP 路径决策、拨号结果、旧网络结果丢弃与配置 reload 版本差异；运行时偏好/临时覆写 API、本机 UDP 恢复、Explain 记录单调时钟过期及过期查询处理已有定向回归；UDP 路径规划失败的缓存现保留完整结构化诊断上下文。其他代理路径 Explain 与完整 API 面仍待补充验证。默认 `clash-lib` 单元测试为 977 通过、12 忽略；全 Rust feature 单元测试为 1150 通过、12 忽略；Dashboard 外全 feature Clippy、格式与 diff 检查通过。Linux 快照与路径绑定观察尚未在 Linux 上验证；Windows IP Helper 自动观察代码已实现，但尚未完成完整 Windows target 构建、live snapshot 或实机换网验收。B11 的物理双网卡切换、route-all、休眠、资源趋势及恢复时间预算仍待专用环境验收。
+日期：2026-10-30。状态：B0–B6 已完成代码级与受控回归；B7 已接入代理端点 TCP/UDP、DNS socket 路径、多个代理协议的路径健康证据及连接池网络代际/PathId 管理，但远端代理互操作与完整 pooled transport 行为仍待验收。本轮以本机 SOCKS5、in-process Shadowsocks、TLS Trojan、AnyTLS 与 VLESS 服务端验证真实握手、应用请求/响应、回退获胜 PathId 及端点/目标健康证据关联。Hysteria2 QUIC/端口跳跃沿用 connector 选定路径；Relay 首跳 PathId 与活动/关闭 Flow 的本机 `networkPaths` 观测已接入，不代表代理服务器之后的远端转发路径。B8 的 DIRECT 与代理端点 TCP 有界多路径调度代码已接入；loopback 测试验证了首选源地址不匹配后的候选回退。B9 被动恢复防抖代码已完成。B10 Explain 覆盖 TCP/UDP 路径决策、拨号结果、旧网络结果丢弃与配置 reload 版本差异；运行时偏好/临时覆写 API、本机 UDP 恢复、Explain 记录单调时钟过期及过期查询处理已有定向回归；UDP 路径规划失败的缓存现保留完整结构化诊断上下文，并能识别网络/策略版本变化后作废的决策。其他代理路径 Explain 与完整 API 面仍待补充验证。默认 `clash-lib` 单元测试为 977 通过、12 忽略；全 Rust feature 单元测试最近一次为 1164 通过、11 忽略；Dashboard 外全 feature Clippy、格式与 diff 检查通过。Linux 快照与路径绑定观察尚未在 Linux 上验证；Windows IP Helper 自动观察代码已实现，但尚未完成完整 Windows target 构建、live snapshot 或实机换网验收。B11 的物理双网卡切换、route-all、休眠、资源趋势及恢复时间预算仍待专用环境验收。
 
 用户确认的目标：主机切换网卡或网络后，自动恢复新连接；已有连接尽力恢复，无法恢复时明确结束。典型场景包括 Wi-Fi ↔ 有线、同一网卡换 Wi-Fi/DHCP 地址、断网重连和休眠唤醒。服务恢复无需用户重启 Chimera、重新加载配置或手动调用 reset。
 
@@ -1019,12 +1019,12 @@ lifecycle tests.
 - `cargo test -p clash-lib --test connection_chain_tests --locked -j 6 direct_tcp_dial_failure_is_queryable_from_path_explain -- --exact --nocapture`：1 passed；`cargo test -p clash-lib --test connection_chain_tests --locked -j 6`：7 passed；`cargo clippy -p clash-lib --test connection_chain_tests --locked -j 6 -- -D warnings`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。测试仅用本机 loopback，不访问公网或更改宿主网络。
 - 本用例覆盖本机拒绝拨号下的 API 诊断闭环，不断言平台专属错误文案，也不代表第三方网卡路径、其他协议或真实换网的失败分类已覆盖。
 
-### 2026-10-30：Explain 记录显示逻辑目标地址（L2，独立审查通过，维护者验收待确认）
+### 2026-10-30：Explain 记录显示逻辑目标地址（L2，独立审查与维护者验收通过）
 
 - 基线：本地 `master` `b6b9c0eead54f5e04faaa1ad19278b4d6a9fe91e`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。本轮不修改参考实现。
 - `PathDecisionRecord` 增加可选 `destination`，Dispatcher 在 TCP/UDP 的 Explain 记录中从逻辑 `Session.destination` 填值；为 `None` 时跳过序列化，避免改变没有目标值的旧记录。Network Dashboard 在展开详情时显示目标，并对长地址换行；目标字段为诊断信息，不等同于代理端之后的最终出口，也不能作为可达性证明。
 - `connection_chain_tests` 的 DIRECT TCP 成功与拨号拒绝用例、`direct_udp_integration_tests` 的 DIRECT UDP 恢复用例均校验目标值；Explain 版本/过期回归同时断言 `None` 不输出该字段。已运行的定向结果：connection chain 7 passed、direct UDP integration 4 passed、path-decision 序列化/限额单测 1 passed；Dashboard lint/build、`cargo clippy -p clash-lib --all-targets --all-features --locked -j 6 -- -D warnings`、`cargo fmt --all -- --check` 与 `git diff --check` 均通过。浏览器用 loopback mock API 实际展开失败记录，确认 `127.0.0.1:54321` 显示在 DESTINATION 项。
-- 受控 UI 检查不连接真实核心、不访问公网或更改系统网络。跨平台真实换网、代理协议端到端诊断和目标隐私策略仍未由本项验证；目标地址沿用 Controller API 当前认证策略，只有配置非空 `secret` 时才要求鉴权。Reviewer 对 `5eae7f0398d5540ea6fd9dd634f4e3df219f8fd9` 审查通过，维护者验收待确认。非阻塞限制：本次断言使用字面 IPv4，尚无 fake-IP、域名目标或 UDP 拨号失败的独立目标值用例；UDP Explain 目标描述建立决策关联时的逻辑目标，不代表该关联后续每个数据报的目标。
+- 受控 UI 检查不连接真实核心、不访问公网或更改系统网络。跨平台真实换网、代理协议端到端诊断和目标隐私策略仍未由本项验证；目标地址沿用 Controller API 当前认证策略，只有配置非空 `secret` 时才要求鉴权。Reviewer 对 `5eae7f0398d5540ea6fd9dd634f4e3df219f8fd9` 审查通过；维护者已批准 `5eae7f0` 与最终 SHA `617f4d315de12c25d2ed2194e07230e06f52b35b`。非阻塞限制：本次断言使用字面 IPv4，尚无 fake-IP、域名目标或 UDP 拨号失败的独立目标值用例；UDP Explain 目标描述建立决策关联时的逻辑目标，不代表该关联后续每个数据报的目标。
 
 ### 2026-10-30：代理端点 TCP 拒绝的 Explain 诊断闭环（L2）
 
@@ -1046,18 +1046,25 @@ lifecycle tests.
 - 扩展 `proxy_endpoint_dial_refusal_is_queryable_with_logical_destination`：通过 SOCKS5 域名地址类型请求 `example.test:443`，将代理端点连接故意设为本机拒绝，并断言 Explain 列表和详情保留域名逻辑目标。失败发生在代理端点握手之前，不需要解析目标域名或访问公网；既有 DIRECT TCP 拒绝测试仍覆盖字面 IP 目标。
 - 定向测试与连接链全量测试均通过：前者 1 passed，后者 9 passed。目标地址字段当前已有域名和字面 IP 的 TCP 失败路径覆盖；fake-IP 经 TUN 反查后进入 Explain 的 API 集成路径仍未覆盖，UDP 目标字段也不代表关联期间每个数据报的目标。
 - 后续补充 `reverse_lookup_restores_domain_for_fake_ip`：resolver 返回映射时，fake-IP `198.18.0.11:8443` 转为 `mapped.example.test:8443`；原有映射缺失测试继续断言返回 `None`。`cargo test -p clash-lib --lib --locked -j 6 reverse_lookup_`：2 passed；`cargo clippy -p clash-lib --lib --locked -j 6 -- -D warnings`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。该单测验证反查转换，不验证 TUN ingress、Dispatcher 记录写入及 Explain HTTP API 的组合。
-- 本地改动未推送。`05344f6` 与当前 fake-IP 单测的完整区间独立审查通过；最终 SHA `405ebc6` 的维护者验收仍待确认。
+- 本地改动未推送。`05344f6` 与当前 fake-IP 单测的完整区间独立审查通过；最终 SHA `405ebc6392a094a207c56b36373ec5b0576851af` 已获维护者批准。
 
-### 2026-10-30：UDP 路径规划错误缓存保留 Explain 上下文（L2，独立审查与维护者验收待完成）
+### 2026-10-30：UDP 路径规划错误缓存保留 Explain 上下文（L2，独立审查通过，维护者验收已批准）
 
 - 基线：本地 `master` `6c44de6595176f70591d51e13d8322800dc42388`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。
 - UDP DIRECT 路径决策缓存原先只保存错误文本。首次遇到硬接口约束无法满足时，Explain 有错误类型、网络/策略版本、候选路径和拒绝理由；同一逻辑 UDP Flow 的后续数据报命中缓存时，这些结构化字段会丢失。缓存现改为保存可克隆的完整路径规划错误，Explain 对缓存命中和首次规划使用同一份上下文。
 - 回归单测 `udp_flow_decision_cache_is_scoped_to_target_and_inbound_user` 现验证带候选 PathId、拒绝类型、intent 索引、错误类型和版本的失败对象经缓存后完全保留。基线定向测试为 1 passed；修改后定向测试为 1 passed；`cargo test -p clash-lib --test direct_udp_integration_tests --locked -j 6` 为 4 passed；`cargo clippy -p clash-lib --lib --locked -j 6 -- -D warnings` 通过。格式与 diff 检查在文档更新后复核。
-- 此修复保留 Explain 诊断上下文，不改变 UDP 路由、路径约束、缓存键或转发行为；本轮没有构造真实网卡缺失/接口约束失败的端到端场景，也未验证其他平台网络恢复。独立 Reviewer 与维护者对最终 SHA 的验收待完成；没有 push、release 或标签操作。
+- 此修复保留 Explain 诊断上下文，不改变 UDP 路由、路径约束、缓存键或转发行为；本轮没有构造真实网卡缺失/接口约束失败的端到端场景，也未验证其他平台网络恢复。独立 Reviewer 对最终 SHA `c1f13e607c611258feafb6be9295ccdeb8c36f16` 审查 PASS；维护者已批准该 SHA。提交本地签名有效、信任未知（`%G?=U`）；没有 push、release 或标签操作。
+
+### 2026-10-30：策略变化时丢弃过期 UDP 路径规划失败（L2，独立审查与维护者验收待完成）
+
+- 基线：本地 `master` `c1f13e607c611258feafb6be9295ccdeb8c36f16`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；参考检出与上一节相同，未修改 `ref/`。
+- UDP 路径规划错误记录前现同时比较网络代次与策略代次。两者均未变时保留真实 `pathPlanningFailed`；网络或策略任一变化时记为新增 `staleDecisionDiscarded`，并在 `reason` 中区分网络变化、策略变化或两者变化。Network Dashboard 将此结果显示为失败状态，避免把过期决策当成当前路径仍不可用。
+- 新增纯函数回归覆盖版本未变、仅策略变化、仅网络变化、两者均变化四种情况；另验证新增 outcome 的 JSON wire 名为 `staleDecisionDiscarded`。定向 Rust 单测 1 passed，wire 名单测 1 passed；`cargo test -p clash-lib --test direct_udp_integration_tests --locked -j 6` 为 4 passed；全 feature 严格 Clippy、Dashboard `npm run lint`、`npm run build`、格式与 diff 检查通过。Build 保留既有 500 kB 主包体积告警。
+- 该项不改变路径选择或 UDP 转发，不增加重放；HTTP 响应 schema 仅增加一种 outcome 字符串。没有进行真实网络切换或跨平台运行。独立审查与维护者对最终 SHA 的验收待完成；没有 push、release 或标签操作。
 
 ### 2026-10-30：非 loopback API 安全失败通过 readiness 返回（L2）
 
 - 基线：本地 `master` `405ebc6392a094a207c56b36373ec5b0576851af`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；本项只增加集成覆盖与记录，不改变运行时代码。
 - 新增 `non_loopback_api_security_failures_are_reported_before_readiness`：以 `0.0.0.0` listener 分别验证缺少 secret、secret 存在但没有有效 CORS origins 时，`start_scaffold_instance` 返回具体安全错误；确认失败返回后该 wildcard API 地址可重新绑定。`ApiRunner` 当前是在 bind 后检查本地地址及安全策略，但在 `axum::serve` 前发送 readiness 失败并退出；inbound 尚未启动，因此本用例不声称覆盖 SOCKS listener 清理或绑定前拦截。
 - 定向 API 集成测试：1 passed；`cargo test -p clash-lib --test api_tests --locked -j 6`：12 passed；`cargo clippy -p clash-lib --test api_tests --locked -j 6 -- -D warnings`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。测试只短暂绑定测试端口，不处理 API 请求、不修改系统网络。
-- 独立审查与维护者验收待完成；本地工作，不包含推送授权。
+- 独立审查 PASS；维护者已批准 SHA `6c44de6595176f70591d51e13d8322800dc42388`。本地工作，不包含推送授权。
