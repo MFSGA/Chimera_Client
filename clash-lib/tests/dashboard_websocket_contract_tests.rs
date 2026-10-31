@@ -85,19 +85,19 @@ async fn first_json_message(api_port: u16, path: &str) -> serde_json::Value {
 async fn dashboard_websocket_payloads_match_typescript_models() {
     let (_clash, api_port) = start_client();
 
-    let traffic = first_json_message(api_port, "/ws/traffic?token=clash-rs").await;
+    let traffic = first_json_message(api_port, "/traffic?token=clash-rs").await;
     assert!(traffic["up"].is_u64());
     assert!(traffic["down"].is_u64());
 
     let connections =
-        first_json_message(api_port, "/ws/connections?token=clash-rs").await;
+        first_json_message(api_port, "/connections?token=clash-rs").await;
     assert!(connections["connections"].is_array());
     assert!(connections["downloadTotal"].is_u64());
     assert!(connections["uploadTotal"].is_u64());
     assert!(connections["memory"].is_u64());
 
     let flows =
-        first_json_message(api_port, "/ws/flows?token=clash-rs&interval=1&top=10")
+        first_json_message(api_port, "/flows?token=clash-rs&interval=1&top=10")
             .await;
     assert!(flows.is_array());
 }
@@ -106,7 +106,7 @@ async fn dashboard_websocket_payloads_match_typescript_models() {
 #[serial_test::serial]
 async fn dashboard_websocket_rejects_invalid_query_token() {
     let (_clash, api_port) = start_client();
-    let url = format!("ws://127.0.0.1:{api_port}/ws/traffic?token=invalid");
+    let url = format!("ws://127.0.0.1:{api_port}/traffic?token=invalid");
 
     match connect_async(url).await {
         Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
