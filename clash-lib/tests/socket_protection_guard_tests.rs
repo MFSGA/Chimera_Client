@@ -8,8 +8,10 @@ use syn::{
     visit::{self, Visit},
 };
 
-const TEST_ONLY_SOURCE_PREFIXES: &[&str] =
-    &["clash-lib/src/proxy/utils/test_utils/"];
+const TEST_ONLY_SOURCE_PREFIXES: &[&str] = &[
+    "clash-lib/src/proxy/utils/test_utils/",
+    "clash-lib/src/proxy/transport/xhttp/tests.rs",
+];
 
 #[derive(Clone, Copy)]
 enum ForbiddenCall {
