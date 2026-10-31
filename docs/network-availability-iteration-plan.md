@@ -1124,3 +1124,11 @@ lifecycle tests.
 - 新增 `proxy_endpoint_total_budget_includes_and_cancels_dns`：通过生产 `DirectConnector::connect_stream` 走代理端点拨号路径，注入挂起的 resolver，确认 DNS 纳入 5 秒 endpoint 总预算、返回 `TimedOut` 且 resolver future 已被取消。测试在 DNS 获取阶段终止，不创建 socket 或发送流量。
 - 定向测试在默认全 feature 与 `--no-default-features --features ring,tun,port` 下各 1 passed；全 feature 库测试 1170 passed、11 ignored；严格 Clippy、格式和 diff 检查通过。测试约耗时 5 秒，外层上限为 10 秒。
 - 该项补足 DIRECT 与代理端点的 DNS 预算分别验证；仍未覆盖真实 DNS 慢响应、代理 TCP 阶段超时与并发 hedge loser 清理，也不代表真实网络切换验收。独立审查与维护者验收结果随最终 SHA 交付记录。本地未推送。
+
+### 2026-10-30：DIRECT TCP hedge 获胜后取消未完成拨号（L2，独立审查与维护者验收待完成）
+
+- 基线：本地 `master` `728ae845badf6f8b4daba1eaf13fb1daa1ac7817`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。未修改参考实现。
+- 将 DIRECT TCP 的错峰并发尝试、快速失败推进、deadline 与首个成功结果选择抽成内部调度器，生产拨号仍使用原来的 120ms hedge、最多 2 并发、5 秒总预算和候选上限；成功返回时调度器释放剩余尝试集合，使未获胜 socket future 取消。
+- 新增三个调度器回归：`direct_tcp_winner_cancels_pending_hedged_attempt` 验证 loser future 在另一个尝试成功时被 drop；`direct_tcp_failure_starts_next_attempt_immediately` 验证快速失败不等待 hedge；`direct_tcp_deadline_cancels_attempts_at_parallel_limit` 验证并发不超过 2 且 deadline 释放挂起 future。执行 `cargo test -p clash-lib --lib --all-features --locked -j 6 direct_tcp_ -- --nocapture` 与 `cargo test -p clash-lib --lib --no-default-features --features ring,tun,port --locked -j 6 direct_tcp_ -- --nocapture`，两者均 5 passed；全 feature 库测试 1173 passed、11 ignored。
+- `cargo clippy -p clash-lib --all-targets --all-features --locked -j 6 -- -D warnings`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。定向测试只使用可控 future 和已有 loopback 测试；本次三个新测试不创建 socket。
+- 测试验证生产共用的调度逻辑和 future 取消边界，不创建真实 socket，不覆盖真实网络中的 connect 取消时序、并发切网或跨平台行为。无 push、release 或标签操作；签名提交及独立审查/维护者验收结果待最终 SHA 确认。
