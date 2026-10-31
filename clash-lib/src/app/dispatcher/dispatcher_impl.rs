@@ -116,6 +116,34 @@ fn classify_path_planning_failure(
     )
 }
 
+fn rule_interface_failure_record(
+    flow_id: uuid::Uuid,
+    versions_at_start: (u64, u64, u64, u64),
+    versions_at_failure: (u64, u64, u64, u64),
+    route: crate::app::flow::RouteDecision,
+    destination: &SocksAddr,
+    reason: String,
+) -> crate::app::flow::PathDecisionRecord {
+    crate::app::flow::PathDecisionRecord {
+        flow_id,
+        config_version: versions_at_start.0,
+        config_version_at_completion: (versions_at_failure.0 != versions_at_start.0)
+            .then_some(versions_at_failure.0),
+        policy_version: versions_at_failure.1,
+        network_version: versions_at_failure.2,
+        operation_id: versions_at_start.3,
+        outcome: crate::app::flow::PathExecutionOutcome::PathPlanningFailed,
+        route,
+        destination: Some(destination.to_string()),
+        candidate_paths: Vec::new(),
+        selected_path: None,
+        rejected: Vec::new(),
+        failure_kind: Some("ruleInterfaceResolutionFailed".to_owned()),
+        reason,
+        recorded_at_ms: chrono::Utc::now().timestamp_millis(),
+    }
+}
+
 /// Resolve the outbound selected by routing without silently changing the
 /// user's routing policy. DIRECT is only used when explicitly selected by
 /// a rule, active group member, or Direct mode; missing names fail closed.
@@ -717,24 +745,37 @@ impl Dispatcher {
             RunMode::Direct => (PROXY_DIRECT, None),
         };
 
-        if let Err(err) = crate::app::router::apply_rule_interface(
-            &mut sess,
-            rule.map(Box::as_ref),
-        )
-        .await
-        {
-            warn!(error = %err, "rule-selected interface unavailable; closing TCP flow");
-            let _ = lhs.shutdown().await;
-            return;
-        }
-
         let rule_summary = rule_summary(rule.map(Box::as_ref));
+        // Create the Explain context before enforcing a rule-bound interface
+        // so fail-closed resolution errors remain visible to the caller.
         let explain_flow_id = uuid::Uuid::new_v4();
         let explain_versions_at_start = self.explain_versions().await;
         let explain_route = crate::app::flow::RouteDecision {
             outbound: outbound_name.to_owned(),
             rule: Some(rule_summary.clone()),
         };
+
+        if let Err(err) = crate::app::router::apply_rule_interface(
+            &mut sess,
+            rule.map(Box::as_ref),
+        )
+        .await
+        {
+            let versions_at_failure = self.explain_versions().await;
+            self.record_path_decision(rule_interface_failure_record(
+                explain_flow_id,
+                explain_versions_at_start,
+                versions_at_failure,
+                explain_route,
+                &sess.destination,
+                err.to_string(),
+            ))
+            .await;
+            warn!(error = %err, "rule-selected interface unavailable; closing TCP flow");
+            let _ = lhs.shutdown().await;
+            return;
+        }
+
         debug!("dispatching {} to {}[{}]", sess, outbound_name, mode);
 
         let mgr = self.outbound_manager.clone();
@@ -1364,27 +1405,48 @@ impl Dispatcher {
                     RunMode::Direct => (PROXY_DIRECT, None),
                 };
 
-                if let Err(err) = crate::app::router::apply_rule_interface(
-                    &mut sess,
-                    rule.map(Box::as_ref),
-                )
-                .await
-                {
-                    warn!(error = %err, "rule-selected interface unavailable; ending UDP association");
-                    break;
-                }
-
-                let requested_outbound_name = outbound_name.to_string();
-
-                // Explain uses one ID for this UDP association attempt. On a
-                // successful first packet, the same ID is attached to the
-                // TrackedDatagram so `/flows` and Explain can be joined.
+                let rule_summary = rule_summary(rule.map(Box::as_ref));
+                // A rejected UDP association also needs an Explain record;
+                // successful associations reuse this ID in TrackedDatagram.
                 let explain_flow_id = uuid::Uuid::new_v4();
                 let explain_versions_at_start = explain_versions_from_status(
                     network_status.as_ref(),
                     packet_generation,
                 )
                 .await;
+                let requested_route = crate::app::flow::RouteDecision {
+                    outbound: outbound_name.to_owned(),
+                    rule: Some(rule_summary.clone()),
+                };
+
+                if let Err(err) = crate::app::router::apply_rule_interface(
+                    &mut sess,
+                    rule.map(Box::as_ref),
+                )
+                .await
+                {
+                    let versions_at_failure = explain_versions_from_status(
+                        network_status.as_ref(),
+                        packet_generation,
+                    )
+                    .await;
+                    store_path_decision(
+                        network_status.as_ref(),
+                        rule_interface_failure_record(
+                            explain_flow_id,
+                            explain_versions_at_start,
+                            versions_at_failure,
+                            requested_route,
+                            &sess.destination,
+                            err.to_string(),
+                        ),
+                    )
+                    .await;
+                    warn!(error = %err, "rule-selected interface unavailable; ending UDP association");
+                    break;
+                }
+
+                let requested_outbound_name = outbound_name.to_string();
 
                 let remote_receiver_w = remote_receiver_w.clone();
 
@@ -1463,7 +1525,6 @@ impl Dispatcher {
                     selected.effective_name
                 };
 
-                let rule_summary = rule_summary(rule.map(Box::as_ref));
                 let explain_route = crate::app::flow::RouteDecision {
                     outbound: outbound_name.clone(),
                     rule: Some(rule_summary.clone()),

@@ -1,6 +1,6 @@
 # 主机网络变化后的可用性迭代计划
 
-日期：2026-10-30。状态：B0–B6 已完成代码级与受控回归；B7 已接入代理端点 TCP/UDP、DNS socket 路径、多个代理协议的路径健康证据及连接池网络代际/PathId 管理，但远端代理互操作与完整 pooled transport 行为仍待验收。本轮以本机 SOCKS5、in-process Shadowsocks、TLS Trojan、AnyTLS 与 VLESS 服务端验证真实握手、应用请求/响应、回退获胜 PathId 及端点/目标健康证据关联。Hysteria2 QUIC/端口跳跃沿用 connector 选定路径；Relay 首跳 PathId 与活动/关闭 Flow 的本机 `networkPaths` 观测已接入，不代表代理服务器之后的远端转发路径。B8 的 DIRECT 与代理端点 TCP 有界多路径调度代码已接入；loopback 测试验证了首选源地址不匹配后的候选回退。B9 被动恢复防抖代码已完成。B10 Explain 覆盖 TCP/UDP 路径决策、拨号结果、旧网络结果丢弃与配置 reload 版本差异；运行时偏好/临时覆写 API、本机 UDP 恢复、Explain 记录单调时钟过期及过期查询处理已有定向回归；UDP 路径规划失败的缓存现保留完整结构化诊断上下文，并能识别网络/策略版本变化后作废的决策。其他代理路径 Explain 与完整 API 面仍待补充验证。默认 `clash-lib` 单元测试为 977 通过、12 忽略；全 Rust feature 单元测试最近一次为 1164 通过、11 忽略；Dashboard 外全 feature Clippy、格式与 diff 检查通过。Linux 快照与路径绑定观察尚未在 Linux 上验证；Windows IP Helper 自动观察代码已实现，但尚未完成完整 Windows target 构建、live snapshot 或实机换网验收。B11 的物理双网卡切换、route-all、休眠、资源趋势及恢复时间预算仍待专用环境验收。
+日期：2026-10-30。状态：B0–B6 已完成代码级与受控回归；B7 已接入代理端点 TCP/UDP、DNS socket 路径、多个代理协议的路径健康证据及连接池网络代际/PathId 管理，但远端代理互操作与完整 pooled transport 行为仍待验收。本轮以本机 SOCKS5、in-process Shadowsocks、TLS Trojan、AnyTLS 与 VLESS 服务端验证真实握手、应用请求/响应、回退获胜 PathId 及端点/目标健康证据关联。Hysteria2 QUIC/端口跳跃沿用 connector 选定路径；Relay 首跳 PathId 与活动/关闭 Flow 的本机 `networkPaths` 观测已接入，不代表代理服务器之后的远端转发路径。B8 的 DIRECT 与代理端点 TCP 有界多路径调度代码已接入；loopback 测试验证了首选源地址不匹配后的候选回退。B9 被动恢复防抖代码已完成。B10 Explain 覆盖 TCP/UDP 路径决策、拨号结果、旧网络结果丢弃与配置 reload 版本差异；运行时偏好/临时覆写 API、本机 UDP 恢复、Explain 记录单调时钟过期及过期查询处理已有定向回归；UDP 路径规划失败的缓存现保留完整结构化诊断上下文，并能识别网络/策略版本变化后作废的决策；规则要求的网卡无法解析时，TCP/UDP 也会生成 Explain 失败记录。其他代理路径 Explain 与完整 API 面仍待补充验证。默认 `clash-lib` 单元测试为 977 通过、12 忽略；全 Rust feature 单元测试最近一次为 1164 通过、11 忽略；Dashboard 外全 feature Clippy、格式与 diff 检查通过。Linux 快照与路径绑定观察尚未在 Linux 上验证；Windows IP Helper 自动观察代码已实现，但尚未完成完整 Windows target 构建、live snapshot 或实机换网验收。B11 的物理双网卡切换、route-all、休眠、资源趋势及恢复时间预算仍待专用环境验收。
 
 用户确认的目标：主机切换网卡或网络后，自动恢复新连接；已有连接尽力恢复，无法恢复时明确结束。典型场景包括 Wi-Fi ↔ 有线、同一网卡换 Wi-Fi/DHCP 地址、断网重连和休眠唤醒。服务恢复无需用户重启 Chimera、重新加载配置或手动调用 reset。
 
@@ -1055,12 +1055,12 @@ lifecycle tests.
 - 回归单测 `udp_flow_decision_cache_is_scoped_to_target_and_inbound_user` 现验证带候选 PathId、拒绝类型、intent 索引、错误类型和版本的失败对象经缓存后完全保留。基线定向测试为 1 passed；修改后定向测试为 1 passed；`cargo test -p clash-lib --test direct_udp_integration_tests --locked -j 6` 为 4 passed；`cargo clippy -p clash-lib --lib --locked -j 6 -- -D warnings` 通过。格式与 diff 检查在文档更新后复核。
 - 此修复保留 Explain 诊断上下文，不改变 UDP 路由、路径约束、缓存键或转发行为；本轮没有构造真实网卡缺失/接口约束失败的端到端场景，也未验证其他平台网络恢复。独立 Reviewer 对最终 SHA `c1f13e607c611258feafb6be9295ccdeb8c36f16` 审查 PASS；维护者已批准该 SHA。提交本地签名有效、信任未知（`%G?=U`）；没有 push、release 或标签操作。
 
-### 2026-10-30：策略变化时丢弃过期 UDP 路径规划失败（L2，独立审查与维护者验收待完成）
+### 2026-10-30：策略变化时丢弃过期 UDP 路径规划失败（L2，独立审查通过，维护者已验收）
 
 - 基线：本地 `master` `c1f13e607c611258feafb6be9295ccdeb8c36f16`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；参考检出与上一节相同，未修改 `ref/`。
 - UDP 路径规划错误记录前现同时比较网络代次与策略代次。两者均未变时保留真实 `pathPlanningFailed`；网络或策略任一变化时记为新增 `staleDecisionDiscarded`，并在 `reason` 中区分网络变化、策略变化或两者变化。Network Dashboard 将此结果显示为失败状态，避免把过期决策当成当前路径仍不可用。
 - 新增纯函数回归覆盖版本未变、仅策略变化、仅网络变化、两者均变化四种情况；另验证新增 outcome 的 JSON wire 名为 `staleDecisionDiscarded`。定向 Rust 单测 1 passed，wire 名单测 1 passed；`cargo test -p clash-lib --test direct_udp_integration_tests --locked -j 6` 为 4 passed；全 feature 严格 Clippy、Dashboard `npm run lint`、`npm run build`、格式与 diff 检查通过。Build 保留既有 500 kB 主包体积告警。
-- 该项不改变路径选择或 UDP 转发，不增加重放；HTTP 响应 schema 仅增加一种 outcome 字符串。没有进行真实网络切换或跨平台运行。独立审查与维护者对最终 SHA 的验收待完成；没有 push、release 或标签操作。
+- 该项不改变路径选择或 UDP 转发，不增加重放；HTTP 响应 schema 仅增加一种 outcome 字符串。没有进行真实网络切换或跨平台运行。独立审查 PASS；维护者已批准最终 SHA `442353f43ffb3028b5c2e3bc4bbaeb3abee3a1ee`。没有 push、release 或标签操作。
 
 ### 2026-10-30：非 loopback API 安全失败通过 readiness 返回（L2）
 
@@ -1068,3 +1068,10 @@ lifecycle tests.
 - 新增 `non_loopback_api_security_failures_are_reported_before_readiness`：以 `0.0.0.0` listener 分别验证缺少 secret、secret 存在但没有有效 CORS origins 时，`start_scaffold_instance` 返回具体安全错误；确认失败返回后该 wildcard API 地址可重新绑定。`ApiRunner` 当前是在 bind 后检查本地地址及安全策略，但在 `axum::serve` 前发送 readiness 失败并退出；inbound 尚未启动，因此本用例不声称覆盖 SOCKS listener 清理或绑定前拦截。
 - 定向 API 集成测试：1 passed；`cargo test -p clash-lib --test api_tests --locked -j 6`：12 passed；`cargo clippy -p clash-lib --test api_tests --locked -j 6 -- -D warnings`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。测试只短暂绑定测试端口，不处理 API 请求、不修改系统网络。
 - 独立审查 PASS；维护者已批准 SHA `6c44de6595176f70591d51e13d8322800dc42388`。本地工作，不包含推送授权。
+
+### 2026-10-30：规则指定网卡不可用时记录 TCP/UDP Explain（L2，独立审查与维护者验收待完成）
+
+- 基线：本地 `master` `442353f43ffb3028b5c2e3bc4bbaeb3abee3a1ee`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。
+- TCP 和 UDP Dispatcher 现先创建 Explain 上下文，再执行规则接口解析；解析失败时写入 `pathPlanningFailed`，包含路由、逻辑目标、`ruleInterfaceResolutionFailed` 和底层错误文本。未解析出具体路径时 `candidatePaths` 为空、`selectedPath` 为 null。连接继续按原有 fail-closed 行为关闭，不回退默认网卡。
+- 新增 `unavailable_rule_interface_is_queryable_for_tcp_and_udp`，用不存在的命名接口在真实本机 SOCKS5 TCP、UDP 会话上验证 Explain 列表和单条详情，并确认 TCP 在既有 SOCKS 响应后关闭。定向测试 1 passed；`cargo test -p clash-lib --test connection_chain_tests --locked -j 6`：10 passed；`cargo test -p clash-lib --test direct_udp_integration_tests --locked -j 6`：4 passed；全 feature 严格 Clippy、`cargo fmt --all -- --check` 和 `git diff --check` 通过。
+- 测试只使用 loopback 和临时端口，没有改系统网络；没有验证 Linux/Windows 的网卡枚举差异或真实换网。独立 Reviewer 与维护者对最终 SHA 的验收待完成；没有 push、release 或标签操作。

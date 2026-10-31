@@ -14,7 +14,7 @@ use tokio::{
 
 mod common;
 
-use common::{ClashInstance, send_http_request};
+use common::{ClashInstance, Socks5UdpSession, send_http_request};
 
 fn available_port() -> u16 {
     StdTcpListener::bind("127.0.0.1:0")
@@ -124,6 +124,30 @@ async fn get_api_json(api_port: u16, path: &str) -> serde_json::Value {
         .expect("failed to collect API GET response")
         .to_bytes();
     serde_json::from_slice(&body).expect("failed to parse API GET JSON")
+}
+
+async fn wait_for_rule_interface_failure(
+    api_port: u16,
+    destination: &str,
+) -> serde_json::Value {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let decisions =
+                get_api_json(api_port, "/runtime/network/path-decisions").await;
+            if let Some(decision) = decisions.as_array().and_then(|records| {
+                records.iter().find(|decision| {
+                    decision["outcome"] == "pathPlanningFailed"
+                        && decision["failureKind"] == "ruleInterfaceResolutionFailed"
+                        && decision["destination"] == destination
+                })
+            }) {
+                break decision.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("rule interface resolution failure was not recorded in Explain")
 }
 
 async fn socks5_connect_with_status(
@@ -555,6 +579,122 @@ async fn direct_tcp_dial_failure_is_queryable_from_path_explain() {
     .await
     .expect("timed out querying the failed DIRECT Explain detail");
     assert_eq!(detail, failed_decision);
+}
+
+#[cfg(feature = "tun")]
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn unavailable_rule_interface_is_queryable_for_tcp_and_udp() {
+    let api_port = available_port();
+    let socks_port = available_port();
+    let tcp_target = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to reserve local TCP target");
+    let tcp_target_port = tcp_target.local_addr().unwrap().port();
+    let udp_target = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("failed to reserve local UDP target");
+    let udp_target_port = udp_target.local_addr().unwrap().port();
+    let missing_interface = "chimera-missing-egress-test-iface";
+    let config = format!(
+        r#"allow-lan: false
+bind-address: 127.0.0.1
+socks-port: {socks_port}
+mode: rule
+log-level: error
+mmdb: null
+external-controller: 127.0.0.1:{api_port}
+secret: clash-rs
+tun:
+  enable: false
+rules:
+  - MATCH,DIRECT,interface={missing_interface}
+"#
+    );
+    let cwd =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
+    let _clash = ClashInstance::start(
+        Options {
+            config: Config::Str(config),
+            cwd: Some(cwd.to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            config_path: None,
+        },
+        vec![api_port, socks_port],
+    )
+    .expect("failed to start rule-interface Explain client");
+
+    let (mut tcp_stream, reply_status) =
+        socks5_connect_with_status(socks_port, tcp_target_port).await;
+    assert_eq!(
+        reply_status, 0x00,
+        "SOCKS5 should preserve its existing pre-dispatch success reply"
+    );
+    let mut byte = [0u8; 1];
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), tcp_stream.read(&mut byte))
+            .await
+            .expect("TCP stream did not close after the interface failure")
+            .expect("failed to read closed TCP flow"),
+        0,
+        "the rejected TCP flow should close without reaching its target"
+    );
+    let tcp_destination = format!("127.0.0.1:{tcp_target_port}");
+    let tcp_decision =
+        wait_for_rule_interface_failure(api_port, &tcp_destination).await;
+    assert_eq!(tcp_decision["route"]["outbound"], "DIRECT");
+    assert!(
+        tcp_decision["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(missing_interface))
+    );
+    assert!(
+        tcp_decision["candidatePaths"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(tcp_decision["selectedPath"].is_null());
+    let tcp_flow_id = tcp_decision["flowId"].as_str().unwrap();
+    assert_eq!(
+        get_api_json(
+            api_port,
+            &format!("/runtime/network/path-decision/{tcp_flow_id}"),
+        )
+        .await,
+        tcp_decision
+    );
+
+    let udp_client = Socks5UdpSession::connect(socks_port).await;
+    udp_client
+        .send_ipv4(b"unavailable-egress", [127, 0, 0, 1], udp_target_port)
+        .await;
+    let udp_destination = format!("127.0.0.1:{udp_target_port}");
+    let udp_decision =
+        wait_for_rule_interface_failure(api_port, &udp_destination).await;
+    assert_eq!(udp_decision["route"]["outbound"], "DIRECT");
+    assert!(
+        udp_decision["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(missing_interface))
+    );
+    assert!(
+        udp_decision["candidatePaths"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(udp_decision["selectedPath"].is_null());
+    let udp_flow_id = udp_decision["flowId"].as_str().unwrap();
+    assert_eq!(
+        get_api_json(
+            api_port,
+            &format!("/runtime/network/path-decision/{udp_flow_id}"),
+        )
+        .await,
+        udp_decision
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
