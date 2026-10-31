@@ -977,12 +977,16 @@ rules:
         .filter_map(|decision| decision["flowId"].as_str().map(str::to_owned))
         .collect::<Vec<_>>();
 
-    let (mut stream, _reply_status) = tokio::time::timeout(
+    let (mut stream, reply_status) = tokio::time::timeout(
         Duration::from_secs(5),
         socks5_connect_with_status(socks_port, 80),
     )
     .await
     .expect("timed out during local SOCKS5 CONNECT");
+    assert_eq!(
+        reply_status, 0x00,
+        "SOCKS5 should preserve the reference success response before dispatch"
+    );
     let mut response_payload = Vec::new();
     tokio::time::timeout(
         Duration::from_secs(5),
