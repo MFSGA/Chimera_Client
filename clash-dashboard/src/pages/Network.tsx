@@ -481,36 +481,71 @@ function DecisionsTable({ records }: { records: NetworkPathDecisionRecord[] }) {
               <td className="min-w-56 px-4 py-3" style={{ color: 'var(--color-text-primary)' }}>{pathLabel(record.selectedPath)}</td>
               <td className="max-w-md px-4 py-3" style={{ color: record.failureKind ? '#ff3b30' : 'var(--color-text-secondary)' }}>
                 {record.failureKind ? `${record.failureKind}: ` : ''}{record.reason}
-                {((record.candidatePaths?.length ?? 0) > 0 || (record.rejected?.length ?? 0) > 0) && (
-                  <details className="mt-2">
-                    <summary className="cursor-pointer select-none text-[12px]" style={{ color: '#0071e3' }}>
-                      Path explanation ({record.candidatePaths?.length ?? 0} candidates, {record.rejected?.length ?? 0} rejected)
-                    </summary>
-                    <div className="mt-2 space-y-2 rounded-lg p-3" style={{ background: 'var(--color-fill-subtle)' }}>
-                      <div>
-                        <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide">Candidate paths</div>
-                        {record.candidatePaths?.length ? (
-                          <ul className="space-y-1">
-                            {(record.candidatePaths ?? []).map((path) => <li key={pathKey(path)}>{pathLabel(path)}</li>)}
-                          </ul>
-                        ) : <div>No path candidate was recorded.</div>}
+                <details className="mt-2">
+                  <summary className="cursor-pointer select-none text-[12px]" style={{ color: '#0071e3' }}>
+                    Decision details
+                  </summary>
+                  <div className="mt-2 space-y-3 rounded-lg p-3" style={{ background: 'var(--color-fill-subtle)' }}>
+                    <dl className="grid gap-x-3 gap-y-2 sm:grid-cols-2">
+                      <div className="min-w-0">
+                        <dt className="text-[11px] font-semibold uppercase tracking-wide">Flow ID</dt>
+                        <dd className="mt-0.5 break-all font-mono text-[11px]">{record.flowId}</dd>
                       </div>
-                      {(record.rejected?.length ?? 0) > 0 && (
-                        <div>
-                          <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide">Rejected paths</div>
-                          <ul className="space-y-1">
-                            {(record.rejected ?? []).map((rejection) => (
-                              <li key={`${pathKey(rejection.path)}-${rejection.reason}-${rejection.intentIndex ?? 'none'}`}>
-                                {pathLabel(rejection.path)} — {phaseLabel(rejection.reason)}
-                                {rejection.intentIndex == null ? '' : ` (preference ${rejection.intentIndex + 1})`}
-                              </li>
-                            ))}
-                          </ul>
+                      <div>
+                        <dt className="text-[11px] font-semibold uppercase tracking-wide">Operation</dt>
+                        <dd className="mt-0.5">{record.operationId}</dd>
+                      </div>
+                      <div>
+                        <dt className="text-[11px] font-semibold uppercase tracking-wide">Configuration version</dt>
+                        <dd className="mt-0.5">
+                          {record.configVersionAtCompletion == null
+                            ? record.configVersion
+                            : `${record.configVersion} → ${record.configVersionAtCompletion}`}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt className="text-[11px] font-semibold uppercase tracking-wide">Network / policy version</dt>
+                        <dd className="mt-0.5">{record.networkVersion} / {record.policyVersion}</dd>
+                      </div>
+                    </dl>
+                    {record.configVersionAtCompletion != null
+                      && record.configVersionAtCompletion !== record.configVersion && (
+                        <div role="status" className="rounded-md px-2 py-1.5 text-[12px]" style={{ background: 'rgba(255,149,0,0.1)', color: '#b55b00' }}>
+                          The connection completed after the configuration changed. The recorded route reflects configuration version {record.configVersion}.
                         </div>
                       )}
-                    </div>
-                  </details>
-                )}
+                    {((record.candidatePaths?.length ?? 0) > 0 || (record.rejected?.length ?? 0) > 0) && (
+                      <div>
+                        <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide">
+                          Path explanation ({record.candidatePaths?.length ?? 0} candidates, {record.rejected?.length ?? 0} rejected)
+                        </div>
+                        <div className="space-y-2">
+                          <div>
+                            <div className="mb-1 text-[11px] font-semibold">Candidate paths</div>
+                            {record.candidatePaths?.length ? (
+                              <ul className="space-y-1">
+                                {(record.candidatePaths ?? []).map((path) => <li key={pathKey(path)}>{pathLabel(path)}</li>)}
+                              </ul>
+                            ) : <div>No path candidate was recorded.</div>}
+                          </div>
+                          {(record.rejected?.length ?? 0) > 0 && (
+                            <div>
+                              <div className="mb-1 text-[11px] font-semibold">Rejected paths</div>
+                              <ul className="space-y-1">
+                                {(record.rejected ?? []).map((rejection) => (
+                                  <li key={`${pathKey(rejection.path)}-${rejection.reason}-${rejection.intentIndex ?? 'none'}`}>
+                                    {pathLabel(rejection.path)} — {phaseLabel(rejection.reason)}
+                                    {rejection.intentIndex == null ? '' : ` (preference ${rejection.intentIndex + 1})`}
+                                  </li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </details>
               </td>
             </tr>
           ))}
