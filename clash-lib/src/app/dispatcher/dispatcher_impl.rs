@@ -116,14 +116,16 @@ fn classify_path_planning_failure(
     )
 }
 
-fn rule_interface_failure_record(
+fn dispatch_failure_record(
     flow_id: uuid::Uuid,
     versions_at_start: (u64, u64, u64, u64),
     versions_at_failure: (u64, u64, u64, u64),
     route: crate::app::flow::RouteDecision,
     destination: &SocksAddr,
+    failure_kind: &str,
     reason: String,
 ) -> crate::app::flow::PathDecisionRecord {
+    let decision_became_stale = versions_at_failure != versions_at_start;
     crate::app::flow::PathDecisionRecord {
         flow_id,
         config_version: versions_at_start.0,
@@ -132,13 +134,17 @@ fn rule_interface_failure_record(
         policy_version: versions_at_failure.1,
         network_version: versions_at_failure.2,
         operation_id: versions_at_start.3,
-        outcome: crate::app::flow::PathExecutionOutcome::PathPlanningFailed,
+        outcome: if decision_became_stale {
+            crate::app::flow::PathExecutionOutcome::StaleDecisionDiscarded
+        } else {
+            crate::app::flow::PathExecutionOutcome::PathPlanningFailed
+        },
         route,
         destination: Some(destination.to_string()),
         candidate_paths: Vec::new(),
         selected_path: None,
         rejected: Vec::new(),
-        failure_kind: Some("ruleInterfaceResolutionFailed".to_owned()),
+        failure_kind: Some(failure_kind.to_owned()),
         reason,
         recorded_at_ms: chrono::Utc::now().timestamp_millis(),
     }
@@ -762,12 +768,13 @@ impl Dispatcher {
         .await
         {
             let versions_at_failure = self.explain_versions().await;
-            self.record_path_decision(rule_interface_failure_record(
+            self.record_path_decision(dispatch_failure_record(
                 explain_flow_id,
                 explain_versions_at_start,
                 versions_at_failure,
                 explain_route,
                 &sess.destination,
+                "ruleInterfaceResolutionFailed",
                 err.to_string(),
             ))
             .await;
@@ -787,6 +794,17 @@ impl Dispatcher {
         {
             Ok(Some(selected)) => selected,
             Ok(None) => {
+                let versions_at_failure = self.explain_versions().await;
+                self.record_path_decision(dispatch_failure_record(
+                    explain_flow_id,
+                    explain_versions_at_start,
+                    versions_at_failure,
+                    explain_route.clone(),
+                    &sess.destination,
+                    "outboundNotFound",
+                    format!("configured outbound `{outbound_name}` is missing"),
+                ))
+                .await;
                 warn!(
                     requested_outbound = outbound_name,
                     "configured outbound is missing; closing TCP flow without DIRECT fallback"
@@ -795,6 +813,17 @@ impl Dispatcher {
                 return;
             }
             Err(error) => {
+                let versions_at_failure = self.explain_versions().await;
+                self.record_path_decision(dispatch_failure_record(
+                    explain_flow_id,
+                    explain_versions_at_start,
+                    versions_at_failure,
+                    explain_route.clone(),
+                    &sess.destination,
+                    "outboundLookupFailed",
+                    error.to_string(),
+                ))
+                .await;
                 warn!(requested_outbound = outbound_name, error = %error, "could not select outbound; closing flow");
                 let _ = lhs.shutdown().await;
                 return;
@@ -816,6 +845,17 @@ impl Dispatcher {
         {
             Ok(pinned) => pinned,
             Err(error) => {
+                let versions_at_failure = self.explain_versions().await;
+                self.record_path_decision(dispatch_failure_record(
+                    explain_flow_id,
+                    explain_versions_at_start,
+                    versions_at_failure,
+                    explain_route.clone(),
+                    &sess.destination,
+                    "outboundGroupSelectionFailed",
+                    error.to_string(),
+                ))
+                .await;
                 warn!(requested_outbound = outbound_name, error = %error, "could not capture selector's outbound; closing flow");
                 let _ = lhs.shutdown().await;
                 return;
@@ -826,6 +866,17 @@ impl Dispatcher {
             .ensure_outbound_ready_for_new_flow(&pinned.handler)
             .await
         {
+            let versions_at_failure = self.explain_versions().await;
+            self.record_path_decision(dispatch_failure_record(
+                explain_flow_id,
+                explain_versions_at_start,
+                versions_at_failure,
+                explain_route.clone(),
+                &sess.destination,
+                "outboundPoolNotReady",
+                error.to_string(),
+            ))
+            .await;
             warn!(requested_outbound = outbound_name, actual_outbound = pinned.handler.name(), error = %error, "outbound pool is not safe for new TCP flow");
             let _ = lhs.shutdown().await;
             return;
@@ -1432,12 +1483,13 @@ impl Dispatcher {
                     .await;
                     store_path_decision(
                         network_status.as_ref(),
-                        rule_interface_failure_record(
+                        dispatch_failure_record(
                             explain_flow_id,
                             explain_versions_at_start,
                             versions_at_failure,
                             requested_route,
                             &sess.destination,
+                            "ruleInterfaceResolutionFailed",
                             err.to_string(),
                         ),
                     )
@@ -1462,10 +1514,48 @@ impl Dispatcher {
                 {
                     Ok(Some(selected)) => selected,
                     Ok(None) => {
+                        let versions_at_failure = explain_versions_from_status(
+                            network_status.as_ref(),
+                            packet_generation,
+                        )
+                        .await;
+                        store_path_decision(
+                            network_status.as_ref(),
+                            dispatch_failure_record(
+                                explain_flow_id,
+                                explain_versions_at_start,
+                                versions_at_failure,
+                                requested_route.clone(),
+                                &sess.destination,
+                                "outboundNotFound",
+                                format!(
+                                    "configured outbound `{requested_outbound_name}` is missing"
+                                ),
+                            ),
+                        )
+                        .await;
                         warn!(requested_outbound = %requested_outbound_name, "configured outbound is missing; dropping UDP packet without DIRECT fallback");
                         continue;
                     }
                     Err(error) => {
+                        let versions_at_failure = explain_versions_from_status(
+                            network_status.as_ref(),
+                            packet_generation,
+                        )
+                        .await;
+                        store_path_decision(
+                            network_status.as_ref(),
+                            dispatch_failure_record(
+                                explain_flow_id,
+                                explain_versions_at_start,
+                                versions_at_failure,
+                                requested_route.clone(),
+                                &sess.destination,
+                                "outboundLookupFailed",
+                                error.to_string(),
+                            ),
+                        )
+                        .await;
                         warn!(requested_outbound = %requested_outbound_name, error = %error, "could not select outbound for UDP flow");
                         continue;
                     }
@@ -1489,6 +1579,24 @@ impl Dispatcher {
                     {
                         Ok(pinned) => pinned,
                         Err(error) => {
+                            let versions_at_failure = explain_versions_from_status(
+                                network_status.as_ref(),
+                                packet_generation,
+                            )
+                            .await;
+                            store_path_decision(
+                                network_status.as_ref(),
+                                dispatch_failure_record(
+                                    explain_flow_id,
+                                    explain_versions_at_start,
+                                    versions_at_failure,
+                                    requested_route.clone(),
+                                    &sess.destination,
+                                    "outboundGroupSelectionFailed",
+                                    error.to_string(),
+                                ),
+                            )
+                            .await;
                             warn!(requested_outbound = %requested_outbound_name, error = %error, "could not capture selector's outbound for UDP flow");
                             continue;
                         }
@@ -1509,6 +1617,24 @@ impl Dispatcher {
                     .ensure_outbound_ready_for_new_flow(&pinned.handler)
                     .await
                 {
+                    let versions_at_failure = explain_versions_from_status(
+                        network_status.as_ref(),
+                        packet_generation,
+                    )
+                    .await;
+                    store_path_decision(
+                        network_status.as_ref(),
+                        dispatch_failure_record(
+                            explain_flow_id,
+                            explain_versions_at_start,
+                            versions_at_failure,
+                            requested_route.clone(),
+                            &sess.destination,
+                            "outboundPoolNotReady",
+                            error.to_string(),
+                        ),
+                    )
+                    .await;
                     warn!(requested_outbound = %requested_outbound_name, actual_outbound = pinned.handler.name(), error = %error, "outbound pool is not safe for new UDP flow");
                     continue;
                 }
@@ -2936,10 +3062,11 @@ mod tests {
         UDP_HEALTH_PROOF_MAX, UDP_SESSION_IDLE, UdpFlowDecisionKey,
         capture_udp_health_proof, classify_flow_end_reason,
         classify_path_planning_failure, confirmed_udp_path,
-        direct_udp_health_destination, preferred_udp_path_address,
-        queue_udp_packet_retry, reverse_lookup, select_outbound_for_flow,
-        should_track_global_selector, try_queue_outbound_packet, udp_health_path,
-        udp_path_cache_versions, udp_path_selection_is_current,
+        direct_udp_health_destination, dispatch_failure_record,
+        preferred_udp_path_address, queue_udp_packet_retry, reverse_lookup,
+        select_outbound_for_flow, should_track_global_selector,
+        try_queue_outbound_packet, udp_health_path, udp_path_cache_versions,
+        udp_path_selection_is_current,
     };
     use crate::{
         app::dns::{ClashResolver, MockClashResolver, ThreadSafeDNSResolver},
@@ -3013,6 +3140,55 @@ mod tests {
                 "networkAndPolicyChangedDuringPathPlanning".to_owned(),
             )
         );
+    }
+
+    #[test]
+    fn pre_dispatch_failure_records_route_destination_and_stale_versions() {
+        let versions = (4, 7, 11, 13);
+        let route = crate::app::flow::RouteDecision {
+            outbound: "selector".to_owned(),
+            rule: Some("MATCH".to_owned()),
+        };
+        let destination = SocksAddr::from_str("example.test:443").unwrap();
+        let current = dispatch_failure_record(
+            uuid::Uuid::new_v4(),
+            versions,
+            versions,
+            route.clone(),
+            &destination,
+            "outboundPoolNotReady",
+            "pool reset failed".to_owned(),
+        );
+        assert_eq!(
+            current.outcome,
+            crate::app::flow::PathExecutionOutcome::PathPlanningFailed
+        );
+        assert_eq!(current.route, route);
+        assert_eq!(current.destination.as_deref(), Some("example.test:443"));
+        assert_eq!(
+            current.failure_kind.as_deref(),
+            Some("outboundPoolNotReady")
+        );
+        assert_eq!(current.reason, "pool reset failed");
+
+        let stale = dispatch_failure_record(
+            uuid::Uuid::new_v4(),
+            versions,
+            (5, 8, 12, 14),
+            current.route,
+            &destination,
+            "outboundLookupFailed",
+            "network changed during lookup".to_owned(),
+        );
+        assert_eq!(
+            stale.outcome,
+            crate::app::flow::PathExecutionOutcome::StaleDecisionDiscarded
+        );
+        assert_eq!(stale.config_version, 4);
+        assert_eq!(stale.config_version_at_completion, Some(5));
+        assert_eq!(stale.policy_version, 8);
+        assert_eq!(stale.network_version, 12);
+        assert_eq!(stale.reason, "network changed during lookup");
     }
 
     #[test]
