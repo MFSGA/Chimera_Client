@@ -1138,8 +1138,8 @@ lifecycle tests.
 - PR #92 的 Windows Rust quality 与 UDP loopback job 在非测试库构建阶段都因 `IP_ADDRESS_PREFIX` 未使用而失败；该类型只被 `windows.rs` 中的测试辅助代码引用。将导入限定到 `#[cfg(test)]`，不改变网络快照运行逻辑。
 - 本机没有 MinGW C 编译器；尝试 `cargo clippy -p clash-lib --target x86_64-pc-windows-gnu --all-targets --all-features --locked -j 6 -- -D warnings` 因缺少 `x86_64-w64-mingw32-gcc` 被依赖构建阻断。Windows MSVC CI 将验证修正后的目标构建与回归；在新 SHA CI 完成前不将 Windows 修复标为远端验证通过。
 
-### 2026-10-31：Explain 集成测试等待首次网络快照（L2）
+### 2026-10-31：跨平台集成测试就绪和日志断言（L2）
 
-- PR #92 的 Linux quality job 在 `connection_chain_tests` 中重复失败。日志显示 Explain 请求可在 `/runtime` 首次网络观察前启动：UDP 流第一次规划使用 `networkVersion=0`，随后快照变为 `1` 并触发 `stale network generation` 重规划；同时 SOCKS5 UDP 本地 fixture 在核心启动期间已经开始 5 秒 accept/receive 计时，慢启动时可能先于实际请求退出。这是集成测试 readiness/fixture 时序不足的证据，尚不表示生产转发路径在已就绪状态下错误。
-- 增加测试辅助函数，等待 `/runtime` 报告非零 `networkVersion` 和 `lastObservedAtMs` 后再触发 Explain 流量；代理拒绝、DIRECT 拨号拒绝和规则指定缺失网卡的用例也先等待此 readiness。SOCKS5 UDP 成功往返用例把上游/relay 任务放到核心及首次快照就绪后启动，并将 fixture 等待上限设为 10 秒。未修改生产网络行为。
-- 本机 `cargo test -p clash-lib --test connection_chain_tests --locked -j 6`：10 passed；该本机为 macOS，不能据此代替 Linux 验证。等待更新后的 Linux CI 确认根因修正有效；未进行真实网络切换、TUN 或公网测试。
+- PR #92 的 Linux quality job 日志显示 Explain 请求可能在 `/runtime` 首次网络观察前启动：UDP 首次规划使用 `networkVersion=0`，快照变为 `1` 后触发 stale-generation 重规划；SOCKS5 UDP fixture 也曾在核心启动期间提前耗尽等待时间。补齐相关 UDP 拒绝用例的首次快照等待，并把 UDP 成功 fixture 延后到核心及首次快照 ready 后启动；等待有界。
+- 跨目标编译 job 的测试日志还发现三项可移植性问题：Linux 将端口占用错误写作 `Address in use`，测试原先只接受 `Address already in use`；WebSocket 合约 fixture 配置 `log-level: error`，在 cross 容器未继承 `RUST_LOG` 时会过滤它自己发送的 warning；SOCKS5 UDP 端点拒绝用例同样需要先等网络代际建立。测试现改为匹配平台无关的 `in use`，WebSocket fixture 使用 `debug`，并在 UDP 拒绝流量前等待首次快照。
+- 这些调整只改测试和迭代记录，不修改生产网络、Controller 或日志行为。本机此前 `cargo test -p clash-lib --test connection_chain_tests --locked -j 6` 为 10 passed；追加修改后的 Linux/Apple/Windows 目标矩阵需在新 SHA 上重跑确认。未进行真实网络切换、TUN 或公网测试。

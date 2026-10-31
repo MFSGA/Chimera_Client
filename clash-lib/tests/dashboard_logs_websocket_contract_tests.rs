@@ -34,7 +34,7 @@ allow-lan: false
 bind-address: 127.0.0.1
 socks-port: {socks_port}
 mode: direct
-log-level: error
+log-level: debug
 mmdb: null
 external-controller: 127.0.0.1:{api_port}
 secret: clash-rs
