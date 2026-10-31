@@ -150,7 +150,9 @@ mod tests {
                 .accept()
                 .await
                 .expect("WebSocket fixture should accept");
-            accept_hdr_async(stream, move |request: &Request, response: Response| {
+            // Tungstenite requires a full HTTP Response as its rejection type.
+            #[allow(clippy::result_large_err)]
+            let callback = move |request: &Request, response: Response| {
                 let host_values = request.headers().get_all("host");
                 let value_count = host_values.iter().count();
                 let host = host_values
@@ -162,9 +164,10 @@ mod tests {
                 *observed_request.lock().expect("request observation lock") =
                     Some((value_count, host, path));
                 Ok(response)
-            })
-            .await
-            .expect("WebSocket upgrade should succeed")
+            };
+            accept_hdr_async(stream, callback)
+                .await
+                .expect("WebSocket upgrade should succeed")
         });
 
         let client = V2rayWsClient::try_new(
@@ -242,25 +245,24 @@ mod tests {
                 .await
                 .expect("TLS handshake should succeed");
             let alpn = stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
-            let websocket = accept_hdr_async(
-                stream,
-                move |request: &Request, response: Response| {
-                    let host_values = request.headers().get_all("host");
-                    let value_count = host_values.iter().count();
-                    let host = host_values
-                        .iter()
-                        .next()
-                        .and_then(|value| value.to_str().ok())
-                        .map(str::to_owned);
-                    let path =
-                        request.uri().path_and_query().map(ToString::to_string);
-                    *observed_request.lock().expect("request observation lock") =
-                        Some((value_count, host, path));
-                    Ok(response)
-                },
-            )
-            .await
-            .expect("TLS WebSocket upgrade should succeed");
+            // Tungstenite requires a full HTTP Response as its rejection type.
+            #[allow(clippy::result_large_err)]
+            let callback = move |request: &Request, response: Response| {
+                let host_values = request.headers().get_all("host");
+                let value_count = host_values.iter().count();
+                let host = host_values
+                    .iter()
+                    .next()
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                let path = request.uri().path_and_query().map(ToString::to_string);
+                *observed_request.lock().expect("request observation lock") =
+                    Some((value_count, host, path));
+                Ok(response)
+            };
+            let websocket = accept_hdr_async(stream, callback)
+                .await
+                .expect("TLS WebSocket upgrade should succeed");
             drop(websocket);
             alpn
         });

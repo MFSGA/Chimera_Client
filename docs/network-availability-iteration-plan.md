@@ -958,8 +958,15 @@ lifecycle tests.
 - 基线：本地 `master` `74e894f420b326d9576282200453aba0aed721ec`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。本轮参考 `ref/` 的 SOCKS5 UDP 关联生命周期与数据包包装语义，没有修改参考代码或生产协议实现。
 - 新增 `socks5_udp_outbound_roundtrip_is_queryable_from_path_explain`：本地 SOCKS 入站通过 SOCKS5 出站 UDP ASSOCIATE 将数据送到回环 UDP 上游；上游解码请求、转发到回环 echo 并将响应封装回 SOCKS5 UDP 数据报。测试对 SOCKS5 UDP ASSOCIATE 握手、数据往返和控制连接关闭都设 5 秒上限；公共 SOCKS5 UDP 测试 helper 检查响应 RSV/FRAG 均为零。测试确认目标地址和 payload 真实往返，再从 `/flows` 取得 UDP Flow，并验证 `/runtime/network/path-decisions` 的成功记录与单 Flow Explain 详情一致且共享 `flowId`；关闭入站 UDP 会话后，等待并断言上游 SOCKS5 控制连接收到 EOF。
 - 基线 `cargo test -p clash-lib --test connection_chain_tests --locked -j 6`：5 passed。新增用例定向运行 1 passed；完整 `connection_chain_tests` 为 6 passed，使用共享 SOCKS5 UDP 响应 helper 的 `direct_udp_integration_tests` 为 4 passed。`cargo fmt --all -- --check` 与 `git diff --check` 通过；目标严格 Clippy `cargo clippy -p clash-lib --test connection_chain_tests --locked -j 6 -- -D warnings` 通过。
-- CI 等价全 feature 严格 Clippy `cargo clippy -p clash-lib --all-targets --all-features --locked -j 6 -- -D warnings` 目前被本轮未修改的 `clash-lib/src/proxy/transport/v2ray/websocket.rs` 两处 `clippy::result_large_err` 阻断（握手回调约第 153、247 行）。该 lint 与新增测试无关；尚未处理，也不能把全 feature Clippy 记作通过。
+- 首轮 CI 等价全 feature 严格 Clippy 暴露了 `clash-lib/src/proxy/transport/v2ray/websocket.rs` 测试中的两处 `clippy::result_large_err`；已在后续“V2Ray WebSocket 测试回调的 Clippy 门禁修复”切片处理。
 - 本轮只有集成测试与迭代记录变更；fixture 限于本机回环，不访问公网、不改变系统网络。尚未验证第三方 SOCKS5 服务端互操作。回滚方式是撤销本切片提交；没有 push、release 或标签操作。
+
+### 2026-10-30：V2Ray WebSocket 测试回调的 Clippy 门禁修复（L2）
+
+- 基线：本地 `master` `f139641e1fcd1bd2c48a858c1c0c5490002dd3e2`；`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。没有更改 V2Ray WebSocket 的生产行为。
+- Tungstenite 的握手回调约定用完整 HTTP `Response` 表示拒绝结果，因此返回类型固定较大。将两个测试回调先绑定为局部闭包，并仅在这两个绑定处说明性地允许 `clippy::result_large_err`，避免全 feature 严格 Clippy 因第三方 API 的固定签名失败。
+- `cargo clippy -p clash-lib --all-targets --all-features --locked -j 6 -- -D warnings` 通过；`cargo test -p clash-lib --lib --all-features v2ray_plugin_ --locked -j 6` 为 7 passed；`cargo fmt --all -- --check` 与 `git diff --check` 通过。
+- 本切片只调整测试回调写法和局部 lint 注释；协议握手断言保持不变。没有访问公网、改动系统网络或执行 push/release。
 
 ### 2026-10-30：B10 过期 Explain 复用生产公共 HTTP 层
 
