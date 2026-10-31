@@ -173,14 +173,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_path_decision_is_not_found_and_absent_from_list() {
-        let flow_id = uuid::Uuid::new_v4();
+    async fn fake_ip_mapping_failure_round_trips_through_explain_api() {
+        let expired_flow_id = uuid::Uuid::new_v4();
         let mut status = NetworkStatus::default();
         let (config_version, policy_version, network_version, operation_id) =
             status.decision_versions();
         assert!(
             status.record_path_decision(crate::app::flow::PathDecisionRecord {
-                flow_id,
+                flow_id: expired_flow_id,
                 config_version,
                 config_version_at_completion: None,
                 policy_version,
@@ -201,6 +201,32 @@ mod tests {
             })
         );
         status.expire_path_decisions_for_test();
+
+        let flow_id = uuid::Uuid::new_v4();
+        let (config_version, policy_version, network_version, operation_id) =
+            status.decision_versions();
+        let explain_record = crate::app::flow::PathDecisionRecord {
+            flow_id,
+            config_version,
+            config_version_at_completion: None,
+            policy_version,
+            network_version,
+            operation_id,
+            outcome: crate::app::flow::PathExecutionOutcome::PathPlanningFailed,
+            route: crate::app::flow::RouteDecision {
+                outbound: "notEvaluated".to_owned(),
+                rule: None,
+            },
+            destination: Some("198.18.0.10:443".to_owned()),
+            candidate_paths: Vec::new(),
+            selected_path: None,
+            rejected: Vec::new(),
+            failure_kind: Some("fakeIpMappingMissing".to_owned()),
+            reason: "fake-IP destination has no reverse mapping; route selection was skipped"
+                .to_owned(),
+            recorded_at_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        assert!(status.record_path_decision(explain_record.clone()));
 
         let (network_reset_tx, _) = tokio::sync::mpsc::channel(1);
         let global = Arc::new(tokio::sync::Mutex::new(GlobalState {
@@ -274,15 +300,37 @@ mod tests {
         assert_eq!(list.status(), StatusCode::OK);
         let list_body = list.into_body().collect().await.unwrap();
         let list_body = list_body.to_bytes();
+        let listed: serde_json::Value = serde_json::from_slice(&list_body).unwrap();
+        let expected = serde_json::to_value(&explain_record).unwrap();
+        assert_eq!(listed, serde_json::json!([expected.clone()]));
+
+        let active_detail = sender
+            .send_request(
+                http::Request::builder()
+                    .uri(format!("/runtime/network/path-decision/{flow_id}"))
+                    .header(http::header::AUTHORIZATION, "Bearer test-secret")
+                    .body(http_body_util::Empty::<bytes::Bytes>::new())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(active_detail.status(), StatusCode::OK);
+        let active_detail_body = active_detail
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&list_body).unwrap(),
-            serde_json::json!([])
+            serde_json::from_slice::<serde_json::Value>(&active_detail_body)
+                .unwrap(),
+            expected
         );
 
         let detail = sender
             .send_request(
                 http::Request::builder()
-                    .uri(format!("/runtime/network/path-decision/{flow_id}"))
+                    .uri(format!("/runtime/network/path-decision/{expired_flow_id}"))
                     .header(http::header::AUTHORIZATION, "Bearer test-secret")
                     .body(http_body_util::Empty::<bytes::Bytes>::new())
                     .unwrap(),
@@ -298,7 +346,7 @@ mod tests {
             .send_request(
                 http::Request::builder()
                     .method(http::Method::OPTIONS)
-                    .uri("/runtime/network/path-decision/test-flow")
+                    .uri(format!("/runtime/network/path-decision/{flow_id}"))
                     .header(http::header::ORIGIN, "https://network-test.example")
                     .header(http::header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
                     .header(
