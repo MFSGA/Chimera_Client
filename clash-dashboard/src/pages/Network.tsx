@@ -474,9 +474,9 @@ function DecisionsTable({ records }: { records: NetworkPathDecisionRecord[] }) {
             <tr key={record.flowId} className="border-b last:border-0" style={{ borderColor: 'var(--color-separator)' }}>
               <td className="whitespace-nowrap px-4 py-3" style={{ color: 'var(--color-text-secondary)' }}>{formatTimestamp(record.recordedAtMs)}</td>
               <td className="px-4 py-3 font-medium" style={{ color: 'var(--color-text-primary)' }}>
-                <div>{record.route.outbound === 'notEvaluated' ? 'Not evaluated' : record.route.outbound}</div>
+                <div>{record.failureKind === 'fakeIpMappingMissing' && record.route.outbound === 'notEvaluated' ? 'Not evaluated' : record.route.outbound}</div>
                 <div className="text-[11px] font-normal" style={{ color: 'var(--color-text-tertiary)' }}>
-                  {record.route.outbound === 'notEvaluated' ? 'Selection skipped' : record.route.rule ?? 'Mode selection'}
+                  {record.failureKind === 'fakeIpMappingMissing' && record.route.outbound === 'notEvaluated' ? 'Selection skipped' : record.route.rule ?? 'Mode selection'}
                 </div>
               </td>
               <td className="px-4 py-3"><Badge variant={phaseVariant(record.outcome)}>{phaseLabel(record.outcome)}</Badge></td>

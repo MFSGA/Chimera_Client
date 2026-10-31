@@ -3980,6 +3980,7 @@ mod tests {
             false,
         );
         dispatcher.attach_network_status(status.clone());
+        let expected_versions = dispatcher.explain_versions().await;
 
         let tcp_destination = SocksAddr::from(SocketAddr::new(fake_ip, 443));
         let tcp_session = Session {
@@ -4060,6 +4061,11 @@ mod tests {
                 Some("fakeIpMappingMissing")
             );
             assert!(decision.reason.contains("route selection was skipped"));
+            assert_eq!(decision.config_version, expected_versions.0);
+            assert_eq!(decision.config_version_at_completion, None);
+            assert_eq!(decision.policy_version, expected_versions.1);
+            assert_eq!(decision.network_version, expected_versions.2);
+            assert_eq!(decision.operation_id, expected_versions.3);
             assert_eq!(
                 decision.destination.as_deref(),
                 Some(destination.to_string().as_str())
