@@ -427,6 +427,65 @@ async fn direct_tcp_flow_is_queryable_from_path_explain() {
 
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
+async fn direct_tcp_dial_failure_is_queryable_from_path_explain() {
+    let target = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to reserve a local TCP port");
+    let target_port = target.local_addr().unwrap().port();
+    drop(target);
+
+    let (_clash, api_port, socks_port) = start_direct_client();
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(3),
+        socks5_connect(socks_port, target_port),
+    )
+    .await
+    .expect("timed out during the local SOCKS5 connection");
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+        .await
+        .expect("timed out waiting for the refused DIRECT dial to close")
+        .expect("failed to read the closed DIRECT stream");
+    assert!(response.is_empty(), "refused DIRECT dial returned payload");
+
+    let failed_decision = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let decisions =
+                get_api_json(api_port, "/runtime/network/path-decisions").await;
+            if let Some(decision) = decisions.as_array().and_then(|records| {
+                records.iter().find(|decision| {
+                    decision["outcome"] == "dialFailed"
+                        && decision["route"]["outbound"] == "DIRECT"
+                        && decision["reason"] == "directDialFailed"
+                })
+            }) {
+                break decision.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("DIRECT refusal did not produce a failed Explain record");
+    assert_eq!(failed_decision["selectedPath"], serde_json::Value::Null);
+    assert!(
+        failed_decision["failureKind"]
+            .as_str()
+            .is_some_and(|failure_kind| !failure_kind.is_empty())
+    );
+
+    let flow_id = failed_decision["flowId"]
+        .as_str()
+        .expect("failed DIRECT Explain should expose a flow ID");
+    let detail = get_api_json(
+        api_port,
+        &format!("/runtime/network/path-decision/{flow_id}"),
+    )
+    .await;
+    assert_eq!(detail, failed_decision);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
 async fn dialer_proxy_connects_through_a_local_socks5_hop() {
     let (upstream_port, mut upstream_destinations, upstream_task) =
         spawn_socks5_relay().await;

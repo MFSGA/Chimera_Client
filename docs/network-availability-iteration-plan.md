@@ -51,6 +51,8 @@
 | B8 有界多路径尝试（代码已接入；DIRECT 调度与代理端点源地址不匹配后的候选回退已受控验证） | 有界 AttemptBudget、错峰启动、单 winner、取消与清理；只竞速代理端点 TCP 建连，协议握手不跨连接重放 | DIRECT 与代理端点 DNS+拨号总预算均为 5 秒、最多 3 次/并发 2、120ms hedge，快速失败立即推进；代理端点计划最多纳入 3 个 DNS 地址，跨地址族与候选 PathId 轮次调度；Preference 保留一个 system-route 回退名额，Require 不回退；旧 networkVersion 完成的 socket 丢弃；失败 socket future 随 winner 取消；不竞速 UDP 业务包或重放应用数据。本轮 loopback 验证源地址不匹配后经 SOCKS5 握手和请求/响应成功回退；代理服务器互操作、连接池与其他网络拓扑仍待验证 |
 | B9 首选恢复与防抖（被动证据范围已完成） | cooldown、真实流量响应和稳定窗口；只改变新 Flow 候选可用性 | 冷却期排除不可用路径；恢复至少 3 次真实响应且跨越 15 秒；单次成功不恢复；不发送面向猜测目标的合成探测。主动探测与 minimum-dwell 校准不在当前实现范围 |
 | B10 运行时意图与 Explain API（偏好 API、本机 UDP 恢复、成功 UDP/TCP 代理连接、SOCKS 握手失败及 flowId 错误状态均有定向验证，其余范围继续补验） | 基于现有鉴权开放偏好更新、effective-paths 和 decision 查询；临时覆盖使用单调时钟及 TTL | 偏好更新校验后在 RuntimeStatus 锁内原子替换并增加 `policyVersion`；临时覆盖到期恢复基础偏好；Explain 记录有界并覆盖 TCP/UDP 路径规划失败、DIRECT/PROXY 拨号成功与失败、旧网络代次结果丢弃；记录候选 PathId、策略拒绝原因、版本和操作编号；成功 UDP 关联的 `flowId` 出现在 `/flows.flowIds`，可查询 `/runtime/network/path-decision/{flowId}`；SOCKS5 出站 UDP 已验证上游转发成功后同一 Flow 的 Explain 列表和详情一致；记录连接完成时发现的 reload 版本差异，`/runtime/network/path-decisions` 可列出近期结果。Explain 记录 TTL 使用单调时钟，避免系统墙钟调整延长或缩短保留期。物理代理端点 TCP/UDP 拨号错误以结构化 `io::Error` 来源保留候选、实际尝试 PathId 与策略/健康拒绝原因，Dispatcher 将其写入 Explain；协议 TLS/认证阶段错误仍保持现有错误边界，不伪称已逐协议分类。偏好更新/临时覆写、有效路径查询、本机 UDP 恢复、成功 DIRECT TCP/UDP、SOCKS5 多跳 TCP、Shadowsocks TCP/UDP、AnyTLS TCP/UDP、Trojan TCP/UDP、VLESS TLS TCP/UDP、生产 `ApiRunner` listener 的 Explain 列表无 token 请求返回 401 且该路由 CORS 预检返回允许头、SOCKS 握手失败详情及格式错误 `flowId` 返回 400、未知 `flowId` 返回 404、过期 Explain 的真实 TCP listener + 认证路由测试（未认证为 401、认证后列表排除且详情为 404，并复用生产公共 HTTP/CORS/追踪层）均已有定向回归；代理端点 TCP 拒绝用例另验证结构化候选及实际尝试 PathId；真实 `ApiRunner` listener 现已覆盖成功启动时 readiness、普通路径到 `/ws/...` 的 URI 改写、查询 token 鉴权及关闭后的 listener 回收；非 loopback 的 secret/CORS 策略现有纯函数单测覆盖拒绝与允许分支，但尚未实际绑定非 loopback 地址验证完整 readiness 错误返回；其他代理协议路径 Explain 和跨平台行为仍待验证 |
+B10 本轮新增回归：本机回环拒绝的 DIRECT TCP 拨号，其 Explain 列表与单条详情一致；不代表其他代理协议或真实网络错误已全部覆盖。
+
 | B11 实机与平台验收 | 保留 A4 的专用双网卡验证；DIRECT/代理/DNS、双栈/TUN、资源趋势与时间预算 | 不使用 reset 的物理切换、DHCP、离线/唤醒和抖动有真实响应证据；20 轮资源回收可核查；macOS/Linux/Windows 各自记录编译、受控测试与实机结果 |
 
 依赖：B0 → B1 → B2 → B3 → B4 → B5 → B6；B7 的协议/池子切片继续推进，B8 DIRECT TCP 已基于 B5 的 PathPlan 独立验证，B9 消费 B6 的真实流量健康证据，B10 读取并更新运行时 PathIntent；它们不表示 B7 全部已完成。B11 依赖可达的专用多网卡环境。不得把未验证前置标成完成。可取得专用硬件时，既有 A4 基线验收提前运行，不必等 B11；它不能替代新 scheduler 的实机验收。
@@ -1009,3 +1011,10 @@ lifecycle tests.
 - Recent path decisions 每条记录新增可展开的诊断详情，展示 `flowId`、操作编号、配置版本及连接完成版本、网络版本和策略版本；如果连接完成时配置已经变化，页面明确提示该路径判断依据的是哪一版配置。候选与拒绝路径仍在详情中展示。只使用现有 Explain API 字段，不改变 Controller API 或运行时决策。
 - `npm run lint` 与 `npm run build` 通过。使用本机 loopback mock API 在浏览器实际展开记录，确认版本字段、配置变化提示和候选路径均可见；没有连接真实核心或修改网络。Network chunk 为 56.87 kB，主 JS 637.94 kB，原有主包体积警告仍在。
 - 该交互检查验证页面展示和展开操作，不覆盖实际换网、真实核心数据兼容或窄屏/移动端实机布局；跨平台网络恢复验收仍需目标平台环境。
+
+### 2026-10-30：DIRECT TCP 拨号失败可从 Explain 列表和详情查询（L2）
+
+- 基线：本地 `master` `6568185f8898c308c120ce379b85a5e892fd9235`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。未修改参考实现或生产拨号行为。
+- 新增 `direct_tcp_dial_failure_is_queryable_from_path_explain`：保留并释放一个 loopback TCP 端口，再经 SOCKS5 入站请求 DIRECT 连接；验证连接关闭后 Explain 列表出现 `dialFailed` / `directDialFailed`、非空失败类型及空 `selectedPath`，并检查单条详情与列表记录完全一致。
+- 定向用例 1 passed；`cargo test -p clash-lib --test connection_chain_tests --locked -j 6`：7 passed；目标严格 Clippy、`cargo fmt --all -- --check` 和 `git diff --check` 通过。测试仅用本机 loopback，不访问公网或更改宿主网络。
+- 本用例覆盖本机拒绝拨号下的 API 诊断闭环，不断言平台专属错误文案，也不代表第三方网卡路径、其他协议或真实换网的失败分类已覆盖。
