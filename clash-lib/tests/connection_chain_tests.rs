@@ -8,7 +8,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, UdpSocket},
     sync::mpsc,
 };
 
@@ -1039,4 +1039,250 @@ async fn http_inbound_forwards_websocket_upgrade_bidirectionally() {
     })
     .await
     .expect("HTTP upgrade connection failure response timed out");
+}
+
+async fn assert_connected_udp_flow_explain(
+    api_port: u16,
+    target_port: u16,
+    outbound: &str,
+) {
+    let (flow, decision) = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let flows = get_api_json(api_port, "/flows?include_closed=true").await;
+            if let Some(flow) = flows.as_array().and_then(|records| {
+                records.iter().find(|flow| {
+                    flow["protocol"] == "udp"
+                        && flow["dstPort"].as_u64() == Some(u64::from(target_port))
+                        && flow["flowIds"]
+                            .as_array()
+                            .is_some_and(|ids| !ids.is_empty())
+                })
+            }) {
+                let flow = flow.clone();
+                let flow_ids = flow["flowIds"]
+                    .as_array()
+                    .expect("tracked UDP flow should expose IDs");
+                let decisions =
+                    get_api_json(api_port, "/runtime/network/path-decisions").await;
+                if let Some(decision) = decisions.as_array().and_then(|records| {
+                    records.iter().find(|decision| {
+                        flow_ids.iter().any(|id| id == &decision["flowId"])
+                            && decision["outcome"] == "connected"
+                            && decision["route"]["outbound"] == outbound
+                    })
+                }) {
+                    break (flow, decision.clone());
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("SOCKS5 UDP flow did not produce a connected Explain record");
+
+    let flow_ids = flow["flowIds"]
+        .as_array()
+        .expect("tracked UDP flow should expose IDs");
+    assert!(
+        flow_ids
+            .iter()
+            .any(|flow_id| flow_id == &decision["flowId"])
+    );
+    let flow_id = decision["flowId"]
+        .as_str()
+        .expect("UDP Explain record should expose a flow ID");
+    let detail = get_api_json(
+        api_port,
+        &format!("/runtime/network/path-decision/{flow_id}"),
+    )
+    .await;
+    assert_eq!(detail, decision);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn socks5_udp_outbound_roundtrip_is_queryable_from_path_explain() {
+    let upstream = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind local SOCKS5 UDP upstream");
+    let upstream_port = upstream.local_addr().unwrap().port();
+
+    let relay = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind local SOCKS5 UDP relay");
+    let relay_addr = relay.local_addr().unwrap();
+    let target = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind local UDP echo target");
+    let target_addr = target.local_addr().unwrap();
+    let (target_tx, target_rx) = tokio::sync::oneshot::channel();
+
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) =
+            tokio::time::timeout(Duration::from_secs(5), upstream.accept())
+                .await
+                .expect("timed out waiting for SOCKS5 UDP association")
+                .expect("failed to accept SOCKS5 UDP association");
+
+        let mut greeting = [0u8; 2];
+        stream
+            .read_exact(&mut greeting)
+            .await
+            .expect("failed to read SOCKS5 greeting");
+        assert_eq!(greeting[0], 0x05);
+        let mut methods = vec![0u8; usize::from(greeting[1])];
+        stream
+            .read_exact(&mut methods)
+            .await
+            .expect("failed to read SOCKS5 authentication methods");
+        assert!(methods.contains(&0x00), "SOCKS5 no-auth was not offered");
+        stream
+            .write_all(&[0x05, 0x00])
+            .await
+            .expect("failed to accept SOCKS5 no-auth");
+
+        let mut request = [0u8; 4];
+        stream
+            .read_exact(&mut request)
+            .await
+            .expect("failed to read SOCKS5 UDP ASSOCIATE request");
+        assert_eq!(request, [0x05, 0x03, 0x00, 0x01]);
+        let mut address = [0u8; 6];
+        stream
+            .read_exact(&mut address)
+            .await
+            .expect("failed to read SOCKS5 UDP ASSOCIATE address");
+        assert_eq!(address, [0u8; 6]);
+
+        let mut response = vec![0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1];
+        response.extend_from_slice(&relay_addr.port().to_be_bytes());
+        stream
+            .write_all(&response)
+            .await
+            .expect("failed to return SOCKS5 UDP relay address");
+
+        let mut byte = [0u8; 1];
+        while stream
+            .read(&mut byte)
+            .await
+            .expect("failed while holding SOCKS5 control connection")
+            != 0
+        {}
+    });
+
+    let relay_task = tokio::spawn(async move {
+        let mut packet = vec![0u8; 65_535];
+        let (len, client_addr) = tokio::time::timeout(
+            Duration::from_secs(5),
+            relay.recv_from(&mut packet),
+        )
+        .await
+        .expect("timed out waiting for SOCKS5 UDP datagram")
+        .expect("failed to receive SOCKS5 UDP datagram");
+        assert!(len >= 10, "SOCKS5 UDP datagram is truncated");
+        assert_eq!(
+            &packet[..4],
+            &[0x00, 0x00, 0x00, 0x01],
+            "expected an unfragmented IPv4 SOCKS5 UDP datagram"
+        );
+        let destination = SocketAddr::from((
+            std::net::Ipv4Addr::new(packet[4], packet[5], packet[6], packet[7]),
+            u16::from_be_bytes([packet[8], packet[9]]),
+        ));
+        target_tx
+            .send(destination)
+            .expect("test should still be waiting for the destination");
+        target
+            .send_to(&packet[10..len], destination)
+            .await
+            .expect("failed to forward SOCKS5 UDP payload to target");
+
+        let mut echoed = vec![0u8; 65_535];
+        let (echoed_len, source) = tokio::time::timeout(
+            Duration::from_secs(5),
+            target.recv_from(&mut echoed),
+        )
+        .await
+        .expect("timed out waiting for local UDP echo")
+        .expect("failed to receive local UDP echo");
+        assert_eq!(source, destination);
+
+        let source_ip = match source.ip() {
+            std::net::IpAddr::V4(ip) => ip.octets(),
+            std::net::IpAddr::V6(_) => panic!("expected an IPv4 UDP echo source"),
+        };
+        let mut response = vec![0x00, 0x00, 0x00, 0x01];
+        response.extend_from_slice(&source_ip);
+        response.extend_from_slice(&source.port().to_be_bytes());
+        response.extend_from_slice(&echoed[..echoed_len]);
+        relay
+            .send_to(&response, client_addr)
+            .await
+            .expect("failed to return SOCKS5 UDP response");
+    });
+
+    let api_port = available_port();
+    let socks_port = available_port();
+    let config = format!(
+        r#"allow-lan: false
+bind-address: 127.0.0.1
+socks-port: {socks_port}
+mode: rule
+log-level: error
+mmdb: null
+external-controller: 127.0.0.1:{api_port}
+secret: clash-rs
+tun:
+  enable: false
+proxies:
+  - name: socks5-udp-out
+    type: socks5
+    server: 127.0.0.1
+    port: {upstream_port}
+    udp: true
+rules:
+  - MATCH,socks5-udp-out
+"#
+    );
+    let cwd =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
+    let _clash = ClashInstance::start(
+        Options {
+            config: Config::Str(config),
+            cwd: Some(cwd.to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            config_path: None,
+        },
+        vec![api_port, socks_port],
+    )
+    .expect("failed to start SOCKS5 UDP Explain integration client");
+
+    let client = common::Socks5UdpSession::connect(socks_port).await;
+    let payload = b"socks5-outbound-udp-roundtrip";
+    client
+        .send_ipv4(payload, [127, 0, 0, 1], target_addr.port())
+        .await;
+    let (response, source) =
+        tokio::time::timeout(Duration::from_secs(5), client.recv())
+            .await
+            .expect("timed out waiting for SOCKS5 UDP echo response");
+    assert_eq!(response, payload);
+    assert_eq!(source, format!("127.0.0.1:{}", target_addr.port()));
+    let destination = tokio::time::timeout(Duration::from_secs(1), target_rx)
+        .await
+        .expect("SOCKS5 UDP relay did not forward the requested destination")
+        .expect("SOCKS5 UDP relay task stopped");
+    assert_eq!(destination, target_addr);
+
+    assert_connected_udp_flow_explain(
+        api_port,
+        target_addr.port(),
+        "socks5-udp-out",
+    )
+    .await;
+
+    relay_task.await.expect("SOCKS5 UDP relay task failed");
+    upstream_task.abort();
+    let _ = upstream_task.await;
 }
