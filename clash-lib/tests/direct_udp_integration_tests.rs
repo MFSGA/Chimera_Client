@@ -496,6 +496,10 @@ async fn network_recovery_replaces_udp_socket_without_restarting_inbound() {
                 && decision["outcome"] == "connected"
         })
         .expect("UDP flow should have a connected Explain record");
+    assert_eq!(
+        connected_decision["destination"].as_str(),
+        Some(format!("127.0.0.1:{echo_port}").as_str())
+    );
     let decision_uri: hyper::Uri = format!(
         "http://127.0.0.1:{api_port}/runtime/network/path-decision/{}",
         connected_decision["flowId"].as_str().unwrap()

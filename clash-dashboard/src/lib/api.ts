@@ -184,6 +184,7 @@ export interface NetworkPathDecisionRecord {
   operationId: number;
   outcome: string;
   route: { outbound: string; rule: string | null };
+  destination?: string;
   candidatePaths: NetworkPathIdView[];
   selectedPath: NetworkPathIdView | null;
   rejected: Array<{

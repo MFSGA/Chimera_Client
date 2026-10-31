@@ -487,6 +487,12 @@ function DecisionsTable({ records }: { records: NetworkPathDecisionRecord[] }) {
                   </summary>
                   <div className="mt-2 space-y-3 rounded-lg p-3" style={{ background: 'var(--color-fill-subtle)' }}>
                     <dl className="grid gap-x-3 gap-y-2 sm:grid-cols-2">
+                      {record.destination && (
+                        <div className="min-w-0">
+                          <dt className="text-[11px] font-semibold uppercase tracking-wide">Destination</dt>
+                          <dd className="mt-0.5 break-all font-mono text-[11px]">{record.destination}</dd>
+                        </div>
+                      )}
                       <div className="min-w-0">
                         <dt className="text-[11px] font-semibold uppercase tracking-wide">Flow ID</dt>
                         <dd className="mt-0.5 break-all font-mono text-[11px]">{record.flowId}</dd>

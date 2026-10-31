@@ -191,6 +191,7 @@ mod tests {
                     outbound: "DIRECT".to_owned(),
                     rule: None,
                 },
+                destination: None,
                 candidate_paths: Vec::new(),
                 selected_path: None,
                 rejected: Vec::new(),
