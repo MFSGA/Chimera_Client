@@ -87,7 +87,7 @@ function phaseVariant(value: string): 'green' | 'amber' | 'red' | 'gray' | 'blue
   if (['recovering', 'awaitingTraffic', 'waitingForNetwork', 'starting', 'reloading'].includes(value)) {
     return 'amber';
   }
-  if (['degraded', 'failed', 'dialFailed', 'pathPlanningFailed', 'staleNetworkDiscarded'].includes(value)) {
+  if (['degraded', 'failed', 'dialFailed', 'pathPlanningFailed', 'staleNetworkDiscarded', 'staleDecisionDiscarded'].includes(value)) {
     return 'red';
   }
   if (['unsupported', 'notConfigured', 'stopped'].includes(value)) return 'gray';

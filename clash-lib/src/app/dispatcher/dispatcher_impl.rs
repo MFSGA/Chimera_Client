@@ -89,6 +89,33 @@ impl std::fmt::Display for DirectPathPlanningError {
 
 impl std::error::Error for DirectPathPlanningError {}
 
+fn classify_path_planning_failure(
+    error: &DirectPathPlanningError,
+    policy_generation: u64,
+    network_generation: u64,
+) -> (crate::app::flow::PathExecutionOutcome, String) {
+    let network_changed = network_generation != error.network_generation;
+    let policy_changed = policy_generation != error.policy_generation;
+    if !network_changed && !policy_changed {
+        return (
+            crate::app::flow::PathExecutionOutcome::PathPlanningFailed,
+            error.to_string(),
+        );
+    }
+
+    let reason = if network_changed && policy_changed {
+        "networkAndPolicyChangedDuringPathPlanning"
+    } else if network_changed {
+        "networkChangedDuringPathPlanning"
+    } else {
+        "policyChangedDuringPathPlanning"
+    };
+    (
+        crate::app::flow::PathExecutionOutcome::StaleDecisionDiscarded,
+        reason.to_owned(),
+    )
+}
+
 /// Resolve the outbound selected by routing without silently changing the
 /// user's routing policy. DIRECT is only used when explicitly selected by
 /// a rule, active group member, or Direct mode; missing names fail closed.
@@ -1645,35 +1672,30 @@ impl Dispatcher {
                         packet_generation,
                     )
                     .await;
-                    let stale_plan =
-                        current_versions.2 != planning_error.network_generation;
+                    let (outcome, reason) = classify_path_planning_failure(
+                        &planning_error,
+                        current_versions.1,
+                        current_versions.2,
+                    );
                     store_path_decision(
                         network_status.as_ref(),
                         crate::app::flow::PathDecisionRecord {
                             flow_id: explain_flow_id,
                             config_version: explain_versions_at_start.0,
-                            config_version_at_completion:
-                                (current_versions.0 != explain_versions_at_start.0)
-                                    .then_some(current_versions.0),
+                            config_version_at_completion: (current_versions.0
+                                != explain_versions_at_start.0)
+                                .then_some(current_versions.0),
                             policy_version: planning_error.policy_generation,
                             network_version: current_versions.2,
                             operation_id: explain_versions_at_start.3,
-                            outcome: if stale_plan {
-                                crate::app::flow::PathExecutionOutcome::StaleNetworkDiscarded
-                            } else {
-                                crate::app::flow::PathExecutionOutcome::PathPlanningFailed
-                            },
+                            outcome,
                             route: explain_route.clone(),
                             destination: Some(sess.destination.to_string()),
                             candidate_paths: planning_error.candidate_paths.clone(),
                             selected_path: None,
                             rejected: planning_error.rejected.clone(),
                             failure_kind: Some(planning_error.kind().to_string()),
-                            reason: if stale_plan {
-                                "networkChangedDuringPathPlanning".to_owned()
-                            } else {
-                                planning_error.to_string()
-                            },
+                            reason,
                             recorded_at_ms: chrono::Utc::now().timestamp_millis(),
                         },
                     )
@@ -2851,7 +2873,8 @@ mod tests {
         DirectPathPlanningError, Dispatcher, OutboundDatagramPacket,
         OutboundHandleMap, PendingUdpHealthProofs, RuntimeModeState,
         UDP_HEALTH_PROOF_MAX, UDP_SESSION_IDLE, UdpFlowDecisionKey,
-        capture_udp_health_proof, classify_flow_end_reason, confirmed_udp_path,
+        capture_udp_health_proof, classify_flow_end_reason,
+        classify_path_planning_failure, confirmed_udp_path,
         direct_udp_health_destination, preferred_udp_path_address,
         queue_udp_packet_retry, reverse_lookup, select_outbound_for_flow,
         should_track_global_selector, try_queue_outbound_packet, udp_health_path,
@@ -2888,6 +2911,47 @@ mod tests {
         state.clear_override(RunMode::Global);
         assert!(matches!(state.effective, RunMode::Global));
         assert!(state.override_mode.is_none());
+    }
+
+    #[test]
+    fn path_planning_failure_is_discarded_after_policy_or_network_change() {
+        let error = DirectPathPlanningError {
+            kind: std::io::ErrorKind::NetworkUnreachable,
+            message: "required path is unavailable".to_owned(),
+            policy_generation: 3,
+            network_generation: 7,
+            candidate_paths: Vec::new(),
+            rejected: Vec::new(),
+        };
+
+        assert_eq!(
+            classify_path_planning_failure(&error, 3, 7),
+            (
+                crate::app::flow::PathExecutionOutcome::PathPlanningFailed,
+                "required path is unavailable".to_owned(),
+            )
+        );
+        assert_eq!(
+            classify_path_planning_failure(&error, 4, 7),
+            (
+                crate::app::flow::PathExecutionOutcome::StaleDecisionDiscarded,
+                "policyChangedDuringPathPlanning".to_owned(),
+            )
+        );
+        assert_eq!(
+            classify_path_planning_failure(&error, 3, 8),
+            (
+                crate::app::flow::PathExecutionOutcome::StaleDecisionDiscarded,
+                "networkChangedDuringPathPlanning".to_owned(),
+            )
+        );
+        assert_eq!(
+            classify_path_planning_failure(&error, 4, 8),
+            (
+                crate::app::flow::PathExecutionOutcome::StaleDecisionDiscarded,
+                "networkAndPolicyChangedDuringPathPlanning".to_owned(),
+            )
+        );
     }
 
     #[test]
