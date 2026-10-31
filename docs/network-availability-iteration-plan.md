@@ -1137,3 +1137,9 @@ lifecycle tests.
 
 - PR #92 的 Windows Rust quality 与 UDP loopback job 在非测试库构建阶段都因 `IP_ADDRESS_PREFIX` 未使用而失败；该类型只被 `windows.rs` 中的测试辅助代码引用。将导入限定到 `#[cfg(test)]`，不改变网络快照运行逻辑。
 - 本机没有 MinGW C 编译器；尝试 `cargo clippy -p clash-lib --target x86_64-pc-windows-gnu --all-targets --all-features --locked -j 6 -- -D warnings` 因缺少 `x86_64-w64-mingw32-gcc` 被依赖构建阻断。Windows MSVC CI 将验证修正后的目标构建与回归；在新 SHA CI 完成前不将 Windows 修复标为远端验证通过。
+
+### 2026-10-31：Explain 集成测试等待首次网络快照（L2）
+
+- PR #92 的 Linux quality job 在 `connection_chain_tests` 中重复失败。日志显示 Explain 请求可在 `/runtime` 首次网络观察前启动：UDP 流第一次规划使用 `networkVersion=0`，随后快照变为 `1` 并触发 `stale network generation` 重规划；同时 SOCKS5 UDP 本地 fixture 在核心启动期间已经开始 5 秒 accept/receive 计时，慢启动时可能先于实际请求退出。这是集成测试 readiness/fixture 时序不足的证据，尚不表示生产转发路径在已就绪状态下错误。
+- 增加测试辅助函数，等待 `/runtime` 报告非零 `networkVersion` 和 `lastObservedAtMs` 后再触发 Explain 流量；代理拒绝、DIRECT 拨号拒绝和规则指定缺失网卡的用例也先等待此 readiness。SOCKS5 UDP 成功往返用例把上游/relay 任务放到核心及首次快照就绪后启动，并将 fixture 等待上限设为 10 秒。未修改生产网络行为。
+- 本机 `cargo test -p clash-lib --test connection_chain_tests --locked -j 6`：10 passed；该本机为 macOS，不能据此代替 Linux 验证。等待更新后的 Linux CI 确认根因修正有效；未进行真实网络切换、TUN 或公网测试。
