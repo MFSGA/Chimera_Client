@@ -1237,7 +1237,11 @@ impl RemoteConnector for DirectConnector {
 mod tests {
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
-        sync::Arc,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
     };
 
     use futures::{SinkExt, StreamExt, stream::FuturesUnordered};
@@ -1276,6 +1280,91 @@ mod tests {
         },
         session::SocksAddr,
     };
+
+    struct ResolveCancellationGuard(Arc<AtomicBool>);
+
+    impl Drop for ResolveCancellationGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct PendingResolveAllResolver {
+        cancelled: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::app::dns::ClashResolver for PendingResolveAllResolver {
+        async fn resolve(
+            &self,
+            _host: &str,
+            _enhanced: bool,
+        ) -> anyhow::Result<Option<IpAddr>> {
+            Ok(None)
+        }
+
+        async fn resolve_all(
+            &self,
+            _host: &str,
+            _enhanced: bool,
+        ) -> anyhow::Result<Vec<IpAddr>> {
+            let _guard = ResolveCancellationGuard(self.cancelled.clone());
+            std::future::pending().await
+        }
+
+        async fn resolve_v4(
+            &self,
+            _host: &str,
+            _enhanced: bool,
+        ) -> anyhow::Result<Option<std::net::Ipv4Addr>> {
+            Ok(None)
+        }
+
+        async fn resolve_v6(
+            &self,
+            _host: &str,
+            _enhanced: bool,
+        ) -> anyhow::Result<Option<std::net::Ipv6Addr>> {
+            Ok(None)
+        }
+
+        async fn cached_for(&self, _ip: IpAddr) -> Option<String> {
+            None
+        }
+
+        async fn exchange(
+            &self,
+            _message: &hickory_proto::op::Message,
+        ) -> anyhow::Result<hickory_proto::op::Message> {
+            anyhow::bail!("DNS exchange is unused in this test")
+        }
+
+        async fn reverse_lookup(&self, _ip: IpAddr) -> Option<String> {
+            None
+        }
+
+        async fn is_fake_ip(&self, _ip: IpAddr) -> bool {
+            false
+        }
+
+        async fn fake_ip_for_host(&self, _host: &str) -> Option<IpAddr> {
+            None
+        }
+
+        fn fake_ip_enabled(&self) -> bool {
+            false
+        }
+
+        fn ipv6(&self) -> bool {
+            false
+        }
+
+        fn set_ipv6(&self, _enable: bool) {}
+
+        fn kind(&self) -> crate::app::dns::ResolverKind {
+            crate::app::dns::ResolverKind::Clash
+        }
+    }
 
     fn s04by_observed_status() -> Arc<tokio::sync::RwLock<NetworkStatus>> {
         let mut status = NetworkStatus::default();
@@ -2420,6 +2509,41 @@ mod tests {
 
         drop(stream);
         drop(listener);
+    }
+
+    #[tokio::test]
+    async fn direct_tcp_total_budget_includes_and_cancels_dns() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let resolver: crate::app::dns::ThreadSafeDNSResolver =
+            Arc::new(PendingResolveAllResolver {
+                cancelled: cancelled.clone(),
+            });
+        let selection = crate::app::flow::DirectPathSelection::default();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            DirectConnector::new().connect_stream_with_path_selection_result(
+                resolver,
+                "pending.example.test",
+                443,
+                None,
+                &selection,
+                #[cfg(target_os = "linux")]
+                None,
+            ),
+        )
+        .await
+        .expect("DIRECT TCP DNS must finish within the total attempt budget");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("pending DNS unexpectedly produced a connection"),
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("DNS resolution exceeded"));
+        assert!(
+            cancelled.load(Ordering::SeqCst),
+            "the timed out DNS future must be dropped"
+        );
     }
 
     #[tokio::test]
