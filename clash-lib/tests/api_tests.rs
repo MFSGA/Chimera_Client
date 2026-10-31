@@ -1013,3 +1013,52 @@ async fn test_get_set_allow_lan() {
         "'allow_lan' should be false after update"
     );
 }
+
+#[test]
+#[serial_test::serial]
+fn occupied_api_port_is_reported_as_startup_failure() {
+    let occupied = TcpListener::bind("127.0.0.1:0")
+        .expect("failed to bind API conflict fixture");
+    let api_port = occupied
+        .local_addr()
+        .expect("failed to inspect API conflict fixture")
+        .port();
+    let socks_port = available_port();
+    let config = format!(
+        r#"allow-lan: false
+bind-address: 127.0.0.1
+socks-port: {socks_port}
+mode: direct
+log-level: error
+mmdb: null
+external-controller: 127.0.0.1:{api_port}
+secret: clash-rs
+tun:
+  enable: false
+rules:
+  - MATCH,DIRECT
+"#
+    );
+    let cwd =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
+    let error = clash_lib::start_scaffold_instance(Options {
+        config: Config::Str(config),
+        cwd: Some(cwd.to_string_lossy().to_string()),
+        rt: None,
+        log_file: None,
+        config_path: None,
+    })
+    .expect_err("an occupied API port must fail startup instead of reporting ready");
+
+    let message = error.to_string().to_ascii_lowercase();
+    assert!(
+        message.contains("failed to bind api server"),
+        "startup should expose the API bind failure, got: {error}"
+    );
+    assert!(
+        message.contains("address already in use")
+            || message.contains("only one usage")
+            || message.contains("10048"),
+        "startup error should identify the occupied port, got: {error}"
+    );
+}
