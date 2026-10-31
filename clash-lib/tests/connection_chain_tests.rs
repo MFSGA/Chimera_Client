@@ -126,6 +126,24 @@ async fn get_api_json(api_port: u16, path: &str) -> serde_json::Value {
     serde_json::from_slice(&body).expect("failed to parse API GET JSON")
 }
 
+async fn wait_for_initial_network_observation(api_port: u16) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let runtime = get_api_json(api_port, "/runtime").await;
+            if runtime["lastObservedAtMs"].as_i64().is_some()
+                && runtime["networkVersion"]
+                    .as_u64()
+                    .is_some_and(|version| version > 0)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("runtime did not complete its initial network observation");
+}
+
 async fn wait_for_rule_interface_failure(
     api_port: u16,
     destination: &str,
@@ -500,6 +518,7 @@ async fn direct_tcp_flow_is_queryable_from_path_explain() {
 #[serial_test::serial]
 async fn direct_tcp_dial_failure_is_queryable_from_path_explain() {
     let (_clash, api_port, socks_port) = start_direct_client();
+    wait_for_initial_network_observation(api_port).await;
     let existing_decisions = tokio::time::timeout(
         Duration::from_secs(3),
         get_api_json(api_port, "/runtime/network/path-decisions"),
@@ -624,6 +643,7 @@ rules:
         vec![api_port, socks_port],
     )
     .expect("failed to start rule-interface Explain client");
+    wait_for_initial_network_observation(api_port).await;
 
     let (mut tcp_stream, reply_status) =
         socks5_connect_with_status(socks_port, tcp_target_port).await;
@@ -1133,6 +1153,7 @@ rules:
         vec![api_port, socks_port],
     )
     .expect("failed to start proxy endpoint Explain client");
+    wait_for_initial_network_observation(api_port).await;
 
     // Keep the proxy port occupied until the local listeners are ready, then
     // release it to produce a deterministic loopback connection refusal.
@@ -1526,9 +1547,49 @@ async fn socks5_udp_outbound_roundtrip_is_queryable_from_path_explain() {
     let target_addr = target.local_addr().unwrap();
     let (target_tx, target_rx) = tokio::sync::oneshot::channel();
 
+    let api_port = available_port();
+    let socks_port = available_port();
+    let config = format!(
+        r#"allow-lan: false
+bind-address: 127.0.0.1
+socks-port: {socks_port}
+mode: rule
+log-level: error
+mmdb: null
+external-controller: 127.0.0.1:{api_port}
+secret: clash-rs
+tun:
+  enable: false
+proxies:
+  - name: socks5-udp-out
+    type: socks5
+    server: 127.0.0.1
+    port: {upstream_port}
+    udp: true
+rules:
+  - MATCH,socks5-udp-out
+"#
+    );
+    let cwd =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
+    let _clash = ClashInstance::start(
+        Options {
+            config: Config::Str(config),
+            cwd: Some(cwd.to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            config_path: None,
+        },
+        vec![api_port, socks_port],
+    )
+    .expect("failed to start SOCKS5 UDP Explain integration client");
+    wait_for_initial_network_observation(api_port).await;
+
+    // Start bounded fixture waits only after core startup and its initial
+    // network snapshot, so slow CI startup cannot expire the local servers.
     let upstream_task = tokio::spawn(async move {
         let (mut stream, _) =
-            tokio::time::timeout(Duration::from_secs(5), upstream.accept())
+            tokio::time::timeout(Duration::from_secs(10), upstream.accept())
                 .await
                 .expect("timed out waiting for SOCKS5 UDP association")
                 .expect("failed to accept SOCKS5 UDP association");
@@ -1582,7 +1643,7 @@ async fn socks5_udp_outbound_roundtrip_is_queryable_from_path_explain() {
     let relay_task = tokio::spawn(async move {
         let mut packet = vec![0u8; 65_535];
         let (len, client_addr) = tokio::time::timeout(
-            Duration::from_secs(5),
+            Duration::from_secs(10),
             relay.recv_from(&mut packet),
         )
         .await
@@ -1608,7 +1669,7 @@ async fn socks5_udp_outbound_roundtrip_is_queryable_from_path_explain() {
 
         let mut echoed = vec![0u8; 65_535];
         let (echoed_len, source) = tokio::time::timeout(
-            Duration::from_secs(5),
+            Duration::from_secs(10),
             target.recv_from(&mut echoed),
         )
         .await
@@ -1629,43 +1690,6 @@ async fn socks5_udp_outbound_roundtrip_is_queryable_from_path_explain() {
             .await
             .expect("failed to return SOCKS5 UDP response");
     });
-
-    let api_port = available_port();
-    let socks_port = available_port();
-    let config = format!(
-        r#"allow-lan: false
-bind-address: 127.0.0.1
-socks-port: {socks_port}
-mode: rule
-log-level: error
-mmdb: null
-external-controller: 127.0.0.1:{api_port}
-secret: clash-rs
-tun:
-  enable: false
-proxies:
-  - name: socks5-udp-out
-    type: socks5
-    server: 127.0.0.1
-    port: {upstream_port}
-    udp: true
-rules:
-  - MATCH,socks5-udp-out
-"#
-    );
-    let cwd =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
-    let _clash = ClashInstance::start(
-        Options {
-            config: Config::Str(config),
-            cwd: Some(cwd.to_string_lossy().to_string()),
-            rt: None,
-            log_file: None,
-            config_path: None,
-        },
-        vec![api_port, socks_port],
-    )
-    .expect("failed to start SOCKS5 UDP Explain integration client");
 
     let client = tokio::time::timeout(
         Duration::from_secs(5),
