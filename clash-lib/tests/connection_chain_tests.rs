@@ -8,13 +8,13 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, UdpSocket},
     sync::mpsc,
 };
 
 mod common;
 
-use common::{ClashInstance, send_http_request};
+use common::{ClashInstance, Socks5UdpSession, send_http_request};
 
 fn available_port() -> u16 {
     StdTcpListener::bind("127.0.0.1:0")
@@ -126,7 +126,52 @@ async fn get_api_json(api_port: u16, path: &str) -> serde_json::Value {
     serde_json::from_slice(&body).expect("failed to parse API GET JSON")
 }
 
-async fn socks5_connect(proxy_port: u16, target_port: u16) -> TcpStream {
+async fn wait_for_initial_network_observation(api_port: u16) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let runtime = get_api_json(api_port, "/runtime").await;
+            if runtime["lastObservedAtMs"].as_i64().is_some()
+                && runtime["networkVersion"]
+                    .as_u64()
+                    .is_some_and(|version| version > 0)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("runtime did not complete its initial network observation");
+}
+
+async fn wait_for_rule_interface_failure(
+    api_port: u16,
+    destination: &str,
+) -> serde_json::Value {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let decisions =
+                get_api_json(api_port, "/runtime/network/path-decisions").await;
+            if let Some(decision) = decisions.as_array().and_then(|records| {
+                records.iter().find(|decision| {
+                    decision["outcome"] == "pathPlanningFailed"
+                        && decision["failureKind"] == "ruleInterfaceResolutionFailed"
+                        && decision["destination"] == destination
+                })
+            }) {
+                break decision.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("rule interface resolution failure was not recorded in Explain")
+}
+
+async fn socks5_connect_with_status(
+    proxy_port: u16,
+    target_port: u16,
+) -> (TcpStream, u8) {
     let mut stream = TcpStream::connect(("127.0.0.1", proxy_port))
         .await
         .expect("failed to connect to SOCKS5 listener");
@@ -142,7 +187,7 @@ async fn socks5_connect(proxy_port: u16, target_port: u16) -> TcpStream {
         .unwrap();
     let mut header = [0u8; 4];
     stream.read_exact(&mut header).await.unwrap();
-    assert_eq!(header[1], 0x00, "SOCKS5 CONNECT was rejected");
+    let reply_status = header[1];
     let remaining = match header[3] {
         0x01 => 6,
         0x04 => 18,
@@ -150,6 +195,46 @@ async fn socks5_connect(proxy_port: u16, target_port: u16) -> TcpStream {
     };
     let mut address = vec![0u8; remaining];
     stream.read_exact(&mut address).await.unwrap();
+    (stream, reply_status)
+}
+
+async fn socks5_connect_domain_with_status(
+    proxy_port: u16,
+    host: &str,
+    target_port: u16,
+) -> (TcpStream, u8) {
+    let mut stream = TcpStream::connect(("127.0.0.1", proxy_port))
+        .await
+        .expect("failed to connect to SOCKS5 listener");
+    stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut greeting = [0u8; 2];
+    stream.read_exact(&mut greeting).await.unwrap();
+    assert_eq!(greeting, [0x05, 0x00]);
+
+    let host_len =
+        u8::try_from(host.len()).expect("SOCKS5 domain name exceeds 255 bytes");
+    let mut request = vec![0x05, 0x01, 0x00, 0x03, host_len];
+    request.extend_from_slice(host.as_bytes());
+    request.extend_from_slice(&target_port.to_be_bytes());
+    stream.write_all(&request).await.unwrap();
+
+    let mut header = [0u8; 4];
+    stream.read_exact(&mut header).await.unwrap();
+    let reply_status = header[1];
+    let remaining = match header[3] {
+        0x01 => 6,
+        0x04 => 18,
+        atyp => panic!("unexpected SOCKS5 address type {atyp}"),
+    };
+    let mut address = vec![0u8; remaining];
+    stream.read_exact(&mut address).await.unwrap();
+    (stream, reply_status)
+}
+
+async fn socks5_connect(proxy_port: u16, target_port: u16) -> TcpStream {
+    let (stream, reply_status) =
+        socks5_connect_with_status(proxy_port, target_port).await;
+    assert_eq!(reply_status, 0x00, "SOCKS5 CONNECT was rejected");
     stream
 }
 
@@ -406,6 +491,10 @@ async fn direct_tcp_flow_is_queryable_from_path_explain() {
         })
         .await
         .expect("DIRECT flow did not produce a connected Explain record");
+    assert_eq!(
+        connected_decision["destination"].as_str(),
+        Some(format!("127.0.0.1:{target_port}").as_str())
+    );
     let flow_ids = tracked_flow["flowIds"]
         .as_array()
         .expect("tracked DIRECT flow should expose IDs");
@@ -423,6 +512,209 @@ async fn direct_tcp_flow_is_queryable_from_path_explain() {
     )
     .await;
     assert_eq!(detail, connected_decision);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn direct_tcp_dial_failure_is_queryable_from_path_explain() {
+    let (_clash, api_port, socks_port) = start_direct_client();
+    wait_for_initial_network_observation(api_port).await;
+    let existing_decisions = tokio::time::timeout(
+        Duration::from_secs(3),
+        get_api_json(api_port, "/runtime/network/path-decisions"),
+    )
+    .await
+    .expect("timed out reading initial path decisions");
+    let existing_flow_ids = existing_decisions
+        .as_array()
+        .expect("initial path decisions should be an array")
+        .iter()
+        .filter_map(|decision| decision["flowId"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+
+    let target = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to reserve a local TCP port");
+    let target_port = target.local_addr().unwrap().port();
+    drop(target);
+
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(3),
+        socks5_connect(socks_port, target_port),
+    )
+    .await
+    .expect("timed out during the local SOCKS5 connection");
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+        .await
+        .expect("timed out waiting for the refused DIRECT dial to close")
+        .expect("failed to read the closed DIRECT stream");
+    assert!(response.is_empty(), "refused DIRECT dial returned payload");
+
+    let failed_decision = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let decisions =
+                get_api_json(api_port, "/runtime/network/path-decisions").await;
+            if let Some(decision) = decisions.as_array().and_then(|records| {
+                records.iter().find(|decision| {
+                    decision["outcome"] == "dialFailed"
+                        && decision["route"]["outbound"] == "DIRECT"
+                        && decision["reason"] == "directDialFailed"
+                        && decision["flowId"].as_str().is_some_and(|flow_id| {
+                            !existing_flow_ids
+                                .iter()
+                                .any(|existing| existing == flow_id)
+                        })
+                })
+            }) {
+                break decision.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("DIRECT refusal did not produce a failed Explain record");
+    assert_eq!(
+        failed_decision["destination"].as_str(),
+        Some(format!("127.0.0.1:{target_port}").as_str())
+    );
+    assert_eq!(failed_decision["selectedPath"], serde_json::Value::Null);
+    assert!(
+        failed_decision["failureKind"]
+            .as_str()
+            .is_some_and(|failure_kind| !failure_kind.is_empty())
+    );
+
+    let flow_id = failed_decision["flowId"]
+        .as_str()
+        .expect("failed DIRECT Explain should expose a flow ID");
+    let detail = tokio::time::timeout(
+        Duration::from_secs(3),
+        get_api_json(
+            api_port,
+            &format!("/runtime/network/path-decision/{flow_id}"),
+        ),
+    )
+    .await
+    .expect("timed out querying the failed DIRECT Explain detail");
+    assert_eq!(detail, failed_decision);
+}
+
+#[cfg(feature = "tun")]
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn unavailable_rule_interface_is_queryable_for_tcp_and_udp() {
+    let api_port = available_port();
+    let socks_port = available_port();
+    let tcp_target = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to reserve local TCP target");
+    let tcp_target_port = tcp_target.local_addr().unwrap().port();
+    let udp_target = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("failed to reserve local UDP target");
+    let udp_target_port = udp_target.local_addr().unwrap().port();
+    let missing_interface = "chimera-missing-egress-test-iface";
+    let config = format!(
+        r#"allow-lan: false
+bind-address: 127.0.0.1
+socks-port: {socks_port}
+mode: rule
+log-level: error
+mmdb: null
+external-controller: 127.0.0.1:{api_port}
+secret: clash-rs
+tun:
+  enable: false
+rules:
+  - MATCH,DIRECT,interface={missing_interface}
+"#
+    );
+    let cwd =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
+    let _clash = ClashInstance::start(
+        Options {
+            config: Config::Str(config),
+            cwd: Some(cwd.to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            config_path: None,
+        },
+        vec![api_port, socks_port],
+    )
+    .expect("failed to start rule-interface Explain client");
+    wait_for_initial_network_observation(api_port).await;
+
+    let (mut tcp_stream, reply_status) =
+        socks5_connect_with_status(socks_port, tcp_target_port).await;
+    assert_eq!(
+        reply_status, 0x00,
+        "SOCKS5 should preserve its existing pre-dispatch success reply"
+    );
+    let mut byte = [0u8; 1];
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), tcp_stream.read(&mut byte))
+            .await
+            .expect("TCP stream did not close after the interface failure")
+            .expect("failed to read closed TCP flow"),
+        0,
+        "the rejected TCP flow should close without reaching its target"
+    );
+    let tcp_destination = format!("127.0.0.1:{tcp_target_port}");
+    let tcp_decision =
+        wait_for_rule_interface_failure(api_port, &tcp_destination).await;
+    assert_eq!(tcp_decision["route"]["outbound"], "DIRECT");
+    assert!(
+        tcp_decision["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(missing_interface))
+    );
+    assert!(
+        tcp_decision["candidatePaths"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(tcp_decision["selectedPath"].is_null());
+    let tcp_flow_id = tcp_decision["flowId"].as_str().unwrap();
+    assert_eq!(
+        get_api_json(
+            api_port,
+            &format!("/runtime/network/path-decision/{tcp_flow_id}"),
+        )
+        .await,
+        tcp_decision
+    );
+
+    let udp_client = Socks5UdpSession::connect(socks_port).await;
+    udp_client
+        .send_ipv4(b"unavailable-egress", [127, 0, 0, 1], udp_target_port)
+        .await;
+    let udp_destination = format!("127.0.0.1:{udp_target_port}");
+    let udp_decision =
+        wait_for_rule_interface_failure(api_port, &udp_destination).await;
+    assert_eq!(udp_decision["route"]["outbound"], "DIRECT");
+    assert!(
+        udp_decision["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(missing_interface))
+    );
+    assert!(
+        udp_decision["candidatePaths"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(udp_decision["selectedPath"].is_null());
+    let udp_flow_id = udp_decision["flowId"].as_str().unwrap();
+    assert_eq!(
+        get_api_json(
+            api_port,
+            &format!("/runtime/network/path-decision/{udp_flow_id}"),
+        )
+        .await,
+        udp_decision
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -816,4 +1108,760 @@ rules:
         .await
         .expect("timed out querying failure path decision detail");
     assert_eq!(detail, failure);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn proxy_endpoint_dial_refusal_is_queryable_with_logical_destination() {
+    let proxy_endpoint = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to reserve local proxy endpoint port");
+    let proxy_endpoint_port = proxy_endpoint.local_addr().unwrap().port();
+    let api_port = available_port();
+    let socks_port = available_port();
+    let config = format!(
+        r#"allow-lan: false
+bind-address: 127.0.0.1
+socks-port: {socks_port}
+mode: rule
+log-level: error
+mmdb: null
+external-controller: 127.0.0.1:{api_port}
+secret: clash-rs
+tun:
+  enable: false
+proxies:
+  - name: refused-proxy
+    type: socks5
+    server: 127.0.0.1
+    port: {proxy_endpoint_port}
+    udp: false
+rules:
+  - MATCH,refused-proxy
+"#
+    );
+    let cwd =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
+    let _clash = ClashInstance::start(
+        Options {
+            config: Config::Str(config),
+            cwd: Some(cwd.to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            config_path: None,
+        },
+        vec![api_port, socks_port],
+    )
+    .expect("failed to start proxy endpoint Explain client");
+    wait_for_initial_network_observation(api_port).await;
+
+    // Keep the proxy port occupied until the local listeners are ready, then
+    // release it to produce a deterministic loopback connection refusal.
+    drop(proxy_endpoint);
+    let existing_decisions = tokio::time::timeout(
+        Duration::from_secs(3),
+        get_api_json(api_port, "/runtime/network/path-decisions"),
+    )
+    .await
+    .expect("timed out reading initial proxy path decisions");
+    let existing_flow_ids = existing_decisions
+        .as_array()
+        .expect("initial path decisions should be an array")
+        .iter()
+        .filter_map(|decision| decision["flowId"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+
+    let (mut stream, reply_status) = tokio::time::timeout(
+        Duration::from_secs(5),
+        socks5_connect_domain_with_status(socks_port, "example.test", 443),
+    )
+    .await
+    .expect("timed out during local SOCKS5 CONNECT");
+    assert_eq!(
+        reply_status, 0x00,
+        "SOCKS5 should preserve the reference success response before dispatch"
+    );
+    let mut response_payload = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        stream.read_to_end(&mut response_payload),
+    )
+    .await
+    .expect("timed out waiting for failed proxy stream to close")
+    .expect("failed to read closed proxy stream");
+    assert!(
+        response_payload.is_empty(),
+        "refused proxy endpoint unexpectedly returned payload"
+    );
+
+    let failure = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let decisions =
+                get_api_json(api_port, "/runtime/network/path-decisions").await;
+            if let Some(decision) = decisions.as_array().and_then(|records| {
+                records.iter().find(|decision| {
+                    decision["outcome"] == "dialFailed"
+                        && decision["route"]["outbound"] == "refused-proxy"
+                        && decision["reason"].as_str().is_some_and(|reason| {
+                            reason.contains("proxyEndpointDialFailed")
+                                && reason.contains("attemptedPaths")
+                        })
+                        && decision["flowId"].as_str().is_some_and(|flow_id| {
+                            !existing_flow_ids
+                                .iter()
+                                .any(|existing| existing == flow_id)
+                        })
+                })
+            }) {
+                break decision.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("proxy endpoint refusal was not recorded in Explain");
+    assert_eq!(
+        failure["destination"].as_str(),
+        Some("example.test:443"),
+        "Explain should retain the requested logical destination"
+    );
+    assert!(
+        failure["failureKind"]
+            .as_str()
+            .is_some_and(|kind| !kind.is_empty())
+    );
+    assert_eq!(failure["selectedPath"], serde_json::Value::Null);
+    assert!(failure["candidatePaths"].is_array());
+
+    let flow_id = failure["flowId"]
+        .as_str()
+        .expect("failed proxy Explain should expose a flow ID");
+    let detail = tokio::time::timeout(
+        Duration::from_secs(3),
+        get_api_json(
+            api_port,
+            &format!("/runtime/network/path-decision/{flow_id}"),
+        ),
+    )
+    .await
+    .expect("timed out querying failed proxy Explain detail");
+    assert_eq!(detail, failure);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn http_inbound_forwards_websocket_upgrade_bidirectionally() {
+    async fn read_headers(stream: &mut TcpStream) -> Vec<u8> {
+        let mut headers = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            stream
+                .read_exact(&mut byte)
+                .await
+                .expect("HTTP upgrade headers should be complete");
+            headers.push(byte[0]);
+            assert!(headers.len() <= 16 * 1024, "HTTP headers exceeded limit");
+            if headers.ends_with(b"\r\n\r\n") {
+                return headers;
+            }
+        }
+    }
+
+    let origin = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind websocket fixture");
+    let origin_port = origin.local_addr().unwrap().port();
+    let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+    let origin_task = tokio::spawn(async move {
+        let (mut stream, _) = origin
+            .accept()
+            .await
+            .expect("websocket fixture should accept connection");
+        let request = read_headers(&mut stream).await;
+        let request = String::from_utf8_lossy(&request);
+        let _ = request_tx.send(request.into_owned());
+
+        stream
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\n\
+                  Connection: Upgrade, X-Upstream-Private\r\n\
+                  Upgrade: websocket\r\n\
+                  X-Upstream-Private: secret\r\n\
+                  Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\
+                  \r\n\x81\x05hello",
+            )
+            .await
+            .expect("websocket fixture should accept the upgrade");
+
+        let mut client_frame_header = [0u8; 2];
+        stream
+            .read_exact(&mut client_frame_header)
+            .await
+            .expect("websocket fixture should receive client data");
+        assert_eq!(client_frame_header, [0x81, 0x84]);
+        let mut client_masked_frame = [0u8; 8];
+        stream
+            .read_exact(&mut client_masked_frame)
+            .await
+            .expect("websocket fixture should receive masked client frame");
+        let mask = &client_masked_frame[..4];
+        let payload: Vec<u8> = client_masked_frame[4..]
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| *byte ^ mask[index % 4])
+            .collect();
+        assert_eq!(payload, b"ping");
+        stream
+            .write_all(b"\x81\x04pong")
+            .await
+            .expect("websocket fixture should return client data");
+    });
+
+    let api_port = available_port();
+    let http_port = available_port();
+    let config = format!(
+        "allow-lan: false\n\
+         bind-address: 127.0.0.1\n\
+         port: {http_port}\n\
+         mode: rule\n\
+         log-level: error\n\
+         mmdb: null\n\
+         external-controller: 127.0.0.1:{api_port}\n\
+         secret: clash-rs\n\
+         authentication:\n\
+           - test-user:test-password\n\
+         tun:\n\
+           enable: false\n\
+         rules:\n\
+           - MATCH,DIRECT\n"
+    );
+    let cwd =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
+    let _clash = ClashInstance::start(
+        Options {
+            config: Config::Str(config),
+            cwd: Some(cwd.to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            config_path: None,
+        },
+        vec![api_port, http_port],
+    )
+    .expect("failed to start HTTP proxy client");
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match TcpStream::connect(("127.0.0.1", http_port)).await {
+                Ok(stream) => {
+                    drop(stream);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+
+        let mut client = TcpStream::connect(("127.0.0.1", http_port))
+            .await
+            .expect("failed to connect to HTTP inbound");
+        client
+            .write_all(
+                format!(
+                    "GET http://127.0.0.1:{origin_port}/socket HTTP/1.1\r\n\
+                     Host: wrong.example\r\n\
+                     Connection: keep-alive, Upgrade, X-Hop-Private\r\n\
+                     X-Hop-Private: secret\r\n\
+                     Proxy-Authorization: Basic dGVzdC11c2VyOnRlc3QtcGFzc3dvcmQ=\r\n\
+                     Upgrade: websocket\r\n\
+                     Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                     Sec-WebSocket-Version: 13\r\n\
+                     \r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("failed to send websocket upgrade request");
+
+        let request = tokio::time::timeout(Duration::from_secs(2), request_rx)
+            .await
+            .expect("origin should receive upgrade request")
+            .expect("origin request channel should remain open");
+        assert!(request.starts_with("GET /socket HTTP/1.1\r\n"));
+        let request_lower = request.to_ascii_lowercase();
+        let connection = request_lower
+            .lines()
+            .find_map(|line| line.strip_prefix("connection:"))
+            .expect("upgrade request should include Connection header");
+        assert_eq!(connection.trim(), "upgrade");
+        assert!(request_lower.contains("upgrade: websocket"));
+        assert!(request.contains("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=="));
+        assert!(request_lower.contains(&format!("host: 127.0.0.1:{origin_port}")));
+        assert!(!request_lower.contains("proxy-authorization:"));
+        assert!(!request_lower.contains("x-hop-private:"));
+
+        let response = read_headers(&mut client).await;
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 101 Switching Protocols"));
+        let response_lower = response.to_ascii_lowercase();
+        assert!(response_lower.contains("upgrade: websocket"));
+        assert!(response_lower.contains("connection: upgrade"));
+        assert!(!response_lower.contains("x-upstream-private:"));
+
+        let mut server_frame = [0u8; 7];
+        client
+            .read_exact(&mut server_frame)
+            .await
+            .expect("HTTP inbound should forward early upstream upgrade data");
+        assert_eq!(&server_frame, b"\x81\x05hello");
+
+        let client_payload = b"ping";
+        let mask = [0x13, 0x57, 0x9b, 0xdf];
+        let mut client_frame = vec![0x81, 0x80 | client_payload.len() as u8];
+        client_frame.extend_from_slice(&mask);
+        client_frame.extend(
+            client_payload
+                .iter()
+                .enumerate()
+                .map(|(index, byte)| *byte ^ mask[index % mask.len()]),
+        );
+        client
+            .write_all(&client_frame)
+            .await
+            .expect("HTTP inbound should forward client upgrade data");
+        let mut acknowledgement = [0u8; 6];
+        client
+            .read_exact(&mut acknowledgement)
+            .await
+            .expect("HTTP inbound should forward upstream upgrade data");
+        assert_eq!(&acknowledgement, b"\x81\x04pong");
+    })
+    .await
+    .expect("HTTP websocket upgrade tunnel timed out");
+    origin_task
+        .await
+        .expect("websocket fixture task should complete");
+
+    let refused_port = available_port();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let mut client = TcpStream::connect(("127.0.0.1", http_port))
+            .await
+            .expect("failed to reconnect to HTTP inbound");
+        client
+            .write_all(
+                format!(
+                    "GET http://127.0.0.1:{refused_port}/socket HTTP/1.1\r\n\
+                     Host: 127.0.0.1:{refused_port}\r\n\
+                     Connection: Upgrade\r\n\
+                     Proxy-Authorization: Basic dGVzdC11c2VyOnRlc3QtcGFzc3dvcmQ=\r\n\
+                     Upgrade: websocket\r\n\
+                     Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                     Sec-WebSocket-Version: 13\r\n\
+                     \r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("failed to send refused websocket upgrade request");
+        let response = read_headers(&mut client).await;
+        assert!(
+            String::from_utf8_lossy(&response)
+                .starts_with("HTTP/1.1 502 Bad Gateway")
+        );
+    })
+    .await
+    .expect("HTTP upgrade connection failure response timed out");
+}
+
+async fn assert_connected_udp_flow_explain(
+    api_port: u16,
+    target_port: u16,
+    outbound: &str,
+) {
+    let (flow, decision) = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let flows = get_api_json(api_port, "/flows?include_closed=true").await;
+            if let Some(flow) = flows.as_array().and_then(|records| {
+                records.iter().find(|flow| {
+                    flow["protocol"] == "udp"
+                        && flow["dstPort"].as_u64() == Some(u64::from(target_port))
+                        && flow["flowIds"]
+                            .as_array()
+                            .is_some_and(|ids| !ids.is_empty())
+                })
+            }) {
+                let flow = flow.clone();
+                let flow_ids = flow["flowIds"]
+                    .as_array()
+                    .expect("tracked UDP flow should expose IDs");
+                let decisions =
+                    get_api_json(api_port, "/runtime/network/path-decisions").await;
+                if let Some(decision) = decisions.as_array().and_then(|records| {
+                    records.iter().find(|decision| {
+                        flow_ids.iter().any(|id| id == &decision["flowId"])
+                            && decision["outcome"] == "connected"
+                            && decision["route"]["outbound"] == outbound
+                    })
+                }) {
+                    break (flow, decision.clone());
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("SOCKS5 UDP flow did not produce a connected Explain record");
+
+    let flow_ids = flow["flowIds"]
+        .as_array()
+        .expect("tracked UDP flow should expose IDs");
+    assert!(
+        flow_ids
+            .iter()
+            .any(|flow_id| flow_id == &decision["flowId"])
+    );
+    let flow_id = decision["flowId"]
+        .as_str()
+        .expect("UDP Explain record should expose a flow ID");
+    let detail = get_api_json(
+        api_port,
+        &format!("/runtime/network/path-decision/{flow_id}"),
+    )
+    .await;
+    assert_eq!(detail, decision);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn socks5_udp_outbound_roundtrip_is_queryable_from_path_explain() {
+    let upstream = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind local SOCKS5 UDP upstream");
+    let upstream_port = upstream.local_addr().unwrap().port();
+
+    let relay = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind local SOCKS5 UDP relay");
+    let relay_addr = relay.local_addr().unwrap();
+    let target = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind local UDP echo target");
+    let target_addr = target.local_addr().unwrap();
+    let (target_tx, target_rx) = tokio::sync::oneshot::channel();
+
+    let api_port = available_port();
+    let socks_port = available_port();
+    let config = format!(
+        r#"allow-lan: false
+bind-address: 127.0.0.1
+socks-port: {socks_port}
+mode: rule
+log-level: error
+mmdb: null
+external-controller: 127.0.0.1:{api_port}
+secret: clash-rs
+tun:
+  enable: false
+proxies:
+  - name: socks5-udp-out
+    type: socks5
+    server: 127.0.0.1
+    port: {upstream_port}
+    udp: true
+rules:
+  - MATCH,socks5-udp-out
+"#
+    );
+    let cwd =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
+    let _clash = ClashInstance::start(
+        Options {
+            config: Config::Str(config),
+            cwd: Some(cwd.to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            config_path: None,
+        },
+        vec![api_port, socks_port],
+    )
+    .expect("failed to start SOCKS5 UDP Explain integration client");
+    wait_for_initial_network_observation(api_port).await;
+
+    // Start bounded fixture waits only after core startup and its initial
+    // network snapshot, so slow CI startup cannot expire the local servers.
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) =
+            tokio::time::timeout(Duration::from_secs(10), upstream.accept())
+                .await
+                .expect("timed out waiting for SOCKS5 UDP association")
+                .expect("failed to accept SOCKS5 UDP association");
+
+        let mut greeting = [0u8; 2];
+        stream
+            .read_exact(&mut greeting)
+            .await
+            .expect("failed to read SOCKS5 greeting");
+        assert_eq!(greeting[0], 0x05);
+        let mut methods = vec![0u8; usize::from(greeting[1])];
+        stream
+            .read_exact(&mut methods)
+            .await
+            .expect("failed to read SOCKS5 authentication methods");
+        assert!(methods.contains(&0x00), "SOCKS5 no-auth was not offered");
+        stream
+            .write_all(&[0x05, 0x00])
+            .await
+            .expect("failed to accept SOCKS5 no-auth");
+
+        let mut request = [0u8; 4];
+        stream
+            .read_exact(&mut request)
+            .await
+            .expect("failed to read SOCKS5 UDP ASSOCIATE request");
+        assert_eq!(request, [0x05, 0x03, 0x00, 0x01]);
+        let mut address = [0u8; 6];
+        stream
+            .read_exact(&mut address)
+            .await
+            .expect("failed to read SOCKS5 UDP ASSOCIATE address");
+        assert_eq!(address, [0u8; 6]);
+
+        let mut response = vec![0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1];
+        response.extend_from_slice(&relay_addr.port().to_be_bytes());
+        stream
+            .write_all(&response)
+            .await
+            .expect("failed to return SOCKS5 UDP relay address");
+
+        let mut byte = [0u8; 1];
+        while stream
+            .read(&mut byte)
+            .await
+            .expect("failed while holding SOCKS5 control connection")
+            != 0
+        {}
+    });
+
+    let relay_task = tokio::spawn(async move {
+        let mut packet = vec![0u8; 65_535];
+        let (len, client_addr) = tokio::time::timeout(
+            Duration::from_secs(10),
+            relay.recv_from(&mut packet),
+        )
+        .await
+        .expect("timed out waiting for SOCKS5 UDP datagram")
+        .expect("failed to receive SOCKS5 UDP datagram");
+        assert!(len >= 10, "SOCKS5 UDP datagram is truncated");
+        assert_eq!(
+            &packet[..4],
+            &[0x00, 0x00, 0x00, 0x01],
+            "expected an unfragmented IPv4 SOCKS5 UDP datagram"
+        );
+        let destination = SocketAddr::from((
+            std::net::Ipv4Addr::new(packet[4], packet[5], packet[6], packet[7]),
+            u16::from_be_bytes([packet[8], packet[9]]),
+        ));
+        target_tx
+            .send(destination)
+            .expect("test should still be waiting for the destination");
+        target
+            .send_to(&packet[10..len], destination)
+            .await
+            .expect("failed to forward SOCKS5 UDP payload to target");
+
+        let mut echoed = vec![0u8; 65_535];
+        let (echoed_len, source) = tokio::time::timeout(
+            Duration::from_secs(10),
+            target.recv_from(&mut echoed),
+        )
+        .await
+        .expect("timed out waiting for local UDP echo")
+        .expect("failed to receive local UDP echo");
+        assert_eq!(source, destination);
+
+        let source_ip = match source.ip() {
+            std::net::IpAddr::V4(ip) => ip.octets(),
+            std::net::IpAddr::V6(_) => panic!("expected an IPv4 UDP echo source"),
+        };
+        let mut response = vec![0x00, 0x00, 0x00, 0x01];
+        response.extend_from_slice(&source_ip);
+        response.extend_from_slice(&source.port().to_be_bytes());
+        response.extend_from_slice(&echoed[..echoed_len]);
+        relay
+            .send_to(&response, client_addr)
+            .await
+            .expect("failed to return SOCKS5 UDP response");
+    });
+
+    let client = tokio::time::timeout(
+        Duration::from_secs(5),
+        common::Socks5UdpSession::connect(socks_port),
+    )
+    .await
+    .expect("timed out during local SOCKS5 UDP ASSOCIATE");
+    let payload = b"socks5-outbound-udp-roundtrip";
+    client
+        .send_ipv4(payload, [127, 0, 0, 1], target_addr.port())
+        .await;
+    let (response, source) =
+        tokio::time::timeout(Duration::from_secs(5), client.recv())
+            .await
+            .expect("timed out waiting for SOCKS5 UDP echo response");
+    assert_eq!(response, payload);
+    assert_eq!(source, format!("127.0.0.1:{}", target_addr.port()));
+    let destination = tokio::time::timeout(Duration::from_secs(1), target_rx)
+        .await
+        .expect("SOCKS5 UDP relay did not forward the requested destination")
+        .expect("SOCKS5 UDP relay task stopped");
+    assert_eq!(destination, target_addr);
+
+    assert_connected_udp_flow_explain(
+        api_port,
+        target_addr.port(),
+        "socks5-udp-out",
+    )
+    .await;
+
+    drop(client);
+    relay_task.await.expect("SOCKS5 UDP relay task failed");
+    tokio::time::timeout(Duration::from_secs(5), upstream_task)
+        .await
+        .expect("SOCKS5 control connection stayed open after the UDP session closed")
+        .expect("SOCKS5 control-connection task failed");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn socks5_udp_proxy_endpoint_refusal_is_queryable_from_path_explain() {
+    let proxy_endpoint = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to reserve local SOCKS5 UDP proxy port");
+    let proxy_endpoint_port = proxy_endpoint.local_addr().unwrap().port();
+    let target = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("failed to reserve local UDP destination");
+    let target_addr = target.local_addr().unwrap();
+    let api_port = available_port();
+    let socks_port = available_port();
+    let config = format!(
+        r#"allow-lan: false
+bind-address: 127.0.0.1
+socks-port: {socks_port}
+mode: rule
+log-level: error
+mmdb: null
+external-controller: 127.0.0.1:{api_port}
+secret: clash-rs
+tun:
+  enable: false
+proxies:
+  - name: socks5-udp-refused
+    type: socks5
+    server: 127.0.0.1
+    port: {proxy_endpoint_port}
+    udp: true
+rules:
+  - MATCH,socks5-udp-refused
+"#
+    );
+    let cwd =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
+    let _clash = ClashInstance::start(
+        Options {
+            config: Config::Str(config),
+            cwd: Some(cwd.to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            config_path: None,
+        },
+        vec![api_port, socks_port],
+    )
+    .expect("failed to start SOCKS5 UDP refusal Explain client");
+    wait_for_initial_network_observation(api_port).await;
+
+    // Snapshot prior decisions while keeping the proxy endpoint reserved.
+    let existing_decisions = tokio::time::timeout(
+        Duration::from_secs(3),
+        get_api_json(api_port, "/runtime/network/path-decisions"),
+    )
+    .await
+    .expect("timed out reading initial UDP path decisions");
+    let existing_flow_ids = existing_decisions
+        .as_array()
+        .expect("initial UDP path decisions should be an array")
+        .iter()
+        .filter_map(|decision| decision["flowId"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+
+    let client = tokio::time::timeout(
+        Duration::from_secs(5),
+        common::Socks5UdpSession::connect(socks_port),
+    )
+    .await
+    .expect("timed out during local SOCKS5 UDP ASSOCIATE");
+    // The UDP ASSOCIATE response confirms the local SOCKS listener is ready.
+    // Release the outbound endpoint only immediately before the first packet.
+    drop(proxy_endpoint);
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        client.send_ipv4(
+            b"proxy-udp-endpoint-refusal",
+            [127, 0, 0, 1],
+            target_addr.port(),
+        ),
+    )
+    .await
+    .expect("timed out sending local SOCKS5 UDP datagram");
+
+    let failure = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let decisions =
+                get_api_json(api_port, "/runtime/network/path-decisions").await;
+            if let Some(decision) = decisions.as_array().and_then(|records| {
+                records.iter().find(|decision| {
+                    decision["outcome"] == "dialFailed"
+                        && decision["route"]["outbound"] == "socks5-udp-refused"
+                        && decision["reason"].as_str().is_some_and(|reason| {
+                            reason.contains("proxyUdpEndpointDialFailed")
+                                && reason.contains("attemptedPaths")
+                        })
+                        && decision["flowId"].as_str().is_some_and(|flow_id| {
+                            !existing_flow_ids
+                                .iter()
+                                .any(|existing| existing == flow_id)
+                        })
+                })
+            }) {
+                break decision.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("SOCKS5 UDP proxy endpoint refusal was not recorded in Explain");
+    assert_eq!(
+        failure["destination"].as_str(),
+        Some(format!("127.0.0.1:{}", target_addr.port()).as_str()),
+        "UDP Explain should retain the requested logical destination"
+    );
+    assert!(
+        failure["failureKind"]
+            .as_str()
+            .is_some_and(|kind| !kind.is_empty())
+    );
+    assert_eq!(failure["selectedPath"], serde_json::Value::Null);
+    assert!(failure["candidatePaths"].is_array());
+
+    let flow_id = failure["flowId"]
+        .as_str()
+        .expect("failed UDP Explain should expose a flow ID");
+    let detail = tokio::time::timeout(
+        Duration::from_secs(3),
+        get_api_json(
+            api_port,
+            &format!("/runtime/network/path-decision/{flow_id}"),
+        ),
+    )
+    .await
+    .expect("timed out querying failed UDP Explain detail");
+    assert_eq!(detail, failure);
+    drop(client);
 }

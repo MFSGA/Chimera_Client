@@ -1967,6 +1967,7 @@ mod tests {
                 outbound: "DIRECT".to_owned(),
                 rule: None,
             },
+            destination: None,
             candidate_paths: vec![test_health_path()],
             selected_path: Some(test_health_path()),
             rejected: Vec::new(),
@@ -1981,6 +1982,7 @@ mod tests {
         assert_eq!(json["outcome"], "connected");
         assert_eq!(json["configVersion"], state.config_version);
         assert_eq!(json["operationId"], state.generation);
+        assert!(json.get("destination").is_none());
 
         let mut stale = decision.clone();
         stale.flow_id = uuid::Uuid::new_v4();

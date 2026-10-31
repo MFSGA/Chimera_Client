@@ -62,6 +62,7 @@ impl std::fmt::Debug for Handler {
 pub(crate) struct PinnedOutbound {
     pub(crate) handler: AnyOutboundHandler,
     selector_chain: Vec<String>,
+    selector_selection_identity: Vec<(String, String)>,
 }
 
 impl PinnedOutbound {
@@ -70,6 +71,8 @@ impl PinnedOutbound {
         session: &Session,
     ) -> io::Result<Self> {
         let mut selector_chain = Vec::new();
+        let mut selector_selection_identity = Vec::new();
+        let mut track_selector_selections = true;
         let mut visited = Vec::<AnyOutboundHandler>::new();
         loop {
             if !matches!(
@@ -83,6 +86,7 @@ impl PinnedOutbound {
                 return Ok(Self {
                     handler,
                     selector_chain,
+                    selector_selection_identity,
                 });
             }
             if visited.len() >= 16
@@ -100,10 +104,28 @@ impl PinnedOutbound {
                 ))
             })?;
             let selected = group.select_proxy_for_connection(session).await?;
+            if track_selector_selections
+                && matches!(handler.proto(), OutboundType::Selector)
+            {
+                selector_selection_identity
+                    .push((handler.name().to_owned(), selected.name().to_owned()));
+            } else {
+                // Once an automatic group chooses a branch, downstream
+                // selectors are not part of the user's direct selection path.
+                track_selector_selections = false;
+            }
             selector_chain.push(handler.name().to_owned());
             visited.push(handler);
             handler = selected;
         }
+    }
+
+    /// Identifies the direct selections made by manual Selector groups.
+    ///
+    /// Automatic group leaf changes do not alter this value, so UDP owners do
+    /// not retire sessions for Fallback, URL-test, or LoadBalance decisions.
+    pub(crate) fn selection_identity(&self) -> Vec<(String, String)> {
+        self.selector_selection_identity.clone()
     }
 
     pub(crate) async fn append_stream_chain(&self, stream: &BoxedChainedStream) {
@@ -685,6 +707,10 @@ mod path_selection_tests {
                 .unwrap();
         assert_eq!(pinned_tcp.handler.name(), "DIRECT");
         assert_eq!(pinned_udp.handler.name(), "DIRECT");
+        assert_eq!(
+            pinned_udp.selection_identity(),
+            [("SELECT".to_owned(), "DIRECT".to_owned())]
+        );
         selector.select("PROXY").await.unwrap();
 
         let session = Session {
@@ -724,6 +750,10 @@ mod path_selection_tests {
             .await
             .unwrap();
         assert_eq!(next.handler.name(), "PROXY");
+        assert_eq!(
+            next.selection_identity(),
+            [("SELECT".to_owned(), "PROXY".to_owned())]
+        );
         let (stream, _) = next
             .handler
             .connect_stream_with_path_selection_result(
@@ -774,11 +804,27 @@ mod path_selection_tests {
             )
             .await,
         );
-        let pinned = PinnedOutbound::capture(outer, &Session::default())
+        let pinned = PinnedOutbound::capture(outer.clone(), &Session::default())
             .await
             .unwrap();
+        assert_eq!(
+            pinned.selection_identity(),
+            [
+                ("OUTER".to_owned(), "INNER".to_owned()),
+                ("INNER".to_owned(), "DIRECT".to_owned()),
+            ]
+        );
         inner.select("PROXY").await.unwrap();
         assert_eq!(pinned.handler.name(), "DIRECT");
+        let next = PinnedOutbound::capture(outer, &Session::default())
+            .await
+            .unwrap();
+        assert_eq!(next.handler.name(), "PROXY");
+        assert_ne!(
+            pinned.selection_identity(),
+            next.selection_identity(),
+            "a nested manual selector change must remain observable"
+        );
         let session = Session::default();
         let resolver: ThreadSafeDNSResolver = Arc::new(NoopResolver);
         let (stream, _) = pinned
@@ -998,6 +1044,81 @@ mod path_selection_tests {
     }
 
     #[tokio::test]
+    async fn manual_selector_identity_ignores_loadbalance_rotation_between_selectors()
+     {
+        let a = mock_node("A");
+        let b = mock_node("B");
+        let resolver: ThreadSafeDNSResolver = Arc::new(NoopResolver);
+        let manager = ProxyManager::new(resolver, None);
+        let selector_a: AnyOutboundHandler = Arc::new(
+            Handler::new(
+                HandlerOptions {
+                    name: "SELECT-A".to_owned(),
+                    udp: true,
+                    ..Default::default()
+                },
+                vec![provider_for(vec![a])],
+                Some("A".to_owned()),
+            )
+            .await,
+        );
+        let selector_b: AnyOutboundHandler = Arc::new(
+            Handler::new(
+                HandlerOptions {
+                    name: "SELECT-B".to_owned(),
+                    udp: true,
+                    ..Default::default()
+                },
+                vec![provider_for(vec![b])],
+                Some("B".to_owned()),
+            )
+            .await,
+        );
+        let balance: AnyOutboundHandler =
+            Arc::new(crate::proxy::group::loadbalance::Handler::new(
+                crate::proxy::group::loadbalance::HandlerOptions {
+                    name: "BALANCE".to_owned(),
+                    udp: true,
+                    strategy: LoadBalanceStrategy::RoundRobin,
+                    ..Default::default()
+                },
+                vec![provider_for(vec![selector_a, selector_b])],
+                manager,
+            ));
+        let selector: AnyOutboundHandler = Arc::new(
+            Handler::new(
+                HandlerOptions {
+                    name: "GLOBAL".to_owned(),
+                    udp: true,
+                    ..Default::default()
+                },
+                vec![provider_for(vec![balance])],
+                None,
+            )
+            .await,
+        );
+
+        let first = PinnedOutbound::capture(selector.clone(), &Session::default())
+            .await
+            .unwrap();
+        let second = PinnedOutbound::capture(selector, &Session::default())
+            .await
+            .unwrap();
+
+        assert_eq!(first.handler.name(), "A");
+        assert_eq!(second.handler.name(), "B");
+        assert_eq!(
+            first.selection_identity(),
+            [("GLOBAL".to_owned(), "BALANCE".to_owned())]
+        );
+        assert_eq!(
+            first.selection_identity(),
+            second.selection_identity(),
+            "LoadBalance's automatic leaf rotation must not retire a GLOBAL UDP association"
+        );
+    }
+
+    #[tokio::test]
     async fn selector_over_fallback_pins_direct_and_preserves_group_chain() {
         let direct = mock_node("DIRECT");
         let proxy = mock_node("PROXY");
@@ -1032,9 +1153,18 @@ mod path_selection_tests {
             .await
             .unwrap();
         assert_eq!(pinned.handler.name(), "DIRECT");
+        assert_eq!(
+            pinned.selection_identity(),
+            [("SELECT".to_owned(), "FALLBACK".to_owned())]
+        );
         manager.report_alive("DIRECT", false).await;
         let next = PinnedOutbound::capture(outer, &session).await.unwrap();
         assert_eq!(next.handler.name(), "PROXY");
+        assert_eq!(
+            next.selection_identity(),
+            [("SELECT".to_owned(), "FALLBACK".to_owned())],
+            "Fallback's automatic leaf change must not look like a manual selector change"
+        );
         let datagram = pinned
             .handler
             .connect_datagram_with_path_selection(

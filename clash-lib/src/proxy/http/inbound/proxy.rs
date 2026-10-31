@@ -7,12 +7,20 @@ use bytes::Bytes;
 use futures::{TryFutureExt, future::BoxFuture};
 
 use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
-use hyper::{Method, Request, Response, Uri, body::Incoming, server::conn::http1};
+use hyper::{
+    Method, Request, Response, Uri,
+    body::Incoming,
+    header::{
+        CONNECTION, HOST, HeaderName, HeaderValue, PROXY_AUTHORIZATION, UPGRADE,
+    },
+    server::conn::http1,
+};
 
 use hyper_util::{
     client::legacy::Client,
     rt::{TokioExecutor, TokioIo},
 };
+use tower::Service;
 use tracing::{instrument, warn};
 
 use crate::{
@@ -23,6 +31,115 @@ use crate::{
 };
 
 use super::{auth::authenticate_req, connector::Connector};
+
+fn requests_protocol_upgrade(req: &Request<Incoming>) -> bool {
+    req.headers().contains_key(UPGRADE)
+        && req.headers().get_all(CONNECTION).iter().any(|value| {
+            value.to_str().is_ok_and(|value| {
+                value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+            })
+        })
+}
+
+fn remove_connection_nominated_headers(
+    headers: &mut http::HeaderMap<HeaderValue>,
+    preserve_upgrade: bool,
+) {
+    let nominated = headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|token| HeaderName::from_bytes(token.trim().as_bytes()).ok())
+        .filter(|name| !preserve_upgrade || name != UPGRADE)
+        .collect::<Vec<_>>();
+    for name in nominated {
+        headers.remove(name);
+    }
+}
+
+async fn proxy_protocol_upgrade(
+    mut req: Request<Incoming>,
+    src: SocketAddr,
+    dispatcher: Arc<Dispatcher>,
+    fw_mark: Option<u32>,
+) -> Result<Response<BoxBody<Bytes, std::io::Error>>, ProxyError> {
+    let downstream_upgrade = hyper::upgrade::on(&mut req);
+    remove_connection_nominated_headers(req.headers_mut(), true);
+    req.headers_mut().remove(PROXY_AUTHORIZATION);
+    req.headers_mut()
+        .insert(CONNECTION, HeaderValue::from_static("Upgrade"));
+    let mut connector = Connector::new(src, dispatcher, fw_mark);
+    let destination = req.uri().clone();
+    let outbound = connector.call(destination.clone()).await?;
+    if destination.scheme().is_some() {
+        let request_target = destination
+            .path_and_query()
+            .map_or("/", |path_and_query| path_and_query.as_str());
+        *req.uri_mut() =
+            request_target
+                .parse()
+                .map_err(|error: http::uri::InvalidUri| {
+                    ProxyError::General(error.to_string())
+                })?;
+        let host = destination
+            .host()
+            .ok_or_else(|| ProxyError::InvalidUrl(destination.to_string()))?;
+        let host = match destination.port() {
+            Some(port) => format!("{host}:{}", port.as_str()),
+            None => host.to_owned(),
+        };
+        let host = HeaderValue::from_str(&host)
+            .map_err(|error| ProxyError::General(error.to_string()))?;
+        req.headers_mut().insert(HOST, host);
+    }
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(outbound)
+        .await
+        .map_err(|error| ProxyError::General(error.to_string()))?;
+    tokio::spawn(async move {
+        if let Err(error) = connection.with_upgrades().await {
+            warn!("HTTP upgrade upstream connection failed: {error}");
+        }
+    });
+
+    let mut response = sender
+        .send_request(req)
+        .await
+        .map_err(|error| ProxyError::General(error.to_string()))?;
+    let switching_protocols =
+        response.status() == hyper::StatusCode::SWITCHING_PROTOCOLS;
+    remove_connection_nominated_headers(response.headers_mut(), switching_protocols);
+    response.headers_mut().remove(CONNECTION);
+    if switching_protocols {
+        response
+            .headers_mut()
+            .insert(CONNECTION, HeaderValue::from_static("Upgrade"));
+        let upstream_upgrade = hyper::upgrade::on(&mut response);
+        tokio::spawn(async move {
+            let (downstream, upstream) =
+                match tokio::try_join!(downstream_upgrade, upstream_upgrade) {
+                    Ok(streams) => streams,
+                    Err(error) => {
+                        warn!("HTTP protocol upgrade failed: {error}");
+                        return;
+                    }
+                };
+            let mut downstream = TokioIo::new(downstream);
+            let mut upstream = TokioIo::new(upstream);
+            if let Err(error) =
+                tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await
+            {
+                warn!("HTTP protocol upgrade tunnel failed: {error}");
+            }
+        });
+    } else {
+        response.headers_mut().remove(UPGRADE);
+    }
+
+    Ok(response.map(|body| body.map_err(map_io_error).boxed()))
+}
 
 pub fn maybe_socks_addr(r: &Uri) -> Option<SocksAddr> {
     let port = r.port_u16().unwrap_or(
@@ -43,7 +160,7 @@ pub fn maybe_socks_addr(r: &Uri) -> Option<SocksAddr> {
 }
 
 async fn proxy(
-    req: Request<hyper::body::Incoming>,
+    mut req: Request<hyper::body::Incoming>,
     src: SocketAddr,
     dispatcher: Arc<Dispatcher>,
     authenticator: ThreadSafeAuthenticator,
@@ -55,12 +172,18 @@ async fn proxy(
         return Ok(res);
     }
 
+    if req.method() != Method::CONNECT {
+        // Proxy credentials authenticate this inbound proxy only and must not
+        // be forwarded to the requested origin, even when authentication is
+        // disabled locally.
+        req.headers_mut().remove(PROXY_AUTHORIZATION);
+    }
+
     let client = Client::builder(TokioExecutor::new())
         .http1_title_case_headers(true)
         .http1_preserve_header_case(true)
         .build(Connector::new(src, dispatcher.clone(), fw_mark));
 
-    // TODO: handle other upgrades: https://github.com/hyperium/hyper/blob/master/examples/upgrades.rs
     if req.method() == Method::CONNECT {
         match maybe_socks_addr(req.uri()) {
             Some(addr) => {
@@ -98,6 +221,17 @@ async fn proxy(
                         .boxed(),
                 )
                 .unwrap()),
+        }
+    } else if requests_protocol_upgrade(&req) {
+        match proxy_protocol_upgrade(req, src, dispatcher, fw_mark).await {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                warn!("http proxy upgrade failed: {error}");
+                Ok(Response::builder()
+                    .status(hyper::StatusCode::BAD_GATEWAY)
+                    .body(Empty::new().map_err(map_io_error).boxed())
+                    .unwrap())
+            }
         }
     } else {
         match client

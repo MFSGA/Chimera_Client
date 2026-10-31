@@ -1,6 +1,6 @@
 # 主机网络变化后的可用性迭代计划
 
-日期：2026-10-24。状态：B0–B6 已完成代码级与受控回归；B7 已接入代理端点 TCP/UDP、DNS socket 路径、多个代理协议的路径健康证据及连接池网络代际/PathId 管理，但远端代理互操作与完整 pooled transport 行为仍待验收。本轮以本机 SOCKS5、in-process Shadowsocks、TLS Trojan、AnyTLS 与 VLESS 服务端验证真实握手、应用请求/响应、回退获胜 PathId 及端点/目标健康证据关联。Hysteria2 QUIC/端口跳跃沿用 connector 选定路径；Relay 首跳 PathId 与活动/关闭 Flow 的本机 `networkPaths` 观测已接入，不代表代理服务器之后的远端转发路径。B8 的 DIRECT 与代理端点 TCP 有界多路径调度代码已接入；loopback 测试验证了首选源地址不匹配后的候选回退。B9 被动恢复防抖代码已完成。B10 Explain 覆盖 TCP/UDP 路径决策、拨号结果、旧网络结果丢弃与配置 reload 版本差异；运行时偏好/临时覆写 API、本机 UDP 恢复、Explain 记录单调时钟过期及过期查询处理已有定向回归，其他代理路径 Explain 与完整 API 面仍待补充验证。默认 `clash-lib` 单元测试为 977 通过、12 忽略；全 Rust feature 单元测试为 1150 通过、12 忽略；Dashboard 外全 feature Clippy、格式与 diff 检查通过。Linux 网络快照与路径绑定观察代码尚未在 Linux 上验证；Windows 自动观察仍不支持。B11 的物理双网卡切换、route-all、休眠、资源趋势及恢复时间预算仍待专用环境验收。
+日期：2026-10-30。状态：B0–B6 已完成代码级与受控回归；B7 已接入代理端点 TCP/UDP、DNS socket 路径、多个代理协议的路径健康证据及连接池网络代际/PathId 管理，但远端代理互操作与完整 pooled transport 行为仍待验收。本轮以本机 SOCKS5、in-process Shadowsocks、TLS Trojan、AnyTLS 与 VLESS 服务端验证真实握手、应用请求/响应、回退获胜 PathId 及端点/目标健康证据关联。Hysteria2 QUIC/端口跳跃沿用 connector 选定路径；Relay 首跳 PathId 与活动/关闭 Flow 的本机 `networkPaths` 观测已接入，不代表代理服务器之后的远端转发路径。B8 的 DIRECT 与代理端点 TCP 有界多路径调度代码已接入；loopback 测试验证了首选源地址不匹配后的候选回退。B9 被动恢复防抖代码已完成。B10 Explain 覆盖 TCP/UDP 路径决策、拨号结果、旧网络结果丢弃与配置 reload 版本差异；运行时偏好/临时覆写 API、本机 UDP 恢复、Explain 记录单调时钟过期及过期查询处理已有定向回归；UDP 路径规划失败的缓存现保留完整结构化诊断上下文，并能识别网络/策略版本变化后作废的决策；规则要求的网卡无法解析时，TCP/UDP 也会生成 Explain 失败记录；出站查找、代理组选择和连接池就绪失败现在也会记录 Explain，并标记版本变化期间过期的结果。其他代理路径 Explain 与完整 API 面仍待补充验证。默认 `clash-lib` 单元测试为 977 通过、12 忽略；全 Rust feature 单元测试最近一次为 1164 通过、11 忽略；Dashboard 外全 feature Clippy、格式与 diff 检查通过。Linux 快照与路径绑定观察尚未在 Linux 上验证；Windows IP Helper 自动观察代码已实现，但尚未完成完整 Windows target 构建、live snapshot 或实机换网验收。B11 的物理双网卡切换、route-all、休眠、资源趋势及恢复时间预算仍待专用环境验收。
 
 用户确认的目标：主机切换网卡或网络后，自动恢复新连接；已有连接尽力恢复，无法恢复时明确结束。典型场景包括 Wi-Fi ↔ 有线、同一网卡换 Wi-Fi/DHCP 地址、断网重连和休眠唤醒。服务恢复无需用户重启 Chimera、重新加载配置或手动调用 reset。
 
@@ -47,10 +47,12 @@
 | B4 策略编译与影子决策（已完成） | 纯候选过滤/显式排序、immutable intent、PathPlan、CandidateRejection；影子计算复用实际路由结果 | Require Ethernet/IPv4 无满足项必失败；偏好仅列 v4 不禁 v6；偏好顺序与源地址身份可测试；决策记录 route/rule、拒绝理由和 `shadowOnly`，不改变 socket。实际 socket 路径统一回报由 B5/B7 接入 |
 | B5 非 TUN DIRECT 新 Flow 接入（已完成） | TCP 按解析地址族选路；UDP literal 或可解析域名按真实地址族选路，逐 Flow 决策缓存，NAT socket 按 `NetworkPathId` 隔离 | 实际 source/interface 绑定与决策一致；硬约束失败明确结束 TCP/UDP；fake-IP 不作为远端地址或族提示；同目标复用决策、不同目标/身份隔离；旧网络代际 socket 退休；多目标/多客户端响应归属保持。活动 TUN 仍沿用当前防回环 socket 保护 |
 | B6 非 TUN DIRECT 健康证据（已完成） | TCP、literal/resolved-domain UDP 和 DNS direct 响应/发送错误接入独立健康记录；API 输出有界状态，不改变选路 | 单目标拒绝/超时不判死路径；不同主机网络错误升级；UDP 响应归回实际远端目标；DNS 成功证据绑定上游 PathId；旧版本/重载事件拒绝 |
-| B7 代理 / DNS / 池接入（进行中） | 代理端点与最终目标、DNS 独立意图；接入实际 socket 路径；给可复用连接记录实际 path/network 代际 | 已实现非 TUN 代理端点 TCP/UDP 与 DNS direct socket 路径选择、DNS 响应健康证据、VLESS/Trojan/AnyTLS/SOCKS/Shadowsocks TCP 最终目标响应路径证据、gRPC/XHTTP H2/H3 按 PathId 选择性退休、Hysteria2 普通及 Salamander QUIC connector 路径、端口跳跃沿用 connector 并固定到初始 PathId、代理端点 UDP 与 Hysteria2 UDP 最终目标响应证据、Relay 首跳 TCP/UDP 本机 PathId 传递，以及活动/关闭 Flow 的 `/flows` `networkPaths` 字段；该字段不代表代理服务器之后的远端转发 NIC。本地 SOCKS5、in-process Shadowsocks、TLS Trojan、AnyTLS UoT 与 VLESS TLS 服务端现覆盖握手、应用请求/响应、获胜 PathId 及相应 TCP/UDP 健康证据关联；Hysteria2 端口跳跃现有多轮 fake-socket 状态机与取消单测。其他代理远端互操作、端口跳跃真实服务端互操作与完整 pooled transport 行为仍待验证 |
+| B7 代理 / DNS / 池接入（进行中） | 代理端点与最终目标、DNS 独立意图；接入实际 socket 路径；给可复用连接记录实际 path/network 代际 | 已实现非 TUN 代理端点 TCP/UDP 与 DNS direct socket 路径选择、DNS 响应健康证据、VLESS/Trojan/AnyTLS/SOCKS/Shadowsocks TCP 最终目标响应路径证据、gRPC/XHTTP H2/H3 按 PathId 选择性退休、Hysteria2 普通及 Salamander QUIC connector 路径、端口跳跃沿用 connector 并固定到初始 PathId、代理端点 UDP 与 Hysteria2 UDP 最终目标响应证据、Relay 首跳 TCP/UDP 本机 PathId 传递，以及活动/关闭 Flow 的 `/flows` `networkPaths` 字段；该字段不代表代理服务器之后的远端转发 NIC。本地 SOCKS5 出站 UDP 现有真实 UDP ASSOCIATE、loopback 上游转发与响应闭环回归；SOCKS5、in-process Shadowsocks、TLS Trojan、AnyTLS UoT 与 VLESS TLS 服务端现覆盖握手、应用请求/响应、获胜 PathId 及相应 TCP/UDP 健康证据关联；Hysteria2 端口跳跃现有多轮 fake-socket 状态机与取消单测。其他代理远端互操作、端口跳跃真实服务端互操作与完整 pooled transport 行为仍待验证 |
 | B8 有界多路径尝试（代码已接入；DIRECT 调度与代理端点源地址不匹配后的候选回退已受控验证） | 有界 AttemptBudget、错峰启动、单 winner、取消与清理；只竞速代理端点 TCP 建连，协议握手不跨连接重放 | DIRECT 与代理端点 DNS+拨号总预算均为 5 秒、最多 3 次/并发 2、120ms hedge，快速失败立即推进；代理端点计划最多纳入 3 个 DNS 地址，跨地址族与候选 PathId 轮次调度；Preference 保留一个 system-route 回退名额，Require 不回退；旧 networkVersion 完成的 socket 丢弃；失败 socket future 随 winner 取消；不竞速 UDP 业务包或重放应用数据。本轮 loopback 验证源地址不匹配后经 SOCKS5 握手和请求/响应成功回退；代理服务器互操作、连接池与其他网络拓扑仍待验证 |
 | B9 首选恢复与防抖（被动证据范围已完成） | cooldown、真实流量响应和稳定窗口；只改变新 Flow 候选可用性 | 冷却期排除不可用路径；恢复至少 3 次真实响应且跨越 15 秒；单次成功不恢复；不发送面向猜测目标的合成探测。主动探测与 minimum-dwell 校准不在当前实现范围 |
-| B10 运行时意图与 Explain API（偏好 API、本机 UDP 恢复、成功 UDP/TCP 代理连接、SOCKS 握手失败及 flowId 错误状态均有定向验证，其余范围继续补验） | 基于现有鉴权开放偏好更新、effective-paths 和 decision 查询；临时覆盖使用单调时钟及 TTL | 偏好更新校验后在 RuntimeStatus 锁内原子替换并增加 `policyVersion`；临时覆盖到期恢复基础偏好；Explain 记录有界并覆盖 TCP/UDP 路径规划失败、DIRECT/PROXY 拨号成功与失败、旧网络代次结果丢弃；记录候选 PathId、策略拒绝原因、版本和操作编号；成功 UDP 关联的 `flowId` 出现在 `/flows.flowIds`，可查询 `/runtime/network/path-decision/{flowId}`；记录连接完成时发现的 reload 版本差异，`/runtime/network/path-decisions` 可列出近期结果。Explain 记录 TTL 使用单调时钟，避免系统墙钟调整延长或缩短保留期。物理代理端点 TCP/UDP 拨号错误以结构化 `io::Error` 来源保留候选、实际尝试 PathId 与策略/健康拒绝原因，Dispatcher 将其写入 Explain；协议 TLS/认证阶段错误仍保持现有错误边界，不伪称已逐协议分类。偏好更新/临时覆写、有效路径查询、本机 UDP 恢复、成功 DIRECT TCP/UDP、SOCKS5 多跳 TCP、Shadowsocks TCP/UDP、AnyTLS TCP/UDP、Trojan TCP、VLESS TLS TCP、生产 `ApiRunner` listener 的 Explain 列表无 token 请求返回 401 且该路由 CORS 预检返回允许头、SOCKS 握手失败详情及格式错误 `flowId` 返回 400、未知 `flowId` 返回 404、过期 Explain 的真实 TCP listener + 认证 Axum route-level 测试（无 token 为 401，有效 token 下列表排除且详情为 404）均已有定向回归；代理端点 TCP 拒绝用例另验证结构化候选及实际尝试 PathId；完整生产 `ApiRunner` 的过期时间行为与 trace 组合、其他代理协议路径 Explain 和跨平台行为仍待验证 |
+| B10 运行时意图与 Explain API（偏好 API、本机 UDP 恢复、成功 UDP/TCP 代理连接、SOCKS 握手失败及 flowId 错误状态均有定向验证，其余范围继续补验） | 基于现有鉴权开放偏好更新、effective-paths 和 decision 查询；临时覆盖使用单调时钟及 TTL | 偏好更新校验后在 RuntimeStatus 锁内原子替换并增加 `policyVersion`；临时覆盖到期恢复基础偏好；Explain 记录有界并覆盖 TCP/UDP 路径规划失败、DIRECT/PROXY 拨号成功与失败、旧网络代次结果丢弃；记录候选 PathId、策略拒绝原因、版本和操作编号；成功 UDP 关联的 `flowId` 出现在 `/flows.flowIds`，可查询 `/runtime/network/path-decision/{flowId}`；SOCKS5 出站 UDP 已验证上游转发成功后同一 Flow 的 Explain 列表和详情一致；记录连接完成时发现的 reload 版本差异，`/runtime/network/path-decisions` 可列出近期结果。Explain 记录 TTL 使用单调时钟，避免系统墙钟调整延长或缩短保留期。物理代理端点 TCP/UDP 拨号错误以结构化 `io::Error` 来源保留候选、实际尝试 PathId 与策略/健康拒绝原因，Dispatcher 将其写入 Explain；UDP DIRECT 路径规划失败的每 Flow 缓存现保留错误种类、版本、候选 PathId 和拒绝原因，重复数据报命中缓存后 Explain 不再丢失这些上下文；协议 TLS/认证阶段错误仍保持现有错误边界，不伪称已逐协议分类。偏好更新/临时覆写、有效路径查询、本机 UDP 恢复、成功 DIRECT TCP/UDP、SOCKS5 多跳 TCP、Shadowsocks TCP/UDP、AnyTLS TCP/UDP、Trojan TCP/UDP、VLESS TLS TCP/UDP、生产 `ApiRunner` listener 的 Explain 列表无 token 请求返回 401 且该路由 CORS 预检返回允许头、SOCKS 握手失败详情及格式错误 `flowId` 返回 400、未知 `flowId` 返回 404、过期 Explain 的真实 TCP listener + 认证路由测试（未认证为 401、认证后列表排除且详情为 404，并复用生产公共 HTTP/CORS/追踪层）均已有定向回归；代理端点 TCP 拒绝用例另验证结构化候选及实际尝试 PathId；真实 `ApiRunner` listener 现已覆盖成功启动时 readiness、普通路径到 `/ws/...` 的 URI 改写、查询 token 鉴权及关闭后的 listener 回收；非 loopback 的 secret/CORS 策略现有纯函数单测覆盖拒绝与允许分支，现又覆盖启动时 readiness 错误传播和 API listener 清理；集成测试短暂绑定 `0.0.0.0`，在 `axum::serve` 前拒绝，尚未验证有效配置下真实非 loopback API 服务；其他代理协议路径 Explain 和跨平台行为仍待验证 |
+B10 Explain 现为 TCP/UDP 决策记录提供可选的逻辑目标地址，并在 Network 详情展开时显示；旧记录没有目标字段时仍兼容。目标地址来自连接会话，不表示代理端后的物理转发目标或可达性证明。本机回环 DIRECT TCP 成功和拨号拒绝回归均校验列表与单条详情中的目标值；Dashboard loopback mock 交互已确认失败记录展开后显示目标地址。该覆盖不代表其他代理协议、真实网络错误或换网行为均已验证。
+
 | B11 实机与平台验收 | 保留 A4 的专用双网卡验证；DIRECT/代理/DNS、双栈/TUN、资源趋势与时间预算 | 不使用 reset 的物理切换、DHCP、离线/唤醒和抖动有真实响应证据；20 轮资源回收可核查；macOS/Linux/Windows 各自记录编译、受控测试与实机结果 |
 
 依赖：B0 → B1 → B2 → B3 → B4 → B5 → B6；B7 的协议/池子切片继续推进，B8 DIRECT TCP 已基于 B5 的 PathPlan 独立验证，B9 消费 B6 的真实流量健康证据，B10 读取并更新运行时 PathIntent；它们不表示 B7 全部已完成。B11 依赖可达的专用多网卡环境。不得把未验证前置标成完成。可取得专用硬件时，既有 A4 基线验收提前运行，不必等 B11；它不能替代新 scheduler 的实机验收。
@@ -301,7 +303,7 @@ cargo test -p clash-lib --test api_reload_tests --locked -- --test-threads=1
 | A2 | 串行恢复、当前接口/DNS/池、独立失败处理已实现 | 实际代理节点在新网络上的端到端响应 |
 | A3 | UDP 网络版本失效、池退休、TCP keepalive、TUN 接口刷新与路由所有权已实现 | route-all 实际出口切换、旧 TCP 失效时限 |
 | A4 | 自动事件受控测试、20 轮 UDP 集成、隔离真实 TUN 回归通过 | 专用环境的物理网卡切换、休眠与资源计数 |
-| Linux / Windows | Linux 快照与自动观察代码已加入、未验证；Windows 仍 unsupported | Linux 编译、定向用例、namespace 换网和实机验收待后续统一执行；Windows 平台实现与验证未完成 |
+| Linux / Windows | Linux 快照与自动观察代码已加入、未验证；Windows IP Helper 快照已实现并开启自动观察，但完整目标构建与 live snapshot 尚未验证 | Linux 编译、定向用例、namespace 换网和实机验收待后续统一执行；Windows CI、live snapshot 和实机换网验收待完成 |
 | Core / Router 重构 | 暂缓 | 不属于本轮范围 |
 
 ## 7. 本轮实现与实际验证（2026-10-02）
@@ -804,10 +806,22 @@ lifecycle tests.
 - 该用例执行了客户端真实 TLS/Trojan 编码和认证及应用请求/响应，但服务端是同进程 loopback fixture，不代表第三方 Trojan 实现互操作，也不覆盖 Trojan UDP、WebSocket/gRPC、认证失败 Explain、真实多 NIC 或跨平台网络切换。
 - `cargo test -p clash-lib --test trojan_integration_tests --features trojan,ring,tun,port --locked -j 6` 为 1 passed、0 failed；`cargo clippy -p clash-lib --test trojan_integration_tests --features trojan,ring,tun,port --locked -j 6 -- -D warnings`、格式与 diff 检查通过。
 
+### 2026-10-30：B10 Trojan UDP 单条路径 Explain 查询
+
+- 基线：本地 `master` `281f86e9bc7e8493eac297f00e2411d327317b80`。扩展 `trojan_integration_tests`：loopback TLS/Trojan fixture 校验 SHA-224 认证、UDP 命令、目标地址和数据帧；fixture 将负载转发到本机 UDP echo，再经 Trojan UDP 帧返回客户端。
+- 客户端通过 SOCKS5 UDP ASSOCIATE 完成真实请求/响应后，从运行中 Controller `/flows?include_closed=true` 查找目标 UDP Flow，并关联同一 `flowId`、`route.outbound=trojan-udp-out`、`outcome=connected` 的 Explain 列表记录；最后查询单条详情并核对 JSON 一致。
+- `cargo test -p clash-lib --features 'trojan aws-lc-rs anytls' --test trojan_integration_tests --locked -- --test-threads=1` 为 2 passed、0 failed。测试服务端是同进程 loopback fixture；本项不代表第三方 Trojan 服务端互操作、WebSocket/gRPC、远端代理认证失败 Explain、多 PathId UDP 实网切换或跨平台网络恢复已验收。
+
 ### 2026-10-24：B10 VLESS TLS TCP 单条路径 Explain 查询
 
 - 基线：本地 `master` `8d2541a16b7ca6795a5081fe1b6ef3ea8ef344a5`。新增 `vless_explain_integration_tests`，本机 TLS/VLESS fixture 校验 UUID、TCP 命令、VMess 地址字段顺序与目标地址，返回 tunneled HTTP 响应；随后从实际 `/flows` 关联 `vless-out` 成功 Explain 记录并校验单条详情与列表一致。
 - `cargo test -p clash-lib --test vless_explain_integration_tests --no-default-features --features ring,tun,port --locked -j 6` 为 1 passed、0 failed；`cargo clippy -p clash-lib --test vless_explain_integration_tests --no-default-features --features ring,tun,port --locked -j 6 -- -D warnings`、格式与 diff 检查通过。该项仅覆盖标准 VLESS-over-TLS TCP，不包含 Reality、Vision、gRPC、WebSocket、加密扩展、第三方服务端互操作或真实多网卡切换。
+
+### 2026-10-30：B10 VLESS UDP 单条路径 Explain 查询
+
+- 基线：本地 `master` `966afefb1eb8ced1caa5f8770111834f03c7d905`。扩展 `vless_explain_integration_tests`：loopback TLS/VLESS fixture 校验 UUID、UDP 命令、VMess 目标地址与长度前缀数据帧，将数据转发到本机 UDP echo 并返回 VLESS UDP 响应帧。
+- 客户端通过 SOCKS5 UDP ASSOCIATE 完成请求/响应后，测试从 Controller `/flows?include_closed=true` 找到目标 UDP Flow，以同一 `flowId` 关联 `route.outbound=vless-udp-out`、`outcome=connected` 的 Explain 列表记录，再查询详情并断言与列表 JSON 一致。
+- `cargo test -p clash-lib --no-default-features --features ring,tun,port --test vless_explain_integration_tests --locked -- --test-threads=1` 为 2 passed、0 failed。loopback fixture 不代表第三方 VLESS 服务端互操作，也不覆盖 Reality、Vision、gRPC、WebSocket、加密扩展、真实多 PathId UDP 切换或跨平台网络恢复。
 
 ### 2026-10-24：B10 生产 Controller listener 的 Explain 鉴权
 
@@ -859,13 +873,275 @@ lifecycle tests.
 - 同一 master push 还触发 `ci.yml` 的 `Release` job：稳定版步骤跳过，`latest` 预发布被重建并指向 `57c7336ada6b9a7e0e802f32d994b379d011b8cc`。这属于 push 工作流行为，不代表完成真实换网验收。
 - Windows 自动网络观察仍未实现，`AUTOMATIC_SUPPORTED` 保持关闭；Windows loopback reset 测试不等于 Windows 主机网络切换验收。下一步需要 Linux Runner 实际执行快照测试，再在隔离 Linux namespace 验证换网恢复；Windows 需另行补齐路由、接口状态和 DNS 观察后才适合开启自动支持。
 
-### 2026-10-30：在主 CI 实际运行 Linux/macOS 实时快照测试（待 CI 验证）
+### 2026-10-30：在主 CI 实际运行 Linux/macOS 实时快照测试（CI 已通过）
 
 - `.github/workflows/ci.yml` 的 Linux 与 macOS quality job 新增精确测试步骤，执行 `app::network::tests::live_supported_platform_snapshot_reports_local_bind_capabilities`。这使 master push 不再只通过 Clippy 编译该测试目标，也会实际运行该只读快照用例。
 - 本次仅调整 CI 执行范围，不增加网络操作；该用例读取本机网络元数据并绑定临时 UDP socket，不发送数据、不改主机网络。
-- 该改动尚未推送，Linux/macOS Runner 的首次执行结果待后续 CI；它不替代 Linux namespace 换网、Windows 网络观察或专用双网卡实机验收。
+- GitHub Actions run `41052184434` 在 Linux 和 macOS 实际执行该测试并通过；Dashboard、三平台质量检查、12 个跨平台编译和 Release job 均成功。`latest` 预发布更新到 `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`，包含 15 个资产。
+- 这只验证 Linux/macOS 的只读快照采集与本地绑定探测，不替代 Linux namespace 换网、Windows 网络观察或专用双网卡实机验收。
+
+### 2026-10-30：GLOBAL 手动选择器切换时退休旧 UDP association
+
+- 基线：本地 `master` 与 `origin/master` 均为 `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`。原 Dispatcher 每个数据报都会重新捕获 GLOBAL selector 的当前叶节点；叶节点变化后，新数据走新出站，但旧 NAT association 的后台转发任务仍可继续收发，直到 10 秒空闲过期。
+- `PinnedOutbound` 现在只记录在自动组之前捕获到的手动 `Selector` 直接选择，不把 Fallback、URLTest、LoadBalance、Smart 等自动组或其下游 Selector 分支纳入比较。GLOBAL 模式的顶层手动 `Selector` 在下一次数据报观察到直接选择变化时，退休该入站的旧 UDP associations，记录 `endReason: outboundChanged` 并清除旧路径决策缓存；Rule 模式和自动组内部变化不触发此逻辑。纯手动的嵌套 Selector 链仍保留各层直接选择身份。
+- 新增 loopback 集成回归：DIRECT 首包得到 echo 响应，Controller 将 GLOBAL 切到 REJECT 后发送下一包，旧 association 必须出现在 `/flows?include_closed=true` 的 `outboundChanged` 计数中。临时关闭选择变化检测时，该用例按预期在 5 秒内因未退休而失败；恢复实现后通过。
+- 独立审查发现并推动修复两类误判：最初按最终叶节点比较会把自动组轮换误判为手动切换；随后发现自动组可能在多个内层 Selector 间轮换。最终 identity 只保留自动组之前的手动 Selector 直接选择；新增 Fallback 叶节点轮换、LoadBalance 在两个内层 Selector 间轮换保持 identity 稳定，以及纯手动嵌套 Selector 改变 identity 的测试。
+- 已通过：`cargo test -p clash-lib --lib --locked`（983 passed、11 ignored）、`cargo test -p clash-lib --test direct_udp_integration_tests --locked -- --test-threads=1`（4 passed）、定向 selector 单元测试（9 passed）、`cargo clippy -p clash-lib --lib --test direct_udp_integration_tests --locked -- -D warnings`、格式和 diff 检查。测试只使用本机 loopback，不修改系统网络。
+- 边界：选择变化在该 UDP 入站收到下一包时被观察；本轮未增加 selector 事件订阅来主动唤醒所有空闲中的 UDP 入站，也未覆盖真实代理服务器 UDP 互操作或跨平台网络切换。
 
 ### 2026-10-24：修复 feature 组合下的测试 Clippy 阻断
 
 - 基线：本地 `master` `f7616356ff3ebd5923eb626e2d93af2db43a1470`。将 `s04br_tests` 从 `Transport` trait 定义之前移到 `clash-lib/src/proxy/transport/mod.rs` 文件末尾，消除 `items_after_test_module`。只调整测试模块位置，不改传输 trait、网络池实现或运行时行为。
 - `s04b` 相关单测为 66 passed；受支持最小 `ring,tun,port` feature 组合的完整 `clash-lib` 库测试为 786 passed、0 failed、12 ignored。Dashboard 外 strict all-target Clippy 命令 `CARGO_TARGET_DIR=/tmp/chimera-client-no-default-target CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo clippy -p clash-lib --all-targets --no-default-features --features ring,tun,port --locked -j 6 -- -D warnings -D unused-variables` 通过；格式与 diff 检查通过。
+
+### 2026-10-30：Dashboard 网络恢复诊断页
+
+- 基线：本地 `master` `1249f6121878002f2a045753943bce3e9858f8d3`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；参考检出 `ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。本切片只消费当前 Controller API，不迁移参考实现。
+- Dashboard 新增只读 Network 页面，展示恢复状态与最近操作、有效本地路径、当前 DIRECT 优选候选、接口偏好顺序、冷却到期时间，以及最近的 Flow 路径决策。页面每 5 秒刷新，保留现有 Controller 认证；不提供修改偏好或重置网络的控制。
+- 为避免诊断页面增加首屏下载体积，该路由改为按需加载。最终 `npm run build` 生成独立 `Network` chunk 44.92 kB，主 JS 637.62 kB；主包原有的 500 kB 体积提示仍存在。`npm run lint`、`npm run build` 均通过。
+- 使用本地受控 HTTP fixture 手动打开 Dashboard 页面，验证恢复卡片、路径表、优选标记、冷却时间和最近决策均渲染正常；未连接正在运行的实际核心，也未进行实机换网或跨平台运行验证。页面明确说明本地 socket 绑定只证明源地址可绑定，不证明互联网可达。
+- 本切片仅改 Dashboard 与本迭代记录；核心网络行为、Controller wire 格式、网络偏好及主机网络状态均未改变。
+
+### 2026-10-30：展开查看连接的候选路径与拒绝原因
+
+- 基线：本地 `master` `f9084b1699a8b2070b7e8a14d61763bdf5995b55`。沿用已存在的 `/runtime/network/path-decisions` 数据，不新增核心 API。
+- Explain 表格新增可展开的路径说明：列出记录中的候选 PathId，以及因强制偏好不匹配、路径不可用、地址族不符或平台不支持而被拒绝的路径；保留 Flow 的出站、规则、结果、选中路径和具体原因。
+- `npm run lint`、`npm run build` 通过。用本地 HTTP fixture 实际展开行内说明，确认候选接口、被拒接口、拒绝原因和偏好序号可见；没有接入实际运行中的核心。
+- 最终 Dashboard 主 JS 为 637.62 kB，按需加载的 Network chunk 为 46.38 kB；主包已有的 500 kB 体积提示仍在。该页面使用的路径名和本地源地址属于网络诊断信息，只通过本地 Controller 提供给已访问 Dashboard 的用户。
+
+### 2026-10-30：显示接口恢复结果
+
+- 基线：本地 `master` `3816d4f5e8271bd5e32c6c7aa8f383c5f3af53ab`。扩展 `/runtime` 已有恢复报告，不修改核心和 Controller API。
+- 最近一次恢复摘要现在同时展示接口刷新、DNS transport 和连接池的结果及错误文本，避免只看 DNS/连接池时遗漏默认出口接口刷新失败。
+- `npm run lint`、`npm run build` 通过。使用本地 fixture 注入接口刷新失败、DNS 成功和连接池跳过的组合，Dashboard 正确显示三项结果与接口错误；没有调用实际网络恢复。
+- 最终 Network chunk 为 46.57 kB，主 JS 637.62 kB；原有主包体积警告仍在。
+
+### 2026-10-30：展示核心组件就绪状态
+
+- 基线：本地 `master` `60b4cc1ddbb12096db2378332914b00fa9065992`。使用 `/runtime` 已有的 `components` 字段，未改运行时生命周期或 API。
+- Network 页面新增 Control、Controller API、DNS、入站和 TUN 组件卡片，展示是否必需、当前阶段、阶段开始时间和错误。这样可以区分进程整体 `running` 与某个必需组件尚未就绪或失败。
+- `npm run lint`、`npm run build` 通过。用本地 fixture 验证 DNS 失败、其他必需组件 ready、TUN 未配置且可选的状态能分别呈现；未连接实际运行核心。
+- 最终主 JS 637.62 kB，按需加载的 Network chunk 48.21 kB；原有主包体积警告仍在。
+
+### 2026-10-30：Dashboard 编辑运行时路径偏好（L2，本地已验收）
+
+- 基线：本地 `master` `7cb55506692c09085d821d704b17308ae768cef7`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。只使用已有 `/runtime/network/path-preference` API。
+- Network 页面可按接口类型和地址族增删、调整软偏好顺序，选择运行时有效期或 15 分钟/1 小时/24 小时临时覆写；可清除临时覆写并恢复原运行时偏好，也可用空列表回到核心默认规则。偏好仅影响使用自动选路的新连接，不改系统路由、不移动已有连接、不写回 YAML；显式 `Require` 仍由核心优先处理。
+- `npm run lint`、`npm run build` 通过。受控本地 HTTP fixture 手动验证添加、排序、15 分钟覆写、应用、清除和恢复默认；选择 15 分钟后点击“Use core default”，GET 返回 `source=runtime`、空 `priority`、`createdAtMs=null` 和 `expiresAtMs=null`，确认不会留下临时 TTL；没有连接真实核心或改变真实网络。
+- 最终构建 Network chunk 55.30 kB、主 JS 637.94 kB；主包原有的 500 kB 体积提示仍存在。维护者已批准本地 SHA `7402e680ae41bb40a4301580310715f51a37e1a7`；该批准仅针对当时的路径偏好页面切片。
+- 独立审查发现手动刷新按钮未立即刷新偏好查询；偏好查询现加入同一刷新流程并纳入忙碌状态，独立复审通过。
+
+### 2026-10-30：HTTP 入站转发 WebSocket Upgrade（L2，待维护者验收）
+
+- 基线：本地 `master` `7402e680ae41bb40a4301580310715f51a37e1a7`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。本轮不迁移参考实现。
+- HTTP 入站在既有 `CONNECT` 和普通请求之外，现识别含 `Upgrade` 且 `Connection` token 含 `upgrade` 的请求。使用启用 Hyper upgrade 的 HTTP/1.1 client connection 经 Dispatcher 建立上游连接；代理 absolute-form URI 转为 origin-form，并始终按 URI authority 重建 `Host`。代理认证头只用于本地认证，不会发给目标；升级请求/响应会移除 `Connection` 指定的逐跳头并重建 `Connection: Upgrade`。上游返回 101 后双向复制升级流；TCP 连接被拒绝时返回 502。
+- 新增 loopback WebSocket 回归：有效 101 握手、上游提前发送的未掩码文本帧、客户端掩码文本帧、服务端回帧，以及认证通过后代理凭据不外泄、伪造 Host 被 URI authority 覆盖、请求/响应逐跳字段清除和 TCP 拨号被拒时返回 502。`cargo test -p clash-lib --test connection_chain_tests --locked -- --test-threads=1` 为 5 passed；该 target 严格 Clippy、格式和 diff 检查通过。未访问公网或修改宿主网络。
+- TLS WebSocket 仍经现有 CONNECT 路径，本轮未新增其实现；未验证第三方服务端、长时升级连接或跨平台运行。独立 Reviewer 对修复后的最终 HTTP Upgrade diff 通过；维护者验收仍待确认最终 SHA `be68f4ea80383dc9bdf39f96e6c6e3296acf7ab3`。
+- 初次独立审查发现代理认证、Host 权威性和逐跳头边界问题；已在后续修复中逐项加入实现与回归检查。修复后的最终 diff 已由独立 Reviewer 复审通过。
+
+### 2026-10-30：Windows 网络恢复只读观察器（L2，待平台验收）
+
+- 基线：本地 `master` `be68f4ea80383dc9bdf39f96e6c6e3296acf7ab3`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；参考检出 `ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。本切片没有迁移参考代码。
+- Windows 现在用 IP Helper 读取适配器地址、运行状态、按优先顺序排列的 DNS 服务器、连接/搜索后缀，以及 IPv4/IPv6 默认路由；按“路由 metric + 接口 metric”挑选主路由，等价路由保留为 ambiguous 证据。候选路径按 family interface index 绑定临时 UDP socket，仅证明本地地址/接口可以绑定，不发送探测包。每次快照最多绑定探测 128 个候选；阻塞采集使用单一 permit，若超过 2 秒，后续轮询等待该任务释放 permit，不再并行堆积工作。现有 TUN interface index/名称用于排除虚拟隧道路径。自动网络恢复状态因此在 Windows 也会进入观察阶段。
+- 新增 Windows 路由选择、等价路由、TUN/断开接口过滤、IPv6 interface index、默认路由解析、DNS 顺序/后缀变化和候选探测上限用例，以及只读实时快照用例。macOS 上 `app::network::tests::` 定向测试 17 passed；核心库无默认 feature 的 `ring,tun,port` 严格 Clippy、`cargo fmt --all` 和 `git diff --check` 通过。Windows GNU target 的最小独立 harness 使用 `windows 0.62` 编译 Windows 模块和测试；`cargo clippy --manifest-path /private/tmp/chimera-win-network-check/Cargo.toml --target x86_64-pc-windows-gnu --tests -- -D warnings` 通过。该 harness 不等同于完整 `clash-lib` target 构建。
+- 完整 `cargo check -p clash-lib --lib --tests --target x86_64-pc-windows-gnu --no-default-features --locked` 被本机缺少 MinGW C 工具链/Windows C 标准头文件阻断于 `zstd-sys`，尚未编译到完整 workspace 的 Windows target。Windows 代码没有在 Windows runner 或真实 Windows 机器运行；新增 live snapshot 测试也尚未执行。因此当前切片尚不能称为 Windows 跨平台验收完成，合入/推送前仍需完整 Windows CI，后续还需在真实多网卡/TUN 环境确认恢复行为。
+- 本机 Linux 交叉检查 `cargo check -p clash-lib --lib --target x86_64-unknown-linux-gnu --no-default-features --features ring,tun,port --locked -j 6` 在构建依赖 `ring` 时因缺少 `x86_64-linux-gnu-gcc` 停止，尚未编译到本项目 Linux cfg；这属于交叉编译工具链阻塞，不是源码失败。当前 macOS 主机没有 Docker、Linux cross-GCC 或 QEMU，故 Linux namespace V1/V2 和 Windows 实机验收仍须在目标 runner/专用环境执行。
+- 网络观察为 L2；独立 Reviewer 已对最终 SHA `325d65c3dad44c8a86b44d671559643828613c9e` 复审通过，维护者验收仍待确认。回滚方式是撤回本切片提交，恢复 Windows `AUTOMATIC_SUPPORTED=false` 及旧的 unsupported snapshot 路径；没有执行 push、release 或系统网络改动。
+
+### 2026-10-30：V2Ray WebSocket 插件 Host 头大小写（L2）
+
+- 基线：本地 `master` `325d65c3dad44c8a86b44d671559643828613c9e`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；参考检出 `ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。仅修复本地 V2Ray WebSocket 插件 Host 默认逻辑，不迁移参考代码。
+- 原逻辑只识别大小写恰为 `Host` 的自定义头；使用合法的小写 `host` 时，又额外插入默认 Host，导致实际 WebSocket 握手带两个 Host 头。现按大小写不敏感识别单个自定义 Host；若配置同时有 `Host` 与 `host` 等多项大小写等价字段，则在握手前以 `InvalidInput` 拒绝，避免根据 HashMap 顺序选择不确定的 authority。回归用例用本机 TCP 和 WebSocket 握手复现：修复前服务端收到两个 Host 值；修复后保留单个配置值，并保留配置路径和 query。
+- 定向明文握手测试修复前 1 failed（服务端观察到 2 个 Host），修复后 1 passed；重复大小写 Host 配置用例修复前 1 failed、修复后 1 passed；TLS WebSocket 握手 1 passed。`cargo test -p clash-lib --lib --no-default-features --features ring,ws,shadowsocks v2ray_plugin_ --locked -j 6 -- --nocapture`：7 passed；相同 feature 下库级严格 Clippy、格式和 diff 检查通过。
+- 明文和 TLS 均使用本机 WebSocket 服务端覆盖实际握手；TCP、协议握手和服务端任务均有 5 秒截止，避免回归导致测试永久等待。TLS 测试确认 ALPN 为 `http/1.1`，并检查唯一 Host 与路径/query。没有验证第三方 V2Ray 插件互操作或生产证书链。无外网访问、无系统网络修改。
+
+### 2026-10-30：SOCKS5 出站 UDP 的 Explain 闭环覆盖（L2）
+
+- 基线：本地 `master` `74e894f420b326d9576282200453aba0aed721ec`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。本轮参考 `ref/` 的 SOCKS5 UDP 关联生命周期与数据包包装语义，没有修改参考代码或生产协议实现。
+- 新增 `socks5_udp_outbound_roundtrip_is_queryable_from_path_explain`：本地 SOCKS 入站通过 SOCKS5 出站 UDP ASSOCIATE 将数据送到回环 UDP 上游；上游解码请求、转发到回环 echo 并将响应封装回 SOCKS5 UDP 数据报。测试对 SOCKS5 UDP ASSOCIATE 握手、数据往返和控制连接关闭都设 5 秒上限；公共 SOCKS5 UDP 测试 helper 检查响应 RSV/FRAG 均为零。测试确认目标地址和 payload 真实往返，再从 `/flows` 取得 UDP Flow，并验证 `/runtime/network/path-decisions` 的成功记录与单 Flow Explain 详情一致且共享 `flowId`；关闭入站 UDP 会话后，等待并断言上游 SOCKS5 控制连接收到 EOF。
+- 基线 `cargo test -p clash-lib --test connection_chain_tests --locked -j 6`：5 passed。新增用例定向运行 1 passed；完整 `connection_chain_tests` 为 6 passed，使用共享 SOCKS5 UDP 响应 helper 的 `direct_udp_integration_tests` 为 4 passed。`cargo fmt --all -- --check` 与 `git diff --check` 通过；目标严格 Clippy `cargo clippy -p clash-lib --test connection_chain_tests --locked -j 6 -- -D warnings` 通过。
+- 首轮 CI 等价全 feature 严格 Clippy 暴露了 `clash-lib/src/proxy/transport/v2ray/websocket.rs` 测试中的两处 `clippy::result_large_err`；已在后续“V2Ray WebSocket 测试回调的 Clippy 门禁修复”切片处理。
+- 本轮只有集成测试与迭代记录变更；fixture 限于本机回环，不访问公网、不改变系统网络。尚未验证第三方 SOCKS5 服务端互操作。回滚方式是撤销本切片提交；没有 push、release 或标签操作。
+
+### 2026-10-30：V2Ray WebSocket 测试回调的 Clippy 门禁修复（L2）
+
+- 基线：本地 `master` `f139641e1fcd1bd2c48a858c1c0c5490002dd3e2`；`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。没有更改 V2Ray WebSocket 的生产行为。
+- Tungstenite 的握手回调约定用完整 HTTP `Response` 表示拒绝结果，因此返回类型固定较大。将两个测试回调先绑定为局部闭包，并仅在这两个绑定处说明性地允许 `clippy::result_large_err`，避免全 feature 严格 Clippy 因第三方 API 的固定签名失败。
+- `cargo clippy -p clash-lib --all-targets --all-features --locked -j 6 -- -D warnings` 通过；`cargo test -p clash-lib --lib --all-features v2ray_plugin_ --locked -j 6` 为 7 passed；`cargo fmt --all -- --check` 与 `git diff --check` 通过。
+- 本切片只调整测试回调写法和局部 lint 注释；协议握手断言保持不变。没有访问公网、改动系统网络或执行 push/release。
+
+### 2026-10-30：ApiRunner 普通路径 WebSocket 改写的真实 listener 覆盖（L2）
+
+- 基线：本地 `master` `b5a1a98b715918ff0d0b30cda2995c879789da7b`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。只扩展集成覆盖，没有改变 API 生产代码。
+- 真实 Dashboard WebSocket 测试现用普通 `/traffic`、`/connections` 和带 `interval/top` 查询的 `/flows` URL。成功收到 JSON 证明生产 `ApiRunner` listener 将普通路径改写到 `/ws/...` 并保留查询；普通 `/traffic?token=invalid` 返回 401，验证改写路由的 token 鉴权仍有效。测试使用 `ClashInstance` 启动完整 runtime，成功启动依赖 API readiness；结束时 helper 取消 runtime、等待 listener 关闭并 join。
+- `cargo test -p clash-lib --test dashboard_websocket_contract_tests --features ws --locked -j 6`：2 passed；目标严格 Clippy `cargo clippy -p clash-lib --test dashboard_websocket_contract_tests --features ws --locked -j 6 -- -D warnings`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。
+- 后续切片补上了端口占用导致的 readiness 失败、活跃 WebSocket shutdown 回归，以及非 loopback secret/CORS 策略的纯函数覆盖；完整非 loopback listener readiness 错误、真实第三方客户端与跨平台运行仍待验证。fixture 仅本机回环，没有外网请求或系统网络变更。
+
+### 2026-10-30：ApiRunner 端口绑定失败不会误报就绪（L2）
+
+- 基线：本地 `master` `e37b2437d535c9368c8b3d4fb063b3a71774fcb3`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；参考检出与前一节记录一致。本轮没有更改运行时生产代码。
+- 新增 `occupied_api_port_is_reported_as_startup_failure`：测试先用本机 loopback listener 占住 Controller 端口，再启动完整独立 runtime；`start_scaffold_instance` 必须返回带有 API bind 失败和“地址已占用”原因的错误，不能返回 ready。错误断言兼容 Unix 与 Windows 的常见错误文案。
+- `cargo test -p clash-lib --test api_tests --locked -j 6`：11 passed；新增用例定向运行 1 passed；目标严格 Clippy `cargo clippy -p clash-lib --test api_tests --locked -j 6 -- -D warnings`、格式和 diff 检查通过。
+- 该回归只占用临时的 loopback API 端口，不修改系统网络。非 loopback listener 缺少 secret/CORS 的安全 readiness 失败仍待覆盖；活跃 WebSocket shutdown 已由下一切片覆盖。没有 push、release 或标签操作。
+
+### 2026-10-30：runtime shutdown 时关闭活跃 Dashboard WebSocket（L2）
+
+- 基线：本地 `master` `6f5be5d33ee29fe58d310dfd09e4bcd5a4f1cc60`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 与前节相同。只新增集成覆盖，没有更改 API 生产代码。
+- 新增 `active_dashboard_websocket_closes_when_runtime_stops`：通过普通 `/traffic` URL 建立真实鉴权 WebSocket、收到首条数据后保持连接，取消完整 runtime；断言 WebSocket 在 3 秒内关闭、运行线程正常退出、API listener 已关闭。错误路径也先取消 token 并 join runtime，避免留下后台实例。
+- `cargo test -p clash-lib --test dashboard_websocket_contract_tests --features ws --locked -j 6`：3 passed；`cargo clippy -p clash-lib --all-targets --all-features --locked -j 6 -- -D warnings`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。
+- 验证仅访问本机回环 API，不改系统网络；非 loopback 安全策略及第三方客户端、其他平台 runner 行为尚未覆盖。没有 push、release 或标签操作。
+
+### 2026-10-30：抽取并覆盖非 loopback API 安全策略（L2）
+
+- 基线：本地 `master` `3c86877f3638617ab8a0537819dd9d472c1f9a12`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；参考检出仍为本记录前文所列 SHA。本轮没有修改 `ref/`。
+- 将非 loopback API listener 的密钥与有效 CORS 检查提取为纯策略函数，生产 listener 仍按原顺序执行校验并保留原错误分类、日志与错误文本。单测覆盖缺密钥、缺有效 CORS、两项齐全，以及 loopback 豁免。
+- `cargo test -p clash-lib --lib --locked non_loopback_api_listener_requires_secret_and_valid_cors -- --nocapture`：1 passed；`cargo clippy -p clash-lib --all-targets --all-features --locked -j 6 -- -D warnings`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。
+- 使用 `192.0.2.1` 文档保留地址做纯函数输入，没有绑定非 loopback socket；因此覆盖策略判定，不证明完整 ApiRunner 对非 loopback readiness 错误的传播和清理。本地 loopback 的 ApiRunner readiness 成功、端口绑定失败和 shutdown 集成覆盖由前述切片验证。没有外网请求或系统网络变更。
+
+### 2026-10-30：B10 过期 Explain 复用生产公共 HTTP 层
+
+- 基线：本地 `master` `bf3afe845ed9bae5635d4528bd15eae76e3994ea`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。没有修改参考实现。
+- 将 `ApiRunner` 使用的公共 HTTP 层集中到 `add_shared_http_layers`：JSON content-type 修正、CORS、共享 AppState 与 HTTP trace。过期 Explain 测试通过该生产 helper 创建本机 TCP listener，再安装相同认证 middleware；一个序列覆盖未认证列表 401、认证后过期列表为空、过期详情 404，以及 Explain 详情路由的 CORS 预检允许头。
+- 定向过期 Explain 测试 1 passed；`cargo test -p clash-lib --test api_tests --locked -j 6` 为 10 passed；`cargo clippy -p clash-lib --lib --tests --no-default-features --features ring,tun,port --locked -j 6 -- -D warnings`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。测试使用本机回环 listener 和测试注入的过期状态，没有外网或宿主网络变更。
+- 该项验证 handler 与生产公共 HTTP 层组合；未启动完整 `ApiRunner`，因此绑定 readiness、安全地址检查、WebSocket URI 改写和完整长驻 runner 生命周期仍待验证。TraceLayer 参与请求，但本项未断言输出的 trace 内容。
+
+### 2026-10-30：Network Dashboard 展示 Explain 版本上下文
+
+- 基线：本地 `master` `3fbf2eadc918e1cf1c42e31992c3d7cc66aea094`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。本轮不读取或修改上游实现。
+- Recent path decisions 每条记录新增可展开的诊断详情，展示 `flowId`、操作编号、配置版本及连接完成版本、网络版本和策略版本；如果连接完成时配置已经变化，页面明确提示该路径判断依据的是哪一版配置。候选与拒绝路径仍在详情中展示。只使用现有 Explain API 字段，不改变 Controller API 或运行时决策。
+- `npm run lint` 与 `npm run build` 通过。使用本机 loopback mock API 在浏览器实际展开记录，确认版本字段、配置变化提示和候选路径均可见；没有连接真实核心或修改网络。Network chunk 为 56.87 kB，主 JS 637.94 kB，原有主包体积警告仍在。
+- 该交互检查验证页面展示和展开操作，不覆盖实际换网、真实核心数据兼容或窄屏/移动端实机布局；跨平台网络恢复验收仍需目标平台环境。
+
+### 2026-10-30：DIRECT TCP 拨号失败可从 Explain 列表和详情查询（L2）
+
+- 基线：本地 `master` `6568185f8898c308c120ce379b85a5e892fd9235`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。未修改参考实现或生产拨号行为。
+- 新增 `direct_tcp_dial_failure_is_queryable_from_path_explain`：先启动并占住 API/SOCKS 端口，再保留并释放一个 loopback TCP 目标端口，经 SOCKS5 入站请求 DIRECT 连接；请求前记录已有 Explain ID，仅接受本次新增记录。验证连接关闭后列表出现 `dialFailed` / `directDialFailed`、非空失败类型及空 `selectedPath`，详情与列表记录一致，所有 API 等待均有明确截止时间。
+- `cargo test -p clash-lib --test connection_chain_tests --locked -j 6 direct_tcp_dial_failure_is_queryable_from_path_explain -- --exact --nocapture`：1 passed；`cargo test -p clash-lib --test connection_chain_tests --locked -j 6`：7 passed；`cargo clippy -p clash-lib --test connection_chain_tests --locked -j 6 -- -D warnings`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。测试仅用本机 loopback，不访问公网或更改宿主网络。
+- 本用例覆盖本机拒绝拨号下的 API 诊断闭环，不断言平台专属错误文案，也不代表第三方网卡路径、其他协议或真实换网的失败分类已覆盖。
+
+### 2026-10-30：Explain 记录显示逻辑目标地址（L2，独立审查与维护者验收通过）
+
+- 基线：本地 `master` `b6b9c0eead54f5e04faaa1ad19278b4d6a9fe91e`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。本轮不修改参考实现。
+- `PathDecisionRecord` 增加可选 `destination`，Dispatcher 在 TCP/UDP 的 Explain 记录中从逻辑 `Session.destination` 填值；为 `None` 时跳过序列化，避免改变没有目标值的旧记录。Network Dashboard 在展开详情时显示目标，并对长地址换行；目标字段为诊断信息，不等同于代理端之后的最终出口，也不能作为可达性证明。
+- `connection_chain_tests` 的 DIRECT TCP 成功与拨号拒绝用例、`direct_udp_integration_tests` 的 DIRECT UDP 恢复用例均校验目标值；Explain 版本/过期回归同时断言 `None` 不输出该字段。已运行的定向结果：connection chain 7 passed、direct UDP integration 4 passed、path-decision 序列化/限额单测 1 passed；Dashboard lint/build、`cargo clippy -p clash-lib --all-targets --all-features --locked -j 6 -- -D warnings`、`cargo fmt --all -- --check` 与 `git diff --check` 均通过。浏览器用 loopback mock API 实际展开失败记录，确认 `127.0.0.1:54321` 显示在 DESTINATION 项。
+- 受控 UI 检查不连接真实核心、不访问公网或更改系统网络。跨平台真实换网、代理协议端到端诊断和目标隐私策略仍未由本项验证；目标地址沿用 Controller API 当前认证策略，只有配置非空 `secret` 时才要求鉴权。Reviewer 对 `5eae7f0398d5540ea6fd9dd634f4e3df219f8fd9` 审查通过；维护者已批准 `5eae7f0` 与最终 SHA `617f4d315de12c25d2ed2194e07230e06f52b35b`。非阻塞限制：本次断言使用字面 IPv4，尚无 fake-IP、域名目标或 UDP 拨号失败的独立目标值用例；UDP Explain 目标描述建立决策关联时的逻辑目标，不代表该关联后续每个数据报的目标。
+
+### 2026-10-30：代理端点 TCP 拒绝的 Explain 诊断闭环（L2）
+
+- 基线：本地 `master` `5eae7f0398d5540ea6fd9dd634f4e3df219f8fd9`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。核对 `ref/` 后保留其 SOCKS5 入站在 Dispatcher 调用前发送 CONNECT 成功响应的既有语义；本项只验证其后的拨号失败和 Explain，不改 SOCKS wire 行为。
+- 新增 `proxy_endpoint_dial_refusal_is_queryable_with_logical_destination`：占用 loopback 代理端口完成本地客户端 readiness 后释放该端口，向 `refused-proxy` 发起 SOCKS5 CONNECT；断言 SOCKS5 `REP=0` 的上游兼容响应仍先于 Dispatcher 执行，再验证流在无回包数据后关闭。近期 Explain 列表新增 `proxyEndpointDialFailed` 记录、记录包含 attemptedPaths 和候选路径数组、`destination` 保留用户请求的 `127.0.0.1:80` 而不是代理服务器地址，单 Flow 详情与列表记录一致。请求前的 flow ID 用于排除旧记录，API 等待和本地请求均有界。
+- 基线 `proxy_handshake_failure_is_queryable_from_path_explain`：1 passed。新增端点拒绝定向测试：1 passed；完整 `cargo test -p clash-lib --test connection_chain_tests --locked -j 6`：8 passed。`cargo clippy -p clash-lib --test connection_chain_tests --locked -j 6 -- -D warnings`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。
+- 该用例验证本机 TCP 连接拒绝的 Dispatcher/API 诊断链，不覆盖远端网络故障、真实多网卡路径、其他代理协议互操作、fake-IP/域名 Explain 目标或跨平台换网。
+
+### 2026-10-30：SOCKS5 UDP 代理端点拒绝的 Explain 诊断闭环（L2）
+
+- 基线：本地 `master` `617f4d315de12c25d2ed2194e07230e06f52b35b`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。本项仅覆盖 UDP Dispatcher/API，不修改生产转发行为。
+- 新增 `socks5_udp_proxy_endpoint_refusal_is_queryable_from_path_explain`：先占用 SOCKS5 UDP 出站控制端点，启动后读取 Explain 初始列表并成功完成本地 SOCKS5 UDP ASSOCIATE；在确认本地 SOCKS listener 就绪后、发送首包前释放出站端点。首包发往保留的 loopback UDP 目标并触发代理控制端点 TCP 拒绝。校验新 `dialFailed` 记录的 `proxyUdpEndpointDialFailed` 原因、尝试路径上下文、失败类型、空 `selectedPath`、逻辑目标地址，以及详情与列表一致。请求前的 flow ID 用于排除旧记录，所有请求和等待均有界。
+- 基线 `socks5_udp_outbound_roundtrip_is_queryable_from_path_explain`：1 passed；新增用例 `cargo test -p clash-lib --test connection_chain_tests --locked -j 6 socks5_udp_proxy_endpoint_refusal_is_queryable_from_path_explain -- --exact --nocapture`：1 passed；最终 `cargo test -p clash-lib --test connection_chain_tests --locked -j 6`：9 passed。`cargo clippy -p clash-lib --test connection_chain_tests --locked -j 6 -- -D warnings`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。
+- 该用例验证本机 loopback SOCKS5 UDP 出站控制连接拒绝，不覆盖真实 SOCKS5 服务器、远端网络故障、Hysteria2 UDP、其他协议互操作或真实换网。
+
+### 2026-10-30：Explain 保留域名逻辑目标（L2）
+
+- 基线：本地 `master` `582294946b823f6a4e44e1896824d372fd58ac32`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；参考实现 SHA 与前述 B10 切片相同，本项未修改参考实现或生产转发代码。
+- 扩展 `proxy_endpoint_dial_refusal_is_queryable_with_logical_destination`：通过 SOCKS5 域名地址类型请求 `example.test:443`，将代理端点连接故意设为本机拒绝，并断言 Explain 列表和详情保留域名逻辑目标。失败发生在代理端点握手之前，不需要解析目标域名或访问公网；既有 DIRECT TCP 拒绝测试仍覆盖字面 IP 目标。
+- 定向测试与连接链全量测试均通过：前者 1 passed，后者 9 passed。目标地址字段当前已有域名和字面 IP 的 TCP 失败路径覆盖；fake-IP 经 TUN 反查后进入 Explain 的 API 集成路径仍未覆盖，UDP 目标字段也不代表关联期间每个数据报的目标。
+- 后续补充 `reverse_lookup_restores_domain_for_fake_ip`：resolver 返回映射时，fake-IP `198.18.0.11:8443` 转为 `mapped.example.test:8443`；原有映射缺失测试继续断言返回 `None`。`cargo test -p clash-lib --lib --locked -j 6 reverse_lookup_`：2 passed；`cargo clippy -p clash-lib --lib --locked -j 6 -- -D warnings`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。该单测验证反查转换，不验证 TUN ingress、Dispatcher 记录写入及 Explain HTTP API 的组合。
+- 本地改动未推送。`05344f6` 与当前 fake-IP 单测的完整区间独立审查通过；最终 SHA `405ebc6392a094a207c56b36373ec5b0576851af` 已获维护者批准。
+
+### 2026-10-30：UDP 路径规划错误缓存保留 Explain 上下文（L2，独立审查通过，维护者验收已批准）
+
+- 基线：本地 `master` `6c44de6595176f70591d51e13d8322800dc42388`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。
+- UDP DIRECT 路径决策缓存原先只保存错误文本。首次遇到硬接口约束无法满足时，Explain 有错误类型、网络/策略版本、候选路径和拒绝理由；同一逻辑 UDP Flow 的后续数据报命中缓存时，这些结构化字段会丢失。缓存现改为保存可克隆的完整路径规划错误，Explain 对缓存命中和首次规划使用同一份上下文。
+- 回归单测 `udp_flow_decision_cache_is_scoped_to_target_and_inbound_user` 现验证带候选 PathId、拒绝类型、intent 索引、错误类型和版本的失败对象经缓存后完全保留。基线定向测试为 1 passed；修改后定向测试为 1 passed；`cargo test -p clash-lib --test direct_udp_integration_tests --locked -j 6` 为 4 passed；`cargo clippy -p clash-lib --lib --locked -j 6 -- -D warnings` 通过。格式与 diff 检查在文档更新后复核。
+- 此修复保留 Explain 诊断上下文，不改变 UDP 路由、路径约束、缓存键或转发行为；本轮没有构造真实网卡缺失/接口约束失败的端到端场景，也未验证其他平台网络恢复。独立 Reviewer 对最终 SHA `c1f13e607c611258feafb6be9295ccdeb8c36f16` 审查 PASS；维护者已批准该 SHA。提交本地签名有效、信任未知（`%G?=U`）；没有 push、release 或标签操作。
+
+### 2026-10-30：策略变化时丢弃过期 UDP 路径规划失败（L2，独立审查通过，维护者已验收）
+
+- 基线：本地 `master` `c1f13e607c611258feafb6be9295ccdeb8c36f16`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；参考检出与上一节相同，未修改 `ref/`。
+- UDP 路径规划错误记录前现同时比较网络代次与策略代次。两者均未变时保留真实 `pathPlanningFailed`；网络或策略任一变化时记为新增 `staleDecisionDiscarded`，并在 `reason` 中区分网络变化、策略变化或两者变化。Network Dashboard 将此结果显示为失败状态，避免把过期决策当成当前路径仍不可用。
+- 新增纯函数回归覆盖版本未变、仅策略变化、仅网络变化、两者均变化四种情况；另验证新增 outcome 的 JSON wire 名为 `staleDecisionDiscarded`。定向 Rust 单测 1 passed，wire 名单测 1 passed；`cargo test -p clash-lib --test direct_udp_integration_tests --locked -j 6` 为 4 passed；全 feature 严格 Clippy、Dashboard `npm run lint`、`npm run build`、格式与 diff 检查通过。Build 保留既有 500 kB 主包体积告警。
+- 该项不改变路径选择或 UDP 转发，不增加重放；HTTP 响应 schema 仅增加一种 outcome 字符串。没有进行真实网络切换或跨平台运行。独立审查 PASS；维护者已批准最终 SHA `442353f43ffb3028b5c2e3bc4bbaeb3abee3a1ee`。没有 push、release 或标签操作。
+
+### 2026-10-30：非 loopback API 安全失败通过 readiness 返回（L2）
+
+- 基线：本地 `master` `405ebc6392a094a207c56b36373ec5b0576851af`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；本项只增加集成覆盖与记录，不改变运行时代码。
+- 新增 `non_loopback_api_security_failures_are_reported_before_readiness`：以 `0.0.0.0` listener 分别验证缺少 secret、secret 存在但没有有效 CORS origins 时，`start_scaffold_instance` 返回具体安全错误；确认失败返回后该 wildcard API 地址可重新绑定。`ApiRunner` 当前是在 bind 后检查本地地址及安全策略，但在 `axum::serve` 前发送 readiness 失败并退出；inbound 尚未启动，因此本用例不声称覆盖 SOCKS listener 清理或绑定前拦截。
+- 定向 API 集成测试：1 passed；`cargo test -p clash-lib --test api_tests --locked -j 6`：12 passed；`cargo clippy -p clash-lib --test api_tests --locked -j 6 -- -D warnings`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。测试只短暂绑定测试端口，不处理 API 请求、不修改系统网络。
+- 独立审查 PASS；维护者已批准 SHA `6c44de6595176f70591d51e13d8322800dc42388`。本地工作，不包含推送授权。
+
+### 2026-10-30：规则指定网卡不可用时记录 TCP/UDP Explain（L2，独立审查通过，维护者已验收）
+
+- 基线：本地 `master` `442353f43ffb3028b5c2e3bc4bbaeb3abee3a1ee`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。
+- TCP 和 UDP Dispatcher 现先创建 Explain 上下文，再执行规则接口解析；解析失败时写入 `pathPlanningFailed`，包含路由、逻辑目标、`ruleInterfaceResolutionFailed` 和底层错误文本。未解析出具体路径时 `candidatePaths` 为空、`selectedPath` 为 null。连接继续按原有 fail-closed 行为关闭，不回退默认网卡。
+- 新增 `unavailable_rule_interface_is_queryable_for_tcp_and_udp`，用不存在的命名接口在真实本机 SOCKS5 TCP、UDP 会话上验证 Explain 列表和单条详情，并确认 TCP 在既有 SOCKS 响应后关闭。定向测试 1 passed；`cargo test -p clash-lib --test connection_chain_tests --locked -j 6`：10 passed；`cargo test -p clash-lib --test direct_udp_integration_tests --locked -j 6`：4 passed；全 feature 严格 Clippy、`cargo fmt --all -- --check` 和 `git diff --check` 通过。
+- 测试只使用 loopback 和临时端口，没有改系统网络；没有验证 Linux/Windows 的网卡枚举差异或真实换网。独立 Reviewer PASS；维护者已验收 SHA `9a9176cb646cff561db50060217bfefab5e9815e`；没有 push、release 或标签操作。
+
+### 2026-10-30：记录 TCP/UDP 出站准备失败与过期决策（L2，独立审查与维护者验收待完成）
+
+- 基线：本地 `master` `9a9176cb646cff561db50060217bfefab5e9815e`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。
+- TCP/UDP 在出站不存在、网络代次池回收失败、动态代理组选择失败或组成员池无法安全复用时，现写入有界 Explain 记录，携带失败类型、规则路由、逻辑目标和底层错误；原有 fail-closed 行为不变，也不回退 DIRECT。规则接口失败复用同一记录构造器。若配置、策略、网络或操作版本在失败处理期间变化，记录为 `staleDecisionDiscarded`，保留开始与失败版本。
+- 基线 `missing_named_outbound_does_not_look_up_direct`：1 passed；基线连接链：10 passed。修改后 `pre_dispatch_failure_records_route_destination_and_stale_versions`：1 passed；`connection_chain_tests`：10 passed；`direct_udp_integration_tests`：4 passed；全 feature 严格 Clippy、格式和 diff 检查通过。
+- 独立 Reviewer PASS；维护者已批准代码 SHA `90b3b411e93f861d1618d4e636275a5a86f17928`。后续 Dispatcher 回归见下一条记录。没有验证真实网络切换或其他平台；没有 push、release 或标签操作。
+
+### 2026-10-30：Dispatcher 中真实注入连接池重置失败（L2，独立审查与维护者验收待完成）
+
+- 基线：本地 `master` `90b3b411e93f861d1618d4e636275a5a86f17928`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；参考检出 SHA 与上一项相同，本轮不改参考实现。
+- 新增 `outbound_pool_reset_failure_is_recorded_for_tcp_and_udp`：用测试处理器在真实 OutboundManager 的网络代次池回收中注入重置失败，再调用真实 Dispatcher TCP/UDP 入口；两路都检查 `outboundPoolNotReady`、路由、逻辑目标和底层错误。loopback TCP listener 未收到连接，UDP receiver 未收到数据，证明原有失败关闭/丢包行为没有 DIRECT 回退。使用进程内状态、临时目录、loopback 与 duplex stream，不改系统网络。
+- 基线 OutboundManager 池失败恢复单测 1 passed；本轮全 feature 库测试 1166 passed、11 ignored，连接链 10 passed，DIRECT UDP 集成 4 passed；全 feature 严格 Clippy、格式和 diff 检查通过。
+- 该用例直接检查 Dispatcher 写入的 RuntimeStatus 记录；真实 HTTP 列表/详情 API 使用同一存储与序列化模型，规则接口失败的 API 列表/详情闭环由前一项覆盖。本轮未验证真实网卡切换或跨平台行为；没有 push、release 或标签操作。
+
+### 2026-10-30：fake-IP 反查失败写入 TCP/UDP Explain（L2，独立审查与维护者验收待完成）
+
+- 基线：本地 `master` `eac49abcb3090576374d65149d7346f721608886`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。本轮不修改参考实现。
+- TCP/UDP 原先在 fake-IP 反查缺少映射时直接关闭/丢弃，没有 Explain。现在这类分支记录 `fakeIpMappingMissing`、原始目的地址和明确的“路由选择已跳过”；`route.outbound=notEvaluated`、`rule=null`，不会伪造已选代理或规则，也不改变 TCP 关闭及 UDP 丢弃行为。Explain 版本与 Flow ID 在反查前创建，正常成功路径沿用同一上下文。Dashboard 仅当失败类型与路由占位同时匹配时显示 “Not evaluated / Selection skipped”，避免与用户自定义的同名出站组冲突。
+- 新增 Dispatcher 级回归 `missing_fake_ip_mapping_is_recorded_for_tcp_and_udp`，用 mock resolver 注入两种协议的映射缺失，并核验 RuntimeStatus 中的独立失败记录、路由占位、起始版本字段与目标地址；该测试覆盖 Dispatcher 分支，未在生产 FakeDns 中构造映射淘汰竞态。`cargo test -p clash-lib --lib --all-features --locked -j 6`：1167 passed、11 ignored；`cargo test -p clash-lib --test connection_chain_tests --test direct_udp_integration_tests --locked -j 6 -- --test-threads=1`：10 + 4 passed；严格 Clippy、无默认 feature 编译、格式和 diff 检查通过。Dashboard `npm run lint`、`npm run build` 通过；构建保留原有主 bundle 超过 500 kB 提示。使用 loopback mock API 实际打开 Network 页，展开 fake-IP 记录并同时放入真实出站名为 `notEvaluated` 的第二条记录；前者显示 “Not evaluated / Selection skipped”，后者仍显示原始组名与规则，详情可见 `198.18.0.10:443`。
+- UI 手动检查使用本机静态 Dashboard 和模拟 API；没有连接真实核心、查询公网 DNS、启动 TUN 或更改宿主网络。API 列表/详情复用已有 PathDecisionRecord 序列化与 handler；本轮新增用例直接检查 RuntimeStatus，不单独发 HTTP 列表/详情请求。未验证跨平台或真实 fake-IP 映射淘汰竞态；没有 push、release 或标签操作。
+
+### 2026-10-30：fake-IP Explain 经 Controller 列表和详情返回（L2，独立审查与维护者验收待完成）
+
+- 基线：本地 `master` `d7d99c89144cf3511e5a25e20bdd5bb4f7a04217`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；参考检出与上一节相同，未修改参考实现。
+- 扩展网络 handler 的本机 HTTP 回归：先写入并过期一条历史记录，再写入 `fakeIpMappingMissing` 决策；使用生产的 `status_routes`、共享 HTTP layer 和 Bearer auth，通过本机 TCP listener 确认 Explain 列表仅返回有效记录、单条详情 JSON 与该记录完全一致、过期详情仍返回 404。保留列表未认证时的 401 与详情路由 CORS 预检检查。
+- 基线过期记录测试 1 passed；更新后的网络 handler 单测 2 passed；全 feature 库测试 1167 passed、11 ignored；全 feature 严格 Clippy、格式和 diff 检查通过。测试只访问 loopback listener，不访问外网或修改主机网络。
+- 此用例验证已构造的 fake-IP Explain 数据穿过真实 HTTP handler/认证/序列化闭环；它不通过活动 Dispatcher 与生产 FakeDns 同时生成该记录。生产映射淘汰竞态、真实网络变化和跨平台行为仍未在本机验证；没有 push、release 或标签操作。
+
+### 2026-10-30：fake-IP 映射在反查间隙丢失仍生成 Explain（L2）
+
+- 基线：本地 `master` `365b435915927399b47dcec1df51cc3fd9f4f796`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。未修改参考实现或生产运行代码。
+- 新增 `missing_fake_ip_reverse_index_is_explained_by_dispatcher`：使用真实 `FakeDns` 与 `EnhancedResolver`，测试存储在 `is_fake_ip` 确认分配后、独立 `reverse_lookup` 前模拟映射淘汰；通过真实 Dispatcher TCP 入口确认连接在有界等待内关闭，并记录 `fakeIpMappingMissing`、`notEvaluated` 与“路由选择已跳过”。这补上此前只有 mock resolver 覆盖 Dispatcher 分支、只有预置记录覆盖 Controller handler 的组合缺口。
+- 定向测试在默认全 feature 与 `--no-default-features --features ring,tun,port` 下各 1 passed；`cargo test -p clash-lib --lib --all-features --locked -j 6`：1168 passed、11 ignored。全 feature all-target 严格 Clippy、格式及 diff 检查通过。测试只使用进程内 fake-DNS 存储、临时目录和 duplex stream，不访问外网、启动 TUN 或修改宿主网络。
+- 本项验证确定性模拟的映射淘汰时序，不触发真实持久化缓存损坏或并发删除，也没有把此新测试与 Controller HTTP 请求放在同一条用例中；HTTP 鉴权/列表/详情行为由上一项回归覆盖。真实换网与跨平台验收仍待专用环境；独立审查和维护者验收结果随最终 SHA 交付记录。本地未推送。
+
+### 2026-10-30：DIRECT TCP 总预算包含 DNS 并取消超时查询（L2）
+
+- 基线：本地 `master` `fb89ef687cba97c9853d823bcc9e3668cf427885`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。未修改参考实现或生产连接代码。
+- 新增 `direct_tcp_total_budget_includes_and_cancels_dns`：通过生产 `DirectConnector` 调用一个挂起的 resolver，确认 DNS 计入 5 秒总预算、最终返回 `TimedOut`，且超时会 drop DNS future。回归只验证 deadline 与取消边界，不创建 socket 或发送 DNS/业务流量；已有 `direct_connector_tries_the_next_resolved_address` 保持地址快速失败后继续尝试的覆盖。
+- 新用例在默认全 feature 与 `--no-default-features --features ring,tun,port` 下各 1 passed；全 feature 库测试 1169 passed、11 ignored；严格 Clippy、格式和 diff 检查通过。超时回归约耗时 5 秒，其外层测试等待上限为 10 秒。
+- 本项未验证真实 DNS 上游慢响应、TCP 连接阶段预算、并发 hedge loser 清理、代理端点预算或真实网络切换；没有改生产实现。独立审查与维护者验收结果随最终 SHA 交付记录。本地未推送。
+
+### 2026-10-30：代理端点 TCP 总预算包含 DNS 并取消超时查询（L2）
+
+- 基线：本地 `master` `d867bd270a80d54b6d2ec5078b96d42b52d6561a`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。未修改参考实现或生产连接代码。
+- 新增 `proxy_endpoint_total_budget_includes_and_cancels_dns`：通过生产 `DirectConnector::connect_stream` 走代理端点拨号路径，注入挂起的 resolver，确认 DNS 纳入 5 秒 endpoint 总预算、返回 `TimedOut` 且 resolver future 已被取消。测试在 DNS 获取阶段终止，不创建 socket 或发送流量。
+- 定向测试在默认全 feature 与 `--no-default-features --features ring,tun,port` 下各 1 passed；全 feature 库测试 1170 passed、11 ignored；严格 Clippy、格式和 diff 检查通过。测试约耗时 5 秒，外层上限为 10 秒。
+- 该项补足 DIRECT 与代理端点的 DNS 预算分别验证；仍未覆盖真实 DNS 慢响应、代理 TCP 阶段超时与并发 hedge loser 清理，也不代表真实网络切换验收。独立审查与维护者验收结果随最终 SHA 交付记录。本地未推送。
+
+### 2026-10-30：DIRECT TCP hedge 获胜后取消未完成拨号（L2，独立审查与维护者验收待完成）
+
+- 基线：本地 `master` `728ae845badf6f8b4daba1eaf13fb1daa1ac7817`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。未修改参考实现。
+- 将 DIRECT TCP 的错峰并发尝试、快速失败推进、deadline 与首个成功结果选择抽成内部调度器，生产拨号仍使用原来的 120ms hedge、最多 2 并发、5 秒总预算和候选上限；成功返回时调度器释放剩余尝试集合，使未获胜 socket future 取消。
+- 新增三个调度器回归：`direct_tcp_winner_cancels_pending_hedged_attempt` 验证 loser future 在另一个尝试成功时被 drop；`direct_tcp_failure_starts_next_attempt_immediately` 验证快速失败不等待 hedge；`direct_tcp_deadline_cancels_attempts_at_parallel_limit` 验证并发不超过 2 且 deadline 释放挂起 future。执行 `cargo test -p clash-lib --lib --all-features --locked -j 6 direct_tcp_ -- --nocapture` 与 `cargo test -p clash-lib --lib --no-default-features --features ring,tun,port --locked -j 6 direct_tcp_ -- --nocapture`，两者均 5 passed；全 feature 库测试 1173 passed、11 ignored。
+- `cargo clippy -p clash-lib --all-targets --all-features --locked -j 6 -- -D warnings`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。定向测试只使用可控 future 和已有 loopback 测试；本次三个新测试不创建 socket。
+- 测试验证生产共用的调度逻辑和 future 取消边界，不创建真实 socket，不覆盖真实网络中的 connect 取消时序、并发切网或跨平台行为。无 push、release 或标签操作；签名提交及独立审查/维护者验收结果待最终 SHA 确认。
+
+### 2026-10-31：Windows 网络快照测试类型仅在测试构建导入（L2）
+
+- PR #92 的 Windows Rust quality 与 UDP loopback job 在非测试库构建阶段都因 `IP_ADDRESS_PREFIX` 未使用而失败；该类型只被 `windows.rs` 中的测试辅助代码引用。将导入限定到 `#[cfg(test)]`，不改变网络快照运行逻辑。
+- 本机没有 MinGW C 编译器；尝试 `cargo clippy -p clash-lib --target x86_64-pc-windows-gnu --all-targets --all-features --locked -j 6 -- -D warnings` 因缺少 `x86_64-w64-mingw32-gcc` 被依赖构建阻断。Windows MSVC CI 将验证修正后的目标构建与回归；在新 SHA CI 完成前不将 Windows 修复标为远端验证通过。
+
+### 2026-10-31：跨平台集成测试就绪和日志断言（L2）
+
+- PR #92 的 Linux quality job 日志显示 Explain 请求可能在 `/runtime` 首次网络观察前启动：UDP 首次规划使用 `networkVersion=0`，快照变为 `1` 后触发 stale-generation 重规划；SOCKS5 UDP fixture 也曾在核心启动期间提前耗尽等待时间。补齐相关 UDP 拒绝用例的首次快照等待，并把 UDP 成功 fixture 延后到核心及首次快照 ready 后启动；等待有界。
+- 跨目标编译 job 的测试日志还发现三项可移植性问题：Linux 将端口占用错误写作 `Address in use`，测试原先只接受 `Address already in use`；WebSocket 合约 fixture 配置 `log-level: error`，在 cross 容器未继承 `RUST_LOG` 时会过滤它自己发送的 warning；SOCKS5 UDP 端点拒绝用例同样需要先等网络代际建立。测试现改为匹配平台无关的 `in use`，WebSocket fixture 使用 `debug`，并在 UDP 拒绝流量前等待首次快照。
+- 这些调整只改测试和迭代记录，不修改生产网络、Controller 或日志行为。本机此前 `cargo test -p clash-lib --test connection_chain_tests --locked -j 6` 为 10 passed；追加修改后的 Linux/Apple/Windows 目标矩阵需在新 SHA 上重跑确认。未进行真实网络切换、TUN 或公网测试。
+- 新 SHA 的跨目标日志进一步发现两项测试覆盖遗漏：socket helper 静态守卫逐个扫描 `src/proxy` 的物理文件，没有识别 `xhttp/mod.rs` 以 `#[cfg(test)] mod tests;` 引入的 `xhttp/tests.rs`，因此把测试夹具里的 `TcpStream::connect` 误当作运行时代码；测试专用扫描范围现精确排除此文件，并有单测确认只匹配该文件。i686 musl 上 GLOBAL UDP 回收用例在启动后立即发流量，超时未观察到 `outboundChanged`；该目标日志还显示同一类 runtime 网络代际会从 0 变为 1。尚无证据认定生产回收实现错误，测试现在等待当前代际的首次成功恢复完成后再建立 UDP 关联，避免首次恢复先以 `NetworkChanged` 结束该关联。armv7 Shadowsocks UDP Explain 用例也在完成 UDP 回环后未观察到成功决策；测试现在在首个 UDP 关联前等待同一类首次网络恢复完成。Mac 本机运行 `cargo test -p clash-lib --all-features --test shadowsocks_integration_tests --locked -j 6` 得到 4 passed；`cargo test -p clash-lib --all-features --locked -j 6 --test direct_udp_integration_tests --test socket_protection_guard_tests` 得到 4 + 6 passed。尚未在 armv7 环境确认这两项等待是否消除超时。以上均只改测试和迭代记录，需由新 SHA 的目标矩阵验证。
+- `f912944` 的下一轮交叉目标日志在 aarch64 macOS、x86_64 Linux GNU 与 i686 musl 上都发现 Trojan UDP Explain 测试超时；日志确认该测试的首次 UDP 流量使用 `networkVersion=0`，随后当前网络版本变成 `1`，并出现 UDP-over-TLS 连接重置。Trojan UDP fixture 现也在发送首包前等待当前网络代际的首次成功恢复；本机运行 `cargo test -p clash-lib --all-features --test trojan_integration_tests --locked -j 6` 得到 2 passed。此处只改测试和迭代记录，需由新 SHA 的交叉目标矩阵确认修正效果。

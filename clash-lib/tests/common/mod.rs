@@ -133,6 +133,50 @@ where
     Ok(res)
 }
 
+/// Waits until the runtime has completed a successful recovery for its
+/// current observed network generation.
+#[allow(dead_code)]
+pub async fn wait_for_initial_network_recovery(api_port: u16) {
+    use http_body_util::BodyExt;
+
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            let url = format!("http://127.0.0.1:{api_port}/runtime");
+            let request = hyper::Request::builder()
+                .uri(&url)
+                .header(http::header::AUTHORIZATION, "Bearer clash-rs")
+                .method(http::Method::GET)
+                .body(http_body_util::Empty::<bytes::Bytes>::new())
+                .expect("failed to build runtime status request");
+            let response = send_http_request(url.parse().unwrap(), request)
+                .await
+                .expect("failed to query runtime status");
+            assert_eq!(response.status(), http::StatusCode::OK);
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .expect("failed to collect runtime status")
+                .to_bytes();
+            let runtime: serde_json::Value = serde_json::from_slice(&body)
+                .expect("failed to parse runtime status");
+            let network_version = runtime["networkVersion"].as_u64();
+            let operation = &runtime["lastOperation"];
+            if runtime["lastObservedAtMs"].as_i64().is_some()
+                && network_version.is_some_and(|version| version > 0)
+                && operation["outcome"] == "succeeded"
+                && operation["finishedAtMs"].as_i64().is_some()
+                && operation["token"]["networkVersion"].as_u64() == network_version
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("runtime did not complete its initial network recovery");
+}
+
 /// SOCKS5 UDP relay session that keeps the TCP control connection alive.
 #[allow(dead_code)]
 pub struct Socks5UdpSession {
@@ -199,6 +243,11 @@ impl Socks5UdpSession {
         assert_eq!(sender, self.relay_addr, "unexpected UDP relay sender");
         let packet = &buf[..len];
         assert!(packet.len() >= 4, "SOCKS5 UDP response is truncated");
+        assert_eq!(
+            &packet[..3],
+            &[0x00, 0x00, 0x00],
+            "SOCKS5 UDP response must be unfragmented",
+        );
         let mut pos = 4usize;
         let source = match packet[3] {
             0x01 => {

@@ -195,109 +195,163 @@ impl DirectConnector {
         let first_family = AddressFamily::from(endpoints[0].ip());
         let ambiguous_first_family = selection.for_family(first_family).is_none()
             && selection.candidates_for_family(first_family).len() > 1;
-        let mut next_attempt = 0;
-        let mut attempts = FuturesUnordered::new();
-        let mut errors = Vec::new();
         let initial_count = if ambiguous_first_family {
             DIRECT_TCP_PARALLEL_LIMIT
         } else {
             1
         };
-        while next_attempt < planned_attempts.len() && attempts.len() < initial_count
-        {
-            push_direct_stream_attempt(
-                &mut attempts,
-                planned_attempts[next_attempt].clone(),
-                iface.cloned(),
-                #[cfg(target_os = "linux")]
-                packet_mark,
-            );
-            next_attempt += 1;
-        }
-        let mut next_hedge = tokio::time::Instant::now() + DIRECT_TCP_HEDGE_DELAY;
+        let mut errors = Vec::new();
+        let outcome = run_direct_stream_attempts::<tokio::net::TcpStream, _, _>(
+            planned_attempts,
+            initial_count,
+            DIRECT_TCP_PARALLEL_LIMIT,
+            DIRECT_TCP_HEDGE_DELAY,
+            deadline,
+            |attempts, attempt| {
+                push_direct_stream_attempt(
+                    attempts,
+                    attempt,
+                    iface.cloned(),
+                    #[cfg(target_os = "linux")]
+                    packet_mark,
+                );
+            },
+            |attempt, error| {
+                errors.push(format!(
+                    "{} via {}: {error}",
+                    attempt.endpoint,
+                    attempt.path.as_ref().map_or_else(
+                        || "system route".to_owned(),
+                        |path| {
+                            format!(
+                                "{}#{}",
+                                path.id.interface.name, path.id.interface.index
+                            )
+                        },
+                    )
+                ));
+                trace!(
+                    endpoint = %attempt.endpoint,
+                    path = ?attempt.path.as_ref().map(|path| &path.id),
+                    error = %error,
+                    "DIRECT TCP path attempt failed"
+                );
+            },
+        )
+        .await;
 
-        loop {
-            if attempts.is_empty() && next_attempt >= planned_attempts.len() {
-                break;
-            }
-            tokio::select! {
-                biased;
-                _ = tokio::time::sleep_until(deadline) => {
-                    errors.push("total DIRECT TCP attempt budget expired".to_owned());
-                    break;
+        match outcome {
+            DirectStreamAttemptOutcome::Connected { attempt, stream } => {
+                if let Some(path) = &attempt.path {
+                    trace!(
+                        endpoint = %attempt.endpoint,
+                        interface = %path.id.interface.name,
+                        interface_index = path.id.interface.index,
+                        family = ?path.id.family,
+                        network_generation = path.id.network_generation,
+                        "DIRECT TCP path attempt won"
+                    );
+                } else {
+                    trace!(endpoint = %attempt.endpoint, "DIRECT TCP system-route attempt won");
                 }
-                result = attempts.next(), if !attempts.is_empty() => {
-                    let Some((attempt, result)) = result else { continue };
-                    match result {
-                        Ok(stream) => {
-                            if let Some(path) = &attempt.path {
-                                trace!(
-                                    endpoint = %attempt.endpoint,
-                                    interface = %path.id.interface.name,
-                                    interface_index = path.id.interface.index,
-                                    family = ?path.id.family,
-                                    network_generation = path.id.network_generation,
-                                    "DIRECT TCP path attempt won"
-                                );
-                            } else {
-                                trace!(endpoint = %attempt.endpoint, "DIRECT TCP system-route attempt won");
-                            }
-                            let path_id =
-                                attempt.path.map(|path| path.id);
-                            return Ok((Box::new(stream) as _, path_id));
-                        }
-                        Err(error) => {
-                            errors.push(format!(
-                                "{} via {}: {error}",
-                                attempt.endpoint,
-                                attempt.path.as_ref().map_or_else(
-                                    || "system route".to_owned(),
-                                    |path| format!("{}#{}", path.id.interface.name, path.id.interface.index),
-                                )
-                            ));
-                            trace!(
-                                endpoint = %attempt.endpoint,
-                                path = ?attempt.path.as_ref().map(|path| &path.id),
-                                error = %error,
-                                "DIRECT TCP path attempt failed"
+                let path_id = attempt.path.map(|path| path.id);
+                Ok((Box::new(stream) as _, path_id))
+            }
+            DirectStreamAttemptOutcome::Exhausted { timed_out } => {
+                if timed_out {
+                    errors
+                        .push("total DIRECT TCP attempt budget expired".to_owned());
+                }
+                Err(new_io_error(format!(
+                    "DIRECT TCP path attempts exhausted: {}",
+                    errors.join("; ")
+                )))
+            }
+        }
+    }
+}
+
+type DirectStreamAttemptFutures<T> = FuturesUnordered<
+    futures::future::BoxFuture<'static, (DirectStreamAttempt, std::io::Result<T>)>,
+>;
+
+enum DirectStreamAttemptOutcome<T> {
+    Connected {
+        attempt: DirectStreamAttempt,
+        stream: T,
+    },
+    Exhausted {
+        timed_out: bool,
+    },
+}
+
+async fn run_direct_stream_attempts<T, StartAttempt, OnFailure>(
+    planned_attempts: Vec<DirectStreamAttempt>,
+    initial_attempt_count: usize,
+    parallel_limit: usize,
+    hedge_delay: Duration,
+    deadline: tokio::time::Instant,
+    mut start_attempt: StartAttempt,
+    mut on_failure: OnFailure,
+) -> DirectStreamAttemptOutcome<T>
+where
+    T: Send + 'static,
+    StartAttempt: FnMut(&mut DirectStreamAttemptFutures<T>, DirectStreamAttempt),
+    OnFailure: FnMut(&DirectStreamAttempt, &std::io::Error),
+{
+    assert!(parallel_limit > 0, "attempt limit must be non-zero");
+
+    let mut next_attempt = 0;
+    let mut active = DirectStreamAttemptFutures::new();
+    let initial_limit = initial_attempt_count.max(1).min(parallel_limit);
+    while next_attempt < planned_attempts.len() && active.len() < initial_limit {
+        start_attempt(&mut active, planned_attempts[next_attempt].clone());
+        next_attempt += 1;
+    }
+    let mut next_hedge = tokio::time::Instant::now() + hedge_delay;
+
+    loop {
+        if active.is_empty() && next_attempt >= planned_attempts.len() {
+            return DirectStreamAttemptOutcome::Exhausted { timed_out: false };
+        }
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => {
+                return DirectStreamAttemptOutcome::Exhausted { timed_out: true };
+            }
+            result = active.next(), if !active.is_empty() => {
+                let Some((attempt, result)) = result else { continue };
+                match result {
+                    Ok(stream) => {
+                        return DirectStreamAttemptOutcome::Connected { attempt, stream };
+                    }
+                    Err(error) => {
+                        on_failure(&attempt, &error);
+                        if next_attempt < planned_attempts.len()
+                            && active.len() < parallel_limit
+                        {
+                            start_attempt(
+                                &mut active,
+                                planned_attempts[next_attempt].clone(),
                             );
-                            if next_attempt < planned_attempts.len()
-                                && attempts.len() < DIRECT_TCP_PARALLEL_LIMIT
-                            {
-                                push_direct_stream_attempt(
-                                    &mut attempts,
-                                    planned_attempts[next_attempt].clone(),
-                                    iface.cloned(),
-                                    #[cfg(target_os = "linux")]
-                                    packet_mark,
-                                );
-                                next_attempt += 1;
-                                next_hedge = tokio::time::Instant::now() + DIRECT_TCP_HEDGE_DELAY;
-                            }
+                            next_attempt += 1;
+                            next_hedge = tokio::time::Instant::now() + hedge_delay;
                         }
                     }
                 }
-                _ = tokio::time::sleep_until(next_hedge),
-                    if next_attempt < planned_attempts.len()
-                        && attempts.len() < DIRECT_TCP_PARALLEL_LIMIT =>
-                {
-                    push_direct_stream_attempt(
-                        &mut attempts,
-                        planned_attempts[next_attempt].clone(),
-                        iface.cloned(),
-                        #[cfg(target_os = "linux")]
-                        packet_mark,
-                    );
-                    next_attempt += 1;
-                    next_hedge = tokio::time::Instant::now() + DIRECT_TCP_HEDGE_DELAY;
-                }
+            }
+            _ = tokio::time::sleep_until(next_hedge),
+                if next_attempt < planned_attempts.len()
+                    && active.len() < parallel_limit =>
+            {
+                start_attempt(
+                    &mut active,
+                    planned_attempts[next_attempt].clone(),
+                );
+                next_attempt += 1;
+                next_hedge = tokio::time::Instant::now() + hedge_delay;
             }
         }
-
-        Err(new_io_error(format!(
-            "DIRECT TCP path attempts exhausted: {}",
-            errors.join("; ")
-        )))
     }
 }
 
@@ -1237,10 +1291,14 @@ impl RemoteConnector for DirectConnector {
 mod tests {
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
-        sync::Arc,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        time::Duration,
     };
 
-    use futures::{SinkExt, StreamExt, stream::FuturesUnordered};
+    use futures::{FutureExt, SinkExt, StreamExt, stream::FuturesUnordered};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, UdpSocket},
@@ -1250,11 +1308,12 @@ mod tests {
     #[cfg(feature = "hysteria")]
     use super::observe_proxy_target_datagram;
     use super::{
-        DirectConnector, DirectStreamAttempt, NetworkPathSource, NetworkPoolContext,
-        ProxyEndpointConnectError, RemoteConnector, build_proxy_endpoint_attempts,
-        observe_proxy_endpoint_datagram, observe_proxy_endpoint_stream,
-        push_proxy_endpoint_stream_attempt,
-        requires_proxy_endpoint_generation_check,
+        DIRECT_TCP_HEDGE_DELAY, DIRECT_TCP_PARALLEL_LIMIT, DirectConnector,
+        DirectStreamAttempt, DirectStreamAttemptOutcome, NetworkPathSource,
+        NetworkPoolContext, ProxyEndpointConnectError, RemoteConnector,
+        build_proxy_endpoint_attempts, observe_proxy_endpoint_datagram,
+        observe_proxy_endpoint_stream, push_proxy_endpoint_stream_attempt,
+        requires_proxy_endpoint_generation_check, run_direct_stream_attempts,
     };
     use crate::app::dns::MockClashResolver;
     use crate::{
@@ -1276,6 +1335,91 @@ mod tests {
         },
         session::SocksAddr,
     };
+
+    struct FutureDropGuard(Arc<AtomicBool>);
+
+    impl Drop for FutureDropGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct PendingResolveAllResolver {
+        cancelled: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::app::dns::ClashResolver for PendingResolveAllResolver {
+        async fn resolve(
+            &self,
+            _host: &str,
+            _enhanced: bool,
+        ) -> anyhow::Result<Option<IpAddr>> {
+            Ok(None)
+        }
+
+        async fn resolve_all(
+            &self,
+            _host: &str,
+            _enhanced: bool,
+        ) -> anyhow::Result<Vec<IpAddr>> {
+            let _guard = FutureDropGuard(self.cancelled.clone());
+            std::future::pending().await
+        }
+
+        async fn resolve_v4(
+            &self,
+            _host: &str,
+            _enhanced: bool,
+        ) -> anyhow::Result<Option<std::net::Ipv4Addr>> {
+            Ok(None)
+        }
+
+        async fn resolve_v6(
+            &self,
+            _host: &str,
+            _enhanced: bool,
+        ) -> anyhow::Result<Option<std::net::Ipv6Addr>> {
+            Ok(None)
+        }
+
+        async fn cached_for(&self, _ip: IpAddr) -> Option<String> {
+            None
+        }
+
+        async fn exchange(
+            &self,
+            _message: &hickory_proto::op::Message,
+        ) -> anyhow::Result<hickory_proto::op::Message> {
+            anyhow::bail!("DNS exchange is unused in this test")
+        }
+
+        async fn reverse_lookup(&self, _ip: IpAddr) -> Option<String> {
+            None
+        }
+
+        async fn is_fake_ip(&self, _ip: IpAddr) -> bool {
+            false
+        }
+
+        async fn fake_ip_for_host(&self, _host: &str) -> Option<IpAddr> {
+            None
+        }
+
+        fn fake_ip_enabled(&self) -> bool {
+            false
+        }
+
+        fn ipv6(&self) -> bool {
+            false
+        }
+
+        fn set_ipv6(&self, _enable: bool) {}
+
+        fn kind(&self) -> crate::app::dns::ResolverKind {
+            crate::app::dns::ResolverKind::Clash
+        }
+    }
 
     fn s04by_observed_status() -> Arc<tokio::sync::RwLock<NetworkStatus>> {
         let mut status = NetworkStatus::default();
@@ -2420,6 +2564,245 @@ mod tests {
 
         drop(stream);
         drop(listener);
+    }
+
+    #[tokio::test]
+    async fn direct_tcp_winner_cancels_pending_hedged_attempt() {
+        let loser_cancelled = Arc::new(AtomicBool::new(false));
+        let attempt_count = Arc::new(AtomicUsize::new(0));
+        let planned_attempts = vec![
+            DirectStreamAttempt {
+                endpoint: "127.0.0.1:443".parse().unwrap(),
+                path: None,
+            },
+            DirectStreamAttempt {
+                endpoint: "127.0.0.2:443".parse().unwrap(),
+                path: None,
+            },
+        ];
+        let loser = loser_cancelled.clone();
+        let started = attempt_count.clone();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(3),
+            run_direct_stream_attempts(
+                planned_attempts,
+                1,
+                DIRECT_TCP_PARALLEL_LIMIT,
+                DIRECT_TCP_HEDGE_DELAY,
+                tokio::time::Instant::now() + Duration::from_secs(2),
+                move |active, attempt| {
+                    let attempt_number = started.fetch_add(1, Ordering::SeqCst);
+                    if attempt_number == 0 {
+                        let loser = loser.clone();
+                        active.push(
+                            async move {
+                                let _guard = FutureDropGuard(loser);
+                                std::future::pending::<std::io::Result<()>>().await
+                            }
+                            .map(move |result| (attempt, result))
+                            .boxed(),
+                        );
+                    } else {
+                        active.push(
+                            async move { Ok(()) }
+                                .map(move |result| (attempt, result))
+                                .boxed(),
+                        );
+                    }
+                },
+                |_, _| {},
+            ),
+        )
+        .await
+        .expect("hedged DIRECT TCP attempt race must remain bounded");
+
+        let DirectStreamAttemptOutcome::Connected { attempt, .. } = outcome else {
+            panic!("the second hedged attempt should win");
+        };
+        assert_eq!(attempt.endpoint, "127.0.0.2:443".parse().unwrap());
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 2);
+        assert!(
+            loser_cancelled.load(Ordering::SeqCst),
+            "the unfinished attempt must be dropped after a winner connects"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_tcp_failure_starts_next_attempt_immediately() {
+        let attempt_count = Arc::new(AtomicUsize::new(0));
+        let failure_count = Arc::new(AtomicUsize::new(0));
+        let started = attempt_count.clone();
+        let failed = failure_count.clone();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_direct_stream_attempts(
+                vec![
+                    DirectStreamAttempt {
+                        endpoint: "127.0.0.1:443".parse().unwrap(),
+                        path: None,
+                    },
+                    DirectStreamAttempt {
+                        endpoint: "127.0.0.2:443".parse().unwrap(),
+                        path: None,
+                    },
+                ],
+                1,
+                DIRECT_TCP_PARALLEL_LIMIT,
+                Duration::from_secs(60),
+                tokio::time::Instant::now() + Duration::from_secs(2),
+                move |active, attempt| {
+                    let attempt_number = started.fetch_add(1, Ordering::SeqCst);
+                    let future = async move {
+                        if attempt_number == 0 {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionRefused,
+                                "controlled first-attempt failure",
+                            ))
+                        } else {
+                            Ok(())
+                        }
+                    };
+                    active.push(future.map(move |result| (attempt, result)).boxed());
+                },
+                move |_, _| {
+                    failed.fetch_add(1, Ordering::SeqCst);
+                },
+            ),
+        )
+        .await
+        .expect("a failed DIRECT TCP attempt must advance without waiting for hedge delay");
+
+        let DirectStreamAttemptOutcome::Connected { attempt, .. } = outcome else {
+            panic!("the next attempt should win after the first attempt fails");
+        };
+        assert_eq!(attempt.endpoint, "127.0.0.2:443".parse().unwrap());
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 2);
+        assert_eq!(failure_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn direct_tcp_deadline_cancels_attempts_at_parallel_limit() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let attempt_count = Arc::new(AtomicUsize::new(0));
+        let planned_attempts = (1..=3)
+            .map(|octet| DirectStreamAttempt {
+                endpoint: format!("127.0.0.{octet}:443").parse().unwrap(),
+                path: None,
+            })
+            .collect();
+        let drop_signal = cancelled.clone();
+        let started = attempt_count.clone();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_direct_stream_attempts(
+                planned_attempts,
+                1,
+                DIRECT_TCP_PARALLEL_LIMIT,
+                Duration::ZERO,
+                tokio::time::Instant::now() + Duration::from_millis(50),
+                move |active, attempt| {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    let drop_signal = drop_signal.clone();
+                    active.push(
+                        async move {
+                            let _guard = FutureDropGuard(drop_signal);
+                            std::future::pending::<std::io::Result<()>>().await
+                        }
+                        .map(move |result| (attempt, result))
+                        .boxed(),
+                    );
+                },
+                |_, _| {},
+            ),
+        )
+        .await
+        .expect("the DIRECT TCP attempt deadline must be bounded");
+
+        assert!(matches!(
+            outcome,
+            DirectStreamAttemptOutcome::Exhausted { timed_out: true }
+        ));
+        assert_eq!(
+            attempt_count.load(Ordering::SeqCst),
+            DIRECT_TCP_PARALLEL_LIMIT,
+            "the hedge scheduler must not exceed its parallel attempt limit"
+        );
+        assert!(
+            cancelled.load(Ordering::SeqCst),
+            "deadline expiration must drop pending socket attempts"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_tcp_total_budget_includes_and_cancels_dns() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let resolver: crate::app::dns::ThreadSafeDNSResolver =
+            Arc::new(PendingResolveAllResolver {
+                cancelled: cancelled.clone(),
+            });
+        let selection = crate::app::flow::DirectPathSelection::default();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            DirectConnector::new().connect_stream_with_path_selection_result(
+                resolver,
+                "pending.example.test",
+                443,
+                None,
+                &selection,
+                #[cfg(target_os = "linux")]
+                None,
+            ),
+        )
+        .await
+        .expect("DIRECT TCP DNS must finish within the total attempt budget");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("pending DNS unexpectedly produced a connection"),
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("DNS resolution exceeded"));
+        assert!(
+            cancelled.load(Ordering::SeqCst),
+            "the timed out DNS future must be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_endpoint_total_budget_includes_and_cancels_dns() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let resolver: crate::app::dns::ThreadSafeDNSResolver =
+            Arc::new(PendingResolveAllResolver {
+                cancelled: cancelled.clone(),
+            });
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            DirectConnector::new().connect_stream(
+                resolver,
+                "pending-proxy.example.test",
+                443,
+                None,
+                #[cfg(target_os = "linux")]
+                None,
+            ),
+        )
+        .await
+        .expect("proxy endpoint DNS must finish within the total attempt budget");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("pending DNS unexpectedly produced a proxy connection"),
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            error
+                .to_string()
+                .contains("proxy endpoint DNS resolution exceeded")
+        );
+        assert!(
+            cancelled.load(Ordering::SeqCst),
+            "the timed out DNS future must be dropped"
+        );
     }
 
     #[tokio::test]

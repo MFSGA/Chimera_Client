@@ -4,7 +4,7 @@ use tokio::net::UdpSocket;
 
 mod common;
 
-use common::{ClashInstance, Socks5UdpSession};
+use common::{ClashInstance, Socks5UdpSession, wait_for_initial_network_recovery};
 
 fn available_port() -> u16 {
     StdTcpListener::bind("127.0.0.1:0")
@@ -130,6 +130,161 @@ async fn ref_compat_udp_sessions_are_isolated_by_client() {
     assert_eq!(data_b, b"from-b");
     assert_eq!(source_a, expected_source);
     assert_eq!(source_b, expected_source);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn global_selector_change_retires_the_previous_udp_association() {
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Empty, Full};
+
+    let api_port = available_port();
+    let socks_port = available_port();
+    let config = format!(
+        r#"allow-lan: false
+bind-address: 127.0.0.1
+socks-port: {socks_port}
+mode: global
+log-level: error
+mmdb: null
+external-controller: 127.0.0.1:{api_port}
+secret: clash-rs
+tun:
+  enable: false
+proxies:
+  - {{name: DIRECT_alias, type: direct}}
+  - {{name: REJECT_alias, type: reject}}
+"#
+    );
+    let cwd =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
+    let _clash = ClashInstance::start(
+        Options {
+            config: Config::Str(config),
+            cwd: Some(cwd.to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            config_path: None,
+        },
+        vec![api_port, socks_port],
+    )
+    .expect("failed to start GLOBAL selector UDP client");
+    wait_for_initial_network_recovery(api_port).await;
+
+    let select_uri: hyper::Uri =
+        format!("http://127.0.0.1:{api_port}/proxies/GLOBAL")
+            .parse()
+            .unwrap();
+    let select_request = hyper::Request::builder()
+        .method("PUT")
+        .uri(select_uri.clone())
+        .header("Authorization", "Bearer clash-rs")
+        .header("Content-Type", "application/json")
+        .body(Full::new(Bytes::from(r#"{"name":"DIRECT"}"#)))
+        .unwrap();
+    let select_response = common::send_http_request(select_uri, select_request)
+        .await
+        .expect("failed to select the initial GLOBAL outbound");
+    let select_status = select_response.status();
+    let select_body = select_response
+        .into_body()
+        .collect()
+        .await
+        .expect("failed to collect GLOBAL selector response")
+        .to_bytes();
+    assert_eq!(
+        select_status,
+        http::StatusCode::ACCEPTED,
+        "GLOBAL selector response: {}",
+        String::from_utf8_lossy(&select_body)
+    );
+
+    let echo_port = spawn_echo_server().await;
+    let client = Socks5UdpSession::connect(socks_port).await;
+    client
+        .send_ipv4(b"before-switch", [127, 0, 0, 1], echo_port)
+        .await;
+    let (reply, _) = tokio::time::timeout(Duration::from_secs(5), client.recv())
+        .await
+        .expect("DIRECT UDP response timed out");
+    assert_eq!(reply, b"before-switch");
+
+    let select_uri: hyper::Uri =
+        format!("http://127.0.0.1:{api_port}/proxies/GLOBAL")
+            .parse()
+            .unwrap();
+    let select_request = hyper::Request::builder()
+        .method("PUT")
+        .uri(select_uri.clone())
+        .header("Authorization", "Bearer clash-rs")
+        .header("Content-Type", "application/json")
+        .body(Full::new(Bytes::from(r#"{"name":"REJECT"}"#)))
+        .unwrap();
+    let select_response = common::send_http_request(select_uri, select_request)
+        .await
+        .expect("failed to change the GLOBAL outbound");
+    let select_status = select_response.status();
+    let select_body = select_response
+        .into_body()
+        .collect()
+        .await
+        .expect("failed to collect GLOBAL selector response")
+        .to_bytes();
+    assert_eq!(
+        select_status,
+        http::StatusCode::ACCEPTED,
+        "GLOBAL selector response: {}",
+        String::from_utf8_lossy(&select_body)
+    );
+
+    client
+        .send_ipv4(b"after-switch", [127, 0, 0, 1], echo_port)
+        .await;
+    let flows = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let uri: hyper::Uri =
+                format!("http://127.0.0.1:{api_port}/flows?include_closed=true")
+                    .parse()
+                    .unwrap();
+            let request = hyper::Request::builder()
+                .uri(uri.clone())
+                .header("Authorization", "Bearer clash-rs")
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            let response = common::send_http_request(uri, request)
+                .await
+                .expect("failed to query UDP flow history");
+            assert_eq!(response.status(), http::StatusCode::OK);
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .expect("failed to collect UDP flow history")
+                .to_bytes();
+            let flows: serde_json::Value =
+                serde_json::from_slice(&body).expect("invalid UDP flow JSON");
+            if flows.as_array().is_some_and(|records| {
+                records.iter().any(|flow| {
+                    flow["protocol"] == "udp"
+                        && flow["dstPort"].as_u64() == Some(u64::from(echo_port))
+                        && flow["endReasons"]["outboundChanged"]
+                            .as_u64()
+                            .unwrap_or_default()
+                            > 0
+                })
+            }) {
+                break flows;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("old UDP association was not retired after GLOBAL selection changed");
+    assert!(flows.as_array().unwrap().iter().any(|flow| {
+        flow["protocol"] == "udp"
+            && flow["dstPort"].as_u64() == Some(u64::from(echo_port))
+            && flow["endReasons"]["outboundChanged"].as_u64() == Some(1)
+    }));
 }
 
 // Exercise the same serialized recovery coordinator used by automatic events,
@@ -342,6 +497,10 @@ async fn network_recovery_replaces_udp_socket_without_restarting_inbound() {
                 && decision["outcome"] == "connected"
         })
         .expect("UDP flow should have a connected Explain record");
+    assert_eq!(
+        connected_decision["destination"].as_str(),
+        Some(format!("127.0.0.1:{echo_port}").as_str())
+    );
     let decision_uri: hyper::Uri = format!(
         "http://127.0.0.1:{api_port}/runtime/network/path-decision/{}",
         connected_decision["flowId"].as_str().unwrap()

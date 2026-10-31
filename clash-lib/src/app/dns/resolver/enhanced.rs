@@ -1380,7 +1380,7 @@ mod tests {
 
     use crate::{
         app::dns::{
-            ClashResolver, Config, ThreadSafeDNSClient,
+            ClashResolver, Config, ThreadSafeDNSClient, ThreadSafeDNSResolver,
             config::NameServer,
             dns_client::{DNSNetMode, DnsClient, Opts},
             resolver::enhanced::EnhancedResolver,
@@ -1427,6 +1427,60 @@ mod tests {
     #[derive(Debug)]
     struct ResetCountingClient {
         resets: Arc<AtomicUsize>,
+    }
+
+    struct EvictAfterExistStore {
+        allocated_ip: std::net::IpAddr,
+        mapping_present: bool,
+    }
+
+    #[async_trait]
+    impl crate::app::dns::fakeip::Store for EvictAfterExistStore {
+        async fn get_by_host(
+            &mut self,
+            _host: &str,
+            _family: crate::app::dns::fakeip::IpFamily,
+        ) -> Option<std::net::IpAddr> {
+            None
+        }
+
+        async fn pub_by_host(
+            &mut self,
+            _host: &str,
+            _family: crate::app::dns::fakeip::IpFamily,
+            _ip: std::net::IpAddr,
+        ) {
+        }
+
+        async fn get_by_ip(&mut self, ip: std::net::IpAddr) -> Option<String> {
+            (self.mapping_present && ip == self.allocated_ip)
+                .then(|| "evicted.example.test".to_owned())
+        }
+
+        async fn put_by_ip(&mut self, _ip: std::net::IpAddr, _host: &str) {}
+
+        async fn del_by_host(
+            &mut self,
+            _host: &str,
+            _family: crate::app::dns::fakeip::IpFamily,
+        ) {
+        }
+
+        async fn exist(&mut self, ip: std::net::IpAddr) -> bool {
+            let exists = self.mapping_present && ip == self.allocated_ip;
+            if exists {
+                // Model eviction immediately after existence is observed and
+                // before the separate reverse-lookup call.
+                self.mapping_present = false;
+            }
+            exists
+        }
+
+        async fn copy_to(
+            &self,
+            _store: &mut Box<dyn crate::app::dns::fakeip::Store>,
+        ) {
+        }
     }
 
     #[async_trait]
@@ -1527,6 +1581,147 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         let health = resolver.dns_health_snapshot().unwrap();
         assert_eq!(health.groups[0].upstreams[0].successes, 1);
+    }
+
+    #[tokio::test]
+    async fn missing_fake_ip_reverse_index_is_explained_by_dispatcher() {
+        use crate::{
+            app::{
+                dispatcher::{Dispatcher, StatisticsManager},
+                network::{NetworkSnapshot, NetworkStatus},
+                outbound::manager::OutboundManager,
+                profile::ThreadSafeCacheFile,
+                router::Router,
+            },
+            config::{
+                def::RunMode,
+                internal::{
+                    proxy::{OutboundDirect, OutboundProxyProtocol},
+                    rule::RuleType,
+                },
+            },
+            proxy::utils::OutboundHandlerRegistry,
+            session::{Session, SocksAddr},
+        };
+        use std::collections::HashMap;
+        use tokio::io::AsyncReadExt;
+
+        let fake_ip: std::net::IpAddr = "198.18.0.2".parse().unwrap();
+        let mut resolver = EnhancedResolver::from_clients(vec![], false);
+        resolver.fake_dns = Some(Arc::new(RwLock::new(
+            crate::app::dns::fakeip::FakeDns::new(crate::app::dns::fakeip::Opts {
+                ipnet: "198.18.0.0/30".parse().unwrap(),
+                skipped_hostnames: None,
+                store: Box::new(EvictAfterExistStore {
+                    allocated_ip: fake_ip,
+                    mapping_present: true,
+                }),
+            })
+            .unwrap(),
+        )));
+        let resolver: ThreadSafeDNSResolver = Arc::new(resolver);
+        assert!(resolver.fake_ip_enabled());
+
+        let status = Arc::new(RwLock::new(NetworkStatus::default()));
+        {
+            let mut status = status.write().await;
+            status.set_automatic_supported_for_test(true);
+            status.observed(&NetworkSnapshot::default());
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let cache = ThreadSafeCacheFile::new(
+            temp.path().join("cache.db").to_str().unwrap(),
+            false,
+        );
+        let registry: OutboundHandlerRegistry =
+            Arc::new(RwLock::new(HashMap::new()));
+        let direct = OutboundManager::load_plain_outbounds(vec![
+            OutboundProxyProtocol::Direct(OutboundDirect {
+                name: "DIRECT".to_owned(),
+            }),
+        ]);
+        let manager = OutboundManager::new(
+            direct,
+            Vec::new(),
+            HashMap::new(),
+            Vec::new(),
+            resolver.clone(),
+            cache,
+            temp.path().to_string_lossy().to_string(),
+            None,
+            registry,
+        )
+        .await
+        .expect("failed to construct outbound manager");
+        let router = Arc::new(
+            Router::new(
+                vec![RuleType::try_from("MATCH,DIRECT".to_owned()).unwrap()],
+                HashMap::new(),
+                resolver.clone(),
+                None,
+                None,
+                None,
+                temp.path().to_string_lossy().to_string(),
+            )
+            .await
+            .expect("failed to construct test router"),
+        );
+        let dispatcher = Dispatcher::new(
+            Arc::new(manager),
+            router,
+            resolver,
+            RunMode::Rule,
+            StatisticsManager::new(),
+            None,
+            false,
+        );
+        dispatcher.attach_network_status(status.clone());
+
+        let destination = SocksAddr::from(std::net::SocketAddr::new(fake_ip, 443));
+        let session = Session {
+            source: "127.0.0.1:12345".parse().unwrap(),
+            destination: destination.clone(),
+            ..Session::default()
+        };
+        let (mut client, server) = tokio::io::duplex(64);
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            dispatcher.dispatch_stream(session, Box::new(server)),
+        )
+        .await
+        .expect("dispatcher did not finish the missing reverse-index flow");
+        let mut byte = [0u8; 1];
+        let bytes_read =
+            tokio::time::timeout(Duration::from_secs(3), client.read(&mut byte))
+                .await
+                .expect(
+                    "duplex peer did not close after the missing reverse-index flow",
+                )
+                .unwrap();
+        assert_eq!(bytes_read, 0);
+
+        let decision = status
+            .write()
+            .await
+            .path_decisions_snapshot()
+            .into_iter()
+            .find(|decision| {
+                decision.destination.as_deref()
+                    == Some(destination.to_string().as_str())
+            })
+            .expect("missing fake-IP reverse index was not explained");
+        assert_eq!(
+            decision.failure_kind.as_deref(),
+            Some("fakeIpMappingMissing")
+        );
+        assert_eq!(
+            decision.outcome,
+            crate::app::flow::PathExecutionOutcome::PathPlanningFailed
+        );
+        assert_eq!(decision.route.outbound, "notEvaluated");
+        assert!(decision.route.rule.is_none());
+        assert!(decision.selected_path.is_none());
+        assert!(decision.reason.contains("route selection was skipped"));
     }
 
     #[tokio::test]

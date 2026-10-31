@@ -3,7 +3,7 @@ import { useQuery } from '@tanstack/react-query';
 import { getVersion } from '../lib/api';
 import {
   LayoutDashboard, Activity, Filter, Terminal,
-  Server, SlidersHorizontal, GitBranch, Shield,
+  Server, SlidersHorizontal, GitBranch, Shield, Radio,
 } from 'lucide-react';
 import logoUrl from '../assets/logo.png';
 import { ThemeToggle } from './ThemeToggle';
@@ -15,6 +15,7 @@ const navItems = [
   { to: '/proxies', label: 'Proxies', icon: Shield },
   { to: '/rules', label: 'Rules', icon: Filter },
   { to: '/dns', label: 'DNS', icon: Server },
+  { to: '/network', label: 'Network', icon: Radio },
   { to: '/logs', label: 'Logs', icon: Terminal },
   { to: '/settings', label: 'Settings', icon: SlidersHorizontal },
 ];
