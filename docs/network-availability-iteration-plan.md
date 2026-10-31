@@ -1032,3 +1032,10 @@ lifecycle tests.
 - 新增 `proxy_endpoint_dial_refusal_is_queryable_with_logical_destination`：占用 loopback 代理端口完成本地客户端 readiness 后释放该端口，向 `refused-proxy` 发起 SOCKS5 CONNECT；断言 SOCKS5 `REP=0` 的上游兼容响应仍先于 Dispatcher 执行，再验证流在无回包数据后关闭。近期 Explain 列表新增 `proxyEndpointDialFailed` 记录、记录包含 attemptedPaths 和候选路径数组、`destination` 保留用户请求的 `127.0.0.1:80` 而不是代理服务器地址，单 Flow 详情与列表记录一致。请求前的 flow ID 用于排除旧记录，API 等待和本地请求均有界。
 - 基线 `proxy_handshake_failure_is_queryable_from_path_explain`：1 passed。新增端点拒绝定向测试：1 passed；完整 `cargo test -p clash-lib --test connection_chain_tests --locked -j 6`：8 passed。`cargo clippy -p clash-lib --test connection_chain_tests --locked -j 6 -- -D warnings`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。
 - 该用例验证本机 TCP 连接拒绝的 Dispatcher/API 诊断链，不覆盖远端网络故障、真实多网卡路径、其他代理协议互操作、fake-IP/域名 Explain 目标或跨平台换网。
+
+### 2026-10-30：SOCKS5 UDP 代理端点拒绝的 Explain 诊断闭环（L2）
+
+- 基线：本地 `master` `617f4d315de12c25d2ed2194e07230e06f52b35b`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。本项仅覆盖 UDP Dispatcher/API，不修改生产转发行为。
+- 新增 `socks5_udp_proxy_endpoint_refusal_is_queryable_from_path_explain`：先占用 SOCKS5 UDP 出站控制端点，待客户端 API/SOCKS listener readiness 后释放；通过本机 SOCKS5 UDP 入站向保留的 loopback UDP 目标发送首包，触发代理控制端点 TCP 拒绝。校验新 `dialFailed` 记录的 `proxyUdpEndpointDialFailed` 原因、尝试路径上下文、失败类型、空 `selectedPath`、逻辑目标地址，以及详情与列表一致。请求前的 flow ID 用于排除旧记录，所有请求和等待均有界。
+- 基线 `socks5_udp_outbound_roundtrip_is_queryable_from_path_explain`：1 passed；新增用例 `cargo test -p clash-lib --test connection_chain_tests --locked -j 6 socks5_udp_proxy_endpoint_refusal_is_queryable_from_path_explain -- --exact --nocapture`：1 passed；最终 `cargo test -p clash-lib --test connection_chain_tests --locked -j 6`：9 passed。`cargo clippy -p clash-lib --test connection_chain_tests --locked -j 6 -- -D warnings`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。
+- 该用例验证本机 loopback SOCKS5 UDP 出站控制连接拒绝，不覆盖真实 SOCKS5 服务器、远端网络故障、Hysteria2 UDP、其他协议互操作或真实换网。

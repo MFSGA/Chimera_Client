@@ -1530,3 +1530,139 @@ rules:
         .expect("SOCKS5 control connection stayed open after the UDP session closed")
         .expect("SOCKS5 control-connection task failed");
 }
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn socks5_udp_proxy_endpoint_refusal_is_queryable_from_path_explain() {
+    let proxy_endpoint = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to reserve local SOCKS5 UDP proxy port");
+    let proxy_endpoint_port = proxy_endpoint.local_addr().unwrap().port();
+    let target = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("failed to reserve local UDP destination");
+    let target_addr = target.local_addr().unwrap();
+    let api_port = available_port();
+    let socks_port = available_port();
+    let config = format!(
+        r#"allow-lan: false
+bind-address: 127.0.0.1
+socks-port: {socks_port}
+mode: rule
+log-level: error
+mmdb: null
+external-controller: 127.0.0.1:{api_port}
+secret: clash-rs
+tun:
+  enable: false
+proxies:
+  - name: socks5-udp-refused
+    type: socks5
+    server: 127.0.0.1
+    port: {proxy_endpoint_port}
+    udp: true
+rules:
+  - MATCH,socks5-udp-refused
+"#
+    );
+    let cwd =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
+    let _clash = ClashInstance::start(
+        Options {
+            config: Config::Str(config),
+            cwd: Some(cwd.to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            config_path: None,
+        },
+        vec![api_port, socks_port],
+    )
+    .expect("failed to start SOCKS5 UDP refusal Explain client");
+
+    // Keep the endpoint reserved until the local listeners are ready so the
+    // first proxy UDP association receives a predictable TCP refusal.
+    drop(proxy_endpoint);
+    let existing_decisions = tokio::time::timeout(
+        Duration::from_secs(3),
+        get_api_json(api_port, "/runtime/network/path-decisions"),
+    )
+    .await
+    .expect("timed out reading initial UDP path decisions");
+    let existing_flow_ids = existing_decisions
+        .as_array()
+        .expect("initial UDP path decisions should be an array")
+        .iter()
+        .filter_map(|decision| decision["flowId"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+
+    let client = tokio::time::timeout(
+        Duration::from_secs(5),
+        common::Socks5UdpSession::connect(socks_port),
+    )
+    .await
+    .expect("timed out during local SOCKS5 UDP ASSOCIATE");
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        client.send_ipv4(
+            b"proxy-udp-endpoint-refusal",
+            [127, 0, 0, 1],
+            target_addr.port(),
+        ),
+    )
+    .await
+    .expect("timed out sending local SOCKS5 UDP datagram");
+
+    let failure = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let decisions =
+                get_api_json(api_port, "/runtime/network/path-decisions").await;
+            if let Some(decision) = decisions.as_array().and_then(|records| {
+                records.iter().find(|decision| {
+                    decision["outcome"] == "dialFailed"
+                        && decision["route"]["outbound"] == "socks5-udp-refused"
+                        && decision["reason"].as_str().is_some_and(|reason| {
+                            reason.contains("proxyUdpEndpointDialFailed")
+                                && reason.contains("attemptedPaths")
+                        })
+                        && decision["flowId"].as_str().is_some_and(|flow_id| {
+                            !existing_flow_ids
+                                .iter()
+                                .any(|existing| existing == flow_id)
+                        })
+                })
+            }) {
+                break decision.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("SOCKS5 UDP proxy endpoint refusal was not recorded in Explain");
+    assert_eq!(
+        failure["destination"].as_str(),
+        Some(format!("127.0.0.1:{}", target_addr.port()).as_str()),
+        "UDP Explain should retain the requested logical destination"
+    );
+    assert!(
+        failure["failureKind"]
+            .as_str()
+            .is_some_and(|kind| !kind.is_empty())
+    );
+    assert_eq!(failure["selectedPath"], serde_json::Value::Null);
+    assert!(failure["candidatePaths"].is_array());
+
+    let flow_id = failure["flowId"]
+        .as_str()
+        .expect("failed UDP Explain should expose a flow ID");
+    let detail = tokio::time::timeout(
+        Duration::from_secs(3),
+        get_api_json(
+            api_port,
+            &format!("/runtime/network/path-decision/{flow_id}"),
+        ),
+    )
+    .await
+    .expect("timed out querying failed UDP Explain detail");
+    assert_eq!(detail, failure);
+    drop(client);
+}
