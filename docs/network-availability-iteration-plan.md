@@ -1103,3 +1103,10 @@ lifecycle tests.
 - 扩展网络 handler 的本机 HTTP 回归：先写入并过期一条历史记录，再写入 `fakeIpMappingMissing` 决策；使用生产的 `status_routes`、共享 HTTP layer 和 Bearer auth，通过本机 TCP listener 确认 Explain 列表仅返回有效记录、单条详情 JSON 与该记录完全一致、过期详情仍返回 404。保留列表未认证时的 401 与详情路由 CORS 预检检查。
 - 基线过期记录测试 1 passed；更新后的网络 handler 单测 2 passed；全 feature 库测试 1167 passed、11 ignored；全 feature 严格 Clippy、格式和 diff 检查通过。测试只访问 loopback listener，不访问外网或修改主机网络。
 - 此用例验证已构造的 fake-IP Explain 数据穿过真实 HTTP handler/认证/序列化闭环；它不通过活动 Dispatcher 与生产 FakeDns 同时生成该记录。生产映射淘汰竞态、真实网络变化和跨平台行为仍未在本机验证；没有 push、release 或标签操作。
+
+### 2026-10-30：fake-IP 映射在反查间隙丢失仍生成 Explain（L2）
+
+- 基线：本地 `master` `365b435915927399b47dcec1df51cc3fd9f4f796`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。未修改参考实现或生产运行代码。
+- 新增 `missing_fake_ip_reverse_index_is_explained_by_dispatcher`：使用真实 `FakeDns` 与 `EnhancedResolver`，测试存储在 `is_fake_ip` 确认分配后、独立 `reverse_lookup` 前模拟映射淘汰；通过真实 Dispatcher TCP 入口确认连接关闭，并记录 `fakeIpMappingMissing`、`notEvaluated` 与“路由选择已跳过”。这补上此前只有 mock resolver 覆盖 Dispatcher 分支、只有预置记录覆盖 Controller handler 的组合缺口。
+- 定向测试在默认全 feature 与 `--no-default-features --features ring,tun,port` 下各 1 passed；`cargo test -p clash-lib --lib --all-features --locked -j 6`：1168 passed、11 ignored。全 feature all-target 严格 Clippy、格式及 diff 检查通过。测试只使用进程内 fake-DNS 存储、临时目录和 duplex stream，不访问外网、启动 TUN 或修改宿主网络。
+- 本项验证确定性模拟的映射淘汰时序，不触发真实持久化缓存损坏或并发删除，也没有把此新测试与 Controller HTTP 请求放在同一条用例中；HTTP 鉴权/列表/详情行为由上一项回归覆盖。真实换网与跨平台验收仍待专用环境；独立审查和维护者验收结果随最终 SHA 交付记录。本地未推送。
