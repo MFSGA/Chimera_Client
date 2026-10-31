@@ -1579,9 +1579,7 @@ rules:
     )
     .expect("failed to start SOCKS5 UDP refusal Explain client");
 
-    // Keep the endpoint reserved until the local listeners are ready so the
-    // first proxy UDP association receives a predictable TCP refusal.
-    drop(proxy_endpoint);
+    // Snapshot prior decisions while keeping the proxy endpoint reserved.
     let existing_decisions = tokio::time::timeout(
         Duration::from_secs(3),
         get_api_json(api_port, "/runtime/network/path-decisions"),
@@ -1601,6 +1599,9 @@ rules:
     )
     .await
     .expect("timed out during local SOCKS5 UDP ASSOCIATE");
+    // The UDP ASSOCIATE response confirms the local SOCKS listener is ready.
+    // Release the outbound endpoint only immediately before the first packet.
+    drop(proxy_endpoint);
     tokio::time::timeout(
         Duration::from_secs(3),
         client.send_ipv4(
