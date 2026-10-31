@@ -820,7 +820,7 @@ impl Dispatcher {
                     versions_at_failure,
                     explain_route.clone(),
                     &sess.destination,
-                    "outboundLookupFailed",
+                    "outboundPoolNotReady",
                     error.to_string(),
                 ))
                 .await;
@@ -1551,7 +1551,7 @@ impl Dispatcher {
                                 versions_at_failure,
                                 requested_route.clone(),
                                 &sess.destination,
-                                "outboundLookupFailed",
+                                "outboundPoolNotReady",
                                 error.to_string(),
                             ),
                         )
@@ -3069,10 +3069,19 @@ mod tests {
         udp_path_selection_is_current,
     };
     use crate::{
-        app::dns::{ClashResolver, MockClashResolver, ThreadSafeDNSResolver},
+        app::{
+            dns::{ClashResolver, MockClashResolver, ThreadSafeDNSResolver},
+            outbound::manager::OutboundManager,
+            router::Router,
+        },
         config::def::RunMode,
         config::internal::proxy::PROXY_DIRECT,
-        proxy::datagram::UdpPacket,
+        config::internal::rule::RuleType,
+        proxy::{
+            AnyOutboundHandler, DialWithConnector, OutboundHandler, OutboundType,
+            datagram::UdpPacket,
+            utils::{NetworkPathSource, OutboundHandlerRegistry},
+        },
         session::{Network, Session, SocksAddr, Type},
     };
 
@@ -3081,9 +3090,93 @@ mod tests {
         net::{IpAddr, SocketAddr},
         str::FromStr,
         sync::Arc,
-        time::Instant,
+        time::{Duration, Instant},
     };
     use tokio::sync::mpsc;
+
+    #[derive(Debug)]
+    struct PoolResetFailureHandler;
+
+    impl DialWithConnector for PoolResetFailureHandler {}
+
+    #[async_trait::async_trait]
+    impl OutboundHandler for PoolResetFailureHandler {
+        fn name(&self) -> &str {
+            "pool-failure"
+        }
+
+        fn proto(&self) -> OutboundType {
+            OutboundType::Vless
+        }
+
+        async fn reset_connection_pool(&self) -> std::io::Result<u32> {
+            Err(std::io::Error::other("injected pool reset failure"))
+        }
+
+        async fn connect_stream(
+            &self,
+            _sess: &Session,
+            _resolver: ThreadSafeDNSResolver,
+        ) -> std::io::Result<crate::app::dispatcher::BoxedChainedStream> {
+            unreachable!("the test fails before attempting a connection")
+        }
+
+        async fn connect_datagram(
+            &self,
+            _sess: &Session,
+            _resolver: ThreadSafeDNSResolver,
+        ) -> std::io::Result<crate::app::dispatcher::BoxedChainedDatagram> {
+            unreachable!("the test fails before attempting a connection")
+        }
+    }
+
+    #[derive(Debug)]
+    struct OnePacketInboundDatagram {
+        packets: std::collections::VecDeque<UdpPacket>,
+    }
+
+    impl futures::Stream for OnePacketInboundDatagram {
+        type Item = UdpPacket;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Ready(self.packets.pop_front())
+        }
+    }
+
+    impl futures::Sink<UdpPacket> for OnePacketInboundDatagram {
+        type Error = std::io::Error;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn start_send(
+            self: std::pin::Pin<&mut Self>,
+            _item: UdpPacket,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
 
     #[test]
     fn client_capability_clearing_mode_override_restores_configured_mode() {
@@ -3177,7 +3270,7 @@ mod tests {
             (5, 8, 12, 14),
             current.route,
             &destination,
-            "outboundLookupFailed",
+            "outboundPoolNotReady",
             "network changed during lookup".to_owned(),
         );
         assert_eq!(
@@ -3571,6 +3664,200 @@ mod tests {
         .await
         .unwrap();
         assert!(missing.is_none());
+    }
+
+    #[tokio::test]
+    async fn outbound_pool_reset_failure_is_recorded_for_tcp_and_udp() {
+        use crate::{
+            app::{
+                network::{NetworkSnapshot, NetworkStatus},
+                profile::ThreadSafeCacheFile,
+            },
+            proxy::utils::test_utils::noop::NoopResolver,
+        };
+        use std::collections::HashMap;
+        use tokio::io::AsyncReadExt;
+        use tokio::sync::RwLock;
+
+        let resolver: ThreadSafeDNSResolver = Arc::new(NoopResolver);
+        let status = Arc::new(RwLock::new(NetworkStatus::default()));
+        {
+            let mut status = status.write().await;
+            status.set_automatic_supported_for_test(true);
+            status.observed(&NetworkSnapshot::default());
+        }
+        let network_path_source = NetworkPathSource::default();
+        network_path_source.attach(status.clone()).await;
+        let registry: OutboundHandlerRegistry =
+            Arc::new(RwLock::new(HashMap::new()));
+        let temp = tempfile::tempdir().unwrap();
+        let manager = OutboundManager::new_with_network_path_source(
+            vec![Arc::new(PoolResetFailureHandler) as AnyOutboundHandler],
+            Vec::new(),
+            HashMap::new(),
+            vec!["pool-failure".to_owned()],
+            resolver.clone(),
+            ThreadSafeCacheFile::new(
+                temp.path().join("cache.db").to_str().unwrap(),
+                false,
+            ),
+            temp.path().to_string_lossy().to_string(),
+            None,
+            registry,
+            network_path_source,
+        )
+        .await
+        .expect("failed to construct outbound manager");
+        let rule = RuleType::try_from("MATCH,pool-failure".to_owned())
+            .expect("failed to parse test route");
+        let router = Arc::new(
+            Router::new(
+                vec![rule],
+                HashMap::new(),
+                resolver.clone(),
+                None,
+                None,
+                None,
+                temp.path().to_string_lossy().to_string(),
+            )
+            .await
+            .expect("failed to construct test router"),
+        );
+        let dispatcher = Dispatcher::new(
+            Arc::new(manager),
+            router,
+            resolver,
+            RunMode::Rule,
+            crate::app::dispatcher::StatisticsManager::new(),
+            None,
+            false,
+        );
+        dispatcher.attach_network_status(status.clone());
+
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let session = Session {
+            source: "127.0.0.1:12345".parse().unwrap(),
+            destination: SocksAddr::from(target_addr),
+            ..Session::default()
+        };
+        let (mut client, server) = tokio::io::duplex(64);
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            dispatcher.dispatch_stream(session, Box::new(server)),
+        )
+        .await
+        .expect("dispatcher did not finish the failed outbound flow");
+        let mut byte = [0u8; 1];
+        assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), target.accept())
+                .await
+                .is_err(),
+            "failed pool reset must not fall back to a DIRECT connection"
+        );
+
+        let mut udp_target = None;
+        for _ in 0..16 {
+            let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            if target.local_addr().unwrap().port() != target_addr.port() {
+                udp_target = Some(target);
+                break;
+            }
+        }
+        let udp_target = udp_target
+            .expect("could not reserve a UDP port distinct from the TCP target");
+        let udp_destination = SocksAddr::from(udp_target.local_addr().unwrap());
+        let udp_source =
+            SocksAddr::from("127.0.0.1:12346".parse::<SocketAddr>().unwrap());
+        let udp_session = Session {
+            network: Network::Udp,
+            typ: Type::Socks5,
+            source: "127.0.0.1:12346".parse().unwrap(),
+            destination: udp_destination.clone(),
+            ..Session::default()
+        };
+        let inbound = OnePacketInboundDatagram {
+            packets: [UdpPacket::new(
+                b"pool failure".to_vec(),
+                udp_source,
+                udp_destination.clone(),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let close_udp = dispatcher
+            .dispatch_datagram(udp_session, Box::new(inbound))
+            .await;
+        let decisions = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let decisions = status.write().await.path_decisions_snapshot();
+                let has_tcp = decisions.iter().any(|decision| {
+                    decision.destination.as_deref()
+                        == Some(target_addr.to_string().as_str())
+                });
+                let has_udp = decisions.iter().any(|decision| {
+                    decision.destination.as_deref()
+                        == Some(udp_destination.to_string().as_str())
+                });
+                if has_tcp && has_udp {
+                    break decisions;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("TCP and UDP pool failures were not both recorded");
+        let tcp_decision = decisions
+            .iter()
+            .find(|decision| {
+                decision.destination.as_deref()
+                    == Some(target_addr.to_string().as_str())
+            })
+            .unwrap();
+        let udp_decision = decisions
+            .iter()
+            .find(|decision| {
+                decision.destination.as_deref()
+                    == Some(udp_destination.to_string().as_str())
+            })
+            .unwrap();
+        let _ = close_udp.send(0);
+
+        let mut received = [0u8; 32];
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                udp_target.recv_from(&mut received),
+            )
+            .await
+            .is_err(),
+            "failed pool reset must not forward a UDP packet through DIRECT"
+        );
+
+        for decision in [tcp_decision, udp_decision] {
+            assert_eq!(
+                decision.outcome,
+                crate::app::flow::PathExecutionOutcome::PathPlanningFailed
+            );
+            assert_eq!(decision.route.outbound, "pool-failure");
+            assert_eq!(decision.route.rule.as_deref(), Some("Match"));
+            assert_eq!(
+                decision.failure_kind.as_deref(),
+                Some("outboundPoolNotReady")
+            );
+            assert!(decision.reason.contains("injected pool reset failure"));
+            assert!(decision.candidate_paths.is_empty());
+            assert!(decision.selected_path.is_none());
+        }
+        assert_eq!(
+            tcp_decision.destination.as_deref(),
+            Some(target_addr.to_string().as_str())
+        );
+        assert_eq!(
+            udp_decision.destination.as_deref(),
+            Some(udp_destination.to_string().as_str())
+        );
     }
 
     #[test]

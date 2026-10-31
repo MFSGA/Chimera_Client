@@ -1079,6 +1079,13 @@ lifecycle tests.
 ### 2026-10-30：记录 TCP/UDP 出站准备失败与过期决策（L2，独立审查与维护者验收待完成）
 
 - 基线：本地 `master` `9a9176cb646cff561db50060217bfefab5e9815e`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。
-- TCP/UDP 在出站查找返回错误或缺失、动态代理组选择失败、连接池无法安全复用时，现写入有界 Explain 记录，携带失败类型、规则路由、逻辑目标和底层错误；原有 fail-closed 行为不变，也不回退 DIRECT。规则接口失败复用同一记录构造器。若配置、策略、网络或操作版本在失败处理期间变化，记录为 `staleDecisionDiscarded`，保留开始与失败版本。
+- TCP/UDP 在出站不存在、网络代次池回收失败、动态代理组选择失败或组成员池无法安全复用时，现写入有界 Explain 记录，携带失败类型、规则路由、逻辑目标和底层错误；原有 fail-closed 行为不变，也不回退 DIRECT。规则接口失败复用同一记录构造器。若配置、策略、网络或操作版本在失败处理期间变化，记录为 `staleDecisionDiscarded`，保留开始与失败版本。
 - 基线 `missing_named_outbound_does_not_look_up_direct`：1 passed；基线连接链：10 passed。修改后 `pre_dispatch_failure_records_route_destination_and_stale_versions`：1 passed；`connection_chain_tests`：10 passed；`direct_udp_integration_tests`：4 passed；全 feature 严格 Clippy、格式和 diff 检查通过。
-- 当前没有通过真实 Dispatcher 注入动态代理组/连接池重置失败的集成场景；记录构造有单测，TCP/UDP 出口与 Explain 共用的 API 链路由现有规则接口失败集成用例验证。没有验证真实网络切换或其他平台；没有 push、release 或标签操作。
+- 独立 Reviewer PASS；维护者已批准代码 SHA `90b3b411e93f861d1618d4e636275a5a86f17928`。后续 Dispatcher 回归见下一条记录。没有验证真实网络切换或其他平台；没有 push、release 或标签操作。
+
+### 2026-10-30：Dispatcher 中真实注入连接池重置失败（L2，独立审查与维护者验收待完成）
+
+- 基线：本地 `master` `90b3b411e93f861d1618d4e636275a5a86f17928`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；参考检出 SHA 与上一项相同，本轮不改参考实现。
+- 新增 `outbound_pool_reset_failure_is_recorded_for_tcp_and_udp`：用测试处理器在真实 OutboundManager 的网络代次池回收中注入重置失败，再调用真实 Dispatcher TCP/UDP 入口；两路都检查 `outboundPoolNotReady`、路由、逻辑目标和底层错误。loopback TCP listener 未收到连接，UDP receiver 未收到数据，证明原有失败关闭/丢包行为没有 DIRECT 回退。使用进程内状态、临时目录、loopback 与 duplex stream，不改系统网络。
+- 基线 OutboundManager 池失败恢复单测 1 passed；本轮全 feature 库测试 1166 passed、11 ignored，连接链 10 passed，DIRECT UDP 集成 4 passed；全 feature 严格 Clippy、格式和 diff 检查通过。
+- 该用例直接检查 Dispatcher 写入的 RuntimeStatus 记录；真实 HTTP 列表/详情 API 使用同一存储与序列化模型，规则接口失败的 API 列表/详情闭环由前一项覆盖。本轮未验证真实网卡切换或跨平台行为；没有 push、release 或标签操作。
