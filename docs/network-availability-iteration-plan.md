@@ -1015,6 +1015,6 @@ lifecycle tests.
 ### 2026-10-30：DIRECT TCP 拨号失败可从 Explain 列表和详情查询（L2）
 
 - 基线：本地 `master` `6568185f8898c308c120ce379b85a5e892fd9235`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。未修改参考实现或生产拨号行为。
-- 新增 `direct_tcp_dial_failure_is_queryable_from_path_explain`：保留并释放一个 loopback TCP 端口，再经 SOCKS5 入站请求 DIRECT 连接；验证连接关闭后 Explain 列表出现 `dialFailed` / `directDialFailed`、非空失败类型及空 `selectedPath`，并检查单条详情与列表记录完全一致。
-- 定向用例 1 passed；`cargo test -p clash-lib --test connection_chain_tests --locked -j 6`：7 passed；目标严格 Clippy、`cargo fmt --all -- --check` 和 `git diff --check` 通过。测试仅用本机 loopback，不访问公网或更改宿主网络。
+- 新增 `direct_tcp_dial_failure_is_queryable_from_path_explain`：先启动并占住 API/SOCKS 端口，再保留并释放一个 loopback TCP 目标端口，经 SOCKS5 入站请求 DIRECT 连接；请求前记录已有 Explain ID，仅接受本次新增记录。验证连接关闭后列表出现 `dialFailed` / `directDialFailed`、非空失败类型及空 `selectedPath`，详情与列表记录一致，所有 API 等待均有明确截止时间。
+- `cargo test -p clash-lib --test connection_chain_tests --locked -j 6 direct_tcp_dial_failure_is_queryable_from_path_explain -- --exact --nocapture`：1 passed；`cargo test -p clash-lib --test connection_chain_tests --locked -j 6`：7 passed；`cargo clippy -p clash-lib --test connection_chain_tests --locked -j 6 -- -D warnings`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。测试仅用本机 loopback，不访问公网或更改宿主网络。
 - 本用例覆盖本机拒绝拨号下的 API 诊断闭环，不断言平台专属错误文案，也不代表第三方网卡路径、其他协议或真实换网的失败分类已覆盖。

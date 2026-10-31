@@ -428,13 +428,26 @@ async fn direct_tcp_flow_is_queryable_from_path_explain() {
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
 async fn direct_tcp_dial_failure_is_queryable_from_path_explain() {
+    let (_clash, api_port, socks_port) = start_direct_client();
+    let existing_decisions = tokio::time::timeout(
+        Duration::from_secs(3),
+        get_api_json(api_port, "/runtime/network/path-decisions"),
+    )
+    .await
+    .expect("timed out reading initial path decisions");
+    let existing_flow_ids = existing_decisions
+        .as_array()
+        .expect("initial path decisions should be an array")
+        .iter()
+        .filter_map(|decision| decision["flowId"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+
     let target = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("failed to reserve a local TCP port");
     let target_port = target.local_addr().unwrap().port();
     drop(target);
 
-    let (_clash, api_port, socks_port) = start_direct_client();
     let mut stream = tokio::time::timeout(
         Duration::from_secs(3),
         socks5_connect(socks_port, target_port),
@@ -457,6 +470,11 @@ async fn direct_tcp_dial_failure_is_queryable_from_path_explain() {
                     decision["outcome"] == "dialFailed"
                         && decision["route"]["outbound"] == "DIRECT"
                         && decision["reason"] == "directDialFailed"
+                        && decision["flowId"].as_str().is_some_and(|flow_id| {
+                            !existing_flow_ids
+                                .iter()
+                                .any(|existing| existing == flow_id)
+                        })
                 })
             }) {
                 break decision.clone();
@@ -476,11 +494,15 @@ async fn direct_tcp_dial_failure_is_queryable_from_path_explain() {
     let flow_id = failed_decision["flowId"]
         .as_str()
         .expect("failed DIRECT Explain should expose a flow ID");
-    let detail = get_api_json(
-        api_port,
-        &format!("/runtime/network/path-decision/{flow_id}"),
+    let detail = tokio::time::timeout(
+        Duration::from_secs(3),
+        get_api_json(
+            api_port,
+            &format!("/runtime/network/path-decision/{flow_id}"),
+        ),
     )
-    .await;
+    .await
+    .expect("timed out querying the failed DIRECT Explain detail");
     assert_eq!(detail, failed_decision);
 }
 
