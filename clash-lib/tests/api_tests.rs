@@ -1062,3 +1062,54 @@ rules:
         "startup error should identify the occupied port, got: {error}"
     );
 }
+
+#[test]
+#[serial_test::serial]
+fn non_loopback_api_security_failures_are_reported_before_readiness() {
+    for (secret_line, expected_message) in [
+        ("", "without a secret"),
+        ("secret: clash-rs\n", "without any valid CORS origins"),
+    ] {
+        let api_port = available_port();
+        let socks_port = available_port();
+        let config = format!(
+            r#"allow-lan: false
+bind-address: 127.0.0.1
+socks-port: {socks_port}
+mode: direct
+log-level: error
+mmdb: null
+external-controller: 0.0.0.0:{api_port}
+{secret_line}tun:
+  enable: false
+rules:
+  - MATCH,DIRECT
+"#
+        );
+        let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/config/client");
+        let error = clash_lib::start_scaffold_instance(Options {
+            config: Config::Str(config),
+            cwd: Some(cwd.to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            config_path: None,
+        })
+        .expect_err("an insecure non-loopback API listener must fail startup");
+
+        let message = error.to_string();
+        assert!(
+            message.contains(expected_message),
+            "startup should expose the API security failure, got: {error}"
+        );
+
+        // ApiRunner binds before checking the resolved address, but it must
+        // fail before starting axum::serve and release both listeners before
+        // reporting startup failure.
+        let api_listener = TcpListener::bind(("0.0.0.0", api_port))
+            .expect("failed API startup should release the wildcard listener");
+        let socks_listener = TcpListener::bind(("127.0.0.1", socks_port))
+            .expect("failed API startup should stop the SOCKS listener");
+        drop((api_listener, socks_listener));
+    }
+}
