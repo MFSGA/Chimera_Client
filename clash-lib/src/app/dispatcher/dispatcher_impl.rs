@@ -42,6 +42,14 @@ use crate::{
 const DEFAULT_BUFFER_SIZE: usize = 64 * 1024;
 const UDP_SESSION_IDLE: Duration = Duration::from_secs(10);
 const UDP_STALE_PACKET_MAX_RETRIES: usize = 3;
+const ROUTE_NOT_EVALUATED: &str = "notEvaluated";
+
+fn not_evaluated_route() -> crate::app::flow::RouteDecision {
+    crate::app::flow::RouteDecision {
+        outbound: ROUTE_NOT_EVALUATED.to_owned(),
+        rule: None,
+    }
+}
 
 /// A datagram can be in-flight when automatic network observation retires its
 /// association. Replan the same packet on the new generation instead of
@@ -722,11 +730,27 @@ impl Dispatcher {
         mut lhs: Box<dyn ClientStream>,
     ) {
         let inbound_destination = sess.destination.clone();
+        // Capture versions before reverse lookup so failures before route
+        // selection retain the same Explain attempt context.
+        let explain_flow_id = uuid::Uuid::new_v4();
+        let explain_versions_at_start = self.explain_versions().await;
         let dest: SocksAddr = match reverse_lookup(&self.resolver, &sess.destination)
             .await
         {
             Some(dest) => dest,
             None => {
+                let versions_at_failure = self.explain_versions().await;
+                self.record_path_decision(dispatch_failure_record(
+                    explain_flow_id,
+                    explain_versions_at_start,
+                    versions_at_failure,
+                    not_evaluated_route(),
+                    &inbound_destination,
+                    "fakeIpMappingMissing",
+                    "fake-IP destination has no reverse mapping; route selection was skipped"
+                        .to_owned(),
+                ))
+                .await;
                 warn!(
                     "dropping flow with fake-IP destination because its domain mapping is missing: {}",
                     sess
@@ -752,10 +776,6 @@ impl Dispatcher {
         };
 
         let rule_summary = rule_summary(rule.map(Box::as_ref));
-        // Create the Explain context before enforcing a rule-bound interface
-        // so fail-closed resolution errors remain visible to the caller.
-        let explain_flow_id = uuid::Uuid::new_v4();
-        let explain_versions_at_start = self.explain_versions().await;
         let explain_route = crate::app::flow::RouteDecision {
             outbound: outbound_name.to_owned(),
             rule: Some(rule_summary.clone()),
@@ -1426,9 +1446,36 @@ impl Dispatcher {
                     sess.resolved_ip = Some(canonical.ip());
                 }
 
+                // Keep an Explain identity for failures that happen before
+                // destination restoration and route selection.
+                let explain_flow_id = uuid::Uuid::new_v4();
+                let explain_versions_at_start = explain_versions_from_status(
+                    network_status.as_ref(),
+                    packet_generation,
+                )
+                .await;
                 let dest = match reverse_lookup(&resolver, &packet.dst_addr).await {
                     Some(dest) => dest,
                     None => {
+                        let versions_at_failure = explain_versions_from_status(
+                            network_status.as_ref(),
+                            packet_generation,
+                        )
+                        .await;
+                        store_path_decision(
+                            network_status.as_ref(),
+                            dispatch_failure_record(
+                                explain_flow_id,
+                                explain_versions_at_start,
+                                versions_at_failure,
+                                not_evaluated_route(),
+                                &packet.dst_addr,
+                                "fakeIpMappingMissing",
+                                "fake-IP destination has no reverse mapping; route selection was skipped"
+                                    .to_owned(),
+                            ),
+                        )
+                        .await;
                         warn!(
                             "dropping flow with fake-IP destination because its domain mapping is missing: {}",
                             sess
@@ -1459,12 +1506,6 @@ impl Dispatcher {
                 let rule_summary = rule_summary(rule.map(Box::as_ref));
                 // A rejected UDP association also needs an Explain record;
                 // successful associations reuse this ID in TrackedDatagram.
-                let explain_flow_id = uuid::Uuid::new_v4();
-                let explain_versions_at_start = explain_versions_from_status(
-                    network_status.as_ref(),
-                    packet_generation,
-                )
-                .await;
                 let requested_route = crate::app::flow::RouteDecision {
                     outbound: outbound_name.to_owned(),
                     rule: Some(rule_summary.clone()),
@@ -3058,9 +3099,9 @@ impl OutboundHandleMap {
 mod tests {
     use super::{
         DirectPathPlanningError, Dispatcher, OutboundDatagramPacket,
-        OutboundHandleMap, PendingUdpHealthProofs, RuntimeModeState,
-        UDP_HEALTH_PROOF_MAX, UDP_SESSION_IDLE, UdpFlowDecisionKey,
-        capture_udp_health_proof, classify_flow_end_reason,
+        OutboundHandleMap, PendingUdpHealthProofs, ROUTE_NOT_EVALUATED,
+        RuntimeModeState, UDP_HEALTH_PROOF_MAX, UDP_SESSION_IDLE,
+        UdpFlowDecisionKey, capture_udp_health_proof, classify_flow_end_reason,
         classify_path_planning_failure, confirmed_udp_path,
         direct_udp_health_destination, dispatch_failure_record,
         preferred_udp_path_address, queue_udp_packet_retry, reverse_lookup,
@@ -3858,6 +3899,174 @@ mod tests {
             udp_decision.destination.as_deref(),
             Some(udp_destination.to_string().as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn missing_fake_ip_mapping_is_recorded_for_tcp_and_udp() {
+        use crate::app::{
+            network::{NetworkSnapshot, NetworkStatus},
+            profile::ThreadSafeCacheFile,
+        };
+        use std::collections::HashMap;
+        use tokio::io::AsyncReadExt;
+        use tokio::sync::RwLock;
+
+        let fake_ip: IpAddr = "198.18.0.10".parse().unwrap();
+        let mut resolver = MockClashResolver::new();
+        resolver
+            .expect_fake_ip_enabled()
+            .times(2)
+            .return_const(true);
+        resolver
+            .expect_is_fake_ip()
+            .times(2)
+            .returning(move |ip| ip == fake_ip);
+        resolver
+            .expect_reverse_lookup()
+            .times(2)
+            .returning(|_| None);
+        let resolver: ThreadSafeDNSResolver = Arc::new(resolver);
+
+        let status = Arc::new(RwLock::new(NetworkStatus::default()));
+        {
+            let mut status = status.write().await;
+            status.set_automatic_supported_for_test(true);
+            status.observed(&NetworkSnapshot::default());
+        }
+        let network_path_source = NetworkPathSource::default();
+        network_path_source.attach(status.clone()).await;
+        let registry: OutboundHandlerRegistry =
+            Arc::new(RwLock::new(HashMap::new()));
+        let temp = tempfile::tempdir().unwrap();
+        let manager = OutboundManager::new_with_network_path_source(
+            vec![Arc::new(PoolResetFailureHandler) as AnyOutboundHandler],
+            Vec::new(),
+            HashMap::new(),
+            vec!["pool-failure".to_owned()],
+            resolver.clone(),
+            ThreadSafeCacheFile::new(
+                temp.path().join("cache.db").to_str().unwrap(),
+                false,
+            ),
+            temp.path().to_string_lossy().to_string(),
+            None,
+            registry,
+            network_path_source,
+        )
+        .await
+        .expect("failed to construct outbound manager");
+        let rule = RuleType::try_from("MATCH,pool-failure".to_owned())
+            .expect("failed to parse test route");
+        let router = Arc::new(
+            Router::new(
+                vec![rule],
+                HashMap::new(),
+                resolver.clone(),
+                None,
+                None,
+                None,
+                temp.path().to_string_lossy().to_string(),
+            )
+            .await
+            .expect("failed to construct test router"),
+        );
+        let dispatcher = Dispatcher::new(
+            Arc::new(manager),
+            router,
+            resolver,
+            RunMode::Rule,
+            crate::app::dispatcher::StatisticsManager::new(),
+            None,
+            false,
+        );
+        dispatcher.attach_network_status(status.clone());
+
+        let tcp_destination = SocksAddr::from(SocketAddr::new(fake_ip, 443));
+        let tcp_session = Session {
+            source: "127.0.0.1:12345".parse().unwrap(),
+            destination: tcp_destination.clone(),
+            ..Session::default()
+        };
+        let (mut client, server) = tokio::io::duplex(64);
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            dispatcher.dispatch_stream(tcp_session, Box::new(server)),
+        )
+        .await
+        .expect("dispatcher did not finish the missing fake-IP flow");
+        let mut byte = [0u8; 1];
+        assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+
+        let udp_destination = SocksAddr::from(SocketAddr::new(fake_ip, 5353));
+        let udp_source =
+            SocksAddr::from("127.0.0.1:12346".parse::<SocketAddr>().unwrap());
+        let udp_session = Session {
+            network: Network::Udp,
+            typ: Type::Socks5,
+            source: "127.0.0.1:12346".parse().unwrap(),
+            destination: udp_destination.clone(),
+            ..Session::default()
+        };
+        let inbound = OnePacketInboundDatagram {
+            packets: [UdpPacket::new(
+                b"missing fake-IP mapping".to_vec(),
+                udp_source,
+                udp_destination.clone(),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let close_udp = dispatcher
+            .dispatch_datagram(udp_session, Box::new(inbound))
+            .await;
+
+        let decisions = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let decisions = status.write().await.path_decisions_snapshot();
+                let has_tcp = decisions.iter().any(|decision| {
+                    decision.destination.as_deref()
+                        == Some(tcp_destination.to_string().as_str())
+                });
+                let has_udp = decisions.iter().any(|decision| {
+                    decision.destination.as_deref()
+                        == Some(udp_destination.to_string().as_str())
+                });
+                if has_tcp && has_udp {
+                    break decisions;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("TCP and UDP fake-IP failures were not both recorded");
+        let _ = close_udp.send(0);
+
+        for destination in [tcp_destination, udp_destination] {
+            let decision = decisions
+                .iter()
+                .find(|decision| {
+                    decision.destination.as_deref()
+                        == Some(destination.to_string().as_str())
+                })
+                .expect("missing fake-IP mapping decision");
+            assert_eq!(
+                decision.outcome,
+                crate::app::flow::PathExecutionOutcome::PathPlanningFailed
+            );
+            assert_eq!(decision.route.outbound, ROUTE_NOT_EVALUATED);
+            assert!(decision.route.rule.is_none());
+            assert_eq!(
+                decision.failure_kind.as_deref(),
+                Some("fakeIpMappingMissing")
+            );
+            assert!(decision.reason.contains("route selection was skipped"));
+            assert_eq!(
+                decision.destination.as_deref(),
+                Some(destination.to_string().as_str())
+            );
+            assert!(decision.candidate_paths.is_empty());
+            assert!(decision.selected_path.is_none());
+        }
     }
 
     #[test]

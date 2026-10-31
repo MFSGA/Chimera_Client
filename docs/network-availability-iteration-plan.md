@@ -1089,3 +1089,10 @@ lifecycle tests.
 - 新增 `outbound_pool_reset_failure_is_recorded_for_tcp_and_udp`：用测试处理器在真实 OutboundManager 的网络代次池回收中注入重置失败，再调用真实 Dispatcher TCP/UDP 入口；两路都检查 `outboundPoolNotReady`、路由、逻辑目标和底层错误。loopback TCP listener 未收到连接，UDP receiver 未收到数据，证明原有失败关闭/丢包行为没有 DIRECT 回退。使用进程内状态、临时目录、loopback 与 duplex stream，不改系统网络。
 - 基线 OutboundManager 池失败恢复单测 1 passed；本轮全 feature 库测试 1166 passed、11 ignored，连接链 10 passed，DIRECT UDP 集成 4 passed；全 feature 严格 Clippy、格式和 diff 检查通过。
 - 该用例直接检查 Dispatcher 写入的 RuntimeStatus 记录；真实 HTTP 列表/详情 API 使用同一存储与序列化模型，规则接口失败的 API 列表/详情闭环由前一项覆盖。本轮未验证真实网卡切换或跨平台行为；没有 push、release 或标签操作。
+
+### 2026-10-30：fake-IP 反查失败写入 TCP/UDP Explain（L2，独立审查与维护者验收待完成）
+
+- 基线：本地 `master` `eac49abcb3090576374d65149d7346f721608886`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。本轮不修改参考实现。
+- TCP/UDP 原先在 fake-IP 反查缺少映射时直接关闭/丢弃，没有 Explain。现在这类分支记录 `fakeIpMappingMissing`、原始目的地址和明确的“路由选择已跳过”；`route.outbound=notEvaluated`、`rule=null`，不会伪造已选代理或规则，也不改变 TCP 关闭及 UDP 丢弃行为。Explain 版本与 Flow ID 在反查前创建，正常成功路径沿用同一上下文。Dashboard 将该路由标记显示为 “Not evaluated / Selection skipped”。
+- 新增 Dispatcher 级回归 `missing_fake_ip_mapping_is_recorded_for_tcp_and_udp`，用 mock resolver 注入两种协议的映射缺失，并核验 RuntimeStatus 中的独立失败记录、路由占位、版本上下文与目标地址；该测试覆盖 Dispatcher 分支，未在生产 FakeDns 中构造映射淘汰竞态。`cargo test -p clash-lib --lib --all-features --locked -j 6`：1167 passed、11 ignored；`cargo test -p clash-lib --test connection_chain_tests --test direct_udp_integration_tests --locked -j 6 -- --test-threads=1`：10 + 4 passed；严格 Clippy、无默认 feature 编译、格式和 diff 检查通过。Dashboard `npm run lint`、`npm run build` 通过；构建保留原有主 bundle 超过 500 kB 提示。使用 loopback mock API 实际打开 Network 页并展开记录，确认状态、路由标签和 `198.18.0.10:443` 目标可见。
+- UI 手动检查使用本机静态 Dashboard 和模拟 API；没有连接真实核心、查询公网 DNS、启动 TUN 或更改宿主网络。API 列表/详情复用已有 PathDecisionRecord 序列化与 handler；本轮新增用例直接检查 RuntimeStatus，不单独发 HTTP 列表/详情请求。未验证跨平台或真实 fake-IP 映射淘汰竞态；没有 push、release 或标签操作。
