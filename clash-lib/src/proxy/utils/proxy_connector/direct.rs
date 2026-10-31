@@ -2547,6 +2547,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proxy_endpoint_total_budget_includes_and_cancels_dns() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let resolver: crate::app::dns::ThreadSafeDNSResolver =
+            Arc::new(PendingResolveAllResolver {
+                cancelled: cancelled.clone(),
+            });
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            DirectConnector::new().connect_stream(
+                resolver,
+                "pending-proxy.example.test",
+                443,
+                None,
+                #[cfg(target_os = "linux")]
+                None,
+            ),
+        )
+        .await
+        .expect("proxy endpoint DNS must finish within the total attempt budget");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("pending DNS unexpectedly produced a proxy connection"),
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            error
+                .to_string()
+                .contains("proxy endpoint DNS resolution exceeded")
+        );
+        assert!(
+            cancelled.load(Ordering::SeqCst),
+            "the timed out DNS future must be dropped"
+        );
+    }
+
+    #[tokio::test]
     async fn proxy_endpoint_connector_enforces_the_latest_explicit_interface() {
         let mut status = NetworkStatus::default();
         status.set_automatic_supported_for_test(true);
