@@ -1117,3 +1117,10 @@ lifecycle tests.
 - 新增 `direct_tcp_total_budget_includes_and_cancels_dns`：通过生产 `DirectConnector` 调用一个挂起的 resolver，确认 DNS 计入 5 秒总预算、最终返回 `TimedOut`，且超时会 drop DNS future。回归只验证 deadline 与取消边界，不创建 socket 或发送 DNS/业务流量；已有 `direct_connector_tries_the_next_resolved_address` 保持地址快速失败后继续尝试的覆盖。
 - 新用例在默认全 feature 与 `--no-default-features --features ring,tun,port` 下各 1 passed；全 feature 库测试 1169 passed、11 ignored；严格 Clippy、格式和 diff 检查通过。超时回归约耗时 5 秒，其外层测试等待上限为 10 秒。
 - 本项未验证真实 DNS 上游慢响应、TCP 连接阶段预算、并发 hedge loser 清理、代理端点预算或真实网络切换；没有改生产实现。独立审查与维护者验收结果随最终 SHA 交付记录。本地未推送。
+
+### 2026-10-30：代理端点 TCP 总预算包含 DNS 并取消超时查询（L2）
+
+- 基线：本地 `master` `d867bd270a80d54b6d2ec5078b96d42b52d6561a`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。未修改参考实现或生产连接代码。
+- 新增 `proxy_endpoint_total_budget_includes_and_cancels_dns`：通过生产 `DirectConnector::connect_stream` 走代理端点拨号路径，注入挂起的 resolver，确认 DNS 纳入 5 秒 endpoint 总预算、返回 `TimedOut` 且 resolver future 已被取消。测试在 DNS 获取阶段终止，不创建 socket 或发送流量。
+- 定向测试在默认全 feature 与 `--no-default-features --features ring,tun,port` 下各 1 passed；全 feature 库测试 1170 passed、11 ignored；严格 Clippy、格式和 diff 检查通过。测试约耗时 5 秒，外层上限为 10 秒。
+- 该项补足 DIRECT 与代理端点的 DNS 预算分别验证；仍未覆盖真实 DNS 慢响应、代理 TCP 阶段超时与并发 hedge loser 清理，也不代表真实网络切换验收。独立审查与维护者验收结果随最终 SHA 交付记录。本地未推送。
