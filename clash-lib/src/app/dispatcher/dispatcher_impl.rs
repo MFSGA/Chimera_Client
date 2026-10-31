@@ -116,14 +116,16 @@ fn classify_path_planning_failure(
     )
 }
 
-fn rule_interface_failure_record(
+fn dispatch_failure_record(
     flow_id: uuid::Uuid,
     versions_at_start: (u64, u64, u64, u64),
     versions_at_failure: (u64, u64, u64, u64),
     route: crate::app::flow::RouteDecision,
     destination: &SocksAddr,
+    failure_kind: &str,
     reason: String,
 ) -> crate::app::flow::PathDecisionRecord {
+    let decision_became_stale = versions_at_failure != versions_at_start;
     crate::app::flow::PathDecisionRecord {
         flow_id,
         config_version: versions_at_start.0,
@@ -132,13 +134,17 @@ fn rule_interface_failure_record(
         policy_version: versions_at_failure.1,
         network_version: versions_at_failure.2,
         operation_id: versions_at_start.3,
-        outcome: crate::app::flow::PathExecutionOutcome::PathPlanningFailed,
+        outcome: if decision_became_stale {
+            crate::app::flow::PathExecutionOutcome::StaleDecisionDiscarded
+        } else {
+            crate::app::flow::PathExecutionOutcome::PathPlanningFailed
+        },
         route,
         destination: Some(destination.to_string()),
         candidate_paths: Vec::new(),
         selected_path: None,
         rejected: Vec::new(),
-        failure_kind: Some("ruleInterfaceResolutionFailed".to_owned()),
+        failure_kind: Some(failure_kind.to_owned()),
         reason,
         recorded_at_ms: chrono::Utc::now().timestamp_millis(),
     }
@@ -762,12 +768,13 @@ impl Dispatcher {
         .await
         {
             let versions_at_failure = self.explain_versions().await;
-            self.record_path_decision(rule_interface_failure_record(
+            self.record_path_decision(dispatch_failure_record(
                 explain_flow_id,
                 explain_versions_at_start,
                 versions_at_failure,
                 explain_route,
                 &sess.destination,
+                "ruleInterfaceResolutionFailed",
                 err.to_string(),
             ))
             .await;
@@ -787,6 +794,17 @@ impl Dispatcher {
         {
             Ok(Some(selected)) => selected,
             Ok(None) => {
+                let versions_at_failure = self.explain_versions().await;
+                self.record_path_decision(dispatch_failure_record(
+                    explain_flow_id,
+                    explain_versions_at_start,
+                    versions_at_failure,
+                    explain_route.clone(),
+                    &sess.destination,
+                    "outboundNotFound",
+                    format!("configured outbound `{outbound_name}` is missing"),
+                ))
+                .await;
                 warn!(
                     requested_outbound = outbound_name,
                     "configured outbound is missing; closing TCP flow without DIRECT fallback"
@@ -795,6 +813,17 @@ impl Dispatcher {
                 return;
             }
             Err(error) => {
+                let versions_at_failure = self.explain_versions().await;
+                self.record_path_decision(dispatch_failure_record(
+                    explain_flow_id,
+                    explain_versions_at_start,
+                    versions_at_failure,
+                    explain_route.clone(),
+                    &sess.destination,
+                    "outboundPoolNotReady",
+                    error.to_string(),
+                ))
+                .await;
                 warn!(requested_outbound = outbound_name, error = %error, "could not select outbound; closing flow");
                 let _ = lhs.shutdown().await;
                 return;
@@ -816,6 +845,17 @@ impl Dispatcher {
         {
             Ok(pinned) => pinned,
             Err(error) => {
+                let versions_at_failure = self.explain_versions().await;
+                self.record_path_decision(dispatch_failure_record(
+                    explain_flow_id,
+                    explain_versions_at_start,
+                    versions_at_failure,
+                    explain_route.clone(),
+                    &sess.destination,
+                    "outboundGroupSelectionFailed",
+                    error.to_string(),
+                ))
+                .await;
                 warn!(requested_outbound = outbound_name, error = %error, "could not capture selector's outbound; closing flow");
                 let _ = lhs.shutdown().await;
                 return;
@@ -826,6 +866,17 @@ impl Dispatcher {
             .ensure_outbound_ready_for_new_flow(&pinned.handler)
             .await
         {
+            let versions_at_failure = self.explain_versions().await;
+            self.record_path_decision(dispatch_failure_record(
+                explain_flow_id,
+                explain_versions_at_start,
+                versions_at_failure,
+                explain_route.clone(),
+                &sess.destination,
+                "outboundPoolNotReady",
+                error.to_string(),
+            ))
+            .await;
             warn!(requested_outbound = outbound_name, actual_outbound = pinned.handler.name(), error = %error, "outbound pool is not safe for new TCP flow");
             let _ = lhs.shutdown().await;
             return;
@@ -1432,12 +1483,13 @@ impl Dispatcher {
                     .await;
                     store_path_decision(
                         network_status.as_ref(),
-                        rule_interface_failure_record(
+                        dispatch_failure_record(
                             explain_flow_id,
                             explain_versions_at_start,
                             versions_at_failure,
                             requested_route,
                             &sess.destination,
+                            "ruleInterfaceResolutionFailed",
                             err.to_string(),
                         ),
                     )
@@ -1462,10 +1514,48 @@ impl Dispatcher {
                 {
                     Ok(Some(selected)) => selected,
                     Ok(None) => {
+                        let versions_at_failure = explain_versions_from_status(
+                            network_status.as_ref(),
+                            packet_generation,
+                        )
+                        .await;
+                        store_path_decision(
+                            network_status.as_ref(),
+                            dispatch_failure_record(
+                                explain_flow_id,
+                                explain_versions_at_start,
+                                versions_at_failure,
+                                requested_route.clone(),
+                                &sess.destination,
+                                "outboundNotFound",
+                                format!(
+                                    "configured outbound `{requested_outbound_name}` is missing"
+                                ),
+                            ),
+                        )
+                        .await;
                         warn!(requested_outbound = %requested_outbound_name, "configured outbound is missing; dropping UDP packet without DIRECT fallback");
                         continue;
                     }
                     Err(error) => {
+                        let versions_at_failure = explain_versions_from_status(
+                            network_status.as_ref(),
+                            packet_generation,
+                        )
+                        .await;
+                        store_path_decision(
+                            network_status.as_ref(),
+                            dispatch_failure_record(
+                                explain_flow_id,
+                                explain_versions_at_start,
+                                versions_at_failure,
+                                requested_route.clone(),
+                                &sess.destination,
+                                "outboundPoolNotReady",
+                                error.to_string(),
+                            ),
+                        )
+                        .await;
                         warn!(requested_outbound = %requested_outbound_name, error = %error, "could not select outbound for UDP flow");
                         continue;
                     }
@@ -1489,6 +1579,24 @@ impl Dispatcher {
                     {
                         Ok(pinned) => pinned,
                         Err(error) => {
+                            let versions_at_failure = explain_versions_from_status(
+                                network_status.as_ref(),
+                                packet_generation,
+                            )
+                            .await;
+                            store_path_decision(
+                                network_status.as_ref(),
+                                dispatch_failure_record(
+                                    explain_flow_id,
+                                    explain_versions_at_start,
+                                    versions_at_failure,
+                                    requested_route.clone(),
+                                    &sess.destination,
+                                    "outboundGroupSelectionFailed",
+                                    error.to_string(),
+                                ),
+                            )
+                            .await;
                             warn!(requested_outbound = %requested_outbound_name, error = %error, "could not capture selector's outbound for UDP flow");
                             continue;
                         }
@@ -1509,6 +1617,24 @@ impl Dispatcher {
                     .ensure_outbound_ready_for_new_flow(&pinned.handler)
                     .await
                 {
+                    let versions_at_failure = explain_versions_from_status(
+                        network_status.as_ref(),
+                        packet_generation,
+                    )
+                    .await;
+                    store_path_decision(
+                        network_status.as_ref(),
+                        dispatch_failure_record(
+                            explain_flow_id,
+                            explain_versions_at_start,
+                            versions_at_failure,
+                            requested_route.clone(),
+                            &sess.destination,
+                            "outboundPoolNotReady",
+                            error.to_string(),
+                        ),
+                    )
+                    .await;
                     warn!(requested_outbound = %requested_outbound_name, actual_outbound = pinned.handler.name(), error = %error, "outbound pool is not safe for new UDP flow");
                     continue;
                 }
@@ -2936,16 +3062,26 @@ mod tests {
         UDP_HEALTH_PROOF_MAX, UDP_SESSION_IDLE, UdpFlowDecisionKey,
         capture_udp_health_proof, classify_flow_end_reason,
         classify_path_planning_failure, confirmed_udp_path,
-        direct_udp_health_destination, preferred_udp_path_address,
-        queue_udp_packet_retry, reverse_lookup, select_outbound_for_flow,
-        should_track_global_selector, try_queue_outbound_packet, udp_health_path,
-        udp_path_cache_versions, udp_path_selection_is_current,
+        direct_udp_health_destination, dispatch_failure_record,
+        preferred_udp_path_address, queue_udp_packet_retry, reverse_lookup,
+        select_outbound_for_flow, should_track_global_selector,
+        try_queue_outbound_packet, udp_health_path, udp_path_cache_versions,
+        udp_path_selection_is_current,
     };
     use crate::{
-        app::dns::{ClashResolver, MockClashResolver, ThreadSafeDNSResolver},
+        app::{
+            dns::{ClashResolver, MockClashResolver, ThreadSafeDNSResolver},
+            outbound::manager::OutboundManager,
+            router::Router,
+        },
         config::def::RunMode,
         config::internal::proxy::PROXY_DIRECT,
-        proxy::datagram::UdpPacket,
+        config::internal::rule::RuleType,
+        proxy::{
+            AnyOutboundHandler, DialWithConnector, OutboundHandler, OutboundType,
+            datagram::UdpPacket,
+            utils::{NetworkPathSource, OutboundHandlerRegistry},
+        },
         session::{Network, Session, SocksAddr, Type},
     };
 
@@ -2954,9 +3090,93 @@ mod tests {
         net::{IpAddr, SocketAddr},
         str::FromStr,
         sync::Arc,
-        time::Instant,
+        time::{Duration, Instant},
     };
     use tokio::sync::mpsc;
+
+    #[derive(Debug)]
+    struct PoolResetFailureHandler;
+
+    impl DialWithConnector for PoolResetFailureHandler {}
+
+    #[async_trait::async_trait]
+    impl OutboundHandler for PoolResetFailureHandler {
+        fn name(&self) -> &str {
+            "pool-failure"
+        }
+
+        fn proto(&self) -> OutboundType {
+            OutboundType::Vless
+        }
+
+        async fn reset_connection_pool(&self) -> std::io::Result<u32> {
+            Err(std::io::Error::other("injected pool reset failure"))
+        }
+
+        async fn connect_stream(
+            &self,
+            _sess: &Session,
+            _resolver: ThreadSafeDNSResolver,
+        ) -> std::io::Result<crate::app::dispatcher::BoxedChainedStream> {
+            unreachable!("the test fails before attempting a connection")
+        }
+
+        async fn connect_datagram(
+            &self,
+            _sess: &Session,
+            _resolver: ThreadSafeDNSResolver,
+        ) -> std::io::Result<crate::app::dispatcher::BoxedChainedDatagram> {
+            unreachable!("the test fails before attempting a connection")
+        }
+    }
+
+    #[derive(Debug)]
+    struct OnePacketInboundDatagram {
+        packets: std::collections::VecDeque<UdpPacket>,
+    }
+
+    impl futures::Stream for OnePacketInboundDatagram {
+        type Item = UdpPacket;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Ready(self.packets.pop_front())
+        }
+    }
+
+    impl futures::Sink<UdpPacket> for OnePacketInboundDatagram {
+        type Error = std::io::Error;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn start_send(
+            self: std::pin::Pin<&mut Self>,
+            _item: UdpPacket,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
 
     #[test]
     fn client_capability_clearing_mode_override_restores_configured_mode() {
@@ -3013,6 +3233,55 @@ mod tests {
                 "networkAndPolicyChangedDuringPathPlanning".to_owned(),
             )
         );
+    }
+
+    #[test]
+    fn pre_dispatch_failure_records_route_destination_and_stale_versions() {
+        let versions = (4, 7, 11, 13);
+        let route = crate::app::flow::RouteDecision {
+            outbound: "selector".to_owned(),
+            rule: Some("MATCH".to_owned()),
+        };
+        let destination = SocksAddr::from_str("example.test:443").unwrap();
+        let current = dispatch_failure_record(
+            uuid::Uuid::new_v4(),
+            versions,
+            versions,
+            route.clone(),
+            &destination,
+            "outboundPoolNotReady",
+            "pool reset failed".to_owned(),
+        );
+        assert_eq!(
+            current.outcome,
+            crate::app::flow::PathExecutionOutcome::PathPlanningFailed
+        );
+        assert_eq!(current.route, route);
+        assert_eq!(current.destination.as_deref(), Some("example.test:443"));
+        assert_eq!(
+            current.failure_kind.as_deref(),
+            Some("outboundPoolNotReady")
+        );
+        assert_eq!(current.reason, "pool reset failed");
+
+        let stale = dispatch_failure_record(
+            uuid::Uuid::new_v4(),
+            versions,
+            (5, 8, 12, 14),
+            current.route,
+            &destination,
+            "outboundPoolNotReady",
+            "network changed during lookup".to_owned(),
+        );
+        assert_eq!(
+            stale.outcome,
+            crate::app::flow::PathExecutionOutcome::StaleDecisionDiscarded
+        );
+        assert_eq!(stale.config_version, 4);
+        assert_eq!(stale.config_version_at_completion, Some(5));
+        assert_eq!(stale.policy_version, 8);
+        assert_eq!(stale.network_version, 12);
+        assert_eq!(stale.reason, "network changed during lookup");
     }
 
     #[test]
@@ -3395,6 +3664,200 @@ mod tests {
         .await
         .unwrap();
         assert!(missing.is_none());
+    }
+
+    #[tokio::test]
+    async fn outbound_pool_reset_failure_is_recorded_for_tcp_and_udp() {
+        use crate::{
+            app::{
+                network::{NetworkSnapshot, NetworkStatus},
+                profile::ThreadSafeCacheFile,
+            },
+            proxy::utils::test_utils::noop::NoopResolver,
+        };
+        use std::collections::HashMap;
+        use tokio::io::AsyncReadExt;
+        use tokio::sync::RwLock;
+
+        let resolver: ThreadSafeDNSResolver = Arc::new(NoopResolver);
+        let status = Arc::new(RwLock::new(NetworkStatus::default()));
+        {
+            let mut status = status.write().await;
+            status.set_automatic_supported_for_test(true);
+            status.observed(&NetworkSnapshot::default());
+        }
+        let network_path_source = NetworkPathSource::default();
+        network_path_source.attach(status.clone()).await;
+        let registry: OutboundHandlerRegistry =
+            Arc::new(RwLock::new(HashMap::new()));
+        let temp = tempfile::tempdir().unwrap();
+        let manager = OutboundManager::new_with_network_path_source(
+            vec![Arc::new(PoolResetFailureHandler) as AnyOutboundHandler],
+            Vec::new(),
+            HashMap::new(),
+            vec!["pool-failure".to_owned()],
+            resolver.clone(),
+            ThreadSafeCacheFile::new(
+                temp.path().join("cache.db").to_str().unwrap(),
+                false,
+            ),
+            temp.path().to_string_lossy().to_string(),
+            None,
+            registry,
+            network_path_source,
+        )
+        .await
+        .expect("failed to construct outbound manager");
+        let rule = RuleType::try_from("MATCH,pool-failure".to_owned())
+            .expect("failed to parse test route");
+        let router = Arc::new(
+            Router::new(
+                vec![rule],
+                HashMap::new(),
+                resolver.clone(),
+                None,
+                None,
+                None,
+                temp.path().to_string_lossy().to_string(),
+            )
+            .await
+            .expect("failed to construct test router"),
+        );
+        let dispatcher = Dispatcher::new(
+            Arc::new(manager),
+            router,
+            resolver,
+            RunMode::Rule,
+            crate::app::dispatcher::StatisticsManager::new(),
+            None,
+            false,
+        );
+        dispatcher.attach_network_status(status.clone());
+
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let session = Session {
+            source: "127.0.0.1:12345".parse().unwrap(),
+            destination: SocksAddr::from(target_addr),
+            ..Session::default()
+        };
+        let (mut client, server) = tokio::io::duplex(64);
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            dispatcher.dispatch_stream(session, Box::new(server)),
+        )
+        .await
+        .expect("dispatcher did not finish the failed outbound flow");
+        let mut byte = [0u8; 1];
+        assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), target.accept())
+                .await
+                .is_err(),
+            "failed pool reset must not fall back to a DIRECT connection"
+        );
+
+        let mut udp_target = None;
+        for _ in 0..16 {
+            let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            if target.local_addr().unwrap().port() != target_addr.port() {
+                udp_target = Some(target);
+                break;
+            }
+        }
+        let udp_target = udp_target
+            .expect("could not reserve a UDP port distinct from the TCP target");
+        let udp_destination = SocksAddr::from(udp_target.local_addr().unwrap());
+        let udp_source =
+            SocksAddr::from("127.0.0.1:12346".parse::<SocketAddr>().unwrap());
+        let udp_session = Session {
+            network: Network::Udp,
+            typ: Type::Socks5,
+            source: "127.0.0.1:12346".parse().unwrap(),
+            destination: udp_destination.clone(),
+            ..Session::default()
+        };
+        let inbound = OnePacketInboundDatagram {
+            packets: [UdpPacket::new(
+                b"pool failure".to_vec(),
+                udp_source,
+                udp_destination.clone(),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let close_udp = dispatcher
+            .dispatch_datagram(udp_session, Box::new(inbound))
+            .await;
+        let decisions = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let decisions = status.write().await.path_decisions_snapshot();
+                let has_tcp = decisions.iter().any(|decision| {
+                    decision.destination.as_deref()
+                        == Some(target_addr.to_string().as_str())
+                });
+                let has_udp = decisions.iter().any(|decision| {
+                    decision.destination.as_deref()
+                        == Some(udp_destination.to_string().as_str())
+                });
+                if has_tcp && has_udp {
+                    break decisions;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("TCP and UDP pool failures were not both recorded");
+        let tcp_decision = decisions
+            .iter()
+            .find(|decision| {
+                decision.destination.as_deref()
+                    == Some(target_addr.to_string().as_str())
+            })
+            .unwrap();
+        let udp_decision = decisions
+            .iter()
+            .find(|decision| {
+                decision.destination.as_deref()
+                    == Some(udp_destination.to_string().as_str())
+            })
+            .unwrap();
+        let _ = close_udp.send(0);
+
+        let mut received = [0u8; 32];
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                udp_target.recv_from(&mut received),
+            )
+            .await
+            .is_err(),
+            "failed pool reset must not forward a UDP packet through DIRECT"
+        );
+
+        for decision in [tcp_decision, udp_decision] {
+            assert_eq!(
+                decision.outcome,
+                crate::app::flow::PathExecutionOutcome::PathPlanningFailed
+            );
+            assert_eq!(decision.route.outbound, "pool-failure");
+            assert_eq!(decision.route.rule.as_deref(), Some("Match"));
+            assert_eq!(
+                decision.failure_kind.as_deref(),
+                Some("outboundPoolNotReady")
+            );
+            assert!(decision.reason.contains("injected pool reset failure"));
+            assert!(decision.candidate_paths.is_empty());
+            assert!(decision.selected_path.is_none());
+        }
+        assert_eq!(
+            tcp_decision.destination.as_deref(),
+            Some(target_addr.to_string().as_str())
+        );
+        assert_eq!(
+            udp_decision.destination.as_deref(),
+            Some(udp_destination.to_string().as_str())
+        );
     }
 
     #[test]
