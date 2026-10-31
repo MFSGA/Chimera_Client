@@ -1096,3 +1096,10 @@ lifecycle tests.
 - TCP/UDP 原先在 fake-IP 反查缺少映射时直接关闭/丢弃，没有 Explain。现在这类分支记录 `fakeIpMappingMissing`、原始目的地址和明确的“路由选择已跳过”；`route.outbound=notEvaluated`、`rule=null`，不会伪造已选代理或规则，也不改变 TCP 关闭及 UDP 丢弃行为。Explain 版本与 Flow ID 在反查前创建，正常成功路径沿用同一上下文。Dashboard 仅当失败类型与路由占位同时匹配时显示 “Not evaluated / Selection skipped”，避免与用户自定义的同名出站组冲突。
 - 新增 Dispatcher 级回归 `missing_fake_ip_mapping_is_recorded_for_tcp_and_udp`，用 mock resolver 注入两种协议的映射缺失，并核验 RuntimeStatus 中的独立失败记录、路由占位、起始版本字段与目标地址；该测试覆盖 Dispatcher 分支，未在生产 FakeDns 中构造映射淘汰竞态。`cargo test -p clash-lib --lib --all-features --locked -j 6`：1167 passed、11 ignored；`cargo test -p clash-lib --test connection_chain_tests --test direct_udp_integration_tests --locked -j 6 -- --test-threads=1`：10 + 4 passed；严格 Clippy、无默认 feature 编译、格式和 diff 检查通过。Dashboard `npm run lint`、`npm run build` 通过；构建保留原有主 bundle 超过 500 kB 提示。使用 loopback mock API 实际打开 Network 页，展开 fake-IP 记录并同时放入真实出站名为 `notEvaluated` 的第二条记录；前者显示 “Not evaluated / Selection skipped”，后者仍显示原始组名与规则，详情可见 `198.18.0.10:443`。
 - UI 手动检查使用本机静态 Dashboard 和模拟 API；没有连接真实核心、查询公网 DNS、启动 TUN 或更改宿主网络。API 列表/详情复用已有 PathDecisionRecord 序列化与 handler；本轮新增用例直接检查 RuntimeStatus，不单独发 HTTP 列表/详情请求。未验证跨平台或真实 fake-IP 映射淘汰竞态；没有 push、release 或标签操作。
+
+### 2026-10-30：fake-IP Explain 经 Controller 列表和详情返回（L2，独立审查与维护者验收待完成）
+
+- 基线：本地 `master` `d7d99c89144cf3511e5a25e20bdd5bb4f7a04217`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；参考检出与上一节相同，未修改参考实现。
+- 扩展网络 handler 的本机 HTTP 回归：先写入并过期一条历史记录，再写入 `fakeIpMappingMissing` 决策；使用生产的 `status_routes`、共享 HTTP layer 和 Bearer auth，通过本机 TCP listener 确认 Explain 列表仅返回有效记录、单条详情 JSON 与该记录完全一致、过期详情仍返回 404。保留列表未认证时的 401 与详情路由 CORS 预检检查。
+- 基线过期记录测试 1 passed；更新后的网络 handler 单测 2 passed；全 feature 库测试 1167 passed、11 ignored；全 feature 严格 Clippy、格式和 diff 检查通过。测试只访问 loopback listener，不访问外网或修改主机网络。
+- 此用例验证已构造的 fake-IP Explain 数据穿过真实 HTTP handler/认证/序列化闭环；它不通过活动 Dispatcher 与生产 FakeDns 同时生成该记录。生产映射淘汰竞态、真实网络变化和跨平台行为仍未在本机验证；没有 push、release 或标签操作。
