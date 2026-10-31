@@ -1132,3 +1132,8 @@ lifecycle tests.
 - 新增三个调度器回归：`direct_tcp_winner_cancels_pending_hedged_attempt` 验证 loser future 在另一个尝试成功时被 drop；`direct_tcp_failure_starts_next_attempt_immediately` 验证快速失败不等待 hedge；`direct_tcp_deadline_cancels_attempts_at_parallel_limit` 验证并发不超过 2 且 deadline 释放挂起 future。执行 `cargo test -p clash-lib --lib --all-features --locked -j 6 direct_tcp_ -- --nocapture` 与 `cargo test -p clash-lib --lib --no-default-features --features ring,tun,port --locked -j 6 direct_tcp_ -- --nocapture`，两者均 5 passed；全 feature 库测试 1173 passed、11 ignored。
 - `cargo clippy -p clash-lib --all-targets --all-features --locked -j 6 -- -D warnings`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。定向测试只使用可控 future 和已有 loopback 测试；本次三个新测试不创建 socket。
 - 测试验证生产共用的调度逻辑和 future 取消边界，不创建真实 socket，不覆盖真实网络中的 connect 取消时序、并发切网或跨平台行为。无 push、release 或标签操作；签名提交及独立审查/维护者验收结果待最终 SHA 确认。
+
+### 2026-10-31：Windows 网络快照测试类型仅在测试构建导入（L2）
+
+- PR #92 的 Windows Rust quality 与 UDP loopback job 在非测试库构建阶段都因 `IP_ADDRESS_PREFIX` 未使用而失败；该类型只被 `windows.rs` 中的测试辅助代码引用。将导入限定到 `#[cfg(test)]`，不改变网络快照运行逻辑。
+- 本机没有 MinGW C 编译器；尝试 `cargo clippy -p clash-lib --target x86_64-pc-windows-gnu --all-targets --all-features --locked -j 6 -- -D warnings` 因缺少 `x86_64-w64-mingw32-gcc` 被依赖构建阻断。Windows MSVC CI 将验证修正后的目标构建与回归；在新 SHA CI 完成前不将 Windows 修复标为远端验证通过。

@@ -21,7 +21,7 @@ use windows::Win32::{
             IF_TYPE_IEEE80211, IF_TYPE_PPP, IF_TYPE_PPPMULTILINKBUNDLE,
             IF_TYPE_PROP_VIRTUAL, IF_TYPE_SOFTWARE_LOOPBACK, IF_TYPE_TUNNEL,
             IF_TYPE_WWANPP, IF_TYPE_WWANPP2, IP_ADAPTER_ADDRESSES_LH,
-            IP_ADDRESS_PREFIX, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
+            MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
         },
         Ndis::IfOperStatusUp,
     },
@@ -29,6 +29,9 @@ use windows::Win32::{
         AF_INET, AF_INET6, AF_UNSPEC, NldsDeprecated, NldsPreferred, SOCKADDR_INET,
     },
 };
+
+#[cfg(test)]
+use windows::Win32::NetworkManagement::IpHelper::IP_ADDRESS_PREFIX;
 
 const INITIAL_ADAPTER_BUFFER_BYTES: usize = 15 * 1024;
 const MAX_ADAPTER_BUFFER_ATTEMPTS: usize = 4;
