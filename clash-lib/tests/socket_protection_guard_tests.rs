@@ -8,10 +8,10 @@ use syn::{
     visit::{self, Visit},
 };
 
-const TEST_ONLY_SOURCE_PREFIXES: &[&str] = &[
-    "clash-lib/src/proxy/utils/test_utils/",
-    "clash-lib/src/proxy/transport/xhttp/tests.rs",
-];
+const TEST_ONLY_SOURCE_DIRECTORY_PREFIXES: &[&str] =
+    &["clash-lib/src/proxy/utils/test_utils/"];
+const TEST_ONLY_SOURCE_FILES: &[&str] =
+    &["clash-lib/src/proxy/transport/xhttp/tests.rs"];
 
 #[derive(Clone, Copy)]
 enum ForbiddenCall {
@@ -52,6 +52,23 @@ fn proxy_runtime_udp_binds_use_socket_helper() {
     assert_no_forbidden_runtime_usage(ForbiddenCall::UdpBind);
 }
 
+#[test]
+fn test_only_source_allowlist_matches_the_declared_xhttp_file_exactly() {
+    assert!(is_test_only_source(
+        "clash-lib/src/proxy/transport/xhttp/tests.rs"
+    ));
+    assert!(!is_test_only_source(
+        "clash-lib/src/proxy/transport/xhttp/tests.rs_runtime.rs"
+    ));
+}
+
+fn is_test_only_source(rel: &str) -> bool {
+    TEST_ONLY_SOURCE_DIRECTORY_PREFIXES
+        .iter()
+        .any(|prefix| rel.starts_with(prefix))
+        || TEST_ONLY_SOURCE_FILES.contains(&rel)
+}
+
 fn assert_no_forbidden_runtime_usage(forbidden: ForbiddenCall) {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir.parent().expect("workspace root");
@@ -65,10 +82,7 @@ fn assert_no_forbidden_runtime_usage(forbidden: ForbiddenCall) {
             .to_string_lossy()
             .replace('\\', "/");
 
-        if TEST_ONLY_SOURCE_PREFIXES
-            .iter()
-            .any(|prefix| rel.starts_with(prefix))
-        {
+        if is_test_only_source(&rel) {
             return;
         }
 
