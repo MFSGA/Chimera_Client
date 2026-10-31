@@ -2628,6 +2628,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_tcp_failure_starts_next_attempt_immediately() {
+        let attempt_count = Arc::new(AtomicUsize::new(0));
+        let failure_count = Arc::new(AtomicUsize::new(0));
+        let started = attempt_count.clone();
+        let failed = failure_count.clone();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_direct_stream_attempts(
+                vec![
+                    DirectStreamAttempt {
+                        endpoint: "127.0.0.1:443".parse().unwrap(),
+                        path: None,
+                    },
+                    DirectStreamAttempt {
+                        endpoint: "127.0.0.2:443".parse().unwrap(),
+                        path: None,
+                    },
+                ],
+                1,
+                DIRECT_TCP_PARALLEL_LIMIT,
+                Duration::from_secs(60),
+                tokio::time::Instant::now() + Duration::from_secs(2),
+                move |active, attempt| {
+                    let attempt_number = started.fetch_add(1, Ordering::SeqCst);
+                    let future = async move {
+                        if attempt_number == 0 {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionRefused,
+                                "controlled first-attempt failure",
+                            ))
+                        } else {
+                            Ok(())
+                        }
+                    };
+                    active.push(future.map(move |result| (attempt, result)).boxed());
+                },
+                move |_, _| {
+                    failed.fetch_add(1, Ordering::SeqCst);
+                },
+            ),
+        )
+        .await
+        .expect("a failed DIRECT TCP attempt must advance without waiting for hedge delay");
+
+        let DirectStreamAttemptOutcome::Connected { attempt, .. } = outcome else {
+            panic!("the next attempt should win after the first attempt fails");
+        };
+        assert_eq!(attempt.endpoint, "127.0.0.2:443".parse().unwrap());
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 2);
+        assert_eq!(failure_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn direct_tcp_deadline_cancels_attempts_at_parallel_limit() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let attempt_count = Arc::new(AtomicUsize::new(0));
+        let planned_attempts = (1..=3)
+            .map(|octet| DirectStreamAttempt {
+                endpoint: format!("127.0.0.{octet}:443").parse().unwrap(),
+                path: None,
+            })
+            .collect();
+        let drop_signal = cancelled.clone();
+        let started = attempt_count.clone();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_direct_stream_attempts(
+                planned_attempts,
+                1,
+                DIRECT_TCP_PARALLEL_LIMIT,
+                Duration::ZERO,
+                tokio::time::Instant::now() + Duration::from_millis(50),
+                move |active, attempt| {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    let drop_signal = drop_signal.clone();
+                    active.push(
+                        async move {
+                            let _guard = FutureDropGuard(drop_signal);
+                            std::future::pending::<std::io::Result<()>>().await
+                        }
+                        .map(move |result| (attempt, result))
+                        .boxed(),
+                    );
+                },
+                |_, _| {},
+            ),
+        )
+        .await
+        .expect("the DIRECT TCP attempt deadline must be bounded");
+
+        assert!(matches!(
+            outcome,
+            DirectStreamAttemptOutcome::Exhausted { timed_out: true }
+        ));
+        assert_eq!(
+            attempt_count.load(Ordering::SeqCst),
+            DIRECT_TCP_PARALLEL_LIMIT,
+            "the hedge scheduler must not exceed its parallel attempt limit"
+        );
+        assert!(
+            cancelled.load(Ordering::SeqCst),
+            "deadline expiration must drop pending socket attempts"
+        );
+    }
+
+    #[tokio::test]
     async fn direct_tcp_total_budget_includes_and_cancels_dns() {
         let cancelled = Arc::new(AtomicBool::new(false));
         let resolver: crate::app::dns::ThreadSafeDNSResolver =
