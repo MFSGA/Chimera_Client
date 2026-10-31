@@ -1691,7 +1691,14 @@ mod tests {
         .await
         .expect("dispatcher did not finish the missing reverse-index flow");
         let mut byte = [0u8; 1];
-        assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+        let bytes_read =
+            tokio::time::timeout(Duration::from_secs(3), client.read(&mut byte))
+                .await
+                .expect(
+                    "duplex peer did not close after the missing reverse-index flow",
+                )
+                .unwrap();
+        assert_eq!(bytes_read, 0);
 
         let decision = status
             .write()

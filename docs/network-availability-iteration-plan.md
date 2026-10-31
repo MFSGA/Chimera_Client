@@ -1107,6 +1107,6 @@ lifecycle tests.
 ### 2026-10-30：fake-IP 映射在反查间隙丢失仍生成 Explain（L2）
 
 - 基线：本地 `master` `365b435915927399b47dcec1df51cc3fd9f4f796`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。未修改参考实现或生产运行代码。
-- 新增 `missing_fake_ip_reverse_index_is_explained_by_dispatcher`：使用真实 `FakeDns` 与 `EnhancedResolver`，测试存储在 `is_fake_ip` 确认分配后、独立 `reverse_lookup` 前模拟映射淘汰；通过真实 Dispatcher TCP 入口确认连接关闭，并记录 `fakeIpMappingMissing`、`notEvaluated` 与“路由选择已跳过”。这补上此前只有 mock resolver 覆盖 Dispatcher 分支、只有预置记录覆盖 Controller handler 的组合缺口。
+- 新增 `missing_fake_ip_reverse_index_is_explained_by_dispatcher`：使用真实 `FakeDns` 与 `EnhancedResolver`，测试存储在 `is_fake_ip` 确认分配后、独立 `reverse_lookup` 前模拟映射淘汰；通过真实 Dispatcher TCP 入口确认连接在有界等待内关闭，并记录 `fakeIpMappingMissing`、`notEvaluated` 与“路由选择已跳过”。这补上此前只有 mock resolver 覆盖 Dispatcher 分支、只有预置记录覆盖 Controller handler 的组合缺口。
 - 定向测试在默认全 feature 与 `--no-default-features --features ring,tun,port` 下各 1 passed；`cargo test -p clash-lib --lib --all-features --locked -j 6`：1168 passed、11 ignored。全 feature all-target 严格 Clippy、格式及 diff 检查通过。测试只使用进程内 fake-DNS 存储、临时目录和 duplex stream，不访问外网、启动 TUN 或修改宿主网络。
 - 本项验证确定性模拟的映射淘汰时序，不触发真实持久化缓存损坏或并发删除，也没有把此新测试与 Controller HTTP 请求放在同一条用例中；HTTP 鉴权/列表/详情行为由上一项回归覆盖。真实换网与跨平台验收仍待专用环境；独立审查和维护者验收结果随最终 SHA 交付记录。本地未推送。
