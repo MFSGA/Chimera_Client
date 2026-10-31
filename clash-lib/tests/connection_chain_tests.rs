@@ -126,7 +126,10 @@ async fn get_api_json(api_port: u16, path: &str) -> serde_json::Value {
     serde_json::from_slice(&body).expect("failed to parse API GET JSON")
 }
 
-async fn socks5_connect(proxy_port: u16, target_port: u16) -> TcpStream {
+async fn socks5_connect_with_status(
+    proxy_port: u16,
+    target_port: u16,
+) -> (TcpStream, u8) {
     let mut stream = TcpStream::connect(("127.0.0.1", proxy_port))
         .await
         .expect("failed to connect to SOCKS5 listener");
@@ -142,7 +145,7 @@ async fn socks5_connect(proxy_port: u16, target_port: u16) -> TcpStream {
         .unwrap();
     let mut header = [0u8; 4];
     stream.read_exact(&mut header).await.unwrap();
-    assert_eq!(header[1], 0x00, "SOCKS5 CONNECT was rejected");
+    let reply_status = header[1];
     let remaining = match header[3] {
         0x01 => 6,
         0x04 => 18,
@@ -150,6 +153,13 @@ async fn socks5_connect(proxy_port: u16, target_port: u16) -> TcpStream {
     };
     let mut address = vec![0u8; remaining];
     stream.read_exact(&mut address).await.unwrap();
+    (stream, reply_status)
+}
+
+async fn socks5_connect(proxy_port: u16, target_port: u16) -> TcpStream {
+    let (stream, reply_status) =
+        socks5_connect_with_status(proxy_port, target_port).await;
+    assert_eq!(reply_status, 0x00, "SOCKS5 CONNECT was rejected");
     stream
 }
 
@@ -904,6 +914,139 @@ rules:
         })
         .await
         .expect("timed out querying failure path decision detail");
+    assert_eq!(detail, failure);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn proxy_endpoint_dial_refusal_is_queryable_with_logical_destination() {
+    let proxy_endpoint = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to reserve local proxy endpoint port");
+    let proxy_endpoint_port = proxy_endpoint.local_addr().unwrap().port();
+    let api_port = available_port();
+    let socks_port = available_port();
+    let config = format!(
+        r#"allow-lan: false
+bind-address: 127.0.0.1
+socks-port: {socks_port}
+mode: rule
+log-level: error
+mmdb: null
+external-controller: 127.0.0.1:{api_port}
+secret: clash-rs
+tun:
+  enable: false
+proxies:
+  - name: refused-proxy
+    type: socks5
+    server: 127.0.0.1
+    port: {proxy_endpoint_port}
+    udp: false
+rules:
+  - MATCH,refused-proxy
+"#
+    );
+    let cwd =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
+    let _clash = ClashInstance::start(
+        Options {
+            config: Config::Str(config),
+            cwd: Some(cwd.to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            config_path: None,
+        },
+        vec![api_port, socks_port],
+    )
+    .expect("failed to start proxy endpoint Explain client");
+
+    // Keep the proxy port occupied until the local listeners are ready, then
+    // release it to produce a deterministic loopback connection refusal.
+    drop(proxy_endpoint);
+    let existing_decisions = tokio::time::timeout(
+        Duration::from_secs(3),
+        get_api_json(api_port, "/runtime/network/path-decisions"),
+    )
+    .await
+    .expect("timed out reading initial proxy path decisions");
+    let existing_flow_ids = existing_decisions
+        .as_array()
+        .expect("initial path decisions should be an array")
+        .iter()
+        .filter_map(|decision| decision["flowId"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+
+    let (mut stream, _reply_status) = tokio::time::timeout(
+        Duration::from_secs(5),
+        socks5_connect_with_status(socks_port, 80),
+    )
+    .await
+    .expect("timed out during local SOCKS5 CONNECT");
+    let mut response_payload = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        stream.read_to_end(&mut response_payload),
+    )
+    .await
+    .expect("timed out waiting for failed proxy stream to close")
+    .expect("failed to read closed proxy stream");
+    assert!(
+        response_payload.is_empty(),
+        "refused proxy endpoint unexpectedly returned payload"
+    );
+
+    let failure = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let decisions =
+                get_api_json(api_port, "/runtime/network/path-decisions").await;
+            if let Some(decision) = decisions.as_array().and_then(|records| {
+                records.iter().find(|decision| {
+                    decision["outcome"] == "dialFailed"
+                        && decision["route"]["outbound"] == "refused-proxy"
+                        && decision["reason"].as_str().is_some_and(|reason| {
+                            reason.contains("proxyEndpointDialFailed")
+                                && reason.contains("attemptedPaths")
+                        })
+                        && decision["flowId"].as_str().is_some_and(|flow_id| {
+                            !existing_flow_ids
+                                .iter()
+                                .any(|existing| existing == flow_id)
+                        })
+                })
+            }) {
+                break decision.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("proxy endpoint refusal was not recorded in Explain");
+    assert_eq!(
+        failure["destination"].as_str(),
+        Some("127.0.0.1:80"),
+        "Explain should retain the requested logical destination"
+    );
+    assert!(
+        failure["failureKind"]
+            .as_str()
+            .is_some_and(|kind| !kind.is_empty())
+    );
+    assert_eq!(failure["selectedPath"], serde_json::Value::Null);
+    assert!(failure["candidatePaths"].is_array());
+
+    let flow_id = failure["flowId"]
+        .as_str()
+        .expect("failed proxy Explain should expose a flow ID");
+    let detail = tokio::time::timeout(
+        Duration::from_secs(3),
+        get_api_json(
+            api_port,
+            &format!("/runtime/network/path-decision/{flow_id}"),
+        ),
+    )
+    .await
+    .expect("timed out querying failed proxy Explain detail");
     assert_eq!(detail, failure);
 }
 

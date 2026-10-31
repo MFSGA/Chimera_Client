@@ -1019,9 +1019,16 @@ lifecycle tests.
 - `cargo test -p clash-lib --test connection_chain_tests --locked -j 6 direct_tcp_dial_failure_is_queryable_from_path_explain -- --exact --nocapture`：1 passed；`cargo test -p clash-lib --test connection_chain_tests --locked -j 6`：7 passed；`cargo clippy -p clash-lib --test connection_chain_tests --locked -j 6 -- -D warnings`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。测试仅用本机 loopback，不访问公网或更改宿主网络。
 - 本用例覆盖本机拒绝拨号下的 API 诊断闭环，不断言平台专属错误文案，也不代表第三方网卡路径、其他协议或真实换网的失败分类已覆盖。
 
-### 2026-10-30：Explain 记录显示逻辑目标地址（L2，待最终审查与维护者验收）
+### 2026-10-30：Explain 记录显示逻辑目标地址（L2，独立审查通过，维护者验收待确认）
 
 - 基线：本地 `master` `b6b9c0eead54f5e04faaa1ad19278b4d6a9fe91e`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。本轮不修改参考实现。
 - `PathDecisionRecord` 增加可选 `destination`，Dispatcher 在 TCP/UDP 的 Explain 记录中从逻辑 `Session.destination` 填值；为 `None` 时跳过序列化，避免改变没有目标值的旧记录。Network Dashboard 在展开详情时显示目标，并对长地址换行；目标字段为诊断信息，不等同于代理端之后的最终出口，也不能作为可达性证明。
 - `connection_chain_tests` 的 DIRECT TCP 成功与拨号拒绝用例、`direct_udp_integration_tests` 的 DIRECT UDP 恢复用例均校验目标值；Explain 版本/过期回归同时断言 `None` 不输出该字段。已运行的定向结果：connection chain 7 passed、direct UDP integration 4 passed、path-decision 序列化/限额单测 1 passed；Dashboard lint/build、`cargo clippy -p clash-lib --all-targets --all-features --locked -j 6 -- -D warnings`、`cargo fmt --all -- --check` 与 `git diff --check` 均通过。浏览器用 loopback mock API 实际展开失败记录，确认 `127.0.0.1:54321` 显示在 DESTINATION 项。
-- 受控 UI 检查不连接真实核心、不访问公网或更改系统网络。跨平台真实换网、代理协议端到端诊断和目标隐私策略仍未由本项验证；目标地址沿用 Controller API 当前认证策略，只有配置非空 `secret` 时才要求鉴权。
+- 受控 UI 检查不连接真实核心、不访问公网或更改系统网络。跨平台真实换网、代理协议端到端诊断和目标隐私策略仍未由本项验证；目标地址沿用 Controller API 当前认证策略，只有配置非空 `secret` 时才要求鉴权。Reviewer 对 `5eae7f0398d5540ea6fd9dd634f4e3df219f8fd9` 审查通过，维护者验收待确认。非阻塞限制：本次断言使用字面 IPv4，尚无 fake-IP、域名目标或 UDP 拨号失败的独立目标值用例；UDP Explain 目标描述建立决策关联时的逻辑目标，不代表该关联后续每个数据报的目标。
+
+### 2026-10-30：代理端点 TCP 拒绝的 Explain 诊断闭环（L2）
+
+- 基线：本地 `master` `5eae7f0398d5540ea6fd9dd634f4e3df219f8fd9`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。核对 `ref/` 后保留其 SOCKS5 入站在 Dispatcher 调用前发送 CONNECT 成功响应的既有语义；本项只验证其后的拨号失败和 Explain，不改 SOCKS wire 行为。
+- 新增 `proxy_endpoint_dial_refusal_is_queryable_with_logical_destination`：占用 loopback 代理端口完成本地客户端 readiness 后释放该端口，向 `refused-proxy` 发起 SOCKS5 CONNECT；验证本地连接在无回包数据后关闭，近期 Explain 列表新增 `proxyEndpointDialFailed` 记录、记录包含 attemptedPaths 和候选路径数组、`destination` 保留用户请求的 `127.0.0.1:80` 而不是代理服务器地址，单 Flow 详情与列表记录一致。请求前的 flow ID 用于排除旧记录，API 等待和本地请求均有界。
+- 基线 `proxy_handshake_failure_is_queryable_from_path_explain`：1 passed。新增端点拒绝定向测试：1 passed；完整 `cargo test -p clash-lib --test connection_chain_tests --locked -j 6`：8 passed。`cargo clippy -p clash-lib --test connection_chain_tests --locked -j 6 -- -D warnings`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。
+- 该用例验证本机 TCP 连接拒绝的 Dispatcher/API 诊断链，不覆盖远端网络故障、真实多网卡路径、其他代理协议互操作、fake-IP/域名 Explain 目标或跨平台换网。
