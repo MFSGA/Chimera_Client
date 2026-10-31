@@ -156,6 +156,39 @@ async fn socks5_connect_with_status(
     (stream, reply_status)
 }
 
+async fn socks5_connect_domain_with_status(
+    proxy_port: u16,
+    host: &str,
+    target_port: u16,
+) -> (TcpStream, u8) {
+    let mut stream = TcpStream::connect(("127.0.0.1", proxy_port))
+        .await
+        .expect("failed to connect to SOCKS5 listener");
+    stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut greeting = [0u8; 2];
+    stream.read_exact(&mut greeting).await.unwrap();
+    assert_eq!(greeting, [0x05, 0x00]);
+
+    let host_len =
+        u8::try_from(host.len()).expect("SOCKS5 domain name exceeds 255 bytes");
+    let mut request = vec![0x05, 0x01, 0x00, 0x03, host_len];
+    request.extend_from_slice(host.as_bytes());
+    request.extend_from_slice(&target_port.to_be_bytes());
+    stream.write_all(&request).await.unwrap();
+
+    let mut header = [0u8; 4];
+    stream.read_exact(&mut header).await.unwrap();
+    let reply_status = header[1];
+    let remaining = match header[3] {
+        0x01 => 6,
+        0x04 => 18,
+        atyp => panic!("unexpected SOCKS5 address type {atyp}"),
+    };
+    let mut address = vec![0u8; remaining];
+    stream.read_exact(&mut address).await.unwrap();
+    (stream, reply_status)
+}
+
 async fn socks5_connect(proxy_port: u16, target_port: u16) -> TcpStream {
     let (stream, reply_status) =
         socks5_connect_with_status(proxy_port, target_port).await;
@@ -979,7 +1012,7 @@ rules:
 
     let (mut stream, reply_status) = tokio::time::timeout(
         Duration::from_secs(5),
-        socks5_connect_with_status(socks_port, 80),
+        socks5_connect_domain_with_status(socks_port, "example.test", 443),
     )
     .await
     .expect("timed out during local SOCKS5 CONNECT");
@@ -1028,7 +1061,7 @@ rules:
     .expect("proxy endpoint refusal was not recorded in Explain");
     assert_eq!(
         failure["destination"].as_str(),
-        Some("127.0.0.1:80"),
+        Some("example.test:443"),
         "Explain should retain the requested logical destination"
     );
     assert!(

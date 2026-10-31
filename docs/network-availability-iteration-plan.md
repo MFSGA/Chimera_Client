@@ -1039,3 +1039,10 @@ lifecycle tests.
 - 新增 `socks5_udp_proxy_endpoint_refusal_is_queryable_from_path_explain`：先占用 SOCKS5 UDP 出站控制端点，启动后读取 Explain 初始列表并成功完成本地 SOCKS5 UDP ASSOCIATE；在确认本地 SOCKS listener 就绪后、发送首包前释放出站端点。首包发往保留的 loopback UDP 目标并触发代理控制端点 TCP 拒绝。校验新 `dialFailed` 记录的 `proxyUdpEndpointDialFailed` 原因、尝试路径上下文、失败类型、空 `selectedPath`、逻辑目标地址，以及详情与列表一致。请求前的 flow ID 用于排除旧记录，所有请求和等待均有界。
 - 基线 `socks5_udp_outbound_roundtrip_is_queryable_from_path_explain`：1 passed；新增用例 `cargo test -p clash-lib --test connection_chain_tests --locked -j 6 socks5_udp_proxy_endpoint_refusal_is_queryable_from_path_explain -- --exact --nocapture`：1 passed；最终 `cargo test -p clash-lib --test connection_chain_tests --locked -j 6`：9 passed。`cargo clippy -p clash-lib --test connection_chain_tests --locked -j 6 -- -D warnings`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。
 - 该用例验证本机 loopback SOCKS5 UDP 出站控制连接拒绝，不覆盖真实 SOCKS5 服务器、远端网络故障、Hysteria2 UDP、其他协议互操作或真实换网。
+
+### 2026-10-30：Explain 保留域名逻辑目标（L2）
+
+- 基线：本地 `master` `582294946b823f6a4e44e1896824d372fd58ac32`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；参考实现 SHA 与前述 B10 切片相同，本项未修改参考实现或生产转发代码。
+- 扩展 `proxy_endpoint_dial_refusal_is_queryable_with_logical_destination`：通过 SOCKS5 域名地址类型请求 `example.test:443`，将代理端点连接故意设为本机拒绝，并断言 Explain 列表和详情保留域名逻辑目标。失败发生在代理端点握手之前，不需要解析目标域名或访问公网；既有 DIRECT TCP 拒绝测试仍覆盖字面 IP 目标。
+- 定向测试与连接链全量测试均通过：前者 1 passed，后者 9 passed。目标地址字段当前已有域名和字面 IP 的 TCP 失败路径覆盖；fake-IP 经 TUN 反查后进入 Explain 的 API 集成路径仍未覆盖，UDP 目标字段也不代表关联期间每个数据报的目标。
+- 本轮独立审查与维护者验收待完成；仅本地工作，不包含推送授权。
