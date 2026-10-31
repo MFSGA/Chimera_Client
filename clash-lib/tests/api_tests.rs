@@ -1104,12 +1104,11 @@ rules:
         );
 
         // ApiRunner binds before checking the resolved address, but it must
-        // fail before starting axum::serve and release both listeners before
-        // reporting startup failure.
+        // fail before starting axum::serve and release the API listener before
+        // reporting startup failure. The inbound SOCKS listener has not started
+        // yet because startup waits for API readiness first.
         let api_listener = TcpListener::bind(("0.0.0.0", api_port))
             .expect("failed API startup should release the wildcard listener");
-        let socks_listener = TcpListener::bind(("127.0.0.1", socks_port))
-            .expect("failed API startup should stop the SOCKS listener");
-        drop((api_listener, socks_listener));
+        drop(api_listener);
     }
 }
