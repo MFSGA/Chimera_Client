@@ -959,3 +959,10 @@ lifecycle tests.
 - 将 `ApiRunner` 使用的公共 HTTP 层集中到 `add_shared_http_layers`：JSON content-type 修正、CORS、共享 AppState 与 HTTP trace。过期 Explain 测试通过该生产 helper 创建本机 TCP listener，再安装相同认证 middleware；一个序列覆盖未认证列表 401、认证后过期列表为空、过期详情 404，以及 Explain 详情路由的 CORS 预检允许头。
 - 定向过期 Explain 测试 1 passed；`cargo test -p clash-lib --test api_tests --locked -j 6` 为 10 passed；`cargo clippy -p clash-lib --lib --tests --no-default-features --features ring,tun,port --locked -j 6 -- -D warnings`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。测试使用本机回环 listener 和测试注入的过期状态，没有外网或宿主网络变更。
 - 该项验证 handler 与生产公共 HTTP 层组合；未启动完整 `ApiRunner`，因此绑定 readiness、安全地址检查、WebSocket URI 改写和完整长驻 runner 生命周期仍待验证。TraceLayer 参与请求，但本项未断言输出的 trace 内容。
+
+### 2026-10-30：Network Dashboard 展示 Explain 版本上下文
+
+- 基线：本地 `master` `3fbf2eadc918e1cf1c42e31992c3d7cc66aea094`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。本轮不读取或修改上游实现。
+- Recent path decisions 每条记录新增可展开的诊断详情，展示 `flowId`、操作编号、配置版本及连接完成版本、网络版本和策略版本；如果连接完成时配置已经变化，页面明确提示该路径判断依据的是哪一版配置。候选与拒绝路径仍在详情中展示。只使用现有 Explain API 字段，不改变 Controller API 或运行时决策。
+- `npm run lint` 与 `npm run build` 通过。使用本机 loopback mock API 在浏览器实际展开记录，确认版本字段、配置变化提示和候选路径均可见；没有连接真实核心或修改网络。Network chunk 为 56.87 kB，主 JS 637.94 kB，原有主包体积警告仍在。
+- 该交互检查验证页面展示和展开操作，不覆盖实际换网、真实核心数据兼容或窄屏/移动端实机布局；跨平台网络恢复验收仍需目标平台环境。
