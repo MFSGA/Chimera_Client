@@ -1045,4 +1045,5 @@ lifecycle tests.
 - 基线：本地 `master` `582294946b823f6a4e44e1896824d372fd58ac32`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；参考实现 SHA 与前述 B10 切片相同，本项未修改参考实现或生产转发代码。
 - 扩展 `proxy_endpoint_dial_refusal_is_queryable_with_logical_destination`：通过 SOCKS5 域名地址类型请求 `example.test:443`，将代理端点连接故意设为本机拒绝，并断言 Explain 列表和详情保留域名逻辑目标。失败发生在代理端点握手之前，不需要解析目标域名或访问公网；既有 DIRECT TCP 拒绝测试仍覆盖字面 IP 目标。
 - 定向测试与连接链全量测试均通过：前者 1 passed，后者 9 passed。目标地址字段当前已有域名和字面 IP 的 TCP 失败路径覆盖；fake-IP 经 TUN 反查后进入 Explain 的 API 集成路径仍未覆盖，UDP 目标字段也不代表关联期间每个数据报的目标。
-- 本轮独立审查与维护者验收待完成；仅本地工作，不包含推送授权。
+- 后续补充 `reverse_lookup_restores_domain_for_fake_ip`：resolver 返回映射时，fake-IP `198.18.0.11:8443` 转为 `mapped.example.test:8443`；原有映射缺失测试继续断言返回 `None`。`cargo test -p clash-lib --lib --locked -j 6 reverse_lookup_`：2 passed；`cargo clippy -p clash-lib --lib --locked -j 6 -- -D warnings`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。该单测验证反查转换，不验证 TUN ingress、Dispatcher 记录写入及 Explain HTTP API 的组合。
+- 本地改动未推送。`05344f6` 的独立审查通过；该 SHA 的维护者验收仍待确认。新增 fake-IP 单测待独立审查和维护者验收。

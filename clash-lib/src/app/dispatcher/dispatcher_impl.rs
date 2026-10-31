@@ -4009,6 +4009,32 @@ mod tests {
 
         assert!(resolved.is_none());
     }
+
+    #[tokio::test]
+    async fn reverse_lookup_restores_domain_for_fake_ip() {
+        let fake_ip: IpAddr = "198.18.0.11".parse().unwrap();
+        let destination = SocksAddr::from_str("198.18.0.11:8443").unwrap();
+
+        let mut resolver = MockClashResolver::new();
+        resolver.expect_fake_ip_enabled().return_const(true);
+        resolver
+            .expect_is_fake_ip()
+            .returning(move |ip| ip == fake_ip);
+        resolver
+            .expect_reverse_lookup()
+            .returning(|_| Some("mapped.example.test".to_owned()));
+
+        let resolved = reverse_lookup(
+            &(Arc::new(resolver) as Arc<dyn ClashResolver>),
+            &destination,
+        )
+        .await;
+
+        assert_eq!(
+            resolved,
+            Some(SocksAddr::Domain("mapped.example.test".to_owned(), 8443))
+        );
+    }
 }
 
 impl Drop for OutboundHandleMap {
