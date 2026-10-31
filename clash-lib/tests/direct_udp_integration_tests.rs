@@ -4,7 +4,7 @@ use tokio::net::UdpSocket;
 
 mod common;
 
-use common::{ClashInstance, Socks5UdpSession};
+use common::{ClashInstance, Socks5UdpSession, wait_for_initial_network_recovery};
 
 fn available_port() -> u16 {
     StdTcpListener::bind("127.0.0.1:0")
@@ -169,6 +169,7 @@ proxies:
         vec![api_port, socks_port],
     )
     .expect("failed to start GLOBAL selector UDP client");
+    wait_for_initial_network_recovery(api_port).await;
 
     let select_uri: hyper::Uri =
         format!("http://127.0.0.1:{api_port}/proxies/GLOBAL")

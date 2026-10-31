@@ -11,7 +11,10 @@ use tokio::{
 
 mod common;
 
-use common::{ClashInstance, Socks5UdpSession, send_http_request, wait_port_ready};
+use common::{
+    ClashInstance, Socks5UdpSession, send_http_request,
+    wait_for_initial_network_recovery, wait_port_ready,
+};
 
 const PASSWORD: &str = "3SYJ/f8nmVuzKvKglykRQDSgg10e/ADilkdRWrrY9HU=";
 
@@ -282,6 +285,7 @@ async fn integration_test_shadowsocks_udp() {
     });
 
     let (_server, _client, socks_port, api_port) = start_shadowsocks_pair(true);
+    wait_for_initial_network_recovery(api_port).await;
     let session = Socks5UdpSession::connect(socks_port).await;
     session
         .send_ipv4(b"shadowsocks-udp-roundtrip", [127, 0, 0, 1], target_port)
