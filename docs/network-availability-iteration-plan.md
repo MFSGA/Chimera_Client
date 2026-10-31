@@ -1110,3 +1110,10 @@ lifecycle tests.
 - 新增 `missing_fake_ip_reverse_index_is_explained_by_dispatcher`：使用真实 `FakeDns` 与 `EnhancedResolver`，测试存储在 `is_fake_ip` 确认分配后、独立 `reverse_lookup` 前模拟映射淘汰；通过真实 Dispatcher TCP 入口确认连接在有界等待内关闭，并记录 `fakeIpMappingMissing`、`notEvaluated` 与“路由选择已跳过”。这补上此前只有 mock resolver 覆盖 Dispatcher 分支、只有预置记录覆盖 Controller handler 的组合缺口。
 - 定向测试在默认全 feature 与 `--no-default-features --features ring,tun,port` 下各 1 passed；`cargo test -p clash-lib --lib --all-features --locked -j 6`：1168 passed、11 ignored。全 feature all-target 严格 Clippy、格式及 diff 检查通过。测试只使用进程内 fake-DNS 存储、临时目录和 duplex stream，不访问外网、启动 TUN 或修改宿主网络。
 - 本项验证确定性模拟的映射淘汰时序，不触发真实持久化缓存损坏或并发删除，也没有把此新测试与 Controller HTTP 请求放在同一条用例中；HTTP 鉴权/列表/详情行为由上一项回归覆盖。真实换网与跨平台验收仍待专用环境；独立审查和维护者验收结果随最终 SHA 交付记录。本地未推送。
+
+### 2026-10-30：DIRECT TCP 总预算包含 DNS 并取消超时查询（L2）
+
+- 基线：本地 `master` `fb89ef687cba97c9853d823bcc9e3668cf427885`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。未修改参考实现或生产连接代码。
+- 新增 `direct_tcp_total_budget_includes_and_cancels_dns`：通过生产 `DirectConnector` 调用一个挂起的 resolver，确认 DNS 计入 5 秒总预算、最终返回 `TimedOut`，且超时会 drop DNS future。回归只验证 deadline 与取消边界，不创建 socket 或发送 DNS/业务流量；已有 `direct_connector_tries_the_next_resolved_address` 保持地址快速失败后继续尝试的覆盖。
+- 新用例在默认全 feature 与 `--no-default-features --features ring,tun,port` 下各 1 passed；全 feature 库测试 1169 passed、11 ignored；严格 Clippy、格式和 diff 检查通过。超时回归约耗时 5 秒，其外层测试等待上限为 10 秒。
+- 本项未验证真实 DNS 上游慢响应、TCP 连接阶段预算、并发 hedge loser 清理、代理端点预算或真实网络切换；没有改生产实现。独立审查与维护者验收结果随最终 SHA 交付记录。本地未推送。
