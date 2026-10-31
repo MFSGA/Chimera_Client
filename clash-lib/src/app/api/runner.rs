@@ -129,6 +129,29 @@ impl ApiReadySignal {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiServerSecurityFailure {
+    MissingSecret,
+    MissingCorsOrigins,
+}
+
+fn validate_api_server_security(
+    listener_addr: SocketAddr,
+    has_secret: bool,
+    valid_cors_origin_count: usize,
+) -> Result<(), ApiServerSecurityFailure> {
+    if listener_addr.ip().is_loopback() {
+        return Ok(());
+    }
+    if !has_secret {
+        return Err(ApiServerSecurityFailure::MissingSecret);
+    }
+    if valid_cors_origin_count == 0 {
+        return Err(ApiServerSecurityFailure::MissingCorsOrigins);
+    }
+    Ok(())
+}
+
 pub(super) fn build_cors_layer(
     configured_origins: Option<&[String]>,
 ) -> (CorsLayer, usize) {
@@ -461,47 +484,48 @@ impl Runner for ApiRunner {
                             }
                         };
                     // TCP related security checks
+                    let has_secret = controller_cfg
+                        .secret
+                        .as_deref()
+                        .is_some_and(|secret| !secret.is_empty());
                     let security_result = match listener.local_addr() {
-                        Ok(addr)
-                            if !addr.ip().is_loopback()
-                                && controller_cfg
-                                    .secret
-                                    .unwrap_or_default()
-                                    .is_empty() =>
-                        {
-                            error!(
-                                "API server is listening on a non-loopback address \
-                             without a secret. This is insecure!"
-                            );
-                            error!(
-                                "Please set a secret in the configuration to secure \
-                             the API server."
-                            );
-                            Err(crate::Error::Operation(
-                                "API server is listening on a non-loopback address \
-                             without a secret. This is insecure!"
-                                    .to_string(),
-                            ))
-                        }
-                        Ok(addr)
-                            if !addr.ip().is_loopback()
-                                && valid_cors_origin_count == 0 =>
-                        {
-                            error!(
-                                "API server is listening on a non-loopback address \
-                                 without any valid CORS origins. This is insecure!"
-                            );
-                            error!(
-                                "Please configure at least one valid \
-                                 cors-allow-origins entry."
-                            );
-                            Err(crate::Error::Operation(
-                                "API server is listening on a non-loopback address \
-                                 without any valid CORS origins"
-                                    .to_string(),
-                            ))
-                        }
-                        Ok(_) => Ok(()),
+                        Ok(addr) => match validate_api_server_security(
+                            addr,
+                            has_secret,
+                            valid_cors_origin_count,
+                        ) {
+                            Ok(()) => Ok(()),
+                            Err(ApiServerSecurityFailure::MissingSecret) => {
+                                error!(
+                                    "API server is listening on a non-loopback address \
+                                     without a secret. This is insecure!"
+                                );
+                                error!(
+                                    "Please set a secret in the configuration to secure \
+                                     the API server."
+                                );
+                                Err(crate::Error::Operation(
+                                    "API server is listening on a non-loopback address \
+                                     without a secret. This is insecure!"
+                                        .to_string(),
+                                ))
+                            }
+                            Err(ApiServerSecurityFailure::MissingCorsOrigins) => {
+                                error!(
+                                    "API server is listening on a non-loopback address \
+                                     without any valid CORS origins. This is insecure!"
+                                );
+                                error!(
+                                    "Please configure at least one valid \
+                                     cors-allow-origins entry."
+                                );
+                                Err(crate::Error::Operation(
+                                    "API server is listening on a non-loopback address \
+                                     without any valid CORS origins"
+                                        .to_string(),
+                                ))
+                            }
+                        },
                         Err(err) => Err(crate::Error::Io(err)),
                     };
                     if let Err(err) = security_result {
@@ -677,6 +701,30 @@ mod tests {
         let (_, valid_origin_count) = build_cors_layer(Some(&origins));
 
         assert_eq!(valid_origin_count, 0);
+    }
+
+    #[test]
+    fn non_loopback_api_listener_requires_secret_and_valid_cors() {
+        let external_addr = "192.0.2.1:13456"
+            .parse()
+            .expect("test address should parse");
+        assert_eq!(
+            validate_api_server_security(external_addr, false, 1),
+            Err(ApiServerSecurityFailure::MissingSecret)
+        );
+        assert_eq!(
+            validate_api_server_security(external_addr, true, 0),
+            Err(ApiServerSecurityFailure::MissingCorsOrigins)
+        );
+        assert_eq!(validate_api_server_security(external_addr, true, 1), Ok(()));
+
+        let loopback_addr = "127.0.0.1:13456"
+            .parse()
+            .expect("loopback test address should parse");
+        assert_eq!(
+            validate_api_server_security(loopback_addr, false, 0),
+            Ok(())
+        );
     }
 
     #[tokio::test]
