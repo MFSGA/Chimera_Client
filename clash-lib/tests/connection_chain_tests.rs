@@ -1258,7 +1258,12 @@ rules:
     )
     .expect("failed to start SOCKS5 UDP Explain integration client");
 
-    let client = common::Socks5UdpSession::connect(socks_port).await;
+    let client = tokio::time::timeout(
+        Duration::from_secs(5),
+        common::Socks5UdpSession::connect(socks_port),
+    )
+    .await
+    .expect("timed out during local SOCKS5 UDP ASSOCIATE");
     let payload = b"socks5-outbound-udp-roundtrip";
     client
         .send_ipv4(payload, [127, 0, 0, 1], target_addr.port())
@@ -1282,7 +1287,10 @@ rules:
     )
     .await;
 
+    drop(client);
     relay_task.await.expect("SOCKS5 UDP relay task failed");
-    upstream_task.abort();
-    let _ = upstream_task.await;
+    tokio::time::timeout(Duration::from_secs(5), upstream_task)
+        .await
+        .expect("SOCKS5 control connection stayed open after the UDP session closed")
+        .expect("SOCKS5 control-connection task failed");
 }

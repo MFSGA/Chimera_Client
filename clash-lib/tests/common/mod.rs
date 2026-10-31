@@ -199,6 +199,11 @@ impl Socks5UdpSession {
         assert_eq!(sender, self.relay_addr, "unexpected UDP relay sender");
         let packet = &buf[..len];
         assert!(packet.len() >= 4, "SOCKS5 UDP response is truncated");
+        assert_eq!(
+            &packet[..3],
+            &[0x00, 0x00, 0x00],
+            "SOCKS5 UDP response must be unfragmented",
+        );
         let mut pos = 4usize;
         let source = match packet[3] {
             0x01 => {
