@@ -51,7 +51,7 @@ ipnet = { version = "2" }
 lru_time_cache = "0.11"
 ip_network_table-deps-treebitmap = "0.5"
 network-interface = { version = "2" }
-sysinfo = { version = "0.39", features = ["network"] }
+sysinfo = { version = "0.40", features = ["network"] }
 
 serde = { version = "1", features = ["derive"] }
 serde_path_to_error = "0.1"
@@ -264,7 +264,7 @@ rcgen = "0.14"
 mockall = "0.15.0"
 tokio-test = "0.4.5"
 serial_test = "4.0"
-httpmock = "0.8.3"
+httpmock = "0.9.0"
 syn = { version = "3", features = ["full", "visit"] }
 
 [lints]
