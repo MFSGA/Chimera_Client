@@ -364,7 +364,8 @@ async fn integration_test_shadowsocks_udp() {
 async fn integration_test_shadowsocks_udp_multi_target() {
     let (first_port, first_task) = spawn_udp_echo().await;
     let (second_port, second_task) = spawn_udp_echo().await;
-    let (_server, _client, socks_port, _) = start_shadowsocks_pair(true);
+    let (_server, _client, socks_port, client_api) = start_shadowsocks_pair(true);
+    wait_for_initial_network_recovery(client_api).await;
     let session = Socks5UdpSession::connect(socks_port).await;
 
     for (payload, port) in [

@@ -19,6 +19,10 @@ mod tests {
     use std::net::TcpListener;
 
     #[test]
+    #[cfg_attr(
+        all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")),
+        ignore = "cross runs ARM tests under QEMU; process ownership needs native Linux /proc"
+    )]
     fn test_get_find_tcp_socket() {
         let socket = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = socket.local_addr().unwrap();
@@ -32,6 +36,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")),
+        ignore = "cross runs ARM tests under QEMU; process ownership needs native Linux /proc"
+    )]
     fn test_get_find_udp_socket() {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = socket.local_addr().unwrap();
