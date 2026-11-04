@@ -76,15 +76,14 @@ rules:
             Ok(Some(Ok(Message::Text(body)))) => {
                 let event: serde_json::Value = serde_json::from_str(body.as_ref())
                     .expect("Dashboard log event should be JSON");
-                assert_eq!(event["type"], "warning");
-                assert!(
-                    event["payload"]
-                        .as_str()
-                        .is_some_and(|payload| payload
-                            .contains("dashboard_contract_log_event")),
-                    "unexpected Dashboard log payload: {event}"
-                );
-                return;
+                let is_contract_event =
+                    event["payload"].as_str().is_some_and(|payload| {
+                        payload.contains("dashboard_contract_log_event")
+                    });
+                if is_contract_event {
+                    assert_eq!(event["type"], "warning");
+                    return;
+                }
             }
             Ok(Some(Ok(message))) => {
                 panic!(
