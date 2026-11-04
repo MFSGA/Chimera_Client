@@ -1150,3 +1150,11 @@ lifecycle tests.
 - `c69eec2` 的目标矩阵显示基于 `/proc/cpuinfo` 识别仿真的跳过条件未命中，ARM 的 sock2proc 两项用例仍失败；x86_64 Linux musl 的 Shadowsocks 多目标 UDP fixture 也在首包期间超时。现将两项进程归属用例明确标为 Linux ARM ignored（真实硬件的验证缺口保留），并让 Shadowsocks 多目标 UDP 用例在首包前等待网络恢复。需由下一 SHA 的跨目标 CI 验证这些调整。
 - 后续 Windows 矩阵还发现两个测试夹具问题：x86_64 的 dialer-proxy Explain 请求在首次网络恢复前启动，现加入有界网络就绪等待；i686 的 DNS 监听占用测试遇到 Windows 排除端口范围，TCP 成功绑定后同端口 UDP 可能返回 `PermissionDenied`（WSAEACCES），现对临时端口候选重试，直到 TCP/UDP 都能占用同一端口。本轮不改生产代码；Windows 两个目标需在新 SHA 上复验。
 - 最终 i686 Windows 日志还发现 Dashboard log WebSocket 会先发送启动期已有的 error，再发送测试注入的 warning；原断言误把第一条消息当成目标 warning。测试现等待包含唯一测试标记的事件后再核对 `type=warning`，不受无关日志顺序影响；只改测试和本记录，需在新 SHA 的 i686 Windows 矩阵复验。
+
+**Windows CI 后续（2026-11-04）：** Windows 网络回归工作流发现 3 个 DNS 测试先选择
+TCP 临时端口，再尝试绑定同号 UDP 端口；当该端口属于 Windows UDP 排除范围时，UDP 绑定会返回
+`WSAEACCES`（错误码 10013）。由于 Windows 的 TCP、UDP 动态/排除端口范围可以分别配置，简单
+反转绑定顺序仍可能碰到 TCP 排除端口。3 个测试现共用一个辅助函数：先分配 loopback UDP
+端口，再绑定同号 TCP；任一协议的候选端口绑定返回 `AddrInUse`、`AddrNotAvailable` 或
+`PermissionDenied` 时释放已打开的 socket 并最多重试 64 次。此修改只影响测试准备；仍需在
+新提交上重新运行 Windows CI。

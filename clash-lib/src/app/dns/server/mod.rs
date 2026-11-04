@@ -324,11 +324,10 @@ mod tests {
 
     #[tokio::test]
     async fn dns_bind_failure_is_reported_by_readiness_and_join() {
-        let tcp = std::net::TcpListener::bind("127.0.0.1:0")
-            .expect("failed to reserve TCP DNS port");
-        let addr: SocketAddr = tcp.local_addr().expect("failed to read DNS address");
-        let udp =
-            std::net::UdpSocket::bind(addr).expect("failed to reserve UDP DNS port");
+        let (tcp, udp, addr) =
+            super::super::test_support::reserve_loopback_tcp_udp_sockets()
+                .await
+                .expect("failed to reserve matching TCP and UDP DNS ports");
         let resolver: ThreadSafeDNSResolver = Arc::new(
             SystemResolver::new(false).expect("system resolver should initialize"),
         );

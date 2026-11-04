@@ -85,10 +85,7 @@ mod tests {
         rr::{self, Name, rdata::opt::EdnsOption},
     };
     use std::{net::Ipv4Addr, str::FromStr};
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::{TcpListener, UdpSocket},
-    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[derive(Debug)]
     struct ResolverProbeOutbound;
@@ -186,9 +183,8 @@ mod tests {
 
     #[tokio::test]
     async fn truncated_udp_response_retries_over_tcp() -> anyhow::Result<()> {
-        let tcp_listener = TcpListener::bind("127.0.0.1:0").await?;
-        let addr = tcp_listener.local_addr()?;
-        let udp_socket = UdpSocket::bind(addr).await?;
+        let (tcp_listener, udp_socket, addr) =
+            super::super::test_support::reserve_loopback_tcp_udp_sockets().await?;
 
         let udp_task = tokio::spawn(async move {
             let mut buffer = [0_u8; 2048];

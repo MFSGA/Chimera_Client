@@ -33,6 +33,8 @@ pub mod resolver;
 mod rule_dispatch;
 mod runtime;
 mod server;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use config::{Config, EdnsClientSubnet};
 pub use health::{

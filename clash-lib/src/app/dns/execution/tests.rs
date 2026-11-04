@@ -1055,13 +1055,11 @@ async fn s03b_proxy_hostname_cannot_resolve_through_system_dns() {
 #[tokio::test]
 async fn s03b_truncated_udp_retries_tcp_through_same_pinned_proxy() {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::{TcpListener, UdpSocket},
-    };
-    let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = tcp_listener.local_addr().unwrap();
-    let udp_socket = UdpSocket::bind(endpoint).await.unwrap();
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (tcp_listener, udp_socket, endpoint) =
+        crate::app::dns::test_support::reserve_loopback_tcp_udp_sockets()
+            .await
+            .unwrap();
 
     let udp_task = tokio::spawn(async move {
         let mut buf = [0u8; 4096];
