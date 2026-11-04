@@ -14,7 +14,10 @@ use tokio::{
 
 mod common;
 
-use common::{ClashInstance, Socks5UdpSession, send_http_request};
+use common::{
+    ClashInstance, Socks5UdpSession, send_http_request,
+    wait_for_initial_network_recovery,
+};
 
 fn available_port() -> u16 {
     StdTcpListener::bind("127.0.0.1:0")
@@ -728,39 +731,6 @@ async fn dialer_proxy_connects_through_a_local_socks5_hop() {
         .await
         .expect("failed to bind local HTTP target");
     let target_port = target.local_addr().unwrap().port();
-    let target_task = tokio::spawn(async move {
-        let (mut stream, _) =
-            tokio::time::timeout(Duration::from_secs(5), target.accept())
-                .await
-                .expect("timed out waiting for local HTTP target connection")
-                .expect("failed to accept local HTTP target connection");
-        let request = tokio::time::timeout(Duration::from_secs(5), async {
-            let mut request = Vec::new();
-            let mut chunk = [0; 512];
-            loop {
-                let length = stream.read(&mut chunk).await?;
-                if length == 0 {
-                    break;
-                }
-                request.extend_from_slice(&chunk[..length]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            std::io::Result::Ok(request)
-        })
-        .await
-        .expect("timed out waiting for HTTP request at local target")
-        .expect("failed to read HTTP request at local target");
-        assert!(request.starts_with(b"GET / HTTP/1.1\r\n"));
-        assert!(request.windows(4).any(|window| window == b"\r\n\r\n"));
-        stream
-            .write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\ndialer-proxy-ok",
-            )
-            .await
-            .unwrap();
-    });
 
     let api_port = available_port();
     let socks_port = available_port();
@@ -804,6 +774,40 @@ rules:
         vec![api_port, socks_port],
     )
     .expect("failed to start dialer-proxy integration client");
+    wait_for_initial_network_recovery(api_port).await;
+    let target_task = tokio::spawn(async move {
+        let (mut stream, _) =
+            tokio::time::timeout(Duration::from_secs(5), target.accept())
+                .await
+                .expect("timed out waiting for local HTTP target connection")
+                .expect("failed to accept local HTTP target connection");
+        let request = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut request = Vec::new();
+            let mut chunk = [0; 512];
+            loop {
+                let length = stream.read(&mut chunk).await?;
+                if length == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..length]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            std::io::Result::Ok(request)
+        })
+        .await
+        .expect("timed out waiting for HTTP request at local target")
+        .expect("failed to read HTTP request at local target");
+        assert!(request.starts_with(b"GET / HTTP/1.1\r\n"));
+        assert!(request.windows(4).any(|window| window == b"\r\n\r\n"));
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\ndialer-proxy-ok",
+            )
+            .await
+            .unwrap();
+    });
 
     let mut stream = tokio::time::timeout(
         Duration::from_secs(5),

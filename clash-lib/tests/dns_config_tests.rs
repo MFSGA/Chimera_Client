@@ -42,14 +42,50 @@ rules:
     )
 }
 
+fn reserve_occupied_dns_sockets() -> (
+    std::net::TcpListener,
+    std::net::UdpSocket,
+    std::net::SocketAddr,
+) {
+    fn is_retryable_bind_error(error: &std::io::Error) -> bool {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::AddrInUse
+                | std::io::ErrorKind::AddrNotAvailable
+                | std::io::ErrorKind::PermissionDenied
+        )
+    }
+
+    let mut last_error = None;
+    for _ in 0..64 {
+        let tcp = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(tcp) => tcp,
+            Err(error) if is_retryable_bind_error(&error) => {
+                last_error = Some(error);
+                continue;
+            }
+            Err(error) => panic!("failed to reserve TCP DNS port: {error}"),
+        };
+        let addr = tcp.local_addr().expect("failed to read DNS address");
+        match std::net::UdpSocket::bind(addr) {
+            Ok(udp) => return (tcp, udp, addr),
+            Err(error) if is_retryable_bind_error(&error) => {
+                last_error = Some(error);
+            }
+            Err(error) => panic!("failed to reserve UDP DNS port: {error}"),
+        }
+    }
+
+    panic!(
+        "failed to reserve matching TCP and UDP DNS ports after 64 attempts: {}",
+        last_error.expect("at least one bind attempt must fail")
+    );
+}
+
 #[test]
 #[serial_test::serial]
 fn occupied_dns_listeners_fail_runtime_startup() {
-    let tcp = std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("failed to reserve TCP DNS port");
-    let addr = tcp.local_addr().expect("failed to read DNS address");
-    let udp =
-        std::net::UdpSocket::bind(addr).expect("failed to reserve UDP DNS port");
+    let (tcp, udp, addr) = reserve_occupied_dns_sockets();
     let temp = tempfile::tempdir().expect("failed to create temp dir");
     let yaml = format!(
         r#"
