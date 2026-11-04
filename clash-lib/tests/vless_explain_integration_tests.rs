@@ -17,7 +17,10 @@ use tokio_rustls::TlsAcceptor;
 
 mod common;
 
-use common::{ClashInstance, Socks5UdpSession, send_http_request};
+use common::{
+    ClashInstance, Socks5UdpSession, send_http_request,
+    wait_for_initial_network_recovery,
+};
 
 const UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
 
@@ -452,6 +455,7 @@ rules:
     )
     .expect("failed to start VLESS UDP client");
 
+    wait_for_initial_network_recovery(client_api).await;
     let session = Socks5UdpSession::connect(socks_port).await;
     let payload = b"vless-udp-roundtrip";
     session

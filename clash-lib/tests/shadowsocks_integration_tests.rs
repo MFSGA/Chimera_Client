@@ -195,6 +195,7 @@ async fn integration_test_shadowsocks_tcp() {
     });
 
     let (_server, _client, socks_port, api_port) = start_shadowsocks_pair(false);
+    wait_for_initial_network_recovery(api_port).await;
     let mut stream = socks5_connect(socks_port, target_port).await;
     stream
         .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
