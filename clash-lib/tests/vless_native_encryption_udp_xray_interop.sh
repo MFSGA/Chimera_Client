@@ -19,6 +19,62 @@ TMP_DIR=$(mktemp -d /tmp/chimera-vless-native-udp-interop.XXXXXX)
 XRAY_PID=
 CLASH_PID=
 ECHO_PID=
+PORT_LOCK_PID=
+
+PORTS_FIFO="$TMP_DIR/ports.out"
+PORT_RELEASE_FIFO="$TMP_DIR/ports.release"
+mkfifo "$PORTS_FIFO" "$PORT_RELEASE_FIFO"
+python3 -u - "$PORTS_FIFO" "$PORT_RELEASE_FIFO" <<'PY' &
+import socket
+import sys
+
+ports_fifo, release_fifo = sys.argv[1:]
+socket_types = (socket.SOCK_STREAM, socket.SOCK_STREAM, socket.SOCK_DGRAM)
+reservations = {}
+with open(ports_fifo, "w", encoding="utf-8") as output:
+    try:
+        for socket_type in socket_types:
+            for _ in range(16):
+                reserved = socket.socket(socket.AF_INET, socket_type)
+                reserved.bind(("127.0.0.1", 0))
+                port = reserved.getsockname()[1]
+                if port not in reservations:
+                    reservations[port] = reserved
+                    break
+                reserved.close()
+            else:
+                raise RuntimeError("could not reserve distinct interop ports")
+    except Exception as error:
+        output.write(f"ERROR {error}\n")
+        output.flush()
+        raise
+    output.write(" ".join(str(port) for port in reservations) + "\n")
+    output.flush()
+
+with open(release_fifo, "r", encoding="utf-8") as release_stream:
+    for line in release_stream:
+        reserved = reservations.pop(int(line), None)
+        if reserved is not None:
+            reserved.close()
+
+for reserved in reservations.values():
+    reserved.close()
+PY
+PORT_LOCK_PID=$!
+if ! IFS= read -r PORT_LINE <"$PORTS_FIFO"; then
+    echo "failed to allocate interop ports" >&2
+    exit 1
+fi
+if [[ "$PORT_LINE" == ERROR\ * ]]; then
+    echo "$PORT_LINE" >&2
+    exit 1
+fi
+read -r XRAY_PORT SOCKS_PORT ECHO_PORT <<<"$PORT_LINE"
+exec 3>"$PORT_RELEASE_FIFO"
+
+release_reserved_port() {
+    printf '%s\n' "$1" >&3
+}
 
 cleanup_processes() {
     for pid in "${CLASH_PID:-}" "${XRAY_PID:-}" "${ECHO_PID:-}"; do
@@ -31,9 +87,14 @@ cleanup_processes() {
             wait "$pid" 2>/dev/null || true
         fi
     done
+    if [[ -n "$PORT_LOCK_PID" ]]; then
+        exec 3>&- 2>/dev/null || true
+        wait "$PORT_LOCK_PID" 2>/dev/null || true
+    fi
     CLASH_PID=
     XRAY_PID=
     ECHO_PID=
+    PORT_LOCK_PID=
 }
 
 on_exit() {
@@ -60,29 +121,6 @@ if [[ -z "$NATIVE_DECRYPTION" || -z "$NATIVE_ENCRYPTION" ]]; then
     echo "failed to parse Xray vlessenc output" >&2
     exit 3
 fi
-
-read -r XRAY_PORT SOCKS_PORT ECHO_PORT <<EOF_PORT
-$(python3 - <<'PY'
-import socket
-ports = []
-socket_types = (socket.SOCK_STREAM, socket.SOCK_STREAM, socket.SOCK_DGRAM)
-reservations = []
-for socket_type in socket_types:
-    for _ in range(16):
-        sock = socket.socket(socket.AF_INET, socket_type)
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-        if port not in ports:
-            ports.append(port)
-            reservations.append(sock)
-            break
-        sock.close()
-    else:
-        raise SystemExit("could not reserve distinct interop ports")
-print(*ports)
-PY
-)
-EOF_PORT
 
 ECHO_READY_FILE="$TMP_DIR/echo.ready"
 
@@ -132,6 +170,7 @@ EOF_CLASH
 "$XRAY_BIN" run -test -config "$TMP_DIR/xray.json"     >"$TMP_DIR/xray-config-test.log" 2>&1
 "$CLASH_BIN" --compatibility false -d "$TMP_DIR/clash-home" -c "$TMP_DIR/chimera.yaml" -t     >"$TMP_DIR/chimera-config-test.log" 2>&1
 
+release_reserved_port "$ECHO_PORT"
 python3 -u - "$ECHO_PORT" "$ECHO_READY_FILE" >"$TMP_DIR/echo.log" 2>&1 <<'PY' &
 import pathlib
 import socket
@@ -163,6 +202,7 @@ if [[ ! -f "$ECHO_READY_FILE" ]]; then
 fi
 
 mkdir -p "$TMP_DIR/clash-home"
+release_reserved_port "$XRAY_PORT"
 "$XRAY_BIN" run -config "$TMP_DIR/xray.json"     >"$TMP_DIR/xray.log" 2>&1 &
 XRAY_PID=$!
 
@@ -188,6 +228,7 @@ else:
     raise SystemExit(f"Xray did not listen on 127.0.0.1:{port} within 12s")
 PY
 
+release_reserved_port "$SOCKS_PORT"
 "$CLASH_BIN" --compatibility false -d "$TMP_DIR/clash-home" -c "$TMP_DIR/chimera.yaml"     >"$TMP_DIR/chimera.log" 2>&1 &
 CLASH_PID=$!
 
