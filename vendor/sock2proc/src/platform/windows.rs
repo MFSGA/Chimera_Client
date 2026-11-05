@@ -389,7 +389,7 @@ fn find_udp_v6_pid(
 fn get_process_path(pid: u32) -> Result<String, io::Error> {
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if handle == 0 {
+        if handle.is_null() {
             return Err(io::Error::last_os_error());
         }
 
