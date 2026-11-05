@@ -65,15 +65,26 @@ read -r XRAY_PORT SOCKS_PORT ECHO_PORT <<EOF_PORT
 $(python3 - <<'PY'
 import socket
 ports = []
-for _ in range(3):
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    ports.append(sock.getsockname()[1])
-    sock.close()
+socket_types = (socket.SOCK_STREAM, socket.SOCK_STREAM, socket.SOCK_DGRAM)
+reservations = []
+for socket_type in socket_types:
+    for _ in range(16):
+        sock = socket.socket(socket.AF_INET, socket_type)
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        if port not in ports:
+            ports.append(port)
+            reservations.append(sock)
+            break
+        sock.close()
+    else:
+        raise SystemExit("could not reserve distinct interop ports")
 print(*ports)
 PY
 )
 EOF_PORT
+
+ECHO_READY_FILE="$TMP_DIR/echo.ready"
 
 cat >"$TMP_DIR/xray.json" <<EOF_XRAY
 {
@@ -121,12 +132,14 @@ EOF_CLASH
 "$XRAY_BIN" run -test -config "$TMP_DIR/xray.json"     >"$TMP_DIR/xray-config-test.log" 2>&1
 "$CLASH_BIN" --compatibility false -d "$TMP_DIR/clash-home" -c "$TMP_DIR/chimera.yaml" -t     >"$TMP_DIR/chimera-config-test.log" 2>&1
 
-python3 -u - "$ECHO_PORT" >"$TMP_DIR/echo.log" 2>&1 <<'PY' &
+python3 -u - "$ECHO_PORT" "$ECHO_READY_FILE" >"$TMP_DIR/echo.log" 2>&1 <<'PY' &
+import pathlib
 import socket
 import sys
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind(("127.0.0.1", int(sys.argv[1])))
+pathlib.Path(sys.argv[2]).write_text("ready", encoding="utf-8")
 
 while True:
     data, addr = sock.recvfrom(65535)
@@ -134,9 +147,47 @@ while True:
 PY
 ECHO_PID=$!
 
+for _ in {1..120}; do
+    if ! kill -0 "$ECHO_PID" 2>/dev/null; then
+        echo "UDP echo listener exited before becoming ready" >&2
+        exit 1
+    fi
+    if [[ -f "$ECHO_READY_FILE" ]]; then
+        break
+    fi
+    sleep 0.1
+done
+if [[ ! -f "$ECHO_READY_FILE" ]]; then
+    echo "UDP echo listener did not become ready within 12s" >&2
+    exit 1
+fi
+
 mkdir -p "$TMP_DIR/clash-home"
 "$XRAY_BIN" run -config "$TMP_DIR/xray.json"     >"$TMP_DIR/xray.log" 2>&1 &
 XRAY_PID=$!
+
+python3 - "$XRAY_PORT" "$XRAY_PID" <<'PY'
+import os
+import socket
+import sys
+import time
+
+port, pid = int(sys.argv[1]), int(sys.argv[2])
+deadline = time.monotonic() + 12
+while time.monotonic() < deadline:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.25):
+            break
+    except OSError:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            raise SystemExit("Xray exited before becoming ready")
+        time.sleep(0.1)
+else:
+    raise SystemExit(f"Xray did not listen on 127.0.0.1:{port} within 12s")
+PY
+
 "$CLASH_BIN" --compatibility false -d "$TMP_DIR/clash-home" -c "$TMP_DIR/chimera.yaml"     >"$TMP_DIR/chimera.log" 2>&1 &
 CLASH_PID=$!
 
