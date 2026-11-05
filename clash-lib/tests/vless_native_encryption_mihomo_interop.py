@@ -37,19 +37,24 @@ def require_executable(name: str, binary: pathlib.Path) -> None:
         raise SystemExit(f"{name} must point to an executable: {binary}")
 
 
-def reserve_tcp_ports(count: int) -> dict[int, socket.socket]:
-    """Hold unique loopback TCP ports until each service is ready to bind."""
+def reserve_service_ports(
+    socket_types: tuple[int, ...],
+) -> dict[int, socket.socket]:
+    """Hold unique loopback ports with the socket type each service needs."""
     reservations: dict[int, socket.socket] = {}
     try:
-        while len(reservations) < count:
-            reserved = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            reserved.bind(("127.0.0.1", 0))
-            port = reserved.getsockname()[1]
-            if port in reservations:
+        for socket_type in socket_types:
+            for _ in range(16):
+                reserved = socket.socket(socket.AF_INET, socket_type)
+                reserved.bind(("127.0.0.1", 0))
+                port = reserved.getsockname()[1]
+                if port not in reservations:
+                    reservations[port] = reserved
+                    break
                 reserved.close()
-                continue
-            reservations[port] = reserved
-    except OSError:
+            else:
+                raise RuntimeError("could not reserve distinct interop ports")
+    except Exception:
         close_reservations(reservations)
         raise
     return reservations
@@ -236,11 +241,18 @@ def run_mode(
 ) -> None:
     with tempfile.TemporaryDirectory(prefix="chimera-mihomo-native-") as temp:
         work = pathlib.Path(temp)
-        reservations = reserve_tcp_ports(4)
+        reservations = reserve_service_ports(
+            (
+                socket.SOCK_STREAM,
+                socket.SOCK_STREAM,
+                socket.SOCK_STREAM,
+                socket.SOCK_DGRAM,
+            )
+        )
         server_port, socks_port, echo_port, udp_echo_port = reservations
         stop = threading.Event()
-        tcp_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        udp_listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        tcp_listener = reservations.pop(echo_port)
+        udp_listener = reservations.pop(udp_echo_port)
         server_process: subprocess.Popen[bytes] | None = None
         client_process: subprocess.Popen[bytes] | None = None
         tcp_thread: threading.Thread | None = None
@@ -250,13 +262,8 @@ def run_mode(
         chimera_log = work / "chimera.log"
 
         try:
-            release_port(reservations, echo_port)
-            tcp_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            tcp_listener.bind(("127.0.0.1", echo_port))
             tcp_thread = start_tcp_echo(tcp_listener, stop)
 
-            release_port(reservations, udp_echo_port)
-            udp_listener.bind(("127.0.0.1", udp_echo_port))
             udp_thread = start_udp_echo(udp_listener, stop)
 
             decryption = server_key.replace(".native.", f".{mode}.")
