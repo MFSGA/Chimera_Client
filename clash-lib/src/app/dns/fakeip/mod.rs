@@ -1,6 +1,6 @@
 use std::{net, sync::Arc};
 
-use crate::{Error, common::trie};
+use crate::{Error, common::trie, config::def::FakeIpFilterMode};
 
 use async_trait::async_trait;
 use byteorder::{BigEndian, ByteOrder};
@@ -57,6 +57,7 @@ pub struct FakeDns {
     gateway: u32,
     cursor: u32,
     skipped_hostnames: Option<trie::StringTrie<bool>>,
+    filter_mode: FakeIpFilterMode,
     ipnet: ipnet::IpNet,
     store: Box<dyn Store>,
 }
@@ -181,6 +182,7 @@ impl FakeDns {
             gateway,
             cursor: 0,
             skipped_hostnames: opt.skipped_hostnames,
+            filter_mode: FakeIpFilterMode::Blacklist,
             ipnet: opt.ipnet,
             store: opt.store,
         })
@@ -237,10 +239,21 @@ impl FakeDns {
         }
     }
 
+    pub fn with_filter_mode(mut self, filter_mode: FakeIpFilterMode) -> Self {
+        self.filter_mode = filter_mode;
+        self
+    }
+
     pub fn should_skip(&self, domain: &str) -> bool {
-        match &self.skipped_hostnames {
-            None => false,
-            Some(host) => host.search(&domain.to_ascii_lowercase()).is_some(),
+        let matched = self
+            .skipped_hostnames
+            .as_ref()
+            .is_some_and(|host| host.search(&domain.to_ascii_lowercase()).is_some());
+        // Mihomo blacklist: matching entries use real DNS.
+        // Mihomo whitelist: only matching entries receive Fake-IP.
+        match self.filter_mode {
+            FakeIpFilterMode::Blacklist => matched,
+            FakeIpFilterMode::Whitelist => !matched,
         }
     }
 
@@ -597,6 +610,37 @@ mod tests {
         assert!(pool.lookup("baz.com").await.is_err());
         assert_eq!(pool.lookup("foo.com").await.unwrap(), foo);
         assert_eq!(pool.lookup("bar.com").await.unwrap(), bar);
+    }
+
+    #[test]
+    fn whitelist_only_generates_fake_ip_for_matching_hosts() {
+        use crate::config::def::FakeIpFilterMode;
+        let mut patterns = trie::StringTrie::new();
+        patterns.insert("*.protected.example", Arc::new(true));
+        let pool = FakeDns::new(Opts {
+            ipnet: "192.168.0.0/30".parse().unwrap(),
+            skipped_hostnames: Some(patterns),
+            store: Box::new(InMemStore::new(10)),
+        })
+        .unwrap()
+        .with_filter_mode(FakeIpFilterMode::Whitelist);
+
+        // Mihomo's skipper inverts the match only in whitelist mode.
+        assert!(!pool.should_skip("api.protected.example"));
+        assert!(!pool.should_skip("API.PROTECTED.EXAMPLE"));
+        assert!(pool.should_skip("unlisted.example"));
+
+        let empty = FakeDns::new(Opts {
+            ipnet: "192.168.0.0/30".parse().unwrap(),
+            skipped_hostnames: None,
+            store: Box::new(InMemStore::new(10)),
+        })
+        .unwrap()
+        .with_filter_mode(FakeIpFilterMode::Whitelist);
+        assert!(
+            empty.should_skip("any.example"),
+            "empty whitelist must not generate Fake-IP"
+        );
     }
 
     #[tokio::test]

@@ -123,6 +123,44 @@ fn s00_fake_ip_filter_and_range_remain_legacy_values() {
 }
 
 #[test]
+fn mihomo_whitelist_mode_reaches_runtime_dns_configuration() {
+    let dns = load(
+        r#"
+  enable: true
+  enhanced-mode: fake-ip
+  nameserver: [1.1.1.1]
+  default-nameserver: [223.5.5.5]
+  fake-ip-filter-mode: whitelist
+  fake-ip-filter: ["*.protected.example"]
+"#,
+        false,
+    );
+    assert_eq!(format!("{:?}", dns.fake_ip_filter_mode), "Whitelist");
+    assert_eq!(dns.fake_ip_filter, ["*.protected.example"]);
+}
+
+#[test]
+fn mihomo_unsupported_fake_ip_filter_sources_fail_instead_of_leaking() {
+    for pattern in [
+        "rule-set:proxy-filter",
+        "geosite:gfw",
+        "RULE-SET,proxy-filter,fake-ip",
+        "GEOSITE,gfw,fake-ip",
+        "MATCH,fake-ip",
+    ] {
+        let body = format!(
+            "  enable: true\n  enhanced-mode: fake-ip\n  nameserver: [1.1.1.1]\n  default-nameserver: [223.5.5.5]\n  fake-ip-filter-mode: whitelist\n  fake-ip-filter: ['{pattern}']\n"
+        );
+        let diagnostic = error(&body);
+        assert!(
+            diagnostic.contains("dns.fake-ip-filter")
+                && diagnostic.contains(pattern),
+            "unsupported Mihomo filter `{pattern}` was not rejected clearly: {diagnostic}"
+        );
+    }
+}
+
+#[test]
 fn s00_nameserver_policy_single_string_keeps_original_server() {
     let dns = load(
         r#"
