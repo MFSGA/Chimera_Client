@@ -171,3 +171,9 @@ S01 准入必须满足：金标准用例在目标 HEAD 实际运行；未知新�
 - 在 `tun.enable && dns.enable && enhanced-mode: fake-ip` 下，`dns.proxy-server-nameserver` 明确拒绝 `#proxy` 代理路由（防止节点解析依赖自身）与 `dhcp://` 系统网络服务 DNS 发现（可能绕过 utun DNS 劫持）；`dns.proxy-server-nameserver-policy` 的选中上游也拒绝 `dhcp://`。在内部配置/热重载的 `Config::validate` 执行相同门禁。普通非 TUN 配置的旧 `#proxy` 语法仍保留。该切片不改变 `dns.nameserver` 的旧业务出口配置。
 - 先写 `dns_config_tests::fake_ip_tun_proxy_bootstrap_rejects_proxy_routing_and_dhcp` 否定测试，修复前实际失败；随后实现并加入 `internal_tun_fake_ip_rejects_proxy_bootstrap_dialer_and_dhcp`、策略 DHCP 否定测试和非 TUN 兼容测试。
 - **边界**：本切片阻断两种已知的危险引导方式，但未证明其他 DNS 上游的物理 NIC 出口均受控；`default-nameserver`、DNS policy 上游的 bootstrap、macOS service-scoped resolver、真实 NIC/utun 抓包和 Mihomo 二进制互操作仍需后续验证。没有改动宿主机 DNS、路由、TUN、Network Extension 或提升权限。
+
+## 2026-11-06 P0: internal default DNS bootstrap validation (local isolated branch)
+
+- Baseline: `codex/macos-tun-fakeip-dns-privacy` at `db728d5`; fixed read-only Mihomo submodule gitlink `63bd52ec794b7051569b76ede2f6cdbf4c091fda`, compared with `config/config.go::parseDNS` (default nameserver must be IP-based).
+- `Config::validate` now enforces nonempty, IP-literal `dns.default-nameserver` without `#proxy` or DHCP even for internal configuration and reload, closing a path that bypassed YAML conversion checks. IP-literal DoH remains accepted. This is stricter than accepting system resolver discovery and is deliberate for bootstrap isolation.
+- Regression: `internal_default_nameserver_bootstrap_rejects_non_ip_and_proxy_dialers` first failed to compile with the missing validator, then passed after implementation. DNS config integration and strict Clippy pass. This is configuration-level fail-closed, **not** proof of no macOS system DNS leakage; physical NIC/utun capture and L2 review remain required.
