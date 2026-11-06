@@ -559,6 +559,50 @@ fn proxy_server_nameserver_cannot_fall_back_when_all_entries_are_skipped() {
 }
 
 #[test]
+fn fake_ip_tun_proxy_bootstrap_rejects_proxy_routing_and_dhcp() {
+    // Mihomo's ProxyServerNameserver uses parseNameServer(..., respectRules=false).
+    // A proxy-selected bootstrap could recursively require the very node it resolves.
+    // DHCP discovers a service-scoped resolver, outside the TUN DNS hijack contract.
+    for (upstream, reason) in [
+        ("'udp://9.9.9.9#proxy=PROXY'", "#proxy"),
+        ("'dhcp://en0'", "DHCP"),
+    ] {
+        let yaml = base_config(&format!(
+            "  enable: true\n  enhanced-mode: fake-ip\n  nameserver: [1.1.1.1]\n  default-nameserver: [223.5.5.5]\n  proxy-server-nameserver: [{upstream}]\n"
+        ))
+        .replacen("dns:\n", "tun:\n  enable: true\ndns:\n", 1);
+        let error = parse_error(yaml).to_string();
+        assert!(
+            error.contains("proxy-server-nameserver") && error.contains(reason),
+            "{upstream} must fail closed: {error}"
+        );
+    }
+}
+
+#[test]
+fn fake_ip_tun_node_policy_rejects_dhcp_service_scoped_resolver() {
+    let yaml = base_config(
+        "  enable: true\n  enhanced-mode: fake-ip\n  nameserver: [1.1.1.1]\n  default-nameserver: [223.5.5.5]\n  proxy-server-nameserver: [9.9.9.9]\n  proxy-server-nameserver-policy:\n    'node.example': 'dhcp://en0'\n"
+    ).replacen("dns:\n", "tun:\n  enable: true\ndns:\n", 1);
+    let error = parse_error(yaml).to_string();
+    assert!(
+        error.contains("proxy-server-nameserver-policy") && error.contains("DHCP"),
+        "{error}"
+    );
+}
+
+#[test]
+fn non_tun_proxy_bootstrap_preserves_legacy_proxy_modifier() {
+    let dns = parse_dns(&base_config(
+        "  enable: true\n  nameserver: [1.1.1.1]\n  default-nameserver: [223.5.5.5]\n  proxy-server-nameserver: ['udp://9.9.9.9#proxy=PROXY']\n",
+    ));
+    assert_eq!(
+        dns.proxy_server_nameserver.unwrap()[0].proxy.as_deref(),
+        Some("PROXY")
+    );
+}
+
+#[test]
 fn mihomo_proxy_server_nameserver_policy_preserves_scalar_and_multiple_upstreams() {
     let yaml = base_config(
         r#"
@@ -612,6 +656,27 @@ fn mihomo_unsupported_proxy_server_policy_sources_are_rejected() {
         assert!(
             error.contains("proxy-server-nameserver-policy"),
             "unsupported selector must be explicitly rejected: {error}"
+        );
+    }
+}
+
+#[test]
+fn mihomo_proxy_server_policy_rejects_whitespace_and_malformed_wildcards() {
+    for selector in [
+        " node.example",
+        "node.example ",
+        "node.example, second.example",
+        "node.example other.example",
+        "partial*.node.example",
+        "node.+.example",
+    ] {
+        let yaml = base_config(&format!(
+            "  enable: true\n  nameserver: [1.1.1.1]\n  proxy-server-nameserver: [8.8.8.8]\n  proxy-server-nameserver-policy:\n    '{selector}': 9.9.9.9\n"
+        ));
+        let error = parse_error(yaml).to_string();
+        assert!(
+            error.contains("proxy-server-nameserver-policy"),
+            "selector {selector:?} was not explicitly rejected: {error}"
         );
     }
 }
@@ -727,6 +792,27 @@ fn mihomo_respect_rules_requires_dedicated_proxy_bootstrap() {
     assert!(dns.respect_rules);
     assert_eq!(dns.nameserver[0].proxy.as_deref(), Some("PROXY"));
     assert_eq!(dns.proxy_server_nameserver.as_ref().unwrap().len(), 1);
+}
+
+#[test]
+fn mihomo_nameserver_policy_rejects_unsafe_whitespace_and_wildcards() {
+    for selector in [
+        " example.com",
+        "example.com ",
+        "one.example, two.example",
+        "example.com bad.test",
+        "prefix*.example.com",
+        "example.+.com",
+    ] {
+        let yaml = base_config(&format!(
+            "  enable: true\n  nameserver: [1.1.1.1]\n  nameserver-policy:\n    '{selector}': 9.9.9.9\n"
+        ));
+        let error = parse_error(yaml).to_string();
+        assert!(
+            error.contains("nameserver-policy"),
+            "selector {selector:?} was not explicitly rejected: {error}"
+        );
+    }
 }
 
 #[test]
