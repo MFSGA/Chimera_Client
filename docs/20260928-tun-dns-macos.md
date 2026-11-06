@@ -176,3 +176,27 @@ System DNS 指向一个与 fake-IP 池、TUN 网关子网及 route exclusions �
 - 从原始 YAML `dns.fake-ip-ttl` 到内部 DNS 配置、解析器和共享 DNS handler 接通，影响普通 DNS server、TUN UDP/TCP hijack 与 DNS API 共用的应答函数。仍未支持运行时完整 Fake IPv6/TUN 抓包认证，不可据此宣称全系统 DNS 零泄漏。
 - Fake-IP 排除域名 A/AAAA 的响应继续使用真实上游 DNS 原始 RRset（包含实际 TTL），**不能**将合成 Fake-IP TTL 写入真实记录；带有 hosts 改写的路径也需后续独立验收。PTR 仍保留现有独立 TTL，不因 fake-ip-ttl 改变。
 - 原 Chimera 合成 Fake-IP TTL 默认 60 秒；本轮默认改为 Mihomo 一致的 1 秒，属于向后兼容的可观察行为变化，需 L2 审查；如必须保留 60 秒，可显式设置 `fake-ip-ttl: 60`。定向测试覆盖默认、0/负数钳制、自定义 45 秒、合成 A/AAAA、过滤排除真实 TTL 与真实配置构造；实际系统 DNS 和物理 NIC 未测试。
+
+## 2026-11-06 XHTTP 二次连接系统 DNS 旁路保护（L2 待审）
+
+- 本地起点 `4cdac10187ebb2075f56b24e63d6ed10ab7156ca`，隔离分支 `codex/macos-tun-fakeip-dns-privacy`；本地 `master=e42dabe74282c77245da1023de0b828830928216`、`origin/master=902c5e7702960ab4f978a014d7079c79d17079fd`。固定参考 Mihomo gitlink `63bd52ec794b7051569b76ede2f6cdbf4c091fda` 未变更。
+- 源码路径：`proxy/transport/xhttp/mod.rs::connect_endpoint_stream` 对 HTTP/2 `download-settings` 独立下行和 HTTP/1.1 后续 upload reconnect 直接调用 `tokio::net::lookup_host`，并没有接收专用 `proxy-server-nameserver` 的解析器。macOS 的 service-scoped DNS 查询不一定经过 utun，`dns-hijack: true` 无法证明对此路径生效；只要 secondary endpoint 是域名，就可能触发系统 resolver。
+- 在 `tun.enable && dns.enable && enhanced-mode: fake-ip` 时，内部配置 `Config::validate` 拒绝需要系统 DNS 的 XHTTP HTTP/1.1 hostname 重连、HTTP/2 非 IP 字面量的有效 `download-settings` 终端；包括 `xhttp-opts.extra.download-settings` 优先于顶层 download-settings 和隐式继承主节点域名的情形。只输出选项名，不回显可能敏感的 endpoint。普通 HTTP/2 代理节点使用已有专用节点解析，不会因此被拒；`download-settings` 指向 IP literal 仍可用。HTTP/3 已使用包含解析器/connector 的单独连接路径，此门禁不机械应用于 HTTP/3。
+- 影响：原来允许的 TUN + Fake-IP + XHTTP split-downlink 域名或 HTTP/1.1 节点域名现在会被拒绝。可暂时使用受控 IP literal secondary endpoint（保留 TLS SNI / 证书校验设置），或者在**未启用上述隐私敏感组合**时保留旧行为。此拒绝不等于端到端 DNS 隔离认证。
+- 实际验证边界：这只是静态/热重载和离线单测的 fail-closed 防线；代理 provider 动态下发的节点和其它仍调用系统 `lookup_host` 的模块（包括 AnyTLS inbound fallback）不一定受此特定校验保护；Network Extension DNS Proxy、浏览器 DoH/DoT、自定义系统 service-scoped resolver、跨网卡 IPv4/IPv6、睡眠/断线/切网及真实抓包仍未完成，不能声称全系统零泄漏。
+
+### macOS 系统级 DNS 受控验收矩阵（尚未执行）
+
+> 以下是**授权的独立 macOS 测试机**验收计划，不是本轮运行日志。不得在用户日常网络或与其它代理实例共用的宿主机自动执行网络设置或特权抓包。
+
+| 场景 | 必须核实的事实 | 当前可用证据 / 缺口 |
+| --- | --- | --- |
+| 系统 resolver 正常请求 | `scutil --dns` 中活动 service-scoped resolver 的顺序、接口与 DNS 服务器；向专用测试域名 A/AAAA/TXT 发请求，证明是否进入 Chimera DNS listener 或 utun | 目前只有 listener/TUN 内部单测；service-scoped ownership 无证据 |
+| UDP/TCP 53 与 IPv4/IPv6 | 在物理 NIC 和 utun 同时抓包，只比较专用 canary QNAME 的出现位置；包括 UDP 截断转 TCP、TCP 多问题拒绝和 IPv6 | 目前无受权 NIC 抓包；不应将局部 TUN 劫持称为物理 NIC 禁止出站 |
+| XHTTP H2 split / H1 reconnect | 有意配置域名 secondary endpoint，TUN+Fake-IP 加载应在启动前拒绝；IP literal 保留行为。模拟动态 Provider / 非 TUN 时单独检查 | 配置校验与离线测试覆盖静态/热重载；Provider 仍有缺口 |
+| 网络切换 / Wi-Fi → 其它物理 NIC / 睡眠恢复 | 触发系统 DNS resolver 变化、上游断线、DNS 超时并记录是否重新建立受控 ownership；验证失败时没有退回 service DNS | 现有 network epoch/重置只验证内部 DNS 连接，不是 OS 级 ownership |
+| TUN 关闭 / DNS Proxy Extension 丢失授权 | 用专用 canary QNAME 验证系统入口是否依旧受控；如果严格防泄漏能力不可用，受保护请求必须拒绝，不可静默调用系统 resolver | 没有安装/启用 DNS Proxy Extension，也没有可证明的 fail-closed OS 接管事务 |
+| 真实及受限出站 | 区分业务明确允许的 DIRECT、代理节点 bootstrap、显式 `fake-ip-filter` 和非受保护流量；只断言指定 canary 的未授权明文泄漏 | 需要维护者明确保护域集合及合法例外，不能泛称物理 NIC 不能有任何 DNS |
+
+- 执行策略：先取得测试机所有者的明确许可，记录活动服务的原始配置以便回滚；用测试专用、不包含真实订阅或用户域名的 canary；通过系统**只读**检查与有权限的专用抓包并行关联，记录不含私有 QNAME 的摘要。没有 DNS Proxy Extension 或等效受管控制面时，验证结论只能是“覆盖不完整”，不能写“零泄漏”。
+- 本地验收（macOS arm64，`--no-default-features --features tun,ring --locked`）：`cargo test -p clash-lib --lib -j 6` 843 passed / 0 failed / 11 ignored；`cargo test -p clash-lib --test dns_config_tests -j 6` 30 passed / 0 failed；`cargo clippy -p clash-lib --all-targets -j 6 -- -D warnings`、`cargo check -p clash-rs --no-default-features --features standard,aws-lc-rs --locked`、`cargo fmt --all -- --check`、`git diff --check` 通过。无 TUN 组合编译通过，但过滤特定 TUN 测试实际运行 0 项，不计作行为验收。离线测试先证实旧实现错误接受需系统 DNS 的 XHTTP secondary hostname，再验证配置转换、`extra.download-settings` 优先级、内部热重载的拒绝和 IP-literal/普通主节点的保留。
