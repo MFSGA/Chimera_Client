@@ -41,7 +41,8 @@
 |---|---|---|---|---|
 | `dns.resolver-profiles` | **S01 已新增编译期输入与严格服务器列表校验**，但尚无实际查询执行；可选，不配置时旧行为不变 | implemented (parse/compile only)，执行尚未接线 | 后续 S02/S03 实现实际 resolver/egress；目前只声明 profile 不会改变 DNS 查询 | 指南 §6、§17；`config/def.rs`、`app/dns/policy.rs`、`dns_policy_s01_tests.rs` |
 | `dns.policy-rules` | **S01 已实现 QNAME+QTYPE 有序编译/纯匹配及加载校验**；运行时对非空规则显式拒绝启动（执行器尚未实现），不能宣称 DNS 出口已生效 | implemented (parse/compile only)，runtime gated | S02/S03 完成 DNS query planning/egress 后再开放运行，不静默忽略 `on-failure: fail` | 指南 §6、§17；`app/dns/policy.rs`、`resolver/mod.rs`、`dns_policy_s01_tests.rs` |
-| `fake-ip-filter-mode: rule/whitelist` | 未见实现（未在本轮测试 Mihomo 输入） | C（条件成立） | 不将 Mihomo 原字段偷偷映射成新行为；未来确需支持则另立决策 | 指南 §2.2、§2.4 |
+| `fake-ip-filter-mode: whitelist` | **本地迭代分支已实现** Mihomo IPv4 Fake-IP 白名单语义：仅匹配的域名使用 Fake-IP，其他域名会使用真实 DNS；模式名称大小写不敏感。完整高级域名匹配及 Fake-IPv6 未实机验证 | A（有意 opt-in） | 严格隐私配置仍推荐 `blacklist` + 空过滤列表；`whitelist` 会让未列出的代理域名使用真实解析 | 本地 `ref-mihomo` 63bd52e `component/fakeip/skipper.go`、`constant/dns.go`；新增 FakeDns/resolver/配置测试 |
+| `fake-ip-filter-mode: rule` | 尚未实现，解析时明确拒绝。`fake-ip-filter` 中的 `rule-set:`、`geosite:`、Mihomo 规则表达式也显式拒绝，防止字面匹配导致隐私意外降级 | C（条件成立） | 不允许静默映射到 blacklist / whitelist；需要先完成有序规则及 RuleSet/GeoSite 运行语义 | `config/def.rs`、`app/dns/config.rs`、`dns_legacy_golden_tests.rs` |
 | `proxy-server-nameserver-policy`、`direct-nameserver-follow-policy` | 未见声明/执行 | C（条件成立） | 老配置未支持时必须给未来明确错误/警告，而不是以为生效 | 指南 §2.2 |
 | `cache-algorithm`、`prefer-h3`、`fallback-lazy-query` | 未见原生承诺；不能因此把现存缓存和 fallback 功能标为缺失 | C（条件成立） | 保留实际已有缓存；不要求照搬 Mihomo 的调参名称 | 指南 §2.2 |
 

@@ -135,6 +135,7 @@ fn validate_default_nameserver_bootstrap(
 impl Config {
     pub fn validate(self) -> Result<Self, crate::Error> {
         validate_default_nameserver_bootstrap(&self.dns.default_nameserver)?;
+        dns::config::validate_fake_ip_filter_patterns(&self.dns.fake_ip_filter)?;
         #[cfg(not(feature = "tun"))]
         if self.tun.enable {
             return Err(Error::InvalidConfig(

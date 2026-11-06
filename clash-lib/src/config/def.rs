@@ -746,11 +746,30 @@ pub struct DNS {
     pub policy_rules: Vec<DnsPolicyRuleDef>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum FakeIpFilterMode {
     #[default]
     Blacklist,
+    Whitelist,
+}
+
+impl<'de> Deserialize<'de> for FakeIpFilterMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Mihomo's FilterMode.UnmarshalText first lowercases the mode name.
+        let mode = String::deserialize(deserializer)?;
+        match mode.to_ascii_lowercase().as_str() {
+            "blacklist" => Ok(Self::Blacklist),
+            "whitelist" => Ok(Self::Whitelist),
+            _ => Err(serde::de::Error::unknown_variant(
+                &mode,
+                &["blacklist", "whitelist"],
+            )),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1170,11 +1189,27 @@ proxy:
 
     #[test]
     fn mihomo_unsupported_fake_ip_filter_modes_are_not_silently_ignored() {
-        for mode in ["whitelist", "rule"] {
+        for mode in ["rule", "RULE"] {
             let yaml = format!("dns:\n  fake-ip-filter-mode: {mode}");
             assert!(
                 yaml.parse::<Config>().is_err(),
                 "unsupported {mode} mode must be rejected rather than treated as blacklist"
+            );
+        }
+    }
+
+    #[test]
+    fn mihomo_fake_ip_whitelist_mode_parses_explicitly() {
+        for mode in ["whitelist", "WhiteList", "WHITELIST"] {
+            let yaml = format!(
+                "dns:\n  fake-ip-filter-mode: {mode}\n  fake-ip-filter:\n    - '*.example.com'"
+            );
+            let cfg: Config = yaml
+                .parse()
+                .expect("Mihomo whitelist mode should be recognized");
+            assert_eq!(
+                cfg.dns.fake_ip_filter_mode,
+                super::FakeIpFilterMode::Whitelist
             );
         }
     }

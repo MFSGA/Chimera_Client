@@ -1895,6 +1895,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mihomo_whitelist_only_protects_selected_domains_from_real_dns() {
+        use crate::config::def::FakeIpFilterMode;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let client = Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(203, 0, 113, 44)),
+            hits: hits.clone(),
+            id: "observed-upstream",
+        });
+        let mut filter = crate::common::trie::StringTrie::new();
+        filter.insert("*.protected.example", Arc::new(true));
+        let mut resolver = EnhancedResolver::from_clients(vec![client], false);
+        resolver.fake_dns = Some(Arc::new(RwLock::new(
+            crate::app::dns::fakeip::FakeDns::new(crate::app::dns::fakeip::Opts {
+                ipnet: "198.18.0.0/30".parse().unwrap(),
+                skipped_hostnames: Some(filter),
+                store: Box::new(crate::app::dns::fakeip::InMemStore::new(2)),
+            })
+            .unwrap()
+            .with_filter_mode(FakeIpFilterMode::Whitelist),
+        )));
+
+        assert!(resolver.should_fake_ip("api.protected.example").await);
+        assert!(!resolver.should_fake_ip("unlisted.example").await);
+
+        assert_eq!(
+            resolver
+                .resolve_v4("api.protected.example", true)
+                .await
+                .unwrap(),
+            Some(Ipv4Addr::new(198, 18, 0, 2)),
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "whitelisted domain must not be resolved upstream"
+        );
+        assert!(
+            resolver
+                .fake_ip_for_host("api.protected.example")
+                .await
+                .is_some()
+        );
+
+        assert_eq!(
+            resolver.resolve_v4("unlisted.example", true).await.unwrap(),
+            Some(Ipv4Addr::new(203, 0, 113, 44)),
+        );
+        assert!(
+            hits.load(Ordering::SeqCst) > 0,
+            "unlisted domain must use the real resolver"
+        );
+        assert!(
+            resolver
+                .fake_ip_for_host("unlisted.example")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn hosts_with_other_address_family_return_no_result() {
         let mut hosts = crate::common::trie::StringTrie::new();
         hosts.insert("v6-only.test", Arc::new("2001:db8::1".parse().unwrap()));

@@ -453,6 +453,26 @@ profile: {{}}
             .expect("Fake-IP TUN with proxy remote domain mode must be valid");
     }
 
+    #[test]
+    fn internal_dns_config_cannot_bypass_unsupported_mihomo_filter_gate() {
+        let mut cfg = parse_config("");
+        cfg.dns.enable = true;
+        cfg.dns.nameserver = vec!["1.1.1.1".to_owned()];
+        cfg.dns.enhanced_mode = def::DNSMode::FakeIp;
+        let mut internal =
+            convert(cfg).expect("build a valid internal Fake-IP config");
+        internal.dns.fake_ip_filter = vec!["geosite:proxy".to_owned()];
+        let err = match crate::Config::Internal(internal).try_parse() {
+            Ok(_) => {
+                panic!("internal config must reject unsupported filter expression")
+            }
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, Error::InvalidConfig(msg) if msg.contains("dns.fake-ip-filter") && msg.contains("geosite:proxy"))
+        );
+    }
+
     #[cfg(feature = "tun")]
     #[test]
     fn internal_tun_fake_ip_cannot_bypass_proxy_dns_privacy_gate() {
