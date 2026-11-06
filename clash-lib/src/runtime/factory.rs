@@ -438,6 +438,7 @@ async fn build_auxiliary_dns_resolver(
             .expect("static fake-ip-range must parse"),
         fake_ip_range6: None,
         fake_ip_filter: Vec::new(),
+        fake_ip_filter_mode: def::FakeIpFilterMode::Blacklist,
         service_discovery_mode: def::DnsServiceDiscoveryMode::Legacy,
         store_fake_ip: false,
         store_smart_stats: false,

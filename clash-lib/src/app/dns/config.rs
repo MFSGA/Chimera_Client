@@ -5,7 +5,7 @@ use crate::{
     common::trie,
     config::def::{
         DNSListen, DNSMode, DnsServiceDiscoveryMode, DohListenDef, DotListenDef,
-        EdnsClientSubnet as DefEdnsClientSubnet,
+        EdnsClientSubnet as DefEdnsClientSubnet, FakeIpFilterMode,
     },
 };
 pub use chimera_dns::{DNSListenAddr, DoH3Config, DoHConfig, DoTConfig};
@@ -73,6 +73,7 @@ pub struct Config {
     pub fake_ip_range: ipnet::IpNet,
     pub fake_ip_range6: Option<ipnet::IpNet>,
     pub fake_ip_filter: Vec<String>,
+    pub fake_ip_filter_mode: FakeIpFilterMode,
     pub service_discovery_mode: DnsServiceDiscoveryMode,
     pub store_fake_ip: bool,
     pub store_smart_stats: bool,
@@ -382,6 +383,37 @@ impl Config {
     }
 }
 
+/// Reject Mihomo filter expressions whose ordered RuleSet/GeoSite semantics
+/// are not implemented by Chimera's domain-pattern trie. Apply this gate to
+/// both YAML conversion and internal configs to protect runtime reloads.
+pub(crate) fn validate_fake_ip_filter_patterns(
+    patterns: &[String],
+) -> Result<(), Error> {
+    const UNSUPPORTED_FILTER_PREFIXES: &[&str] = &[
+        "rule-set:",
+        "geosite:",
+        "rule-set,",
+        "geosite,",
+        "domain,",
+        "domain-suffix,",
+        "domain-keyword,",
+        "domain-regex,",
+        "match,",
+    ];
+    for pattern in patterns {
+        let lower = pattern.trim().to_ascii_lowercase();
+        if UNSUPPORTED_FILTER_PREFIXES
+            .iter()
+            .any(|prefix| lower.starts_with(prefix))
+        {
+            return Err(Error::InvalidConfig(format!(
+                "dns.fake-ip-filter `{pattern}` uses unsupported Mihomo rule-set/geosite/rule syntax; refusing to silently treat it as a literal domain"
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl TryFrom<crate::config::def::Config> for Config {
     type Error = Error;
 
@@ -395,6 +427,7 @@ impl TryFrom<&crate::config::def::Config> for Config {
 
     fn try_from(c: &crate::config::def::Config) -> Result<Self, Self::Error> {
         let dc = &c.dns;
+        validate_fake_ip_filter_patterns(&dc.fake_ip_filter)?;
         let compiled_policy = super::policy::CompiledDnsPolicy::compile(c)?;
         if dc.enable && dc.nameserver.is_empty() {
             return Err(Error::InvalidConfig(String::from(
@@ -577,6 +610,7 @@ impl TryFrom<&crate::config::def::Config> for Config {
                 })
                 .transpose()?,
             fake_ip_filter: dc.fake_ip_filter.clone(),
+            fake_ip_filter_mode: dc.fake_ip_filter_mode,
             service_discovery_mode: dc.service_discovery_mode,
             store_fake_ip: c.profile.store_fake_ip,
             store_smart_stats: c.profile.store_smart_stats,

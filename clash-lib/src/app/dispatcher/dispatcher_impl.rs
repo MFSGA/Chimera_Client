@@ -4122,6 +4122,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proxy_remote_domain_mode_never_invokes_local_resolver() {
+        // An unexpected DNS lookup is a mock panic. Both transports use this
+        // helper after the selected outbound has been determined.
+        let resolver: ThreadSafeDNSResolver = Arc::new(MockClashResolver::new());
+        for (host, port) in [("proxied.example", 443), ("udp-proxy.example", 53)] {
+            let destination = SocksAddr::Domain(host.to_owned(), port);
+            let mut sess = Session {
+                destination: destination.clone(),
+                ..Default::default()
+            };
+            Dispatcher::maybe_resolve_proxy_destination_locally(
+                &resolver, false, "PROXY", &mut sess,
+            )
+            .await;
+            assert_eq!(sess.destination, destination);
+            assert_eq!(sess.resolved_ip, None);
+        }
+    }
+
+    #[tokio::test]
     async fn proxy_local_resolution_replaces_connect_destination() {
         let real_ip: IpAddr = "203.0.113.7".parse().unwrap();
         let mut resolver = MockClashResolver::new();

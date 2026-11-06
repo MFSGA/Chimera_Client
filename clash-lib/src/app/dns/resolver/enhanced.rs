@@ -398,9 +398,13 @@ impl EnhancedResolver {
             )
             .await?;
             if clients.is_empty() {
+                // No dedicated bootstrap clients must never be silently
+                // interpreted as permission to use general DNS. In ordinary
+                // YAML conversion an empty list is rejected earlier, but
+                // internal configs/reloads can still construct Some(empty).
                 return Err(Error::InvalidConfig(
-                    "proxy-server-nameserver configured but no usable DNS clients initialized"
-                        .into(),
+                    "dns.proxy-server-nameserver was explicitly configured but has no usable clients; refusing DNS bootstrap fallback"
+                        .to_owned(),
                 ));
             }
             Some(clients)
@@ -1892,6 +1896,67 @@ mod tests {
             Some(Ipv4Addr::new(203, 0, 113, 44)),
         );
         assert!(resolver.fake_ip_for_host("printer.lan").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn mihomo_whitelist_only_protects_selected_domains_from_real_dns() {
+        use crate::config::def::FakeIpFilterMode;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let client = Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(203, 0, 113, 44)),
+            hits: hits.clone(),
+            id: "observed-upstream",
+        });
+        let mut filter = crate::common::trie::StringTrie::new();
+        filter.insert("*.protected.example", Arc::new(true));
+        let mut resolver = EnhancedResolver::from_clients(vec![client], false);
+        resolver.fake_dns = Some(Arc::new(RwLock::new(
+            crate::app::dns::fakeip::FakeDns::new(crate::app::dns::fakeip::Opts {
+                ipnet: "198.18.0.0/30".parse().unwrap(),
+                skipped_hostnames: Some(filter),
+                store: Box::new(crate::app::dns::fakeip::InMemStore::new(2)),
+            })
+            .unwrap()
+            .with_filter_mode(FakeIpFilterMode::Whitelist),
+        )));
+
+        assert!(resolver.should_fake_ip("api.protected.example").await);
+        assert!(!resolver.should_fake_ip("unlisted.example").await);
+
+        assert_eq!(
+            resolver
+                .resolve_v4("api.protected.example", true)
+                .await
+                .unwrap(),
+            Some(Ipv4Addr::new(198, 18, 0, 2)),
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "whitelisted domain must not be resolved upstream"
+        );
+        assert!(
+            resolver
+                .fake_ip_for_host("api.protected.example")
+                .await
+                .is_some()
+        );
+
+        assert_eq!(
+            resolver.resolve_v4("unlisted.example", true).await.unwrap(),
+            Some(Ipv4Addr::new(203, 0, 113, 44)),
+        );
+        assert!(
+            hits.load(Ordering::SeqCst) > 0,
+            "unlisted domain must use the real resolver"
+        );
+        assert!(
+            resolver
+                .fake_ip_for_host("unlisted.example")
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -3493,6 +3558,33 @@ mod tests {
 
         assert!(resolver.proxy_resolver.is_none());
         assert!(resolver.proxy_server_domains.is_none());
+    }
+
+    #[tokio::test]
+    async fn explicitly_configured_empty_proxy_nameserver_must_not_fall_back() {
+        // "None" means no dedicated proxy bootstrap was configured.
+        // "Some(empty)" means it was requested but no clients exist;
+        // silently using the general resolver breaks the caller's DNS boundary.
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::app::profile::ThreadSafeCacheFile::new(
+            temp.path().join("cache.db").to_str().unwrap(),
+            false,
+        );
+        let mut config = make_proxy_nameserver_config();
+        config.proxy_server_nameserver = Some(vec![]);
+        let outcome = EnhancedResolver::new(
+            config,
+            store,
+            None,
+            Arc::new(RwLock::new(std::collections::HashMap::new())),
+            None,
+        )
+        .await;
+        let error = match outcome {
+            Ok(_) => panic!("explicit empty proxy bootstrap must not fall back"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("proxy-server-nameserver"), "{error}");
     }
 
     #[tokio::test]

@@ -77,6 +77,10 @@ pub struct TunConfig {
     pub inet6_route_exclude_address: Option<Vec<String>>,
     #[serde(default, alias = "route_all", alias = "auto-route")]
     pub route_all: bool,
+    /// Mihomo's strict-route is not implemented by Chimera's platform routing.
+    /// Keep the field explicit so a privacy-sensitive setting cannot be ignored.
+    #[serde(default)]
+    pub strict_route: bool,
     pub mtu: Option<u16>,
     #[serde(alias = "so_mark")]
     pub so_mark: Option<u32>,
@@ -407,6 +411,68 @@ fn suspicious_dns_listener_tls_key(transport: &str, field: &str) -> bool {
             .any(|known| near_sensitive_key(known, &lower))
 }
 
+/// Some Mihomo options express strong DNS or TUN privacy guarantees.
+/// Until their runtime semantics exist here, accepting them as no-op YAML
+/// entries is more dangerous than rejecting the configuration.
+///
+/// Keep this targeted: legacy vendor keys unrelated to security remain
+/// accepted for backward compatibility.
+fn reject_unsupported_mihomo_privacy_fields(value: &Value) -> Result<(), Error> {
+    const UNSUPPORTED: &[(&str, &[&str])] = &[
+        (
+            "tun",
+            &[
+                "dns-mode",
+                "auto-detect-interface",
+                "include-interface",
+                "exclude-interface",
+                "stack",
+                "route-address",
+            ],
+        ),
+        (
+            "dns",
+            &[
+                "proxy-server-nameserver-policy",
+                "direct-nameserver-follow-policy",
+                "fake-ip-ttl",
+                "use-system-hosts",
+                "fallback-lazy-query",
+            ],
+        ),
+    ];
+
+    for &(section, fields) in UNSUPPORTED {
+        let Some(mapping) = value.get(section).and_then(Value::as_mapping) else {
+            continue;
+        };
+
+        for &field in fields {
+            if mapping.keys().any(|key| key.as_str() == Some(field)) {
+                return Err(Error::InvalidConfig(format!(
+                    "{section}.{field} is not implemented; refusing to silently ignore a Mihomo privacy-sensitive setting"
+                )));
+            }
+        }
+    }
+
+    // A GeoSite fallback selector affects which DNS upstream sees a query.
+    // Ignoring it can expose QNAMEs to an unintended resolver.
+    if value
+        .get("dns")
+        .and_then(|dns| dns.get("fallback-filter"))
+        .and_then(|fallback| fallback.get("geosite"))
+        .is_some()
+    {
+        return Err(Error::InvalidConfig(
+            "dns.fallback-filter.geosite is not implemented; refusing to silently ignore a Mihomo privacy-sensitive setting"
+                .to_owned(),
+        ));
+    }
+
+    Ok(())
+}
+
 impl FromStr for Config {
     type Err = Error;
 
@@ -423,39 +489,7 @@ impl FromStr for Config {
             ))
         })?;
 
-        // Mihomo gives these fields operational DNS privacy semantics. Until
-        // Chimera implements them, accepting them as ignored YAML keys risks
-        // routing proxy-node or Fake-IP lookups through unintended resolvers.
-        // Check the merged YAML before serde silently discards unknown fields.
-        if let Some(Value::Mapping(dns)) = val
-            .as_mapping()
-            .and_then(|root| root.get(Value::String("dns".to_owned())))
-        {
-            for field in [
-                "fake-ip-filter-mode",
-                "fake-ip-ttl",
-                "fake_ip_ttl",
-                "proxy-server-nameserver-policy",
-                "direct-nameserver-follow-policy",
-                // Near-miss spelling must not make the same privacy controls
-                // silently disappear during serde deserialization.
-                "fake_ip_filter_mode",
-                "proxy_server_nameserver_policy",
-                "direct_nameserver_follow_policy",
-                // System hosts and fallback query timing have separate Mihomo
-                // semantics; Chimera's use-hosts is not an equivalent alias.
-                "use-system-hosts",
-                "fallback-lazy-query",
-                "use_system_hosts",
-                "fallback_lazy_query",
-            ] {
-                if dns.contains_key(Value::String(field.to_owned())) {
-                    return Err(Error::InvalidConfig(format!(
-                        "dns.{field} is not implemented; refusing to ignore a privacy-sensitive setting"
-                    )));
-                }
-            }
-        }
+        reject_unsupported_mihomo_privacy_fields(&val)?;
 
         if let Some(tun_fields) = val.get("tun").and_then(Value::as_mapping) {
             for field in tun_fields.keys().filter_map(Value::as_str) {
@@ -715,6 +749,9 @@ pub struct DNS {
     pub fake_ip_range6: Option<String>,
     /// Fake IP addresses filter
     pub fake_ip_filter: Vec<String>,
+    /// Only Mihomo's default blacklist semantics are currently implemented.
+    /// Unsupported modes must fail parsing rather than silently fall back.
+    pub fake_ip_filter_mode: FakeIpFilterMode,
     /// Opt-in safe forwarding for SRV service-discovery queries in Fake-IP mode.
     /// The default preserves the legacy empty-answer behavior.
     pub service_discovery_mode: DnsServiceDiscoveryMode,
@@ -737,6 +774,32 @@ pub struct DNS {
     pub resolver_profiles: HashMap<String, DnsResolverProfileDef>,
     /// S01: ordered query policy rules; never changes Business Rules.
     pub policy_rules: Vec<DnsPolicyRuleDef>,
+}
+
+#[derive(Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FakeIpFilterMode {
+    #[default]
+    Blacklist,
+    Whitelist,
+}
+
+impl<'de> Deserialize<'de> for FakeIpFilterMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Mihomo's FilterMode.UnmarshalText first lowercases the mode name.
+        let mode = String::deserialize(deserializer)?;
+        match mode.to_ascii_lowercase().as_str() {
+            "blacklist" => Ok(Self::Blacklist),
+            "whitelist" => Ok(Self::Whitelist),
+            _ => Err(serde::de::Error::unknown_variant(
+                &mode,
+                &["blacklist", "whitelist"],
+            )),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1141,6 +1204,134 @@ proxy:
                 .as_ref()
                 .is_some_and(|exp| exp.proxy_resolve_local)
         );
+    }
+
+    #[test]
+    fn mihomo_fake_ip_filter_blacklist_is_accepted() {
+        let cfg: Config = "dns:\n  fake-ip-filter-mode: blacklist"
+            .parse()
+            .expect("Mihomo default filter mode must work");
+        assert_eq!(
+            cfg.dns.fake_ip_filter_mode,
+            super::FakeIpFilterMode::Blacklist
+        );
+    }
+
+    #[test]
+    fn mihomo_unsupported_fake_ip_filter_modes_are_not_silently_ignored() {
+        for mode in ["rule", "RULE"] {
+            let yaml = format!("dns:\n  fake-ip-filter-mode: {mode}");
+            assert!(
+                yaml.parse::<Config>().is_err(),
+                "unsupported {mode} mode must be rejected rather than treated as blacklist"
+            );
+        }
+    }
+
+    #[test]
+    fn mihomo_fake_ip_whitelist_mode_parses_explicitly() {
+        for mode in ["whitelist", "WhiteList", "WHITELIST"] {
+            let yaml = format!(
+                "dns:\n  fake-ip-filter-mode: {mode}\n  fake-ip-filter:\n    - '*.example.com'"
+            );
+            let cfg: Config = yaml
+                .parse()
+                .expect("Mihomo whitelist mode should be recognized");
+            assert_eq!(
+                cfg.dns.fake_ip_filter_mode,
+                super::FakeIpFilterMode::Whitelist
+            );
+        }
+    }
+
+    #[test]
+    fn mihomo_privacy_fields_fail_closed_instead_of_being_ignored() {
+        // The fixed Mihomo reference uses these to control DNS egress,
+        // Fake-IP and TUN routing. An accepted no-op is unsafe.
+        for (section, key, value) in [
+            ("tun", "dns-mode", "hijack"),
+            ("tun", "auto-detect-interface", "true"),
+            ("tun", "include-interface", "[en0]"),
+            ("tun", "exclude-interface", "[en1]"),
+            ("tun", "stack", "system"),
+            ("tun", "route-address", "[0.0.0.0/0]"),
+            (
+                "dns",
+                "proxy-server-nameserver-policy",
+                "{example.test: 9.9.9.9}",
+            ),
+            ("dns", "direct-nameserver-follow-policy", "false"),
+            ("dns", "fake-ip-ttl", "1"),
+            ("dns", "use-system-hosts", "false"),
+            ("dns", "fallback-lazy-query", "true"),
+        ] {
+            let config = format!("{section}:\n  enable: false\n  {key}: {value}\n");
+            let error = match config.parse::<Config>() {
+                Ok(_) => panic!(
+                    "unsupported {section}.{key} must not be silently accepted"
+                ),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains(&format!("{section}.{key}"))
+                    && error.contains("not implemented"),
+                "missing fail-closed diagnostic for {section}.{key}: {error}"
+            );
+            // Errors must not print potentially private DNS policy values.
+            assert!(
+                !error.contains("example.test"),
+                "error leaked a DNS policy value"
+            );
+        }
+    }
+
+    #[test]
+    fn mihomo_privacy_field_guard_applies_after_yaml_merge() {
+        let config = r#"
+common: &unsafe_tun
+  dns-mode: hijack
+tun:
+  <<: *unsafe_tun
+  enable: false
+"#;
+        let error = match config.parse::<Config>() {
+            Ok(_) => panic!("YAML merge must not bypass the privacy field guard"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("tun.dns-mode"), "{error}");
+    }
+
+    #[test]
+    fn unsupported_mihomo_fallback_geosite_is_never_silently_ignored() {
+        let config = r#"
+dns:
+  enable: false
+  fallback-filter:
+    geosite: [private]
+"#;
+        let error = match config.parse::<Config>() {
+            Ok(_) => {
+                panic!("unsupported geosite fallback filter must not be ignored")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("dns.fallback-filter.geosite"), "{error}");
+    }
+
+    #[test]
+    fn unrelated_legacy_vendor_extensions_remain_accepted() {
+        let config: Config = r#"
+tun:
+  enable: false
+  custom-vendor-option: 1
+dns:
+  enable: false
+  custom-vendor-option: true
+"#
+        .parse()
+        .expect("do not globally reject unrelated legacy vendor fields");
+        assert!(!config.tun.expect("tun section").enable);
+        assert!(!config.dns.enable);
     }
 
     #[test]
