@@ -48,6 +48,15 @@
 
 **尚未审定的事实**：Mihomo 端具体字段和行为尚未在固定 `ref-mihomo` 对照运行；本矩阵的 Mihomo 语义仅引用上传的 v2.0 设计稿所列候选，**不是经 Mihomo 运行验证的兼容认证**。`#RULES`、跨 Host/Gateway、多网卡真实 DNS 出口、IPv6 Fake-IP 仍需要专门实验，不能以配置解析成功代替运行时验证。
 
+## 2026-11-06 macOS DNS 配置拒绝与节点引导失效关闭（L2 待审）
+
+- 基线：隔离分支 `codex/macos-tun-fakeip-dns-privacy`，开发前 HEAD `78b1d0cda8d231ece2748db44bbdade7c8de0128`；本地 `master=e42dabe74282c77245da1023de0b828830928216`，`origin/master=902c5e7702960ab4f978a014d7079c79d17079fd`；固定只读 Mihomo gitlink `63bd52ec794b7051569b76ede2f6cdbf4c091fda`。同一项目另一隔离分支已有 `2c7fd3469989` 的类似字段拒绝提交；本轮不重置、不 cherry-pick、不改该分支。
+- 参考：固定 Mihomo `config/config.go::RawDNS`、`RawTun`、`parseDNS` 和 `docs/config.yaml`。Mihomo 的节点 DNS 和 fallback 选择语义不能以 Chimera YAML 反序列化成功替代；不支持的敏感选项应当报错。这里只建立 fail-closed 边界，**未实现对应运行时字段语义**。
+- 本轮在 YAML merge 后、反序列化前拒绝 12 项未实现的隐私相关输入：`tun.dns-mode`、`tun.auto-detect-interface`、`tun.include-interface`、`tun.exclude-interface`、`tun.stack`、`tun.route-address`、`dns.proxy-server-nameserver-policy`、`dns.direct-nameserver-follow-policy`、`dns.fake-ip-ttl`、`dns.use-system-hosts`、`dns.fallback-lazy-query`、`dns.fallback-filter.geosite`。保留不相关 vendor 字段兼容；诊断只输出字段名，不输出 DNS policy 值。以上 12 项仍为 unsupported，绝非 implemented。
+- 内部解析器 `EnhancedResolver::new` 的 `proxy_server_nameserver=Some(vec![])` 原先会降级为默认解析器；现在直接拒绝，防止在配置转换之外（内部配置或未来热重载路径）悄然回退。没有配置（`None`）仍保留旧行为。普通 YAML 的空列表在配置转换层已提前拒绝。定向负例先证明旧实现错误地接受 `Some(empty)`，修复后通过。
+- 仍存在的风险：`default-nameserver` 可能为系统/物理出口 DNS，当前系统 service-scoped DNS ownership 与物理 NIC 隔离尚未验证；macOS 真实网络与 TUN 抓包、跨平台测试及 L2 独立 Reviewer/维护者批准均未完成。没有修改系统 DNS、TUN、路由、权限、子模块或远端 Git。
+- 下一步最小切片：隔离构建并测试 `proxy-server-nameserver-policy` 节点域名路由（含 policy 未命中、多个上游及失败时不泄漏到主 DNS），对照固定 Mihomo `parseNameServerPolicy`，测试实际请求的 DNS 客户端选择，再从拒绝列表移除；随后补真实 macOS 授权测试环境的 NIC/TUN DNS 出口抓包。
+
 ## 3. 变更管理与 S01 准入
 
 当前决定是 **保留已实现旧配置行为**，不存在本轮批准的 REMOVE/DEPRECATE。对每个未来不兼容行为使用指南 §2.3 的 `DNS-COMPAT-XXXX` 决策模板；没有具体旧行为、影响、迁移、回滚、测试和维护者批准，不允许落地。

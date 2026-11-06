@@ -398,9 +398,13 @@ impl EnhancedResolver {
             )
             .await?;
             if clients.is_empty() {
+                // No dedicated bootstrap clients must never be silently
+                // interpreted as permission to use general DNS. In ordinary
+                // YAML conversion an empty list is rejected earlier, but
+                // internal configs/reloads can still construct Some(empty).
                 return Err(Error::InvalidConfig(
-                    "proxy-server-nameserver configured but no usable DNS clients initialized"
-                        .into(),
+                    "dns.proxy-server-nameserver was explicitly configured but has no usable clients; refusing DNS bootstrap fallback"
+                        .to_owned(),
                 ));
             }
             Some(clients)
@@ -3554,6 +3558,33 @@ mod tests {
 
         assert!(resolver.proxy_resolver.is_none());
         assert!(resolver.proxy_server_domains.is_none());
+    }
+
+    #[tokio::test]
+    async fn explicitly_configured_empty_proxy_nameserver_must_not_fall_back() {
+        // "None" means no dedicated proxy bootstrap was configured.
+        // "Some(empty)" means it was requested but no clients exist;
+        // silently using the general resolver breaks the caller's DNS boundary.
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::app::profile::ThreadSafeCacheFile::new(
+            temp.path().join("cache.db").to_str().unwrap(),
+            false,
+        );
+        let mut config = make_proxy_nameserver_config();
+        config.proxy_server_nameserver = Some(vec![]);
+        let outcome = EnhancedResolver::new(
+            config,
+            store,
+            None,
+            Arc::new(RwLock::new(std::collections::HashMap::new())),
+            None,
+        )
+        .await;
+        let error = match outcome {
+            Ok(_) => panic!("explicit empty proxy bootstrap must not fall back"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("proxy-server-nameserver"), "{error}");
     }
 
     #[tokio::test]
