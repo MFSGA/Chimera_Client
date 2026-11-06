@@ -128,6 +128,11 @@ pub trait ClashResolver: Sync + Send {
     async fn is_fake_ip(&self, ip: std::net::IpAddr) -> bool;
     async fn fake_ip_for_host(&self, host: &str) -> Option<std::net::IpAddr>;
     fn fake_ip_enabled(&self) -> bool;
+    /// TTL for locally synthesized Fake-IP A/AAAA DNS answers, in seconds.
+    /// Mihomo's default and minimum are one second.
+    fn fake_ip_ttl(&self) -> u32 {
+        1
+    }
     fn fake_ip_v6_enabled(&self) -> bool {
         false
     }

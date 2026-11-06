@@ -67,6 +67,7 @@ pub struct EnhancedResolver {
     direct_resolver: Option<ThreadSafeDNSResolver>,
 
     fake_dns: Option<ThreadSafeFakeDns>,
+    fake_ip_ttl: u32,
     safe_srv: bool,
 
     reverse_lookup_cache:
@@ -291,6 +292,7 @@ impl EnhancedResolver {
             proxy_server_domains: None,
             direct_resolver: None,
             fake_dns: None,
+            fake_ip_ttl: 1,
             safe_srv: false,
             reverse_lookup_cache: None,
         }
@@ -344,6 +346,7 @@ impl EnhancedResolver {
             direct_resolver: None,
 
             fake_dns: None,
+            fake_ip_ttl: 1,
             safe_srv: false,
 
             reverse_lookup_cache: None,
@@ -416,6 +419,7 @@ impl EnhancedResolver {
             direct_resolver: None,
 
             fake_dns: None,
+            fake_ip_ttl: 1,
             safe_srv: false,
 
             reverse_lookup_cache: None,
@@ -660,6 +664,7 @@ impl EnhancedResolver {
                 _ => None,
             },
 
+            fake_ip_ttl: cfg.fake_ip_ttl.max(1),
             safe_srv: cfg.service_discovery_mode
                 == crate::config::def::DnsServiceDiscoveryMode::Safe,
 
@@ -1469,6 +1474,10 @@ impl ClashResolver for EnhancedResolver {
 
     fn fake_ip_enabled(&self) -> bool {
         self.fake_dns.is_some()
+    }
+
+    fn fake_ip_ttl(&self) -> u32 {
+        self.fake_ip_ttl.max(1)
     }
 
     fn safe_srv_enabled(&self) -> bool {
@@ -3958,6 +3967,30 @@ mod tests {
             }],
             ..Config::default()
         }
+    }
+
+    #[tokio::test]
+    async fn configured_fake_ip_ttl_reaches_runtime_resolver() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_store = crate::app::profile::ThreadSafeCacheFile::new(
+            temp.path().join("cache.db").to_str().unwrap(),
+            false,
+        );
+        let mut config = make_proxy_nameserver_config();
+        config.enhance_mode = crate::config::def::DNSMode::FakeIp;
+        config.fake_ip_range = "198.18.0.0/16".parse().unwrap();
+        config.fake_ip_ttl = 29;
+        let resolver = EnhancedResolver::new(
+            config,
+            cache_store,
+            None,
+            Arc::new(RwLock::new(std::collections::HashMap::new())),
+            None,
+        )
+        .await
+        .expect("Fake-IP resolver should initialize from config");
+        assert!(resolver.fake_ip_enabled());
+        assert_eq!(resolver.fake_ip_ttl(), 29);
     }
 
     #[tokio::test]

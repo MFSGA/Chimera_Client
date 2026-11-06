@@ -789,6 +789,21 @@ fn mihomo_nameserver_policy_rejects_case_insensitive_duplicate_selectors() {
 }
 
 #[test]
+fn mihomo_fake_ip_ttl_defaults_to_one_and_clamps_nonpositive_values() {
+    let base = r#"
+  enable: true
+  enhanced-mode: fake-ip
+  nameserver: [1.1.1.1]
+  default-nameserver: [223.5.5.5]
+"#;
+    assert_eq!(parse_dns(&base_config(base)).fake_ip_ttl, 1);
+    for (raw, expected) in [("0", 1), ("-17", 1), ("45", 45)] {
+        let yaml = base_config(&format!("{base}  fake-ip-ttl: {raw}\n"));
+        assert_eq!(parse_dns(&yaml).fake_ip_ttl, expected, "{raw}");
+    }
+}
+
+#[test]
 fn invalid_hosts_entry_is_rejected() {
     let yaml = base_config(
         r#"

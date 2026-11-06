@@ -189,6 +189,8 @@ mod tests {
         mock.expect_ipv6().return_const(false);
         mock.expect_fake_ip_enabled().return_const(true);
         mock.expect_fake_ip_v6_enabled().return_const(false);
+        mock.expect_should_fake_ip().once().return_const(true);
+        mock.expect_fake_ip_ttl().return_const(1_u32);
         mock.expect_exchange().never();
         mock.expect_resolve_v4()
             .once()

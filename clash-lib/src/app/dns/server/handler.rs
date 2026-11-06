@@ -241,6 +241,20 @@ pub async fn exchange_with_resolver<'a>(
         .map(|x| x.name().to_ascii().trim_end_matches('.').to_owned())
         .unwrap();
 
+    // Mihomo forwards an excluded A/AAAA hostname to its real DNS
+    // resolver, preserving the upstream RRset and TTL. Synthesizing an
+    // address from resolve_v4/v6 here would falsely attach Fake-IP TTL
+    // to a real address and could lose CNAME/other upstream records.
+    if enhanced
+        && resolver.fake_ip_enabled()
+        && !resolver.should_fake_ip(&host).await
+    {
+        return resolver
+            .exchange(req)
+            .await
+            .map_err(|error| chimera_dns::DNSError::QueryFailed(error.to_string()));
+    }
+
     let mut res = build_dns_response_message(req, false, false);
 
     let answer = match req.queries.first().map(|query| query.query_type()) {
@@ -257,8 +271,11 @@ pub async fn exchange_with_resolver<'a>(
 
     match answer {
         Ok(Some(rdata)) => {
-            let records =
-                vec![Record::from_rdata(name, DEFAULT_DNS_SERVER_TTL, rdata)];
+            let records = vec![Record::from_rdata(
+                name,
+                resolver.fake_ip_ttl().max(1),
+                rdata,
+            )];
             res.metadata.response_code = ResponseCode::NoError;
             res.add_answers(records);
             Ok(res)
@@ -351,6 +368,8 @@ mod tests {
         resolver.expect_ipv6().return_const(false);
         resolver.expect_fake_ip_enabled().return_const(true);
         resolver.expect_fake_ip_v6_enabled().return_const(false);
+        resolver.expect_should_fake_ip().once().return_const(true);
+        resolver.expect_fake_ip_ttl().return_const(1_u32);
         resolver
             .expect_resolve_v4()
             .with(
@@ -369,6 +388,72 @@ mod tests {
 
         assert_eq!(response.answers.len(), 1);
         assert_eq!(response.answers[0].data.to_string(), "198.18.0.7");
+    }
+
+    #[tokio::test]
+    async fn fake_ip_a_answer_uses_configured_mihomo_ttl() {
+        let mut resolver = MockClashResolver::new();
+        resolver.expect_ipv6().return_const(false);
+        resolver.expect_fake_ip_enabled().return_const(true);
+        resolver.expect_fake_ip_v6_enabled().return_const(false);
+        resolver.expect_should_fake_ip().once().return_const(true);
+        resolver.expect_fake_ip_ttl().once().return_const(17_u32);
+        resolver
+            .expect_resolve_v4()
+            .with(
+                mockall::predicate::eq("example.com"),
+                mockall::predicate::eq(true),
+            )
+            .once()
+            .returning(|_, _| Ok(Some("198.18.0.9".parse().unwrap())));
+        resolver.expect_exchange().never();
+
+        let resolver: ThreadSafeDNSResolver = Arc::new(resolver);
+        let response =
+            exchange_with_resolver(&resolver, &query(RecordType::A), true)
+                .await
+                .expect("synthetic A query must be answered locally");
+        assert_eq!(response.answers.len(), 1);
+        assert_eq!(response.answers[0].ttl, 17);
+        assert_eq!(response.answers[0].data.to_string(), "198.18.0.9");
+    }
+
+    #[tokio::test]
+    async fn fake_ip_excluded_a_retains_upstream_record_and_ttl() {
+        let mut resolver = MockClashResolver::new();
+        resolver.expect_ipv6().return_const(false);
+        resolver.expect_fake_ip_enabled().return_const(true);
+        resolver.expect_fake_ip_v6_enabled().return_const(false);
+        resolver
+            .expect_should_fake_ip()
+            .with(mockall::predicate::eq("example.com"))
+            .once()
+            .return_const(false);
+        resolver.expect_fake_ip_ttl().never();
+        resolver.expect_resolve_v4().never();
+        resolver.expect_exchange().once().returning(|request| {
+            let mut response = Message::response(request.metadata.id, OpCode::Query);
+            response.add_queries(request.queries.iter().cloned());
+            response.add_answer(hickory_proto::rr::Record::from_rdata(
+                request.queries[0].name().clone(),
+                319,
+                hickory_proto::rr::RData::A(hickory_proto::rr::rdata::A(
+                    "203.0.113.7".parse().unwrap(),
+                )),
+            ));
+            Ok(response)
+        });
+
+        let resolver: ThreadSafeDNSResolver = Arc::new(resolver);
+        let response =
+            exchange_with_resolver(&resolver, &query(RecordType::A), true)
+                .await
+                .expect(
+                    "Fake-IP-excluded domain must preserve real upstream answer",
+                );
+        assert_eq!(response.answers.len(), 1);
+        assert_eq!(response.answers[0].ttl, 319);
+        assert_eq!(response.answers[0].data.to_string(), "203.0.113.7");
     }
 
     #[tokio::test]
@@ -952,6 +1037,7 @@ mod tests {
         resolver.expect_ipv6().return_const(false);
         resolver.expect_fake_ip_enabled().return_const(true);
         resolver.expect_fake_ip_v6_enabled().return_const(false);
+        resolver.expect_should_fake_ip().once().return_const(true);
         resolver
             .expect_resolve_v4()
             .once()
@@ -971,6 +1057,8 @@ mod tests {
         resolver.expect_dns_ipv6().return_const(true);
         resolver.expect_fake_ip_enabled().return_const(true);
         resolver.expect_fake_ip_v6_enabled().return_const(true);
+        resolver.expect_should_fake_ip().once().return_const(true);
+        resolver.expect_fake_ip_ttl().return_const(1_u32);
         resolver
             .expect_resolve_v6()
             .with(
@@ -991,6 +1079,32 @@ mod tests {
 
         assert_eq!(response.answers.len(), 1);
         assert_eq!(response.answers[0].record_type(), RecordType::AAAA);
+    }
+
+    #[tokio::test]
+    async fn fake_ipv6_answer_uses_configured_mihomo_ttl() {
+        let mut resolver = MockClashResolver::new();
+        resolver.expect_ipv6().return_const(true);
+        resolver.expect_fake_ip_enabled().return_const(true);
+        resolver.expect_fake_ip_v6_enabled().return_const(true);
+        resolver.expect_should_fake_ip().once().return_const(true);
+        resolver.expect_fake_ip_ttl().once().return_const(31_u32);
+        resolver
+            .expect_resolve_v6()
+            .with(
+                mockall::predicate::eq("example.com"),
+                mockall::predicate::eq(true),
+            )
+            .once()
+            .returning(|_, _| Ok(Some("fd00::5".parse().unwrap())));
+        resolver.expect_exchange().never();
+        let resolver: ThreadSafeDNSResolver = Arc::new(resolver);
+        let response =
+            exchange_with_resolver(&resolver, &query(RecordType::AAAA), true)
+                .await
+                .expect("synthetic AAAA is local");
+        assert_eq!(response.answers.len(), 1);
+        assert_eq!(response.answers[0].ttl, 31);
     }
 
     #[tokio::test]
