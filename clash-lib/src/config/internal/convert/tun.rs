@@ -127,6 +127,15 @@ pub(super) fn convert(
             }
             let mut route_exclude_address =
                 parse_routes(t.route_exclude_address, "route-exclude-address")?;
+            // The macOS route installer does not implement exclusions. Do not
+            // accept a configuration whose intended bypass routing is ignored.
+            #[cfg(target_os = "macos")]
+            if !route_exclude_address.is_empty() {
+                return Err(Error::InvalidConfig(
+                    "tun.route-exclude-address is not implemented on macOS"
+                        .to_owned(),
+                ));
+            }
 
             let inet4_route_exclude_address = parse_routes(
                 t.inet4_route_exclude_address,
@@ -139,6 +148,13 @@ pub(super) fn convert(
                 return Err(Error::InvalidConfig(
                     "parse tun inet4-route-exclude-address: IPv6 CIDR is not allowed"
                         .to_string(),
+                ));
+            }
+            #[cfg(target_os = "macos")]
+            if !inet4_route_exclude_address.is_empty() {
+                return Err(Error::InvalidConfig(
+                    "tun.inet4-route-exclude-address is not implemented on macOS"
+                        .to_owned(),
                 ));
             }
             route_exclude_address.extend(inet4_route_exclude_address);
@@ -154,6 +170,13 @@ pub(super) fn convert(
                 return Err(Error::InvalidConfig(
                     "parse tun inet6-route-exclude-address: IPv4 CIDR is not allowed"
                         .to_string(),
+                ));
+            }
+            #[cfg(target_os = "macos")]
+            if !inet6_route_exclude_address.is_empty() {
+                return Err(Error::InvalidConfig(
+                    "tun.inet6-route-exclude-address is not implemented on macOS"
+                        .to_owned(),
                 ));
             }
             route_exclude_address.extend(inet6_route_exclude_address);
@@ -410,6 +433,7 @@ routes:
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn parse_route_exclude_address_variants() {
         let tun = parse_tun(
@@ -432,6 +456,34 @@ inet6-route-exclude-address:
             "192.168.0.0/16"
         );
         assert_eq!(converted.route_exclude_address[2].to_string(), "fe80::/10");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_route_exclusions_fail_closed_before_tun_startup() {
+        for field in [
+            "route-exclude-address",
+            "inet4-route-exclude-address",
+            "inet6-route-exclude-address",
+        ] {
+            let cidr = if field.starts_with("inet6") {
+                "fe80::/10"
+            } else {
+                "192.0.2.0/24"
+            };
+            for route_all in [false, true] {
+                let tun = parse_tun(&format!(
+                    "enable: true\nroute-all: {route_all}\n{field}: [{cidr}]"
+                ));
+                let err = match convert(Some(tun)) {
+                    Ok(_) => panic!("macOS must not accept ignored {field}"),
+                    Err(err) => err.to_string(),
+                };
+                assert!(err.contains(field), "{err}");
+            }
+        }
+        convert(Some(parse_tun("enable: true\nroute-exclude-address: []")))
+            .expect("empty exclusions must remain compatible");
     }
 
     #[test]
