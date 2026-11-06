@@ -146,3 +146,11 @@ System DNS 指向一个与 fake-IP 池、TUN 网关子网及 route exclusions �
 - 本轮验证：`cargo test -p clash-lib --lib --no-default-features --features tun,ring --locked -j 6`：816 passed / 0 failed / 11 ignored；`cargo test -p clash-lib --test dns_config_tests --no-default-features --features tun,ring --locked`：17 passed；`cargo test -p clash-lib --lib --no-default-features --features ring --locked whitelist`：3 passed；无 TUN 的内部配置拒绝测试 1 passed；`cargo check -p clash-rs --no-default-features --features standard,aws-lc-rs --locked`、`cargo clippy -p clash-lib --all-targets --no-default-features --features tun,ring --locked -j 6 -- -D warnings`、`cargo fmt --all -- --check` 与 `git diff --check` 均通过。原始→内部配置的白名单金标准及高级 filter 错误测试均通过。
 - 已知独立金标准冲突：`dns_legacy_golden_tests` 全部执行为 12 passed / 1 failed；失败的是 `s00_respect_rules_and_legacy_proxy_modifier_are_preserved`，在本轮修改前的 `0c36e2e` 中已经与 `dns.respect-rules` 必须存在 `proxy-server-nameserver` 的校验不一致。不能把该失败当成 whitelist 回归，也不能静默更新金标准测试；需要独立的兼容性决策和修正。
 - 后续开发应优先检查尚未合入的 `codex/macos-mihomo-privacy-field-guard-20261105` (2c7fd34)，避免重复工作；仍需评估代理服务器 DNS 引导回退和 macOS 系统级失效关闭。无授权不修改机器网络、不推送。
+
+## 2026-11-06 Mihomo proxy-server-nameserver-policy（普通域名子集）
+
+- 独立开发起点是本地 `e8e9fcce761d8e6cb233c45cd1cf91dd77fd212f`，固定 Mihomo 参考 gitlink `63bd52ec794b7051569b76ede2f6cdbf4c091fda`。源码对照 `config/config.go::parseNameServerPolicy` 与 `dns/resolver.go` 的专用节点解析器。参考目录保持只读。没有同步、合并、推送或修改 macOS 宿主网络。
+- 允许有序普通域名选择器、逗号分隔多个域名、单值或多值 DNS 上游、大小写不敏感；连接节点域名优先使用选中策略，否则使用独立 `proxy-server-nameserver`。专用解析器/策略失败时不自动切换到主 DNS 或 fallback；内部配置也不能绕过专用节点 DNS 必填检查。Network path reset 覆盖策略客户端。
+- 本阶段明确拒绝尚无等价行为的 `geosite:` / `rule-set:`、`system` DNS 上游及策略内部 `#proxy`。匹配依赖 Chimera 现有域名 trie；并不等价于 Mihomo 完整 RuleSet、GeoSite 和特殊出站语义。对实际 macOS 系统物理网卡的 DNS 零泄漏仍没有运行时抓包证明。
+- 增加定向 YAML/运行时/模拟上游测试：规则顺序、多个上游、大小写、策略命中和未命中、专用 DNS 错误 fail-closed、网络路径重建和内部配置校验。另将相同的有序节点策略挂入 DNS 传输层实际使用的独立 `outbound_resolver`，测试该调用入口命中策略和未命中走专用默认解析器；内部 Config 热更新即使直接输入 `geosite:` 也会拒绝。`dns_legacy_golden_tests::s00_respect_rules_and_legacy_proxy_modifier_are_preserved` 仍有先前的 `respect-rules` 校验差异，需要单独兼容性决策，不能藉本次改动无依据更新测试。
+- 验收待补：默认/全功能和无 TUN 组合、Linux/Windows、真实 DNS 节点和 macOS TUN/NIC 出口、L2 独立 Reviewer 和维护者批准，均不得由单纯配置解析或模拟上游测试替代。

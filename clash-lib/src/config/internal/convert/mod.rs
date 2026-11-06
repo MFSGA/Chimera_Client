@@ -473,6 +473,58 @@ profile: {{}}
         );
     }
 
+    #[test]
+    fn internal_proxy_server_dns_policy_requires_dedicated_nameserver() {
+        let mut cfg = parse_config("");
+        cfg.dns.enable = true;
+        cfg.dns.nameserver = vec!["1.1.1.1".to_owned()];
+        let mut internal = convert(cfg).expect("build a valid internal DNS config");
+        let nameservers = crate::app::dns::config::Config::parse_nameserver(&[
+            "9.9.9.9".to_owned(),
+        ])
+        .unwrap();
+        internal
+            .dns
+            .proxy_server_nameserver_policy
+            .push(("node.example".to_owned(), nameservers));
+        let err = match crate::Config::Internal(internal).try_parse() {
+            Ok(_) => panic!("internal node policy must require dedicated bootstrap"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, Error::InvalidConfig(msg) if msg.contains("proxy-server-nameserver-policy"))
+        );
+    }
+
+    #[test]
+    fn internal_node_dns_policy_cannot_bypass_advanced_selector_gate() {
+        let mut cfg = parse_config("");
+        cfg.dns.enable = true;
+        cfg.dns.nameserver = vec!["1.1.1.1".to_owned()];
+        cfg.dns.proxy_server_nameserver = vec!["8.8.8.8".to_owned()];
+        let mut internal =
+            convert(cfg).expect("build internal config with dedicated proxy DNS");
+        let servers = crate::app::dns::config::Config::parse_nameserver(&[
+            "9.9.9.9".to_owned(),
+        ])
+        .unwrap();
+        internal
+            .dns
+            .proxy_server_nameserver_policy
+            .push(("geosite:private".to_owned(), servers));
+        let err = match crate::Config::Internal(internal).try_parse() {
+            Ok(_) => panic!(
+                "internal config cannot silently ignore GeoSite node DNS selector"
+            ),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains("proxy-server-nameserver-policy")
+                && err.contains("geosite:private"),
+            "{err}"
+        );
+    }
+
     #[cfg(feature = "tun")]
     #[test]
     fn internal_tun_fake_ip_cannot_bypass_proxy_dns_privacy_gate() {

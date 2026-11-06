@@ -415,12 +415,16 @@ impl EnhancedResolver {
         let outbound_resolver: Arc<dyn ClashResolver> = proxy_resolver
             .as_ref()
             .map(|clients| {
-                Arc::new(Self::from_clients_with_ipv6_policy(
+                let mut resolver = Self::from_clients_with_ipv6_policy(
                     clients.clone(),
                     None,
                     ipv6_policy.clone(),
                     dns_ipv6,
-                )) as Arc<dyn ClashResolver>
+                );
+                resolver.proxy_node_resolver = true;
+                resolver.proxy_server_nameserver_policy =
+                    proxy_server_nameserver_policy.clone();
+                Arc::new(resolver) as Arc<dyn ClashResolver>
             })
             .unwrap_or_else(|| default_resolver.clone());
 
@@ -3508,6 +3512,52 @@ mod tests {
 
         assert!(resolver.proxy_resolver.is_some());
         assert!(resolver.proxy_server_domains.is_none());
+    }
+
+    #[tokio::test]
+    async fn proxy_server_specific_policy_is_installed_from_runtime_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::app::profile::ThreadSafeCacheFile::new(
+            temp.path().join("cache.db").to_str().unwrap(),
+            false,
+        );
+        let mut config = make_proxy_nameserver_config();
+        config.proxy_server_nameserver_policy.push((
+            "PROXY.EXAMPLE.COM".to_owned(),
+            vec![NameServer {
+                net: DNSNetMode::Udp,
+                host: url::Host::Ipv4("9.9.9.9".parse().unwrap()),
+                port: 53,
+                interface: None,
+                proxy: None,
+                doh_path: None,
+            }],
+        ));
+        let resolver = EnhancedResolver::new(
+            config,
+            store,
+            None,
+            make_outbound_registry(&[("node-a", "PROXY.EXAMPLE.COM")]),
+            None,
+        )
+        .await
+        .expect("per-node policy should initialize offline");
+
+        assert_eq!(resolver.proxy_server_nameserver_policy.len(), 1);
+        assert!(
+            resolver.proxy_server_nameserver_policy[0]
+                .0
+                .search("proxy.example.com")
+                .is_some()
+        );
+        assert!(
+            resolver
+                .proxy_server_domains
+                .as_ref()
+                .unwrap()
+                .search("proxy.example.com")
+                .is_some()
+        );
     }
 
     #[tokio::test]

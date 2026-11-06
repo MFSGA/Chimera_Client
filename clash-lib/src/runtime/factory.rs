@@ -427,6 +427,7 @@ async fn build_auxiliary_dns_resolver(
         ipv6,
         nameserver: effective_nameserver,
         proxy_server_nameserver: None,
+        proxy_server_nameserver_policy: Vec::new(),
         direct_nameserver: None,
         fallback: Vec::new(),
         fallback_filter: Default::default(),

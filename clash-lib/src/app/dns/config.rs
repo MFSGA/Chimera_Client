@@ -69,6 +69,7 @@ pub struct Config {
     pub enhance_mode: DNSMode,
     pub default_nameserver: Vec<NameServer>,
     pub proxy_server_nameserver: Option<Vec<NameServer>>,
+    pub proxy_server_nameserver_policy: Vec<(String, Vec<NameServer>)>,
     pub direct_nameserver: Option<Vec<NameServer>>,
     pub fake_ip_range: ipnet::IpNet,
     pub fake_ip_range6: Option<ipnet::IpNet>,
@@ -268,6 +269,82 @@ impl Config {
             }
         }
         Ok(policy)
+    }
+
+    /// Parse Mihomo per-proxy-node DNS routing in YAML order.
+    /// Scalar and list values both represent sets of DNS upstreams.
+    /// GeoSite and RuleSet selectors must remain rejected until supported.
+    pub fn parse_proxy_server_nameserver_policy(
+        mapping: &serde_yaml::Mapping,
+    ) -> Result<Vec<(String, Vec<NameServer>)>, Error> {
+        let mut policies = Vec::new();
+        for (raw_domain, value) in mapping {
+            let domain = raw_domain.as_str().ok_or_else(|| {
+                Error::InvalidConfig(
+                    "dns.proxy-server-nameserver-policy requires string domain keys"
+                        .to_owned(),
+                )
+            })?;
+            let server_strings: Vec<String> = match value {
+                serde_yaml::Value::String(server) => vec![server.clone()],
+                serde_yaml::Value::Sequence(list) => list
+                    .iter()
+                    .map(|entry| {
+                        entry.as_str().map(str::to_owned).ok_or_else(|| {
+                            Error::InvalidConfig(format!(
+                                "dns.proxy-server-nameserver-policy for {domain} requires DNS server strings"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                _ => {
+                    return Err(Error::InvalidConfig(format!(
+                        "dns.proxy-server-nameserver-policy for {domain} requires a server or list"
+                    )));
+                }
+            };
+
+            if server_strings
+                .iter()
+                .any(|server| server.trim().eq_ignore_ascii_case("system"))
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "dns.proxy-server-nameserver-policy for {domain} cannot use unsupported system DNS upstream"
+                )));
+            }
+            let nameservers = Self::parse_nameserver(&server_strings)?;
+            if nameservers.is_empty() {
+                return Err(Error::InvalidConfig(format!(
+                    "dns.proxy-server-nameserver-policy for {domain} has no usable DNS clients"
+                )));
+            }
+            if nameservers
+                .iter()
+                .any(|nameserver| nameserver.proxy.is_some())
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "dns.proxy-server-nameserver-policy for {domain} cannot use #proxy until explicit node-DNS dialer routing is supported"
+                )));
+            }
+            let lower = domain.to_ascii_lowercase();
+            if lower.starts_with("geosite:") || lower.starts_with("rule-set:") {
+                return Err(Error::InvalidConfig(format!(
+                    "dns.proxy-server-nameserver-policy selector {domain} requires unsupported GeoSite/RuleSet matching"
+                )));
+            }
+
+            for subdomain in domain.split(',') {
+                let subdomain = subdomain.trim();
+                let (_, valid) = trie::valid_and_split_domain(subdomain);
+                if !valid {
+                    return Err(Error::InvalidConfig(format!(
+                        "dns.proxy-server-nameserver-policy invalid domain: {subdomain}"
+                    )));
+                }
+                policies.push((subdomain.to_ascii_lowercase(), nameservers.clone()));
+            }
+        }
+        Ok(policies)
     }
 
     pub fn parse_fallback_ip_cidr(
@@ -476,6 +553,18 @@ impl TryFrom<&crate::config::def::Config> for Config {
         // Domain hostnames are allowed here: they are bootstrapped through
         // `default-nameserver` at client-construction time, mirroring how
         // `nameserver` resolves its own DoH/DoT hosts.
+        let proxy_server_nameserver_policy =
+            Config::parse_proxy_server_nameserver_policy(
+                &dc.proxy_server_nameserver_policy,
+            )?;
+        if !proxy_server_nameserver_policy.is_empty()
+            && dc.proxy_server_nameserver.is_empty()
+        {
+            return Err(Error::InvalidConfig(
+                "dns.proxy-server-nameserver-policy requires non-empty dns.proxy-server-nameserver".to_owned(),
+            ));
+        }
+
         let proxy_server_nameserver = if !dc.proxy_server_nameserver.is_empty() {
             let ns = Config::parse_nameserver(&dc.proxy_server_nameserver)?;
             if ns.is_empty() {
@@ -590,6 +679,7 @@ impl TryFrom<&crate::config::def::Config> for Config {
             enhance_mode: dc.enhanced_mode.clone(),
             default_nameserver,
             proxy_server_nameserver,
+            proxy_server_nameserver_policy,
             direct_nameserver,
             fake_ip_range: dc.fake_ip_range.parse::<ipnet::IpNet>().map_err(
                 |_| Error::InvalidConfig(String::from("invalid fake ip range")),

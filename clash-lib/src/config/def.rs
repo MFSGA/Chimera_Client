@@ -433,7 +433,6 @@ fn reject_unsupported_mihomo_privacy_fields(value: &Value) -> Result<(), Error> 
         (
             "dns",
             &[
-                "proxy-server-nameserver-policy",
                 "direct-nameserver-follow-policy",
                 "fake-ip-ttl",
                 "use-system-hosts",
@@ -727,6 +726,8 @@ pub struct DNS {
     pub nameserver: Vec<String>,
     /// DNS upstreams dedicated to resolving proxy node hostnames
     pub proxy_server_nameserver: Vec<String>,
+    /// Ordered Mihomo per-node DNS policy. Mapping order is significant.
+    pub proxy_server_nameserver_policy: serde_yaml::Mapping,
     /// DNS upstreams used when the final outbound is DIRECT.
     pub direct_nameserver: Vec<String>,
     /// Fallback DNS upstream servers
@@ -1255,11 +1256,6 @@ proxy:
             ("tun", "exclude-interface", "[en1]"),
             ("tun", "stack", "system"),
             ("tun", "route-address", "[0.0.0.0/0]"),
-            (
-                "dns",
-                "proxy-server-nameserver-policy",
-                "{example.test: 9.9.9.9}",
-            ),
             ("dns", "direct-nameserver-follow-policy", "false"),
             ("dns", "fake-ip-ttl", "1"),
             ("dns", "use-system-hosts", "false"),

@@ -157,6 +157,43 @@ impl Config {
             ));
         }
 
+        // Preserve the dedicated bootstrap boundary for internal configs as
+        // well as for YAML. A policy without default proxy DNS is invalid.
+        if !self.dns.proxy_server_nameserver_policy.is_empty()
+            && self
+                .dns
+                .proxy_server_nameserver
+                .as_ref()
+                .is_none_or(Vec::is_empty)
+        {
+            return Err(Error::InvalidConfig(
+                "dns.proxy-server-nameserver-policy requires non-empty dns.proxy-server-nameserver".to_owned(),
+            ));
+        }
+
+        // Internal configs and reloads bypass the YAML parser. Reject node
+        // policy selectors and dialer overrides whose semantics are not yet
+        // supported, rather than silently treating them as literal domains.
+        for (domain, servers) in &self.dns.proxy_server_nameserver_policy {
+            let lower = domain.to_ascii_lowercase();
+            let (_, valid) = crate::common::trie::valid_and_split_domain(domain);
+            if lower.starts_with("geosite:")
+                || lower.starts_with("rule-set:")
+                || !valid
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "dns.proxy-server-nameserver-policy unsupported selector: {domain}"
+                )));
+            }
+            if servers.is_empty()
+                || servers.iter().any(|server| server.proxy.is_some())
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "dns.proxy-server-nameserver-policy for {domain} has no usable upstream or an unsupported #proxy dialer"
+                )));
+            }
+        }
+
         if self.tun.enable
             && self.dns.enable
             && self.dns.enhance_mode == def::DNSMode::FakeIp
