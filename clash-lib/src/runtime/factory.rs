@@ -141,6 +141,10 @@ pub(super) async fn create_components(
     // TODO: we should separate the DNS resolver and DNS server config here
     let dns_listen = config.dns.listen.clone();
     let dns_enable = config.dns.enable;
+    // Apply the same privacy contract to new nodes from proxy providers.
+    let protect_provider_dns = config.tun.enable
+        && dns_enable
+        && config.dns.enhance_mode == crate::config::def::DNSMode::FakeIp;
     let managed_dns_proxy_bridge = cfg!(target_os = "macos")
         && config.tun.enable
         && config.tun.dns_hijack
@@ -195,6 +199,7 @@ pub(super) async fn create_components(
             config.general.routing_mask,
             outbound_registry.clone(),
             network_path_source.clone(),
+            protect_provider_dns,
         )
         .await?,
     );

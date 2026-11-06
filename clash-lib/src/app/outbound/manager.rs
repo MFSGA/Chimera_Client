@@ -269,6 +269,7 @@ impl OutboundManager {
             fw_mark,
             registry,
             NetworkPathSource::default(),
+            false,
         )
         .await
     }
@@ -284,6 +285,7 @@ impl OutboundManager {
         fw_mark: Option<u32>,
         registry: OutboundHandlerRegistry,
         network_path_source: NetworkPathSource,
+        protect_provider_dns: bool,
     ) -> Result<Self, Error> {
         // Build all handlers in a plain HashMap during initialization.
         // Once fully assembled it is written into the shared registry so that
@@ -307,8 +309,13 @@ impl OutboundManager {
         };
 
         debug!("initializing proxy providers");
-        m.load_proxy_providers(cwd, proxy_providers, dns_resolver)
-            .await?;
+        m.load_proxy_providers(
+            cwd,
+            proxy_providers,
+            dns_resolver,
+            protect_provider_dns,
+        )
+        .await?;
 
         debug!("initializing handlers");
         m.load_handlers(
@@ -1364,6 +1371,7 @@ impl OutboundManager {
         cwd: String,
         proxy_providers: HashMap<String, OutboundProxyProviderDef>,
         resolver: ThreadSafeDNSResolver,
+        protect_provider_dns: bool,
     ) -> Result<(), Error> {
         let provider_registry = &mut self.proxy_providers;
         for (name, provider) in proxy_providers.into_iter() {
@@ -1396,11 +1404,12 @@ impl OutboundManager {
                         self.proxy_manager.clone(),
                     );
                     let provider: ThreadSafeProxyProvider = Arc::new(RwLock::new(
-                        ProxySetProvider::new(
+                        ProxySetProvider::new_with_dns_privacy(
                             name.clone(),
                             Duration::from_secs(http.interval),
                             vehicle,
                             health_check,
+                            protect_provider_dns,
                         )
                         .map_err(|x| {
                             Error::InvalidConfig(format!(
@@ -1511,11 +1520,12 @@ impl OutboundManager {
                     );
 
                     let provider: ThreadSafeProxyProvider = Arc::new(RwLock::new(
-                        ProxySetProvider::new(
+                        ProxySetProvider::new_with_dns_privacy(
                             name.clone(),
                             Duration::from_secs(file.interval.unwrap_or_default()),
                             vehicle,
                             health_check,
+                            protect_provider_dns,
                         )
                         .map_err(|x| {
                             Error::InvalidConfig(format!(

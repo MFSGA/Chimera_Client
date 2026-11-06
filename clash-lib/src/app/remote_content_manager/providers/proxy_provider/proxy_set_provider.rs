@@ -12,7 +12,9 @@ use crate::{
         },
     },
     common::errors::map_io_error,
-    config::internal::proxy::OutboundProxyProtocol,
+    config::internal::{
+        config::validate_xhttp_secondary_managed_dns, proxy::OutboundProxyProtocol,
+    },
     proxy::AnyOutboundHandler,
 };
 use async_trait::async_trait;
@@ -55,6 +57,18 @@ impl ProxySetProvider {
         interval: Duration,
         vehicle: ThreadSafeProviderVehicle,
         hc: HealthCheck,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_dns_privacy(name, interval, vehicle, hc, false)
+    }
+
+    /// Provider refreshes bypass Config::validate. Apply the same fail-closed
+    /// XHTTP DNS policy to all subsequent versions of a provider.
+    pub(crate) fn new_with_dns_privacy(
+        name: String,
+        interval: Duration,
+        vehicle: ThreadSafeProviderVehicle,
+        hc: HealthCheck,
+        protect_provider_dns: bool,
     ) -> anyhow::Result<Self> {
         let hc = Arc::new(hc);
 
@@ -126,6 +140,14 @@ impl ProxySetProvider {
                     }
                 })
                 .filter_map(|proxy| {
+                    if protect_provider_dns
+                        && let Err(error) =
+                            validate_xhttp_secondary_managed_dns(&proxy)
+                    {
+                        // Reject this entire update rather than publish only
+                        // the safe subset, retaining last good proxies/cache.
+                        return Some(Err(error));
+                    }
                     match OutboundManager::load_provider_outbound(proxy) {
                         Ok(handler) => handler.map(Ok),
                         Err(e) => Some(Err(e)),
@@ -262,9 +284,64 @@ mod update_reliability_tests {
     const SAME_NAME_NEW_HOST: &[u8] = b"proxies:\n  - name: last-good\n    type: socks5\n    server: 198.51.100.12\n    port: 1080\n";
     const PARTIAL: &[u8] = b"proxies:\n  - name: broken\n    type: unknown-protocol\n  - name: recovered\n    type: socks5\n    server: 198.51.100.11\n    port: 1081\n";
 
+    const UNSAFE_XHTTP_DOWNLINK: &[u8] = br#"
+proxies:
+  - name: leaking-xhttp
+    type: vless
+    server: managed.example
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    network: xhttp
+    alpn: [h2]
+    xhttp-opts:
+      mode: stream-up
+      download-settings:
+        address: private-secondary.example
+        port: 443
+"#;
+    const SAFE_XHTTP_DOWNLINK: &[u8] = br#"
+proxies:
+  - name: safe-xhttp
+    type: vless
+    server: managed.example
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    network: xhttp
+    alpn: [h2]
+    xhttp-opts:
+      mode: stream-up
+      download-settings:
+        address: 192.0.2.48
+        port: 443
+"#;
+    const MIXED_SAFE_AND_UNSAFE_XHTTP: &[u8] = br#"
+proxies:
+  - name: safe-socks
+    type: socks5
+    server: 198.51.100.44
+    port: 1080
+  - name: unsafe-http1
+    type: vless
+    server: private-reconnect.example
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    network: xhttp
+    alpn: [http/1.1]
+    xhttp-opts:
+      mode: auto
+"#;
+
     fn provider_with_refresh(
         path: String,
         refreshed_content: &'static [u8],
+    ) -> ProxySetProvider {
+        provider_with_refresh_dns_mode(path, refreshed_content, false)
+    }
+
+    fn provider_with_refresh_dns_mode(
+        path: String,
+        refreshed_content: &'static [u8],
+        protect_provider_dns: bool,
     ) -> ProxySetProvider {
         let reads = Arc::new(AtomicUsize::new(0));
         let mut vehicle = MockProviderVehicle::new();
@@ -285,13 +362,112 @@ mod update_reliability_tests {
             true,
             manager,
         );
-        ProxySetProvider::new(
+        ProxySetProvider::new_with_dns_privacy(
             "synthetic-provider".to_owned(),
             Duration::ZERO,
             Arc::new(vehicle),
             health,
+            protect_provider_dns,
         )
         .expect("offline provider should construct")
+    }
+
+    #[tokio::test]
+    async fn protected_provider_rejects_xhttp_dns_leak_without_replacing_last_good()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("protected-provider.yaml");
+        let provider = provider_with_refresh_dns_mode(
+            path.to_string_lossy().into_owned(),
+            UNSAFE_XHTTP_DOWNLINK,
+            true,
+        );
+        provider.initialize().await.expect("safe initial provider");
+        let before = provider.strict_content_snapshot().await.unwrap();
+        let error = provider
+            .update()
+            .await
+            .expect_err("unsafe XHTTP domain must not enter the provider");
+        let diagnostic = error.to_string();
+        assert!(
+            diagnostic.contains("xhttp") && diagnostic.contains("download-settings"),
+            "{diagnostic}"
+        );
+        assert!(!diagnostic.contains("private-secondary.example"));
+
+        let after = provider.strict_content_snapshot().await.unwrap();
+        assert_eq!(before.revision, after.revision);
+        assert!(Arc::ptr_eq(&before.proxies[0], &after.proxies[0]));
+        assert_eq!(after.proxies[0].name(), "last-good");
+        assert_eq!(std::fs::read(&path).unwrap(), VALID);
+    }
+
+    #[tokio::test]
+    async fn mixed_safe_and_unsafe_provider_refresh_is_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed-protected-provider.yaml");
+        let provider = provider_with_refresh_dns_mode(
+            path.to_string_lossy().into_owned(),
+            MIXED_SAFE_AND_UNSAFE_XHTTP,
+            true,
+        );
+        provider.initialize().await.expect("safe initial provider");
+        let before = provider.strict_content_snapshot().await.unwrap();
+        let diagnostic = provider
+            .update()
+            .await
+            .expect_err("a safe candidate must not mask unsafe XHTTP reconnect")
+            .to_string();
+        assert!(
+            diagnostic.contains("xhttp") && diagnostic.contains("http/1.1"),
+            "{diagnostic}"
+        );
+        assert!(!diagnostic.contains("private-reconnect.example"));
+
+        let after = provider.strict_content_snapshot().await.unwrap();
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.proxies.len(), 1);
+        assert!(Arc::ptr_eq(&before.proxies[0], &after.proxies[0]));
+        assert_eq!(std::fs::read(&path).unwrap(), VALID);
+    }
+
+    #[tokio::test]
+    async fn protected_provider_accepts_literal_xhttp_downlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("literal-provider.yaml");
+        let provider = provider_with_refresh_dns_mode(
+            path.to_string_lossy().into_owned(),
+            SAFE_XHTTP_DOWNLINK,
+            true,
+        );
+        provider.initialize().await.expect("safe initial provider");
+        provider
+            .update()
+            .await
+            .expect("IP-literal secondary avoids OS DNS");
+        let snapshot = provider.strict_content_snapshot().await.unwrap();
+        assert_eq!(snapshot.revision, 2);
+        assert_eq!(snapshot.proxies[0].name(), "safe-xhttp");
+    }
+
+    #[tokio::test]
+    async fn unprotected_provider_preserves_existing_domain_downlink_behavior() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-provider.yaml");
+        let provider = provider_with_refresh_dns_mode(
+            path.to_string_lossy().into_owned(),
+            UNSAFE_XHTTP_DOWNLINK,
+            false,
+        );
+        provider
+            .initialize()
+            .await
+            .expect("non-TUN initial provider");
+        provider
+            .update()
+            .await
+            .expect("legacy mode still allows domain downlinks");
+        assert_eq!(provider.proxies().await[0].name(), "leaking-xhttp");
     }
 
     #[tokio::test]
