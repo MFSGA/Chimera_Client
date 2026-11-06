@@ -200,3 +200,18 @@ System DNS 指向一个与 fake-IP 池、TUN 网关子网及 route exclusions �
 
 - 执行策略：先取得测试机所有者的明确许可，记录活动服务的原始配置以便回滚；用测试专用、不包含真实订阅或用户域名的 canary；通过系统**只读**检查与有权限的专用抓包并行关联，记录不含私有 QNAME 的摘要。没有 DNS Proxy Extension 或等效受管控制面时，验证结论只能是“覆盖不完整”，不能写“零泄漏”。
 - 本地验收（macOS arm64，`--no-default-features --features tun,ring --locked`）：`cargo test -p clash-lib --lib -j 6` 843 passed / 0 failed / 11 ignored；`cargo test -p clash-lib --test dns_config_tests -j 6` 30 passed / 0 failed；`cargo clippy -p clash-lib --all-targets -j 6 -- -D warnings`、`cargo check -p clash-rs --no-default-features --features standard,aws-lc-rs --locked`、`cargo fmt --all -- --check`、`git diff --check` 通过。无 TUN 组合编译通过，但过滤特定 TUN 测试实际运行 0 项，不计作行为验收。离线测试先证实旧实现错误接受需系统 DNS 的 XHTTP secondary hostname，再验证配置转换、`extra.download-settings` 优先级、内部热重载的拒绝和 IP-literal/普通主节点的保留。
+
+## 2026-11-06 AnyTLS 入站 fallback 系统 DNS 隔离（L2 待审）
+
+- 基线：`codex/macos-tun-fakeip-dns-privacy`，本切片前 `HEAD=bb172c82f2737e3e003da6e979a37e352b469eff`，本地 `master=e42dabe74282c77245da1023de0b828830928216`、`origin/master=902c5e7702960ab4f978a014d7079c79d17079fd`。只读参考为主检出 `ref-mihomo` 固定 `63bd52ec794b7051569b76ede2f6cdbf4c091fda`；本隔离工作树中子模块未检出，未更改 gitlink。固定 Mihomo `config/config.go::RawDNS` / `parseDNS` 用于 DNS 字段与失败路径对照；AnyTLS inbound camouflage fallback 是 Chimera 本地特定路径，本切片不声称存在同名 Mihomo 等价字段。
+- 发现 `proxy/anytls/inbound/handler.rs::connect_fallback_backend` 在 AnyTLS 身份验证失败时调用 `tokio::net::lookup_host(fallback_addr)`，即使 TUN + Fake-IP 已启用，也不使用 Chimera 的受管 DNS 引导。macOS service-scoped resolver 可能通过物理 NIC 发出域名查询，不能以 TUN hijack 推断已保护。
+- 在 `config/internal/config.rs::Config::validate` 为 `feature=anytls` 的 AnyTLS 入站增加保护：仅当 `tun.enable && dns.enable && enhanced-mode: fake-ip` 且配置了 `fallback` 时，要求值为可解析的 IP 字面量 `SocketAddr`（IPv4 `192.0.2.53:443`、IPv6 `[2001:db8::53]:443`）。域名或未明确端口的地址 fail-closed，报错不包含 hostname/密码；没有 fallback、未启用 TUN 或 DNS 的旧行为保持不变。此门禁同样覆盖内部配置热重载。
+- 测试先在原有调用链下写拒绝域名的否定测试，新增 `fake_ip_tun_rejects_anytls_fallback_system_dns_hostname`、`fake_ip_tun_allows_anytls_ip_literal_fallback_and_non_tun_hostname`、`anytls_inbound_fallback_cannot_bypass_gate_by_internal_reload`。无实际 TUN、系统网络、权限提升或 NIC 抓包。迁移方式：敏感组合的 AnyTLS fallback 改用受控 IP:port（IPv6 必须方括号），或取消 fallback；不能把放宽 TUN 隐私设置视为等价的防泄漏方案。
+- **限制**：静态配置拒绝不等于 OS DNS ownership / 全局防泄漏；动态 provider、其它系统解析器、DIRECT/代理节点 DNS、浏览器 DoH/DoT、切网、睡眠、IPv6 及真实物理 NIC 仍需独立授权测试。此行为变更需要 L2 独立 Reviewer 与维护者批准，不自动推送/合并。
+
+## 2026-11-06 AnyTLS 入站 fallback 的系统 DNS 旁路（L2 待审）
+
+- 开发起点 `bb172c82f2737e3e003da6e979a37e352b469eff`；`clash-lib/src/proxy/anytls/inbound/handler.rs::connect_fallback_backend` 在 TLS 客户端认证失败后，对 `fallback` 字段调用 `tokio::net::lookup_host`，绕过 Chimera 自己的 DNS resolver。macOS 的 service-scoped resolver 并不保证经过 utun，因此在 TUN + Fake-IP 的严格隐私场景下可能发生未受控 DNS 外发。
+- 新的内部 `Config::validate` 校验在 `tun.enable && dns.enable && enhance_mode=fake-ip` 时拒绝 AnyTLS inbound `fallback` 非 `SocketAddr` 的值，只允许不需要系统解析的 `IPv4:port` 或 `[IPv6]:port`；`fallback` 未设置或 TUN 关闭时保留原有配置行为。配置错误不输出实际 fallback 地址。此改动限制原先允许的 hostname fallback，部署者可将该回退终端改为静态 IP 地址并自行确保 TLS/服务端兼容。
+- 使用 `tun,ring,anytls` 特性组合的离线测试先确认旧配置错误地允许 hostname fallback，再覆盖普通加载、IPv4/IPv6 字面量、非 TUN 兼容及 Internal 热重载无法绕过。最终 `cargo test -p clash-lib --lib --no-default-features --features tun,ring,anytls --locked -j 6` 为 883 passed / 0 failed / 11 ignored；`cargo test -p clash-lib --test dns_config_tests --no-default-features --features tun,ring,anytls --locked -j 6` 为 30 passed；`cargo clippy -p clash-lib --all-targets --no-default-features --features tun,ring,anytls --locked -j 6 -- -D warnings`、fmt、diff 检查通过。无真实 AnyTLS 认证失败的外网请求或 macOS DNS/NIC 抓包。
+- 此门禁仅涵盖代码可确认的 AnyTLS 入站伪装回退。不代表对所有通过 libc/getaddrinfo、浏览器 DoH、网络扩展、XHTTP 动态节点以及未识别的系统 DNS 路径均已控制；macOS DNS Proxy Extension 的服务级接管、可审计的出口保护和物理 NIC 的独立抓包仍未实现。
