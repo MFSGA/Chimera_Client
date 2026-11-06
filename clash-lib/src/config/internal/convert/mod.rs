@@ -245,6 +245,209 @@ profile: {{}}
             .expect("def config should parse")
     }
 
+    #[cfg(feature = "tun")]
+    #[test]
+    fn fake_ip_tun_rejects_xhttp_secondary_system_dns_endpoints() {
+        // The XHTTP HTTP/1.1 reconnect and HTTP/2 separate downlink use
+        // tokio::lookup_host, not the configured proxy-server-nameserver.
+        // These cases may be accepted in ordinary mode but cannot be
+        // silently treated as protected DNS inside Fake-IP TUN.
+        let scenarios = [
+            ("h2", "download.example", "download-settings"),
+            ("http/1.1", "primary.example", "http/1.1"),
+        ];
+        for (alpn, host, offending) in scenarios {
+            let download = if alpn == "h2" {
+                "      download-settings:\n        address: download.example\n        port: 8443\n"
+            } else {
+                ""
+            };
+            let raw = format!(
+                "tun:\n  enable: true\nproxies:\n  - name: XHTTP\n    type: vless\n    server: {host}\n    port: 443\n    uuid: b831381d-6324-4d53-ad4f-8cda48b30811\n    network: xhttp\n    alpn: [{alpn}]\n    xhttp-opts:\n      mode: auto\n{download}",
+            );
+            let err = match convert({
+                let mut cfg = parse_config(&raw);
+                cfg.dns.enable = true;
+                cfg.dns.nameserver = vec!["1.1.1.1".to_owned()];
+                cfg.dns.enhanced_mode = def::DNSMode::FakeIp;
+                cfg
+            }) {
+                Ok(_) => panic!("unprotected secondary XHTTP DNS must fail"),
+                Err(error) => error.to_string(),
+            };
+            assert!(err.contains("xhttp") && err.contains(offending), "{err}");
+            assert!(
+                !err.contains("download.example")
+                    && !err.contains("primary.example"),
+                "{err}"
+            );
+        }
+    }
+
+    #[cfg(feature = "tun")]
+    #[test]
+    fn fake_ip_tun_allows_literal_xhttp_secondary_and_primary_managed_dns() {
+        for (server, alpn, download) in [
+            ("primary.example", "h2", ""),
+            (
+                "primary.example",
+                "h2",
+                "download-settings:\n        address: 192.0.2.42\n        port: 8443",
+            ),
+            ("192.0.2.15", "http/1.1", ""),
+        ] {
+            let raw = format!(
+                "tun:\n  enable: true\nproxies:\n  - name: XHTTP\n    type: vless\n    server: {server}\n    port: 443\n    uuid: b831381d-6324-4d53-ad4f-8cda48b30811\n    network: xhttp\n    alpn: [{alpn}]\n    xhttp-opts:\n      mode: auto\n      {download}\n",
+            );
+            convert({
+                let mut cfg = parse_config(&raw);
+                cfg.dns.enable = true;
+                cfg.dns.nameserver = vec!["1.1.1.1".to_owned()];
+                cfg.dns.enhanced_mode = def::DNSMode::FakeIp;
+                cfg
+            })
+            .expect("no secondary system-DNS hostname");
+        }
+    }
+
+    #[cfg(feature = "tun")]
+    #[test]
+    fn xhttp_extra_download_precedence_cannot_bypass_dns_safety_gate() {
+        let mut cfg = parse_config(
+            r#"
+tun:
+  enable: true
+proxies:
+  - name: XHTTP
+    type: vless
+    server: primary.example
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    network: xhttp
+    alpn: [h2]
+    xhttp-opts:
+      download-settings:
+        address: 192.0.2.10
+      extra:
+        download-settings:
+          address: private.example
+"#,
+        );
+        cfg.dns.enable = true;
+        cfg.dns.nameserver = vec!["1.1.1.1".to_owned()];
+        cfg.dns.enhanced_mode = def::DNSMode::FakeIp;
+        let err = match convert(cfg) {
+            Ok(_) => {
+                panic!("effective extra.download-settings requires DNS protection")
+            }
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("xhttp download-settings"), "{err}");
+        assert!(!err.contains("private.example"), "{err}");
+    }
+
+    #[cfg(feature = "tun")]
+    #[test]
+    fn xhttp_unsafe_secondary_rejected_after_internal_reload() {
+        // Start with a valid non-TUN configuration, then enable TUN through
+        // the Internal config path (reloads do not call YAML parsing).
+        let mut cfg = parse_config(
+            r#"
+proxies:
+  - name: XHTTP
+    type: vless
+    server: primary.example
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    network: xhttp
+    alpn: [h2]
+    xhttp-opts:
+      download-settings:
+        address: hidden.example
+"#,
+        );
+        cfg.dns.enable = true;
+        cfg.dns.nameserver = vec!["1.1.1.1".to_owned()];
+        cfg.dns.enhanced_mode = def::DNSMode::FakeIp;
+        let mut internal =
+            convert(cfg).expect("non-TUN allows existing XHTTP semantics");
+        internal.tun.enable = true;
+        let error = match crate::Config::Internal(internal).try_parse() {
+            Ok(_) => panic!("reload must not bypass XHTTP DNS egress gate"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("xhttp download-settings"), "{error}");
+        assert!(!error.contains("hidden.example"), "{error}");
+    }
+
+    #[cfg(all(feature = "tun", feature = "anytls"))]
+    #[test]
+    fn fake_ip_tun_rejects_anytls_fallback_system_dns_hostname() {
+        for hostname in ["camouflage.example:443", "localhost:443", "192.0.2.53"] {
+            let mut cfg = parse_config(&format!(
+                "tun:\n  enable: true\nlisteners:\n  - name: tls-in\n    type: anytls\n    listen: 127.0.0.1\n    port: 34432\n    password: test-password\n    fallback: {hostname}\n",
+            ));
+            cfg.dns.enable = true;
+            cfg.dns.enhanced_mode = def::DNSMode::FakeIp;
+            cfg.dns.nameserver = vec!["1.1.1.1".to_owned()];
+            let err = match convert(cfg) {
+                Ok(_) => {
+                    panic!("AnyTLS hostname fallback may use unprotected OS DNS")
+                }
+                Err(error) => error.to_string(),
+            };
+            assert!(err.contains("anytls") && err.contains("fallback"), "{err}");
+            assert!(
+                !err.contains("camouflage.example") && !err.contains("localhost"),
+                "{err}"
+            );
+        }
+    }
+
+    #[cfg(all(feature = "tun", feature = "anytls"))]
+    #[test]
+    fn fake_ip_tun_allows_anytls_ip_literal_fallback_and_non_tun_hostname() {
+        for (tun_enabled, addr) in [
+            (true, "192.0.2.53:443"),
+            (true, "[2001:db8::53]:443"),
+            (false, "camouflage.example:443"),
+        ] {
+            let mut cfg = parse_config(&format!(
+                "tun:\n  enable: {tun_enabled}\nlisteners:\n  - name: tls-in\n    type: anytls\n    listen: 127.0.0.1\n    port: 34432\n    password: test-password\n    fallback: '{addr}'\n",
+            ));
+            cfg.dns.enable = true;
+            cfg.dns.enhanced_mode = def::DNSMode::FakeIp;
+            cfg.dns.nameserver = vec!["1.1.1.1".to_owned()];
+            convert(cfg).expect(
+                "IP literal needs no system DNS; non-TUN legacy is unchanged",
+            );
+        }
+    }
+
+    #[cfg(all(feature = "tun", feature = "anytls"))]
+    #[test]
+    fn anytls_inbound_fallback_cannot_bypass_gate_by_internal_reload() {
+        let mut cfg = parse_config(
+            "listeners:\n  - name: tls-in\n    type: anytls\n    listen: 127.0.0.1\n    port: 34432\n    password: test-password\n    fallback: private.example:443\n",
+        );
+        cfg.dns.enable = true;
+        cfg.dns.enhanced_mode = def::DNSMode::FakeIp;
+        cfg.dns.nameserver = vec!["1.1.1.1".to_owned()];
+        let mut internal = convert(cfg).expect("baseline without TUN is accepted");
+        internal.tun.enable = true;
+        let error = match crate::Config::Internal(internal).try_parse() {
+            Ok(_) => {
+                panic!("internal reload must reject unaudited AnyTLS system DNS")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("anytls") && error.contains("fallback"),
+            "{error}"
+        );
+        assert!(!error.contains("private.example"), "{error}");
+    }
+
     #[cfg(not(feature = "tun"))]
     #[test]
     fn reject_enabled_tun_without_tun_feature() {
