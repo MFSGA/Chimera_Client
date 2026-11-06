@@ -939,6 +939,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn keyed_blake2s_macs_match_independent_reference_vectors() {
+        // Independently generated using Python hashlib.blake2s with digest_size=16/24.
+        let key: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let first = b"WireGuard MAC test: ";
+        let second = b"Chimera cookie";
+
+        assert_eq!(
+            b2s_keyed_mac_16(&key, first),
+            [
+                0xf0, 0x46, 0x85, 0x0b, 0x3a, 0x3f, 0xfb, 0x3d, 0x69, 0x2f, 0x8b,
+                0xa5, 0xd5, 0x4b, 0x58, 0x6f
+            ]
+        );
+        assert_eq!(
+            b2s_keyed_mac_16_2(&key, first, second),
+            [
+                0x27, 0x59, 0x8b, 0x1e, 0xe4, 0x71, 0x7e, 0x4a, 0xbb, 0xd5, 0x0f,
+                0xd1, 0xdc, 0xc7, 0x33, 0x01
+            ]
+        );
+        assert_eq!(
+            b2s_mac_24(&key, &42_u64.to_le_bytes()),
+            [
+                0x49, 0xe9, 0x5c, 0x2f, 0xbf, 0x44, 0xf8, 0xd4, 0xae, 0x3f, 0xb7,
+                0x36, 0x77, 0x19, 0xce, 0x86, 0xa5, 0xdd, 0xca, 0x06, 0xac, 0xe8,
+                0x5a, 0x92,
+            ]
+        );
+    }
+
+    #[test]
     fn chacha20_seal_rfc7530_test_vector() {
         let plaintext = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
         let aad: [u8; 12] = [
