@@ -179,6 +179,12 @@
 - 不支持且会明确报错：`geosite:`、`rule-set:`、策略值的 `system` 上游及 `#proxy` 指定出站。其它 Mihomo DNS 高级策略、真实 DNS 出口接口选择、系统 service-scoped resolver、TUN/NIC 抓包和跨平台运行仍未验证；不能宣称全部兼容或全系统零泄漏。
 - 对应测试涵盖 YAML→运行时、客户端构造、多个上游、匹配顺序、未知节点默认专用解析器、策略失败无公共 DNS 回退、大小写、网络切换重置及内部热更新校验；既有 `dns_legacy_golden_tests::s00_respect_rules_and_legacy_proxy_modifier_are_preserved` 的前序冲突仍单列，不改旧测试掩盖失败。
 
+### 2026-11-06 macOS TUN 路由排除项失效关闭（L2 待审）
+
+- 基线：独立工作树从 `a734515f5e33027013cc0bb3652272ed49a120e3` 建立；原指定工作树分支已前进到 `9dfd4b327eb6a67f1adfc84796473c518face9cb`，未改动其工作区。固定 Mihomo gitlink 为 `63bd52ec794b7051569b76ede2f6cdbf4c091fda`，本工作树未检出子模块，无法直接读取该提交源码；参考行为只以本地配置字段及已有路由实现为依据，不宣称完整 Mihomo 对照验证。
+- macOS `proxy/tun/routes/mod.rs` 在 `route-all` 下对 `route-exclude-address` 仅警告并忽略；此前转换层仍接受该值。现在 macOS 转换阶段拒绝非空 `route-exclude-address`、`inet4-route-exclude-address`、`inet6-route-exclude-address`，包括 `route-all: false`，避免配置通过后不按预期排除路由。空列表保持旧行为；其他平台转换行为不变。
+- 先增加 `macos_route_exclusions_fail_closed_before_tun_startup` 否定测试并确认旧代码失败；修复后需复测。该切片不实现 macOS 排除路由，也不保证系统 DNS ownership、真实物理网卡无泄漏。L2 审查、维护者批准和实机抓包仍待完成。
+
 ## 3. 变更管理与 S01 准入
 
 当前决定是 **保留已实现旧配置行为**，不存在本轮批准的 REMOVE/DEPRECATE。对每个未来不兼容行为使用指南 §2.3 的 `DNS-COMPAT-XXXX` 决策模板；没有具体旧行为、影响、迁移、回滚、测试和维护者批准，不允许落地。
