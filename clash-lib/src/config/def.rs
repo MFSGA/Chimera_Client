@@ -77,6 +77,10 @@ pub struct TunConfig {
     pub inet6_route_exclude_address: Option<Vec<String>>,
     #[serde(default, alias = "route_all", alias = "auto-route")]
     pub route_all: bool,
+    /// Mihomo's strict-route is not implemented by Chimera's platform routing.
+    /// Keep the field explicit so a privacy-sensitive setting cannot be ignored.
+    #[serde(default)]
+    pub strict_route: bool,
     pub mtu: Option<u16>,
     #[serde(alias = "so_mark")]
     pub so_mark: Option<u32>,
@@ -715,6 +719,9 @@ pub struct DNS {
     pub fake_ip_range6: Option<String>,
     /// Fake IP addresses filter
     pub fake_ip_filter: Vec<String>,
+    /// Only Mihomo's default blacklist semantics are currently implemented.
+    /// Unsupported modes must fail parsing rather than silently fall back.
+    pub fake_ip_filter_mode: FakeIpFilterMode,
     /// Opt-in safe forwarding for SRV service-discovery queries in Fake-IP mode.
     /// The default preserves the legacy empty-answer behavior.
     pub service_discovery_mode: DnsServiceDiscoveryMode,
@@ -737,6 +744,13 @@ pub struct DNS {
     pub resolver_profiles: HashMap<String, DnsResolverProfileDef>,
     /// S01: ordered query policy rules; never changes Business Rules.
     pub policy_rules: Vec<DnsPolicyRuleDef>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FakeIpFilterMode {
+    #[default]
+    Blacklist,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1141,6 +1155,28 @@ proxy:
                 .as_ref()
                 .is_some_and(|exp| exp.proxy_resolve_local)
         );
+    }
+
+    #[test]
+    fn mihomo_fake_ip_filter_blacklist_is_accepted() {
+        let cfg: Config = "dns:\n  fake-ip-filter-mode: blacklist"
+            .parse()
+            .expect("Mihomo default filter mode must work");
+        assert_eq!(
+            cfg.dns.fake_ip_filter_mode,
+            super::FakeIpFilterMode::Blacklist
+        );
+    }
+
+    #[test]
+    fn mihomo_unsupported_fake_ip_filter_modes_are_not_silently_ignored() {
+        for mode in ["whitelist", "rule"] {
+            let yaml = format!("dns:\n  fake-ip-filter-mode: {mode}");
+            assert!(
+                yaml.parse::<Config>().is_err(),
+                "unsupported {mode} mode must be rejected rather than treated as blacklist"
+            );
+        }
     }
 
     #[test]

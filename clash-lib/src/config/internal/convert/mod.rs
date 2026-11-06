@@ -407,6 +407,73 @@ profile: {{}}
     }
 
     #[test]
+    fn mihomo_respect_rules_requires_proxy_server_nameserver() {
+        let mut cfg = parse_config("");
+        cfg.dns.respect_rules = true;
+        cfg.dns.nameserver = vec!["1.1.1.1".to_owned()];
+        let err = match convert(cfg) {
+            Ok(_) => panic!("respect-rules needs bootstrap DNS for proxy nodes"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, Error::InvalidConfig(msg) if msg.contains("proxy-server-nameserver"))
+        );
+    }
+
+    #[cfg(feature = "tun")]
+    #[test]
+    fn tun_fake_ip_rejects_local_resolution_of_proxy_destinations() {
+        let mut cfg = parse_config("tun:\n  enable: true");
+        cfg.dns.enable = true;
+        cfg.dns.nameserver = vec!["1.1.1.1".to_owned()];
+        cfg.dns.enhanced_mode = def::DNSMode::FakeIp;
+        cfg.experimental =
+            Some(serde_yaml::from_str("proxy-resolve-local: true").unwrap());
+        let err = match convert(cfg) {
+            Ok(_) => panic!(
+                "proxy destination local DNS must not be allowed in Fake-IP TUN"
+            ),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, Error::InvalidConfig(msg) if msg.contains("proxy-resolve-local"))
+        );
+    }
+
+    #[cfg(feature = "tun")]
+    #[test]
+    fn tun_fake_ip_accepts_remote_domain_proxy_mode() {
+        let mut cfg = parse_config("tun:\n  enable: true\n  dns-hijack: true");
+        cfg.dns.enable = true;
+        cfg.dns.nameserver = vec!["1.1.1.1".to_owned()];
+        cfg.dns.enhanced_mode = def::DNSMode::FakeIp;
+        cfg.experimental =
+            Some(serde_yaml::from_str("proxy-resolve-local: false").unwrap());
+        convert(cfg)
+            .expect("Fake-IP TUN with proxy remote domain mode must be valid");
+    }
+
+    #[cfg(feature = "tun")]
+    #[test]
+    fn internal_tun_fake_ip_cannot_bypass_proxy_dns_privacy_gate() {
+        let mut cfg = parse_config("tun:\n  enable: true");
+        cfg.dns.enable = true;
+        cfg.dns.nameserver = vec!["1.1.1.1".to_owned()];
+        cfg.dns.enhanced_mode = def::DNSMode::FakeIp;
+        let mut internal =
+            convert(cfg).expect("build a valid internal Fake-IP config");
+        internal.experimental =
+            Some(serde_yaml::from_str("proxy-resolve-local: true").unwrap());
+        let err = match crate::Config::Internal(internal).try_parse() {
+            Ok(_) => panic!("internal configs must honor the same DNS privacy gate"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, Error::InvalidConfig(msg) if msg.contains("proxy-resolve-local"))
+        );
+    }
+
+    #[test]
     fn ipv6_disabled_rejects_literal_ipv6_proxy_server() {
         let error = match convert(parse_config(
             "proxies:\n  - name: ipv6-node\n    type: socks5\n    server: '2001:db8::1'\n    port: 1080\n",

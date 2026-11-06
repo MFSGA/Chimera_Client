@@ -167,6 +167,39 @@ impl Config {
             }
         }
 
+        // Do not bootstrap proxy-node DNS through the same rule-routed DNS
+        // transport which could itself depend on that proxy. Mihomo requires
+        // proxy-server-nameserver when respect-rules is enabled.
+        if self.dns.respect_rules
+            && self
+                .dns
+                .proxy_server_nameserver
+                .as_ref()
+                .is_none_or(Vec::is_empty)
+        {
+            return Err(Error::InvalidConfig(
+                "dns.respect-rules requires non-empty dns.proxy-server-nameserver (Mihomo compatibility; avoid proxy DNS bootstrap loops)".to_owned(),
+            ));
+        }
+
+        // A Fake-IP destination recovered into a domain must reach the
+        // selected PROXY outbound by name; the optional local resolution
+        // setting would otherwise turn it back into a real-IP lookup.
+        // Validate here, not only in YAML conversion: Internal configs and
+        // runtime reloads also pass through this boundary.
+        if self.tun.enable
+            && self.dns.enable
+            && self.dns.enhance_mode == def::DNSMode::FakeIp
+            && self
+                .experimental
+                .as_ref()
+                .is_some_and(|exp| exp.proxy_resolve_local)
+        {
+            return Err(Error::InvalidConfig(
+                "experimental.proxy-resolve-local cannot be enabled with TUN + Fake-IP: it resolves proxy-routed destination domains locally".to_owned(),
+            ));
+        }
+
         self.validate_ipv6_policy()?;
 
         for r in self.rules.iter() {

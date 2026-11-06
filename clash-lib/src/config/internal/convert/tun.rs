@@ -104,6 +104,11 @@ pub(super) fn convert(
 
     match before {
         Some(t) => {
+            if t.strict_route {
+                return Err(Error::InvalidConfig(
+                    "tun.strict-route is not implemented; refusing to silently ignore a DNS-leak protection setting".to_owned(),
+                ));
+            }
             let (dns_hijack, dns_hijack_rules) = parse_dns_hijack(t.dns_hijack)?;
             let gateway_v6 = match (t.ipv6, t.gateway_v6) {
                 (Some(false), Some(_)) => {
@@ -203,6 +208,23 @@ mod tests {
             let converted = convert(Some(tun)).expect("tun convert should succeed");
             assert_eq!(converted.device_id, value);
         }
+    }
+
+    #[test]
+    fn mihomo_strict_route_fails_closed_instead_of_silently_being_ignored() {
+        let err = match convert(Some(parse_tun("enable: true\nstrict-route: true")))
+        {
+            Ok(_) => {
+                panic!("unsupported strict-route must not be silently accepted")
+            }
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, crate::Error::InvalidConfig(msg) if msg.contains("tun.strict-route"))
+        );
+
+        convert(Some(parse_tun("enable: true\nstrict-route: false")))
+            .expect("disabled strict-route preserves existing configurations");
     }
 
     #[test]
