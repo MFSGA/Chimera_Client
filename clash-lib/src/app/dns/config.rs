@@ -75,6 +75,7 @@ pub struct Config {
     pub fake_ip_range: ipnet::IpNet,
     pub fake_ip_range6: Option<ipnet::IpNet>,
     pub fake_ip_filter: Vec<String>,
+    pub fake_ip_ttl: u32,
     pub fake_ip_filter_mode: FakeIpFilterMode,
     pub service_discovery_mode: DnsServiceDiscoveryMode,
     pub store_fake_ip: bool,
@@ -702,6 +703,11 @@ impl TryFrom<&crate::config::def::Config> for Config {
                 })
                 .transpose()?,
             fake_ip_filter: dc.fake_ip_filter.clone(),
+            fake_ip_ttl: u32::try_from(dc.fake_ip_ttl.max(1)).map_err(|_| {
+                Error::InvalidConfig(
+                    "dns.fake-ip-ttl exceeds u32 seconds".to_owned(),
+                )
+            })?,
             fake_ip_filter_mode: dc.fake_ip_filter_mode,
             service_discovery_mode: dc.service_discovery_mode,
             store_fake_ip: c.profile.store_fake_ip,

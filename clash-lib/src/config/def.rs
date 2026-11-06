@@ -430,10 +430,7 @@ fn reject_unsupported_mihomo_privacy_fields(value: &Value) -> Result<(), Error> 
                 "route-address",
             ],
         ),
-        (
-            "dns",
-            &["fake-ip-ttl", "use-system-hosts", "fallback-lazy-query"],
-        ),
+        ("dns", &["use-system-hosts", "fallback-lazy-query"]),
     ];
 
     for &(section, fields) in UNSUPPORTED {
@@ -748,6 +745,9 @@ pub struct DNS {
     pub fake_ip_range6: Option<String>,
     /// Fake IP addresses filter
     pub fake_ip_filter: Vec<String>,
+    /// Mihomo synthetic Fake-IP response TTL; values below 1 clamp to 1.
+    #[educe(Default = 1)]
+    pub fake_ip_ttl: i64,
     /// Only Mihomo's default blacklist semantics are currently implemented.
     /// Unsupported modes must fail parsing rather than silently fall back.
     pub fake_ip_filter_mode: FakeIpFilterMode,
@@ -1254,7 +1254,6 @@ proxy:
             ("tun", "exclude-interface", "[en1]"),
             ("tun", "stack", "system"),
             ("tun", "route-address", "[0.0.0.0/0]"),
-            ("dns", "fake-ip-ttl", "1"),
             ("dns", "use-system-hosts", "false"),
             ("dns", "fallback-lazy-query", "true"),
         ] {
