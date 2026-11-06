@@ -232,4 +232,54 @@ mod tests {
 
         assert_eq!(plaintext, cookie);
     }
+
+    #[test]
+    fn cookie_reply_rejects_tampered_ciphertext_tag_and_aad() {
+        let private_key = crate::x25519::StaticSecret::from([9; 32]);
+        let public_key = crate::x25519::PublicKey::from(&private_key);
+        let rate_limiter = RateLimiter::new(&public_key, u64::MAX);
+        let mac1 = [0xa5; 16];
+        let mut packet = [0; super::super::COOKIE_REPLY_SZ];
+        let reply = rate_limiter
+            .format_cookie_reply(7, [0x5a; COOKIE_SIZE], &mac1, &mut packet)
+            .unwrap();
+        let nonce: &XNonce = reply[8..32].try_into().unwrap();
+        let cipher = XChaCha20Poly1305::new(&rate_limiter.cookie_key);
+
+        let mut tampered_ciphertext = reply[32..].to_vec();
+        tampered_ciphertext[0] ^= 1;
+        assert!(cipher
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: &tampered_ciphertext,
+                    aad: &mac1,
+                },
+            )
+            .is_err());
+
+        let mut tampered_tag = reply[32..].to_vec();
+        *tampered_tag.last_mut().unwrap() ^= 1;
+        assert!(cipher
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: &tampered_tag,
+                    aad: &mac1,
+                },
+            )
+            .is_err());
+
+        let mut wrong_mac1 = mac1;
+        wrong_mac1[0] ^= 1;
+        assert!(cipher
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: &reply[32..],
+                    aad: &wrong_mac1,
+                },
+            )
+            .is_err());
+    }
 }
