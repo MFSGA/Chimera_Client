@@ -162,11 +162,10 @@ impl Config {
         // reloads must not bypass that privacy-sensitive validation.
         for domain in self.dns.nameserver_policy.keys() {
             let lower = domain.to_ascii_lowercase();
-            let (_, valid) = crate::common::trie::valid_and_split_domain(domain);
             if lower.starts_with("geosite:")
                 || lower.starts_with("rule-set:")
                 || domain.contains(',')
-                || !valid
+                || !dns::config::valid_nameserver_policy_domain(domain)
             {
                 return Err(Error::InvalidConfig(format!(
                     "dns.nameserver-policy unsupported or unexpanded domain selector: {domain}"
@@ -193,10 +192,10 @@ impl Config {
         // supported, rather than silently treating them as literal domains.
         for (domain, servers) in &self.dns.proxy_server_nameserver_policy {
             let lower = domain.to_ascii_lowercase();
-            let (_, valid) = crate::common::trie::valid_and_split_domain(domain);
             if lower.starts_with("geosite:")
                 || lower.starts_with("rule-set:")
-                || !valid
+                || domain.contains(',')
+                || !dns::config::valid_nameserver_policy_domain(domain)
             {
                 return Err(Error::InvalidConfig(format!(
                     "dns.proxy-server-nameserver-policy unsupported selector: {domain}"
@@ -208,6 +207,41 @@ impl Config {
                 return Err(Error::InvalidConfig(format!(
                     "dns.proxy-server-nameserver-policy for {domain} has no usable upstream or an unsupported #proxy dialer"
                 )));
+            }
+            if self.tun.enable
+                && self.dns.enable
+                && self.dns.enhance_mode == def::DNSMode::FakeIp
+                && servers
+                    .iter()
+                    .any(|server| server.net == dns::config::DNSNetMode::Dhcp)
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "dns.proxy-server-nameserver-policy for {domain} cannot use DHCP in TUN + Fake-IP; DHCP resolver discovery is outside managed node DNS"
+                )));
+            }
+        }
+
+        // A dedicated node bootstrap resolver must not route through a proxy
+        // that may itself need this resolver, or discover an OS DHCP resolver
+        // outside the macOS TUN DNS hijack. The default DNS path remains
+        // available only for explicitly configured IP-literal DNS servers.
+        if self.tun.enable
+            && self.dns.enable
+            && self.dns.enhance_mode == def::DNSMode::FakeIp
+            && let Some(servers) = &self.dns.proxy_server_nameserver
+        {
+            if servers.iter().any(|server| server.proxy.is_some()) {
+                return Err(Error::InvalidConfig(
+                    "dns.proxy-server-nameserver cannot use #proxy in TUN + Fake-IP; node DNS bootstrap must not depend on a proxy".to_owned(),
+                ));
+            }
+            if servers
+                .iter()
+                .any(|server| server.net == dns::config::DNSNetMode::Dhcp)
+            {
+                return Err(Error::InvalidConfig(
+                    "dns.proxy-server-nameserver cannot use DHCP in TUN + Fake-IP; DHCP DNS discovery is outside the managed bootstrap boundary".to_owned(),
+                ));
             }
         }
 
@@ -700,6 +734,71 @@ mod tests {
             error.contains("proxy-server-nameserver"),
             "empty explicit bootstrap must fail closed: {error}"
         );
+    }
+
+    #[test]
+    fn internal_nameserver_policy_rejects_selectors_that_bypass_runtime_trie() {
+        let yaml = "dns:\n  enable: true\n  nameserver: [1.1.1.1]\n";
+        let server = crate::app::dns::config::Config::parse_nameserver(&[
+            "9.9.9.9".to_owned()
+        ])
+        .unwrap()
+        .remove(0);
+        for selector in [
+            " example.com",
+            "example.com bad.test",
+            "bad*.example.com",
+            "+",
+            "example.com,other.example",
+            "rule-set:private",
+        ] {
+            let mut config =
+                crate::Config::Str(yaml.to_owned()).try_parse().unwrap();
+            config
+                .dns
+                .nameserver_policy
+                .insert(selector.to_owned(), server.clone());
+            let error = match config.validate() {
+                Ok(_) => panic!("internal config accepted selector {selector:?}"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("dns.nameserver-policy"), "{error}");
+        }
+    }
+
+    #[test]
+    fn internal_proxy_server_policy_rejects_malformed_domain_selectors() {
+        let yaml = "dns:\n  enable: true\n  nameserver: [1.1.1.1]\n";
+        let server = crate::app::dns::config::Config::parse_nameserver(&[
+            "9.9.9.9".to_owned()
+        ])
+        .unwrap()
+        .remove(0);
+        for selector in [
+            " node.example",
+            "node.example other.example",
+            "bad*.node.example",
+            "node.+.example",
+            "node-a.example,node-b.example",
+        ] {
+            let mut config =
+                crate::Config::Str(yaml.to_owned()).try_parse().unwrap();
+            config.dns.proxy_server_nameserver = Some(vec![server.clone()]);
+            config
+                .dns
+                .proxy_server_nameserver_policy
+                .push((selector.to_owned(), vec![server.clone()]));
+            let error = match config.validate() {
+                Ok(_) => {
+                    panic!("internal node DNS policy accepted selector {selector:?}")
+                }
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains("dns.proxy-server-nameserver-policy"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

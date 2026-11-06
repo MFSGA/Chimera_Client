@@ -176,3 +176,52 @@ System DNS 指向一个与 fake-IP 池、TUN 网关子网及 route exclusions �
 - 从原始 YAML `dns.fake-ip-ttl` 到内部 DNS 配置、解析器和共享 DNS handler 接通，影响普通 DNS server、TUN UDP/TCP hijack 与 DNS API 共用的应答函数。仍未支持运行时完整 Fake IPv6/TUN 抓包认证，不可据此宣称全系统 DNS 零泄漏。
 - Fake-IP 排除域名 A/AAAA 的响应继续使用真实上游 DNS 原始 RRset（包含实际 TTL），**不能**将合成 Fake-IP TTL 写入真实记录；带有 hosts 改写的路径也需后续独立验收。PTR 仍保留现有独立 TTL，不因 fake-ip-ttl 改变。
 - 原 Chimera 合成 Fake-IP TTL 默认 60 秒；本轮默认改为 Mihomo 一致的 1 秒，属于向后兼容的可观察行为变化，需 L2 审查；如必须保留 60 秒，可显式设置 `fake-ip-ttl: 60`。定向测试覆盖默认、0/负数钳制、自定义 45 秒、合成 A/AAAA、过滤排除真实 TTL 与真实配置构造；实际系统 DNS 和物理 NIC 未测试。
+
+## 2026-11-06 XHTTP 二次连接系统 DNS 旁路保护（L2 待审）
+
+- 本地起点 [本地快照已省略]，隔离分支 `隔离候选分支`；本地 `master=[基线已省略]、`origin/master=[基线已省略]。固定参考 Mihomo gitlink `63bd52ec794b7051569b76ede2f6cdbf4c091fda` 未变更。
+- 源码路径：`proxy/transport/xhttp/mod.rs::connect_endpoint_stream` 对 HTTP/2 `download-settings` 独立下行和 HTTP/1.1 后续 upload reconnect 直接调用 `tokio::net::lookup_host`，并没有接收专用 `proxy-server-nameserver` 的解析器。macOS 的 service-scoped DNS 查询不一定经过 utun，`dns-hijack: true` 无法证明对此路径生效；只要 secondary endpoint 是域名，就可能触发系统 resolver。
+- 在 `tun.enable && dns.enable && enhanced-mode: fake-ip` 时，内部配置 `Config::validate` 拒绝需要系统 DNS 的 XHTTP HTTP/1.1 hostname 重连、HTTP/2 非 IP 字面量的有效 `download-settings` 终端；包括 `xhttp-opts.extra.download-settings` 优先于顶层 download-settings 和隐式继承主节点域名的情形。只输出选项名，不回显可能敏感的 endpoint。普通 HTTP/2 代理节点使用已有专用节点解析，不会因此被拒；`download-settings` 指向 IP literal 仍可用。HTTP/3 已使用包含解析器/connector 的单独连接路径，此门禁不机械应用于 HTTP/3。
+- 影响：原来允许的 TUN + Fake-IP + XHTTP split-downlink 域名或 HTTP/1.1 节点域名现在会被拒绝。可暂时使用受控 IP literal secondary endpoint（保留 TLS SNI / 证书校验设置），或者在**未启用上述隐私敏感组合**时保留旧行为。此拒绝不等于端到端 DNS 隔离认证。
+- 实际验证边界：这只是静态/热重载和离线单测的 fail-closed 防线；代理 provider 动态下发的节点和其它仍调用系统 `lookup_host` 的模块（包括 AnyTLS inbound fallback）不一定受此特定校验保护；Network Extension DNS Proxy、浏览器 DoH/DoT、自定义系统 service-scoped resolver、跨网卡 IPv4/IPv6、睡眠/断线/切网及真实抓包仍未完成，不能声称全系统零泄漏。
+
+### macOS 系统级 DNS 受控验收矩阵（尚未执行）
+
+> 以下是**授权的独立 macOS 测试机**验收计划，不是本轮运行日志。不得在用户日常网络或与其它代理实例共用的宿主机自动执行网络设置或特权抓包。
+
+| 场景 | 必须核实的事实 | 当前可用证据 / 缺口 |
+| --- | --- | --- |
+| 系统 resolver 正常请求 | `scutil --dns` 中活动 service-scoped resolver 的顺序、接口与 DNS 服务器；向专用测试域名 A/AAAA/TXT 发请求，证明是否进入 Chimera DNS listener 或 utun | 目前只有 listener/TUN 内部单测；service-scoped ownership 无证据 |
+| UDP/TCP 53 与 IPv4/IPv6 | 在物理 NIC 和 utun 同时抓包，只比较专用 canary QNAME 的出现位置；包括 UDP 截断转 TCP、TCP 多问题拒绝和 IPv6 | 目前无受权 NIC 抓包；不应将局部 TUN 劫持称为物理 NIC 禁止出站 |
+| XHTTP H2 split / H1 reconnect | 有意配置域名 secondary endpoint，TUN+Fake-IP 加载应在启动前拒绝；IP literal 保留行为。模拟动态 Provider / 非 TUN 时单独检查 | 配置校验与离线测试覆盖静态/热重载；Provider 仍有缺口 |
+| 网络切换 / Wi-Fi → 其它物理 NIC / 睡眠恢复 | 触发系统 DNS resolver 变化、上游断线、DNS 超时并记录是否重新建立受控 ownership；验证失败时没有退回 service DNS | 现有 network epoch/重置只验证内部 DNS 连接，不是 OS 级 ownership |
+| TUN 关闭 / DNS Proxy Extension 丢失授权 | 用专用 canary QNAME 验证系统入口是否依旧受控；如果严格防泄漏能力不可用，受保护请求必须拒绝，不可静默调用系统 resolver | 没有安装/启用 DNS Proxy Extension，也没有可证明的 fail-closed OS 接管事务 |
+| 真实及受限出站 | 区分业务明确允许的 DIRECT、代理节点 bootstrap、显式 `fake-ip-filter` 和非受保护流量；只断言指定 canary 的未授权明文泄漏 | 需要维护者明确保护域集合及合法例外，不能泛称物理 NIC 不能有任何 DNS |
+
+- 执行策略：先取得测试机所有者的明确许可，记录活动服务的原始配置以便回滚；用测试专用、不包含真实订阅或用户域名的 canary；通过系统**只读**检查与有权限的专用抓包并行关联，记录不含私有 QNAME 的摘要。没有 DNS Proxy Extension 或等效受管控制面时，验证结论只能是“覆盖不完整”，不能写“零泄漏”。
+- 本地验收（macOS arm64，`--no-default-features --features tun,ring --locked`）：`cargo test -p clash-lib --lib -j 6` 843 passed / 0 failed / 11 ignored；`cargo test -p clash-lib --test dns_config_tests -j 6` 30 passed / 0 failed；`cargo clippy -p clash-lib --all-targets -j 6 -- -D warnings`、`cargo check -p clash-rs --no-default-features --features standard,aws-lc-rs --locked`、`cargo fmt --all -- --check`、`git diff --check` 通过。无 TUN 组合编译通过，但过滤特定 TUN 测试实际运行 0 项，不计作行为验收。离线测试先证实旧实现错误接受需系统 DNS 的 XHTTP secondary hostname，再验证配置转换、`extra.download-settings` 优先级、内部热重载的拒绝和 IP-literal/普通主节点的保留。
+
+## 2026-11-06 AnyTLS 入站 fallback 系统 DNS 隔离（L2 待审）
+
+- 基线：`隔离候选分支`，本切片前 `HEAD [本地快照已省略]，本地 `master=[基线已省略]、`origin/master=[基线已省略]。只读参考为主检出 `ref-mihomo` 固定 `63bd52ec794b7051569b76ede2f6cdbf4c091fda`；本隔离工作树中子模块未检出，未更改 gitlink。固定 Mihomo `config/config.go::RawDNS` / `parseDNS` 用于 DNS 字段与失败路径对照；AnyTLS inbound camouflage fallback 是 Chimera 本地特定路径，本切片不声称存在同名 Mihomo 等价字段。
+- 发现 `proxy/anytls/inbound/handler.rs::connect_fallback_backend` 在 AnyTLS 身份验证失败时调用 `tokio::net::lookup_host(fallback_addr)`，即使 TUN + Fake-IP 已启用，也不使用 Chimera 的受管 DNS 引导。macOS service-scoped resolver 可能通过物理 NIC 发出域名查询，不能以 TUN hijack 推断已保护。
+- 在 `config/internal/config.rs::Config::validate` 为 `feature=anytls` 的 AnyTLS 入站增加保护：仅当 `tun.enable && dns.enable && enhanced-mode: fake-ip` 且配置了 `fallback` 时，要求值为可解析的 IP 字面量 `SocketAddr`（IPv4 `192.0.2.53:443`、IPv6 `[2001:db8::53]:443`）。域名或未明确端口的地址 fail-closed，报错不包含 hostname/密码；没有 fallback、未启用 TUN 或 DNS 的旧行为保持不变。此门禁同样覆盖内部配置热重载。
+- 测试先在原有调用链下写拒绝域名的否定测试，新增 `fake_ip_tun_rejects_anytls_fallback_system_dns_hostname`、`fake_ip_tun_allows_anytls_ip_literal_fallback_and_non_tun_hostname`、`anytls_inbound_fallback_cannot_bypass_gate_by_internal_reload`。无实际 TUN、系统网络、权限提升或 NIC 抓包。迁移方式：敏感组合的 AnyTLS fallback 改用受控 IP:port（IPv6 必须方括号），或取消 fallback；不能把放宽 TUN 隐私设置视为等价的防泄漏方案。
+- **限制**：静态配置拒绝不等于 OS DNS ownership / 全局防泄漏；动态 provider、其它系统解析器、DIRECT/代理节点 DNS、浏览器 DoH/DoT、切网、睡眠、IPv6 及真实物理 NIC 仍需独立授权测试。此行为变更需要 L2 独立 Reviewer 与维护者批准，不自动推送/合并。
+
+## 2026-11-06 AnyTLS 入站 fallback 的系统 DNS 旁路（L2 待审）
+
+- 开发起点 `bb172c82f2737e3e003da6e979a37e352b469eff`；`clash-lib/src/proxy/anytls/inbound/handler.rs::connect_fallback_backend` 在 TLS 客户端认证失败后，对 `fallback` 字段调用 `tokio::net::lookup_host`，绕过 Chimera 自己的 DNS resolver。macOS 的 service-scoped resolver 并不保证经过 utun，因此在 TUN + Fake-IP 的严格隐私场景下可能发生未受控 DNS 外发。
+- 新的内部 `Config::validate` 校验在 `tun.enable && dns.enable && enhance_mode=fake-ip` 时拒绝 AnyTLS inbound `fallback` 非 `SocketAddr` 的值，只允许不需要系统解析的 `IPv4:port` 或 `[IPv6]:port`；`fallback` 未设置或 TUN 关闭时保留原有配置行为。配置错误不输出实际 fallback 地址。此改动限制原先允许的 hostname fallback，部署者可将该回退终端改为静态 IP 地址并自行确保 TLS/服务端兼容。
+- 使用 `tun,ring,anytls` 特性组合的离线测试先确认旧配置错误地允许 hostname fallback，再覆盖普通加载、IPv4/IPv6 字面量、非 TUN 兼容及 Internal 热重载无法绕过。最终 `cargo test -p clash-lib --lib --no-default-features --features tun,ring,anytls --locked -j 6` 为 883 passed / 0 failed / 11 ignored；`cargo test -p clash-lib --test dns_config_tests --no-default-features --features tun,ring,anytls --locked -j 6` 为 30 passed；`cargo clippy -p clash-lib --all-targets --no-default-features --features tun,ring,anytls --locked -j 6 -- -D warnings`、fmt、diff 检查通过。无真实 AnyTLS 认证失败的外网请求或 macOS DNS/NIC 抓包。
+- 此门禁仅涵盖代码可确认的 AnyTLS 入站伪装回退。不代表对所有通过 libc/getaddrinfo、浏览器 DoH、网络扩展、XHTTP 动态节点以及未识别的系统 DNS 路径均已控制；macOS DNS Proxy Extension 的服务级接管、可审计的出口保护和物理 NIC 的独立抓包仍未实现。
+
+## 2026-11-06 XHTTP 动态 Provider 解析路径的防旁路校验（L2 待审）
+
+- 开发起点 `76b27f3ee53f13e8b00b10af7d43d405969f9712`；固定 `ref-mihomo` gitlink 未变更。本地隔离分支 `隔离候选分支`，没有同步远端、合并或操作宿主机网络。
+- 补齐 `ProxySetProvider` 的**运行时更新入口**。之前 YAML 静态 `Config::validate` 可以阻止 XHTTP HTTP/2 独立下载和 HTTP/1.1 重连中的系统 DNS 域名，但是 HTTP/file Provider 后续从远端或文件更新新 VLESS/XHTTP 节点时会直接执行 `OutboundProxyProtocol::try_from` → `OutboundManager::load_provider_outbound`，不会再经过静态 Config 校验。此旁路可重新引入 `tokio::net::lookup_host` 触发的 macOS service-scoped DNS。
+- `runtime::factory` 只在 `tun.enable && dns.enable && dns.enhance_mode=fake-ip` 时将隐私保护标志传入 `OutboundManager`，由 Http/File ProxySetProvider 的解析闭包应用与静态配置**相同**的 XHTTP secondary 域名拒绝逻辑。若任意新节点违反此保护，整次 Provider 更新报错、保留上次已生效的节点集合、内容 revision 和本地缓存；不得只过滤掉危险节点再悄悄发布部分更新。错误不输出敏感的 hostname。IP 字面量 downlink 与未启用此保护的旧行为保持可用。
+- 测试使用完全离线的 `MockProviderVehicle` 和临时缓存，覆盖：初始安全代理、动态加载危险 H2 secondary hostname、混合安全 SOCKS + 危险 H1 reconnect 的原子拒绝、旧 revision/cache 保留、IP 字面量 XHTTP 和非严格模式下的域名兼容。没有真实订阅、DNS 查询或物理 NIC 出站。
+- TUN + Ring 本地回归：`cargo test -p clash-lib --lib --no-default-features --features tun,ring --locked -j 6` 847 passed / 0 failed / 11 ignored；`cargo test -p clash-lib --test dns_config_tests --no-default-features --features tun,ring --locked -j 6` 30 passed；严格 Clippy、无 Dashboard CLI 编译、fmt 与 diff 检查通过。没有证据支持“整个 macOS 系统的 DNS 已被接管”或“物理网卡零泄漏”。
+- 剩余风险：DNS Proxy Extension ownership、macOS service-scoped resolver、浏览器内置 DoH/DoT、其它可能调用系统 resolver 的传输，以及独立授权测试机上的 IPv4/IPv6 NIC 与 utun 双边抓包未解决。动态 Provider 筛选基于此时的 TUN + Fake-IP 运行配置；运行时模式切换应通过重新构造 Provider 或显式重新校验完成，不能依赖旧标志代替真正的系统级 DNS 保护。
+- `tun,ring,anytls` 组合的最后回归：`cargo test -p clash-lib --lib --no-default-features --features tun,ring,anytls --locked -j 6` 887 passed / 0 failed / 11 ignored；DNS 配置 30 passed；严格 Clippy 通过。额外执行旧 S00 `dns_legacy_golden_tests` 全套仍为 12 passed / 1 failed，唯一失败仍是历史 `respect-rules` 未指定节点引导 DNS 的夹具冲突，未修改测试、未标为新回归。静态配置与动态 Provider 均按同一规则执行，但仍需后续 L2 独立代码审查及测试机系统级 DNS 出口验证。
