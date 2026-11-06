@@ -225,7 +225,7 @@ pub async fn clash_process_e2e_throughput(
         tokio::net::TcpListener::bind(format!("0.0.0.0:{echo_port}")).await?,
     );
 
-    wait_for_port(socks_port, 90).await.map_err(|e| {
+    wait_for_port(socks_port, 90).await.inspect_err(|_| {
         match child.try_wait() {
             Ok(Some(status)) => {
                 eprintln!(
@@ -244,7 +244,6 @@ pub async fn clash_process_e2e_throughput(
             }
         }
         child.start_kill().ok();
-        e
     })?;
 
     let destinations = destination_list(gateway_ip);
@@ -497,40 +496,49 @@ fn destination_list(gateway_ip: Option<String>) -> Vec<String> {
         destination_list.insert(0, ip);
     } else {
         debug!("CLIENT_IP env not set, ");
-        let mut networks = Networks::new_with_refreshed_list();
-        networks.refresh(true);
+        match Networks::new_with_refreshed_list() {
+            Ok(mut networks) => {
+                networks.refresh(true);
 
-        trace!("networks: {:?}", networks);
-        // 收集所有有流量的网卡的 IPv4 地址
-        let mut active_interfaces = networks
-            .iter()
-            .filter(|(_, data)| {
-                data.mac_address().to_string() != "00:00:00:00:00:00"
-            })
-            .collect::<Vec<_>>();
+                trace!("networks: {:?}", networks);
+                // 收集所有有流量的网卡的 IPv4 地址
+                let mut active_interfaces = networks
+                    .iter()
+                    .filter(|(_, data)| {
+                        data.mac_address().to_string() != "00:00:00:00:00:00"
+                    })
+                    .collect::<Vec<_>>();
 
-        // 按流量排序：优先按发送流量降序，其次按接收流量降序
-        active_interfaces.sort_by(|a, b| {
-            b.1.total_transmitted()
-                .cmp(&a.1.total_transmitted())
-                .then_with(|| b.1.total_received().cmp(&a.1.total_received()))
-        });
-        for (iface_name, data) in active_interfaces {
-            trace!("Processing interface: {}, {:#?}", iface_name, data);
+                // 按流量排序：优先按发送流量降序，其次按接收流量降序
+                active_interfaces.sort_by(|a, b| {
+                    b.1.total_transmitted()
+                        .cmp(&a.1.total_transmitted())
+                        .then_with(|| {
+                            b.1.total_received().cmp(&a.1.total_received())
+                        })
+                });
+                for (iface_name, data) in active_interfaces {
+                    trace!("Processing interface: {:?}, {:#?}", iface_name, data);
 
-            // 获取该网卡的所有 IP 地址
-            for ip_network in data.ip_networks() {
-                let addr = ip_network.addr;
-                // 只添加 IPv4 地址，排除 loopback
-                if addr.is_ipv4() && !addr.is_loopback() {
-                    let ip_str = addr.to_string();
-                    // 跳过已存在的 IP
-                    if !destination_list.contains(&ip_str) {
-                        debug!("Found IPv4 address on {}: {}", iface_name, ip_str);
-                        destination_list.push(ip_str);
+                    // 获取该网卡的所有 IP 地址
+                    for ip_network in data.ip_networks() {
+                        let addr = ip_network.addr;
+                        // 只添加 IPv4 地址，排除 loopback
+                        if addr.is_ipv4() && !addr.is_loopback() {
+                            let ip_str = addr.to_string();
+                            // 跳过已存在的 IP
+                            if !destination_list.contains(&ip_str) {
+                                debug!(
+                                    "Found IPv4 address on {:?}: {}",
+                                    iface_name, ip_str
+                                );
+                                destination_list.push(ip_str);
+                            }
+                        }
                     }
                 }
             }
+            Err(error) => debug!("failed to enumerate network interfaces: {error}"),
         }
 
         if let Ok(interfaces) = network_interface::NetworkInterface::show() {

@@ -14,11 +14,13 @@ use std::sync::atomic::Ordering;
 use crate::sleepyinstant::Instant;
 
 use super::tls::verify_slices_are_equal;
-use aead::generic_array::GenericArray;
-use aead::{AeadInPlace, KeyInit};
-use chacha20poly1305::{Key, XChaCha20Poly1305};
+use aead::{AeadInOut, KeyInit};
+use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
+use getrandom::{
+    rand_core::{Rng, UnwrapErr},
+    SysRng,
+};
 use parking_lot::Mutex;
-use rand_core::{OsRng, RngCore};
 
 const COOKIE_REFRESH: u64 = 128; // Use 128 and not 120 so the compiler can optimize out the division
 const COOKIE_SIZE: usize = 16;
@@ -58,7 +60,7 @@ pub struct RateLimiter {
 impl RateLimiter {
     pub fn new(public_key: &crate::x25519::PublicKey, limit: u64) -> Self {
         let mut secret_key = [0u8; 16];
-        OsRng.fill_bytes(&mut secret_key);
+        UnwrapErr(SysRng).fill_bytes(&mut secret_key);
         RateLimiter {
             nonce_key: Self::rand_bytes(),
             secret_key,
@@ -74,7 +76,7 @@ impl RateLimiter {
 
     fn rand_bytes() -> [u8; 32] {
         let mut key = [0u8; 32];
-        OsRng.fill_bytes(&mut key);
+        UnwrapErr(SysRng).fill_bytes(&mut key);
         key
     }
 
@@ -142,11 +144,13 @@ impl RateLimiter {
 
         let cipher = XChaCha20Poly1305::new(&self.cookie_key);
 
-        let iv = GenericArray::from_slice(nonce);
+        let iv: &XNonce = (&*nonce)
+            .try_into()
+            .map_err(|_| WireGuardError::DestinationBufferTooSmall)?;
 
         encrypted_cookie[..16].copy_from_slice(&cookie);
         let tag = cipher
-            .encrypt_in_place_detached(iv, mac1, &mut encrypted_cookie[..16])
+            .encrypt_inout_detached(iv, mac1, (&mut encrypted_cookie[..16]).into())
             .map_err(|_| WireGuardError::DestinationBufferTooSmall)?;
 
         encrypted_cookie[16..].copy_from_slice(&tag);
@@ -194,5 +198,38 @@ impl RateLimiter {
         }
 
         Ok(packet)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use aead::{Aead, Payload};
+
+    use super::*;
+
+    #[test]
+    fn cookie_reply_round_trips_with_detached_aead_tag() {
+        let private_key = crate::x25519::StaticSecret::from([7; 32]);
+        let public_key = crate::x25519::PublicKey::from(&private_key);
+        let rate_limiter = RateLimiter::new(&public_key, u64::MAX);
+        let cookie = [0x5a; COOKIE_SIZE];
+        let mac1 = [0xa5; 16];
+        let mut packet = [0; super::super::COOKIE_REPLY_SZ];
+
+        let reply = rate_limiter
+            .format_cookie_reply(7, cookie, &mac1, &mut packet)
+            .unwrap();
+        let nonce: &XNonce = reply[8..32].try_into().unwrap();
+        let plaintext = XChaCha20Poly1305::new(&rate_limiter.cookie_key)
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: &reply[32..],
+                    aad: &mac1,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(plaintext, cookie);
     }
 }
