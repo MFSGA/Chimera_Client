@@ -108,8 +108,33 @@ pub(crate) fn validate_xhttp_secondary_managed_dns(
     Ok(())
 }
 
+/// Validate bootstrap for internal configs and reloads, not only YAML.
+/// Resolving an upstream via itself, a proxy, or DHCP can escape managed DNS.
+fn validate_default_nameserver_bootstrap(
+    servers: &[dns::config::NameServer],
+) -> Result<(), Error> {
+    if servers.is_empty() {
+        return Err(Error::InvalidConfig(
+            "dns.default-nameserver requires at least one IP-literal upstream"
+                .to_owned(),
+        ));
+    }
+    for server in servers {
+        if matches!(server.host, url::Host::Domain(_))
+            || server.proxy.is_some()
+            || server.net == dns::config::DNSNetMode::Dhcp
+        {
+            return Err(Error::InvalidConfig(
+                "dns.default-nameserver must use IP-literal upstreams without #proxy or DHCP bootstrap".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl Config {
     pub fn validate(self) -> Result<Self, crate::Error> {
+        validate_default_nameserver_bootstrap(&self.dns.default_nameserver)?;
         #[cfg(not(feature = "tun"))]
         if self.tun.enable {
             return Err(Error::InvalidConfig(
@@ -587,6 +612,27 @@ mod tests {
             error.contains("proxy-server-nameserver"),
             "empty explicit bootstrap must fail closed: {error}"
         );
+    }
+
+    #[test]
+    fn internal_default_nameserver_bootstrap_rejects_non_ip_and_proxy_dialers() {
+        use crate::app::dns::config::Config as DnsConfig;
+
+        for server in [
+            "https://dns.example/dns-query",
+            "1.1.1.1#proxy=PROXY",
+            "dhcp://en0",
+        ] {
+            let parsed = DnsConfig::parse_nameserver(&[server.to_owned()]).unwrap();
+            assert!(
+                super::validate_default_nameserver_bootstrap(&parsed).is_err(),
+                "internal DNS bootstrap accepted {server}"
+            );
+        }
+        let parsed =
+            DnsConfig::parse_nameserver(&["https://1.1.1.1/dns-query".to_owned()])
+                .unwrap();
+        assert!(super::validate_default_nameserver_bootstrap(&parsed).is_ok());
     }
 
     #[test]

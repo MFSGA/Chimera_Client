@@ -109,3 +109,9 @@ S01 准入必须满足：金标准用例在目标 HEAD 实际运行；未知新�
 - 第二项：内部配置将 `dns.proxy-server-nameserver` 设为显式空列表时，验证阶段直接 `InvalidConfig`，未配置 `None` 则维持旧行为。源分支 `54b80b2` 的独立 P0 修复已适配最新主线；否定测试 `explicit_empty_proxy_node_bootstrap_fails_internal_reload` 先失败（0/1），再实施修复。
 - macOS 本地验证：Rust 1.99.0（由于项目锁定的 1.99.1 安装不完整，需补跑锁定工具链），TUN+Ring、无默认 feature 核心库 834 通过、0 失败、11 忽略；`dns_config_tests` 20/20；严格 all-target Clippy（`-D warnings`）、Cargo fmt 和 Git diff 检查通过。端口占用日志是 DNS listener 失败路径的预期注入。
 - 局限：未进行 macOS 物理 NIC/utun 抓包、Mihomo 二进制互操作、独立 L2 Reviewer 或远端 required CI。不得把本地候选标成已合并至 `master` 或已通过发布审查；未修改系统 DNS、路由、TUN、Network Extension、权限或远端分支。
+
+## 2026-11-09 — 批次 2：内部 default-nameserver 引导安全校验（L2 待审）
+
+- 以最新 `origin/master` `f304da17` 及第一批隔离提交为基线，借鉴原始 `088f487`，只移植可独立应用的 `default-nameserver` 内部配置校验及对应测试；固定 Mihomo gitlink `63bd52ec794b7051569b76ede2f6cdbf4c091fda` 保持只读。
+- 内部配置和热重载拒绝空、非 IP 字面量、`#proxy` 或 `dhcp://` 上游，保留 IP 字面量 DoH 的旧配置；这并非系统级 macOS DNS 零泄漏验收。
+- 独立 L2 审查、Rust 1.99.1 锁定工具链核验、Mihomo 二进制互操作和 NIC/utun 抓包仍待完成；未更新本地 `master` 或远端分支。
