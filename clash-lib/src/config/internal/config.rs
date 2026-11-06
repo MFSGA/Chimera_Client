@@ -210,6 +210,41 @@ impl Config {
                     "dns.proxy-server-nameserver-policy for {domain} has no usable upstream or an unsupported #proxy dialer"
                 )));
             }
+            if self.tun.enable
+                && self.dns.enable
+                && self.dns.enhance_mode == def::DNSMode::FakeIp
+                && servers
+                    .iter()
+                    .any(|server| server.net == dns::config::DNSNetMode::Dhcp)
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "dns.proxy-server-nameserver-policy for {domain} cannot use DHCP in TUN + Fake-IP; DHCP resolver discovery is outside managed node DNS"
+                )));
+            }
+        }
+
+        // A dedicated node bootstrap resolver must not route through a proxy
+        // that may itself need this resolver, or discover an OS DHCP resolver
+        // outside the macOS TUN DNS hijack. The default DNS path remains
+        // available only for explicitly configured IP-literal DNS servers.
+        if self.tun.enable
+            && self.dns.enable
+            && self.dns.enhance_mode == def::DNSMode::FakeIp
+            && let Some(servers) = &self.dns.proxy_server_nameserver
+        {
+            if servers.iter().any(|server| server.proxy.is_some()) {
+                return Err(Error::InvalidConfig(
+                    "dns.proxy-server-nameserver cannot use #proxy in TUN + Fake-IP; node DNS bootstrap must not depend on a proxy".to_owned(),
+                ));
+            }
+            if servers
+                .iter()
+                .any(|server| server.net == dns::config::DNSNetMode::Dhcp)
+            {
+                return Err(Error::InvalidConfig(
+                    "dns.proxy-server-nameserver cannot use DHCP in TUN + Fake-IP; DHCP DNS discovery is outside the managed bootstrap boundary".to_owned(),
+                ));
+            }
         }
 
         if self.tun.enable

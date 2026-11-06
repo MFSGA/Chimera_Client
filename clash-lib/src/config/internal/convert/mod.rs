@@ -1078,6 +1078,37 @@ proxies:
         assert!(!error.contains("private.example"), "{error}");
     }
 
+    #[cfg(feature = "tun")]
+    #[test]
+    fn internal_tun_fake_ip_rejects_proxy_bootstrap_dialer_and_dhcp() {
+        for (upstream, reason) in [
+            ("udp://9.9.9.9#proxy=PROXY", "#proxy"),
+            ("dhcp://en0", "DHCP"),
+        ] {
+            let mut cfg = parse_config("tun:\n  enable: true");
+            cfg.dns.enable = true;
+            cfg.dns.enhanced_mode = def::DNSMode::FakeIp;
+            cfg.dns.nameserver = vec!["1.1.1.1".to_owned()];
+            let mut internal = convert(cfg).expect("valid protected DNS baseline");
+            internal.dns.proxy_server_nameserver = Some(
+                crate::app::dns::config::Config::parse_nameserver(&[
+                    upstream.to_owned()
+                ])
+                .unwrap(),
+            );
+            let error = match crate::Config::Internal(internal).try_parse() {
+                Ok(_) => {
+                    panic!("internal bootstrap {upstream} bypassed privacy gate")
+                }
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains("proxy-server-nameserver") && error.contains(reason),
+                "{upstream}: {error}"
+            );
+        }
+    }
+
     #[cfg(not(feature = "tun"))]
     #[test]
     fn reject_enabled_tun_without_tun_feature() {
