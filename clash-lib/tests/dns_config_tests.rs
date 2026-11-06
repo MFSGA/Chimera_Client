@@ -520,6 +520,29 @@ fn default_nameserver_rejects_only_skipped_entries() {
 }
 
 #[test]
+fn proxy_server_nameserver_cannot_fall_back_when_all_entries_are_skipped() {
+    let yaml = base_config(
+        r#"
+  enable: true
+  respect-rules: true
+  nameserver:
+    - 1.1.1.1
+  default-nameserver:
+    - 223.5.5.5
+  proxy-server-nameserver:
+    - system
+"#,
+    );
+
+    let err = parse_error(yaml);
+    assert!(
+        err.to_string().contains("proxy-server-nameserver")
+            && err.to_string().contains("no usable entries"),
+        "proxy bootstrap must not quietly revert to main DNS: {err}"
+    );
+}
+
+#[test]
 fn invalid_hosts_entry_is_rejected() {
     let yaml = base_config(
         r#"

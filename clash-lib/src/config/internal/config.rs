@@ -108,13 +108,51 @@ pub(crate) fn validate_xhttp_secondary_managed_dns(
     Ok(())
 }
 
+/// Validate bootstrap for internal configs and reloads, not only YAML.
+/// Resolving an upstream via itself, a proxy, or DHCP can escape managed DNS.
+fn validate_default_nameserver_bootstrap(
+    servers: &[dns::config::NameServer],
+) -> Result<(), Error> {
+    if servers.is_empty() {
+        return Err(Error::InvalidConfig(
+            "dns.default-nameserver requires at least one IP-literal upstream"
+                .to_owned(),
+        ));
+    }
+    for server in servers {
+        if matches!(server.host, url::Host::Domain(_))
+            || server.proxy.is_some()
+            || server.net == dns::config::DNSNetMode::Dhcp
+        {
+            return Err(Error::InvalidConfig(
+                "dns.default-nameserver must use IP-literal upstreams without #proxy or DHCP bootstrap".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl Config {
     pub fn validate(self) -> Result<Self, crate::Error> {
+        validate_default_nameserver_bootstrap(&self.dns.default_nameserver)?;
         #[cfg(not(feature = "tun"))]
         if self.tun.enable {
             return Err(Error::InvalidConfig(
                 "tun is enabled in the configuration, but clash-lib was built without the `tun` feature"
                     .to_owned(),
+            ));
+        }
+
+        // An explicitly empty dedicated node-DNS pool is different from no
+        // override. Internal config reloads must fail closed before startup.
+        if self
+            .dns
+            .proxy_server_nameserver
+            .as_ref()
+            .is_some_and(Vec::is_empty)
+        {
+            return Err(Error::InvalidConfig(
+                "dns.proxy-server-nameserver cannot be explicitly empty".to_owned(),
             ));
         }
 
@@ -556,6 +594,46 @@ mod tests {
     use std::net::{IpAddr, SocketAddr};
 
     use super::{DnsHijackAddress, DnsHijackProtocol, DnsHijackRule, TunConfig};
+
+    #[test]
+    fn explicit_empty_proxy_node_bootstrap_fails_internal_reload() {
+        // A deliberately empty dedicated node pool must not be treated as
+        // an absent setting and fall back to ordinary DNS during reload.
+        let yaml = "dns:\n  enable: true\n  nameserver: [1.1.1.1]\n";
+        let mut config = crate::Config::Str(yaml.to_owned())
+            .try_parse()
+            .expect("baseline must be accepted");
+        config.dns.proxy_server_nameserver = Some(Vec::new());
+        let error = match config.validate() {
+            Ok(_) => panic!("explicit empty node DNS silently accepted"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("proxy-server-nameserver"),
+            "empty explicit bootstrap must fail closed: {error}"
+        );
+    }
+
+    #[test]
+    fn internal_default_nameserver_bootstrap_rejects_non_ip_and_proxy_dialers() {
+        use crate::app::dns::config::Config as DnsConfig;
+
+        for server in [
+            "https://dns.example/dns-query",
+            "1.1.1.1#proxy=PROXY",
+            "dhcp://en0",
+        ] {
+            let parsed = DnsConfig::parse_nameserver(&[server.to_owned()]).unwrap();
+            assert!(
+                super::validate_default_nameserver_bootstrap(&parsed).is_err(),
+                "internal DNS bootstrap accepted {server}"
+            );
+        }
+        let parsed =
+            DnsConfig::parse_nameserver(&["https://1.1.1.1/dns-query".to_owned()])
+                .unwrap();
+        assert!(super::validate_default_nameserver_bootstrap(&parsed).is_ok());
+    }
 
     #[test]
     fn dns_hijack_rule_matches_udp_destination() {
