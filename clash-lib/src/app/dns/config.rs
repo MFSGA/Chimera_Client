@@ -338,7 +338,7 @@ impl Config {
             for subdomain in domain.split(',') {
                 let subdomain = subdomain.trim();
                 let (_, valid) = trie::valid_and_split_domain(subdomain);
-                if !valid {
+                if !valid || subdomain.chars().any(char::is_whitespace) {
                     return Err(Error::InvalidConfig(format!(
                         "dns.proxy-server-nameserver-policy invalid domain: {subdomain}"
                     )));

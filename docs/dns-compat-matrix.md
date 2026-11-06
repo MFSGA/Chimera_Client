@@ -157,3 +157,10 @@ S01 准入必须满足：金标准用例在目标 HEAD 实际运行；未知新�
 - 先写 `nameserver_policy_expands_comma_selectors_into_runtime_domains`，原代码确定性失败（0/1），修复后通过；另加 `nameserver_policy_rejects_ambiguous_or_unsupported_comma_keys`、YAML→内部配置集成测试，以及 `comma_delimited_nameserver_policy_uses_dedicated_upstream`，用 mock DNS 证明两个域名命中策略上游、未匹配域名仍走主上游。
 - 本地验证：macOS，Rust 1.99.0；`--no-default-features --features tun,ring` 核心库 **845 pass/0 fail/11 ignored**，默认 features + `tun,ring` 核心库 **1037 pass/0 fail/11 ignored**；两组 `dns_config_tests` **22/22**，严格 `clippy --all-targets -D warnings`、`cargo fmt --check` 和 `git diff --check` 均通过。
 - 未覆盖：policy value 多上游数组（当前 `HashMap<String,String>`）、Mihomo 有序 selector 冲突覆盖语义、实际 Mihomo 二进制互操作、macOS 物理 NIC/utun 抓包、Rust 1.99.1 锁定工具链（本机安装缺少 manifest）、远端 required CI、独立 L2 审查。本批只本地签名提交；不自动推送/合并主线，不修改系统网络。
+
+### 2026-11-06：代理节点 DNS policy 选择器边界
+
+- 固定 `ref-mihomo` gitlink：`63bd52ec794b7051569b76ede2f6cdbf4c091fda`；只读核对 `config/config.go` 的 `ProxyServerNameserverPolicy` 与 `parseNameServerPolicy` 调用，未执行 Mihomo 二进制对照测试。
+- 内部配置（含热重载）和 YAML 解析均拒绝带空白字符的 `proxy-server-nameserver-policy` 域名选择器。此前内部配置会接受 `node.example `，但无法匹配实际查询，造成策略静默失效；新增先失败后通过的否定测试。
+- 独立节点解析器增加混合大小写回归断言（既有实现已通过），保持节点 DNS 选择不区分 QNAME 大小写。
+- 验证：`cargo test -p clash-lib --lib internal_node_dns_policy_rejects_whitespace_selector --features tun,ring`、`cargo test -p clash-lib --test dns_config_tests --features tun,ring -- --test-threads=1`（30/30）、`cargo clippy -p clash-lib --all-targets --no-default-features --features tun,ring -- -D warnings`、`cargo fmt --all`。未进行 macOS 网络变更或抓包；Mihomo 的完整规则选择语义仍待运行时对照。

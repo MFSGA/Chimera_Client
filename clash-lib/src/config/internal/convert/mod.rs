@@ -729,6 +729,28 @@ proxies:
     }
 
     #[test]
+    fn internal_node_dns_policy_rejects_whitespace_selector() {
+        let mut cfg = parse_config("");
+        cfg.dns.enable = true;
+        cfg.dns.nameserver = vec!["1.1.1.1".to_owned()];
+        cfg.dns.proxy_server_nameserver = vec!["8.8.8.8".to_owned()];
+        let mut internal = convert(cfg).unwrap();
+        let servers = crate::app::dns::config::Config::parse_nameserver(&[
+            "9.9.9.9".to_owned(),
+        ])
+        .unwrap();
+        internal
+            .dns
+            .proxy_server_nameserver_policy
+            .push(("node.example ".to_owned(), servers));
+        let err = crate::Config::Internal(internal)
+            .try_parse()
+            .err()
+            .expect("whitespace selector must fail closed");
+        assert!(err.to_string().contains("proxy-server-nameserver-policy"));
+    }
+
+    #[test]
     fn internal_main_dns_policy_rejects_unsupported_geosite_and_combined_keys() {
         for selector in ["geosite:gfw", "rule-set:protected", "a.example,b.example"]
         {

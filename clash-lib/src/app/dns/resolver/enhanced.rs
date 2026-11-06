@@ -3403,6 +3403,16 @@ mod tests {
         );
         assert_eq!(policy_hits.load(Ordering::SeqCst), 1);
         assert_eq!(default_hits.load(Ordering::SeqCst), 1);
+        // DNS QNAME casing must not bypass the dedicated node resolver policy.
+        assert_eq!(
+            node_resolver
+                .resolve_v4("NoDe.ExAmPlE.CoM", false)
+                .await
+                .unwrap(),
+            Some(Ipv4Addr::new(192, 0, 2, 11)),
+        );
+        assert_eq!(policy_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(default_hits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

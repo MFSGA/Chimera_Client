@@ -197,6 +197,7 @@ impl Config {
             if lower.starts_with("geosite:")
                 || lower.starts_with("rule-set:")
                 || !valid
+                || domain.chars().any(char::is_whitespace)
             {
                 return Err(Error::InvalidConfig(format!(
                     "dns.proxy-server-nameserver-policy unsupported selector: {domain}"
