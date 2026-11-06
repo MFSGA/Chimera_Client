@@ -19,7 +19,7 @@
 | `dns.listen` | 既有 UDP/TCP/DoT/DoH/DoH3 对应配置入口；TLS listener 必须配置证书与密钥，不等于端到端互操作已测 | implemented/partial validation | A | 保留 `listen: {udp: '127.0.0.1:0'}` | `dns/config.rs`，`dns_config_tests.rs::encrypted_dns_listeners_require_certificate_pairs`；S00 `legacy_normal` |
 | `dns.ipv6` | 需要顶层 `ipv6` 和 DNS 层 `ipv6` 同时启用；关闭时 DNS listener 对 AAAA 空答 | implemented | A | 保留现有两个开关 | `dns/config.rs:474`；S00 `ipv6_requires_global_and_dns_flags` |
 | `dns.nameserver` | `Vec<String>`；支持 UDP/TCP/DoT/DoH/DHCP 入口（按编译特性），省略 scheme 时默认 UDP；`system` 被跳过，全部跳过时报错 | implemented | A | 不得默认改成新 profile；旧配置 `nameserver: [1.1.1.1]` 继续可用 | `dns/config.rs:81`；S00 `legacy_normal`、`invalid_values` |
-| `dns.nameserver-policy` | `HashMap<String,String>`；domain trie 匹配、每个值**单个** DNS upstream，不能直接接受 Mihomo 数组 | implemented subset | A（子集） | 改成只接受数组会破坏；`example.com: 1.1.1.1` 必须继续可读 | `config/def.rs:419`、`dns/config.rs:214`、`resolver/enhanced.rs::match_policy`；S00 `nameserver_policy_single_string`、`old_nameserver_policy_does_not_accept_new_array_syntax` |
+| `dns.nameserver-policy` | `HashMap<String,String>`，每个值仍只接受**单个** DNS upstream；本地迭代已按 Mihomo 拆分逗号域名键，统一域名大小写，拒绝未实现的 `geosite:` / `rule-set:` 选择器以及重复键，内部热更新也无法绕过。尚不支持 Mihomo 数组/GeoSite/RuleSet 完整语义 | implemented subset (安全拒绝未实现) | A（子集） | 不破坏原有单字符串格式；`example.com: 1.1.1.1` 继续可读。真正引入多上游数组需要独立 L2 兼容决策并审查旧金标准 | `app/dns/config.rs::parse_nameserver_policy`、`config/internal/config.rs`、`resolver/enhanced.rs::match_policy`；S00 单值金标准和新增逗号/高级选择器拒绝测试 |
 | `dns.default-nameserver` | `Vec<String>`；必须非空且解析为 IP literal，可用来 bootstrap 上游域名 | implemented | A | 旧 `default-nameserver: [223.5.5.5]` 保留 | `dns/config.rs:385–411`；`dns_config_tests.rs::default_nameserver_must_be_ip_address` |
 | `dns.proxy-server-nameserver` | `Vec<String>`；非空时用于代理节点域名的特定解析；同名普通 DNS 不应越权替代 | implemented | A | 保留独立字段；`proxy-server-nameserver: [9.9.9.9]` | `dns/config.rs:414`、`resolver/enhanced.rs::ip_exchange`；S00 `proxy_and_direct_nameservers`；`proxy_server_nameserver_precedes_nameserver_policy_without_leaking` |
 | `dns.direct-nameserver` | `Vec<String>`；非空时单独构造 direct resolver（有现存 fallback 语义） | implemented | A | 保留 `direct-nameserver: [192.0.2.53]` | `dns/config.rs:426`、`resolver/enhanced.rs::direct_resolver`；S00 `proxy_and_direct_nameservers`；`direct_resolver_prefers_direct_nameserver_without_fallback_query` |
@@ -43,7 +43,8 @@
 | `dns.policy-rules` | **S01 已实现 QNAME+QTYPE 有序编译/纯匹配及加载校验**；运行时对非空规则显式拒绝启动（执行器尚未实现），不能宣称 DNS 出口已生效 | implemented (parse/compile only)，runtime gated | S02/S03 完成 DNS query planning/egress 后再开放运行，不静默忽略 `on-failure: fail` | 指南 §6、§17；`app/dns/policy.rs`、`resolver/mod.rs`、`dns_policy_s01_tests.rs` |
 | `fake-ip-filter-mode: whitelist` | **本地迭代分支已实现** Mihomo IPv4 Fake-IP 白名单语义：仅匹配的域名使用 Fake-IP，其他域名会使用真实 DNS；模式名称大小写不敏感。完整高级域名匹配及 Fake-IPv6 未实机验证 | A（有意 opt-in） | 严格隐私配置仍推荐 `blacklist` + 空过滤列表；`whitelist` 会让未列出的代理域名使用真实解析 | 本地 `ref-mihomo` 63bd52e `component/fakeip/skipper.go`、`constant/dns.go`；新增 FakeDns/resolver/配置测试 |
 | `fake-ip-filter-mode: rule` | 尚未实现，解析时明确拒绝。`fake-ip-filter` 中的 `rule-set:`、`geosite:`、Mihomo 规则表达式也显式拒绝，防止字面匹配导致隐私意外降级 | C（条件成立） | 不允许静默映射到 blacklist / whitelist；需要先完成有序规则及 RuleSet/GeoSite 运行语义 | `config/def.rs`、`app/dns/config.rs`、`dns_legacy_golden_tests.rs` |
-| `proxy-server-nameserver-policy`、`direct-nameserver-follow-policy` | 未见声明/执行 | C（条件成立） | 老配置未支持时必须给未来明确错误/警告，而不是以为生效 | 指南 §2.2 |
+| `proxy-server-nameserver-policy` | **本地迭代分支已实现普通域名子集的运行时选择**：有序匹配、大小写不敏感、标量/多个上游、逗号分隔规则；未命中节点使用独立 `proxy-server-nameserver`，策略失败不降级至主 DNS。`geosite:`、`rule-set:`、`system`、`#proxy` 暂拒绝；未进行真实 macOS DNS 出口抓包或完整 Mihomo 互操作 | A（部分支持，L2 待审） | 仅此字段从 P0 拒绝列表移除；仍要求独立节点 nameserver | 固定 Mihomo `config/config.go::parseNameServerPolicy`、`dns/resolver.go`；`app/dns/config.rs`、`resolver/enhanced.rs`、`dns_config_tests.rs` |
+| `direct-nameserver-follow-policy` | **本地分支实现运行时语义**：默认 false 保持旧 DIRECT 解析行为；设为 true 且配置 `direct-nameserver` 时，在独立 DIRECT 解析器上共享 `nameserver-policy` 的同一批上游/域名匹配器。匹配规则时优先策略且失败不回退；未命中时走 `direct-nameserver`，该上游失败也不降级为普通 DNS（Mihomo 独立 DirectResolver 语义）；没有 `direct-nameserver` 则和 Mihomo 一样不会生成专用解析器。域名匹配显式转为小写，防止大小写绕过策略 | A（部分等价，L2 待审） | 只有显式 true 更严格；false 下 Chimera 原有 DIRECT→主 DNS fallback 保留以维护既有兼容。尚无真实 macOS NIC/TUN 出口抓包 | 固定 Mihomo `config/config.go::parseDNS`、`dns/resolver.go::ReCreateServer`；`app/dns/config.rs`、`resolver/enhanced.rs`、新增 config/runtime 负例测试 |
 | `cache-algorithm`、`prefer-h3`、`fallback-lazy-query` | 未见原生承诺；不能因此把现存缓存和 fallback 功能标为缺失 | C（条件成立） | 保留实际已有缓存；不要求照搬 Mihomo 的调参名称 | 指南 §2.2 |
 
 **尚未审定的事实**：Mihomo 端具体字段和行为尚未在固定 `ref-mihomo` 对照运行；本矩阵的 Mihomo 语义仅引用上传的 v2.0 设计稿所列候选，**不是经 Mihomo 运行验证的兼容认证**。`#RULES`、跨 Host/Gateway、多网卡真实 DNS 出口、IPv6 Fake-IP 仍需要专门实验，不能以配置解析成功代替运行时验证。
@@ -55,7 +56,15 @@
 - 本轮在 YAML merge 后、反序列化前拒绝 12 项未实现的隐私相关输入：`tun.dns-mode`、`tun.auto-detect-interface`、`tun.include-interface`、`tun.exclude-interface`、`tun.stack`、`tun.route-address`、`dns.proxy-server-nameserver-policy`、`dns.direct-nameserver-follow-policy`、`dns.fake-ip-ttl`、`dns.use-system-hosts`、`dns.fallback-lazy-query`、`dns.fallback-filter.geosite`。保留不相关 vendor 字段兼容；诊断只输出字段名，不输出 DNS policy 值。以上 12 项仍为 unsupported，绝非 implemented。
 - 内部解析器 `EnhancedResolver::new` 的 `proxy_server_nameserver=Some(vec![])` 原先会降级为默认解析器；现在直接拒绝，防止在配置转换之外（内部配置或未来热重载路径）悄然回退。没有配置（`None`）仍保留旧行为。普通 YAML 的空列表在配置转换层已提前拒绝。定向负例先证明旧实现错误地接受 `Some(empty)`，修复后通过。
 - 仍存在的风险：`default-nameserver` 可能为系统/物理出口 DNS，当前系统 service-scoped DNS ownership 与物理 NIC 隔离尚未验证；macOS 真实网络与 TUN 抓包、跨平台测试及 L2 独立 Reviewer/维护者批准均未完成。没有修改系统 DNS、TUN、路由、权限、子模块或远端 Git。
-- 下一步最小切片：隔离构建并测试 `proxy-server-nameserver-policy` 节点域名路由（含 policy 未命中、多个上游及失败时不泄漏到主 DNS），对照固定 Mihomo `parseNameServerPolicy`，测试实际请求的 DNS 客户端选择，再从拒绝列表移除；随后补真实 macOS 授权测试环境的 NIC/TUN DNS 出口抓包。
+- 当时计划的下一步是 `proxy-server-nameserver-policy`；它已在随后独立提交中实现普通域名子集，见下文。上述 12 项拒绝列表记录的是 P0 历史提交 `27d943b`，不能将它理解为本地 P1 HEAD 仍拒绝全部字段。
+
+### 2026-11-06 节点 DNS 策略部分 Mihomo 兼容（L2 待审）
+
+- 基线 `e8e9fcce761d8e6cb233c45cd1cf91dd77fd212f`；Mihomo 固定 gitlink `63bd52ec794b7051569b76ede2f6cdbf4c091fda`，参考 `config/config.go::parseNameServerPolicy`、`dns/resolver.go` 的专用 ProxyResolver。参考子模块保持只读。
+- `dns.proxy-server-nameserver-policy` 已支持按 YAML 顺序的普通域名选择器、既有 trie 的星号/加号域名匹配、逗号拆分域名、字符串或上游列表、大小写不敏感；仅代理节点域名应用，未命中走独立默认节点 DNS，匹配的策略失败则直接失败而不回退普通 DNS 或 fallback。网络路径重置包含其专属 DNS 客户端，内部配置也强制要求独立节点 nameserver。
+- 运行时还将这套有序策略挂到 DNS 传输层的独立 `outbound_resolver` 上（并非只影响普通 DNS listener），新增该入口下选中专用策略或回退**专用默认节点 DNS**的模拟测试。内部配置绕过 YAML 注入不支持的 GeoSite 等规则也会被拒绝。
+- 不支持且会明确报错：`geosite:`、`rule-set:`、策略值的 `system` 上游及 `#proxy` 指定出站。其它 Mihomo DNS 高级策略、真实 DNS 出口接口选择、系统 service-scoped resolver、TUN/NIC 抓包和跨平台运行仍未验证；不能宣称全部兼容或全系统零泄漏。
+- 对应测试涵盖 YAML→运行时、客户端构造、多个上游、匹配顺序、未知节点默认专用解析器、策略失败无公共 DNS 回退、大小写、网络切换重置及内部热更新校验；既有 `dns_legacy_golden_tests::s00_respect_rules_and_legacy_proxy_modifier_are_preserved` 的前序冲突仍单列，不改旧测试掩盖失败。
 
 ## 3. 变更管理与 S01 准入
 
