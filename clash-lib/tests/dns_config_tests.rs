@@ -559,6 +559,236 @@ fn proxy_server_nameserver_cannot_fall_back_when_all_entries_are_skipped() {
 }
 
 #[test]
+fn mihomo_proxy_server_nameserver_policy_preserves_scalar_and_multiple_upstreams() {
+    let yaml = base_config(
+        r#"
+  enable: true
+  nameserver: [1.1.1.1]
+  default-nameserver: [223.5.5.5]
+  proxy-server-nameserver: [8.8.8.8]
+  proxy-server-nameserver-policy:
+    "Node-A.Example": "tls://9.9.9.9:853"
+    "node-b.example": ["1.1.1.1", "1.0.0.1"]
+"#,
+    );
+    let dns = parse_dns(&yaml);
+    assert_eq!(
+        dns.proxy_server_nameserver_policy.len(),
+        2,
+        "per-node policy should be built, not silently ignored",
+    );
+    let entries = &dns.proxy_server_nameserver_policy;
+    assert_eq!(entries[0].0, "node-a.example");
+    assert_eq!(entries[0].1.len(), 1);
+    assert_eq!(entries[1].0, "node-b.example");
+    assert_eq!(entries[1].1.len(), 2);
+}
+
+#[test]
+fn mihomo_proxy_server_policy_requires_dedicated_bootstrap_nameservers() {
+    let yaml = base_config(
+        r#"
+  enable: true
+  nameserver: [1.1.1.1]
+  default-nameserver: [223.5.5.5]
+  proxy-server-nameserver-policy:
+    "node-a.example": "9.9.9.9"
+"#,
+    );
+    let error = parse_error(yaml).to_string();
+    assert!(
+        error.contains("proxy-server-nameserver"),
+        "per-node policy without a dedicated default cannot use main DNS: {error}"
+    );
+}
+
+#[test]
+fn mihomo_unsupported_proxy_server_policy_sources_are_rejected() {
+    for domain in ["geosite:gfw", "rule-set:proxy-nodes"] {
+        let yaml = base_config(&format!(
+            "  enable: true\n  nameserver: [1.1.1.1]\n  proxy-server-nameserver: [8.8.8.8]\n  proxy-server-nameserver-policy:\n    '{domain}': 9.9.9.9\n"
+        ));
+        let error = parse_error(yaml).to_string();
+        assert!(
+            error.contains("proxy-server-nameserver-policy"),
+            "unsupported selector must be explicitly rejected: {error}"
+        );
+    }
+}
+
+#[test]
+fn mihomo_proxy_server_policy_expands_comma_separated_domains_in_order() {
+    let yaml = base_config(
+        r#"
+  enable: true
+  nameserver: [1.1.1.1]
+  proxy-server-nameserver: [8.8.8.8]
+  proxy-server-nameserver-policy:
+    "node-a.example,node-b.example": ["9.9.9.9", "149.112.112.112"]
+    "node-c.example": "1.0.0.1"
+"#,
+    );
+    let policies = parse_dns(&yaml).proxy_server_nameserver_policy;
+    let names: Vec<&str> =
+        policies.iter().map(|(domain, _)| domain.as_str()).collect();
+    assert_eq!(
+        names,
+        ["node-a.example", "node-b.example", "node-c.example"]
+    );
+    assert_eq!(policies[0].1.len(), 2);
+    assert_eq!(policies[1].1.len(), 2);
+}
+
+#[test]
+fn mihomo_proxy_server_policy_never_silently_skips_system_upstream() {
+    let yaml = base_config(
+        r#"
+  enable: true
+  nameserver: [1.1.1.1]
+  proxy-server-nameserver: [8.8.8.8]
+  proxy-server-nameserver-policy:
+    "proxy.example": ["system", "9.9.9.9"]
+"#,
+    );
+    let error = parse_error(yaml).to_string();
+    assert!(
+        error.contains("proxy-server-nameserver-policy") && error.contains("system"),
+        "system upstream is not implemented and must not be silently dropped: {error}"
+    );
+}
+
+#[test]
+fn mihomo_proxy_server_policy_rejects_explicit_outbound_modifier_until_routable() {
+    // The dedicated node bootstrap client registry currently contains no
+    // user proxy handlers, so an accepted #proxy= reference could not honor
+    // Mihomo's explicit outbound selection semantics.
+    let yaml = base_config(
+        r#"
+  enable: true
+  nameserver: [1.1.1.1]
+  proxy-server-nameserver: [8.8.8.8]
+  proxy-server-nameserver-policy:
+    "proxy.example": "tls://9.9.9.9:853#proxy=PROXY"
+"#,
+    );
+    let error = parse_error(yaml).to_string();
+    assert!(
+        error.contains("proxy-server-nameserver-policy") && error.contains("#proxy"),
+        "unimplemented explicit DNS dialer must not be silently accepted: {error}"
+    );
+}
+
+#[test]
+fn mihomo_direct_nameserver_follow_policy_parses_explicit_values() {
+    let body = r#"
+  enable: true
+  nameserver: [1.1.1.1]
+  default-nameserver: [223.5.5.5]
+  direct-nameserver: [192.0.2.53]
+  nameserver-policy:
+    "protected.example": 9.9.9.9
+"#;
+    let without_flag = parse_dns(&base_config(body));
+    assert!(!without_flag.direct_nameserver_follow_policy);
+    assert_eq!(without_flag.nameserver_policy.len(), 1);
+    assert_eq!(
+        without_flag.direct_nameserver.as_ref().unwrap()[0]
+            .host
+            .to_string(),
+        "192.0.2.53"
+    );
+
+    for (value, expected) in [("true", true), ("false", false)] {
+        let yaml = base_config(&format!(
+            "{body}  direct-nameserver-follow-policy: {value}\n"
+        ));
+        let parsed = parse_dns(&yaml);
+        assert_eq!(parsed.direct_nameserver_follow_policy, expected);
+        assert_eq!(parsed.nameserver_policy.len(), 1);
+    }
+}
+
+#[test]
+fn mihomo_respect_rules_requires_dedicated_proxy_bootstrap() {
+    let bad = base_config(
+        "  enable: true\n  nameserver: ['udp://1.1.1.1#proxy=PROXY']\n  respect-rules: true\n",
+    );
+    let error = parse_error(bad).to_string();
+    assert!(
+        error.contains("dns.respect-rules")
+            && error.contains("proxy-server-nameserver"),
+        "{error}"
+    );
+
+    let good = base_config(
+        "  enable: true\n  nameserver: ['udp://1.1.1.1#proxy=PROXY']\n  respect-rules: true\n  proxy-server-nameserver: [9.9.9.9]\n",
+    );
+    let dns = parse_dns(&good);
+    assert!(dns.respect_rules);
+    assert_eq!(dns.nameserver[0].proxy.as_deref(), Some("PROXY"));
+    assert_eq!(dns.proxy_server_nameserver.as_ref().unwrap().len(), 1);
+}
+
+#[test]
+fn mihomo_nameserver_policy_multiple_domains_split_without_silent_literal_match() {
+    let yaml = base_config(
+        r#"
+  enable: true
+  nameserver: [1.1.1.1]
+  nameserver-policy:
+    "one.example,two.example": 9.9.9.9
+    "*.other.example": 149.112.112.112
+"#,
+    );
+    let dns = parse_dns(&yaml);
+    assert_eq!(dns.nameserver_policy.len(), 3);
+    assert!(dns.nameserver_policy.contains_key("one.example"));
+    assert!(dns.nameserver_policy.contains_key("two.example"));
+    assert!(dns.nameserver_policy.contains_key("*.other.example"));
+    assert!(
+        !dns.nameserver_policy
+            .contains_key("one.example,two.example")
+    );
+}
+
+#[test]
+fn mihomo_nameserver_policy_rejects_unsupported_geosite_and_ruleset_selectors() {
+    for domain in [
+        "geosite:gfw",
+        "GEOSITE:private",
+        "rule-set:protected",
+        "example.com,rule-set:protected",
+    ] {
+        let yaml = base_config(&format!(
+            "  enable: true\n  nameserver: [1.1.1.1]\n  nameserver-policy:\n    '{domain}': 9.9.9.9\n"
+        ));
+        let error = parse_error(yaml).to_string();
+        assert!(
+            error.contains("nameserver-policy") && error.contains(domain),
+            "unsupported Mihomo policy selectors must not be literal domain matches: {error}",
+        );
+    }
+}
+
+#[test]
+fn mihomo_nameserver_policy_rejects_case_insensitive_duplicate_selectors() {
+    let yaml = base_config(
+        r#"
+  enable: true
+  nameserver: [1.1.1.1]
+  nameserver-policy:
+    "Primary.Example,secondary.example": 9.9.9.9
+    "primary.example": 149.112.112.112
+"#,
+    );
+    let error = parse_error(yaml).to_string();
+    assert!(
+        error.contains("nameserver-policy") && error.contains("repeats domain"),
+        "ambiguous overlapping policy keys must not have HashMap-dependent precedence: {error}"
+    );
+}
+
+#[test]
 fn invalid_hosts_entry_is_rejected() {
     let yaml = base_config(
         r#"

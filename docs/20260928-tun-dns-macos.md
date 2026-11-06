@@ -146,3 +146,26 @@ System DNS 指向一个与 fake-IP 池、TUN 网关子网及 route exclusions �
 - 本轮验证：`cargo test -p clash-lib --lib --no-default-features --features tun,ring --locked -j 6`：816 passed / 0 failed / 11 ignored；`cargo test -p clash-lib --test dns_config_tests --no-default-features --features tun,ring --locked`：17 passed；`cargo test -p clash-lib --lib --no-default-features --features ring --locked whitelist`：3 passed；无 TUN 的内部配置拒绝测试 1 passed；`cargo check -p clash-rs --no-default-features --features standard,aws-lc-rs --locked`、`cargo clippy -p clash-lib --all-targets --no-default-features --features tun,ring --locked -j 6 -- -D warnings`、`cargo fmt --all -- --check` 与 `git diff --check` 均通过。原始→内部配置的白名单金标准及高级 filter 错误测试均通过。
 - 已知独立金标准冲突：`dns_legacy_golden_tests` 全部执行为 12 passed / 1 failed；失败的是 `s00_respect_rules_and_legacy_proxy_modifier_are_preserved`，在本轮修改前的 `0c36e2e` 中已经与 `dns.respect-rules` 必须存在 `proxy-server-nameserver` 的校验不一致。不能把该失败当成 whitelist 回归，也不能静默更新金标准测试；需要独立的兼容性决策和修正。
 - 后续开发应优先检查尚未合入的 `隔离候选分支` (2c7fd34)，避免重复工作；仍需评估代理服务器 DNS 引导回退和 macOS 系统级失效关闭。无授权不修改机器网络、不推送。
+
+## 2026-11-06 Mihomo proxy-server-nameserver-policy（普通域名子集）
+
+- 独立开发起点是本地 `e8e9fcce761d8e6cb233c45cd1cf91dd77fd212f`，固定 Mihomo 参考 gitlink `63bd52ec794b7051569b76ede2f6cdbf4c091fda`。源码对照 `config/config.go::parseNameServerPolicy` 与 `dns/resolver.go` 的专用节点解析器。参考目录保持只读。没有同步、合并、推送或修改 macOS 宿主网络。
+- 允许有序普通域名选择器、逗号分隔多个域名、单值或多值 DNS 上游、大小写不敏感；连接节点域名优先使用选中策略，否则使用独立 `proxy-server-nameserver`。专用解析器/策略失败时不自动切换到主 DNS 或 fallback；内部配置也不能绕过专用节点 DNS 必填检查。Network path reset 覆盖策略客户端。
+- 本阶段明确拒绝尚无等价行为的 `geosite:` / `rule-set:`、`system` DNS 上游及策略内部 `#proxy`。匹配依赖 Chimera 现有域名 trie；并不等价于 Mihomo 完整 RuleSet、GeoSite 和特殊出站语义。对实际 macOS 系统物理网卡的 DNS 零泄漏仍没有运行时抓包证明。
+- 增加定向 YAML/运行时/模拟上游测试：规则顺序、多个上游、大小写、策略命中和未命中、专用 DNS 错误 fail-closed、网络路径重建和内部配置校验。另将相同的有序节点策略挂入 DNS 传输层实际使用的独立 `outbound_resolver`，测试该调用入口命中策略和未命中走专用默认解析器；内部 Config 热更新即使直接输入 `geosite:` 也会拒绝。`dns_legacy_golden_tests::s00_respect_rules_and_legacy_proxy_modifier_are_preserved` 仍有先前的 `respect-rules` 校验差异，需要单独兼容性决策，不能藉本次改动无依据更新测试。
+- 验收待补：默认/全功能和无 TUN 组合、Linux/Windows、真实 DNS 节点和 macOS TUN/NIC 出口、L2 独立 Reviewer 和维护者批准，均不得由单纯配置解析或模拟上游测试替代。
+
+## 2026-11-06 Mihomo direct-nameserver-follow-policy 与原有金标准冲突（L2 待审）
+
+- 基线：隔离分支 `隔离候选分支` HEAD [本地快照已省略]；`master=[基线已省略]，`origin/master=[基线已省略]；固定 Mihomo gitlink `63bd52ec794b7051569b76ede2f6cdbf4c091fda`。参考 `ref-mihomo/config/config.go::parseDNS`、`ref-mihomo/dns/resolver.go` 的 DirectResolver 及 `DirectFollowPolicy`，只读不修改参考目录。
+- 新增 `dns.direct-nameserver-follow-policy: bool`，默认 false；通过原始 YAML → 运行时 Config → `EnhancedResolver::new` 的 DIRECT 解析器创建 → Dispatcher 选用 DIRECT 解析器。配置为 true 时，DIRECT 解析器与主解析器共享已编译的 `nameserver-policy`（同一组客户端），规则匹配时走指定 DNS 上游，匹配失败不转主 DNS。未命中使用 `direct-nameserver`；此时专用上游故障也不回退普通 DNS，以免 QNAME 越过显式 DIRECT 策略边界。false 保留原先的 direct→main fallback，以兼容旧 Chimera 行为；未配置 `direct-nameserver` 时与 Mihomo 一样没有专用 DirectResolver，此字段不会改变主解析器。
+- 同时修复主 DNS `nameserver-policy` 构造和 QNAME 匹配的大小写问题（之前混合大小写可绕开策略）；DIRECT 共享同一组策略客户端也获此修复。因共享策略也共享客户端，将其网络切换重置的所有权留在主解析器；DIRECT 子解析器只重置自己独有的传输，避免同一策略客户端重置两次。新增解析配置、模式开关、匹配/未匹配、多上游失败不回退、混合大小写策略、共享策略重置、调用链测试；无真实 DNS、NIC 或 TUN 外网请求。
+- **保留的 S00 金标准冲突**：`dns_legacy_golden_tests::s00_respect_rules_and_legacy_proxy_modifier_are_preserved` 仍要求 `respect-rules: true` 无 `proxy-server-nameserver` 可通过，但固定 Mihomo `parseDNS` 必须要求节点引导 DNS。选择安全语义后，该旧金标准不再符合当前兼容约束；不能为了绿色测试放宽安全校验、禁用测试或擅自更改历史金标准。本轮新增独立正反配置测试证明：缺少时明确拒绝，补上专用节点 DNS 后 `#proxy=PROXY` 保留。旧用例改版需独立 L2 兼容性决策及维护者批准，测试缺口继续如实报告。
+- 本阶段（TUN + Ring）核心单测 834 passed / 0 failed / 11 ignored，DNS 配置集成 26 passed / 0 failed；严格 Clippy、无 Dashboard CLI 编译、Rust 格式和 diff 检查通过。无 TUN 的完整库测试为 800 passed / 7 failed / 9 ignored：7 项均为既有 `config::internal::convert::tests` 的 TUN 正例在关闭 TUN feature 下得到预期的配置拒绝，但旧测试仍要求成功；本轮新增的无 TUN `direct_follow_policy` 两项及共享重置一项通过。旧 S00 金标准仍为 12 passed / 1 failed（缺少节点引导 DNS 的 `respect-rules` 用例），需维护者独立决定迁移；未修改这些历史测试。
+- 仍需专用 macOS 受权网络测试环境完成 DNS 出口抓包、切换网络服务、IPv6、DIRECT 和代理节点上游故障、TUN 关闭等边界验证；无法据单测证明系统级 DNS 零泄漏。
+
+## 2026-11-06 Mihomo nameserver-policy 普通域名子集安全增强（L2 待审）
+
+- 基线：本地 `9dfd4b327eb6a67f1adfc84796473c518face9cb`；固定 Mihomo gitlink `63bd52ec794b7051569b76ede2f6cdbf4c091fda` 的 `config/config.go::parseNameServerPolicy`。参考 Go 实现会将逗号分隔的域名键拆开，对 `geosite:` 和 `rule-set:` 建立专用 Matcher；Chimera 仍没有这两个 Matcher，不能让输入静默落为字面 domain trie。
+- 原始配置 `dns.nameserver-policy` 现在支持普通域名逗号拆分，保持每条规则**仅单个**上游字符串的既有格式；任何 `geosite:`/`rule-set:` 子键明确报错（即使混在逗号列表中），重复域名键拒绝以避免 HashMap 不确定覆盖；普通域名键在转换时转小写。内部配置与热更新也拒绝高级选择器和未拆分逗号键，避免绕过 YAML 的防泄漏校验。完整 GeoSite/RuleSet、多上游数组与 Mihomo 有序规则优先级尚未实现。
+- 测试按“旧实现失败 → 修复后通过”增加逗号匹配、GeoSite/RuleSet 显式拒绝、重复键检测及内部配置无法绕过用例；旧版单个字符串上游 S00 金标准定向测试仍通过。TUN + Ring 核心单测 835 passed / 0 failed / 11 ignored，DNS 配置集成 29 passed，严格 Clippy、无 Dashboard CLI 编译、fmt 与 diff 检查通过。旧版 DNS 金标准全套仍为 12 passed / 1 failed（历史 `respect-rules` 夹具冲突），未修改旧测试。没有对真实 macOS 系统 DNS、NIC、TUN 或代理出站进行操作。
