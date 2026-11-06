@@ -19,7 +19,9 @@ use crate::{
         def::{self, LogLevel, RunMode},
         internal::{
             listener::InboundOpts,
-            proxy::{OutboundProxy, OutboundProxyProviderDef},
+            proxy::{
+                OutboundProxy, OutboundProxyProtocol, OutboundProxyProviderDef,
+            },
             rule::RuleType,
         },
     },
@@ -53,6 +55,59 @@ pub struct Config {
     pub profile: Profile,
 }
 
+/// Some XHTTP secondary connections resolve their target with
+/// tokio::net::lookup_host rather than Chimera's managed node DNS resolver.
+/// In TUN + Fake-IP this hostname would escape to the OS resolver, including
+/// macOS service-scoped DNS paths which the TUN DNS hijack cannot guarantee.
+fn xhttp_secondary_system_dns_risk(
+    vless: &crate::config::internal::proxy::OutboundVless,
+) -> Option<&'static str> {
+    if vless.network.as_deref() != Some("xhttp") {
+        return None;
+    }
+    let opts = vless.xhttp_opts.as_ref()?;
+    // The HTTP/3 transport uses the managed connector instead.
+    if matches!(vless.alpn.as_deref(), Some([version]) if version == "h3") {
+        return None;
+    }
+    if let Some(download) = opts
+        .extra
+        .as_ref()
+        .and_then(|extra| extra.download_settings.as_ref())
+        .or(opts.download_settings.as_ref())
+    {
+        let server = if download.address.is_empty() {
+            &vless.common_opts.server
+        } else {
+            &download.address
+        };
+        if server.parse::<IpAddr>().is_err() {
+            return Some("download-settings");
+        }
+    }
+    if matches!(vless.alpn.as_deref(), Some([version]) if version == "http/1.1")
+        && vless.common_opts.server.parse::<IpAddr>().is_err()
+    {
+        return Some("http/1.1");
+    }
+    None
+}
+
+/// Shared security gate for static configuration and later provider refreshes.
+/// Diagnostics intentionally exclude endpoint hostnames.
+pub(crate) fn validate_xhttp_secondary_managed_dns(
+    outbound: &OutboundProxyProtocol,
+) -> Result<(), Error> {
+    if let OutboundProxyProtocol::Vless(vless) = outbound
+        && let Some(context) = xhttp_secondary_system_dns_risk(vless)
+    {
+        return Err(Error::InvalidConfig(format!(
+            "vless xhttp {context} requires an IP-literal secondary endpoint in TUN + Fake-IP; system DNS lookup is not protected by proxy-server-nameserver"
+        )));
+    }
+    Ok(())
+}
+
 impl Config {
     pub fn validate(self) -> Result<Self, crate::Error> {
         #[cfg(not(feature = "tun"))]
@@ -61,6 +116,17 @@ impl Config {
                 "tun is enabled in the configuration, but clash-lib was built without the `tun` feature"
                     .to_owned(),
             ));
+        }
+
+        if self.tun.enable
+            && self.dns.enable
+            && self.dns.enhance_mode == def::DNSMode::FakeIp
+        {
+            for outbound in self.proxies.values() {
+                if let OutboundProxy::ProxyServer(server) = outbound {
+                    validate_xhttp_secondary_managed_dns(server)?;
+                }
+            }
         }
 
         for r in self.rules.iter() {
@@ -76,9 +142,27 @@ impl Config {
         #[cfg(feature = "anytls")]
         for opts in &self.listeners {
             if let InboundOpts::Anytls {
-                common_opts, users, ..
+                common_opts,
+                users,
+                fallback,
+                ..
             } = opts
             {
+                // The camouflage fallback invokes tokio::lookup_host on
+                // authentication failure. Only literal socket endpoints are
+                // safe without a managed resolver in TUN + Fake-IP.
+                if self.tun.enable
+                    && self.dns.enable
+                    && self.dns.enhance_mode == def::DNSMode::FakeIp
+                    && fallback
+                        .as_ref()
+                        .is_some_and(|addr| addr.parse::<SocketAddr>().is_err())
+                {
+                    return Err(Error::InvalidConfig(
+                        "anytls inbound fallback requires an IP-literal host:port in TUN + Fake-IP; system DNS lookup is not protected"
+                            .to_owned(),
+                    ));
+                }
                 let mut seen = std::collections::HashSet::new();
                 for user in users {
                     if !seen.insert(user.password.as_str()) {
