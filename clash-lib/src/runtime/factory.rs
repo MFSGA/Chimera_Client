@@ -429,6 +429,7 @@ async fn build_auxiliary_dns_resolver(
         proxy_server_nameserver: None,
         proxy_server_nameserver_policy: Vec::new(),
         direct_nameserver: None,
+        direct_nameserver_follow_policy: false,
         fallback: Vec::new(),
         fallback_filter: Default::default(),
         listen: DNSListenAddr::default(),

@@ -679,6 +679,57 @@ fn mihomo_proxy_server_policy_rejects_explicit_outbound_modifier_until_routable(
 }
 
 #[test]
+fn mihomo_direct_nameserver_follow_policy_parses_explicit_values() {
+    let body = r#"
+  enable: true
+  nameserver: [1.1.1.1]
+  default-nameserver: [223.5.5.5]
+  direct-nameserver: [192.0.2.53]
+  nameserver-policy:
+    "protected.example": 9.9.9.9
+"#;
+    let without_flag = parse_dns(&base_config(body));
+    assert!(!without_flag.direct_nameserver_follow_policy);
+    assert_eq!(without_flag.nameserver_policy.len(), 1);
+    assert_eq!(
+        without_flag.direct_nameserver.as_ref().unwrap()[0]
+            .host
+            .to_string(),
+        "192.0.2.53"
+    );
+
+    for (value, expected) in [("true", true), ("false", false)] {
+        let yaml = base_config(&format!(
+            "{body}  direct-nameserver-follow-policy: {value}\n"
+        ));
+        let parsed = parse_dns(&yaml);
+        assert_eq!(parsed.direct_nameserver_follow_policy, expected);
+        assert_eq!(parsed.nameserver_policy.len(), 1);
+    }
+}
+
+#[test]
+fn mihomo_respect_rules_requires_dedicated_proxy_bootstrap() {
+    let bad = base_config(
+        "  enable: true\n  nameserver: ['udp://1.1.1.1#proxy=PROXY']\n  respect-rules: true\n",
+    );
+    let error = parse_error(bad).to_string();
+    assert!(
+        error.contains("dns.respect-rules")
+            && error.contains("proxy-server-nameserver"),
+        "{error}"
+    );
+
+    let good = base_config(
+        "  enable: true\n  nameserver: ['udp://1.1.1.1#proxy=PROXY']\n  respect-rules: true\n  proxy-server-nameserver: [9.9.9.9]\n",
+    );
+    let dns = parse_dns(&good);
+    assert!(dns.respect_rules);
+    assert_eq!(dns.nameserver[0].proxy.as_deref(), Some("PROXY"));
+    assert_eq!(dns.proxy_server_nameserver.as_ref().unwrap().len(), 1);
+}
+
+#[test]
 fn invalid_hosts_entry_is_rejected() {
     let yaml = base_config(
         r#"

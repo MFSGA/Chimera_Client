@@ -432,12 +432,7 @@ fn reject_unsupported_mihomo_privacy_fields(value: &Value) -> Result<(), Error> 
         ),
         (
             "dns",
-            &[
-                "direct-nameserver-follow-policy",
-                "fake-ip-ttl",
-                "use-system-hosts",
-                "fallback-lazy-query",
-            ],
+            &["fake-ip-ttl", "use-system-hosts", "fallback-lazy-query"],
         ),
     ];
 
@@ -730,6 +725,9 @@ pub struct DNS {
     pub proxy_server_nameserver_policy: serde_yaml::Mapping,
     /// DNS upstreams used when the final outbound is DIRECT.
     pub direct_nameserver: Vec<String>,
+    /// Match the main nameserver-policy when using direct-nameserver.
+    /// Mihomo defaults this to false; no direct-nameserver means no effect.
+    pub direct_nameserver_follow_policy: bool,
     /// Fallback DNS upstream servers
     pub fallback: Vec<String>,
     /// Fallback DNS filter
@@ -1256,7 +1254,6 @@ proxy:
             ("tun", "exclude-interface", "[en1]"),
             ("tun", "stack", "system"),
             ("tun", "route-address", "[0.0.0.0/0]"),
-            ("dns", "direct-nameserver-follow-policy", "false"),
             ("dns", "fake-ip-ttl", "1"),
             ("dns", "use-system-hosts", "false"),
             ("dns", "fallback-lazy-query", "true"),

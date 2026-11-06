@@ -57,7 +57,10 @@ pub struct EnhancedResolver {
     // Message with a per-response SOA TTL. Keep a bounded negative cache
     // alongside it, activated only when the positive cache is enabled.
     negative_cache: Mutex<lru_time_cache::LruCache<String, NegativeEntry>>,
-    policy: Option<trie::StringTrie<Vec<ThreadSafeDNSClient>>>,
+    policy: Option<Arc<trie::StringTrie<Vec<ThreadSafeDNSClient>>>>,
+    /// The DIRECT child shares this policy and its clients with its parent;
+    /// only the parent owns the policy clients' network-reset lifecycle.
+    policy_is_parent_shared: bool,
 
     proxy_resolver: Option<Vec<ThreadSafeDNSClient>>,
     proxy_server_domains: Option<trie::StringTrie<bool>>,
@@ -210,6 +213,42 @@ impl EnhancedResolver {
     }
 
     #[cfg(test)]
+    fn direct_with_optional_policy(
+        direct_clients: Vec<ThreadSafeDNSClient>,
+        fallback_clients: Vec<ThreadSafeDNSClient>,
+        ipv6: bool,
+        follow_policy: bool,
+        nameserver_policy: Option<Arc<trie::StringTrie<Vec<ThreadSafeDNSClient>>>>,
+    ) -> Self {
+        Self::direct_with_optional_ipv6_policy(
+            direct_clients,
+            fallback_clients,
+            Arc::new(AtomicBool::new(ipv6)),
+            ipv6,
+            follow_policy,
+            nameserver_policy,
+        )
+    }
+
+    fn direct_with_optional_ipv6_policy(
+        direct_clients: Vec<ThreadSafeDNSClient>,
+        fallback_clients: Vec<ThreadSafeDNSClient>,
+        ipv6: Arc<AtomicBool>,
+        dns_ipv6: bool,
+        follow_policy: bool,
+        nameserver_policy: Option<Arc<trie::StringTrie<Vec<ThreadSafeDNSClient>>>>,
+    ) -> Self {
+        let fallback = (!follow_policy).then_some(fallback_clients);
+        let mut resolver =
+            Self::from_clients_with_ipv6_policy(direct_clients, fallback, ipv6, dns_ipv6);
+        if follow_policy {
+            resolver.policy = nameserver_policy;
+            resolver.policy_is_parent_shared = resolver.policy.is_some();
+        }
+        resolver
+    }
+
+    #[cfg(test)]
     fn from_clients_with_fallback(
         main: Vec<ThreadSafeDNSClient>,
         fallback: Option<Vec<ThreadSafeDNSClient>>,
@@ -247,6 +286,7 @@ impl EnhancedResolver {
                 1024,
             )),
             policy: None,
+            policy_is_parent_shared: false,
             proxy_resolver: None,
             proxy_server_domains: None,
             direct_resolver: None,
@@ -297,6 +337,7 @@ impl EnhancedResolver {
                 1024,
             )),
             policy: None,
+            policy_is_parent_shared: false,
 
             proxy_resolver: None,
             proxy_server_domains: None,
@@ -368,6 +409,7 @@ impl EnhancedResolver {
                 1024,
             )),
             policy: None,
+            policy_is_parent_shared: false,
 
             proxy_resolver: None,
             proxy_server_domains: None,
@@ -444,6 +486,35 @@ impl EnhancedResolver {
         )
         .await?;
 
+        let policy = if !cfg.nameserver_policy.is_empty() {
+            let mut p = trie::StringTrie::new();
+            for (domain, ns) in &cfg.nameserver_policy {
+                p.insert(
+                    &domain.to_ascii_lowercase(),
+                    Arc::new(
+                        make_clients(
+                            vec![ns.to_owned()],
+                            Some(default_resolver.clone()),
+                            Some(outbound_resolver.clone()),
+                            outbounds.clone(),
+                            edns_client_subnet.clone(),
+                            DnsClientNetworkOptions {
+                                fw_mark: cfg.fw_mark,
+                                rule_dispatch: rule_dispatch.clone(),
+                                network_path_source: network_path_source.clone(),
+                                health: Some(health.clone()),
+                                group: Some("policy"),
+                            },
+                        )
+                        .await?,
+                    ),
+                );
+            }
+            Some(Arc::new(p))
+        } else {
+            None
+        };
+
         let direct_resolver = if let Some(direct_nameserver) = cfg.direct_nameserver
         {
             let clients = make_clients(
@@ -461,11 +532,13 @@ impl EnhancedResolver {
                 },
             )
             .await?;
-            Some(Arc::new(Self::from_clients_with_ipv6_policy(
+            Some(Arc::new(Self::direct_with_optional_ipv6_policy(
                 clients,
-                Some(main.clone()),
+                main.clone(),
                 ipv6_policy.clone(),
                 dns_ipv6,
+                cfg.direct_nameserver_follow_policy,
+                policy.clone(),
             )) as ThreadSafeDNSResolver)
         } else {
             None
@@ -556,34 +629,8 @@ impl EnhancedResolver {
                 4096,
                 hickory_resolver::TtlConfig::default(),
             )),
-            policy: if !cfg.nameserver_policy.is_empty() {
-                let mut p = trie::StringTrie::new();
-                for (domain, ns) in &cfg.nameserver_policy {
-                    p.insert(
-                        domain.as_str(),
-                        Arc::new(
-                            make_clients(
-                                vec![ns.to_owned()],
-                                Some(default_resolver.clone()),
-                                Some(outbound_resolver.clone()),
-                                outbounds.clone(),
-                                edns_client_subnet.clone(),
-                                DnsClientNetworkOptions {
-                                    fw_mark: cfg.fw_mark,
-                                    rule_dispatch: rule_dispatch.clone(),
-                                    network_path_source: network_path_source.clone(),
-                                    health: Some(health.clone()),
-                                    group: Some("policy"),
-                                },
-                            )
-                            .await?,
-                        ),
-                    );
-                }
-                Some(p)
-            } else {
-                None
-            },
+            policy,
+            policy_is_parent_shared: false,
             fake_dns: match cfg.enhance_mode {
                 DNSMode::FakeIp => Some(Arc::new(RwLock::new(
                     fakeip::FakeDns::new(fakeip::Opts {
@@ -916,6 +963,8 @@ impl EnhancedResolver {
         if let (Some(policy), Some(domain)) =
             (&self.policy, EnhancedResolver::domain_name_of_message(m))
         {
+            // DNS owner names are case-insensitive; bypassing the policy on
+            // mixed-case labels could send QNAMEs to an unintended upstream.
             return policy
                 .search(&domain.to_ascii_lowercase())
                 .map(|n| n.get_data().unwrap());
@@ -1351,7 +1400,12 @@ impl ClashResolver for EnhancedResolver {
         if let Some(proxy_resolver) = &self.proxy_resolver {
             clients.extend(proxy_resolver.iter().cloned());
         }
-        if let Some(policy) = &self.policy {
+        for (_, policy_clients) in &self.proxy_server_nameserver_policy {
+            clients.extend(policy_clients.iter().cloned());
+        }
+        if !self.policy_is_parent_shared
+            && let Some(policy) = &self.policy
+        {
             policy.traverse(|_, policy_clients| {
                 clients.extend(policy_clients.iter().cloned());
                 true
@@ -2365,6 +2419,173 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_nameserver_follow_policy_routes_only_matching_domain() {
+        let policy_hits = Arc::new(AtomicUsize::new(0));
+        let direct_hits = Arc::new(AtomicUsize::new(0));
+        let general_hits = Arc::new(AtomicUsize::new(0));
+        let mut matcher = crate::common::trie::StringTrie::new();
+        matcher.insert(
+            "proxy.example.com",
+            Arc::new(vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 90)),
+                hits: policy_hits.clone(),
+                id: "private-policy",
+            }) as ThreadSafeDNSClient]),
+        );
+        let policy = Some(Arc::new(matcher));
+        let mk_direct = || {
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 91)),
+                hits: direct_hits.clone(),
+                id: "direct-nameserver",
+            }) as ThreadSafeDNSClient]
+        };
+        let mk_general = || {
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 92)),
+                hits: general_hits.clone(),
+                id: "general-nameserver",
+            }) as ThreadSafeDNSClient]
+        };
+
+        let with_follow = EnhancedResolver::direct_with_optional_policy(
+            mk_direct(),
+            mk_general(),
+            false,
+            true,
+            policy.clone(),
+        );
+        assert_eq!(
+            with_follow
+                .resolve_v4("proxy.example.com", false)
+                .await
+                .unwrap(),
+            Some(Ipv4Addr::new(192, 0, 2, 90)),
+        );
+        assert_eq!(policy_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(direct_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(general_hits.load(Ordering::SeqCst), 0);
+
+        assert_eq!(
+            with_follow
+                .resolve_v4("other.example.com", false)
+                .await
+                .unwrap(),
+            Some(Ipv4Addr::new(192, 0, 2, 91)),
+        );
+        assert_eq!(direct_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(general_hits.load(Ordering::SeqCst), 0);
+
+        let without_follow = EnhancedResolver::direct_with_optional_policy(
+            mk_direct(),
+            mk_general(),
+            false,
+            false,
+            policy,
+        );
+        assert_eq!(
+            without_follow
+                .resolve_v4("proxy.example.com", false)
+                .await
+                .unwrap(),
+            Some(Ipv4Addr::new(192, 0, 2, 91)),
+        );
+        assert_eq!(policy_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(direct_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(general_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn direct_follow_policy_failure_never_falls_back_to_default_dns() {
+        let direct_hits = Arc::new(AtomicUsize::new(0));
+        let general_hits = Arc::new(AtomicUsize::new(0));
+        let mut matcher = crate::common::trie::StringTrie::new();
+        matcher.insert(
+            "proxy.example.com",
+            Arc::new(vec![Arc::new(FailingClient {
+                id: "private-policy",
+                reason: "private upstream offline",
+            }) as ThreadSafeDNSClient]),
+        );
+        let resolver = EnhancedResolver::direct_with_optional_policy(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 91)),
+                hits: direct_hits.clone(),
+                id: "direct-nameserver",
+            })],
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 92)),
+                hits: general_hits.clone(),
+                id: "general-nameserver",
+            })],
+            false,
+            true,
+            Some(Arc::new(matcher)),
+        );
+        let failure = resolver
+            .resolve_v4("proxy.example.com", false)
+            .await
+            .unwrap_err();
+        assert!(failure.to_string().contains("private upstream offline"));
+        assert_eq!(direct_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(general_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn direct_follow_policy_does_not_fallback_on_unmatched_direct_failure() {
+        let general_hits = Arc::new(AtomicUsize::new(0));
+        let resolver = EnhancedResolver::direct_with_optional_policy(
+            vec![Arc::new(FailingClient {
+                id: "direct-upstream",
+                reason: "direct upstream unreachable",
+            })],
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 92)),
+                hits: general_hits.clone(),
+                id: "main-dns",
+            })],
+            false,
+            true,
+            None,
+        );
+        let error = resolver
+            .resolve_v4("other.example.com", false)
+            .await
+            .expect_err("opted-in DIRECT policy must not leak QNAME into main DNS");
+        assert!(
+            error.to_string().contains("direct upstream unreachable"),
+            "{error}"
+        );
+        assert_eq!(general_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn shared_direct_policy_does_not_reset_transport_twice() {
+        let resets = Arc::new(AtomicUsize::new(0));
+        let mut primary = EnhancedResolver::from_clients(vec![], false);
+        let mut policy = crate::common::trie::StringTrie::new();
+        policy.insert(
+            "protected.example",
+            Arc::new(vec![Arc::new(ResetCountingClient {
+                resets: resets.clone(),
+            }) as ThreadSafeDNSClient]),
+        );
+        let shared_policy = Arc::new(policy);
+        primary.policy = Some(shared_policy.clone());
+        let direct = EnhancedResolver::direct_with_optional_policy(
+            vec![],
+            vec![],
+            false,
+            true,
+            Some(shared_policy),
+        );
+        primary.direct_resolver = Some(Arc::new(direct));
+
+        assert_eq!(primary.reset_transports().await.unwrap(), 1);
+        assert_eq!(resets.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn reset_transports_covers_all_upstream_collections() {
         let resets = Arc::new(AtomicUsize::new(0));
         let client = || -> ThreadSafeDNSClient {
@@ -2382,10 +2603,15 @@ mod tests {
         )));
         let mut policy = crate::common::trie::StringTrie::new();
         assert!(policy.insert("policy.example", Arc::new(vec![client()])));
-        resolver.policy = Some(policy);
+        resolver.policy = Some(Arc::new(policy));
+        let mut proxy_selector = crate::common::trie::StringTrie::new();
+        proxy_selector.insert("proxy.example", Arc::new(true));
+        resolver
+            .proxy_server_nameserver_policy
+            .push((Arc::new(proxy_selector), vec![client()]));
 
-        assert_eq!(resolver.reset_transports().await.unwrap(), 5);
-        assert_eq!(resets.load(Ordering::SeqCst), 5);
+        assert_eq!(resolver.reset_transports().await.unwrap(), 6);
+        assert_eq!(resets.load(Ordering::SeqCst), 6);
     }
 
     /// Global IPv6 disable applies to literal endpoints as well as DNS.
@@ -2939,7 +3165,7 @@ mod tests {
                 id: "private-policy",
             }) as ThreadSafeDNSClient]),
         );
-        resolver.policy = Some(policy);
+        resolver.policy = Some(Arc::new(policy));
         resolver.main = vec![Arc::new(CountingClient {
             response: response_with_a(Ipv4Addr::new(192, 0, 2, 77)),
             hits: main_hits.clone(),
@@ -2978,7 +3204,7 @@ mod tests {
                 reason: "private DNS offline",
             }) as ThreadSafeDNSClient]),
         );
-        resolver.policy = Some(policy);
+        resolver.policy = Some(Arc::new(policy));
         resolver.main = vec![Arc::new(CountingClient {
             response: response_with_a(Ipv4Addr::new(192, 0, 2, 77)),
             hits: main_hits.clone(),
@@ -3026,7 +3252,7 @@ mod tests {
                 id: "private-policy",
             }) as ThreadSafeDNSClient]),
         );
-        resolver.policy = Some(policy);
+        resolver.policy = Some(Arc::new(policy));
         resolver.main = vec![Arc::new(CountingClient {
             response: response_with_a(Ipv4Addr::new(192, 0, 2, 78)),
             hits: main_hits.clone(),
@@ -3049,6 +3275,197 @@ mod tests {
         assert_eq!(proxy_hits.load(Ordering::SeqCst), 1);
         assert_eq!(policy_hits.load(Ordering::SeqCst), 0);
         assert_eq!(main_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn proxy_server_policy_uses_specific_upstream_and_dedicated_default() {
+        let mut resolver = EnhancedResolver::from_clients(vec![], false);
+        let specific_hits = Arc::new(AtomicUsize::new(0));
+        let default_hits = Arc::new(AtomicUsize::new(0));
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        let generic_hits = Arc::new(AtomicUsize::new(0));
+
+        let mut known_proxy_domains = crate::common::trie::StringTrie::new();
+        known_proxy_domains.insert("proxy.example.com", Arc::new(true));
+        known_proxy_domains.insert("other.example.com", Arc::new(true));
+        resolver.proxy_server_domains = Some(known_proxy_domains);
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+            hits: default_hits.clone(),
+            id: "proxy-server-default",
+        })]);
+        let mut specific = crate::common::trie::StringTrie::new();
+        specific.insert("proxy.example.com", Arc::new(true));
+        resolver.proxy_server_nameserver_policy.push((
+            Arc::new(specific),
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+                hits: specific_hits.clone(),
+                id: "proxy-server-specific",
+            })],
+        ));
+        let mut general_policy = crate::common::trie::StringTrie::new();
+        general_policy.insert(
+            "proxy.example.com",
+            Arc::new(vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 99)),
+                hits: generic_hits.clone(),
+                id: "general-policy",
+            }) as ThreadSafeDNSClient]),
+        );
+        resolver.policy = Some(Arc::new(general_policy));
+        resolver.main = vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 98)),
+            hits: main_hits.clone(),
+            id: "public-main",
+        })];
+
+        resolver
+            .ip_exchange(&test_query_with_type(rr::RecordType::A))
+            .await
+            .expect("known proxy hostname must use its dedicated policy");
+        assert_eq!(specific_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(default_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(generic_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(main_hits.load(Ordering::SeqCst), 0);
+
+        let mut mixed_case_proxy = test_query_with_type(rr::RecordType::A);
+        mixed_case_proxy.queries[0]
+            .set_name(rr::Name::from_utf8("PrOxY.ExAmPlE.CoM.").unwrap());
+        resolver.ip_exchange(&mixed_case_proxy).await.expect(
+            "DNS proxy server domains must match regardless of query casing",
+        );
+        assert_eq!(specific_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(default_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(main_hits.load(Ordering::SeqCst), 0);
+
+        let mut other_proxy = test_query_with_type(rr::RecordType::A);
+        other_proxy.queries[0]
+            .set_name(rr::Name::from_utf8("other.example.com.").unwrap());
+        resolver.ip_exchange(&other_proxy).await.expect(
+            "unmatched proxy node should use dedicated default, not main DNS",
+        );
+        assert_eq!(default_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(specific_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(main_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn dedicated_outbound_resolver_applies_node_dns_policy_before_default() {
+        // This is the resolver passed into DNS transports as
+        // outbound_resolver, not the top-level DNS listener resolver.
+        let default_hits = Arc::new(AtomicUsize::new(0));
+        let policy_hits = Arc::new(AtomicUsize::new(0));
+        let mut node_resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+                hits: default_hits.clone(),
+                id: "node-default",
+            })],
+            false,
+        );
+        node_resolver.proxy_node_resolver = true;
+        let mut matcher = crate::common::trie::StringTrie::new();
+        matcher.insert("node.example.com", Arc::new(true));
+        node_resolver.proxy_server_nameserver_policy.push((
+            Arc::new(matcher),
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+                hits: policy_hits.clone(),
+                id: "node-policy",
+            })],
+        ));
+
+        assert_eq!(
+            node_resolver
+                .resolve_v4("node.example.com", false)
+                .await
+                .unwrap(),
+            Some(Ipv4Addr::new(192, 0, 2, 11)),
+        );
+        assert_eq!(policy_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(default_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            node_resolver
+                .resolve_v4("other.example.com", false)
+                .await
+                .unwrap(),
+            Some(Ipv4Addr::new(192, 0, 2, 10)),
+        );
+        assert_eq!(policy_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(default_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn proxy_server_specific_policy_failure_never_falls_back_to_public_dns() {
+        let mut resolver = EnhancedResolver::from_clients(vec![], false);
+        let default_hits = Arc::new(AtomicUsize::new(0));
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        let mut domains = crate::common::trie::StringTrie::new();
+        domains.insert("proxy.example.com", Arc::new(true));
+        resolver.proxy_server_domains = Some(domains);
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+            hits: default_hits.clone(),
+            id: "proxy-default",
+        })]);
+        let mut selector = crate::common::trie::StringTrie::new();
+        selector.insert("proxy.example.com", Arc::new(true));
+        resolver.proxy_server_nameserver_policy.push((
+            Arc::new(selector),
+            vec![Arc::new(FailingClient {
+                id: "proxy-policy",
+                reason: "dedicated node DNS unavailable",
+            })],
+        ));
+        resolver.main = vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 99)),
+            hits: main_hits.clone(),
+            id: "public-main",
+        })];
+        let err = resolver
+            .ip_exchange(&test_query_with_type(rr::RecordType::A))
+            .await
+            .expect_err("a failed dedicated policy must fail closed");
+        assert!(err.to_string().contains("dedicated node DNS unavailable"));
+        assert_eq!(default_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(main_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn proxy_server_policy_respects_first_matching_rule_order() {
+        let mut resolver = EnhancedResolver::from_clients(vec![], false);
+        let first_hits = Arc::new(AtomicUsize::new(0));
+        let second_hits = Arc::new(AtomicUsize::new(0));
+        let mut domains = crate::common::trie::StringTrie::new();
+        domains.insert("proxy.example.com", Arc::new(true));
+        resolver.proxy_server_domains = Some(domains);
+        resolver.proxy_resolver = Some(vec![Arc::new(FailingClient {
+            id: "proxy-default",
+            reason: "default should not be used",
+        })]);
+
+        for (pattern, hits, id) in [
+            ("*.example.com", first_hits.clone(), "first-rule"),
+            ("proxy.example.com", second_hits.clone(), "second-rule"),
+        ] {
+            let mut selector = crate::common::trie::StringTrie::new();
+            selector.insert(pattern, Arc::new(true));
+            resolver.proxy_server_nameserver_policy.push((
+                Arc::new(selector),
+                vec![Arc::new(CountingClient {
+                    response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+                    hits,
+                    id,
+                })],
+            ));
+        }
+        resolver
+            .ip_exchange(&test_query_with_type(rr::RecordType::A))
+            .await
+            .expect("first matching policy wins");
+        assert_eq!(first_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(second_hits.load(Ordering::SeqCst), 0);
     }
 
     #[derive(Debug)]
@@ -3173,6 +3590,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dns_nameserver_policy_matches_case_insensitive_domains() {
+        // The same compiled policy is reused by the normal and opt-in
+        // DIRECT resolvers. Uppercase YAML keys and mixed-case DNS requests
+        // must not bypass their selected upstream.
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::app::profile::ThreadSafeCacheFile::new(
+            temp.path().join("cache.db").to_str().unwrap(),
+            false,
+        );
+        let mut config = make_proxy_nameserver_config();
+        config.nameserver_policy.insert(
+            "PrOtEcTeD.ExAmPlE".to_owned(),
+            NameServer {
+                net: DNSNetMode::Udp,
+                host: url::Host::Ipv4("9.9.9.9".parse().unwrap()),
+                port: 53,
+                interface: None,
+                proxy: None,
+                doh_path: None,
+            },
+        );
+        config.direct_nameserver = Some(vec![NameServer {
+            net: DNSNetMode::Udp,
+            host: url::Host::Ipv4("192.0.2.53".parse().unwrap()),
+            port: 53,
+            interface: None,
+            proxy: None,
+            doh_path: None,
+        }]);
+        config.direct_nameserver_follow_policy = true;
+
+        let resolver = EnhancedResolver::new(
+            config,
+            store,
+            None,
+            Arc::new(RwLock::new(std::collections::HashMap::new())),
+            None,
+        )
+        .await
+        .expect("DNS policy with mixed-case domains should initialize");
+
+        let policy = resolver
+            .policy
+            .as_ref()
+            .expect("compiled nameserver-policy");
+        assert!(policy.search("protected.example").is_some());
+        assert!(resolver.direct_resolver.is_some());
+    }
+
+    #[tokio::test]
+    async fn mixed_case_dns_qname_cannot_bypass_nameserver_policy() {
+        let protected_hits = Arc::new(AtomicUsize::new(0));
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(198, 51, 100, 5)),
+                hits: public_hits.clone(),
+                id: "public",
+            })],
+            false,
+        );
+        let mut policy = crate::common::trie::StringTrie::new();
+        policy.insert(
+            "proxy.example.com",
+            Arc::new(vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(203, 0, 113, 5)),
+                hits: protected_hits.clone(),
+                id: "protected",
+            }) as ThreadSafeDNSClient]),
+        );
+        resolver.policy = Some(Arc::new(policy));
+        let mut query = test_query_with_type(rr::RecordType::A);
+        query.queries[0]
+            .set_name(rr::Name::from_utf8("PrOxY.ExAmPlE.CoM.").unwrap());
+        let response = resolver.ip_exchange(&query).await.unwrap();
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&response),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5))],
+        );
+        assert_eq!(protected_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(public_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn nameserver_policy_works_without_fallback() {
         let mut resolver = EnhancedResolver::new_default().await;
         resolver.lru_cache = None;
@@ -3191,7 +3692,7 @@ mod tests {
                     id: "policy-ns",
                 })]),
             );
-            Some(policy)
+            Some(Arc::new(policy))
         };
         resolver.main = vec![Arc::new(CountingClient {
             response: response_with_a(Ipv4Addr::new(198, 51, 100, 20)),

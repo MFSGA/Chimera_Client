@@ -71,6 +71,7 @@ pub struct Config {
     pub proxy_server_nameserver: Option<Vec<NameServer>>,
     pub proxy_server_nameserver_policy: Vec<(String, Vec<NameServer>)>,
     pub direct_nameserver: Option<Vec<NameServer>>,
+    pub direct_nameserver_follow_policy: bool,
     pub fake_ip_range: ipnet::IpNet,
     pub fake_ip_range6: Option<ipnet::IpNet>,
     pub fake_ip_filter: Vec<String>,
@@ -681,6 +682,7 @@ impl TryFrom<&crate::config::def::Config> for Config {
             proxy_server_nameserver,
             proxy_server_nameserver_policy,
             direct_nameserver,
+            direct_nameserver_follow_policy: dc.direct_nameserver_follow_policy,
             fake_ip_range: dc.fake_ip_range.parse::<ipnet::IpNet>().map_err(
                 |_| Error::InvalidConfig(String::from("invalid fake ip range")),
             )?,
