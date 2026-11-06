@@ -525,6 +525,36 @@ profile: {{}}
         );
     }
 
+    #[test]
+    fn internal_main_dns_policy_rejects_unsupported_geosite_and_combined_keys() {
+        for selector in ["geosite:gfw", "rule-set:protected", "a.example,b.example"]
+        {
+            let mut cfg = parse_config("");
+            cfg.dns.enable = true;
+            cfg.dns.nameserver = vec!["1.1.1.1".to_owned()];
+            let mut internal = convert(cfg).expect("valid DNS config");
+            let server = crate::app::dns::config::Config::parse_nameserver(&[
+                "9.9.9.9".to_owned(),
+            ])
+            .expect("valid upstream")
+            .remove(0);
+            internal
+                .dns
+                .nameserver_policy
+                .insert(selector.to_owned(), server);
+            let error = match crate::Config::Internal(internal).try_parse() {
+                Ok(_) => panic!(
+                    "unsupported internal DNS selector {selector} must be rejected"
+                ),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains("dns.nameserver-policy") && error.contains(selector),
+                "{error}"
+            );
+        }
+    }
+
     #[cfg(feature = "tun")]
     #[test]
     fn internal_tun_fake_ip_cannot_bypass_proxy_dns_privacy_gate() {

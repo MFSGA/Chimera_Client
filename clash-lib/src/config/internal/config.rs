@@ -157,6 +157,23 @@ impl Config {
             ));
         }
 
+        // YAML conversion expands comma-delimited main DNS policy selectors
+        // and rejects Mihomo GeoSite/RuleSet patterns. Internal configs and
+        // reloads must not bypass that privacy-sensitive validation.
+        for domain in self.dns.nameserver_policy.keys() {
+            let lower = domain.to_ascii_lowercase();
+            let (_, valid) = crate::common::trie::valid_and_split_domain(domain);
+            if lower.starts_with("geosite:")
+                || lower.starts_with("rule-set:")
+                || domain.contains(',')
+                || !valid
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "dns.nameserver-policy unsupported or unexpanded domain selector: {domain}"
+                )));
+            }
+        }
+
         // Preserve the dedicated bootstrap boundary for internal configs as
         // well as for YAML. A policy without default proxy DNS is invalid.
         if !self.dns.proxy_server_nameserver_policy.is_empty()

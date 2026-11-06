@@ -730,6 +730,65 @@ fn mihomo_respect_rules_requires_dedicated_proxy_bootstrap() {
 }
 
 #[test]
+fn mihomo_nameserver_policy_multiple_domains_split_without_silent_literal_match() {
+    let yaml = base_config(
+        r#"
+  enable: true
+  nameserver: [1.1.1.1]
+  nameserver-policy:
+    "one.example,two.example": 9.9.9.9
+    "*.other.example": 149.112.112.112
+"#,
+    );
+    let dns = parse_dns(&yaml);
+    assert_eq!(dns.nameserver_policy.len(), 3);
+    assert!(dns.nameserver_policy.contains_key("one.example"));
+    assert!(dns.nameserver_policy.contains_key("two.example"));
+    assert!(dns.nameserver_policy.contains_key("*.other.example"));
+    assert!(
+        !dns.nameserver_policy
+            .contains_key("one.example,two.example")
+    );
+}
+
+#[test]
+fn mihomo_nameserver_policy_rejects_unsupported_geosite_and_ruleset_selectors() {
+    for domain in [
+        "geosite:gfw",
+        "GEOSITE:private",
+        "rule-set:protected",
+        "example.com,rule-set:protected",
+    ] {
+        let yaml = base_config(&format!(
+            "  enable: true\n  nameserver: [1.1.1.1]\n  nameserver-policy:\n    '{domain}': 9.9.9.9\n"
+        ));
+        let error = parse_error(yaml).to_string();
+        assert!(
+            error.contains("nameserver-policy") && error.contains(domain),
+            "unsupported Mihomo policy selectors must not be literal domain matches: {error}",
+        );
+    }
+}
+
+#[test]
+fn mihomo_nameserver_policy_rejects_case_insensitive_duplicate_selectors() {
+    let yaml = base_config(
+        r#"
+  enable: true
+  nameserver: [1.1.1.1]
+  nameserver-policy:
+    "Primary.Example,secondary.example": 9.9.9.9
+    "primary.example": 149.112.112.112
+"#,
+    );
+    let error = parse_error(yaml).to_string();
+    assert!(
+        error.contains("nameserver-policy") && error.contains("repeats domain"),
+        "ambiguous overlapping policy keys must not have HashMap-dependent precedence: {error}"
+    );
+}
+
+#[test]
 fn invalid_hosts_entry_is_rejected() {
     let yaml = base_config(
         r#"
