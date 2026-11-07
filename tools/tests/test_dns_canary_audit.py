@@ -290,6 +290,33 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "NOT_VERIFIED")
         self.assertIn("missing_physical_capture:en1", result["coverage_issues"])
 
+    def test_double_trailing_dot_in_physical_calibration_cannot_confirm_coverage(self) -> None:
+        (self.folder / "en0.log").write_text(
+            PHYSICAL_NOISE.replace(
+                "calibration.evidence.example.test.",
+                "calibration.evidence.example.test..",
+            ),
+            encoding="utf-8",
+        )
+        result = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(result["verdict"], "NOT_VERIFIED")
+        self.assertIn("no_physical_calibration_observed:en0", result["coverage_issues"])
+
+    def test_double_trailing_dot_in_tun_canary_cannot_count_as_query(self) -> None:
+        (self.folder / "utun7.log").write_text(
+            TUN_CANARY.replace(
+                "CAnary.Evidence.Example.Test.",
+                "CAnary.Evidence.Example.Test..",
+            ).replace(
+                "canary.evidence.example.test.",
+                "canary.evidence.example.test..",
+            ),
+            encoding="utf-8",
+        )
+        result = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(result["verdict"], "NOT_VERIFIED")
+        self.assertEqual(result["canary_queries_after_stimulus"]["tun"], 0)
+
     def test_missing_tun_canary_is_not_verified(self) -> None:
         (self.folder / "utun7.log").write_text(
             "2026-11-06 07:00:01 IP 192.0.2.3.50234 > 192.0.2.53.53: "
@@ -959,6 +986,22 @@ class AuditTests(unittest.TestCase):
         self.manifest["coverage_complete"] = True
         with self.assertRaisesRegex(audit.AuditError, "unknown manifest fields"):
             audit.analyze_manifest(self.save_manifest())
+
+    def test_multiple_trailing_root_dots_are_invalid_dns_names(self) -> None:
+        self.manifest["canary_qname"] = "canary.evidence.example.test.."
+        with self.assertRaisesRegex(audit.AuditError, "trailing"):
+            audit.analyze_manifest(self.save_manifest())
+        self.manifest["canary_qname"] = CANARY
+        self.manifest["physical_calibration_qname"] = "calibration.evidence.example.test.."
+        with self.assertRaisesRegex(audit.AuditError, "trailing"):
+            audit.analyze_manifest(self.save_manifest())
+
+    def test_one_optional_terminal_root_dot_remains_valid(self) -> None:
+        self.manifest["canary_qname"] = CANARY + "."
+        self.manifest["physical_calibration_qname"] = "calibration.evidence.example.test."
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["verdict"], "NO_PHYSICAL_CANARY_OBSERVED_IN_SUPPLIED_LOGS")
+        self.assertEqual(report["canary_qname"], CANARY)
 
     def test_invalid_canary_name_is_rejected(self) -> None:
         for name in ("", "*.example.test", "one", "example..test", "https://example.test",

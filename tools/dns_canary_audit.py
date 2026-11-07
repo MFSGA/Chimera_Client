@@ -78,7 +78,9 @@ def sha256_file(path: Path) -> str:
 def normalize_canary(value: Any) -> str:
     if not isinstance(value, str):
         raise AuditError("canary_qname must be an ASCII DNS name")
-    name = value.rstrip(".").lower()
+    if value.endswith(".."):
+        raise AuditError("DNS name has multiple trailing root dots")
+    name = (value[:-1] if value.endswith(".") else value).lower()
     if not name or len(name) > 253 or "." not in name:
         raise AuditError("canary_qname must be a full, non-root DNS name")
     try:
@@ -88,6 +90,17 @@ def normalize_canary(value: Any) -> str:
     if any(not LABEL.fullmatch(part) for part in name.split(".")):
         raise AuditError("canary_qname contains an invalid DNS label")
     return name
+
+
+def matches_question_name(packet_name: str, expected: str) -> bool:
+    """Match decoded QNAME conservatively: at most one terminal root dot."""
+    if packet_name.endswith(".."):
+        return False
+    name = (packet_name[:-1] if packet_name.endswith(".") else packet_name).lower()
+    return (
+        name == expected
+        and all(LABEL.fullmatch(part) is not None for part in name.split("."))
+    )
 
 
 def evidence_path(folder: Path, user_path: Any) -> Path:
@@ -126,7 +139,7 @@ def parse_packet(line: str, canary: str, include_endpoints: bool) -> dict[str, s
     if destination is None:
         return None
     question = QUESTION.search(match["details"])
-    if question is None or question["qname"].rstrip(".").lower() != canary:
+    if question is None or not matches_question_name(question["qname"], canary):
         return None
     payload = match["details"]
     transport = "tcp" if "Flags [" in payload else "udp"
@@ -540,7 +553,7 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
                         if question:
                             candidate_dns_query_lines += 1
                             if (calibration is not None and role == "physical"
-                                    and question["qname"].rstrip(".").lower() == calibration
+                                    and matches_question_name(question["qname"], calibration)
                                     and packet_utc is not None and shared_window is not None
                                     and shared_window[0] <= packet_utc < shared_window[1]
                                     and stimulus_at is not None
