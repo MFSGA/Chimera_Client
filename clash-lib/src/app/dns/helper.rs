@@ -33,6 +33,20 @@ pub async fn make_clients(
     edns_client_subnet: Option<EdnsClientSubnet>,
     network_options: DnsClientNetworkOptions,
 ) -> Result<Vec<ThreadSafeDNSClient>, crate::Error> {
+    // Dedicated node DNS must not construct a transport that can select
+    // SystemResolver implicitly, including after the client is rebuilt on a
+    // network-path change. The upstream bootstrap (father) is a different
+    // resolver role and cannot substitute for the transport dialer.
+    if !servers.is_empty()
+        && network_options.group == Some("proxy_server")
+        && outbound_resolver.is_none()
+    {
+        return Err(crate::Error::InvalidConfig(
+            "proxy_server DNS clients require an explicit outbound resolver"
+                .to_owned(),
+        ));
+    }
+
     let mut rv = Vec::new();
     let had_configured_servers = !servers.is_empty();
     let mut initialization_errors = Vec::new();
@@ -141,6 +155,79 @@ pub fn build_dns_response_message(
 mod tests {
     use super::*;
     use crate::app::dns::MockClashResolver;
+
+    #[tokio::test]
+    async fn node_dns_group_fails_closed_without_explicit_transport_resolver() {
+        // Mihomo keeps ProxyServerNameserver isolated. A bootstrap resolver
+        // alone must never authorize the transport's SystemResolver fallback.
+        let upstream = NameServer {
+            net: DNSNetMode::Udp,
+            host: url::Host::Ipv4(std::net::Ipv4Addr::new(192, 0, 2, 53)),
+            port: 53,
+            interface: None,
+            proxy: None,
+            doh_path: None,
+        };
+        for father in [
+            None,
+            Some(Arc::new(MockClashResolver::new()) as Arc<dyn ClashResolver>),
+        ] {
+            let result = make_clients(
+                vec![upstream.clone()],
+                father,
+                None,
+                Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+                None,
+                DnsClientNetworkOptions {
+                    group: Some("proxy_server"),
+                    ..Default::default()
+                },
+            )
+            .await;
+            let error = match result {
+                Ok(_) => {
+                    panic!("node DNS transport allowed implicit system resolver")
+                }
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("explicit outbound resolver"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn node_dns_group_accepts_managed_transport_resolver_and_empty_legacy_group()
+     {
+        let registry =
+            || Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let group = || DnsClientNetworkOptions {
+            group: Some("proxy_server"),
+            ..Default::default()
+        };
+        let empty = make_clients(vec![], None, None, registry(), None, group())
+            .await
+            .expect("empty node DNS group does not need a dialer");
+        assert!(empty.is_empty());
+        let upstream = NameServer {
+            net: DNSNetMode::Udp,
+            host: url::Host::Ipv4(std::net::Ipv4Addr::new(192, 0, 2, 53)),
+            port: 53,
+            interface: None,
+            proxy: None,
+            doh_path: None,
+        };
+        let transport: Arc<dyn ClashResolver> = Arc::new(MockClashResolver::new());
+        let managed = make_clients(
+            vec![upstream],
+            None,
+            Some(transport),
+            registry(),
+            None,
+            group(),
+        )
+        .await
+        .expect("explicitly managed resolver must remain supported");
+        assert_eq!(managed.len(), 1);
+    }
 
     #[tokio::test]
     async fn all_unresolvable_upstreams_return_a_configuration_error() {
