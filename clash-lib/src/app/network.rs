@@ -60,8 +60,10 @@ where
             Err(_) => ComponentResult::timed_out(),
         }
     }
-    let dns = attempt(dns).await;
-    let pools = attempt(pools).await;
+    // Both reset components must be polled before an outer recovery deadline
+    // can cancel this transaction. Waiting for stalled DNS cleanup first
+    // would otherwise skip independent outbound pool invalidation entirely.
+    let (dns, pools) = tokio::join!(attempt(dns), attempt(pools));
     RecoveryReport {
         interface: ComponentResult::skipped(),
         dns,
@@ -2132,6 +2134,68 @@ eth0 00000000 00000000 0001 0 0 0 00000000 0 0 0\n";
             observer.observe(&online("en0", "192.0.2.3"), Instant::now()),
             Some(true)
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_network_recovery_still_attempts_outbound_pool_reset() {
+        // A request-level recovery deadline can elapse before the per-DNS
+        // component deadline. Independent outbound cleanup must be polled
+        // immediately rather than waiting for a stalled DNS reset.
+        let attempted = std::sync::atomic::AtomicBool::new(false);
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            reset_resources_report(
+                std::future::pending::<Result<u32, &str>>(),
+                async {
+                    attempted.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok::<u32, &str>(1)
+                },
+            ),
+        )
+        .await;
+        assert!(result.is_err(), "stalled DNS recovery must stay bounded");
+        assert!(
+            attempted.load(std::sync::atomic::Ordering::SeqCst),
+            "outbound pool reset was skipped before recovery cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_network_recovery_retains_both_failure_causes() {
+        let report = reset_resources_report(
+            async { Err::<u32, _>("managed DNS reset unavailable") },
+            async { Err::<u32, _>("outbound pool reset unavailable") },
+        )
+        .await;
+        assert_eq!(
+            report.dns.phase,
+            super::super::runtime_state::ComponentPhase::Failed
+        );
+        assert_eq!(
+            report.pools.phase,
+            super::super::runtime_state::ComponentPhase::Failed
+        );
+        let error = report.into_result().unwrap_err().to_string();
+        assert!(error.contains("managed DNS reset unavailable"), "{error}");
+        assert!(error.contains("outbound pool reset unavailable"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn cancelled_network_recovery_still_attempts_dns_if_pools_stall() {
+        let dns_attempted = std::sync::atomic::AtomicBool::new(false);
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            reset_resources_report(
+                async {
+                    dns_attempted.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok::<u32, &str>(2)
+                },
+                std::future::pending::<Result<u32, &str>>(),
+            ),
+        )
+        .await;
+        assert!(result.is_err(), "pool stall must remain bounded");
+        assert!(dns_attempted.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]

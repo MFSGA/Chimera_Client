@@ -254,6 +254,20 @@ impl Config {
             }
         }
 
+        // An explicitly configured empty node DNS pool is not the same as
+        // leaving it unspecified. Reject before a resolver can silently
+        // fall back to ordinary DNS during internal reloads.
+        if self
+            .dns
+            .proxy_server_nameserver
+            .as_ref()
+            .is_some_and(Vec::is_empty)
+        {
+            return Err(Error::InvalidConfig(
+                "dns.proxy-server-nameserver cannot be explicitly empty".to_owned(),
+            ));
+        }
+
         // Preserve the dedicated bootstrap boundary for internal configs as
         // well as for YAML. A policy without default proxy DNS is invalid.
         if !self.dns.proxy_server_nameserver_policy.is_empty()
@@ -1051,6 +1065,18 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("without the `tun` feature"), "{error}");
+    }
+
+    #[test]
+    fn internal_explicit_empty_node_dns_fails_before_runtime_bootstrap() {
+        let yaml = "dns:\n  enable: true\n  nameserver: [1.1.1.1]\n";
+        let mut config = crate::Config::Str(yaml.to_owned()).try_parse().unwrap();
+        config.dns.proxy_server_nameserver = Some(vec![]);
+        let error = match config.validate() {
+            Ok(_) => panic!("explicit empty node DNS silently accepted"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("proxy-server-nameserver"), "{error}");
     }
 
     #[test]
