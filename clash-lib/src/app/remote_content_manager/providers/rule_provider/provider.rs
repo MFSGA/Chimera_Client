@@ -346,10 +346,8 @@ impl Provider for RuleProviderImpl {
 
         if let Some(fetcher) = &self.fetcher {
             trace!("initializing rule provider {} with fetcher", self.name());
-            let ele = fetcher.initial().await.map_err(map_io_error)?;
-            if let Some(updater) = fetcher.on_update.as_ref() {
-                updater(ele).await.map_err(map_io_error)?; // Directly pass RuleContent
-            }
+            // Publish parsed rules before the fetcher persists initial cache.
+            fetcher.initial().await.map_err(map_io_error)?;
             fetcher.start_polling().await;
         } else {
             trace!("initializing inline rule provider {}", self.name());

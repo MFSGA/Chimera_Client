@@ -205,11 +205,10 @@ impl Provider for ProxySetProvider {
     }
 
     async fn initialize(&self) -> std::io::Result<()> {
-        let proxies = self.fetcher.initial().await.map_err(map_io_error)?;
-        debug!("{} initialized with {} proxies", self.name(), proxies.len());
-        if let Some(updater) = self.fetcher.on_update.as_ref() {
-            updater(proxies).await.map_err(map_io_error)?;
-        }
+        // Fetcher applies the fallible DNS registration updater before
+        // persisting the initial remote/cache revision.
+        self.fetcher.initial().await.map_err(map_io_error)?;
+        debug!("{} initialized", self.name());
         self.fetcher.start_polling().await;
         if let Err(e) = self.fetcher.start_watch().await {
             warn!(
@@ -577,6 +576,11 @@ proxies:
             VALID,
             "failed DNS registration must not replace last-good provider cache"
         );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "rejected provider must not leave a staged file containing endpoint data"
+        );
         let after = provider.strict_content_snapshot().await.unwrap();
         assert_eq!(before.revision, after.revision);
         assert!(Arc::ptr_eq(&before.proxies[0], &after.proxies[0]));
@@ -640,12 +644,90 @@ proxies:
             "{diagnostic}"
         );
         assert!(provider.strict_content_snapshot().await.is_none());
+        assert!(
+            !path.exists(),
+            "failed initial node-DNS registration must not persist rejected provider content"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "rejected initial provider must clean up staged endpoint content"
+        );
         tokio::time::sleep(Duration::from_millis(60)).await;
         assert_eq!(
             reads.load(Ordering::SeqCst),
             1,
             "failed startup must not run provider refresh"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_initial_dns_registration_preserves_corrupt_cache_until_accepted_recovery()
+     {
+        const REMOTE: &[u8] = b"proxies:\n  - name: recovered-proxy\n    type: socks5\n    server: accepted-node.example\n    port: 1080\n";
+        const CORRUPT: &[u8] = b"provider-cache-is-not-valid-yaml";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid-previous-cache.yaml");
+        std::fs::write(&path, CORRUPT).unwrap();
+        let mut vehicle = MockProviderVehicle::new();
+        vehicle
+            .expect_path()
+            .return_const(path.to_string_lossy().into_owned());
+        vehicle.expect_typ().return_const(ProviderVehicleType::Http);
+        vehicle
+            .expect_read()
+            .times(2)
+            .returning(|| Ok(REMOTE.to_vec()));
+
+        let mut resolver = MockClashResolver::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let hits = calls.clone();
+        resolver
+            .expect_replace_proxy_provider_dns_domains()
+            .times(2)
+            .returning(move |owner, domains| {
+                assert_eq!(owner, "recovering-provider");
+                assert_eq!(domains, vec!["accepted-node.example".to_owned()]);
+                if hits.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(anyhow::anyhow!(
+                        "synthetic recovery DNS registration failure"
+                    ))
+                } else {
+                    Ok(())
+                }
+            });
+        let health = HealthCheck::new(
+            vec![],
+            "http://example.invalid/check".to_owned(),
+            0,
+            true,
+            ProxyManager::new(Arc::new(resolver), None),
+        );
+        let provider = ProxySetProvider::new_with_dns_privacy(
+            "recovering-provider".to_owned(),
+            Duration::ZERO,
+            Arc::new(vehicle),
+            health,
+            true,
+        )
+        .unwrap();
+
+        let diagnostic = provider.initialize().await.unwrap_err().to_string();
+        assert!(diagnostic.contains("synthetic recovery DNS registration failure"));
+        assert_eq!(std::fs::read(&path).unwrap(), CORRUPT);
+        assert!(provider.strict_content_snapshot().await.is_none());
+
+        provider
+            .initialize()
+            .await
+            .expect("DNS registration recovered");
+        assert_eq!(std::fs::read(&path).unwrap(), REMOTE);
+        let revision = provider.strict_content_snapshot().await.unwrap();
+        assert_eq!(
+            revision.proxies[0].server_name(),
+            Some("accepted-node.example")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

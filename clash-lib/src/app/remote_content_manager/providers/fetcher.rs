@@ -19,21 +19,39 @@ use crate::common::utils;
 
 use super::{ProviderVehicleType, ThreadSafeProviderVehicle};
 
-fn write_cache_atomically(path: &Path, content: &[u8]) -> io::Result<()> {
+/// Stage on the destination filesystem and sync bytes *before* calling an
+/// updater that makes new proxy endpoints reachable. Common disk, quota and
+/// parent-path errors must not publish nodes before they are detected.
+fn stage_cache_write(
+    path: &Path,
+    content: &[u8],
+) -> io::Result<tempfile::NamedTempFile> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
 
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    temporary.write_all(content)?;
-    temporary.flush()?;
-    temporary.as_file().sync_all()?;
-    temporary
+    let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+    staged.write_all(content)?;
+    staged.flush()?;
+    staged.as_file().sync_all()?;
+    Ok(staged)
+}
+
+fn persist_staged_cache(
+    staged: tempfile::NamedTempFile,
+    path: &Path,
+) -> io::Result<()> {
+    staged
         .persist(path)
         .map(|_| ())
         .map_err(|error| error.error)
+}
+
+#[cfg(test)]
+fn write_cache_atomically(path: &Path, content: &[u8]) -> io::Result<()> {
+    persist_staged_cache(stage_cache_write(path, content)?, path)
 }
 
 fn cache_needs_immediate_update(
@@ -110,10 +128,14 @@ where
         self.inner.read().await.updated_at.into()
     }
 
-    pub async fn initial(&self) -> anyhow::Result<T> {
+    /// Validate and publish the first revision before persisting a downloaded
+    /// provider cache. A failed bootstrap DNS registrar must not leave a
+    /// persisted provider that the next startup treats as accepted.
+    pub async fn initial(&self) -> anyhow::Result<()> {
         let mut is_local = false;
         let mut recovered_invalid_cache = false;
         let mut immediately_update = false;
+        let mut cached_at = None;
 
         let vehicle_path = self.vehicle.path().to_owned();
 
@@ -123,10 +145,11 @@ where
             Ok(meta) => {
                 let content = fs::read(&vehicle_path)?;
                 is_local = true;
-                inner.updated_at = meta.modified()?;
+                let modified = meta.modified()?;
+                cached_at = Some(modified);
                 immediately_update = cache_needs_immediate_update(
                     SystemTime::now(),
-                    inner.updated_at,
+                    modified,
                     self.interval,
                 );
                 content
@@ -149,13 +172,27 @@ where
             }
         };
 
-        if self.vehicle_type() != ProviderVehicleType::File
-            && (!is_local || recovered_invalid_cache)
-        {
-            write_cache_atomically(Path::new(self.vehicle.path()), &content)?;
+        let staged_cache = (self.vehicle_type() != ProviderVehicleType::File
+            && (!is_local || recovered_invalid_cache))
+            .then(|| stage_cache_write(Path::new(&vehicle_path), &content))
+            .transpose()?;
+
+        if let Some(on_update) = self.on_update.as_ref() {
+            // Failure must precede cache/hash mutation. In particular, a
+            // proxy provider's node DNS domains must be installed before a
+            // downloaded provider can survive a future restart.
+            on_update(items).await?;
+        }
+
+        if let Some(staged_cache) = staged_cache {
+            persist_staged_cache(staged_cache, Path::new(&vehicle_path))?;
             inner.updated_at = SystemTime::now();
             // A recovered cache has just been refreshed successfully.
             immediately_update = false;
+        } else if let Some(cached_at) = cached_at {
+            // Do not inspect the cache a second time after publication:
+            // another process may have replaced it in the meantime.
+            inner.updated_at = cached_at;
         }
 
         inner.hash = utils::md5(&content)[..16]
@@ -164,7 +201,7 @@ where
 
         self.initial_immediate_refresh
             .store(immediately_update, Ordering::Release);
-        Ok(items)
+        Ok(())
     }
 
     /// Start background refresh only after the initial updater has installed
@@ -222,14 +259,20 @@ where
             return Ok(true);
         }
 
+        // Stage potential cache write failures before the updater makes
+        // endpoints reachable. Only the atomic rename follows publication.
+        let staged_cache = (vehicle.typ() != ProviderVehicleType::File)
+            .then(|| stage_cache_write(Path::new(vehicle.path()), &content))
+            .transpose()?;
+
         // A protected proxy-provider registers its DNS endpoint domains here.
         // A rejected revision may not advance the content hash or overwrite
         // last-good cached YAML; a later identical refresh must retry it.
         if let Some(on_update) = on_update {
             on_update(payload).await?;
         }
-        if vehicle.typ() != ProviderVehicleType::File {
-            write_cache_atomically(Path::new(vehicle.path()), &content)?;
+        if let Some(staged_cache) = staged_cache {
+            persist_staged_cache(staged_cache, Path::new(vehicle.path()))?;
         }
         this.hash = hash;
         this.updated_at = now;
@@ -391,6 +434,66 @@ mod tests {
 
     use super::{Fetcher, cache_needs_immediate_update, write_cache_atomically};
 
+    async fn assert_unwritable_cache_is_rejected_before_provider_publication(
+        initial: bool,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let directory = tempfile::tempdir().unwrap();
+        let blocked_parent = directory.path().join("parent-is-file");
+        std::fs::write(&blocked_parent, b"existing user content").unwrap();
+        let cache_path = blocked_parent.join("provider.yaml");
+        let mut vehicle = MockProviderVehicle::new();
+        vehicle
+            .expect_path()
+            .return_const(cache_path.to_string_lossy().into_owned());
+        vehicle.expect_typ().return_const(ProviderVehicleType::Http);
+        vehicle
+            .expect_read()
+            .times(1)
+            .returning(|| Ok(b"accepted provider".to_vec()));
+
+        let published = Arc::new(AtomicUsize::new(0));
+        let hits = published.clone();
+        let updater =
+            move |_candidate: String| -> BoxFuture<'static, anyhow::Result<()>> {
+                hits.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            };
+        let fetcher = Fetcher::new(
+            "staged-cache-only".to_owned(),
+            Duration::ZERO,
+            Arc::new(vehicle),
+            |content| Ok(String::from_utf8(content.to_vec())?),
+            Some(updater),
+        );
+        let result = if initial {
+            fetcher.initial().await.map(|_| ())
+        } else {
+            fetcher.update().await.map(|_| ())
+        };
+        assert!(result.is_err(), "unwritable cache must be reported");
+        assert_eq!(
+            published.load(Ordering::SeqCst),
+            0,
+            "a candidate may not become visible before its cache can be staged"
+        );
+        assert_eq!(
+            std::fs::read(&blocked_parent).unwrap(),
+            b"existing user content"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_staging_failure_prevents_node_registration_publication() {
+        assert_unwritable_cache_is_rejected_before_provider_publication(true).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_staging_failure_prevents_node_registration_publication() {
+        assert_unwritable_cache_is_rejected_before_provider_publication(false).await;
+    }
+
     #[test]
     fn atomic_cache_write_replaces_existing_content() {
         let directory = tempfile::tempdir().unwrap();
@@ -484,9 +587,16 @@ mod tests {
             }
             Ok("valid".to_owned())
         };
-        let updater = |_input: String| -> BoxFuture<'static, anyhow::Result<()>> {
-            Box::pin(async { Ok(()) })
-        };
+        let accepted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let accepted_for_callback = accepted.clone();
+        let updater =
+            move |input: String| -> BoxFuture<'static, anyhow::Result<()>> {
+                let accepted = accepted_for_callback.clone();
+                Box::pin(async move {
+                    accepted.lock().unwrap().push(input);
+                    Ok(())
+                })
+            };
         let fetcher = Fetcher::new(
             "cache-recovery".to_owned(),
             Duration::ZERO,
@@ -495,7 +605,8 @@ mod tests {
             Some(updater),
         );
 
-        assert_eq!(fetcher.initial().await.unwrap(), "valid");
+        fetcher.initial().await.unwrap();
+        assert_eq!(*accepted.lock().unwrap(), ["valid"]);
         assert_eq!(
             std::fs::read(&path).unwrap(),
             b"valid remote content",
