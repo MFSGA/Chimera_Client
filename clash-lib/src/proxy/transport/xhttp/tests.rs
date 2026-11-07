@@ -1,8 +1,9 @@
 use super::{
-    Client, MetadataPlacement, UplinkDataPlacement, XhttpChunkSizeRange,
-    XhttpDownloadConfig, XhttpEndpointConfig, XhttpHttpVersion, XhttpMetadataConfig,
-    XhttpMode, XhttpPaddingConfig, XhttpReusePolicy, XhttpReuseValueRange,
-    XhttpSecurity, XhttpUplinkConfig, build_request, connect_download_stream,
+    Client, GlobalIpv6Policy, MetadataPlacement, UplinkDataPlacement,
+    XhttpChunkSizeRange, XhttpDownloadConfig, XhttpEndpointConfig, XhttpHttpVersion,
+    XhttpMetadataConfig, XhttpMode, XhttpPaddingConfig, XhttpReusePolicy,
+    XhttpReuseValueRange, XhttpSecurity, XhttpUplinkConfig, build_request,
+    connect_download_stream, endpoint_allowed_for_global_policy,
     open_separate_downlink_response, remaining_post_interval,
 };
 #[cfg(feature = "xhttp-h3")]
@@ -12,6 +13,7 @@ use crate::{
     session::Session,
 };
 use crate::{
+    app::dns::{ClashResolver, SystemResolver},
     common::utils::{encode_hex, sha256},
     proxy::transport::Transport,
 };
@@ -149,6 +151,13 @@ async fn spawn_h3_packet_up_echo_server() -> std::net::SocketAddr {
     });
 
     addr
+}
+
+#[cfg(feature = "xhttp-h3")]
+fn ipv6_enabled_mock_resolver() -> Arc<MockClashResolver> {
+    let mut resolver = MockClashResolver::new();
+    resolver.expect_ipv6().return_const(true).times(0..);
+    Arc::new(resolver)
 }
 
 #[cfg(feature = "xhttp-h3")]
@@ -615,7 +624,8 @@ async fn xhttp_download_tls_uses_certificate_fingerprint_pin() {
     let (addr, fingerprint) = spawn_tls_h2_download_server().await;
     let download = pinned_tls_download(addr, fingerprint);
 
-    let stream = connect_download_stream(&download)
+    let ipv6_policy = GlobalIpv6Policy::default();
+    let stream = connect_download_stream(&download, &ipv6_policy)
         .await
         .expect("matching certificate fingerprint should complete TLS");
     let _sender = super::handshake_http2(stream, None)
@@ -628,7 +638,8 @@ async fn xhttp_download_tls_rejects_wrong_certificate_fingerprint() {
     let (addr, _fingerprint) = spawn_tls_h2_download_server().await;
     let download = pinned_tls_download(addr, "00".repeat(32));
 
-    let err = match connect_download_stream(&download).await {
+    let ipv6_policy = GlobalIpv6Policy::default();
+    let err = match connect_download_stream(&download, &ipv6_policy).await {
         Ok(_) => panic!("wrong certificate fingerprint must fail TLS"),
         Err(err) => err,
     };
@@ -638,6 +649,30 @@ async fn xhttp_download_tls_rejects_wrong_certificate_fingerprint() {
             || err.to_string().contains("certificate"),
         "unexpected TLS pinning error: {err}"
     );
+}
+
+#[test]
+fn xhttp_auxiliary_endpoint_policy_tracks_live_resolver_updates() {
+    let resolver = Arc::new(SystemResolver::new(true).unwrap());
+    let shared_resolver: crate::app::dns::ThreadSafeDNSResolver = resolver.clone();
+    let policy = GlobalIpv6Policy::default();
+    policy.set_resolver(shared_resolver);
+
+    assert!(policy.enabled());
+    resolver.set_ipv6(false);
+    assert!(!policy.enabled());
+    resolver.set_ipv6(true);
+    assert!(policy.enabled());
+}
+
+#[test]
+fn xhttp_endpoint_policy_blocks_ipv6_only_when_globally_disabled() {
+    let ipv4: std::net::SocketAddr = "192.0.2.1:443".parse().unwrap();
+    let ipv6: std::net::SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+
+    assert!(endpoint_allowed_for_global_policy(ipv4, false));
+    assert!(!endpoint_allowed_for_global_policy(ipv6, false));
+    assert!(endpoint_allowed_for_global_policy(ipv6, true));
 }
 
 #[test]
@@ -785,7 +820,7 @@ async fn xhttp_http3_stream_one_echoes_bytes_through_connector_udp() {
     )
     .with_upload_endpoint(Some(endpoint))
     .with_http_version(XhttpHttpVersion::Http3);
-    let resolver = Arc::new(MockClashResolver::new());
+    let resolver = ipv6_enabled_mock_resolver();
     let connector = DirectConnector::new();
     let mut proxied = client
         .connect_stream_with_connector(&Session::default(), resolver, &connector)
@@ -843,7 +878,7 @@ async fn xhttp_http3_reuses_one_quic_connection_for_logical_streams() {
         h_max_reusable_secs: Some(XhttpReuseValueRange { min: 0, max: 0 }),
         h_keep_alive_period: 0,
     }));
-    let resolver = Arc::new(MockClashResolver::new());
+    let resolver = ipv6_enabled_mock_resolver();
     let connector = DirectConnector::new();
     let mut first = client
         .connect_stream_with_connector(&Session::default(), resolver, &connector)
@@ -1011,7 +1046,7 @@ async fn s04bw_unpooled_h3_stream_drop_closes_quic_driver() {
             Duration::from_secs(3),
             client.connect_stream_with_connector(
                 &Session::default(),
-                Arc::new(MockClashResolver::new()),
+                ipv6_enabled_mock_resolver(),
                 &DirectConnector::new(),
             ),
         )
@@ -1073,7 +1108,7 @@ async fn s04bw_cancel_unpooled_h3_after_sender_acquisition_closes_driver() {
             &client,
             &endpoint,
             &Session::default(),
-            Arc::new(MockClashResolver::new()),
+            ipv6_enabled_mock_resolver(),
             &DirectConnector::new(),
             NetworkPoolContext::default(),
         )
@@ -1166,7 +1201,7 @@ async fn s04bw_unpooled_separate_h3_upload_download_close_after_stream_drop() {
         Duration::from_secs(3),
         client.connect_stream_with_connector(
             &Session::default(),
-            Arc::new(MockClashResolver::new()),
+            ipv6_enabled_mock_resolver(),
             &DirectConnector::new(),
         ),
     )
@@ -1238,7 +1273,7 @@ async fn s04bw_unpooled_upload_closes_if_download_endpoint_rejects_tls() {
         Duration::from_secs(3),
         client.connect_stream_with_connector(
             &Session::default(),
-            Arc::new(MockClashResolver::new()),
+            ipv6_enabled_mock_resolver(),
             &DirectConnector::new(),
         ),
     )
@@ -1279,7 +1314,7 @@ async fn s04bv_h3_pool_registration_abort_closes_unpublished_driver() {
         super::connect_h3_sender(
             &endpoint,
             &Session::default(),
-            Arc::new(MockClashResolver::new()),
+            ipv6_enabled_mock_resolver(),
             &DirectConnector::new(),
             Some(0),
             NetworkPoolContext::default(),
@@ -1386,7 +1421,7 @@ async fn s04bv_h3_pool_retirement_closes_udp_after_last_active_stream() {
             Duration::from_secs(3),
             client.connect_stream_with_connector(
                 &Session::default(),
-                Arc::new(MockClashResolver::new()),
+                ipv6_enabled_mock_resolver(),
                 &DirectConnector::new(),
             ),
         )
@@ -1618,7 +1653,7 @@ async fn s04bt_abort_between_h3_sender_acquisition_and_handoff_releases_both_slo
         .with_http_version(XhttpHttpVersion::Http3)
         .with_reuse_policy(Some(reuse_policy)),
     );
-    let resolver = Arc::new(MockClashResolver::new());
+    let resolver = ipv6_enabled_mock_resolver();
     let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel();
     let borrower = client.clone();
     let task = tokio::spawn(async move {
@@ -1743,7 +1778,7 @@ async fn s04bt_failed_h3_downlink_setup_releases_previously_acquired_upload() {
         Duration::from_secs(5),
         client.connect_stream_with_connector(
             &Session::default(),
-            Arc::new(MockClashResolver::new()),
+            ipv6_enabled_mock_resolver(),
             &DirectConnector::new(),
         ),
     )
@@ -1809,7 +1844,7 @@ async fn xhttp_http3_reuses_separate_download_connection() {
         None,
         Some(download.clone()),
     );
-    let resolver = Arc::new(MockClashResolver::new());
+    let resolver = ipv6_enabled_mock_resolver();
     let connector = DirectConnector::new();
     let session = Session::default();
 
@@ -1935,7 +1970,7 @@ async fn xhttp_http3_stream_up_uses_separate_download_settings() {
     .with_upload_endpoint(Some(endpoint))
     .with_http_version(XhttpHttpVersion::Http3)
     .with_reuse_policy(Some(reuse_policy));
-    let resolver = Arc::new(MockClashResolver::new());
+    let resolver = ipv6_enabled_mock_resolver();
     let connector = DirectConnector::new();
     let mut proxied = client
         .connect_stream_with_connector(&Session::default(), resolver, &connector)
@@ -2027,7 +2062,7 @@ async fn xhttp_http3_stream_up_echoes_streaming_post() {
     )
     .with_upload_endpoint(Some(endpoint))
     .with_http_version(XhttpHttpVersion::Http3);
-    let resolver = Arc::new(MockClashResolver::new());
+    let resolver = ipv6_enabled_mock_resolver();
     let connector = DirectConnector::new();
     let mut proxied = client
         .connect_stream_with_connector(&Session::default(), resolver, &connector)
@@ -2080,7 +2115,7 @@ async fn xhttp_http3_packet_up_echoes_sequenced_posts() {
     )
     .with_upload_endpoint(Some(endpoint))
     .with_http_version(XhttpHttpVersion::Http3);
-    let resolver = Arc::new(MockClashResolver::new());
+    let resolver = ipv6_enabled_mock_resolver();
     let connector = DirectConnector::new();
     let mut proxied = client
         .connect_stream_with_connector(&Session::default(), resolver, &connector)

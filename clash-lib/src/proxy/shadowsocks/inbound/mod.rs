@@ -240,6 +240,7 @@ impl InboundHandlerTrait for ShadowsocksInbound {
                 None,
                 #[cfg(target_os = "linux")]
                 self.fw_mark,
+                self.addr.is_ipv6(),
                 None,
             )
             .await

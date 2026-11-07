@@ -99,6 +99,11 @@ pub(super) fn finish_pool_delivery<T>(
 
 #[async_trait::async_trait]
 pub trait Transport: Send + Sync {
+    /// Update the global IP-family policy for transport-owned auxiliary
+    /// connections. Transports that do not open their own sockets can ignore
+    /// it; XHTTP uses it for separate upload/download endpoints.
+    fn set_ipv6_resolver(&self, _resolver: crate::app::dns::ThreadSafeDNSResolver) {}
+
     /// Retire cached underlying connections after the physical path changes.
     /// Existing logical streams retain their own handles and are not replayed.
     async fn reset_connection_pool(&self) -> std::io::Result<u32> {

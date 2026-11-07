@@ -566,11 +566,26 @@ pub(crate) async fn new_protected_tcp_stream_with_source(
     }
 }
 
-/// Create an outbound dual-stack UDP socket protected from TUN re-entry.
+/// Create a multi-destination UDP socket protected from TUN re-entry.
+/// When IPv6 is disabled, this binds an IPv4-only socket.
 pub async fn new_protected_dual_stack_udp_socket(
     iface: Option<&OutboundInterface>,
     #[cfg(target_os = "linux")] so_mark: Option<u32>,
+    ipv6_enabled: bool,
 ) -> std::io::Result<UdpSocket> {
+    if !ipv6_enabled {
+        let ipv4_any = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0));
+        return new_protected_udp_socket(
+            None,
+            iface,
+            #[cfg(target_os = "linux")]
+            so_mark,
+            Some(ipv4_any),
+            false,
+        )
+        .await;
+    }
+
     #[cfg(feature = "tun")]
     {
         #[cfg(target_os = "macos")]
@@ -825,11 +840,31 @@ pub async fn new_udp_socket(
     src: Option<SocketAddr>,
     iface: Option<&OutboundInterface>,
     #[cfg(target_os = "linux")] so_mark: Option<u32>,
+    ipv6_enabled: bool,
     // Optional family hint for the socket.
     // If not provided, the family will be determined based on the source
     // address or interface.
     family_hint: Option<std::net::SocketAddr>,
 ) -> std::io::Result<UdpSocket> {
+    if !ipv6_enabled
+        && (family_hint.is_some_and(|addr| addr.is_ipv6())
+            || src.is_some_and(|addr| addr.is_ipv6()))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "IPv6 is disabled; cannot create an IPv6 UDP socket",
+        ));
+    }
+    if !ipv6_enabled
+        && iface
+            .is_some_and(|iface| iface.addr_v4.is_none() && iface.addr_v6.is_some())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "IPv6 is disabled and the selected outbound interface has no IPv4 address",
+        ));
+    }
+
     // Determine the socket family based on the source address or interface
     // logic:
     // - If family_hint is provided, use it.
@@ -848,7 +883,7 @@ pub async fn new_udp_socket(
             try_create_dualstack_socket(src, socket2::Type::DGRAM)?.0,
             socket2::Domain::IPV6,
         ),
-        (None, _, Some(iface)) if iface.addr_v6.is_some() => (
+        (None, _, Some(iface)) if ipv6_enabled && iface.addr_v6.is_some() => (
             socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::DGRAM, None)?,
             socket2::Domain::IPV6,
         ),
@@ -931,7 +966,18 @@ pub async fn new_protected_udp_socket(
     iface: Option<&OutboundInterface>,
     #[cfg(target_os = "linux")] so_mark: Option<u32>,
     family_hint: Option<std::net::SocketAddr>,
+    ipv6_enabled: bool,
 ) -> std::io::Result<UdpSocket> {
+    if !ipv6_enabled
+        && (family_hint.is_some_and(|address| address.is_ipv6())
+            || src.is_some_and(|address| address.is_ipv6()))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "IPv6 is disabled; cannot create an IPv6 UDP socket",
+        ));
+    }
+
     #[cfg(feature = "tun")]
     {
         let effective_iface = effective_interface_for_destination(
@@ -946,6 +992,7 @@ pub async fn new_protected_udp_socket(
             effective_iface.as_ref(),
             #[cfg(target_os = "linux")]
             so_mark,
+            ipv6_enabled,
             family_hint,
         )
         .await;
@@ -958,6 +1005,7 @@ pub async fn new_protected_udp_socket(
             iface,
             #[cfg(target_os = "linux")]
             so_mark,
+            ipv6_enabled,
             family_hint,
         )
         .await
@@ -983,6 +1031,21 @@ mod tests {
                 .expect("released TCP port should be reused after a bounded retry");
         assert_eq!(new_listener.local_addr().unwrap(), actual_address);
         release.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ipv6_disabled_rejects_ipv6_udp_socket_hint() {
+        let hint: SocketAddr = "[2001:db8::1]:53".parse().unwrap();
+        #[cfg(target_os = "linux")]
+        let result =
+            super::new_udp_socket(None, None, None, false, Some(hint)).await;
+        #[cfg(not(target_os = "linux"))]
+        let result = super::new_udp_socket(None, None, false, Some(hint)).await;
+
+        let error =
+            result.expect_err("global IPv6 disable must reject IPv6 sockets");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("IPv6 is disabled"));
     }
 
     use std::{
@@ -1115,12 +1178,12 @@ mod tests {
         let family_hint = Some("127.0.0.1:0".parse().expect("valid socket addr"));
 
         #[cfg(target_os = "linux")]
-        let _socket = new_udp_socket(None, None, None, family_hint)
+        let _socket = new_udp_socket(None, None, None, true, family_hint)
             .await
             .expect("udp socket should be created");
 
         #[cfg(not(target_os = "linux"))]
-        let _socket = new_udp_socket(None, None, family_hint)
+        let _socket = new_udp_socket(None, None, true, family_hint)
             .await
             .expect("udp socket should be created");
 
@@ -1170,6 +1233,7 @@ mod tests {
                 Some(&iface),
                 #[cfg(target_os = "linux")]
                 None,
+                true,
                 Some(hint),
             )
             .await;
@@ -1249,12 +1313,14 @@ mod tests {
         };
         let source = SocketAddr::from((observed_ip, 0));
         let family_hint = "198.51.100.43:53".parse().unwrap();
-        let socket =
-            new_udp_socket(Some(source), Some(&bound_iface), Some(family_hint))
-                .await
-                .expect(
-                    "observed interface and observed source should bind together",
-                );
+        let socket = new_udp_socket(
+            Some(source),
+            Some(&bound_iface),
+            true,
+            Some(family_hint),
+        )
+        .await
+        .expect("observed interface and observed source should bind together");
         assert_eq!(socket.local_addr().unwrap().ip(), observed_ip);
         assert_ne!(socket.local_addr().unwrap().port(), 0);
         // An actual packet to the documentation-only hint is intentionally
@@ -1274,6 +1340,7 @@ mod tests {
             Some(&iface),
             #[cfg(target_os = "linux")]
             None,
+            true,
             Some(target),
         )
         .await;

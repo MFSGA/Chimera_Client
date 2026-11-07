@@ -127,6 +127,7 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> std::io::Result<BoxedChainedDatagram> {
+        let ipv6_enabled = resolver.ipv6();
         let udp = if sess.typ == crate::session::Type::Dns {
             let destination = sess.destination.ip().ok_or_else(|| {
                 std::io::Error::other(
@@ -139,6 +140,7 @@ impl OutboundHandler for Handler {
                 #[cfg(target_os = "linux")]
                 sess.so_mark,
                 Some((destination, sess.destination.port()).into()),
+                ipv6_enabled,
             )
             .await?
         } else {
@@ -148,6 +150,7 @@ impl OutboundHandler for Handler {
                 sess.iface.as_ref(),
                 #[cfg(target_os = "linux")]
                 sess.so_mark,
+                ipv6_enabled,
             )
             .await?
         };
@@ -165,6 +168,7 @@ impl OutboundHandler for Handler {
                 .clone();
             if sess.iface.is_none()
                 && sess.typ != crate::session::Type::Dns
+                && ipv6_enabled
                 && v6.as_ref().is_some_and(|v6| {
                     v4.as_ref().is_none_or(|v4| v4.name != v6.name)
                 })
@@ -173,6 +177,7 @@ impl OutboundHandler for Handler {
                     Some("[::]:0".parse().map_err(std::io::Error::other)?),
                     None,
                     Some("[::]:0".parse().map_err(std::io::Error::other)?),
+                    true,
                 )
                 .await?;
                 datagram.with_ipv6_socket(socket)
@@ -191,6 +196,7 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
         selection: &crate::app::flow::DirectPathSelection,
     ) -> std::io::Result<BoxedChainedDatagram> {
+        let ipv6_enabled = resolver.ipv6();
         let Some(destination) = sess.destination.ip() else {
             if selection.required {
                 return Err(std::io::Error::new(
@@ -220,6 +226,7 @@ impl OutboundHandler for Handler {
             #[cfg(target_os = "linux")]
             sess.so_mark,
             Some(endpoint),
+            ipv6_enabled,
         )
         .await?;
         let local = socket.local_addr()?;
@@ -404,7 +411,9 @@ mod tests {
 
     fn make_resolver() -> ThreadSafeDNSResolver {
         // IP destinations never touch the resolver; an empty mock is enough.
-        Arc::new(MockClashResolver::new())
+        let mut resolver = MockClashResolver::new();
+        resolver.expect_ipv6().return_const(true);
+        Arc::new(resolver)
     }
 
     fn loopback_path(source: Ipv4Addr) -> NetworkPath {

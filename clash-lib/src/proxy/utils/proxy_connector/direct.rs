@@ -16,6 +16,32 @@ impl DirectConnector {
         }
     }
 
+    fn enforce_global_ipv6(
+        address: &str,
+        addresses: Vec<IpAddr>,
+        ipv6_enabled: bool,
+    ) -> std::io::Result<Vec<IpAddr>> {
+        if ipv6_enabled {
+            return Ok(addresses);
+        }
+
+        let had_ipv6 = addresses.iter().any(IpAddr::is_ipv6);
+        let addresses = addresses
+            .into_iter()
+            .filter(IpAddr::is_ipv4)
+            .collect::<Vec<_>>();
+        if addresses.is_empty() && had_ipv6 {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                format!(
+                    "IPv6 is disabled and address `{address}` has no IPv4 endpoint"
+                ),
+            ))
+        } else {
+            Ok(addresses)
+        }
+    }
+
     #[cfg(test)]
     fn endpoint_path(
         iface: Option<&OutboundInterface>,
@@ -140,6 +166,8 @@ impl DirectConnector {
             })?
             .map_err(|error| new_io_error(format!("can't resolve dns: {error}")))?
         };
+        let ipv6_enabled = !addresses.iter().any(IpAddr::is_ipv6) || resolver.ipv6();
+        let addresses = Self::enforce_global_ipv6(address, addresses, ipv6_enabled)?;
         if addresses.is_empty() {
             return Err(new_io_error("no dns result"));
         }
@@ -211,6 +239,7 @@ impl DirectConnector {
                 push_direct_stream_attempt(
                     attempts,
                     attempt,
+                    resolver.clone(),
                     iface.cloned(),
                     #[cfg(target_os = "linux")]
                     packet_mark,
@@ -363,12 +392,18 @@ fn push_direct_stream_attempt(
         >,
     >,
     attempt: DirectStreamAttempt,
+    resolver: ThreadSafeDNSResolver,
     iface: Option<OutboundInterface>,
     #[cfg(target_os = "linux")] packet_mark: Option<u32>,
 ) {
     attempts.push(
         async move {
-            let result = if let Some(path) = attempt.path.as_ref() {
+            let result = if attempt.endpoint.is_ipv6() && !resolver.ipv6() {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    "IPv6 is disabled before DIRECT TCP socket creation",
+                ))
+            } else if let Some(path) = attempt.path.as_ref() {
                 match (
                     crate::proxy::direct::outbound_interface_for_path(
                         path,
@@ -498,13 +533,19 @@ fn push_proxy_endpoint_stream_attempt(
         >,
     >,
     attempt: DirectStreamAttempt,
+    resolver: ThreadSafeDNSResolver,
     iface: Option<OutboundInterface>,
     generation_status: Option<(u64, SharedNetworkStatus)>,
     #[cfg(target_os = "linux")] packet_mark: Option<u32>,
 ) {
     attempts.push(
         async move {
-            let result = if let Some(path) = attempt.path.as_ref() {
+            let result = if attempt.endpoint.is_ipv6() && !resolver.ipv6() {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    "IPv6 is disabled before proxy endpoint TCP socket creation",
+                ))
+            } else if let Some(path) = attempt.path.as_ref() {
                 match (
                     crate::proxy::direct::outbound_interface_for_path(
                         path,
@@ -721,6 +762,8 @@ impl RemoteConnector for DirectConnector {
                     new_io_error(format!("can't resolve dns: {error}"))
                 })?
         };
+        let ipv6_enabled = !addresses.iter().any(IpAddr::is_ipv6) || resolver.ipv6();
+        let addresses = Self::enforce_global_ipv6(address, addresses, ipv6_enabled)?;
         if addresses.is_empty() {
             return Err(new_io_error("no dns result"));
         }
@@ -893,6 +936,7 @@ impl RemoteConnector for DirectConnector {
             push_proxy_endpoint_stream_attempt(
                 &mut attempts,
                 planned_attempts[next_attempt].clone(),
+                resolver.clone(),
                 iface.cloned(),
                 generation_status.clone(),
                 #[cfg(target_os = "linux")]
@@ -986,6 +1030,7 @@ impl RemoteConnector for DirectConnector {
                                 push_proxy_endpoint_stream_attempt(
                                     &mut attempts,
                                     planned_attempts[next_attempt].clone(),
+                                    resolver.clone(),
                                     iface.cloned(),
                                     generation_status.clone(),
                                     #[cfg(target_os = "linux")]
@@ -1012,6 +1057,7 @@ impl RemoteConnector for DirectConnector {
                     push_proxy_endpoint_stream_attempt(
                         &mut attempts,
                         planned_attempts[next_attempt].clone(),
+                        resolver.clone(),
                         iface.cloned(),
                         generation_status.clone(),
                         #[cfg(target_os = "linux")]
@@ -1067,6 +1113,7 @@ impl RemoteConnector for DirectConnector {
         #[cfg(target_os = "linux")] so_mark: Option<u32>,
         mut pool_context: NetworkPoolContext,
     ) -> std::io::Result<(AnyOutboundDatagram, NetworkPoolContext)> {
+        let ipv6_enabled = resolver.ipv6();
         let path_snapshot = if let Some(source) = self.path_source.as_ref() {
             source
                 .snapshot()
@@ -1173,6 +1220,7 @@ impl RemoteConnector for DirectConnector {
                         #[cfg(target_os = "linux")]
                         so_mark,
                         Some(target),
+                        ipv6_enabled,
                     )
                     .await?;
                     let local = socket.local_addr()?;
@@ -1233,6 +1281,7 @@ impl RemoteConnector for DirectConnector {
                     #[cfg(target_os = "linux")]
                     so_mark,
                     Some(target),
+                    ipv6_enabled,
                 )
                 .await
                 .map_err(|error| {
@@ -1255,6 +1304,7 @@ impl RemoteConnector for DirectConnector {
                 #[cfg(target_os = "linux")]
                 so_mark,
                 target,
+                ipv6_enabled,
             )
             .await?
         };
@@ -1312,7 +1362,8 @@ mod tests {
         DirectStreamAttempt, DirectStreamAttemptOutcome, NetworkPathSource,
         NetworkPoolContext, ProxyEndpointConnectError, RemoteConnector,
         build_proxy_endpoint_attempts, observe_proxy_endpoint_datagram,
-        observe_proxy_endpoint_stream, push_proxy_endpoint_stream_attempt,
+        observe_proxy_endpoint_stream, push_direct_stream_attempt,
+        push_proxy_endpoint_stream_attempt,
         requires_proxy_endpoint_generation_check, run_direct_stream_attempts,
     };
     use crate::app::dns::MockClashResolver;
@@ -1335,6 +1386,86 @@ mod tests {
         },
         session::SocksAddr,
     };
+
+    #[test]
+    fn global_ipv6_filter_keeps_ipv4_and_rejects_ipv6_only_endpoints() {
+        let addresses = vec![
+            "192.0.2.10".parse().unwrap(),
+            "2001:db8::10".parse().unwrap(),
+        ];
+        let filtered = DirectConnector::enforce_global_ipv6(
+            "proxy.example",
+            addresses.clone(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(filtered, vec!["192.0.2.10".parse::<IpAddr>().unwrap()]);
+        assert_eq!(
+            DirectConnector::enforce_global_ipv6(
+                "2001:db8::10",
+                vec!["2001:db8::10".parse().unwrap()],
+                false,
+            )
+            .unwrap_err()
+            .to_string(),
+            "IPv6 is disabled and address `2001:db8::10` has no IPv4 endpoint"
+        );
+        assert_eq!(
+            DirectConnector::enforce_global_ipv6("proxy.example", addresses, true)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn ipv6_disabled_blocks_tcp_socket_attempts_before_dial() {
+        let endpoint: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let mut direct_resolver = MockClashResolver::new();
+        direct_resolver.expect_ipv6().return_const(false);
+        let mut direct_attempts = FuturesUnordered::new();
+        push_direct_stream_attempt(
+            &mut direct_attempts,
+            DirectStreamAttempt {
+                endpoint,
+                path: None,
+            },
+            Arc::new(direct_resolver),
+            None,
+            #[cfg(target_os = "linux")]
+            None,
+        );
+        let (_, direct_result) = direct_attempts.next().await.unwrap();
+        assert!(
+            direct_result
+                .unwrap_err()
+                .to_string()
+                .contains("IPv6 is disabled")
+        );
+
+        let mut proxy_resolver = MockClashResolver::new();
+        proxy_resolver.expect_ipv6().return_const(false);
+        let mut proxy_attempts = FuturesUnordered::new();
+        push_proxy_endpoint_stream_attempt(
+            &mut proxy_attempts,
+            DirectStreamAttempt {
+                endpoint,
+                path: None,
+            },
+            Arc::new(proxy_resolver),
+            None,
+            None,
+            #[cfg(target_os = "linux")]
+            None,
+        );
+        let (_, proxy_result) = proxy_attempts.next().await.unwrap();
+        assert!(
+            proxy_result
+                .unwrap_err()
+                .to_string()
+                .contains("IPv6 is disabled")
+        );
+    }
 
     struct FutureDropGuard(Arc<AtomicBool>);
 
@@ -1642,6 +1773,7 @@ mod tests {
                 endpoint,
                 path: None,
             },
+            Arc::new(crate::app::dns::SystemResolver::new(true).unwrap()),
             None,
             // Deliberately stale: the unpinned loopback dial must not
             // depend on the OS outbound network snapshot.

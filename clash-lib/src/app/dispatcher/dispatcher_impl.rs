@@ -730,6 +730,17 @@ impl Dispatcher {
         mut lhs: Box<dyn ClientStream>,
     ) {
         let inbound_destination = sess.destination.clone();
+        if !self.resolver.ipv6()
+            && sess.destination.ip().is_some_and(|ip| {
+                SocketAddr::new(ip, 0).to_canonical().ip().is_ipv6()
+            })
+        {
+            warn!(
+                destination = %inbound_destination,
+                "dropping stream because IPv6 is disabled"
+            );
+            return;
+        }
         // Capture versions before reverse lookup so failures before route
         // selection retain the same Explain attempt context.
         let explain_flow_id = uuid::Uuid::new_v4();
@@ -1444,6 +1455,15 @@ impl Dispatcher {
                     let canonical = addr.to_canonical();
                     packet.dst_addr = SocksAddr::Ip(canonical);
                     sess.resolved_ip = Some(canonical.ip());
+                }
+                if !resolver.ipv6()
+                    && packet.dst_addr.ip().is_some_and(|ip| ip.is_ipv6())
+                {
+                    warn!(
+                        destination = %packet.dst_addr,
+                        "ending UDP association because IPv6 is disabled"
+                    );
+                    break;
                 }
 
                 // Keep an Explain identity for failures that happen before

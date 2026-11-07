@@ -323,6 +323,9 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
     ) -> io::Result<BoxedChainedStream> {
+        if let Some(transport) = self.opts.transport.as_ref() {
+            transport.set_ipv6_resolver(resolver.clone());
+        }
         let pool_context =
             connector.connection_pool_context(sess.iface.as_ref()).await;
         if let Some((stream, path_ids)) = self
@@ -372,6 +375,9 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
     ) -> io::Result<BoxedChainedDatagram> {
+        if let Some(transport) = self.opts.transport.as_ref() {
+            transport.set_ipv6_resolver(resolver.clone());
+        }
         let pool_context =
             connector.connection_pool_context(sess.iface.as_ref()).await;
         if let Some((stream, path_ids)) = self
