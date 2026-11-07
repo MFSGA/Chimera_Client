@@ -32,6 +32,9 @@ const DHCP_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct Inner {
     clients: Vec<ThreadSafeDNSClient>,
+    // Incremented on every network reset; in-flight DHCP probes must not
+    // replace fresh service DNS with a result from a previous network path.
+    generation: u64,
     iface_expires_at: std::time::Instant,
     dns_expires_at: std::time::Instant,
     iface_addr: ipnet::IpNet,
@@ -76,15 +79,45 @@ impl Client for DhcpClient {
     async fn reset_transport(&self) -> anyhow::Result<u32> {
         let clients = {
             let mut inner = self.inner.lock().await;
+            inner.generation = inner.generation.wrapping_add(1);
             inner.iface_expires_at = Instant::now();
             inner.dns_expires_at = Instant::now();
             inner.iface_addr = ipnet::IpNet::default();
             std::mem::take(&mut inner.clients)
         };
 
+        // Network-path changes must invalidate *all* discovered DHCP DNS
+        // transports. An error or stall in one old connection cannot prevent
+        // a different connection from being reset before the outer resolver
+        // recovery deadline cancels this operation.
+        let results = futures::future::join_all(clients.into_iter().map(
+            |client| async move {
+                let id = client.id();
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    client.reset_transport(),
+                )
+                .await;
+                (id, result)
+            },
+        ))
+        .await;
         let mut reset = 0_u32;
-        for client in clients {
-            reset = reset.saturating_add(client.reset_transport().await?);
+        let mut errors = Vec::new();
+        for (id, result) in results {
+            match result {
+                Ok(Ok(count)) => reset = reset.saturating_add(count),
+                Ok(Err(error)) => errors.push(format!("{id}: {error}")),
+                Err(_) => {
+                    errors.push(format!("{id}: DHCP DNS transport reset timed out"))
+                }
+            }
+        }
+        if !errors.is_empty() {
+            anyhow::bail!(
+                "DHCP DNS transport cleanup failed: {}",
+                errors.join("; ")
+            );
         }
         Ok(reset)
     }
@@ -106,6 +139,7 @@ impl DhcpClient {
             iface,
             inner: Mutex::new(Inner {
                 clients: vec![],
+                generation: 0,
                 iface_expires_at: Instant::now(),
                 dns_expires_at: Instant::now(),
                 iface_addr: ipnet::IpNet::default(),
@@ -116,6 +150,9 @@ impl DhcpClient {
     }
 
     async fn resolve(&self) -> io::Result<Vec<ThreadSafeDNSClient>> {
+        // Capture before checking the lease: a concurrent network reset in
+        // either the lease check or DHCP discovery invalidates this attempt.
+        let generation = self.inner.lock().await.generation;
         let expired = self.update_if_lease_expired().await?;
         if expired {
             let iface =
@@ -126,9 +163,7 @@ impl DhcpClient {
                     )
                 })?;
             let dns = probe_dns_server(&iface).await?;
-            let mut inner = self.inner.lock().await;
-
-            inner.clients = make_clients(
+            let discovered_clients = make_clients(
                 dns.into_iter()
                     .map(|s| NameServer {
                         net: DNSNetMode::Udp,
@@ -151,9 +186,27 @@ impl DhcpClient {
             )
             .await
             .map_err(|err| io::Error::other(err.to_string()))?;
+            self.install_discovered_clients(generation, discovered_clients)
+                .await?;
         }
 
         Ok(self.inner.lock().await.clients.clone())
+    }
+
+    async fn install_discovered_clients(
+        &self,
+        generation: u64,
+        discovered_clients: Vec<ThreadSafeDNSClient>,
+    ) -> io::Result<()> {
+        let mut inner = self.inner.lock().await;
+        if inner.generation != generation {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "DHCP DNS discovery invalidated by network path reset",
+            ));
+        }
+        inner.clients = discovered_clients;
+        Ok(())
     }
 
     /// Check if interface updated or DHCP changed
@@ -354,5 +407,188 @@ mod test {
         .await
         .expect("must prob");
         assert!(!ns.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Debug)]
+    struct ResetProbe {
+        label: &'static str,
+        invoked: Arc<AtomicBool>,
+        failure: bool,
+        stall: bool,
+    }
+
+    #[async_trait]
+    impl Client for ResetProbe {
+        fn id(&self) -> String {
+            self.label.to_owned()
+        }
+
+        async fn exchange(&self, _: &Message) -> anyhow::Result<Message> {
+            anyhow::bail!("offline reset probe cannot exchange DNS")
+        }
+
+        async fn reset_transport(&self) -> anyhow::Result<u32> {
+            self.invoked.store(true, Ordering::SeqCst);
+            if self.stall {
+                std::future::pending::<()>().await;
+            }
+            if self.failure {
+                anyhow::bail!("{} reset failed", self.label);
+            }
+            Ok(3)
+        }
+    }
+
+    fn test_client(handlers: Vec<ThreadSafeDNSClient>) -> DhcpClient {
+        // Purely synthetic adapter; no live DHCP interface lookup or sockets.
+        DhcpClient {
+            iface: OutboundInterface {
+                name: "offline-test-only".to_owned(),
+                addr_v4: None,
+                netmask_v4: None,
+                broadcast_v4: None,
+                addr_v6: None,
+                netmask_v6: None,
+                broadcast_v6: None,
+                index: 0,
+                mac_addr: None,
+            },
+            fw_mark: None,
+            network_path_source: None,
+            inner: Mutex::new(Inner {
+                clients: handlers,
+                generation: 0,
+                iface_expires_at: Instant::now(),
+                dns_expires_at: Instant::now(),
+                iface_addr: ipnet::IpNet::default(),
+            }),
+        }
+    }
+
+    fn probe(
+        label: &'static str,
+        invoked: Arc<AtomicBool>,
+        failure: bool,
+        stall: bool,
+    ) -> ThreadSafeDNSClient {
+        Arc::new(ResetProbe {
+            label,
+            invoked,
+            failure,
+            stall,
+        })
+    }
+
+    #[tokio::test]
+    async fn dhcp_discovery_started_before_network_reset_must_not_reinstall_stale_dns()
+     {
+        // Simulates the discovery completion path without issuing DHCP.
+        let client = test_client(Vec::new());
+        let old_generation = client.inner.lock().await.generation;
+        client.reset_transport().await.unwrap();
+        let attempted = Arc::new(AtomicBool::new(false));
+        let stale = probe("old-network-dns", attempted, false, false);
+        let error = client
+            .install_discovered_clients(old_generation, vec![stale])
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(client.inner.lock().await.clients.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dhcp_discovery_on_current_network_can_commit_its_clients() {
+        let client = test_client(Vec::new());
+        let generation = client.inner.lock().await.generation;
+        let attempted = Arc::new(AtomicBool::new(false));
+        let resolved = probe("current-network-dns", attempted, false, false);
+        client
+            .install_discovered_clients(generation, vec![resolved])
+            .await
+            .unwrap();
+        assert_eq!(client.inner.lock().await.clients.len(), 1);
+        assert_eq!(client.reset_transport().await.unwrap(), 3);
+        assert!(client.inner.lock().await.clients.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dhcp_reset_attempts_every_old_transport_even_when_first_fails() {
+        // Mihomo resets every DHCP child. A failed first Chimera child must
+        // not leave later old-path transports untouched after network change.
+        let first = Arc::new(AtomicBool::new(false));
+        let second = Arc::new(AtomicBool::new(false));
+        let client = test_client(vec![
+            probe("first", first.clone(), true, false),
+            probe("second", second.clone(), false, false),
+        ]);
+        let error = client.reset_transport().await.unwrap_err().to_string();
+        assert!(error.contains("first reset failed"), "{error}");
+        assert!(first.load(Ordering::SeqCst));
+        assert!(
+            second.load(Ordering::SeqCst),
+            "second old DHCP DNS transport was not reset"
+        );
+        assert!(client.inner.lock().await.clients.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dhcp_reset_reports_every_failure_without_claiming_success() {
+        let first = Arc::new(AtomicBool::new(false));
+        let second = Arc::new(AtomicBool::new(false));
+        let client = test_client(vec![
+            probe("first", first.clone(), true, false),
+            probe("second", second.clone(), true, false),
+        ]);
+        let error = client.reset_transport().await.unwrap_err().to_string();
+        assert!(error.contains("first reset failed"), "{error}");
+        assert!(error.contains("second reset failed"), "{error}");
+        assert!(first.load(Ordering::SeqCst));
+        assert!(second.load(Ordering::SeqCst));
+        assert!(client.inner.lock().await.clients.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dhcp_reset_counts_all_successful_old_transports_once() {
+        let first = Arc::new(AtomicBool::new(false));
+        let second = Arc::new(AtomicBool::new(false));
+        let client = test_client(vec![
+            probe("first", first.clone(), false, false),
+            probe("second", second.clone(), false, false),
+        ]);
+        assert_eq!(client.reset_transport().await.unwrap(), 6);
+        assert_eq!(client.reset_transport().await.unwrap(), 0);
+        assert!(first.load(Ordering::SeqCst));
+        assert!(second.load(Ordering::SeqCst));
+        assert!(client.inner.lock().await.clients.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stalled_dhcp_reset_does_not_block_sibling_cleanup() {
+        let first = Arc::new(AtomicBool::new(false));
+        let second = Arc::new(AtomicBool::new(false));
+        let client = test_client(vec![
+            probe("stalled", first.clone(), false, true),
+            probe("second", second.clone(), false, false),
+        ]);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                client.reset_transport()
+            )
+            .await
+            .is_err()
+        );
+        assert!(first.load(Ordering::SeqCst));
+        assert!(
+            second.load(Ordering::SeqCst),
+            "stalled DHCP child prevented sibling reset"
+        );
+        assert!(client.inner.lock().await.clients.is_empty());
     }
 }
