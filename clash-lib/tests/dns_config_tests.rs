@@ -875,6 +875,26 @@ fn mihomo_respect_rules_requires_dedicated_proxy_bootstrap() {
 }
 
 #[test]
+fn dns_listener_privacy_typos_fail_before_any_listener_is_started() {
+    for (detail, body) in [
+        ("listen.tpc", "  listen:\n    tpc: 127.0.0.1:5353\n"),
+        (
+            "listen.doh.ca-kye",
+            "  listen:\n    doh:\n      addr: 127.0.0.1:5353\n      ca-kye: secret.example\n",
+        ),
+    ] {
+        let yaml =
+            base_config(&format!("  enable: true\n  nameserver: [1.1.1.1]\n{body}"));
+        let error = parse_error(yaml).to_string();
+        assert!(
+            error.contains(&format!("dns.{detail}")) && error.contains("unknown"),
+            "invalid listener {detail} must abort startup: {error}"
+        );
+        assert!(!error.contains("secret.example"), "{error}");
+    }
+}
+
+#[test]
 fn tun_fake_ip_privacy_field_typos_fail_before_runtime() {
     for (section, field, value) in [
         ("dns", "nameserver-polcy", "secret.example"),

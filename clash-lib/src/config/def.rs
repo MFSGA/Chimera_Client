@@ -369,6 +369,34 @@ fn unknown_sensitive_tun_field(field: &str) -> bool {
             .any(|known| lower == *known || near_sensitive_key(known, &lower))
 }
 
+/// DNS listeners are security boundaries: a typo in `tcp`, `doh`, or
+/// `ca-key` must not silently disable a listener or its TLS identity.
+fn unknown_sensitive_dns_listener_field(field: &str) -> bool {
+    const KNOWN: &[&str] = &["udp", "tcp", "doh", "dot", "doh3"];
+    if KNOWN.contains(&field) {
+        return false;
+    }
+    let lower = field.to_ascii_lowercase();
+    const PREFIXES: &[&str] =
+        &["udp", "tcp", "doh", "dot", "dns", "http", "tls", "listen"];
+    PREFIXES.iter().any(|prefix| lower.starts_with(prefix))
+        || KNOWN.iter().any(|known| within_one_edit(known, &lower))
+}
+
+fn unknown_sensitive_dns_tls_listen_field(transport: &str, field: &str) -> bool {
+    const COMMON: &[&str] = &["addr", "ca-cert", "ca-key"];
+    if COMMON.contains(&field) || (transport != "dot" && field == "hostname") {
+        return false;
+    }
+    let lower = field.to_ascii_lowercase();
+    const PREFIXES: &[&str] = &["addr", "ca-", "cert", "key", "host", "tls"];
+    PREFIXES.iter().any(|prefix| lower.starts_with(prefix))
+        || COMMON
+            .iter()
+            .chain(std::iter::once(&"hostname"))
+            .any(|known| within_one_edit(known, &lower) || lower == *known)
+}
+
 fn unknown_sensitive_fallback_filter_field(field: &str) -> bool {
     const KNOWN: &[&str] = &["geoip", "geoip-code", "ipcidr", "domain", "geosite"];
     if KNOWN.contains(&field) {
@@ -463,6 +491,36 @@ fn reject_unsupported_mihomo_privacy_fields(value: &Value) -> Result<(), Error> 
                 return Err(Error::InvalidConfig(format!(
                     "dns.{field} is an unknown privacy-sensitive DNS field; refusing to silently ignore it"
                 )));
+            }
+        }
+    }
+
+    // A partial/typo listener block can deserialize as an empty listener
+    // set. Validate protocol and TLS identity keys before serde drops them.
+    if let Some(listeners) = value
+        .get("dns")
+        .and_then(|dns| dns.get("listen"))
+        .and_then(Value::as_mapping)
+    {
+        for (key, definition) in listeners {
+            let Some(protocol) = key.as_str() else {
+                continue;
+            };
+            if unknown_sensitive_dns_listener_field(protocol) {
+                return Err(Error::InvalidConfig(format!(
+                    "dns.listen.{protocol} is an unknown privacy-sensitive DNS listener field; refusing to silently ignore it"
+                )));
+            }
+            if matches!(protocol, "doh" | "dot" | "doh3")
+                && let Some(fields) = definition.as_mapping()
+            {
+                for field in fields.keys().filter_map(Value::as_str) {
+                    if unknown_sensitive_dns_tls_listen_field(protocol, field) {
+                        return Err(Error::InvalidConfig(format!(
+                            "dns.listen.{protocol}.{field} is an unknown privacy-sensitive DNS TLS listener field; refusing to silently ignore it"
+                        )));
+                    }
+                }
             }
         }
     }
@@ -1350,6 +1408,60 @@ proxy:
             vendor_extension.parse::<Config>().is_ok(),
             "unrelated legacy/vendor TUN keys must remain accepted"
         );
+    }
+
+    #[test]
+    fn dns_listener_privacy_typos_cannot_silently_disable_listener() {
+        for field in ["tpc", "udpp", "dho", "dottt", "doh4"] {
+            let yaml = format!(
+                "dns:\n  enable: false\n  listen:\n    {field}: 127.0.0.1:5353\n"
+            );
+            let error = match yaml.parse::<Config>() {
+                Ok(_) => {
+                    panic!("unknown DNS listener {field} was silently accepted")
+                }
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains(&format!("dns.listen.{field}"))
+                    && error.contains("unknown"),
+                "listener typo needs precise fail-closed diagnostics: {error}"
+            );
+        }
+        // Keep unrelated legacy/vendor listener extensions accepted.
+        let yaml = "dns:\n  enable: false\n  listen:\n    udp: 127.0.0.1:5353\n    vendor-extension: true\n";
+        assert!(yaml.parse::<Config>().is_ok());
+    }
+
+    #[test]
+    fn dns_tls_listener_certificate_typos_fail_closed() {
+        for (transport, field) in [
+            ("doh", "ca-kye"),
+            ("dot", "ca-cret"),
+            ("doh3", "hostnamee"),
+            ("doh", "adrd"),
+        ] {
+            let yaml = format!(
+                "dns:\n  enable: false\n  listen:\n    {transport}:\n      addr: 127.0.0.1:5353\n      {field}: secret.example\n"
+            );
+            let error = match yaml.parse::<Config>() {
+                Ok(_) => {
+                    panic!("unknown DNS TLS listener {transport}.{field} accepted")
+                }
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains(&format!("dns.listen.{transport}.{field}"))
+                    && error.contains("unknown"),
+                "TLS listener typo needs precise diagnostic: {error}"
+            );
+            assert!(
+                !error.contains("secret.example"),
+                "DNS secret leaked: {error}"
+            );
+        }
+        let legacy = "dns:\n  listen:\n    doh:\n      addr: 127.0.0.1:5353\n      vendor-extension: true\n";
+        assert!(legacy.parse::<Config>().is_ok());
     }
 
     #[test]
