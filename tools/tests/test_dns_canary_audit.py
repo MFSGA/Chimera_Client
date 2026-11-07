@@ -876,6 +876,58 @@ class AuditTests(unittest.TestCase):
         with self.assertRaisesRegex(audit.AuditError, "manifest exceeds"):
             audit.analyze_manifest(path)
 
+    def test_boolean_schema_version_is_not_integer_version_1(self) -> None:
+        self.manifest["schema_version"] = True
+        with self.assertRaisesRegex(audit.AuditError, "schema_version"):
+            audit.analyze_manifest(self.save_manifest())
+
+    def test_duplicate_top_level_json_keys_are_rejected(self) -> None:
+        manifest = self.save_manifest()
+        raw = manifest.read_text(encoding="utf-8")
+        original = '"case_id": "wifi_up_ipv4_ipv6"'
+        self.assertIn(original, raw)
+        manifest.write_text(raw.replace(
+            original, '"case_id": "shadow", "case_id": "wifi_up_ipv4_ipv6"'
+        ), encoding="utf-8")
+        with self.assertRaisesRegex(audit.AuditError, "duplicate JSON"):
+            audit.analyze_manifest(manifest)
+
+    def test_nonstandard_json_nan_is_rejected(self) -> None:
+        path = self.save_manifest()
+        raw = path.read_text(encoding="utf-8")
+        self.assertIn('"canary_observation_deadline_seconds": 30', raw)
+        path.write_text(
+            raw.replace('"canary_observation_deadline_seconds": 30',
+                        '"canary_observation_deadline_seconds": NaN'),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(audit.AuditError, "nonstandard JSON"):
+            audit.analyze_manifest(path)
+
+    def test_duplicate_nested_capture_json_keys_are_rejected(self) -> None:
+        manifest = self.save_manifest()
+        raw = manifest.read_text(encoding="utf-8")
+        first = '"role": "physical"'
+        self.assertIn(first, raw)
+        manifest.write_text(
+            raw.replace(first, '"role": "tun", "role": "physical"', 1),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(audit.AuditError, "duplicate JSON"):
+            audit.analyze_manifest(manifest)
+
+    def test_excessive_tcpdump_counter_digits_are_incomplete_evidence(self) -> None:
+        (self.folder / "en0.stats.txt").write_text(
+            "tcpdump: listening on en0, link-type EN10MB (Ethernet)\n"
+            + ("9" * 5000) +
+            " packets captured\n2 packets received by filter\n"
+            "0 packets dropped by kernel\n",
+            encoding="utf-8",
+        )
+        result = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(result["verdict"], "NOT_VERIFIED")
+        self.assertIn("incomplete_tcpdump_stats:physical:en0", result["coverage_issues"])
+
     def test_invalid_manifest_field_is_rejected_instead_of_ignored(self) -> None:
         self.manifest["coverage_complete"] = True
         with self.assertRaisesRegex(audit.AuditError, "unknown manifest fields"):

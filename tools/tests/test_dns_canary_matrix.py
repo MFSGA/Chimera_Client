@@ -293,6 +293,47 @@ class MatrixTests(unittest.TestCase):
         with self.assertRaisesRegex(audit.AuditError, "case_id"):
             matrix.analyze_matrix(self.write_matrix())
 
+    def test_boolean_schema_version_is_rejected(self) -> None:
+        self.matrix["schema_version"] = True
+        with self.assertRaisesRegex(audit.AuditError, "schema_version"):
+            matrix.analyze_matrix(self.write_matrix())
+
+    def test_duplicate_matrix_profile_key_is_rejected(self) -> None:
+        self.matrix["profile"] = "macos_dns_egress_v1"
+        path = self.write_matrix()
+        raw = path.read_text(encoding="utf-8")
+        self.assertIn('"profile": "macos_dns_egress_v1"', raw)
+        path.write_text(raw.replace(
+            '"profile": "macos_dns_egress_v1"',
+            '"profile": "unsupported", "profile": "macos_dns_egress_v1"',
+            1,
+        ), encoding="utf-8")
+        with self.assertRaisesRegex(audit.AuditError, "duplicate JSON"):
+            matrix.analyze_matrix(path)
+
+    def test_nonstandard_json_infinity_is_rejected(self) -> None:
+        path = self.write_matrix()
+        raw = path.read_text(encoding="utf-8")
+        self.assertIn('"required_cases": [', raw)
+        path.write_text(
+            raw.replace('"required_cases": [', '"required_cases": [Infinity, ', 1),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(audit.AuditError, "nonstandard JSON"):
+            matrix.analyze_matrix(path)
+
+    def test_duplicate_nested_case_path_is_rejected(self) -> None:
+        path = self.write_matrix()
+        raw = path.read_text(encoding="utf-8")
+        token = '"manifest": "wifi/manifest.json"'
+        self.assertIn(token, raw)
+        path.write_text(raw.replace(
+            token, '"manifest": "outside.json", "manifest": "wifi/manifest.json"',
+            1,
+        ), encoding="utf-8")
+        with self.assertRaisesRegex(audit.AuditError, "duplicate JSON"):
+            matrix.analyze_matrix(path)
+
     def test_unknown_fields_rejected(self) -> None:
         self.matrix["all_cases_verified"] = True
         with self.assertRaisesRegex(audit.AuditError, "unknown"):

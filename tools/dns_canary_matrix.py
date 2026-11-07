@@ -44,11 +44,17 @@ def _matrix_manifest(path: Path) -> dict[str, Any]:
     if path.stat().st_size > MAX_MATRIX_BYTES:
         raise audit.AuditError("matrix manifest exceeds 256 KiB")
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=audit.reject_duplicate_json_keys,
+            parse_constant=audit.reject_non_json_constant,
+        )
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise audit.AuditError("cannot read valid JSON matrix manifest") from error
-    if not isinstance(data, dict) or data.get("schema_version") != SCHEMA_VERSION:
-        raise audit.AuditError("matrix schema_version must be 1")
+    if (not isinstance(data, dict)
+            or type(data.get("schema_version")) is not int
+            or data["schema_version"] != SCHEMA_VERSION):
+        raise audit.AuditError("matrix schema_version must be integer 1")
     required_keys = {"schema_version", "matrix_id", "required_cases", "cases"}
     if not required_keys.issubset(data) or set(data) - required_keys - {"profile"}:
         raise audit.AuditError("unknown or missing matrix manifest fields")

@@ -142,15 +142,35 @@ def expected_interfaces(manifest: dict[str, Any], key: str) -> list[str]:
     return raw
 
 
+def reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Never accept ambiguous JSON evidence with repeated object keys."""
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise AuditError("duplicate JSON key in audit evidence")
+        result[key] = value
+    return result
+
+
+def reject_non_json_constant(value: str) -> Any:
+    raise AuditError("nonstandard JSON numeric constant is invalid evidence")
+
+
 def _load_manifest(path: Path) -> dict[str, Any]:
     if path.stat().st_size > MAX_MANIFEST_BYTES:
         raise AuditError("manifest exceeds 256 KiB; reject oversized evidence inventory")
     try:
-        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=reject_duplicate_json_keys,
+            parse_constant=reject_non_json_constant,
+        )
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise AuditError("cannot read valid JSON manifest") from error
-    if not isinstance(manifest, dict) or manifest.get("schema_version") != SCHEMA_VERSION:
-        raise AuditError("manifest schema_version must be 1")
+    if (not isinstance(manifest, dict)
+            or type(manifest.get("schema_version")) is not int
+            or manifest["schema_version"] != SCHEMA_VERSION):
+        raise AuditError("manifest schema_version must be integer 1")
     unknown = set(manifest) - KNOWN_MANIFEST_FIELDS
     if unknown:
         raise AuditError(f"unknown manifest fields: {', '.join(sorted(unknown))}")
@@ -270,7 +290,9 @@ def read_tcpdump_stats(path: Path, expected_interface: str) -> dict[str, Any]:
             rf"(?m)^\s*(\d+)\s+packets?\s+{re.escape(kind)}\s*$",
             decoded,
         )
-        return int(matches[0]) if len(matches) == 1 else None
+        if len(matches) != 1 or len(matches[0]) > 15:
+            return None
+        return int(matches[0])
 
     # On macOS tcpdump normally emits a startup line naming the actual
     # interface, e.g. "tcpdump: listening on en0, link-type ...".
