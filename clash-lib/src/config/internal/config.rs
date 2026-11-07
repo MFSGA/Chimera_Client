@@ -241,8 +241,18 @@ impl Config {
         // YAML conversion expands comma-delimited main DNS policy selectors
         // and rejects Mihomo GeoSite/RuleSet patterns. Internal configs and
         // reloads must not bypass that privacy-sensitive validation.
+        // The internal map can contain multiple spellings of the same DNS
+        // name, while the runtime trie lowercases keys and would pick an
+        // arbitrary policy based on HashMap iteration order.
+        let mut seen_policy_domains = std::collections::HashSet::new();
         for domain in self.dns.nameserver_policy.keys() {
             let lower = domain.to_ascii_lowercase();
+            if !seen_policy_domains.insert(lower.clone()) {
+                return Err(Error::InvalidConfig(
+                    "dns.nameserver-policy contains duplicate case-insensitive selectors"
+                        .to_owned(),
+                ));
+            }
             if lower.starts_with("geosite:")
                 || lower.starts_with("rule-set:")
                 || domain.contains(',')
@@ -1065,6 +1075,39 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(error.contains("without the `tun` feature"), "{error}");
+    }
+
+    #[test]
+    fn internal_nameserver_policy_rejects_case_insensitive_duplicate_selectors() {
+        // A direct Internal reload can bypass YAML normalization and provide
+        // two differently cased entries for a single DNS policy domain.
+        let yaml = "dns:\n  enable: true\n  nameserver: [1.1.1.1]\n";
+        let mut config = crate::Config::Str(yaml.to_owned()).try_parse().unwrap();
+        let upstreams = crate::app::dns::config::Config::parse_nameserver(&[
+            "9.9.9.9".to_owned(),
+            "8.8.8.8".to_owned(),
+        ])
+        .unwrap();
+        config
+            .dns
+            .nameserver_policy
+            .insert("Private.Example".to_owned(), upstreams[0].clone());
+        config
+            .dns
+            .nameserver_policy
+            .insert("private.example".to_owned(), upstreams[1].clone());
+        let error = match config.validate() {
+            Ok(_) => panic!("case-duplicate DNS selectors were silently accepted"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("dns.nameserver-policy") && error.contains("duplicate"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("Private.Example"),
+            "domain values should not be logged"
+        );
     }
 
     #[test]
