@@ -1,4 +1,11 @@
-use std::{collections::HashSet, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashSet,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use axum::{
     Json, Router,
@@ -59,7 +66,7 @@ struct ConfigState {
     dns_listen_addr: DNSListenAddr,
     dns_enabled: bool,
     ipv6_allowed: bool,
-    controller_listener_ipv6: bool,
+    controller_listener_ipv6: Arc<AtomicBool>,
     patch_lock: Arc<Mutex<()>>,
 }
 
@@ -74,7 +81,7 @@ pub fn routes(
     dns_listen_addr: DNSListenAddr,
     dns_enabled: bool,
     ipv6_allowed: bool,
-    controller_listener_ipv6: bool,
+    controller_listener_ipv6: Arc<AtomicBool>,
 ) -> Router<Arc<AppState>> {
     Router::new()
         .route(
@@ -705,7 +712,7 @@ async fn patch_configs(
             state.dns_resolver.ipv6(),
             listener_ipv6,
             dns_listener_ipv6,
-            state.controller_listener_ipv6,
+            state.controller_listener_ipv6.load(Ordering::Relaxed),
         )
     {
         return (StatusCode::BAD_REQUEST, message).into_response();

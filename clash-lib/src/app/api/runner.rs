@@ -1,4 +1,13 @@
-use std::{io, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    io,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use axum::{
     Router, ServiceExt, middleware,
@@ -37,20 +46,55 @@ use crate::{
 /// only EADDRINUSE and retain the original error on a persistent conflict.
 async fn bind_api_tcp_after_shutdown(
     addr: &str,
+    ipv6_enabled: bool,
 ) -> io::Result<tokio::net::TcpListener> {
     const MAX_RETRIES: u32 = 5;
-    for attempt in 0..=MAX_RETRIES {
-        match tokio::net::TcpListener::bind(addr).await {
-            Err(error)
-                if error.kind() == io::ErrorKind::AddrInUse
-                    && attempt < MAX_RETRIES =>
-            {
-                tokio::time::sleep(Duration::from_millis(25 * (1 << attempt))).await;
+    let addresses = tokio::net::lookup_host(addr).await?;
+    let addresses = filter_api_bind_addresses(addresses, ipv6_enabled);
+    if addresses.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            format!(
+                "API address `{addr}` has no IPv4 addresses while global IPv6 is disabled"
+            ),
+        ));
+    }
+
+    let mut last_error = None;
+    for address in addresses {
+        for attempt in 0..=MAX_RETRIES {
+            match tokio::net::TcpListener::bind(address).await {
+                Ok(listener) => return Ok(listener),
+                Err(error)
+                    if error.kind() == io::ErrorKind::AddrInUse
+                        && attempt < MAX_RETRIES =>
+                {
+                    tokio::time::sleep(Duration::from_millis(25 * (1 << attempt)))
+                        .await;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    break;
+                }
             }
-            result => return result,
         }
     }
-    unreachable!("bounded API bind retry loop always returns on final attempt")
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            format!("API address `{addr}` did not resolve to a bindable address"),
+        )
+    }))
+}
+
+fn filter_api_bind_addresses(
+    addresses: impl IntoIterator<Item = SocketAddr>,
+    ipv6_enabled: bool,
+) -> Vec<SocketAddr> {
+    addresses
+        .into_iter()
+        .filter(|address| ipv6_enabled || address.is_ipv4())
+        .collect()
 }
 
 pub struct ApiRunner {
@@ -354,6 +398,9 @@ impl Runner for ApiRunner {
         let dns_listen_addr = self.dns_listen_addr.clone();
         let dns_enabled = self.dns_enabled;
         let ipv6_allowed = self.ipv6_allowed;
+        let global_ipv6_enabled = dns_resolver.ipv6();
+        let controller_listener_ipv6 = Arc::new(AtomicBool::new(false));
+        let controller_listener_ipv6_for_routes = controller_listener_ipv6.clone();
         let cancellation_token = self.cancellation_token.clone();
         let ready_tx = self
             .ready_tx
@@ -362,11 +409,6 @@ impl Runner for ApiRunner {
             .take();
 
         tracing::debug!("API controller configuration: {:?}", controller_cfg);
-        let controller_listener_ipv6 = controller_cfg
-            .external_controller
-            .as_deref()
-            .and_then(|address| address.parse::<SocketAddr>().ok())
-            .is_some_and(|address| address.is_ipv6());
         let ipc_addr = controller_cfg.external_controller_ipc;
         let tcp_addr = controller_cfg.external_controller;
         let endpoint_count =
@@ -415,7 +457,7 @@ impl Runner for ApiRunner {
                         dns_listen_addr,
                         dns_enabled,
                         ipv6_allowed,
-                        controller_listener_ipv6,
+                        controller_listener_ipv6_for_routes,
                     ),
                 )
                 .nest(
@@ -482,61 +524,72 @@ impl Runner for ApiRunner {
                 )
                 .layer(router_clone);
                 let tcp_ready_signal = ready_signal.clone();
+                let controller_listener_ipv6 = controller_listener_ipv6.clone();
                 Some(async move {
                     info!("Starting API server on TCP address {bind_addr}");
-                    let listener =
-                        match bind_api_tcp_after_shutdown(&bind_addr).await {
-                            Ok(listener) => listener,
-                            Err(err) => {
-                                tcp_ready_signal.fail(format!(
-                                    "failed to bind API server on {bind_addr}: {err}"
-                                ));
-                                return Err(crate::Error::Io(err));
-                            }
-                        };
+                    let listener = match bind_api_tcp_after_shutdown(
+                        &bind_addr,
+                        global_ipv6_enabled,
+                    )
+                    .await
+                    {
+                        Ok(listener) => listener,
+                        Err(err) => {
+                            tcp_ready_signal.fail(format!(
+                                "failed to bind API server on {bind_addr}: {err}"
+                            ));
+                            return Err(crate::Error::Io(err));
+                        }
+                    };
                     // TCP related security checks
                     let has_secret = controller_cfg
                         .secret
                         .as_deref()
                         .is_some_and(|secret| !secret.is_empty());
                     let security_result = match listener.local_addr() {
-                        Ok(addr) => match validate_api_server_security(
-                            addr,
-                            has_secret,
-                            valid_cors_origin_count,
-                        ) {
-                            Ok(()) => Ok(()),
-                            Err(ApiServerSecurityFailure::MissingSecret) => {
-                                error!(
-                                    "API server is listening on a non-loopback address \
+                        Ok(addr) => {
+                            controller_listener_ipv6
+                                .store(addr.is_ipv6(), Ordering::Relaxed);
+                            match validate_api_server_security(
+                                addr,
+                                has_secret,
+                                valid_cors_origin_count,
+                            ) {
+                                Ok(()) => Ok(()),
+                                Err(ApiServerSecurityFailure::MissingSecret) => {
+                                    error!(
+                                        "API server is listening on a non-loopback address \
                                      without a secret. This is insecure!"
-                                );
-                                error!(
-                                    "Please set a secret in the configuration to secure \
+                                    );
+                                    error!(
+                                        "Please set a secret in the configuration to secure \
                                      the API server."
-                                );
-                                Err(crate::Error::Operation(
+                                    );
+                                    Err(crate::Error::Operation(
                                     "API server is listening on a non-loopback address \
                                      without a secret. This is insecure!"
                                         .to_string(),
                                 ))
-                            }
-                            Err(ApiServerSecurityFailure::MissingCorsOrigins) => {
-                                error!(
-                                    "API server is listening on a non-loopback address \
+                                }
+                                Err(
+                                    ApiServerSecurityFailure::MissingCorsOrigins,
+                                ) => {
+                                    error!(
+                                        "API server is listening on a non-loopback address \
                                      without any valid CORS origins. This is insecure!"
-                                );
-                                error!(
-                                    "Please configure at least one valid \
+                                    );
+                                    error!(
+                                        "Please configure at least one valid \
                                      cors-allow-origins entry."
-                                );
-                                Err(crate::Error::Operation(
+                                    );
+                                    Err(crate::Error::Operation(
                                     "API server is listening on a non-loopback address \
                                      without any valid CORS origins"
                                         .to_string(),
                                 ))
+                                }
                             }
-                        },
+                        }
                         Err(err) => Err(crate::Error::Io(err)),
                     };
                     if let Err(err) = security_result {
@@ -738,6 +791,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ipv4_only_controller_bind_filters_ipv6_hostname_results() {
+        let ipv4 = "127.0.0.1:9090"
+            .parse::<SocketAddr>()
+            .expect("test IPv4 address should parse");
+        let ipv6 = "[::1]:9090"
+            .parse::<SocketAddr>()
+            .expect("test IPv6 address should parse");
+
+        assert_eq!(
+            super::filter_api_bind_addresses([ipv6, ipv4], false),
+            vec![ipv4]
+        );
+        assert_eq!(
+            super::filter_api_bind_addresses([ipv6, ipv4], true),
+            vec![ipv6, ipv4]
+        );
+    }
+
     #[tokio::test]
     async fn api_listener_rebinds_after_old_address_is_released() {
         let old = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -746,9 +818,10 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(85)).await;
             drop(old);
         });
-        let new_listener = super::bind_api_tcp_after_shutdown(&addr.to_string())
-            .await
-            .expect("API listener should rebind once old socket closes");
+        let new_listener =
+            super::bind_api_tcp_after_shutdown(&addr.to_string(), true)
+                .await
+                .expect("API listener should rebind once old socket closes");
         assert_eq!(new_listener.local_addr().unwrap(), addr);
         release.await.unwrap();
     }
