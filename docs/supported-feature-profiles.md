@@ -59,7 +59,7 @@ On 2026-10-25, `ci/check-feature-profiles.sh` passed on macOS with:
 
 ```bash
 CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 \
-  CARGO_TARGET_DIR=/Volumes/ChimeraBuild/chimera-feature-profiles-target \
+  CARGO_TARGET_DIR=/tmp/chimera-cargo-target \
   ci/check-feature-profiles.sh
 ```
 

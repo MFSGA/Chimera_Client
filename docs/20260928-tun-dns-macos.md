@@ -41,7 +41,7 @@ System DNS 指向一个与 fake-IP 池、TUN 网关子网及 route exclusions �
 - 新增 `dns_restore_failure_is_reported_by_convergence` 和 `dns_restore_failure_blocks_unprotected_runtime_launch`，分别验证 converge 错误可见，以及 DNS 无法恢复时不启动不受保护的目标运行态；桌面与服务两份 manager workspace 定向测试通过。
 - Service shutdown 在首次 manager shutdown 失败或超时后会等待控制 executor 结束，并反复执行 manager shutdown，直到 DNS restore 与 core stop 成功才返回；新增 `shutdown_retry_keeps_retrying_after_a_transient_failure` 验证瞬时失败后的重试。持续平台故障会阻止 service teardown，这是为了避免主动拆掉仍接管系统 DNS 的 core。
 - 为运行 service 定向测试，补上其原本缺失的 `tempfile` 开发依赖，并把已过时的 `Meow` 测试映射改为当前支持的 `ChimeraClient` 映射。首次测试发现这两处既有编译问题，修正后目标用例可运行。
-- 下一步：在签名宿主进程接入 System Extension 激活/停用与 DNS Proxy provider 配置，设置 `127.0.0.1:1053` 并纳入现有 ownership 生命周期；确认服务模式与桌面模式的启停行为一致，且不会静默覆盖其他 DNS Proxy。bundle 落位和 loopback bridge 已完成；当前机器没有有效代码签名身份，激活验证仍需匹配 Team ID、entitlement/profile。然后做专用 Mac resolver/物理网卡抓包验证。DIRECT 专用 DNS 继续暂缓，不阻塞该链路。
+- 下一步：在签名宿主进程接入 System Extension 激活/停用与 DNS Proxy provider 配置，设置 `127.0.0.1:1053` 并纳入现有 ownership 生命周期；确认服务模式与桌面模式的启停行为一致，且不会静默覆盖其他 DNS Proxy。bundle 落位和 loopback bridge 已完成；当前测试环境没有可用代码签名身份，激活验证仍需匹配 Team ID、entitlement/profile。然后做专用 Mac resolver/物理网卡抓包验证。DIRECT 专用 DNS 继续暂缓，不阻塞该链路。
 
 ## 验证记录
 
@@ -61,7 +61,7 @@ System DNS 指向一个与 fake-IP 池、TUN 网关子网及 route exclusions �
 
 ## 下一步
 
-扩展构建、Tauri bundle 落位和 `127.0.0.1:1053` loopback bridge 已完成。当前机器没有有效的代码签名身份，因此宿主激活/停用和 provider 配置还不能在此验证；这仍需匹配的 Team ID、entitlement/profile，并要让桌面/服务模式共享 ownership 生命周期。完成宿主接入后，再安排专用 Mac resolver 顺序、普通 A/AAAA/HTTPS 查询和物理网卡抓包验证。DIRECT 专用 DNS 继续暂缓，不阻塞系统级 DNS 接管。
+扩展构建、Tauri bundle 落位和 `127.0.0.1:1053` loopback bridge 已完成。当前测试环境没有可用的代码签名身份，因此宿主激活/停用和 provider 配置还不能在此验证；这仍需匹配的 Team ID、entitlement/profile，并要让桌面/服务模式共享 ownership 生命周期。完成宿主接入后，再安排专用 Mac resolver 顺序、普通 A/AAAA/HTTPS 查询和物理网卡抓包验证。DIRECT 专用 DNS 继续暂缓，不阻塞系统级 DNS 接管。
 
 ## 2026-09-29 Client-only utun DNS packet 接入切片
 
@@ -111,7 +111,7 @@ System DNS 指向一个与 fake-IP 池、TUN 网关子网及 route exclusions �
 - 中间曾有一次无效对照：临时配置把 `mmdb` 设为空，却保留 `fallback-filter.geoip: true`。当前 `GeoIPFilter` 在没有 GeoIP 数据库时会把答案判定为需要 fallback；本机的部分 DoH/DoT fallback 随后报连接 reset，导致测试人为失败。有效复测使用了现有 `Country.mmdb`，没有因此修改 DNS 上游或关闭 GeoIP fallback。
 - 按 Ctrl-C 正常停止后，`utun1989` 消失，53 端口 listener 关闭；Wi-Fi 与 Ethernet DNS 均恢复为原来的 `8.8.8.8`、`114.114.114.114`，默认路由恢复经 `en1`。HTTP/HTTPS/SOCKS 系统代理仍启用在 `127.0.0.1:7866`，Nyanpasu/Mihomo 仍在运行；测试请求明确绕过了它。临时配置使用私有文件权限，原始 `config.yaml` 未修改。
 - 这次验证覆盖了当前配置的 TUN + fake-IP + 全局路由下，一条 DIRECT 和一条代理规则的真实 HTTPS 流量；不等同于证明每个应用、每个协议、浏览器内置 DoH/DoT、mDNS 或所有目标网站都已覆盖。端口 53 被占用、缺少修改系统 DNS 的权限，或 macOS `networksetup`/`scutil` 操作失败时，启动仍会明确失败并尝试恢复原 DNS；本次系统 DNS 改写与清理均成功。
-- Dispatcher 对缺少反向记录的 fake-IP 现在按 fail-closed 处理：丢弃该 TCP/UDP 流并写明日志，不再把合成地址当真实 IP 继续匹配规则。这样不会静默跳过域名规则；行为与本地 Mihomo 基线 `63bd52e` 的 `preHandleMetadata` 对 fake DNS mapping 缺失时返回错误相符。回归用例 `reverse_lookup_rejects_fake_ip_when_mapping_is_missing` 定向运行通过（1 passed）。本轮 `cargo fmt --all -- --check`、`cargo check -p clash-lib --features tun`、`git diff --check` 也通过；没有启动会修改主机网络的 TUN 测试。
+- Dispatcher 对缺少反向记录的 fake-IP 现在按 fail-closed 处理：丢弃该 TCP/UDP 流并写明日志，不再把合成地址当真实 IP 继续匹配规则。这样不会静默跳过域名规则；行为与本地 Mihomo 基线 [本地快照已省略] 的 `preHandleMetadata` 对 fake DNS mapping 缺失时返回错误相符。回归用例 `reverse_lookup_rejects_fake_ip_when_mapping_is_missing` 定向运行通过（1 passed）。本轮 `cargo fmt --all -- --check`、`cargo check -p clash-lib --features tun`、`git diff --check` 也通过；没有启动会修改主机网络的 TUN 测试。
 
 ## 2026-09-30 需求澄清：fake-IP 不依赖改写 macOS 系统 DNS
 

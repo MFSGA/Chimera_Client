@@ -149,8 +149,8 @@ non-production benchmark host.
 
 因平台 C 交叉编译器缺失，**不能**把两项 `boring-noise`
 标记为代码 FAIL，也不能标记为通过。保留日志：
-`/tmp/chimera-boring-noise-x86_64-unknown-linux-gnu.log`、
-`/tmp/chimera-boring-noise-x86_64-pc-windows-gnu.log`；
+`/tmp/chimera-test-output`、
+`/tmp/chimera-test-output`；
 本地临时日志不随 Git 分发。
 
 上文记录的 macOS 核心库 934/0/12、WireGuard 双加密后端

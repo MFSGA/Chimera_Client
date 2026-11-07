@@ -87,9 +87,9 @@ S00 **没有**实现新路径，也不能凭单测声称已有可执行的“leg
 | 命令 | 结果 |
 |---|---|
 | `cargo fmt --all -- --check`、`git diff --check` | 通过 |
-| `CARGO_TARGET_DIR=/tmp/chimera-dns-review-target CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo test -p clash-lib --lib --no-default-features --locked --offline app::dns::server::handler::tests` | 25 passed |
-| `CARGO_TARGET_DIR=/tmp/chimera-dns-review-target CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo test -p clash-lib --no-default-features --features ring,port --test dns_config_tests --locked --offline` | 17 passed |
-| `CARGO_TARGET_DIR=/tmp/chimera-dns-review-target CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo test -p clash-lib --no-default-features --features ring,port --test dns_legacy_golden_tests --locked --offline` | 11 passed |
+| `CARGO_TARGET_DIR=/tmp/chimera-cargo-target CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo test -p clash-lib --lib --no-default-features --locked --offline app::dns::server::handler::tests` | 25 passed |
+| `CARGO_TARGET_DIR=/tmp/chimera-cargo-target CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo test -p clash-lib --no-default-features --features ring,port --test dns_config_tests --locked --offline` | 17 passed |
+| `CARGO_TARGET_DIR=/tmp/chimera-cargo-target CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo test -p clash-lib --no-default-features --features ring,port --test dns_legacy_golden_tests --locked --offline` | 11 passed |
 
 默认 feature 的 handler 单测重跑在 `rustc` 连续数分钟无 CPU 活动、占用约 3.4 GB 后中断；no-default 首次尝试使用共享 `target` 时遇到旧 `displaydoc` 元数据与 Rust 1.99 不兼容及卷空间耗尽，未清理共享构建缓存。改用 `/tmp` 临时 target 后，handler 定向测试通过。`dns_config_tests` 不带 TLS provider 的 no-default 组合有 4 项依赖加密 provider 的既有测试失败；改用 `ring,port` 后 17 项通过。
 
@@ -103,8 +103,8 @@ DNSSEC 单元回归在 `exchange_with_resolver` helper 层覆盖 DO/CD/AD 与 TS
 
 | 验证命令 | 结果 |
 |---|---|
-| `CARGO_TARGET_DIR=/Volumes/ChimeraBuild/Chimera_Client_dns_s03c_target CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo test -p chimera-dns --no-default-features --locked --offline` | 4 passed；含 AD-only SRV UDP listener 回归 |
-| `CARGO_TARGET_DIR=/Volumes/ChimeraBuild/Chimera_Client_dns_s03c_target CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo test -p clash-lib --lib --features aws-lc-rs --locked --offline app::dns::server::handler::tests` | 25 passed |
+| `CARGO_TARGET_DIR=/tmp/chimera-cargo-target CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo test -p chimera-dns --no-default-features --locked --offline` | 4 passed；含 AD-only SRV UDP listener 回归 |
+| `CARGO_TARGET_DIR=/tmp/chimera-cargo-target CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo test -p clash-lib --lib --features aws-lc-rs --locked --offline app::dns::server::handler::tests` | 25 passed |
 | `cargo fmt --all -- --check`、`git diff --check` | 通过 |
 
 本地未跟踪文件和 `ref-meow` submodule 的既有改动均保持原样。实现提交 `8e055f5e9d3bb519f0973d36430c41bf248313e4` 已通过独立 L2 审查（APPROVE，无阻断发现）；审查指出 safe SRV 请求同时带 AD 且上游返回需清理的地址附加记录时会按既有策略返回 SERVFAIL，这是已记录的 fail-closed 行为。该提交位于本地 `master`，提交时相对 `origin/master` ahead 2，尚未推送。`git verify-commit HEAD` 通过，GPG 签名有效但本地信任级别未知（`%G? = U`）；GitHub Verified 和远端 CI 未核实。

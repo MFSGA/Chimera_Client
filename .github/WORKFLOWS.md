@@ -58,7 +58,7 @@
   Dashboard 构建是 Cargo 之外的显式步骤，`--full` 只将成功生成的 `dist/`
   提供给后续 Rust 检查，不生成或依赖构建标记。
 - 默认 `CARGO_TARGET_DIR` 指向
-  `/Volumes/ChimeraClientVlessTests/Chimera_Client_master_target`：
+  `[本机路径已省略]`：
   这是外接 Ventoy USB 上的 APFS sparsebundle 挂载卷（不是原始
   exFAT 分区）；未挂载时脚本明确失败，不回退几乎已满的 Mac
   系统盘。其他机器用 `--target-dir /绝对/路径` 或

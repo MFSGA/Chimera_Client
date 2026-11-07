@@ -7,7 +7,7 @@ umask 077
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${CONFIG_FILE:-$ROOT_DIR/config.yaml}"
-MIHOMO_GZ="${MIHOMO_GZ:-/Users/adam/Downloads/mihomo-darwin-arm64-v1.19.31.gz}"
+MIHOMO_GZ="${MIHOMO_GZ:-$HOME/Downloads/mihomo-darwin-arm64-v1.19.31.gz}"
 DOMAIN="${DOMAIN:-example.com}"
 TEST_PORT="${TEST_PORT:-443}"
 DNS_SERVER="${DNS_SERVER:-8.8.8.8}"

@@ -24,21 +24,21 @@ TLS 指纹模拟明确排除。Android FFI、页面交互以及本地 gRPC 旧�
 ## 验证记录
 
 - `cargo fmt -p clash-lib`：通过。
-- `CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo check -p clash-lib`：通过。
+- `CARGO_TARGET_DIR=/tmp/chimera-cargo-target cargo check -p clash-lib`：通过。
 - 同一目标目录下 `cargo check -p clash-lib --no-default-features` 与 `cargo check -p clash-lib --all-features`：本轮最终改动后通过。
-- `CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo clippy -p clash-lib --all-targets --no-default-features --features zero_copy,tls,extended-health-check,aws-lc-rs,ring,ws,anytls,shadowsocks,wireguard,trojan,hysteria,xhttp-h3,tun,tproxy,redir,http_port,mixed_port,tracing,port,reality,vless-encryption -- -D warnings`：通过；该组合覆盖全部核心 feature，不启用会触发 Dashboard `npm ci` 的 `dashboard`。
+- `CARGO_TARGET_DIR=/tmp/chimera-cargo-target cargo clippy -p clash-lib --all-targets --no-default-features --features zero_copy,tls,extended-health-check,aws-lc-rs,ring,ws,anytls,shadowsocks,wireguard,trojan,hysteria,xhttp-h3,tun,tproxy,redir,http_port,mixed_port,tracing,port,reality,vless-encryption -- -D warnings`：通过；该组合覆盖全部核心 feature，不启用会触发 Dashboard `npm ci` 的 `dashboard`。
 - `cargo fmt --all -- --check`：通过。
-- `CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo test -p clash-lib --lib client_capability`：6 个定向用例通过，978 个其他测试被过滤。
+- `CARGO_TARGET_DIR=/tmp/chimera-cargo-target cargo test -p clash-lib --lib client_capability`：6 个定向用例通过，978 个其他测试被过滤。
 - 同一目标目录下 `cargo test -p clash-lib --lib client_capability --features shadowsocks,anytls,trojan,hysteria,wireguard,ws,xhttp-h3`：6 个定向用例通过，1143 个其他测试被过滤。
 - `cargo fmt --all -- --check` 与 `git diff --check`：通过。
-- `CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo test -p clash-lib --test api_tests client_capability_controller_endpoints_expose_validation_and_mode_override -- --exact`：通过；覆盖能力查询、节点校验、合法/非法组、组循环、会话覆写清除和测速历史查询路由。
-- `CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo test -p clash-lib --test api_reload_tests put_configs_reloads_runtime_from_file -- --exact`：通过；确认重载后有效模式继承新配置且旧会话覆写清除。
+- `CARGO_TARGET_DIR=/tmp/chimera-cargo-target cargo test -p clash-lib --test api_tests client_capability_controller_endpoints_expose_validation_and_mode_override -- --exact`：通过；覆盖能力查询、节点校验、合法/非法组、组循环、会话覆写清除和测速历史查询路由。
+- `CARGO_TARGET_DIR=/tmp/chimera-cargo-target cargo test -p clash-lib --test api_reload_tests put_configs_reloads_runtime_from_file -- --exact`：通过；确认重载后有效模式继承新配置且旧会话覆写清除。
 - 最终复审补出 `dialer-proxy` 目标校验、自动注册的 `GLOBAL` 目标及 URL fragment 脱敏缺口；实现后再次运行 Controller 集成测试，覆盖 `DIRECT`/`GLOBAL`/有效代理组目标、缺失目标、保留名冲突和就绪状态查询，通过。6 个能力定向单测也通过。fragment、userinfo 和 query 值均不会出现在测速历史响应中。
-- `CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo check -p clash-lib`、`--no-default-features`、`--all-features`：均通过。
-- `CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo clippy -p clash-lib --all-targets --no-default-features --features zero_copy,tls,extended-health-check,aws-lc-rs,ring,ws,anytls,shadowsocks,wireguard,trojan,hysteria,xhttp-h3,tun,tproxy,redir,http_port,mixed_port,tracing,port,reality,vless-encryption -- -D warnings`：通过。
+- `CARGO_TARGET_DIR=/tmp/chimera-cargo-target cargo check -p clash-lib`、`--no-default-features`、`--all-features`：均通过。
+- `CARGO_TARGET_DIR=/tmp/chimera-cargo-target cargo clippy -p clash-lib --all-targets --no-default-features --features zero_copy,tls,extended-health-check,aws-lc-rs,ring,ws,anytls,shadowsocks,wireguard,trojan,hysteria,xhttp-h3,tun,tproxy,redir,http_port,mixed_port,tracing,port,reality,vless-encryption -- -D warnings`：通过。
 - 后续补跑本机端到端行为用例：`cargo test -p clash-lib --test direct_udp_integration_tests`（3 项）、`cargo test -p clash-lib --test shadowsocks_integration_tests --features shadowsocks`（4 项）、`cargo test -p clash-lib --test anytls_integration_tests --features anytls`（2 项）、`cargo test -p clash-lib --test connection_chain_tests`（1 项）、`cargo test -p clash-lib --test vless_transport_contract_tests --features ws`（4 项），全部通过。这些测试使用本地 loopback 服务；Direct UDP 恢复用例调用本地 `/network/reset`，不修改宿主机网卡、路由或 DNS。
 - `git diff --check`：通过。
-- 初次使用仓库默认 `target` 软链接构建时，目标卷仅剩 33 MiB，写入失败；改用主卷临时目录后完成上述编译和测试。没有删除原构建缓存。
+- 初次使用仓库默认 `target` 软链接构建时，首次构建因目标空间不足退出；改用隔离临时目录后完成编译和测试，没有清理原构建缓存。
 - 带 `--all-features` 的定向测试被 Dashboard 构建脚本的 `npm ci` 阻断：现有 `node_modules/lucide-react` 清理返回 `ENOTEMPTY`。Rust `--all-features` 编译已通过；未删除或重装前端依赖。
 - 完整 `clash-lib` 测试、跨平台构建和真实 API 客户端互操作尚未执行。
 - 独立 Reviewer 在最终 diff 上未发现阻塞问题；Reviewer 为只读审查，未独立重跑测试。没有创建 PR 或推送；本轮按本地 `master` 迭代流程提交，提交签名与 SHA 在交付信息中核验。
@@ -46,8 +46,8 @@ TLS 指纹模拟明确排除。Android FFI、页面交互以及本地 gRPC 旧�
 ## 2026-10-24 追加验证
 
 - 本次续接基线为本地 `master` `718495497864f4451a26061e0c18aaf3a2d18fe0`；增加 `dialer_proxy_connects_through_a_local_socks5_hop`，通过两个 loopback SOCKS5 中继和本地 HTTP 目标验证真实 TCP `dialer-proxy` 链。测试解析并断言 upstream 到 leaf、leaf 到目标的 CONNECT 地址，检查 HTTP 请求头和响应体，并为连接、读取及目标任务设置超时；不操作宿主机网卡、路由、DNS 或 TUN。
-- `CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo test -p clash-lib --test connection_chain_tests`：2 项通过。
-- `CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo clippy -p clash-lib --test connection_chain_tests -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check`：通过。
+- `CARGO_TARGET_DIR=/tmp/chimera-cargo-target cargo test -p clash-lib --test connection_chain_tests`：2 项通过。
+- `CARGO_TARGET_DIR=/tmp/chimera-cargo-target cargo clippy -p clash-lib --test connection_chain_tests -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check`：通过。
 - 独立 Reviewer 只读复核本次最终测试 diff，未发现阻塞问题；Reviewer 未独立重跑测试。残余小风险是测试端口“释放后再绑定”的竞争窗口；本测试实际路径全程使用 loopback。
 
 ## 剩余边界

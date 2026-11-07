@@ -15,20 +15,19 @@ Usage: ci/verify-quality-gates.sh [--quick|--full] [--target-dir PATH] [--allow-
   --full           Additionally test no-default-features and CLI, verify/lint/build
                    existing Dashboard dependencies once, run all-feature all-target
                    Clippy + LAN tests.
-  --target-dir     Cargo artifact directory. Defaults to CARGO_TARGET_DIR or
-                   /Volumes/ChimeraClientVlessTests/Chimera_Client_master_target.
+  --target-dir     Cargo artifact directory. Uses CARGO_TARGET_DIR if set; required otherwise.
   --reinstall-dashboard  Run pnpm install from the lockfile before Dashboard checks.
   --allow-network  Permit explicitly requested pnpm install to fetch packages;
                    the optional reinstall is offline by default.
-The default target lives in an APFS sparsebundle backed by the external
-Ventoy USB drive. It MUST be mounted. Builds never silently fall back to
-the almost-full system disk. Do not use raw exFAT as a Cargo target directory.
+Set an absolute Cargo target directory on a dedicated build filesystem using
+--target-dir or CARGO_TARGET_DIR. The script fails closed if the parent is
+missing or the resolved target shares a filesystem with the repository.
 HELP
 }
 mode=quick
 reinstall_dashboard=0
 pnpm_network=(--offline)
-target_dir="${CARGO_TARGET_DIR:-/Volumes/ChimeraClientVlessTests/Chimera_Client_master_target}"
+target_dir="${CARGO_TARGET_DIR:-}"
 while (($#)); do
   case "$1" in
     --quick) mode=quick ;;
@@ -48,7 +47,7 @@ done
 # Do not silently use local target/, even if Cargo's normal default would
 # otherwise make the check succeed on one machine and fill another's disk.
 if [[ -z "$target_dir" || "$target_dir" != /* ]]; then
-  echo "Cargo target directory must be an absolute path: $target_dir" >&2
+  echo "Set CARGO_TARGET_DIR or pass --target-dir with an absolute path" >&2
   exit 2
 fi
 if [[ "$target_dir" == "$ROOT/target" || "$target_dir" == "$ROOT/target/"* ]]; then
@@ -56,25 +55,24 @@ if [[ "$target_dir" == "$ROOT/target" || "$target_dir" == "$ROOT/target/"* ]]; t
   exit 2
 fi
 if [[ ! -d "$(dirname "$target_dir")" ]]; then
-  echo "External build volume is not mounted: $(dirname "$target_dir")" >&2
+  echo "Target parent directory does not exist: $(dirname "$target_dir")" >&2
   exit 2
 fi
 mkdir -p "$target_dir"
-# An unmounted /Volumes/... directory can still exist on the system disk.
+# Resolve symlinks before verifying the target filesystem.
 # Compare actual filesystems AFTER resolving any symlink, before compiling.
 resolved_target="$(cd "$target_dir" && pwd -P)"
 root_device="$(df -P "$ROOT" | awk 'NR == 2 {print $1}')"
 target_device="$(df -P "$resolved_target" | awk 'NR == 2 {print $1}')"
 if [[ -z "$target_device" || "$target_device" == "$root_device" ]]; then
-  echo "Target resolves onto the system disk (external volume missing?): $resolved_target" >&2
+  echo "Target resolves onto the repository filesystem: $resolved_target" >&2
   exit 2
 fi
 export CARGO_TARGET_DIR="$target_dir"
 
-# Keep the pnpm store on the same APFS volume when using the project's known
-# external build image. Other callers may supply their own pnpm_config_store_dir.
-if [[ -z "${pnpm_config_store_dir:-}" && "$target_dir" == /Volumes/ChimeraClientVlessTests/* ]]; then
-  export pnpm_config_store_dir=/Volumes/ChimeraClientVlessTests/pnpm-store
+# Keep pnpm artifacts on the selected Cargo filesystem unless overridden.
+if [[ -z "${pnpm_config_store_dir:-}" ]]; then
+  export pnpm_config_store_dir="$target_dir/pnpm-store"
   mkdir -p "$pnpm_config_store_dir"
 fi
 

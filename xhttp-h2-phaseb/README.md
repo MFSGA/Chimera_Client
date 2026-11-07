@@ -13,11 +13,11 @@ This is **H2C prior-knowledge** (cleartext HTTP/2). Use the provided clients.
 ## Docs
 
 - Request flow and sequence diagrams:
-  [docs/20260309-xhttp-h2-phaseb-sequence-diagrams.md](/home/si/Desktop/mfsga/Chimera_Client/docs/20260309-xhttp-h2-phaseb-sequence-diagrams.md)
+  [docs/20260309-xhttp-h2-phaseb-sequence-diagrams.md]
 - Xray/XHTTP terminology mapping:
-  [docs/20260309-xhttp-h2-phaseb-xray-term-mapping.md](/home/si/Desktop/mfsga/Chimera_Client/docs/20260309-xhttp-h2-phaseb-xray-term-mapping.md)
+  [docs/20260309-xhttp-h2-phaseb-xray-term-mapping.md]
 - Proposed Chimera xhttp config draft:
-  [docs/20260309-xhttp-config-draft.md](/home/si/Desktop/mfsga/Chimera_Client/docs/20260309-xhttp-config-draft.md)
+  [docs/20260309-xhttp-config-draft.md]
 
 ## Run
 

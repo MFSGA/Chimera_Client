@@ -8,7 +8,7 @@
 ## 2026-11-07 运行时隔离补充（P0）
 
 - 固定 Mihomo 只读参考：`ref-mihomo` gitlink / 工作树 `63bd52ec794b7051569b76ede2f6cdbf4c091fda`；`config/config.go::parseDNS` 中解析独立 `proxy-server-nameserver`，并在配置 `proxy-server-nameserver-policy` 时要求其非空。这里的运行时零客户端失效关闭是 Chimera 的隐私安全强化，**不是已证明 Mihomo 具有相同错误路径**。
-- Chimera 基线 `e42dabe74282c77245da1023de0b828830928216`：`resolver/enhanced.rs::new_with_network_path_source` 对已配置但运行时零客户端的 `proxy-server-nameserver` 发出警告并回退默认 DNS；即使解析层通常会拒绝全跳过配置，内部配置和运行时构造仍可能出现此状态。
+- Chimera 基线 [本地快照已省略]：`resolver/enhanced.rs::new_with_network_path_source` 对已配置但运行时零客户端的 `proxy-server-nameserver` 发出警告并回退默认 DNS；即使解析层通常会拒绝全跳过配置，内部配置和运行时构造仍可能出现此状态。
 - 先写否定测试 `configured_proxy_nameserver_with_no_runtime_clients_fails_closed`，修复前实测 0 passed / 1 failed；修复后该状态直接返回 `InvalidConfig`，不会构造回退到默认 DNS 的代理节点解析器。测试不触碰系统 DNS、路由或 TUN；仍需故障注入验证实际已构造客户端超时、provider 更新和物理 NIC/utun 抓包。
 
 ## 1. 已有配置及行为
@@ -55,7 +55,7 @@ S01 准入必须满足：金标准用例在目标 HEAD 实际运行；未知新�
 
 ## 2026-11-08 — 代理节点专用 DNS 失败隔离回归（本地候选，L2 审查待办）
 
-- 最新隔离整合分支 `codex/dns-master-integration-20261108-v3` 基于 `origin/master` `840c5a2b8f6a6be3e783dea026cc1bf3b5143f2f`，单独移植空客户端失效关闭修复及 A/AAAA 故障注入测试；不包含远端已经撤回的合并历史。原工作树、用户未提交更改不变。固定 Mihomo 参考为 `63bd52ec794b7051569b76ede2f6cdbf4c091fda`，仅只读核查配置/解析器；尚无二进制互操作对照。
+- 最新隔离整合分支 `隔离候选分支` 基于 `origin/master` `840c5a2b8f6a6be3e783dea026cc1bf3b5143f2f`，单独移植空客户端失效关闭修复及 A/AAAA 故障注入测试；不包含远端已经撤回的合并历史。原工作树、用户未提交更改不变。固定 Mihomo 参考为 `63bd52ec794b7051569b76ede2f6cdbf4c091fda`，仅只读核查配置/解析器；尚无二进制互操作对照。
 - `proxy_bootstrap_failure_never_queries_policy_main_or_fallback` 对 A 和 AAAA 注入专用 DNS 错误，断言专用上游共调用两次，policy/main/fallback 均未收到查询，两种请求均返回错误。此为内存客户端隔离断言，不证明物理 NIC 或 utun 上没有 DNS 泄漏。
 - 定向 `configured_proxy_nameserver_with_no_runtime_clients_fails_closed` 不仅要求失败，还断言返回明确的 `InvalidConfig` 和静态诊断消息，避免将其他初始化错误误认为成功执行了隐私失效关闭。A/AAAA 故障测试分别在专用上游模拟失败，拒绝 policy/main/fallback 降级。TUN+Ring（无默认 feature）核心回归、DNS 配置及 S01/S02 策略测试用于验证未破坏旧配置；macOS DNS ownership、DNS Proxy 激活、抓包及 L2 独立审查仍未完成。
 - `origin/master` 在 2026-11-08 先从 `a96c21d` 回到 `54b95ff`，又因提交重签从 `54b95ff` 变为 `840c5a2`；后两个基线 Git tree 相同但 Git 祖先不同。当前本地 `master` 仍有未提交修改，整合内容先保留于隔离候选分支。不得把测试成功或本地签名当成独立 L2 审查、GitHub Verified、required CI 或系统级隐私验收。
@@ -84,20 +84,20 @@ S01 准入必须满足：金标准用例在目标 HEAD 实际运行；未知新�
 
 ## 2026-11-08 05:17 PST — v0.29.0 新基线隔离整合（L2 待审）
 
-- `origin/master` 在本轮新增 `ffda1a7c894e2b6cf14609fa2639630d91052d91`，修改 Cargo 版本及锁文件；旧的 `840c5a2` 候选现为历史快照。已在隔离分支 `codex/macos-dns-privacy-v029-integration-20261108` 上从 `ffda1a7` 重新签名 cherry-pick 六项 DNS 修复/否定测试；未覆盖原有候选和主工作树。
+- `origin/master` 在本轮新增 `ffda1a7c894e2b6cf14609fa2639630d91052d91`，修改 Cargo 版本及锁文件；旧的 `840c5a2` 候选现为历史快照。已在隔离分支 `隔离候选分支` 上从 `ffda1a7` 重新签名 cherry-pick 六项 DNS 修复/否定测试；未覆盖原有候选和主工作树。
 - v0.29.0、macOS：TUN+Ring、无默认 feature 核心单测 832 通过、0 失败、11 忽略；DNS 配置 19/19；S01 17/17；S02 14/14；默认 feature 核心单测 1024 通过、0 失败、11 忽略；DNS 配置 19/19。Cargo fmt、严格 Clippy（TUN+Ring 与默认 feature、all-targets）通过。测试中的 DNS 端口占用错误日志属于预期的负例，断言最终通过。
 - 保持固定 Mihomo `63bd52ec794b7051569b76ede2f6cdbf4c091fda` 只读；无 Mihomo 二进制实时对照、macOS NIC/utun 抓包或系统 DNS ownership 验收。候选仅本地签名、GitHub Verified 与候选 required CI 不可确认；L2 独立 Reviewer 及维护者批准仍缺失，禁止据此更新 master 或推送。
 
 ## 2026-11-08 06:01 PST — Fake-IP TTL 显式字段失效关闭（仅本地后续切片）
 
 - 固定 Mihomo `63bd52ec794b7051569b76ede2f6cdbf4c091fda` 的 `config/config.go` 声明 `dns.fake-ip-ttl`，并将值传给运行时 `FakeIPTTL`；Chimera 当前不支持同等响应 TTL 语义。接受该字段但不改变运行时结果会误导配置者。
-- 从公开 PR #107 的固定 HEAD `8b3faa49c55906402e99bcb05a467afca62eee92` 本地派生 `codex/dns-fake-ip-ttl-strict-guard-20261108`，先添加 `fake_ip_ttl_not_implemented_must_not_be_silently_ignored`：`fake-ip-ttl` 和 `fake_ip_ttl`、DNS 开关两态必须明确报错且不回显用户值；原有 `fake-ip-range` 继续接受。修复前目标测试 0/1，证明静默接受；修复后 1/1。
+- 从公开 PR #107 的固定 HEAD [本地快照已省略] 本地派生 `隔离候选分支`，先添加 `fake_ip_ttl_not_implemented_must_not_be_silently_ignored`：`fake-ip-ttl` 和 `fake_ip_ttl`、DNS 开关两态必须明确报错且不回显用户值；原有 `fake-ip-range` 继续接受。修复前目标测试 0/1，证明静默接受；修复后 1/1。
 - `clash-lib/src/config/def.rs` 仅在既有 merge 后严格字段检查中添加这两个键，没有实现、也没有声称实现 Mihomo TTL 语义；修改有潜在旧配置行为改变，因此仍为 L2。
 - macOS v0.29.0、TUN + Ring、无默认 feature：核心单测 832 通过/0 失败/11 忽略、DNS 配置 20/20、S01 17/17、S02 14/14；默认 feature：核心单测 1024 通过/0 失败/11 忽略、DNS 配置 20/20；两组严格 Clippy（all-targets）、Cargo fmt 与 Git diff check 均通过。未运行实时 Mihomo 二进制对照与真实 NIC/utun 抓包。
 - 该后续切片**仅在本地分支**；没有修改或推送 PR #107，也没有更改其待审 HEAD，新的本地提交尚未取得 GitHub Verified / 独立 Reviewer / required CI。PR #107 正在运行的 CI 和此前审查要求不得继承为本切片的批准。
 
 ## 2026-11-08 06:25 PST — PR #107 合并后基线重锚定
 
-- PR #107 在 2026-11-08 06:20:34 PST 已合并为 `master` `befdcdb9360c5b88aa1920c75ef83861fba2ffeb`。该提交与原 PR HEAD `8b3faa49c55906402e99bcb05a467afca62eee92` 的 Git tree 相同，虽提交历史 SHA 不同，但七项 DNS 变更的最终源码已进入远端 `master`。
-- 此 TTL 切片原本地提交 `7b9b2bb4649fa14836e21e4528756dadf7ef5510` 保留；已在独立分支 `codex/dns-fake-ip-ttl-post-merge-20261108` 上以新 `master` 为直接父提交单独签名移植（最终 SHA 以该分支 HEAD 为准），不重放 PR #107 已合并的七项提交。
+- PR #107 在 2026-11-08 06:20:34 PST 已合并为 `master` `befdcdb9360c5b88aa1920c75ef83861fba2ffeb`。该提交与原 PR HEAD [本地快照已省略] 的 Git tree 相同，虽提交历史 SHA 不同，但七项 DNS 变更的最终源码已进入远端 `master`。
+- 此 TTL 切片原本地提交 `7b9b2bb4649fa14836e21e4528756dadf7ef5510` 保留；已在独立分支 `隔离候选分支` 上以新 `master` 为直接父提交单独签名移植（最终 SHA 以该分支 HEAD 为准），不重放 PR #107 已合并的七项提交。
 - 此后续提交与 PR #107 是不同审查对象，不能继承后者的 GitHub Verified、CI、Reviewer 或维护者决定；必须独立核验最终 SHA、运行相关测试并获得 L2 审查/批准。未授权修改本机 DNS、路由、TUN 或进行物理 NIC/utun 抓包。

@@ -19,7 +19,7 @@
 
 本节是当前实施队列；下方 A0–A4 及状态机章节保留为历史基线、已完成证据与未完成验收，不再以其中“下一最小步骤”决定代码执行顺序。原用户目标继续有效：**在用户允许的路径内最大限度恢复新连接；已有连接尽力保留，无法恢复时明确结束。**
 
-设计参考：[Flow、多网卡与双栈设计指南](/Users/adam/Downloads/Chimera_Client_Flow_MultiNIC_DualStack_Rust_Design_Guide_zh.md)。该文档提供设计建议；实施范围由用户关于网络切换可用性、状态机观测和“继续代码直到计划完成”的请求，以及本计划的切片门槛决定。文档中的命令、API 和参数不会自动改变默认行为，也不授权运行主机网络实验、提交或发布。
+设计参考：[Flow、多网卡与双栈设计指南]。该文档提供设计建议；实施范围由用户关于网络切换可用性、状态机观测和“继续代码直到计划完成”的请求，以及本计划的切片门槛决定。文档中的命令、API 和参数不会自动改变默认行为，也不授权运行主机网络实验、提交或发布。
 
 ### 现状与设计之间的差距
 
@@ -671,37 +671,37 @@ lifecycle tests.
 ### 2026-10-24：B10 API 与本地 UDP 恢复回归
 
 - 基线：本地 `master` `8a057f4bd5d450a958a3fe8677ea30ad4bf0b428`；在 Darwin 上按默认 `clash-lib` feature 运行，不启用 Dashboard `--all-features`。
-- `CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo test -p clash-lib --test api_tests --locked runtime_path_preference_updates_are_versioned_and_temporary -- --exact --nocapture`：1 项通过，覆盖偏好读取/更新、临时覆写、清除恢复、版本递增、effective-paths 与未知 Flow 决策查询。
-- `CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo test -p clash-lib --test direct_udp_integration_tests --locked network_recovery_replaces_udp_socket_without_restarting_inbound -- --exact --nocapture --test-threads=1`：1 项通过；仅使用 loopback UDP echo 和本地 `/network/reset`，验证 socket 更换、runtime readiness、恢复证据及 UDP Flow 到 Explain 记录的关联，不修改宿主机网卡、路由、DNS 或 TUN。
+- `CARGO_TARGET_DIR=/tmp/chimera-cargo-target cargo test -p clash-lib --test api_tests --locked runtime_path_preference_updates_are_versioned_and_temporary -- --exact --nocapture`：1 项通过，覆盖偏好读取/更新、临时覆写、清除恢复、版本递增、effective-paths 与未知 Flow 决策查询。
+- `CARGO_TARGET_DIR=/tmp/chimera-cargo-target cargo test -p clash-lib --test direct_udp_integration_tests --locked network_recovery_replaces_udp_socket_without_restarting_inbound -- --exact --nocapture --test-threads=1`：1 项通过；仅使用 loopback UDP echo 和本地 `/network/reset`，验证 socket 更换、runtime readiness、恢复证据及 UDP Flow 到 Explain 记录的关联，不修改宿主机网卡、路由、DNS 或 TUN。
 - 这两项使 B10 的偏好 API/临时覆写和本机恢复链路有了实际测试证据；不代表 B8 代理端点多路径竞速、B7 全协议池行为或 B11 专用网络验收已完成。`--all-features`、其他平台及真实多网卡仍未验证。
-- 随后 `CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo test -p clash-lib --lib --locked` 首次运行发现 `proxy::tun::datagram::tests::ipv4_tun_udp_non_a_privacy_and_excluded_forwarding` 的 mock 未声明新增的 `safe_srv_enabled()` 查询；为 mock 补上 `false` 预期后，完整默认单元测试为 972 通过、0 失败、12 ignored。定向用例通过；`cargo clippy -p clash-lib --lib --locked -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check` 通过。该修复只调整测试夹具，不改变 DNS 行为。
+- 随后 `CARGO_TARGET_DIR=/tmp/chimera-cargo-target cargo test -p clash-lib --lib --locked` 首次运行发现 `proxy::tun::datagram::tests::ipv4_tun_udp_non_a_privacy_and_excluded_forwarding` 的 mock 未声明新增的 `safe_srv_enabled()` 查询；为 mock 补上 `false` 预期后，完整默认单元测试为 972 通过、0 失败、12 ignored。定向用例通过；`cargo clippy -p clash-lib --lib --locked -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check` 通过。该修复只调整测试夹具，不改变 DNS 行为。
 
 ### 2026-10-24：B8 代理端点多路径源地址回退
 
 - 基线：本地 `master` `b12567c387e6bdb506af79f1b964feb4fe8be228`；测试只监听本机 loopback，不修改系统路由、接口、DNS 或 TUN。
 - 新增 `proxy_endpoint_dial_uses_next_path_when_actual_source_mismatches`：安排 wildcard 源地址路径优先、具体 `127.0.0.1` 路径作为候选回退；确认两条路径均在计划和连接池上下文中可选。首个 TCP socket 到达本地 listener，但实际本地源地址与请求绑定不符而被丢弃，connector 随后用具体源地址路径成功；返回上下文必须指向该回退 PathId，并有界接收两次本地连接，避免 listener 残留。
-- 定向测试通过：`CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo test -p clash-lib --lib --locked proxy::utils::proxy_connector::tests::proxy_endpoint_dial_uses_next_path_when_actual_source_mismatches -- --exact --nocapture`。完整默认单元测试 973 通过、0 失败、12 ignored；`cargo clippy -p clash-lib --lib --locked -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check` 通过。
+- 定向测试通过：`CARGO_TARGET_DIR=/tmp/chimera-cargo-target cargo test -p clash-lib --lib --locked proxy::utils::proxy_connector::tests::proxy_endpoint_dial_uses_next_path_when_actual_source_mismatches -- --exact --nocapture`。完整默认单元测试 973 通过、0 失败、12 ignored；`cargo clippy -p clash-lib --lib --locked -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check` 通过。
 - 独立审查未发现阻塞项；审查确认路径计划顺序、实际 winner PathId、两次 listener 接收和有界等待均可检出候选跳过/不回退问题。审查者未独立重跑测试。此证据只覆盖本机 loopback 上的 TCP 实际源地址不匹配回退，不代表代理服务器互操作、连接池复用、其他 NIC/地址族或实机切换已验收。
 
 ### 2026-10-24：B7 SOCKS5 路径健康闭环
 
 - 基线：本地 `master` `418dd51b0a0975818c4870f22e07dd88af5f62ed`；测试使用 loopback 上的受控 SOCKS5 服务，不访问公网、不改宿主网络设置。
 - 新增 `socks5_handshake_and_target_response_keep_the_dialed_path`：首选 wildcard 源路径连接后因本地实际地址不匹配而退出，具体 loopback 源地址路径赢得拨号；随后通过真实 SOCKS5 greeting、CONNECT 和隧道内 `target-request` / 单字节 `R` 目标响应。断言最终 `ChainedStream.network_path_ids()` 指向具体获胜 PathId，端点 2 字节握手证据与目标 1 字节响应证据分开记录，且获胜 PathId 下端点和目标各有独立的 `available` 健康记录。
-- 定向用例通过：`CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo test -p clash-lib --lib --locked proxy::socks::outbound::path_health_tests::socks5_handshake_and_target_response_keep_the_dialed_path -- --exact --nocapture`。既有真实代理链测试 `cargo test -p clash-lib --test connection_chain_tests --locked -- --test-threads=1` 为 2/2 通过；完整默认单元测试为 974/974 通过、12 ignored；`cargo clippy -p clash-lib --lib --locked -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check` 通过。
+- 定向用例通过：`CARGO_TARGET_DIR=/tmp/chimera-cargo-target cargo test -p clash-lib --lib --locked proxy::socks::outbound::path_health_tests::socks5_handshake_and_target_response_keep_the_dialed_path -- --exact --nocapture`。既有真实代理链测试 `cargo test -p clash-lib --test connection_chain_tests --locked -- --test-threads=1` 为 2/2 通过；完整默认单元测试为 974/974 通过、12 ignored；`cargo clippy -p clash-lib --lib --locked -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check` 通过。
 - 首版测试只等待两项路径结果，因此在证据收集断言处失败；检查运行时记录后发现失败尝试也会发送一个路径结果，现版显式消费三个有界事件并核对两种成功响应证据。独立审查发现长响应的精确字节数断言理论上受 TCP 短读影响，改为唯一单字节目标响应，并与 2 字节 SOCKS 握手响应区分。此项只验证本机 SOCKS5 流式代理路径，不代表 UDP、TLS/认证代理、其他协议池、Linux 实机或真实多网卡切换已完成。
 
 ### 2026-10-24：B7 Shadowsocks 路径健康闭环
 
 - 基线：本地 `master` `69f58a9fd2bee7629eefe0f123f06ed1faf0546b`；仅连接 loopback 上的 in-process Shadowsocks 服务端，不访问公网、不改宿主网络设置。
 - 新增 `encrypted_handshake_and_target_response_keep_the_dialed_path`：首选 wildcard 源路径连接后因本地实际地址不匹配而退出，具体 loopback 源地址路径赢得拨号；本地 AES-256-GCM 服务端解密真实 Shadowsocks handshake 与 `target-request`，再加密返回单字节 `R`。断言服务端解析到目标与请求字节正确、客户端收到解密后的 `R`，最终链路保留获胜 PathId；端点加密 socket 响应和目标明文响应分别产生 `proxyEndpointTcp`/`proxyTcp` 证据，获胜 PathId 下端点与目标有独立的可用记录。
-- 定向用例与全功能单元测试通过：`CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo test -p clash-lib --lib --all-features --locked proxy::shadowsocks::outbound::tests::path_health_tests::encrypted_handshake_and_target_response_keep_the_dialed_path -- --exact --nocapture` 通过；`cargo test -p clash-lib --lib --all-features --locked` 为 1144 passed、0 failed、12 ignored。默认单元测试 974 passed、0 failed、12 ignored；`cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check` 通过。
+- 定向用例与全功能单元测试通过：`CARGO_TARGET_DIR=/tmp/chimera-cargo-target cargo test -p clash-lib --lib --all-features --locked proxy::shadowsocks::outbound::tests::path_health_tests::encrypted_handshake_and_target_response_keep_the_dialed_path -- --exact --nocapture` 通过；`cargo test -p clash-lib --lib --all-features --locked` 为 1144 passed、0 failed、12 ignored。默认单元测试 974 passed、0 failed、12 ignored；`cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings`、`cargo fmt --all -- --check`、`git diff --check` 通过。
 - 该受控测试证明本地 TCP Shadowsocks 加密流的握手后目标响应归属；未覆盖 Docker/远端 Shadowsocks 服务、插件、UDP、池复用或物理网络变化，不能替代其他代理协议互操作与 B11 实机验收。
 
 ### 2026-10-24：B7 Trojan TLS 路径健康闭环
 
 - 基线：本地 `master` `9870ac4625d0267fec3bc442e756ddcea524b9ee`；服务端绑定 loopback，使用测试生成的自签 TLS 证书并只在测试客户端跳过证书校验，不访问公网、不改宿主网络设置。
 - 新增 `tls_handshake_and_target_response_keep_the_dialed_path`：首选 wildcard 源路径连接后实际源地址校验失败，具体 loopback 源地址路径回退成功；本地 TLS 服务端校验 Trojan SHA-224 密码帧、CONNECT 命令、目标地址和请求，再通过 TLS 返回单字节 `R`。断言获胜 PathId 沿链路保留，TLS endpoint socket 响应单独产生 `proxyEndpointTcp`，解密后的目标响应产生 1 字节 `proxyTcp` 证据，且端点/目标健康记录分别可用。
-- 定向用例与全功能测试通过：`CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo test -p clash-lib --lib --all-features --locked proxy::trojan::path_health_tests::tls_handshake_and_target_response_keep_the_dialed_path -- --exact --nocapture` 通过；`cargo test -p clash-lib --lib --all-features --locked` 为 1145 passed、0 failed、12 ignored。默认测试 974 passed、0 failed、12 ignored。
+- 定向用例与全功能测试通过：`CARGO_TARGET_DIR=/tmp/chimera-cargo-target cargo test -p clash-lib --lib --all-features --locked proxy::trojan::path_health_tests::tls_handshake_and_target_response_keep_the_dialed_path -- --exact --nocapture` 通过；`cargo test -p clash-lib --lib --all-features --locked` 为 1145 passed、0 failed、12 ignored。默认测试 974 passed、0 failed、12 ignored。
 - `cargo clippy -p clash-lib --all-targets --all-features --locked -- -D warnings` 在 Dashboard 构建步骤的 `npm ci` 因 macOS `ENOTEMPTY`（`clash-dashboard/node_modules/lucide-react`）失败，Rust Clippy 尚未开始。为不删除 node_modules 中的用户 `.DS_Store`，改用明确列出除 Dashboard 外所有 Cargo feature 的组合运行 `cargo clippy -p clash-lib --all-targets --no-default-features --features zero_copy,tls,aws-lc-rs,tun,port,reality,vless-encryption,extended-health-check,ring,ws,anytls,shadowsocks,wireguard,trojan,hysteria,xhttp-h3,tproxy,redir,http_port,mixed_port,tracing --locked -- -D warnings`，通过。`cargo fmt --all -- --check` 与 `git diff --check` 通过。
 - 此项证明受控本地 TLS Trojan TCP 握手后的健康证据归属；未覆盖远端 Trojan 服务、WebSocket/gRPC、UDP、连接池或多网卡实机切换。全 feature Clippy 的 Dashboard build 分支仍因用户数据保留和 `npm ci` 环境问题未验证。
 
@@ -709,7 +709,7 @@ lifecycle tests.
 
 - 基线：本地 `master` `ee9ccbac776c7198fb7e4baff7eb6e48717199b1`；服务端绑定 loopback，使用测试生成的自签 TLS 证书并只在测试客户端跳过证书校验，不访问公网、不改宿主网络设置。
 - 新增 `tls_handshake_and_target_response_keep_the_dialed_path`：验证 AnyTLS SHA-256 密码校验、v2 SETTINGS（含 padding scheme）、SYN、携带目标地址的 PSH 帧，以及 tunneled 请求/响应。首选 wildcard 源路径被服务器接收后关闭，具体 loopback 源地址路径回退成功；断言获胜 PathId 沿链路保留，TLS endpoint socket 响应单独产生 `proxyEndpointTcp`，AnyTLS 解帧后的目标响应产生 1 字节 `proxyTcp` 证据，endpoint 与目标健康记录分别可用。
-- 定向用例通过：`CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo test -p clash-lib --lib --all-features --locked proxy::anytls::path_health_tests::tls_handshake_and_target_response_keep_the_dialed_path -- --exact --nocapture`。全库测试命令 `CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo test -p clash-lib --lib --no-default-features --features zero_copy,tls,aws-lc-rs,tun,port,reality,vless-encryption,extended-health-check,ring,ws,anytls,shadowsocks,wireguard,trojan,hysteria,xhttp-h3,tproxy,redir,http_port,mixed_port,tracing --locked` 为 1146 passed、0 failed、12 ignored；该组合启用所有 Rust feature，不启用仅驱动 npm 资源的 `dashboard` feature。
+- 定向用例通过：`CARGO_TARGET_DIR=/tmp/chimera-cargo-target cargo test -p clash-lib --lib --all-features --locked proxy::anytls::path_health_tests::tls_handshake_and_target_response_keep_the_dialed_path -- --exact --nocapture`。全库测试命令 `CARGO_TARGET_DIR=/tmp/chimera-cargo-target cargo test -p clash-lib --lib --no-default-features --features zero_copy,tls,aws-lc-rs,tun,port,reality,vless-encryption,extended-health-check,ring,ws,anytls,shadowsocks,wireguard,trojan,hysteria,xhttp-h3,tproxy,redir,http_port,mixed_port,tracing --locked` 为 1146 passed、0 failed、12 ignored；该组合启用所有 Rust feature，不启用仅驱动 npm 资源的 `dashboard` feature。
 - 全 `--all-features` 库测试与 Clippy 均在 Dashboard `npm ci` 时因 macOS `ENOTEMPTY`（`clash-dashboard/node_modules/lucide-react`）失败，Rust Clippy 尚未开始。为保留目录中的用户 `.DS_Store`，未改动 `node_modules`；显式 Rust feature 组合下全库 Clippy `-D warnings` 通过。`cargo fmt --all -- --check` 与 `git diff --check` 通过。
 - 此项证明受控本地 TLS AnyTLS TCP 握手后的路径和健康证据归属；不覆盖 sing-box/anytls-go 远端互操作、UDP-over-TCP、多路复用会话、池复用、其他路径 Explain 或真实网络切换。
 
@@ -717,42 +717,42 @@ lifecycle tests.
 
 - 基线：本地 `master` `226dd0c4a0ad231b49dd14bbafe4c47e81c3ff06`。测试服务端只绑定 loopback；证书在测试中生成，客户端跳过证书校验仅限测试，不访问公网、不修改宿主网络设置。
 - 新增 `udp_over_tcp_echo_keeps_the_dialed_path_and_health_evidence`：本地 TLS 服务端校验 AnyTLS v2 认证与 SETTINGS/SYN 帧、特殊 UoT stream 目标、connect 模式和实际 UDP 目标，然后按 length-prefixed 格式回显完整数据。客户端核对回包 payload/source/destination、获胜 PathId、`proxyEndpointTcp` 与 `proxyUdp` 收发证据，并确认 endpoint 和 UDP 目标分别产生可用健康记录。
-- 定向用例 `CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo test -p clash-lib --lib --all-features --locked proxy::anytls::path_health_tests::udp_over_tcp_echo_keeps_the_dialed_path_and_health_evidence -- --exact --nocapture` 通过。全 Rust feature 库测试命令 `CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo test -p clash-lib --lib --no-default-features --features zero_copy,tls,aws-lc-rs,tun,port,reality,vless-encryption,extended-health-check,ring,ws,anytls,shadowsocks,wireguard,trojan,hysteria,xhttp-h3,tproxy,redir,http_port,mixed_port,tracing --locked` 为 1147 passed、0 failed、12 ignored；Dashboard 外严格 Clippy 命令 `CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo clippy -p clash-lib --all-targets --no-default-features --features zero_copy,tls,aws-lc-rs,tun,port,reality,vless-encryption,extended-health-check,ring,ws,anytls,shadowsocks,wireguard,trojan,hysteria,xhttp-h3,tproxy,redir,http_port,mixed_port,tracing --locked -- -D warnings` 通过；`cargo fmt --all -- --check` 与 `git diff --check` 通过。`--all-features` 的完整测试/Clippy 仍被 Dashboard build `npm ci` 的 `ENOTEMPTY` 阻断，详情见上一条。
+- 定向用例 `CARGO_TARGET_DIR=/tmp/chimera-cargo-target cargo test -p clash-lib --lib --all-features --locked proxy::anytls::path_health_tests::udp_over_tcp_echo_keeps_the_dialed_path_and_health_evidence -- --exact --nocapture` 通过。全 Rust feature 库测试命令 `CARGO_TARGET_DIR=/tmp/chimera-cargo-target cargo test -p clash-lib --lib --no-default-features --features zero_copy,tls,aws-lc-rs,tun,port,reality,vless-encryption,extended-health-check,ring,ws,anytls,shadowsocks,wireguard,trojan,hysteria,xhttp-h3,tproxy,redir,http_port,mixed_port,tracing --locked` 为 1147 passed、0 failed、12 ignored；Dashboard 外严格 Clippy 命令 `CARGO_TARGET_DIR=/tmp/chimera-cargo-target cargo clippy -p clash-lib --all-targets --no-default-features --features zero_copy,tls,aws-lc-rs,tun,port,reality,vless-encryption,extended-health-check,ring,ws,anytls,shadowsocks,wireguard,trojan,hysteria,xhttp-h3,tproxy,redir,http_port,mixed_port,tracing --locked -- -D warnings` 通过；`cargo fmt --all -- --check` 与 `git diff --check` 通过。`--all-features` 的完整测试/Clippy 仍被 Dashboard build `npm ci` 的 `ENOTEMPTY` 阻断，详情见上一条。
 - 此项验证客户端 UoT 实际帧封装、UDP 回显及本机路径健康关联，不替代 anytls-go/sing-box 远端互操作、不同 MTU/大包、丢包/重连、多路复用与连接池切换测试。
 
 ### 2026-10-24：B7 VLESS TLS 路径健康闭环
 
 - 基线：本地 `master` `52b76e9c591e018952d719c331c4e33d0bff6d09`；测试服务端绑定 loopback，证书在内存生成，客户端跳过证书校验仅用于测试，不访问公网、不改宿主网络设置。
 - 新增 `tls_handshake_and_target_response_keep_the_dialed_path`：本地 TLS 服务端校验 VLESS 版本、UUID、空 add-on 长度、TCP 命令、VMess 地址编码与 `target-request`；服务端分次写入两字节响应头字段和单字节 `R` payload，验证客户端接受完整响应。TLS 层可能合并这些写入，因此这不证明客户端必然经历短读，也不覆盖短读恢复。客户端断言具体 loopback 源地址路径胜出、获胜 PathId 保留、endpoint TLS 收包产生 `proxyEndpointTcp`、VLESS 解包后的 `R` 产生 1 字节 `proxyTcp`，并核对该路径上的 endpoint/目标健康记录分别可用。
-- 定向命令 `CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo test -p clash-lib --lib --no-default-features --features zero_copy,tls,aws-lc-rs,tun,port,reality,vless-encryption,extended-health-check,ring,ws,anytls,shadowsocks,wireguard,trojan,hysteria,xhttp-h3,tproxy,redir,http_port,mixed_port,tracing --locked proxy::vless::path_health_tests::tls_handshake_and_target_response_keep_the_dialed_path -- --exact --nocapture` 通过。相同 Rust feature 组合全库测试为 1148 passed、0 failed、12 ignored；严格 Clippy `-D warnings`、`cargo fmt --all -- --check`、`git diff --check` 通过。
+- 定向命令 `CARGO_TARGET_DIR=/tmp/chimera-cargo-target cargo test -p clash-lib --lib --no-default-features --features zero_copy,tls,aws-lc-rs,tun,port,reality,vless-encryption,extended-health-check,ring,ws,anytls,shadowsocks,wireguard,trojan,hysteria,xhttp-h3,tproxy,redir,http_port,mixed_port,tracing --locked proxy::vless::path_health_tests::tls_handshake_and_target_response_keep_the_dialed_path -- --exact --nocapture` 通过。相同 Rust feature 组合全库测试为 1148 passed、0 failed、12 ignored；严格 Clippy `-D warnings`、`cargo fmt --all -- --check`、`git diff --check` 通过。
 - 本轮验证基础 VLESS-over-TLS TCP 与路径健康闭环；未覆盖 Xray/远端服务互操作、REALITY/Vision/gRPC/WS、加密扩展、UDP、连接池或真实网络切换。完整 `--all-features` 仍受 Dashboard `npm ci` 的 `ENOTEMPTY` 限制；其余 Rust feature 已在上述命令中完整启用。
 
 ### 2026-10-24：B10 成功 UDP 的单条路径 Explain 查询
 
 - 基线：本地 `master` `3506adff70af760a9aa9fb81c33264e34c212340`。测试复用 loopback UDP echo 与本地 SOCKS 入站，不访问公网、不修改宿主网络设置。
 - 扩展 `network_recovery_replaces_udp_socket_without_restarting_inbound`：在 `/flows` 找到真实 UDP association 的 `flowId`，再从 `/runtime/network/path-decisions` 选出同一 Flow 的成功记录，调用 `/runtime/network/path-decision/{flowId}` 并断言单条接口完整返回与列表一致的 JSON 记录。
-- 定向验证命令 `CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo test -p clash-lib --test direct_udp_integration_tests --no-default-features --features zero_copy,tls,aws-lc-rs,tun,port,reality,vless-encryption,extended-health-check,ring,ws,anytls,shadowsocks,wireguard,trojan,hysteria,xhttp-h3,tproxy,redir,http_port,mixed_port,tracing --locked network_recovery_replaces_udp_socket_without_restarting_inbound -- --exact --nocapture`：1 passed。该 feature 集合覆盖所有 Rust feature，排除只触发 Dashboard npm 资源构建的 `dashboard`；`cargo fmt --all -- --check` 与 `git diff --check` 通过。
+- 定向验证命令 `CARGO_TARGET_DIR=/tmp/chimera-cargo-target cargo test -p clash-lib --test direct_udp_integration_tests --no-default-features --features zero_copy,tls,aws-lc-rs,tun,port,reality,vless-encryption,extended-health-check,ring,ws,anytls,shadowsocks,wireguard,trojan,hysteria,xhttp-h3,tproxy,redir,http_port,mixed_port,tracing --locked network_recovery_replaces_udp_socket_without_restarting_inbound -- --exact --nocapture`：1 passed。该 feature 集合覆盖所有 Rust feature，排除只触发 Dashboard npm 资源构建的 `dashboard`；`cargo fmt --all -- --check` 与 `git diff --check` 通过。
 - 本项只补足现有成功 UDP decision detail 路由的真实 Controller 查询回归，不改变 API 实现；未覆盖 TCP 代理 Explain、失败/过期记录查询、认证拒绝或跨平台路径状态。
 
 ### 2026-10-24：B10 成功代理 TCP 的单条路径 Explain 查询
 
 - 基线：本地 `master` `a4ae4bd47e4acfea1c1c931d889c7afe9178d671`。使用本机两跳 SOCKS5 relay 和 HTTP target，不访问公网、不修改宿主网络设置。
 - 扩展 `dialer_proxy_connects_through_a_local_socks5_hop`：完成通过 `upstream-hop → leaf-proxy` 的本地 TCP 请求/响应后，在 `/flows?include_closed=true` 取得 TCP `flowId`，从 `/runtime/network/path-decisions` 找到该 ID 对应的 `connected`、`route.outbound=leaf-proxy` 记录，再查询 `/runtime/network/path-decision/{flowId}` 并比对完整记录。
-- 定向命令 `CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo test -p clash-lib --test connection_chain_tests --no-default-features --features zero_copy,tls,aws-lc-rs,tun,port,reality,vless-encryption,extended-health-check,ring,ws,anytls,shadowsocks,wireguard,trojan,hysteria,xhttp-h3,tproxy,redir,http_port,mixed_port,tracing --locked dialer_proxy_connects_through_a_local_socks5_hop -- --exact --nocapture`：1 passed。`cargo fmt --all -- --check` 与 `git diff --check` 通过。
+- 定向命令 `CARGO_TARGET_DIR=/tmp/chimera-cargo-target cargo test -p clash-lib --test connection_chain_tests --no-default-features --features zero_copy,tls,aws-lc-rs,tun,port,reality,vless-encryption,extended-health-check,ring,ws,anytls,shadowsocks,wireguard,trojan,hysteria,xhttp-h3,tproxy,redir,http_port,mixed_port,tracing --locked dialer_proxy_connects_through_a_local_socks5_hop -- --exact --nocapture`：1 passed。`cargo fmt --all -- --check` 与 `git diff --check` 通过。
 - 本项证明成功的受控 SOCKS5 多跳 TCP flow 可从 Controller `/flows` 追到 Explain 列表及单条详情；不覆盖其他代理协议、代理失败/过期记录、网络切换或远端互操作。
 
 ### 2026-10-24：B10 SOCKS 握手失败的单条路径 Explain 查询
 
 - 基线：本地 `master` `d5d5b22124be3f0ad4ebf8dad2ddd91d5c3436ab`。本地 SOCKS5 假服务接受 TCP 连接后立即关闭，不访问公网、不修改宿主网络设置。
 - 新增 `proxy_handshake_failure_is_queryable_from_path_explain`：通过本地 SOCKS 入站发起连接，令 outbound 的 SOCKS 握手因对端关闭而失败；轮询 `/runtime/network/path-decisions` 取得 `route.outbound=failing-proxy` 且 `outcome=dialFailed` 的记录，检查有错误类别与失败原因，再用相同 `flowId` 查询单条详情并核对完整 JSON。
-- 完整连接链集成测试命令 `CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo test -p clash-lib --test connection_chain_tests --no-default-features --features zero_copy,tls,aws-lc-rs,tun,port,reality,vless-encryption,extended-health-check,ring,ws,anytls,shadowsocks,wireguard,trojan,hysteria,xhttp-h3,tproxy,redir,http_port,mixed_port,tracing --locked -- --nocapture`：3 passed。Dashboard 外全 Rust feature Clippy 命令 `CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo clippy -p clash-lib --all-targets --no-default-features --features zero_copy,tls,aws-lc-rs,tun,port,reality,vless-encryption,extended-health-check,ring,ws,anytls,shadowsocks,wireguard,trojan,hysteria,xhttp-h3,tproxy,redir,http_port,mixed_port,tracing --locked -- -D warnings`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。
+- 完整连接链集成测试命令 `CARGO_TARGET_DIR=/tmp/chimera-cargo-target cargo test -p clash-lib --test connection_chain_tests --no-default-features --features zero_copy,tls,aws-lc-rs,tun,port,reality,vless-encryption,extended-health-check,ring,ws,anytls,shadowsocks,wireguard,trojan,hysteria,xhttp-h3,tproxy,redir,http_port,mixed_port,tracing --locked -- --nocapture`：3 passed。Dashboard 外全 Rust feature Clippy 命令 `CARGO_TARGET_DIR=/tmp/chimera-cargo-target cargo clippy -p clash-lib --all-targets --no-default-features --features zero_copy,tls,aws-lc-rs,tun,port,reality,vless-encryption,extended-health-check,ring,ws,anytls,shadowsocks,wireguard,trojan,hysteria,xhttp-h3,tproxy,redir,http_port,mixed_port,tracing --locked -- -D warnings`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。
 - 该记录验证 outbound connection setup 的失败结果可查询，错误发生在 TCP accept 之后的 SOCKS 握手阶段；不验证 TCP connect refusal 的逐候选 PathId 诊断，也不证明 TLS/各协议认证错误已有专用分类。过期记录 API、跨平台及远端互操作仍待验收。
 
 ### 2026-10-24：B10 单条路径 Explain 的 flowId 错误状态
 
 - 基线：本地 `master` `89c86613c2cfbd5b9179b3c02aff741064a677f0`。
 - 扩展 `runtime_path_preference_updates_are_versioned_and_temporary`：在自动路径观察器不支持平台的早退之前，对 `/runtime/network/path-decision/{flowId}` 分别发送格式错误的 UUID 与格式正确但不存在的 UUID，确认返回 `400 Bad Request` 和 `404 Not Found`。
-- 定向命令 `CARGO_TARGET_DIR=/private/tmp/chimera-client-capability-target cargo test -p clash-lib --test api_tests --no-default-features --features zero_copy,tls,aws-lc-rs,tun,port,reality,vless-encryption,extended-health-check,ring,ws,anytls,shadowsocks,wireguard,trojan,hysteria,xhttp-h3,tproxy,redir,http_port,mixed_port,tracing --locked runtime_path_preference_updates_are_versioned_and_temporary -- --exact --nocapture`：1 passed。`cargo fmt --all -- --check` 与 `git diff --check` 通过。
+- 定向命令 `CARGO_TARGET_DIR=/tmp/chimera-cargo-target cargo test -p clash-lib --test api_tests --no-default-features --features zero_copy,tls,aws-lc-rs,tun,port,reality,vless-encryption,extended-health-check,ring,ws,anytls,shadowsocks,wireguard,trojan,hysteria,xhttp-h3,tproxy,redir,http_port,mixed_port,tracing --locked runtime_path_preference_updates_are_versioned_and_temporary -- --exact --nocapture`：1 passed。`cargo fmt --all -- --check` 与 `git diff --check` 通过。
 - 这验证参数解析错误与缺失记录的 HTTP 状态；没有构造已过期但曾存在的记录，因此过期清理后的 API 行为仍未单独覆盖。
 
 ### 2026-10-24：B7 Dispatcher 代理 UDP 路径健康证据
@@ -782,14 +782,14 @@ lifecycle tests.
 
 - 基线：本地 `master` `64f881cd509bfefc2841675a4c28b6989b0f1cf1`。`dns_stream_builder` 的测试根证书参数只会在 `aws-lc-rs` 或 `ring` 启用的 TLS 分支中读取；将参数命名为 `_tls_root_store` 保留原分支行为，同时让无 TLS backend 的 `cfg(test)` 编译通过。没有改变生产逻辑。
 - 定向 `--no-default-features` Explain 过期 handler 测试为 1 passed。完整的零 feature 库测试可编译，但 22 个既有测试失败：它们无条件要求加密 DNS/TLS provider 或 TUN 能力；该组合不能代表功能测试的有效最小支持集。显式 `ring,tun,port` 组合的完整库单测为 786 passed、0 failed、12 ignored。
-- 验证使用独立 `/tmp` target（本仓库 `target` 链接到的测试盘只剩 33 MiB，第一次编译因盘满退出；未清理或改动该用户 target）。复现命令：`CARGO_TARGET_DIR=/tmp/chimera-client-no-default-target CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo test -p clash-lib --lib --no-default-features --features ring,tun,port --locked -j 6`。格式检查及 `git diff --check` 通过。
+- 验证使用独立 `/tmp` target（本仓库 `target` 链接到的测试盘只剩 容量信息已省略，第一次编译因盘满退出；未清理或改动该用户 target）。复现命令：`CARGO_TARGET_DIR=/tmp/chimera-cargo-target CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo test -p clash-lib --lib --no-default-features --features ring,tun,port --locked -j 6`。格式检查及 `git diff --check` 通过。
 - 尚未做完整零 feature 测试分支的 cfg 整理；下一步应按 TLS、TUN 等 feature 为依赖这些能力的测试加精确条件，或清楚记录其不属于受支持的测试组合，避免把功能被关闭误报成运行时回归。
 
 ### 2026-10-24：B10 过期 Explain Axum route-level 验证
 
 - 基线：本地 `master` `78c78f6b90bcda3b03326bbbecd14554c9d63a47`。将过期 Explain 测试从直接调用两个 handler 改为对 `/runtime/network/path-decisions` 与 `/runtime/network/path-decision/{flowId}` 的 Axum `oneshot` 请求。
 - 列表请求先于详情请求执行，独立验证列表路由会排除并清理过期记录；随后详情路由返回 404 和过期说明。测试使用生产同一 `status_routes` 和 `/runtime` 挂载路径，但没有启动 TCP listener，也没有经过生产鉴权/CORS/trace middleware；listener 的真实 HTTP 测试仍待补。
-- 验证：定向 `expired_path_decision_is_not_found_and_absent_from_list` 在 `--no-default-features --features ring,tun,port` 配置下 1 passed；`cargo fmt --all -- --check` 与 `git diff --check` 通过。该构建缓存位于 `/tmp/chimera-client-no-default-target`。同 feature 组合的首次 strict all-target Clippy 被既有 `clash-lib/src/proxy/transport/mod.rs:101` `items_after_test_module` lint 阻断；该测试模块位置已在后续小切片修正，见下文。
+- 验证：定向 `expired_path_decision_is_not_found_and_absent_from_list` 在 `--no-default-features --features ring,tun,port` 配置下 1 passed；`cargo fmt --all -- --check` 与 `git diff --check` 通过。该构建缓存位于 `/tmp/chimera-test-output`。同 feature 组合的首次 strict all-target Clippy 被既有 `clash-lib/src/proxy/transport/mod.rs:101` `items_after_test_module` lint 阻断；该测试模块位置已在后续小切片修正，见下文。
 
 ### 2026-10-24：B10 Shadowsocks TCP 单条路径 Explain 查询
 
@@ -869,7 +869,7 @@ lifecycle tests.
 
 - 基线：本地 `master` `6f71b06f7596930d42479d6871719b2dc02b7aa0`；`ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。本轮仅增加 connector 回归测试和本记录，不改生产拨号行为。
 - 新增 `proxy_endpoint_tcp_refusal_reports_attempted_path_ids`：用真实 loopback interface 和临时关闭的本地 TCP 端口触发拒绝，构造两个可用 PathId；断言结构化 `ProxyEndpointConnectError` 同时保留完整候选集合和两个实际尝试路径。
-- 验证：定向测试 1 passed；`ring,tun,port` 下完整 `clash-lib` 库测试 787 passed、0 failed、12 ignored；Dashboard 外同 feature 组合的 all-target strict Clippy（`-D warnings -D unused-variables`）、`cargo fmt --all -- --check`、`git diff --check` 通过。测试使用 `CARGO_TARGET_DIR=/private/tmp/chimera-client-no-default-target CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0`；仓库 `target` 卷及默认测试缓存卷空间不足，未清理既有缓存，改用已有低体积缓存完成验证。
+- 验证：定向测试 1 passed；`ring,tun,port` 下完整 `clash-lib` 库测试 787 passed、0 failed、12 ignored；Dashboard 外同 feature 组合的 all-target strict Clippy（`-D warnings -D unused-variables`）、`cargo fmt --all -- --check`、`git diff --check` 通过。测试使用 `CARGO_TARGET_DIR=/tmp/chimera-cargo-target CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0`；仓库 `target` 卷及默认测试缓存卷空间不足，未清理既有缓存，改用已有低体积缓存完成验证。
 - 此项证明 loopback 上的连接拒绝仍能返回逐候选 PathId 诊断；不覆盖非 loopback 实际网络错误、完整 Dispatcher Explain 返回、代理认证阶段错误或跨平台行为。
 
 ### 2026-10-30：Linux/macOS 只读实时快照纳入常规测试
@@ -901,7 +901,7 @@ lifecycle tests.
 ### 2026-10-24：修复 feature 组合下的测试 Clippy 阻断
 
 - 基线：本地 `master` `f7616356ff3ebd5923eb626e2d93af2db43a1470`。将 `s04br_tests` 从 `Transport` trait 定义之前移到 `clash-lib/src/proxy/transport/mod.rs` 文件末尾，消除 `items_after_test_module`。只调整测试模块位置，不改传输 trait、网络池实现或运行时行为。
-- `s04b` 相关单测为 66 passed；受支持最小 `ring,tun,port` feature 组合的完整 `clash-lib` 库测试为 786 passed、0 failed、12 ignored。Dashboard 外 strict all-target Clippy 命令 `CARGO_TARGET_DIR=/tmp/chimera-client-no-default-target CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo clippy -p clash-lib --all-targets --no-default-features --features ring,tun,port --locked -j 6 -- -D warnings -D unused-variables` 通过；格式与 diff 检查通过。
+- `s04b` 相关单测为 66 passed；受支持最小 `ring,tun,port` feature 组合的完整 `clash-lib` 库测试为 786 passed、0 failed、12 ignored。Dashboard 外 strict all-target Clippy 命令 `CARGO_TARGET_DIR=/tmp/chimera-cargo-target CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo clippy -p clash-lib --all-targets --no-default-features --features ring,tun,port --locked -j 6 -- -D warnings -D unused-variables` 通过；格式与 diff 检查通过。
 
 ### 2026-10-30：Dashboard 网络恢复诊断页
 
@@ -952,7 +952,7 @@ lifecycle tests.
 
 - 基线：本地 `master` `be68f4ea80383dc9bdf39f96e6c6e3296acf7ab3`，`origin/master` `aafb4ebdc389bc425b7556b1cb72f6a9560d0232`；参考检出 `ref/`、`ref-mihomo/`、`ref-meow/` 分别为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`、`63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`3bf59376708809386c20b648c4d709148a077a79`。本切片没有迁移参考代码。
 - Windows 现在用 IP Helper 读取适配器地址、运行状态、按优先顺序排列的 DNS 服务器、连接/搜索后缀，以及 IPv4/IPv6 默认路由；按“路由 metric + 接口 metric”挑选主路由，等价路由保留为 ambiguous 证据。候选路径按 family interface index 绑定临时 UDP socket，仅证明本地地址/接口可以绑定，不发送探测包。每次快照最多绑定探测 128 个候选；阻塞采集使用单一 permit，若超过 2 秒，后续轮询等待该任务释放 permit，不再并行堆积工作。现有 TUN interface index/名称用于排除虚拟隧道路径。自动网络恢复状态因此在 Windows 也会进入观察阶段。
-- 新增 Windows 路由选择、等价路由、TUN/断开接口过滤、IPv6 interface index、默认路由解析、DNS 顺序/后缀变化和候选探测上限用例，以及只读实时快照用例。macOS 上 `app::network::tests::` 定向测试 17 passed；核心库无默认 feature 的 `ring,tun,port` 严格 Clippy、`cargo fmt --all` 和 `git diff --check` 通过。Windows GNU target 的最小独立 harness 使用 `windows 0.62` 编译 Windows 模块和测试；`cargo clippy --manifest-path /private/tmp/chimera-win-network-check/Cargo.toml --target x86_64-pc-windows-gnu --tests -- -D warnings` 通过。该 harness 不等同于完整 `clash-lib` target 构建。
+- 新增 Windows 路由选择、等价路由、TUN/断开接口过滤、IPv6 interface index、默认路由解析、DNS 顺序/后缀变化和候选探测上限用例，以及只读实时快照用例。macOS 上 `app::network::tests::` 定向测试 17 passed；核心库无默认 feature 的 `ring,tun,port` 严格 Clippy、`cargo fmt --all` 和 `git diff --check` 通过。Windows GNU target 的最小独立 harness 使用 `windows 0.62` 编译 Windows 模块和测试；`cargo clippy --manifest-path /tmp/chimera-test-output --target x86_64-pc-windows-gnu --tests -- -D warnings` 通过。该 harness 不等同于完整 `clash-lib` target 构建。
 - 完整 `cargo check -p clash-lib --lib --tests --target x86_64-pc-windows-gnu --no-default-features --locked` 被本机缺少 MinGW C 工具链/Windows C 标准头文件阻断于 `zstd-sys`，尚未编译到完整 workspace 的 Windows target。Windows 代码没有在 Windows runner 或真实 Windows 机器运行；新增 live snapshot 测试也尚未执行。因此当前切片尚不能称为 Windows 跨平台验收完成，合入/推送前仍需完整 Windows CI，后续还需在真实多网卡/TUN 环境确认恢复行为。
 - 本机 Linux 交叉检查 `cargo check -p clash-lib --lib --target x86_64-unknown-linux-gnu --no-default-features --features ring,tun,port --locked -j 6` 在构建依赖 `ring` 时因缺少 `x86_64-linux-gnu-gcc` 停止，尚未编译到本项目 Linux cfg；这属于交叉编译工具链阻塞，不是源码失败。当前 macOS 主机没有 Docker、Linux cross-GCC 或 QEMU，故 Linux namespace V1/V2 和 Windows 实机验收仍须在目标 runner/专用环境执行。
 - 网络观察为 L2；独立 Reviewer 已对最终 SHA `325d65c3dad44c8a86b44d671559643828613c9e` 复审通过，维护者验收仍待确认。回滚方式是撤回本切片提交，恢复 Windows `AUTOMATIC_SUPPORTED=false` 及旧的 unsupported snapshot 路径；没有执行 push、release 或系统网络改动。
