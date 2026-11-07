@@ -115,3 +115,45 @@ python3 tools/dns_canary_audit.py \
 ## 数据保留和回滚
 
 分析器不安装代理、系统扩展或服务，回滚只需删除此测试工具和报告。原始抓包包含潜在隐私数据：最小化采集时长，按测试机组织的数据保留策略管理并及时删除；不要将原始 `tcpdump`、真实私有 `scutil --dns` 快照、订阅或真实 QNAME 直接上传公开 PR。输出结果是**一份经用户控制证据推导的离线报告**，不是独立、完整的系统网络审计。
+
+## 离线多场景汇总（`dns_canary_matrix.py`）
+
+系统级 DNS 验收不能只提交一次普通 Wi-Fi 查询。新增 **只读** 多场景汇总入口，对每个 case 的 manifest、原始抓包及 tcpdump 统计重新运行单场景审核，并汇总输入 SHA-256、缺失场景、人工风险标记和结果计数。每个 case 还输出刺激后 canary 数量及按 **IPv4/IPv6、UDP/TCP、DNS QTYPE** 分组的计数，方便核查具体覆盖；不会复制原始 QNAME、DNS 服务器或网络 IP 到矩阵报告。
+
+```sh
+python3 -m unittest discover -s tools/tests -p 'test_dns_canary_*.py' -q
+
+# 预先准备的纯虚构例子：故意只提交 1 个 case，因此退出码应为 4
+python3 tools/dns_canary_matrix.py tools/examples/dns_canary/matrix-incomplete.json
+
+# 真正离线汇总、生成权限 0600 的 JSON（须传入由测试人员准备的完整矩阵）
+python3 tools/dns_canary_matrix.py /path/to/private/matrix.json \
+  --output /path/to/private/summary.json
+```
+
+矩阵示例结构：
+
+```json
+{
+  "schema_version": 1,
+  "matrix_id": "macos_egress_run_001",
+  "profile": "macos_dns_egress_v1",
+  "required_cases": [
+    "wifi_a_aaaa", "tcp_53", "ipv6", "network_change",
+    "sleep_resume", "dns_upstream_failure", "tun_or_dns_proxy_unavailable"
+  ],
+  "cases": [
+    {"case_id": "wifi_a_aaaa", "manifest": "wifi_a_aaaa/manifest.json"}
+  ]
+}
+```
+
+其中 `cases[]` 每个条目的 `case_id` 必须与对应子目录里单场景 `manifest.json` 的 `case_id` 完全一致。路径均相对矩阵 JSON 所在目录，拒绝外部符号链接、路径穿越、重复 case / 重复底层 manifest。这里的例子特意缺少 6 个实际场景，因此**不是完整验收结果**。
+
+`profile: macos_dns_egress_v1` 是固定的**最低场景清单**：正常 Wi-Fi A/AAAA、TCP 53、IPv6、网络切换、睡眠恢复、DNS 上游故障和 TUN/DNS Proxy 不可用。缺任一场景即 `NOT_VERIFIED`，即使操作人员将 `required_cases` 自行缩减也不能跳过。`profile` 可省略，表示仅按操作人员提供的 `required_cases` 比对——这样的汇总只代表**自定义场景集合**，不能称作内置 macOS 基线验收。未知 profile 被拒绝。
+
+为降低复制旧证据冒充多场景的风险，内置 profile 还检查不同 case 是否重复使用同一 canary QNAME、刺激 UTC 时间戳或完全相同的抓包文件 SHA-256；同时核查 `wifi_a_aaaa` 在 utun 是否实际观测 A 与 AAAA、`tcp_53` 是否观测 TCP 查询，以及 `ipv6` 是否观测经 IPv6 传输的 AAAA 查询。缺少这些内容时输出 `profile_evidence_issues` 并判为 `NOT_VERIFIED`。这些规则不足以排除其他复制、伪造、时间偏差或场景标签错误，**每一场景是否真实执行仍需独立人工和 OS 证据**。切网、休眠和故障用例不会由这个工具自动触发。
+
+整组矩阵的退出码与单 case 一致：`0` 仅代表所列及内置要求的 case 均未在所提供日志中观察到物理 canary；`3` 表示至少一个 case 观察到物理 canary（即使其他 case 不完整，也优先保留正向证据）；`4` 表示缺少 case 或任一 case 不可验证；`2` 表示输入错误或输出文件无法安全创建。`system_zero_leak_verified` 永远为 `false`，需要实际 macOS service-scoped resolver ownership、NIC/utun 同步抓包、DoH/DoT 等额外独立验证。
+
+与单 case 一样，矩阵报告采用私有原子写入、默认禁止覆盖；显式 `--overwrite` 不会顺着符号链接写入目标。禁止用矩阵输出文件路径覆盖它本身、任何子 case manifest、tcpdump 日志、统计 stderr 或 `scutil` 快照；保存前再次逐项比对证据的 SHA-256，以免使用分析后被篡改的材料。
