@@ -1,0 +1,5 @@
+# SYNTHETIC EXAMPLE — NOT A REAL scutil --dns CAPTURE
+DNS configuration
+resolver #1
+  nameserver[0] : 192.0.2.53
+  if_index : 7 (utun7)
