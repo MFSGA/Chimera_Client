@@ -82,6 +82,7 @@ pub fn routes(
     dns_enabled: bool,
     ipv6_allowed: bool,
     controller_listener_ipv6: Arc<AtomicBool>,
+    patch_lock: Arc<Mutex<()>>,
 ) -> Router<Arc<AppState>> {
     Router::new()
         .route(
@@ -104,7 +105,7 @@ pub fn routes(
             dns_enabled,
             ipv6_allowed,
             controller_listener_ipv6,
-            patch_lock: Arc::new(Mutex::new(())),
+            patch_lock,
         })
 }
 
@@ -668,9 +669,9 @@ async fn patch_configs(
     State(state): State<ConfigState>,
     Json(payload): Json<PatchConfigRequest>,
 ) -> impl IntoResponse {
-    // Serialize PATCH requests while validating listener state and applying
-    // IPv6 policy; otherwise two valid snapshots can interleave into an
-    // IPv6 listener with IPv6 disabled.
+    // Serialize PATCH requests with each other and with TCP listener setup;
+    // otherwise a startup PATCH can disable IPv6 after the bind policy was
+    // read but before the IPv6 listener address is recorded.
     let _patch_guard = state.patch_lock.lock().await;
     let requested_bind_address = match payload.bind_address.as_deref() {
         Some(bind_address) => match bind_address.parse::<BindAddress>() {
