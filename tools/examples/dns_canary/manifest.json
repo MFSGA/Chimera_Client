@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "case_id": "synthetic_wifi_example",
+  "canary_qname": "canary.evidence.example.test",
+  "expected_physical_interfaces": [
+    "en0"
+  ],
+  "expected_tun_interfaces": [
+    "utun7"
+  ],
+  "resolver_snapshot": "scutil-dns.txt",
+  "captures": [
+    {
+      "role": "physical",
+      "interface": "en0",
+      "path": "en0.txt",
+      "started_at_utc": "2026-11-06T15:00:00Z",
+      "ended_at_utc": "2026-11-06T15:05:00Z"
+    },
+    {
+      "role": "tun",
+      "interface": "utun7",
+      "path": "utun7.txt",
+      "started_at_utc": "2026-11-06T15:00:30Z",
+      "ended_at_utc": "2026-11-06T15:06:00Z"
+    }
+  ]
+}

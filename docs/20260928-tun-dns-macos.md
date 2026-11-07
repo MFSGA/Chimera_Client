@@ -225,3 +225,9 @@ System DNS 指向一个与 fake-IP 池、TUN 网关子网及 route exclusions �
 - TUN + Ring 本地回归：`cargo test -p clash-lib --lib --no-default-features --features tun,ring --locked -j 6` 847 passed / 0 failed / 11 ignored；`cargo test -p clash-lib --test dns_config_tests --no-default-features --features tun,ring --locked -j 6` 30 passed；严格 Clippy、无 Dashboard CLI 编译、fmt 与 diff 检查通过。没有证据支持“整个 macOS 系统的 DNS 已被接管”或“物理网卡零泄漏”。
 - 剩余风险：DNS Proxy Extension ownership、macOS service-scoped resolver、浏览器内置 DoH/DoT、其它可能调用系统 resolver 的传输，以及独立授权测试机上的 IPv4/IPv6 NIC 与 utun 双边抓包未解决。动态 Provider 筛选基于此时的 TUN + Fake-IP 运行配置；运行时模式切换应通过重新构造 Provider 或显式重新校验完成，不能依赖旧标志代替真正的系统级 DNS 保护。
 - `tun,ring,anytls` 组合的最后回归：`cargo test -p clash-lib --lib --no-default-features --features tun,ring,anytls --locked -j 6` 887 passed / 0 failed / 11 ignored；DNS 配置 30 passed；严格 Clippy 通过。额外执行旧 S00 `dns_legacy_golden_tests` 全套仍为 12 passed / 1 failed，唯一失败仍是历史 `respect-rules` 未指定节点引导 DNS 的夹具冲突，未修改测试、未标为新回归。静态配置与动态 Provider 均按同一规则执行，但仍需后续 L2 独立代码审查及测试机系统级 DNS 出口验证。
+## 2026-11-06 DNS Canary 离线证据工具（未实机执行）
+
+- 为补充系统级 macOS DNS 防泄漏的**可审计证据**，新增 `tools/dns_canary_audit.py`、离线回归测试、虚构样例和单独的 [`DNS Canary 审计操作指南`](dns-canary-audit.md)。基于合并后 `master=286941f3370b1ddd003b332cea1be8054b915d4b` 的隔离分支开发，未修改运行时 TUN、DNS、系统路由或 Network Extension。
+- 工具仅读取测试人员保存的 macOS `tcpdump` 明文 UDP/TCP 53 文本日志和 `scutil --dns` 快照，按物理接口与 utun 分别记录测试专用 QNAME 的查询证据、IPv4/IPv6/TCP/UDP 类型、快照/抓包 SHA-256 和证据缺口。发现物理出口的 canary 会明确报告；缺少接口、无 utun canary、未解码非空 DNS payload、空抓包或缺快照则报告 `NOT_VERIFIED`，不能把缺失数据误判为零泄漏。
+- 默认不在 JSON 报告中输出其它域名或 IP 端点；原始抓包仍可能含私人 DNS，必须留在授权测试机保管。无论结果为何都保留 `system_zero_leak_verified: false`；该工具不能检测 DoH/DoT/DoQ、网络服务 resolver 优先级、完整物理接口覆盖或系统级接管。
+- 当前阶段只运行 Python 标准库离线单测与虚构样例；没有执行 `tcpdump`、`scutil`、DNS canary 真实查询，没有请求 root，也没有修改主机网络。真实抓包须由测试机所有者逐场景明确授权。
