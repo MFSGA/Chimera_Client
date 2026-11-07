@@ -89,6 +89,13 @@ async fn dashboard_websocket_payloads_match_typescript_models() {
     assert!(traffic["up"].is_u64());
     assert!(traffic["down"].is_u64());
 
+    let ws_traffic =
+        first_json_message(api_port, "/ws/traffic?token=clash-rs").await;
+    assert!(ws_traffic["up"].is_u64());
+    assert!(ws_traffic["down"].is_u64());
+    assert!(ws_traffic["upTotal"].is_u64());
+    assert!(ws_traffic["downTotal"].is_u64());
+
     let connections =
         first_json_message(api_port, "/connections?token=clash-rs").await;
     assert!(connections["connections"].is_array());
@@ -100,6 +107,35 @@ async fn dashboard_websocket_payloads_match_typescript_models() {
         first_json_message(api_port, "/flows?token=clash-rs&interval=1&top=10")
             .await;
     assert!(flows.is_array());
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn connections_websocket_interval_is_milliseconds() {
+    let (_clash, api_port) = start_client();
+    let url = format!(
+        "ws://127.0.0.1:{api_port}/ws/connections?token=clash-rs&interval=100"
+    );
+    let (mut socket, response) = connect_async(url)
+        .await
+        .expect("failed to connect to connections WebSocket");
+    assert_eq!(response.status(), http::StatusCode::SWITCHING_PROTOCOLS);
+
+    let started = tokio::time::Instant::now();
+    for _ in 0..2 {
+        let message = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("connections WebSocket did not send at millisecond cadence")
+            .expect("connections WebSocket closed before sending a snapshot")
+            .expect("failed to receive connections WebSocket snapshot");
+        let Message::Text(body) = message else {
+            panic!("connections WebSocket should send text JSON snapshots");
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(body.as_ref()).expect("snapshot should be JSON");
+        assert!(payload["connections"].is_array());
+    }
+    assert!(started.elapsed() < Duration::from_secs(2));
 }
 
 #[tokio::test(flavor = "current_thread")]

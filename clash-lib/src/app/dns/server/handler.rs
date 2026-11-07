@@ -375,6 +375,7 @@ mod tests {
     async fn non_a_queries_are_not_forwarded_for_fake_ip_domains() {
         let mut resolver = MockClashResolver::new();
         resolver.expect_ipv6().return_const(true);
+        resolver.expect_dns_ipv6().return_const(true);
         resolver
             .expect_should_fake_ip()
             .with(mockall::predicate::eq("example.com"))
@@ -812,6 +813,7 @@ mod tests {
         for record_type in [RecordType::HTTPS, RecordType::SVCB] {
             let mut resolver = MockClashResolver::new();
             resolver.expect_ipv6().return_const(true);
+            resolver.expect_dns_ipv6().return_const(true);
             resolver
                 .expect_should_fake_ip()
                 .with(mockall::predicate::eq("example.com"))

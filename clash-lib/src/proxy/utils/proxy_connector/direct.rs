@@ -1662,9 +1662,11 @@ mod tests {
         let source = NetworkPathSource::default();
         source.attach(status).await;
         let connector = DirectConnector::with_path_source(source);
+        let mut resolver = MockClashResolver::new();
+        resolver.expect_ipv6().return_const(false);
         let result = connector
             .connect_datagram_with_pool_context(
-                Arc::new(MockClashResolver::new()),
+                Arc::new(resolver),
                 None,
                 SocksAddr::Ip("198.51.100.53:53".parse().unwrap()),
                 None,
@@ -1701,9 +1703,11 @@ mod tests {
         let source = NetworkPathSource::default();
         source.attach(status).await;
         let connector = DirectConnector::with_path_source(source);
+        let mut resolver = MockClashResolver::new();
+        resolver.expect_ipv6().return_const(false);
         let (mut datagram, observed_context) = connector
             .connect_datagram_with_pool_context(
-                Arc::new(MockClashResolver::new()),
+                Arc::new(resolver),
                 None,
                 SocksAddr::Ip(address),
                 None,
