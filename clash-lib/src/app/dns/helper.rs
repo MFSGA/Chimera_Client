@@ -33,11 +33,14 @@ pub async fn make_clients(
     edns_client_subnet: Option<EdnsClientSubnet>,
     network_options: DnsClientNetworkOptions,
 ) -> Result<Vec<ThreadSafeDNSClient>, crate::Error> {
-    // Dedicated node DNS and bootstrap DNS must not construct transport
-    // streams using the implicit SystemResolver. The upstream bootstrap
+    // Dedicated node, bootstrap, and DHCP-discovered DNS must not construct
+    // transport streams using the implicit SystemResolver. The upstream bootstrap
     // (father) is a separate role and cannot substitute for this dialer.
     if !servers.is_empty()
-        && matches!(network_options.group, Some("proxy_server" | "bootstrap"))
+        && matches!(
+            network_options.group,
+            Some("proxy_server" | "bootstrap" | "dhcp")
+        )
         && outbound_resolver.is_none()
     {
         return Err(crate::Error::InvalidConfig(format!(
@@ -228,6 +231,55 @@ mod tests {
         .await
         .expect("explicitly managed resolver must remain supported");
         assert_eq!(managed.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dhcp_discovered_dns_requires_managed_transport_resolver() {
+        // DHCP nameservers are IP literals, but without an explicit
+        // transport resolver the lazy DNS stream builder instantiates a
+        // SystemResolver and leaves a future libc DNS escape hatch.
+        let upstream = NameServer {
+            net: DNSNetMode::Udp,
+            host: url::Host::Ipv4(std::net::Ipv4Addr::new(192, 0, 2, 53)),
+            port: 53,
+            interface: None,
+            proxy: None,
+            doh_path: None,
+        };
+        let registry =
+            || Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let group = || DnsClientNetworkOptions {
+            group: Some("dhcp"),
+            ..Default::default()
+        };
+        let result = make_clients(
+            vec![upstream.clone()],
+            None,
+            None,
+            registry(),
+            None,
+            group(),
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("DHCP DNS allowed implicit system transport resolver"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("explicit outbound resolver"), "{error}");
+
+        let managed: Arc<dyn ClashResolver> =
+            Arc::new(crate::app::dns::execution::LiteralOnlyResolver::default());
+        let clients = make_clients(
+            vec![upstream],
+            None,
+            Some(managed),
+            registry(),
+            None,
+            group(),
+        )
+        .await
+        .expect("DHCP discovered IP literal supports managed transport");
+        assert_eq!(clients.len(), 1);
     }
 
     #[tokio::test]
