@@ -130,6 +130,7 @@ impl Handler {
             sess.iface.as_ref(),
             #[cfg(target_os = "linux")]
             sess.so_mark,
+            resolver.ipv6(),
             Some((bind_ip, bind_port).into()),
         )
         .await?;

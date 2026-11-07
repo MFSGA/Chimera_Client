@@ -11,9 +11,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(feature = "xhttp-h3")]
-use std::sync::atomic::AtomicBool;
-
 use async_trait::async_trait;
 #[cfg(feature = "xhttp-h3")]
 use bytes::Buf;
@@ -22,6 +19,8 @@ use http::{Request, StatusCode, Version};
 use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
 use hyper::body::{Frame, Incoming};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+#[cfg(feature = "xhttp-h3")]
+use std::sync::atomic::AtomicBool;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     sync::{Mutex, mpsc},
@@ -57,18 +56,18 @@ use super::TlsClient;
 use super::Transport;
 #[cfg(all(feature = "tun", target_os = "linux"))]
 use crate::app::net::TUN_SOMARK;
-#[cfg(feature = "xhttp-h3")]
 use crate::{
     app::dns::ThreadSafeDNSResolver,
-    proxy::utils::RemoteConnector,
-    session::{Session, SocksAddr},
-};
-use crate::{
     common::errors::map_io_error,
     proxy::{
         AnyStream,
         utils::{NetworkPoolContext, new_protected_tcp_stream},
     },
+};
+#[cfg(feature = "xhttp-h3")]
+use crate::{
+    proxy::utils::RemoteConnector,
+    session::{Session, SocksAddr},
 };
 #[cfg(feature = "xhttp-h3")]
 use quinn::{
@@ -85,6 +84,26 @@ const READ_CHUNK_SIZE: usize = 8 * 1024;
 #[allow(dead_code)]
 const DEFAULT_XHTTP_ALPN: [&str; 1] = ["h2"];
 const DEFAULT_XHTTP_USER_AGENT: &str = "Mozilla/5.0";
+
+#[derive(Clone, Default)]
+struct GlobalIpv6Policy(Arc<std::sync::RwLock<Option<ThreadSafeDNSResolver>>>);
+
+impl GlobalIpv6Policy {
+    fn set_resolver(&self, resolver: ThreadSafeDNSResolver) {
+        *self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(resolver);
+    }
+
+    fn enabled(&self) -> bool {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_none_or(|resolver| resolver.ipv6())
+    }
+}
 
 type H1SendRequest =
     hyper::client::conn::http1::SendRequest<BoxBody<Bytes, Infallible>>;
@@ -477,6 +496,7 @@ pub struct Client {
     #[cfg(feature = "xhttp-h3")]
     h3_download_reuse_pool: Mutex<Vec<ReusableH3>>,
     download_reuse_pool: Mutex<Vec<ReusableH2>>,
+    ipv6_policy: GlobalIpv6Policy,
 }
 
 impl Client {
@@ -529,6 +549,7 @@ impl Client {
             h3_reuse_pool: Mutex::new(Vec::new()),
             download_reuse_max_connections,
             download_reuse_pool: Mutex::new(Vec::new()),
+            ipv6_policy: GlobalIpv6Policy::default(),
             #[cfg(feature = "xhttp-h3")]
             h3_download_reuse_pool: Mutex::new(Vec::new()),
         }
@@ -781,32 +802,74 @@ async fn secure_endpoint_stream(
 
 async fn connect_endpoint_stream(
     config: &XhttpEndpointConfig,
+    ipv6_policy: &GlobalIpv6Policy,
 ) -> io::Result<AnyStream> {
-    let endpoint = tokio::net::lookup_host((config.server.as_str(), config.port))
+    let endpoints = tokio::net::lookup_host((config.server.as_str(), config.port))
         .await?
-        .next()
-        .ok_or_else(|| io::Error::other("xhttp endpoint resolved no addresses"))?;
+        .collect::<Vec<_>>();
+    let had_ipv6_endpoint = endpoints.iter().any(|endpoint| endpoint.is_ipv6());
+    let mut errors = Vec::new();
     #[cfg(all(feature = "tun", target_os = "linux"))]
     let so_mark = *TUN_SOMARK.read().await;
     #[cfg(all(not(feature = "tun"), target_os = "linux"))]
     let so_mark = None;
-    let tcp = new_protected_tcp_stream(
-        endpoint,
-        None,
-        #[cfg(target_os = "linux")]
-        so_mark,
-    )
-    .await?;
-    secure_endpoint_stream(config, Box::new(tcp)).await
+    for endpoint in endpoints {
+        if !endpoint_allowed_for_global_policy(endpoint, ipv6_policy.enabled()) {
+            continue;
+        }
+        match new_protected_tcp_stream(
+            endpoint,
+            None,
+            #[cfg(target_os = "linux")]
+            so_mark,
+        )
+        .await
+        {
+            Ok(tcp) => return secure_endpoint_stream(config, Box::new(tcp)).await,
+            Err(error) => errors.push(format!("{endpoint}: {error}")),
+        }
+    }
+    if errors.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            if !ipv6_policy.enabled() && had_ipv6_endpoint {
+                format!(
+                    "IPv6 is disabled and xhttp endpoint {}:{} has no IPv4 address",
+                    config.server, config.port
+                )
+            } else {
+                format!(
+                    "xhttp endpoint {}:{} resolved no usable addresses",
+                    config.server, config.port
+                )
+            },
+        ));
+    }
+    Err(io::Error::other(format!(
+        "all xhttp endpoint addresses failed: {}",
+        errors.join("; ")
+    )))
+}
+
+fn endpoint_allowed_for_global_policy(
+    endpoint: std::net::SocketAddr,
+    ipv6_enabled: bool,
+) -> bool {
+    ipv6_enabled || endpoint.is_ipv4()
 }
 
 async fn connect_download_stream(
     config: &XhttpDownloadConfig,
+    ipv6_policy: &GlobalIpv6Policy,
 ) -> io::Result<AnyStream> {
-    connect_endpoint_stream(&XhttpEndpointConfig::from(config)).await
+    connect_endpoint_stream(&XhttpEndpointConfig::from(config), ipv6_policy).await
 }
 
-async fn connect_plain_stream(server: &str, port: u16) -> io::Result<AnyStream> {
+async fn connect_plain_stream(
+    server: &str,
+    port: u16,
+    ipv6_policy: &GlobalIpv6Policy,
+) -> io::Result<AnyStream> {
     let endpoint = XhttpEndpointConfig {
         server: server.to_owned(),
         port,
@@ -820,7 +883,7 @@ async fn connect_plain_stream(server: &str, port: u16) -> io::Result<AnyStream> 
         tls_key: None,
         reality: None,
     };
-    connect_endpoint_stream(&endpoint).await
+    connect_endpoint_stream(&endpoint, ipv6_policy).await
 }
 
 async fn acquire_download_sender(
@@ -832,8 +895,12 @@ async fn acquire_download_sender(
     Option<Arc<AtomicU64>>,
     Option<Arc<AtomicU64>>,
 )> {
-    let Some(reuse_policy) = download.reuse_policy.as_ref() else {
-        let stream = connect_download_stream(download).await?;
+    let Some(reuse_policy) = download
+        .reuse_policy
+        .as_ref()
+        .filter(|_| client.ipv6_policy.enabled())
+    else {
+        let stream = connect_download_stream(download, &client.ipv6_policy).await?;
         let sender = handshake_http2(stream, None).await?;
         return Ok((sender, None, None));
     };
@@ -862,7 +929,7 @@ async fn acquire_download_sender(
         ));
     }
 
-    let stream = connect_download_stream(download).await?;
+    let stream = connect_download_stream(download, &client.ipv6_policy).await?;
     let sender =
         handshake_http2(stream, Some(reuse_policy.h_keep_alive_period)).await?;
 
@@ -1807,7 +1874,12 @@ async fn acquire_h3_upload_sender(
     connector: &dyn RemoteConnector,
     pool_context: NetworkPoolContext,
 ) -> io::Result<H3UploadSender> {
-    let Some(reuse_policy) = client.reuse_policy.as_ref() else {
+    client.ipv6_policy.set_resolver(resolver.clone());
+    let Some(reuse_policy) = client
+        .reuse_policy
+        .as_ref()
+        .filter(|_| client.ipv6_policy.enabled())
+    else {
         let (sender, connected_context, socket) = connect_h3_sender(
             endpoint_config,
             sess,
@@ -1914,7 +1986,12 @@ async fn acquire_h3_download_sender(
     connector: &dyn RemoteConnector,
     pool_context: NetworkPoolContext,
 ) -> io::Result<H3DownlinkSender> {
-    let Some(reuse_policy) = download.reuse_policy.as_ref() else {
+    client.ipv6_policy.set_resolver(resolver.clone());
+    let Some(reuse_policy) = download
+        .reuse_policy
+        .as_ref()
+        .filter(|_| client.ipv6_policy.enabled())
+    else {
         let (sender, connected_context, socket) = connect_h3_sender(
             &XhttpEndpointConfig::from(download),
             sess,
@@ -2178,6 +2255,10 @@ async fn connect_h3_stream(
 
 #[async_trait]
 impl Transport for Client {
+    fn set_ipv6_resolver(&self, resolver: ThreadSafeDNSResolver) {
+        self.ipv6_policy.set_resolver(resolver);
+    }
+
     async fn reset_connection_pool(&self) -> io::Result<u32> {
         let mut cancellation = self.recovery_cancellation.lock().await;
         cancellation.cancel();
@@ -2204,6 +2285,7 @@ impl Transport for Client {
         resolver: crate::app::dns::ThreadSafeDNSResolver,
         connector: &dyn crate::proxy::utils::RemoteConnector,
     ) -> io::Result<Option<AnyStream>> {
+        self.set_ipv6_resolver(resolver.clone());
         Ok(self
             .connect_stream_with_connector_and_path_ids(sess, resolver, connector)
             .await?
@@ -2216,6 +2298,7 @@ impl Transport for Client {
         resolver: crate::app::dns::ThreadSafeDNSResolver,
         connector: &dyn crate::proxy::utils::RemoteConnector,
     ) -> io::Result<Option<(AnyStream, Vec<crate::app::flow::NetworkPathId>)>> {
+        self.set_ipv6_resolver(resolver.clone());
         let cancellation = self.recovery_cancellation.lock().await.clone();
         let outcome = tokio::select! {
             biased;
@@ -2381,6 +2464,9 @@ impl Transport for Client {
         &self,
         pool_context: NetworkPoolContext,
     ) -> io::Result<Option<AnyStream>> {
+        if !self.ipv6_policy.enabled() {
+            return Ok(None);
+        }
         Ok(self
             .try_reuse_stream_with_pool_metadata(pool_context)
             .await?
@@ -2391,6 +2477,9 @@ impl Transport for Client {
         &self,
         pool_context: NetworkPoolContext,
     ) -> io::Result<Option<(AnyStream, NetworkPoolContext)>> {
+        if !self.ipv6_policy.enabled() {
+            return Ok(None);
+        }
         let network_generation = pool_context.network_generation;
         let cancellation = self.recovery_cancellation.lock().await.clone();
         let outcome = tokio::select! {
@@ -2657,8 +2746,11 @@ async fn proxy_packet_up_http1(
             &client.padding,
             XhttpHttpVersion::Http1,
         )?;
-        let downlink_stream =
-            connect_endpoint_stream(&XhttpEndpointConfig::from(download)).await?;
+        let downlink_stream = connect_endpoint_stream(
+            &XhttpEndpointConfig::from(download),
+            &client.ipv6_policy,
+        )
+        .await?;
         let mut downlink_sender = handshake_http1(downlink_stream).await?;
         downlink_sender
             .send_request(downlink_request)
@@ -2713,6 +2805,7 @@ async fn proxy_packet_up_http1(
     let min_posts_interval_ms = client.min_posts_interval_ms;
     let upload_endpoint = client.upload_endpoint.clone();
     let use_tls = client.use_tls;
+    let ipv6_policy = client.ipv6_policy.clone();
 
     tokio::spawn(async move {
         let mut seq: u64 = 0;
@@ -2765,26 +2858,34 @@ async fn proxy_packet_up_http1(
                         }
                         last_write_at = Some(Instant::now());
 
-                        let upload_stream = if let Some(stream) =
-                            initial_upload_stream.take()
-                        {
-                            stream
-                        } else {
-                            match upload_endpoint.as_ref() {
-                                Some(endpoint) => {
-                                    match connect_endpoint_stream(endpoint).await {
+                        let upload_stream =
+                            if let Some(stream) = initial_upload_stream.take() {
+                                stream
+                            } else {
+                                match upload_endpoint.as_ref() {
+                                    Some(endpoint) => match connect_endpoint_stream(
+                                        endpoint,
+                                        &ipv6_policy,
+                                    )
+                                    .await
+                                    {
                                         Ok(stream) => stream,
                                         Err(_) => return,
+                                    },
+                                    None => {
+                                        match connect_plain_stream(
+                                            &server,
+                                            port,
+                                            &ipv6_policy,
+                                        )
+                                        .await
+                                        {
+                                            Ok(stream) => stream,
+                                            Err(_) => return,
+                                        }
                                     }
                                 }
-                                None => {
-                                    match connect_plain_stream(&server, port).await {
-                                        Ok(stream) => stream,
-                                        Err(_) => return,
-                                    }
-                                }
-                            }
-                        };
+                            };
                         let mut sender = match handshake_http1(upload_stream).await {
                             Ok(sender) => sender,
                             Err(_) => return,

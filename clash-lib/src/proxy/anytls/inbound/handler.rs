@@ -11,6 +11,7 @@ use super::{
 use crate::app::net::TUN_SOMARK;
 use crate::{
     Dispatcher,
+    app::dns::ThreadSafeDNSResolver,
     proxy::{AnyStream, utils::new_protected_tcp_stream},
     session::{Network, Session, SocksAddr, Type},
 };
@@ -28,14 +29,29 @@ const DUPLEX_BUFFER_SIZE: usize = 64 * 1024;
 /// Read buffer size for framed relay (mirrors the outbound).
 const RELAY_BUFFER_SIZE: usize = 16 * 1024;
 
+fn filter_fallback_endpoints(
+    mut endpoints: Vec<SocketAddr>,
+    ipv6_enabled: bool,
+) -> Vec<SocketAddr> {
+    if !ipv6_enabled {
+        endpoints.retain(|endpoint| endpoint.is_ipv4());
+    }
+    endpoints
+}
+
 /// Forward an unauthenticated TLS stream to a fallback backend for camouflage.
 ///
 /// The 32 bytes already consumed for the password check are prepended before
 /// piping the rest of the (decrypted) application stream to the backend.
 async fn connect_fallback_backend(
     fallback_addr: &str,
+    resolver: ThreadSafeDNSResolver,
 ) -> std::io::Result<tokio::net::TcpStream> {
-    let endpoints = tokio::net::lookup_host(fallback_addr).await?;
+    let endpoints = tokio::net::lookup_host(fallback_addr)
+        .await?
+        .collect::<Vec<_>>();
+    let had_ipv6_endpoint = endpoints.iter().any(SocketAddr::is_ipv6);
+    let endpoints = filter_fallback_endpoints(endpoints, resolver.ipv6());
     #[cfg(all(target_os = "linux", feature = "tun"))]
     let so_mark = *TUN_SOMARK.read().await;
     #[cfg(all(target_os = "linux", not(feature = "tun")))]
@@ -43,6 +59,9 @@ async fn connect_fallback_backend(
     let mut errors = Vec::new();
 
     for endpoint in endpoints {
+        if !resolver.ipv6() && endpoint.is_ipv6() {
+            continue;
+        }
         match new_protected_tcp_stream(
             endpoint,
             None,
@@ -59,7 +78,13 @@ async fn connect_fallback_backend(
     if errors.is_empty() {
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("fallback address {fallback_addr} resolved to no endpoints"),
+            if !resolver.ipv6() && had_ipv6_endpoint {
+                format!(
+                    "IPv6 is disabled and fallback address {fallback_addr} has no IPv4 endpoint"
+                )
+            } else {
+                format!("fallback address {fallback_addr} resolved to no endpoints")
+            },
         ))
     } else {
         Err(std::io::Error::other(format!(
@@ -74,8 +99,9 @@ async fn handle_fallback(
     already_read: &[u8],
     fallback_addr: &str,
     src_addr: SocketAddr,
+    resolver: ThreadSafeDNSResolver,
 ) {
-    let mut backend = match connect_fallback_backend(fallback_addr).await {
+    let mut backend = match connect_fallback_backend(fallback_addr, resolver).await {
         Ok(stream) => stream,
         Err(error) => {
             debug!(
@@ -118,6 +144,7 @@ async fn do_handshake(
     acceptor: TlsAcceptor,
     user_map: Arc<HashMap<[u8; 32], String>>,
     fallback: Option<String>,
+    resolver: ThreadSafeDNSResolver,
 ) -> Option<(
     tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
     Option<String>,
@@ -150,7 +177,14 @@ async fn do_handshake(
         }
         None => {
             if let Some(addr) = fallback {
-                handle_fallback(tls_stream, &hash_buf, &addr, src_addr).await;
+                handle_fallback(
+                    tls_stream,
+                    &hash_buf,
+                    &addr,
+                    src_addr,
+                    resolver.clone(),
+                )
+                .await;
             } else {
                 warn!(
                     "anytls inbound rejected connection from {src_addr}: wrong \
@@ -276,7 +310,14 @@ pub(super) async fn handle_connection(
 
     let handshake_result = timeout(
         HANDSHAKE_TIMEOUT,
-        do_handshake(raw_stream, src_addr, acceptor, user_map, fallback),
+        do_handshake(
+            raw_stream,
+            src_addr,
+            acceptor,
+            user_map,
+            fallback,
+            dispatcher.resolver(),
+        ),
     )
     .await;
 
@@ -601,6 +642,7 @@ async fn handle_tcp_relay(
 
 #[cfg(test)]
 mod tests {
+    use super::filter_fallback_endpoints;
     use crate::{
         proxy::anytls::inbound::{
             framing::{
@@ -619,6 +661,21 @@ mod tests {
         net::{TcpListener, TcpStream},
     };
     use tokio_rustls::TlsConnector;
+
+    #[test]
+    fn fallback_uses_only_ipv4_when_global_ipv6_is_disabled() {
+        let ipv4 = "192.0.2.1:443".parse().unwrap();
+        let ipv6 = "[2001:db8::1]:443".parse().unwrap();
+
+        assert_eq!(
+            filter_fallback_endpoints(vec![ipv6, ipv4], false),
+            vec![ipv4]
+        );
+        assert_eq!(
+            filter_fallback_endpoints(vec![ipv6, ipv4], true),
+            vec![ipv6, ipv4]
+        );
+    }
 
     fn install_crypto_provider() {
         crate::setup_default_crypto_provider();
@@ -841,7 +898,9 @@ mod tests {
             return; // authenticated — not testing this path
         }
         if let Some(addr) = fallback {
-            super::handle_fallback(tls, &hash_buf, &addr, src).await;
+            let resolver =
+                Arc::new(crate::app::dns::SystemResolver::new(true).unwrap());
+            super::handle_fallback(tls, &hash_buf, &addr, src, resolver).await;
         }
     }
 
