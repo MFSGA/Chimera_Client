@@ -44,11 +44,7 @@ def _matrix_manifest(path: Path) -> dict[str, Any]:
     if path.stat().st_size > MAX_MATRIX_BYTES:
         raise audit.AuditError("matrix manifest exceeds 256 KiB")
     try:
-        data = json.loads(
-            path.read_text(encoding="utf-8"),
-            object_pairs_hook=audit.reject_duplicate_json_keys,
-            parse_constant=audit.reject_non_json_constant,
-        )
+        data = audit.parse_strict_json(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise audit.AuditError("cannot read valid JSON matrix manifest") from error
     if (not isinstance(data, dict)

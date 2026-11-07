@@ -892,6 +892,33 @@ class AuditTests(unittest.TestCase):
         with self.assertRaisesRegex(audit.AuditError, "duplicate JSON"):
             audit.analyze_manifest(manifest)
 
+    def test_deeply_nested_json_rejected_without_unhandled_recursion_error(self) -> None:
+        manifest = self.save_manifest()
+        manifest.write_text(
+            '{"schema_version":1,"unused":' + "[" * 2000 + "0" + "]" * 2000 + "}",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(audit.AuditError, "nested JSON"):
+            audit.analyze_manifest(manifest)
+
+    def test_oversized_json_integer_rejected_before_parsing(self) -> None:
+        manifest = self.save_manifest()
+        raw = manifest.read_text(encoding="utf-8")
+        raw = raw.replace('"canary_observation_deadline_seconds": 30',
+                          '"canary_observation_deadline_seconds": ' + "9" * 5000)
+        manifest.write_text(raw, encoding="utf-8")
+        with self.assertRaisesRegex(audit.AuditError, "JSON integer exceeds"):
+            audit.analyze_manifest(manifest)
+
+    def test_floating_point_json_is_invalid_audit_evidence(self) -> None:
+        manifest = self.save_manifest()
+        raw = manifest.read_text(encoding="utf-8")
+        raw = raw.replace('"canary_observation_deadline_seconds": 30',
+                          '"canary_observation_deadline_seconds": 1.5')
+        manifest.write_text(raw, encoding="utf-8")
+        with self.assertRaisesRegex(audit.AuditError, "floating-point JSON"):
+            audit.analyze_manifest(manifest)
+
     def test_nonstandard_json_nan_is_rejected(self) -> None:
         path = self.save_manifest()
         raw = path.read_text(encoding="utf-8")

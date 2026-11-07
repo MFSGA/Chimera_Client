@@ -311,6 +311,35 @@ class MatrixTests(unittest.TestCase):
         with self.assertRaisesRegex(audit.AuditError, "duplicate JSON"):
             matrix.analyze_matrix(path)
 
+    def test_deeply_nested_matrix_json_fails_closed(self) -> None:
+        path = self.write_matrix()
+        path.write_text(
+            '{"schema_version":1,"unused":' + "[" * 2000 + "0" + "]" * 2000 + "}",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(audit.AuditError, "nested JSON"):
+            matrix.analyze_matrix(path)
+
+    def test_extremely_long_matrix_integer_is_rejected_before_parsing(self) -> None:
+        path = self.write_matrix()
+        raw = path.read_text(encoding="utf-8")
+        path.write_text(
+            raw.replace('"schema_version": 1', '"schema_version": ' + "9" * 5000),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(audit.AuditError, "JSON integer exceeds"):
+            matrix.analyze_matrix(path)
+
+    def test_floating_point_matrix_json_is_rejected(self) -> None:
+        path = self.write_matrix()
+        raw = path.read_text(encoding="utf-8")
+        path.write_text(
+            raw.replace('"schema_version": 1', '"schema_version": 1.0'),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(audit.AuditError, "floating-point JSON"):
+            matrix.analyze_matrix(path)
+
     def test_nonstandard_json_infinity_is_rejected(self) -> None:
         path = self.write_matrix()
         raw = path.read_text(encoding="utf-8")

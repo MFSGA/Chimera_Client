@@ -156,15 +156,33 @@ def reject_non_json_constant(value: str) -> Any:
     raise AuditError("nonstandard JSON numeric constant is invalid evidence")
 
 
+def parse_strict_json(contents: str) -> Any:
+    """Bound integer parsing and depth, reject floats, NaN and duplicate keys."""
+    def bounded_int(value: str) -> int:
+        if len(value.lstrip("-")) > 18:
+            raise AuditError("JSON integer exceeds 18 digits")
+        return int(value)
+
+    def no_float(value: str) -> Any:
+        raise AuditError("floating-point JSON values are unsupported in audit manifests")
+
+    try:
+        return json.loads(
+            contents,
+            object_pairs_hook=reject_duplicate_json_keys,
+            parse_constant=reject_non_json_constant,
+            parse_int=bounded_int,
+            parse_float=no_float,
+        )
+    except RecursionError as error:
+        raise AuditError("excessively nested JSON evidence is not supported") from error
+
+
 def _load_manifest(path: Path) -> dict[str, Any]:
     if path.stat().st_size > MAX_MANIFEST_BYTES:
         raise AuditError("manifest exceeds 256 KiB; reject oversized evidence inventory")
     try:
-        manifest = json.loads(
-            path.read_text(encoding="utf-8"),
-            object_pairs_hook=reject_duplicate_json_keys,
-            parse_constant=reject_non_json_constant,
-        )
+        manifest = parse_strict_json(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise AuditError("cannot read valid JSON manifest") from error
     if (not isinstance(manifest, dict)
