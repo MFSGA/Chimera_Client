@@ -398,9 +398,10 @@ impl Runner for ApiRunner {
         let dns_listen_addr = self.dns_listen_addr.clone();
         let dns_enabled = self.dns_enabled;
         let ipv6_allowed = self.ipv6_allowed;
-        let global_ipv6_enabled = dns_resolver.ipv6();
         let controller_listener_ipv6 = Arc::new(AtomicBool::new(false));
         let controller_listener_ipv6_for_routes = controller_listener_ipv6.clone();
+        let patch_lock = Arc::new(Mutex::new(()));
+        let patch_lock_for_routes = patch_lock.clone();
         let cancellation_token = self.cancellation_token.clone();
         let ready_tx = self
             .ready_tx
@@ -458,6 +459,7 @@ impl Runner for ApiRunner {
                         dns_enabled,
                         ipv6_allowed,
                         controller_listener_ipv6_for_routes,
+                        patch_lock_for_routes,
                     ),
                 )
                 .nest(
@@ -525,8 +527,12 @@ impl Runner for ApiRunner {
                 .layer(router_clone);
                 let tcp_ready_signal = ready_signal.clone();
                 let controller_listener_ipv6 = controller_listener_ipv6.clone();
+                let patch_lock = patch_lock.clone();
+                let dns_resolver = dns_resolver.clone();
                 Some(async move {
                     info!("Starting API server on TCP address {bind_addr}");
+                    let patch_guard = patch_lock.lock().await;
+                    let global_ipv6_enabled = dns_resolver.ipv6();
                     let listener = match bind_api_tcp_after_shutdown(
                         &bind_addr,
                         global_ipv6_enabled,
@@ -548,8 +554,6 @@ impl Runner for ApiRunner {
                         .is_some_and(|secret| !secret.is_empty());
                     let security_result = match listener.local_addr() {
                         Ok(addr) => {
-                            controller_listener_ipv6
-                                .store(addr.is_ipv6(), Ordering::Relaxed);
                             match validate_api_server_security(
                                 addr,
                                 has_secret,
@@ -596,6 +600,10 @@ impl Runner for ApiRunner {
                         tcp_ready_signal.fail(err.to_string());
                         return Err(err);
                     }
+                    let actual_ipv6 =
+                        listener.local_addr().map_err(crate::Error::Io)?.is_ipv6();
+                    controller_listener_ipv6.store(actual_ipv6, Ordering::Relaxed);
+                    drop(patch_guard);
                     tcp_ready_signal.ready();
                     axum::serve(
                         listener,
