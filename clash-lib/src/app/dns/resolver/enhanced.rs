@@ -3418,6 +3418,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn node_bootstrap_mixed_case_wire_query_never_uses_default_node_dns() {
+        let policy_hits = Arc::new(AtomicUsize::new(0));
+        let default_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+                hits: default_hits.clone(),
+                id: "node-default",
+            })],
+            false,
+        );
+        resolver.proxy_node_resolver = true;
+        let mut policy = crate::common::trie::StringTrie::new();
+        policy.insert("node.example.com", Arc::new(true));
+        resolver.proxy_server_nameserver_policy.push((
+            Arc::new(policy),
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+                hits: policy_hits.clone(),
+                id: "node-specific",
+            })],
+        ));
+        let mut raw_query = test_query_with_type(rr::RecordType::A);
+        raw_query.queries[0]
+            .set_name(rr::Name::from_utf8("NoDe.ExAmPlE.CoM.").unwrap());
+        resolver.ip_exchange(&raw_query).await.unwrap();
+        assert_eq!(
+            policy_hits.load(Ordering::SeqCst),
+            1,
+            "node policy must handle mixed-case wire QNAME"
+        );
+        assert_eq!(
+            default_hits.load(Ordering::SeqCst),
+            0,
+            "unmatched node policy must not fall back to default node DNS"
+        );
+    }
+
+    #[tokio::test]
+    async fn node_bootstrap_policy_failure_does_not_try_default_or_general_fallback()
+    {
+        let default_hits = Arc::new(AtomicUsize::new(0));
+        let fallback_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+                hits: default_hits.clone(),
+                id: "node-default",
+            })],
+            false,
+        );
+        resolver.proxy_node_resolver = true;
+        resolver.fallback = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 12)),
+            hits: fallback_hits.clone(),
+            id: "general-fallback",
+        })]);
+        let mut matcher = crate::common::trie::StringTrie::new();
+        matcher.insert("node.example.com", Arc::new(true));
+        resolver.proxy_server_nameserver_policy.push((
+            Arc::new(matcher),
+            vec![Arc::new(FailingClient {
+                id: "node-policy",
+                reason: "dedicated node DNS offline",
+            })],
+        ));
+        let mut node_query = test_query_with_type(rr::RecordType::A);
+        node_query.queries[0]
+            .set_name(rr::Name::from_utf8("node.example.com.").unwrap());
+        let error = resolver
+            .ip_exchange(&node_query)
+            .await
+            .expect_err("node policy failure must be terminal");
+        assert!(error.to_string().contains("dedicated node DNS offline"));
+        assert_eq!(default_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn proxy_server_specific_policy_failure_never_falls_back_to_public_dns() {
         let mut resolver = EnhancedResolver::from_clients(vec![], false);
         let default_hits = Arc::new(AtomicUsize::new(0));
