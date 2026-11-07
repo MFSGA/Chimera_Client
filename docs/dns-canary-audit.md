@@ -9,8 +9,8 @@
 此阶段专门收集“测试专用 canary QNAME 是否出现在物理接口的明文 DNS 查询（UDP/TCP 目标端口 53）上”的证据，同时观察它是否出现在对应 `utun` 上。
 
 - **物理网卡发现 canary**：报告 `PHYSICAL_CANARY_PLAINTEXT_DNS_OBSERVED`。这能证明在所提供的抓包里看到该明文查询，但是否属于未授权泄漏仍要结合预期代理/DIRECT 策略判断。
-- **物理网卡未发现 canary、utun 在公共采集时段内有 canary，物理网卡同一时段存在端口 53 报文，且清单、日志与时间戳基本一致**：报告 `NO_PHYSICAL_CANARY_OBSERVED_IN_SUPPLIED_LOGS`。**仅指提供的文本中没有看到**，不证明接口覆盖充分、OS 时钟准确、macOS resolver 优先级或零泄漏。
-- **证据不足**：`NOT_VERIFIED`。例如缺少活动物理网卡或 utun 的日志、没有 canary 在公共时段到达 utun、未提供 tcpdump 时间戳的 UTC 偏移、数据包时间戳与声明的采集窗口不符、`scutil --dns` 快照缺失或记录时间不在公共窗口内、快照没有基本的 resolver/nameserver 行、存在未解码的 DNS 非空载荷，或某份日志没有有效的 53 端口数据包行。
+- **物理网卡未发现 canary、utun 在公共采集时段且本次 canary 刺激发出后的合理时间内有 canary，物理网卡同一时段存在端口 53 报文，且清单、日志与时间戳基本一致**：报告 `NO_PHYSICAL_CANARY_OBSERVED_IN_SUPPLIED_LOGS`。**仅指提供的文本中没有看到**，不证明接口覆盖充分、OS 时钟准确、macOS resolver 优先级或零泄漏。
+- **证据不足**：`NOT_VERIFIED`。例如缺少活动物理网卡或 utun 的日志、没有 canary 在公共时段和本次刺激时间之后到达 utun、没有记录刺激时间或共同捕获窗口不足以覆盖整个观察期限、未提供 tcpdump 时间戳的 UTC 偏移、数据包时间戳与声明的采集窗口不符、`scutil --dns` 快照缺失或记录时间不在公共窗口内、快照没有基本的 resolver/nameserver 行、存在未解码的 DNS 非空载荷，或某份日志没有有效的 53 端口数据包行。
 - **始终**输出 `system_zero_leak_verified: false`。DoH/DoT/DoQ、mDNS、服务专属 resolver、DNS Proxy Extension ownership、浏览器自己的 DNS、未抓取网卡、TCP 重组失败和真实代理互操作均不在这项离线验证范围内。
 
 ## 本地零网络测试（无需 macOS 特权）
@@ -52,7 +52,7 @@ python3 tools/dns_canary_audit.py \
 
    为每个捕获进程手工记录开启和停止时的 UTC 时间（例如执行 `date -u '+%Y-%m-%dT%H:%M:%SZ'`），并记录抓包期间当前系统的 UTC 偏移（例如通过只读 `date '+%z'` 确认后填写 `-08:00`）。不同接口必须存在共同的采集窗口；工具还会尝试将 `tcpdump -tttt` 的本地时间戳转为 UTC，核对数据包自身是否落在各自声明窗口、utun canary 是否在公共时段内出现。**时钟同步、操作者时间声明及固定 UTC 偏移都不是独立证明**；跨夏令时/DST 跳变的采集必须拆成不同 case，不能只给整段一个偏移。
 
-3. **记录系统 DNS 状态和受控 canary**。在捕获时段保存 `scutil --dns > scutil-dns.txt`（只读），并记录该快照采集时的 UTC 时间（对应 manifest 的 `resolver_snapshot_recorded_at_utc`）。工具只核对独立一行的 `DNS configuration` 标题、`resolver #` 与 `nameserver[0]` 等基本文本结构及时间窗口；报告仅显示 resolver/nameserver 数量，不输出其具体 IP。**这种形状检查不证明配置是操作系统的真实快照，更不证明 service-scoped DNS 已被 Chimera 接管。** 工具还会识别 `DNS configuration (for scoped queries)` 区块或 resolver 上的 `flags : Scoped`，统计接口为 `en0` 等非 utun/loopback 的 scoped resolver，并添加 `review_flags: ["physical_scoped_dns_resolver_present"]` 供人工核对；接口名称缺失时标记 `scoped_resolver_interface_unknown`。**这些均是风险提示，不是实际物理出口 DNS 查询的证据，也不会凭该提示改变 canary 判定。** 由所有者控制专属测试域名并发起一次明确的系统 resolver 查询。可选使用 `dns-sd -G v4v6 <专属canary域名>`（需手动停止），它与直接使用 `dig @server` 测试上游不是同一种路径。对于强制 TCP 53、断线、切换 Wi-Fi、休眠唤醒等情境分别创建 case，不能把一个正常 A 查询的结果冒充所有场景通过。
+3. **记录系统 DNS 状态和受控 canary**。在捕获时段保存 `scutil --dns > scutil-dns.txt`（只读），并记录该快照采集时的 UTC 时间（对应 manifest 的 `resolver_snapshot_recorded_at_utc`）。工具只核对独立一行的 `DNS configuration` 标题、`resolver #` 与 `nameserver[0]` 等基本文本结构及时间窗口；报告仅显示 resolver/nameserver 数量，不输出其具体 IP。**这种形状检查不证明配置是操作系统的真实快照，更不证明 service-scoped DNS 已被 Chimera 接管。** 工具还会识别 `DNS configuration (for scoped queries)` 区块或 resolver 上的 `flags : Scoped`，统计接口为 `en0` 等非 utun/loopback 的 scoped resolver，并添加 `review_flags: ["physical_scoped_dns_resolver_present"]` 供人工核对；接口名称缺失时标记 `scoped_resolver_interface_unknown`。**这些均是风险提示，不是实际物理出口 DNS 查询的证据，也不会凭该提示改变 canary 判定。** 由所有者控制每次测试**唯一**的专属 canary 域名，先记录 `canary_stimulus_at_utc` 的准确 UTC 时间，再人工发起系统 resolver 查询；`canary_observation_deadline_seconds` 默认 30，可在 1–300 秒内调整，但所有受测网卡的共同捕获窗口必须完整包含 `[刺激时间, 截止时间]`。可选使用 `dns-sd -G v4v6 <专属canary域名>`（需手动停止），它与直接使用 `dig @server` 测试上游不是同一种路径。缓存命中可能导致没有真实 DNS 包，此时应为 `NOT_VERIFIED` 而不是把先前采集的查询冒充本次请求。对于强制 TCP 53、断线、切换 Wi-Fi、休眠唤醒等情境分别创建 case，不能把一个正常 A 查询的结果冒充所有场景通过。
 4. **整理 manifest**。将抓包及快照保存在相同证据目录；例如：
 
    ```json
@@ -60,6 +60,8 @@ python3 tools/dns_canary_audit.py \
      "schema_version": 1,
      "case_id": "wifi_up_ipv4_ipv6",
      "canary_qname": "unique-canary.your-controlled-test-domain.example",
+     "canary_stimulus_at_utc": "2026-11-06T15:00:00Z",
+     "canary_observation_deadline_seconds": 30,
      "expected_physical_interfaces": ["en0"],
      "expected_tun_interfaces": ["utun7"],
      "resolver_snapshot": "scutil-dns.txt",
@@ -75,7 +77,7 @@ python3 tools/dns_canary_audit.py \
    }
    ```
 
-   清单中的 `expected_physical_interfaces` 必须列出所有受测物理接口，未提交任何一个所列接口的日志即为 `NOT_VERIFIED`。`resolver_snapshot_recorded_at_utc` 缺失或不落在公共窗口内，同样为 `NOT_VERIFIED`。macOS TUN 接口须以 `utun` 加数字命名；不能把 `utun` 或 `lo0` 错报为物理出口。每个接口需有有时区的 `started_at_utc` 与 `ended_at_utc`，以及格式为 `±HH:MM` 的 `packet_time_utc_offset`；偏移缺失、时间戳无法换算或日志报文落在声明窗口之外时，不得将“物理接口未观察到 canary”视为通过。但清单与系统时间都来自操作者，并非分析器独立发现活动接口、时钟或抓包持续性的证明。
+   清单中的 `expected_physical_interfaces` 必须列出所有受测物理接口，未提交任何一个所列接口的日志即为 `NOT_VERIFIED`。缺少 canary 刺激时间、utun canary 早于该刺激，或共同捕获窗口没覆盖整段观察期限，都不得输出阴性结论。`resolver_snapshot_recorded_at_utc` 缺失或不落在公共窗口内，同样为 `NOT_VERIFIED`。macOS TUN 接口须以 `utun` 加数字命名；不能把 `utun` 或 `lo0` 错报为物理出口。每个接口需有有时区的 `started_at_utc` 与 `ended_at_utc`，以及格式为 `±HH:MM` 的 `packet_time_utc_offset`；偏移缺失、时间戳无法换算或日志报文落在声明窗口之外时，不得将“物理接口未观察到 canary”视为通过。但清单与系统时间都来自操作者，并非分析器独立发现活动接口、时钟或抓包持续性的证明。
 
 5. **离线出报告**。这一步不需要管理员权限，也不发起任何网络请求：
 
@@ -84,7 +86,7 @@ python3 tools/dns_canary_audit.py \
      --output /path/to/private/report.json
    ```
 
-   输出 JSON 包含 `case_id`、`verdict`、`coverage_issues`、供人工复核的 `review_flags`、manifest SHA-256、声明的接口及公共 UTC 采集窗口、`scutil` 快照结构数量/作用域 resolver 数量和快照时间、各抓包 SHA-256/字节数/解析到的数据包数、包时间戳的 UTC 归一化与窗口内事件计数，以及与 canary 匹配的 qtype/IPv4/IPv6/TCP/UDP/时间戳及原始行 SHA-256。默认不会在报告中包含源或目标 IP；仅需在本地审计时可显式选择 `--include-endpoints`，但须单独处理敏感数据。
+   输出 JSON 包含 `case_id`、`verdict`、`coverage_issues`、供人工复核的 `review_flags`、canary 刺激与观察期限、刺激后观察到的 canary 事件计数、manifest SHA-256、声明的接口及公共 UTC 采集窗口、`scutil` 快照结构数量/作用域 resolver 数量和快照时间、各抓包 SHA-256/字节数/解析到的数据包数、包时间戳的 UTC 归一化与窗口内事件计数，以及与 canary 匹配的 qtype/IPv4/IPv6/TCP/UDP/时间戳及原始行 SHA-256。默认不会在报告中包含源或目标 IP；仅需在本地审计时可显式选择 `--include-endpoints`，但须单独处理敏感数据。
 
 ## 退出码和合并验收
 

@@ -232,3 +232,4 @@ System DNS 指向一个与 fake-IP 池、TUN 网关子网及 route exclusions �
 - 默认不在 JSON 报告中输出其它域名或 IP 端点；原始抓包仍可能含私人 DNS，必须留在授权测试机保管。无论结果为何都保留 `system_zero_leak_verified: false`；该工具不能检测 DoH/DoT/DoQ、网络服务 resolver 优先级、完整物理接口覆盖或系统级接管。
 - 当前阶段只运行 Python 标准库离线单测与虚构样例；没有执行 `tcpdump`、`scutil`、DNS canary 真实查询，没有请求 root，也没有修改主机网络。真实抓包须由测试机所有者逐场景明确授权。
 - 当晚后续迭代：从 `scutil --dns` 文本中只提取 resolver/nameserver 数量、scoped resolver 数量以及是否涉及非 utun/loopback 的作用域接口（或接口未知）；只把它们作为人工审查用的 `review_flags`，不把 resolver 的存在等同于物理 DNS 已泄漏，也不输出真实 nameserver IP。结合前一轮的窗口/时间戳一致性与输入 SHA-256 核验，纯离线回归扩大至 61 项通过。该结果仍不涉及 macOS 系统 resolver/Network Extension 的实际控制，不是零泄漏认证。
+- 再补专属 canary **人工刺激时间**和最多 300 秒的可配置观察期限：阴性结果必须有发生在明确刺激之后、且处于全部接口公共采集时段内的 utun canary；如果没有记录刺激时间、此前的缓存/旧查询被误用，或采集没有覆盖整个截止期限，一律 `NOT_VERIFIED`。物理接口确已观察到的 canary 保留原始正向证据，不因缺少刺激元数据而静默隐藏。离线回归达到 69 项通过；仍未实际执行 canary DNS 查询。

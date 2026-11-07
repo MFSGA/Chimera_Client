@@ -44,6 +44,7 @@ KNOWN_MANIFEST_FIELDS = {
     "schema_version", "case_id", "canary_qname", "captures",
     "expected_physical_interfaces", "expected_tun_interfaces",
     "resolver_snapshot", "resolver_snapshot_recorded_at_utc",
+    "canary_stimulus_at_utc", "canary_observation_deadline_seconds",
 }
 
 
@@ -266,6 +267,33 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
     if not isinstance(raw_captures, list) or not 1 <= len(raw_captures) <= 16:
         raise AuditError("captures must contain 1 to 16 recorded logs")
 
+    deadline_seconds = manifest.get("canary_observation_deadline_seconds", 30)
+    if type(deadline_seconds) is not int or not 1 <= deadline_seconds <= 300:
+        raise AuditError("canary observation deadline must be 1..300 seconds")
+    stimulus_at_raw = manifest.get("canary_stimulus_at_utc")
+    stimulus_at: datetime | None = None
+    stimulus_issues: list[str] = []
+    if stimulus_at_raw is None:
+        stimulus_issues.append("missing_canary_stimulus_at_utc")
+    else:
+        if not isinstance(stimulus_at_raw, str):
+            raise AuditError("canary stimulus must be a timezone-aware ISO-8601 timestamp")
+        try:
+            candidate = datetime.fromisoformat(
+                stimulus_at_raw.replace("Z", "+00:00")
+            )
+        except ValueError as error:
+            raise AuditError("invalid canary stimulus timestamp") from error
+        if candidate.tzinfo is None or candidate.utcoffset() is None:
+            raise AuditError("canary stimulus timestamp must be timezone-aware")
+        stimulus_at = candidate.astimezone(timezone.utc)
+    try:
+        stimulus_deadline = (
+            stimulus_at + timedelta(seconds=deadline_seconds) if stimulus_at else None
+        )
+    except OverflowError as error:
+        raise AuditError("canary stimulus deadline exceeds supported timestamp range") from error
+
     # The shared time window is needed *while* streaming each capture, not
     # after all files have been read. Only operator assertions are available;
     # packet timestamps provide an additional, narrower sanity check.
@@ -279,6 +307,11 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
         earliest_end = min(window[1] for window in windows if window is not None)
         if latest_start < earliest_end:
             shared_window = (latest_start, earliest_end)
+    if stimulus_at is not None and shared_window is not None:
+        if not shared_window[0] <= stimulus_at < shared_window[1]:
+            stimulus_issues.append("canary_stimulus_outside_shared_capture_window")
+        if stimulus_deadline > shared_window[1]:
+            stimulus_issues.append("capture_does_not_cover_stimulus_deadline")
 
     summaries: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []
@@ -287,6 +320,7 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
     seen_file_ids: set[tuple[int, int]] = set()
     missing_offsets: list[str] = []
     by_role_inside_window = {"physical": 0, "tun": 0}
+    by_role_after_stimulus = {"physical": 0, "tun": 0}
     for spec, window in zip(raw_captures, windows):
         required = {"role", "interface", "path"}
         optional = {"started_at_utc", "ended_at_utc", "packet_time_utc_offset"}
@@ -389,6 +423,9 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
                                 and shared_window[0] <= packet_utc < shared_window[1]):
                             canary_queries_inside_window += 1
                             by_role_inside_window[role] += 1
+                            if (stimulus_at is not None
+                                    and stimulus_at <= packet_utc <= stimulus_deadline):
+                                by_role_after_stimulus[role] += 1
                     if len(events) == MAX_CANARY_EVENTS:
                         raise AuditError("more than 5000 canary queries; split the capture")
                     events.append({"role": role, "interface": interface, **event})
@@ -420,7 +457,7 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
             "canary_queries": canary_queries,
         })
 
-    missing: list[str] = []
+    missing: list[str] = list(stimulus_issues)
     for role in ("physical", "tun"):
         for interface in expected[role]:
             if (role, interface) not in seen_interfaces:
@@ -445,6 +482,8 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
             missing.append("one_or_more_physical_captures_have_no_port53_packet_in_shared_window")
         if by_role_inside_window["tun"] == 0:
             missing.append("no_tun_canary_in_shared_capture_window")
+        if stimulus_at is not None and by_role_after_stimulus["tun"] == 0:
+            missing.append("no_utun_canary_observed_after_stimulus")
     if any(summary["packet_lines"] == 0 for summary in summaries):
         missing.append("one_or_more_captures_have_no_packet_lines")
     if any(summary["port53_packet_lines"] == 0 for summary in summaries):
@@ -553,11 +592,16 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
         "resolver_snapshot": snapshot_result,
         "captures": summaries,
         "canary_query_counts": by_role,
+        "canary_stimulus": {
+            "at_utc": stimulus_at.isoformat() if stimulus_at else None,
+            "deadline_seconds": deadline_seconds,
+        },
+        "canary_queries_after_stimulus": by_role_after_stimulus,
         "canary_queries_in_shared_window": by_role_inside_window,
         "canary_queries": events,
         "limitations": [
             "Only supplied tcpdump text for UDP/TCP destination port 53 is examined.",
-            "The interface inventory, capture completeness and declared UTC time windows are operator claims, not independently proven.",
+            "The interface inventory, capture completeness, stimulus timing and declared UTC time windows are operator claims, not independently proven.",
             "The supplied scutil snapshot is hashed, not interpreted or verified for priority/ownership.",
             "No inference about encrypted DNS (DoH/DoT/DoQ), mDNS, DNS Proxy, NIC bypass or system-wide zero leak.",
             "Packet timestamps are converted using operator-supplied fixed UTC offsets; actual OS clock sync and capture windows are not independently attested.",

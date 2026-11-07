@@ -53,6 +53,8 @@ class AuditTests(unittest.TestCase):
             "schema_version": 1,
             "case_id": "wifi_up_ipv4_ipv6",
             "canary_qname": "CaNaRy.Evidence.Example.Test.",
+            "canary_stimulus_at_utc": "2026-11-06T15:00:00Z",
+            "canary_observation_deadline_seconds": 30,
             "expected_physical_interfaces": ["en0"],
             "expected_tun_interfaces": ["utun7"],
             "resolver_snapshot": "scutil-dns.txt",
@@ -106,6 +108,61 @@ class AuditTests(unittest.TestCase):
         )
         self.assertTrue(result["resolver_snapshot"]["sha256"])
         self.assertFalse(result["resolver_snapshot"].get("content"))
+
+    def test_negative_verdict_requires_explicit_canary_stimulus_metadata(self) -> None:
+        del self.manifest["canary_stimulus_at_utc"]
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["verdict"], "NOT_VERIFIED")
+        self.assertIn("missing_canary_stimulus_at_utc", report["coverage_issues"])
+
+    def test_stale_utun_canary_before_stimulus_is_not_negative_evidence(self) -> None:
+        self.manifest["canary_stimulus_at_utc"] = "2026-11-06T15:00:02Z"
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["verdict"], "NOT_VERIFIED")
+        self.assertIn("no_utun_canary_observed_after_stimulus", report["coverage_issues"])
+
+    def test_capture_must_cover_entire_stimulus_deadline(self) -> None:
+        self.manifest["canary_stimulus_at_utc"] = "2026-11-06T15:04:50Z"
+        self.manifest["canary_observation_deadline_seconds"] = 30
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["verdict"], "NOT_VERIFIED")
+        self.assertIn("capture_does_not_cover_stimulus_deadline", report["coverage_issues"])
+
+    def test_stimulus_deadline_is_strictly_bounded(self) -> None:
+        for value in (0, -1, 301, True, "30", None):
+            with self.subTest(value=value):
+                self.manifest["canary_observation_deadline_seconds"] = value
+                with self.assertRaisesRegex(audit.AuditError, "deadline"):
+                    audit.analyze_manifest(self.save_manifest())
+
+    def test_stimulus_timestamp_is_timezone_aware(self) -> None:
+        for value in ("2026-11-06T15:00:00", "tomorrow", 42):
+            with self.subTest(value=value):
+                self.manifest["canary_stimulus_at_utc"] = value
+                with self.assertRaisesRegex(audit.AuditError, "stimulus"):
+                    audit.analyze_manifest(self.save_manifest())
+
+    def test_extreme_future_stimulus_cannot_overflow_deadline(self) -> None:
+        self.manifest["canary_stimulus_at_utc"] = "9999-12-31T23:59:59Z"
+        with self.assertRaisesRegex(audit.AuditError, "stimulus deadline"):
+            audit.analyze_manifest(self.save_manifest())
+
+    def test_tun_canary_observed_in_stimulus_window_is_counted(self) -> None:
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["canary_queries_after_stimulus"], {
+            "physical": 0, "tun": 2
+        })
+        self.assertEqual(
+            report["canary_stimulus"]["at_utc"], "2026-11-06T15:00:00+00:00"
+        )
+        self.assertEqual(report["canary_stimulus"]["deadline_seconds"], 30)
+        self.assertEqual(report["verdict"], "NO_PHYSICAL_CANARY_OBSERVED_IN_SUPPLIED_LOGS")
+
+    def test_physical_canary_observation_still_wins_if_stimulus_missing(self) -> None:
+        del self.manifest["canary_stimulus_at_utc"]
+        (self.folder / "en0.log").write_text(PHYSICAL_LEAK, encoding="utf-8")
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["verdict"], "PHYSICAL_CANARY_PLAINTEXT_DNS_OBSERVED")
 
     def test_no_private_dns_names_or_ip_endpoints_leak_into_default_report(self) -> None:
         result = json.dumps(audit.analyze_manifest(self.save_manifest()))
