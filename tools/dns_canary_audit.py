@@ -106,7 +106,11 @@ def matches_question_name(packet_name: str, expected: str) -> bool:
 def evidence_path(folder: Path, user_path: Any) -> Path:
     if not isinstance(user_path, str) or not user_path:
         raise AuditError("capture/snapshot path must be a nonempty relative path")
+    if "\x00" in user_path:
+        raise AuditError("capture/snapshot path contains a NUL character")
     relative = Path(user_path)
+    if any(len(component.encode("utf-8")) > 255 for component in relative.parts):
+        raise AuditError("evidence path component exceeds 255 bytes")
     if relative.is_absolute() or ".." in relative.parts:
         raise AuditError("capture/snapshot paths must stay inside the manifest folder")
     path = (folder / relative).resolve()

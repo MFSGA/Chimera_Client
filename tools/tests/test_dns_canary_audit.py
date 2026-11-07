@@ -1011,6 +1011,11 @@ class AuditTests(unittest.TestCase):
                 with self.assertRaises(audit.AuditError):
                     audit.analyze_manifest(self.save_manifest())
 
+    def test_excessively_long_evidence_filename_is_auditable_error(self) -> None:
+        self.manifest["resolver_snapshot"] = "x" * 300
+        with self.assertRaisesRegex(audit.AuditError, "path component exceeds"):
+            audit.analyze_manifest(self.save_manifest())
+
     def test_path_traversal_and_symlink_escape_rejected(self) -> None:
         self.manifest["captures"][0]["path"] = "../outside.log"
         with self.assertRaisesRegex(audit.AuditError, "paths must stay"):
