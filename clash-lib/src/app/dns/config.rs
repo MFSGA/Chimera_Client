@@ -90,6 +90,24 @@ pub struct Config {
     pub compiled_policy: super::policy::CompiledDnsPolicy,
 }
 
+/// Match the pinned Mihomo policy-domain validation for boundary whitespace
+/// and wildcard placement. For privacy, also reject embedded whitespace:
+/// a literal trie key containing spaces would silently miss real DNS names.
+pub(crate) fn valid_nameserver_policy_domain(domain: &str) -> bool {
+    let (parts, valid) = trie::valid_and_split_domain(domain);
+    if !valid || domain.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let Some(parts) = parts else {
+        return false;
+    };
+    parts.iter().enumerate().all(|(index, part)| {
+        (!part.contains('*') || *part == "*")
+            && (!part.contains('+')
+                || (index == 0 && *part == "+" && parts.len() > 1))
+    })
+}
+
 impl Config {
     pub fn parse_nameserver(servers: &[String]) -> Result<Vec<NameServer>, Error> {
         let mut nameservers = vec![];
@@ -254,9 +272,7 @@ impl Config {
                             .into(),
                     ));
                 }
-
-                let (_, valid) = trie::valid_and_split_domain(selector);
-                if !valid {
+                if !valid_nameserver_policy_domain(selector) {
                     return Err(Error::InvalidConfig(format!(
                         "DNS ResolverRule invalid domain: {selector}"
                     )));
@@ -336,9 +352,9 @@ impl Config {
             }
 
             for subdomain in domain.split(',') {
-                let subdomain = subdomain.trim();
-                let (_, valid) = trie::valid_and_split_domain(subdomain);
-                if !valid || subdomain.chars().any(char::is_whitespace) {
+                // Keep the original key: Mihomo validates each token rather
+                // than silently trimming a privacy-sensitive DNS selector.
+                if !valid_nameserver_policy_domain(subdomain) {
                     return Err(Error::InvalidConfig(format!(
                         "dns.proxy-server-nameserver-policy invalid domain: {subdomain}"
                     )));
@@ -792,6 +808,63 @@ mod tests {
         let _sock: std::net::SocketAddr = format!("{}:{}", ns[0].host, ns[0].port)
             .parse()
             .expect("address should parse to SocketAddr");
+    }
+
+    #[test]
+    fn nameserver_policy_rejects_selector_ambiguity_before_runtime_trie() {
+        // Fixed ref-mihomo component/trie/domain.go rejects boundary
+        // whitespace and misplaced wildcards. Embedded whitespace is a
+        // privacy-hardening rejection: it would become an unmatchable key.
+        for selector in [
+            " example.com",
+            "example.com ",
+            "one.example, two.example",
+            "example.com bad.test",
+            "partial*.example.com",
+            "foo.+.example.com",
+            "+",
+        ] {
+            let policy =
+                HashMap::from([(selector.to_owned(), "9.9.9.9".to_owned())]);
+            let error = Config::parse_nameserver_policy(&policy)
+                .expect_err("ambiguous DNS policy selector must fail closed");
+            assert!(
+                error.to_string().contains("nameserver-policy"),
+                "{selector:?}: {error}"
+            );
+        }
+        for selector in ["example.com", "*.example.com", ".example.com"] {
+            let policy =
+                HashMap::from([(selector.to_owned(), "9.9.9.9".to_owned())]);
+            assert!(
+                Config::parse_nameserver_policy(&policy).is_ok(),
+                "valid existing selector {selector:?} must remain accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_nameserver_policy_rejects_selector_ambiguity_before_node_dns() {
+        for selector in [
+            " node.example",
+            "node.example ",
+            "node-a.example, node-b.example",
+            "node.example other.example",
+            "part*.example.com",
+            "node.+.example.com",
+        ] {
+            let mut mapping = serde_yaml::Mapping::new();
+            mapping.insert(
+                serde_yaml::Value::String(selector.to_owned()),
+                serde_yaml::Value::String("9.9.9.9".to_owned()),
+            );
+            let error = Config::parse_proxy_server_nameserver_policy(&mapping)
+                .expect_err("node DNS policy selector must not silently change");
+            assert!(
+                error.to_string().contains("proxy-server-nameserver-policy"),
+                "{selector:?}: {error}"
+            );
+        }
     }
 
     #[test]

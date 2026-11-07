@@ -661,6 +661,27 @@ fn mihomo_unsupported_proxy_server_policy_sources_are_rejected() {
 }
 
 #[test]
+fn mihomo_proxy_server_policy_rejects_whitespace_and_malformed_wildcards() {
+    for selector in [
+        " node.example",
+        "node.example ",
+        "node.example, second.example",
+        "node.example other.example",
+        "partial*.node.example",
+        "node.+.example",
+    ] {
+        let yaml = base_config(&format!(
+            "  enable: true\n  nameserver: [1.1.1.1]\n  proxy-server-nameserver: [8.8.8.8]\n  proxy-server-nameserver-policy:\n    '{selector}': 9.9.9.9\n"
+        ));
+        let error = parse_error(yaml).to_string();
+        assert!(
+            error.contains("proxy-server-nameserver-policy"),
+            "selector {selector:?} was not explicitly rejected: {error}"
+        );
+    }
+}
+
+#[test]
 fn mihomo_proxy_server_policy_expands_comma_separated_domains_in_order() {
     let yaml = base_config(
         r#"
@@ -771,6 +792,27 @@ fn mihomo_respect_rules_requires_dedicated_proxy_bootstrap() {
     assert!(dns.respect_rules);
     assert_eq!(dns.nameserver[0].proxy.as_deref(), Some("PROXY"));
     assert_eq!(dns.proxy_server_nameserver.as_ref().unwrap().len(), 1);
+}
+
+#[test]
+fn mihomo_nameserver_policy_rejects_unsafe_whitespace_and_wildcards() {
+    for selector in [
+        " example.com",
+        "example.com ",
+        "one.example, two.example",
+        "example.com bad.test",
+        "prefix*.example.com",
+        "example.+.com",
+    ] {
+        let yaml = base_config(&format!(
+            "  enable: true\n  nameserver: [1.1.1.1]\n  nameserver-policy:\n    '{selector}': 9.9.9.9\n"
+        ));
+        let error = parse_error(yaml).to_string();
+        assert!(
+            error.contains("nameserver-policy"),
+            "selector {selector:?} was not explicitly rejected: {error}"
+        );
+    }
 }
 
 #[test]
