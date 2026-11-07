@@ -32,6 +32,26 @@ fn stage_cache_write(
         .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
 
+    // An atomic rename can replace an existing regular file or symlink but
+    // not a directory. Detect an already-impossible commit *before* the
+    // updater publishes new proxy endpoints / node DNS ownership.
+    // This is a preflight, not a cross-process rename transaction; another
+    // writer can still replace the destination after the check.
+    match fs::symlink_metadata(path) {
+        Ok(metadata)
+            if !metadata.file_type().is_file()
+                && !metadata.file_type().is_symlink() =>
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "provider cache destination is not a regular file or symlink",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
     let mut staged = tempfile::NamedTempFile::new_in(parent)?;
     staged.write_all(content)?;
     staged.flush()?;
@@ -492,6 +512,53 @@ mod tests {
     #[tokio::test]
     async fn refresh_staging_failure_prevents_node_registration_publication() {
         assert_unwritable_cache_is_rejected_before_provider_publication(false).await;
+    }
+
+    #[tokio::test]
+    async fn directory_cache_destination_must_not_publish_new_proxy_revision() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("provider.yaml");
+        std::fs::create_dir(&destination).unwrap();
+        let mut vehicle = MockProviderVehicle::new();
+        vehicle
+            .expect_path()
+            .return_const(destination.to_string_lossy().into_owned());
+        vehicle.expect_typ().return_const(ProviderVehicleType::Http);
+        vehicle
+            .expect_read()
+            .times(1)
+            .returning(|| Ok(b"new node".to_vec()));
+
+        let published = Arc::new(AtomicUsize::new(0));
+        let observed = published.clone();
+        let updater =
+            move |_candidate: String| -> BoxFuture<'static, anyhow::Result<()>> {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            };
+        let fetcher = Fetcher::new(
+            "directory-target".to_owned(),
+            Duration::ZERO,
+            Arc::new(vehicle),
+            |content| Ok(String::from_utf8(content.to_vec())?),
+            Some(updater),
+        );
+
+        assert!(
+            fetcher.update().await.is_err(),
+            "atomic rename over a directory must be rejected"
+        );
+        assert_eq!(
+            published.load(Ordering::SeqCst),
+            0,
+            "cache destination rejection must precede DNS endpoint publication"
+        );
+        assert!(
+            destination.is_dir(),
+            "existing directory must not be modified"
+        );
     }
 
     #[test]
