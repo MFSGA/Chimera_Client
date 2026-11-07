@@ -1082,7 +1082,11 @@ impl EnhancedResolver {
         // retain their historical shared-cache behavior. Dynamic provider
         // domains can be added/removed between awaits, so only those require
         // a cache-isolated answer role.
-        let live_provider_domain = if provider_node_snapshot {
+        let live_provider_domain = if self.proxy_resolver.is_none() {
+            // Most ordinary DNS queries have no configured dedicated node
+            // pool. They must never acquire the provider registry lock.
+            false
+        } else if provider_node_snapshot {
             true
         } else if let Some(domain) =
             EnhancedResolver::domain_name_of_message(message)
@@ -3343,6 +3347,36 @@ mod tests {
         );
         assert_eq!(node_hits.load(Ordering::SeqCst), 1);
         assert_eq!(main_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn ordinary_dns_without_node_pool_does_not_wait_for_provider_registry() {
+        // Without any configured proxy-node resolver, the provider registry
+        // cannot affect upstream selection. Ordinary DNS must not stall
+        // behind a concurrent provider-domain update holding its write lock.
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        let resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+                hits: main_hits.clone(),
+                id: "ordinary-dns",
+            })],
+            false,
+        );
+        assert!(resolver.proxy_resolver.is_none());
+        let _registry_writer = resolver.provider_proxy_server_domains.write().await;
+        let result = tokio::time::timeout(
+            Duration::from_millis(150),
+            resolver.ip_exchange(&test_query_with_type(rr::RecordType::A)),
+        )
+        .await
+        .expect("ordinary DNS must not await irrelevant provider registry lock")
+        .expect("synthetic DNS succeeds");
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&result),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))]
+        );
+        assert_eq!(main_hits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
