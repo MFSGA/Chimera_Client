@@ -269,3 +269,10 @@ S01 准入必须满足：金标准用例在目标 HEAD 实际运行；未知新�
 - Fixed read-only Mihomo gitlink `63bd52ec794b7051569b76ede2f6cdbf4c091fda`; reference `config/config.go` DNS parsing and dedicated node resolver. This change is a Chimera fail-closed boundary, not a claim of complete Mihomo runtime parity.
 - Internal configuration/reload could set `dns.proxy-server-nameserver = Some([])` without a policy or `respect-rules`, pass `Config::validate`, and defer failure until resolver construction. A negative test first failed with `explicit empty node DNS silently accepted`; now validation rejects an explicitly empty pool while retaining `None` as the legacy unspecified configuration.
 - No system DNS, routing, TUN, Network Extension or privileged operations. L2 review and real physical NIC/utun egress capture remain outstanding.
+
+## 2026-11-07 12:55 PST: node DNS outbound isolation regression probes
+
+- Fixed read-only Mihomo gitlink: `63bd52ec794b7051569b76ede2f6cdbf4c091fda`; compared `config/config.go::parseDNS` dedicated `ProxyServerNameserver` and `ProxyServerPolicy` construction with Chimera `resolver/enhanced.rs::ip_exchange`.
+- Added two offline regression tests at the **dedicated outbound resolver** boundary: mixed-case DNS wire QNAME must select node policy rather than default node DNS; when that node policy fails, neither default node DNS nor general fallback is queried. These use synthetic DNS clients, not physical NIC/TUN.
+- Initial failure of the second test was caused by the test fixture querying `proxy.example.com` rather than the policy's `node.example.com`; corrected the fixture and both tests passed **without production changes**. This is additional verified coverage, **not** a newly demonstrated or repaired production leak.
+- Still pending: transport-level fallback/bootstrap socket path fault injection, macOS NIC/utun capture, independent L2 review, and actual Mihomo interoperability.
