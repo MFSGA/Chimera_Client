@@ -714,6 +714,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn network_reset_bootstrap_timeout_fails_before_transport_rebuild() {
+        // A network-path reset must not dial the previous upstream address or
+        // fall back to the system resolver when managed bootstrap times out.
+        let mut bootstrap = MockClashResolver::new();
+        bootstrap
+            .expect_reset_transports()
+            .once()
+            .returning(|| Ok(0));
+        bootstrap
+            .expect_resolve()
+            .with(
+                mockall::predicate::eq("example.org"),
+                mockall::predicate::eq(false),
+            )
+            .once()
+            .returning(|_, _| Err(anyhow::anyhow!("managed bootstrap timeout")));
+        let mut outbound = MockClashResolver::new();
+        outbound
+            .expect_reset_transports()
+            .once()
+            .returning(|| Ok(0));
+        let mut client = client_with_ecs(None);
+        client.bootstrap_resolver = Some(Arc::new(bootstrap));
+        client.outbound_resolver = Some(Arc::new(outbound));
+        let original_address = client.cfg.read().await.addr();
+
+        client.reset_transport().await.unwrap();
+        let error = match client.rebuild_with_retries().await {
+            Ok(_) => panic!("network reset must fail closed on bootstrap timeout"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("managed bootstrap timeout"), "{error}");
+        assert_eq!(client.cfg.read().await.addr(), original_address);
+        assert!(client.inner.read().await.c.is_none());
+        assert!(client.refresh_address_on_rebuild.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
     async fn reset_transport_aborts_background_and_marks_address_refresh() {
         let client = client_with_ecs(None);
         client.inner.write().await.bg_handle =
@@ -740,6 +778,202 @@ mod tests {
 
         assert_eq!(client.reset_transport().await.unwrap(), 4);
         assert!(client.refresh_address_on_rebuild.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn reset_transport_resets_distinct_managed_outbound_resolver() {
+        // After a network-path change, a distinct transport resolver must
+        // release its old upstream sockets, not just the bootstrap resolver.
+        let mut bootstrap = MockClashResolver::new();
+        bootstrap
+            .expect_reset_transports()
+            .once()
+            .returning(|| Ok(2));
+        let mut outbound = MockClashResolver::new();
+        outbound
+            .expect_reset_transports()
+            .once()
+            .returning(|| Ok(4));
+        let mut client = client_with_ecs(None);
+        client.bootstrap_resolver = Some(Arc::new(bootstrap));
+        client.outbound_resolver = Some(Arc::new(outbound));
+
+        assert_eq!(client.reset_transport().await.unwrap(), 7);
+        assert!(client.inner.read().await.c.is_none());
+        assert!(client.refresh_address_on_rebuild.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn reset_transport_clears_distinct_outbound_even_if_bootstrap_reset_fails()
+    {
+        // A bootstrap reset error must not skip cleanup of a separate
+        // managed transport resolver or reactivate the old DNS stream.
+        let mut bootstrap = MockClashResolver::new();
+        bootstrap
+            .expect_reset_transports()
+            .once()
+            .returning(|| Err(anyhow::anyhow!("bootstrap reset unavailable")));
+        let mut outbound = MockClashResolver::new();
+        outbound
+            .expect_reset_transports()
+            .once()
+            .returning(|| Ok(2));
+        let mut client = client_with_ecs(None);
+        client.bootstrap_resolver = Some(Arc::new(bootstrap));
+        client.outbound_resolver = Some(Arc::new(outbound));
+        client.inner.write().await.bg_handle =
+            Some(tokio::spawn(std::future::pending::<()>()));
+
+        let error = client.reset_transport().await.unwrap_err().to_string();
+        assert!(error.contains("bootstrap reset unavailable"), "{error}");
+        let inner = client.inner.read().await;
+        assert!(inner.c.is_none());
+        assert!(inner.bg_handle.is_none());
+        assert!(client.refresh_address_on_rebuild.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn reset_transport_reports_both_managed_resolver_failures() {
+        // Both managed reset attempts run even when the first fails; losing
+        // the outbound error would hide a network-path cleanup failure.
+        let mut bootstrap = MockClashResolver::new();
+        bootstrap
+            .expect_reset_transports()
+            .once()
+            .returning(|| Err(anyhow::anyhow!("bootstrap reset timeout")));
+        let mut outbound = MockClashResolver::new();
+        outbound
+            .expect_reset_transports()
+            .once()
+            .returning(|| Err(anyhow::anyhow!("outbound transport reset error")));
+        let mut client = client_with_ecs(None);
+        client.bootstrap_resolver = Some(Arc::new(bootstrap));
+        client.outbound_resolver = Some(Arc::new(outbound));
+
+        let error = client.reset_transport().await.unwrap_err().to_string();
+        assert!(error.contains("bootstrap reset timeout"), "{error}");
+        assert!(error.contains("outbound transport reset error"), "{error}");
+        assert!(client.inner.read().await.c.is_none());
+        assert!(client.refresh_address_on_rebuild.load(Ordering::Acquire));
+    }
+
+    struct StalledBootstrapReset;
+
+    #[async_trait]
+    impl ClashResolver for StalledBootstrapReset {
+        async fn resolve(
+            &self,
+            _host: &str,
+            _enhanced: bool,
+        ) -> anyhow::Result<Option<net::IpAddr>> {
+            unreachable!("DNS lookup not needed in reset test")
+        }
+
+        async fn resolve_v4(
+            &self,
+            _host: &str,
+            _enhanced: bool,
+        ) -> anyhow::Result<Option<net::Ipv4Addr>> {
+            unreachable!("IPv4 lookup not needed in reset test")
+        }
+
+        async fn resolve_v6(
+            &self,
+            _host: &str,
+            _enhanced: bool,
+        ) -> anyhow::Result<Option<net::Ipv6Addr>> {
+            unreachable!("IPv6 lookup not needed in reset test")
+        }
+
+        async fn cached_for(&self, _ip: net::IpAddr) -> Option<String> {
+            None
+        }
+
+        async fn exchange(&self, _message: &Message) -> anyhow::Result<Message> {
+            unreachable!("DNS exchange not needed in reset test")
+        }
+
+        async fn reverse_lookup(&self, _ip: net::IpAddr) -> Option<String> {
+            None
+        }
+
+        async fn is_fake_ip(&self, _ip: net::IpAddr) -> bool {
+            false
+        }
+
+        async fn fake_ip_for_host(&self, _host: &str) -> Option<net::IpAddr> {
+            None
+        }
+
+        fn fake_ip_enabled(&self) -> bool {
+            false
+        }
+
+        fn ipv6(&self) -> bool {
+            false
+        }
+
+        fn set_ipv6(&self, _enable: bool) {}
+
+        async fn reset_transports(&self) -> anyhow::Result<u32> {
+            std::future::pending().await
+        }
+
+        fn kind(&self) -> crate::app::dns::ResolverKind {
+            crate::app::dns::ResolverKind::Clash
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_bootstrap_reset_cannot_prevent_outbound_reset_attempt() {
+        // EnhancedResolver bounds each client's reset to five seconds. A
+        // stalled bootstrap must not keep a *different* managed outbound
+        // resolver from receiving its own reset before that deadline.
+        let called = Arc::new(AtomicBool::new(false));
+        let observed = called.clone();
+        let mut outbound = MockClashResolver::new();
+        outbound
+            .expect_reset_transports()
+            .times(0..=1)
+            .returning(move || {
+                observed.store(true, Ordering::SeqCst);
+                Ok(1)
+            });
+        let mut client = client_with_ecs(None);
+        client.bootstrap_resolver = Some(Arc::new(StalledBootstrapReset));
+        client.outbound_resolver = Some(Arc::new(outbound));
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                client.reset_transport(),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            called.load(Ordering::SeqCst),
+            "outbound resolver reset was skipped while bootstrap hung"
+        );
+        assert!(client.inner.read().await.c.is_none());
+        assert!(client.refresh_address_on_rebuild.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn reset_transport_does_not_reset_shared_resolver_twice() {
+        // The normal node-DNS configuration uses the same managed resolver
+        // for bootstrap and transport, which must receive only one reset.
+        let mut resolver = MockClashResolver::new();
+        resolver
+            .expect_reset_transports()
+            .once()
+            .returning(|| Ok(3));
+        let shared: Arc<dyn ClashResolver> = Arc::new(resolver);
+        let mut client = client_with_ecs(None);
+        client.bootstrap_resolver = Some(shared.clone());
+        client.outbound_resolver = Some(shared);
+
+        assert_eq!(client.reset_transport().await.unwrap(), 4);
     }
 
     #[tokio::test]
@@ -1533,12 +1767,56 @@ impl Client for DnsClient {
             background.abort();
         }
         drop(inner);
-        let reset = if let Some(resolver) = &self.bootstrap_resolver {
-            resolver.reset_transports().await?
-        } else {
-            0
-        };
-        Ok(reset.saturating_add(1))
+        // Bootstrap and outbound DNS can use different managed resolvers.
+        // Clear both after a path change so a rebuilt transport never relies
+        // on an outbound resolver that still holds sockets from the old path.
+        // The normal node-DNS setup shares one resolver: reset it only once.
+        // Reset independent managed resolvers concurrently. The outer DNS
+        // reset has a bounded deadline; awaiting a stalled bootstrap first
+        // must not prevent the outbound resolver from being cleared at all.
+        let (bootstrap_reset, outbound_reset) = tokio::join!(
+            async {
+                if let Some(resolver) = &self.bootstrap_resolver {
+                    Some(resolver.reset_transports().await)
+                } else {
+                    None
+                }
+            },
+            async {
+                if let Some(resolver) = &self.outbound_resolver
+                    && self
+                        .bootstrap_resolver
+                        .as_ref()
+                        .is_none_or(|bootstrap| !Arc::ptr_eq(bootstrap, resolver))
+                {
+                    Some(resolver.reset_transports().await)
+                } else {
+                    None
+                }
+            },
+        );
+        let mut reset = 1_u32;
+        let mut errors = Vec::new();
+        if let Some(result) = bootstrap_reset {
+            match result {
+                Ok(count) => reset = reset.saturating_add(count),
+                Err(error) => {
+                    errors.push(format!("bootstrap resolver reset: {error}"))
+                }
+            }
+        }
+        if let Some(result) = outbound_reset {
+            match result {
+                Ok(count) => reset = reset.saturating_add(count),
+                Err(error) => {
+                    errors.push(format!("outbound resolver reset: {error}"))
+                }
+            }
+        }
+        if !errors.is_empty() {
+            return Err(anyhow!(errors.join("; ")));
+        }
+        Ok(reset)
     }
 
     #[instrument(skip(msg), level = "trace")]

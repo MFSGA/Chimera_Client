@@ -392,7 +392,9 @@ impl EnhancedResolver {
             main: make_clients(
                 cfg.default_nameserver.clone(),
                 None,
-                None,
+                Some(Arc::new(
+                    crate::app::dns::execution::LiteralOnlyResolver::default(),
+                )),
                 Arc::new(RwLock::new(std::collections::HashMap::new())),
                 edns_client_subnet.clone(),
                 DnsClientNetworkOptions {
@@ -431,7 +433,7 @@ impl EnhancedResolver {
             let clients = make_clients(
                 proxy_nameserver,
                 Some(default_resolver.clone()),
-                None,
+                Some(default_resolver.clone()),
                 Arc::new(RwLock::new(std::collections::HashMap::new())),
                 edns_client_subnet.clone(),
                 DnsClientNetworkOptions {
