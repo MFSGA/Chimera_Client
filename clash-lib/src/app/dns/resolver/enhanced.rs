@@ -924,7 +924,11 @@ impl EnhancedResolver {
         }
         trace!(q = q.to_string(), "querying resolver");
         let res = self
-            .exchange_no_cache_with_policy(message, !provider_node_query)
+            .exchange_no_cache_with_policy(
+                message,
+                !provider_node_query,
+                provider_node_query,
+            )
             .await
             .map(|mut r| {
                 if let Some(edns) = r.edns.as_mut() {
@@ -942,19 +946,26 @@ impl EnhancedResolver {
         &self,
         message: &op::Message,
     ) -> anyhow::Result<op::Message> {
-        self.exchange_no_cache_with_policy(message, true).await
+        self.exchange_no_cache_with_policy(message, true, false)
+            .await
     }
 
     async fn exchange_no_cache_with_policy(
         &self,
         message: &op::Message,
         populate_shared_cache: bool,
+        provider_node_snapshot: bool,
     ) -> anyhow::Result<op::Message> {
         let q = message.queries.first().unwrap();
 
         let query = async move {
             if EnhancedResolver::is_ip_request(q) {
-                return self.ip_exchange(message).await;
+                return self
+                    .ip_exchange_with_provider_snapshot(
+                        message,
+                        provider_node_snapshot,
+                    )
+                    .await;
             }
 
             if let Some(matched) = self.match_policy(message) {
@@ -1021,10 +1032,20 @@ impl EnhancedResolver {
             .any(|domains| domains.contains(&domain))
     }
 
-    #[instrument(skip_all, level = "trace")]
+    #[cfg(test)]
     async fn ip_exchange(
         &self,
         message: &op::Message,
+    ) -> anyhow::Result<op::Message> {
+        self.ip_exchange_with_provider_snapshot(message, false)
+            .await
+    }
+
+    #[instrument(skip_all, level = "trace")]
+    async fn ip_exchange_with_provider_snapshot(
+        &self,
+        message: &op::Message,
+        provider_node_snapshot: bool,
     ) -> anyhow::Result<op::Message> {
         if self.proxy_node_resolver {
             // This resolver is the transport's dedicated proxy node DNS
@@ -1042,12 +1063,10 @@ impl EnhancedResolver {
 
         if let Some(proxy_resolver) = &self.proxy_resolver
             && let Some(domain) = EnhancedResolver::domain_name_of_message(message)
-            && (self
-                .proxy_server_domains
-                .as_ref()
-                .is_some_and(|static_domains| {
-                    static_domains.search(&domain).is_some()
-                })
+            && (provider_node_snapshot
+                || self.proxy_server_domains.as_ref().is_some_and(
+                    |static_domains| static_domains.search(&domain).is_some(),
+                )
                 || self.is_registered_provider_domain(&domain).await)
         {
             debug!(
@@ -3246,6 +3265,53 @@ mod tests {
             vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11))]
         );
         assert_eq!(proxy_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(main_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn provider_node_dns_snapshot_survives_concurrent_owner_removal() {
+        // A query already classified as a provider endpoint must retain the
+        // dedicated DNS choice if a refresh removes its owner mid-flight.
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        let node_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+                hits: main_hits.clone(),
+                id: "public-main",
+            })],
+            false,
+        );
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: node_hits.clone(),
+            id: "node-only",
+        })]);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        let request = test_query_with_type(rr::RecordType::A);
+        let provider_snapshot = resolver
+            .is_registered_provider_domain("proxy.example.com")
+            .await;
+        assert!(provider_snapshot);
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        let result = resolver
+            .ip_exchange_with_provider_snapshot(&request, provider_snapshot)
+            .await
+            .unwrap();
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&result),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11))]
+        );
+        assert_eq!(node_hits.load(Ordering::SeqCst), 1);
         assert_eq!(main_hits.load(Ordering::SeqCst), 0);
     }
 
