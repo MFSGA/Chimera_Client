@@ -388,6 +388,40 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"new provider");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn staged_cache_keeps_legacy_symlink_replacement_semantics() {
+        // Historically NamedTempFile::persist atomically replaced the cache
+        // pathname itself. Preserve that behavior rather than following a
+        // symlink and modifying an unrelated file outside the cache path.
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("original-target.yaml");
+        let cache_link = dir.path().join("provider.yaml");
+        std::fs::write(&outside, b"owner's original content").unwrap();
+        std::os::unix::fs::symlink(&outside, &cache_link).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&cache_link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        write_cache_atomically(&cache_link, b"accepted provider").unwrap();
+
+        assert_eq!(
+            std::fs::read(&outside).unwrap(),
+            b"owner's original content"
+        );
+        assert_eq!(std::fs::read(&cache_link).unwrap(), b"accepted provider");
+        assert!(
+            std::fs::symlink_metadata(&cache_link)
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "cache target should be a regular file after atomic replacement"
+        );
+    }
+
     #[test]
     fn future_cache_timestamp_does_not_panic_or_force_refresh() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
