@@ -199,7 +199,7 @@ pub async fn exchange_with_resolver<'a>(
         return Ok(answer);
     }
 
-    if should_filter_aaaa(req, resolver.ipv6()) {
+    if should_filter_aaaa(req, resolver.ipv6() && resolver.dns_ipv6()) {
         return Ok(build_dns_response_message(req, false, false));
     }
 
@@ -966,6 +966,7 @@ mod tests {
     async fn aaaa_query_returns_fake_ipv6_when_pool_is_enabled() {
         let mut resolver = MockClashResolver::new();
         resolver.expect_ipv6().return_const(true);
+        resolver.expect_dns_ipv6().return_const(true);
         resolver.expect_fake_ip_enabled().return_const(true);
         resolver.expect_fake_ip_v6_enabled().return_const(true);
         resolver
@@ -994,6 +995,7 @@ mod tests {
     async fn aaaa_query_without_fake_ipv6_pool_is_not_forwarded() {
         let mut resolver = MockClashResolver::new();
         resolver.expect_ipv6().return_const(true);
+        resolver.expect_dns_ipv6().return_const(true);
         resolver.expect_fake_ip_v6_enabled().return_const(false);
         resolver
             .expect_should_fake_ip()

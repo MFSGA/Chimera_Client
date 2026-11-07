@@ -155,6 +155,12 @@ pub trait ClashResolver: Sync + Send {
     fn ipv6(&self) -> bool;
     fn set_ipv6(&self, enable: bool);
 
+    /// Whether the DNS section itself permits AAAA responses. The effective
+    /// response policy must also honor the root-level global IPv6 setting.
+    fn dns_ipv6(&self) -> bool {
+        self.ipv6()
+    }
+
     /// Drop all live upstream transports owned by this resolver. The resolver
     /// remains usable and reconnects lazily on the next query.
     async fn reset_transports(&self) -> anyhow::Result<u32> {

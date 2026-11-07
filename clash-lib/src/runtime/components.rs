@@ -27,6 +27,7 @@ use crate::{app::net::clear_net_config, proxy::tun};
 pub(super) struct RuntimeComponents {
     pub(super) cache_store: profile::ThreadSafeCacheFile,
     pub(super) dns_resolver: ThreadSafeDNSResolver,
+    pub(super) control_plane_dns_resolver: ThreadSafeDNSResolver,
     pub(super) outbound_manager: Arc<OutboundManager>,
     pub(super) router: Arc<Router>,
     pub(super) dispatcher: Arc<Dispatcher>,
@@ -307,6 +308,7 @@ impl RuntimeComponents {
             self.dispatcher.clone(),
             global_state,
             self.dns_resolver.clone(),
+            self.control_plane_dns_resolver.clone(),
             self.outbound_manager.clone(),
             self.statistics_manager.clone(),
             self.cache_store.clone(),
@@ -413,6 +415,7 @@ impl RuntimeComponents {
         Ok(Self {
             cache_store: self.cache_store.clone(),
             dns_resolver: self.dns_resolver.clone(),
+            control_plane_dns_resolver: self.control_plane_dns_resolver.clone(),
             outbound_manager: self.outbound_manager.clone(),
             router: self.router.clone(),
             dispatcher: self.dispatcher.clone(),

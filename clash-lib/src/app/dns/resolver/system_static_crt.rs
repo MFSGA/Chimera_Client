@@ -4,19 +4,28 @@ use async_trait::async_trait;
 use hickory_resolver::TokioResolver;
 use rand::seq::IteratorRandom;
 
-use crate::app::dns::{ClashResolver, ResolverKind, parse_ip_literal};
+use crate::{
+    Error,
+    app::dns::{ClashResolver, ResolverKind, parse_ip_literal},
+};
 
 pub struct SystemResolver {
     inner: TokioResolver,
     ipv6: AtomicBool,
+    dns_ipv6: bool,
 }
 
 /// Bug in libc, use tokio impl instead: https://sourceware.org/bugzilla/show_bug.cgi?id=10652
 impl SystemResolver {
     pub fn new(ipv6: bool) -> anyhow::Result<Self> {
+        Self::new_with_ipv6(ipv6, ipv6)
+    }
+
+    pub fn new_with_ipv6(global_ipv6: bool, dns_ipv6: bool) -> anyhow::Result<Self> {
         Ok(Self {
             inner: TokioResolver::builder_tokio()?.build(),
-            ipv6: AtomicBool::new(ipv6),
+            ipv6: AtomicBool::new(global_ipv6),
+            dns_ipv6,
         })
     }
 }
@@ -29,14 +38,36 @@ impl ClashResolver for SystemResolver {
         _: bool,
     ) -> anyhow::Result<Option<std::net::IpAddr>> {
         if let Some(ip) = parse_ip_literal(host) {
+            if ip.is_ipv6() && !self.ipv6() {
+                return Err(Error::DNSError(format!(
+                    "IPv6 is disabled; cannot resolve IPv6 literal `{host}`"
+                ))
+                .into());
+            }
             return Ok(Some(ip));
         }
 
-        let response = self.inner.lookup_ip(host).await?;
-        Ok(response
+        let response = self.inner.lookup_ip(host).await.map_err(|error| {
+            if self.ipv6() {
+                anyhow::Error::from(error)
+            } else {
+                Error::DNSError(format!(
+                    "IPv6 is disabled; IPv4 lookup for hostname `{host}` failed: {error}"
+                ))
+                .into()
+            }
+        })?;
+        let address = response
             .iter()
             .filter(|x| self.ipv6() || x.is_ipv4())
-            .choose(&mut rand::rng()))
+            .choose(&mut rand::rng());
+        if address.is_none() && !self.ipv6() {
+            return Err(Error::DNSError(format!(
+                "IPv6 is disabled and hostname `{host}` has no IPv4 address"
+            ))
+            .into());
+        }
+        Ok(address)
     }
 
     async fn resolve_all(
@@ -45,16 +76,37 @@ impl ClashResolver for SystemResolver {
         _: bool,
     ) -> anyhow::Result<Vec<std::net::IpAddr>> {
         if let Some(ip) = parse_ip_literal(host) {
+            if ip.is_ipv6() && !self.ipv6() {
+                return Err(Error::DNSError(format!(
+                    "IPv6 is disabled; cannot resolve IPv6 literal `{host}`"
+                ))
+                .into());
+            }
             return Ok(vec![ip]);
         }
 
-        let response = self.inner.lookup_ip(host).await?;
+        let response = self.inner.lookup_ip(host).await.map_err(|error| {
+            if self.ipv6() {
+                anyhow::Error::from(error)
+            } else {
+                Error::DNSError(format!(
+                    "IPv6 is disabled; IPv4 lookup for hostname `{host}` failed: {error}"
+                ))
+                .into()
+            }
+        })?;
         let mut addresses = response
             .iter()
             .filter(|address| self.ipv6() || address.is_ipv4())
             .collect::<Vec<_>>();
         addresses.sort_unstable();
         addresses.dedup();
+        if addresses.is_empty() && !self.ipv6() {
+            return Err(Error::DNSError(format!(
+                "IPv6 is disabled and hostname `{host}` has no IPv4 address"
+            ))
+            .into());
+        }
         Ok(addresses)
     }
 
@@ -63,6 +115,18 @@ impl ClashResolver for SystemResolver {
         host: &str,
         _: bool,
     ) -> anyhow::Result<Option<std::net::Ipv4Addr>> {
+        if let Some(ip) = parse_ip_literal(host) {
+            return match ip {
+                std::net::IpAddr::V4(ip) => Ok(Some(ip)),
+                std::net::IpAddr::V6(_) if !self.ipv6() => {
+                    Err(Error::DNSError(format!(
+                        "IPv6 is disabled; cannot resolve IPv6 literal `{host}`"
+                    ))
+                    .into())
+                }
+                std::net::IpAddr::V6(_) => Ok(None),
+            };
+        }
         let response = self.inner.ipv4_lookup(host).await?;
         Ok(response
             .answers()
@@ -79,6 +143,15 @@ impl ClashResolver for SystemResolver {
         host: &str,
         _: bool,
     ) -> anyhow::Result<Option<std::net::Ipv6Addr>> {
+        if !self.ipv6() {
+            return Err(Error::DNSError("IPv6 is disabled".into()).into());
+        }
+        if let Some(ip) = parse_ip_literal(host) {
+            return Ok(match ip {
+                std::net::IpAddr::V6(ip) => Some(ip),
+                std::net::IpAddr::V4(_) => None,
+            });
+        }
         let response = self.inner.ipv6_lookup(host).await?;
         Ok(response
             .answers()
@@ -107,6 +180,10 @@ impl ClashResolver for SystemResolver {
 
     fn set_ipv6(&self, val: bool) {
         self.ipv6.store(val, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn dns_ipv6(&self) -> bool {
+        self.dns_ipv6
     }
 
     fn kind(&self) -> ResolverKind {

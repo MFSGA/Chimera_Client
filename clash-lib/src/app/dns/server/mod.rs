@@ -26,7 +26,7 @@ struct DnsMessageExchanger {
 
 impl chimera_dns::DnsMessageExchanger for DnsMessageExchanger {
     fn ipv6(&self) -> bool {
-        self.resolver.ipv6()
+        self.resolver.ipv6() && self.resolver.dns_ipv6()
     }
 
     #[instrument(skip(self))]

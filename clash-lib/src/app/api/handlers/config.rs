@@ -55,9 +55,12 @@ struct ConfigState {
     dispatcher: Arc<dispatcher::Dispatcher>,
     global_state: Arc<Mutex<GlobalState>>,
     dns_resolver: ThreadSafeDNSResolver,
+    control_plane_dns_resolver: ThreadSafeDNSResolver,
     dns_listen_addr: DNSListenAddr,
     dns_enabled: bool,
     ipv6_allowed: bool,
+    controller_listener_ipv6: bool,
+    patch_lock: Arc<Mutex<()>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -67,9 +70,11 @@ pub fn routes(
     dispatcher: Arc<dispatcher::Dispatcher>,
     global_state: Arc<Mutex<GlobalState>>,
     dns_resolver: ThreadSafeDNSResolver,
+    control_plane_dns_resolver: ThreadSafeDNSResolver,
     dns_listen_addr: DNSListenAddr,
     dns_enabled: bool,
     ipv6_allowed: bool,
+    controller_listener_ipv6: bool,
 ) -> Router<Arc<AppState>> {
     Router::new()
         .route(
@@ -87,9 +92,12 @@ pub fn routes(
             dispatcher,
             global_state,
             dns_resolver,
+            control_plane_dns_resolver,
             dns_listen_addr,
             dns_enabled,
             ipv6_allowed,
+            controller_listener_ipv6,
+            patch_lock: Arc::new(Mutex::new(())),
         })
 }
 
@@ -631,9 +639,19 @@ impl PatchConfigRequest {
 fn validate_ipv6_update(
     requested: Option<bool>,
     allowed: bool,
+    current_ipv6: bool,
+    listener_ipv6: bool,
+    dns_listener_ipv6: bool,
+    controller_listener_ipv6: bool,
 ) -> Result<(), &'static str> {
     if requested == Some(true) && !allowed {
         Err("IPv6 cannot be enabled while TUN is IPv4-only")
+    } else if !requested.unwrap_or(current_ipv6)
+        && (listener_ipv6 || dns_listener_ipv6 || controller_listener_ipv6)
+    {
+        Err(
+            "cannot disable IPv6 while IPv6 listeners are active; reload with IPv4 listener addresses",
+        )
     } else {
         Ok(())
     }
@@ -643,23 +661,13 @@ async fn patch_configs(
     State(state): State<ConfigState>,
     Json(payload): Json<PatchConfigRequest>,
 ) -> impl IntoResponse {
-    if let Err(message) = validate_ipv6_update(payload.ipv6, state.ipv6_allowed) {
-        return (StatusCode::BAD_REQUEST, message).into_response();
-    }
-
-    let inbound_manager = state.inbound_manager.clone();
-    let listener_snapshot = if payload.rebuild_listeners() {
-        Some(inbound_manager.snapshot_options().await)
-    } else {
-        None
-    };
-    let mut need_restart = false;
-    if let Some(bind_address) = payload.bind_address.clone() {
-        match bind_address.parse::<BindAddress>() {
-            Ok(bind_address) => {
-                inbound_manager.set_bind_address(bind_address).await;
-                need_restart = true;
-            }
+    // Serialize PATCH requests while validating listener state and applying
+    // IPv6 policy; otherwise two valid snapshots can interleave into an
+    // IPv6 listener with IPv6 disabled.
+    let _patch_guard = state.patch_lock.lock().await;
+    let requested_bind_address = match payload.bind_address.as_deref() {
+        Some(bind_address) => match bind_address.parse::<BindAddress>() {
+            Ok(bind_address) => Some(bind_address),
             Err(_) => {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -667,7 +675,51 @@ async fn patch_configs(
                 )
                     .into_response();
             }
-        }
+        },
+        None => None,
+    };
+    let inbound_manager = state.inbound_manager.clone();
+    let current_listeners = inbound_manager.snapshot_options().await;
+    let listener_ipv6 = requested_bind_address
+        .map(|address| address.0.is_ipv6())
+        .unwrap_or_else(|| {
+            current_listeners
+                .iter()
+                .any(|listener| listener.common_opts().listen.0.is_ipv6())
+        });
+    let dns_listener_ipv6 = state.dns_enabled
+        && [
+            state.dns_listen_addr.udp,
+            state.dns_listen_addr.tcp,
+            state.dns_listen_addr.doh.as_ref().map(|value| value.addr),
+            state.dns_listen_addr.dot.as_ref().map(|value| value.addr),
+            state.dns_listen_addr.doh3.as_ref().map(|value| value.addr),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|address| address.is_ipv6());
+    if (payload.ipv6.is_some() || requested_bind_address.is_some())
+        && let Err(message) = validate_ipv6_update(
+            payload.ipv6,
+            state.ipv6_allowed,
+            state.dns_resolver.ipv6(),
+            listener_ipv6,
+            dns_listener_ipv6,
+            state.controller_listener_ipv6,
+        )
+    {
+        return (StatusCode::BAD_REQUEST, message).into_response();
+    }
+
+    let listener_snapshot = if payload.rebuild_listeners() {
+        Some(current_listeners)
+    } else {
+        None
+    };
+    let mut need_restart = false;
+    if let Some(bind_address) = requested_bind_address {
+        inbound_manager.set_bind_address(bind_address).await;
+        need_restart = true;
     }
 
     if payload.rebuild_listeners() {
@@ -723,6 +775,7 @@ async fn patch_configs(
 
     if let Some(ipv6) = payload.ipv6 {
         state.dns_resolver.set_ipv6(ipv6);
+        state.control_plane_dns_resolver.set_ipv6(ipv6);
     }
 
     StatusCode::ACCEPTED.into_response()
@@ -736,10 +789,44 @@ mod tests {
 
     #[test]
     fn blocks_enabling_ipv6_for_ipv4_only_tun() {
-        assert!(validate_ipv6_update(Some(true), false).is_err());
-        assert!(validate_ipv6_update(Some(false), false).is_ok());
-        assert!(validate_ipv6_update(None, false).is_ok());
-        assert!(validate_ipv6_update(Some(true), true).is_ok());
+        assert!(
+            validate_ipv6_update(Some(true), false, false, false, false, false)
+                .is_err()
+        );
+        assert!(
+            validate_ipv6_update(Some(false), false, false, false, false, false)
+                .is_ok()
+        );
+        assert!(
+            validate_ipv6_update(None, false, false, false, false, false).is_ok()
+        );
+        assert!(
+            validate_ipv6_update(Some(true), true, false, false, false, false)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn blocks_disabling_ipv6_with_ipv6_listener() {
+        assert!(
+            validate_ipv6_update(Some(false), true, true, true, false, false)
+                .is_err()
+        );
+        assert!(
+            validate_ipv6_update(Some(false), true, true, false, false, true)
+                .is_err(),
+            "the API controller's IPv6 bind cannot be retained after disabling IPv6"
+        );
+        assert!(
+            validate_ipv6_update(Some(false), true, true, false, false, false)
+                .is_ok(),
+            "a v4 bind address allows an atomic IPv6 disable"
+        );
+        assert!(
+            validate_ipv6_update(Some(false), true, true, false, true, false)
+                .is_err(),
+            "a running IPv6 DNS listener cannot be retained after disabling IPv6"
+        );
     }
 
     #[test]

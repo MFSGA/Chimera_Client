@@ -66,7 +66,7 @@ pub(crate) async fn new_with_network_path_source(
         }
     } else {
         Ok(Arc::new(
-            SystemResolver::new(cfg.ipv6)
+            SystemResolver::new_with_ipv6(cfg.global_ipv6, cfg.dns_ipv6)
                 .map_err(|err| crate::Error::DNSError(err.to_string()))?,
         ))
     }

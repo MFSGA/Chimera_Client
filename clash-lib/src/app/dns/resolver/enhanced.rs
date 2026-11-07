@@ -42,7 +42,8 @@ struct NegativeEntry {
 }
 
 pub struct EnhancedResolver {
-    ipv6: AtomicBool,
+    ipv6: Arc<AtomicBool>,
+    dns_ipv6: bool,
     health: Arc<DnsHealthTracker>,
     hosts: Option<trie::StringTrie<net::IpAddr>>,
     main: Vec<ThreadSafeDNSClient>,
@@ -203,21 +204,38 @@ impl EnhancedResolver {
             && message.signature.is_none()
     }
 
+    #[cfg(test)]
     fn from_clients(main: Vec<ThreadSafeDNSClient>, ipv6: bool) -> Self {
         Self::from_clients_with_fallback(main, None, ipv6)
     }
 
+    #[cfg(test)]
     fn from_clients_with_fallback(
         main: Vec<ThreadSafeDNSClient>,
         fallback: Option<Vec<ThreadSafeDNSClient>>,
         ipv6: bool,
+    ) -> Self {
+        Self::from_clients_with_ipv6_policy(
+            main,
+            fallback,
+            Arc::new(AtomicBool::new(ipv6)),
+            ipv6,
+        )
+    }
+
+    fn from_clients_with_ipv6_policy(
+        main: Vec<ThreadSafeDNSClient>,
+        fallback: Option<Vec<ThreadSafeDNSClient>>,
+        ipv6: Arc<AtomicBool>,
+        dns_ipv6: bool,
     ) -> Self {
         let health = Arc::new(DnsHealthTracker::default());
         let main = observe_clients(main, "main", &health);
         let fallback =
             fallback.map(|clients| observe_clients(clients, "fallback", &health));
         Self {
-            ipv6: AtomicBool::new(ipv6),
+            ipv6,
+            dns_ipv6,
             health,
             hosts: None,
             main,
@@ -248,7 +266,8 @@ impl EnhancedResolver {
         use crate::app::dns::config::NameServer;
 
         EnhancedResolver {
-            ipv6: AtomicBool::new(false),
+            ipv6: Arc::new(AtomicBool::new(false)),
+            dns_ipv6: false,
             health: Arc::new(DnsHealthTracker::default()),
             hosts: None,
             main: make_clients(
@@ -316,10 +335,14 @@ impl EnhancedResolver {
         rule_dispatch: Option<Arc<RuleDispatch>>,
         network_path_source: Option<NetworkPathSource>,
     ) -> Result<Self, Error> {
+        let global_ipv6 = cfg.global_ipv6;
+        let dns_ipv6 = cfg.dns_ipv6;
+        let ipv6_policy = Arc::new(AtomicBool::new(global_ipv6));
         let edns_client_subnet = cfg.edns_client_subnet.clone();
         let health = Arc::new(DnsHealthTracker::default());
         let default_resolver = Arc::new(EnhancedResolver {
-            ipv6: AtomicBool::new(false),
+            ipv6: ipv6_policy.clone(),
+            dns_ipv6,
             health: health.clone(),
             hosts: None,
             main: make_clients(
@@ -391,8 +414,12 @@ impl EnhancedResolver {
         let outbound_resolver: Arc<dyn ClashResolver> = proxy_resolver
             .as_ref()
             .map(|clients| {
-                Arc::new(Self::from_clients(clients.clone(), cfg.ipv6))
-                    as Arc<dyn ClashResolver>
+                Arc::new(Self::from_clients_with_ipv6_policy(
+                    clients.clone(),
+                    None,
+                    ipv6_policy.clone(),
+                    dns_ipv6,
+                )) as Arc<dyn ClashResolver>
             })
             .unwrap_or_else(|| default_resolver.clone());
 
@@ -429,10 +456,11 @@ impl EnhancedResolver {
                 },
             )
             .await?;
-            Some(Arc::new(Self::from_clients_with_fallback(
+            Some(Arc::new(Self::from_clients_with_ipv6_policy(
                 clients,
                 Some(main.clone()),
-                cfg.ipv6,
+                ipv6_policy.clone(),
+                dns_ipv6,
             )) as ThreadSafeDNSResolver)
         } else {
             None
@@ -458,7 +486,8 @@ impl EnhancedResolver {
         drop(plain_outbounds);
 
         Ok(Self {
-            ipv6: AtomicBool::new(cfg.ipv6),
+            ipv6: ipv6_policy,
+            dns_ipv6,
             health: health.clone(),
             main,
             hosts: cfg.hosts,
@@ -1016,6 +1045,12 @@ impl ClashResolver for EnhancedResolver {
         enhanced: bool,
     ) -> anyhow::Result<Option<net::IpAddr>> {
         if let Some(ip) = parse_ip_literal(host) {
+            if ip.is_ipv6() && !self.ipv6.load(Relaxed) {
+                return Err(Error::DNSError(format!(
+                    "IPv6 is disabled; cannot resolve IPv6 literal `{host}`"
+                ))
+                .into());
+            }
             return Ok(Some(ip));
         }
 
@@ -1063,10 +1098,28 @@ impl ClashResolver for EnhancedResolver {
                     ))
                 }
             }
-            false => self
-                .resolve_v4(host, enhanced)
-                .await
-                .map(|ip| ip.map(net::IpAddr::from)),
+            false => match self.resolve_v4(host, enhanced).await {
+                Ok(Some(ip)) => Ok(Some(net::IpAddr::V4(ip))),
+                Ok(None) => Err(Error::DNSError(format!(
+                    "IPv6 is disabled and hostname `{host}` has no IPv4 address"
+                ))
+                .into()),
+                Err(error) => {
+                    let detail = error.to_string();
+                    let message = if detail.contains("NODATA")
+                        || detail.contains("NXDomain")
+                    {
+                        format!(
+                            "IPv6 is disabled and hostname `{host}` has no IPv4 address: {detail}"
+                        )
+                    } else {
+                        format!(
+                            "IPv6 is disabled; IPv4 lookup for hostname `{host}` failed: {detail}"
+                        )
+                    };
+                    Err(Error::DNSError(message).into())
+                }
+            },
         }
     }
 
@@ -1076,6 +1129,12 @@ impl ClashResolver for EnhancedResolver {
         enhanced: bool,
     ) -> anyhow::Result<Vec<net::IpAddr>> {
         if let Some(ip) = parse_ip_literal(host) {
+            if ip.is_ipv6() && !self.ipv6.load(Relaxed) {
+                return Err(Error::DNSError(format!(
+                    "IPv6 is disabled; cannot resolve IPv6 literal `{host}`"
+                ))
+                .into());
+            }
             return Ok(vec![ip]);
         }
         if enhanced {
@@ -1105,8 +1164,26 @@ impl ClashResolver for EnhancedResolver {
         addresses.sort_unstable();
         addresses.dedup();
         if addresses.is_empty() {
+            let no_ipv4_record = !ipv6_enabled
+                && errors.iter().any(|error| {
+                    error.starts_with("A: ")
+                        && (error.contains("NODATA") || error.contains("NXDomain"))
+                });
             return Err(if errors.is_empty() {
-                anyhow!("no record for hostname: {host}")
+                if ipv6_enabled {
+                    anyhow!("no record for hostname: {host}")
+                } else {
+                    Error::DNSError(format!(
+                        "IPv6 is disabled and hostname `{host}` has no IPv4 address"
+                    ))
+                    .into()
+                }
+            } else if no_ipv4_record {
+                Error::DNSError(format!(
+                    "IPv6 is disabled and hostname `{host}` has no IPv4 address: {}",
+                    errors.join("; ")
+                ))
+                .into()
             } else {
                 anyhow!("DNS resolution failed for {host}: {}", errors.join("; "))
             });
@@ -1120,6 +1197,19 @@ impl ClashResolver for EnhancedResolver {
         host: &str,
         enhanced: bool,
     ) -> anyhow::Result<Option<net::Ipv4Addr>> {
+        if let Some(ip) = parse_ip_literal(host) {
+            return match ip {
+                net::IpAddr::V4(ip) => Ok(Some(ip)),
+                net::IpAddr::V6(_) if !self.ipv6.load(Relaxed) => {
+                    Err(Error::DNSError(format!(
+                        "IPv6 is disabled; cannot resolve IPv6 literal `{host}`"
+                    ))
+                    .into())
+                }
+                net::IpAddr::V6(_) => Ok(None),
+            };
+        }
+
         if enhanced
             && let Some(hosts) = &self.hosts
             && let Some(v) = hosts.search(host)
@@ -1130,10 +1220,6 @@ impl ClashResolver for EnhancedResolver {
                 // record; it must not panic a release=abort process.
                 net::IpAddr::V6(_) => None,
             }));
-        }
-
-        if let Ok(ip) = host.parse::<net::Ipv4Addr>() {
-            return Ok(Some(ip));
         }
 
         if enhanced && self.fake_ip_enabled() {
@@ -1152,10 +1238,12 @@ impl ClashResolver for EnhancedResolver {
         }
 
         match self.lookup_ip(host, rr::RecordType::A).await {
-            Ok(result) => match result.choose(&mut rand::rng()).unwrap() {
-                net::IpAddr::V4(v4) => Ok(Some(*v4)),
-                _ => unreachable!("invalid IP family"),
-            },
+            Ok(result) => {
+                Ok(result.choose(&mut rand::rng()).and_then(|ip| match ip {
+                    net::IpAddr::V4(v4) => Some(*v4),
+                    _ => None,
+                }))
+            }
             Err(e) => Err(e),
         }
     }
@@ -1166,29 +1254,33 @@ impl ClashResolver for EnhancedResolver {
         host: &str,
         enhanced: bool,
     ) -> anyhow::Result<Option<net::Ipv6Addr>> {
-        if let Some(std::net::IpAddr::V6(ip)) = parse_ip_literal(host) {
-            return Ok(Some(ip));
-        }
-
         if !self.ipv6.load(Relaxed) {
-            return Err(Error::DNSError("ipv6 disabled".into()).into());
+            return Err(Error::DNSError("IPv6 is disabled".into()).into());
+        }
+        if let Some(ip) = parse_ip_literal(host) {
+            return Ok(match ip {
+                net::IpAddr::V6(ip) => Some(ip),
+                net::IpAddr::V4(_) => None,
+            });
         }
 
         if enhanced
             && let Some(hosts) = &self.hosts
             && let Some(v) = hosts.search(host)
         {
-            return Ok(v.get_data().map(|v| match v {
-                net::IpAddr::V6(v6) => *v6,
-                _ => unreachable!("invalid IP family"),
+            return Ok(v.get_data().and_then(|v| match v {
+                net::IpAddr::V6(v6) => Some(*v6),
+                net::IpAddr::V4(_) => None,
             }));
         }
 
         match self.lookup_ip(host, rr::RecordType::AAAA).await {
-            Ok(result) => match result.choose(&mut rand::rng()).unwrap() {
-                net::IpAddr::V6(v6) => Ok(Some(*v6)),
-                _ => unreachable!("invalid IP family"),
-            },
+            Ok(result) => {
+                Ok(result.choose(&mut rand::rng()).and_then(|ip| match ip {
+                    net::IpAddr::V6(v6) => Some(*v6),
+                    _ => None,
+                }))
+            }
 
             Err(e) => Err(e),
         }
@@ -1228,6 +1320,10 @@ impl ClashResolver for EnhancedResolver {
 
     fn ipv6(&self) -> bool {
         self.ipv6.load(Relaxed)
+    }
+
+    fn dns_ipv6(&self) -> bool {
+        self.dns_ipv6
     }
 
     fn set_ipv6(&self, enable: bool) {
@@ -1372,7 +1468,7 @@ mod tests {
         net::Ipv4Addr,
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::{Duration, Instant},
     };
@@ -1388,6 +1484,27 @@ mod tests {
         },
         proxy,
     };
+
+    #[test]
+    fn nested_resolvers_follow_global_ipv6_toggle() {
+        let ipv6_policy = Arc::new(AtomicBool::new(true));
+        let resolver = EnhancedResolver::from_clients_with_ipv6_policy(
+            vec![],
+            None,
+            ipv6_policy.clone(),
+            false,
+        );
+        let bootstrap = EnhancedResolver::from_clients_with_ipv6_policy(
+            vec![],
+            None,
+            ipv6_policy,
+            false,
+        );
+
+        assert!(bootstrap.ipv6());
+        resolver.set_ipv6(false);
+        assert!(!bootstrap.ipv6());
+    }
 
     #[derive(Debug)]
     struct FixedClient {
@@ -1779,13 +1896,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ipv4_hosts_with_other_address_family_do_not_abort() {
+    async fn hosts_with_other_address_family_return_no_result() {
         let mut hosts = crate::common::trie::StringTrie::new();
         hosts.insert("v6-only.test", Arc::new("2001:db8::1".parse().unwrap()));
-        let mut resolver = EnhancedResolver::from_clients(vec![], false);
+        hosts.insert("v4-only.test", Arc::new("192.0.2.1".parse().unwrap()));
+        let mut resolver = EnhancedResolver::from_clients(vec![], true);
         resolver.hosts = Some(hosts);
         assert_eq!(
             resolver.resolve_v4("v6-only.test", true).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            resolver.resolve_v6("v4-only.test", true).await.unwrap(),
             None
         );
     }
@@ -2003,6 +2125,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ipv4_only_hostname_without_a_record_has_clear_disabled_ipv6_error() {
+        let resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(FixedClient {
+                response: op::Message::response(0, op::OpCode::Query),
+            })],
+            false,
+        );
+        let error = resolver
+            .resolve("ipv4only.example", false)
+            .await
+            .expect_err("hostname without A record must report the IPv6 policy");
+        let message = error.to_string();
+        assert!(message.contains("IPv6 is disabled"), "{message}");
+        assert!(message.contains("no IPv4 address"), "{message}");
+
+        let error = resolver
+            .resolve_all("ipv4only.example", false)
+            .await
+            .expect_err("resolve_all must report the same policy");
+        let message = error.to_string();
+        assert!(message.contains("IPv6 is disabled"), "{message}");
+        assert!(message.contains("no IPv4 address"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn ipv6_literal_is_rejected_when_disabled() {
+        let resolver = EnhancedResolver::from_clients(Vec::new(), false);
+        let error = resolver
+            .resolve("2001:db8::1", false)
+            .await
+            .expect_err("IPv6 literal must not bypass the global setting");
+        assert!(error.to_string().contains("IPv6 is disabled"));
+    }
+
+    #[tokio::test]
     async fn one_address_family_can_succeed_while_the_other_fails() {
         #[derive(Debug)]
         struct OnlyIpv4;
@@ -2163,26 +2320,18 @@ mod tests {
         assert_eq!(resets.load(Ordering::SeqCst), 5);
     }
 
-    /// Regression test for https://github.com/Watfaq/clash-rs/issues/976
-    /// IPv6 literal addresses must be returned directly even when dns.ipv6 is
-    /// disabled, because they do not require DNS resolution.
+    /// Global IPv6 disable applies to literal endpoints as well as DNS.
     #[tokio::test]
     async fn test_resolve_ipv6_literal_when_ipv6_disabled() {
         let resolver = EnhancedResolver::new_default().await;
-        // Ensure ipv6 is disabled, mirroring `dns.ipv6 = false`.
         resolver.set_ipv6(false);
         assert!(!resolver.ipv6(), "ipv6 should be disabled");
 
-        // Resolving an IPv6 literal must succeed even with ipv6 disabled.
-        let result = resolver
+        let error = resolver
             .resolve("::1", false)
             .await
-            .expect("resolve should not error for IPv6 literal");
-        assert_eq!(
-            result,
-            Some(std::net::IpAddr::V6("::1".parse().unwrap())),
-            "IPv6 literal should be returned as-is"
-        );
+            .expect_err("global IPv6 disable must reject a literal endpoint");
+        assert!(error.to_string().contains("IPv6 is disabled"));
     }
 
     /// Resolving a plain IPv4 literal must still work when ipv6 is disabled.
@@ -2202,21 +2351,16 @@ mod tests {
         );
     }
 
-    /// resolve_v6 must return an IPv6 literal directly even when ipv6 is
-    /// disabled (no DNS lookup needed for a literal).
     #[tokio::test]
     async fn test_resolve_v6_literal_when_ipv6_disabled() {
         let resolver = EnhancedResolver::new_default().await;
         resolver.set_ipv6(false);
 
-        let result = resolver.resolve_v6("::1", false).await.expect(
-            "resolve_v6 should not error for IPv6 literal when ipv6 disabled",
-        );
-        assert_eq!(
-            result,
-            Some("::1".parse::<std::net::Ipv6Addr>().unwrap()),
-            "IPv6 literal should be returned directly"
-        );
+        let error = resolver
+            .resolve_v6("::1", false)
+            .await
+            .expect_err("resolve_v6 must honor global IPv6 disable");
+        assert!(error.to_string().contains("IPv6 is disabled"));
     }
 
     #[tokio::test]
