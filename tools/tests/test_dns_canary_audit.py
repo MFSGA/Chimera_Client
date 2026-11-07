@@ -46,10 +46,12 @@ class AuditTests(unittest.TestCase):
         (self.folder / "en0.log").write_text(PHYSICAL_NOISE, encoding="utf-8")
         (self.folder / "utun7.log").write_text(TUN_CANARY, encoding="utf-8")
         (self.folder / "en0.stats.txt").write_text(
+            "tcpdump: listening on en0, link-type EN10MB (Ethernet)\n"
             "2 packets captured\n2 packets received by filter\n0 packets dropped by kernel\n",
             encoding="utf-8",
         )
         (self.folder / "utun7.stats.txt").write_text(
+            "tcpdump: listening on utun7, link-type RAW\n"
             "2 packets captured\n2 packets received by filter\n0 packets dropped by kernel\n",
             encoding="utf-8",
         )
@@ -250,6 +252,121 @@ class AuditTests(unittest.TestCase):
             "one_or_more_captures_have_no_port53_packet_lines",
             result["coverage_issues"],
         )
+
+    def test_tcpdump_statistics_must_bind_to_declared_interface(self) -> None:
+        (self.folder / "en0.stats.txt").write_text(
+            "tcpdump: listening on en1, link-type EN10MB (Ethernet)\n"
+            "2 packets captured\n2 packets received by filter\n"
+            "0 packets dropped by kernel\n", encoding="utf-8"
+        )
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["verdict"], "NOT_VERIFIED")
+        self.assertIn(
+            "tcpdump_stats_interface_unconfirmed:physical:en0",
+            report["coverage_issues"],
+        )
+
+    def test_tcpdump_statistics_without_interface_header_not_verified(self) -> None:
+        (self.folder / "en0.stats.txt").write_text(
+            "2 packets captured\n2 packets received by filter\n"
+            "0 packets dropped by kernel\n", encoding="utf-8"
+        )
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["verdict"], "NOT_VERIFIED")
+        self.assertIn(
+            "tcpdump_stats_interface_unconfirmed:physical:en0",
+            report["coverage_issues"],
+        )
+
+    def test_tcpdump_interface_binding_is_reported_without_raw_stderr(self) -> None:
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertTrue(report["captures"][0]["tcpdump_stats"]["interface_confirmed"])
+        self.assertTrue(report["captures"][1]["tcpdump_stats"]["interface_confirmed"])
+        self.assertNotIn("tcpdump: listening on", json.dumps(report))
+
+    def test_two_independent_physical_interfaces_are_analyzed(self) -> None:
+        self.manifest["expected_physical_interfaces"].append("en1")
+        self.manifest["captures"].append({
+            "role": "physical",
+            "interface": "en1",
+            "path": "en1.log",
+            "tcpdump_stats_path": "en1.stats.txt",
+            "started_at_utc": "2026-11-06T15:00:00Z",
+            "ended_at_utc": "2026-11-06T15:04:00Z",
+            "packet_time_utc_offset": "-08:00",
+        })
+        (self.folder / "en1.log").write_text(
+            "2026-11-06 07:00:00.000010 IP 192.0.2.80.53004 > 9.9.9.9.53: "
+            "122+ A? second-interface.example.test. (44)\n", encoding="utf-8",
+        )
+        (self.folder / "en1.stats.txt").write_text(
+            "tcpdump: listening on en1, link-type EN10MB (Ethernet)\n"
+            "1 packet captured\n1 packet received by filter\n"
+            "0 packets dropped by kernel\n", encoding="utf-8",
+        )
+        result = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(result["verdict"], "NO_PHYSICAL_CANARY_OBSERVED_IN_SUPPLIED_LOGS")
+        self.assertEqual(result["canary_query_counts"], {"physical": 0, "tun": 2})
+        self.assertEqual(result["coverage_issues"], [])
+
+    def test_second_physical_nic_canary_remains_positive_evidence(self) -> None:
+        self.manifest["expected_physical_interfaces"].append("en1")
+        self.manifest["captures"].append({
+            "role": "physical", "interface": "en1", "path": "en1.log",
+            "tcpdump_stats_path": "en1.stats.txt",
+            "started_at_utc": "2026-11-06T15:00:00Z",
+            "ended_at_utc": "2026-11-06T15:04:00Z",
+            "packet_time_utc_offset": "-08:00",
+        })
+        (self.folder / "en1.log").write_text(
+            "2026-11-06 07:00:00.000010 IP6 2001:db8::9.50003 > "
+            "2001:4860:4860::8888.53: 101+ AAAA? "
+            "canary.evidence.example.test. (55)\n", encoding="utf-8",
+        )
+        (self.folder / "en1.stats.txt").write_text(
+            "tcpdump: listening on en1, link-type EN10MB (Ethernet)\n"
+            "1 packet captured\n1 packet received by filter\n"
+            "0 packets dropped by kernel\n", encoding="utf-8",
+        )
+        result = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(result["verdict"], "PHYSICAL_CANARY_PLAINTEXT_DNS_OBSERVED")
+        self.assertEqual(result["canary_query_counts"], {"physical": 1, "tun": 2})
+        self.assertEqual(result["coverage_issues"], [])
+        self.assertEqual(result["canary_queries"][-1]["interface"], "en1")
+
+    def test_physical_query_not_hidden_by_mismatched_tcpdump_header(self) -> None:
+        (self.folder / "en0.log").write_text(PHYSICAL_LEAK, encoding="utf-8")
+        (self.folder / "en0.stats.txt").write_text(
+            "tcpdump: listening on en1, link-type EN10MB (Ethernet)\n"
+            "2 packets captured\n2 packets received by filter\n"
+            "0 packets dropped by kernel\n", encoding="utf-8",
+        )
+        result = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(result["verdict"], "PHYSICAL_CANARY_PLAINTEXT_DNS_OBSERVED")
+        self.assertIn(
+            "tcpdump_stats_interface_unconfirmed:physical:en0",
+            result["coverage_issues"],
+        )
+
+    def test_copied_packet_log_cannot_be_used_for_second_nic(self) -> None:
+        self.manifest["expected_physical_interfaces"].append("en1")
+        self.manifest["captures"].append({
+            "role": "physical", "interface": "en1", "path": "en1.log",
+            "tcpdump_stats_path": "en1.stats.txt",
+            "started_at_utc": "2026-11-06T15:00:00Z",
+            "ended_at_utc": "2026-11-06T15:04:00Z",
+            "packet_time_utc_offset": "-08:00",
+        })
+        (self.folder / "en1.log").write_bytes((self.folder / "en0.log").read_bytes())
+        (self.folder / "en1.stats.txt").write_text(
+            "tcpdump: listening on en1, link-type EN10MB (Ethernet)\n"
+            "2 packets captured\n2 packets received by filter\n"
+            "0 packets dropped by kernel\n", encoding="utf-8",
+        )
+        result = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(result["verdict"], "NOT_VERIFIED")
+        self.assertIn("identical_capture_content_across_interfaces",
+                      result["coverage_issues"])
 
     def test_missing_capture_stats_cannot_prove_no_drop(self) -> None:
         del self.manifest["captures"][0]["tcpdump_stats_path"]
@@ -772,6 +889,7 @@ class AuditTests(unittest.TestCase):
             encoding="utf-8",
         )
         (self.folder / "en0.stats.txt").write_text(
+            "tcpdump: listening on en0, link-type EN10MB (Ethernet)\n"
             "3 packets captured\n3 packets received by filter\n0 packets dropped by kernel\n",
             encoding="utf-8",
         )

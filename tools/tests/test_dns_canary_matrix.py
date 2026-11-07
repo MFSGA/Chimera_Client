@@ -189,7 +189,8 @@ class MatrixTests(unittest.TestCase):
                 )
                 self.change_case(
                     scenario, "utun7.stats.txt",
-                    "1 packets captured\n1 packets received by filter\n"
+                    "tcpdump: listening on utun7, link-type RAW\n"
+                    "1 packet captured\n1 packet received by filter\n"
                     "0 packets dropped by kernel\n",
                 )
                 self.matrix["profile"] = "macos_dns_egress_v1"

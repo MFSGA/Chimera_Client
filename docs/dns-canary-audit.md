@@ -30,7 +30,7 @@ python3 tools/dns_canary_audit.py \
 
 此外，`tools/examples/dns_canary/manifest-leak.json` 模拟物理网卡出现 canary（退出码 3），`manifest-incomplete.json` 模拟第二个活动物理接口 `en1` 缺失（退出码 4）。三个夹具的可复现结果都由离线单测验证，绝非真实网络采集。
 
-分析器只读取 manifest 同目录下的相对路径，拒绝 `..`、绝对路径、指向外部文件的符号链接、重复接口/文件/统计文件（含指向同一 inode 的硬链接）、未知 manifest 字段和超大输入；manifest 最大 256 KiB，每份抓包最大 128 MiB，`scutil` 快照最大 4 MiB，单份 tcpdump 统计最大 64 KiB。必须为各抓包给出 `packet_time_utc_offset`（例如 PST 使用 `-08:00`）；缺少时可报告观察到的外发，但**不能生成阴性结论**。重复运行时默认拒绝覆盖已有报告，显式指定 `--overwrite` 才可替换。输出 JSON 采用同目录临时文件原子落盘，文件权限为 0600；拒绝将报告路径设为 manifest、抓包或 resolver 快照。显式覆盖既有报告时也不会顺着符号链接修改其目标。抓包在分析期间发生变化会中止，而非生成不一致的 SHA-256。
+分析器只读取 manifest 同目录下的相对路径，拒绝 `..`、绝对路径、指向外部文件的符号链接、重复接口/文件/统计文件（含指向同一 inode 的硬链接）、未知 manifest 字段和超大输入；如果不同接口的抓包内容 SHA-256 **完全相同**，阴性结论降级为 `NOT_VERIFIED`，避免把同一日志复制成两份后冒充多网卡覆盖（即使确实发生相同的广播报文，也需要重新采集或人工复核）。manifest 最大 256 KiB，每份抓包最大 128 MiB，`scutil` 快照最大 4 MiB，单份 tcpdump 统计最大 64 KiB。必须为各抓包给出 `packet_time_utc_offset`（例如 PST 使用 `-08:00`）；缺少时可报告观察到的外发，但**不能生成阴性结论**。重复运行时默认拒绝覆盖已有报告，显式指定 `--overwrite` 才可替换。输出 JSON 采用同目录临时文件原子落盘，文件权限为 0600；拒绝将报告路径设为 manifest、抓包或 resolver 快照。显式覆盖既有报告时也不会顺着符号链接修改其目标。抓包在分析期间发生变化会中止，而非生成不一致的 SHA-256。
 
 ## 独立授权测试 Mac：操作人员采集流程（未在本轮执行）
 
@@ -48,7 +48,7 @@ python3 tools/dns_canary_audit.py \
      '(udp dst port 53 or tcp dst port 53)' > utun7.txt 2> utun7.stats.txt
    ```
 
-   **警告：** 原始 tcpdump 日志可能包含其他用户的 DNS 域名和 IP。应在无个人流量的隔离机器执行。报告默认**不回显其他域名或源/目标地址**，但这不等于原始日志无敏感信息。分析器要求 tcpdump 的单行文本解码格式，**不要使用可能让 DNS 包头和地址跨行输出的 `-vv` 模式**；如有非空 DNS 载荷无法解码，应标记 `NOT_VERIFIED` 并重采，而非判定零泄漏。务必用 Ctrl-C/正常终止结束每个 `tcpdump`，让 stderr 落下最终 `N packets captured`、`0 packets dropped by kernel`（部分系统还提供 `dropped by interface`），否则缺少统计或统计与 stdout 解析包数不匹配会被判为证据不足。
+   **警告：** 原始 tcpdump 日志可能包含其他用户的 DNS 域名和 IP。应在无个人流量的隔离机器执行。报告默认**不回显其他域名或源/目标地址**，但这不等于原始日志无敏感信息。分析器要求 tcpdump 的单行文本解码格式，**不要使用可能让 DNS 包头和地址跨行输出的 `-vv` 模式**；如有非空 DNS 载荷无法解码，应标记 `NOT_VERIFIED` 并重采，而非判定零泄漏。务必用 Ctrl-C/正常终止结束每个 `tcpdump`，让 stderr 保留 `tcpdump: listening on en0, ...`（替换为各接口真实名称）的**启动行**以及最终 `N packets captured`、`0 packets dropped by kernel`（部分系统还提供 `dropped by interface`）。如果无法从该 stderr 确认对应接口、缺少统计或统计与 stdout 解析包数不匹配，均判为证据不足。启动行仍是用户提供的文本，工具无法独立验证它来自真实系统进程。
 
    为每个捕获进程手工记录开启和停止时的 UTC 时间（例如执行 `date -u '+%Y-%m-%dT%H:%M:%SZ'`），并记录抓包期间当前系统的 UTC 偏移（例如通过只读 `date '+%z'` 确认后填写 `-08:00`）。不同接口必须存在共同的采集窗口；工具还会尝试将 `tcpdump -tttt` 的本地时间戳转为 UTC，核对数据包自身是否落在各自声明窗口、utun canary 是否在公共时段内出现。**时钟同步、操作者时间声明及固定 UTC 偏移都不是独立证明**；跨夏令时/DST 跳变的采集必须拆成不同 case，不能只给整段一个偏移。
 

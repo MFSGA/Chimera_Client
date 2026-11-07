@@ -1,3 +1,4 @@
+tcpdump: listening on utun7, link-type EN10MB (Ethernet)
 2 packets captured
 2 packets received by filter
 0 packets dropped by kernel

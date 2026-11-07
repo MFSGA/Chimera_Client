@@ -253,8 +253,8 @@ def summarize_scutil_snapshot(lines: list[str]) -> dict[str, int]:
     }
 
 
-def read_tcpdump_stats(path: Path) -> dict[str, Any]:
-    """Summarize tcpdump's shutdown stderr, without exposing raw output."""
+def read_tcpdump_stats(path: Path, expected_interface: str) -> dict[str, Any]:
+    """Summarize tcpdump stderr and bind its startup line to the declared NIC."""
     if path.stat().st_size > MAX_TCPDUMP_STATS_BYTES:
         raise AuditError("tcpdump stats exceeds 64 KiB; split the evidence")
     raw = path.read_bytes()
@@ -271,6 +271,14 @@ def read_tcpdump_stats(path: Path) -> dict[str, Any]:
         )
         return int(matches[0]) if len(matches) == 1 else None
 
+    # On macOS tcpdump normally emits a startup line naming the actual
+    # interface, e.g. "tcpdump: listening on en0, link-type ...".
+    # This remains operator-supplied text, not independent OS attestation.
+    starts = re.findall(
+        r"(?m)^\s*(?:tcpdump:\s*)?listening on ([A-Za-z][A-Za-z0-9_.-]{0,31}),",
+        decoded,
+    )
+    interface_confirmed = starts == [expected_interface]
     captured = count("captured")
     dropped = count("dropped by kernel")
     interface_dropped = count("dropped by interface")
@@ -285,6 +293,7 @@ def read_tcpdump_stats(path: Path) -> dict[str, Any]:
         "dropped_by_kernel": dropped,
         "dropped_by_interface": interface_dropped,
         "received_by_filter": received,
+        "interface_confirmed": interface_confirmed,
         "structure_recognized": captured is not None and dropped is not None,
     }
 
@@ -355,6 +364,7 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
     seen_interfaces: set[tuple[str, str]] = set()
     seen_paths: set[Path] = set()
     seen_file_ids: set[tuple[int, int]] = set()
+    capture_content_hashes: set[str] = set()
     missing_offsets: list[str] = []
     stats_issues: list[str] = []
     by_role_inside_window = {"physical": 0, "tun": 0}
@@ -476,6 +486,10 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
         if (size_before != size_after
                 or input_digest.hexdigest() != sha256_file(file_path)):
             raise AuditError("capture changed while it was being analyzed")
+        capture_hash = input_digest.hexdigest()
+        if capture_hash in capture_content_hashes:
+            stats_issues.append("identical_capture_content_across_interfaces")
+        capture_content_hashes.add(capture_hash)
         stats_result: dict[str, Any] = {"provided": False}
         if "tcpdump_stats_path" not in spec:
             stats_issues.append(f"missing_tcpdump_stats:{role}:{interface}")
@@ -485,7 +499,9 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
             if stats_key in seen_file_ids:
                 raise AuditError("the same underlying file cannot represent two evidence sources")
             seen_file_ids.add(stats_key)
-            stats_result = read_tcpdump_stats(stats_path)
+            stats_result = read_tcpdump_stats(stats_path, interface)
+            if not stats_result["interface_confirmed"]:
+                stats_issues.append(f"tcpdump_stats_interface_unconfirmed:{role}:{interface}")
             if not stats_result["structure_recognized"]:
                 stats_issues.append(f"incomplete_tcpdump_stats:{role}:{interface}")
             else:
