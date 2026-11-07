@@ -121,21 +121,33 @@ async fn connections_websocket_interval_is_milliseconds() {
         .expect("failed to connect to connections WebSocket");
     assert_eq!(response.status(), http::StatusCode::SWITCHING_PROTOCOLS);
 
-    let started = tokio::time::Instant::now();
-    for _ in 0..2 {
-        let message = tokio::time::timeout(Duration::from_secs(2), socket.next())
+    let first_message = tokio::time::timeout(Duration::from_secs(2), socket.next())
+        .await
+        .expect("connections WebSocket did not send its first snapshot")
+        .expect("connections WebSocket closed before sending a snapshot")
+        .expect("failed to receive connections WebSocket snapshot");
+    let Message::Text(first_body) = first_message else {
+        panic!("connections WebSocket should send text JSON snapshots");
+    };
+    let first_payload: serde_json::Value = serde_json::from_str(first_body.as_ref())
+        .expect("first snapshot should be JSON");
+    assert!(first_payload["connections"].is_array());
+
+    let second_frame_started = tokio::time::Instant::now();
+    let second_message =
+        tokio::time::timeout(Duration::from_millis(750), socket.next())
             .await
-            .expect("connections WebSocket did not send at millisecond cadence")
-            .expect("connections WebSocket closed before sending a snapshot")
+            .expect("connections WebSocket ignored the 100ms interval")
+            .expect("connections WebSocket closed before sending its next snapshot")
             .expect("failed to receive connections WebSocket snapshot");
-        let Message::Text(body) = message else {
-            panic!("connections WebSocket should send text JSON snapshots");
-        };
-        let payload: serde_json::Value =
-            serde_json::from_str(body.as_ref()).expect("snapshot should be JSON");
-        assert!(payload["connections"].is_array());
-    }
-    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(second_frame_started.elapsed() < Duration::from_millis(750));
+    let Message::Text(second_body) = second_message else {
+        panic!("connections WebSocket should send text JSON snapshots");
+    };
+    let second_payload: serde_json::Value =
+        serde_json::from_str(second_body.as_ref())
+            .expect("second snapshot should be JSON");
+    assert!(second_payload["connections"].is_array());
 }
 
 #[tokio::test(flavor = "current_thread")]
