@@ -1,0 +1,2 @@
+2026-11-06 07:00:00.000001 IP 192.0.2.50.51111 > 9.9.9.9.53: 1001+ A? canary.evidence.example.test. (54)
+2026-11-06 07:00:00.000002 IP6 2001:db8::10.55555 > 2001:4860:4860::8888.53: Flags [P.], seq 1:70, ack 1, length 69: 1002+ AAAA? canary.evidence.example.test. (69)

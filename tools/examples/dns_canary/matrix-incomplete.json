@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "matrix_id": "synthetic_incomplete_macos_v1",
+  "profile": "macos_dns_egress_v1",
+  "required_cases": [
+    "wifi_a_aaaa",
+    "tcp_53",
+    "ipv6",
+    "network_change",
+    "sleep_resume",
+    "dns_upstream_failure",
+    "tun_or_dns_proxy_unavailable"
+  ],
+  "cases": [
+    {
+      "case_id": "synthetic_wifi_example",
+      "manifest": "manifest.json"
+    }
+  ]
+}
