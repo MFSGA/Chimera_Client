@@ -11,6 +11,7 @@ use axum::{
 };
 use http::HeaderMap;
 use serde::Deserialize;
+use std::time::Duration;
 use tracing::{debug, warn};
 
 use crate::app::{
@@ -33,13 +34,31 @@ pub fn routes(statistics_manager: Arc<StatisticsManager>) -> Router<Arc<AppState
 
 #[derive(Deserialize)]
 pub struct GetConnectionsQuery {
-    pub interval: Option<u64>,
+    pub interval: Option<String>,
+}
+
+impl GetConnectionsQuery {
+    const DEFAULT_INTERVAL_MS: u64 = 1_000;
+    // Avoid effectively permanent WebSocket timers from unreasonable values.
+    const MAX_INTERVAL_MS: u64 = 86_400_000;
+
+    pub fn interval_ms(&self) -> Option<u64> {
+        let interval_ms = match self.interval.as_deref() {
+            Some("") => Self::DEFAULT_INTERVAL_MS,
+            Some(interval) => interval.parse().ok()?,
+            None => Self::DEFAULT_INTERVAL_MS,
+        };
+        if interval_ms == 0 || interval_ms > Self::MAX_INTERVAL_MS {
+            return None;
+        }
+
+        Some(interval_ms)
+    }
 }
 
 async fn get_connections(
     headers: HeaderMap,
     State(state): State<ConnectionState>,
-    q: Query<GetConnectionsQuery>,
     req: Request<Body>,
 ) -> impl IntoResponse {
     if !is_request_websocket(&headers) {
@@ -47,6 +66,18 @@ async fn get_connections(
         let snapshot = mgr.snapshot().await;
         return Json(snapshot).into_response();
     }
+
+    let query = match Query::<GetConnectionsQuery>::try_from_uri(req.uri()) {
+        Ok(Query(query)) => query,
+        Err(err) => return err.into_response(),
+    };
+    let Some(interval_ms) = query.interval_ms() else {
+        return (
+            http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "message": "Body invalid" })),
+        )
+            .into_response();
+    };
 
     let ws = match WebSocketUpgrade::from_request(req, &state).await {
         Ok(ws) => ws,
@@ -60,8 +91,6 @@ async fn get_connections(
         warn!("ws upgrade error: {}", e);
     })
     .on_upgrade(move |mut socket| async move {
-        let interval = q.interval;
-
         let mgr = state.statistics_manager.clone();
 
         loop {
@@ -80,10 +109,7 @@ async fn get_connections(
                 break;
             }
 
-            tokio::time::sleep(tokio::time::Duration::from_secs(
-                interval.unwrap_or(1).max(1),
-            ))
-            .await;
+            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
         }
     })
 }

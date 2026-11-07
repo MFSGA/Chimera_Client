@@ -357,6 +357,13 @@ impl StatisticsManager {
         )
     }
 
+    pub fn total(&self) -> (u64, u64) {
+        (
+            self.upload_total.load(Ordering::Relaxed),
+            self.download_total.load(Ordering::Relaxed),
+        )
+    }
+
     #[allow(dead_code)]
     pub fn reset_statistic(&self) {
         self.upload_temp.store(0, Ordering::Relaxed);

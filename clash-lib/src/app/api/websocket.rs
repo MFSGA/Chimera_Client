@@ -6,6 +6,7 @@ use axum::{
         Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
+    http::StatusCode,
     response::IntoResponse,
     routing::get,
 };
@@ -15,9 +16,8 @@ use tracing::{debug, warn};
 use crate::app::api::{
     AppState,
     handlers::{
-        connection::GetConnectionsQuery,
-        flows::ws_handle as flows_ws_handle,
-        memory::{GetMemoryQuery, GetMemoryResponse},
+        connection::GetConnectionsQuery, flows::ws_handle as flows_ws_handle,
+        memory::GetMemoryResponse,
     },
 };
 
@@ -36,9 +36,16 @@ pub async fn connections(
     State(state): State<Arc<AppState>>,
     query: Query<GetConnectionsQuery>,
 ) -> impl IntoResponse {
+    let Some(interval_ms) = query.interval_ms() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({ "message": "Body invalid" })),
+        )
+            .into_response();
+    };
+
     let callback = async move |mut socket: WebSocket| {
-        let interval = query.interval.unwrap_or(1).max(1);
-        let mut interval = tokio::time::interval(Duration::from_secs(interval));
+        let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
 
         loop {
             interval.tick().await;
@@ -67,14 +74,19 @@ pub async fn traffic(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
     let callback = async move |mut socket: WebSocket| {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        let interval = Duration::from_secs(1);
+        let start = tokio::time::Instant::now() + interval;
+        let mut interval = tokio::time::interval_at(start, interval);
 
         loop {
             interval.tick().await;
             let (up, down) = state.statistics_manager.now();
+            let (up_total, down_total) = state.statistics_manager.total();
             let response = json!({
                 "up": up,
                 "down": down,
+                "upTotal": up_total,
+                "downTotal": down_total,
             })
             .to_string();
 
@@ -92,16 +104,22 @@ pub async fn traffic(
 pub async fn memory(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
-    query: Query<GetMemoryQuery>,
 ) -> impl IntoResponse {
     let callback = async move |mut socket: WebSocket| {
-        let interval = query.interval.unwrap_or(1).max(1);
-        let mut interval = tokio::time::interval(Duration::from_secs(interval));
+        let interval = Duration::from_secs(1);
+        let start = tokio::time::Instant::now() + interval;
+        let mut interval = tokio::time::interval_at(start, interval);
+        let mut first = true;
 
         loop {
             interval.tick().await;
             let snapshot = GetMemoryResponse {
-                inuse: state.statistics_manager.memory_usage(),
+                inuse: if first {
+                    first = false;
+                    0
+                } else {
+                    state.statistics_manager.memory_usage()
+                },
                 oslimit: 0,
             };
 
