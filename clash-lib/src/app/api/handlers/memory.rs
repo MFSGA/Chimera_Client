@@ -1,14 +1,9 @@
 use std::sync::Arc;
 
 use axum::{Json, extract::State, response::IntoResponse};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::app::api::AppState;
-
-#[derive(Deserialize)]
-pub struct GetMemoryQuery {
-    pub interval: Option<u64>,
-}
 
 #[derive(Serialize)]
 pub struct GetMemoryResponse {

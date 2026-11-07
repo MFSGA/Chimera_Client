@@ -13,6 +13,10 @@ use crate::app::api::AppState;
 struct TrafficResponse {
     up: u64,
     down: u64,
+    #[serde(rename = "upTotal")]
+    up_total: u64,
+    #[serde(rename = "downTotal")]
+    down_total: u64,
 }
 
 pub async fn handle(
@@ -25,10 +29,20 @@ pub async fn handle(
     })
     .on_upgrade(move |mut socket| async move {
         let mgr = state.statistics_manager.clone();
+        let interval = std::time::Duration::from_secs(1);
+        let start = tokio::time::Instant::now() + interval;
+        let mut ticker = tokio::time::interval_at(start, interval);
 
         loop {
+            ticker.tick().await;
             let (up, down) = mgr.now();
-            let response = TrafficResponse { up, down };
+            let (up_total, down_total) = mgr.total();
+            let response = TrafficResponse {
+                up,
+                down,
+                up_total,
+                down_total,
+            };
             let body = match serde_json::to_string(&response) {
                 Ok(body) => body,
                 Err(err) => {
@@ -41,8 +55,6 @@ pub async fn handle(
                 warn!("ws send error: {}", err);
                 break;
             }
-
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
     })
 }

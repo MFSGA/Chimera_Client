@@ -32,7 +32,12 @@ export function useTraffic(): UseTrafficReturn {
     };
   });
 
-  const [current, setCurrent] = useState<TrafficData>({ up: 0, down: 0 });
+  const [current, setCurrent] = useState<TrafficData>({
+    up: 0,
+    down: 0,
+    upTotal: 0,
+    downTotal: 0,
+  });
 
   useEffect(() => {
     if (!lastMessage) return;
