@@ -795,6 +795,40 @@ fn mihomo_respect_rules_requires_dedicated_proxy_bootstrap() {
 }
 
 #[test]
+fn tun_fake_ip_privacy_field_typos_fail_before_runtime() {
+    for (section, field, value) in [
+        ("dns", "nameserver-polcy", "secret.example"),
+        ("dns", "fake-ip-filtre-mode", "whitelist"),
+        ("tun", "dns-hijak", "true"),
+        ("tun", "strict-rout", "true"),
+    ] {
+        let dns_extension = if section == "dns" {
+            format!("  {field}: {value}\n")
+        } else {
+            String::new()
+        };
+        let tun_extension = if section == "tun" {
+            format!("  {field}: {value}\n")
+        } else {
+            String::new()
+        };
+        let yaml = format!(
+            "dns:\n  enable: true\n  enhanced-mode: fake-ip\n  nameserver: [1.1.1.1]\n{dns_extension}tun:\n  enable: false\n{tun_extension}"
+        );
+        let error = parse_error(yaml).to_string();
+        assert!(
+            error.contains(&format!("{section}.{field}"))
+                && error.contains("unknown"),
+            "privacy typo must stop runtime before DNS starts: {error}"
+        );
+        assert!(
+            !error.contains("secret.example"),
+            "DNS policy value must not appear in diagnostic"
+        );
+    }
+}
+
+#[test]
 fn mihomo_nameserver_policy_rejects_unsafe_whitespace_and_wildcards() {
     for selector in [
         " example.com",

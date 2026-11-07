@@ -344,6 +344,7 @@ fn unknown_sensitive_tun_field(field: &str) -> bool {
         "route-all",
         "route_all",
         "auto-route",
+        "strict-route",
         "mtu",
         "so-mark",
         "so_mark",
@@ -363,7 +364,6 @@ fn unknown_sensitive_tun_field(field: &str) -> bool {
         "gateway", "device", "so-mark", "stack",
     ];
     PREFIXES.iter().any(|prefix| lower.starts_with(prefix))
-        || near_sensitive_key("strict-route", &lower)
         || KNOWN
             .iter()
             .any(|known| lower == *known || near_sensitive_key(known, &lower))
@@ -442,6 +442,40 @@ fn reject_unsupported_mihomo_privacy_fields(value: &Value) -> Result<(), Error> 
             if mapping.keys().any(|key| key.as_str() == Some(field)) {
                 return Err(Error::InvalidConfig(format!(
                     "{section}.{field} is not implemented; refusing to silently ignore a Mihomo privacy-sensitive setting"
+                )));
+            }
+        }
+    }
+
+    if let Some(tun_fields) = value.get("tun").and_then(Value::as_mapping) {
+        for field in tun_fields.keys().filter_map(Value::as_str) {
+            if unknown_sensitive_tun_field(field) {
+                return Err(Error::InvalidConfig(format!(
+                    "tun.{field} is an unknown privacy-sensitive TUN field; refusing to silently ignore it"
+                )));
+            }
+        }
+    }
+
+    if let Some(dns_fields) = value.get("dns").and_then(Value::as_mapping) {
+        for field in dns_fields.keys().filter_map(Value::as_str) {
+            if unknown_sensitive_dns_field(field) {
+                return Err(Error::InvalidConfig(format!(
+                    "dns.{field} is an unknown privacy-sensitive DNS field; refusing to silently ignore it"
+                )));
+            }
+        }
+    }
+
+    if let Some(fallback_fields) = value
+        .get("dns")
+        .and_then(|dns| dns.get("fallback-filter"))
+        .and_then(Value::as_mapping)
+    {
+        for field in fallback_fields.keys().filter_map(Value::as_str) {
+            if unknown_sensitive_fallback_filter_field(field) {
+                return Err(Error::InvalidConfig(format!(
+                    "dns.fallback-filter.{field} is an unknown privacy-sensitive fallback filter; refusing to silently ignore it"
                 )));
             }
         }
@@ -1241,6 +1275,105 @@ proxy:
                 super::FakeIpFilterMode::Whitelist
             );
         }
+    }
+
+    #[test]
+    fn unknown_privacy_shaped_dns_field_names_fail_closed() {
+        // A typo in a DNS egress control silently becomes a no-op with the
+        // legacy permissive deserializer. Unrelated vendor keys remain legal.
+        for field in [
+            "nameserver-polcy",
+            "namserver-policy",
+            "proxy-server-nameserver-policiy",
+            "fake-ip-filtre-mode",
+            "drect-nameserver-follow-policy",
+            "respec-rules",
+            "enhance-mode",
+        ] {
+            let yaml = format!("dns:\n  enable: false\n  {field}: secret.example\n");
+            let error = match yaml.parse::<Config>() {
+                Ok(_) => panic!("unknown sensitive DNS field {field} was ignored"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains(&format!("dns.{field}")) && error.contains("unknown"),
+                "missing precise unknown-field diagnostic: {error}"
+            );
+            assert!(
+                !error.contains("secret.example"),
+                "unknown-field error must not disclose private DNS data"
+            );
+        }
+        let vendor_extension = "dns:\n  enable: false\n  vendor-extension: true\n";
+        assert!(
+            vendor_extension.parse::<Config>().is_ok(),
+            "unrelated legacy/vendor DNS keys must remain accepted"
+        );
+    }
+
+    #[test]
+    fn unknown_dns_privacy_typo_in_yaml_merge_fails_closed() {
+        let yaml = "template: &privacy\n  nameserver-polcy: secret.example\ndns:\n  <<: *privacy\n  enable: false\n";
+        let error = match yaml.parse::<Config>() {
+            Ok(_) => panic!("YAML anchor merged unknown DNS privacy key"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("dns.nameserver-polcy"), "{error}");
+        assert!(!error.contains("secret.example"), "{error}");
+    }
+
+    #[test]
+    fn unknown_privacy_shaped_tun_field_names_fail_closed() {
+        for field in [
+            "dns-hijak",
+            "strict-rout",
+            "auto-rout",
+            "route-al",
+            "route-exclude-addres",
+            "include-interfac",
+            "exclude-interfac",
+        ] {
+            let yaml = format!("tun:\n  enable: false\n  {field}: true\n");
+            let error = match yaml.parse::<Config>() {
+                Ok(_) => panic!("unknown sensitive TUN field {field} was ignored"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains(&format!("tun.{field}")) && error.contains("unknown"),
+                "missing precise privacy-field diagnostic: {error}"
+            );
+        }
+        let vendor_extension = "tun:\n  enable: false\n  vendor-extension: true\n";
+        assert!(
+            vendor_extension.parse::<Config>().is_ok(),
+            "unrelated legacy/vendor TUN keys must remain accepted"
+        );
+    }
+
+    #[test]
+    fn fallback_filter_unknown_privacy_fields_fail_closed() {
+        for field in ["geoiip", "geoip-cod", "ipcid", "domai", "geosit"] {
+            let yaml = format!(
+                "dns:\n  enable: false\n  fallback-filter:\n    {field}: secret.example\n"
+            );
+            let error = match yaml.parse::<Config>() {
+                Ok(_) => {
+                    panic!("invalid fallback-filter field {field} silently ignored")
+                }
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains(&format!("dns.fallback-filter.{field}"))
+                    && error.contains("unknown"),
+                "missing explicit fallback privacy diagnostic: {error}"
+            );
+            assert!(
+                !error.contains("secret.example"),
+                "fallback privacy diagnostic must not expose values"
+            );
+        }
+        let vendor = "dns:\n  fallback-filter:\n    vendor-extension: true\n";
+        assert!(vendor.parse::<Config>().is_ok());
     }
 
     #[test]
