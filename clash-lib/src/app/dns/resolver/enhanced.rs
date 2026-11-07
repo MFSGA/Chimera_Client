@@ -392,7 +392,9 @@ impl EnhancedResolver {
             main: make_clients(
                 cfg.default_nameserver.clone(),
                 None,
-                None,
+                Some(Arc::new(
+                    crate::app::dns::execution::LiteralOnlyResolver::default(),
+                )),
                 Arc::new(RwLock::new(std::collections::HashMap::new())),
                 edns_client_subnet.clone(),
                 DnsClientNetworkOptions {

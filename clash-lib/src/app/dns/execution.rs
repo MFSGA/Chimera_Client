@@ -39,10 +39,10 @@ use super::{
     policy::{CompiledDnsPolicy, DnsEgress, DnsFailure},
 };
 
-/// S03b bootstrap guard: no implicit system DNS lookup may escape the
-/// explicit strict-DNS policy. Only literal addresses are resolvable until
-/// S04 supplies a separately verified bootstrap dependency graph.
-struct LiteralOnlyResolver {
+/// DNS transport guard shared by strict DNS and the IP-literal bootstrap
+/// upstreams. Never delegates unpinned hostnames to OS/system DNS. Strict
+/// DNS can supply explicit pins, while default-nameserver uses no pins.
+pub(crate) struct LiteralOnlyResolver {
     ipv6: AtomicBool,
     pins: HashMap<String, IpAddr>,
 }
