@@ -99,6 +99,7 @@ def analyze_matrix(matrix_path: Path) -> dict[str, Any]:
     case_files: set[tuple[int, int]] = set()
     seen_ids: set[str] = set()
     seen_canary: set[str] = set()
+    seen_calibration_hash: set[str] = set()
     seen_stimulus: set[str] = set()
     seen_capture_hash: set[str] = set()
     profile_evidence_issues: set[str] = set()
@@ -158,6 +159,13 @@ def analyze_matrix(matrix_path: Path) -> dict[str, Any]:
                 for event in eligible
             ):
                 profile_evidence_issues.add("profile_ipv6_tun_question_missing")
+            calibration_hash = child["physical_calibration_qname_sha256"]
+            if calibration_hash is not None:
+                if calibration_hash in seen_calibration_hash:
+                    profile_evidence_issues.add(
+                        "profile_reused_physical_calibration_qname"
+                    )
+                seen_calibration_hash.add(calibration_hash)
             canary = child["canary_qname"]
             if canary in seen_canary:
                 profile_evidence_issues.add("profile_reused_canary_qname")
@@ -188,6 +196,7 @@ def analyze_matrix(matrix_path: Path) -> dict[str, Any]:
             "coverage_issues": child["coverage_issues"],
             "review_flags": child["review_flags"],
             "canary_queries_after_stimulus": child["canary_queries_after_stimulus"],
+            "physical_calibration_counts": child["physical_calibration_counts"],
             "observed_canary_protocols": summarize_canary_protocols(child["canary_queries"]),
             "capture_digests": [
                 {

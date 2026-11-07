@@ -17,7 +17,7 @@ import dns_canary_audit as audit  # noqa: E402
 
 PHYSICAL_NOISE = (
     "2026-11-06 07:00:00.000001 IP 192.0.2.11.51111 > 9.9.9.9.53: "
-    "125+ A? unrelated.private.example. (44)\n"
+    "125+ A? calibration.evidence.example.test. (44)\n"
     "2026-11-06 07:00:00.000002 IP 9.9.9.9.53 > 192.0.2.11.51111: "
     "125 1/0/0 A 203.0.113.7 (60)\n"
 )
@@ -63,6 +63,7 @@ class AuditTests(unittest.TestCase):
             "schema_version": 1,
             "case_id": "wifi_up_ipv4_ipv6",
             "canary_qname": "CaNaRy.Evidence.Example.Test.",
+            "physical_calibration_qname": "calibration.evidence.example.test",
             "canary_stimulus_at_utc": "2026-11-06T15:00:00Z",
             "canary_observation_deadline_seconds": 30,
             "expected_physical_interfaces": ["en0"],
@@ -177,6 +178,16 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(report["verdict"], "PHYSICAL_CANARY_PLAINTEXT_DNS_OBSERVED")
 
     def test_no_private_dns_names_or_ip_endpoints_leak_into_default_report(self) -> None:
+        (self.folder / "en0.log").write_text(
+            PHYSICAL_NOISE +
+            "2026-11-06 07:00:00.000012 IP 192.0.2.90.50221 > 8.8.8.8.53: "
+            "123+ A? unrelated.private.example. (50)\n", encoding="utf-8",
+        )
+        (self.folder / "en0.stats.txt").write_text(
+            "tcpdump: listening on en0, link-type EN10MB (Ethernet)\n"
+            "3 packets captured\n3 packets received by filter\n"
+            "0 packets dropped by kernel\n", encoding="utf-8",
+        )
         result = json.dumps(audit.analyze_manifest(self.save_manifest()))
         self.assertNotIn("unrelated.private.example", result)
         self.assertNotIn("2001:db8::10", result)
@@ -217,6 +228,61 @@ class AuditTests(unittest.TestCase):
         )
         result = audit.analyze_manifest(self.save_manifest())
         self.assertEqual(result["canary_query_counts"]["physical"], 0)
+
+    def test_calibration_is_required_for_negative_physical_egress_claim(self) -> None:
+        del self.manifest["physical_calibration_qname"]
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["verdict"], "NOT_VERIFIED")
+        self.assertIn("missing_physical_calibration_qname", report["coverage_issues"])
+
+    def test_wrong_calibration_domain_does_not_confirm_interface(self) -> None:
+        self.manifest["physical_calibration_qname"] = "different-calibration.example.test"
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["verdict"], "NOT_VERIFIED")
+        self.assertIn("no_physical_calibration_observed:en0", report["coverage_issues"])
+
+    def test_calibration_before_protected_stimulus_does_not_prove_overlap(self) -> None:
+        # The physical NIC was active earlier; the protected query happened
+        # later. An old calibration does not prove DNS visibility at that time.
+        self.manifest["canary_stimulus_at_utc"] = "2026-11-06T15:00:02Z"
+        (self.folder / "utun7.log").write_text(
+            TUN_CANARY.replace("07:00:00.", "07:00:03."),
+            encoding="utf-8",
+        )
+        result = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(result["canary_queries_after_stimulus"]["tun"], 2)
+        self.assertEqual(result["verdict"], "NOT_VERIFIED")
+        self.assertIn(
+            "no_physical_calibration_observed:en0", result["coverage_issues"]
+        )
+
+    def test_calibration_and_protected_canary_must_be_distinct(self) -> None:
+        self.manifest["physical_calibration_qname"] = CANARY
+        with self.assertRaisesRegex(audit.AuditError, "distinct"):
+            audit.analyze_manifest(self.save_manifest())
+
+    def test_invalid_calibration_qname_is_rejected(self) -> None:
+        self.manifest["physical_calibration_qname"] = "*.not-dns.example.test"
+        with self.assertRaises(audit.AuditError):
+            audit.analyze_manifest(self.save_manifest())
+
+    def test_explicit_physical_calibration_is_counted_without_exposing_endpoints(self) -> None:
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["physical_calibration_counts"], {"en0": 1})
+        self.assertEqual(
+            report["physical_calibration_qname_sha256"],
+            hashlib.sha256(b"calibration.evidence.example.test").hexdigest(),
+        )
+        self.assertNotIn("calibration.evidence.example.test", json.dumps(report))
+        self.assertEqual(report["verdict"], "NO_PHYSICAL_CANARY_OBSERVED_IN_SUPPLIED_LOGS")
+        self.assertNotIn("9.9.9.9", json.dumps(report))
+        self.assertNotIn("192.0.2.11", json.dumps(report))
+
+    def test_positive_physical_canary_not_hidden_by_missing_calibration(self) -> None:
+        del self.manifest["physical_calibration_qname"]
+        (self.folder / "en0.log").write_text(PHYSICAL_LEAK, encoding="utf-8")
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["verdict"], "PHYSICAL_CANARY_PLAINTEXT_DNS_OBSERVED")
 
     def test_missing_physical_interface_is_not_verified(self) -> None:
         self.manifest["expected_physical_interfaces"].append("en1")
@@ -297,7 +363,7 @@ class AuditTests(unittest.TestCase):
         })
         (self.folder / "en1.log").write_text(
             "2026-11-06 07:00:00.000010 IP 192.0.2.80.53004 > 9.9.9.9.53: "
-            "122+ A? second-interface.example.test. (44)\n", encoding="utf-8",
+            "122+ A? calibration.evidence.example.test. (44)\n", encoding="utf-8",
         )
         (self.folder / "en1.stats.txt").write_text(
             "tcpdump: listening on en1, link-type EN10MB (Ethernet)\n"
@@ -319,13 +385,15 @@ class AuditTests(unittest.TestCase):
             "packet_time_utc_offset": "-08:00",
         })
         (self.folder / "en1.log").write_text(
+            "2026-11-06 07:00:00.000009 IP 192.0.2.90.50002 > 9.9.9.9.53: "
+            "100+ A? calibration.evidence.example.test. (55)\n"
             "2026-11-06 07:00:00.000010 IP6 2001:db8::9.50003 > "
             "2001:4860:4860::8888.53: 101+ AAAA? "
             "canary.evidence.example.test. (55)\n", encoding="utf-8",
         )
         (self.folder / "en1.stats.txt").write_text(
             "tcpdump: listening on en1, link-type EN10MB (Ethernet)\n"
-            "1 packet captured\n1 packet received by filter\n"
+            "2 packets captured\n2 packets received by filter\n"
             "0 packets dropped by kernel\n", encoding="utf-8",
         )
         result = audit.analyze_manifest(self.save_manifest())

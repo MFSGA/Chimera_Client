@@ -216,6 +216,7 @@ class MatrixTests(unittest.TestCase):
             child = json.loads(manifest_path.read_text(encoding="utf-8"))
             child["case_id"] = scenario
             child["canary_qname"] = f"canary-{i}.evidence.example.test"
+            child["physical_calibration_qname"] = f"calibration-{i}.evidence.example.test"
             child["canary_stimulus_at_utc"] = f"2026-11-06T15:00:{i:02d}Z"
             child["resolver_snapshot_recorded_at_utc"] = "2026-11-06T15:00:20Z"
             manifest_path.write_text(json.dumps(child), encoding="utf-8")
@@ -227,7 +228,7 @@ class MatrixTests(unittest.TestCase):
             )
             (destination / "en0.txt").write_text(
                 (destination / "en0.txt").read_text()
-                .replace("unrelated.private.example", f"unrelated-{i}.private.example")
+                .replace("calibration.evidence.example.test", f"calibration-{i}.evidence.example.test")
                 .replace("07:00:00.", f"07:00:{i:02d}."),
                 encoding="utf-8",
             )
@@ -242,6 +243,35 @@ class MatrixTests(unittest.TestCase):
         self.assertFalse(report["system_zero_leak_verified"])
         self.assertTrue(any("operator" in item for item in report["limitations"]))
         self.assertNotIn("canary-1.evidence.example.test", json.dumps(report))
+
+    def test_profile_reused_physical_calibration_name_is_not_fresh_evidence(self) -> None:
+        # Two independent captures, unique protected canaries and timestamps,
+        # but intentionally the SAME physical calibration domain.
+        second = self.folder / "tcp53"
+        manifest_path = second / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["canary_qname"] = "another-canary.evidence.example.test"
+        manifest["canary_stimulus_at_utc"] = "2026-11-06T15:00:01Z"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        (second / "utun7.txt").write_text(
+            (second / "utun7.txt").read_text()
+            .replace("canary.evidence.example.test", "another-canary.evidence.example.test")
+            .replace("07:00:00.", "07:00:01."),
+            encoding="utf-8",
+        )
+        (second / "en0.txt").write_text(
+            (second / "en0.txt").read_text().replace("07:00:00.", "07:00:01."),
+            encoding="utf-8",
+        )
+        self.matrix["profile"] = "macos_dns_egress_v1"
+        self.matrix["required_cases"] = ["wifi", "tcp53"]
+        self.matrix["cases"] = self.matrix["cases"][:2]
+        report = matrix.analyze_matrix(self.write_matrix())
+        self.assertEqual(report["case_counts"]["no_physical_observed"], 2)
+        self.assertIn(
+            "profile_reused_physical_calibration_qname",
+            report["profile_evidence_issues"],
+        )
 
     def test_unrecognized_profile_is_rejected(self) -> None:
         self.matrix["profile"] = "ignore_missing_cases"

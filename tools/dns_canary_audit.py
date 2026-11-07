@@ -42,7 +42,8 @@ PACKET_PREFIX = re.compile(
 INTERFACE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,31}$")
 LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 KNOWN_MANIFEST_FIELDS = {
-    "schema_version", "case_id", "canary_qname", "captures",
+    "schema_version", "case_id", "canary_qname", "physical_calibration_qname",
+    "captures",
     "expected_physical_interfaces", "expected_tun_interfaces",
     "resolver_snapshot", "resolver_snapshot_recorded_at_utc",
     "canary_stimulus_at_utc", "canary_observation_deadline_seconds",
@@ -307,6 +308,12 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
     manifest = _load_manifest(manifest_path)
     folder = manifest_path.parent
     canary = normalize_canary(manifest.get("canary_qname"))
+    calibration_raw = manifest.get("physical_calibration_qname")
+    calibration = (
+        normalize_canary(calibration_raw) if calibration_raw is not None else None
+    )
+    if calibration is not None and calibration == canary:
+        raise AuditError("physical calibration and protected canary must be distinct")
     expected = {
         "physical": expected_interfaces(manifest, "expected_physical_interfaces"),
         "tun": expected_interfaces(manifest, "expected_tun_interfaces"),
@@ -371,6 +378,7 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
     stats_issues: list[str] = []
     by_role_inside_window = {"physical": 0, "tun": 0}
     by_role_after_stimulus = {"physical": 0, "tun": 0}
+    physical_calibration_counts = {name: 0 for name in expected["physical"]}
     for spec, window in zip(raw_captures, windows):
         required = {"role", "interface", "path"}
         optional = {
@@ -457,9 +465,17 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
                         if packet_utc is not None and shared_window is not None:
                             if shared_window[0] <= packet_utc < shared_window[1]:
                                 port53_packets_inside_window += 1
-                    if port_53_destination(match["dst"]):
-                        if QUESTION.search(match["details"]):
+                    if dest_port_53:
+                        question = QUESTION.search(match["details"])
+                        if question:
                             candidate_dns_query_lines += 1
+                            if (calibration is not None and role == "physical"
+                                    and question["qname"].rstrip(".").lower() == calibration
+                                    and packet_utc is not None and shared_window is not None
+                                    and shared_window[0] <= packet_utc < shared_window[1]
+                                    and stimulus_at is not None
+                                    and stimulus_at <= packet_utc <= stimulus_deadline):
+                                physical_calibration_counts[interface] += 1
                         else:
                             # TCP handshake/control packets (length 0) are not
                             # evidence of a dropped DNS question. Nonempty TCP
@@ -553,6 +569,12 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
         })
 
     missing: list[str] = list(stimulus_issues) + stats_issues
+    if calibration is None:
+        missing.append("missing_physical_calibration_qname")
+    else:
+        for interface, count in physical_calibration_counts.items():
+            if count == 0:
+                missing.append(f"no_physical_calibration_observed:{interface}")
     for role in ("physical", "tun"):
         for interface in expected[role]:
             if (role, interface) not in seen_interfaces:
@@ -695,6 +717,11 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
         "resolver_snapshot": snapshot_result,
         "captures": summaries,
         "canary_query_counts": by_role,
+        "physical_calibration_counts": physical_calibration_counts,
+        "physical_calibration_qname_sha256": (
+            hashlib.sha256(calibration.encode("ascii")).hexdigest()
+            if calibration is not None else None
+        ),
         "canary_stimulus": {
             "at_utc": stimulus_at.isoformat() if stimulus_at else None,
             "deadline_seconds": deadline_seconds,

@@ -32,5 +32,6 @@
   ],
   "resolver_snapshot_recorded_at_utc": "2026-11-06T15:00:20Z",
   "canary_stimulus_at_utc": "2026-11-06T15:00:00Z",
-  "canary_observation_deadline_seconds": 30
+  "canary_observation_deadline_seconds": 30,
+  "physical_calibration_qname": "calibration.evidence.example.test"
 }
