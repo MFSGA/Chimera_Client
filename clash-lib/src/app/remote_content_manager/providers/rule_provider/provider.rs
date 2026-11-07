@@ -102,8 +102,12 @@ pub trait RuleProvider: Provider {
 
 pub type ThreadSafeRuleProvider = Arc<dyn RuleProvider + Send + Sync>;
 
-type RuleUpdater =
-    Box<dyn Fn(RuleContent) -> BoxFuture<'static, ()> + Send + Sync + 'static>;
+type RuleUpdater = Box<
+    dyn Fn(RuleContent) -> BoxFuture<'static, anyhow::Result<()>>
+        + Send
+        + Sync
+        + 'static,
+>;
 type RuleParser =
     Box<dyn Fn(&[u8]) -> anyhow::Result<RuleContent> + Send + Sync + 'static>;
 
@@ -147,16 +151,18 @@ impl RuleProviderImpl {
         let inner_clone = inner.clone();
 
         let n = name.clone();
-        let updater: RuleUpdater =
-            Box::new(move |input: RuleContent| -> BoxFuture<'static, ()> {
+        let updater: RuleUpdater = Box::new(
+            move |input: RuleContent| -> BoxFuture<'static, anyhow::Result<()>> {
                 let n = n.clone(); // Clone name for the async block
                 let inner: Arc<tokio::sync::RwLock<Inner>> = inner_clone.clone();
                 Box::pin(async move {
                     let mut inner = inner.write().await;
                     trace!("updated rules for provider: {}", n);
                     inner.content = input;
+                    Ok(())
                 })
-            });
+            },
+        );
 
         let n_parser = name.clone(); // Clone name specifically for the parser closure
         let current_behavior = behavior;
@@ -342,8 +348,9 @@ impl Provider for RuleProviderImpl {
             trace!("initializing rule provider {} with fetcher", self.name());
             let ele = fetcher.initial().await.map_err(map_io_error)?;
             if let Some(updater) = fetcher.on_update.as_ref() {
-                updater(ele).await; // Directly pass RuleContent
+                updater(ele).await.map_err(map_io_error)?; // Directly pass RuleContent
             }
+            fetcher.start_polling().await;
         } else {
             trace!("initializing inline rule provider {}", self.name());
             let rules = make_rules(
@@ -375,11 +382,8 @@ impl Provider for RuleProviderImpl {
 
     async fn update(&self) -> std::io::Result<()> {
         if let Some(fetcher) = &self.fetcher {
-            let (ele, same) = fetcher.update().await.map_err(map_io_error)?;
+            let same = fetcher.update().await.map_err(map_io_error)?;
             debug!("rule provider {} updated. same? {}", self.name(), same);
-            if !same && let Some(updater) = fetcher.on_update.as_ref() {
-                updater(ele).await; // Directly pass RuleContent
-            }
         } else {
             trace!("no fetcher for rule provider {}", self.name());
         }

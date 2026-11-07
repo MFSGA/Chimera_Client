@@ -36,7 +36,7 @@ struct Inner {
 }
 
 type ProxyUpdater = Box<
-    dyn Fn(Vec<AnyOutboundHandler>) -> BoxFuture<'static, ()>
+    dyn Fn(Vec<AnyOutboundHandler>) -> BoxFuture<'static, anyhow::Result<()>>
         + Send
         + Sync
         + 'static,
@@ -103,7 +103,9 @@ impl ProxySetProvider {
                         warn!(
                             "proxy provider {name} exhausted content revision; refusing update"
                         );
-                        return;
+                        return Err(anyhow::anyhow!(
+                            "provider content revision exhausted"
+                        ));
                     };
                     if let Err(error) =
                         hc.replace_provider_dns_domains(&name, &input).await
@@ -115,7 +117,7 @@ impl ProxySetProvider {
                             error = %error,
                             "retaining previous provider revision: node DNS domain registration failed"
                         );
-                        return;
+                        return Err(error);
                     }
                     inner.proxies.clone_from(&input);
                     inner.revision = next_revision;
@@ -124,6 +126,7 @@ impl ProxySetProvider {
                 tokio::spawn(async move {
                     hc.check().await;
                 });
+                Ok(())
             })
         });
 
@@ -205,8 +208,9 @@ impl Provider for ProxySetProvider {
         let proxies = self.fetcher.initial().await.map_err(map_io_error)?;
         debug!("{} initialized with {} proxies", self.name(), proxies.len());
         if let Some(updater) = self.fetcher.on_update.as_ref() {
-            updater(proxies).await;
+            updater(proxies).await.map_err(map_io_error)?;
         }
+        self.fetcher.start_polling().await;
         if let Err(e) = self.fetcher.start_watch().await {
             warn!(
                 "proxy provider '{}': live file watching unavailable, falling back to interval polling: {}",
@@ -218,16 +222,8 @@ impl Provider for ProxySetProvider {
     }
 
     async fn update(&self) -> std::io::Result<()> {
-        let (proxies, same) = self.fetcher.update().await.map_err(map_io_error)?;
-        debug!(
-            "{} updated with {} proxies, same? {}",
-            self.name(),
-            proxies.len(),
-            same
-        );
-        if !same && let Some(updater) = self.fetcher.on_update.as_ref() {
-            updater(proxies).await;
-        }
+        let same = self.fetcher.update().await.map_err(map_io_error)?;
+        debug!("{} updated with same content? {}", self.name(), same);
         Ok(())
     }
 
@@ -534,7 +530,7 @@ proxies:
             .return_const(path.to_string_lossy().to_string());
         vehicle.expect_typ().return_const(ProviderVehicleType::Http);
         let reads = Arc::new(AtomicUsize::new(0));
-        vehicle.expect_read().times(2).returning(move || {
+        vehicle.expect_read().times(3).returning(move || {
             Ok(if reads.fetch_add(1, Ordering::SeqCst) == 0 {
                 VALID
             } else {
@@ -547,13 +543,10 @@ proxies:
         let hits = calls.clone();
         resolver
             .expect_replace_proxy_provider_dns_domains()
-            .times(2)
-            .returning(move |_, _| {
-                if hits.fetch_add(1, Ordering::SeqCst) == 0 {
-                    Ok(())
-                } else {
-                    Err(anyhow::anyhow!("synthetic registrar outage"))
-                }
+            .times(3)
+            .returning(move |_, _| match hits.fetch_add(1, Ordering::SeqCst) {
+                0 | 2 => Ok(()),
+                _ => Err(anyhow::anyhow!("synthetic registrar outage")),
             });
         let health = HealthCheck::new(
             vec![],
@@ -572,14 +565,87 @@ proxies:
         .unwrap();
         provider.initialize().await.unwrap();
         let before = provider.strict_content_snapshot().await.unwrap();
-        // Current Fetcher API cannot propagate the async update-hook error;
-        // only assert the privacy-critical visible revision is preserved.
-        let _ = provider.update().await;
+        let diagnostic = provider.update().await.expect_err(
+            "a failed DNS node registration must not report successful provider refresh"
+        ).to_string();
+        assert!(
+            diagnostic.contains("synthetic registrar outage"),
+            "{diagnostic}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            VALID,
+            "failed DNS registration must not replace last-good provider cache"
+        );
         let after = provider.strict_content_snapshot().await.unwrap();
         assert_eq!(before.revision, after.revision);
         assert!(Arc::ptr_eq(&before.proxies[0], &after.proxies[0]));
         assert_eq!(after.proxies[0].server_name(), Some("198.51.100.10"));
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        provider
+            .update()
+            .await
+            .expect("same remote version must retry after registration failure");
+        let recovered = provider.strict_content_snapshot().await.unwrap();
+        assert!(recovered.revision > before.revision);
+        assert_eq!(
+            recovered.proxies[0].server_name(),
+            Some("dynamic-node.example")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), NEW_HOST);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn provider_initial_dns_failure_rejects_startup_without_polling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("initial-node-dns-failure.yaml");
+        let mut vehicle = MockProviderVehicle::new();
+        vehicle
+            .expect_path()
+            .return_const(path.to_string_lossy().into_owned());
+        vehicle.expect_typ().return_const(ProviderVehicleType::Http);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let read_counter = reads.clone();
+        vehicle.expect_read().returning(move || {
+            read_counter.fetch_add(1, Ordering::SeqCst);
+            Ok(VALID.to_vec())
+        });
+        let mut resolver = MockClashResolver::new();
+        resolver
+            .expect_replace_proxy_provider_dns_domains()
+            .times(1)
+            .returning(|_, _| {
+                Err(anyhow::anyhow!("synthetic initial node DNS outage"))
+            });
+        let health = HealthCheck::new(
+            vec![],
+            "http://example.invalid/check".to_owned(),
+            0,
+            true,
+            ProxyManager::new(Arc::new(resolver), None),
+        );
+        let provider = ProxySetProvider::new_with_dns_privacy(
+            "init-failure".to_owned(),
+            Duration::from_millis(5),
+            Arc::new(vehicle),
+            health,
+            true,
+        )
+        .unwrap();
+        let diagnostic = provider.initialize().await.expect_err(
+            "initial proxy DNS registration must fail startup rather than expose empty readiness"
+        ).to_string();
+        assert!(
+            diagnostic.contains("synthetic initial node DNS outage"),
+            "{diagnostic}"
+        );
+        assert!(provider.strict_content_snapshot().await.is_none());
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "failed startup must not run provider refresh"
+        );
     }
 
     #[tokio::test]

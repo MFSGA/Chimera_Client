@@ -2,7 +2,10 @@ use std::{
     fs::{self, metadata},
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 
@@ -55,6 +58,8 @@ pub struct Fetcher<U, P> {
     parser: Arc<P>,
     pub on_update: Option<Arc<U>>,
     cancel_token: CancellationToken,
+    initial_immediate_refresh: AtomicBool,
+    polling_started: AtomicBool,
 }
 
 impl<U, P> Drop for Fetcher<U, P> {
@@ -66,7 +71,7 @@ impl<U, P> Drop for Fetcher<U, P> {
 impl<T, U, P> Fetcher<U, P>
 where
     T: Send + Sync + 'static,
-    U: Fn(T) -> BoxFuture<'static, ()> + Send + Sync + 'static,
+    U: Fn(T) -> BoxFuture<'static, anyhow::Result<()>> + Send + Sync + 'static,
     P: Fn(&[u8]) -> anyhow::Result<T> + Send + Sync + 'static,
 {
     pub fn new(
@@ -88,6 +93,8 @@ where
             parser: Arc::new(parser),
             on_update: on_update.map(Arc::new),
             cancel_token: CancellationToken::new(),
+            initial_immediate_refresh: AtomicBool::new(false),
+            polling_started: AtomicBool::new(false),
         }
     }
 
@@ -155,24 +162,37 @@ where
             .try_into()
             .expect("md5 must be 16 bytes");
 
-        drop(inner);
-
-        if !self.ticker_interval.is_zero() {
-            self.pull_loop(
-                immediately_update,
-                tokio::time::interval(self.ticker_interval),
-            )
-            .await;
-        }
-
+        self.initial_immediate_refresh
+            .store(immediately_update, Ordering::Release);
         Ok(items)
     }
 
-    pub async fn update(&self) -> anyhow::Result<(T, bool)> {
-        Fetcher::<U, P>::update_inner(
+    /// Start background refresh only after the initial updater has installed
+    /// and published the first accepted revision. Otherwise the first poll
+    /// could overtake the bootstrap node-DNS registration at startup.
+    pub async fn start_polling(&self) {
+        if self.ticker_interval.is_zero()
+            || self.polling_started.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        self.pull_loop(
+            self.initial_immediate_refresh.load(Ordering::Acquire),
+            tokio::time::interval(self.ticker_interval),
+        )
+        .await;
+    }
+
+    /// Apply a parsed revision before committing its source hash and cache.
+    /// A failed updater must remain retryable on the next refresh, including
+    /// background polling. Callers must not publish provider revisions after
+    /// DNS registration has failed.
+    pub async fn update(&self) -> anyhow::Result<bool> {
+        Self::update_inner(
             self.inner.clone(),
             self.vehicle.clone(),
             self.parser.clone(),
+            self.on_update.clone(),
         )
         .await
     }
@@ -181,13 +201,16 @@ where
         inner: Arc<RwLock<Inner>>,
         vehicle: ThreadSafeProviderVehicle,
         parser: Arc<P>,
-    ) -> anyhow::Result<(T, bool)> {
+        on_update: Option<Arc<U>>,
+    ) -> anyhow::Result<bool> {
+        // Serialize source/hash changes with publication across manual,
+        // watcher and periodic updates.
         let mut this = inner.write().await;
         let content = vehicle.read().await?;
-        let proxies = parser(&content)?;
+        let payload = parser(&content)?;
 
         let now = SystemTime::now();
-        let hash = utils::md5(&content)[..16]
+        let hash: [u8; 16] = utils::md5(&content)[..16]
             .try_into()
             .expect("md5 must be 16 bytes");
 
@@ -196,17 +219,21 @@ where
             if vehicle.typ() != ProviderVehicleType::File {
                 filetime::set_file_times(vehicle.path(), now.into(), now.into())?;
             }
-            return Ok((proxies, true));
+            return Ok(true);
         }
 
+        // A protected proxy-provider registers its DNS endpoint domains here.
+        // A rejected revision may not advance the content hash or overwrite
+        // last-good cached YAML; a later identical refresh must retry it.
+        if let Some(on_update) = on_update {
+            on_update(payload).await?;
+        }
         if vehicle.typ() != ProviderVehicleType::File {
             write_cache_atomically(Path::new(vehicle.path()), &content)?;
         }
-
         this.hash = hash;
         this.updated_at = now;
-
-        Ok((proxies, false))
+        Ok(false)
     }
 
     #[cfg(test)]
@@ -221,23 +248,10 @@ where
         on_update: Option<Arc<U>>,
         name: &str,
     ) {
-        let (elm, same) =
-            match Fetcher::<U, P>::update_inner(inner, vehicle, parser).await {
-                Ok(result) => result,
-                Err(e) => {
-                    warn!("{} update failed: {}", name, e);
-                    return;
-                }
-            };
-
-        if same {
-            trace!("fetcher {} no update", name);
-            return;
-        }
-
-        if let Some(on_update) = on_update {
-            info!("fetcher {} updated", name);
-            on_update(elm).await;
+        match Self::update_inner(inner, vehicle, parser, on_update).await {
+            Ok(true) => trace!("fetcher {} no update", name),
+            Ok(false) => info!("fetcher {} updated", name),
+            Err(error) => warn!("{} update failed: {}", name, error),
         }
     }
 
@@ -470,8 +484,9 @@ mod tests {
             }
             Ok("valid".to_owned())
         };
-        let updater =
-            |_input: String| -> BoxFuture<'static, ()> { Box::pin(async {}) };
+        let updater = |_input: String| -> BoxFuture<'static, anyhow::Result<()>> {
+            Box::pin(async { Ok(()) })
+        };
         let fetcher = Fetcher::new(
             "cache-recovery".to_owned(),
             Duration::ZERO,
@@ -490,8 +505,7 @@ mod tests {
             fetcher.updated_at().await.timestamp() > 10,
             "recovery must replace the stale provider timestamp"
         );
-        let (parsed, unchanged) = fetcher.update().await.unwrap();
-        assert_eq!(parsed, "valid");
+        let unchanged = fetcher.update().await.unwrap();
         assert!(
             unchanged,
             "recovered cache and in-memory hash must match remote content"
@@ -520,8 +534,9 @@ mod tests {
             }
             Ok("valid".to_owned())
         };
-        let updater =
-            |_input: String| -> BoxFuture<'static, ()> { Box::pin(async {}) };
+        let updater = |_input: String| -> BoxFuture<'static, anyhow::Result<()>> {
+            Box::pin(async { Ok(()) })
+        };
         let fetcher = Fetcher::new(
             "cache-recovery-failure".to_owned(),
             Duration::ZERO,
@@ -568,11 +583,13 @@ mod tests {
             Ok("parsed".to_owned())
         };
 
-        let updater = move |input: String| -> BoxFuture<'static, ()> {
-            Box::pin(async move {
-                assert_eq!(input, "parsed".to_owned());
-            })
-        };
+        let updater =
+            move |input: String| -> BoxFuture<'static, anyhow::Result<()>> {
+                Box::pin(async move {
+                    assert_eq!(input, "parsed".to_owned());
+                    Ok(())
+                })
+            };
 
         let mut f = Fetcher::new(
             "test_fetcher".to_string(),
@@ -583,6 +600,7 @@ mod tests {
         );
 
         let _ = f.initial().await;
+        f.start_polling().await;
 
         sleep(Duration::from_secs_f64(5.5)).await;
         f.destroy().await;
