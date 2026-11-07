@@ -150,10 +150,9 @@ impl DhcpClient {
     }
 
     async fn resolve(&self) -> io::Result<Vec<ThreadSafeDNSClient>> {
-        // Capture before checking the lease: a concurrent network reset in
-        // either the lease check or DHCP discovery invalidates this attempt.
-        let generation = self.inner.lock().await.generation;
-        let expired = self.update_if_lease_expired().await?;
+        // The lease check returns its generation while still holding the
+        // cache lock. A reset after that snapshot makes this discovery stale.
+        let (expired, generation) = self.update_if_lease_expired().await?;
         if expired {
             let iface =
                 get_interface_by_name(&self.iface.name).ok_or_else(|| {
@@ -220,52 +219,75 @@ impl DhcpClient {
         Ok(())
     }
 
-    /// Check if interface updated or DHCP changed
-    /// and update if necessary
-    async fn update_if_lease_expired(&self) -> io::Result<bool> {
+    /// Check whether the DHCP lease's interface still owns its DNS source.
+    /// Only refresh the check TTL after a valid interface observation. A lost
+    /// or unaddressed NIC must invalidate stale DNS clients immediately.
+    async fn update_if_lease_expired(&self) -> io::Result<(bool, u64)> {
+        self.update_if_lease_expired_with(get_interface_by_name)
+            .await
+    }
+
+    async fn update_if_lease_expired_with(
+        &self,
+        lookup: impl FnOnce(&str) -> Option<OutboundInterface>,
+    ) -> io::Result<(bool, u64)> {
         let mut inner = self.inner.lock().await;
         if inner.clients.is_empty() {
-            return Ok(true);
+            return Ok((true, inner.generation));
         }
-
         if Instant::now() < inner.iface_expires_at {
-            return Ok(false);
+            return Ok((false, inner.generation));
         }
 
-        inner.iface_expires_at = Instant::now().add(IFACE_TTL);
-
-        let iface = get_interface_by_name(&self.iface.name).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "DHCP interface disappeared")
-        })?;
-
-        let addr = iface.addr_v4.ok_or(io::Error::other(format!(
-            "no address on interface: {:?}",
-            self.iface
-        )))?;
-
-        if Instant::now() < inner.dns_expires_at
-            && inner.iface_addr.addr() == addr
-            && inner.iface_addr.netmask()
-                == iface.netmask_v4.ok_or(io::Error::other(format!(
-                    "no netmask on iface: {:?}",
-                    self.iface
-                )))?
-        {
-            Ok(false)
-        } else {
-            inner.dns_expires_at = Instant::now().add(DHCP_TTL);
-            inner.iface_addr = ipnet::IpNet::new(
-                addr.into(),
-                u32::from(iface.netmask_v4.ok_or(io::Error::other("no netmask"))?)
-                    .count_ones() as _,
-            )
-            .map_err(|_x| {
+        // Testable offline lookup boundary. Do not cache a successful lease
+        // timestamp before validating the interface, address and netmask.
+        let observed_net = (|| {
+            let iface = lookup(&self.iface.name).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "DHCP interface disappeared")
+            })?;
+            let addr = iface.addr_v4.ok_or_else(|| {
                 io::Error::other(format!(
-                    "invalid netmask: {}",
-                    iface.netmask_v4.expect("expect netmask parse error")
+                    "no address on interface: {:?}",
+                    self.iface
                 ))
             })?;
-            Ok(true)
+            let mask = iface.netmask_v4.ok_or_else(|| {
+                io::Error::other(format!("no netmask on iface: {:?}", self.iface))
+            })?;
+            ipnet::IpNet::new(addr.into(), u32::from(mask).count_ones() as _)
+                .map_err(|error| {
+                    io::Error::other(format!(
+                        "invalid DHCP interface netmask: {error}"
+                    ))
+                })
+        })();
+
+        let observed_net = match observed_net {
+            Ok(net) => net,
+            Err(error) => {
+                // Once the lease's interface is gone, using an old DNS IP on
+                // the new default route could leak names to the wrong service.
+                inner.generation = inner.generation.wrapping_add(1);
+                inner.clients.clear();
+                inner.iface_expires_at = Instant::now();
+                inner.dns_expires_at = Instant::now();
+                inner.iface_addr = ipnet::IpNet::default();
+                return Err(error);
+            }
+        };
+
+        inner.iface_expires_at = Instant::now().add(IFACE_TTL);
+        if Instant::now() < inner.dns_expires_at && inner.iface_addr == observed_net
+        {
+            Ok((false, inner.generation))
+        } else {
+            // Lease/address change or DHCP TTL expiry: stop serving all old
+            // DNS upstreams immediately, before async DHCP reprobe finishes.
+            inner.generation = inner.generation.wrapping_add(1);
+            inner.clients.clear();
+            inner.dns_expires_at = Instant::now().add(DHCP_TTL);
+            inner.iface_addr = observed_net;
+            Ok((true, inner.generation))
         }
     }
 }
@@ -510,6 +532,146 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(client.inner.lock().await.clients.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disappeared_dhcp_interface_invalidates_cached_servers() {
+        // Deliberately inject a disappearing network interface. The old
+        // lease may no longer be used even if its DNS server IP is reachable
+        // through a *different* physical network.
+        let called = Arc::new(AtomicBool::new(false));
+        let client = test_client(vec![probe("old-dns", called, false, false)]);
+        {
+            let mut inner = client.inner.lock().await;
+            inner.iface_expires_at = Instant::now() - Duration::from_secs(1);
+        }
+        let generation = client.inner.lock().await.generation;
+        let error = client
+            .update_if_lease_expired_with(|_| None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let inner = client.inner.lock().await;
+        assert!(
+            inner.clients.is_empty(),
+            "old DNS pool must not survive lost interface"
+        );
+        assert!(
+            inner.generation != generation,
+            "in-flight discovery must also be invalidated"
+        );
+        assert!(inner.iface_expires_at <= Instant::now());
+    }
+
+    #[tokio::test]
+    async fn dhcp_interface_lost_ipv4_address_invalidates_cached_servers() {
+        let called = Arc::new(AtomicBool::new(false));
+        let client = test_client(vec![probe("old-dns", called, false, false)]);
+        {
+            let mut inner = client.inner.lock().await;
+            inner.iface_expires_at = Instant::now() - Duration::from_secs(1);
+        }
+        // This synthetic interface has no IPv4 address. Do not read the real
+        // host interface inventory or emit any DHCP discovery traffic.
+        let lookup = client.iface.clone();
+        let error = client
+            .update_if_lease_expired_with(|_| Some(lookup))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(client.inner.lock().await.clients.is_empty());
+    }
+
+    #[tokio::test]
+    async fn changed_dhcp_network_invalidates_old_clients_before_discovery_completes()
+     {
+        // A second DNS query arriving while the first re-probes DHCP must
+        // never use cached DNS servers from the previous interface address.
+        let called = Arc::new(AtomicBool::new(false));
+        let client = test_client(vec![probe("old-network", called, false, false)]);
+        {
+            let mut inner = client.inner.lock().await;
+            inner.iface_expires_at = Instant::now() - Duration::from_secs(1);
+            inner.dns_expires_at = Instant::now() + Duration::from_secs(3600);
+            inner.iface_addr = "192.0.2.10/24".parse().unwrap();
+        }
+        let old_generation = client.inner.lock().await.generation;
+        let mut replaced_iface = client.iface.clone();
+        replaced_iface.addr_v4 = Some(Ipv4Addr::new(198, 51, 100, 10));
+        replaced_iface.netmask_v4 = Some(Ipv4Addr::new(255, 255, 255, 0));
+        let requery = client
+            .update_if_lease_expired_with(|_| Some(replaced_iface))
+            .await
+            .unwrap();
+        assert!(
+            requery.0,
+            "changed lease must initiate fresh DHCP discovery"
+        );
+        let inner = client.inner.lock().await;
+        assert!(
+            inner.clients.is_empty(),
+            "old DNS servers remained available during re-probe"
+        );
+        assert_ne!(inner.generation, old_generation);
+    }
+
+    #[tokio::test]
+    async fn same_dhcp_interface_and_live_lease_reuses_current_dns_only() {
+        let client = test_client(vec![probe(
+            "still-valid-dns",
+            Arc::new(AtomicBool::new(false)),
+            false,
+            false,
+        )]);
+        {
+            let mut inner = client.inner.lock().await;
+            inner.iface_expires_at = Instant::now() - Duration::from_secs(1);
+            inner.dns_expires_at = Instant::now() + Duration::from_secs(600);
+            inner.iface_addr = "192.0.2.10/24".parse().unwrap();
+        }
+        let generation = client.inner.lock().await.generation;
+        let mut iface = client.iface.clone();
+        iface.addr_v4 = Some(Ipv4Addr::new(192, 0, 2, 10));
+        iface.netmask_v4 = Some(Ipv4Addr::new(255, 255, 255, 0));
+        let (needs_probe, observed_generation) = client
+            .update_if_lease_expired_with(|_| Some(iface))
+            .await
+            .unwrap();
+        assert!(
+            !needs_probe,
+            "unchanged live lease must reuse its DNS clients"
+        );
+        assert_eq!(observed_generation, generation);
+        let inner = client.inner.lock().await;
+        assert_eq!(inner.clients.len(), 1);
+        assert!(inner.iface_expires_at > Instant::now());
+    }
+
+    #[tokio::test]
+    async fn expired_dhcp_dns_lease_invalidates_servers_even_on_same_interface() {
+        let client = test_client(vec![probe(
+            "expired-lease-dns",
+            Arc::new(AtomicBool::new(false)),
+            false,
+            false,
+        )]);
+        {
+            let mut inner = client.inner.lock().await;
+            inner.iface_expires_at = Instant::now() - Duration::from_secs(1);
+            inner.dns_expires_at = Instant::now() - Duration::from_secs(1);
+            inner.iface_addr = "192.0.2.10/24".parse().unwrap();
+        }
+        let generation = client.inner.lock().await.generation;
+        let mut iface = client.iface.clone();
+        iface.addr_v4 = Some(Ipv4Addr::new(192, 0, 2, 10));
+        iface.netmask_v4 = Some(Ipv4Addr::new(255, 255, 255, 0));
+        let (needs_probe, observed_generation) = client
+            .update_if_lease_expired_with(|_| Some(iface))
+            .await
+            .unwrap();
+        assert!(needs_probe);
+        assert_ne!(observed_generation, generation);
         assert!(client.inner.lock().await.clients.is_empty());
     }
 
