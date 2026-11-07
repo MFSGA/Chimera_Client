@@ -3934,6 +3934,7 @@ mod tests {
 
         let fake_ip: IpAddr = "198.18.0.10".parse().unwrap();
         let mut resolver = MockClashResolver::new();
+        resolver.expect_ipv6().return_const(false);
         resolver
             .expect_fake_ip_enabled()
             .times(2)
