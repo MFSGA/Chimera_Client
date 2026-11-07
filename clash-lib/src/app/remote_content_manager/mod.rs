@@ -111,6 +111,20 @@ impl ProxyManager {
         }
     }
 
+    pub(crate) async fn replace_provider_dns_domains(
+        &self,
+        provider: &str,
+        proxies: &[AnyOutboundHandler],
+    ) -> anyhow::Result<()> {
+        let domains = proxies
+            .iter()
+            .filter_map(|proxy| proxy.server_name().map(str::to_owned))
+            .collect();
+        self.dns_resolver
+            .replace_proxy_provider_dns_domains(provider, domains)
+            .await
+    }
+
     pub async fn alive(&self, name: &str) -> bool {
         self.proxy_state
             .read()

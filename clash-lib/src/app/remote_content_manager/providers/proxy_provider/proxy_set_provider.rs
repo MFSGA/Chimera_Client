@@ -93,6 +93,9 @@ impl ProxySetProvider {
             let name = updater_name.clone();
             let inner = inner_clone.clone();
             Box::pin(async move {
+                // Serialise registration with publication: two overlapping
+                // refreshes must never publish A after B has replaced A's
+                // node-DNS ownership, even briefly.
                 {
                     let mut inner = inner.write().await;
                     debug!("updating {} proxies for: {}", input.len(), name);
@@ -102,6 +105,18 @@ impl ProxySetProvider {
                         );
                         return;
                     };
+                    if let Err(error) =
+                        hc.replace_provider_dns_domains(&name, &input).await
+                    {
+                        // Retain the last accepted revision if its DNS
+                        // ownership could not be installed beforehand.
+                        warn!(
+                            provider = name.as_str(),
+                            error = %error,
+                            "retaining previous provider revision: node DNS domain registration failed"
+                        );
+                        return;
+                    }
                     inner.proxies.clone_from(&input);
                     inner.revision = next_revision;
                 }
@@ -400,7 +415,11 @@ proxies:
                 Ok(refreshed_content.to_vec())
             }
         });
-        let manager = ProxyManager::new(Arc::new(MockClashResolver::new()), None);
+        let mut dns_resolver = MockClashResolver::new();
+        dns_resolver
+            .expect_replace_proxy_provider_dns_domains()
+            .returning(|_, _| Ok(()));
+        let manager = ProxyManager::new(Arc::new(dns_resolver), None);
         let health = HealthCheck::new(
             vec![],
             "http://example.invalid/check".to_owned(),
@@ -416,6 +435,151 @@ proxies:
             protect_provider_dns,
         )
         .expect("offline provider should construct")
+    }
+
+    async fn assert_provider_registers_new_proxy_host_before_refresh(
+        protect_provider_dns: bool,
+    ) {
+        // Provider hosts are absent from the resolver's startup proxy-domain
+        // trie. Every accepted revision must replace the provider-owned set
+        // before its new endpoints become connectable.
+        const FIRST: &[u8] = b"proxies:\n  - name: dynamic\n    type: socks5\n    server: Node.One.Example\n    port: 1080\n";
+        const SECOND: &[u8] = b"proxies:\n  - name: dynamic\n    type: socks5\n    server: node.two.example\n    port: 1080\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dynamic-provider.yaml");
+        let mut vehicle = MockProviderVehicle::new();
+        vehicle
+            .expect_path()
+            .return_const(path.to_string_lossy().to_string());
+        vehicle.expect_typ().return_const(ProviderVehicleType::Http);
+        let reads = Arc::new(AtomicUsize::new(0));
+        vehicle.expect_read().times(2).returning(move || {
+            Ok(if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                FIRST
+            } else {
+                SECOND
+            }
+            .to_vec())
+        });
+        let calls =
+            Arc::new(std::sync::Mutex::new(Vec::<(String, Vec<String>)>::new()));
+        let captured = calls.clone();
+        let mut resolver = MockClashResolver::new();
+        resolver
+            .expect_replace_proxy_provider_dns_domains()
+            .times(2)
+            .returning(move |owner, names| {
+                captured.lock().unwrap().push((owner.to_owned(), names));
+                Ok(())
+            });
+        let manager = ProxyManager::new(Arc::new(resolver), None);
+        let hc = HealthCheck::new(
+            vec![],
+            "http://example.invalid/health".to_owned(),
+            0,
+            true,
+            manager,
+        );
+        let provider = ProxySetProvider::new_with_dns_privacy(
+            "dynamic-owner".to_owned(),
+            Duration::ZERO,
+            Arc::new(vehicle),
+            hc,
+            protect_provider_dns,
+        )
+        .unwrap();
+        provider.initialize().await.unwrap();
+        let snapshot = provider.strict_content_snapshot().await.unwrap();
+        assert_eq!(snapshot.proxies[0].server_name(), Some("Node.One.Example"));
+        provider.update().await.unwrap();
+        let snapshot = provider.strict_content_snapshot().await.unwrap();
+        assert_eq!(snapshot.proxies[0].server_name(), Some("node.two.example"));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                (
+                    "dynamic-owner".to_owned(),
+                    vec!["Node.One.Example".to_owned()]
+                ),
+                (
+                    "dynamic-owner".to_owned(),
+                    vec!["node.two.example".to_owned()]
+                ),
+            ],
+            "accepted provider refresh must publish its exact endpoint ownership to node DNS",
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_provider_registers_new_proxy_host_before_publishing_refresh()
+    {
+        assert_provider_registers_new_proxy_host_before_refresh(true).await;
+    }
+
+    #[tokio::test]
+    async fn provider_node_dns_registration_is_not_limited_to_tun_fake_ip() {
+        // An explicitly configured proxy-server-nameserver also applies to
+        // provider nodes when TUN/Fake-IP privacy enforcement is not enabled.
+        assert_provider_registers_new_proxy_host_before_refresh(false).await;
+    }
+
+    #[tokio::test]
+    async fn provider_dns_registration_failure_preserves_last_visible_revision() {
+        const NEW_HOST: &[u8] = b"proxies:\n  - name: new-proxy\n    type: socks5\n    server: dynamic-node.example\n    port: 1080\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registrar-failure.yaml");
+        let mut vehicle = MockProviderVehicle::new();
+        vehicle
+            .expect_path()
+            .return_const(path.to_string_lossy().to_string());
+        vehicle.expect_typ().return_const(ProviderVehicleType::Http);
+        let reads = Arc::new(AtomicUsize::new(0));
+        vehicle.expect_read().times(2).returning(move || {
+            Ok(if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                VALID
+            } else {
+                NEW_HOST
+            }
+            .to_vec())
+        });
+        let mut resolver = MockClashResolver::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let hits = calls.clone();
+        resolver
+            .expect_replace_proxy_provider_dns_domains()
+            .times(2)
+            .returning(move |_, _| {
+                if hits.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("synthetic registrar outage"))
+                }
+            });
+        let health = HealthCheck::new(
+            vec![],
+            "http://example.invalid/check".to_owned(),
+            0,
+            true,
+            ProxyManager::new(Arc::new(resolver), None),
+        );
+        let provider = ProxySetProvider::new_with_dns_privacy(
+            "unstable-dns".to_owned(),
+            Duration::ZERO,
+            Arc::new(vehicle),
+            health,
+            true,
+        )
+        .unwrap();
+        provider.initialize().await.unwrap();
+        let before = provider.strict_content_snapshot().await.unwrap();
+        // Current Fetcher API cannot propagate the async update-hook error;
+        // only assert the privacy-critical visible revision is preserved.
+        let _ = provider.update().await;
+        let after = provider.strict_content_snapshot().await.unwrap();
+        assert_eq!(before.revision, after.revision);
+        assert!(Arc::ptr_eq(&before.proxies[0], &after.proxies[0]));
+        assert_eq!(after.proxies[0].server_name(), Some("198.51.100.10"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -1048,7 +1212,11 @@ proxies:
             .return_const("/tmp/chimera-wireguard-provider".to_owned());
         vehicle.expect_typ().return_const(ProviderVehicleType::Http);
 
-        let manager = ProxyManager::new(Arc::new(MockClashResolver::new()), None);
+        let mut dns_resolver = MockClashResolver::new();
+        dns_resolver
+            .expect_replace_proxy_provider_dns_domains()
+            .returning(|_, _| Ok(()));
+        let manager = ProxyManager::new(Arc::new(dns_resolver), None);
         let health = HealthCheck::new(
             vec![],
             "http://www.gstatic.com/generate_204".to_owned(),
@@ -1107,7 +1275,11 @@ proxies:
             .return_const(cache_path.to_string_lossy().into_owned());
         vehicle.expect_typ().return_const(ProviderVehicleType::Http);
 
-        let manager = ProxyManager::new(Arc::new(MockClashResolver::new()), None);
+        let mut dns_resolver = MockClashResolver::new();
+        dns_resolver
+            .expect_replace_proxy_provider_dns_domains()
+            .returning(|_, _| Ok(()));
+        let manager = ProxyManager::new(Arc::new(dns_resolver), None);
         let health = HealthCheck::new(
             vec![],
             "http://www.gstatic.com/generate_204".to_owned(),

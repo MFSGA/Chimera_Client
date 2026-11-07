@@ -64,6 +64,10 @@ pub struct EnhancedResolver {
 
     proxy_resolver: Option<Vec<ThreadSafeDNSClient>>,
     proxy_server_domains: Option<trie::StringTrie<bool>>,
+    /// Live provider-host ownership is independent of the startup static
+    /// outbound trie; each refreshed provider replaces only its own names.
+    provider_proxy_server_domains:
+        RwLock<std::collections::HashMap<String, std::collections::HashSet<String>>>,
     direct_resolver: Option<ThreadSafeDNSResolver>,
 
     fake_dns: Option<ThreadSafeFakeDns>,
@@ -290,6 +294,7 @@ impl EnhancedResolver {
             policy_is_parent_shared: false,
             proxy_resolver: None,
             proxy_server_domains: None,
+            provider_proxy_server_domains: RwLock::new(Default::default()),
             direct_resolver: None,
             fake_dns: None,
             fake_ip_ttl: 1,
@@ -343,6 +348,7 @@ impl EnhancedResolver {
 
             proxy_resolver: None,
             proxy_server_domains: None,
+            provider_proxy_server_domains: RwLock::new(Default::default()),
             direct_resolver: None,
 
             fake_dns: None,
@@ -418,6 +424,7 @@ impl EnhancedResolver {
 
             proxy_resolver: None,
             proxy_server_domains: None,
+            provider_proxy_server_domains: RwLock::new(Default::default()),
             direct_resolver: None,
 
             fake_dns: None,
@@ -672,6 +679,7 @@ impl EnhancedResolver {
 
             proxy_resolver,
             proxy_server_domains: proxy_server_domains_trie,
+            provider_proxy_server_domains: RwLock::new(Default::default()),
             direct_resolver,
 
             reverse_lookup_cache: Some(Arc::new(RwLock::new(
@@ -879,8 +887,18 @@ impl EnhancedResolver {
             .first()
             .ok_or_else(|| anyhow!("invalid query"))?;
 
+        // Provider refreshes can introduce a node hostname previously cached
+        // from ordinary DNS. Never read or write that shared cache for live
+        // provider endpoint A/AAAA queries; dedicated node DNS must win.
+        let provider_node_query = self.proxy_resolver.is_some()
+            && EnhancedResolver::is_ip_request(q)
+            && self
+                .is_registered_provider_domain(&q.name().to_ascii())
+                .await;
+
         trace!(q = q.to_string(), "start");
-        if Self::cache_safe_request(message)
+        if !provider_node_query
+            && Self::cache_safe_request(message)
             && let Some(lru) = &self.lru_cache
             && let Some(Ok(mut cached)) = lru.get(q, Instant::now()).map(|c| {
                 c.inspect_err(|x| warn!("failed to get cached message: {}", x))
@@ -896,7 +914,8 @@ impl EnhancedResolver {
             cached.queries = message.queries.clone();
             return Ok(cached);
         }
-        if Self::cache_safe_request(message)
+        if !provider_node_query
+            && Self::cache_safe_request(message)
             && self.lru_cache.is_some()
             && let Some(cached) = self.cached_negative(q, message, Instant::now())
         {
@@ -904,20 +923,32 @@ impl EnhancedResolver {
             return Ok(cached);
         }
         trace!(q = q.to_string(), "querying resolver");
-        let res = self.exchange_no_cache(message).await.map(|mut r| {
-            if let Some(edns) = r.edns.as_mut() {
-                // Remove only padding options, keep everything else
-                edns.options_mut().remove(rr::rdata::opt::EdnsCode::Padding);
-            }
-            r
-        });
+        let res = self
+            .exchange_no_cache_with_policy(message, !provider_node_query)
+            .await
+            .map(|mut r| {
+                if let Some(edns) = r.edns.as_mut() {
+                    // Remove only padding options, keep everything else
+                    edns.options_mut().remove(rr::rdata::opt::EdnsCode::Padding);
+                }
+                r
+            });
         trace!(q = q.to_string(), "query completed");
         res
     }
 
+    #[cfg(test)]
     async fn exchange_no_cache(
         &self,
         message: &op::Message,
+    ) -> anyhow::Result<op::Message> {
+        self.exchange_no_cache_with_policy(message, true).await
+    }
+
+    async fn exchange_no_cache_with_policy(
+        &self,
+        message: &op::Message,
+        populate_shared_cache: bool,
     ) -> anyhow::Result<op::Message> {
         let q = message.queries.first().unwrap();
 
@@ -935,14 +966,16 @@ impl EnhancedResolver {
 
         let rv = query.await;
 
-        if let Ok(msg) = &rv
+        if populate_shared_cache
+            && let Ok(msg) = &rv
             && Self::cache_safe_request(message)
             && self.lru_cache.is_some()
         {
             self.cache_negative(q, msg, Instant::now());
         }
 
-        if let Ok(msg) = &rv
+        if populate_shared_cache
+            && let Ok(msg) = &rv
             && Self::cache_safe_request(message)
             && Self::cache_safe_response(msg)
             && let Some(lru) = &self.lru_cache
@@ -979,20 +1012,57 @@ impl EnhancedResolver {
         None
     }
 
+    async fn is_registered_provider_domain(&self, domain: &str) -> bool {
+        let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+        self.provider_proxy_server_domains
+            .read()
+            .await
+            .values()
+            .any(|domains| domains.contains(&domain))
+    }
+
     #[instrument(skip_all, level = "trace")]
     async fn ip_exchange(
         &self,
         message: &op::Message,
     ) -> anyhow::Result<op::Message> {
-        if let (Some(proxy_resolver), Some(proxy_domains)) =
-            (&self.proxy_resolver, &self.proxy_server_domains)
+        if self.proxy_node_resolver {
+            // This resolver is the transport's dedicated proxy node DNS
+            // bootstrap context. It must not go through generic main DNS.
+            if let Some(domain) = EnhancedResolver::domain_name_of_message(message) {
+                for (matcher, clients) in &self.proxy_server_nameserver_policy {
+                    if matcher.search(&domain).is_some() {
+                        return EnhancedResolver::batch_exchange(clients, message)
+                            .await;
+                    }
+                }
+            }
+            return EnhancedResolver::batch_exchange(&self.main, message).await;
+        }
+
+        if let Some(proxy_resolver) = &self.proxy_resolver
             && let Some(domain) = EnhancedResolver::domain_name_of_message(message)
-            && proxy_domains.search(&domain).is_some()
+            && (self
+                .proxy_server_domains
+                .as_ref()
+                .is_some_and(|static_domains| {
+                    static_domains.search(&domain).is_some()
+                })
+                || self.is_registered_provider_domain(&domain).await)
         {
             debug!(
                 "using proxy-server-nameserver for proxy server domain: {}",
                 domain
             );
+            for (matcher, clients) in &self.proxy_server_nameserver_policy {
+                if matcher.search(&domain).is_some() {
+                    debug!(
+                        "using proxy-server-nameserver-policy for proxy domain: {}",
+                        domain
+                    );
+                    return EnhancedResolver::batch_exchange(clients, message).await;
+                }
+            }
             return EnhancedResolver::batch_exchange(proxy_resolver, message).await;
         }
 
@@ -1495,6 +1565,41 @@ impl ClashResolver for EnhancedResolver {
 
     fn direct_resolver(&self) -> Option<ThreadSafeDNSResolver> {
         self.direct_resolver.clone()
+    }
+
+    async fn replace_proxy_provider_dns_domains(
+        &self,
+        provider: &str,
+        domains: Vec<String>,
+    ) -> anyhow::Result<()> {
+        // Provider node hostnames are loaded *after* the static proxy trie is
+        // built. Register their exact DNS names so they cannot silently use
+        // generic main/fallback DNS when dedicated node DNS exists.
+        let domains: std::collections::HashSet<String> = domains
+            .into_iter()
+            .map(|host| match url::Host::parse(&host) {
+                Ok(url::Host::Domain(domain))
+                    if !domain.trim_end_matches('.').is_empty() =>
+                {
+                    // WHATWG URL host parsing normalizes IDNA to its ASCII
+                    // wire name. A lowercase-only comparison would otherwise
+                    // let Unicode provider endpoints fall through to main DNS.
+                    Ok(Some(domain.trim_end_matches('.').to_ascii_lowercase()))
+                }
+                Ok(url::Host::Ipv4(_) | url::Host::Ipv6(_)) => Ok(None),
+                _ => Err(anyhow!("invalid proxy provider DNS endpoint hostname")),
+            })
+            .collect::<anyhow::Result<Vec<Option<String>>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+        let mut providers = self.provider_proxy_server_domains.write().await;
+        if domains.is_empty() {
+            providers.remove(provider);
+        } else {
+            providers.insert(provider.to_owned(), domains);
+        }
+        Ok(())
     }
 
     async fn is_fake_ip(&self, ip: std::net::IpAddr) -> bool {
@@ -3104,6 +3209,183 @@ mod tests {
                 .unwrap()
                 .get(&query, Instant::now())
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn refreshed_proxy_provider_host_uses_dedicated_node_dns_not_public_main()
+    {
+        // Mihomo resolves proxy provider endpoints through ProxyServerNameserver
+        // even if they did not exist when the primary resolver was built.
+        let mut resolver = EnhancedResolver::from_clients(vec![], false);
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        let proxy_hits = Arc::new(AtomicUsize::new(0));
+        resolver.main = vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+            hits: main_hits.clone(),
+            id: "public-main",
+        })];
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: proxy_hits.clone(),
+            id: "node-only",
+        })]);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "remote-proxies",
+                vec!["PrOxY.ExAmPlE.CoM".to_owned()],
+            )
+            .await
+            .unwrap();
+        let result = resolver
+            .ip_exchange(&test_query_with_type(rr::RecordType::A))
+            .await
+            .unwrap();
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&result),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11))]
+        );
+        assert_eq!(proxy_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(main_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn provider_node_dns_never_reuses_public_answer_cached_before_registration()
+     {
+        // A public DNS answer could have been cached before this hostname
+        // appeared in a proxy provider. Registration must revoke that trust.
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        let node_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+                hits: main_hits.clone(),
+                id: "main-dns",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: node_hits.clone(),
+            id: "node-dns",
+        })]);
+        let mut request = test_query_with_type(rr::RecordType::A);
+        request.metadata.recursion_desired = true;
+        let before = resolver.exchange(&request).await.unwrap();
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&before),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))]
+        );
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "provider-cache",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        let after = resolver.exchange(&request).await.unwrap();
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&after),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11))],
+            "a cached ordinary DNS answer cannot override newly registered node bootstrap"
+        );
+        assert_eq!(main_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(node_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn provider_node_dns_ownership_is_per_provider_and_removed_on_empty_refresh()
+     {
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        let node_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+                hits: public_hits.clone(),
+                id: "main",
+            })],
+            false,
+        );
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: node_hits.clone(),
+            id: "node",
+        })]);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "provider-A",
+                vec!["Shared.Example".into()],
+            )
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "provider-B",
+                vec!["shared.example".into()],
+            )
+            .await
+            .unwrap();
+        let mut q = test_query_with_type(rr::RecordType::A);
+        q.queries[0].set_name(rr::Name::from_utf8("shared.example.").unwrap());
+        resolver.ip_exchange(&q).await.unwrap();
+        assert_eq!(node_hits.load(Ordering::SeqCst), 1);
+        resolver
+            .replace_proxy_provider_dns_domains("provider-A", vec![])
+            .await
+            .unwrap();
+        resolver.ip_exchange(&q).await.unwrap();
+        assert_eq!(
+            node_hits.load(Ordering::SeqCst),
+            2,
+            "provider-B still owns the name"
+        );
+        resolver
+            .replace_proxy_provider_dns_domains("provider-B", vec![])
+            .await
+            .unwrap();
+        resolver.ip_exchange(&q).await.unwrap();
+        assert_eq!(node_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            public_hits.load(Ordering::SeqCst),
+            1,
+            "unused proxy domain is no longer owned"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_node_dns_normalizes_unicode_hostname_to_wire_idna() {
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        let node_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+                hits: public_hits.clone(),
+                id: "main",
+            })],
+            false,
+        );
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: node_hits.clone(),
+            id: "node",
+        })]);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "unicode-node",
+                vec!["bücher.example".into()],
+            )
+            .await
+            .unwrap();
+        let mut q = test_query_with_type(rr::RecordType::A);
+        q.queries[0]
+            .set_name(rr::Name::from_utf8("xn--bcher-kva.example.").unwrap());
+        resolver.ip_exchange(&q).await.unwrap();
+        assert_eq!(node_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            public_hits.load(Ordering::SeqCst),
+            0,
+            "IDNA node must never fall through to public DNS"
         );
     }
 

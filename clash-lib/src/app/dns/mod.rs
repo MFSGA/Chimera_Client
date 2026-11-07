@@ -157,6 +157,18 @@ pub trait ClashResolver: Sync + Send {
         None
     }
 
+    /// Refresh the exact proxy endpoint hostnames belonging to a provider.
+    /// The default keeps external/legacy resolver implementations compatible.
+    /// EnhancedResolver uses this to select dedicated node DNS for provider
+    /// endpoints before newly fetched nodes become connectable.
+    async fn replace_proxy_provider_dns_domains(
+        &self,
+        _provider: &str,
+        _domains: Vec<String>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     fn ipv6(&self) -> bool;
     fn set_ipv6(&self, enable: bool);
 

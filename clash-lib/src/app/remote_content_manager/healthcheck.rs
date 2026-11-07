@@ -68,6 +68,19 @@ impl HealthCheck {
         }
     }
 
+    /// Register accepted provider endpoints before a revision becomes visible.
+    /// A privacy-mode refresh may not silently publish new hostnames while the
+    /// resolver still routes them through ordinary nameserver/fallback.
+    pub(crate) async fn replace_provider_dns_domains(
+        &self,
+        provider: &str,
+        proxies: &[AnyOutboundHandler],
+    ) -> anyhow::Result<()> {
+        self.proxy_manager
+            .replace_provider_dns_domains(provider, proxies)
+            .await
+    }
+
     pub fn with_probe(
         mut self,
         probe: HealthCheckProbe,
