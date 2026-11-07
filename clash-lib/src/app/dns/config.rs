@@ -56,6 +56,11 @@ pub struct EdnsClientSubnet {
 #[derive(Default)]
 pub struct Config {
     pub enable: bool,
+    /// Effective global IPv6 policy from the root configuration.
+    pub global_ipv6: bool,
+    /// The independent `dns.ipv6` policy for client AAAA answers.
+    pub dns_ipv6: bool,
+    /// Effective DNS IPv6 response setting (`global_ipv6 && dns_ipv6`).
     pub ipv6: bool,
     pub nameserver: Vec<NameServer>,
     pub fallback: Vec<NameServer>,
@@ -479,6 +484,8 @@ impl TryFrom<&crate::config::def::Config> for Config {
 
         Ok(Self {
             enable: dc.enable,
+            global_ipv6: c.ipv6,
+            dns_ipv6: dc.ipv6,
             ipv6: c.ipv6 && dc.ipv6,
             fw_mark: c.routing_mark,
             nameserver: nameservers,

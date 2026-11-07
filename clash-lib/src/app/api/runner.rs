@@ -60,6 +60,7 @@ pub struct ApiRunner {
     dispatcher: Arc<dispatcher::Dispatcher>,
     global_state: Arc<Mutex<GlobalState>>,
     dns_resolver: ThreadSafeDNSResolver,
+    control_plane_dns_resolver: ThreadSafeDNSResolver,
     outbound_manager: ThreadSafeOutboundManager,
     statistics_manager: Arc<StatisticsManager>,
     cache_store: ThreadSafeCacheFile,
@@ -258,6 +259,7 @@ impl ApiRunner {
         dispatcher: Arc<dispatcher::Dispatcher>,
         global_state: Arc<Mutex<GlobalState>>,
         dns_resolver: ThreadSafeDNSResolver,
+        control_plane_dns_resolver: ThreadSafeDNSResolver,
         outbound_manager: ThreadSafeOutboundManager,
         statistics_manager: Arc<StatisticsManager>,
         cache_store: ThreadSafeCacheFile,
@@ -276,6 +278,7 @@ impl ApiRunner {
             dispatcher,
             global_state,
             dns_resolver,
+            control_plane_dns_resolver,
             outbound_manager,
             statistics_manager,
             cache_store,
@@ -341,6 +344,7 @@ impl Runner for ApiRunner {
         let dispatcher = self.dispatcher.clone();
         let global_state = self.global_state.clone();
         let dns_resolver = self.dns_resolver.clone();
+        let control_plane_dns_resolver = self.control_plane_dns_resolver.clone();
         let outbound_manager = self.outbound_manager.clone();
         let statistics_manager = self.statistics_manager.clone();
         let cache_store = self.cache_store.clone();
@@ -358,6 +362,11 @@ impl Runner for ApiRunner {
             .take();
 
         tracing::debug!("API controller configuration: {:?}", controller_cfg);
+        let controller_listener_ipv6 = controller_cfg
+            .external_controller
+            .as_deref()
+            .and_then(|address| address.parse::<SocketAddr>().ok())
+            .is_some_and(|address| address.is_ipv6());
         let ipc_addr = controller_cfg.external_controller_ipc;
         let tcp_addr = controller_cfg.external_controller;
         let endpoint_count =
@@ -402,9 +411,11 @@ impl Runner for ApiRunner {
                         dispatcher.clone(),
                         global_state.clone(),
                         dns_resolver.clone(),
+                        control_plane_dns_resolver.clone(),
                         dns_listen_addr,
                         dns_enabled,
                         ipv6_allowed,
+                        controller_listener_ipv6,
                     ),
                 )
                 .nest(

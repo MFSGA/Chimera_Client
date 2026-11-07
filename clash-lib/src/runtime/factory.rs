@@ -85,7 +85,7 @@ pub(super) async fn create_components(
     );
 
     let system_resolver = Arc::new(
-        SystemResolver::new(config.dns.ipv6)
+        SystemResolver::new_with_ipv6(config.general.ipv6, config.dns.dns_ipv6)
             .map_err(|x| Error::DNSError(x.to_string()))?,
     );
 
@@ -379,6 +379,7 @@ pub(super) async fn create_components(
     Ok(RuntimeComponents {
         cache_store,
         dns_resolver,
+        control_plane_dns_resolver,
         outbound_manager,
         router,
         dispatcher,
@@ -421,6 +422,8 @@ async fn build_auxiliary_dns_resolver(
 
     let cfg = dns::Config {
         enable: true,
+        global_ipv6: ipv6,
+        dns_ipv6: ipv6,
         ipv6,
         nameserver: effective_nameserver,
         proxy_server_nameserver: None,
