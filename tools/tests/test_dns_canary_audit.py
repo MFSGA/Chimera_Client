@@ -56,6 +56,7 @@ class AuditTests(unittest.TestCase):
             "expected_physical_interfaces": ["en0"],
             "expected_tun_interfaces": ["utun7"],
             "resolver_snapshot": "scutil-dns.txt",
+            "resolver_snapshot_recorded_at_utc": "2026-11-06T15:00:20Z",
             "captures": [
                 {"role": "physical", "interface": "en0", "path": "en0.log",
                  "started_at_utc": "2026-11-06T15:00:00Z",
@@ -291,6 +292,65 @@ class AuditTests(unittest.TestCase):
         with self.assertRaisesRegex(audit.AuditError, "before end"):
             audit.analyze_manifest(self.save_manifest())
 
+    def test_snapshot_with_arbitrary_text_is_not_verified(self) -> None:
+        (self.folder / "scutil-dns.txt").write_text(
+            "not a resolver snapshot", encoding="utf-8"
+        )
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["verdict"], "NOT_VERIFIED")
+        self.assertIn("unrecognized_scutil_dns_snapshot", report["coverage_issues"])
+        self.assertNotIn("not a resolver snapshot", json.dumps(report))
+
+    def test_scutil_snapshot_timestamp_must_be_within_overlap(self) -> None:
+        self.manifest["resolver_snapshot_recorded_at_utc"] = "2026-11-06T15:10:00Z"
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["verdict"], "NOT_VERIFIED")
+        self.assertIn("scutil_dns_snapshot_outside_shared_capture_window",
+                      report["coverage_issues"])
+
+    def test_scutil_snapshot_timestamp_missing_is_not_verified(self) -> None:
+        del self.manifest["resolver_snapshot_recorded_at_utc"]
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["verdict"], "NOT_VERIFIED")
+        self.assertIn("missing_scutil_dns_snapshot_recorded_at_utc",
+                      report["coverage_issues"])
+
+    def test_scutil_snapshot_timestamp_requires_timezone(self) -> None:
+        self.manifest["resolver_snapshot_recorded_at_utc"] = "2026-11-06T15:00:20"
+        with self.assertRaisesRegex(audit.AuditError, "timezone-aware"):
+            audit.analyze_manifest(self.save_manifest())
+
+    def test_scutil_snapshot_needs_actual_resolver_nameserver(self) -> None:
+        (self.folder / "scutil-dns.txt").write_text(
+            "DNS configuration\nresolver #1\n  flags : Request A records\n",
+            encoding="utf-8"
+        )
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["verdict"], "NOT_VERIFIED")
+        self.assertIn("unrecognized_scutil_dns_snapshot", report["coverage_issues"])
+
+    def test_scutil_snapshot_lookalike_header_does_not_count(self) -> None:
+        (self.folder / "scutil-dns.txt").write_text(
+            "DNS configuration IS NOT FROM SCUTIL\n"
+            "resolver #1\n"
+            "nameserver[0] : 192.0.2.53\n",
+            encoding="utf-8",
+        )
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["verdict"], "NOT_VERIFIED")
+        self.assertIn("unrecognized_scutil_dns_snapshot", report["coverage_issues"])
+
+    def test_scutil_snapshot_is_size_bounded(self) -> None:
+        (self.folder / "scutil-dns.txt").write_bytes(b"x" * (4 * 1024 * 1024 + 1))
+        with self.assertRaisesRegex(audit.AuditError, "scutil snapshot exceeds"):
+            audit.analyze_manifest(self.save_manifest())
+
+    def test_snapshot_metadata_is_limited_to_counts_not_server_addresses(self) -> None:
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["resolver_snapshot"]["resolver_sections"], 1)
+        self.assertEqual(report["resolver_snapshot"]["nameserver_entries"], 1)
+        self.assertNotIn("192.0.2.53", json.dumps(report))
+
     def test_missing_scutil_snapshot_is_not_verified(self) -> None:
         del self.manifest["resolver_snapshot"]
         result = audit.analyze_manifest(self.save_manifest())
@@ -309,6 +369,12 @@ class AuditTests(unittest.TestCase):
         self.assertIn("source_endpoint", report["canary_queries"][0])
         self.assertIn("destination_endpoint", report["canary_queries"][0])
         self.assertEqual(report["canary_queries"][0]["destination_endpoint"], "192.0.2.53.53")
+
+    def test_oversized_manifest_rejected_before_json_parsing(self) -> None:
+        path = self.folder / "oversized-manifest.json"
+        path.write_bytes(b" " * (256 * 1024 + 1))
+        with self.assertRaisesRegex(audit.AuditError, "manifest exceeds"):
+            audit.analyze_manifest(path)
 
     def test_invalid_manifest_field_is_rejected_instead_of_ignored(self) -> None:
         self.manifest["coverage_complete"] = True
@@ -347,6 +413,13 @@ class AuditTests(unittest.TestCase):
         self.manifest["expected_physical_interfaces"] = ["utun7"]
         self.manifest["captures"][0]["interface"] = "utun7"
         with self.assertRaisesRegex(audit.AuditError, "physical"):
+            audit.analyze_manifest(self.save_manifest())
+
+    def test_hardlinked_capture_files_cannot_impersonate_two_interfaces(self) -> None:
+        import os
+        os.link(self.folder / "en0.log", self.folder / "same-bytes-other-name.log")
+        self.manifest["captures"][1]["path"] = "same-bytes-other-name.log"
+        with self.assertRaisesRegex(audit.AuditError, "same underlying"):
             audit.analyze_manifest(self.save_manifest())
 
     def test_duplicate_capture_file_and_interface_rejected(self) -> None:

@@ -21,6 +21,8 @@ from typing import Any
 
 SCHEMA_VERSION = 1
 MAX_CAPTURE_BYTES = 128 * 1024 * 1024
+MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024
+MAX_MANIFEST_BYTES = 256 * 1024
 MAX_CANARY_EVENTS = 5000
 
 PACKET = re.compile(
@@ -41,7 +43,7 @@ LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 KNOWN_MANIFEST_FIELDS = {
     "schema_version", "case_id", "canary_qname", "captures",
     "expected_physical_interfaces", "expected_tun_interfaces",
-    "resolver_snapshot",
+    "resolver_snapshot", "resolver_snapshot_recorded_at_utc",
 }
 
 
@@ -138,6 +140,8 @@ def expected_interfaces(manifest: dict[str, Any], key: str) -> list[str]:
 
 
 def _load_manifest(path: Path) -> dict[str, Any]:
+    if path.stat().st_size > MAX_MANIFEST_BYTES:
+        raise AuditError("manifest exceeds 256 KiB; reject oversized evidence inventory")
     try:
         manifest = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
@@ -239,6 +243,7 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
     events: list[dict[str, Any]] = []
     seen_interfaces: set[tuple[str, str]] = set()
     seen_paths: set[Path] = set()
+    seen_file_ids: set[tuple[int, int]] = set()
     missing_offsets: list[str] = []
     by_role_inside_window = {"physical": 0, "tun": 0}
     for spec, window in zip(raw_captures, windows):
@@ -268,6 +273,11 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
         file_path = evidence_path(folder, spec["path"])
         if file_path in seen_paths:
             raise AuditError("a capture file cannot represent two interfaces")
+        stat = file_path.stat()
+        inode_key = (stat.st_dev, stat.st_ino)
+        if inode_key in seen_file_ids:
+            raise AuditError("captures for two interfaces cannot refer to the same underlying file")
+        seen_file_ids.add(inode_key)
         seen_paths.add(file_path)
         packet_lines = 0
         port53_packet_lines = 0
@@ -405,12 +415,63 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
     snapshot_result: dict[str, Any] = {"provided": False}
     if "resolver_snapshot" in manifest:
         path = evidence_path(folder, manifest["resolver_snapshot"])
-        if not path.stat().st_size:
+        if path.stat().st_size > MAX_SNAPSHOT_BYTES:
+            raise AuditError("scutil snapshot exceeds 4 MiB; reject oversized evidence")
+        snapshot_bytes = path.read_bytes()
+        snapshot_digest = hashlib.sha256(snapshot_bytes).hexdigest()
+        if not snapshot_bytes:
             missing.append("empty_resolver_snapshot")
+        try:
+            snapshot_text = snapshot_bytes.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise AuditError("scutil snapshot must be UTF-8 text") from error
+        lines = snapshot_text.splitlines()
+        # This deliberately checks only *shape*, not the correctness of the
+        # macOS service-scoped resolver order or its ownership. No nameserver
+        # addresses or search domains are copied into the report.
+        headers = sum(
+            re.fullmatch(r"DNS configuration(?: \(for scoped queries\))?", line.strip())
+            is not None for line in lines
+        )
+        resolvers = sum(
+            re.fullmatch(r"\s*resolver #\d+\s*", line) is not None
+            for line in lines
+        )
+        nameservers = sum(
+            re.fullmatch(r"\s*nameserver\[\d+\]\s*:\s*\S+.*", line) is not None
+            for line in lines
+        )
+        if not (headers and resolvers and nameservers):
+            missing.append("unrecognized_scutil_dns_snapshot")
+        snapshot_at_raw = manifest.get("resolver_snapshot_recorded_at_utc")
+        snapshot_at = None
+        if snapshot_at_raw is None:
+            missing.append("missing_scutil_dns_snapshot_recorded_at_utc")
+        else:
+            if not isinstance(snapshot_at_raw, str):
+                raise AuditError("scutil snapshot timestamp must be timezone-aware ISO-8601")
+            try:
+                candidate = datetime.fromisoformat(
+                    snapshot_at_raw.replace("Z", "+00:00")
+                )
+            except ValueError as error:
+                raise AuditError("invalid scutil snapshot timestamp") from error
+            if candidate.tzinfo is None or candidate.utcoffset() is None:
+                raise AuditError("scutil snapshot timestamp must be timezone-aware ISO-8601")
+            snapshot_at = candidate.astimezone(timezone.utc)
+            if (shared_window is not None
+                    and not shared_window[0] <= snapshot_at < shared_window[1]):
+                missing.append("scutil_dns_snapshot_outside_shared_capture_window")
+        if sha256_file(path) != snapshot_digest:
+            raise AuditError("scutil snapshot changed while it was being analyzed")
         snapshot_result = {
             "provided": True,
-            "sha256": sha256_file(path),
-            "bytes": path.stat().st_size,
+            "sha256": snapshot_digest,
+            "bytes": len(snapshot_bytes),
+            "resolver_sections": resolvers,
+            "nameserver_entries": nameservers,
+            "recorded_at_utc": snapshot_at.isoformat() if snapshot_at else None,
+            "structure_recognized": bool(headers and resolvers and nameservers),
         }
     else:
         missing.append("missing_scutil_dns_resolver_snapshot")

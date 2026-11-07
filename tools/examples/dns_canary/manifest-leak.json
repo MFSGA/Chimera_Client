@@ -26,5 +26,6 @@
       "ended_at_utc": "2026-11-06T15:06:00Z",
       "packet_time_utc_offset": "-08:00"
     }
-  ]
+  ],
+  "resolver_snapshot_recorded_at_utc": "2026-11-06T15:00:20Z"
 }
