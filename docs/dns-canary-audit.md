@@ -10,7 +10,7 @@
 
 - **物理网卡发现 canary**：报告 `PHYSICAL_CANARY_PLAINTEXT_DNS_OBSERVED`。这能证明在所提供的抓包里看到该明文查询，但是否属于未授权泄漏仍要结合预期代理/DIRECT 策略判断。
 - **物理网卡未发现 canary、utun 在公共采集时段且本次 canary 刺激发出后的合理时间内有 canary，物理网卡同一时段存在端口 53 报文，且清单、日志与时间戳基本一致**：报告 `NO_PHYSICAL_CANARY_OBSERVED_IN_SUPPLIED_LOGS`。**仅指提供的文本中没有看到**，不证明接口覆盖充分、OS 时钟准确、macOS resolver 优先级或零泄漏。
-- **证据不足**：`NOT_VERIFIED`。例如缺少活动物理网卡或 utun 的日志、没有 canary 在公共时段和本次刺激时间之后到达 utun、没有记录刺激时间或共同捕获窗口不足以覆盖整个观察期限、未提供 tcpdump 时间戳的 UTC 偏移、数据包时间戳与声明的采集窗口不符、`scutil --dns` 快照缺失或记录时间不在公共窗口内、快照没有基本的 resolver/nameserver 行、存在未解码的 DNS 非空载荷，或某份日志没有有效的 53 端口数据包行。
+- **证据不足**：`NOT_VERIFIED`。例如缺少活动物理网卡或 utun 的日志、没有 canary 在公共时段和本次刺激时间之后到达 utun、没有记录刺激时间或共同捕获窗口不足以覆盖整个观察期限、未提供 tcpdump 时间戳的 UTC 偏移、数据包时间戳与声明的采集窗口不符、`scutil --dns` 快照缺失或记录时间不在公共窗口内、快照没有基本的 resolver/nameserver 行、tcpdump 退出统计缺失或显示丢包/记录数不匹配、存在未解码的 DNS 非空载荷，或某份日志没有有效的 53 端口数据包行。
 - **始终**输出 `system_zero_leak_verified: false`。DoH/DoT/DoQ、mDNS、服务专属 resolver、DNS Proxy Extension ownership、浏览器自己的 DNS、未抓取网卡、TCP 重组失败和真实代理互操作均不在这项离线验证范围内。
 
 ## 本地零网络测试（无需 macOS 特权）
@@ -30,7 +30,7 @@ python3 tools/dns_canary_audit.py \
 
 此外，`tools/examples/dns_canary/manifest-leak.json` 模拟物理网卡出现 canary（退出码 3），`manifest-incomplete.json` 模拟第二个活动物理接口 `en1` 缺失（退出码 4）。三个夹具的可复现结果都由离线单测验证，绝非真实网络采集。
 
-分析器只读取 manifest 同目录下的相对路径，拒绝 `..`、绝对路径、指向外部文件的符号链接、重复接口/文件（含指向同一 inode 的硬链接）、未知 manifest 字段和超大输入；manifest 最大 256 KiB，每份抓包最大 128 MiB，`scutil` 快照最大 4 MiB。必须为各抓包给出 `packet_time_utc_offset`（例如 PST 使用 `-08:00`）；缺少时可报告观察到的外发，但**不能生成阴性结论**。重复运行时默认拒绝覆盖已有报告，显式指定 `--overwrite` 才可替换。输出 JSON 采用同目录临时文件原子落盘，文件权限为 0600；拒绝将报告路径设为 manifest、抓包或 resolver 快照。显式覆盖既有报告时也不会顺着符号链接修改其目标。抓包在分析期间发生变化会中止，而非生成不一致的 SHA-256。
+分析器只读取 manifest 同目录下的相对路径，拒绝 `..`、绝对路径、指向外部文件的符号链接、重复接口/文件/统计文件（含指向同一 inode 的硬链接）、未知 manifest 字段和超大输入；manifest 最大 256 KiB，每份抓包最大 128 MiB，`scutil` 快照最大 4 MiB，单份 tcpdump 统计最大 64 KiB。必须为各抓包给出 `packet_time_utc_offset`（例如 PST 使用 `-08:00`）；缺少时可报告观察到的外发，但**不能生成阴性结论**。重复运行时默认拒绝覆盖已有报告，显式指定 `--overwrite` 才可替换。输出 JSON 采用同目录临时文件原子落盘，文件权限为 0600；拒绝将报告路径设为 manifest、抓包或 resolver 快照。显式覆盖既有报告时也不会顺着符号链接修改其目标。抓包在分析期间发生变化会中止，而非生成不一致的 SHA-256。
 
 ## 独立授权测试 Mac：操作人员采集流程（未在本轮执行）
 
@@ -42,13 +42,13 @@ python3 tools/dns_canary_audit.py \
    ```sh
    # 以下命令仅供获得授权后在测试机手工执行；不要在日常宿主机自动执行
    sudo tcpdump -i en0 -p -nn -tttt -s0 \
-     '(udp dst port 53 or tcp dst port 53)' > en0.txt
+     '(udp dst port 53 or tcp dst port 53)' > en0.txt 2> en0.stats.txt
 
    sudo tcpdump -i utun7 -p -nn -tttt -s0 \
-     '(udp dst port 53 or tcp dst port 53)' > utun7.txt
+     '(udp dst port 53 or tcp dst port 53)' > utun7.txt 2> utun7.stats.txt
    ```
 
-   **警告：** 原始 tcpdump 日志可能包含其他用户的 DNS 域名和 IP。应在无个人流量的隔离机器执行。报告默认**不回显其他域名或源/目标地址**，但这不等于原始日志无敏感信息。分析器要求 tcpdump 的单行文本解码格式，**不要使用可能让 DNS 包头和地址跨行输出的 `-vv` 模式**；如有非空 DNS 载荷无法解码，应标记 `NOT_VERIFIED` 并重采，而非判定零泄漏。
+   **警告：** 原始 tcpdump 日志可能包含其他用户的 DNS 域名和 IP。应在无个人流量的隔离机器执行。报告默认**不回显其他域名或源/目标地址**，但这不等于原始日志无敏感信息。分析器要求 tcpdump 的单行文本解码格式，**不要使用可能让 DNS 包头和地址跨行输出的 `-vv` 模式**；如有非空 DNS 载荷无法解码，应标记 `NOT_VERIFIED` 并重采，而非判定零泄漏。务必用 Ctrl-C/正常终止结束每个 `tcpdump`，让 stderr 落下最终 `N packets captured`、`0 packets dropped by kernel`（部分系统还提供 `dropped by interface`），否则缺少统计或统计与 stdout 解析包数不匹配会被判为证据不足。
 
    为每个捕获进程手工记录开启和停止时的 UTC 时间（例如执行 `date -u '+%Y-%m-%dT%H:%M:%SZ'`），并记录抓包期间当前系统的 UTC 偏移（例如通过只读 `date '+%z'` 确认后填写 `-08:00`）。不同接口必须存在共同的采集窗口；工具还会尝试将 `tcpdump -tttt` 的本地时间戳转为 UTC，核对数据包自身是否落在各自声明窗口、utun canary 是否在公共时段内出现。**时钟同步、操作者时间声明及固定 UTC 偏移都不是独立证明**；跨夏令时/DST 跳变的采集必须拆成不同 case，不能只给整段一个偏移。
 
@@ -68,16 +68,18 @@ python3 tools/dns_canary_audit.py \
      "resolver_snapshot_recorded_at_utc": "2026-11-06T15:00:20Z",
      "captures": [
        {"role": "physical", "interface": "en0", "path": "en0.txt",
+        "tcpdump_stats_path": "en0.stats.txt",
         "started_at_utc": "2026-11-06T15:00:00Z", "ended_at_utc": "2026-11-06T15:05:00Z",
         "packet_time_utc_offset": "-08:00"},
        {"role": "tun", "interface": "utun7", "path": "utun7.txt",
+        "tcpdump_stats_path": "utun7.stats.txt",
         "started_at_utc": "2026-11-06T15:00:00Z", "ended_at_utc": "2026-11-06T15:06:00Z",
         "packet_time_utc_offset": "-08:00"}
      ]
    }
    ```
 
-   清单中的 `expected_physical_interfaces` 必须列出所有受测物理接口，未提交任何一个所列接口的日志即为 `NOT_VERIFIED`。缺少 canary 刺激时间、utun canary 早于该刺激，或共同捕获窗口没覆盖整段观察期限，都不得输出阴性结论。`resolver_snapshot_recorded_at_utc` 缺失或不落在公共窗口内，同样为 `NOT_VERIFIED`。macOS TUN 接口须以 `utun` 加数字命名；不能把 `utun` 或 `lo0` 错报为物理出口。每个接口需有有时区的 `started_at_utc` 与 `ended_at_utc`，以及格式为 `±HH:MM` 的 `packet_time_utc_offset`；偏移缺失、时间戳无法换算或日志报文落在声明窗口之外时，不得将“物理接口未观察到 canary”视为通过。但清单与系统时间都来自操作者，并非分析器独立发现活动接口、时钟或抓包持续性的证明。
+   清单中的 `expected_physical_interfaces` 必须列出所有受测物理接口，未提交任何一个所列接口的日志即为 `NOT_VERIFIED`。每个接口必须单独保存 `tcpdump_stats_path`；内核或接口丢包、统计不完整及 `captured` 与已解析数据包数不一致时，阴性结果一律降级。缺少 canary 刺激时间、utun canary 早于该刺激，或共同捕获窗口没覆盖整段观察期限，都不得输出阴性结论。`resolver_snapshot_recorded_at_utc` 缺失或不落在公共窗口内，同样为 `NOT_VERIFIED`。macOS TUN 接口须以 `utun` 加数字命名；不能把 `utun` 或 `lo0` 错报为物理出口。每个接口需有有时区的 `started_at_utc` 与 `ended_at_utc`，以及格式为 `±HH:MM` 的 `packet_time_utc_offset`；偏移缺失、时间戳无法换算或日志报文落在声明窗口之外时，不得将“物理接口未观察到 canary”视为通过。但清单与系统时间都来自操作者，并非分析器独立发现活动接口、时钟或抓包持续性的证明。
 
 5. **离线出报告**。这一步不需要管理员权限，也不发起任何网络请求：
 
@@ -86,7 +88,7 @@ python3 tools/dns_canary_audit.py \
      --output /path/to/private/report.json
    ```
 
-   输出 JSON 包含 `case_id`、`verdict`、`coverage_issues`、供人工复核的 `review_flags`、canary 刺激与观察期限、刺激后观察到的 canary 事件计数、manifest SHA-256、声明的接口及公共 UTC 采集窗口、`scutil` 快照结构数量/作用域 resolver 数量和快照时间、各抓包 SHA-256/字节数/解析到的数据包数、包时间戳的 UTC 归一化与窗口内事件计数，以及与 canary 匹配的 qtype/IPv4/IPv6/TCP/UDP/时间戳及原始行 SHA-256。默认不会在报告中包含源或目标 IP；仅需在本地审计时可显式选择 `--include-endpoints`，但须单独处理敏感数据。
+   输出 JSON 包含 `case_id`、`verdict`、`coverage_issues`、供人工复核的 `review_flags`、canary 刺激与观察期限、刺激后观察到的 canary 事件计数、manifest SHA-256、声明的接口及公共 UTC 采集窗口、`scutil` 快照结构数量/作用域 resolver 数量和快照时间、各抓包 SHA-256/字节数/解析到的数据包数与对应 tcpdump 统计的 SHA-256/丢包计数、包时间戳的 UTC 归一化与窗口内事件计数，以及与 canary 匹配的 qtype/IPv4/IPv6/TCP/UDP/时间戳及原始行 SHA-256。默认不会在报告中包含源或目标 IP；仅需在本地审计时可显式选择 `--include-endpoints`，但须单独处理敏感数据。
 
 ## 退出码和合并验收
 

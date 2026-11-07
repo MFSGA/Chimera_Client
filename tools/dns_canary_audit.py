@@ -23,6 +23,7 @@ SCHEMA_VERSION = 1
 MAX_CAPTURE_BYTES = 128 * 1024 * 1024
 MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024
 MAX_MANIFEST_BYTES = 256 * 1024
+MAX_TCPDUMP_STATS_BYTES = 64 * 1024
 MAX_CANARY_EVENTS = 5000
 
 PACKET = re.compile(
@@ -252,6 +253,42 @@ def summarize_scutil_snapshot(lines: list[str]) -> dict[str, int]:
     }
 
 
+def read_tcpdump_stats(path: Path) -> dict[str, Any]:
+    """Summarize tcpdump's shutdown stderr, without exposing raw output."""
+    if path.stat().st_size > MAX_TCPDUMP_STATS_BYTES:
+        raise AuditError("tcpdump stats exceeds 64 KiB; split the evidence")
+    raw = path.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    try:
+        decoded = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise AuditError("tcpdump stats must be UTF-8 text") from error
+
+    def count(kind: str) -> int | None:
+        matches = re.findall(
+            rf"(?m)^\s*(\d+)\s+packets?\s+{re.escape(kind)}\s*$",
+            decoded,
+        )
+        return int(matches[0]) if len(matches) == 1 else None
+
+    captured = count("captured")
+    dropped = count("dropped by kernel")
+    interface_dropped = count("dropped by interface")
+    received = count("received by filter")
+    if sha256_file(path) != digest:
+        raise AuditError("tcpdump stats changed while it was being analyzed")
+    return {
+        "provided": True,
+        "sha256": digest,
+        "bytes": len(raw),
+        "captured": captured,
+        "dropped_by_kernel": dropped,
+        "dropped_by_interface": interface_dropped,
+        "received_by_filter": received,
+        "structure_recognized": captured is not None and dropped is not None,
+    }
+
+
 def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) -> dict[str, Any]:
     """Analyze user-provided files only. No OS probing, packets, DNS or subprocesses."""
     manifest_path = manifest_path.resolve()
@@ -319,11 +356,15 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
     seen_paths: set[Path] = set()
     seen_file_ids: set[tuple[int, int]] = set()
     missing_offsets: list[str] = []
+    stats_issues: list[str] = []
     by_role_inside_window = {"physical": 0, "tun": 0}
     by_role_after_stimulus = {"physical": 0, "tun": 0}
     for spec, window in zip(raw_captures, windows):
         required = {"role", "interface", "path"}
-        optional = {"started_at_utc", "ended_at_utc", "packet_time_utc_offset"}
+        optional = {
+            "started_at_utc", "ended_at_utc", "packet_time_utc_offset",
+            "tcpdump_stats_path",
+        }
         if (not isinstance(spec, dict) or not required.issubset(spec)
                 or set(spec) - required - optional):
             raise AuditError("each capture requires role, interface, path and optional window")
@@ -435,6 +476,25 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
         if (size_before != size_after
                 or input_digest.hexdigest() != sha256_file(file_path)):
             raise AuditError("capture changed while it was being analyzed")
+        stats_result: dict[str, Any] = {"provided": False}
+        if "tcpdump_stats_path" not in spec:
+            stats_issues.append(f"missing_tcpdump_stats:{role}:{interface}")
+        else:
+            stats_path = evidence_path(folder, spec["tcpdump_stats_path"])
+            stats_key = (stats_path.stat().st_dev, stats_path.stat().st_ino)
+            if stats_key in seen_file_ids:
+                raise AuditError("the same underlying file cannot represent two evidence sources")
+            seen_file_ids.add(stats_key)
+            stats_result = read_tcpdump_stats(stats_path)
+            if not stats_result["structure_recognized"]:
+                stats_issues.append(f"incomplete_tcpdump_stats:{role}:{interface}")
+            else:
+                if stats_result["dropped_by_kernel"] > 0:
+                    stats_issues.append(f"tcpdump_kernel_packets_dropped:{role}:{interface}")
+                if stats_result["dropped_by_interface"] is not None and stats_result["dropped_by_interface"] > 0:
+                    stats_issues.append(f"tcpdump_interface_packets_dropped:{role}:{interface}")
+                if stats_result["captured"] != packet_lines:
+                    stats_issues.append(f"tcpdump_capture_count_mismatch:{role}:{interface}")
         summaries.append({
             "role": role,
             "interface": interface,
@@ -455,9 +515,10 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
             "canary_queries_in_shared_window": canary_queries_inside_window,
             "packet_time_utc_offset": spec.get("packet_time_utc_offset"),
             "canary_queries": canary_queries,
+            "tcpdump_stats": stats_result,
         })
 
-    missing: list[str] = list(stimulus_issues)
+    missing: list[str] = list(stimulus_issues) + stats_issues
     for role in ("physical", "tun"):
         for interface in expected[role]:
             if (role, interface) not in seen_interfaces:
@@ -632,6 +693,14 @@ def write_private_report(
         if (sha256_file(file_path) != summary["capture_sha256"]
                 or file_path.stat().st_size != summary["capture_bytes"]):
             raise AuditError("capture changed before the report could be saved")
+        if "tcpdump_stats_path" in capture:
+            stats_path = evidence_path(evidence_folder, capture["tcpdump_stats_path"])
+            inputs.add(stats_path)
+            expected = summary["tcpdump_stats"]
+            if (not expected["provided"]
+                    or sha256_file(stats_path) != expected["sha256"]
+                    or stats_path.stat().st_size != expected["bytes"]):
+                raise AuditError("tcpdump stats changed before the report could be saved")
     if "resolver_snapshot" in manifest:
         snapshot = evidence_path(evidence_folder, manifest["resolver_snapshot"])
         inputs.add(snapshot)

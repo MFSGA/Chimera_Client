@@ -16,7 +16,8 @@
       "path": "en0-leak.txt",
       "started_at_utc": "2026-11-06T15:00:00Z",
       "ended_at_utc": "2026-11-06T15:05:00Z",
-      "packet_time_utc_offset": "-08:00"
+      "packet_time_utc_offset": "-08:00",
+      "tcpdump_stats_path": "en0-leak.stats.txt"
     },
     {
       "role": "tun",
@@ -24,7 +25,8 @@
       "path": "utun7.txt",
       "started_at_utc": "2026-11-06T15:00:00Z",
       "ended_at_utc": "2026-11-06T15:06:00Z",
-      "packet_time_utc_offset": "-08:00"
+      "packet_time_utc_offset": "-08:00",
+      "tcpdump_stats_path": "utun7.stats.txt"
     }
   ],
   "resolver_snapshot_recorded_at_utc": "2026-11-06T15:00:20Z",

@@ -1,0 +1,3 @@
+2 packets captured
+2 packets received by filter
+0 packets dropped by kernel

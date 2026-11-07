@@ -45,6 +45,14 @@ class AuditTests(unittest.TestCase):
         self.folder = Path(self.tmp.name)
         (self.folder / "en0.log").write_text(PHYSICAL_NOISE, encoding="utf-8")
         (self.folder / "utun7.log").write_text(TUN_CANARY, encoding="utf-8")
+        (self.folder / "en0.stats.txt").write_text(
+            "2 packets captured\n2 packets received by filter\n0 packets dropped by kernel\n",
+            encoding="utf-8",
+        )
+        (self.folder / "utun7.stats.txt").write_text(
+            "2 packets captured\n2 packets received by filter\n0 packets dropped by kernel\n",
+            encoding="utf-8",
+        )
         (self.folder / "scutil-dns.txt").write_text(
             "DNS configuration\nresolver #1\n  nameserver[0] : 192.0.2.53\n",
             encoding="utf-8",
@@ -61,10 +69,12 @@ class AuditTests(unittest.TestCase):
             "resolver_snapshot_recorded_at_utc": "2026-11-06T15:00:20Z",
             "captures": [
                 {"role": "physical", "interface": "en0", "path": "en0.log",
+                 "tcpdump_stats_path": "en0.stats.txt",
                  "started_at_utc": "2026-11-06T15:00:00Z",
                  "ended_at_utc": "2026-11-06T15:05:00Z",
                  "packet_time_utc_offset": "-08:00"},
                 {"role": "tun", "interface": "utun7", "path": "utun7.log",
+                 "tcpdump_stats_path": "utun7.stats.txt",
                  "started_at_utc": "2026-11-06T15:00:00Z",
                  "ended_at_utc": "2026-11-06T15:06:00Z",
                  "packet_time_utc_offset": "-08:00"},
@@ -240,6 +250,105 @@ class AuditTests(unittest.TestCase):
             "one_or_more_captures_have_no_port53_packet_lines",
             result["coverage_issues"],
         )
+
+    def test_missing_capture_stats_cannot_prove_no_drop(self) -> None:
+        del self.manifest["captures"][0]["tcpdump_stats_path"]
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["verdict"], "NOT_VERIFIED")
+        self.assertIn("missing_tcpdump_stats:physical:en0", report["coverage_issues"])
+
+    def test_kernel_drops_invalidate_negative_evidence(self) -> None:
+        (self.folder / "en0.stats.txt").write_text(
+            "2 packets captured\n3 packets received by filter\n1 packet dropped by kernel\n",
+            encoding="utf-8",
+        )
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["verdict"], "NOT_VERIFIED")
+        self.assertIn("tcpdump_kernel_packets_dropped:physical:en0", report["coverage_issues"])
+
+    def test_stats_capture_count_mismatch_invalidates_negative_result(self) -> None:
+        (self.folder / "utun7.stats.txt").write_text(
+            "3 packets captured\n3 packets received by filter\n0 packets dropped by kernel\n",
+            encoding="utf-8",
+        )
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["verdict"], "NOT_VERIFIED")
+        self.assertIn("tcpdump_capture_count_mismatch:tun:utun7", report["coverage_issues"])
+
+    def test_malformed_stats_are_not_silently_accepted(self) -> None:
+        (self.folder / "en0.stats.txt").write_text(
+            "tcpdump started but never stopped\n", encoding="utf-8"
+        )
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["verdict"], "NOT_VERIFIED")
+        self.assertIn("incomplete_tcpdump_stats:physical:en0", report["coverage_issues"])
+
+    def test_stats_provenance_is_recorded_without_raw_stderr(self) -> None:
+        report = audit.analyze_manifest(self.save_manifest())
+        summary = report["captures"][0]["tcpdump_stats"]
+        self.assertEqual(summary["captured"], 2)
+        self.assertEqual(summary["dropped_by_kernel"], 0)
+        self.assertEqual(len(summary["sha256"]), 64)
+        self.assertNotIn("packets received by filter", json.dumps(report))
+
+    def test_physical_canary_wins_even_if_kernel_drops_packets(self) -> None:
+        (self.folder / "en0.log").write_text(PHYSICAL_LEAK, encoding="utf-8")
+        (self.folder / "en0.stats.txt").write_text(
+            "2 packets captured\n3 packets received by filter\n1 packet dropped by kernel\n",
+            encoding="utf-8",
+        )
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["verdict"], "PHYSICAL_CANARY_PLAINTEXT_DNS_OBSERVED")
+        self.assertIn("tcpdump_kernel_packets_dropped:physical:en0", report["coverage_issues"])
+
+    def test_interface_drops_are_not_silently_ignored(self) -> None:
+        (self.folder / "en0.stats.txt").write_text(
+            "2 packets captured\n2 packets received by filter\n"
+            "0 packets dropped by kernel\n1 packet dropped by interface\n",
+            encoding="utf-8",
+        )
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["verdict"], "NOT_VERIFIED")
+        self.assertIn("tcpdump_interface_packets_dropped:physical:en0",
+                      report["coverage_issues"])
+
+    def test_duplicate_tcpdump_stats_file_cannot_impersonate_two_interfaces(self) -> None:
+        self.manifest["captures"][1]["tcpdump_stats_path"] = "en0.stats.txt"
+        with self.assertRaisesRegex(audit.AuditError, "same underlying"):
+            audit.analyze_manifest(self.save_manifest())
+
+    def test_tcpdump_stats_cannot_alias_the_capture_file(self) -> None:
+        self.manifest["captures"][0]["tcpdump_stats_path"] = "en0.log"
+        with self.assertRaisesRegex(audit.AuditError, "same underlying"):
+            audit.analyze_manifest(self.save_manifest())
+
+    def test_tcpdump_stats_changed_after_analysis_is_rejected_before_report(self) -> None:
+        import unittest.mock
+        manifest = self.save_manifest()
+        output = self.folder / "never-written.json"
+        real_analysis = audit.analyze_manifest
+
+        def mutate_stats_after_analysis(path: Path, **kwargs: object) -> dict:
+            report = real_analysis(path, **kwargs)
+            (self.folder / "en0.stats.txt").write_text(
+                "2 packets captured\n2 packets received by filter\n"
+                "1 packet dropped by kernel\n",
+                encoding="utf-8",
+            )
+            return report
+
+        with unittest.mock.patch.object(audit, "analyze_manifest",
+                                       side_effect=mutate_stats_after_analysis):
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(
+                    audit.main([str(manifest), "--output", str(output)]), 2
+                )
+        self.assertFalse(output.exists())
+
+    def test_stats_larger_than_64kib_are_rejected(self) -> None:
+        (self.folder / "en0.stats.txt").write_bytes(b"x" * (64 * 1024 + 1))
+        with self.assertRaisesRegex(audit.AuditError, "tcpdump stats exceeds"):
+            audit.analyze_manifest(self.save_manifest())
 
     def test_capture_windows_required_for_negative_assessment(self) -> None:
         del self.manifest["captures"][0]["started_at_utc"]
@@ -660,6 +769,10 @@ class AuditTests(unittest.TestCase):
             PHYSICAL_NOISE +
             "2026-11-06 07:00:02.000001 IP 192.0.2.50.51234 > 8.8.8.8.53: "
             "Flags [S], seq 1, win 256, length 0\n",
+            encoding="utf-8",
+        )
+        (self.folder / "en0.stats.txt").write_text(
+            "3 packets captured\n3 packets received by filter\n0 packets dropped by kernel\n",
             encoding="utf-8",
         )
         result = audit.analyze_manifest(self.save_manifest())
