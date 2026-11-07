@@ -164,16 +164,7 @@ impl DhcpClient {
                 })?;
             let dns = probe_dns_server(&iface).await?;
             let discovered_clients = make_clients(
-                dns.into_iter()
-                    .map(|s| NameServer {
-                        net: DNSNetMode::Udp,
-                        host: url::Host::Ipv4(s),
-                        port: 53,
-                        interface: None,
-                        proxy: None,
-                        doh_path: None,
-                    })
-                    .collect(),
+                Self::discovered_upstreams(&iface, dns),
                 None,
                 None,
                 direct_only_registry(),
@@ -191,6 +182,26 @@ impl DhcpClient {
         }
 
         Ok(self.inner.lock().await.clients.clone())
+    }
+
+    fn discovered_upstreams(
+        iface: &OutboundInterface,
+        servers: Vec<Ipv4Addr>,
+    ) -> Vec<NameServer> {
+        // Mihomo dhcp.go binds discovered resolver egress to the DHCP
+        // interface. Keep the same physical service NIC that offered these
+        // addresses instead of silently routing their DNS via the default NIC.
+        servers
+            .into_iter()
+            .map(|address| NameServer {
+                net: DNSNetMode::Udp,
+                host: url::Host::Ipv4(address),
+                port: 53,
+                interface: Some(iface.clone()),
+                proxy: None,
+                doh_path: None,
+            })
+            .collect()
     }
 
     async fn install_discovered_clients(
@@ -500,6 +511,28 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert!(client.inner.lock().await.clients.is_empty());
+    }
+
+    #[test]
+    fn dhcp_discovered_upstreams_keep_the_lease_interface() {
+        // Fixed Mihomo's dhcp.go assigns ProxyName=ifaceName to discovered
+        // DNS. Chimera must not silently pick the default outbound NIC.
+        let client = test_client(Vec::new());
+        let dns = vec![Ipv4Addr::new(192, 0, 2, 53), Ipv4Addr::new(192, 0, 2, 54)];
+        let upstreams = DhcpClient::discovered_upstreams(&client.iface, dns.clone());
+        assert_eq!(upstreams.len(), 2);
+        for (upstream, expected) in upstreams.iter().zip(dns) {
+            assert_eq!(upstream.net, DNSNetMode::Udp);
+            assert_eq!(upstream.host, url::Host::<String>::Ipv4(expected));
+            assert_eq!(upstream.port, 53);
+            let bound_iface = upstream
+                .interface
+                .as_ref()
+                .expect("discovered DNS must retain its DHCP NIC");
+            assert_eq!(bound_iface.name, client.iface.name);
+            assert_eq!(bound_iface.index, client.iface.index);
+            assert!(upstream.proxy.is_none());
+        }
     }
 
     #[tokio::test]
