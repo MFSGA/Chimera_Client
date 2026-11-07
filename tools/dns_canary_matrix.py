@@ -7,6 +7,7 @@ system-wide leak freedom, even if every supplied case is clean.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -44,7 +45,10 @@ def _matrix_manifest(path: Path) -> dict[str, Any]:
     if path.stat().st_size > MAX_MATRIX_BYTES:
         raise audit.AuditError("matrix manifest exceeds 256 KiB")
     try:
-        data = audit.parse_strict_json(path.read_text(encoding="utf-8"))
+        contents = audit.read_bounded_bytes(
+            path, MAX_MATRIX_BYTES, "matrix manifest exceeds 256 KiB",
+        ).decode("utf-8")
+        data = audit.parse_strict_json(contents)
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise audit.AuditError("cannot read valid JSON matrix manifest") from error
     if (not isinstance(data, dict)
@@ -94,7 +98,9 @@ def analyze_matrix(matrix_path: Path) -> dict[str, Any]:
     """Read an audit matrix and its child case evidence, with no OS probes."""
     matrix_path = matrix_path.resolve()
     base = matrix_path.parent
-    matrix_sha256 = audit.sha256_file(matrix_path)
+    matrix_sha256 = hashlib.sha256(audit.read_bounded_bytes(
+        matrix_path, MAX_MATRIX_BYTES, "matrix manifest exceeds 256 KiB",
+    )).hexdigest()
     data = _matrix_manifest(matrix_path)
     case_summaries: list[dict[str, Any]] = []
     case_paths: set[Path] = set()

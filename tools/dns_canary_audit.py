@@ -54,10 +54,23 @@ class AuditError(ValueError):
     """Invalid audit evidence or manifest: no result should be trusted."""
 
 
+def read_bounded_bytes(path: Path, maximum: int, overflow_message: str) -> bytes:
+    """Use a bounded read even if a file grows after its initial stat check."""
+    with path.open("rb") as source:
+        data = source.read(maximum + 1)
+    if len(data) > maximum:
+        raise AuditError(overflow_message)
+    return data
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
+    consumed = 0
     with path.open("rb") as source:
         for block in iter(lambda: source.read(1024 * 1024), b""):
+            consumed += len(block)
+            if consumed > MAX_CAPTURE_BYTES:
+                raise AuditError("evidence hashing exceeds 128 MiB limit")
             digest.update(block)
     return digest.hexdigest()
 
@@ -182,7 +195,10 @@ def _load_manifest(path: Path) -> dict[str, Any]:
     if path.stat().st_size > MAX_MANIFEST_BYTES:
         raise AuditError("manifest exceeds 256 KiB; reject oversized evidence inventory")
     try:
-        manifest = parse_strict_json(path.read_text(encoding="utf-8"))
+        contents = read_bounded_bytes(
+            path, MAX_MANIFEST_BYTES, "manifest exceeds 256 KiB",
+        ).decode("utf-8")
+        manifest = parse_strict_json(contents)
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise AuditError("cannot read valid JSON manifest") from error
     if (not isinstance(manifest, dict)
@@ -296,7 +312,11 @@ def read_tcpdump_stats(path: Path, expected_interface: str) -> dict[str, Any]:
     """Summarize tcpdump stderr and bind its startup line to the declared NIC."""
     if path.stat().st_size > MAX_TCPDUMP_STATS_BYTES:
         raise AuditError("tcpdump stats exceeds 64 KiB; split the evidence")
-    raw = path.read_bytes()
+    raw = read_bounded_bytes(
+        path, MAX_TCPDUMP_STATS_BYTES, "tcpdump stats exceeds 64 KiB",
+    )
+    if b"\x00" in raw:
+        raise AuditError("tcpdump stats contain NUL bytes; expected plain text")
     digest = hashlib.sha256(raw).hexdigest()
     try:
         decoded = raw.decode("utf-8")
@@ -344,7 +364,11 @@ def read_tcpdump_stats(path: Path, expected_interface: str) -> dict[str, Any]:
 def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) -> dict[str, Any]:
     """Analyze user-provided files only. No OS probing, packets, DNS or subprocesses."""
     manifest_path = manifest_path.resolve()
-    manifest_sha256 = sha256_file(manifest_path)
+    # Fingerprint the first *bounded* read, before a separate manifest parse:
+    # a file changed between reads cannot borrow a newer SHA-256.
+    manifest_sha256 = hashlib.sha256(read_bounded_bytes(
+        manifest_path, MAX_MANIFEST_BYTES, "manifest exceeds 256 KiB",
+    )).hexdigest()
     manifest = _load_manifest(manifest_path)
     folder = manifest_path.parent
     canary = normalize_canary(manifest.get("canary_qname"))
@@ -470,8 +494,14 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
         canary_queries = 0
         input_digest = hashlib.sha256()
         size_before = file_path.stat().st_size
+        bytes_consumed = 0
         with file_path.open("rb") as capture:
             for raw_line in capture:
+                bytes_consumed += len(raw_line)
+                if bytes_consumed > MAX_CAPTURE_BYTES:
+                    raise AuditError("capture exceeds 128 MiB while being read")
+                if b"\x00" in raw_line:
+                    raise AuditError("capture contains NUL bytes; expected plain text")
                 input_digest.update(raw_line)
                 try:
                     line = raw_line.decode("utf-8")
@@ -663,7 +693,11 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
         path = evidence_path(folder, manifest["resolver_snapshot"])
         if path.stat().st_size > MAX_SNAPSHOT_BYTES:
             raise AuditError("scutil snapshot exceeds 4 MiB; reject oversized evidence")
-        snapshot_bytes = path.read_bytes()
+        snapshot_bytes = read_bounded_bytes(
+            path, MAX_SNAPSHOT_BYTES, "scutil snapshot exceeds 4 MiB",
+        )
+        if b"\x00" in snapshot_bytes:
+            raise AuditError("scutil snapshot contains NUL bytes; expected plain text")
         snapshot_digest = hashlib.sha256(snapshot_bytes).hexdigest()
         if not snapshot_bytes:
             missing.append("empty_resolver_snapshot")

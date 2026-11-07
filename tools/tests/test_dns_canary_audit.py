@@ -1230,6 +1230,54 @@ class AuditTests(unittest.TestCase):
             with self.assertRaisesRegex(audit.AuditError, "capture changed"):
                 audit.analyze_manifest(self.save_manifest())
 
+    def test_hashing_cannot_continue_past_global_evidence_limit(self) -> None:
+        from unittest.mock import patch
+        candidate = self.folder / "oversized-for-hash.txt"
+        candidate.write_bytes(b"0123456789")
+        with patch.object(audit, "MAX_CAPTURE_BYTES", 8):
+            with self.assertRaisesRegex(audit.AuditError, "hashing exceeds"):
+                audit.sha256_file(candidate)
+
+    def test_bounded_file_reader_enforces_cap_at_actual_read(self) -> None:
+        path = self.folder / "growing-evidence.txt"
+        path.write_bytes(b"123456789")
+        with self.assertRaisesRegex(audit.AuditError, "exceeds test limit"):
+            audit.read_bounded_bytes(path, 8, "evidence exceeds test limit")
+        self.assertEqual(
+            audit.read_bounded_bytes(path, 9, "evidence exceeds test limit"),
+            b"123456789",
+        )
+
+    def test_capture_size_limit_is_checked_while_streaming(self) -> None:
+        # Simulate a capture that passed an earlier size precheck but grew
+        # before the stream was consumed, without writing 128 MiB in tests.
+        from unittest.mock import patch
+        manifest = self.save_manifest()
+        def accepted_path(folder: Path, name: str) -> Path:
+            return (folder / name).resolve()
+        with patch.object(audit, "MAX_CAPTURE_BYTES", 50):
+            with patch.object(audit, "evidence_path", side_effect=accepted_path):
+                with self.assertRaisesRegex(audit.AuditError, "capture exceeds"):
+                    audit.analyze_manifest(manifest)
+
+    def test_nul_bytes_in_capture_are_rejected_as_nontext_evidence(self) -> None:
+        path = self.folder / "en0.log"
+        path.write_bytes(path.read_bytes() + b"\x00")
+        with self.assertRaisesRegex(audit.AuditError, "NUL"):
+            audit.analyze_manifest(self.save_manifest())
+
+    def test_nul_bytes_in_tcpdump_stats_are_rejected(self) -> None:
+        path = self.folder / "en0.stats.txt"
+        path.write_bytes(path.read_bytes() + b"\x00")
+        with self.assertRaisesRegex(audit.AuditError, "NUL"):
+            audit.analyze_manifest(self.save_manifest())
+
+    def test_nul_bytes_in_scutil_snapshot_are_rejected(self) -> None:
+        path = self.folder / "scutil-dns.txt"
+        path.write_bytes(path.read_bytes() + b"\x00")
+        with self.assertRaisesRegex(audit.AuditError, "NUL"):
+            audit.analyze_manifest(self.save_manifest())
+
     def test_non_utf8_capture_is_invalid_evidence(self) -> None:
         (self.folder / "en0.log").write_bytes(b"2026-11-06 bad dns capture" + bytes([0xff, 0x80]))
         with self.assertRaisesRegex(audit.AuditError, "UTF-8"):
