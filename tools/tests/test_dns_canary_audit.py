@@ -59,10 +59,12 @@ class AuditTests(unittest.TestCase):
             "captures": [
                 {"role": "physical", "interface": "en0", "path": "en0.log",
                  "started_at_utc": "2026-11-06T15:00:00Z",
-                 "ended_at_utc": "2026-11-06T15:05:00Z"},
+                 "ended_at_utc": "2026-11-06T15:05:00Z",
+                 "packet_time_utc_offset": "-08:00"},
                 {"role": "tun", "interface": "utun7", "path": "utun7.log",
-                 "started_at_utc": "2026-11-06T15:00:30Z",
-                 "ended_at_utc": "2026-11-06T15:06:00Z"},
+                 "started_at_utc": "2026-11-06T15:00:00Z",
+                 "ended_at_utc": "2026-11-06T15:06:00Z",
+                 "packet_time_utc_offset": "-08:00"},
             ],
         }
 
@@ -188,6 +190,91 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "NOT_VERIFIED")
         self.assertIn("capture_windows_missing_for_one_or_more_interfaces",
                       result["coverage_issues"])
+
+    def test_missing_tz_offset_must_not_make_negative_result_look_verified(self) -> None:
+        del self.manifest["captures"][0]["packet_time_utc_offset"]
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["verdict"], "NOT_VERIFIED")
+        self.assertIn(
+            "missing_packet_time_utc_offset:physical:en0",
+            report["coverage_issues"],
+        )
+
+    def test_packet_times_outside_declared_window_cannot_pass(self) -> None:
+        # Manifest window claims 15:00-15:05Z but actual observed traffic was
+        # at 14:59Z, before both physical and utun logs started.
+        (self.folder / "en0.log").write_text(
+            PHYSICAL_NOISE.replace("07:00:00", "06:59:00"), encoding="utf-8"
+        )
+        (self.folder / "utun7.log").write_text(
+            TUN_CANARY.replace("07:00:00", "06:59:00"), encoding="utf-8"
+        )
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["verdict"], "NOT_VERIFIED")
+        self.assertIn(
+            "one_or_more_packet_timestamps_outside_declared_window",
+            report["coverage_issues"],
+        )
+        self.assertIn(
+            "no_tun_canary_in_shared_capture_window",
+            report["coverage_issues"],
+        )
+
+    def test_canary_outside_overlap_is_insufficient_even_if_captured(self) -> None:
+        # Files overlap 15:00-15:05Z, but the canary itself appears at 15:05:30Z.
+        (self.folder / "utun7.log").write_text(
+            TUN_CANARY.replace("07:00:00", "07:05:30"), encoding="utf-8"
+        )
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["verdict"], "NOT_VERIFIED")
+        self.assertIn(
+            "no_tun_canary_in_shared_capture_window",
+            report["coverage_issues"],
+        )
+
+    def test_wrong_offset_disagrees_with_declared_utc_window(self) -> None:
+        self.manifest["captures"][0]["packet_time_utc_offset"] = "+00:00"
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["verdict"], "NOT_VERIFIED")
+        self.assertIn(
+            "one_or_more_packet_timestamps_outside_declared_window",
+            report["coverage_issues"],
+        )
+
+    def test_invalid_timezone_offset_is_rejected(self) -> None:
+        for value in ("PST", "-8:00", "-25:00", "+00:99", ""):
+            with self.subTest(value=value):
+                self.manifest["captures"][0]["packet_time_utc_offset"] = value
+                with self.assertRaisesRegex(audit.AuditError, "offset"):
+                    audit.analyze_manifest(self.save_manifest())
+
+    def test_undated_tcpdump_packet_cannot_support_negative_verdict(self) -> None:
+        (self.folder / "en0.log").write_text(
+            PHYSICAL_NOISE.replace("2026-11-06 ", ""), encoding="utf-8"
+        )
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["verdict"], "NOT_VERIFIED")
+        self.assertIn(
+            "one_or_more_undated_or_invalid_packet_timestamps",
+            report["coverage_issues"],
+        )
+
+    def test_observed_physical_leak_overrides_missing_timezone(self) -> None:
+        del self.manifest["captures"][0]["packet_time_utc_offset"]
+        (self.folder / "en0.log").write_text(PHYSICAL_LEAK, encoding="utf-8")
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["verdict"], "PHYSICAL_CANARY_PLAINTEXT_DNS_OBSERVED")
+        self.assertIn("missing_packet_time_utc_offset:physical:en0", report["coverage_issues"])
+
+    def test_valid_packet_time_is_normalized_to_utc(self) -> None:
+        report = audit.analyze_manifest(self.save_manifest())
+        times = [event["observed_at_utc"] for event in report["canary_queries"]]
+        self.assertEqual(times, [
+            "2026-11-06T15:00:00.000003+00:00",
+            "2026-11-06T15:00:00.000004+00:00",
+        ])
+        self.assertEqual(report["captures"][0]["port53_packets_in_shared_window"], 2)
+        self.assertEqual(report["canary_queries_in_shared_window"], {"physical": 0, "tun": 2})
 
     def test_non_overlapping_capture_windows_are_not_verified(self) -> None:
         self.manifest["captures"][1]["started_at_utc"] = "2026-11-06T15:10:00Z"
@@ -420,6 +507,58 @@ class AuditTests(unittest.TestCase):
                     audit.main([str(manifest), "--output", str(output)]), 2
                 )
         self.assertFalse(output.exists())
+
+    def test_capture_changed_after_analysis_cannot_be_saved_as_trusted_report(self) -> None:
+        import unittest.mock
+        manifest = self.save_manifest()
+        output = self.folder / "must-not-exist.json"
+        real_analysis = audit.analyze_manifest
+
+        def change_capture_after_analysis(path: Path, **kwargs: object) -> dict:
+            result = real_analysis(path, **kwargs)
+            (self.folder / "en0.log").write_text(
+                PHYSICAL_NOISE + PHYSICAL_LEAK, encoding="utf-8"
+            )
+            return result
+
+        with unittest.mock.patch.object(
+            audit, "analyze_manifest", side_effect=change_capture_after_analysis
+        ):
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(
+                    audit.main([str(manifest), "--output", str(output)]), 2
+                )
+        self.assertFalse(output.exists())
+
+    def test_scutil_snapshot_changed_after_analysis_cannot_be_reported(self) -> None:
+        import unittest.mock
+        manifest = self.save_manifest()
+        output = self.folder / "must-not-exist.json"
+        real_analysis = audit.analyze_manifest
+
+        def change_snapshot_after_analysis(path: Path, **kwargs: object) -> dict:
+            result = real_analysis(path, **kwargs)
+            (self.folder / "scutil-dns.txt").write_text(
+                "modified snapshot after verification", encoding="utf-8"
+            )
+            return result
+
+        with unittest.mock.patch.object(
+            audit, "analyze_manifest", side_effect=change_snapshot_after_analysis
+        ):
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(
+                    audit.main([str(manifest), "--output", str(output)]), 2
+                )
+        self.assertFalse(output.exists())
+
+    def test_report_limitations_are_separate_and_explicit(self) -> None:
+        report = audit.analyze_manifest(self.save_manifest())
+        limitations = report["limitations"]
+        self.assertGreaterEqual(len(limitations), 5)
+        self.assertTrue(any("scutil" in limitation for limitation in limitations))
+        self.assertTrue(any("time" in limitation for limitation in limitations))
+        self.assertTrue(any("DoH" in limitation for limitation in limitations))
 
     def test_capture_mutated_during_analysis_is_rejected(self) -> None:
         import unittest.mock

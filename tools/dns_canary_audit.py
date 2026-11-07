@@ -15,7 +15,7 @@ import os
 import re
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -178,6 +178,34 @@ def parse_operator_window(spec: dict[str, Any]) -> tuple[datetime, datetime] | N
     return start, end
 
 
+def parse_packet_utc_offset(raw: Any) -> timezone | None:
+    """An operator-supplied fixed offset for tcpdump -tttt local timestamps."""
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise AuditError("packet_time_utc_offset must be a signed HH:MM offset")
+    match = re.fullmatch(r"([+-])(\d{2}):(\d{2})", raw)
+    if match is None:
+        raise AuditError("packet_time_utc_offset must be a signed HH:MM offset")
+    hours, minutes = int(match[2]), int(match[3])
+    if hours > 14 or minutes > 59 or (hours == 14 and minutes != 0):
+        raise AuditError("packet_time_utc_offset is outside the valid UTC offset range")
+    delta = timedelta(hours=hours, minutes=minutes)
+    return timezone(delta if match[1] == "+" else -delta)
+
+
+def observed_packet_utc(raw: str, offset: timezone | None) -> datetime | None:
+    """Do not guess a date or timezone from a time-only tcpdump line."""
+    if offset is None or not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?", raw
+    ):
+        return None
+    try:
+        return datetime.fromisoformat(raw).replace(tzinfo=offset).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
 def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) -> dict[str, Any]:
     """Analyze user-provided files only. No OS probing, packets, DNS or subprocesses."""
     manifest_path = manifest_path.resolve()
@@ -193,20 +221,33 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
     if not isinstance(raw_captures, list) or not 1 <= len(raw_captures) <= 16:
         raise AuditError("captures must contain 1 to 16 recorded logs")
 
+    # The shared time window is needed *while* streaming each capture, not
+    # after all files have been read. Only operator assertions are available;
+    # packet timestamps provide an additional, narrower sanity check.
+    windows = [
+        parse_operator_window(spec) if isinstance(spec, dict) else None
+        for spec in raw_captures
+    ]
+    shared_window: tuple[datetime, datetime] | None = None
+    if all(window is not None for window in windows):
+        latest_start = max(window[0] for window in windows if window is not None)
+        earliest_end = min(window[1] for window in windows if window is not None)
+        if latest_start < earliest_end:
+            shared_window = (latest_start, earliest_end)
+
     summaries: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []
     seen_interfaces: set[tuple[str, str]] = set()
     seen_paths: set[Path] = set()
-    declared_windows: list[tuple[datetime, datetime]] = []
-    for spec in raw_captures:
+    missing_offsets: list[str] = []
+    by_role_inside_window = {"physical": 0, "tun": 0}
+    for spec, window in zip(raw_captures, windows):
         required = {"role", "interface", "path"}
-        optional = {"started_at_utc", "ended_at_utc"}
+        optional = {"started_at_utc", "ended_at_utc", "packet_time_utc_offset"}
         if (not isinstance(spec, dict) or not required.issubset(spec)
                 or set(spec) - required - optional):
             raise AuditError("each capture requires role, interface, path and optional window")
-        window = parse_operator_window(spec)
-        if window is not None:
-            declared_windows.append(window)
+        packet_offset = parse_packet_utc_offset(spec.get("packet_time_utc_offset"))
         role, interface = spec["role"], spec["interface"]
         if role not in ("physical", "tun"):
             raise AuditError("capture role must be physical or tun")
@@ -221,6 +262,8 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
             raise AuditError("duplicate capture role/interface")
         if interface not in expected[role]:
             raise AuditError("capture interface is not in the declared inventory")
+        if packet_offset is None:
+            missing_offsets.append(f"missing_packet_time_utc_offset:{role}:{interface}")
         seen_interfaces.add(key)
         file_path = evidence_path(folder, spec["path"])
         if file_path in seen_paths:
@@ -231,6 +274,10 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
         candidate_dns_query_lines = 0
         unparsed_dns_payload_lines = 0
         unparsed_packet_or_canary_lines = 0
+        invalid_timestamp_lines = 0
+        outside_declared_window_lines = 0
+        port53_packets_inside_window = 0
+        canary_queries_inside_window = 0
         canary_queries = 0
         input_digest = hashlib.sha256()
         size_before = file_path.stat().st_size
@@ -244,11 +291,23 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
                 # Count packet lines as evidence the supplied text really contains
                 # tcpdump-style records. This does not prove a capture window.
                 match = PACKET.match(line.strip())
+                packet_utc = (
+                    observed_packet_utc(match["timestamp"], packet_offset)
+                    if match is not None else None
+                )
                 if match is not None:
                     packet_lines += 1
                     if (port_53_destination(match["src"])
                             or port_53_destination(match["dst"])):
                         port53_packet_lines += 1
+                        if packet_offset is not None and packet_utc is None:
+                            invalid_timestamp_lines += 1
+                        if packet_utc is not None and window is not None:
+                            if not window[0] <= packet_utc < window[1]:
+                                outside_declared_window_lines += 1
+                        if packet_utc is not None and shared_window is not None:
+                            if shared_window[0] <= packet_utc < shared_window[1]:
+                                port53_packets_inside_window += 1
                     if port_53_destination(match["dst"]):
                         if QUESTION.search(match["details"]):
                             candidate_dns_query_lines += 1
@@ -273,6 +332,12 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
                     unparsed_packet_or_canary_lines += 1
                 if event is not None:
                     canary_queries += 1
+                    if packet_utc is not None:
+                        event["observed_at_utc"] = packet_utc.isoformat()
+                        if (shared_window is not None
+                                and shared_window[0] <= packet_utc < shared_window[1]):
+                            canary_queries_inside_window += 1
+                            by_role_inside_window[role] += 1
                     if len(events) == MAX_CANARY_EVENTS:
                         raise AuditError("more than 5000 canary queries; split the capture")
                     events.append({"role": role, "interface": interface, **event})
@@ -296,6 +361,11 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
             "parsed_dns_question_lines": candidate_dns_query_lines,
             "unparsed_dns_payload_lines": unparsed_dns_payload_lines,
             "unparsed_packet_or_canary_lines": unparsed_packet_or_canary_lines,
+            "invalid_packet_timestamp_lines": invalid_timestamp_lines,
+            "packets_outside_declared_window": outside_declared_window_lines,
+            "port53_packets_in_shared_window": port53_packets_inside_window,
+            "canary_queries_in_shared_window": canary_queries_inside_window,
+            "packet_time_utc_offset": spec.get("packet_time_utc_offset"),
             "canary_queries": canary_queries,
         })
 
@@ -304,19 +374,26 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
         for interface in expected[role]:
             if (role, interface) not in seen_interfaces:
                 missing.append(f"missing_{role}_capture:{interface}")
-    overlapping_window = None
-    if len(declared_windows) != len(raw_captures):
+    missing.extend(missing_offsets)
+    overlapping_window = (
+        {"start": shared_window[0].isoformat(), "end": shared_window[1].isoformat()}
+        if shared_window is not None else None
+    )
+    if any(window is None for window in windows):
         missing.append("capture_windows_missing_for_one_or_more_interfaces")
-    else:
-        earliest_end = min(end for _, end in declared_windows)
-        latest_start = max(start for start, _ in declared_windows)
-        if latest_start >= earliest_end:
-            missing.append("declared_capture_windows_do_not_overlap")
-        else:
-            overlapping_window = {
-                "start": latest_start.isoformat(),
-                "end": earliest_end.isoformat(),
-            }
+    elif shared_window is None:
+        missing.append("declared_capture_windows_do_not_overlap")
+    if any(s["invalid_packet_timestamp_lines"] > 0 for s in summaries):
+        missing.append("one_or_more_undated_or_invalid_packet_timestamps")
+    if any(s["packets_outside_declared_window"] > 0 for s in summaries):
+        missing.append("one_or_more_packet_timestamps_outside_declared_window")
+    if shared_window is not None:
+        if any(s["role"] == "physical"
+               and s["port53_packets_in_shared_window"] == 0
+               and s["packet_time_utc_offset"] is not None for s in summaries):
+            missing.append("one_or_more_physical_captures_have_no_port53_packet_in_shared_window")
+        if by_role_inside_window["tun"] == 0:
+            missing.append("no_tun_canary_in_shared_capture_window")
     if any(summary["packet_lines"] == 0 for summary in summaries):
         missing.append("one_or_more_captures_have_no_packet_lines")
     if any(summary["port53_packet_lines"] == 0 for summary in summaries):
@@ -368,32 +445,47 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
         "resolver_snapshot": snapshot_result,
         "captures": summaries,
         "canary_query_counts": by_role,
+        "canary_queries_in_shared_window": by_role_inside_window,
         "canary_queries": events,
         "limitations": [
             "Only supplied tcpdump text for UDP/TCP destination port 53 is examined.",
-            "The interface inventory, capture completeness and declared UTC time windows are operator claims, not independently proven."
+            "The interface inventory, capture completeness and declared UTC time windows are operator claims, not independently proven.",
             "The supplied scutil snapshot is hashed, not interpreted or verified for priority/ownership.",
             "No inference about encrypted DNS (DoH/DoT/DoQ), mDNS, DNS Proxy, NIC bypass or system-wide zero leak.",
-            "Packet timestamps are copied verbatim from tcpdump without timezone verification.",
+            "Packet timestamps are converted using operator-supplied fixed UTC offsets; actual OS clock sync and capture windows are not independently attested.",
         ],
     }
 
 
 def write_private_report(
     output: Path, content: str, *, overwrite: bool,
-    manifest_path: Path, expected_manifest_sha256: str
+    manifest_path: Path, report: dict[str, Any]
 ) -> None:
     """Write mode-0600 JSON atomically, never truncating evidence or following links."""
     manifest_path = manifest_path.resolve()
-    if sha256_file(manifest_path) != expected_manifest_sha256:
+    if sha256_file(manifest_path) != report["manifest_sha256"]:
         raise AuditError("manifest changed before the report could be saved")
     manifest = _load_manifest(manifest_path)
     inputs = {manifest_path}
     evidence_folder = manifest_path.parent
-    for capture in manifest["captures"]:
-        inputs.add(evidence_path(evidence_folder, capture["path"]))
+    if len(manifest["captures"]) != len(report["captures"]):
+        raise AuditError("report does not match the evidence inventory")
+    for capture, summary in zip(manifest["captures"], report["captures"]):
+        if (capture["role"], capture["interface"]) != (
+            summary["role"], summary["interface"]
+        ):
+            raise AuditError("report does not match the evidence inventory")
+        file_path = evidence_path(evidence_folder, capture["path"])
+        inputs.add(file_path)
+        if (sha256_file(file_path) != summary["capture_sha256"]
+                or file_path.stat().st_size != summary["capture_bytes"]):
+            raise AuditError("capture changed before the report could be saved")
     if "resolver_snapshot" in manifest:
-        inputs.add(evidence_path(evidence_folder, manifest["resolver_snapshot"]))
+        snapshot = evidence_path(evidence_folder, manifest["resolver_snapshot"])
+        inputs.add(snapshot)
+        if (sha256_file(snapshot) != report["resolver_snapshot"]["sha256"]
+                or snapshot.stat().st_size != report["resolver_snapshot"]["bytes"]):
+            raise AuditError("resolver snapshot changed before the report could be saved")
     if output.resolve() in inputs:
         raise AuditError("report output must not overwrite the manifest or input evidence")
 
@@ -434,7 +526,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.output, content,
                 overwrite=args.overwrite,
                 manifest_path=args.manifest,
-                expected_manifest_sha256=report["manifest_sha256"],
+                report=report,
             )
             print(f"case={report['case_id']} verdict={report['verdict']} report={args.output}")
         else:
