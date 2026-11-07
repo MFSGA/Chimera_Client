@@ -167,6 +167,46 @@ fn validate_macos_fake_ip_dns_egress(
             )));
         }
     }
+    // An upstream #interface override pins DNS sockets to a named interface
+    // rather than the verified network-path selection. This is unsafe even
+    // for a DNS IP literal: the QNAME can leave over a physical service NIC.
+    let has_override = |server: &dns::config::NameServer| server.interface.is_some();
+    for (scope, explicit_interface) in [
+        ("dns.nameserver", dns.nameserver.iter().any(has_override)),
+        (
+            "dns.default-nameserver",
+            dns.default_nameserver.iter().any(has_override),
+        ),
+        ("dns.fallback", dns.fallback.iter().any(has_override)),
+        (
+            "dns.direct-nameserver",
+            dns.direct_nameserver
+                .as_ref()
+                .is_some_and(|servers| servers.iter().any(has_override)),
+        ),
+        (
+            "dns.nameserver-policy",
+            dns.nameserver_policy.values().any(has_override),
+        ),
+        (
+            "dns.proxy-server-nameserver",
+            dns.proxy_server_nameserver
+                .as_ref()
+                .is_some_and(|servers| servers.iter().any(has_override)),
+        ),
+        (
+            "dns.proxy-server-nameserver-policy",
+            dns.proxy_server_nameserver_policy
+                .iter()
+                .any(|(_, servers)| servers.iter().any(has_override)),
+        ),
+    ] {
+        if explicit_interface {
+            return Err(Error::InvalidConfig(format!(
+                "{scope} cannot force #interface in macOS TUN + Fake-IP; interface-bound DNS egress is outside the verified managed path"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -840,6 +880,113 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fake_physical_dns_iface() -> crate::app::net::OutboundInterface {
+        // A synthetic interface: never inspect or mutate the host NIC.
+        crate::app::net::OutboundInterface {
+            name: "en-test".into(),
+            addr_v4: None,
+            netmask_v4: None,
+            broadcast_v4: None,
+            addr_v6: None,
+            netmask_v6: None,
+            broadcast_v6: None,
+            index: 12345,
+            mac_addr: None,
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "tun"))]
+    #[test]
+    fn internal_macos_fake_ip_tun_rejects_physical_dns_interface_overrides() {
+        // A #interface modifier bypasses path-managed outbound selection.
+        // Reject each DNS upstream scope before any socket is opened.
+        let yaml = "tun:\n  enable: true\ndns:\n  enable: true\n  enhanced-mode: fake-ip\n  nameserver: [1.1.1.1]\n  default-nameserver: [223.5.5.5]\n";
+        let mut overridden = crate::app::dns::config::Config::parse_nameserver(&[
+            "9.9.9.9".to_owned(),
+        ])
+        .unwrap()
+        .remove(0);
+        overridden.interface = Some(fake_physical_dns_iface());
+        for scope in [
+            "nameserver",
+            "default-nameserver",
+            "fallback",
+            "direct-nameserver",
+            "nameserver-policy",
+            "proxy-server-nameserver",
+            "proxy-server-nameserver-policy",
+        ] {
+            let mut config =
+                crate::Config::Str(yaml.to_owned()).try_parse().unwrap();
+            match scope {
+                "nameserver" => config.dns.nameserver.push(overridden.clone()),
+                "default-nameserver" => {
+                    config.dns.default_nameserver.push(overridden.clone())
+                }
+                "fallback" => config.dns.fallback.push(overridden.clone()),
+                "direct-nameserver" => {
+                    config.dns.direct_nameserver = Some(vec![overridden.clone()]);
+                }
+                "nameserver-policy" => {
+                    config
+                        .dns
+                        .nameserver_policy
+                        .insert("private.example".into(), overridden.clone());
+                }
+                "proxy-server-nameserver" => {
+                    config.dns.proxy_server_nameserver =
+                        Some(vec![overridden.clone()]);
+                }
+                "proxy-server-nameserver-policy" => {
+                    config.dns.proxy_server_nameserver =
+                        Some(config.dns.nameserver.clone());
+                    config
+                        .dns
+                        .proxy_server_nameserver_policy
+                        .push(("node.example".into(), vec![overridden.clone()]));
+                }
+                _ => unreachable!(),
+            }
+            let error = match config.validate() {
+                Ok(_) => panic!(
+                    "macOS TUN Fake-IP allowed dns.{scope} physical interface"
+                ),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains(&format!("dns.{scope}"))
+                    && error.contains("#interface"),
+                "{scope}: {error}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn non_tun_dns_interface_override_keeps_legacy_compatibility() {
+        let yaml = "dns:\n  enable: true\n  nameserver: [1.1.1.1]\n  default-nameserver: [223.5.5.5]\n";
+        let mut config = crate::Config::Str(yaml.to_owned()).try_parse().unwrap();
+        config.dns.nameserver[0].interface = Some(fake_physical_dns_iface());
+        config.dns.default_nameserver[0].interface = Some(fake_physical_dns_iface());
+        assert!(
+            config.validate().is_ok(),
+            "non-TUN legacy bindings must remain accepted"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", feature = "tun"))]
+    #[test]
+    fn tun_normal_mode_dns_interface_override_keeps_legacy_compatibility() {
+        let yaml = "tun:\n  enable: true\ndns:\n  enable: true\n  enhanced-mode: normal\n  nameserver: [1.1.1.1]\n  default-nameserver: [223.5.5.5]\n";
+        let mut config = crate::Config::Str(yaml.to_owned()).try_parse().unwrap();
+        config.dns.nameserver[0].interface = Some(fake_physical_dns_iface());
+        assert!(
+            config.validate().is_ok(),
+            "non-Fake-IP TUN DNS retains legacy explicit interface selection"
+        );
     }
 
     #[cfg(all(target_os = "macos", feature = "tun"))]
