@@ -185,9 +185,10 @@ pub struct Config {
     pub listeners: Option<Vec<InboundOpts>>,
     // 13. these options has default vals,
     // and needs extra processing
-    /// whether your network environment supports IPv6
-    /// this will affect the DNS server response to AAAA questions
-    /// default is `false`
+    /// Globally enable IPv6 for proxy traffic and DNS responses.
+    /// When false, IPv6 endpoints and listeners are rejected, domain lookups
+    /// use IPv4 results only, and IPv6 TUN/DNS settings are unavailable.
+    /// The default is `false`.
     pub ipv6: bool,
     /// outbound interface name
     #[serde(rename = "interface-name")]

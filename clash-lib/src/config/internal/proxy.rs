@@ -58,6 +58,28 @@ pub enum OutboundProxyProtocol {
 }
 
 impl OutboundProxyProtocol {
+    pub(crate) fn server_address(&self) -> Option<&str> {
+        match self {
+            OutboundProxyProtocol::Direct(_) | OutboundProxyProtocol::Reject(_) => {
+                None
+            }
+            #[cfg(feature = "shadowsocks")]
+            OutboundProxyProtocol::Ss(proxy) => Some(&proxy.common_opts.server),
+            OutboundProxyProtocol::Socks5(proxy) => Some(&proxy.common_opts.server),
+            #[cfg(feature = "anytls")]
+            OutboundProxyProtocol::Anytls(proxy) => Some(&proxy.common_opts.server),
+            OutboundProxyProtocol::Vless(proxy) => Some(&proxy.common_opts.server),
+            #[cfg(feature = "wireguard")]
+            OutboundProxyProtocol::Wireguard(proxy) => {
+                Some(&proxy.common_opts.server)
+            }
+            #[cfg(feature = "trojan")]
+            OutboundProxyProtocol::Trojan(proxy) => Some(&proxy.common_opts.server),
+            #[cfg(feature = "hysteria")]
+            OutboundProxyProtocol::Hysteria2(proxy) => Some(&proxy.server),
+        }
+    }
+
     pub(crate) fn type_name(&self) -> &'static str {
         match self {
             OutboundProxyProtocol::Direct(_) => "direct",

@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 
+#[cfg(feature = "anytls")]
+use crate::config::internal::listener::InboundOpts;
+
 use tracing::warn;
 
 use crate::{
@@ -61,8 +64,9 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
         }
     }
     let dns: crate::app::dns::Config = (&c).try_into()?;
+    validate_global_ipv6(&c, &dns)?;
     let mut tun = tun::convert(c.tun.take())?;
-    validate_dns_tun_ipv6(&dns, &tun)?;
+    validate_dns_tun_ipv6(c.ipv6, &dns, &tun)?;
     configure_fake_ip_route(&dns, &mut tun)?;
 
     config::Config {
@@ -147,13 +151,170 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
     .validate()
 }
 
+fn validate_global_ipv6(
+    config: &def::Config,
+    dns: &crate::app::dns::Config,
+) -> Result<(), Error> {
+    if config.ipv6 {
+        return Ok(());
+    }
+
+    if config.bind_address.0.is_ipv6() {
+        return Err(Error::InvalidConfig(
+            "ipv6 is disabled but bind-address uses an IPv6 address".to_owned(),
+        ));
+    }
+    if config.listeners.as_ref().is_some_and(|listeners| {
+        listeners
+            .iter()
+            .any(|listener| listener.common_opts().listen.0.is_ipv6())
+    }) {
+        return Err(Error::InvalidConfig(
+            "ipv6 is disabled but a listener uses an IPv6 address".to_owned(),
+        ));
+    }
+
+    #[cfg(feature = "anytls")]
+    if config.listeners.as_ref().is_some_and(|listeners| {
+        listeners.iter().any(|listener| {
+            matches!(
+                listener,
+                InboundOpts::Anytls {
+                    fallback: Some(fallback),
+                    ..
+                } if fallback
+                    .parse::<std::net::SocketAddr>()
+                    .is_ok_and(|address| address.is_ipv6())
+            )
+        })
+    }) {
+        return Err(Error::InvalidConfig(
+            "ipv6 is disabled but an AnyTLS fallback uses an IPv6 address"
+                .to_owned(),
+        ));
+    }
+
+    for proxy in config.proxy.as_deref().unwrap_or_default() {
+        if let Some(server) = proxy.server_address()
+            && is_ipv6_literal(server)
+        {
+            return Err(Error::InvalidConfig(format!(
+                "ipv6 is disabled but proxy `{}` uses an IPv6 server address",
+                proxy.name()
+            )));
+        }
+    }
+
+    let name_servers = dns
+        .nameserver
+        .iter()
+        .chain(dns.fallback.iter())
+        .chain(dns.default_nameserver.iter())
+        .chain(dns.proxy_server_nameserver.iter().flatten())
+        .chain(dns.direct_nameserver.iter().flatten())
+        .chain(dns.nameserver_policy.values());
+    if name_servers
+        .into_iter()
+        .any(|nameserver| matches!(&nameserver.host, url::Host::Ipv6(_)))
+    {
+        return Err(Error::InvalidConfig(
+            "ipv6 is disabled but a DNS nameserver uses an IPv6 address".to_owned(),
+        ));
+    }
+
+    let listen = &dns.listen;
+    let listen_addresses = [
+        listen.udp,
+        listen.tcp,
+        listen.doh.as_ref().map(|value| value.addr),
+        listen.dot.as_ref().map(|value| value.addr),
+        listen.doh3.as_ref().map(|value| value.addr),
+    ];
+    if listen_addresses
+        .into_iter()
+        .flatten()
+        .any(|address| address.is_ipv6())
+    {
+        return Err(Error::InvalidConfig(
+            "ipv6 is disabled but a DNS listener uses an IPv6 address".to_owned(),
+        ));
+    }
+
+    if config
+        .dns
+        .edns_client_subnet
+        .as_ref()
+        .is_some_and(|subnet| subnet.ipv6.is_some())
+        || config.dns.fake_ip_range6.is_some()
+    {
+        return Err(Error::InvalidConfig(
+            "ipv6 is disabled but DNS IPv6 client-subnet or fake-IP settings are configured"
+                .to_owned(),
+        ));
+    }
+    if config
+        .hosts
+        .values()
+        .any(|address| is_ipv6_literal(address))
+    {
+        return Err(Error::InvalidConfig(
+            "ipv6 is disabled but hosts contains an IPv6 address".to_owned(),
+        ));
+    }
+
+    if let Some(tun) = &config.tun {
+        let has_ipv6_route = [
+            tun.routes.as_ref(),
+            tun.route_exclude_address.as_ref(),
+            tun.inet4_route_exclude_address.as_ref(),
+            tun.inet6_route_exclude_address.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|route| route.parse::<ipnet::IpNet>().ok())
+        .any(|route| route.addr().is_ipv6());
+        if tun.ipv6 == Some(true)
+            || tun.gateway_v6.is_some()
+            || !tun
+                .inet6_route_exclude_address
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+            || has_ipv6_route
+        {
+            return Err(Error::InvalidConfig(
+                "ipv6 is disabled but TUN IPv6 gateway, routes, or enablement are configured"
+                    .to_owned(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn is_ipv6_literal(address: &str) -> bool {
+    let address = address.trim();
+    let address = address
+        .strip_prefix('[')
+        .and_then(|address| address.strip_suffix(']'))
+        .unwrap_or(address);
+    address.parse::<std::net::Ipv6Addr>().is_ok()
+}
+
 fn validate_dns_tun_ipv6(
+    global_ipv6: bool,
     dns: &crate::app::dns::Config,
     tun: &config::TunConfig,
 ) -> Result<(), Error> {
-    if tun.enable && dns.ipv6 && tun.gateway_v6.is_none() {
+    if tun.enable && global_ipv6 && tun.gateway_v6.is_none() && dns.ipv6 {
         return Err(Error::InvalidConfig(
             "dns IPv6 responses require tun.ipv6 when TUN is enabled".to_owned(),
+        ));
+    }
+    if tun.enable && global_ipv6 && tun.gateway_v6.is_none() {
+        return Err(Error::InvalidConfig(
+            "global IPv6 requires tun.ipv6 when TUN is enabled".to_owned(),
         ));
     }
     Ok(())
@@ -243,6 +404,77 @@ profile: {{}}
         );
         yaml.parse::<def::Config>()
             .expect("def config should parse")
+    }
+
+    #[test]
+    fn ipv6_disabled_rejects_literal_ipv6_proxy_server() {
+        let error = match convert(parse_config(
+            "proxies:\n  - name: ipv6-node\n    type: socks5\n    server: '2001:db8::1'\n    port: 1080\n",
+        )) {
+            Ok(_) => panic!("IPv6 proxy endpoint must be rejected globally"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("ipv6-node"), "{error}");
+        assert!(error.contains("IPv6 server address"), "{error}");
+    }
+
+    #[test]
+    fn ipv6_disabled_keeps_domain_proxy_servers_valid() {
+        convert(parse_config(
+            "proxies:\n  - name: domain-node\n    type: socks5\n    server: node.example\n    port: 1080\n",
+        ))
+        .expect("domain endpoints are filtered to IPv4 at runtime");
+    }
+
+    #[test]
+    fn ipv6_enabled_accepts_literal_ipv6_proxy_server() {
+        let mut config = parse_config(
+            "proxies:\n  - name: ipv6-node\n    type: socks5\n    server: '2001:db8::1'\n    port: 1080\n",
+        );
+        config.ipv6 = true;
+        convert(config).expect("IPv6 endpoint should be accepted when enabled");
+    }
+
+    #[test]
+    fn global_ipv6_is_independent_from_dns_aaaa_responses() {
+        let mut config = parse_config("");
+        config.ipv6 = true;
+        config.dns.ipv6 = false;
+
+        let converted = convert(config).expect("global IPv6 should be enabled");
+        assert!(converted.general.ipv6);
+        assert!(converted.dns.global_ipv6);
+        assert!(!converted.dns.dns_ipv6);
+        assert!(!converted.dns.ipv6);
+    }
+
+    #[test]
+    fn ipv6_disabled_rejects_ipv6_tun_dns_hijack_address() {
+        let error = match convert(parse_config(
+            "tun:\n  enable: true\n  dns-hijack:\n    - 'udp://[2001:db8::1]:53'\n",
+        )) {
+            Ok(_) => panic!("IPv6 DNS hijack address must be rejected globally"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("DNS hijack rule uses an IPv6 address"),
+            "{error}"
+        );
+    }
+
+    #[cfg(feature = "anytls")]
+    #[test]
+    fn ipv6_disabled_rejects_literal_ipv6_anytls_fallback() {
+        let error = match convert(parse_config(
+            "listeners:\n  - name: anytls-in\n    type: anytls\n    listen: 127.0.0.1\n    port: 8443\n    password: test\n    fallback: '[2001:db8::1]:443'\n",
+        )) {
+            Ok(_) => panic!("IPv6 AnyTLS fallback must be rejected globally"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("AnyTLS fallback uses an IPv6 address"),
+            "{error}"
+        );
     }
 
     #[cfg(feature = "tun")]
