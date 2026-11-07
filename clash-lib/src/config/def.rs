@@ -1289,6 +1289,7 @@ proxy:
             "drect-nameserver-follow-policy",
             "respec-rules",
             "enhance-mode",
+            "edns-clinet-subnet",
         ] {
             let yaml = format!("dns:\n  enable: false\n  {field}: secret.example\n");
             let error = match yaml.parse::<Config>() {
@@ -1332,6 +1333,7 @@ proxy:
             "route-exclude-addres",
             "include-interfac",
             "exclude-interfac",
+            "strcit-route",
         ] {
             let yaml = format!("tun:\n  enable: false\n  {field}: true\n");
             let error = match yaml.parse::<Config>() {
