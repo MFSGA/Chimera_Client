@@ -5,9 +5,9 @@ use windows::{
         Foundation::GetLastError,
         Networking::WinSock::{
             ADDRESS_FAMILY, AF_INET, AF_INET6, IP_MULTICAST_IF, IP_UNICAST_IF,
-            IPPROTO_IP, IPPROTO_IPV6, IPV6_MULTICAST_IF, IPV6_UNICAST_IF, SO_TYPE,
-            SOCK_DGRAM, SOCKADDR, SOCKADDR_INET, SOCKET, SOL_SOCKET,
-            WINSOCK_SOCKET_TYPE, getsockname, getsockopt, setsockopt,
+            IPPROTO_IP, IPPROTO_IPV6, IPV6_MULTICAST_IF, IPV6_UNICAST_IF,
+            IPV6_V6ONLY, SO_TYPE, SOCK_DGRAM, SOCKADDR, SOCKADDR_INET, SOCKET,
+            SOL_SOCKET, WINSOCK_SOCKET_TYPE, getsockname, getsockopt, setsockopt,
         },
     },
     core::PSTR,
@@ -115,6 +115,24 @@ fn socket_family(socket: SOCKET) -> io::Result<socket2::Domain> {
     }
 }
 
+fn ipv6_only(socket: SOCKET) -> io::Result<bool> {
+    let mut value = [0u8; 4];
+    let mut len = value.len() as i32;
+    let result = unsafe {
+        getsockopt(
+            socket,
+            IPPROTO_IPV6.0,
+            IPV6_V6ONLY,
+            PSTR::from_raw(value.as_mut_ptr()),
+            &mut len,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(i32::from_ne_bytes(value) != 0)
+}
+
 fn bind_socket_to_interface(
     handle: SOCKET,
     iface: &OutboundInterface,
@@ -178,6 +196,7 @@ fn bind_socket_to_interface(
     }
 
     if family == socket2::Domain::IPV6
+        && !ipv6_only(handle)?
         && let Err(err) =
             bind_socket_to_interface(handle, iface, socket2::Domain::IPV4)
     {
@@ -187,4 +206,22 @@ fn bind_socket_to_interface(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ipv6_only_detects_socket_mode() {
+        for kind in [socket2::Type::STREAM, socket2::Type::DGRAM] {
+            let socket =
+                socket2::Socket::new(socket2::Domain::IPV6, kind, None).unwrap();
+            socket.set_only_v6(true).unwrap();
+            let handle = SOCKET(socket.as_raw_socket() as usize);
+            assert!(ipv6_only(handle).unwrap());
+            socket.set_only_v6(false).unwrap();
+            assert!(!ipv6_only(handle).unwrap());
+        }
+    }
 }
