@@ -2,6 +2,7 @@ use crate::{
     app::dns::{
         Client, EnhancedResolver, ThreadSafeDNSClient,
         dns_client::DNSNetMode,
+        execution::LiteralOnlyResolver,
         helper::{DnsClientNetworkOptions, make_clients},
     },
     proxy::utils::NetworkPathSource,
@@ -165,12 +166,15 @@ impl DhcpClient {
             let discovered_clients = make_clients(
                 Self::discovered_upstreams(&iface, dns),
                 None,
-                None,
+                // DHCP supplied literal IPs; there is no legitimate need
+                // to invoke macOS/system DNS to dial these wire transports.
+                Some(Arc::new(LiteralOnlyResolver::default())),
                 direct_only_registry(),
                 None,
                 DnsClientNetworkOptions {
                     fw_mark: self.fw_mark,
                     network_path_source: self.network_path_source.clone(),
+                    group: Some("dhcp"),
                     ..Default::default()
                 },
             )
