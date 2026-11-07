@@ -129,6 +129,8 @@ impl Config {
             }
         }
 
+        self.validate_ipv6_policy()?;
+
         for r in self.rules.iter() {
             if !self.proxies.contains_key(r.target())
                 && !self.proxy_groups.contains_key(r.target())
@@ -176,6 +178,155 @@ impl Config {
         }
         Ok(self)
     }
+
+    fn validate_ipv6_policy(&self) -> Result<(), crate::Error> {
+        if self.general.ipv6 {
+            if self.tun.enable && self.tun.gateway_v6.is_none() {
+                return Err(Error::InvalidConfig(
+                    "global IPv6 requires tun.ipv6 when TUN is enabled".to_owned(),
+                ));
+            }
+            return Ok(());
+        }
+
+        let invalid = |message: &str| {
+            Error::InvalidConfig(format!("ipv6 is disabled but {message}"))
+        };
+        if self.general.bind_address.0.is_ipv6() {
+            return Err(invalid("bind-address uses an IPv6 address"));
+        }
+        if self
+            .listeners
+            .iter()
+            .any(|listener| listener.common_opts().listen.0.is_ipv6())
+        {
+            return Err(invalid("a listener uses an IPv6 address"));
+        }
+        #[cfg(feature = "anytls")]
+        if self.listeners.iter().any(|listener| {
+            matches!(
+                listener,
+                InboundOpts::Anytls {
+                    fallback: Some(fallback),
+                    ..
+                } if fallback
+                    .parse::<SocketAddr>()
+                    .is_ok_and(|address| address.is_ipv6())
+            )
+        }) {
+            return Err(invalid("an AnyTLS fallback uses an IPv6 address"));
+        }
+        if let Some(name) = self.proxies.values().find_map(|proxy| {
+            let OutboundProxy::ProxyServer(server) = proxy else {
+                return None;
+            };
+            server
+                .server_address()
+                .filter(|address| is_ipv6_literal(address))
+                .map(|_| server.name())
+        }) {
+            return Err(invalid(&format!(
+                "proxy `{}` uses an IPv6 server address",
+                name
+            )));
+        }
+
+        let name_servers = self
+            .dns
+            .nameserver
+            .iter()
+            .chain(self.dns.fallback.iter())
+            .chain(self.dns.default_nameserver.iter())
+            .chain(self.dns.proxy_server_nameserver.iter().flatten())
+            .chain(self.dns.direct_nameserver.iter().flatten())
+            .chain(self.dns.nameserver_policy.values());
+        if name_servers
+            .into_iter()
+            .any(|nameserver| matches!(&nameserver.host, url::Host::Ipv6(_)))
+        {
+            return Err(invalid("a DNS nameserver uses an IPv6 address"));
+        }
+        let listen = &self.dns.listen;
+        let listen_addresses = [
+            listen.udp,
+            listen.tcp,
+            listen.doh.as_ref().map(|value| value.addr),
+            listen.dot.as_ref().map(|value| value.addr),
+            listen.doh3.as_ref().map(|value| value.addr),
+        ];
+        if listen_addresses
+            .into_iter()
+            .flatten()
+            .any(|address| address.is_ipv6())
+        {
+            return Err(invalid("a DNS listener uses an IPv6 address"));
+        }
+        if self
+            .dns
+            .edns_client_subnet
+            .as_ref()
+            .is_some_and(|subnet| subnet.ipv6.is_some())
+            || self.dns.fake_ip_range6.is_some()
+        {
+            return Err(invalid(
+                "DNS IPv6 client-subnet or fake-IP settings are configured",
+            ));
+        }
+        let mut has_ipv6_host = false;
+        if let Some(hosts) = &self.dns.hosts {
+            hosts.traverse(|_, address| {
+                has_ipv6_host |= address.is_ipv6();
+                true
+            });
+        }
+        if has_ipv6_host {
+            return Err(invalid("hosts contains an IPv6 address"));
+        }
+        if self.tun.gateway_v6.is_some()
+            || self
+                .tun
+                .routes
+                .iter()
+                .chain(self.tun.route_exclude_address.iter())
+                .any(|route| route.addr().is_ipv6())
+        {
+            return Err(invalid("TUN IPv6 gateway or routes are configured"));
+        }
+        if self
+            .tun
+            .dns_hijack_rules
+            .iter()
+            .any(|rule| matches!(rule.address, DnsHijackAddress::Ip(IpAddr::V6(_))))
+        {
+            return Err(invalid("a TUN DNS hijack rule uses an IPv6 address"));
+        }
+        if self.general.interface.as_ref().is_some_and(|interface| {
+            matches!(interface, Interface::IpAddr(IpAddr::V6(_)))
+        }) {
+            return Err(invalid("interface-name selects an IPv6 address"));
+        }
+        if self
+            .general
+            .controller
+            .external_controller
+            .as_deref()
+            .and_then(|address| address.parse::<SocketAddr>().ok())
+            .is_some_and(|address| address.is_ipv6())
+        {
+            return Err(invalid("external-controller uses an IPv6 address"));
+        }
+
+        Ok(())
+    }
+}
+
+fn is_ipv6_literal(address: &str) -> bool {
+    let address = address.trim();
+    let address = address
+        .strip_prefix('[')
+        .and_then(|address| address.strip_suffix(']'))
+        .unwrap_or(address);
+    address.parse::<Ipv6Addr>().is_ok()
 }
 
 pub struct General {
