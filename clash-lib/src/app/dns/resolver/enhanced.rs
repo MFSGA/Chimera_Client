@@ -958,24 +958,25 @@ impl EnhancedResolver {
     ) -> anyhow::Result<op::Message> {
         let q = message.queries.first().unwrap();
 
-        let query = async move {
-            if EnhancedResolver::is_ip_request(q) {
-                return self
-                    .ip_exchange_with_provider_snapshot(
-                        message,
-                        provider_node_snapshot,
-                    )
-                    .await;
-            }
-
-            if let Some(matched) = self.match_policy(message) {
-                return EnhancedResolver::batch_exchange(matched, message).await;
-            }
-
+        let mut used_dedicated_node_dns = false;
+        let rv = if EnhancedResolver::is_ip_request(q) {
+            self.ip_exchange_with_provider_snapshot_and_source(
+                message,
+                provider_node_snapshot,
+                &mut used_dedicated_node_dns,
+            )
+            .await
+        } else if let Some(matched) = self.match_policy(message) {
+            EnhancedResolver::batch_exchange(matched, message).await
+        } else {
             EnhancedResolver::batch_exchange(&self.main, message).await
         };
 
-        let rv = query.await;
+        // Live provider ownership can change after the initial cache bypass
+        // decision. Never insert a dedicated node answer into shared generic
+        // DNS caches, even if the domain has since been removed.
+        let populate_shared_cache =
+            populate_shared_cache && !used_dedicated_node_dns;
 
         if populate_shared_cache
             && let Ok(msg) = &rv
@@ -1041,11 +1042,27 @@ impl EnhancedResolver {
             .await
     }
 
-    #[instrument(skip_all, level = "trace")]
+    #[cfg(test)]
     async fn ip_exchange_with_provider_snapshot(
         &self,
         message: &op::Message,
         provider_node_snapshot: bool,
+    ) -> anyhow::Result<op::Message> {
+        let mut used_dedicated_node_dns = false;
+        self.ip_exchange_with_provider_snapshot_and_source(
+            message,
+            provider_node_snapshot,
+            &mut used_dedicated_node_dns,
+        )
+        .await
+    }
+
+    #[instrument(skip_all, level = "trace")]
+    async fn ip_exchange_with_provider_snapshot_and_source(
+        &self,
+        message: &op::Message,
+        provider_node_snapshot: bool,
+        used_dedicated_node_dns: &mut bool,
     ) -> anyhow::Result<op::Message> {
         if self.proxy_node_resolver {
             // This resolver is the transport's dedicated proxy node DNS
@@ -1061,14 +1078,27 @@ impl EnhancedResolver {
             return EnhancedResolver::batch_exchange(&self.main, message).await;
         }
 
+        // Static proxy node domains do not change within this resolver and
+        // retain their historical shared-cache behavior. Dynamic provider
+        // domains can be added/removed between awaits, so only those require
+        // a cache-isolated answer role.
+        let live_provider_domain = if provider_node_snapshot {
+            true
+        } else if let Some(domain) =
+            EnhancedResolver::domain_name_of_message(message)
+        {
+            self.is_registered_provider_domain(&domain).await
+        } else {
+            false
+        };
         if let Some(proxy_resolver) = &self.proxy_resolver
             && let Some(domain) = EnhancedResolver::domain_name_of_message(message)
-            && (provider_node_snapshot
+            && (live_provider_domain
                 || self.proxy_server_domains.as_ref().is_some_and(
                     |static_domains| static_domains.search(&domain).is_some(),
-                )
-                || self.is_registered_provider_domain(&domain).await)
+                ))
         {
+            *used_dedicated_node_dns = live_provider_domain;
             debug!(
                 "using proxy-server-nameserver for proxy server domain: {}",
                 domain
@@ -3313,6 +3343,64 @@ mod tests {
         );
         assert_eq!(node_hits.load(Ordering::SeqCst), 1);
         assert_eq!(main_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn provider_registration_during_query_never_caches_node_answer_as_public_dns()
+     {
+        // A request initially classified as generic DNS can race with a
+        // provider registration before its actual upstream is selected.
+        // Even if dedicated node DNS wins, its answer must not poison the
+        // shared generic response cache after that provider is removed.
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        let node_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+                hits: main_hits.clone(),
+                id: "public-dns",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: node_hits.clone(),
+            id: "node-dns",
+        })]);
+        let mut query = test_query_with_type(rr::RecordType::A);
+        query.metadata.recursion_desired = true;
+        let was_node_at_start = resolver
+            .is_registered_provider_domain("proxy.example.com")
+            .await;
+        assert!(!was_node_at_start);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "new-provider",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        let during = resolver
+            .exchange_no_cache_with_policy(&query, true, was_node_at_start)
+            .await
+            .unwrap();
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&during),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11))]
+        );
+        resolver
+            .replace_proxy_provider_dns_domains("new-provider", vec![])
+            .await
+            .unwrap();
+        let afterward = resolver.exchange(&query).await.unwrap();
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&afterward),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))],
+            "removed provider's dedicated node answer must not remain in public cache"
+        );
+        assert_eq!(node_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(main_hits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
