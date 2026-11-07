@@ -52,7 +52,7 @@ python3 tools/dns_canary_audit.py \
 
    为每个捕获进程手工记录开启和停止时的 UTC 时间（例如执行 `date -u '+%Y-%m-%dT%H:%M:%SZ'`），并记录抓包期间当前系统的 UTC 偏移（例如通过只读 `date '+%z'` 确认后填写 `-08:00`）。不同接口必须存在共同的采集窗口；工具还会尝试将 `tcpdump -tttt` 的本地时间戳转为 UTC，核对数据包自身是否落在各自声明窗口、utun canary 是否在公共时段内出现。**时钟同步、操作者时间声明及固定 UTC 偏移都不是独立证明**；跨夏令时/DST 跳变的采集必须拆成不同 case，不能只给整段一个偏移。
 
-3. **记录系统 DNS 状态和受控 canary**。在捕获时段保存 `scutil --dns > scutil-dns.txt`（只读），并记录该快照采集时的 UTC 时间（对应 manifest 的 `resolver_snapshot_recorded_at_utc`）。工具只核对独立一行的 `DNS configuration` 标题、`resolver #` 与 `nameserver[0]` 等基本文本结构及时间窗口；报告仅显示 resolver/nameserver 数量，不输出其具体 IP。**这种形状检查不证明配置是操作系统的真实快照，更不证明 service-scoped DNS 已被 Chimera 接管。** 由所有者控制专属测试域名并发起一次明确的系统 resolver 查询。可选使用 `dns-sd -G v4v6 <专属canary域名>`（需手动停止），它与直接使用 `dig @server` 测试上游不是同一种路径。对于强制 TCP 53、断线、切换 Wi-Fi、休眠唤醒等情境分别创建 case，不能把一个正常 A 查询的结果冒充所有场景通过。
+3. **记录系统 DNS 状态和受控 canary**。在捕获时段保存 `scutil --dns > scutil-dns.txt`（只读），并记录该快照采集时的 UTC 时间（对应 manifest 的 `resolver_snapshot_recorded_at_utc`）。工具只核对独立一行的 `DNS configuration` 标题、`resolver #` 与 `nameserver[0]` 等基本文本结构及时间窗口；报告仅显示 resolver/nameserver 数量，不输出其具体 IP。**这种形状检查不证明配置是操作系统的真实快照，更不证明 service-scoped DNS 已被 Chimera 接管。** 工具还会识别 `DNS configuration (for scoped queries)` 区块或 resolver 上的 `flags : Scoped`，统计接口为 `en0` 等非 utun/loopback 的 scoped resolver，并添加 `review_flags: ["physical_scoped_dns_resolver_present"]` 供人工核对；接口名称缺失时标记 `scoped_resolver_interface_unknown`。**这些均是风险提示，不是实际物理出口 DNS 查询的证据，也不会凭该提示改变 canary 判定。** 由所有者控制专属测试域名并发起一次明确的系统 resolver 查询。可选使用 `dns-sd -G v4v6 <专属canary域名>`（需手动停止），它与直接使用 `dig @server` 测试上游不是同一种路径。对于强制 TCP 53、断线、切换 Wi-Fi、休眠唤醒等情境分别创建 case，不能把一个正常 A 查询的结果冒充所有场景通过。
 4. **整理 manifest**。将抓包及快照保存在相同证据目录；例如：
 
    ```json
@@ -84,7 +84,7 @@ python3 tools/dns_canary_audit.py \
      --output /path/to/private/report.json
    ```
 
-   输出 JSON 包含 `case_id`、`verdict`、`coverage_issues`、manifest SHA-256、声明的接口及公共 UTC 采集窗口、`scutil` 快照结构数量和快照时间、各抓包 SHA-256/字节数/解析到的数据包数、包时间戳的 UTC 归一化与窗口内事件计数，以及与 canary 匹配的 qtype/IPv4/IPv6/TCP/UDP/时间戳及原始行 SHA-256。默认不会在报告中包含源或目标 IP；仅需在本地审计时可显式选择 `--include-endpoints`，但须单独处理敏感数据。
+   输出 JSON 包含 `case_id`、`verdict`、`coverage_issues`、供人工复核的 `review_flags`、manifest SHA-256、声明的接口及公共 UTC 采集窗口、`scutil` 快照结构数量/作用域 resolver 数量和快照时间、各抓包 SHA-256/字节数/解析到的数据包数、包时间戳的 UTC 归一化与窗口内事件计数，以及与 canary 匹配的 qtype/IPv4/IPv6/TCP/UDP/时间戳及原始行 SHA-256。默认不会在报告中包含源或目标 IP；仅需在本地审计时可显式选择 `--include-endpoints`，但须单独处理敏感数据。
 
 ## 退出码和合并验收
 

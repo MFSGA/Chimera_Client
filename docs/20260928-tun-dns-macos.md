@@ -231,3 +231,4 @@ System DNS 指向一个与 fake-IP 池、TUN 网关子网及 route exclusions �
 - 工具仅读取测试人员保存的 macOS `tcpdump` 明文 UDP/TCP 53 文本日志和 `scutil --dns` 快照，按物理接口与 utun 分别记录测试专用 QNAME 的查询证据、IPv4/IPv6/TCP/UDP 类型、快照/抓包 SHA-256 和证据缺口。发现物理出口的 canary 会明确报告；缺少接口、无 utun canary、未解码非空 DNS payload、空抓包或缺快照则报告 `NOT_VERIFIED`，不能把缺失数据误判为零泄漏。
 - 默认不在 JSON 报告中输出其它域名或 IP 端点；原始抓包仍可能含私人 DNS，必须留在授权测试机保管。无论结果为何都保留 `system_zero_leak_verified: false`；该工具不能检测 DoH/DoT/DoQ、网络服务 resolver 优先级、完整物理接口覆盖或系统级接管。
 - 当前阶段只运行 Python 标准库离线单测与虚构样例；没有执行 `tcpdump`、`scutil`、DNS canary 真实查询，没有请求 root，也没有修改主机网络。真实抓包须由测试机所有者逐场景明确授权。
+- 当晚后续迭代：从 `scutil --dns` 文本中只提取 resolver/nameserver 数量、scoped resolver 数量以及是否涉及非 utun/loopback 的作用域接口（或接口未知）；只把它们作为人工审查用的 `review_flags`，不把 resolver 的存在等同于物理 DNS 已泄漏，也不输出真实 nameserver IP。结合前一轮的窗口/时间戳一致性与输入 SHA-256 核验，纯离线回归扩大至 61 项通过。该结果仍不涉及 macOS 系统 resolver/Network Extension 的实际控制，不是零泄漏认证。

@@ -351,6 +351,76 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(report["resolver_snapshot"]["nameserver_entries"], 1)
         self.assertNotIn("192.0.2.53", json.dumps(report))
 
+    def test_scutil_scoped_physical_resolver_is_review_flag_not_leak_claim(self) -> None:
+        (self.folder / "scutil-dns.txt").write_text(
+            "DNS configuration\n"
+            "resolver #1\n"
+            "  nameserver[0] : 192.0.2.53\n"
+            "  if_index : 17 (utun7)\n"
+            "\nDNS configuration (for scoped queries)\n"
+            "resolver #1\n"
+            "  nameserver[0] : 192.0.2.1\n"
+            "  if_index : 5 (en0)\n"
+            "  flags : Scoped, Request A records\n",
+            encoding="utf-8",
+        )
+        report = audit.analyze_manifest(self.save_manifest())
+        snap = report["resolver_snapshot"]
+        self.assertEqual(snap["resolver_sections"], 2)
+        self.assertEqual(snap["scoped_resolvers"], 1)
+        self.assertEqual(snap["physical_scoped_resolvers"], 1)
+        self.assertIn("physical_scoped_dns_resolver_present", report["review_flags"])
+        self.assertEqual(report["verdict"], "NO_PHYSICAL_CANARY_OBSERVED_IN_SUPPLIED_LOGS")
+        self.assertFalse(report["system_zero_leak_verified"])
+        self.assertNotIn("192.0.2.1", json.dumps(report))
+
+    def test_scutil_scoped_utun_is_not_physical_resolver(self) -> None:
+        (self.folder / "scutil-dns.txt").write_text(
+            "DNS configuration\nresolver #1\n  nameserver[0] : 192.0.2.53\n"
+            "DNS configuration (for scoped queries)\n"
+            "resolver #1\n  nameserver[0] : 192.0.2.53\n"
+            "  if_index : 17 (utun7)\n",
+            encoding="utf-8",
+        )
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["resolver_snapshot"]["physical_scoped_resolvers"], 0)
+        self.assertNotIn("physical_scoped_dns_resolver_present", report["review_flags"])
+
+    def test_scutil_scoped_resolver_without_interface_is_review_flag(self) -> None:
+        (self.folder / "scutil-dns.txt").write_text(
+            "DNS configuration\nresolver #1\n  nameserver[0] : 192.0.2.53\n"
+            "DNS configuration (for scoped queries)\n"
+            "resolver #1\n  nameserver[0] : 192.0.2.1\n"
+            "  if_index : 5\n",
+            encoding="utf-8",
+        )
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["resolver_snapshot"]["unknown_scoped_interfaces"], 1)
+        self.assertIn("scoped_resolver_interface_unknown", report["review_flags"])
+
+    def test_scutil_scoped_flag_in_default_section_is_review_flag(self) -> None:
+        (self.folder / "scutil-dns.txt").write_text(
+            "DNS configuration\n"
+            "resolver #1\n  nameserver[0] : 192.0.2.1\n"
+            "  if_index : 5 (en0)\n"
+            "  flags : Supplemental, Scoped, Request A records\n",
+            encoding="utf-8",
+        )
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["resolver_snapshot"]["physical_scoped_resolvers"], 1)
+        self.assertIn("physical_scoped_dns_resolver_present", report["review_flags"])
+
+    def test_unscoped_physical_resolver_is_not_mislabeled_scoped(self) -> None:
+        (self.folder / "scutil-dns.txt").write_text(
+            "DNS configuration\n"
+            "resolver #1\n  nameserver[0] : 192.0.2.1\n"
+            "  if_index : 5 (en0)\n  flags : Request A records\n",
+            encoding="utf-8",
+        )
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["resolver_snapshot"]["physical_scoped_resolvers"], 0)
+        self.assertNotIn("physical_scoped_dns_resolver_present", report["review_flags"])
+
     def test_missing_scutil_snapshot_is_not_verified(self) -> None:
         del self.manifest["resolver_snapshot"]
         result = audit.analyze_manifest(self.save_manifest())

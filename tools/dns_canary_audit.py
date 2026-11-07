@@ -210,6 +210,47 @@ def observed_packet_utc(raw: str, offset: timezone | None) -> datetime | None:
         return None
 
 
+def summarize_scutil_snapshot(lines: list[str]) -> dict[str, int]:
+    """Structure-only macOS resolver inventory; never retain nameserver IPs."""
+    headers = 0
+    scoped_section = False
+    current: dict[str, Any] | None = None
+    resolvers: list[dict[str, Any]] = []
+    for line in lines:
+        trimmed = line.strip()
+        if re.fullmatch(r"DNS configuration(?: \(for scoped queries\))?", trimmed):
+            headers += 1
+            scoped_section = trimmed.endswith("(for scoped queries)")
+            current = None
+        elif re.fullmatch(r"resolver #\d+", trimmed):
+            current = {"scoped": scoped_section, "nameservers": 0, "interface": None}
+            resolvers.append(current)
+        elif current is not None:
+            if re.fullmatch(r"nameserver\[\d+\]\s*:\s*\S+.*", trimmed):
+                current["nameservers"] += 1
+            index = re.fullmatch(
+                r"if_index\s*:\s*\d+(?:\s*\(([^)]+)\))?", trimmed
+            )
+            if index:
+                current["interface"] = index.group(1)
+            if re.fullmatch(r"flags\s*:\s*.*\bScoped\b.*", trimmed):
+                current["scoped"] = True
+    scoped = [r for r in resolvers if r["scoped"] and r["nameservers"]]
+    return {
+        "headers": headers,
+        "resolver_sections": len(resolvers),
+        "nameserver_entries": sum(r["nameservers"] for r in resolvers),
+        "scoped_resolvers": len(scoped),
+        "physical_scoped_resolvers": sum(
+            r["interface"] is not None
+            and not r["interface"].startswith("utun")
+            and r["interface"] != "lo0"
+            for r in scoped
+        ),
+        "unknown_scoped_interfaces": sum(r["interface"] is None for r in scoped),
+    }
+
+
 def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) -> dict[str, Any]:
     """Analyze user-provided files only. No OS probing, packets, DNS or subprocesses."""
     manifest_path = manifest_path.resolve()
@@ -412,6 +453,7 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
         missing.append("one_or_more_captures_have_undecoded_dns_payloads")
     if any(summary["unparsed_packet_or_canary_lines"] > 0 for summary in summaries):
         missing.append("one_or_more_captures_have_unparsed_packet_or_canary_lines")
+    review_flags: list[str] = []
     snapshot_result: dict[str, Any] = {"provided": False}
     if "resolver_snapshot" in manifest:
         path = evidence_path(folder, manifest["resolver_snapshot"])
@@ -429,20 +471,17 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
         # This deliberately checks only *shape*, not the correctness of the
         # macOS service-scoped resolver order or its ownership. No nameserver
         # addresses or search domains are copied into the report.
-        headers = sum(
-            re.fullmatch(r"DNS configuration(?: \(for scoped queries\))?", line.strip())
-            is not None for line in lines
-        )
-        resolvers = sum(
-            re.fullmatch(r"\s*resolver #\d+\s*", line) is not None
-            for line in lines
-        )
-        nameservers = sum(
-            re.fullmatch(r"\s*nameserver\[\d+\]\s*:\s*\S+.*", line) is not None
-            for line in lines
-        )
-        if not (headers and resolvers and nameservers):
+        resolver_inventory = summarize_scutil_snapshot(lines)
+        if not (
+            resolver_inventory["headers"]
+            and resolver_inventory["resolver_sections"]
+            and resolver_inventory["nameserver_entries"]
+        ):
             missing.append("unrecognized_scutil_dns_snapshot")
+        if resolver_inventory["physical_scoped_resolvers"] > 0:
+            review_flags.append("physical_scoped_dns_resolver_present")
+        if resolver_inventory["unknown_scoped_interfaces"] > 0:
+            review_flags.append("scoped_resolver_interface_unknown")
         snapshot_at_raw = manifest.get("resolver_snapshot_recorded_at_utc")
         snapshot_at = None
         if snapshot_at_raw is None:
@@ -468,10 +507,17 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
             "provided": True,
             "sha256": snapshot_digest,
             "bytes": len(snapshot_bytes),
-            "resolver_sections": resolvers,
-            "nameserver_entries": nameservers,
+            "resolver_sections": resolver_inventory["resolver_sections"],
+            "nameserver_entries": resolver_inventory["nameserver_entries"],
+            "scoped_resolvers": resolver_inventory["scoped_resolvers"],
+            "physical_scoped_resolvers": resolver_inventory["physical_scoped_resolvers"],
+            "unknown_scoped_interfaces": resolver_inventory["unknown_scoped_interfaces"],
             "recorded_at_utc": snapshot_at.isoformat() if snapshot_at else None,
-            "structure_recognized": bool(headers and resolvers and nameservers),
+            "structure_recognized": bool(
+                resolver_inventory["headers"]
+                and resolver_inventory["resolver_sections"]
+                and resolver_inventory["nameserver_entries"]
+            ),
         }
     else:
         missing.append("missing_scutil_dns_resolver_snapshot")
@@ -501,6 +547,7 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
         "verdict": verdict,
         "system_zero_leak_verified": False,
         "coverage_issues": missing,
+        "review_flags": review_flags,
         "declared_interface_inventory": expected,
         "operator_declared_capture_overlap_utc": overlapping_window,
         "resolver_snapshot": snapshot_result,
