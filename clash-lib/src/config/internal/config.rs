@@ -132,6 +132,44 @@ fn validate_default_nameserver_bootstrap(
     Ok(())
 }
 
+/// macOS DHCP discovery uses sockets scoped to a physical network service,
+/// not a DNS transport whose path has been proven to stay inside the TUN.
+/// In Fake-IP privacy mode, refuse DHCP sources in all general DNS pools,
+/// not just the dedicated node bootstrap pools checked below.
+#[cfg(target_os = "macos")]
+fn validate_macos_fake_ip_dns_egress(
+    dns: &dns::Config,
+    tun: &TunConfig,
+) -> Result<(), Error> {
+    if !tun.enable || !dns.enable || dns.enhance_mode != def::DNSMode::FakeIp {
+        return Ok(());
+    }
+    let is_dhcp = |server: &dns::config::NameServer| {
+        server.net == dns::config::DNSNetMode::Dhcp
+    };
+    for (scope, unsafe_dhcp) in [
+        ("dns.nameserver", dns.nameserver.iter().any(is_dhcp)),
+        ("dns.fallback", dns.fallback.iter().any(is_dhcp)),
+        (
+            "dns.direct-nameserver",
+            dns.direct_nameserver
+                .as_ref()
+                .is_some_and(|servers| servers.iter().any(is_dhcp)),
+        ),
+        (
+            "dns.nameserver-policy",
+            dns.nameserver_policy.values().any(is_dhcp),
+        ),
+    ] {
+        if unsafe_dhcp {
+            return Err(Error::InvalidConfig(format!(
+                "{scope} cannot use DHCP in macOS TUN + Fake-IP; DHCP discovers service-scoped DNS outside verified managed egress"
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl Config {
     pub fn validate(self) -> Result<Self, crate::Error> {
         validate_default_nameserver_bootstrap(&self.dns.default_nameserver)?;
@@ -156,6 +194,9 @@ impl Config {
                 "dns.proxy-server-nameserver cannot be explicitly empty".to_owned(),
             ));
         }
+
+        #[cfg(target_os = "macos")]
+        validate_macos_fake_ip_dns_egress(&self.dns, &self.tun)?;
 
         // YAML conversion expands comma-delimited main DNS policy selectors
         // and rejects Mihomo GeoSite/RuleSet patterns. Internal configs and
@@ -799,6 +840,70 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "tun"))]
+    #[test]
+    fn internal_macos_fake_ip_tun_rejects_service_scoped_dhcp_dns_egress() {
+        // Runtime reloads accept an Internal Config directly and must not
+        // bypass checks added for YAML conversion alone.
+        let yaml = "tun:\n  enable: true\ndns:\n  enable: true\n  enhanced-mode: fake-ip\n  nameserver: [1.1.1.1]\n  default-nameserver: [223.5.5.5]\n";
+        let dhcp = crate::app::dns::config::Config::parse_nameserver(&[
+            "dhcp://en0".to_owned(),
+        ])
+        .unwrap()
+        .remove(0);
+        for scope in [
+            "nameserver",
+            "fallback",
+            "direct-nameserver",
+            "nameserver-policy",
+        ] {
+            let mut config =
+                crate::Config::Str(yaml.to_owned()).try_parse().unwrap();
+            match scope {
+                "nameserver" => config.dns.nameserver.push(dhcp.clone()),
+                "fallback" => config.dns.fallback.push(dhcp.clone()),
+                "direct-nameserver" => {
+                    config.dns.direct_nameserver = Some(vec![dhcp.clone()])
+                }
+                "nameserver-policy" => {
+                    config
+                        .dns
+                        .nameserver_policy
+                        .insert("internal.example".into(), dhcp.clone());
+                }
+                _ => unreachable!(),
+            }
+            let error = match config.validate() {
+                Ok(_) => {
+                    panic!("internal DNS {scope} accepted service DNS DHCP egress")
+                }
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains(&format!("dns.{scope}")) && error.contains("DHCP"),
+                "{scope}: {error}"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", not(feature = "tun")))]
+    #[test]
+    fn internal_macos_dhcp_cannot_mask_missing_tun_feature() {
+        let yaml = "dns:\n  enable: true\n  enhanced-mode: fake-ip\n  nameserver: [1.1.1.1]\n  default-nameserver: [223.5.5.5]\n";
+        let mut config = crate::Config::Str(yaml.to_owned()).try_parse().unwrap();
+        config.tun.enable = true;
+        config.dns.nameserver =
+            crate::app::dns::config::Config::parse_nameserver(&[
+                "dhcp://en0".to_owned()
+            ])
+            .unwrap();
+        let error = match config.validate() {
+            Ok(_) => panic!("internal config accepted unavailable TUN feature"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("without the `tun` feature"), "{error}");
     }
 
     #[test]

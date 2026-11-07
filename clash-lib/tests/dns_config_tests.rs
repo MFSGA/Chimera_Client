@@ -591,6 +591,86 @@ fn fake_ip_tun_node_policy_rejects_dhcp_service_scoped_resolver() {
     );
 }
 
+#[cfg(all(target_os = "macos", feature = "tun"))]
+#[test]
+fn macos_fake_ip_tun_rejects_dhcp_in_all_dns_egress_pools() {
+    // ref-mihomo parses dhcp://, but Chimera's DHCP discovery sends a
+    // physical-interface request and does not guarantee service-scoped DNS
+    // egress through the TUN. Until runtime capture proves isolation, refuse
+    // to accept these upstreams in macOS TUN + Fake-IP.
+    for (scope, body) in [
+        ("nameserver", "  nameserver: ['dhcp://en0']\n"),
+        (
+            "fallback",
+            "  nameserver: [1.1.1.1]\n  fallback: ['dhcp://en0']\n",
+        ),
+        (
+            "direct-nameserver",
+            "  nameserver: [1.1.1.1]\n  direct-nameserver: ['dhcp://en0']\n",
+        ),
+        (
+            "nameserver-policy",
+            "  nameserver: [1.1.1.1]\n  nameserver-policy:\n    'internal.example': 'dhcp://en0'\n",
+        ),
+    ] {
+        let yaml = base_config(&format!(
+            "  enable: true\n  enhanced-mode: fake-ip\n  default-nameserver: [223.5.5.5]\n{body}"
+        ))
+        .replacen("dns:\n", "tun:\n  enable: true\ndns:\n", 1);
+        let error = parse_error(yaml).to_string();
+        assert!(
+            error.contains(&format!("dns.{scope}")) && error.contains("DHCP"),
+            "{scope} must not silently discover service-scoped DNS: {error}"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_non_tun_dhcp_nameserver_remains_compatible() {
+    // Deliberately retain all legacy DHCP-upstream forms outside the narrow
+    // high-privacy TUN + Fake-IP mode, without actually probing DHCP.
+    for (scope, body) in [
+        ("nameserver", "  nameserver: ['dhcp://en0']\n"),
+        (
+            "fallback",
+            "  nameserver: [1.1.1.1]\n  fallback: ['dhcp://en0']\n",
+        ),
+        (
+            "direct-nameserver",
+            "  nameserver: [1.1.1.1]\n  direct-nameserver: ['dhcp://en0']\n",
+        ),
+        (
+            "nameserver-policy",
+            "  nameserver: [1.1.1.1]\n  nameserver-policy:\n    'internal.example': 'dhcp://en0'\n",
+        ),
+    ] {
+        let yaml = base_config(&format!(
+            "  enable: true\n  enhanced-mode: fake-ip\n  default-nameserver: [223.5.5.5]\n{body}"
+        ));
+        let dns = parse_dns(&yaml);
+        let net = match scope {
+            "nameserver" => &dns.nameserver[0].net,
+            "fallback" => &dns.fallback[0].net,
+            "direct-nameserver" => &dns.direct_nameserver.as_ref().unwrap()[0].net,
+            "nameserver-policy" => &dns.nameserver_policy["internal.example"].net,
+            _ => unreachable!(),
+        };
+        assert_eq!(*net, DNSNetMode::Dhcp, "legacy {scope} must still parse");
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "tun"))]
+#[test]
+fn macos_tun_normal_dns_mode_keeps_dhcp_legacy_compatibility() {
+    let yaml = base_config(
+        "  enable: true\n  enhanced-mode: normal\n  nameserver: ['dhcp://en0']\n  default-nameserver: [223.5.5.5]\n",
+    )
+    .replacen("dns:\n", "tun:\n  enable: true\ndns:\n", 1);
+    let dns = parse_dns(&yaml);
+    assert_eq!(dns.nameserver[0].net, DNSNetMode::Dhcp);
+}
+
 #[test]
 fn non_tun_proxy_bootstrap_preserves_legacy_proxy_modifier() {
     let dns = parse_dns(&base_config(
