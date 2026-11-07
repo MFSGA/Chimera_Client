@@ -10,7 +10,7 @@
 
 - **物理网卡发现 canary**：报告 `PHYSICAL_CANARY_PLAINTEXT_DNS_OBSERVED`。这能证明在所提供的抓包里看到该明文查询，但是否属于未授权泄漏仍要结合预期代理/DIRECT 策略判断。
 - **物理网卡未发现 canary、utun 在公共采集时段且本次 canary 刺激发出后的合理时间内有 canary，物理网卡同一时段存在端口 53 报文，且清单、日志与时间戳基本一致**：报告 `NO_PHYSICAL_CANARY_OBSERVED_IN_SUPPLIED_LOGS`。**仅指提供的文本中没有看到**，不证明接口覆盖充分、OS 时钟准确、macOS resolver 优先级或零泄漏。
-- **证据不足**：`NOT_VERIFIED`。例如缺少活动物理网卡或 utun 的日志、没有 canary 在公共时段和本次刺激时间之后到达 utun、没有记录刺激时间或共同捕获窗口不足以覆盖整个观察期限、未提供 tcpdump 时间戳的 UTC 偏移、数据包时间戳与声明的采集窗口不符、`scutil --dns` 快照缺失或记录时间不在公共窗口内、快照没有基本的 resolver/nameserver 行、tcpdump 退出统计缺失或显示丢包/记录数不匹配、存在未解码的 DNS 非空载荷，或某份日志没有有效的 53 端口数据包行。
+- **证据不足**：`NOT_VERIFIED`。例如缺少活动物理网卡或 utun 的日志、没有 canary 在公共时段和本次刺激时间之后到达 utun、没有记录刺激时间或共同捕获窗口不足以覆盖整个观察期限、未提供 tcpdump 时间戳的 UTC 偏移、数据包时间戳与声明的采集窗口不符、`scutil --dns` 快照缺失或记录时间不在公共窗口内、快照没有基本的 resolver/nameserver 行、tcpdump 退出统计缺失或显示丢包/计数不匹配、日志混入非 53 端口流量或物理接口只见 DNS 应答却未见向目标端口 53 发出的查询、存在未解码的 DNS 非空载荷，或某份日志没有有效的 53 端口数据包行。
 - **始终**输出 `system_zero_leak_verified: false`。DoH/DoT/DoQ、mDNS、服务专属 resolver、DNS Proxy Extension ownership、浏览器自己的 DNS、未抓取网卡、TCP 重组失败和真实代理互操作均不在这项离线验证范围内。
 
 ## 本地零网络测试（无需 macOS 特权）
@@ -48,7 +48,7 @@ python3 tools/dns_canary_audit.py \
      '(udp dst port 53 or tcp dst port 53)' > utun7.txt 2> utun7.stats.txt
    ```
 
-   **警告：** 原始 tcpdump 日志可能包含其他用户的 DNS 域名和 IP。应在无个人流量的隔离机器执行。报告默认**不回显其他域名或源/目标地址**，但这不等于原始日志无敏感信息。分析器要求 tcpdump 的单行文本解码格式，**不要使用可能让 DNS 包头和地址跨行输出的 `-vv` 模式**；如有非空 DNS 载荷无法解码，应标记 `NOT_VERIFIED` 并重采，而非判定零泄漏。务必用 Ctrl-C/正常终止结束每个 `tcpdump`，让 stderr 保留 `tcpdump: listening on en0, ...`（替换为各接口真实名称）的**启动行**以及最终 `N packets captured`、`0 packets dropped by kernel`（部分系统还提供 `dropped by interface`）。如果无法从该 stderr 确认对应接口、缺少统计或统计与 stdout 解析包数不匹配，均判为证据不足。启动行仍是用户提供的文本，工具无法独立验证它来自真实系统进程。
+   **警告：** 原始 tcpdump 日志可能包含其他用户的 DNS 域名和 IP。应在无个人流量的隔离机器执行。报告默认**不回显其他域名或源/目标地址**，但这不等于原始日志无敏感信息。分析器要求 tcpdump 的单行文本解码格式，**不要使用可能让 DNS 包头和地址跨行输出的 `-vv` 模式**；如有非空 DNS 载荷无法解码，应标记 `NOT_VERIFIED` 并重采，而非判定零泄漏。务必用 Ctrl-C/正常终止结束每个 `tcpdump`，让 stderr 保留 `tcpdump: listening on en0, ...`（替换为各接口真实名称）的**启动行**以及最终 `N packets captured`、`N packets received by filter`、`0 packets dropped by kernel`（部分系统还提供 `dropped by interface`）。如果无法从该 stderr 确认对应接口、缺少统计或三者计数不一致，均判为证据不足。不同平台的 tcpdump 计数语义可能不完全相同：本工具专门采取保守标准，不能把这种 `NOT_VERIFIED` 解释为已经泄漏。启动行仍是用户提供的文本，工具无法独立验证它来自真实系统进程。
 
    为每个捕获进程手工记录开启和停止时的 UTC 时间（例如执行 `date -u '+%Y-%m-%dT%H:%M:%SZ'`），并记录抓包期间当前系统的 UTC 偏移（例如通过只读 `date '+%z'` 确认后填写 `-08:00`）。不同接口必须存在共同的采集窗口；工具还会尝试将 `tcpdump -tttt` 的本地时间戳转为 UTC，核对数据包自身是否落在各自声明窗口、utun canary 是否在公共时段内出现。**时钟同步、操作者时间声明及固定 UTC 偏移都不是独立证明**；跨夏令时/DST 跳变的采集必须拆成不同 case，不能只给整段一个偏移。
 

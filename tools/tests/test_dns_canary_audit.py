@@ -383,6 +383,85 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(report["verdict"], "NOT_VERIFIED")
         self.assertIn("tcpdump_kernel_packets_dropped:physical:en0", report["coverage_issues"])
 
+    def test_received_by_filter_must_be_reported_for_negative_evidence(self) -> None:
+        (self.folder / "en0.stats.txt").write_text(
+            "tcpdump: listening on en0, link-type EN10MB (Ethernet)\n"
+            "2 packets captured\n0 packets dropped by kernel\n",
+            encoding="utf-8",
+        )
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["verdict"], "NOT_VERIFIED")
+        self.assertIn("incomplete_tcpdump_stats:physical:en0", report["coverage_issues"])
+
+    def test_received_count_mismatch_is_an_evidence_gap(self) -> None:
+        for count in (1, 3):
+            with self.subTest(received=count):
+                (self.folder / "en0.stats.txt").write_text(
+                    "tcpdump: listening on en0, link-type EN10MB (Ethernet)\n"
+                    f"2 packets captured\n{count} packets received by filter\n"
+                    "0 packets dropped by kernel\n", encoding="utf-8",
+                )
+                report = audit.analyze_manifest(self.save_manifest())
+                self.assertEqual(report["verdict"], "NOT_VERIFIED")
+                self.assertIn(
+                    "tcpdump_filter_count_inconsistent:physical:en0",
+                    report["coverage_issues"],
+                )
+
+    def test_mixed_dns_and_http_packets_in_capture_are_not_verified(self) -> None:
+        (self.folder / "en0.log").write_text(
+            PHYSICAL_NOISE +
+            "2026-11-06 07:00:00.000010 IP 192.0.2.80.45678 > 192.0.2.81.443: "
+            "Flags [P.], seq 1:20, ack 1, length 19\n", encoding="utf-8",
+        )
+        (self.folder / "en0.stats.txt").write_text(
+            "tcpdump: listening on en0, link-type EN10MB (Ethernet)\n"
+            "3 packets captured\n3 packets received by filter\n"
+            "0 packets dropped by kernel\n", encoding="utf-8",
+        )
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["verdict"], "NOT_VERIFIED")
+        self.assertIn(
+            "one_or_more_captures_have_non_port53_packets",
+            report["coverage_issues"],
+        )
+        self.assertEqual(report["captures"][0]["non_port53_packet_lines"], 1)
+
+    def test_inbound_only_dns_replies_do_not_prove_outgoing_dns_coverage(self) -> None:
+        (self.folder / "en0.log").write_text(
+            "2026-11-06 07:00:00.000010 IP 9.9.9.9.53 > 192.0.2.80.34567: "
+            "120 1/0/0 A 203.0.113.1 (64)\n", encoding="utf-8",
+        )
+        (self.folder / "en0.stats.txt").write_text(
+            "tcpdump: listening on en0, link-type EN10MB (Ethernet)\n"
+            "1 packet captured\n1 packet received by filter\n"
+            "0 packets dropped by kernel\n", encoding="utf-8",
+        )
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["verdict"], "NOT_VERIFIED")
+        self.assertIn(
+            "one_or_more_physical_captures_lack_outgoing_port53_packets",
+            report["coverage_issues"],
+        )
+
+    def test_physical_canary_is_reported_even_with_unfiltered_packets(self) -> None:
+        (self.folder / "en0.log").write_text(
+            PHYSICAL_LEAK +
+            "2026-11-06 07:00:00.000010 IP 192.0.2.80.45678 > 192.0.2.81.443: "
+            "Flags [P.], seq 1:20, ack 1, length 19\n", encoding="utf-8",
+        )
+        (self.folder / "en0.stats.txt").write_text(
+            "tcpdump: listening on en0, link-type EN10MB (Ethernet)\n"
+            "3 packets captured\n3 packets received by filter\n"
+            "0 packets dropped by kernel\n", encoding="utf-8",
+        )
+        report = audit.analyze_manifest(self.save_manifest())
+        self.assertEqual(report["verdict"], "PHYSICAL_CANARY_PLAINTEXT_DNS_OBSERVED")
+        self.assertIn(
+            "one_or_more_captures_have_non_port53_packets",
+            report["coverage_issues"],
+        )
+
     def test_stats_capture_count_mismatch_invalidates_negative_result(self) -> None:
         (self.folder / "utun7.stats.txt").write_text(
             "3 packets captured\n3 packets received by filter\n0 packets dropped by kernel\n",

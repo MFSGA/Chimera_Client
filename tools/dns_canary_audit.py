@@ -294,7 +294,9 @@ def read_tcpdump_stats(path: Path, expected_interface: str) -> dict[str, Any]:
         "dropped_by_interface": interface_dropped,
         "received_by_filter": received,
         "interface_confirmed": interface_confirmed,
-        "structure_recognized": captured is not None and dropped is not None,
+        "structure_recognized": (
+            captured is not None and dropped is not None and received is not None
+        ),
     }
 
 
@@ -407,6 +409,9 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
         seen_paths.add(file_path)
         packet_lines = 0
         port53_packet_lines = 0
+        non_port53_packet_lines = 0
+        outbound_port53_packet_lines = 0
+        outbound_port53_packets_in_shared_window = 0
         candidate_dns_query_lines = 0
         unparsed_dns_payload_lines = 0
         unparsed_packet_or_canary_lines = 0
@@ -433,8 +438,16 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
                 )
                 if match is not None:
                     packet_lines += 1
-                    if (port_53_destination(match["src"])
-                            or port_53_destination(match["dst"])):
+                    source_port_53 = port_53_destination(match["src"]) is not None
+                    dest_port_53 = port_53_destination(match["dst"]) is not None
+                    if not source_port_53 and not dest_port_53:
+                        non_port53_packet_lines += 1
+                    if dest_port_53:
+                        outbound_port53_packet_lines += 1
+                        if (packet_utc is not None and shared_window is not None
+                                and shared_window[0] <= packet_utc < shared_window[1]):
+                            outbound_port53_packets_in_shared_window += 1
+                    if source_port_53 or dest_port_53:
                         port53_packet_lines += 1
                         if packet_offset is not None and packet_utc is None:
                             invalid_timestamp_lines += 1
@@ -511,6 +524,8 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
                     stats_issues.append(f"tcpdump_interface_packets_dropped:{role}:{interface}")
                 if stats_result["captured"] != packet_lines:
                     stats_issues.append(f"tcpdump_capture_count_mismatch:{role}:{interface}")
+                if stats_result["received_by_filter"] != stats_result["captured"]:
+                    stats_issues.append(f"tcpdump_filter_count_inconsistent:{role}:{interface}")
         summaries.append({
             "role": role,
             "interface": interface,
@@ -522,6 +537,9 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
             "capture_bytes": size_before,
             "packet_lines": packet_lines,
             "port53_packet_lines": port53_packet_lines,
+            "non_port53_packet_lines": non_port53_packet_lines,
+            "outbound_port53_packet_lines": outbound_port53_packet_lines,
+            "outbound_port53_packets_in_shared_window": outbound_port53_packets_in_shared_window,
             "parsed_dns_question_lines": candidate_dns_query_lines,
             "unparsed_dns_payload_lines": unparsed_dns_payload_lines,
             "unparsed_packet_or_canary_lines": unparsed_packet_or_canary_lines,
@@ -561,6 +579,14 @@ def analyze_manifest(manifest_path: Path, *, include_endpoints: bool = False) ->
             missing.append("no_tun_canary_in_shared_capture_window")
         if stimulus_at is not None and by_role_after_stimulus["tun"] == 0:
             missing.append("no_utun_canary_observed_after_stimulus")
+    if any(summary["non_port53_packet_lines"] > 0 for summary in summaries):
+        missing.append("one_or_more_captures_have_non_port53_packets")
+    if shared_window is not None and any(
+        summary["role"] == "physical"
+        and summary["outbound_port53_packets_in_shared_window"] == 0
+        for summary in summaries
+    ):
+        missing.append("one_or_more_physical_captures_lack_outgoing_port53_packets")
     if any(summary["packet_lines"] == 0 for summary in summaries):
         missing.append("one_or_more_captures_have_no_packet_lines")
     if any(summary["port53_packet_lines"] == 0 for summary in summaries):
