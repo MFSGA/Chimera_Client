@@ -3409,7 +3409,11 @@ mod tests {
             None,
         )
         .await;
-        assert!(result.is_err(), "empty proxy DNS clients must fail closed");
+        assert!(
+            matches!(result, Err(crate::Error::InvalidConfig(message))
+                if message == "proxy-server-nameserver configured but no usable DNS clients initialized"),
+            "empty proxy DNS clients must fail closed with a specific configuration error"
+        );
     }
 
     #[tokio::test]
