@@ -103,6 +103,29 @@ async fn persist_with_rollback(
     Ok(())
 }
 
+/// The source read and staging happen in the caller; this helper starts only
+/// after the candidate is ready for DNS/provider publication. It keeps the
+/// commit worker alive when the caller is cancelled and preserves an audit
+/// warning if a late error would otherwise have no observer. Deliberately do
+/// not log the error text: parser, provider and disk errors can contain
+/// private node hostnames, filesystem locations or credentials.
+async fn finish_published_transaction<R, F>(work: F) -> anyhow::Result<R>
+where
+    R: Send + 'static,
+    F: std::future::Future<Output = anyhow::Result<R>> + Send + 'static,
+{
+    let (completion, observed) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let result = work.await;
+        if let Err(unobserved) = completion.send(result)
+            && unobserved.is_err()
+        {
+            warn!("abandoned provider transaction failed");
+        }
+    });
+    observed.await?
+}
+
 fn cache_needs_immediate_update(
     now: SystemTime,
     modified: SystemTime,
@@ -257,7 +280,7 @@ where
         let accepted = self.on_cache_commit_accepted.clone();
         let immediate_refresh = self.initial_immediate_refresh.clone();
         let initialized = self.initialized.clone();
-        tokio::spawn(async move {
+        finish_published_transaction(async move {
             if let Some(on_update) = on_update {
                 // Failure must precede cache/hash mutation. In particular,
                 // proxy node domains must be registered before downloaded
@@ -292,7 +315,7 @@ where
             initialized.store(true, Ordering::Release);
             Ok(())
         })
-        .await?
+        .await
     }
 
     /// Publish an already-valid HTTP cache without reading from its remote
@@ -422,7 +445,7 @@ where
         // Moving the owned fetcher write guard into this worker also keeps
         // subsequent updates serialized until commit or rollback finishes.
         let cache_path = vehicle.path().to_owned();
-        tokio::spawn(async move {
+        finish_published_transaction(async move {
             // A rejected revision may not advance its content hash or
             // overwrite last-good cached YAML; the same bytes must retry.
             if let Some(on_update) = on_update {
@@ -443,7 +466,7 @@ where
             }
             Ok(false)
         })
-        .await?
+        .await
     }
 
     #[cfg(test)]
@@ -809,6 +832,143 @@ mod tests {
             !cache_path.exists(),
             "cancelled pre-staging fetch may not create cache"
         );
+    }
+
+    struct CaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn observed_commit_failure_returns_diagnostic_without_orphan_warning() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || CaptureWriter(writer.clone()))
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("failed-observed.yaml");
+        let mut vehicle = MockProviderVehicle::new();
+        vehicle
+            .expect_path()
+            .return_const(path.to_string_lossy().into_owned());
+        vehicle.expect_typ().return_const(ProviderVehicleType::Http);
+        vehicle
+            .expect_read()
+            .times(1)
+            .returning(|| Ok(b"candidate".to_vec()));
+        let updater = |_payload: String| -> BoxFuture<'static, anyhow::Result<()>> {
+            Box::pin(async {
+                anyhow::bail!("synthetic private-provider.internal rejected")
+            })
+        };
+        let fetcher = Fetcher::new(
+            "observed-failure".into(),
+            Duration::ZERO,
+            Arc::new(vehicle),
+            |bytes| Ok(String::from_utf8(bytes.to_vec())?),
+            Some(updater),
+        );
+        let reported = fetcher.update().await.unwrap_err().to_string();
+        assert!(reported.contains("synthetic private-provider.internal"));
+        let log = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(
+            !log.contains("abandoned provider transaction failed"),
+            "an observed error should not produce a duplicate orphan warning"
+        );
+        assert!(!log.contains("private-provider.internal"));
+        assert!(
+            !path.exists(),
+            "failed update may not leave a persisted revision"
+        );
+    }
+
+    #[tokio::test]
+    async fn detached_commit_failure_emits_sanitized_diagnostic_without_caller() {
+        // The caller can be gone when a DNS/cache transaction fails. The
+        // worker must leave a non-sensitive audit diagnostic, rather than
+        // silently dropping a failed JoinHandle or logging the node secret.
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || CaptureWriter(writer.clone()))
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("failed-offline-commit.yaml");
+        let mut vehicle = MockProviderVehicle::new();
+        vehicle
+            .expect_path()
+            .return_const(path.to_string_lossy().into_owned());
+        vehicle.expect_typ().return_const(ProviderVehicleType::Http);
+        vehicle
+            .expect_read()
+            .times(1)
+            .returning(|| Ok(b"new candidate".to_vec()));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let released = Arc::new(tokio::sync::Notify::new());
+        let signal = entered.clone();
+        let resume = released.clone();
+        let updater =
+            move |_payload: String| -> BoxFuture<'static, anyhow::Result<()>> {
+                let signal = signal.clone();
+                let resume = resume.clone();
+                Box::pin(async move {
+                    signal.notify_one();
+                    resume.notified().await;
+                    anyhow::bail!(
+                        "synthetic secret hostname: private-provider.internal"
+                    )
+                })
+            };
+        let fetcher = Arc::new(Fetcher::new(
+            "no-caller".into(),
+            Duration::ZERO,
+            Arc::new(vehicle),
+            |bytes| Ok(String::from_utf8(bytes.to_vec())?),
+            Some(updater),
+        ));
+        let running = fetcher.clone();
+        let request = tokio::spawn(async move { running.update().await });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("transaction must reach updater");
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        released.notify_one();
+
+        let text = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let log =
+                    String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+                if log.contains("abandoned provider transaction failed") {
+                    break log;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("an unobserved failed provider transaction must be logged");
+        assert!(
+            !text.contains("private-provider.internal"),
+            "node endpoint must be redacted"
+        );
+        assert!(!path.exists(), "rejected candidate must not be persisted");
     }
 
     #[tokio::test]

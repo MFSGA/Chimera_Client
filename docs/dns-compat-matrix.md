@@ -1144,3 +1144,8 @@ S01 准入必须满足：金标准用例在目标 HEAD 实际运行；未知新�
 
 - Source reads, parsing and cache staging remain cancellable. Once a candidate is staged, an owned worker keeps the provider update lock through publication, cache commit or compensation, even if the API caller or watcher stops waiting. Initial publication follows the same boundary and marks the provider initialized only after acceptance.
 - Deterministic regressions cover cancellation during source reads (no publication) and cancellation after staging (the commit/rollback finishes and readers are released). Final rebased validation is pending.
+
+### Late commit error diagnostics
+
+- If the initiating request has already been cancelled, the detached commit worker now emits one generic warning when publication or compensation fails. It deliberately omits underlying error text, which may contain node names, credentials or filesystem details. A live caller receives the specific error without an extra warning.
+- Added mock logging regressions for both observed and abandoned failures, including a private-hostname sentinel that must not appear in logs. Final rebased validation is pending.
