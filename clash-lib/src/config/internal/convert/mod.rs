@@ -639,14 +639,18 @@ proxies:
     #[cfg(all(feature = "tun", feature = "anytls"))]
     #[test]
     fn fake_ip_tun_allows_anytls_ip_literal_fallback_and_non_tun_hostname() {
-        for (tun_enabled, addr) in [
-            (true, "192.0.2.53:443"),
-            (true, "[2001:db8::53]:443"),
-            (false, "camouflage.example:443"),
+        for (tun_enabled, ipv6_enabled, addr) in [
+            (true, false, "192.0.2.53:443"),
+            (true, true, "[2001:db8::53]:443"),
+            (false, false, "camouflage.example:443"),
         ] {
             let mut cfg = parse_config(&format!(
                 "tun:\n  enable: {tun_enabled}\nlisteners:\n  - name: tls-in\n    type: anytls\n    listen: 127.0.0.1\n    port: 34432\n    password: test-password\n    fallback: '{addr}'\n",
             ));
+            cfg.ipv6 = ipv6_enabled;
+            if let Some(tun) = cfg.tun.as_mut() {
+                tun.ipv6 = Some(ipv6_enabled);
+            }
             cfg.dns.enable = true;
             cfg.dns.enhanced_mode = def::DNSMode::FakeIp;
             cfg.dns.nameserver = vec!["1.1.1.1".to_owned()];
