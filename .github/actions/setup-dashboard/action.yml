@@ -1,0 +1,35 @@
+---
+name: Set up Dashboard
+description: >-
+  Install and build Dashboard assets with the pinned Node.js and pnpm versions.
+inputs:
+  lint:
+    description: Run Dashboard lint before building.
+    required: false
+    default: "false"
+  build:
+    description: Build Dashboard assets after installation.
+    required: false
+    default: "true"
+runs:
+  using: composite
+  steps:
+    - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115  # v6
+      with:
+        package_json_file: clash-dashboard/package.json
+    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
+      with:
+        node-version-file: clash-dashboard/.node-version
+        cache: pnpm
+        cache-dependency-path: clash-dashboard/pnpm-lock.yaml
+    - name: Install Dashboard dependencies
+      shell: bash
+      run: pnpm --dir clash-dashboard install --frozen-lockfile
+    - name: Lint Dashboard
+      if: ${{ inputs.lint == 'true' }}
+      shell: bash
+      run: pnpm --dir clash-dashboard run lint
+    - name: Build Dashboard
+      if: ${{ inputs.build == 'true' }}
+      shell: bash
+      run: pnpm --dir clash-dashboard run build

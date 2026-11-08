@@ -24,7 +24,7 @@
 
 ## 2. 项目事实与检查范围
 
-- **Dashboard**：当前 `ci.yml` 从 `clash-dashboard/.node-version` 和 `package.json` 的 `packageManager` 读取 Node.js/pnpm 版本并执行 frozen install、lint、build；Dashboard job 完成后把 `dist/` 交给 quality / compile。独立触发的两个吞吐工作流也按相同文件配置版本，构建 Dashboard 资源后再构建启用 Dashboard 的 `clash-rs` 测试子进程。Nix 开发环境和 package 会校验锁定的 Node.js/pnpm 包版本与这两个来源一致。`clash-lib/build.rs` 只校验并追踪已构建资源，不运行 Node.js/pnpm；未启用 `dashboard` 时不需要前端产物。只代表构建阶段通过，不能证明与真实 Proxy/TUN 交互。
+- **Dashboard**：CI、macOS build 和两个吞吐 workflow 复用 `.github/actions/setup-dashboard/action.yml`，从 `clash-dashboard/.node-version` 和 `package.json` 的 `packageManager` 读取 Node.js/pnpm 版本并执行 frozen install、按需 lint/build；Dashboard job 完成后把 `dist/` 交给 quality / compile。Nix 开发环境和 package 会校验锁定的 Node.js/pnpm 包版本与这两个来源一致。`clash-lib/build.rs` 只校验并追踪已构建资源，不运行 Node.js/pnpm；未启用 `dashboard` 时不需要前端产物。只代表构建阶段通过，不能证明与真实 Proxy/TUN 交互。
 - **Actions 固定**：工作流第三方 action 使用完整提交 SHA，行尾注释保留对应 release tag 或分支；Dependabot 每日检查 GitHub Actions 更新。
 - **Rust quality**：所有 Rust workflow 从 `rust-toolchain.toml` 读取固定工具链版本；`cargo fmt --all -- --check` 与 CLI feature 转发检查（均仅 Linux），`cargo clippy -p clash-lib --all-targets --all-features -- -D warnings`（Linux、Windows、macOS）及 LAN proxy 集成测试。查 job 时同时确认平台与选中的 feature。
 - **Rust cache**：直接使用 `actions/cache` 的 quality、compile、coverage、macOS build 和 Windows network job 按操作系统/目标、Rust 版本、`Cargo.lock`、Cargo 清单与 `.cargo/config.toml` 区分缓存；吞吐工作流使用 rust-cache action 自带的工具链与锁文件键。
