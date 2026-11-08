@@ -44,7 +44,7 @@ rustPlatform.buildRustPackage {
         || baseName == "cache.db"
         || baseName == "result"
         || lib.hasPrefix "result-" baseName
-        || lib.hasInfix ".yaml" baseName
+        || (lib.hasInfix ".yaml" baseName && baseName != "pnpm-lock.yaml")
         || lib.hasSuffix ".log" baseName
       );
   };
@@ -63,7 +63,7 @@ rustPlatform.buildRustPackage {
     src = ../clash-dashboard;
     pnpm = pnpm;
     fetcherVersion = 4;
-    hash = "sha256-0waT+Kvwk5CB8+LJcps4EdZZn0EZsHLFJu2D3MOHF1A=";
+    hash = "sha256-ADpZvCE8LQZOD7hEW3KcQgTkyPLm6MRP4+GAd4pQ3gU=";
   };
 
   nativeBuildInputs = [
