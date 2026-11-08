@@ -707,6 +707,84 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn failed_commit_retry_marker_survives_registrar_outage_until_acceptance()
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retry-owner.yaml");
+        let saved = dir.path().join("old-accepted.yaml");
+        let reads = Arc::new(AtomicUsize::new(0));
+        let next_read = reads.clone();
+        let mut vehicle = MockProviderVehicle::new();
+        vehicle
+            .expect_path()
+            .return_const(path.to_string_lossy().into_owned());
+        vehicle.expect_typ().return_const(ProviderVehicleType::Http);
+        vehicle.expect_read().times(5).returning(move || {
+            Ok(if next_read.fetch_add(1, Ordering::SeqCst) == 1 {
+                b"new unsafe candidate".to_vec()
+            } else {
+                b"old accepted bytes".to_vec()
+            })
+        });
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let invoked = calls.clone();
+        let affected_path = path.clone();
+        let archived = saved.clone();
+        let updater =
+            move |_candidate: String| -> BoxFuture<'static, anyhow::Result<()>> {
+                let ordinal = invoked.fetch_add(1, Ordering::SeqCst);
+                let path = affected_path.clone();
+                let saved = archived.clone();
+                Box::pin(async move {
+                    match ordinal {
+                        1 => {
+                            // After successful staging, make rename
+                            // impossible by replacing the cache destination.
+                            std::fs::rename(&path, &saved)?;
+                            std::fs::create_dir(&path)?;
+                        }
+                        2 => anyhow::bail!("synthetic registrar still down"),
+                        _ => {}
+                    }
+                    Ok(())
+                })
+            };
+        let fetcher = Fetcher::new(
+            "retry-after-rollback".into(),
+            Duration::ZERO,
+            Arc::new(vehicle),
+            |bytes| Ok(String::from_utf8(bytes.to_vec())?),
+            Some(updater),
+        );
+
+        fetcher.initial().await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"old accepted bytes");
+        assert!(fetcher.update().await.is_err(), "final rename must fail");
+        assert!(path.is_dir());
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&saved, &path).unwrap();
+
+        let error = fetcher.update().await.unwrap_err().to_string();
+        assert!(error.contains("synthetic registrar still down"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"old accepted bytes");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        assert!(
+            !fetcher.update().await.unwrap(),
+            "unchanged last-good bytes must be republished while failed-commit flag is set"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"old accepted bytes");
+        assert!(
+            fetcher.update().await.unwrap(),
+            "successful acceptance must reset retry marker for identical bytes"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
+
     struct PausedProviderVehicle {
         path: String,
         read_started: Arc<tokio::sync::Notify>,

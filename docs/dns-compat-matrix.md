@@ -1154,3 +1154,7 @@ S01 准入必须满足：金标准用例在目标 HEAD 实际运行；未知新�
 
 - If both the cache rename and DNS rollback fail, the proxy provider is hidden for safety. The Fetcher now records that the same-process recovery must republish, so a later fetch of byte-for-byte identical last-good YAML retries DNS registration instead of being skipped by the unchanged content hash. The recovery marker clears only after successful acceptance.
 - Added a deterministic regression that fails the candidate commit and rollback, repairs the cache destination, then verifies the identical last-good revision becomes visible again and subsequent identical updates return to the no-op path. Final rebased validation is pending.
+
+### Preserve the recovery retry marker during registrar outages
+
+- Added a deterministic Fetcher regression for failed cache commit, repeated node-DNS registrar errors while retrying the unchanged last-good bytes, eventual successful re-registration, and return to the unchanged-hash fast path. Validation pending.
