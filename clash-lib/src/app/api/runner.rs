@@ -432,6 +432,7 @@ impl Runner for ApiRunner {
 
         let handle = tokio::spawn(async move {
             info!("Starting API server");
+            let rule_routes = handlers::rule::routes(router.clone());
             let router = Router::new()
                 .route("/", get(handlers::hello::handle))
                 .route("/capabilities", get(handlers::capabilities::get))
@@ -482,10 +483,8 @@ impl Runner for ApiRunner {
                     "/runtime",
                     handlers::network::status_routes(global_state.clone()),
                 )
-                .nest_service(
-                    "/rules",
-                    handlers::rule::routes(router).with_state(app_state.clone()),
-                );
+                .nest("/rules", rule_routes.clone())
+                .nest("/rules/", rule_routes);
             let mut router = add_shared_http_layers(router, app_state.clone(), cors);
 
             if let Some(external_ui) = controller_cfg.external_ui.clone() {
