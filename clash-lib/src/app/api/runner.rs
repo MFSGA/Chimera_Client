@@ -482,7 +482,10 @@ impl Runner for ApiRunner {
                     "/runtime",
                     handlers::network::status_routes(global_state.clone()),
                 )
-                .nest("/rules", handlers::rule::routes(router));
+                .nest_service(
+                    "/rules",
+                    handlers::rule::routes(router).with_state(app_state.clone()),
+                );
             let mut router = add_shared_http_layers(router, app_state.clone(), cors);
 
             if let Some(external_ui) = controller_cfg.external_ui.clone() {
