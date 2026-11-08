@@ -73,3 +73,9 @@ S01 准入必须满足：金标准用例在目标 HEAD 实际运行；未知新�
 - 新增 `clash-lib/tests/dns_config_tests.rs::unimplemented_mihomo_dns_privacy_controls_must_fail_closed`：启用/禁用 DNS、YAML merge、下划线误拼、错误保密以及无关 vendor 扩展回归。首次 canonical 用例修复前 0/1、证明被静默接受；新增 typo 用例及系统 hosts/fallback 字段用例均先失败再修复。修复后定向测试 1/1 通过。
 - 在 macOS、`--no-default-features --features tun,ring` 下，核心单测 832 通过/0 失败/11 忽略；DNS 配置 19/19、S01 17/17、S02 14/14。关闭 TUN、启用 ring 的核心配置相关定向测试 7/7。Cargo fmt 和严格 Clippy（TUN+Ring all-targets；无 TUN、Ring lib）通过。尚未宣称 Mihomo 二进制行为等价或 NIC/utun 无泄漏。
 - 该切片保留于独立本地分支，基线为 `840c5a2b8f6a6be3e783dea026cc1bf3b5143f2f`，原主工作区未提交修改、固定参考及系统 DNS/路由/TUN 未改变。独立 L2 审查、维护者批准、GitHub Verified 和候选 SHA 的 required CI 仍缺失，不合入本地/远端 master。
+
+## 2026-11-08 05:17 PST — v0.29.0 新基线隔离整合（L2 待审）
+
+- `origin/master` 在本轮新增 `ffda1a7c894e2b6cf14609fa2639630d91052d91`，修改 Cargo 版本及锁文件；旧的 `840c5a2` 候选现为历史快照。已在隔离分支 `codex/macos-dns-privacy-v029-integration-20261108` 上从 `ffda1a7` 重新签名 cherry-pick 六项 DNS 修复/否定测试；未覆盖原有候选和主工作树。
+- v0.29.0、macOS：TUN+Ring、无默认 feature 核心单测 832 通过、0 失败、11 忽略；DNS 配置 19/19；S01 17/17；S02 14/14；默认 feature 核心单测 1024 通过、0 失败、11 忽略；DNS 配置 19/19。Cargo fmt、严格 Clippy（TUN+Ring 与默认 feature、all-targets）通过。测试中的 DNS 端口占用错误日志属于预期的负例，断言最终通过。
+- 保持固定 Mihomo `63bd52ec794b7051569b76ede2f6cdbf4c091fda` 只读；无 Mihomo 二进制实时对照、macOS NIC/utun 抓包或系统 DNS ownership 验收。候选仅本地签名、GitHub Verified 与候选 required CI 不可确认；L2 独立 Reviewer 及维护者批准仍缺失，禁止据此更新 master 或推送。
