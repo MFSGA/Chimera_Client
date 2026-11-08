@@ -66,6 +66,14 @@ S01 准入必须满足：金标准用例在目标 HEAD 实际运行；未知新�
 - 先新增 `nameserver_policy_rejects_unimplemented_compound_selectors` 否定测试，修复前因 `example.com other.test` 被错误接受而失败；再在 `clash-lib/src/app/dns/config.rs` 的转换层显式拒绝空白、逗号复合、`geosite:` 和 `rule-set:` 键。诊断不包含域名/上游地址；普通域名及现有 `*.`/`+.` 通配符继续成功。该切片是失效关闭，并**未实现** Mihomo 的高级规则执行语义。
 - `clash-lib/tests/dns_config_tests.rs::nameserver_policy_compound_selectors_fail_closed_at_yaml_conversion` 对启用和禁用 DNS 的 YAML 都验证上述四类输入被拒绝，避免仅通过底层解析单测冒充 YAML 转换兼容。尚未执行 Mihomo 二进制差异运行、macOS 系统 resolver 或物理 NIC/utun 抓包。
 
+## 2026-11-08 06:00 PST — fake-ip-ttl 未实现字段拒绝（独立本地 P0 候选）
+
+- 只读参考固定 `ref-mihomo` `63bd52ec794b7051569b76ede2f6cdbf4c091fda`：`config/config.go:240` 明确接受 `dns.fake-ip-ttl`；默认值 `1` 见第 513 行，配置值被赋给运行时 DNS 配置的 `FakeIPTTL`（第 1539 行）。Chimera 当前没有相应的 TTL 运行时字段或行为，故不能以 Serde 成功解析代替语义兼容。
+- 在 `clash-lib/tests/dns_config_tests.rs` 先新增负例：`fake-ip-ttl` 与下划线误拼 `fake_ip_ttl`，分别在 `dns.enable=true/false` 时必须拒绝；还验证错误不泄露配置值、旧版 `fake-ip-range` 仍被接受。修复前定向测试 **0/1**，配置被静默接受；修复后 **1/1**。
+- `clash-lib/src/config/def.rs` 在 YAML merge 后、Serde 反序列化前明确拒绝这两个键。该改动是安全 fail-closed 保护，**不声称实现 Mihomo 的 TTL 语义**，也不影响未显式设置 TTL 的旧配置。
+- macOS 上 `--no-default-features --features tun,ring`：Cargo fmt、严格 Clippy（all-targets）、lib 832/832（另 11 ignored）、DNS config 20/20、S01 17/17、S02 14/14 全通过；默认 features 严格 Clippy 也通过。DNS listener 端口冲突日志为预期负例。未做真实 DNS/TUN/NIC 抓包、Mihomo 二进制对照或系统设置修改。
+- 独立 L2 Reviewer/维护者批准仍缺失；本地候选不得自动并入 PR #107 或 master。下一切片应核对固定 Mihomo `proxy-server-nameserver-policy` 解析和运行时隔离，并做失效关闭故障注入。
+
 ## 2026-11-08 — 未实现的 Mihomo DNS 隐私字段严格拒绝（本地 P0 候选，L2 待审）
 
 - 固定只读 Mihomo `63bd52ec794b7051569b76ede2f6cdbf4c091fda` 的 `config/config.go` 定义 `fake-ip-filter-mode`、`proxy-server-nameserver-policy`、`direct-nameserver-follow-policy`、`use-system-hosts` 和 `fallback-lazy-query`，分别控制 Fake-IP 过滤、代理节点 DNS 策略、direct 查询策略、系统 hosts 使用及 fallback 查询时机。Chimera 仍没有相同运行语义，因此不将 YAML 反序列化成功视为兼容。
@@ -79,3 +87,17 @@ S01 准入必须满足：金标准用例在目标 HEAD 实际运行；未知新�
 - `origin/master` 在本轮新增 `ffda1a7c894e2b6cf14609fa2639630d91052d91`，修改 Cargo 版本及锁文件；旧的 `840c5a2` 候选现为历史快照。已在隔离分支 `codex/macos-dns-privacy-v029-integration-20261108` 上从 `ffda1a7` 重新签名 cherry-pick 六项 DNS 修复/否定测试；未覆盖原有候选和主工作树。
 - v0.29.0、macOS：TUN+Ring、无默认 feature 核心单测 832 通过、0 失败、11 忽略；DNS 配置 19/19；S01 17/17；S02 14/14；默认 feature 核心单测 1024 通过、0 失败、11 忽略；DNS 配置 19/19。Cargo fmt、严格 Clippy（TUN+Ring 与默认 feature、all-targets）通过。测试中的 DNS 端口占用错误日志属于预期的负例，断言最终通过。
 - 保持固定 Mihomo `63bd52ec794b7051569b76ede2f6cdbf4c091fda` 只读；无 Mihomo 二进制实时对照、macOS NIC/utun 抓包或系统 DNS ownership 验收。候选仅本地签名、GitHub Verified 与候选 required CI 不可确认；L2 独立 Reviewer 及维护者批准仍缺失，禁止据此更新 master 或推送。
+
+## 2026-11-08 06:01 PST — Fake-IP TTL 显式字段失效关闭（仅本地后续切片）
+
+- 固定 Mihomo `63bd52ec794b7051569b76ede2f6cdbf4c091fda` 的 `config/config.go` 声明 `dns.fake-ip-ttl`，并将值传给运行时 `FakeIPTTL`；Chimera 当前不支持同等响应 TTL 语义。接受该字段但不改变运行时结果会误导配置者。
+- 从公开 PR #107 的固定 HEAD `8b3faa49c55906402e99bcb05a467afca62eee92` 本地派生 `codex/dns-fake-ip-ttl-strict-guard-20261108`，先添加 `fake_ip_ttl_not_implemented_must_not_be_silently_ignored`：`fake-ip-ttl` 和 `fake_ip_ttl`、DNS 开关两态必须明确报错且不回显用户值；原有 `fake-ip-range` 继续接受。修复前目标测试 0/1，证明静默接受；修复后 1/1。
+- `clash-lib/src/config/def.rs` 仅在既有 merge 后严格字段检查中添加这两个键，没有实现、也没有声称实现 Mihomo TTL 语义；修改有潜在旧配置行为改变，因此仍为 L2。
+- macOS v0.29.0、TUN + Ring、无默认 feature：核心单测 832 通过/0 失败/11 忽略、DNS 配置 20/20、S01 17/17、S02 14/14；默认 feature：核心单测 1024 通过/0 失败/11 忽略、DNS 配置 20/20；两组严格 Clippy（all-targets）、Cargo fmt 与 Git diff check 均通过。未运行实时 Mihomo 二进制对照与真实 NIC/utun 抓包。
+- 该后续切片**仅在本地分支**；没有修改或推送 PR #107，也没有更改其待审 HEAD，新的本地提交尚未取得 GitHub Verified / 独立 Reviewer / required CI。PR #107 正在运行的 CI 和此前审查要求不得继承为本切片的批准。
+
+## 2026-11-08 06:25 PST — PR #107 合并后基线重锚定
+
+- PR #107 在 2026-11-08 06:20:34 PST 已合并为 `master` `befdcdb9360c5b88aa1920c75ef83861fba2ffeb`。该提交与原 PR HEAD `8b3faa49c55906402e99bcb05a467afca62eee92` 的 Git tree 相同，虽提交历史 SHA 不同，但七项 DNS 变更的最终源码已进入远端 `master`。
+- 此 TTL 切片原本地提交 `7b9b2bb4649fa14836e21e4528756dadf7ef5510` 保留；已在独立分支 `codex/dns-fake-ip-ttl-post-merge-20261108` 上以新 `master` 为直接父提交单独签名移植（最终 SHA 以该分支 HEAD 为准），不重放 PR #107 已合并的七项提交。
+- 此后续提交与 PR #107 是不同审查对象，不能继承后者的 GitHub Verified、CI、Reviewer 或维护者决定；必须独立核验最终 SHA、运行相关测试并获得 L2 审查/批准。未授权修改本机 DNS、路由、TUN 或进行物理 NIC/utun 抓包。

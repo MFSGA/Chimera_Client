@@ -332,6 +332,37 @@ fn nameserver_policy_compound_selectors_fail_closed_at_yaml_conversion() {
 }
 
 #[test]
+fn fake_ip_ttl_not_implemented_must_not_be_silently_ignored() {
+    // Mihomo's fake-ip-ttl influences DNS response TTL; Chimera does not
+    // implement that runtime behavior. A parsed-but-ignored key is unsafe.
+    for field in ["fake-ip-ttl", "fake_ip_ttl"] {
+        for enabled in [true, false] {
+            let yaml = base_config(&format!(
+                "  enable: {enabled}\n  enhanced-mode: fake-ip\n  nameserver: [1.1.1.1]\n  default-nameserver: [1.1.1.1]\n  {field}: 42\n"
+            ));
+            let error = parse_error(yaml);
+            assert!(
+                error.to_string().contains(field),
+                "explicit {field} must return a diagnostic even when dns.enable={enabled}: {error}"
+            );
+            assert!(
+                !error.to_string().contains("42"),
+                "error must not leak a user-supplied configuration value"
+            );
+        }
+    }
+
+    // Preserve the existing, supported pool configuration syntax.
+    let existing = base_config(
+        "  enable: true\n  enhanced-mode: fake-ip\n  nameserver: [1.1.1.1]\n  default-nameserver: [1.1.1.1]\n  fake-ip-range: 198.18.0.1/16\n",
+    );
+    assert!(
+        Config::Str(existing).try_parse().is_ok(),
+        "supported legacy fake-ip-range must remain accepted"
+    );
+}
+
+#[test]
 fn unimplemented_mihomo_dns_privacy_controls_must_fail_closed() {
     for (field, value) in [
         ("fake-ip-filter-mode", "whitelist"),

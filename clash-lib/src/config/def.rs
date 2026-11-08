@@ -244,6 +244,8 @@ impl FromStr for Config {
         {
             for field in [
                 "fake-ip-filter-mode",
+                "fake-ip-ttl",
+                "fake_ip_ttl",
                 "proxy-server-nameserver-policy",
                 "direct-nameserver-follow-policy",
                 // Near-miss spelling must not make the same privacy controls
