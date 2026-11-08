@@ -234,6 +234,32 @@ impl FromStr for Config {
             ))
         })?;
 
+        // Mihomo gives these fields operational DNS privacy semantics. Until
+        // Chimera implements them, accepting them as ignored YAML keys risks
+        // routing proxy-node or Fake-IP lookups through unintended resolvers.
+        // Check the merged YAML before serde silently discards unknown fields.
+        if let Some(Value::Mapping(dns)) = val
+            .as_mapping()
+            .and_then(|root| root.get(Value::String("dns".to_owned())))
+        {
+            for field in [
+                "fake-ip-filter-mode",
+                "proxy-server-nameserver-policy",
+                "direct-nameserver-follow-policy",
+                // Near-miss spelling must not make the same privacy controls
+                // silently disappear during serde deserialization.
+                "fake_ip_filter_mode",
+                "proxy_server_nameserver_policy",
+                "direct_nameserver_follow_policy",
+            ] {
+                if dns.contains_key(Value::String(field.to_owned())) {
+                    return Err(Error::InvalidConfig(format!(
+                        "dns.{field} is not implemented; refusing to ignore a privacy-sensitive setting"
+                    )));
+                }
+            }
+        }
+
         serde_yaml::from_value(val).map_err(|e| {
             Error::InvalidConfig(format!("could not parse config content: {e}"))
         })

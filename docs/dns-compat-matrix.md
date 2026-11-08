@@ -65,3 +65,11 @@ S01 准入必须满足：金标准用例在目标 HEAD 实际运行；未知新�
 - 固定 Mihomo `63bd52ec794b7051569b76ede2f6cdbf4c091fda` 的 `config/config.go::parseNameServerPolicy` 将逗号分隔域名、`geosite:` 和 `rule-set:` 视为有运行含义的策略选择器。Chimera 的 `parse_nameserver_policy` 原来只调用宽松的域名分割器，导致这些键及带空白的复合选择器被当作无法匹配的单个 trie 字面键，配置成功但没有预期 DNS 策略。
 - 先新增 `nameserver_policy_rejects_unimplemented_compound_selectors` 否定测试，修复前因 `example.com other.test` 被错误接受而失败；再在 `clash-lib/src/app/dns/config.rs` 的转换层显式拒绝空白、逗号复合、`geosite:` 和 `rule-set:` 键。诊断不包含域名/上游地址；普通域名及现有 `*.`/`+.` 通配符继续成功。该切片是失效关闭，并**未实现** Mihomo 的高级规则执行语义。
 - `clash-lib/tests/dns_config_tests.rs::nameserver_policy_compound_selectors_fail_closed_at_yaml_conversion` 对启用和禁用 DNS 的 YAML 都验证上述四类输入被拒绝，避免仅通过底层解析单测冒充 YAML 转换兼容。尚未执行 Mihomo 二进制差异运行、macOS 系统 resolver 或物理 NIC/utun 抓包。
+
+## 2026-11-08 — 未实现的 Mihomo DNS 隐私字段严格拒绝（本地 P0 候选，L2 待审）
+
+- 固定只读 Mihomo `63bd52ec794b7051569b76ede2f6cdbf4c091fda` 的 `config/config.go` 定义 `fake-ip-filter-mode`、`proxy-server-nameserver-policy` 和 `direct-nameserver-follow-policy`，分别控制 Fake-IP 过滤、代理节点 DNS 策略及 direct 查询策略。Chimera 仍没有相同运行语义，因此不将 YAML 反序列化成功视为兼容。
+- `clash-lib/src/config/def.rs` 在 YAML merge 完成后、Serde 忽略未知字段前，拒绝这三个完整字段及相应下划线误拼；错误仅包含字段名，不回显配置值。无关 vendor 扩展与既有 DNS 配置继续可解析。其他隐私相关未知字段、仅部分近似拼写和平台特有限制仍待逐项审计。
+- 新增 `clash-lib/tests/dns_config_tests.rs::unimplemented_mihomo_dns_privacy_controls_must_fail_closed`：启用/禁用 DNS、YAML merge、下划线误拼、错误保密以及无关 vendor 扩展回归。首次 canonical 用例修复前 0/1、证明被静默接受；新增 typo 用例再次先失败再修复。修复后定向测试 1/1 通过。
+- 在 macOS、`--no-default-features --features tun,ring` 下，核心单测 832 通过/0 失败/11 忽略；DNS 配置 19/19、S01 17/17、S02 14/14。关闭 TUN、启用 ring 的核心配置相关定向测试 7/7。Cargo fmt 和严格 Clippy（TUN+Ring all-targets；无 TUN、Ring lib）通过。尚未宣称 Mihomo 二进制行为等价或 NIC/utun 无泄漏。
+- 该切片保留于独立本地分支，基线为 `840c5a2b8f6a6be3e783dea026cc1bf3b5143f2f`，原主工作区未提交修改、固定参考及系统 DNS/路由/TUN 未改变。独立 L2 审查、维护者批准、GitHub Verified 和候选 SHA 的 required CI 仍缺失，不合入本地/远端 master。
