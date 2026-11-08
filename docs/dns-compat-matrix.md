@@ -1149,3 +1149,8 @@ S01 准入必须满足：金标准用例在目标 HEAD 实际运行；未知新�
 
 - If the initiating request has already been cancelled, the detached commit worker now emits one generic warning when publication or compensation fails. It deliberately omits underlying error text, which may contain node names, credentials or filesystem details. A live caller receives the specific error without an extra warning.
 - Added mock logging regressions for both observed and abandoned failures, including a private-hostname sentinel that must not appear in logs. Final rebased validation is pending.
+
+### Retry an identical last-good provider revision after failed compensation
+
+- If both the cache rename and DNS rollback fail, the proxy provider is hidden for safety. The Fetcher now records that the same-process recovery must republish, so a later fetch of byte-for-byte identical last-good YAML retries DNS registration instead of being skipped by the unchanged content hash. The recovery marker clears only after successful acceptance.
+- Added a deterministic regression that fails the candidate commit and rollback, repairs the cache destination, then verifies the identical last-good revision becomes visible again and subsequent identical updates return to the no-op path. Final rebased validation is pending.

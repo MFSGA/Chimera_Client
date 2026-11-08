@@ -886,11 +886,10 @@ proxies:
         vehicle.expect_typ().return_const(ProviderVehicleType::Http);
         let reads = Arc::new(AtomicUsize::new(0));
         let next_read = reads.clone();
-        vehicle.expect_read().times(2).returning(move || {
-            Ok(if next_read.fetch_add(1, Ordering::SeqCst) == 0 {
-                OLD
-            } else {
-                NEW
+        vehicle.expect_read().times(4).returning(move || {
+            Ok(match next_read.fetch_add(1, Ordering::SeqCst) {
+                0 | 2 | 3 => OLD,
+                _ => NEW,
             }
             .to_vec())
         });
@@ -899,11 +898,14 @@ proxies:
         let sabotaged_path = path.clone();
         let saved_path = saved.clone();
         let mut resolver = MockClashResolver::new();
+        resolver.expect_resolve_all().returning(|_, _| {
+            Err(anyhow::anyhow!("synthetic offline healthcheck DNS denial"))
+        });
         resolver
             .expect_replace_proxy_provider_dns_domains()
-            .times(3)
+            .times(4)
             .returning(move |_, _| match counter.fetch_add(1, Ordering::SeqCst) {
-                0 => Ok(()),
+                0 | 3 => Ok(()),
                 1 => {
                     std::fs::rename(&sabotaged_path, &saved_path).unwrap();
                     std::fs::create_dir(&sabotaged_path).unwrap();
@@ -942,6 +944,39 @@ proxies:
         assert!(provider.proxies().await.is_empty());
         assert_eq!(std::fs::read(&saved).unwrap(), OLD);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        // After the DNS rollback itself failed, the provider has no accepted
+        // visible revision, even though Fetcher's last durable hash still
+        // matches OLD. The next healthy fetch of *identical* OLD bytes must
+        // re-register its node domains instead of silently hash-skipping.
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&saved, &path).unwrap();
+        provider
+            .update()
+            .await
+            .expect("same cached bytes must restore a disabled provider");
+        let recovered = provider
+            .strict_content_snapshot()
+            .await
+            .expect("last-good provider must become visible after re-registration");
+        assert_eq!(
+            recovered.proxies[0].server_name(),
+            Some("previously-accepted.example")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), OLD);
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+
+        // The recovery marker must be cleared after acceptance. Another
+        // identical response should behave like the legacy unchanged
+        // provider update, with no spurious DNS registration or revision.
+        provider
+            .update()
+            .await
+            .expect("unchanged post-recovery update");
+        let stable = provider.strict_content_snapshot().await.unwrap();
+        assert_eq!(stable.revision, recovered.revision);
+        assert!(Arc::ptr_eq(&stable.proxies[0], &recovered.proxies[0]));
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
     }
 
     #[tokio::test]

@@ -137,6 +137,10 @@ fn cache_needs_immediate_update(
 struct Inner {
     updated_at: SystemTime,
     hash: [u8; 16],
+    // A failed provider cache commit may have failed DNS compensation and
+    // disabled the visible provider. Do not skip an identical last-good hash
+    // until the updater has successfully re-registered its endpoints.
+    force_republish: bool,
 }
 
 pub struct Fetcher<U, P> {
@@ -182,6 +186,7 @@ where
             inner: Arc::new(tokio::sync::RwLock::new(Inner {
                 updated_at: SystemTime::UNIX_EPOCH,
                 hash: [0; 16],
+                force_republish: false,
             })),
             parser: Arc::new(parser),
             on_update: on_update.map(Arc::new),
@@ -307,6 +312,7 @@ where
             inner.hash = utils::md5(&content)[..16]
                 .try_into()
                 .expect("md5 must be 16 bytes");
+            inner.force_republish = false;
 
             if let Some(accepted) = accepted {
                 accepted().await;
@@ -424,7 +430,7 @@ where
             .try_into()
             .expect("md5 must be 16 bytes");
 
-        if hash == this.hash {
+        if hash == this.hash && !this.force_republish {
             this.updated_at = now;
             if vehicle.typ() != ProviderVehicleType::File {
                 filetime::set_file_times(vehicle.path(), now.into(), now.into())?;
@@ -451,16 +457,24 @@ where
             if let Some(on_update) = on_update {
                 on_update(payload).await?;
             }
-            if let Some(staged_cache) = staged_cache {
-                persist_with_rollback(
+            if let Some(staged_cache) = staged_cache
+                && let Err(error) = persist_with_rollback(
                     staged_cache,
                     Path::new(&cache_path),
                     on_cache_commit_rollback.as_ref(),
                 )
-                .await?;
+                .await
+            {
+                // Even a successful rollback has failed to accept this
+                // candidate. A failed DNS rollback can also disable the old
+                // provider, so the next identical last-good bytes must be
+                // re-registered, not silently hash-skipped.
+                this.force_republish = true;
+                return Err(error);
             }
             this.hash = hash;
             this.updated_at = now;
+            this.force_republish = false;
             if let Some(accepted) = on_cache_commit_accepted {
                 accepted().await;
             }
