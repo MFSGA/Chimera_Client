@@ -7,7 +7,8 @@ use crate::{
             healthcheck::HealthCheck,
             providers::{
                 Provider, ProviderType, ProviderVehicleType,
-                ThreadSafeProviderVehicle, fetcher::Fetcher,
+                ThreadSafeProviderVehicle,
+                fetcher::{CacheCommitAccepted, CacheCommitRollback, Fetcher},
                 initialize_provider_with_retry,
             },
         },
@@ -31,6 +32,7 @@ struct ProviderScheme {
     proxies: Option<Vec<HashMap<String, Value>>>,
 }
 
+#[derive(Clone)]
 struct Inner {
     proxies: Vec<AnyOutboundHandler>,
     revision: u64,
@@ -86,6 +88,12 @@ impl ProxySetProvider {
             revision: 0,
         }));
         let inner_clone = inner.clone();
+        // The fetcher serializes candidate updates through its own lock.
+        // Keep the previous visible revision until the corresponding cache
+        // rename succeeds, so a late rename error can restore both provider
+        // visibility and the registrar's owner-scoped DNS mapping.
+        let rollback_revision = Arc::new(tokio::sync::Mutex::new(None::<Inner>));
+        let updater_rollback_revision = rollback_revision.clone();
 
         let updater_hc = hc.clone();
         let updater_name = name.clone();
@@ -93,6 +101,7 @@ impl ProxySetProvider {
             let hc = updater_hc.clone();
             let name = updater_name.clone();
             let inner = inner_clone.clone();
+            let rollback_revision = updater_rollback_revision.clone();
             Box::pin(async move {
                 // Serialise registration with publication: two overlapping
                 // refreshes must never publish A after B has replaced A's
@@ -120,13 +129,12 @@ impl ProxySetProvider {
                         );
                         return Err(error);
                     }
+                    *rollback_revision.lock().await = Some(inner.clone());
                     inner.proxies.clone_from(&input);
                     inner.revision = next_revision;
                 }
-                hc.update(input).await;
-                tokio::spawn(async move {
-                    hc.check().await;
-                });
+                // Do not run health probes against a provisional revision:
+                // the final cache rename has not succeeded yet.
                 Ok(())
             })
         });
@@ -186,7 +194,63 @@ impl ProxySetProvider {
             Ok(accepted)
         });
 
-        let fetcher = Fetcher::new(name, interval, vehicle, parser, Some(updater));
+        let rollback_hc = hc.clone();
+        let rollback_name = name.clone();
+        let rollback_inner = inner.clone();
+        let rollback_slot = rollback_revision.clone();
+        let rollback: CacheCommitRollback = Arc::new(move || {
+            let hc = rollback_hc.clone();
+            let name = rollback_name.clone();
+            let inner = rollback_inner.clone();
+            let slot = rollback_slot.clone();
+            Box::pin(async move {
+                let Some(previous) = slot.lock().await.take() else {
+                    return Err(anyhow::anyhow!(
+                        "provider cache commit rollback missing previous revision"
+                    ));
+                };
+                // The provider inner lock prevents old/new proxy snapshots
+                // from being read while DNS ownership is restored.
+                let mut current = inner.write().await;
+                if let Err(error) = hc
+                    .replace_provider_dns_domains(&name, &previous.proxies)
+                    .await
+                {
+                    // If the registrar itself fails during compensation,
+                    // disable this provider instead of exposing a revision
+                    // whose DNS bootstrap owner is no longer trustworthy.
+                    current.proxies.clear();
+                    current.revision = 0;
+                    hc.update(vec![]).await;
+                    return Err(error);
+                }
+                current.proxies.clone_from(&previous.proxies);
+                current.revision = previous.revision;
+                hc.update(previous.proxies).await;
+                Ok(())
+            })
+        });
+        let accepted_slot = rollback_revision;
+        let accepted_inner = inner.clone();
+        let accepted_hc = hc.clone();
+        let accepted: CacheCommitAccepted = Arc::new(move || {
+            let slot = accepted_slot.clone();
+            let inner = accepted_inner.clone();
+            let hc = accepted_hc.clone();
+            Box::pin(async move {
+                slot.lock().await.take();
+                // Health-check sockets may use the proxy's hostname. Only
+                // schedule probes after its node DNS registration and cache
+                // have both committed successfully.
+                let proxies = inner.read().await.proxies.clone();
+                hc.update(proxies).await;
+                tokio::spawn(async move {
+                    hc.check().await;
+                });
+            })
+        });
+        let fetcher = Fetcher::new(name, interval, vehicle, parser, Some(updater))
+            .with_cache_commit_hooks(rollback, accepted);
         Ok(Self { fetcher, hc, inner })
     }
 }
@@ -583,6 +647,307 @@ proxies:
         );
         assert_eq!(std::fs::read(&path).unwrap(), NEW_HOST);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_cache_rename_restores_own_dns_without_affecting_other_owner()
+     {
+        use std::collections::HashMap;
+        const FIRST: &[u8] = b"proxies:\n  - name: same-node\n    type: socks5\n    server: shared.example\n    port: 1080\n";
+        const NEXT: &[u8] = b"proxies:\n  - name: same-node\n    type: socks5\n    server: replacement.example\n    port: 1080\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = dir.path().join("owner-a.yaml");
+        let saved_a = dir.path().join("owner-a-last-good.yaml");
+        let path_b = dir.path().join("owner-b.yaml");
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let hit = reads.clone();
+        let mut vehicle_a = MockProviderVehicle::new();
+        vehicle_a
+            .expect_path()
+            .return_const(path_a.to_string_lossy().into_owned());
+        vehicle_a
+            .expect_typ()
+            .return_const(ProviderVehicleType::Http);
+        vehicle_a.expect_read().times(3).returning(move || {
+            Ok(if hit.fetch_add(1, Ordering::SeqCst) == 0 {
+                FIRST
+            } else {
+                NEXT
+            }
+            .to_vec())
+        });
+        let mut vehicle_b = MockProviderVehicle::new();
+        vehicle_b
+            .expect_path()
+            .return_const(path_b.to_string_lossy().into_owned());
+        vehicle_b
+            .expect_typ()
+            .return_const(ProviderVehicleType::Http);
+        vehicle_b
+            .expect_read()
+            .times(1)
+            .returning(|| Ok(FIRST.to_vec()));
+
+        let registered =
+            Arc::new(std::sync::Mutex::new(HashMap::<String, Vec<String>>::new()));
+        let events =
+            Arc::new(std::sync::Mutex::new(Vec::<(String, Vec<String>)>::new()));
+        let owned = registered.clone();
+        let history = events.clone();
+        let target = path_a.clone();
+        let retained = saved_a.clone();
+        let sabotaged = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let one_time = sabotaged.clone();
+        let mut resolver = MockClashResolver::new();
+        resolver
+            .expect_replace_proxy_provider_dns_domains()
+            .returning(move |owner, domains| {
+                if owner == "owner-a"
+                    && domains == ["replacement.example"]
+                    && !one_time.swap(true, Ordering::SeqCst)
+                {
+                    std::fs::rename(&target, &retained).unwrap();
+                    std::fs::create_dir(&target).unwrap();
+                }
+                history
+                    .lock()
+                    .unwrap()
+                    .push((owner.to_owned(), domains.clone()));
+                owned.lock().unwrap().insert(owner.to_owned(), domains);
+                Ok(())
+            });
+        let resolver = Arc::new(resolver);
+        let health_b = HealthCheck::new(
+            vec![],
+            "http://example.invalid/check".into(),
+            0,
+            true,
+            ProxyManager::new(resolver.clone(), None),
+        );
+        let health_a = HealthCheck::new(
+            vec![],
+            "http://example.invalid/check".into(),
+            0,
+            true,
+            ProxyManager::new(resolver, None),
+        );
+        let provider_b = ProxySetProvider::new_with_dns_privacy(
+            "owner-b".into(),
+            Duration::ZERO,
+            Arc::new(vehicle_b),
+            health_b,
+            true,
+        )
+        .unwrap();
+        let provider_a = ProxySetProvider::new_with_dns_privacy(
+            "owner-a".into(),
+            Duration::ZERO,
+            Arc::new(vehicle_a),
+            health_a,
+            true,
+        )
+        .unwrap();
+        provider_b.initialize().await.unwrap();
+        provider_a.initialize().await.unwrap();
+        let before = provider_a.strict_content_snapshot().await.unwrap();
+
+        let failure = provider_a.update().await.unwrap_err().to_string();
+        assert!(
+            !failure.is_empty(),
+            "simulated final cache rename must fail"
+        );
+        let after = provider_a.strict_content_snapshot().await.unwrap();
+        assert_eq!(before.revision, after.revision);
+        assert!(Arc::ptr_eq(&before.proxies[0], &after.proxies[0]));
+        assert_eq!(after.proxies[0].server_name(), Some("shared.example"));
+        assert_eq!(std::fs::read(&saved_a).unwrap(), FIRST);
+        assert!(path_a.is_dir());
+        assert_eq!(std::fs::read(&path_b).unwrap(), FIRST);
+        assert_eq!(
+            *registered.lock().unwrap(),
+            HashMap::from([
+                ("owner-a".to_owned(), vec!["shared.example".to_owned()]),
+                ("owner-b".to_owned(), vec!["shared.example".to_owned()]),
+            ]),
+            "rollback must restore only the failed owner's DNS domains"
+        );
+        let snapshot_b = provider_b.strict_content_snapshot().await.unwrap();
+        assert_eq!(snapshot_b.proxies[0].server_name(), Some("shared.example"));
+
+        // Once the external destination is repaired the *identical* remote
+        // revision must be retried and committed rather than hash-skipped.
+        std::fs::remove_dir(&path_a).unwrap();
+        std::fs::rename(&saved_a, &path_a).unwrap();
+        provider_a
+            .update()
+            .await
+            .expect("retry must persist accepted revision");
+        let committed = provider_a.strict_content_snapshot().await.unwrap();
+        assert_eq!(committed.revision, before.revision + 1);
+        assert_eq!(
+            committed.proxies[0].server_name(),
+            Some("replacement.example")
+        );
+        assert_eq!(std::fs::read(&path_a).unwrap(), NEXT);
+        assert_eq!(
+            *registered.lock().unwrap(),
+            HashMap::from([
+                ("owner-a".to_owned(), vec!["replacement.example".to_owned()]),
+                ("owner-b".to_owned(), vec!["shared.example".to_owned()]),
+            ])
+        );
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(owner, _)| owner == "owner-a")
+                .count(),
+            4,
+            "initial + failed candidate + rollback + successful retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_rename_and_dns_rollback_disables_provisional_provider() {
+        const OLD: &[u8] = b"proxies:\n  - name: node\n    type: socks5\n    server: previously-accepted.example\n    port: 1080\n";
+        const NEW: &[u8] = b"proxies:\n  - name: node\n    type: socks5\n    server: never-committed.example\n    port: 1080\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rename-rollback.yaml");
+        let saved = dir.path().join("last-good-archive.yaml");
+        let mut vehicle = MockProviderVehicle::new();
+        vehicle
+            .expect_path()
+            .return_const(path.to_string_lossy().into_owned());
+        vehicle.expect_typ().return_const(ProviderVehicleType::Http);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let next_read = reads.clone();
+        vehicle.expect_read().times(2).returning(move || {
+            Ok(if next_read.fetch_add(1, Ordering::SeqCst) == 0 {
+                OLD
+            } else {
+                NEW
+            }
+            .to_vec())
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let sabotaged_path = path.clone();
+        let saved_path = saved.clone();
+        let mut resolver = MockClashResolver::new();
+        resolver
+            .expect_replace_proxy_provider_dns_domains()
+            .times(3)
+            .returning(move |_, _| match counter.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(()),
+                1 => {
+                    std::fs::rename(&sabotaged_path, &saved_path).unwrap();
+                    std::fs::create_dir(&sabotaged_path).unwrap();
+                    Ok(())
+                }
+                _ => Err(anyhow::anyhow!("synthetic node DNS restoration failure")),
+            });
+        let health = HealthCheck::new(
+            vec![],
+            "http://example.invalid/check".into(),
+            0,
+            true,
+            ProxyManager::new(Arc::new(resolver), None),
+        );
+        let provider = ProxySetProvider::new_with_dns_privacy(
+            "rollback-outage".into(),
+            Duration::ZERO,
+            Arc::new(vehicle),
+            health,
+            true,
+        )
+        .unwrap();
+        provider.initialize().await.unwrap();
+        assert!(provider.strict_content_snapshot().await.is_some());
+
+        let diagnostic = provider.update().await.unwrap_err().to_string();
+        assert!(diagnostic.contains("rollback failed"), "{diagnostic}");
+        assert!(
+            diagnostic.contains("synthetic node DNS restoration failure"),
+            "{diagnostic}"
+        );
+        assert!(
+            provider.strict_content_snapshot().await.is_none(),
+            "failed compensation must fail closed, never expose new or stale nodes"
+        );
+        assert!(provider.proxies().await.is_empty());
+        assert_eq!(std::fs::read(&saved).unwrap(), OLD);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn failed_initial_cache_rename_retracts_node_dns_and_provider_revision() {
+        const REMOTE: &[u8] = b"proxies:\n  - name: staged-node\n    type: socks5\n    server: staged.example\n    port: 1080\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("first-cache.yaml");
+        let mut vehicle = MockProviderVehicle::new();
+        vehicle
+            .expect_path()
+            .return_const(path.to_string_lossy().into_owned());
+        vehicle.expect_typ().return_const(ProviderVehicleType::Http);
+        vehicle
+            .expect_read()
+            .times(1)
+            .returning(|| Ok(REMOTE.to_vec()));
+
+        let changes = Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let recorded = changes.clone();
+        let blocked_path = path.clone();
+        let mut resolver = MockClashResolver::new();
+        resolver
+            .expect_replace_proxy_provider_dns_domains()
+            .returning(move |owner, domains| {
+                assert_eq!(owner, "initial-rename-owner");
+                if domains == ["staged.example"] {
+                    // The destination changes *after* successful preflight and
+                    // DNS registration, but before NamedTempFile::persist.
+                    std::fs::create_dir(&blocked_path).unwrap();
+                }
+                recorded.lock().unwrap().push(domains);
+                Ok(())
+            });
+        let health = HealthCheck::new(
+            vec![],
+            "http://example.invalid/check".into(),
+            0,
+            true,
+            ProxyManager::new(Arc::new(resolver), None),
+        );
+        let provider = ProxySetProvider::new_with_dns_privacy(
+            "initial-rename-owner".into(),
+            Duration::ZERO,
+            Arc::new(vehicle),
+            health,
+            true,
+        )
+        .unwrap();
+
+        let error = provider.initialize().await.unwrap_err().to_string();
+        assert!(!error.is_empty(), "final rename must fail explicitly");
+        assert!(
+            provider.strict_content_snapshot().await.is_none(),
+            "a nonpersisted initial revision must not remain visible"
+        );
+        assert_eq!(
+            *changes.lock().unwrap(),
+            vec![vec!["staged.example".to_owned()], vec![]],
+            "failed commit must remove its provider-owned node DNS domains"
+        );
+        assert!(
+            path.is_dir(),
+            "external destination replacement is preserved"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "failed commit must remove its temporary staged cache"
+        );
     }
 
     #[tokio::test]

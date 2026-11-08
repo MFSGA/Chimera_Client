@@ -74,6 +74,35 @@ fn write_cache_atomically(path: &Path, content: &[u8]) -> io::Result<()> {
     persist_staged_cache(stage_cache_write(path, content)?, path)
 }
 
+/// A failed final rename must compensate the already published proxy
+/// revision and its provider-owned DNS domains. This callback runs while the
+/// fetcher's update lock is held, so the next revision cannot overtake it.
+pub(crate) type CacheCommitRollback =
+    Arc<dyn Fn() -> BoxFuture<'static, anyhow::Result<()>> + Send + Sync>;
+
+/// Release the previous revision retained for rollback after the cache
+/// commit is durable (or when the source is a local file).
+pub(crate) type CacheCommitAccepted =
+    Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
+
+async fn persist_with_rollback(
+    staged: tempfile::NamedTempFile,
+    path: &Path,
+    rollback: Option<&CacheCommitRollback>,
+) -> anyhow::Result<()> {
+    if let Err(error) = persist_staged_cache(staged, path) {
+        if let Some(rollback) = rollback
+            && let Err(rollback_error) = rollback().await
+        {
+            return Err(anyhow::anyhow!(
+                "provider cache commit failed: {error}; provisional provider rollback failed: {rollback_error}"
+            ));
+        }
+        return Err(error.into());
+    }
+    Ok(())
+}
+
 fn cache_needs_immediate_update(
     now: SystemTime,
     modified: SystemTime,
@@ -95,6 +124,8 @@ pub struct Fetcher<U, P> {
     inner: Arc<RwLock<Inner>>,
     parser: Arc<P>,
     pub on_update: Option<Arc<U>>,
+    on_cache_commit_rollback: Option<CacheCommitRollback>,
+    on_cache_commit_accepted: Option<CacheCommitAccepted>,
     cancel_token: CancellationToken,
     initialized: AtomicBool,
     initial_immediate_refresh: AtomicBool,
@@ -131,11 +162,25 @@ where
             })),
             parser: Arc::new(parser),
             on_update: on_update.map(Arc::new),
+            on_cache_commit_rollback: None,
+            on_cache_commit_accepted: None,
             cancel_token: CancellationToken::new(),
             initialized: AtomicBool::new(false),
             initial_immediate_refresh: AtomicBool::new(false),
             polling_started: AtomicBool::new(false),
         }
+    }
+
+    /// Configure transactional rollback for provider updates that must keep
+    /// their DNS ownership and visible revision aligned with durable cache.
+    pub(crate) fn with_cache_commit_hooks(
+        mut self,
+        rollback: CacheCommitRollback,
+        accepted: CacheCommitAccepted,
+    ) -> Self {
+        self.on_cache_commit_rollback = Some(rollback);
+        self.on_cache_commit_accepted = Some(accepted);
+        self
     }
 
     pub fn name(&self) -> &str {
@@ -210,7 +255,12 @@ where
         }
 
         if let Some(staged_cache) = staged_cache {
-            persist_staged_cache(staged_cache, Path::new(&vehicle_path))?;
+            persist_with_rollback(
+                staged_cache,
+                Path::new(&vehicle_path),
+                self.on_cache_commit_rollback.as_ref(),
+            )
+            .await?;
             inner.updated_at = SystemTime::now();
             // A recovered cache has just been refreshed successfully.
             immediately_update = false;
@@ -224,6 +274,9 @@ where
             .try_into()
             .expect("md5 must be 16 bytes");
 
+        if let Some(accepted) = &self.on_cache_commit_accepted {
+            accepted().await;
+        }
         self.initial_immediate_refresh
             .store(immediately_update, Ordering::Release);
         self.initialized.store(true, Ordering::Release);
@@ -306,6 +359,8 @@ where
             self.vehicle.clone(),
             self.parser.clone(),
             self.on_update.clone(),
+            self.on_cache_commit_rollback.clone(),
+            self.on_cache_commit_accepted.clone(),
         )
         .await
     }
@@ -315,6 +370,8 @@ where
         vehicle: ThreadSafeProviderVehicle,
         parser: Arc<P>,
         on_update: Option<Arc<U>>,
+        on_cache_commit_rollback: Option<CacheCommitRollback>,
+        on_cache_commit_accepted: Option<CacheCommitAccepted>,
     ) -> anyhow::Result<bool> {
         // Serialize source/hash changes with publication across manual,
         // watcher and periodic updates.
@@ -348,10 +405,18 @@ where
             on_update(payload).await?;
         }
         if let Some(staged_cache) = staged_cache {
-            persist_staged_cache(staged_cache, Path::new(vehicle.path()))?;
+            persist_with_rollback(
+                staged_cache,
+                Path::new(vehicle.path()),
+                on_cache_commit_rollback.as_ref(),
+            )
+            .await?;
         }
         this.hash = hash;
         this.updated_at = now;
+        if let Some(accepted) = on_cache_commit_accepted {
+            accepted().await;
+        }
         Ok(false)
     }
 
@@ -365,9 +430,20 @@ where
         vehicle: ThreadSafeProviderVehicle,
         parser: Arc<P>,
         on_update: Option<Arc<U>>,
+        on_cache_commit_rollback: Option<CacheCommitRollback>,
+        on_cache_commit_accepted: Option<CacheCommitAccepted>,
         name: &str,
     ) {
-        match Self::update_inner(inner, vehicle, parser, on_update).await {
+        match Self::update_inner(
+            inner,
+            vehicle,
+            parser,
+            on_update,
+            on_cache_commit_rollback,
+            on_cache_commit_accepted,
+        )
+        .await
+        {
             Ok(true) => trace!("fetcher {} no update", name),
             Ok(false) => info!("fetcher {} updated", name),
             Err(error) => warn!("{} update failed: {}", name, error),
@@ -393,6 +469,8 @@ where
         let vehicle = self.vehicle.clone();
         let parser = self.parser.clone();
         let on_update = self.on_update.clone();
+        let on_cache_commit_rollback = self.on_cache_commit_rollback.clone();
+        let on_cache_commit_accepted = self.on_cache_commit_accepted.clone();
         let name = self.name.clone();
         let cancel_token = self.cancel_token.clone();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
@@ -445,6 +523,8 @@ where
                             vehicle.clone(),
                             parser.clone(),
                             on_update.clone(),
+                            on_cache_commit_rollback.clone(),
+                            on_cache_commit_accepted.clone(),
                             &name,
                         )
                         .await;
@@ -465,6 +545,8 @@ where
         let vehicle = self.vehicle.clone();
         let parser = self.parser.clone();
         let on_update = self.on_update.clone();
+        let on_cache_commit_rollback = self.on_cache_commit_rollback.clone();
+        let on_cache_commit_accepted = self.on_cache_commit_accepted.clone();
         let name = self.name.clone();
         let cancel_token = self.cancel_token.clone();
         let fire_immediately = immediately_update;
@@ -476,6 +558,8 @@ where
                     vehicle.clone(),
                     parser.clone(),
                     on_update.clone(),
+                    on_cache_commit_rollback.clone(),
+                    on_cache_commit_accepted.clone(),
                     &name,
                 )
             };
