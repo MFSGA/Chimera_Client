@@ -1,4 +1,5 @@
 import { request } from './client';
+import type { ApiSettingsSnapshot } from './client';
 import type { EffectiveNetworkPaths, NetworkPathDecisionRecord, PathPreferencePriority, PathPreferenceView, RuntimeNetworkStatus } from './types';
 
 // Network recovery diagnostics
@@ -12,9 +13,10 @@ export const getNetworkPathPreference = () =>
 export const updateNetworkPathPreference = (
   priority: PathPreferencePriority[],
   ttlMs?: number,
+  settings?: ApiSettingsSnapshot,
 ) => request<PathPreferenceView>('/runtime/network/path-preference', {
   method: 'PUT',
   body: JSON.stringify({ priority, ...(ttlMs == null ? {} : { ttlMs }) }),
-});
-export const clearTemporaryNetworkPathPreference = () =>
-  request<PathPreferenceView>('/runtime/network/path-preference', { method: 'DELETE' });
+}, settings);
+export const clearTemporaryNetworkPathPreference = (settings?: ApiSettingsSnapshot) =>
+  request<PathPreferenceView>('/runtime/network/path-preference', { method: 'DELETE' }, settings);

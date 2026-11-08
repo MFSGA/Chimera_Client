@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { getCapabilities, getVersion } from '@/lib/api/system';
 import { getApiUrl, getSecret, setApiSettings } from '@/lib/settings';
 import { queryKeys } from '@/lib/queryKeys';
+import { useApiSettingsRevision } from '@/hooks/useApiSettingsRevision';
 import { Save, AlertTriangle, CheckCircle, XCircle } from 'lucide-react';
 
 function isDevMode(): boolean {
@@ -12,9 +13,11 @@ function isDevMode(): boolean {
 
 export function Settings() {
   const queryClient = useQueryClient();
+  const settingsRevision = useApiSettingsRevision();
   const [apiUrl, setApiUrlState] = useState(getApiUrl);
   const [configuredApiUrl, setConfiguredApiUrl] = useState(getApiUrl);
   const [secret, setSecretState] = useState(getSecret);
+  const [configuredSecret, setConfiguredSecret] = useState(getSecret);
   const [saved, setSaved] = useState(false);
   const saveTimersRef = useRef<number[]>([]);
 
@@ -44,21 +47,51 @@ export function Settings() {
   });
 
   useEffect(() => {
-    if (isDevMode() && !localStorage.getItem('clash-api-url')) {
-      setApiUrlState('http://127.0.0.1:9090');
-    }
-  }, []);
+    const storedApiUrl = localStorage.getItem('clash-api-url');
+    const currentApiUrl = getApiUrl();
+    const currentSecret = getSecret();
+    setApiUrlState(storedApiUrl || (isDevMode() ? 'http://127.0.0.1:9090' : currentApiUrl));
+    setConfiguredApiUrl(currentApiUrl);
+    setSecretState(currentSecret);
+    setConfiguredSecret(currentSecret);
+    setSaved(false);
+  }, [settingsRevision]);
 
   async function handleSave() {
+    const currentUrl = getApiUrl();
+    const currentSecret = getSecret();
+    if (currentUrl !== configuredApiUrl || currentSecret !== configuredSecret) {
+      const storedApiUrl = localStorage.getItem('clash-api-url');
+      setConfiguredApiUrl(currentUrl);
+      setConfiguredSecret(currentSecret);
+      if (apiUrl === configuredApiUrl) {
+        setApiUrlState(storedApiUrl || (isDevMode() ? 'http://127.0.0.1:9090' : currentUrl));
+      }
+      if (secret === configuredSecret) setSecretState(currentSecret);
+      setSaved(false);
+      return;
+    }
+
     const apiUrlChanged = apiUrl !== configuredApiUrl;
     const settingsChanged = apiUrlChanged || secret !== getSecret();
 
     if (settingsChanged) {
       await queryClient.cancelQueries({ queryKey: queryKeys.all });
+      const latestUrl = getApiUrl();
+      const latestSecret = getSecret();
+      if (latestUrl !== currentUrl || latestSecret !== currentSecret) {
+        setConfiguredApiUrl(latestUrl);
+        setConfiguredSecret(latestSecret);
+        setApiUrlState(localStorage.getItem('clash-api-url') || (isDevMode() ? 'http://127.0.0.1:9090' : latestUrl));
+        setSecretState(latestSecret);
+        setSaved(false);
+        return;
+      }
       setApiSettings(apiUrl, secret);
     }
 
     setConfiguredApiUrl(apiUrl);
+    setConfiguredSecret(secret);
     setSaved(true);
     saveTimersRef.current.push(window.setTimeout(() => setSaved(false), 2000));
     if (!apiUrlChanged) {

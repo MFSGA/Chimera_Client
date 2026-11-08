@@ -1,4 +1,6 @@
 import { queryKeys } from '@/lib/queryKeys';
+import { captureApiSettings } from '@/lib/api/client';
+import type { ApiSettingsSnapshot } from '@/lib/api/client';
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { getProxies, selectProxy, getGroupDelay } from '@/lib/api/proxies';
@@ -61,23 +63,29 @@ export function ProxyGroups({ mode }: ProxyGroupsProps) {
   });
 
   const selectMutation = useMutation({
-    mutationFn: ({ group, proxy }: { group: string; proxy: string }) =>
-      selectProxy(group, proxy),
-    onMutate: async ({ group, proxy }) => {
-      await queryClient.cancelQueries({ queryKey: queryKeys.proxies() });
-      const previous = queryClient.getQueryData<{ proxies: Record<string, Proxy> }>(queryKeys.proxies());
-      queryClient.setQueryData<{ proxies: Record<string, Proxy> }>(queryKeys.proxies(), (old) => {
+    mutationFn: ({ group, proxy, settings }: {
+      group: string;
+      proxy: string;
+      queryKey: ReturnType<typeof queryKeys.proxies>;
+      settings: ApiSettingsSnapshot;
+    }) => selectProxy(group, proxy, settings),
+    onMutate: async ({ group, proxy, queryKey }) => {
+      await queryClient.cancelQueries({ queryKey });
+      const previous = queryClient.getQueryData<{ proxies: Record<string, Proxy> }>(queryKey);
+      queryClient.setQueryData<{ proxies: Record<string, Proxy> }>(queryKey, (old) => {
         if (!old) return old;
         return {
           ...old,
           proxies: { ...old.proxies, [group]: { ...old.proxies[group], now: proxy } },
         };
       });
-      return { previous };
+      return { previous, queryKey };
     },
     onError: (_err, _vars, ctx) => {
-      if (ctx?.previous) queryClient.setQueryData(queryKeys.proxies(), ctx.previous);
-      queryClient.invalidateQueries({ queryKey: queryKeys.proxies() });
+      if (ctx?.previous) queryClient.setQueryData(ctx.queryKey, ctx.previous);
+    },
+    onSettled: (_data, _error, variables) => {
+      queryClient.invalidateQueries({ queryKey: variables.queryKey });
     },
   });
 
@@ -278,7 +286,12 @@ export function ProxyGroups({ mode }: ProxyGroupsProps) {
                         return isSelector ? (
                           <button
                             key={proxyName}
-                            onClick={() => selectMutation.mutate({ group: group.name, proxy: proxyName })}
+                            onClick={() => selectMutation.mutate({
+                              group: group.name,
+                              proxy: proxyName,
+                              queryKey: queryKeys.proxies(),
+                              settings: captureApiSettings(),
+                            })}
                             className="px-3 py-2 rounded-lg text-left border transition-all"
                             style={{ ...chipStyle, cursor: 'pointer' }}
                           >

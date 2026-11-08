@@ -4,6 +4,8 @@ import type { UseQueryResult } from '@tanstack/react-query';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { queryKeys } from '@/lib/queryKeys';
+import { captureApiSettings } from '@/lib/api/client';
+import type { ApiSettingsSnapshot } from '@/lib/api/client';
 import { clearTemporaryNetworkPathPreference, updateNetworkPathPreference } from '@/lib/api/network';
 import type { EffectiveNetworkPaths, PathPreferencePriority, PathPreferenceView } from '@/lib/api/types/network';
 import { formatTimestamp, isPreferenceInterface, phaseLabel, priorityKey, samePriority } from '@/features/network/networkUtils';
@@ -21,6 +23,7 @@ export function PathPreferenceEditor({
   const [lifetime, setLifetime] = useState('unchanged');
   const [candidateKey, setCandidateKey] = useState('');
   const syncedPreference = useRef('');
+  type PreferenceQueryKey = ReturnType<typeof queryKeys.network.pathPreference>;
 
   useEffect(() => {
     const current = preference.data;
@@ -39,16 +42,21 @@ export function PathPreferenceEditor({
   }, [preference.data]);
 
   const save = useMutation({
-    mutationFn: ({ priority, ttlMs }: { priority: PathPreferencePriority[]; ttlMs?: number }) =>
-      updateNetworkPathPreference(priority, ttlMs),
-    onSuccess: (data: PathPreferenceView) => {
-      queryClient.setQueryData(queryKeys.network.pathPreference(), data);
+    mutationFn: ({ priority, ttlMs, settings }: {
+      priority: PathPreferencePriority[];
+      ttlMs?: number;
+      queryKey: PreferenceQueryKey;
+      settings: ApiSettingsSnapshot;
+    }) => updateNetworkPathPreference(priority, ttlMs, settings),
+    onSuccess: (data: PathPreferenceView, variables) => {
+      queryClient.setQueryData(variables.queryKey, data);
     },
   });
   const clearTemporary = useMutation({
-    mutationFn: clearTemporaryNetworkPathPreference,
-    onSuccess: (data: PathPreferenceView) => {
-      queryClient.setQueryData(queryKeys.network.pathPreference(), data);
+    mutationFn: ({ settings }: { queryKey: PreferenceQueryKey; settings: ApiSettingsSnapshot }) =>
+      clearTemporaryNetworkPathPreference(settings),
+    onSuccess: (data: PathPreferenceView, variables) => {
+      queryClient.setQueryData(variables.queryKey, data);
     },
   });
 
@@ -79,7 +87,12 @@ export function PathPreferenceEditor({
           ? undefined
           : Math.max(1000, Math.min(86_400_000, preference.data.expiresAtMs - Date.now())))
         : Number(lifetime);
-    save.mutate({ priority, ttlMs });
+    save.mutate({
+      priority,
+      ttlMs,
+      queryKey: queryKeys.network.pathPreference(),
+      settings: captureApiSettings(),
+    });
   }
 
   function movePriority(index: number, offset: -1 | 1) {
@@ -201,11 +214,18 @@ export function PathPreferenceEditor({
           )}
           <div className="flex flex-wrap justify-end gap-2">
             {isTemporary && (
-              <Button variant="outline" disabled={busy} onClick={() => clearTemporary.mutate()}>
+              <Button variant="outline" disabled={busy} onClick={() => clearTemporary.mutate({
+                queryKey: queryKeys.network.pathPreference(),
+                settings: captureApiSettings(),
+              })}>
                 Clear temporary override
               </Button>
             )}
-            <Button variant="outline" disabled={busy || !preference.data.automaticSupported} onClick={() => save.mutate({ priority: [] })}>
+            <Button variant="outline" disabled={busy || !preference.data.automaticSupported} onClick={() => save.mutate({
+              priority: [],
+              queryKey: queryKeys.network.pathPreference(),
+              settings: captureApiSettings(),
+            })}>
               Use core default
             </Button>
             <Button disabled={busy || !preference.data.automaticSupported} onClick={() => applyPreference(draft)}>

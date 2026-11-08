@@ -1,9 +1,21 @@
 import { getApiUrl, getSecret } from '../settings';
 
+export interface ApiSettingsSnapshot {
+  baseUrl: string;
+  secret: string;
+}
+
+export function captureApiSettings(): ApiSettingsSnapshot {
+  return { baseUrl: getApiUrl(), secret: getSecret() };
+}
+
 // HTTP client
-export async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const baseUrl = getApiUrl();
-  const secret = getSecret();
+export async function request<T>(
+  path: string,
+  options?: RequestInit,
+  settings: ApiSettingsSnapshot = captureApiSettings(),
+): Promise<T> {
+  const { baseUrl, secret } = settings;
   const url = `${baseUrl}${path}`;
 
   const headers: Record<string, string> = {
