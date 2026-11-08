@@ -1139,3 +1139,8 @@ S01 准入必须满足：金标准用例在目标 HEAD 实际运行；未知新�
 - Proxy-provider updates stage cache writes before publication. If the final rename fails after provisional proxy/DNS publication, the update now restores that provider's previous revision and DNS ownership while serialized against later updates; if compensation itself fails, the provider is hidden and the error reports both failures.
 - Readers of the provider wait for the pending cache commit to settle, so a failed or cancelled provisional update does not expose a revision that was never durably cached. These callbacks are an in-process recovery mechanism, not a cross-process crash-atomic transaction.
 - Added deterministic filesystem and mock-resolver regressions for initial/refresh rename failure, shared DNS ownership, retry after repair, and readers waiting on a provisional commit. Validation for the rebased result is pending.
+
+### Cancellation boundary
+
+- Source reads, parsing and cache staging remain cancellable. Once a candidate is staged, an owned worker keeps the provider update lock through publication, cache commit or compensation, even if the API caller or watcher stops waiting. Initial publication follows the same boundary and marks the provider initialized only after acceptance.
+- Deterministic regressions cover cancellation during source reads (no publication) and cancellation after staging (the commit/rollback finishes and readers are released). Final rebased validation is pending.

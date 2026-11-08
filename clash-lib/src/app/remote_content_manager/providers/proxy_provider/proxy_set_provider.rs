@@ -945,6 +945,122 @@ proxies:
     }
 
     #[tokio::test]
+    async fn cancelled_refresh_request_still_compensates_failed_cache_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cancel-rename-failure.yaml");
+        let saved = dir.path().join("retained-accepted.yaml");
+        let provider = Arc::new(provider_with_refresh_dns_mode(
+            path.to_string_lossy().into_owned(),
+            SAME_NAME_NEW_HOST,
+            true,
+        ));
+        provider.initialize().await.unwrap();
+        let before = provider.strict_content_snapshot().await.unwrap();
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let signal = entered.clone();
+        let resume = release.clone();
+        *provider.before_cache_commit.lock().await = Some(Arc::new(move || {
+            let signal = signal.clone();
+            let resume = resume.clone();
+            Box::pin(async move {
+                signal.notify_one();
+                resume.notified().await;
+            })
+        }));
+        let updating = provider.clone();
+        let request = tokio::spawn(async move { updating.update().await });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("must reach pre-commit barrier");
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        // An external writer replaces the target after preflight. The
+        // detached commit worker must compensate instead of wedging readers.
+        std::fs::rename(&path, &saved).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                provider.strict_content_snapshot()
+            )
+            .await
+            .is_err()
+        );
+        release.notify_one();
+
+        let reverted = tokio::time::timeout(
+            Duration::from_secs(2),
+            provider.strict_content_snapshot(),
+        )
+        .await
+        .expect("failed commit must not strand reader admission")
+        .expect("the previous revision must remain visible");
+        assert_eq!(reverted.revision, before.revision);
+        assert!(Arc::ptr_eq(&reverted.proxies[0], &before.proxies[0]));
+        assert_eq!(std::fs::read(&saved).unwrap(), VALID);
+        assert!(path.is_dir());
+    }
+
+    #[tokio::test]
+    async fn cancelling_refresh_request_must_not_strand_accepted_cache_revision() {
+        // Cancelling the API caller must not cancel a provider transaction
+        // after it has registered its node DNS and before the cache rename.
+        // A detached commit worker must finish and unblock the next reader.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cancel-commit.yaml");
+        let provider = Arc::new(provider_with_refresh_dns_mode(
+            path.to_string_lossy().into_owned(),
+            SAME_NAME_NEW_HOST,
+            true,
+        ));
+        provider.initialize().await.unwrap();
+        let before = provider.strict_content_snapshot().await.unwrap();
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let entry = entered.clone();
+        let resume = release.clone();
+        *provider.before_cache_commit.lock().await = Some(Arc::new(move || {
+            let entry = entry.clone();
+            let resume = resume.clone();
+            Box::pin(async move {
+                entry.notify_one();
+                resume.notified().await;
+            })
+        }));
+        let updating = provider.clone();
+        let request = tokio::spawn(async move { updating.update().await });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("candidate must reach its pre-commit barrier");
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                provider.strict_content_snapshot()
+            )
+            .await
+            .is_err(),
+            "uncommitted candidates still must not become observable"
+        );
+        release.notify_one();
+        let accepted = tokio::time::timeout(
+            Duration::from_secs(2),
+            provider.strict_content_snapshot(),
+        )
+        .await
+        .expect("cancelled caller must not strand provider admission")
+        .expect("committed revision must be visible");
+        assert_eq!(accepted.revision, before.revision + 1);
+        assert_eq!(accepted.proxies[0].server_name(), Some("198.51.100.12"));
+        assert_eq!(std::fs::read(&path).unwrap(), SAME_NAME_NEW_HOST);
+    }
+
+    #[tokio::test]
     async fn cancellation_of_provisional_provider_update_fails_closed_to_readers() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cancelled-pending.yaml");
@@ -990,9 +1106,19 @@ proxies:
                 .is_err(),
             "cancelled update must block ordinary proxy readers too"
         );
-        // This is an explicit availability limitation: the provider must be
-        // reconstructed after cancellation. It may not release the gate and
-        // accidentally expose the incomplete revision.
+        // The worker remains paused, so neither API should expose the
+        // provisional revision. Releasing the pause must let it commit and
+        // reopen admission even though the requesting task is gone.
+        release.notify_one();
+        let accepted = tokio::time::timeout(
+            Duration::from_secs(2),
+            provider.strict_content_snapshot(),
+        )
+        .await
+        .expect("canceled caller must not strand the commit worker")
+        .expect("accepted snapshot");
+        assert_eq!(accepted.proxies[0].server_name(), Some("198.51.100.12"));
+        assert_eq!(std::fs::read(&path).unwrap(), SAME_NAME_NEW_HOST);
     }
 
     #[tokio::test]
@@ -1106,6 +1232,96 @@ proxies:
         assert_eq!(after.revision, before.revision + 1);
         assert_eq!(after.proxies[0].server_name(), Some("198.51.100.12"));
         assert_eq!(std::fs::read(&path).unwrap(), NEXT);
+    }
+
+    #[tokio::test]
+    async fn cancelling_initial_provider_request_after_staging_finishes_dns_and_cache()
+     {
+        const FIRST: &[u8] = b"proxies:\n  - name: first-node\n    type: socks5\n    server: first.example\n    port: 1080\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cancel-initial-provider.yaml");
+        let mut vehicle = MockProviderVehicle::new();
+        vehicle
+            .expect_path()
+            .return_const(path.to_string_lossy().into_owned());
+        vehicle.expect_typ().return_const(ProviderVehicleType::Http);
+        vehicle
+            .expect_read()
+            .times(1)
+            .returning(|| Ok(FIRST.to_vec()));
+        let changes = Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let captured = changes.clone();
+        let mut resolver = MockClashResolver::new();
+        resolver.expect_resolve_all().returning(|_, _| {
+            Err(anyhow::anyhow!(
+                "offline test intentionally denies node DNS"
+            ))
+        });
+        resolver
+            .expect_replace_proxy_provider_dns_domains()
+            .returning(move |_owner, domains| {
+                captured.lock().unwrap().push(domains);
+                Ok(())
+            });
+        let health = HealthCheck::new(
+            vec![],
+            "http://example.invalid/check".into(),
+            0,
+            true,
+            ProxyManager::new(Arc::new(resolver), None),
+        );
+        let provider = Arc::new(
+            ProxySetProvider::new_with_dns_privacy(
+                "cancelled-initial".into(),
+                Duration::ZERO,
+                Arc::new(vehicle),
+                health,
+                true,
+            )
+            .unwrap(),
+        );
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let continue_commit = Arc::new(tokio::sync::Notify::new());
+        let signal = entered.clone();
+        let resume = continue_commit.clone();
+        *provider.before_cache_commit.lock().await = Some(Arc::new(move || {
+            let signal = signal.clone();
+            let resume = resume.clone();
+            Box::pin(async move {
+                signal.notify_one();
+                resume.notified().await;
+            })
+        }));
+
+        let initializing = provider.clone();
+        let initial_request =
+            tokio::spawn(async move { initializing.initialize().await });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("initial revision must reach pre-persist barrier");
+        initial_request.abort();
+        assert!(initial_request.await.unwrap_err().is_cancelled());
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                provider.strict_content_snapshot(),
+            )
+            .await
+            .is_err(),
+            "an uncommitted initial revision must remain invisible"
+        );
+        continue_commit.notify_one();
+        let accepted = tokio::time::timeout(
+            Duration::from_secs(2),
+            provider.strict_content_snapshot(),
+        )
+        .await
+        .expect("cancelled initial request must not strand reader admission")
+        .expect("initial revision must be accepted");
+        assert_eq!(accepted.revision, 1);
+        assert_eq!(accepted.proxies[0].server_name(), Some("first.example"));
+        assert_eq!(std::fs::read(&path).unwrap(), FIRST);
+        assert_eq!(*changes.lock().unwrap(), [vec!["first.example".to_owned()]]);
     }
 
     #[tokio::test]

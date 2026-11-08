@@ -127,8 +127,8 @@ pub struct Fetcher<U, P> {
     on_cache_commit_rollback: Option<CacheCommitRollback>,
     on_cache_commit_accepted: Option<CacheCommitAccepted>,
     cancel_token: CancellationToken,
-    initialized: AtomicBool,
-    initial_immediate_refresh: AtomicBool,
+    initialized: Arc<AtomicBool>,
+    initial_immediate_refresh: Arc<AtomicBool>,
     polling_started: AtomicBool,
 }
 
@@ -165,8 +165,8 @@ where
             on_cache_commit_rollback: None,
             on_cache_commit_accepted: None,
             cancel_token: CancellationToken::new(),
-            initialized: AtomicBool::new(false),
-            initial_immediate_refresh: AtomicBool::new(false),
+            initialized: Arc::new(AtomicBool::new(false)),
+            initial_immediate_refresh: Arc::new(AtomicBool::new(false)),
             polling_started: AtomicBool::new(false),
         }
     }
@@ -206,7 +206,7 @@ where
 
         let vehicle_path = self.vehicle.path().to_owned();
 
-        let mut inner = self.inner.write().await;
+        let mut inner = self.inner.clone().write_owned().await;
         if self.initialized.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -247,40 +247,52 @@ where
             .then(|| stage_cache_write(Path::new(&vehicle_path), &content))
             .transpose()?;
 
-        if let Some(on_update) = self.on_update.as_ref() {
-            // Failure must precede cache/hash mutation. In particular, a
-            // proxy provider's node DNS domains must be installed before a
-            // downloaded provider can survive a future restart.
-            on_update(items).await?;
-        }
+        // Parsing, any remote recovery read and cache staging above remain
+        // cancellable. Once registration begins, run the *entire* initial
+        // publish/rename/compensation sequence in an owned worker. Dropping
+        // the startup caller must not strand the provider's reader gate or
+        // leave an unpersisted revision with registered DNS ownership.
+        let on_update = self.on_update.clone();
+        let rollback = self.on_cache_commit_rollback.clone();
+        let accepted = self.on_cache_commit_accepted.clone();
+        let immediate_refresh = self.initial_immediate_refresh.clone();
+        let initialized = self.initialized.clone();
+        tokio::spawn(async move {
+            if let Some(on_update) = on_update {
+                // Failure must precede cache/hash mutation. In particular,
+                // proxy node domains must be registered before downloaded
+                // provider bytes can survive a future restart.
+                on_update(items).await?;
+            }
 
-        if let Some(staged_cache) = staged_cache {
-            persist_with_rollback(
-                staged_cache,
-                Path::new(&vehicle_path),
-                self.on_cache_commit_rollback.as_ref(),
-            )
-            .await?;
-            inner.updated_at = SystemTime::now();
-            // A recovered cache has just been refreshed successfully.
-            immediately_update = false;
-        } else if let Some(cached_at) = cached_at {
-            // Do not inspect the cache a second time after publication:
-            // another process may have replaced it in the meantime.
-            inner.updated_at = cached_at;
-        }
+            if let Some(staged_cache) = staged_cache {
+                persist_with_rollback(
+                    staged_cache,
+                    Path::new(&vehicle_path),
+                    rollback.as_ref(),
+                )
+                .await?;
+                inner.updated_at = SystemTime::now();
+                // A recovered cache has been refreshed successfully.
+                immediately_update = false;
+            } else if let Some(cached_at) = cached_at {
+                // Do not inspect the cache a second time after publication:
+                // another process may have replaced it in the meantime.
+                inner.updated_at = cached_at;
+            }
 
-        inner.hash = utils::md5(&content)[..16]
-            .try_into()
-            .expect("md5 must be 16 bytes");
+            inner.hash = utils::md5(&content)[..16]
+                .try_into()
+                .expect("md5 must be 16 bytes");
 
-        if let Some(accepted) = &self.on_cache_commit_accepted {
-            accepted().await;
-        }
-        self.initial_immediate_refresh
-            .store(immediately_update, Ordering::Release);
-        self.initialized.store(true, Ordering::Release);
-        Ok(())
+            if let Some(accepted) = accepted {
+                accepted().await;
+            }
+            immediate_refresh.store(immediately_update, Ordering::Release);
+            initialized.store(true, Ordering::Release);
+            Ok(())
+        })
+        .await?
     }
 
     /// Publish an already-valid HTTP cache without reading from its remote
@@ -353,6 +365,11 @@ where
     /// A failed updater must remain retryable on the next refresh, including
     /// background polling. Callers must not publish provider revisions after
     /// DNS registration has failed.
+    ///
+    /// Only the already-staged publication/commit phase must outlive a
+    /// cancelled caller. Fetching, parsing and staging remain cancellable;
+    /// otherwise cancelling a slow HTTP provider download could still
+    /// publish its nodes unexpectedly.
     pub async fn update(&self) -> anyhow::Result<bool> {
         Self::update_inner(
             self.inner.clone(),
@@ -375,7 +392,7 @@ where
     ) -> anyhow::Result<bool> {
         // Serialize source/hash changes with publication across manual,
         // watcher and periodic updates.
-        let mut this = inner.write().await;
+        let mut this = inner.write_owned().await;
         let content = vehicle.read().await?;
         let payload = parser(&content)?;
 
@@ -398,26 +415,35 @@ where
             .then(|| stage_cache_write(Path::new(vehicle.path()), &content))
             .transpose()?;
 
-        // A protected proxy-provider registers its DNS endpoint domains here.
-        // A rejected revision may not advance the content hash or overwrite
-        // last-good cached YAML; a later identical refresh must retry it.
-        if let Some(on_update) = on_update {
-            on_update(payload).await?;
-        }
-        if let Some(staged_cache) = staged_cache {
-            persist_with_rollback(
-                staged_cache,
-                Path::new(vehicle.path()),
-                on_cache_commit_rollback.as_ref(),
-            )
-            .await?;
-        }
-        this.hash = hash;
-        this.updated_at = now;
-        if let Some(accepted) = on_cache_commit_accepted {
-            accepted().await;
-        }
-        Ok(false)
+        // The source is now fully fetched, parsed and staged. Only the
+        // side-effecting provider publication is non-cancellable: a dropped
+        // API caller (or watcher) must not abandon DNS ownership and an
+        // uncommitted proxy revision with the admission lock held.
+        // Moving the owned fetcher write guard into this worker also keeps
+        // subsequent updates serialized until commit or rollback finishes.
+        let cache_path = vehicle.path().to_owned();
+        tokio::spawn(async move {
+            // A rejected revision may not advance its content hash or
+            // overwrite last-good cached YAML; the same bytes must retry.
+            if let Some(on_update) = on_update {
+                on_update(payload).await?;
+            }
+            if let Some(staged_cache) = staged_cache {
+                persist_with_rollback(
+                    staged_cache,
+                    Path::new(&cache_path),
+                    on_cache_commit_rollback.as_ref(),
+                )
+                .await?;
+            }
+            this.hash = hash;
+            this.updated_at = now;
+            if let Some(accepted) = on_cache_commit_accepted {
+                accepted().await;
+            }
+            Ok(false)
+        })
+        .await?
     }
 
     #[cfg(test)]
@@ -641,6 +667,147 @@ mod tests {
         assert_eq!(
             std::fs::read(&blocked_parent).unwrap(),
             b"existing user content"
+        );
+    }
+
+    struct PausedProviderVehicle {
+        path: String,
+        read_started: Arc<tokio::sync::Notify>,
+        release_read: Arc<tokio::sync::Notify>,
+        read_dropped: Arc<tokio::sync::Notify>,
+    }
+
+    struct ReadDropNotice(Arc<tokio::sync::Notify>);
+
+    impl Drop for ReadDropNotice {
+        fn drop(&mut self) {
+            self.0.notify_one();
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::app::remote_content_manager::providers::ProviderVehicle
+        for PausedProviderVehicle
+    {
+        async fn read(&self) -> std::io::Result<Vec<u8>> {
+            // Prove the pending source I/O future is dropped on cancellation,
+            // without relying on a scheduling sleep.
+            let _drop_signal = ReadDropNotice(self.read_dropped.clone());
+            self.read_started.notify_one();
+            self.release_read.notified().await;
+            Ok(b"remote candidate".to_vec())
+        }
+
+        fn path(&self) -> &str {
+            &self.path
+        }
+
+        fn typ(&self) -> ProviderVehicleType {
+            ProviderVehicleType::Http
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_initial_before_source_read_finishes_does_not_publish_or_persist()
+     {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("cancelled-initial-download.yaml");
+        let read_started = Arc::new(tokio::sync::Notify::new());
+        let release_read = Arc::new(tokio::sync::Notify::new());
+        let read_dropped = Arc::new(tokio::sync::Notify::new());
+        let vehicle = Arc::new(PausedProviderVehicle {
+            path: cache_path.to_string_lossy().into_owned(),
+            read_started: read_started.clone(),
+            release_read: release_read.clone(),
+            read_dropped: read_dropped.clone(),
+        });
+        let published = Arc::new(AtomicUsize::new(0));
+        let hits = published.clone();
+        let updater =
+            move |_input: String| -> BoxFuture<'static, anyhow::Result<()>> {
+                hits.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            };
+        let fetcher = Arc::new(Fetcher::new(
+            "initial-download-cancel".into(),
+            Duration::ZERO,
+            vehicle,
+            |bytes| Ok(String::from_utf8(bytes.to_vec())?),
+            Some(updater),
+        ));
+        let initializing = fetcher.clone();
+        let request = tokio::spawn(async move { initializing.initial().await });
+        tokio::time::timeout(Duration::from_secs(2), read_started.notified())
+            .await
+            .expect("initial remote read should start");
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_millis(300), read_dropped.notified())
+            .await
+            .expect("cancelled caller must drop pending source I/O before response release");
+        release_read.notify_one();
+        assert_eq!(published.load(Ordering::SeqCst), 0);
+        assert!(
+            !cache_path.exists(),
+            "cancelled initial download must not become accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_source_read_finishes_does_not_publish_or_persist() {
+        // Cancellation while still fetching content is different from
+        // cancellation of an already-staged publication transaction.
+        // No candidate exists yet, so the in-flight fetch must remain
+        // cancellable; a detached worker must start only *after* staging.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("not-downloaded.yaml");
+        let read_started = Arc::new(tokio::sync::Notify::new());
+        let release_read = Arc::new(tokio::sync::Notify::new());
+        let read_dropped = Arc::new(tokio::sync::Notify::new());
+        let vehicle = Arc::new(PausedProviderVehicle {
+            path: cache_path.to_string_lossy().into_owned(),
+            read_started: read_started.clone(),
+            release_read: release_read.clone(),
+            read_dropped: read_dropped.clone(),
+        });
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let updates = accepted.clone();
+        let updater =
+            move |_input: String| -> BoxFuture<'static, anyhow::Result<()>> {
+                updates.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            };
+        let fetcher = Arc::new(Fetcher::new(
+            "source-cancellation".into(),
+            Duration::ZERO,
+            vehicle,
+            |content| Ok(String::from_utf8(content.to_vec())?),
+            Some(updater),
+        ));
+
+        let updating = fetcher.clone();
+        let request = tokio::spawn(async move { updating.update().await });
+        tokio::time::timeout(Duration::from_secs(2), read_started.notified())
+            .await
+            .expect("vehicle read must start before cancellation");
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_millis(300), read_dropped.notified())
+            .await
+            .expect("cancelled caller must drop pending source I/O before response release");
+        release_read.notify_one();
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            0,
+            "a cancelled pre-staging fetch may not continue to DNS publication"
+        );
+        assert!(
+            !cache_path.exists(),
+            "cancelled pre-staging fetch may not create cache"
         );
     }
 
