@@ -332,6 +332,62 @@ fn nameserver_policy_compound_selectors_fail_closed_at_yaml_conversion() {
 }
 
 #[test]
+fn unimplemented_mihomo_dns_privacy_controls_must_fail_closed() {
+    for (field, value) in [
+        ("fake-ip-filter-mode", "whitelist"),
+        (
+            "proxy-server-nameserver-policy",
+            "{example.com: 192.0.2.53}",
+        ),
+        ("direct-nameserver-follow-policy", "true"),
+        ("fake_ip_filter_mode", "whitelist"),
+        (
+            "proxy_server_nameserver_policy",
+            "{example.com: 192.0.2.53}",
+        ),
+        ("direct_nameserver_follow_policy", "true"),
+    ] {
+        for enabled in [true, false] {
+            let yaml = base_config(&format!(
+                "  enable: {enabled}\n  nameserver: [1.1.1.1]\n  default-nameserver: [1.1.1.1]\n  {field}: {value}\n"
+            ));
+            let error = parse_error(yaml);
+            assert!(
+                error.to_string().contains(field),
+                "explicit {field} must be rejected even with enable={enabled}: {error}"
+            );
+            assert!(
+                !error.to_string().contains("192.0.2.53")
+                    && !error.to_string().contains("whitelist"),
+                "privacy field error must not print a configured value"
+            );
+        }
+    }
+
+    // Validation must happen after expanding YAML merge keys.
+    let merged = format!(
+        "x-dns-privacy: &privacy\n  proxy-server-nameserver-policy:\n    example.com: 192.0.2.53\n{}",
+        base_config(
+            "  <<: *privacy\n  enable: false\n  nameserver: [1.1.1.1]\n  default-nameserver: [1.1.1.1]\n"
+        )
+    );
+    assert!(
+        parse_error(merged)
+            .to_string()
+            .contains("proxy-server-nameserver-policy"),
+        "merged privacy controls must be rejected"
+    );
+
+    let unrelated_vendor_setting = base_config(
+        "  enable: false\n  nameserver: [1.1.1.1]\n  default-nameserver: [1.1.1.1]\n  unrelated-vendor-extension: true\n",
+    );
+    assert!(
+        Config::Str(unrelated_vendor_setting).try_parse().is_ok(),
+        "privacy validation must not break unrelated legacy/vendor YAML"
+    );
+}
+
+#[test]
 fn service_discovery_safe_mode_is_opt_in_and_parsed() {
     let dns = parse_dns(&base_config(
         r#"  enable: true
