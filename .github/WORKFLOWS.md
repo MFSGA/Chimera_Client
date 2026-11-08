@@ -26,6 +26,7 @@
 
 - **Dashboard**：当前 `ci.yml` 从 `clash-dashboard/.node-version` 和 `package.json` 的 `packageManager` 读取 Node.js/pnpm 版本并执行 frozen install、lint、build；Dashboard job 完成后把 `dist/` 交给 quality / compile。独立触发的两个吞吐工作流也按相同文件配置版本，构建 Dashboard 资源后再构建启用 Dashboard 的 `clash-rs` 测试子进程。Nix 开发环境和 package 会校验锁定的 Node.js/pnpm 包版本与这两个来源一致。`clash-lib/build.rs` 只校验并追踪已构建资源，不运行 Node.js/pnpm；未启用 `dashboard` 时不需要前端产物。只代表构建阶段通过，不能证明与真实 Proxy/TUN 交互。
 - **Rust quality**：所有 Rust workflow 从 `rust-toolchain.toml` 读取固定工具链版本；`cargo fmt --all -- --check` 与 CLI feature 转发检查（均仅 Linux），`cargo clippy -p clash-lib --all-targets --all-features -- -D warnings`（Linux、Windows、macOS）及 LAN proxy 集成测试。查 job 时同时确认平台与选中的 feature。
+- **Rust cache**：直接使用 `actions/cache` 的 quality、compile、coverage、macOS build 和 Windows network job 按操作系统/目标、Rust 版本、`Cargo.lock`、Cargo 清单与 `.cargo/config.toml` 区分缓存；吞吐工作流使用 rust-cache action 自带的工具链与锁文件键。
 - **Compile**：多个 Linux/Windows/macOS 目标、部分 `cross`/不同 feature，`no-test` 与 PR 条件使某些目标不会运行测试。构建成功不等于真实运行或网卡/TUN 权限验证通过。
 - **Windows network**：测试明确使用本地 loopback；不覆盖真实 NIC 修改、安装网络驱动或生产路由权限。
 - **Coverage / throughput / spell / email**：是不同独立工作流；PR checks 未完成或按路径跳过时均需说明，不可混为全绿。

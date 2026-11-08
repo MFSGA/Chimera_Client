@@ -89,8 +89,8 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target
-          key: quality-${{ matrix.os }}-${{ hashFiles('**/Cargo.toml') }}
-          restore-keys: quality-${{ matrix.os }}-
+          key: quality-${{ matrix.os }}-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', '.cargo/config.toml') }}
+          restore-keys: quality-${{ matrix.os }}-${{ steps.rust-version.outputs.version }}-
       - uses: ilammy/setup-nasm@v1
         if: runner.os == 'Windows' || runner.os == 'macOS'
       - uses: dtolnay/rust-toolchain@master
@@ -232,9 +232,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             /target
-          key: ${{ matrix.release-name || matrix.target }}-${{ hashFiles('**/Cargo.toml') }}
+          key: compile-${{ matrix.os || 'ubuntu-latest' }}-${{ matrix.release-name || matrix.target }}-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', '.cargo/config.toml') }}
           restore-keys: |
-            ${{ matrix.release-name || matrix.target }}
+            compile-${{ matrix.os || 'ubuntu-latest' }}-${{ matrix.release-name || matrix.target }}-${{ steps.rust-version.outputs.version }}-
 
       - name: Cache Docker images.
         uses: ScribeMD/docker-cache@0.5.0

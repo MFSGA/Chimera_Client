@@ -41,7 +41,9 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-          key: coverage-${{ hashFiles('**/Cargo.toml') }}-${{ matrix.os }}
+          key: coverage-${{ matrix.os }}-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', '.cargo/config.toml') }}
+          restore-keys: |
+            coverage-${{ matrix.os }}-${{ steps.rust-version.outputs.version }}-
       - uses: ilammy/setup-nasm@v1
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov

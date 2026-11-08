@@ -59,9 +59,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: windows-network-${{ runner.os }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
+          key: windows-network-${{ runner.os }}-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', '.cargo/config.toml') }}
           restore-keys: |
-            windows-network-${{ runner.os }}-
+            windows-network-${{ runner.os }}-${{ steps.rust-version.outputs.version }}-
 
       - uses: dtolnay/rust-toolchain@master
         with:

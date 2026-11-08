@@ -67,8 +67,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: macos-${{ matrix.target }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
-          restore-keys: macos-${{ matrix.target }}-
+          key: macos-${{ matrix.target }}-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', '.cargo/config.toml') }}
+          restore-keys: macos-${{ matrix.target }}-${{ steps.rust-version.outputs.version }}-
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ steps.rust-version.outputs.version }}
