@@ -52,3 +52,10 @@
 当前决定是 **保留已实现旧配置行为**，不存在本轮批准的 REMOVE/DEPRECATE。对每个未来不兼容行为使用指南 §2.3 的 `DNS-COMPAT-XXXX` 决策模板；没有具体旧行为、影响、迁移、回滚、测试和维护者批准，不允许落地。
 
 S01 准入必须满足：金标准用例在目标 HEAD 实际运行；未知新配置不会被误称为可用；即使新规则生效，也严格保持业务规则顺序，不能将 `dns.egress` 当作业务流量出口。有关真实 DNS 出口与网络泄漏的完整证明在后续 S03/S04 隔离验证执行，S00 仅建立基线。
+
+## 2026-11-08 — 代理节点专用 DNS 失败隔离回归（本地候选，L2 审查待办）
+
+- 在基于 `origin/master` `a96c21d8133f535455e79a213eb20dc0efe441f6` 的隔离整合分支上，先纳入原签名提交 `5e6e39e` 的空客户端失效关闭修复，再从已有独立测试工作树复制仅 `enhanced.rs` 的 A/AAAA 故障注入测试；原工作树不变。固定 Mihomo 参考为 `63bd52ec794b7051569b76ede2f6cdbf4c091fda`，仅只读核查配置/解析器；尚无二进制互操作对照。
+- `proxy_bootstrap_failure_never_queries_policy_main_or_fallback` 对 A 和 AAAA 注入专用 DNS 错误，断言专用上游共调用两次，policy/main/fallback 均未收到查询，两种请求均返回错误。此为内存客户端隔离断言，不证明物理 NIC 或 utun 上没有 DNS 泄漏。
+- 定向 `configured_proxy_nameserver_with_no_runtime_clients_fails_closed` 与新增 A/AAAA 故障测试分别 1/1 通过；`dns_config_tests`（TUN+Ring，无默认 feature）17/17 通过；`cargo fmt --all -- --check`、严格 Clippy（相同 feature，lib）通过。macOS DNS ownership、DNS Proxy 激活、抓包及 L2 独立审查仍未完成。
+- 本地 `master` 落后远端 23 个提交且包含未提交修改，整合内容先保留于隔离候选分支；不得把测试成功或本地签名当成合并授权、GitHub Verified 或系统级隐私验收。
