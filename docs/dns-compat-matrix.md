@@ -1121,3 +1121,7 @@ S01 准入必须满足：金标准用例在目标 HEAD 实际运行；未知新�
 - Added deterministic offline regression `concurrent_dhcp_queries_share_one_discovery_and_refresh_lease_ttl`: it holds the first probe open while a second query arrives, verifies the second waits and does not run another probe, then checks both queries receive the first installed DNS client and the lease timestamps are refreshed.
 - Validation: `cargo test -p clash-lib --lib --no-default-features --features tun,ring app::dns::dhcp::tests:: -- --test-threads=1` — **13 passed, 0 failed**; `cargo clippy -p clash-lib --no-default-features --features tun,ring --all-targets -- -D warnings` passed; `cargo fmt --all -- --check` and `git diff --check` passed.
 - Tests use synthetic DNS clients and an in-memory interface snapshot; no DHCP packets, host DNS, routes, TUN, or real NIC were used. Independent review of the updated final SHA and maintainer acceptance remain pending; this does not verify real interface-switch behavior or system-level DNS egress.
+
+### 2026-11-07：Mihomo DNS 传输/缓存字段显式拒绝（隔离切片）
+
+固定只读 `ref-mihomo` 基线 `63bd52ec794b7051569b76ede2f6cdbf4c091fda` 的 `config/config.go` 声明 `dns.prefer-h3` 和 `dns.cache-algorithm`，并在解析 DNS 配置时使用它们。Chimera 尚未实现对应 HTTP/3 优先选择及缓存算法的运行时语义。新增 `mihomo_dns_transport_preferences_must_not_be_silent_noops` 负例：修复前 `prefer-h3: true` 被静默接受（红灯）；现在两字段均在配置解析时明确拒绝，不把 YAML 兼容误报为语义兼容。既有 vendor 扩展仍可保留。该切片不改变任何系统 DNS、路由或 TUN 状态，也不证明 Mihomo 二进制互操作。

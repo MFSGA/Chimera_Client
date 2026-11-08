@@ -498,7 +498,18 @@ fn reject_unsupported_mihomo_privacy_fields(value: &Value) -> Result<(), Error> 
                 "route-address",
             ],
         ),
-        ("dns", &["use-system-hosts", "fallback-lazy-query"]),
+        (
+            "dns",
+            &[
+                "use-system-hosts",
+                "fallback-lazy-query",
+                // Mihomo selects HTTP/3 upstream transport and DNS cache policy.
+                // Neither runtime contract exists here; accepting them as no-ops
+                // would misrepresent the configured DNS execution path.
+                "prefer-h3",
+                "cache-algorithm",
+            ],
+        ),
     ];
 
     for &(section, fields) in UNSUPPORTED {
@@ -1561,6 +1572,24 @@ proxy:
         }
         let vendor = "dns:\n  fallback-filter:\n    vendor-extension: true\n";
         assert!(vendor.parse::<Config>().is_ok());
+    }
+
+    #[test]
+    fn mihomo_dns_transport_preferences_must_not_be_silent_noops() {
+        for (key, value) in [("prefer-h3", "true"), ("cache-algorithm", "arc")] {
+            let yaml = format!("dns:\n  enable: false\n  {key}: {value}\n");
+            let error = match yaml.parse::<Config>() {
+                Ok(_) => panic!(
+                    "unsupported Mihomo option dns.{key} was silently accepted"
+                ),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains(&format!("dns.{key}"))
+                    && error.contains("not implemented"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
