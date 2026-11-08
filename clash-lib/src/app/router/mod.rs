@@ -252,11 +252,10 @@ impl Router {
         for provider in &self.deferred_rule_providers {
             let provider = provider.clone();
             tokio::spawn(async move {
-                if let Err(error) = provider.activate_after_commit().await {
+                if provider.activate_after_commit().await.is_err() {
                     error!(
                         provider = provider.name(),
-                        %error,
-                        "deferred rule provider initialization failed after bounded retries; provider remains registered"
+                        "deferred rule provider initialization failed after bounded retries; provider remains registered (details withheld)"
                     );
                 }
             });

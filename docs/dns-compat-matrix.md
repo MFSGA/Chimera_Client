@@ -1133,3 +1133,45 @@ S01 准入必须满足：金标准用例在目标 HEAD 实际运行；未知新�
 - In `make_clients`, `proxy_server` groups now reject the entire group if any configured bootstrap upstream cannot initialize, rather than silently keeping only a subset. Ordinary DNS groups retain their existing best-effort behavior.
 - Added deterministic resolver-mock regressions for an unresolved hostname and a bootstrap timeout, each paired with a healthy IP-literal upstream. Both cases must return an error containing the failed hostname and reason. These tests do not exercise a real network timeout or NIC/TUN packet capture.
 - The change affects DNS configuration/runtime behavior (L2). Independent review, maintainer acceptance and cross-platform/real-network validation remain pending; no system DNS, routes or TUN state were changed.
+
+## 2026-11-14: provider cache commit compensation and visibility gate
+
+- Proxy-provider updates stage cache writes before publication. If the final rename fails after provisional proxy/DNS publication, the update now restores that provider's previous revision and DNS ownership while serialized against later updates; if compensation itself fails, the provider is hidden and the error reports both failures.
+- Readers of the provider wait for the pending cache commit to settle, so a failed or cancelled provisional update does not expose a revision that was never durably cached. These callbacks are an in-process recovery mechanism, not a cross-process crash-atomic transaction.
+- Added deterministic filesystem and mock-resolver regressions for initial/refresh rename failure, shared DNS ownership, retry after repair, and readers waiting on a provisional commit. See the batch validation below.
+
+### Cancellation boundary
+
+- Source reads, parsing and cache staging remain cancellable. Once a candidate is staged, an owned worker keeps the provider update lock through publication, cache commit or compensation, even if the API caller or watcher stops waiting. Initial publication follows the same boundary and marks the provider initialized only after acceptance.
+- Deterministic regressions cover cancellation during source reads (no publication) and cancellation after staging (the commit/rollback finishes and readers are released). See the batch validation below.
+
+### Late commit error diagnostics
+
+- If the initiating request has already been cancelled, the detached commit worker now emits one generic warning when publication or compensation fails. It deliberately omits underlying error text, which may contain node names, credentials or filesystem details. A live caller receives the specific error without an extra warning.
+- Added mock logging regressions for both observed and abandoned failures, including a private-hostname sentinel that must not appear in logs. See the batch validation below.
+
+### Retry an identical last-good provider revision after failed compensation
+
+- If both the cache rename and DNS rollback fail, the proxy provider is hidden for safety. The Fetcher now records that the same-process recovery must republish, so a later fetch of byte-for-byte identical last-good YAML retries DNS registration instead of being skipped by the unchanged content hash. The recovery marker clears only after successful acceptance.
+- Added a deterministic regression that fails the candidate commit and rollback, repairs the cache destination, then verifies the identical last-good revision becomes visible again and subsequent identical updates return to the no-op path. See the batch validation below.
+
+### Preserve the recovery retry marker during registrar outages
+
+- Added a deterministic Fetcher regression for failed cache commit, repeated node-DNS registrar errors while retrying the unchanged last-good bytes, eventual successful re-registration, and return to the unchanged-hash fast path. See the batch validation below.
+
+### Recover cancelled initial publication after cache rename failure
+
+- Added a deterministic startup regression that cancels the caller after provisional DNS registration, forces the final cache rename to fail, and verifies readers stay blocked until the owned transaction rolls DNS back and releases them without exposing an initial revision. The same provider then retries successfully. See the batch validation below.
+
+### Provider transaction batch validation (2026-11-14)
+
+- `cargo test -p clash-lib --lib --no-default-features --features tun,ring app::remote_content_manager::providers::proxy_provider::proxy_set_provider::update_reliability_tests:: -- --test-threads=1`: **29 passed, 0 failed**. The retry-marker regression also passed separately: `cargo test -p clash-lib --lib --features tun,ring app::remote_content_manager::providers::fetcher::tests::failed_commit_retry_marker_survives_registrar_outage_until_acceptance -- --exact --test-threads=1` (**1/1**).
+- `cargo clippy -p clash-lib --all-targets --no-default-features --features tun,ring -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check origin/master..HEAD` passed.
+- These checks exercise mocked filesystem/cache rename and DNS registrar failures. They do not establish crash-atomicity across processes, host DNS ownership, physical NIC/utun behavior, or cross-platform runtime behavior. Independent L2 review and owner acceptance of the final SHA remain pending.
+
+### Deferred cached-provider activation and background error logging
+
+- Independent review found that selector construction reads a protected provider's cache inside `create_components()`, before that candidate can be committed. Holding its reader gate until post-commit activation deadlocks candidate construction. The Fetcher now finishes cache preparation in an owned transaction and releases the gate inside the still-unpublished candidate after the durable cache and provider revision are validated. Post-commit health-check activation remains deferred to `ProxySetProvider::activate_after_commit()`. Metadata lookup runs before publication, and the post-commit hook remains retryable if its caller is cancelled.
+- The `deferred_cached_provider_releases_readers_after_runtime_commit` regression now checks that internal candidate readers can load the validated cache before commit and that activation still leaves the revision readable. The existing macOS runtime test also exercises selector construction, provider-cache availability and post-commit refresh through `create_components()`. Background polling, DNS registration, and deferred initialization logs now withhold raw error text; caller-facing update errors retain their details.
+- Validation: `cargo test -p clash-lib --lib --no-default-features --features tun,ring app::remote_content_manager::providers::proxy_provider::proxy_set_provider::update_reliability_tests:: -- --test-threads=1` passed **30/30**; `cargo test -p clash-lib --lib --no-default-features --features tun,ring app::remote_content_manager::providers::fetcher::tests:: -- --test-threads=1` passed **17/17**; `cargo test -p clash-lib --lib --no-default-features --features tun,ring app::remote_content_manager::providers::tests::deferred_initialization_retry_log_withholds_error_text -- --exact --test-threads=1` passed **1/1**. `cargo test -p clash-lib --lib --features tun,ring runtime::tests::protected_candidate_http_proxy_provider_uses_cache_and_keeps_it_on_refresh_failure -- --exact --test-threads=1` passed **1/1**. Strict TUN+Ring all-target Clippy and rustfmt checks on changed Rust files passed.
+- The runtime regression uses local HTTP fixtures, mocked DNS and in-memory candidate construction; it does not activate a host TUN or alter system DNS. Linux/Windows runtime behavior remains untested. Independent review passed for provider code SHA `16a66e2d37add2eff4d1d3d0179043c4d4533beb`; owner acceptance and GitHub Verified checks remain pending. This record-only follow-up does not change provider code.
