@@ -292,7 +292,9 @@ mod tests {
             }
         });
 
-        let resolver = Arc::new(MockClashResolver::new());
+        let mut resolver = MockClashResolver::new();
+        resolver.expect_ipv6().return_const(false);
+        let resolver = Arc::new(resolver);
         let datagram = DirectConnector::new()
             .connect_datagram(
                 resolver,
