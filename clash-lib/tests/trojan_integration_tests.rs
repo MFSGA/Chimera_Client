@@ -25,12 +25,14 @@ use common::{
 
 const PASSWORD: &str = "local-trojan-explain-test-password";
 
-fn available_port() -> u16 {
-    StdTcpListener::bind("127.0.0.1:0")
-        .expect("failed to reserve test port")
+fn reserve_port() -> (StdTcpListener, u16) {
+    let listener =
+        StdTcpListener::bind("127.0.0.1:0").expect("failed to reserve test port");
+    let port = listener
         .local_addr()
         .expect("failed to inspect test port")
-        .port()
+        .port();
+    (listener, port)
 }
 
 async fn socks5_connect(proxy_port: u16, target_port: u16) -> TcpStream {
@@ -271,8 +273,8 @@ async fn trojan_udp_server(
 async fn integration_test_trojan_tcp_flow_is_queryable_from_path_explain() {
     clash_lib::setup_default_crypto_provider();
 
-    let client_api = available_port();
-    let socks_port = available_port();
+    let (client_api_reservation, client_api) = reserve_port();
+    let (socks_port_reservation, socks_port) = reserve_port();
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("failed to bind local Trojan server");
@@ -319,6 +321,7 @@ rules:
   - MATCH,trojan-out
 "#
     );
+    drop((client_api_reservation, socks_port_reservation));
     let _client = ClashInstance::start(
         Options {
             config: Config::Str(config),
@@ -404,8 +407,8 @@ rules:
 async fn integration_test_trojan_udp_flow_is_queryable_from_path_explain() {
     clash_lib::setup_default_crypto_provider();
 
-    let client_api = available_port();
-    let socks_port = available_port();
+    let (client_api_reservation, client_api) = reserve_port();
+    let (socks_port_reservation, socks_port) = reserve_port();
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("failed to bind local Trojan UDP server");
@@ -461,6 +464,7 @@ rules:
   - MATCH,trojan-udp-out
 "#
     );
+    drop((client_api_reservation, socks_port_reservation));
     let _client = ClashInstance::start(
         Options {
             config: Config::Str(config),
