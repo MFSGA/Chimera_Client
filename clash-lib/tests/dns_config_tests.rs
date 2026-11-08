@@ -346,6 +346,10 @@ fn unimplemented_mihomo_dns_privacy_controls_must_fail_closed() {
             "{example.com: 192.0.2.53}",
         ),
         ("direct_nameserver_follow_policy", "true"),
+        ("use-system-hosts", "true"),
+        ("fallback-lazy-query", "true"),
+        ("use_system_hosts", "true"),
+        ("fallback_lazy_query", "true"),
     ] {
         for enabled in [true, false] {
             let yaml = base_config(&format!(

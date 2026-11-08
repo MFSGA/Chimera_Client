@@ -251,6 +251,12 @@ impl FromStr for Config {
                 "fake_ip_filter_mode",
                 "proxy_server_nameserver_policy",
                 "direct_nameserver_follow_policy",
+                // System hosts and fallback query timing have separate Mihomo
+                // semantics; Chimera's use-hosts is not an equivalent alias.
+                "use-system-hosts",
+                "fallback-lazy-query",
+                "use_system_hosts",
+                "fallback_lazy_query",
             ] {
                 if dns.contains_key(Value::String(field.to_owned())) {
                     return Err(Error::InvalidConfig(format!(
