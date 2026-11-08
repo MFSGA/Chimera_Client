@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button';
 import { queryKeys } from '@/lib/queryKeys';
 import { captureApiSettings } from '@/lib/api/client';
 import type { ApiSettingsSnapshot } from '@/lib/api/client';
+import { useApiSettingsRevision } from '@/hooks/useApiSettingsRevision';
 import { clearTemporaryNetworkPathPreference, updateNetworkPathPreference } from '@/lib/api/network';
 import type { EffectiveNetworkPaths, PathPreferencePriority, PathPreferenceView } from '@/lib/api/types/network';
 import { formatTimestamp, isPreferenceInterface, phaseLabel, priorityKey, samePriority } from '@/features/network/networkUtils';
@@ -19,6 +20,7 @@ export function PathPreferenceEditor({
   preference: UseQueryResult<PathPreferenceView, Error>;
 }) {
   const queryClient = useQueryClient();
+  const settingsRevision = useApiSettingsRevision();
   const [draft, setDraft] = useState<PathPreferencePriority[]>([]);
   const [lifetime, setLifetime] = useState('unchanged');
   const [candidateKey, setCandidateKey] = useState('');
@@ -29,6 +31,7 @@ export function PathPreferenceEditor({
     const current = preference.data;
     if (!current) return;
     const versionKey = JSON.stringify([
+      settingsRevision,
       current.policyVersion,
       current.source,
       current.createdAtMs,
@@ -39,7 +42,8 @@ export function PathPreferenceEditor({
     syncedPreference.current = versionKey;
     setDraft(current.priority);
     setLifetime('unchanged');
-  }, [preference.data]);
+    setCandidateKey('');
+  }, [preference.data, settingsRevision]);
 
   const save = useMutation({
     mutationFn: ({ priority, ttlMs, settings }: {

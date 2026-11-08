@@ -1,5 +1,8 @@
 import { queryKeys } from '@/lib/queryKeys';
-import { useState } from 'react';
+import { captureApiSettings } from '@/lib/api/client';
+import { useApiSettingsRevision } from '@/hooks/useApiSettingsRevision';
+import { getSettingsRevision } from '@/lib/settings';
+import { useEffect, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { getProxies, getProxyDelay } from '@/lib/api/proxies';
 import { getProxyProviders, getProviderProxyDelay, updateProxyProvider, healthcheckProvider } from '@/lib/api/providers';
@@ -168,11 +171,20 @@ function ProviderSection({
 
 export function ProxyList() {
   const queryClient = useQueryClient();
+  const settingsRevision = useApiSettingsRevision();
   const [testingProxies, setTestingProxies] = useState<Set<string>>(new Set());
   const [testingProviders, setTestingProviders] = useState<Set<string>>(new Set());
   const [updatingProviders, setUpdatingProviders] = useState<Set<string>>(new Set());
   const [testingAll, setTestingAll] = useState(false);
   const [batchFailedProviders, setBatchFailedProviders] = useState<string[]>([]);
+
+  useEffect(() => {
+    setTestingProxies(new Set());
+    setTestingProviders(new Set());
+    setUpdatingProviders(new Set());
+    setTestingAll(false);
+    setBatchFailedProviders([]);
+  }, [settingsRevision]);
 
   const { data: proxiesData, isLoading: proxiesLoading, isError: proxiesError } = useQuery({
     queryKey: queryKeys.proxies(),
@@ -240,6 +252,8 @@ export function ProxyList() {
   }
 
   async function testAllProxies() {
+    const requestSettings = captureApiSettings();
+    const requestRevision = getSettingsRevision();
     setTestingAll(true);
     setBatchFailedProviders([]);
     try {
@@ -251,6 +265,13 @@ export function ProxyList() {
           getProxyDelay(proxy.name, TEST_URL, TEST_TIMEOUT).catch(() => {})
         )),
       ]);
+      const currentSettings = captureApiSettings();
+      if (
+        requestRevision !== getSettingsRevision()
+        ||
+        requestSettings.baseUrl !== currentSettings.baseUrl
+        || requestSettings.secret !== currentSettings.secret
+      ) return;
       proxyKeys.forEach((k) => setTestingProxies((s) => { const next = new Set(s); next.delete(k); return next; }));
       const failed = providers.filter((_, i) => providerResults[i].status === 'rejected').map((p) => p.name);
       if (failed.length > 0) setBatchFailedProviders(failed);
@@ -259,7 +280,7 @@ export function ProxyList() {
         queryClient.refetchQueries({ queryKey: queryKeys.proxyProviders() }),
       ]);
     } finally {
-      setTestingAll(false);
+      if (requestRevision === getSettingsRevision()) setTestingAll(false);
     }
   }
 

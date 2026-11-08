@@ -1,7 +1,9 @@
 import { queryKeys } from '@/lib/queryKeys';
 import { captureApiSettings } from '@/lib/api/client';
 import type { ApiSettingsSnapshot } from '@/lib/api/client';
-import { useState } from 'react';
+import { useApiSettingsRevision } from '@/hooks/useApiSettingsRevision';
+import { getSettingsRevision } from '@/lib/settings';
+import { useEffect, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { getProxies, selectProxy, getGroupDelay } from '@/lib/api/proxies';
 import { getProxyProviders } from '@/lib/api/providers';
@@ -46,9 +48,15 @@ interface ProxyGroupsProps {
 
 export function ProxyGroups({ mode }: ProxyGroupsProps) {
   const queryClient = useQueryClient();
+  const settingsRevision = useApiSettingsRevision();
   const [testingGroups, setTestingGroups] = useState<Set<string>>(new Set());
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [groupLatencyMap, setGroupLatencyMap] = useState<Record<string, number>>({});
+
+  useEffect(() => {
+    setTestingGroups(new Set());
+    setGroupLatencyMap({});
+  }, [settingsRevision]);
 
   const { data, isLoading } = useQuery({
     queryKey: queryKeys.proxies(),
@@ -136,10 +144,19 @@ export function ProxyGroups({ mode }: ProxyGroupsProps) {
 
   async function testGroupDelay(group: Proxy) {
     if (!group.all) return;
+    const requestSettings = captureApiSettings();
+    const requestRevision = getSettingsRevision();
     setTestingGroups((s) => new Set(s).add(group.name));
     setExpanded((prev) => new Set(prev).add(group.name));
     try {
-      const result = await getGroupDelay(group.name, TEST_URL, TEST_TIMEOUT);
+      const result = await getGroupDelay(group.name, TEST_URL, TEST_TIMEOUT, requestSettings);
+      const currentSettings = captureApiSettings();
+      if (
+        requestRevision !== getSettingsRevision()
+        ||
+        requestSettings.baseUrl !== currentSettings.baseUrl
+        || requestSettings.secret !== currentSettings.secret
+      ) return;
       // result is { [groupName]: latencyMs } — store the group's own latency
       const ms = result[group.name];
       if (ms !== undefined) {
@@ -152,7 +169,9 @@ export function ProxyGroups({ mode }: ProxyGroupsProps) {
     } catch {
       // leave existing latency values unchanged on error
     } finally {
-      setTestingGroups((s) => { const next = new Set(s); next.delete(group.name); return next; });
+      if (requestRevision === getSettingsRevision()) {
+        setTestingGroups((s) => { const next = new Set(s); next.delete(group.name); return next; });
+      }
     }
   }
 

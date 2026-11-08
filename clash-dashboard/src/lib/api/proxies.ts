@@ -19,7 +19,14 @@ export const getProxyDelay = (name: string, url: string, timeout: number) =>
   );
 
 // Groups
-export const getGroupDelay = (name: string, url: string, timeout: number) =>
+export const getGroupDelay = (
+  name: string,
+  url: string,
+  timeout: number,
+  settings?: ApiSettingsSnapshot,
+) =>
   request<Record<string, number>>(
-    `/group/${encodeURIComponent(name)}/delay?url=${encodeURIComponent(url)}&timeout=${timeout}`
+    `/group/${encodeURIComponent(name)}/delay?url=${encodeURIComponent(url)}&timeout=${timeout}`,
+    undefined,
+    settings,
   );
