@@ -1,16 +1,16 @@
 import { useState, useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { getMemory, getConfigs, patchConfigs, reloadConfigs, getWsUrl } from '../lib/api';
-import { useTraffic } from '../hooks/useTraffic';
-import { TrafficChart } from '../components/TrafficChart';
-import { ProxyGroups } from '../components/ProxyGroups';
+import { getMemory, getConfigs, patchConfigs, reloadConfigs, getWsUrl } from '@/lib/api';
+import { useTraffic } from '@/hooks/useTraffic';
+import { TrafficChart } from '@/components/TrafficChart';
+import { ProxyGroups } from '@/components/ProxyGroups';
 import {
   ArrowUp, ArrowDown, Activity, HardDrive,
   Globe, Router, Sliders, Server, Wifi, FileText, Shield,
   RefreshCw, ChevronDown, ChevronUp,
 } from 'lucide-react';
-import { useWebSocket } from '../hooks/useWebSocket';
-import type { ConnectionsData, PatchableConfig, ClashConfig } from '../lib/api';
+import { useWebSocket } from '@/hooks/useWebSocket';
+import type { ConnectionsData, PatchableConfig, ClashConfig } from '@/lib/api';
 
 function formatSpeed(bytes: number): string {
   if (bytes < 1024) return `${bytes} B/s`;

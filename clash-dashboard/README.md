@@ -18,6 +18,17 @@ Use a version manager that reads `.node-version`, or enter the repository's
 - **uPlot** for real-time traffic charts
 - **lucide-react** for icons
 
+## Code organization
+
+- `src/App.tsx` defines the route table and lazy-loads each screen.
+- `src/app/` holds application-wide providers and shared client configuration.
+- `src/features/<name>/` holds the screen for one user-facing feature.
+- `src/components/` contains components shared by multiple features.
+- `src/hooks/` and `src/lib/` contain cross-feature hooks and utilities.
+
+Keep feature-specific state and UI close to its screen. Promote code to the
+shared directories when multiple features use it.
+
 ## Development
 
 ```bash

@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
-import { useWebSocket } from '../hooks/useWebSocket';
-import { getWsUrl } from '../lib/api';
-import type { LogEntry } from '../lib/api';
+import { useWebSocket } from '@/hooks/useWebSocket';
+import { getWsUrl } from '@/lib/api';
+import type { LogEntry } from '@/lib/api';
 
 const LEVELS = ['all', 'debug', 'info', 'warning', 'error'] as const;
 type Level = (typeof LEVELS)[number];

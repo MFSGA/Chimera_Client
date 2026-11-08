@@ -1,8 +1,8 @@
 import { useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { getRules, getRuleProviders, updateRuleProvider, getRuleProviderRules, matchRuleProvider } from '../lib/api';
+import { getRules, getRuleProviders, updateRuleProvider, getRuleProviderRules, matchRuleProvider } from '@/lib/api';
 import { RefreshCw, Search } from 'lucide-react';
-import type { RuleProvider } from '../lib/api';
+import type { RuleProvider } from '@/lib/api';
 
 function getRuleTypeBadgeStyle(type: string): { background: string; color: string } {
   switch (type) {

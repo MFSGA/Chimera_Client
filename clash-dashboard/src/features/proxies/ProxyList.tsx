@@ -3,9 +3,9 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   getProxies, getProxyProviders, getProxyDelay, getProviderProxyDelay,
   updateProxyProvider, healthcheckProvider,
-} from '../lib/api';
+} from '@/lib/api';
 import { Activity, RefreshCw, Zap } from 'lucide-react';
-import type { Proxy, ProxyProvider } from '../lib/api';
+import type { Proxy, ProxyProvider } from '@/lib/api';
 
 const TEST_URL = 'http://www.gstatic.com/generate_204';
 const TEST_TIMEOUT = 5000;

@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { getCapabilities, getVersion } from '../lib/api';
-import { getApiUrl, getSecret, setApiUrl, setSecret } from '../lib/settings';
+import { getCapabilities, getVersion } from '@/lib/api';
+import { getApiUrl, getSecret, setApiUrl, setSecret } from '@/lib/settings';
 import { Save, AlertTriangle, CheckCircle, XCircle } from 'lucide-react';
 
 function isDevMode(): boolean {

@@ -2,8 +2,8 @@ import { useEffect, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { UseQueryResult } from '@tanstack/react-query';
 import { AlertTriangle, Clock3, RefreshCw, Route, Wifi } from 'lucide-react';
-import { Badge } from '../components/ui/badge';
-import { Button } from '../components/ui/button';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
 import {
   getEffectiveNetworkPaths,
   getNetworkPathDecisions,
@@ -11,7 +11,7 @@ import {
   getNetworkStatus,
   clearTemporaryNetworkPathPreference,
   updateNetworkPathPreference,
-} from '../lib/api';
+} from '@/lib/api';
 import type {
   EffectiveNetworkPaths,
   NetworkPathDecisionRecord,
@@ -19,7 +19,7 @@ import type {
   PathPreferencePriority,
   PathPreferenceView,
   RuntimeNetworkStatus,
-} from '../lib/api';
+} from '@/lib/api';
 
 const PATH_PREFERENCE_QUERY_KEY = ['network-path-preference'] as const;
 const PREFERENCE_INTERFACES: PathPreferencePriority['interface'][] = [

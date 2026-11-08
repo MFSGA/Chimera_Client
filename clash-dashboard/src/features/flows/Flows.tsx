@@ -1,8 +1,8 @@
 import { useMemo, useState } from 'react';
 import { ResponsiveSankey } from '@nivo/sankey';
 import { Activity, ArrowUp, ArrowDown, GitBranch, ChevronUp, ChevronDown, Search } from 'lucide-react';
-import { useFlows } from '../hooks/useFlows';
-import type { FlowRecord } from '../hooks/useFlows';
+import { useFlows } from '@/hooks/useFlows';
+import type { FlowRecord } from '@/hooks/useFlows';
 import type { DefaultLink, DefaultNode, SankeyLinkDatum, SankeyNodeDatum } from '@nivo/sankey';
 
 // ─── Formatting ────────────────────────────────────────────────────────────────
