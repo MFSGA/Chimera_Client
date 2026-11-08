@@ -4,11 +4,15 @@
   pkg-config,
   cmake,
   protobuf,
-  nodejs,
-  fetchNpmDeps,
-  npmHooks,
+  nodejs_22,
+  fetchPnpmDeps,
+  pnpm_11,
+  pnpmConfigHook,
   llvmPackages,
 }:
+let
+  pnpm = pnpm_11.override { nodejs-slim = nodejs_22; };
+in
 
 rustPlatform.buildRustPackage {
   pname = "chimera-client";
@@ -45,25 +49,30 @@ rustPlatform.buildRustPackage {
     allowBuiltinFetchGit = true;
   };
 
-  npmDeps = fetchNpmDeps {
+  pnpmDeps = fetchPnpmDeps {
+    pname = "clash-dashboard";
+    version = "0.0.0";
     src = ../clash-dashboard;
-    hash = "sha256-fL0PTkAtopysqXr1D8JmtQ7C77SGOBnpweRe02bn7jE=";
+    pnpm = pnpm;
+    fetcherVersion = 4;
+    hash = "sha256-0waT+Kvwk5CB8+LJcps4EdZZn0EZsHLFJu2D3MOHF1A=";
   };
 
   nativeBuildInputs = [
     pkg-config
     cmake
     protobuf
-    nodejs
-    npmHooks.npmConfigHook
+    nodejs_22
+    pnpm
+    pnpmConfigHook
     llvmPackages.libclang
   ];
 
   LIBCLANG_PATH = "${llvmPackages.libclang.lib}/lib";
-  npmRoot = "clash-dashboard";
+  pnpmRoot = "clash-dashboard";
 
   preBuild = ''
-    npm --prefix clash-dashboard run build
+    pnpm --dir clash-dashboard run build
   '';
 
   cargoBuildFlags = [

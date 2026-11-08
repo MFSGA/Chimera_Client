@@ -23,17 +23,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: clash-dashboard/package.json
       - uses: actions/setup-node@v7
         with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: clash-dashboard/package-lock.json
+          node-version: 22.23.3
+          cache: pnpm
+          cache-dependency-path: clash-dashboard/pnpm-lock.yaml
       - name: Install dashboard dependencies
         working-directory: clash-dashboard
-        run: npm ci
+        run: pnpm install --frozen-lockfile
       - name: Build dashboard
         working-directory: clash-dashboard
-        run: npm run build
+        run: pnpm run build
       - uses: actions/upload-artifact@v7
         with:
           name: dashboard-dist

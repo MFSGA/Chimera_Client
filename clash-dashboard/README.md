@@ -2,6 +2,9 @@
 
 A web dashboard for [clash-rs](https://github.com/watfaq/clash-rs) proxy software.
 
+CI and Nix use Node.js 22.23.3 and pnpm 11.27.0. The `packageManager` field in
+`package.json` pins pnpm; `pnpm-lock.yaml` pins the complete dependency graph.
+
 ## Stack
 
 - **Vite** + **React 19** + **TypeScript**
@@ -15,8 +18,8 @@ A web dashboard for [clash-rs](https://github.com/watfaq/clash-rs) proxy softwar
 ## Development
 
 ```bash
-npm install
-npm run dev
+pnpm install --frozen-lockfile
+pnpm dev
 ```
 
 The dashboard connects to the clash-rs API at `window.location.origin` by default. To develop against a local clash-rs instance:
@@ -30,7 +33,7 @@ Or set `localStorage['clash-api-url']` before loading the page.
 ## Build
 
 ```bash
-npm run build
+pnpm build
 ```
 
 Output goes to `dist/`. This is a static SPA — no server-side rendering.
@@ -38,9 +41,9 @@ Output goes to `dist/`. This is a static SPA — no server-side rendering.
 Run the same frontend quality gate used by CI before submitting changes:
 
 ```bash
-npm ci
-npm run lint
-npm run build
+pnpm install --frozen-lockfile
+pnpm lint
+pnpm build
 ```
 
 ## Embedding in the Binary
@@ -50,12 +53,12 @@ The dashboard is served by clash-rs when the `dashboard` feature flag is enabled
 The app uses `base: './'` in Vite config to support being served from any path prefix.
 
 Cargo builds with the `dashboard` feature embed the existing `dist/` output; they
-do not install Node.js dependencies or invoke npm. Build the frontend before a
+do not install Node.js dependencies or invoke pnpm. Build the frontend before a
 dashboard-enabled CLI build:
 
 ```bash
-npm ci
-npm run build
+pnpm install --frozen-lockfile
+pnpm build
 cargo build -p clash-rs
 ```
 

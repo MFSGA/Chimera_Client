@@ -157,12 +157,13 @@ Cargo 的 `-p` 参数使用 package 名称，不一定等于目录名。
   nixpkgs 输入来自 GitHub flake 并由 `flake.lock` 固定 revision；换机时需确认
   flakes 可用且锁定源码可以从本地缓存或网络获取。
 - CLI 默认启用 `dashboard`。`clash-lib/build.rs` 只校验并追踪
-  `clash-dashboard/dist/` 中已构建的静态资源，不运行 `npm ci` 或 `npm run build`。
+  `clash-dashboard/dist/` 中已构建的静态资源，不运行 `pnpm install` 或 `pnpm build`。
   普通 Cargo 构建 Dashboard-enabled CLI 前，需在 `clash-dashboard/` 显式运行
-  `npm ci` 和 `npm run build`；这一步需要 Node.js/npm 和依赖可用。Nix package
-  使用 `fetchNpmDeps`/`npmConfigHook` 准备依赖，并在 Cargo 构建前运行 Dashboard build。
+  `pnpm install --frozen-lockfile` 和 `pnpm build`；这一步需要 Node.js、pnpm 和依赖可用。Nix package
+  使用 `fetchPnpmDeps`/`pnpmConfigHook` 准备依赖，并在 Cargo 构建前运行 Dashboard build。
   未启用 `dashboard` 的 Rust
-  构建不依赖这些前端资源。CI 使用 Node.js 22，在独立 Dashboard job 中构建资源，
+  构建不依赖这些前端资源。CI 使用固定的 Node.js 22.23.3 和 pnpm 11.27.0，
+  在独立 Dashboard job 中构建资源，
   再把 `dist/` 交给 Rust jobs。
 
 ## 验证命令与选择
@@ -210,8 +211,9 @@ cargo doc -p clash-lib --no-deps
 - 仓库根目录没有 Makefile 或 `start.ps1`；不要使用旧说明中的 `make docs`、
   `make test-no-docker` 或 PowerShell 启动命令。
 
-前端改动在 `clash-dashboard/` 中执行 `npm ci`、`npm run lint`、`npm run build`；
-涉及页面行为时补充实际交互检查。依赖未变且已安装时无需反复运行 `npm ci`。
+前端改动在 `clash-dashboard/` 中执行 `pnpm install --frozen-lockfile`、
+`pnpm run lint`、`pnpm run build`；涉及页面行为时补充实际交互检查。
+依赖未变且已安装时无需反复运行安装命令。
 
 ## 运行、配置与本地状态
 

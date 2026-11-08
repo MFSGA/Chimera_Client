@@ -50,20 +50,25 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake libclang-dev protobuf-compiler
 
+      - name: Set up pnpm for Dashboard
+        uses: pnpm/action-setup@v6
+        with:
+          package_json_file: clash-dashboard/package.json
+
       - name: Set up Node.js for Dashboard
         uses: actions/setup-node@v7
         with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: clash-dashboard/package-lock.json
+          node-version: 22.23.3
+          cache: pnpm
+          cache-dependency-path: clash-dashboard/pnpm-lock.yaml
 
       - name: Install Dashboard dependencies
         working-directory: clash-dashboard
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
       - name: Build Dashboard assets
         working-directory: clash-dashboard
-        run: npm run build
+        run: pnpm run build
 
       # Build the binary that the tests will spawn as a subprocess.
       # clash-bin's `standard` feature (enabled by default) governs which

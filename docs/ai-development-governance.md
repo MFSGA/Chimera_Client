@@ -69,7 +69,7 @@
 | Rust 局部逻辑              | `cargo fmt --all -- --check`、相关 `cargo test -p <package>`、`cargo check -p <package>`                                | 未测 feature 或跨平台等价                    |
 | 公共接口/协议/配置         | `cargo test --workspace`、相关集成测试、`cargo clippy --workspace --all-targets -- -D warnings` 及受影响的 feature 组合 | 真实 TUN、DNS 权限、生产配置安全             |
 | Controller API             | 真实请求、鉴权/CORS 与 WebSocket 相关回归、失败/取消路径                                                                | Dashboard 按钮或未执行的平台 E2E             |
-| Dashboard                  | `cd clash-dashboard && npm run format:check && npm run lint && npm run build`、相关实际交互验证                         | 代理数据路径与 OS 网络已验证                 |
+| Dashboard                  | `cd clash-dashboard && pnpm install --frozen-lockfile && pnpm run lint && pnpm run build`、相关实际交互验证             | 代理数据路径与 OS 网络已验证                 |
 | Windows/Linux/macOS 和网络 | 运行实际目标 runner 的适用 CI/集成测试；确认 loopback/VM/真实宿主边界                                                   | 未运行平台、实际 NIC/TUN、真实公网或权限操作 |
 | CI/Release                 | 校对 YAML 触发器、权限、构建产物与 GitHub run/job URL；更新门禁经 L3 审批                                               | CI 绿等于 Release、tag 和安装成功            |
 

@@ -16,11 +16,11 @@ configuration.
 Build Dashboard assets before using a Dashboard-enabled profile:
 
 ```bash
-npm --prefix clash-dashboard ci
-npm --prefix clash-dashboard run build
+pnpm --dir clash-dashboard install --frozen-lockfile
+pnpm --dir clash-dashboard build
 ```
 
-The Nix package prepares dependencies from `fetchNpmDeps` and runs the Dashboard
+The Nix package prepares dependencies from `fetchPnpmDeps` and runs the Dashboard
 build in its pre-build phase before invoking Cargo.
 
 `clash-lib` has its own default feature set. It is a library build profile, not

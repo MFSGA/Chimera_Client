@@ -40,6 +40,7 @@
           rust = pkgs.rust-bin.stable.latest.default.override {
             extensions = [ "clippy" "rustfmt" ];
           };
+          pnpm = pkgs.pnpm_11.override { nodejs-slim = pkgs.nodejs_22; };
         in {
           default = pkgs.mkShell {
             nativeBuildInputs = with pkgs; [
@@ -55,7 +56,7 @@
               pkg-config
               protobuf
               rust
-            ];
+            ] ++ [ pnpm ];
 
             buildInputs = with pkgs; [ openssl ];
 
@@ -66,6 +67,7 @@
               echo "Chimera Client development environment"
               echo "Rust: $(rustc --version)"
               echo "Node.js: $(node --version)"
+              echo "pnpm: $(pnpm --version)"
               echo "Run: cargo check --workspace"
             '';
           };

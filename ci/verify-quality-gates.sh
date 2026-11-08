@@ -17,8 +17,8 @@ Usage: ci/verify-quality-gates.sh [--quick|--full] [--target-dir PATH] [--allow-
                    Clippy + LAN tests.
   --target-dir     Cargo artifact directory. Defaults to CARGO_TARGET_DIR or
                    /Volumes/ChimeraClientVlessTests/Chimera_Client_master_target.
-  --reinstall-dashboard  Run npm ci from the lockfile before Dashboard checks.
-  --allow-network  Permit explicitly requested npm ci to fetch packages;
+  --reinstall-dashboard  Run pnpm install from the lockfile before Dashboard checks.
+  --allow-network  Permit explicitly requested pnpm install to fetch packages;
                    the optional reinstall is offline by default.
 The default target lives in an APFS sparsebundle backed by the external
 Ventoy USB drive. It MUST be mounted. Builds never silently fall back to
@@ -27,7 +27,7 @@ HELP
 }
 mode=quick
 reinstall_dashboard=0
-npm_network=(--offline)
+pnpm_network=(--offline)
 target_dir="${CARGO_TARGET_DIR:-/Volumes/ChimeraClientVlessTests/Chimera_Client_master_target}"
 while (($#)); do
   case "$1" in
@@ -37,7 +37,7 @@ while (($#)); do
       shift
       if (($# == 0)); then echo "Missing --target-dir argument" >&2; exit 2; fi
       target_dir="$1" ;;
-    --allow-network) npm_network=() ;;
+    --allow-network) pnpm_network=() ;;
     --reinstall-dashboard) reinstall_dashboard=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -71,11 +71,11 @@ if [[ -z "$target_device" || "$target_device" == "$root_device" ]]; then
 fi
 export CARGO_TARGET_DIR="$target_dir"
 
-# Keep npm cache on the same APFS volume when using the project's known
-# external build image. Other callers may supply their own npm_config_cache.
-if [[ -z "${npm_config_cache:-}" && "$target_dir" == /Volumes/ChimeraClientVlessTests/* ]]; then
-  export npm_config_cache=/Volumes/ChimeraClientVlessTests/npm-cache
-  mkdir -p "$npm_config_cache"
+# Keep the pnpm store on the same APFS volume when using the project's known
+# external build image. Other callers may supply their own pnpm_config_store_dir.
+if [[ -z "${pnpm_config_store_dir:-}" && "$target_dir" == /Volumes/ChimeraClientVlessTests/* ]]; then
+  export pnpm_config_store_dir=/Volumes/ChimeraClientVlessTests/pnpm-store
+  mkdir -p "$pnpm_config_store_dir"
 fi
 
 printf 'Repository: %s\nMode: %s\nCargo target: %s\n' "$ROOT" "$mode" "$CARGO_TARGET_DIR"
@@ -94,19 +94,19 @@ run "Default-feature all-target strict Clippy" cargo clippy -p clash-lib --all-t
 run "Core library unit tests" cargo test -p clash-lib --lib --locked
 
 if [[ "$mode" == full ]]; then
-  # npm's immutable install and the Dashboard's lint/build are the same gates
-  # used by CI. Rust consumes the generated dist/ files but never invokes npm.
+  # pnpm's frozen install and the Dashboard's lint/build are the same gates
+  # used by CI. Rust consumes the generated dist/ files but never invokes pnpm.
   if ((reinstall_dashboard)); then
-    run "Dashboard clean dependency install" npm --prefix clash-dashboard ci "${npm_network[@]}"
+    run "Dashboard frozen dependency install" pnpm --dir clash-dashboard install --frozen-lockfile "${pnpm_network[@]}"
   else
-    [[ -f "$ROOT/clash-dashboard/node_modules/.package-lock.json" ]] || {
+    [[ -f "$ROOT/clash-dashboard/node_modules/.pnpm/lock.yaml" ]] || {
       echo "Dashboard dependencies absent: run --reinstall-dashboard (optionally --allow-network)" >&2
       exit 2
     }
-    run "Dashboard installed dependency validation" npm --prefix clash-dashboard ls --depth=0
+    run "Dashboard installed dependency validation" pnpm --dir clash-dashboard list --depth=0
   fi
-  run "Dashboard lint" npm --prefix clash-dashboard run lint
-  run "Dashboard TypeScript and Vite build" npm --prefix clash-dashboard run build
+  run "Dashboard lint" pnpm --dir clash-dashboard run lint
+  run "Dashboard TypeScript and Vite build" pnpm --dir clash-dashboard run build
   [[ -s "$ROOT/clash-dashboard/dist/index.html" ]] || {
     echo "Dashboard did not produce dist/index.html" >&2; exit 1;
   }

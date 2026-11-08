@@ -20,7 +20,7 @@ and the Dashboard TypeScript build.
 | Live traffic, connections, logs, and flows | `/ws/traffic`, `/ws/connections`, `/ws/logs`, `/ws/flows` | `TrafficData`, `ConnectionsData`, `LogEntry`, `FlowRecord` | WebSocket contract tests, log WebSocket integration test, logging and flow handler tests |
 
 `ci/test-dashboard-api-contract.sh` runs these focused checks on Linux CI. The
-Dashboard job runs `npm run lint` and `npm run build`, which type-check the
+Dashboard job runs `pnpm run lint` and `pnpm run build`, which type-check the
 frontend models and their consumers. The HTTP request helper sends bearer
 authentication and accepts either a plain-text error body or JSON with a
 `message`; WebSocket authentication uses the `token` query parameter. The

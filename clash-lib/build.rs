@@ -10,7 +10,7 @@ fn main() -> anyhow::Result<()> {
 
     anyhow::ensure!(
         dashboard_dist.join("index.html").is_file(),
-        "Dashboard assets are missing at {}. Build them separately with `npm --prefix clash-dashboard ci` and `npm --prefix clash-dashboard run build`, then retry the Cargo build. The dashboard feature embeds prebuilt assets; the Rust build does not install Node.js dependencies or run npm.",
+        "Dashboard assets are missing at {}. Build them separately with `pnpm --dir clash-dashboard install --frozen-lockfile` and `pnpm --dir clash-dashboard run build`, then retry the Cargo build. The dashboard feature embeds prebuilt assets; the Rust build does not install Node.js dependencies or run pnpm.",
         dashboard_dist.display()
     );
 
