@@ -1,6 +1,10 @@
 #![cfg(feature = "shadowsocks")]
 
-use std::{net::TcpListener as StdTcpListener, path::PathBuf, time::Duration};
+use std::{
+    net::{TcpListener as StdTcpListener, UdpSocket as StdUdpSocket},
+    path::PathBuf,
+    time::Duration,
+};
 
 use clash_lib::{Config, Options};
 use http_body_util::BodyExt;
@@ -26,17 +30,49 @@ fn udp_roundtrip_timeout() -> Duration {
     }
 }
 
-fn available_listener_ports() -> [u16; 4] {
-    let reservations: [StdTcpListener; 4] = std::array::from_fn(|_| {
-        StdTcpListener::bind("127.0.0.1:0")
-            .expect("failed to reserve Shadowsocks listener port")
-    });
-    reservations.map(|listener| listener.local_addr().unwrap().port())
+fn reserve_listener_port(needs_udp: bool) -> (StdTcpListener, Option<StdUdpSocket>) {
+    let mut last_tcp_bind_error = None;
+
+    for _ in 0..32 {
+        let udp_reservation = if needs_udp {
+            Some(
+                StdUdpSocket::bind("127.0.0.1:0")
+                    .expect("failed to reserve Shadowsocks UDP listener port"),
+            )
+        } else {
+            None
+        };
+        let address = udp_reservation
+            .as_ref()
+            .map(|socket| socket.local_addr().expect("failed to read UDP port"))
+            .unwrap_or_else(|| {
+                "127.0.0.1:0".parse().expect("valid loopback address")
+            });
+
+        match StdTcpListener::bind(address) {
+            Ok(tcp_reservation) => return (tcp_reservation, udp_reservation),
+            Err(error) => last_tcp_bind_error = Some(error),
+        }
+    }
+
+    panic!(
+        "failed to reserve compatible Shadowsocks listener port after 32 attempts: {last_tcp_bind_error:?}"
+    );
+}
+
+fn available_listener_ports(udp: bool) -> [u16; 4] {
+    let reservations = [
+        reserve_listener_port(false),
+        reserve_listener_port(udp),
+        reserve_listener_port(false),
+        reserve_listener_port(false),
+    ];
+    reservations.map(|(listener, _udp)| listener.local_addr().unwrap().port())
 }
 
 fn start_shadowsocks_pair(udp: bool) -> (ClashInstance, ClashInstance, u16, u16) {
     let [server_api, server_port, client_api, socks_port] =
-        available_listener_ports();
+        available_listener_ports(udp);
     let cwd =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
 
