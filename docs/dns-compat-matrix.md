@@ -5,6 +5,12 @@
 > 本地基线：`275ac992808acac4dd51783f5fc295c157218f8e`；指南公开基线：`71ddfd62ddb3dd6820130ae6282a786dfbe0b87f`。远端 `origin/master` 当时为 `71ddfd6`。
 > **A = Core/Keep、B = Legacy/Review、C = Skip/Reject** 是指南的*产品取舍建议*，与“当前实现状态”是两个不同的判断轴。除非有 Decision 及维护者批准，表中的建议**不构成删除旧字段的授权**。
 
+## 2026-11-07 运行时隔离补充（P0）
+
+- 固定 Mihomo 只读参考：`ref-mihomo` gitlink / 工作树 `63bd52ec794b7051569b76ede2f6cdbf4c091fda`；`config/config.go::parseDNS` 中解析独立 `proxy-server-nameserver`，并在配置 `proxy-server-nameserver-policy` 时要求其非空。这里的运行时零客户端失效关闭是 Chimera 的隐私安全强化，**不是已证明 Mihomo 具有相同错误路径**。
+- Chimera 基线 `e42dabe74282c77245da1023de0b828830928216`：`resolver/enhanced.rs::new_with_network_path_source` 对已配置但运行时零客户端的 `proxy-server-nameserver` 发出警告并回退默认 DNS；即使解析层通常会拒绝全跳过配置，内部配置和运行时构造仍可能出现此状态。
+- 先写否定测试 `configured_proxy_nameserver_with_no_runtime_clients_fails_closed`，修复前实测 0 passed / 1 failed；修复后该状态直接返回 `InvalidConfig`，不会构造回退到默认 DNS 的代理节点解析器。测试不触碰系统 DNS、路由或 TUN；仍需故障注入验证实际已构造客户端超时、provider 更新和物理 NIC/utun 抓包。
+
 ## 1. 已有配置及行为
 
 | 字段或机制 | 当前输入/真实行为（含边界） | 现状 | 建议 A/B/C | 会破坏现有使用吗？ / 迁移示例 | 实证/金标准 |

@@ -398,15 +398,12 @@ impl EnhancedResolver {
             )
             .await?;
             if clients.is_empty() {
-                warn!(
-                    "no usable proxy-server-nameserver clients were initialized; \
-                     proxy server domain resolution will fall back to the main \
-                     nameservers"
-                );
-                None
-            } else {
-                Some(clients)
+                return Err(Error::InvalidConfig(
+                    "proxy-server-nameserver configured but no usable DNS clients initialized"
+                        .into(),
+                ));
             }
+            Some(clients)
         } else {
             None
         };
@@ -3323,6 +3320,28 @@ mod tests {
 
         assert!(resolver.proxy_resolver.is_some());
         assert!(resolver.proxy_server_domains.is_none());
+    }
+
+    #[tokio::test]
+    async fn configured_proxy_nameserver_with_no_runtime_clients_fails_closed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_store = crate::app::profile::ThreadSafeCacheFile::new(
+            temp_dir.path().join("cache.db").to_str().unwrap(),
+            false,
+        );
+        let mut config = make_proxy_nameserver_config();
+        // A parsed configuration can still produce no usable clients at runtime.
+        // Never silently switch proxy hostname resolution to default/main DNS.
+        config.proxy_server_nameserver = Some(vec![]);
+        let result = EnhancedResolver::new(
+            config,
+            cache_store,
+            None,
+            Arc::new(RwLock::new(std::collections::HashMap::new())),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "empty proxy DNS clients must fail closed");
     }
 
     #[tokio::test]
