@@ -2,8 +2,11 @@
 
 A web dashboard for [clash-rs](https://github.com/watfaq/clash-rs) proxy software.
 
-CI and Nix use Node.js 22.23.3 and pnpm 11.27.0. The `packageManager` field in
-`package.json` pins pnpm; `pnpm-lock.yaml` pins the complete dependency graph.
+Node.js is pinned in `.node-version`; CI reads that file and Nix checks its
+locked Node.js package against it. The `packageManager` field in `package.json`
+pins pnpm for CI and Nix, while `pnpm-lock.yaml` pins the complete dependency graph.
+Use a version manager that reads `.node-version`, or enter the repository's
+`nix develop` shell for the matching local Node.js and pnpm versions.
 
 ## Stack
 

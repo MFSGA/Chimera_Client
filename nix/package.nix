@@ -11,8 +11,16 @@
   llvmPackages,
 }:
 let
+  nodeVersion = lib.removeSuffix "\n" (
+    builtins.readFile ../clash-dashboard/.node-version
+  );
+  pnpmVersion = lib.removePrefix "pnpm@" (
+    (builtins.fromJSON (builtins.readFile ../clash-dashboard/package.json)).packageManager
+  );
   pnpm = pnpm_11.override { nodejs-slim = nodejs_22; };
 in
+assert nodejs_22.version == nodeVersion;
+assert pnpm.version == pnpmVersion;
 
 rustPlatform.buildRustPackage {
   pname = "chimera-client";

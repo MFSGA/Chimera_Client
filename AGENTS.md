@@ -162,8 +162,9 @@ Cargo 的 `-p` 参数使用 package 名称，不一定等于目录名。
   `pnpm install --frozen-lockfile` 和 `pnpm build`；这一步需要 Node.js、pnpm 和依赖可用。Nix package
   使用 `fetchPnpmDeps`/`pnpmConfigHook` 准备依赖，并在 Cargo 构建前运行 Dashboard build。
   未启用 `dashboard` 的 Rust
-  构建不依赖这些前端资源。CI 使用固定的 Node.js 22.23.3 和 pnpm 11.27.0，
-  在独立 Dashboard job 中构建资源，
+  构建不依赖这些前端资源。Node.js 版本以 `clash-dashboard/.node-version` 为准；
+  CI 从该文件读取版本，Nix 检查锁定的 Node.js 与 pnpm 包版本是否分别匹配
+  `.node-version` 和 `package.json` 的 `packageManager`。CI 在独立 Dashboard job 中构建资源，
   再把 `dist/` 交给 Rust jobs。
 
 ## 验证命令与选择
