@@ -1270,6 +1270,138 @@ proxies:
     }
 
     #[tokio::test]
+    async fn cancelled_initial_failed_rename_compensates_dns_and_can_retry() {
+        const FIRST: &[u8] = b"proxies:\n  - name: staged-initial\n    type: socks5\n    server: staged-initial.example\n    port: 1080\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cancelled-initial-failure.yaml");
+        let mut vehicle = MockProviderVehicle::new();
+        vehicle
+            .expect_path()
+            .return_const(path.to_string_lossy().into_owned());
+        vehicle.expect_typ().return_const(ProviderVehicleType::Http);
+        vehicle
+            .expect_read()
+            .times(2)
+            .returning(|| Ok(FIRST.to_vec()));
+
+        let calls = Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let recorded = calls.clone();
+        let target = path.clone();
+        let mut resolver = MockClashResolver::new();
+        resolver.expect_resolve_all().returning(|_, _| {
+            Err(anyhow::anyhow!("synthetic offline healthcheck DNS denial"))
+        });
+        resolver
+            .expect_replace_proxy_provider_dns_domains()
+            .times(3)
+            .returning(move |owner, domains| {
+                assert_eq!(owner, "cancelled-initial-owner");
+                let mut events = recorded.lock().unwrap();
+                if events.is_empty() {
+                    assert_eq!(domains, ["staged-initial.example"]);
+                    // The cache was staged; sabotage the final rename *after*
+                    // the DNS registrar accepted a provisional endpoint.
+                    std::fs::create_dir(&target).unwrap();
+                }
+                events.push(domains);
+                Ok(())
+            });
+        let health = HealthCheck::new(
+            vec![],
+            "http://example.invalid/check".into(),
+            0,
+            true,
+            ProxyManager::new(Arc::new(resolver), None),
+        );
+        let provider = Arc::new(
+            ProxySetProvider::new_with_dns_privacy(
+                "cancelled-initial-owner".into(),
+                Duration::ZERO,
+                Arc::new(vehicle),
+                health,
+                true,
+            )
+            .unwrap(),
+        );
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let signal = entered.clone();
+        let release = resume.clone();
+        *provider.before_cache_commit.lock().await = Some(Arc::new(move || {
+            let signal = signal.clone();
+            let release = release.clone();
+            Box::pin(async move {
+                signal.notify_one();
+                release.notified().await;
+            })
+        }));
+
+        let started = provider.clone();
+        let request = tokio::spawn(async move { started.initialize().await });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("initial publication must reach pre-persist barrier");
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                provider.strict_content_snapshot()
+            )
+            .await
+            .is_err(),
+            "provisional node cannot be read before transaction resolution"
+        );
+        resume.notify_one();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                provider.strict_content_snapshot()
+            )
+            .await
+            .expect("failed commit must release readers")
+            .is_none(),
+            "cancelled startup's failed rename must retract the provider"
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![vec!["staged-initial.example".to_owned()], vec![]],
+            "owner-scoped DNS must be cleared when initial commit cannot persist"
+        );
+        assert!(
+            path.is_dir(),
+            "external destination mutation must be preserved"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "failed transaction must clean its staged temporary file"
+        );
+
+        std::fs::remove_dir(&path).unwrap();
+        *provider.before_cache_commit.lock().await = None;
+        provider
+            .initialize()
+            .await
+            .expect("subsequent startup must register and persist");
+        let accepted = provider.strict_content_snapshot().await.unwrap();
+        assert_eq!(accepted.revision, 1);
+        assert_eq!(
+            accepted.proxies[0].server_name(),
+            Some("staged-initial.example")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), FIRST);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                vec!["staged-initial.example".to_owned()],
+                vec![],
+                vec!["staged-initial.example".to_owned()]
+            ],
+        );
+    }
+
+    #[tokio::test]
     async fn cancelling_initial_provider_request_after_staging_finishes_dns_and_cache()
      {
         const FIRST: &[u8] = b"proxies:\n  - name: first-node\n    type: socks5\n    server: first.example\n    port: 1080\n";

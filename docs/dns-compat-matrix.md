@@ -1158,3 +1158,7 @@ S01 准入必须满足：金标准用例在目标 HEAD 实际运行；未知新�
 ### Preserve the recovery retry marker during registrar outages
 
 - Added a deterministic Fetcher regression for failed cache commit, repeated node-DNS registrar errors while retrying the unchanged last-good bytes, eventual successful re-registration, and return to the unchanged-hash fast path. Validation pending.
+
+### Recover cancelled initial publication after cache rename failure
+
+- Added a deterministic startup regression that cancels the caller after provisional DNS registration, forces the final cache rename to fail, and verifies readers stay blocked until the owned transaction rolls DNS back and releases them without exposing an initial revision. The same provider then retries successfully. Validation pending.
