@@ -2980,6 +2980,74 @@ mod tests {
         assert_eq!(main_hits.load(Ordering::SeqCst), 0);
     }
 
+    #[derive(Debug)]
+    struct CountingFailingClient {
+        hits: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::app::dns::Client for CountingFailingClient {
+        fn id(&self) -> String {
+            "dedicated-proxy-dns".to_owned()
+        }
+
+        async fn exchange(&self, _msg: &op::Message) -> anyhow::Result<op::Message> {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::anyhow!("injected bootstrap timeout"))
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_bootstrap_failure_never_queries_policy_main_or_fallback() {
+        let mut resolver = EnhancedResolver::from_clients_with_fallback(
+            vec![],
+            Some(vec![]),
+            false,
+        );
+        let dedicated_hits = Arc::new(AtomicUsize::new(0));
+        let policy_hits = Arc::new(AtomicUsize::new(0));
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        let fallback_hits = Arc::new(AtomicUsize::new(0));
+        let mut domains = crate::common::trie::StringTrie::new();
+        domains.insert("proxy.example.com", Arc::new(true));
+        resolver.proxy_server_domains = Some(domains);
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingFailingClient {
+            hits: dedicated_hits.clone(),
+        })]);
+        let mut policy = crate::common::trie::StringTrie::new();
+        policy.insert(
+            "proxy.example.com",
+            Arc::new(vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 70)),
+                hits: policy_hits.clone(),
+                id: "policy-dns",
+            }) as ThreadSafeDNSClient]),
+        );
+        resolver.policy = Some(policy);
+        resolver.main = vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 71)),
+            hits: main_hits.clone(),
+            id: "main-dns",
+        })];
+        resolver.fallback = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 72)),
+            hits: fallback_hits.clone(),
+            id: "fallback-dns",
+        })]);
+
+        for record_type in [rr::RecordType::A, rr::RecordType::AAAA] {
+            let err = resolver
+                .exchange_no_cache(&test_query_with_type(record_type))
+                .await
+                .expect_err("dedicated bootstrap failure must fail closed");
+            assert!(err.to_string().contains("injected bootstrap timeout"));
+        }
+        assert_eq!(dedicated_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(policy_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(main_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn nameserver_policy_works_without_fallback() {
         let mut resolver = EnhancedResolver::new_default().await;
