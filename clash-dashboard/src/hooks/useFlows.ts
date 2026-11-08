@@ -38,12 +38,19 @@ export function useFlows(includeClosed = true): UseFlowsReturn {
   const url = getWsUrl(`/ws/flows?interval=5&top=50&include_closed=${includeClosed}`);
   const { lastMessage, readyState } = useWebSocket<FlowRecord[]>(url);
 
-  const [flows, setFlows] = useState<FlowRecord[]>([]);
+  const [flowState, setFlowState] = useState<{ url: string; flows: FlowRecord[] }>(() => ({
+    url,
+    flows: [],
+  }));
 
   useEffect(() => {
     if (!lastMessage) return;
-    setFlows(lastMessage);
-  }, [lastMessage]);
+    setFlowState({ url, flows: lastMessage });
+  }, [lastMessage, url]);
 
-  return { flows, readyState };
+  useEffect(() => {
+    setFlowState({ url, flows: [] });
+  }, [url]);
+
+  return { flows: flowState.url === url ? flowState.flows : [], readyState };
 }

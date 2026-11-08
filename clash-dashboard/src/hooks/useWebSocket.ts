@@ -7,12 +7,20 @@ interface UseWebSocketReturn<T> {
   readyState: ReadyState;
 }
 
+interface MessageState<T> {
+  url: string | null;
+  message: T | null;
+}
+
 export function useWebSocket<T = unknown>(url: string | null): UseWebSocketReturn<T> {
-  const [lastMessage, setLastMessage] = useState<T | null>(null);
+  const [messageState, setMessageState] = useState<MessageState<T>>({
+    url: null,
+    message: null,
+  });
   const [readyState, setReadyState] = useState<ReadyState>('CLOSED');
 
   useEffect(() => {
-    setLastMessage(null);
+    setMessageState({ url, message: null });
     if (!url) {
       setReadyState('CLOSED');
       return;
@@ -52,7 +60,7 @@ export function useWebSocket<T = unknown>(url: string | null): UseWebSocketRetur
       currentSocket.onmessage = (event) => {
         if (!active || socket !== currentSocket) return;
         try {
-          setLastMessage(JSON.parse(event.data) as T);
+          setMessageState({ url, message: JSON.parse(event.data) as T });
         } catch {
           // Ignore malformed messages and keep the connection alive.
         }
@@ -79,5 +87,8 @@ export function useWebSocket<T = unknown>(url: string | null): UseWebSocketRetur
     };
   }, [url]);
 
-  return { lastMessage, readyState };
+  return {
+    lastMessage: messageState.url === url ? messageState.message : null,
+    readyState,
+  };
 }
