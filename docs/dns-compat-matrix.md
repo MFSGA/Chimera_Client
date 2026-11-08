@@ -1133,3 +1133,9 @@ S01 准入必须满足：金标准用例在目标 HEAD 实际运行；未知新�
 - In `make_clients`, `proxy_server` groups now reject the entire group if any configured bootstrap upstream cannot initialize, rather than silently keeping only a subset. Ordinary DNS groups retain their existing best-effort behavior.
 - Added deterministic resolver-mock regressions for an unresolved hostname and a bootstrap timeout, each paired with a healthy IP-literal upstream. Both cases must return an error containing the failed hostname and reason. These tests do not exercise a real network timeout or NIC/TUN packet capture.
 - The change affects DNS configuration/runtime behavior (L2). Independent review, maintainer acceptance and cross-platform/real-network validation remain pending; no system DNS, routes or TUN state were changed.
+
+## 2026-11-14: provider cache commit compensation and visibility gate
+
+- Proxy-provider updates stage cache writes before publication. If the final rename fails after provisional proxy/DNS publication, the update now restores that provider's previous revision and DNS ownership while serialized against later updates; if compensation itself fails, the provider is hidden and the error reports both failures.
+- Readers of the provider wait for the pending cache commit to settle, so a failed or cancelled provisional update does not expose a revision that was never durably cached. These callbacks are an in-process recovery mechanism, not a cross-process crash-atomic transaction.
+- Added deterministic filesystem and mock-resolver regressions for initial/refresh rename failure, shared DNS ownership, retry after repair, and readers waiting on a provisional commit. Validation for the rebased result is pending.

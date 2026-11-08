@@ -48,10 +48,18 @@ type ProxyParser = Box<
     dyn Fn(&[u8]) -> anyhow::Result<Vec<AnyOutboundHandler>> + Send + Sync + 'static,
 >;
 
+#[cfg(test)]
+type BeforeCacheCommit = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
+
 pub struct ProxySetProvider {
     fetcher: Fetcher<ProxyUpdater, ProxyParser>,
     hc: Arc<HealthCheck>,
     inner: Arc<tokio::sync::RwLock<Inner>>,
+    /// Prevent readers from observing an uncommitted proxy revision while
+    /// provider DNS ownership and the backing cache are in transition.
+    publication_gate: Arc<tokio::sync::RwLock<()>>,
+    #[cfg(test)]
+    before_cache_commit: Arc<tokio::sync::Mutex<Option<BeforeCacheCommit>>>,
 }
 
 impl ProxySetProvider {
@@ -94,6 +102,18 @@ impl ProxySetProvider {
         // visibility and the registrar's owner-scoped DNS mapping.
         let rollback_revision = Arc::new(tokio::sync::Mutex::new(None::<Inner>));
         let updater_rollback_revision = rollback_revision.clone();
+        let publication_gate = Arc::new(tokio::sync::RwLock::new(()));
+        let updater_gate = publication_gate.clone();
+        let pending_publication = Arc::new(tokio::sync::Mutex::new(
+            None::<tokio::sync::OwnedRwLockWriteGuard<()>>,
+        ));
+        let updater_pending_publication = pending_publication.clone();
+        #[cfg(test)]
+        let before_cache_commit: Arc<
+            tokio::sync::Mutex<Option<BeforeCacheCommit>>,
+        > = Arc::new(tokio::sync::Mutex::new(None));
+        #[cfg(test)]
+        let updater_before_commit = before_cache_commit.clone();
 
         let updater_hc = hc.clone();
         let updater_name = name.clone();
@@ -102,7 +122,20 @@ impl ProxySetProvider {
             let name = updater_name.clone();
             let inner = inner_clone.clone();
             let rollback_revision = updater_rollback_revision.clone();
+            let publication_gate = updater_gate.clone();
+            let pending_publication = updater_pending_publication.clone();
+            #[cfg(test)]
+            let before_commit = updater_before_commit.clone();
             Box::pin(async move {
+                // Hold reader admission across registration, provisional
+                // publication and final cache commit/compensation. Readers
+                // cannot observe a candidate that later fails persistence.
+                let admission = publication_gate.write_owned().await;
+                // Store the owned guard *before* any fallible/awaited DNS
+                // registration. Otherwise cancellation after changing the
+                // visible proxy revision but before handing over the guard
+                // can silently reopen readers on uncommitted content.
+                *pending_publication.lock().await = Some(admission);
                 // Serialise registration with publication: two overlapping
                 // refreshes must never publish A after B has replaced A's
                 // node-DNS ownership, even briefly.
@@ -113,6 +146,7 @@ impl ProxySetProvider {
                         warn!(
                             "proxy provider {name} exhausted content revision; refusing update"
                         );
+                        pending_publication.lock().await.take();
                         return Err(anyhow::anyhow!(
                             "provider content revision exhausted"
                         ));
@@ -127,14 +161,21 @@ impl ProxySetProvider {
                             error = %error,
                             "retaining previous provider revision: node DNS domain registration failed"
                         );
+                        pending_publication.lock().await.take();
                         return Err(error);
                     }
                     *rollback_revision.lock().await = Some(inner.clone());
                     inner.proxies.clone_from(&input);
                     inner.revision = next_revision;
                 }
+                // The guard remains in the slot after the updater returns;
+                // Fetcher releases it only after commit or rollback.
                 // Do not run health probes against a provisional revision:
                 // the final cache rename has not succeeded yet.
+                #[cfg(test)]
+                if let Some(pause) = before_commit.lock().await.as_ref().cloned() {
+                    pause().await;
+                }
                 Ok(())
             })
         });
@@ -198,12 +239,18 @@ impl ProxySetProvider {
         let rollback_name = name.clone();
         let rollback_inner = inner.clone();
         let rollback_slot = rollback_revision.clone();
+        let rollback_admission = pending_publication.clone();
         let rollback: CacheCommitRollback = Arc::new(move || {
             let hc = rollback_hc.clone();
             let name = rollback_name.clone();
             let inner = rollback_inner.clone();
             let slot = rollback_slot.clone();
+            let admission = rollback_admission.clone();
             Box::pin(async move {
+                // Keep the owned admission guard in its slot until the
+                // previous snapshot has really been restored. Cancelling an
+                // in-flight DNS rollback must not *release* an untrusted new
+                // revision to readers.
                 let Some(previous) = slot.lock().await.take() else {
                     return Err(anyhow::anyhow!(
                         "provider cache commit rollback missing previous revision"
@@ -222,26 +269,33 @@ impl ProxySetProvider {
                     current.proxies.clear();
                     current.revision = 0;
                     hc.update(vec![]).await;
+                    admission.lock().await.take();
                     return Err(error);
                 }
                 current.proxies.clone_from(&previous.proxies);
                 current.revision = previous.revision;
                 hc.update(previous.proxies).await;
+                admission.lock().await.take();
                 Ok(())
             })
         });
         let accepted_slot = rollback_revision;
+        let accepted_admission = pending_publication;
         let accepted_inner = inner.clone();
         let accepted_hc = hc.clone();
         let accepted: CacheCommitAccepted = Arc::new(move || {
             let slot = accepted_slot.clone();
+            let admission = accepted_admission.clone();
             let inner = accepted_inner.clone();
             let hc = accepted_hc.clone();
             Box::pin(async move {
                 slot.lock().await.take();
-                // Health-check sockets may use the proxy's hostname. Only
-                // schedule probes after its node DNS registration and cache
-                // have both committed successfully.
+                // The atomic cache rename succeeded and its DNS ownership
+                // was registered. This does not imply power-loss durability
+                // of the containing directory. Release reader admission
+                // before awaiting health-check state, to prevent unrelated
+                // cancellation from stranding the publication gate.
+                admission.lock().await.take();
                 let proxies = inner.read().await.proxies.clone();
                 hc.update(proxies).await;
                 tokio::spawn(async move {
@@ -251,7 +305,14 @@ impl ProxySetProvider {
         });
         let fetcher = Fetcher::new(name, interval, vehicle, parser, Some(updater))
             .with_cache_commit_hooks(rollback, accepted);
-        Ok(Self { fetcher, hc, inner })
+        Ok(Self {
+            fetcher,
+            hc,
+            inner,
+            publication_gate,
+            #[cfg(test)]
+            before_cache_commit,
+        })
     }
 }
 
@@ -327,10 +388,12 @@ impl Provider for ProxySetProvider {
 #[async_trait]
 impl ProxyProvider for ProxySetProvider {
     async fn proxies(&self) -> Vec<AnyOutboundHandler> {
+        let _admission = self.publication_gate.read().await;
         self.inner.read().await.proxies.to_vec()
     }
 
     async fn strict_content_snapshot(&self) -> Option<ProxyProviderContentSnapshot> {
+        let _admission = self.publication_gate.read().await;
         let inner = self.inner.read().await;
         (inner.revision != 0).then(|| ProxyProviderContentSnapshot {
             revision: inner.revision,
@@ -879,6 +942,170 @@ proxies:
         assert!(provider.proxies().await.is_empty());
         assert_eq!(std::fs::read(&saved).unwrap(), OLD);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn cancellation_of_provisional_provider_update_fails_closed_to_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cancelled-pending.yaml");
+        let provider = Arc::new(provider_with_refresh_dns_mode(
+            path.to_string_lossy().into_owned(),
+            SAME_NAME_NEW_HOST,
+            true,
+        ));
+        provider.initialize().await.unwrap();
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let signal = entered.clone();
+        let hold = release.clone();
+        *provider.before_cache_commit.lock().await = Some(Arc::new(move || {
+            let signal = signal.clone();
+            let hold = hold.clone();
+            Box::pin(async move {
+                signal.notify_one();
+                hold.notified().await;
+            })
+        }));
+        let updating = provider.clone();
+        let task = tokio::spawn(async move { updating.update().await });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("provisional publication must be reached");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(125),
+                provider.strict_content_snapshot(),
+            )
+            .await
+            .is_err(),
+            "a cancelled provisional revision must not become visible"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(125), provider.proxies(),)
+                .await
+                .is_err(),
+            "cancelled update must block ordinary proxy readers too"
+        );
+        // This is an explicit availability limitation: the provider must be
+        // reconstructed after cancellation. It may not release the gate and
+        // accidentally expose the incomplete revision.
+    }
+
+    #[tokio::test]
+    async fn failed_pending_commit_releases_readers_with_only_last_good_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending-failure.yaml");
+        let saved = dir.path().join("preexisting-cache.yaml");
+        let provider = Arc::new(provider_with_refresh_dns_mode(
+            path.to_string_lossy().into_owned(),
+            SAME_NAME_NEW_HOST,
+            true,
+        ));
+        provider.initialize().await.unwrap();
+        let before = provider.strict_content_snapshot().await.unwrap();
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let trigger = entered.clone();
+        let resumed = release.clone();
+        *provider.before_cache_commit.lock().await = Some(Arc::new(move || {
+            let trigger = trigger.clone();
+            let resumed = resumed.clone();
+            Box::pin(async move {
+                trigger.notify_one();
+                resumed.notified().await;
+            })
+        }));
+        let updating = provider.clone();
+        let task = tokio::spawn(async move { updating.update().await });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("refresh must reach pre-persist barrier");
+
+        std::fs::rename(&path, &saved).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let reading_snapshot = provider.clone();
+        let mut snapshot =
+            tokio::spawn(
+                async move { reading_snapshot.strict_content_snapshot().await },
+            );
+        let reading_proxies = provider.clone();
+        let mut proxies =
+            tokio::spawn(async move { reading_proxies.proxies().await });
+        let snapshot_early =
+            tokio::time::timeout(Duration::from_millis(125), &mut snapshot).await;
+        let proxies_early =
+            tokio::time::timeout(Duration::from_millis(125), &mut proxies).await;
+        release.notify_one();
+        assert!(task.await.unwrap().is_err());
+        assert!(snapshot_early.is_err(), "snapshot must wait for rollback");
+        assert!(proxies_early.is_err(), "proxy list must wait for rollback");
+        let restored = snapshot.await.unwrap().unwrap();
+        let restored_proxies = proxies.await.unwrap();
+        assert_eq!(restored.revision, before.revision);
+        assert!(Arc::ptr_eq(&restored.proxies[0], &before.proxies[0]));
+        assert!(Arc::ptr_eq(&restored_proxies[0], &before.proxies[0]));
+        assert_eq!(std::fs::read(&saved).unwrap(), VALID);
+        assert!(path.is_dir());
+    }
+
+    #[tokio::test]
+    async fn pending_cache_commit_blocks_provider_readers_until_cache_rename_succeeds()
+     {
+        const NEXT: &[u8] = b"proxies:\n  - name: future-node\n    type: socks5\n    server: 198.51.100.12\n    port: 1080\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("admission-gate.yaml");
+        let provider = Arc::new(provider_with_refresh_dns_mode(
+            path.to_string_lossy().into_owned(),
+            NEXT,
+            true,
+        ));
+        provider.initialize().await.unwrap();
+        let before = provider.strict_content_snapshot().await.unwrap();
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let continue_commit = Arc::new(tokio::sync::Notify::new());
+        let pause_entered = entered.clone();
+        let pause_release = continue_commit.clone();
+        *provider.before_cache_commit.lock().await = Some(Arc::new(move || {
+            let entered = pause_entered.clone();
+            let release = pause_release.clone();
+            Box::pin(async move {
+                entered.notify_one();
+                release.notified().await;
+            })
+        }));
+
+        let updating = provider.clone();
+        let update_task = tokio::spawn(async move { updating.update().await });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("injected commit barrier must be reached");
+
+        let observing = provider.clone();
+        let mut snapshot_task =
+            tokio::spawn(async move { observing.strict_content_snapshot().await });
+        let early =
+            tokio::time::timeout(Duration::from_millis(125), &mut snapshot_task)
+                .await;
+        let saw_uncommitted = early.is_ok();
+        continue_commit.notify_one();
+        update_task.await.unwrap().unwrap();
+        let after = match early {
+            Ok(joined) => joined.unwrap().unwrap(),
+            Err(_) => snapshot_task.await.unwrap().unwrap(),
+        };
+        assert!(
+            !saw_uncommitted,
+            "provider readers must not observe the next revision before cache commit"
+        );
+        assert_eq!(after.revision, before.revision + 1);
+        assert_eq!(after.proxies[0].server_name(), Some("198.51.100.12"));
+        assert_eq!(std::fs::read(&path).unwrap(), NEXT);
     }
 
     #[tokio::test]
