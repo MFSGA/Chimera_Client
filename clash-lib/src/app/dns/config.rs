@@ -226,6 +226,21 @@ impl Config {
         let mut policy = HashMap::new();
 
         for (domain, server) in policy_map {
+            // Mihomo interprets comma-separated domain selectors and
+            // geosite/rule-set keys. Until Chimera implements those runtime
+            // semantics, inserting them as literal trie keys would silently
+            // bypass the intended DNS policy.
+            let lower = domain.to_ascii_lowercase();
+            if domain.chars().any(char::is_whitespace)
+                || domain.contains(',')
+                || lower.starts_with("geosite:")
+                || lower.starts_with("rule-set:")
+            {
+                return Err(Error::InvalidConfig(
+                    "DNS nameserver-policy selector uses unsupported syntax".into(),
+                ));
+            }
+
             let nameservers =
                 Config::parse_nameserver(std::slice::from_ref(server))?;
 
@@ -649,6 +664,33 @@ mod tests {
             .expect_err("a policy without a usable nameserver must be rejected");
 
         assert!(error.to_string().contains("no usable nameserver"));
+    }
+
+    #[test]
+    fn nameserver_policy_rejects_unimplemented_compound_selectors() {
+        // Mihomo treats comma-delimited and geosite/rule-set keys as selectors;
+        // Chimera's plain domain trie must never accept them as inert literals.
+        for selector in [
+            "example.com other.test",
+            "example.com,other.test",
+            "geosite:private",
+            "rule-set:private",
+        ] {
+            let policy =
+                HashMap::from([(selector.to_owned(), "192.0.2.53".to_owned())]);
+            assert!(
+                Config::parse_nameserver_policy(&policy).is_err(),
+                "unsupported selector {selector:?} must not be silently accepted"
+            );
+        }
+        for selector in ["example.com", "*.example.com", "+.example.com"] {
+            let policy =
+                HashMap::from([(selector.to_owned(), "192.0.2.53".to_owned())]);
+            assert!(
+                Config::parse_nameserver_policy(&policy).is_ok(),
+                "existing selector {selector:?} must remain supported"
+            );
+        }
     }
 
     #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]

@@ -309,6 +309,29 @@ fn full_dns_fixture_parses_expected_runtime_shape() {
 }
 
 #[test]
+fn nameserver_policy_compound_selectors_fail_closed_at_yaml_conversion() {
+    for enabled in [false, true] {
+        for selector in [
+            "example.com other.test",
+            "example.com,other.test",
+            "geosite:private",
+            "rule-set:private",
+        ] {
+            let yaml = base_config(&format!(
+                "  enable: {enabled}\n  enhanced-mode: normal\n  nameserver: [1.1.1.1]\n  default-nameserver: [1.1.1.1]\n  nameserver-policy:\n    '{selector}': 192.0.2.53\n"
+            ));
+            let error = parse_error(yaml);
+            assert!(
+                error
+                    .to_string()
+                    .contains("selector uses unsupported syntax"),
+                "unsupported DNS selector {selector:?} must be rejected even with enable={enabled}: {error}"
+            );
+        }
+    }
+}
+
+#[test]
 fn service_discovery_safe_mode_is_opt_in_and_parsed() {
     let dns = parse_dns(&base_config(
         r#"  enable: true
