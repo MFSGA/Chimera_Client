@@ -41,13 +41,17 @@ jobs:
       run:
         shell: pwsh
     env:
-      RUSTUP_TOOLCHAIN: stable
       RUST_BACKTRACE: "1"
       CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: true
+
+      - name: Read pinned Rust toolchain
+        id: rust-version
+        shell: bash
+        run: echo "version=$(bash ci/read-rust-toolchain-version.sh)" >> "$GITHUB_OUTPUT"
 
       - uses: actions/cache@v6
         with:
@@ -61,7 +65,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: stable
+          toolchain: ${{ steps.rust-version.outputs.version }}
           components: clippy, rustfmt
 
       - uses: ilammy/setup-nasm@v1

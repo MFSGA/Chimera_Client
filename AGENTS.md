@@ -147,7 +147,7 @@ Cargo 的 `-p` 参数使用 package 名称，不一定等于目录名。
 
 ## 工具链与构建前提
 
-- `rust-toolchain.toml` 选择 `stable`，并未固定具体版本；注释中的 nightly 不是当前配置。
+- `rust-toolchain.toml` 固定 Rust `1.99.1` 及 `clippy`、`rustfmt` 组件；Nix 与 CI 从该文件读取版本，升级时验证受支持的 feature 组合。
 - `.cargo/config.toml` 设置 `--cfg tokio_unstable` 和 `RUSTC_BOOTSTRAP=1`，
   当前源码仍使用不稳定功能。不要把它描述成无需特殊配置的纯 stable 构建。
 - 从仓库根目录运行下列命令，确保加载本地 Cargo 配置。

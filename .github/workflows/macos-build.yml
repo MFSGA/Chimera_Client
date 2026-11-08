@@ -14,9 +14,6 @@ defaults:
   run:
     shell: bash
 
-env:
-  RUSTUP_TOOLCHAIN: stable
-
 jobs:
   dashboard:
     name: Build dashboard
@@ -57,6 +54,9 @@ jobs:
             target: x86_64-apple-darwin
     steps:
       - uses: actions/checkout@v7
+      - name: Read pinned Rust toolchain
+        id: rust-version
+        run: echo "version=$(bash ci/read-rust-toolchain-version.sh)" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@v8
         with:
           name: dashboard-dist
@@ -71,7 +71,7 @@ jobs:
           restore-keys: macos-${{ matrix.target }}-
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+          toolchain: ${{ steps.rust-version.outputs.version }}
           targets: ${{ matrix.target }}
       - uses: ilammy/setup-nasm@v1
       - name: Install Protoc

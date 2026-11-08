@@ -19,7 +19,6 @@ concurrency:
 
 env:
   RUST_LOG: "clash_lib=info"
-  RUST_TOOLCHAIN: "stable"
   THROUGHPUT_RESULTS_FILE: ${{ github.workspace }}/throughput-results.json
 
 jobs:
@@ -31,10 +30,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Read pinned Rust toolchain
+        id: rust-version
+        run: echo "version=$(bash ci/read-rust-toolchain-version.sh)" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          toolchain: ${{ steps.rust-version.outputs.version }}
 
       - name: Cache Rust dependencies
         uses: Itsusinn/rust-cache@92e40e4e88556b42f44b1a0c0e417d27f4e30f90

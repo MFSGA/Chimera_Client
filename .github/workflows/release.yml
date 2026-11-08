@@ -30,6 +30,10 @@ jobs:
           ref: master
           token: ${{ secrets.ADMIN_PAT }}
 
+      - name: Read pinned Rust toolchain
+        id: rust-version
+        run: echo "version=$(bash ci/read-rust-toolchain-version.sh)" >> "$GITHUB_OUTPUT"
+
       - name: Configure Git
         run: |
           git config user.name "github-actions[bot]"
@@ -37,6 +41,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ steps.rust-version.outputs.version }}
 
       - name: Install cargo-edit
         run: cargo install cargo-edit

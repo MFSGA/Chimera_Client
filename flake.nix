@@ -11,13 +11,14 @@
     let
       systems = [ "aarch64-darwin" "x86_64-linux" ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
+      rustVersion = (builtins.fromTOML (builtins.readFile ./rust-toolchain.toml)).toolchain.channel;
       packages = forAllSystems (system:
         let
           pkgs = import nixpkgs {
             inherit system;
             overlays = [ rust-overlay.overlays.default ];
           };
-          rust = pkgs.rust-bin.stable.latest.default.override {
+          rust = pkgs.rust-bin.stable.${rustVersion}.default.override {
             extensions = [ "clippy" "rustfmt" ];
           };
           rustPlatform = pkgs.makeRustPlatform {
@@ -37,7 +38,7 @@
             inherit system;
             overlays = [ rust-overlay.overlays.default ];
           };
-          rust = pkgs.rust-bin.stable.latest.default.override {
+          rust = pkgs.rust-bin.stable.${rustVersion}.default.override {
             extensions = [ "clippy" "rustfmt" ];
           };
           nodeVersion = pkgs.lib.removeSuffix "\n" (

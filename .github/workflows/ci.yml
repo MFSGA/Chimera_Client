@@ -22,7 +22,6 @@ env:
   REGISTRY: "ghcr.io"
   IMAGE_NAME: "clash-rs"
   RUST_LOG: "clash=TRACE"
-  RUSTUP_TOOLCHAIN: "stable"
   SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
   CROSS_CONTAINER_UID: 1001
   CROSS_CONTAINER_GID: 118
@@ -72,6 +71,9 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: true
+      - name: Read pinned Rust toolchain
+        id: rust-version
+        run: echo "version=$(bash ci/read-rust-toolchain-version.sh)" >> "$GITHUB_OUTPUT"
       - name: Download verified dashboard build
         uses: actions/download-artifact@v8
         with:
@@ -93,7 +95,7 @@ jobs:
         if: runner.os == 'Windows' || runner.os == 'macOS'
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+          toolchain: ${{ steps.rust-version.outputs.version }}
           components: rustfmt,clippy
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
@@ -212,6 +214,9 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: true
+      - name: Read pinned Rust toolchain
+        id: rust-version
+        run: echo "version=$(bash ci/read-rust-toolchain-version.sh)" >> "$GITHUB_OUTPUT"
       - name: Download dashboard build
         uses: actions/download-artifact@v8
         with:
@@ -242,13 +247,13 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+          toolchain: ${{ steps.rust-version.outputs.version }}
           targets: ${{ matrix.build-std && 'x86_64-unknown-linux-gnu' || matrix.target }}
           components: ${{ matrix.components || matrix.build-std && 'rustfmt,clippy,rust-src' || 'rustfmt,clippy' }}
 
       - name: Install target for native cargo builds
         if: ${{ matrix.tool != 'cross' }}
-        run: rustup target add ${{ matrix.target }} --toolchain ${{ env.RUSTUP_TOOLCHAIN }}
+        run: rustup target add ${{ matrix.target }} --toolchain ${{ steps.rust-version.outputs.version }}
 
       - name: Install cross-rs/cross
         if: matrix.tool == 'cross'
