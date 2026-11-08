@@ -59,3 +59,9 @@ S01 准入必须满足：金标准用例在目标 HEAD 实际运行；未知新�
 - `proxy_bootstrap_failure_never_queries_policy_main_or_fallback` 对 A 和 AAAA 注入专用 DNS 错误，断言专用上游共调用两次，policy/main/fallback 均未收到查询，两种请求均返回错误。此为内存客户端隔离断言，不证明物理 NIC 或 utun 上没有 DNS 泄漏。
 - 定向 `configured_proxy_nameserver_with_no_runtime_clients_fails_closed` 不仅要求失败，还断言返回明确的 `InvalidConfig` 和静态诊断消息，避免将其他初始化错误误认为成功执行了隐私失效关闭。A/AAAA 故障测试分别在专用上游模拟失败，拒绝 policy/main/fallback 降级。TUN+Ring（无默认 feature）核心回归、DNS 配置及 S01/S02 策略测试用于验证未破坏旧配置；macOS DNS ownership、DNS Proxy 激活、抓包及 L2 独立审查仍未完成。
 - `origin/master` 在 2026-11-08 先从 `a96c21d` 回到 `54b95ff`，又因提交重签从 `54b95ff` 变为 `840c5a2`；后两个基线 Git tree 相同但 Git 祖先不同。当前本地 `master` 仍有未提交修改，整合内容先保留于隔离候选分支。不得把测试成功或本地签名当成独立 L2 审查、GitHub Verified、required CI 或系统级隐私验收。
+
+## 2026-11-08 — nameserver-policy 复合选择器失效关闭（新增候选，L2 审查待办）
+
+- 固定 Mihomo `63bd52ec794b7051569b76ede2f6cdbf4c091fda` 的 `config/config.go::parseNameServerPolicy` 将逗号分隔域名、`geosite:` 和 `rule-set:` 视为有运行含义的策略选择器。Chimera 的 `parse_nameserver_policy` 原来只调用宽松的域名分割器，导致这些键及带空白的复合选择器被当作无法匹配的单个 trie 字面键，配置成功但没有预期 DNS 策略。
+- 先新增 `nameserver_policy_rejects_unimplemented_compound_selectors` 否定测试，修复前因 `example.com other.test` 被错误接受而失败；再在 `clash-lib/src/app/dns/config.rs` 的转换层显式拒绝空白、逗号复合、`geosite:` 和 `rule-set:` 键。诊断不包含域名/上游地址；普通域名及现有 `*.`/`+.` 通配符继续成功。该切片是失效关闭，并**未实现** Mihomo 的高级规则执行语义。
+- `clash-lib/tests/dns_config_tests.rs::nameserver_policy_compound_selectors_fail_closed_at_yaml_conversion` 对启用和禁用 DNS 的 YAML 都验证上述四类输入被拒绝，避免仅通过底层解析单测冒充 YAML 转换兼容。尚未执行 Mihomo 二进制差异运行、macOS 系统 resolver 或物理 NIC/utun 抓包。
