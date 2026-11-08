@@ -1,1 +1,3 @@
 docs/chimera-nextgen-dns-ai-guide.md whitespace=-blank-at-eol
+ci/*.sh text eol=lf
+rust-toolchain.toml text eol=lf
