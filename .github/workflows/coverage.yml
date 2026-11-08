@@ -25,6 +25,7 @@ jobs:
 
       - name: Read pinned Rust toolchain
         id: rust-version
+        shell: bash
         run: echo "version=$(bash ci/read-rust-toolchain-version.sh)" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
