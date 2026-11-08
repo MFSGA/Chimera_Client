@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useWebSocket } from './useWebSocket';
-import { getWsUrl } from '../lib/api';
+import { getWsUrl } from '../lib/api/client';
 
 export interface FlowRecord {
   dstHost: string;

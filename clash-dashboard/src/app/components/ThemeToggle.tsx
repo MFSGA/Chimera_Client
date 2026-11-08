@@ -1,5 +1,5 @@
 import { Monitor, Sun, Moon } from 'lucide-react';
-import { useTheme, type Theme } from '../hooks/useTheme';
+import { useTheme, type Theme } from '@/hooks/useTheme';
 
 const OPTIONS: { value: Theme; icon: React.ReactNode; label: string }[] = [
   { value: 'system', icon: <Monitor size={13} />, label: 'System' },

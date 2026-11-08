@@ -1,7 +1,7 @@
 import { useState } from 'react';
-import { queryDNS } from '@/lib/api';
+import { queryDNS } from '@/lib/api/dns';
 import { Search } from 'lucide-react';
-import type { DNSQueryResult } from '@/lib/api';
+import type { DNSQueryResult } from '@/lib/api/types/dns';
 
 const DNS_TYPES = ['A', 'AAAA', 'CNAME', 'MX', 'TXT', 'NS', 'SOA'];
 

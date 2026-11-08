@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useWebSocket } from './useWebSocket';
-import { getWsUrl } from '../lib/api';
-import type { TrafficData } from '../lib/api';
+import { getWsUrl } from '../lib/api/client';
+import type { TrafficData } from '../lib/api/types/realtime';
 
 const HISTORY_LENGTH = 60;
 

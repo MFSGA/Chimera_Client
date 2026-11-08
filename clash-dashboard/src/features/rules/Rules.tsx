@@ -1,8 +1,10 @@
+import { queryKeys } from '@/lib/queryKeys';
 import { useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { getRules, getRuleProviders, updateRuleProvider, getRuleProviderRules, matchRuleProvider } from '@/lib/api';
+import { getRules } from '@/lib/api/rules';
+import { getRuleProviders, updateRuleProvider, getRuleProviderRules, matchRuleProvider } from '@/lib/api/providers';
 import { RefreshCw, Search } from 'lucide-react';
-import type { RuleProvider } from '@/lib/api';
+import type { RuleProvider } from '@/lib/api/types/rules';
 
 function getRuleTypeBadgeStyle(type: string): { background: string; color: string } {
   switch (type) {
@@ -34,12 +36,12 @@ function RuleProviderRulesPanel({ name, behavior }: { name: string; behavior?: s
   const [matchTarget, setMatchTarget] = useState<string | null>(null);
 
   const { data: rulesData, isLoading: rulesLoading, isError: rulesError } = useQuery({
-    queryKey: ['rule-provider-rules', name],
+    queryKey: queryKeys.ruleProviderRules(name),
     queryFn: () => getRuleProviderRules(name),
   });
 
   const { data: matchData, isLoading: matchLoading, isError: matchError } = useQuery({
-    queryKey: ['rule-provider-match', name, matchTarget],
+    queryKey: queryKeys.ruleProviderMatch(name, matchTarget),
     queryFn: () => matchRuleProvider(name, matchTarget!),
     enabled: matchTarget !== null && matchTarget.trim().length > 0,
   });
@@ -144,9 +146,9 @@ export function Rules() {
   const [updatingRuleProviders, setUpdatingRuleProviders] = useState<Set<string>>(new Set());
   const [expandedRuleProviders, setExpandedRuleProviders] = useState<Set<string>>(new Set());
 
-  const { data, isLoading, isError } = useQuery({ queryKey: ['rules'], queryFn: getRules });
+  const { data, isLoading, isError } = useQuery({ queryKey: queryKeys.rules(), queryFn: getRules });
   const { data: ruleData, isLoading: ruleIsLoading, isError: ruleIsError } = useQuery({
-    queryKey: ['rule-providers'],
+    queryKey: queryKeys.ruleProviders(),
     queryFn: getRuleProviders,
     refetchInterval: 60000,
   });
@@ -179,7 +181,7 @@ export function Rules() {
     setUpdatingRuleProviders((s) => new Set(s).add(provider.name));
     try {
       await updateRuleProvider(provider.name);
-      await queryClient.invalidateQueries({ queryKey: ['rule-providers'] });
+      await queryClient.invalidateQueries({ queryKey: queryKeys.ruleProviders() });
     } catch (err) {
       console.error(`Failed to update rule provider "${provider.name}":`, err);
     } finally {

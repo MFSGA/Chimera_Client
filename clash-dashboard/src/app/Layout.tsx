@@ -1,12 +1,13 @@
+import { queryKeys } from '@/lib/queryKeys';
 import { NavLink, Outlet } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
-import { getVersion } from '../lib/api';
+import { getVersion } from '@/lib/api/system';
 import {
   LayoutDashboard, Activity, Filter, Terminal,
   Server, SlidersHorizontal, GitBranch, Shield, Radio,
 } from 'lucide-react';
-import logoUrl from '../assets/logo.png';
-import { ThemeToggle } from './ThemeToggle';
+import logoUrl from '@/assets/logo.png';
+import { ThemeToggle } from '@/app/components/ThemeToggle';
 
 const navItems = [
   { to: '/', label: 'Overview', icon: LayoutDashboard, end: true },
@@ -22,7 +23,7 @@ const navItems = [
 
 export function Layout() {
   const { data: version, error } = useQuery({
-    queryKey: ['version'],
+    queryKey: queryKeys.version(),
     queryFn: getVersion,
     refetchInterval: 10000,
     retry: 0,

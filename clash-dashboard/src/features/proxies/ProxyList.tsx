@@ -1,11 +1,11 @@
+import { queryKeys } from '@/lib/queryKeys';
 import { useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import {
-  getProxies, getProxyProviders, getProxyDelay, getProviderProxyDelay,
-  updateProxyProvider, healthcheckProvider,
-} from '@/lib/api';
+import { getProxies, getProxyDelay } from '@/lib/api/proxies';
+import { getProxyProviders, getProviderProxyDelay, updateProxyProvider, healthcheckProvider } from '@/lib/api/providers';
 import { Activity, RefreshCw, Zap } from 'lucide-react';
-import type { Proxy, ProxyProvider } from '@/lib/api';
+import type { Proxy } from '@/lib/api/types/proxies';
+import type { ProxyProvider } from '@/lib/api/types/providers';
 
 const TEST_URL = 'http://www.gstatic.com/generate_204';
 const TEST_TIMEOUT = 5000;
@@ -175,13 +175,13 @@ export function ProxyList() {
   const [batchFailedProviders, setBatchFailedProviders] = useState<string[]>([]);
 
   const { data: proxiesData, isLoading: proxiesLoading, isError: proxiesError } = useQuery({
-    queryKey: ['proxies'],
+    queryKey: queryKeys.proxies(),
     queryFn: getProxies,
     refetchInterval: 30000,
   });
 
   const { data: providersData, isLoading: providersLoading, isError: providersError } = useQuery({
-    queryKey: ['providers'],
+    queryKey: queryKeys.proxyProviders(),
     queryFn: getProxyProviders,
     refetchInterval: 60000,
   });
@@ -206,7 +206,7 @@ export function ProxyList() {
     setTestingProxies((s) => new Set(s).add(key));
     try {
       await getProxyDelay(proxy.name, TEST_URL, TEST_TIMEOUT);
-      await queryClient.refetchQueries({ queryKey: ['proxies'] });
+      await queryClient.refetchQueries({ queryKey: queryKeys.proxies() });
     } catch {
       // ignore, server will have recorded the timeout
     } finally {
@@ -219,7 +219,7 @@ export function ProxyList() {
     setTestingProxies((s) => new Set(s).add(key));
     try {
       await getProviderProxyDelay(providerName, proxy.name, TEST_URL, TEST_TIMEOUT);
-      await queryClient.refetchQueries({ queryKey: ['providers'] });
+      await queryClient.refetchQueries({ queryKey: queryKeys.proxyProviders() });
     } catch {
       // ignore
     } finally {
@@ -231,7 +231,7 @@ export function ProxyList() {
     setTestingProviders((s) => new Set(s).add(provider.name));
     try {
       await healthcheckProvider(provider.name);
-      await queryClient.refetchQueries({ queryKey: ['providers'] });
+      await queryClient.refetchQueries({ queryKey: queryKeys.proxyProviders() });
     } catch {
       // ignore
     } finally {
@@ -255,8 +255,8 @@ export function ProxyList() {
       const failed = providers.filter((_, i) => providerResults[i].status === 'rejected').map((p) => p.name);
       if (failed.length > 0) setBatchFailedProviders(failed);
       await Promise.all([
-        queryClient.refetchQueries({ queryKey: ['proxies'] }),
-        queryClient.refetchQueries({ queryKey: ['providers'] }),
+        queryClient.refetchQueries({ queryKey: queryKeys.proxies() }),
+        queryClient.refetchQueries({ queryKey: queryKeys.proxyProviders() }),
       ]);
     } finally {
       setTestingAll(false);
@@ -267,7 +267,7 @@ export function ProxyList() {
     setUpdatingProviders((s) => new Set(s).add(provider.name));
     try {
       await updateProxyProvider(provider.name);
-      await queryClient.invalidateQueries({ queryKey: ['providers'] });
+      await queryClient.invalidateQueries({ queryKey: queryKeys.proxyProviders() });
     } finally {
       setUpdatingProviders((s) => { const next = new Set(s); next.delete(provider.name); return next; });
     }

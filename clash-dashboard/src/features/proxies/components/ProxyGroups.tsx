@@ -1,8 +1,10 @@
+import { queryKeys } from '@/lib/queryKeys';
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { getProxies, getProxyProviders, selectProxy, getGroupDelay } from '../lib/api';
+import { getProxies, selectProxy, getGroupDelay } from '@/lib/api/proxies';
+import { getProxyProviders } from '@/lib/api/providers';
 import { RefreshCw, ChevronDown, ChevronUp, Check } from 'lucide-react';
-import type { Proxy } from '../lib/api';
+import type { Proxy } from '@/lib/api/types/proxies';
 
 const TEST_URL = 'http://www.gstatic.com/generate_204';
 const TEST_TIMEOUT = 5000;
@@ -47,13 +49,13 @@ export function ProxyGroups({ mode }: ProxyGroupsProps) {
   const [groupLatencyMap, setGroupLatencyMap] = useState<Record<string, number>>({});
 
   const { data, isLoading } = useQuery({
-    queryKey: ['proxies'],
+    queryKey: queryKeys.proxies(),
     queryFn: getProxies,
     refetchInterval: 30000,
   });
 
   const { data: providersData } = useQuery({
-    queryKey: ['providers'],
+    queryKey: queryKeys.proxyProviders(),
     queryFn: getProxyProviders,
     refetchInterval: 60000,
   });
@@ -62,9 +64,9 @@ export function ProxyGroups({ mode }: ProxyGroupsProps) {
     mutationFn: ({ group, proxy }: { group: string; proxy: string }) =>
       selectProxy(group, proxy),
     onMutate: async ({ group, proxy }) => {
-      await queryClient.cancelQueries({ queryKey: ['proxies'] });
-      const previous = queryClient.getQueryData<{ proxies: Record<string, Proxy> }>(['proxies']);
-      queryClient.setQueryData<{ proxies: Record<string, Proxy> }>(['proxies'], (old) => {
+      await queryClient.cancelQueries({ queryKey: queryKeys.proxies() });
+      const previous = queryClient.getQueryData<{ proxies: Record<string, Proxy> }>(queryKeys.proxies());
+      queryClient.setQueryData<{ proxies: Record<string, Proxy> }>(queryKeys.proxies(), (old) => {
         if (!old) return old;
         return {
           ...old,
@@ -74,8 +76,8 @@ export function ProxyGroups({ mode }: ProxyGroupsProps) {
       return { previous };
     },
     onError: (_err, _vars, ctx) => {
-      if (ctx?.previous) queryClient.setQueryData(['proxies'], ctx.previous);
-      queryClient.invalidateQueries({ queryKey: ['proxies'] });
+      if (ctx?.previous) queryClient.setQueryData(queryKeys.proxies(), ctx.previous);
+      queryClient.invalidateQueries({ queryKey: queryKeys.proxies() });
     },
   });
 
@@ -136,8 +138,8 @@ export function ProxyGroups({ mode }: ProxyGroupsProps) {
         setGroupLatencyMap((prev) => ({ ...prev, [group.name]: ms }));
       }
       await Promise.all([
-        queryClient.refetchQueries({ queryKey: ['proxies'] }),
-        queryClient.refetchQueries({ queryKey: ['providers'] }),
+        queryClient.refetchQueries({ queryKey: queryKeys.proxies() }),
+        queryClient.refetchQueries({ queryKey: queryKeys.proxyProviders() }),
       ]);
     } catch {
       // leave existing latency values unchanged on error

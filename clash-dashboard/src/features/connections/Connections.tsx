@@ -1,9 +1,10 @@
 import { useState } from 'react';
 import { useMutation } from '@tanstack/react-query';
-import { closeAllConnections, closeConnection, getWsUrl } from '@/lib/api';
+import { closeAllConnections, closeConnection } from '@/lib/api/connections';
+import { getWsUrl } from '@/lib/api/client';
 import { useWebSocket } from '@/hooks/useWebSocket';
 import { X, Trash2, Search, ArrowUp, ArrowDown, Activity } from 'lucide-react';
-import type { ConnectionsData, Connection } from '@/lib/api';
+import type { ConnectionsData, Connection } from '@/lib/api/types/connections';
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes}B`;

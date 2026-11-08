@@ -1,6 +1,7 @@
 import { lazy, Suspense, type ReactNode } from 'react';
 import { HashRouter as BrowserRouter, Routes, Route } from 'react-router-dom';
-import { Layout } from './components/Layout';
+import { Layout } from './app/Layout';
+import { useApiSettingsRevision } from './hooks/useApiSettingsRevision';
 const Overview = lazy(() => import('./features/overview/Overview').then(({ Overview }) => ({ default: Overview })));
 const ProxyList = lazy(() => import('./features/proxies/ProxyList').then(({ ProxyList }) => ({ default: ProxyList })));
 const Connections = lazy(() => import('./features/connections/Connections').then(({ Connections }) => ({ default: Connections })));
@@ -21,6 +22,8 @@ function LazyPage({ children, message = 'Loading page…' }: { children: ReactNo
 }
 
 export default function App() {
+  useApiSettingsRevision();
+
   return (
     <BrowserRouter>
       <Routes>

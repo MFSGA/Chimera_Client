@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef } from 'react';
-import { useQuery } from '@tanstack/react-query';
-import { getCapabilities, getVersion } from '@/lib/api';
-import { getApiUrl, getSecret, setApiUrl, setSecret } from '@/lib/settings';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { getCapabilities, getVersion } from '@/lib/api/system';
+import { getApiUrl, getSecret, setApiSettings } from '@/lib/settings';
+import { queryKeys } from '@/lib/queryKeys';
 import { Save, AlertTriangle, CheckCircle, XCircle } from 'lucide-react';
 
 function isDevMode(): boolean {
@@ -10,6 +11,7 @@ function isDevMode(): boolean {
 }
 
 export function Settings() {
+  const queryClient = useQueryClient();
   const [apiUrl, setApiUrlState] = useState(getApiUrl);
   const [configuredApiUrl, setConfiguredApiUrl] = useState(getApiUrl);
   const [secret, setSecretState] = useState(getSecret);
@@ -24,7 +26,7 @@ export function Settings() {
   }, []);
 
   const { data, error, refetch } = useQuery({
-    queryKey: ['version', configuredApiUrl],
+    queryKey: queryKeys.version(configuredApiUrl),
     queryFn: getVersion,
     retry: 0,
     refetchInterval: 5000,
@@ -34,7 +36,7 @@ export function Settings() {
   const showDevPrompt = isDevMode() && !isConnected && !localStorage.getItem('clash-api-url');
 
   const { data: capabilities } = useQuery({
-    queryKey: ['capabilities', configuredApiUrl],
+    queryKey: queryKeys.capabilities(configuredApiUrl),
     queryFn: getCapabilities,
     enabled: isConnected,
     retry: 0,
@@ -47,10 +49,15 @@ export function Settings() {
     }
   }, []);
 
-  function handleSave() {
+  async function handleSave() {
     const apiUrlChanged = apiUrl !== configuredApiUrl;
-    setApiUrl(apiUrl);
-    setSecret(secret);
+    const settingsChanged = apiUrlChanged || secret !== getSecret();
+
+    if (settingsChanged) {
+      await queryClient.cancelQueries({ queryKey: queryKeys.all });
+      setApiSettings(apiUrl, secret);
+    }
+
     setConfiguredApiUrl(apiUrl);
     setSaved(true);
     saveTimersRef.current.push(window.setTimeout(() => setSaved(false), 2000));

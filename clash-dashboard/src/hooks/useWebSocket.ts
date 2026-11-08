@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useState } from 'react';
 
 export type ReadyState = 'CONNECTING' | 'OPEN' | 'CLOSING' | 'CLOSED';
 
@@ -10,75 +10,74 @@ interface UseWebSocketReturn<T> {
 export function useWebSocket<T = unknown>(url: string | null): UseWebSocketReturn<T> {
   const [lastMessage, setLastMessage] = useState<T | null>(null);
   const [readyState, setReadyState] = useState<ReadyState>('CLOSED');
-  const wsRef = useRef<WebSocket | null>(null);
-  const retryCount = useRef(0);
-  const retryTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const unmounted = useRef(false);
-  const connectRef = useRef<() => void>(() => {});
 
-  const connect = useCallback(() => {
+  useEffect(() => {
+    setLastMessage(null);
     if (!url) {
-      wsRef.current?.close();
-      wsRef.current = null;
-      retryCount.current = 0;
       setReadyState('CLOSED');
-      setLastMessage(null);
       return;
     }
-    if (unmounted.current) return;
 
-    setReadyState('CONNECTING');
-    const ws = new WebSocket(url);
-    wsRef.current = ws;
+    let active = true;
+    let retryCount = 0;
+    let socket: WebSocket | null = null;
+    let retryTimeout: ReturnType<typeof setTimeout> | null = null;
 
-    ws.onopen = () => {
-      if (unmounted.current) { ws.close(); return; }
-      setReadyState('OPEN');
-      retryCount.current = 0;
+    const scheduleReconnect = () => {
+      if (!active) return;
+      const delay = Math.min(1000 * 2 ** retryCount, 30000);
+      retryCount = Math.min(retryCount + 1, 8);
+      retryTimeout = setTimeout(connect, delay);
     };
 
-    ws.onmessage = (event) => {
-      if (unmounted.current) return;
+    const connect = () => {
+      if (!active) return;
+      setReadyState('CONNECTING');
+
       try {
-        const data = JSON.parse(event.data) as T;
-        setLastMessage(data);
+        socket = new WebSocket(url);
       } catch {
-        // ignore parse errors
+        setReadyState('CLOSED');
+        scheduleReconnect();
+        return;
       }
+
+      const currentSocket = socket;
+      currentSocket.onopen = () => {
+        if (!active || socket !== currentSocket) return;
+        setReadyState('OPEN');
+        retryCount = 0;
+      };
+
+      currentSocket.onmessage = (event) => {
+        if (!active || socket !== currentSocket) return;
+        try {
+          setLastMessage(JSON.parse(event.data) as T);
+        } catch {
+          // Ignore malformed messages and keep the connection alive.
+        }
+      };
+
+      currentSocket.onclose = () => {
+        if (!active || socket !== currentSocket) return;
+        socket = null;
+        setReadyState('CLOSED');
+        scheduleReconnect();
+      };
+
+      currentSocket.onerror = () => currentSocket.close();
     };
 
-    ws.onclose = () => {
-      if (unmounted.current) return;
-      setReadyState('CLOSED');
-      wsRef.current = null;
-
-      const delay = Math.min(1000 * 2 ** retryCount.current, 30000);
-      retryCount.current += 1;
-      retryTimeout.current = setTimeout(() => connectRef.current(), delay);
-    };
-
-    ws.onerror = () => {
-      ws.close();
-    };
-  }, [url]);
-
-  useEffect(() => {
-    connectRef.current = connect;
-  }, [connect]);
-
-  useEffect(() => {
-    unmounted.current = false;
     connect();
 
     return () => {
-      unmounted.current = true;
-      if (retryTimeout.current) clearTimeout(retryTimeout.current);
-      if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
-      }
+      active = false;
+      if (retryTimeout) clearTimeout(retryTimeout);
+      const previousSocket = socket;
+      socket = null;
+      previousSocket?.close();
     };
-  }, [connect]);
+  }, [url]);
 
   return { lastMessage, readyState };
 }

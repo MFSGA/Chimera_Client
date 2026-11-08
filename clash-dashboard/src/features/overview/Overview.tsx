@@ -1,16 +1,20 @@
+import { queryKeys } from '@/lib/queryKeys';
 import { useState, useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { getMemory, getConfigs, patchConfigs, reloadConfigs, getWsUrl } from '@/lib/api';
+import { getMemory } from '@/lib/api/system';
+import { getConfigs, patchConfigs, reloadConfigs } from '@/lib/api/config';
+import { getWsUrl } from '@/lib/api/client';
 import { useTraffic } from '@/hooks/useTraffic';
-import { TrafficChart } from '@/components/TrafficChart';
-import { ProxyGroups } from '@/components/ProxyGroups';
+import { TrafficChart } from '@/features/overview/components/TrafficChart';
+import { ProxyGroups } from '@/features/proxies/components/ProxyGroups';
 import {
   ArrowUp, ArrowDown, Activity, HardDrive,
   Globe, Router, Sliders, Server, Wifi, FileText, Shield,
   RefreshCw, ChevronDown, ChevronUp,
 } from 'lucide-react';
 import { useWebSocket } from '@/hooks/useWebSocket';
-import type { ConnectionsData, PatchableConfig, ClashConfig } from '@/lib/api';
+import type { ConnectionsData } from '@/lib/api/types/connections';
+import type { PatchableConfig, ClashConfig } from '@/lib/api/types/config';
 
 function formatSpeed(bytes: number): string {
   if (bytes < 1024) return `${bytes} B/s`;
@@ -164,22 +168,22 @@ function EditSection({ title, children }: { title: string; children: React.React
 export function Overview() {
   const queryClient = useQueryClient();
   const { history, current } = useTraffic();
-  const { data: memory } = useQuery({ queryKey: ['memory'], queryFn: getMemory, refetchInterval: 5000 });
-  const { data: configs, isLoading: configsLoading } = useQuery({ queryKey: ['configs'], queryFn: getConfigs, refetchInterval: 10000 });
+  const { data: memory } = useQuery({ queryKey: queryKeys.memory(), queryFn: getMemory, refetchInterval: 5000 });
+  const { data: configs, isLoading: configsLoading } = useQuery({ queryKey: queryKeys.configs(), queryFn: getConfigs, refetchInterval: 10000 });
 
   const modeMutation = useMutation({
     mutationFn: (mode: string) => patchConfigs({ mode }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['configs'] }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: queryKeys.configs() }),
   });
 
   const patchMutation = useMutation({
     mutationFn: (patch: PatchableConfig) => patchConfigs(patch),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['configs'] }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: queryKeys.configs() }),
   });
 
   const reloadMutation = useMutation({
     mutationFn: () => reloadConfigs(''),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['configs'] }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: queryKeys.configs() }),
   });
 
   function patch(fields: PatchableConfig) { patchMutation.mutate(fields); }
