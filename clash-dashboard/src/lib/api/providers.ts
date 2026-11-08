@@ -1,4 +1,5 @@
 import { request } from './client';
+import type { ApiSettingsSnapshot } from './client';
 import type { ProxyProvider, RuleProvider } from './types';
 
 // Providers
@@ -6,8 +7,8 @@ export const getProxyProviders = () =>
   request<{ providers: Record<string, ProxyProvider> }>('/providers/proxies');
 export const updateProxyProvider = (name: string) =>
   request<void>(`/providers/proxies/${encodeURIComponent(name)}`, { method: 'PUT' });
-export const healthcheckProvider = (name: string) =>
-  request<void>(`/providers/proxies/${encodeURIComponent(name)}/healthcheck`);
+export const healthcheckProvider = (name: string, settings?: ApiSettingsSnapshot) =>
+  request<void>(`/providers/proxies/${encodeURIComponent(name)}/healthcheck`, undefined, settings);
 export const getProviderProxyDelay = (providerName: string, proxyName: string, url: string, timeout: number) =>
   request<{ delay: number; overall: number }>(
     `/providers/proxies/${encodeURIComponent(providerName)}/${encodeURIComponent(proxyName)}/healthcheck?url=${encodeURIComponent(url)}&timeout=${timeout}`

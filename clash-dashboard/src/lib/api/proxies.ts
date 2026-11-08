@@ -13,9 +13,16 @@ export const selectProxy = (
     method: 'PUT',
     body: JSON.stringify({ name: proxyName }),
   }, settings);
-export const getProxyDelay = (name: string, url: string, timeout: number) =>
+export const getProxyDelay = (
+  name: string,
+  url: string,
+  timeout: number,
+  settings?: ApiSettingsSnapshot,
+) =>
   request<{ delay: number; overall: number }>(
-    `/proxies/${encodeURIComponent(name)}/delay?url=${encodeURIComponent(url)}&timeout=${timeout}`
+    `/proxies/${encodeURIComponent(name)}/delay?url=${encodeURIComponent(url)}&timeout=${timeout}`,
+    undefined,
+    settings,
   );
 
 // Groups

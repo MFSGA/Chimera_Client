@@ -260,9 +260,9 @@ export function ProxyList() {
       const proxyKeys = configProxies.map((p) => `static::${p.name}`);
       proxyKeys.forEach((k) => setTestingProxies((s) => new Set(s).add(k)));
       const [providerResults] = await Promise.all([
-        Promise.allSettled(providers.map((p) => healthcheckProvider(p.name))),
+        Promise.allSettled(providers.map((p) => healthcheckProvider(p.name, requestSettings))),
         Promise.allSettled(configProxies.map((proxy) =>
-          getProxyDelay(proxy.name, TEST_URL, TEST_TIMEOUT).catch(() => {})
+          getProxyDelay(proxy.name, TEST_URL, TEST_TIMEOUT, requestSettings).catch(() => {})
         )),
       ]);
       const currentSettings = captureApiSettings();
