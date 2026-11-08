@@ -32,11 +32,11 @@ jobs:
     name: Dashboard
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: pnpm/action-setup@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6
         with:
           package_json_file: clash-dashboard/package.json
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: clash-dashboard/.node-version
           cache: pnpm
@@ -51,7 +51,7 @@ jobs:
         working-directory: clash-dashboard
         run: pnpm run build
       - name: Upload dashboard build
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: dashboard-dist
           path: clash-dashboard/dist/
@@ -68,18 +68,18 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-15]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: true
       - name: Read pinned Rust toolchain
         id: rust-version
         run: echo "version=$(bash ci/read-rust-toolchain-version.sh)" >> "$GITHUB_OUTPUT"
       - name: Download verified dashboard build
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: dashboard-dist
           path: clash-dashboard/dist
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -91,14 +91,14 @@ jobs:
             target
           key: quality-${{ matrix.os }}-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', '.cargo/config.toml') }}
           restore-keys: quality-${{ matrix.os }}-${{ steps.rust-version.outputs.version }}-
-      - uses: ilammy/setup-nasm@v1
+      - uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1
         if: runner.os == 'Windows' || runner.os == 'macOS'
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ steps.rust-version.outputs.version }}
           components: rustfmt,clippy
       - name: Install Protoc
-        uses: arduino/setup-protoc@v3
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           version: "23.x"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
@@ -211,18 +211,18 @@ jobs:
             target: x86_64-apple-darwin
             extra-args: -F "plus"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: true
       - name: Read pinned Rust toolchain
         id: rust-version
         run: echo "version=$(bash ci/read-rust-toolchain-version.sh)" >> "$GITHUB_OUTPUT"
       - name: Download dashboard build
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: dashboard-dist
           path: clash-dashboard/dist
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -237,15 +237,15 @@ jobs:
             compile-${{ matrix.os || 'ubuntu-latest' }}-${{ matrix.release-name || matrix.target }}-${{ steps.rust-version.outputs.version }}-
 
       - name: Cache Docker images.
-        uses: ScribeMD/docker-cache@0.5.0
+        uses: ScribeMD/docker-cache@fb28c93772363301b8d0a6072ce850224b73f74e # 0.5.0
         if: startsWith(matrix.os, 'ubuntu') && !matrix.no-docker-test
         with:
           key: ${{ matrix.os }}
           read-only: ${{ matrix.target != 'x86_64-unknown-linux-gnu' }}
 
-      - uses: ilammy/setup-nasm@v1
+      - uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1
 
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ steps.rust-version.outputs.version }}
           targets: ${{ matrix.build-std && 'x86_64-unknown-linux-gnu' || matrix.target }}
@@ -262,7 +262,7 @@ jobs:
           cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Install Protoc
-        uses: arduino/setup-protoc@v3
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           version: "23.x"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
@@ -274,7 +274,7 @@ jobs:
 
       - name: Cargo fmt
         if: ${{ github.event_name == 'pull_request' }}
-        uses: clechasseur/rs-cargo@v4
+        uses: clechasseur/rs-cargo@2a8aa939121c79dd2b4305ed6bf83bc400ce1036 # v4
         with:
           command: fmt
           args: --all -- --check
@@ -283,7 +283,7 @@ jobs:
 
       - name: Cargo clippy
         if: ${{ github.event_name == 'pull_request' }}
-        uses: clechasseur/rs-cargo@v4
+        uses: clechasseur/rs-cargo@2a8aa939121c79dd2b4305ed6bf83bc400ce1036 # v4
         with:
           tool: ${{ matrix.tool }}
           command: clippy
@@ -292,7 +292,7 @@ jobs:
           CLASH_DOCKER_TEST: "true"
 
       - name: Cargo test
-        uses: clechasseur/rs-cargo@v4
+        uses: clechasseur/rs-cargo@2a8aa939121c79dd2b4305ed6bf83bc400ce1036 # v4
         if: ${{ !matrix.no-test &&  github.event_name == 'pull_request' }}
         with:
           tool: ${{ matrix.tool }}
@@ -304,7 +304,7 @@ jobs:
           RUSTFLAGS: ${{ matrix.rustflags || '--cfg tokio_unstable' }}
 
       - name: Cargo build
-        uses: clechasseur/rs-cargo@v4
+        uses: clechasseur/rs-cargo@2a8aa939121c79dd2b4305ed6bf83bc400ce1036 # v4
         with:
           tool: ${{ matrix.tool }}
           command: build
@@ -345,7 +345,7 @@ jobs:
           echo "binary=${binary}" >> "${GITHUB_OUTPUT}"
 
       - name: Upload binaries
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: ${{ !matrix.no-release }}
         with:
           name: binary-${{ matrix.release-name || matrix.target }}
@@ -357,7 +357,7 @@ jobs:
       - name: Setup tmate session
         if: ${{ failure() && github.event_name == 'pull_request' && github.actor != 'dependabot[bot]' && vars.CI_ENABLE_TMATE == 'true' }}
         timeout-minutes: 15
-        uses: mxschmitt/action-tmate@v3
+        uses: mxschmitt/action-tmate@35b54afac29c97fb54faba5b513f8fbd1882f113 # v3
         with:
           detached: true
           limit-access-to-actor: true
@@ -369,7 +369,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           fetch-tags: true
@@ -378,7 +378,7 @@ jobs:
       # merged artifact and immediately downloading it has failed with
       # "No artifacts found for ID" even after a successful merge step.
       - name: Download binaries
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: "binary-*"
           merge-multiple: true
@@ -413,7 +413,7 @@ jobs:
           git tag -d latest || true
 
       - name: Generate a changelog
-        uses: orhun/git-cliff-action@main
+        uses: orhun/git-cliff-action@a9a95522b26fe6403f7bb24031f21fb573d0f5ff # main
         id: git-cliff
         with:
           config: .github/cliff.toml
@@ -422,7 +422,7 @@ jobs:
           GITHUB_REPO: ${{ github.repository }}
 
       - name: Github stable release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
         if: startsWith(github.ref, 'refs/tags/v')
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -434,7 +434,7 @@ jobs:
             LICENSE*
 
       - name: Github nightly release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
         if: startsWith(github.ref, 'refs/heads/master')
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
