@@ -10,6 +10,7 @@ use crate::{
     },
 };
 pub use chimera_dns::{DNSListenAddr, DoH3Config, DoHConfig, DoTConfig};
+use indexmap::IndexMap;
 use ipnet::{AddrParseError, Ipv4Net, Ipv6Net};
 use percent_encoding::percent_decode_str;
 use std::{
@@ -82,7 +83,7 @@ pub struct Config {
     pub store_fake_ip: bool,
     pub store_smart_stats: bool,
     pub hosts: Option<trie::StringTrie<IpAddr>>,
-    pub nameserver_policy: HashMap<String, Vec<NameServer>>,
+    pub nameserver_policy: IndexMap<String, Vec<NameServer>>,
     pub edns_client_subnet: Option<EdnsClientSubnet>,
     pub fw_mark: Option<u32>,
     pub respect_rules: bool,
@@ -336,9 +337,9 @@ impl Config {
     }
 
     pub fn parse_nameserver_policy(
-        policy_map: &HashMap<String, DnsPolicyUpstreams>,
-    ) -> Result<HashMap<String, Vec<NameServer>>, Error> {
-        let mut policy = HashMap::new();
+        policy_map: &IndexMap<String, DnsPolicyUpstreams>,
+    ) -> Result<IndexMap<String, Vec<NameServer>>, Error> {
+        let mut policy = IndexMap::new();
 
         for (selector_group, servers) in policy_map {
             // Reject skipped entries even when another server is valid. Such
@@ -1079,7 +1080,7 @@ mod tests {
             "+",
         ] {
             let policy =
-                HashMap::from([(selector.to_owned(), "9.9.9.9".to_owned().into())]);
+                IndexMap::from([(selector.to_owned(), "9.9.9.9".to_owned().into())]);
             let error = Config::parse_nameserver_policy(&policy)
                 .expect_err("ambiguous DNS policy selector must fail closed");
             assert!(
@@ -1089,7 +1090,7 @@ mod tests {
         }
         for selector in ["example.com", "*.example.com", ".example.com"] {
             let policy =
-                HashMap::from([(selector.to_owned(), "9.9.9.9".to_owned().into())]);
+                IndexMap::from([(selector.to_owned(), "9.9.9.9".to_owned().into())]);
             assert!(
                 Config::parse_nameserver_policy(&policy).is_ok(),
                 "valid existing selector {selector:?} must remain accepted"
@@ -1099,7 +1100,7 @@ mod tests {
 
     #[test]
     fn nameserver_policies_normalize_idna_and_reject_canonical_duplicates() {
-        let unicode = HashMap::from([(
+        let unicode = IndexMap::from([(
             "bücher.example".to_owned(),
             "9.9.9.9".to_owned().into(),
         )]);
@@ -1107,7 +1108,7 @@ mod tests {
             .expect("Unicode selector should normalize to its DNS wire name");
         assert!(parsed.contains_key("xn--bcher-kva.example"));
 
-        let aliases = HashMap::from([
+        let aliases = IndexMap::from([
             ("bücher.example".to_owned(), "9.9.9.9".to_owned().into()),
             (
                 "xn--bcher-kva.example".to_owned(),
@@ -1188,7 +1189,7 @@ mod tests {
     #[test]
     fn nameserver_policy_rejects_skipped_system_entry() {
         let policy =
-            HashMap::from([("example.com".to_owned(), "system".to_owned().into())]);
+            IndexMap::from([("example.com".to_owned(), "system".to_owned().into())]);
 
         let error = Config::parse_nameserver_policy(&policy)
             .expect_err("a policy without a usable nameserver must be rejected");
@@ -1205,7 +1206,7 @@ mod tests {
             "geosite:private",
             "rule-set:private",
         ] {
-            let policy = HashMap::from([(
+            let policy = IndexMap::from([(
                 selector.to_owned(),
                 "192.0.2.53".to_owned().into(),
             )]);
@@ -1214,7 +1215,7 @@ mod tests {
                 "unsupported selector {selector:?} must not be silently accepted"
             );
         }
-        let combined = HashMap::from([(
+        let combined = IndexMap::from([(
             "example.com,other.test".to_owned(),
             "192.0.2.53".to_owned().into(),
         )]);
@@ -1225,7 +1226,7 @@ mod tests {
         assert!(expanded.contains_key("other.test"));
 
         for selector in ["example.com", "*.example.com", "+.example.com"] {
-            let policy = HashMap::from([(
+            let policy = IndexMap::from([(
                 selector.to_owned(),
                 "192.0.2.53".to_owned().into(),
             )]);
@@ -1237,8 +1238,60 @@ mod tests {
     }
 
     #[test]
+    fn nameserver_policy_overlapping_exact_and_plus_follow_yaml_order() {
+        // Mihomo inserts domain policies in YAML order. '+.' writes
+        // both the apex and its wildcard branch; a later exact selector
+        // changes the apex, but must leave the wildcard branch intact.
+        for (selectors, expected_apex) in [
+            (
+                "    example.com: 192.0.2.53\n    '+.example.com': 192.0.2.54\n",
+                "192.0.2.54",
+            ),
+            (
+                "    '+.example.com': 192.0.2.54\n    example.com: 192.0.2.53\n",
+                "192.0.2.53",
+            ),
+        ] {
+            for attempt in 0..64 {
+                let raw: crate::config::def::Config =
+                    format!("dns:\n  nameserver-policy:\n{selectors}")
+                        .parse()
+                        .expect("YAML must parse");
+                let parsed =
+                    Config::parse_nameserver_policy(&raw.dns.nameserver_policy)
+                        .expect("policy must convert");
+                let mut trie = trie::StringTrie::new();
+                for (selector, upstreams) in &parsed {
+                    assert!(
+                        trie.insert(
+                            selector,
+                            std::sync::Arc::new(upstreams.clone())
+                        )
+                    );
+                }
+                let apex = &trie
+                    .search("example.com")
+                    .expect("apex must match")
+                    .get_data()
+                    .expect("apex must have nameservers")[0];
+                assert_eq!(
+                    apex.host.to_string(),
+                    expected_apex,
+                    "YAML insertion order changed at iteration {attempt}"
+                );
+                let wildcard = &trie
+                    .search("www.example.com")
+                    .expect("subdomain must match")
+                    .get_data()
+                    .expect("wildcard must have nameservers")[0];
+                assert_eq!(wildcard.host.to_string(), "192.0.2.54");
+            }
+        }
+    }
+
+    #[test]
     fn nameserver_policy_expands_comma_selectors_into_runtime_domains() {
-        let policy = HashMap::from([(
+        let policy = IndexMap::from([(
             "EXAMPLE.com,*.other.test,+.internal.test".to_owned(),
             "192.0.2.53".to_owned().into(),
         )]);
@@ -1276,13 +1329,13 @@ mod tests {
             "EXAMPLE.COM,example.com",
         ] {
             let policy =
-                HashMap::from([(key.to_owned(), "192.0.2.53".to_owned().into())]);
+                IndexMap::from([(key.to_owned(), "192.0.2.53".to_owned().into())]);
             assert!(
                 Config::parse_nameserver_policy(&policy).is_err(),
                 "ambiguous selector {key:?} must fail closed"
             );
         }
-        let policy = HashMap::from([
+        let policy = IndexMap::from([
             (
                 "example.com,other.test".to_owned(),
                 "192.0.2.53".to_owned().into(),

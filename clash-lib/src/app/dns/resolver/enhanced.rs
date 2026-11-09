@@ -199,15 +199,12 @@ fn normalize_proxy_server_domain(host: &str) -> Option<String> {
 }
 
 fn ordered_nameserver_policy_entries<T>(
-    policies: &std::collections::HashMap<String, T>,
+    policies: &indexmap::IndexMap<String, T>,
 ) -> Vec<(&String, &T)> {
-    let mut entries = policies.iter().collect::<Vec<_>>();
-    // StringTrie expands `+.` into both a bare apex and a suffix wildcard.
-    // Insert that broad alias first so an explicit apex rule always wins.
-    entries.sort_by(|(left, _), (right, _)| {
-        right.starts_with("+.").cmp(&left.starts_with("+."))
-    });
-    entries
+    // Mihomo inserts selectors in YAML declaration order. StringTrie expands
+    // `+.` into both an apex and wildcard entry, so later selectors may
+    // intentionally replace only the overlapping apex decision.
+    policies.iter().collect()
 }
 
 pub struct EnhancedResolver {
@@ -3250,16 +3247,22 @@ mod tests {
     };
 
     #[test]
-    fn ordinary_nameserver_policy_exact_apex_beats_plus_suffix_alias() {
-        for policies in [
-            std::collections::HashMap::from([
-                ("+.example.com".to_owned(), "suffix"),
-                ("example.com".to_owned(), "exact"),
-            ]),
-            std::collections::HashMap::from([
-                ("example.com".to_owned(), "exact"),
-                ("+.example.com".to_owned(), "suffix"),
-            ]),
+    fn ordinary_nameserver_policy_overlapping_selectors_follow_insertion_order() {
+        for (policies, expected_apex) in [
+            (
+                indexmap::IndexMap::from([
+                    ("+.example.com".to_owned(), "suffix"),
+                    ("example.com".to_owned(), "exact"),
+                ]),
+                "exact",
+            ),
+            (
+                indexmap::IndexMap::from([
+                    ("example.com".to_owned(), "exact"),
+                    ("+.example.com".to_owned(), "suffix"),
+                ]),
+                "suffix",
+            ),
         ] {
             let mut matcher = crate::common::trie::StringTrie::new();
             for (selector, destination) in
@@ -3272,8 +3275,8 @@ mod tests {
                 matcher
                     .search("example.com")
                     .and_then(|node| node.get_data()),
-                Some(&"exact"),
-                "an exact apex policy must override `+.` regardless of HashMap order"
+                Some(&expected_apex),
+                "the last declaration must win for an overlapping apex selector"
             );
             assert_eq!(
                 matcher
@@ -12274,12 +12277,11 @@ mod tests {
 
     #[tokio::test]
     async fn comma_delimited_nameserver_policy_uses_dedicated_upstream() {
-        let parsed =
-            Config::parse_nameserver_policy(&std::collections::HashMap::from([(
-                "proxy.example.com,other.test".to_owned(),
-                "192.0.2.53".to_owned().into(),
-            )]))
-            .expect("comma-separated selectors must compile into runtime policy");
+        let parsed = Config::parse_nameserver_policy(&indexmap::IndexMap::from([(
+            "proxy.example.com,other.test".to_owned(),
+            "192.0.2.53".to_owned().into(),
+        )]))
+        .expect("comma-separated selectors must compile into runtime policy");
         let mut resolver = EnhancedResolver::new_default().await;
         resolver.lru_cache = None;
         let policy_hits = Arc::new(AtomicUsize::new(0));

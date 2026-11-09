@@ -1,4 +1,5 @@
 use educe::Educe;
+use indexmap::IndexMap;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_yaml::Value;
 
@@ -908,7 +909,7 @@ pub struct DNS {
     pub default_nameserver: Vec<String>,
     pub edns_client_subnet: Option<EdnsClientSubnet>,
     /// Lookup domains via one or more selected DNS upstreams.
-    pub nameserver_policy: HashMap<String, DnsPolicyUpstreams>,
+    pub nameserver_policy: IndexMap<String, DnsPolicyUpstreams>,
     /// Fake IP addresses pool CIDR
     #[educe(Default = "198.19.0.1/16")]
     pub fake_ip_range: String,
