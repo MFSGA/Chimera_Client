@@ -118,6 +118,19 @@ impl Config {
             ));
         }
 
+        // An explicitly empty dedicated node-DNS pool is different from no
+        // override. Internal config reloads must fail closed before startup.
+        if self
+            .dns
+            .proxy_server_nameserver
+            .as_ref()
+            .is_some_and(Vec::is_empty)
+        {
+            return Err(Error::InvalidConfig(
+                "dns.proxy-server-nameserver cannot be explicitly empty".to_owned(),
+            ));
+        }
+
         if self.tun.enable
             && self.dns.enable
             && self.dns.enhance_mode == def::DNSMode::FakeIp
@@ -556,6 +569,25 @@ mod tests {
     use std::net::{IpAddr, SocketAddr};
 
     use super::{DnsHijackAddress, DnsHijackProtocol, DnsHijackRule, TunConfig};
+
+    #[test]
+    fn explicit_empty_proxy_node_bootstrap_fails_internal_reload() {
+        // A deliberately empty dedicated node pool must not be treated as
+        // an absent setting and fall back to ordinary DNS during reload.
+        let yaml = "dns:\n  enable: true\n  nameserver: [1.1.1.1]\n";
+        let mut config = crate::Config::Str(yaml.to_owned())
+            .try_parse()
+            .expect("baseline must be accepted");
+        config.dns.proxy_server_nameserver = Some(Vec::new());
+        let error = match config.validate() {
+            Ok(_) => panic!("explicit empty node DNS silently accepted"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("proxy-server-nameserver"),
+            "empty explicit bootstrap must fail closed: {error}"
+        );
+    }
 
     #[test]
     fn dns_hijack_rule_matches_udp_destination() {
