@@ -173,7 +173,7 @@ fn validate_macos_fake_ip_dns_egress(
         ),
         (
             "dns.nameserver-policy",
-            dns.nameserver_policy.values().any(is_dhcp),
+            dns.nameserver_policy.values().flatten().any(is_dhcp),
         ),
     ] {
         if unsafe_dhcp {
@@ -201,7 +201,7 @@ fn validate_macos_fake_ip_dns_egress(
         ),
         (
             "dns.nameserver-policy",
-            dns.nameserver_policy.values().any(has_override),
+            dns.nameserver_policy.values().flatten().any(has_override),
         ),
         (
             "dns.proxy-server-nameserver",
@@ -552,7 +552,7 @@ impl Config {
             .chain(self.dns.default_nameserver.iter())
             .chain(self.dns.proxy_server_nameserver.iter().flatten())
             .chain(self.dns.direct_nameserver.iter().flatten())
-            .chain(self.dns.nameserver_policy.values());
+            .chain(self.dns.nameserver_policy.values().flatten());
         if name_servers
             .into_iter()
             .any(|nameserver| matches!(&nameserver.host, url::Host::Ipv6(_)))
@@ -910,7 +910,7 @@ mod tests {
             config
                 .dns
                 .nameserver_policy
-                .insert(selector.to_owned(), server.clone());
+                .insert(selector.to_owned(), vec![server.clone()]);
             let error = match config.validate() {
                 Ok(_) => panic!("internal config accepted selector {selector:?}"),
                 Err(error) => error.to_string(),
@@ -1071,7 +1071,7 @@ mod tests {
                     config
                         .dns
                         .nameserver_policy
-                        .insert("private.example".into(), overridden.clone());
+                        .insert("private.example".into(), vec![overridden.clone()]);
                 }
                 "proxy-server-nameserver" => {
                     config.dns.proxy_server_nameserver =
@@ -1172,7 +1172,7 @@ mod tests {
                     config
                         .dns
                         .nameserver_policy
-                        .insert("internal.example".into(), dhcp.clone());
+                        .insert("internal.example".into(), vec![dhcp.clone()]);
                 }
                 _ => unreachable!(),
             }
@@ -1221,11 +1221,11 @@ mod tests {
         config
             .dns
             .nameserver_policy
-            .insert("Private.Example".to_owned(), upstreams[0].clone());
+            .insert("Private.Example".to_owned(), vec![upstreams[0].clone()]);
         config
             .dns
             .nameserver_policy
-            .insert("private.example".to_owned(), upstreams[1].clone());
+            .insert("private.example".to_owned(), vec![upstreams[1].clone()]);
         let error = match config.validate() {
             Ok(_) => panic!("case-duplicate DNS selectors were silently accepted"),
             Err(error) => error.to_string(),

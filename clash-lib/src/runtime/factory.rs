@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     path::PathBuf,
     sync::{Arc, OnceLock},
 };
@@ -519,7 +518,7 @@ async fn build_auxiliary_dns_resolver(
         store_fake_ip: false,
         store_smart_stats: false,
         hosts: None,
-        nameserver_policy: HashMap::new(),
+        nameserver_policy: indexmap::IndexMap::new(),
         edns_client_subnet: None,
         fw_mark,
         respect_rules: false,

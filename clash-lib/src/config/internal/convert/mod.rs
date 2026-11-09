@@ -212,7 +212,7 @@ fn validate_global_ipv6(
         .chain(dns.default_nameserver.iter())
         .chain(dns.proxy_server_nameserver.iter().flatten())
         .chain(dns.direct_nameserver.iter().flatten())
-        .chain(dns.nameserver_policy.values());
+        .chain(dns.nameserver_policy.values().flatten());
     if name_servers
         .into_iter()
         .any(|nameserver| matches!(&nameserver.host, url::Host::Ipv6(_)))
@@ -782,7 +782,7 @@ proxies:
             internal
                 .dns
                 .nameserver_policy
-                .insert(selector.to_owned(), server);
+                .insert(selector.to_owned(), vec![server]);
             let error = match crate::Config::Internal(internal).try_parse() {
                 Ok(_) => panic!(
                     "unsupported internal DNS selector {selector} must be rejected"
