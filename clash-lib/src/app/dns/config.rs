@@ -882,9 +882,9 @@ mod tests {
     }
 
     #[test]
-    fn nameserver_policy_rejects_unimplemented_compound_selectors() {
-        // Mihomo treats comma-delimited and geosite/rule-set keys as selectors;
-        // Chimera's plain domain trie must never accept them as inert literals.
+    fn nameserver_policy_rejects_unsupported_selectors_and_expands_domains() {
+        // Reject unsupported GeoSite/RuleSet selectors and unmatchable
+        // whitespace; comma-delimited ordinary domains are expanded.
         for selector in [
             "example.com other.test",
             "geosite:private",
@@ -897,6 +897,16 @@ mod tests {
                 "unsupported selector {selector:?} must not be silently accepted"
             );
         }
+        let combined = HashMap::from([(
+            "example.com,other.test".to_owned(),
+            "192.0.2.53".to_owned(),
+        )]);
+        let expanded = Config::parse_nameserver_policy(&combined)
+            .expect("Mihomo-compatible comma domain expansion must be supported");
+        assert_eq!(expanded.len(), 2);
+        assert!(expanded.contains_key("example.com"));
+        assert!(expanded.contains_key("other.test"));
+
         for selector in ["example.com", "*.example.com", "+.example.com"] {
             let policy =
                 HashMap::from([(selector.to_owned(), "192.0.2.53".to_owned())]);
