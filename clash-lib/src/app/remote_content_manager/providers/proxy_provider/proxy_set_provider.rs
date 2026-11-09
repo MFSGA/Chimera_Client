@@ -340,53 +340,6 @@ proxies:
       mode: auto
 "#;
 
-    const UNSAFE_XHTTP_DOWNLINK: &[u8] = br#"
-proxies:
-  - name: leaking-xhttp
-    type: vless
-    server: managed.example
-    port: 443
-    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
-    network: xhttp
-    alpn: [h2]
-    xhttp-opts:
-      mode: stream-up
-      download-settings:
-        address: private-secondary.example
-        port: 443
-"#;
-    const SAFE_XHTTP_DOWNLINK: &[u8] = br#"
-proxies:
-  - name: safe-xhttp
-    type: vless
-    server: managed.example
-    port: 443
-    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
-    network: xhttp
-    alpn: [h2]
-    xhttp-opts:
-      mode: stream-up
-      download-settings:
-        address: 192.0.2.48
-        port: 443
-"#;
-    const MIXED_SAFE_AND_UNSAFE_XHTTP: &[u8] = br#"
-proxies:
-  - name: safe-socks
-    type: socks5
-    server: 198.51.100.44
-    port: 1080
-  - name: unsafe-http1
-    type: vless
-    server: private-reconnect.example
-    port: 443
-    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
-    network: xhttp
-    alpn: [http/1.1]
-    xhttp-opts:
-      mode: auto
-"#;
-
     fn provider_with_refresh(
         path: String,
         refreshed_content: &'static [u8],

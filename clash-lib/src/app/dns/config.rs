@@ -248,6 +248,9 @@ impl Config {
         let mut policy = HashMap::new();
 
         for (selector_group, server) in policy_map {
+            // Comma-separated ordinary domains are expanded below. Each
+            // selector is validated independently; GeoSite/RuleSet remain
+            // unsupported and cannot silently become literal trie entries.
             let nameservers =
                 Config::parse_nameserver(std::slice::from_ref(server))?;
 

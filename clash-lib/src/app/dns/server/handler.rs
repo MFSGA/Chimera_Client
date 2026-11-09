@@ -1085,6 +1085,7 @@ mod tests {
     async fn fake_ipv6_answer_uses_configured_mihomo_ttl() {
         let mut resolver = MockClashResolver::new();
         resolver.expect_ipv6().return_const(true);
+        resolver.expect_dns_ipv6().return_const(true);
         resolver.expect_fake_ip_enabled().return_const(true);
         resolver.expect_fake_ip_v6_enabled().return_const(true);
         resolver.expect_should_fake_ip().once().return_const(true);
