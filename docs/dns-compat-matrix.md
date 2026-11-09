@@ -115,3 +115,10 @@ S01 准入必须满足：金标准用例在目标 HEAD 实际运行；未知新�
 - 以最新 `origin/master` `f304da17` 及第一批隔离提交为基线，借鉴原始 `088f487`，只移植可独立应用的 `default-nameserver` 内部配置校验及对应测试；固定 Mihomo gitlink `63bd52ec794b7051569b76ede2f6cdbf4c091fda` 保持只读。
 - 内部配置和热重载拒绝空、非 IP 字面量、`#proxy` 或 `dhcp://` 上游，保留 IP 字面量 DoH 的旧配置；这并非系统级 macOS DNS 零泄漏验收。
 - 独立 L2 审查、Rust 1.99.1 锁定工具链核验、Mihomo 二进制互操作和 NIC/utun 抓包仍待完成；未更新本地 `master` 或远端分支。
+
+## 2026-11-09 — 批次 3：DNS 监听与 TLS 身份字段拼写失效关闭（L2 待审）
+
+- 基于最新 `origin/master` `f304da17` 与前两批本地候选，独立适配原始候选 `377085f` 的 DNS 监听/TLS 隐私字段诊断，不引入其依赖的较大范围配置校验重构。
+- 先写 `dns_listener_typo_must_not_silently_disable_listener`：旧行为会接受 `dns.listen.tpc`（否定测试 0/1）；新增合并后 YAML 校验，拒绝 DNS 监听协议和 DoH/DoT/DoH3 的证书、主机名、地址相关拼写错误，同时保持普通 `vendor-extension` 字段兼容。
+- `dns_tls_certificate_typo_must_not_silently_disable_identity` 断言诊断不会打印 `secret.example`。两个定向测试通过；TUN+Ring 无默认 feature 核心库 837 通过/0 失败/11 忽略，DNS 配置 21/21，严格 all-target Clippy、fmt 和 diff 检查通过（Rust 1.99.0，锁定 1.99.1 安装状态待修复）。
+- 固定 `ref-mihomo` gitlink `63bd52ec794b7051569b76ede2f6cdbf4c091fda` 保持只读；未实际运行 Mihomo 二进制、macOS NIC/utun 抓包、远端 CI 或独立 L2 Review。此批仅保存在隔离集成分支，不将测试结果当成主线发布批准。
