@@ -1,4 +1,5 @@
 use educe::Educe;
+use indexmap::IndexMap;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_yaml::Value;
 
@@ -90,6 +91,31 @@ pub struct TunConfig {
     pub route_table_v6: u32,
     #[serde(default, alias = "dns_hijack")]
     pub dns_hijack: DnsHijack,
+}
+
+/// Mihomo accepts either a legacy single DNS upstream or an ordered list
+/// for each nameserver-policy selector. Preserve scalar YAML serialization
+/// instead of silently rewriting existing user configurations to arrays.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum DnsPolicyUpstreams {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+impl DnsPolicyUpstreams {
+    pub fn as_servers(&self) -> &[String] {
+        match self {
+            Self::Single(value) => std::slice::from_ref(value),
+            Self::Multiple(values) => values,
+        }
+    }
+}
+
+impl From<String> for DnsPolicyUpstreams {
+    fn from(value: String) -> Self {
+        Self::Single(value)
+    }
 }
 
 #[derive(Deserialize, Educe)]
@@ -882,8 +908,8 @@ pub struct DNS {
     )]
     pub default_nameserver: Vec<String>,
     pub edns_client_subnet: Option<EdnsClientSubnet>,
-    /// Lookup domains via specific nameservers
-    pub nameserver_policy: HashMap<String, String>,
+    /// Lookup domains via one or more selected DNS upstreams.
+    pub nameserver_policy: IndexMap<String, DnsPolicyUpstreams>,
     /// Fake IP addresses pool CIDR
     #[educe(Default = "198.19.0.1/16")]
     pub fake_ip_range: String,

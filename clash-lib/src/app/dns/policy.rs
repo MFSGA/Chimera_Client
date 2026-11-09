@@ -238,7 +238,12 @@ fn compile_action(
             .chain(c.dns.default_nameserver.iter())
             .chain(c.dns.proxy_server_nameserver.iter())
             .chain(c.dns.direct_nameserver.iter())
-            .chain(c.dns.nameserver_policy.values());
+            .chain(
+                c.dns
+                    .nameserver_policy
+                    .values()
+                    .flat_map(|v| v.as_servers().iter()),
+            );
         let forced = candidate_servers.map_or_else(
             || inherited.any(|v| v.contains('#')),
             |servers| {
