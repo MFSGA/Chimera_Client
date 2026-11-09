@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod rule_interface_tests;
-mod rules;
+pub(crate) mod rules;
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 

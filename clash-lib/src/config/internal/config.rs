@@ -264,17 +264,35 @@ impl Config {
             self.general.controller.external_controller.as_deref(),
         )?;
 
-        // YAML conversion expands comma-delimited main DNS policy selectors
-        // and rejects Mihomo GeoSite/RuleSet patterns. Internal configs and
-        // reloads must not bypass that privacy-sensitive validation.
+        // YAML conversion expands comma-delimited main DNS policy selectors.
+        // Keep GeoSite selectors only after syntax validation so internal
+        // reloads cannot bypass the same runtime matcher guarantees.
         // The internal map can contain multiple spellings of the same DNS
         // name, while the runtime trie lowercases keys and would pick an
         // arbitrary policy based on HashMap iteration order.
         let mut seen_policy_domains = HashSet::new();
         for domain in self.dns.nameserver_policy.keys() {
             let lower = domain.to_ascii_lowercase();
-            if lower.starts_with("geosite:")
-                || lower.starts_with("rule-set:")
+            if let Some(code) = lower.strip_prefix("geosite:") {
+                if code.is_empty()
+                    || code.contains(':')
+                    || code.contains(',')
+                    || code.chars().any(char::is_whitespace)
+                {
+                    return Err(Error::InvalidConfig(
+                        "dns.nameserver-policy contains an invalid GeoSite selector"
+                            .to_owned(),
+                    ));
+                }
+                if !seen_policy_domains.insert(lower) {
+                    return Err(Error::InvalidConfig(
+                        "dns.nameserver-policy contains duplicate GeoSite selectors"
+                            .to_owned(),
+                    ));
+                }
+                continue;
+            }
+            if lower.starts_with("rule-set:")
                 || domain.contains(',')
                 || !dns::config::valid_nameserver_policy_domain(domain)
             {
@@ -903,6 +921,8 @@ mod tests {
             "bad*.example.com",
             "+",
             "example.com,other.example",
+            "geosite:",
+            "geosite:private,cn",
             "rule-set:private",
         ] {
             let mut config =

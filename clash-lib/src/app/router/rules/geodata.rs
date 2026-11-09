@@ -82,6 +82,17 @@ impl GeoSiteMatcher {
     }
 }
 
+impl GeoSiteMatcher {
+    /// Match an already-normalized DNS query without constructing a routing
+    /// Session. Uses the same GeoSite data and operators as business rules.
+    pub(crate) fn matches_domain(&self, domain: &str) -> bool {
+        let matched = self.set.search(domain).is_some()
+            || self.keywords.iter().any(|keyword| domain.contains(keyword))
+            || self.regexes.iter().any(|regex| regex.is_match(domain));
+        if self.not { !matched } else { matched }
+    }
+}
+
 impl RuleMatcher for GeoSiteMatcher {
     fn target(&self) -> &str {
         self.target.as_str()
@@ -92,16 +103,12 @@ impl RuleMatcher for GeoSiteMatcher {
     }
 
     fn apply(&self, sess: &Session) -> bool {
-        let matched = match &sess.destination {
-            crate::session::SocksAddr::Ip(_) => false,
+        match &sess.destination {
+            crate::session::SocksAddr::Ip(_) => self.not,
             crate::session::SocksAddr::Domain(domain, _) => {
-                self.set.search(domain).is_some()
-                    || self.keywords.iter().any(|keyword| domain.contains(keyword))
-                    || self.regexes.iter().any(|regex| regex.is_match(domain))
+                self.matches_domain(domain)
             }
-        };
-
-        if self.not { !matched } else { matched }
+        }
     }
 
     fn type_name(&self) -> &str {

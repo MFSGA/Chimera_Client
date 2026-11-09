@@ -311,11 +311,7 @@ fn full_dns_fixture_parses_expected_runtime_shape() {
 #[test]
 fn nameserver_policy_compound_selectors_fail_closed_at_yaml_conversion() {
     for enabled in [false, true] {
-        for selector in [
-            "example.com other.test",
-            "geosite:private",
-            "rule-set:private",
-        ] {
+        for selector in ["example.com other.test", "rule-set:private"] {
             let yaml = base_config(&format!(
                 "  enable: {enabled}\n  enhanced-mode: normal\n  nameserver: [1.1.1.1]\n  default-nameserver: [1.1.1.1]\n  nameserver-policy:\n    '{selector}': 192.0.2.53\n"
             ));
@@ -326,6 +322,33 @@ fn nameserver_policy_compound_selectors_fail_closed_at_yaml_conversion() {
             );
         }
     }
+}
+
+#[test]
+#[serial_test::serial]
+fn geosite_dns_policy_without_geodata_fails_runtime_startup() {
+    let temp = tempfile::tempdir().expect("temp directory must be created");
+    let yaml = base_config(
+        "  enable: true\n  nameserver: [1.1.1.1]\n  default-nameserver: [1.1.1.1]\n  nameserver-policy:\n    'geosite:private': 192.0.2.53\n",
+    )
+    .replacen("ipv6: true", "ipv6: false", 1)
+    .replace("dns:\n", "mmdb: null\ngeosite: null\ntun:\n  enable: false\ndns:\n");
+    assert!(Config::Str(yaml.clone()).try_parse().is_ok());
+    let error = match clash_lib::start_scaffold(Options {
+        config: Config::Str(yaml),
+        cwd: Some(temp.path().to_string_lossy().to_string()),
+        rt: Some(TokioRuntime::SingleThread),
+        log_file: None,
+        config_path: None,
+    }) {
+        Ok(_) => panic!("GeoSite selectors without GeoSite data must not start"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        error.contains("geosite matcher requires configured GeoSite data"),
+        "missing geodata must fail closed with a precise diagnostic: {error}"
+    );
+    assert!(!clash_lib::shutdown());
 }
 
 #[test]
@@ -456,7 +479,7 @@ fn invalid_upstream_diagnostics_do_not_echo_private_uri_parts() {
 
 #[test]
 fn policy_selector_diagnostics_reject_without_exposing_private_qname() {
-    let private_selector = "geosite:private-dns-secret.example";
+    let private_selector = "geosite:private-dns-secret.example,";
     let yaml = base_config(&format!(
         "  enable: true\n  nameserver: [1.1.1.1]\n  default-nameserver: [223.5.5.5]\n  nameserver-policy:\n    '{private_selector}': 9.9.9.9\n"
     ));
@@ -1152,13 +1175,8 @@ fn mihomo_nameserver_policy_multiple_domains_split_without_silent_literal_match(
 }
 
 #[test]
-fn mihomo_nameserver_policy_rejects_unsupported_geosite_and_ruleset_selectors() {
-    for domain in [
-        "geosite:gfw",
-        "GEOSITE:private",
-        "rule-set:protected",
-        "example.com,rule-set:protected",
-    ] {
+fn mihomo_nameserver_policy_rejects_unsupported_ruleset_selectors() {
+    for domain in ["rule-set:protected", "example.com,rule-set:protected"] {
         let yaml = base_config(&format!(
             "  enable: true\n  nameserver: [1.1.1.1]\n  nameserver-policy:\n    '{domain}': 9.9.9.9\n"
         ));

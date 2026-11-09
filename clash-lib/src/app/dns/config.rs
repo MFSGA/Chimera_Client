@@ -84,6 +84,13 @@ pub struct Config {
     pub store_smart_stats: bool,
     pub hosts: Option<trie::StringTrie<IpAddr>>,
     pub nameserver_policy: IndexMap<String, Vec<NameServer>>,
+    /// Filled after GeoSite loading; shared with the resolver created earlier.
+    /// DNS queries fail closed while a configured matcher remains unready.
+    pub(crate) geosite_policy_matchers: Arc<
+        std::sync::OnceLock<
+            HashMap<String, crate::app::router::rules::geodata::GeoSiteMatcher>,
+        >,
+    >,
     pub edns_client_subnet: Option<EdnsClientSubnet>,
     pub fw_mark: Option<u32>,
     pub respect_rules: bool,
@@ -402,35 +409,58 @@ impl Config {
                 ));
             }
 
-            // Mihomo expands comma-delimited domain keys into individual
-            // policies. Keep geosite/rule-set unsupported until their
-            // matchers exist; never register inert trie literals for them.
-            for selector in selector_group.split(',') {
-                let lower = selector.to_ascii_lowercase();
-                if selector.is_empty()
-                    || selector.chars().any(char::is_whitespace)
-                    || lower.starts_with("geosite:")
-                    || lower.starts_with("rule-set:")
-                {
+            // Mihomo gives GeoSite comma keys a different meaning from
+            // ordinary comma-domain keys. Expand the former as matchers,
+            // never as inert trie labels.
+            let lower_group = selector_group.to_ascii_lowercase();
+            let is_geosite_group = lower_group.starts_with("geosite:");
+            let group = if is_geosite_group {
+                &lower_group["geosite:".len()..]
+            } else {
+                lower_group.as_str()
+            };
+            for token in group.split(',') {
+                if token.is_empty() || token.chars().any(char::is_whitespace) {
                     return Err(Error::InvalidConfig(
                         "DNS nameserver-policy selector uses unsupported syntax"
                             .into(),
                     ));
                 }
-                if !valid_nameserver_policy_domain(selector) {
-                    return Err(Error::InvalidConfig(
-                        "DNS nameserver-policy invalid domain selector".to_owned(),
-                    ));
-                }
-                let normalized = Self::normalize_domain_selector(selector)?;
+                let selector = if is_geosite_group {
+                    // GeoSite contains an optional @attribute suffix. The
+                    // GeoSite matcher validates the code and attributes when
+                    // geodata becomes available at runtime startup.
+                    if token.contains(':') {
+                        return Err(Error::InvalidConfig(
+                            "DNS nameserver-policy selector uses unsupported syntax"
+                                .into(),
+                        ));
+                    }
+                    format!("geosite:{token}")
+                } else {
+                    if token.starts_with("geosite:")
+                        || token.starts_with("rule-set:")
+                    {
+                        return Err(Error::InvalidConfig(
+                            "DNS nameserver-policy selector uses unsupported syntax"
+                                .into(),
+                        ));
+                    }
+                    if !valid_nameserver_policy_domain(token) {
+                        return Err(Error::InvalidConfig(format!(
+                            "DNS nameserver-policy invalid domain selector: {token}"
+                        )));
+                    }
+                    Self::normalize_domain_selector(token)?
+                };
                 // Preserve *last declaration* semantics, including overlap
                 // between expanded comma groups. Replacing an IndexMap entry
                 // in place keeps its old position; that would apply the final
                 // exact domain before an intervening `+.` wildcard and route
-                // the apex through the wrong DNS upstream. Reinsert under its
+                // the apex through the wrong DNS upstream. Reinsert under the
                 // canonical IDNA key so runtime matching uses DNS wire names.
-                policy.shift_remove(&normalized);
-                policy.insert(normalized, nameservers.clone());
+                policy.shift_remove(&selector);
+                policy.insert(selector, nameservers.clone());
             }
         }
         Ok(policy)
@@ -922,6 +952,7 @@ impl TryFrom<&crate::config::def::Config> for Config {
             store_smart_stats: c.profile.store_smart_stats,
             hosts: Some(hosts),
             nameserver_policy,
+            geosite_policy_matchers: Arc::new(std::sync::OnceLock::new()),
             edns_client_subnet,
             respect_rules: dc.respect_rules,
             compiled_policy,
@@ -1141,7 +1172,7 @@ mod tests {
     }
 
     #[test]
-    fn nameserver_policies_normalize_idna_and_reject_canonical_duplicates() {
+    fn nameserver_policies_normalize_idna_and_keep_last_canonical_declaration() {
         let unicode = IndexMap::from([(
             "bücher.example".to_owned(),
             "9.9.9.9".to_owned().into(),
@@ -1157,11 +1188,12 @@ mod tests {
                 "1.1.1.1".to_owned().into(),
             ),
         ]);
-        assert!(
-            Config::parse_nameserver_policy_ordered(&aliases)
-                .expect_err("Unicode/ASCII aliases must not race in the trie")
-                .to_string()
-                .contains("nameserver-policy")
+        let parsed = Config::parse_nameserver_policy_ordered(&aliases)
+            .expect("later IDNA aliases should follow YAML declaration order");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed["xn--bcher-kva.example"][0].host.to_string(),
+            "1.1.1.1"
         );
     }
 
@@ -1241,13 +1273,9 @@ mod tests {
 
     #[test]
     fn nameserver_policy_rejects_unsupported_selectors_and_expands_domains() {
-        // Reject unsupported GeoSite/RuleSet selectors and unmatchable
-        // whitespace; comma-delimited ordinary domains are expanded.
-        for selector in [
-            "example.com other.test",
-            "geosite:private",
-            "rule-set:private",
-        ] {
+        // Reject unsupported RuleSet selectors and unmatchable whitespace;
+        // GeoSite is covered by dedicated matcher tests below.
+        for selector in ["example.com other.test", "rule-set:private"] {
             let policy = IndexMap::from([(
                 selector.to_owned(),
                 "192.0.2.53".to_owned().into(),
@@ -1431,6 +1459,43 @@ dns:
                     .expect("wildcard must have nameservers")[0];
                 assert_eq!(wildcard.host.to_string(), "192.0.2.54");
             }
+        }
+    }
+
+    #[test]
+    fn geosite_policy_selectors_expand_without_becoming_literal_domains() {
+        let policy = IndexMap::from([(
+            "GEOSITE:PRIVATE,CN".to_owned(),
+            DnsPolicyUpstreams::Single("192.0.2.53".to_owned()),
+        )]);
+        let parsed = Config::parse_nameserver_policy_ordered(&policy).expect(
+            "GeoSite selectors must be recognized for actual matcher execution",
+        );
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.contains_key("geosite:private"));
+        assert!(parsed.contains_key("geosite:cn"));
+        assert!(!parsed.contains_key("cn"));
+    }
+
+    #[test]
+    fn geosite_policy_selectors_reject_malformed_and_rule_set_tokens() {
+        for key in [
+            "geosite:",
+            "geosite:private,",
+            "geosite:,private",
+            "geosite:private,cn:invalid",
+            "geosite:private, cn",
+            "rule-set:private",
+            "geosite:private,rule-set:private",
+        ] {
+            let policy = IndexMap::from([(
+                key.to_owned(),
+                DnsPolicyUpstreams::Single("192.0.2.53".to_owned()),
+            )]);
+            assert!(
+                Config::parse_nameserver_policy_ordered(&policy).is_err(),
+                "invalid policy {key:?} must be rejected before runtime"
+            );
         }
     }
 
