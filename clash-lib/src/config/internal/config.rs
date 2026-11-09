@@ -264,18 +264,77 @@ impl Config {
             self.general.controller.external_controller.as_deref(),
         )?;
 
-        // YAML conversion expands comma-delimited main DNS policy selectors
-        // and rejects Mihomo GeoSite/RuleSet patterns. Internal configs and
-        // reloads must not bypass that privacy-sensitive validation.
+        // YAML conversion expands comma-delimited main DNS policy selectors.
+        // Keep GeoSite selectors only after syntax validation so internal
+        // reloads cannot bypass the same runtime matcher guarantees.
         // The internal map can contain multiple spellings of the same DNS
         // name, while the runtime trie lowercases keys and would pick an
         // arbitrary policy based on HashMap iteration order.
         let mut seen_policy_domains = HashSet::new();
         for domain in self.dns.nameserver_policy.keys() {
             let lower = domain.to_ascii_lowercase();
-            if lower.starts_with("geosite:")
-                || lower.starts_with("rule-set:")
-                || domain.contains(',')
+            if let Some(code) = lower.strip_prefix("geosite:") {
+                if code.is_empty()
+                    || code.contains(':')
+                    || code.contains(',')
+                    || code.chars().any(char::is_whitespace)
+                {
+                    return Err(Error::InvalidConfig(
+                        "dns.nameserver-policy contains an invalid GeoSite selector"
+                            .to_owned(),
+                    ));
+                }
+                if !seen_policy_domains.insert(lower) {
+                    return Err(Error::InvalidConfig(
+                        "dns.nameserver-policy contains duplicate GeoSite selectors"
+                            .to_owned(),
+                    ));
+                }
+                continue;
+            }
+            if let Some(name) = lower.strip_prefix("rule-set:") {
+                if name.is_empty()
+                    || name.contains(':')
+                    || name.contains(',')
+                    || name.chars().any(char::is_whitespace)
+                {
+                    return Err(Error::InvalidConfig(
+                        "dns.nameserver-policy contains an invalid RuleSet selector"
+                            .to_owned(),
+                    ));
+                }
+                let matching: Vec<_> = self
+                    .rule_providers
+                    .iter()
+                    .filter(|(id, _)| id.eq_ignore_ascii_case(name))
+                    .collect();
+                let [(_, RuleProviderDef::Inline(inline))] = matching.as_slice()
+                else {
+                    return Err(Error::InvalidConfig(
+                        "dns.nameserver-policy RuleSet requires exactly one inline domain rule-provider"
+                            .to_owned(),
+                    ));
+                };
+                if inline.behavior != RuleSetBehavior::Domain
+                    || inline.inline_rules.is_empty()
+                    || inline.inline_rules.iter().any(|selector| {
+                        dns::config::normalize_dns_domain_pattern(selector).is_none()
+                    })
+                {
+                    return Err(Error::InvalidConfig(
+                        "dns.nameserver-policy RuleSet requires valid inline domain rules"
+                            .to_owned(),
+                    ));
+                }
+                if !seen_policy_domains.insert(lower) {
+                    return Err(Error::InvalidConfig(
+                        "dns.nameserver-policy contains duplicate RuleSet selectors"
+                            .to_owned(),
+                    ));
+                }
+                continue;
+            }
+            if domain.contains(',')
                 || !dns::config::valid_nameserver_policy_domain(domain)
             {
                 return Err(Error::InvalidConfig(
@@ -903,6 +962,8 @@ mod tests {
             "bad*.example.com",
             "+",
             "example.com,other.example",
+            "geosite:",
+            "geosite:private,cn",
             "rule-set:private",
         ] {
             let mut config =

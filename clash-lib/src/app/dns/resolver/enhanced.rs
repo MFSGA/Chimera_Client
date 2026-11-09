@@ -1,5 +1,7 @@
 use crate::{
     Error,
+    app::remote_content_manager::providers::rule_provider::ThreadSafeRuleProvider,
+    app::router::rules::geodata::GeoSiteMatcher,
     app::{dns::helper::DnsClientNetworkOptions, profile::ThreadSafeCacheFile},
     common::trie,
     config::def::DNSMode,
@@ -25,7 +27,7 @@ use rand::seq::IndexedRandom;
 use std::{
     net,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed},
     },
     time::{Duration, Instant},
@@ -207,6 +209,20 @@ fn ordered_nameserver_policy_entries<T>(
     policies.iter().collect()
 }
 
+/// A run of ordinary domains is one trie, just as in Mihomo. GeoSite
+/// matchers split the run and are evaluated in the declared YAML order.
+enum PolicySegment {
+    Domains(trie::StringTrie<Vec<ThreadSafeDNSClient>>),
+    GeoSite {
+        code: String,
+        clients: Vec<ThreadSafeDNSClient>,
+    },
+    RuleSet {
+        name: String,
+        clients: Vec<ThreadSafeDNSClient>,
+    },
+}
+
 pub struct EnhancedResolver {
     ipv6: Arc<AtomicBool>,
     dns_ipv6: bool,
@@ -254,6 +270,11 @@ pub struct EnhancedResolver {
     /// The DIRECT child shares this policy and its clients with its parent;
     /// only the parent owns the policy clients' network-reset lifecycle.
     policy_is_parent_shared: bool,
+    policy_segments: Option<Arc<Vec<PolicySegment>>>,
+    geosite_policy_matchers:
+        Arc<OnceLock<std::collections::HashMap<String, GeoSiteMatcher>>>,
+    rule_set_policy_registry:
+        Arc<OnceLock<std::collections::HashMap<String, ThreadSafeRuleProvider>>>,
 
     proxy_resolver: Option<Vec<ThreadSafeDNSClient>>,
     /// Per-proxy-host DNS upstream overrides. Selector specificity, not YAML
@@ -640,6 +661,23 @@ impl EnhancedResolver {
         resolver
     }
 
+    fn with_shared_policy_segments(
+        mut self,
+        policy_segments: Option<Arc<Vec<PolicySegment>>>,
+        geosite_policy_matchers: Arc<
+            OnceLock<std::collections::HashMap<String, GeoSiteMatcher>>,
+        >,
+        rule_set_policy_registry: Arc<
+            OnceLock<std::collections::HashMap<String, ThreadSafeRuleProvider>>,
+        >,
+    ) -> Self {
+        self.policy_is_parent_shared |= policy_segments.is_some();
+        self.policy_segments = policy_segments;
+        self.geosite_policy_matchers = geosite_policy_matchers;
+        self.rule_set_policy_registry = rule_set_policy_registry;
+        self
+    }
+
     fn with_parent_transport_gate(
         mut self,
         parent_failure: Arc<AtomicBool>,
@@ -703,6 +741,9 @@ impl EnhancedResolver {
             ),
             policy: None,
             policy_is_parent_shared: false,
+            policy_segments: None,
+            geosite_policy_matchers: Arc::new(OnceLock::new()),
+            rule_set_policy_registry: Arc::new(OnceLock::new()),
             proxy_resolver: None,
             proxy_server_nameserver_policy: Vec::new(),
             proxy_node_resolver: false,
@@ -775,6 +816,9 @@ impl EnhancedResolver {
             ),
             policy: None,
             policy_is_parent_shared: false,
+            policy_segments: None,
+            geosite_policy_matchers: Arc::new(OnceLock::new()),
+            rule_set_policy_registry: Arc::new(OnceLock::new()),
 
             proxy_resolver: None,
             proxy_server_nameserver_policy: Vec::new(),
@@ -884,6 +928,9 @@ impl EnhancedResolver {
             ),
             policy: None,
             policy_is_parent_shared: false,
+            policy_segments: None,
+            geosite_policy_matchers: Arc::new(OnceLock::new()),
+            rule_set_policy_registry: Arc::new(OnceLock::new()),
 
             proxy_resolver: None,
             proxy_server_nameserver_policy: Vec::new(),
@@ -1059,21 +1106,47 @@ impl EnhancedResolver {
         )
         .await?;
 
-        let policy = if !cfg.nameserver_policy.is_empty() {
-            let mut p = trie::StringTrie::new();
-            let mut seen = std::collections::HashSet::new();
-            for (domain, ns) in
-                ordered_nameserver_policy_entries(&cfg.nameserver_policy)
+        let mut seen_policy_selectors = std::collections::HashSet::new();
+        let mut has_special_policy = false;
+        let mut policy_segments = Vec::new();
+        let mut current_policy_trie = trie::StringTrie::new();
+        let mut has_current_policy_domains = false;
+        for (selector, servers) in
+            ordered_nameserver_policy_entries(&cfg.nameserver_policy)
+        {
+            let lower = selector.to_ascii_lowercase();
+            let (geo_code, rule_set_name) = if let Some(code) =
+                lower.strip_prefix("geosite:")
             {
-                // Internal reload/config constructors need the same privacy
-                // validation as YAML conversion. Invalid entries must not
-                // silently miss the trie and send QNAMEs to main DNS.
-                let lower = domain.to_ascii_lowercase();
-                if domain.contains(',')
-                    || lower.starts_with("geosite:")
-                    || lower.starts_with("rule-set:")
+                if code.is_empty()
+                    || code.contains(':')
+                    || code.contains(',')
+                    || code.chars().any(char::is_whitespace)
+                {
+                    return Err(Error::InvalidConfig(
+                        "dns.nameserver-policy contains an invalid GeoSite selector"
+                            .to_owned(),
+                    ));
+                }
+                has_special_policy = true;
+                (Some(code.to_owned()), None)
+            } else if let Some(name) = lower.strip_prefix("rule-set:") {
+                if name.is_empty()
+                    || name.contains(':')
+                    || name.contains(',')
+                    || name.chars().any(char::is_whitespace)
+                {
+                    return Err(Error::InvalidConfig(
+                        "dns.nameserver-policy contains an invalid RuleSet selector"
+                            .to_owned(),
+                    ));
+                }
+                has_special_policy = true;
+                (None, Some(name.to_owned()))
+            } else {
+                if selector.contains(',')
                     || !crate::app::dns::config::valid_nameserver_policy_domain(
-                        domain,
+                        selector,
                     )
                 {
                     return Err(Error::InvalidConfig(
@@ -1081,47 +1154,91 @@ impl EnhancedResolver {
                             .to_owned(),
                     ));
                 }
-                let normalized =
-                    crate::app::dns::config::normalize_dns_domain_pattern(
-                        domain,
-                    )
+                (None, None)
+            };
+            let canonical_selector = if let Some(code) = &geo_code {
+                format!("geosite:{code}")
+            } else if let Some(name) = &rule_set_name {
+                format!("rule-set:{name}")
+            } else {
+                crate::app::dns::config::normalize_dns_domain_pattern(selector)
                     .ok_or_else(|| {
                         Error::InvalidConfig(
                             "dns.nameserver-policy contains an invalid domain selector"
                                 .to_owned(),
                         )
-                    })?;
-                if !seen.insert(normalized.clone()) {
-                    return Err(Error::InvalidConfig(
-                        "dns.nameserver-policy contains duplicate normalized selectors"
-                            .to_owned(),
-                    ));
-                }
-                let clients = make_clients(
-                    ns.to_owned(),
-                    Some(default_resolver.clone()),
-                    Some(outbound_resolver.clone()),
-                    outbounds.clone(),
-                    edns_client_subnet.clone(),
-                    DnsClientNetworkOptions {
-                        fw_mark: cfg.fw_mark,
-                        rule_dispatch: rule_dispatch.clone(),
-                        network_path_source: network_path_source.clone(),
-                        health: Some(health.clone()),
-                        group: Some("policy"),
-                    },
-                )
-                .await?;
-                if clients.is_empty() || !p.insert(&normalized, Arc::new(clients)) {
-                    return Err(Error::InvalidConfig(
-                        "dns.nameserver-policy has no usable clients or an unmatchable selector"
-                            .to_owned(),
-                    ));
-                }
+                    })?
+            };
+            if !seen_policy_selectors.insert(canonical_selector.clone()) {
+                return Err(Error::InvalidConfig(
+                    "dns.nameserver-policy contains duplicate normalized selectors"
+                        .to_owned(),
+                ));
             }
-            Some(Arc::new(p))
+            let clients = make_clients(
+                servers.to_owned(),
+                Some(default_resolver.clone()),
+                Some(outbound_resolver.clone()),
+                outbounds.clone(),
+                edns_client_subnet.clone(),
+                DnsClientNetworkOptions {
+                    fw_mark: cfg.fw_mark,
+                    rule_dispatch: rule_dispatch.clone(),
+                    network_path_source: network_path_source.clone(),
+                    health: Some(health.clone()),
+                    group: Some("policy"),
+                },
+            )
+            .await?;
+            if clients.is_empty() {
+                return Err(Error::InvalidConfig(
+                    "dns.nameserver-policy has no usable clients".to_owned(),
+                ));
+            }
+            if let Some(code) = geo_code {
+                if has_current_policy_domains {
+                    policy_segments.push(PolicySegment::Domains(std::mem::take(
+                        &mut current_policy_trie,
+                    )));
+                    has_current_policy_domains = false;
+                }
+                policy_segments.push(PolicySegment::GeoSite { code, clients });
+            } else if let Some(name) = rule_set_name {
+                if has_current_policy_domains {
+                    policy_segments.push(PolicySegment::Domains(std::mem::take(
+                        &mut current_policy_trie,
+                    )));
+                    has_current_policy_domains = false;
+                }
+                policy_segments.push(PolicySegment::RuleSet { name, clients });
+            } else {
+                if !current_policy_trie
+                    .insert(&canonical_selector, Arc::new(clients))
+                {
+                    return Err(Error::InvalidConfig(
+                        "dns.nameserver-policy contains an unmatchable selector"
+                            .to_owned(),
+                    ));
+                }
+                has_current_policy_domains = true;
+            }
+        }
+        if has_current_policy_domains {
+            policy_segments.push(PolicySegment::Domains(current_policy_trie));
+        }
+        let (policy, policy_segments) = if has_special_policy {
+            (None, Some(Arc::new(policy_segments)))
+        } else if cfg.nameserver_policy.is_empty() {
+            (None, None)
         } else {
-            None
+            let mut segments = policy_segments.into_iter();
+            let Some(PolicySegment::Domains(domains)) = segments.next() else {
+                return Err(Error::InvalidConfig(
+                    "dns.nameserver-policy contains no domain policies".to_owned(),
+                ));
+            };
+            debug_assert!(segments.next().is_none());
+            (Some(Arc::new(domains)), None)
         };
 
         let direct_resolver = if let Some(direct_nameserver) = cfg.direct_nameserver
@@ -1141,20 +1258,30 @@ impl EnhancedResolver {
                 },
             )
             .await?;
+            let direct = Self::direct_with_optional_ipv6_policy(
+                clients,
+                main.clone(),
+                ipv6_policy.clone(),
+                dns_ipv6,
+                cfg.direct_nameserver_follow_policy,
+                policy.clone(),
+            );
+            let direct = if cfg.direct_nameserver_follow_policy {
+                direct.with_shared_policy_segments(
+                    policy_segments.clone(),
+                    cfg.geosite_policy_matchers.clone(),
+                    cfg.rule_set_policy_registry.clone(),
+                )
+            } else {
+                direct
+            };
             Some(Arc::new(
-                Self::direct_with_optional_ipv6_policy(
-                    clients,
-                    main.clone(),
-                    ipv6_policy.clone(),
-                    dns_ipv6,
-                    cfg.direct_nameserver_follow_policy,
-                    policy.clone(),
-                )
-                .with_parent_transport_gate(
-                    Arc::clone(&parent_transport_failed),
-                    Arc::clone(&parent_resets_in_progress),
-                )
-                .with_parent_publication_gate(Arc::clone(&parent_published)),
+                direct
+                    .with_parent_transport_gate(
+                        Arc::clone(&parent_transport_failed),
+                        Arc::clone(&parent_resets_in_progress),
+                    )
+                    .with_parent_publication_gate(Arc::clone(&parent_published)),
             ) as ThreadSafeDNSResolver)
         } else {
             None
@@ -1261,6 +1388,9 @@ impl EnhancedResolver {
             )),
             policy,
             policy_is_parent_shared: false,
+            policy_segments,
+            geosite_policy_matchers: cfg.geosite_policy_matchers.clone(),
+            rule_set_policy_registry: cfg.rule_set_policy_registry.clone(),
             fake_dns: match cfg.enhance_mode {
                 DNSMode::FakeIp => Some(Arc::new(RwLock::new(
                     fakeip::FakeDns::new(fakeip::Opts {
@@ -2163,7 +2293,7 @@ impl EnhancedResolver {
                 self.batch_exchange_if_transport_usable(&self.main, message)
                     .await
             }
-        } else if let Some(matched) = self.match_policy(message) {
+        } else if let Some(matched) = self.match_policy(message).await? {
             self.batch_exchange_if_transport_usable(matched, message)
                 .await
         } else {
@@ -2388,17 +2518,78 @@ impl EnhancedResolver {
         rv
     }
 
-    fn match_policy(&self, m: &op::Message) -> Option<&Vec<ThreadSafeDNSClient>> {
-        if let (Some(policy), Some(domain)) =
-            (&self.policy, EnhancedResolver::domain_name_of_message(m))
-        {
-            // DNS owner names are case-insensitive; bypassing the policy on
-            // mixed-case labels could send QNAMEs to an unintended upstream.
-            return policy
-                .search(&domain.to_ascii_lowercase())
-                .map(|n| n.get_data().unwrap());
+    async fn match_policy(
+        &self,
+        m: &op::Message,
+    ) -> anyhow::Result<Option<&Vec<ThreadSafeDNSClient>>> {
+        let Some(domain) = Self::domain_name_of_message(m) else {
+            return Ok(None);
+        };
+        let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+        if let Some(segments) = &self.policy_segments {
+            // A provider may not have finished loading when DNS becomes
+            // available during runtime construction. Reject any unclassified
+            // DNS query until all referenced matcher registries are ready.
+            let has_geosite = segments
+                .iter()
+                .any(|segment| matches!(segment, PolicySegment::GeoSite { .. }));
+            let prepared_geosite = if has_geosite {
+                Some(self.geosite_policy_matchers.get().ok_or_else(|| {
+                    anyhow!("GeoSite DNS policy is not ready; refusing ordinary DNS fallback")
+                })?)
+            } else {
+                None
+            };
+            let has_ruleset = segments
+                .iter()
+                .any(|segment| matches!(segment, PolicySegment::RuleSet { .. }));
+            let prepared_ruleset = if has_ruleset {
+                Some(self.rule_set_policy_registry.get().ok_or_else(|| {
+                    anyhow!("RuleSet DNS policy is not ready; refusing ordinary DNS fallback")
+                })?)
+            } else {
+                None
+            };
+            for segment in segments.iter() {
+                match segment {
+                    PolicySegment::Domains(domains) => {
+                        if let Some(node) = domains.search(&domain)
+                            && let Some(clients) = node.get_data()
+                        {
+                            return Ok(Some(clients));
+                        }
+                    }
+                    PolicySegment::GeoSite { code, clients } => {
+                        let matcher = prepared_geosite
+                            .and_then(|prepared| prepared.get(code))
+                            .ok_or_else(|| {
+                                anyhow!("GeoSite DNS matcher unavailable; refusing DNS fallback")
+                            })?;
+                        if matcher.matches_domain(&domain) {
+                            return Ok(Some(clients));
+                        }
+                    }
+                    PolicySegment::RuleSet { name, clients } => {
+                        let provider = prepared_ruleset
+                            .and_then(|prepared| prepared.get(name))
+                            .ok_or_else(|| {
+                                anyhow!("RuleSet DNS provider unavailable; refusing DNS fallback")
+                            })?;
+                        // Wait for provider refresh instead of interpreting
+                        // lock contention as a missed match.
+                        if provider.match_dns_domain(&domain).await? {
+                            return Ok(Some(clients));
+                        }
+                    }
+                }
+            }
+            return Ok(None);
         }
-        None
+        Ok(self
+            .policy
+            .as_ref()
+            .and_then(|policy| policy.search(&domain))
+            .and_then(|node| node.get_data()))
     }
 
     async fn provider_domain_generation(&self, domain: &str) -> u64 {
@@ -2515,7 +2706,7 @@ impl EnhancedResolver {
                 .await;
         }
 
-        if let Some(matched) = self.match_policy(message) {
+        if let Some(matched) = self.match_policy(message).await? {
             return self
                 .batch_exchange_if_transport_usable(matched, message)
                 .await;
@@ -3032,6 +3223,27 @@ impl ClashResolver for EnhancedResolver {
             });
         }
 
+        if let Some(segments) = &self.policy_segments {
+            for segment in segments.iter() {
+                match segment {
+                    PolicySegment::Domains(domains) => {
+                        domains.traverse(|_, nameservers| {
+                            clients.extend(nameservers.iter().cloned());
+                            true
+                        });
+                    }
+                    PolicySegment::GeoSite {
+                        clients: entries, ..
+                    }
+                    | PolicySegment::RuleSet {
+                        clients: entries, ..
+                    } => {
+                        clients.extend(entries.iter().cloned());
+                    }
+                }
+            }
+        }
+
         let mut reset = 0_u32;
         let mut errors = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -3216,7 +3428,18 @@ impl ClashResolver for EnhancedResolver {
 mod tests {
     use super::{
         CACHE_CANDIDATE_TEST_PAUSE, CacheCandidateKind, CacheCandidateTestPause,
-        PROVIDER_EPOCH_CACHE_CAPACITY, PROVIDER_EPOCH_CACHE_MAX_TTL,
+        GeoSiteMatcher, PROVIDER_EPOCH_CACHE_CAPACITY, PROVIDER_EPOCH_CACHE_MAX_TTL,
+        PolicySegment,
+    };
+    use crate::app::remote_content_manager::providers::{
+        Provider,
+        rule_provider::{
+            RuleProviderImpl, RuleSetBehavior, RuleSetFormat, ThreadSafeRuleProvider,
+        },
+    };
+    use crate::common::geodata::{
+        GeoDataLookup, MockGeoDataLookupTrait,
+        geodata_proto::{Domain, GeoSite, domain},
     };
     use async_trait::async_trait;
     use hickory_net::{DnsHandle, client, udp::UdpClientStream, xfer::FirstAnswer};
@@ -3228,7 +3451,7 @@ mod tests {
     use std::{
         net::Ipv4Addr,
         sync::{
-            Arc,
+            Arc, OnceLock,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::{Duration, Instant},
@@ -12409,6 +12632,469 @@ mod tests {
             vec![std::net::IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5))],
         );
         assert_eq!(protected_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(public_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn dns_rule_set_is_ordered_and_fail_closed_until_registration() {
+        let mut resolver = EnhancedResolver::new_default().await;
+        resolver.lru_cache = None;
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        let domain_hits = Arc::new(AtomicUsize::new(0));
+        let ruleset_hits = Arc::new(AtomicUsize::new(0));
+        let domain_client: ThreadSafeDNSClient = Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(203, 0, 113, 50)),
+            hits: domain_hits.clone(),
+            id: "domain-policy",
+        });
+        let ruleset_client: ThreadSafeDNSClient = Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(203, 0, 113, 51)),
+            hits: ruleset_hits.clone(),
+            id: "ruleset-policy",
+        });
+        let mut plain = crate::common::trie::StringTrie::new();
+        plain.insert("proxy.example.com", Arc::new(vec![domain_client.clone()]));
+        resolver.policy_segments = Some(Arc::new(vec![
+            PolicySegment::Domains(plain),
+            PolicySegment::RuleSet {
+                name: "private-domain".to_owned(),
+                clients: vec![ruleset_client.clone()],
+            },
+        ]));
+        resolver.main = vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(198, 51, 100, 50)),
+            hits: main_hits.clone(),
+            id: "public-main",
+        })];
+        let query = test_query_with_type(rr::RecordType::TXT);
+        let err = resolver.exchange_no_cache(&query).await.expect_err(
+            "rule set is not registered; reject before trying any upstream",
+        );
+        assert!(err.to_string().contains("RuleSet DNS policy is not ready"));
+        assert_eq!(main_hits.load(Ordering::SeqCst), 0);
+        let provider = RuleProviderImpl::new(
+            "private-domain".to_owned(),
+            RuleSetBehavior::Domain,
+            RuleSetFormat::Yaml,
+            None,
+            None,
+            None,
+            None,
+            Some(vec![
+                "+.EXAMPLE.COM".to_owned(),
+                "bücher.example".to_owned(),
+            ]),
+        );
+        provider.initialize().await.expect("inline rules init");
+        let provider: ThreadSafeRuleProvider = Arc::new(provider);
+        assert!(
+            resolver
+                .rule_set_policy_registry
+                .set(std::collections::HashMap::from([(
+                    "private-domain".to_owned(),
+                    provider
+                )]))
+                .is_ok()
+        );
+        resolver
+            .exchange_no_cache(&query)
+            .await
+            .expect("domain rule first");
+        assert_eq!(domain_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(ruleset_hits.load(Ordering::SeqCst), 0);
+        let mut after = crate::common::trie::StringTrie::new();
+        after.insert("proxy.example.com", Arc::new(vec![domain_client]));
+        resolver.policy_segments = Some(Arc::new(vec![
+            PolicySegment::RuleSet {
+                name: "private-domain".to_owned(),
+                clients: vec![ruleset_client],
+            },
+            PolicySegment::Domains(after),
+        ]));
+        resolver
+            .exchange_no_cache(&query)
+            .await
+            .expect("rule-set first");
+        assert_eq!(ruleset_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(domain_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(main_hits.load(Ordering::SeqCst), 0);
+
+        let mut idna_query = test_query_with_type(rr::RecordType::TXT);
+        idna_query.queries[0]
+            .set_name(rr::Name::from_utf8("xn--bcher-kva.example.").unwrap());
+        resolver
+            .exchange_no_cache(&idna_query)
+            .await
+            .expect("canonical IDNA DNS name should match its U-label RuleSet");
+        assert_eq!(ruleset_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(main_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn dns_rule_set_upstream_failure_does_not_query_public_dns() {
+        let mut resolver = EnhancedResolver::new_default().await;
+        resolver.lru_cache = None;
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        let provider = RuleProviderImpl::new(
+            "private-domain".to_owned(),
+            RuleSetBehavior::Domain,
+            RuleSetFormat::Yaml,
+            None,
+            None,
+            None,
+            None,
+            Some(vec!["+.example.com".to_owned()]),
+        );
+        provider
+            .initialize()
+            .await
+            .expect("inline domain provider init");
+        assert!(
+            resolver
+                .rule_set_policy_registry
+                .set(std::collections::HashMap::from([(
+                    "private-domain".to_owned(),
+                    Arc::new(provider) as ThreadSafeRuleProvider,
+                )]))
+                .is_ok()
+        );
+        resolver.policy_segments = Some(Arc::new(vec![PolicySegment::RuleSet {
+            name: "private-domain".to_owned(),
+            clients: vec![Arc::new(FailingClient {
+                id: "private-rule-dns",
+                reason: "injected private rule-set DNS outage",
+            })],
+        }]));
+        resolver.main = vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(198, 51, 100, 51)),
+            hits: public_hits.clone(),
+            id: "main",
+        })];
+        resolver.fallback = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(198, 51, 100, 52)),
+            hits: public_hits.clone(),
+            id: "fallback",
+        })]);
+        for kind in [rr::RecordType::A, rr::RecordType::TXT] {
+            let err = resolver
+                .exchange_no_cache(&test_query_with_type(kind))
+                .await
+                .expect_err("RuleSet DNS outage must fail closed");
+            assert!(
+                err.to_string()
+                    .contains("injected private rule-set DNS outage")
+            );
+        }
+        assert_eq!(public_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn geosite_policy_fails_closed_before_data_and_preserves_interleaved_order()
+     {
+        let mut loader = MockGeoDataLookupTrait::new();
+        loader.expect_get().returning(|code| {
+            (code == "private").then(|| GeoSite {
+                country_code: "private".to_owned(),
+                domain: vec![Domain {
+                    r#type: domain::Type::Full as i32,
+                    value: "proxy.example.com".to_owned(),
+                    attribute: vec![],
+                }],
+            })
+        });
+        let loader: GeoDataLookup = Arc::new(loader);
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        let domain_hits = Arc::new(AtomicUsize::new(0));
+        let geo_hits = Arc::new(AtomicUsize::new(0));
+        let domain_client: ThreadSafeDNSClient = Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(203, 0, 113, 21)),
+            hits: domain_hits.clone(),
+            id: "plain-domain-policy",
+        });
+        let geosite_client: ThreadSafeDNSClient = Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(203, 0, 113, 22)),
+            hits: geo_hits.clone(),
+            id: "geosite-policy",
+        });
+        let mut resolver = EnhancedResolver::new_default().await;
+        resolver.lru_cache = None;
+        resolver.main = vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(198, 51, 100, 21)),
+            hits: main_hits.clone(),
+            id: "main-public",
+        })];
+
+        // A run of plain domain rules before a matcher takes precedence,
+        // even though both could match the same QNAME.
+        let mut before = crate::common::trie::StringTrie::new();
+        before.insert("proxy.example.com", Arc::new(vec![domain_client.clone()]));
+        resolver.policy_segments = Some(Arc::new(vec![
+            PolicySegment::Domains(before),
+            PolicySegment::GeoSite {
+                code: "private".to_owned(),
+                clients: vec![geosite_client.clone()],
+            },
+        ]));
+
+        let query = test_query_with_type(rr::RecordType::TXT);
+        let err = resolver.exchange_no_cache(&query).await.expect_err(
+            "GeoSite unready must not fall back even for a plain domain match",
+        );
+        assert!(err.to_string().contains("GeoSite DNS policy is not ready"));
+        assert_eq!(main_hits.load(Ordering::SeqCst), 0);
+        let compiled = GeoSiteMatcher::new(
+            "private".to_owned(),
+            "dns-nameserver-policy".to_owned(),
+            Some(&loader),
+        )
+        .expect("valid GeoSite matcher");
+        assert!(
+            resolver
+                .geosite_policy_matchers
+                .set(std::collections::HashMap::from([(
+                    "private".to_owned(),
+                    compiled,
+                )]))
+                .is_ok()
+        );
+        resolver
+            .exchange_no_cache(&query)
+            .await
+            .expect("plain domain response");
+        assert_eq!(domain_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(geo_hits.load(Ordering::SeqCst), 0);
+
+        // A GeoSite matcher preceding the same trie must win on its match.
+        let mut after = crate::common::trie::StringTrie::new();
+        after.insert("proxy.example.com", Arc::new(vec![domain_client]));
+        resolver.policy_segments = Some(Arc::new(vec![
+            PolicySegment::GeoSite {
+                code: "private".to_owned(),
+                clients: vec![geosite_client],
+            },
+            PolicySegment::Domains(after),
+        ]));
+        resolver
+            .exchange_no_cache(&query)
+            .await
+            .expect("geosite selected response");
+        assert_eq!(geo_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(main_hits.load(Ordering::SeqCst), 0);
+
+        let mut other = op::Message::query();
+        let mut q = op::Query::new();
+        q.set_name(rr::Name::from_utf8("other.example.org").unwrap());
+        q.set_query_type(rr::RecordType::TXT);
+        other.add_query(q);
+        resolver
+            .exchange_no_cache(&other)
+            .await
+            .expect("unmatched returns main");
+        assert_eq!(main_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn direct_follow_policy_uses_shared_geosite_segment() {
+        let mut loader = MockGeoDataLookupTrait::new();
+        loader.expect_get().returning(|code| {
+            (code == "private").then(|| GeoSite {
+                country_code: "private".to_owned(),
+                domain: vec![Domain {
+                    r#type: domain::Type::Full as i32,
+                    value: "proxy.example.com".to_owned(),
+                    attribute: vec![],
+                }],
+            })
+        });
+        let loader: GeoDataLookup = Arc::new(loader);
+        let matcher = GeoSiteMatcher::new(
+            "private".to_owned(),
+            "dns-nameserver-policy".to_owned(),
+            Some(&loader),
+        )
+        .expect("valid GeoSite matcher");
+        let matchers = Arc::new(OnceLock::new());
+        assert!(
+            matchers
+                .set(std::collections::HashMap::from([(
+                    "private".to_owned(),
+                    matcher,
+                )]))
+                .is_ok(),
+            "GeoSite matcher should be published once"
+        );
+
+        let direct_hits = Arc::new(AtomicUsize::new(0));
+        let policy_hits = Arc::new(AtomicUsize::new(0));
+        let policy_client: ThreadSafeDNSClient = Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(203, 0, 113, 24)),
+            hits: policy_hits.clone(),
+            id: "shared-geosite-policy",
+        });
+        let segments = Arc::new(vec![PolicySegment::GeoSite {
+            code: "private".to_owned(),
+            clients: vec![policy_client],
+        }]);
+        let mut direct = EnhancedResolver::direct_with_optional_ipv6_policy(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(198, 51, 100, 24)),
+                hits: direct_hits.clone(),
+                id: "direct-main",
+            })],
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+            false,
+            true,
+            None,
+        )
+        .with_shared_policy_segments(
+            Some(segments),
+            matchers,
+            Arc::new(OnceLock::new()),
+        );
+        direct.lru_cache = None;
+
+        let mut query = test_query_with_type(rr::RecordType::A);
+        query.queries[0]
+            .set_name(rr::Name::from_utf8("proxy.example.com.").unwrap());
+        let response = direct.exchange_no_cache(&query).await.unwrap();
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&response),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(203, 0, 113, 24))]
+        );
+        assert_eq!(policy_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(direct_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn direct_follow_policy_uses_shared_ruleset_segment() {
+        let provider = RuleProviderImpl::new(
+            "private-domain".to_owned(),
+            RuleSetBehavior::Domain,
+            RuleSetFormat::Yaml,
+            None,
+            None,
+            None,
+            None,
+            Some(vec!["+.example.com".to_owned()]),
+        );
+        provider
+            .initialize()
+            .await
+            .expect("inline DNS RuleSet provider initializes");
+        let registry = Arc::new(OnceLock::new());
+        assert!(
+            registry
+                .set(std::collections::HashMap::from([(
+                    "private-domain".to_owned(),
+                    Arc::new(provider) as ThreadSafeRuleProvider,
+                )]))
+                .is_ok()
+        );
+
+        let direct_hits = Arc::new(AtomicUsize::new(0));
+        let policy_hits = Arc::new(AtomicUsize::new(0));
+        let policy_client: ThreadSafeDNSClient = Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(203, 0, 113, 25)),
+            hits: policy_hits.clone(),
+            id: "shared-ruleset-policy",
+        });
+        let segments = Arc::new(vec![PolicySegment::RuleSet {
+            name: "private-domain".to_owned(),
+            clients: vec![policy_client],
+        }]);
+        let mut direct = EnhancedResolver::direct_with_optional_ipv6_policy(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(198, 51, 100, 25)),
+                hits: direct_hits.clone(),
+                id: "direct-main",
+            })],
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+            false,
+            true,
+            None,
+        )
+        .with_shared_policy_segments(
+            Some(segments),
+            Arc::new(OnceLock::new()),
+            registry,
+        );
+        direct.lru_cache = None;
+
+        let mut query = test_query_with_type(rr::RecordType::A);
+        query.queries[0]
+            .set_name(rr::Name::from_utf8("PrOxY.ExAmPlE.CoM.").unwrap());
+        let response = direct.exchange_no_cache(&query).await.unwrap();
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&response),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(203, 0, 113, 25))]
+        );
+        assert_eq!(policy_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(direct_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn geosite_matcher_dns_failure_never_uses_public_main_or_fallback() {
+        let mut loader = MockGeoDataLookupTrait::new();
+        loader.expect_get().returning(|code| {
+            (code == "private").then(|| GeoSite {
+                country_code: "private".to_owned(),
+                domain: vec![Domain {
+                    r#type: domain::Type::Domain as i32,
+                    value: "example.com".to_owned(),
+                    attribute: vec![],
+                }],
+            })
+        });
+        let mut resolver = EnhancedResolver::new_default().await;
+        resolver.lru_cache = None;
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        resolver.main = vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(198, 51, 100, 22)),
+            hits: public_hits.clone(),
+            id: "public-main",
+        })];
+        resolver.fallback = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(198, 51, 100, 23)),
+            hits: public_hits.clone(),
+            id: "public-fallback",
+        })]);
+        resolver.policy_segments = Some(Arc::new(vec![PolicySegment::GeoSite {
+            code: "private".to_owned(),
+            clients: vec![Arc::new(FailingClient {
+                id: "selected-geosite",
+                reason: "injected geo DNS timeout",
+            })],
+        }]));
+        let loader: GeoDataLookup = Arc::new(loader);
+        let compiled = GeoSiteMatcher::new(
+            "private".to_owned(),
+            "dns-nameserver-policy".to_owned(),
+            Some(&loader),
+        )
+        .expect("valid GeoSite matcher");
+        assert!(
+            resolver
+                .geosite_policy_matchers
+                .set(std::collections::HashMap::from([(
+                    "private".to_owned(),
+                    compiled,
+                )]))
+                .is_ok()
+        );
+        for kind in [rr::RecordType::A, rr::RecordType::TXT] {
+            let error = resolver
+                .exchange_no_cache(&test_query_with_type(kind))
+                .await
+                .expect_err(
+                    "GeoSite upstream failure must not resolve via main/fallback",
+                );
+            assert!(
+                error.to_string().contains("injected geo DNS timeout"),
+                "unexpected DNS error: {error}"
+            );
+        }
         assert_eq!(public_hits.load(Ordering::SeqCst), 0);
     }
 

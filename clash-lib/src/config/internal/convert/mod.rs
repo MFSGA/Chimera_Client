@@ -767,9 +767,13 @@ proxies:
     }
 
     #[test]
-    fn internal_main_dns_policy_rejects_unsupported_geosite_and_combined_keys() {
-        for selector in ["geosite:gfw", "rule-set:protected", "a.example,b.example"]
-        {
+    fn internal_main_dns_policy_rejects_malformed_geosite_and_combined_keys() {
+        for selector in [
+            "geosite:",
+            "geosite:private,cn",
+            "rule-set:protected",
+            "a.example,b.example",
+        ] {
             let mut cfg = parse_config("");
             cfg.dns.enable = true;
             cfg.dns.nameserver = vec!["1.1.1.1".to_owned()];
@@ -790,9 +794,7 @@ proxies:
                 Err(error) => error.to_string(),
             };
             assert!(
-                error.contains("dns.nameserver-policy")
-                    && error.contains("unsupported")
-                    && !error.contains(selector),
+                error.contains("dns.nameserver-policy") && !error.contains(selector),
                 "{error}"
             );
         }

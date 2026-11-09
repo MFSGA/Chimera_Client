@@ -96,6 +96,47 @@ fn validate_protected_candidate_geo_data(
     Ok(())
 }
 
+/// Complete GeoSite DNS policy registration atomically after geodata loads.
+/// Existing DNS lookups reject ordinary fallback until this succeeds.
+fn install_dns_geosite_policy(
+    codes: &[String],
+    geodata: Option<&GeoDataLookup>,
+    handle: &Arc<
+        OnceLock<
+            std::collections::HashMap<
+                String,
+                crate::app::router::rules::geodata::GeoSiteMatcher,
+            >,
+        >,
+    >,
+) -> Result<()> {
+    if codes.is_empty() {
+        return Ok(());
+    }
+    let geodata = geodata.ok_or_else(|| {
+        Error::InvalidConfig(
+            "dns.nameserver-policy geosite matcher requires configured GeoSite data"
+                .to_owned(),
+        )
+    })?;
+    let mut prepared = std::collections::HashMap::new();
+    for code in codes {
+        // Compile all country codes and regexes before publishing readiness.
+        let matcher = crate::app::router::rules::geodata::GeoSiteMatcher::new(
+            code.clone(),
+            "dns-nameserver-policy".to_owned(),
+            Some(geodata),
+        )?;
+        prepared.insert(code.clone(), matcher);
+    }
+    handle.set(prepared).map_err(|_| {
+        Error::InvalidConfig(
+            "GeoSite DNS policy data was initialized more than once".to_owned(),
+        )
+    })?;
+    Ok(())
+}
+
 pub(super) async fn create_components(
     cwd: PathBuf,
     config: InternalConfig,
@@ -227,6 +268,31 @@ pub(super) async fn create_components(
         None
     };
 
+    // DNS is built before GeoSite is loaded. Keep the matcher readiness
+    // handle shared so policy lookup cannot fall through to public DNS.
+    let geosite_policy_matchers = config.dns.geosite_policy_matchers.clone();
+    let rule_set_policy_registry = config.dns.rule_set_policy_registry.clone();
+    let rule_set_policy_names: Vec<String> = if dns_enable {
+        config
+            .dns
+            .nameserver_policy
+            .keys()
+            .filter_map(|key| key.strip_prefix("rule-set:").map(str::to_owned))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let geosite_policy_codes: Vec<String> = if dns_enable {
+        config
+            .dns
+            .nameserver_policy
+            .keys()
+            .filter_map(|key| key.strip_prefix("geosite:").map(str::to_owned))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let dns_resolver = dns::resolver::new_with_network_path_source(
         config.dns,
         Some(cache_store.clone()),
@@ -332,6 +398,12 @@ pub(super) async fn create_components(
         None
     };
 
+    install_dns_geosite_policy(
+        &geosite_policy_codes,
+        geodata.as_ref(),
+        &geosite_policy_matchers,
+    )?;
+
     debug!("initializing country asn mmdb");
     let asn_mmdb = if let Some(asn_mmdb_name) = config.general.asn_mmdb {
         Some(Arc::new(
@@ -352,7 +424,7 @@ pub(super) async fn create_components(
 
     debug!("initializing router");
     let router = Arc::new(
-        Router::new_with_provider_initialization(
+        Router::new_with_provider_initialization_and_dns_rule_sets(
             config.rules,
             config.rule_providers,
             dns_resolver.clone(),
@@ -363,9 +435,31 @@ pub(super) async fn create_components(
                 cwd: cwd.to_string_lossy().to_string(),
                 defer_http_providers: staged_protected_dns,
             },
+            &rule_set_policy_names,
         )
         .await?,
     );
+    if !rule_set_policy_names.is_empty() {
+        let mut resolved = std::collections::HashMap::new();
+        for requested in &rule_set_policy_names {
+            let provider = router
+                .get_rule_providers()
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(requested))
+                .map(|(_, provider)| provider)
+                .ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "DNS rule-set {requested} is missing after router initialization"
+                    ))
+                })?;
+            resolved.insert(requested.clone(), provider.clone());
+        }
+        rule_set_policy_registry.set(resolved).map_err(|_| {
+            Error::InvalidConfig(
+                "DNS rule-set registry was initialized twice".to_owned(),
+            )
+        })?;
+    }
 
     if let Some(rd) = &rule_dispatch
         && rd.router.set(Arc::downgrade(&router)).is_err()
@@ -375,6 +469,10 @@ pub(super) async fn create_components(
              indicates a double-initialization bug"
         );
     }
+
+    // Once DNS RuleSet registry and rule dispatch are published, other
+    // providers may start background fetches without a startup-only DNS race.
+    router.start_other_rule_provider_initialization(&rule_set_policy_names);
 
     let tcp_buffer_size = config
         .experimental
@@ -519,6 +617,8 @@ async fn build_auxiliary_dns_resolver(
         store_smart_stats: false,
         hosts: None,
         nameserver_policy: indexmap::IndexMap::new(),
+        rule_set_policy_registry: Arc::new(OnceLock::new()),
+        geosite_policy_matchers: Arc::new(OnceLock::new()),
         edns_client_subnet: None,
         fw_mark,
         respect_rules: false,
@@ -534,4 +634,85 @@ async fn build_auxiliary_dns_resolver(
         Some(network_context.network_path_source),
     )
     .await
+}
+
+#[cfg(test)]
+mod geosite_dns_policy_tests {
+    use super::*;
+    use crate::common::geodata::{
+        MockGeoDataLookupTrait,
+        geodata_proto::{Domain, GeoSite, domain},
+    };
+
+    #[test]
+    fn validation_rejects_missing_or_invalid_geosite_without_publishing() {
+        let handle = Arc::new(OnceLock::new());
+        let absent =
+            install_dns_geosite_policy(&["private".to_owned()], None, &handle)
+                .expect_err("enabled GeoSite policy without data must fail startup");
+        assert!(
+            absent
+                .to_string()
+                .contains("requires configured GeoSite data")
+        );
+        assert!(handle.get().is_none());
+
+        let mut mock = MockGeoDataLookupTrait::new();
+        mock.expect_get().returning(|country| {
+            (country == "private").then(|| GeoSite {
+                country_code: "private".to_owned(),
+                domain: vec![Domain {
+                    r#type: domain::Type::Full as i32,
+                    value: "proxy.example.com".to_owned(),
+                    attribute: vec![],
+                }],
+            })
+        });
+        let loader: GeoDataLookup = Arc::new(mock);
+        let invalid = install_dns_geosite_policy(
+            &["private".to_owned(), "unknown".to_owned()],
+            Some(&loader),
+            &handle,
+        )
+        .expect_err(
+            "a missing second GeoSite category must reject the entire install",
+        );
+        assert!(invalid.to_string().contains("unknown not found"));
+        assert!(
+            handle.get().is_none(),
+            "failed preflight must not publish partial data"
+        );
+        install_dns_geosite_policy(&["private".to_owned()], Some(&loader), &handle)
+            .expect("valid GeoSite matcher should publish data");
+        assert!(handle.get().is_some());
+        assert!(
+            install_dns_geosite_policy(&[], None, &Arc::new(OnceLock::new()))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn malformed_geosite_regex_fails_before_registration() {
+        let mut mock = MockGeoDataLookupTrait::new();
+        mock.expect_get().returning(|code| {
+            (code == "invalid").then(|| GeoSite {
+                country_code: "invalid".to_owned(),
+                domain: vec![Domain {
+                    r#type: domain::Type::Regex as i32,
+                    value: "[unclosed".to_owned(),
+                    attribute: vec![],
+                }],
+            })
+        });
+        let loader: GeoDataLookup = Arc::new(mock);
+        let handle = Arc::new(OnceLock::new());
+        let error = install_dns_geosite_policy(
+            &["invalid".to_owned()],
+            Some(&loader),
+            &handle,
+        )
+        .expect_err("invalid GeoSite regex must fail closed at startup");
+        assert!(error.to_string().contains("invalid geosite regex"));
+        assert!(handle.get().is_none());
+    }
 }

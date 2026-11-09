@@ -2,7 +2,10 @@ use std::{
     collections::HashMap,
     fmt::Display,
     net::{IpAddr, Ipv4Addr},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -89,6 +92,16 @@ struct Inner {
 #[async_trait]
 pub trait RuleProvider: Provider {
     fn search(&self, sess: &Session) -> bool;
+
+    /// DNS privacy requires a tri-state match: matched, unmatched, or unsafe
+    /// (not initialized / wrong provider behavior). Do not reuse search(),
+    /// which returns false whenever the rule provider write lock is busy.
+    async fn match_dns_domain(&self, _domain: &str) -> anyhow::Result<bool> {
+        Err(Error::InvalidConfig(
+            "DNS rule-set provider does not support safe domain matching".to_owned(),
+        )
+        .into())
+    }
     fn behavior(&self) -> RuleSetBehavior;
     fn format(&self) -> RuleSetFormat;
     /// Returns up to `limit` rules as strings. Only Classical providers return
@@ -118,6 +131,7 @@ pub struct RuleProviderImpl {
     behavior: RuleSetBehavior,
     format: RuleSetFormat,
     inline_rules: Option<Vec<String>>,
+    initialized: AtomicBool,
 
     mmdb: Option<MmdbLookup>,
     geodata: Option<GeoDataLookup>,
@@ -266,6 +280,7 @@ impl RuleProviderImpl {
             behavior,
             format,
             inline_rules,
+            initialized: AtomicBool::new(false),
 
             mmdb,
             geodata,
@@ -275,6 +290,41 @@ impl RuleProviderImpl {
 
 #[async_trait]
 impl RuleProvider for RuleProviderImpl {
+    async fn match_dns_domain(&self, domain: &str) -> anyhow::Result<bool> {
+        if self.behavior != RuleSetBehavior::Domain {
+            return Err(Error::InvalidConfig(
+                "DNS rule-set requires a domain-behavior provider".to_owned(),
+            )
+            .into());
+        }
+        if !self.initialized.load(Ordering::Acquire) {
+            return Err(Error::DNSError(
+                "DNS rule-set provider is not initialized; refusing public fallback"
+                    .to_owned(),
+            )
+            .into());
+        }
+        // Unlike search(), async read waits out a rule refresh rather than
+        // misclassifying a temporarily locked provider as "unmatched".
+        let inner = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.inner.read(),
+        )
+        .await
+        .map_err(|_| {
+            Error::DNSError(
+                "DNS rule-set refresh read lock timed out; refusing public fallback".to_owned(),
+            )
+        })?;
+        let RuleContent::Domain(domains) = &inner.content else {
+            return Err(Error::DNSError(
+                "DNS rule-set provider has invalid domain content".to_owned(),
+            )
+            .into());
+        };
+        Ok(domains.has(domain))
+    }
+
     fn search(&self, sess: &Session) -> bool {
         let inner = self.inner.try_read();
 
@@ -375,6 +425,7 @@ impl Provider for RuleProviderImpl {
                 }
             }
         }
+        self.initialized.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -456,7 +507,18 @@ fn make_rules(
 fn make_domain_rules(rules: Vec<String>) -> Result<trie::StringTrie<bool>, Error> {
     let mut trie = trie::StringTrie::new();
     for rule in rules {
-        trie.insert(&rule, Arc::new(true));
+        // DomainSet::has receives DNS wire names in lowercase ASCII. Store
+        // selectors in the same form so uppercase and U-label payloads cannot
+        // be accepted as rules that silently never match.
+        let normalized =
+            crate::app::dns::config::normalize_dns_domain_pattern(&rule)
+                .ok_or_else(|| {
+                    Error::InvalidConfig(
+                        "rule provider contains an invalid domain selector"
+                            .to_owned(),
+                    )
+                })?;
+        trie.insert(&normalized, Arc::new(true));
     }
     Ok(trie)
 }
@@ -534,6 +596,89 @@ mod tests {
             Ok(_) => panic!("provider interface constraint was silently ignored"),
         };
         assert!(error.to_string().contains("interface="));
+    }
+
+    #[tokio::test]
+    async fn dns_domain_match_rejects_uninitialized_and_waits_for_refresh_lock() {
+        let provider = RuleProviderImpl::new(
+            "private-domain".to_owned(),
+            RuleSetBehavior::Domain,
+            RuleSetFormat::Yaml,
+            None,
+            None,
+            None,
+            None,
+            Some(vec!["+.private.example".to_owned()]),
+        );
+        let error = provider
+            .match_dns_domain("app.private.example")
+            .await
+            .expect_err("uninitialized provider must never be treated as no match");
+        assert!(error.to_string().contains("not initialized"));
+
+        provider
+            .initialize()
+            .await
+            .expect("inline provider initialization");
+        assert!(
+            provider
+                .match_dns_domain("app.private.example")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !provider
+                .match_dns_domain("unrelated.example")
+                .await
+                .unwrap()
+        );
+
+        // Simulate a provider refresh holding the writer lock. DNS waits for
+        // an actual snapshot; routing's try_read false is not safe here.
+        let guard = provider.inner.write().await;
+        let read = provider.match_dns_domain("app.private.example");
+        tokio::pin!(read);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(15), &mut read)
+                .await
+                .is_err(),
+            "DNS matcher must wait for provider refresh, not report no-match"
+        );
+        drop(guard);
+        assert!(read.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn dns_domain_match_normalizes_case_and_idna_domain_rules() {
+        let provider = RuleProviderImpl::new(
+            "private-domain".to_owned(),
+            RuleSetBehavior::Domain,
+            RuleSetFormat::Yaml,
+            None,
+            None,
+            None,
+            None,
+            Some(vec![
+                "PRIVATE.EXAMPLE".to_owned(),
+                "bücher.example".to_owned(),
+            ]),
+        );
+        provider
+            .initialize()
+            .await
+            .expect("valid inline domain rules should initialize");
+
+        assert!(
+            provider.match_dns_domain("private.example").await.unwrap(),
+            "ASCII case variants must match the same DNS name"
+        );
+        assert!(
+            provider
+                .match_dns_domain("xn--bcher-kva.example")
+                .await
+                .unwrap(),
+            "Unicode rules must match their canonical IDNA wire name"
+        );
     }
 
     #[tokio::test]
