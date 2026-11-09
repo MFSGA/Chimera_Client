@@ -423,13 +423,14 @@ impl Config {
                     ));
                 }
                 let normalized = Self::normalize_domain_selector(selector)?;
-                if policy.insert(normalized, nameservers.clone()).is_some() {
-                    // Ordered input preserves declaration order, but aliases
-                    // that normalize to the same selector remain ambiguous.
-                    return Err(Error::InvalidConfig(
-                        "dns.nameserver-policy repeats domain selector".to_owned(),
-                    ));
-                }
+                // Preserve *last declaration* semantics, including overlap
+                // between expanded comma groups. Replacing an IndexMap entry
+                // in place keeps its old position; that would apply the final
+                // exact domain before an intervening `+.` wildcard and route
+                // the apex through the wrong DNS upstream. Reinsert under its
+                // canonical IDNA key so runtime matching uses DNS wire names.
+                policy.shift_remove(&normalized);
+                policy.insert(normalized, nameservers.clone());
             }
         }
         Ok(policy)
@@ -1306,6 +1307,81 @@ mod tests {
     }
 
     #[test]
+    fn nameserver_policy_colliding_expanded_domain_obeys_last_declaration() {
+        // Mihomo converts comma groups to an ordered list of policies and
+        // overwrites an existing trie node when a subsequent exact domain
+        // appears. Updating an IndexMap key *in place* would put the last
+        // rule before a later "+." rule and yield the wrong apex result.
+        for (groups, expected_apex) in [
+            (
+                [
+                    ("example.com,other.test", "192.0.2.53"),
+                    ("+.example.com", "192.0.2.54"),
+                    ("EXAMPLE.COM", "192.0.2.55"),
+                ],
+                "192.0.2.55",
+            ),
+            (
+                [
+                    ("EXAMPLE.COM", "192.0.2.55"),
+                    ("+.example.com", "192.0.2.54"),
+                    ("example.com,other.test", "192.0.2.53"),
+                ],
+                "192.0.2.53",
+            ),
+        ] {
+            let mut raw = IndexMap::new();
+            for (key, address) in groups {
+                raw.insert(
+                    key.to_owned(),
+                    DnsPolicyUpstreams::Single(address.to_owned()),
+                );
+            }
+            let parsed = Config::parse_nameserver_policy_ordered(&raw)
+                .expect("Mihomo last declared matching selector should be accepted");
+            assert_eq!(parsed.len(), 3);
+            let mut trie = trie::StringTrie::new();
+            for (selector, upstreams) in &parsed {
+                trie.insert(selector, Arc::new(upstreams.clone()));
+            }
+            let apex = trie.search("example.com").unwrap().get_data().unwrap();
+            assert_eq!(apex[0].host.to_string(), expected_apex);
+            let subdomain =
+                trie.search("www.example.com").unwrap().get_data().unwrap();
+            assert_eq!(subdomain[0].host.to_string(), "192.0.2.54");
+        }
+    }
+
+    #[test]
+    fn nameserver_policy_yaml_collision_keeps_last_declaration_order() {
+        let yaml = r#"
+dns:
+  nameserver-policy:
+    "example.com,other.test": 192.0.2.53
+    "+.example.com": 192.0.2.54
+    "EXAMPLE.COM": 192.0.2.55
+"#;
+        let cfg: crate::config::def::Config = yaml
+            .parse()
+            .expect("YAML definition must retain source declaration order");
+        let parsed =
+            Config::parse_nameserver_policy_ordered(&cfg.dns.nameserver_policy)
+                .expect("later canonical domain entry is legal");
+        assert_eq!(
+            parsed.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["other.test", "+.example.com", "example.com"]
+        );
+        let mut trie = trie::StringTrie::new();
+        for (selector, upstreams) in &parsed {
+            trie.insert(selector, Arc::new(upstreams.clone()));
+        }
+        let apex = trie.search("example.com").unwrap().get_data().unwrap();
+        assert_eq!(apex[0].host.to_string(), "192.0.2.55");
+        let wildcard = trie.search("www.example.com").unwrap().get_data().unwrap();
+        assert_eq!(wildcard[0].host.to_string(), "192.0.2.54");
+    }
+
+    #[test]
     fn nameserver_policy_overlapping_exact_and_plus_follow_yaml_order() {
         // Mihomo inserts domain policies in YAML order. '+.' writes
         // both the apex and its wildcard branch; a later exact selector
@@ -1386,7 +1462,7 @@ mod tests {
     }
 
     #[test]
-    fn nameserver_policy_rejects_ambiguous_or_unsupported_comma_keys() {
+    fn nameserver_policy_rejects_malformed_comma_keys_and_obeys_collisions() {
         for key in [
             "example.com,",
             ",example.com",
@@ -1394,8 +1470,6 @@ mod tests {
             "example.com, other.test",
             "example.com,geosite:private",
             "example.com,rule-set:private",
-            "example.com,example.com",
-            "EXAMPLE.COM,example.com",
         ] {
             let policy =
                 IndexMap::from([(key.to_owned(), "192.0.2.53".to_owned().into())]);
@@ -1411,10 +1485,23 @@ mod tests {
             ),
             ("OTHER.TEST".to_owned(), "192.0.2.54".to_owned().into()),
         ]);
-        assert!(
-            Config::parse_nameserver_policy_ordered(&policy).is_err(),
-            "overlapping canonical selectors must not depend on map iteration order"
+        let parsed = Config::parse_nameserver_policy_ordered(&policy)
+            .expect("later canonical selector must overwrite older policy");
+        assert_eq!(parsed["other.test"][0].host.to_string(), "192.0.2.54");
+        assert_eq!(
+            parsed.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["example.com", "other.test"]
         );
+        for group in ["example.com,example.com", "EXAMPLE.COM,example.com"] {
+            let policy = IndexMap::from([(
+                group.to_owned(),
+                DnsPolicyUpstreams::Single("192.0.2.53".to_owned()),
+            )]);
+            let parsed = Config::parse_nameserver_policy_ordered(&policy).expect(
+                "repeated tokens within the same group are permitted by Mihomo",
+            );
+            assert_eq!(parsed.len(), 1);
+        }
     }
 
     #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]

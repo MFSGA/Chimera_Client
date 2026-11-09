@@ -1173,7 +1173,7 @@ fn mihomo_nameserver_policy_rejects_unsupported_geosite_and_ruleset_selectors() 
 }
 
 #[test]
-fn mihomo_nameserver_policy_rejects_case_insensitive_duplicate_selectors() {
+fn mihomo_nameserver_policy_preserves_last_case_insensitive_declaration() {
     let yaml = base_config(
         r#"
   enable: true
@@ -1183,10 +1183,18 @@ fn mihomo_nameserver_policy_rejects_case_insensitive_duplicate_selectors() {
     "primary.example": 149.112.112.112
 "#,
     );
-    let error = parse_error(yaml).to_string();
+    let dns = parse_dns(&yaml);
     assert!(
-        error.contains("nameserver-policy") && error.contains("repeats domain"),
-        "ambiguous overlapping policy keys must not have HashMap-dependent precedence: {error}"
+        dns.nameserver_policy["primary.example"][0].host.to_string()
+            == "149.112.112.112",
+        "later canonical selector must win for the overlapping domain"
+    );
+    assert_eq!(
+        dns.nameserver_policy["secondary.example"][0]
+            .host
+            .to_string(),
+        "9.9.9.9",
+        "comma-group selectors not overwritten later must retain their upstream"
     );
 }
 
