@@ -336,7 +336,34 @@ impl Config {
         Ok(nameservers)
     }
 
+    /// Compatibility entry point for existing callers with scalar policy
+    /// values and unordered maps. Retain the historical one-server output.
+    /// New runtime policy construction must use the ordered multi-server API.
     pub fn parse_nameserver_policy(
+        policy_map: &HashMap<String, String>,
+    ) -> Result<HashMap<String, NameServer>, Error> {
+        let ordered = policy_map
+            .iter()
+            .map(|(selector, value)| {
+                (selector.clone(), DnsPolicyUpstreams::Single(value.clone()))
+            })
+            .collect();
+        Self::parse_nameserver_policy_ordered(&ordered)?
+            .into_iter()
+            .map(|(selector, upstreams)| {
+                let upstream = upstreams.into_iter().next().ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "DNS nameserver-policy for {selector} has no usable nameserver"
+                    ))
+                })?;
+                Ok((selector, upstream))
+            })
+            .collect()
+    }
+
+    /// Preserve YAML selector declaration order and all configured upstreams
+    /// through runtime matcher construction.
+    pub fn parse_nameserver_policy_ordered(
         policy_map: &IndexMap<String, DnsPolicyUpstreams>,
     ) -> Result<IndexMap<String, Vec<NameServer>>, Error> {
         let mut policy = IndexMap::new();
@@ -383,8 +410,8 @@ impl Config {
                 }
                 let normalized = Self::normalize_domain_selector(selector)?;
                 if policy.insert(normalized, nameservers.clone()).is_some() {
-                    // The YAML policy map is unordered; conflicting aliases
-                    // must fail closed rather than use iteration order.
+                    // Ordered input preserves declaration order, but aliases
+                    // that normalize to the same selector remain ambiguous.
                     return Err(Error::InvalidConfig(
                         "dns.nameserver-policy repeats domain selector".to_owned(),
                     ));
@@ -683,7 +710,7 @@ impl TryFrom<&crate::config::def::Config> for Config {
         let nameservers = Config::parse_nameserver(&dc.nameserver)?;
         let fallback = Config::parse_nameserver(&dc.fallback)?;
         let nameserver_policy =
-            Config::parse_nameserver_policy(&dc.nameserver_policy)?;
+            Config::parse_nameserver_policy_ordered(&dc.nameserver_policy)?;
 
         if dc.enable && nameservers.is_empty() {
             return Err(Error::InvalidConfig(
@@ -1081,7 +1108,7 @@ mod tests {
         ] {
             let policy =
                 IndexMap::from([(selector.to_owned(), "9.9.9.9".to_owned().into())]);
-            let error = Config::parse_nameserver_policy(&policy)
+            let error = Config::parse_nameserver_policy_ordered(&policy)
                 .expect_err("ambiguous DNS policy selector must fail closed");
             assert!(
                 error.to_string().contains("nameserver-policy"),
@@ -1092,7 +1119,7 @@ mod tests {
             let policy =
                 IndexMap::from([(selector.to_owned(), "9.9.9.9".to_owned().into())]);
             assert!(
-                Config::parse_nameserver_policy(&policy).is_ok(),
+                Config::parse_nameserver_policy_ordered(&policy).is_ok(),
                 "valid existing selector {selector:?} must remain accepted"
             );
         }
@@ -1104,7 +1131,7 @@ mod tests {
             "bücher.example".to_owned(),
             "9.9.9.9".to_owned().into(),
         )]);
-        let parsed = Config::parse_nameserver_policy(&unicode)
+        let parsed = Config::parse_nameserver_policy_ordered(&unicode)
             .expect("Unicode selector should normalize to its DNS wire name");
         assert!(parsed.contains_key("xn--bcher-kva.example"));
 
@@ -1116,7 +1143,7 @@ mod tests {
             ),
         ]);
         assert!(
-            Config::parse_nameserver_policy(&aliases)
+            Config::parse_nameserver_policy_ordered(&aliases)
                 .expect_err("Unicode/ASCII aliases must not race in the trie")
                 .to_string()
                 .contains("nameserver-policy")
@@ -1191,7 +1218,7 @@ mod tests {
         let policy =
             IndexMap::from([("example.com".to_owned(), "system".to_owned().into())]);
 
-        let error = Config::parse_nameserver_policy(&policy)
+        let error = Config::parse_nameserver_policy_ordered(&policy)
             .expect_err("a policy without a usable nameserver must be rejected");
 
         assert!(error.to_string().contains("no usable nameserver"));
@@ -1211,7 +1238,7 @@ mod tests {
                 "192.0.2.53".to_owned().into(),
             )]);
             assert!(
-                Config::parse_nameserver_policy(&policy).is_err(),
+                Config::parse_nameserver_policy_ordered(&policy).is_err(),
                 "unsupported selector {selector:?} must not be silently accepted"
             );
         }
@@ -1219,7 +1246,7 @@ mod tests {
             "example.com,other.test".to_owned(),
             "192.0.2.53".to_owned().into(),
         )]);
-        let expanded = Config::parse_nameserver_policy(&combined)
+        let expanded = Config::parse_nameserver_policy_ordered(&combined)
             .expect("Mihomo-compatible comma domain expansion must be supported");
         assert_eq!(expanded.len(), 2);
         assert!(expanded.contains_key("example.com"));
@@ -1231,10 +1258,29 @@ mod tests {
                 "192.0.2.53".to_owned().into(),
             )]);
             assert!(
-                Config::parse_nameserver_policy(&policy).is_ok(),
+                Config::parse_nameserver_policy_ordered(&policy).is_ok(),
                 "existing selector {selector:?} must remain supported"
             );
         }
+    }
+
+    #[test]
+    fn legacy_hashmap_policy_api_remains_source_compatible() {
+        // Existing callers and locally staged regression tests still use
+        // HashMap<String,String> and require exactly one upstream per key.
+        let valid = std::collections::HashMap::from([(
+            "example.com".to_owned(),
+            "192.0.2.53".to_owned(),
+        )]);
+        let parsed: std::collections::HashMap<String, NameServer> =
+            Config::parse_nameserver_policy(&valid)
+                .expect("legacy API must compile");
+        assert_eq!(parsed["example.com"].host.to_string(), "192.0.2.53");
+        let invalid = std::collections::HashMap::from([(
+            "example.com bad.test".to_owned(),
+            "192.0.2.53".to_owned(),
+        )]);
+        assert!(Config::parse_nameserver_policy(&invalid).is_err());
     }
 
     #[test]
@@ -1257,9 +1303,10 @@ mod tests {
                     format!("dns:\n  nameserver-policy:\n{selectors}")
                         .parse()
                         .expect("YAML must parse");
-                let parsed =
-                    Config::parse_nameserver_policy(&raw.dns.nameserver_policy)
-                        .expect("policy must convert");
+                let parsed = Config::parse_nameserver_policy_ordered(
+                    &raw.dns.nameserver_policy,
+                )
+                .expect("policy must convert");
                 let mut trie = trie::StringTrie::new();
                 for (selector, upstreams) in &parsed {
                     assert!(
@@ -1295,7 +1342,7 @@ mod tests {
             "EXAMPLE.com,*.other.test,+.internal.test".to_owned(),
             "192.0.2.53".to_owned().into(),
         )]);
-        let parsed = Config::parse_nameserver_policy(&policy)
+        let parsed = Config::parse_nameserver_policy_ordered(&policy)
             .expect("comma-delimited domain policy should expand");
         assert_eq!(parsed.len(), 3);
         let mut trie = crate::common::trie::StringTrie::<bool>::new();
@@ -1331,7 +1378,7 @@ mod tests {
             let policy =
                 IndexMap::from([(key.to_owned(), "192.0.2.53".to_owned().into())]);
             assert!(
-                Config::parse_nameserver_policy(&policy).is_err(),
+                Config::parse_nameserver_policy_ordered(&policy).is_err(),
                 "ambiguous selector {key:?} must fail closed"
             );
         }
@@ -1343,7 +1390,7 @@ mod tests {
             ("OTHER.TEST".to_owned(), "192.0.2.54".to_owned().into()),
         ]);
         assert!(
-            Config::parse_nameserver_policy(&policy).is_err(),
+            Config::parse_nameserver_policy_ordered(&policy).is_err(),
             "overlapping canonical selectors must not depend on map iteration order"
         );
     }

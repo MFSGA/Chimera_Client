@@ -12277,11 +12277,12 @@ mod tests {
 
     #[tokio::test]
     async fn comma_delimited_nameserver_policy_uses_dedicated_upstream() {
-        let parsed = Config::parse_nameserver_policy(&indexmap::IndexMap::from([(
-            "proxy.example.com,other.test".to_owned(),
-            "192.0.2.53".to_owned().into(),
-        )]))
-        .expect("comma-separated selectors must compile into runtime policy");
+        let parsed =
+            Config::parse_nameserver_policy_ordered(&indexmap::IndexMap::from([(
+                "proxy.example.com,other.test".to_owned(),
+                "192.0.2.53".to_owned().into(),
+            )]))
+            .expect("comma-separated selectors must compile into runtime policy");
         let mut resolver = EnhancedResolver::new_default().await;
         resolver.lru_cache = None;
         let policy_hits = Arc::new(AtomicUsize::new(0));

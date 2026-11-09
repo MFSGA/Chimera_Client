@@ -1029,3 +1029,12 @@ S01 准入必须满足：金标准用例在目标 HEAD 实际运行；未知新�
 - 原始配置 `DNS.nameserver_policy`、内部 `dns::Config.nameserver_policy` 和 `parse_nameserver_policy` 输出均改成 `indexmap::IndexMap`，确保从带 YAML 合并的解析直到 live `EnhancedResolver` 依次插入对应 trie；改用工作区既有的 `indexmap 2.14.2`（直接依赖启用 `serde` 特性），同步必要 `Cargo.lock` 和 `runtime/factory.rs` 构造。
 - 本地 macOS、Rust 1.99.0，`--no-default-features --features tun,ring`：核心单测 **848/848 通过，另 11 ignored**，`dns_config_tests` 25/25、`dns_legacy_golden_tests` 11/11、`dns_policy_s02_tests` 15/15；默认 features + `tun,ring`：核心单测 **1040/1040 通过，另 11 ignored**，同样三个集成测试均通过。两组 `clippy --all-targets -- -D warnings`、`cargo fmt --all --check`、`git diff --check` 均通过。`clash-rs` CLI `cargo check --no-default-features --features standard,aws-lc-rs --locked` 通过；默认 CLI 构建受隔离工作树缺少 `clash-dashboard/dist` 阻塞，非此次 Rust 配置编译错误，未构建 Dashboard。
 - 边界：上述普通域名同组 trie 优先级不是 Mihomo geosite/rule-set 的动态匹配优先级；二者仍严格拒绝，避免静默误路由。没有实际 Mihomo 二进制差异运行、macOS 真实 NIC/utun 抓包、锁定 Rust 1.99.1（本机安装 manifest 缺失）、远端 CI 或独立 L2 Reviewer。仅本地签名提交；不自动推送、合并 `master` 或修改宿主机网络及其他工作树。
+
+
+## 2026-11-09 — 多上游、有序策略候选合并与旧 API 兼容（L2 待独立审查）
+
+- 基线：本地 master fb561bde919faab25c8b2500b2f8e5255e120c3f；origin/master f304da17b7eaf6a187daf03a96bb1e77a26dd049；固定只读 Mihomo gitlink 63bd52ec794b7051569b76ede2f6cdbf4c091fda。独立候选分支 codex/dns-policy-multiupstream-l2-20261109 上分批签名 cherry-pick：a219f67（多上游）与 053cbb7（规则声明顺序）。
+- 本轮接口回归红绿测试：新的多上游改动原本把公开 Config::parse_nameserver_policy 的 HashMap<String,String> 输入、HashMap<String,NameServer> 返回改成了 IndexMap<String,DnsPolicyUpstreams> 与 IndexMap<String,Vec<NameServer>>。新增 legacy_hashmap_policy_api_remains_source_compatible，旧代码出现 E0308 编译失败；修复后保留 legacy 方法的原输入/返回签名与单上游语义；另开 parse_nameserver_policy_ordered 用于 YAML 有序多上游，已有多上游调用全部迁移过去。用户原未提交的空白选择器测试无需修改即可保持编译兼容。
+- 实测 macOS Rust 1.99.0、CARGO_INCREMENTAL=0：精简 features(tun,ring) 核心 849 pass/0 fail/11 ignored；默认+features(tun,ring) 核心 1041 pass/0 fail/11 ignored。两组 DNS config 25/25、legacy golden 11/11、DNS policy 15/15，严格 Clippy --all-targets -D warnings、Cargo fmt、git diff --check 均通过。CLI（standard,aws-lc-rs，不带 Dashboard）check 通过。
+- 运行语义：单字符串/数组 YAML 经 IndexMap 规范化解析 → 多个 DNS NameServer → 策略的独立 DNS client 组；实际 batch_exchange 是多个上游并发的现有策略，不代表严格串行重试。模拟测试已覆盖 policy 上游失败不落到 public main/fallback、第二个上游以及 IPv6/egress 检查。
+- **治理状态：本批是编码 Agent 自检，不是独立 L2 Reviewer。** 独立 Reviewer 或规范规定的仓库所有者针对确切 SHA 的书面豁免、维护者决定、GitHub Verified、远端 required CI、macOS 实机 NIC/utun DNS 防泄漏包级验证仍待完成；本机仓库锁定 Rust 1.99.1 工具链不可用，使用了 Rust 1.99.0。原主工作树及用户未提交文件保留，不推送、不合并远端、不修改宿主机 DNS/TUN/路由。
