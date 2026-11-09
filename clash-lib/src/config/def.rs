@@ -218,6 +218,78 @@ impl TryFrom<PathBuf> for Config {
     }
 }
 
+/// Detect one-character misspellings and adjacent transpositions in
+/// listener keys without inspecting or echoing secret configuration values.
+fn near_dns_listener_key(expected: &str, actual: &str) -> bool {
+    let a = expected.as_bytes();
+    let b = actual.as_bytes();
+    if a.len().abs_diff(b.len()) > 1 {
+        return false;
+    }
+    if a.len() == b.len() {
+        let differing: Vec<_> = a
+            .iter()
+            .zip(b)
+            .enumerate()
+            .filter_map(|(i, (left, right))| (left != right).then_some(i))
+            .collect();
+        return match differing.as_slice() {
+            [_] => true,
+            [first, second]
+                if *second == *first + 1
+                    && a[*first] == b[*second]
+                    && a[*second] == b[*first] =>
+            {
+                true
+            }
+            _ => false,
+        };
+    }
+    let (short, long) = if a.len() < b.len() { (a, b) } else { (b, a) };
+    let (mut i, mut j, mut skipped) = (0, 0, false);
+    while i < short.len() {
+        if short[i] == long[j] {
+            i += 1;
+            j += 1;
+        } else if skipped {
+            return false;
+        } else {
+            skipped = true;
+            j += 1;
+        }
+    }
+    true
+}
+
+fn suspicious_dns_listener_key(field: &str) -> bool {
+    const KNOWN: &[&str] = &["udp", "tcp", "doh", "dot", "doh3"];
+    if KNOWN.contains(&field) {
+        return false;
+    }
+    let field = field.to_ascii_lowercase();
+    ["udp", "tcp", "doh", "dot", "dns", "http", "tls", "listen"]
+        .iter()
+        .any(|prefix| field.starts_with(prefix))
+        || KNOWN
+            .iter()
+            .any(|known| near_dns_listener_key(known, &field))
+}
+
+fn suspicious_dns_listener_tls_key(transport: &str, field: &str) -> bool {
+    const COMMON: &[&str] = &["addr", "ca-cert", "ca-key"];
+    if COMMON.contains(&field) || (transport != "dot" && field == "hostname") {
+        return false;
+    }
+    let lower = field.to_ascii_lowercase();
+    ["addr", "ca-", "cert", "key", "host", "tls"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+        || COMMON
+            .iter()
+            .chain(std::iter::once(&"hostname"))
+            .any(|known| near_dns_listener_key(known, &lower))
+}
+
 impl FromStr for Config {
     type Err = Error;
 
@@ -264,6 +336,37 @@ impl FromStr for Config {
                     return Err(Error::InvalidConfig(format!(
                         "dns.{field} is not implemented; refusing to ignore a privacy-sensitive setting"
                     )));
+                }
+            }
+        }
+
+        // Serde accepts unknown mapping keys. A mistyped DNS listener or
+        // TLS certificate key would silently disable the intended endpoint.
+        // Validate after YAML merges, but before deserialization.
+        if let Some(listeners) = val
+            .get("dns")
+            .and_then(|dns| dns.get("listen"))
+            .and_then(Value::as_mapping)
+        {
+            for (key, definition) in listeners {
+                let Some(protocol) = key.as_str() else {
+                    continue;
+                };
+                if suspicious_dns_listener_key(protocol) {
+                    return Err(Error::InvalidConfig(format!(
+                        "dns.listen.{protocol} is an unknown privacy-sensitive DNS listener field"
+                    )));
+                }
+                if matches!(protocol, "doh" | "dot" | "doh3")
+                    && let Some(fields) = definition.as_mapping()
+                {
+                    for field in fields.keys().filter_map(Value::as_str) {
+                        if suspicious_dns_listener_tls_key(protocol, field) {
+                            return Err(Error::InvalidConfig(format!(
+                                "dns.listen.{protocol}.{field} is an unknown privacy-sensitive TLS listener field"
+                            )));
+                        }
+                    }
                 }
             }
         }
@@ -642,6 +745,61 @@ mod tests {
     use super::Config;
     #[cfg(feature = "wireguard")]
     use crate::config::internal::proxy::OutboundProxyProtocol;
+
+    #[test]
+    fn dns_listener_typo_must_not_silently_disable_listener() {
+        for typo in ["tpc", "udpp", "dho", "dottt", "doh4"] {
+            let yaml = format!(
+                "dns:\n  enable: false\n  listen:\n    {typo}: 127.0.0.1:5353\n"
+            );
+            let error = match yaml.parse::<Config>() {
+                Ok(_) => panic!("DNS listener typo {typo} silently accepted"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains(&format!("dns.listen.{typo}"))
+                    && error.contains("unknown"),
+                "wrong listener key needs a precise, safe diagnostic: {error}"
+            );
+        }
+        assert!(
+            "dns:\n  enable: false\n  listen:\n    udp: 127.0.0.1:5353\n    vendor-extension: true\n"
+                .parse::<Config>()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn dns_tls_certificate_typo_must_not_silently_disable_identity() {
+        for (transport, typo) in [
+            ("doh", "ca-kye"),
+            ("dot", "ca-cret"),
+            ("doh3", "hostnamee"),
+            ("doh", "adrd"),
+        ] {
+            let yaml = format!(
+                "dns:\n  enable: false\n  listen:\n    {transport}:\n      addr: 127.0.0.1:5353\n      {typo}: secret.example\n"
+            );
+            let error = match yaml.parse::<Config>() {
+                Ok(_) => panic!("DNS TLS typo {transport}.{typo} silently accepted"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains(&format!("dns.listen.{transport}.{typo}"))
+                    && error.contains("unknown"),
+                "TLS typo needs a precise diagnostic: {error}"
+            );
+            assert!(
+                !error.contains("secret.example"),
+                "diagnostic leaked config value"
+            );
+        }
+        assert!(
+            "dns:\n  listen:\n    doh:\n      addr: 127.0.0.1:5353\n      vendor-extension: true\n"
+                .parse::<Config>()
+                .is_ok()
+        );
+    }
 
     #[test]
     fn yaml_compat_merges_aliases_without_overwriting_explicit_values() {
