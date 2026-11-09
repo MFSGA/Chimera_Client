@@ -271,6 +271,17 @@ pub(super) async fn create_components(
     // DNS is built before GeoSite is loaded. Keep the matcher readiness
     // handle shared so policy lookup cannot fall through to public DNS.
     let geosite_policy_matchers = config.dns.geosite_policy_matchers.clone();
+    let rule_set_policy_registry = config.dns.rule_set_policy_registry.clone();
+    let rule_set_policy_names: Vec<String> = if dns_enable {
+        config
+            .dns
+            .nameserver_policy
+            .keys()
+            .filter_map(|key| key.strip_prefix("rule-set:").map(str::to_owned))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let geosite_policy_codes: Vec<String> = if dns_enable {
         config
             .dns
@@ -413,7 +424,7 @@ pub(super) async fn create_components(
 
     debug!("initializing router");
     let router = Arc::new(
-        Router::new_with_provider_initialization(
+        Router::new_with_provider_initialization_and_dns_rule_sets(
             config.rules,
             config.rule_providers,
             dns_resolver.clone(),
@@ -424,9 +435,31 @@ pub(super) async fn create_components(
                 cwd: cwd.to_string_lossy().to_string(),
                 defer_http_providers: staged_protected_dns,
             },
+            &rule_set_policy_names,
         )
         .await?,
     );
+    if !rule_set_policy_names.is_empty() {
+        let mut resolved = std::collections::HashMap::new();
+        for requested in &rule_set_policy_names {
+            let provider = router
+                .get_rule_providers()
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(requested))
+                .map(|(_, provider)| provider)
+                .ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "DNS rule-set {requested} is missing after router initialization"
+                    ))
+                })?;
+            resolved.insert(requested.clone(), provider.clone());
+        }
+        rule_set_policy_registry.set(resolved).map_err(|_| {
+            Error::InvalidConfig(
+                "DNS rule-set registry was initialized twice".to_owned(),
+            )
+        })?;
+    }
 
     if let Some(rd) = &rule_dispatch
         && rd.router.set(Arc::downgrade(&router)).is_err()
@@ -436,6 +469,10 @@ pub(super) async fn create_components(
              indicates a double-initialization bug"
         );
     }
+
+    // Once DNS RuleSet registry and rule dispatch are published, other
+    // providers may start background fetches without a startup-only DNS race.
+    router.start_other_rule_provider_initialization(&rule_set_policy_names);
 
     let tcp_buffer_size = config
         .experimental
@@ -580,6 +617,7 @@ async fn build_auxiliary_dns_resolver(
         store_smart_stats: false,
         hosts: None,
         nameserver_policy: indexmap::IndexMap::new(),
+        rule_set_policy_registry: Arc::new(OnceLock::new()),
         geosite_policy_matchers: Arc::new(OnceLock::new()),
         edns_client_subnet: None,
         fw_mark,

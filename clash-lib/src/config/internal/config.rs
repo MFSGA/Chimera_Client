@@ -292,8 +292,51 @@ impl Config {
                 }
                 continue;
             }
-            if lower.starts_with("rule-set:")
-                || domain.contains(',')
+            if let Some(name) = lower.strip_prefix("rule-set:") {
+                if name.is_empty()
+                    || name.contains(':')
+                    || name.contains(',')
+                    || name.chars().any(char::is_whitespace)
+                {
+                    return Err(Error::InvalidConfig(
+                        "dns.nameserver-policy contains an invalid RuleSet selector"
+                            .to_owned(),
+                    ));
+                }
+                let matching: Vec<_> = self
+                    .rule_providers
+                    .iter()
+                    .filter(|(id, _)| id.eq_ignore_ascii_case(name))
+                    .collect();
+                let [(_, RuleProviderDef::Inline(inline))] = matching.as_slice()
+                else {
+                    return Err(Error::InvalidConfig(
+                        "dns.nameserver-policy RuleSet requires exactly one inline domain rule-provider"
+                            .to_owned(),
+                    ));
+                };
+                if inline.behavior != RuleSetBehavior::Domain
+                    || inline.inline_rules.is_empty()
+                    || inline.inline_rules.iter().any(|selector| {
+                        selector.chars().any(char::is_whitespace)
+                            || !crate::common::trie::valid_and_split_domain(selector)
+                                .1
+                    })
+                {
+                    return Err(Error::InvalidConfig(
+                        "dns.nameserver-policy RuleSet requires valid inline domain rules"
+                            .to_owned(),
+                    ));
+                }
+                if !seen_policy_domains.insert(lower) {
+                    return Err(Error::InvalidConfig(
+                        "dns.nameserver-policy contains duplicate RuleSet selectors"
+                            .to_owned(),
+                    ));
+                }
+                continue;
+            }
+            if domain.contains(',')
                 || !dns::config::valid_nameserver_policy_domain(domain)
             {
                 return Err(Error::InvalidConfig(

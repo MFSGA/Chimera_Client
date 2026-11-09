@@ -84,8 +84,16 @@ pub struct Config {
     pub store_smart_stats: bool,
     pub hosts: Option<trie::StringTrie<IpAddr>>,
     pub nameserver_policy: IndexMap<String, Vec<NameServer>>,
-    /// Filled after GeoSite loading; shared with the resolver created earlier.
+    /// Filled after inline RuleSet providers initialize; shared with the resolver.
     /// DNS queries fail closed while a configured matcher remains unready.
+    pub(crate) rule_set_policy_registry: Arc<
+        std::sync::OnceLock<
+            HashMap<
+                String,
+                crate::app::remote_content_manager::providers::rule_provider::ThreadSafeRuleProvider,
+            >,
+        >,
+    >,
     pub(crate) geosite_policy_matchers: Arc<
         std::sync::OnceLock<
             HashMap<String, crate::app::router::rules::geodata::GeoSiteMatcher>,
@@ -414,8 +422,11 @@ impl Config {
             // never as inert trie labels.
             let lower_group = selector_group.to_ascii_lowercase();
             let is_geosite_group = lower_group.starts_with("geosite:");
+            let is_ruleset_group = lower_group.starts_with("rule-set:");
             let group = if is_geosite_group {
                 &lower_group["geosite:".len()..]
+            } else if is_ruleset_group {
+                &lower_group["rule-set:".len()..]
             } else {
                 lower_group.as_str()
             };
@@ -437,6 +448,14 @@ impl Config {
                         ));
                     }
                     format!("geosite:{token}")
+                } else if is_ruleset_group {
+                    if token.contains(':') {
+                        return Err(Error::InvalidConfig(
+                            "DNS nameserver-policy selector uses unsupported syntax"
+                                .into(),
+                        ));
+                    }
+                    format!("rule-set:{token}")
                 } else {
                     if token.starts_with("geosite:")
                         || token.starts_with("rule-set:")
@@ -756,6 +775,41 @@ impl TryFrom<&crate::config::def::Config> for Config {
         let fallback = Config::parse_nameserver(&dc.fallback)?;
         let nameserver_policy =
             Config::parse_nameserver_policy_ordered(&dc.nameserver_policy)?;
+        for selector in nameserver_policy.keys() {
+            if let Some(name) = selector.strip_prefix("rule-set:") {
+                // Only inline domain providers have a synchronous, no-network
+                // startup path. File/HTTP providers need an independent
+                // bootstrap-and-refresh lifecycle before DNS can use them.
+                let matching: Vec<_> = c
+                    .rule_provider
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|providers| providers.iter())
+                    .filter(|(id, _)| id.eq_ignore_ascii_case(name))
+                    .collect();
+                let [(_, crate::config::def::RuleProviderDef::Inline(inline))] =
+                    matching.as_slice()
+                else {
+                    return Err(Error::InvalidConfig(
+                        "dns.nameserver-policy RuleSet requires exactly one inline domain rule-provider"
+                            .to_owned(),
+                    ));
+                };
+                if inline.behavior
+                    != crate::app::remote_content_manager::providers::rule_provider::RuleSetBehavior::Domain
+                    || inline.inline_rules.is_empty()
+                    || inline.inline_rules.iter().any(|domain| {
+                        domain.chars().any(char::is_whitespace)
+                            || !trie::valid_and_split_domain(domain).1
+                    })
+                {
+                    return Err(Error::InvalidConfig(
+                        "dns.nameserver-policy RuleSet requires a nonempty inline domain rule-provider with valid domain selectors"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
 
         if dc.enable && nameservers.is_empty() {
             return Err(Error::InvalidConfig(
@@ -952,6 +1006,7 @@ impl TryFrom<&crate::config::def::Config> for Config {
             store_smart_stats: c.profile.store_smart_stats,
             hosts: Some(hosts),
             nameserver_policy,
+            rule_set_policy_registry: Arc::new(std::sync::OnceLock::new()),
             geosite_policy_matchers: Arc::new(std::sync::OnceLock::new()),
             edns_client_subnet,
             respect_rules: dc.respect_rules,
@@ -1273,18 +1328,15 @@ mod tests {
 
     #[test]
     fn nameserver_policy_rejects_unsupported_selectors_and_expands_domains() {
-        // Reject unsupported RuleSet selectors and unmatchable whitespace;
-        // GeoSite is covered by dedicated matcher tests below.
-        for selector in ["example.com other.test", "rule-set:private"] {
-            let policy = IndexMap::from([(
-                selector.to_owned(),
-                "192.0.2.53".to_owned().into(),
-            )]);
-            assert!(
-                Config::parse_nameserver_policy_ordered(&policy).is_err(),
-                "unsupported selector {selector:?} must not be silently accepted"
-            );
-        }
+        // Reject unmatchable whitespace; RuleSet and GeoSite are covered by
+        // dedicated matcher validation tests below.
+        let selector = "example.com other.test";
+        let policy =
+            IndexMap::from([(selector.to_owned(), "192.0.2.53".to_owned().into())]);
+        assert!(
+            Config::parse_nameserver_policy_ordered(&policy).is_err(),
+            "unsupported selector {selector:?} must not be silently accepted"
+        );
         let combined = IndexMap::from([(
             "example.com,other.test".to_owned(),
             "192.0.2.53".to_owned().into(),
@@ -1294,7 +1346,6 @@ mod tests {
         assert_eq!(expanded.len(), 2);
         assert!(expanded.contains_key("example.com"));
         assert!(expanded.contains_key("other.test"));
-
         for selector in ["example.com", "*.example.com", "+.example.com"] {
             let policy = IndexMap::from([(
                 selector.to_owned(),
@@ -1303,6 +1354,38 @@ mod tests {
             assert!(
                 Config::parse_nameserver_policy_ordered(&policy).is_ok(),
                 "existing selector {selector:?} must remain supported"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_rule_set_selector_group_expands_and_rejects_unsafe_tokens() {
+        let policy = IndexMap::from([(
+            "RULE-SET:PRIVATE,OTHER".to_owned(),
+            DnsPolicyUpstreams::Single("192.0.2.53".to_owned()),
+        )]);
+        let parsed = Config::parse_nameserver_policy_ordered(&policy)
+            .expect("RuleSet comma groups should expand to provider selectors");
+        assert_eq!(
+            parsed.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["rule-set:private", "rule-set:other"]
+        );
+        for invalid in [
+            "rule-set:",
+            "rule-set:private,",
+            "rule-set:,other",
+            "rule-set:private,,other",
+            "rule-set:pr ivate",
+            "rule-set:private,geosite:cn",
+            "rule-set:private,rule-set:other",
+        ] {
+            let policy = IndexMap::from([(
+                invalid.to_owned(),
+                DnsPolicyUpstreams::Single("192.0.2.53".to_owned()),
+            )]);
+            assert!(
+                Config::parse_nameserver_policy_ordered(&policy).is_err(),
+                "malformed RuleSet key {invalid:?} must fail closed"
             );
         }
     }
@@ -1485,7 +1568,6 @@ dns:
             "geosite:,private",
             "geosite:private,cn:invalid",
             "geosite:private, cn",
-            "rule-set:private",
             "geosite:private,rule-set:private",
         ] {
             let policy = IndexMap::from([(

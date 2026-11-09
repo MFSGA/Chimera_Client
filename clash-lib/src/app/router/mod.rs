@@ -160,6 +160,23 @@ impl Router {
         dns_resolver: ThreadSafeDNSResolver,
         options: RouterProviderInitOptions,
     ) -> Result<Self, crate::Error> {
+        Self::new_with_provider_initialization_and_dns_rule_sets(
+            rules,
+            rule_providers,
+            dns_resolver,
+            options,
+            &[],
+        )
+        .await
+    }
+
+    pub(crate) async fn new_with_provider_initialization_and_dns_rule_sets(
+        rules: Vec<RuleType>,
+        rule_providers: HashMap<String, RuleProviderDef>,
+        dns_resolver: ThreadSafeDNSResolver,
+        options: RouterProviderInitOptions,
+        required_dns_rule_sets: &[String],
+    ) -> Result<Self, crate::Error> {
         let RouterProviderInitOptions {
             country_mmdb,
             asn_mmdb,
@@ -176,6 +193,7 @@ impl Router {
             geodata.clone(),
             cwd,
             defer_http_providers,
+            required_dns_rule_sets,
         )
         .await?;
 
@@ -201,6 +219,35 @@ impl Router {
         })
     }
 
+    /// Build a router with inline domain providers ready for DNS policy use.
+    /// Other rule providers retain their normal asynchronous initialization.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_with_dns_rule_sets(
+        rules: Vec<RuleType>,
+        rule_providers: HashMap<String, RuleProviderDef>,
+        dns_resolver: ThreadSafeDNSResolver,
+        country_mmdb: Option<MmdbLookup>,
+        asn_mmdb: Option<MmdbLookup>,
+        geodata: Option<GeoDataLookup>,
+        cwd: String,
+        required_dns_rule_sets: &[String],
+    ) -> Result<Self, crate::Error> {
+        Self::new_with_provider_initialization_and_dns_rule_sets(
+            rules,
+            rule_providers,
+            dns_resolver,
+            RouterProviderInitOptions {
+                country_mmdb,
+                asn_mmdb,
+                geodata,
+                cwd,
+                defer_http_providers: false,
+            },
+            required_dns_rule_sets,
+        )
+        .await
+    }
+
     pub(crate) fn activate_deferred_providers_after_commit(&self) {
         for provider in &self.deferred_rule_providers {
             let provider = provider.clone();
@@ -211,6 +258,51 @@ impl Router {
                         %error,
                         "deferred rule provider initialization failed after bounded retries; provider remains registered"
                     );
+                }
+            });
+        }
+    }
+
+    pub(crate) fn start_other_rule_provider_initialization(
+        &self,
+        required_dns_rule_sets: &[String],
+    ) {
+        if required_dns_rule_sets.is_empty() {
+            return;
+        }
+        let mut excluded = required_dns_rule_sets.to_vec();
+        excluded.extend(
+            self.deferred_rule_providers
+                .iter()
+                .map(|provider| provider.name().to_owned()),
+        );
+        Self::spawn_background_rule_provider_initializers(
+            &self.rule_providers,
+            &excluded,
+        );
+    }
+
+    fn spawn_background_rule_provider_initializers(
+        providers: &HashMap<String, ThreadSafeRuleProvider>,
+        excluded_names: &[String],
+    ) {
+        for (name, provider) in providers.iter() {
+            if excluded_names
+                .iter()
+                .any(|excluded| excluded.eq_ignore_ascii_case(name))
+            {
+                continue;
+            }
+            let provider = provider.clone();
+            tokio::spawn(async move {
+                info!("initializing rule provider {}", provider.name());
+                match provider.initialize().await {
+                    Ok(()) => info!("rule provider {} initialized", provider.name()),
+                    Err(err) => error!(
+                        "failed to initialize rule provider {}: {}",
+                        provider.name(),
+                        err
+                    ),
                 }
             });
         }
@@ -343,6 +435,7 @@ impl Router {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn load_rule_providers(
         rule_providers: HashMap<String, RuleProviderDef>,
         rule_provider_registry: &mut HashMap<String, ThreadSafeRuleProvider>,
@@ -351,6 +444,7 @@ impl Router {
         geodata: Option<GeoDataLookup>,
         cwd: String,
         defer_http_providers: bool,
+        required_dns_rule_sets: &[String],
     ) -> Result<Vec<ThreadSafeRuleProvider>, crate::Error> {
         for (name, provider) in rule_providers.into_iter() {
             match provider {
@@ -415,8 +509,49 @@ impl Router {
             }
         }
 
+        // DNS-referenced RuleSets must be ready before their registry is
+        // published. Config conversion limits these to inline domain sources,
+        // so initialization is synchronous and has no DNS bootstrap dependency.
+        for requested in required_dns_rule_sets {
+            let mut matches = rule_provider_registry
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case(requested));
+            let Some((name, provider)) = matches.next() else {
+                return Err(crate::Error::InvalidConfig(
+                    "DNS nameserver-policy references a missing RuleSet provider"
+                        .to_owned(),
+                ));
+            };
+            if matches.next().is_some() {
+                return Err(crate::Error::InvalidConfig(
+                    "DNS nameserver-policy RuleSet provider name is ambiguous"
+                        .to_owned(),
+                ));
+            }
+            if provider.vehicle_type() != ProviderVehicleType::Inline
+                || provider.behavior()
+                    != crate::app::remote_content_manager::providers::rule_provider::RuleSetBehavior::Domain
+            {
+                return Err(crate::Error::InvalidConfig(
+                    "DNS nameserver-policy RuleSet requires an inline domain provider"
+                        .to_owned(),
+                ));
+            }
+            provider.initialize().await.map_err(|_| {
+                crate::Error::InvalidConfig(format!(
+                    "DNS nameserver-policy RuleSet provider {name} failed initialization"
+                ))
+            })?;
+        }
+
         let mut deferred = Vec::new();
-        for provider in rule_provider_registry.values() {
+        for (name, provider) in rule_provider_registry.iter() {
+            if required_dns_rule_sets
+                .iter()
+                .any(|required| required.eq_ignore_ascii_case(name))
+            {
+                continue;
+            }
             if defer_http_providers
                 && provider.vehicle_type() == ProviderVehicleType::Http
             {
@@ -432,19 +567,17 @@ impl Router {
                 deferred.push(provider.clone());
                 continue;
             }
+        }
 
-            let provider = provider.clone();
-            tokio::spawn(async move {
-                info!("initializing rule provider {}", provider.name());
-                match provider.initialize().await {
-                    Ok(()) => info!("rule provider {} initialized", provider.name()),
-                    Err(err) => error!(
-                        "failed to initialize rule provider {}: {}",
-                        provider.name(),
-                        err
-                    ),
-                }
-            });
+        if required_dns_rule_sets.is_empty() {
+            let deferred_names = deferred
+                .iter()
+                .map(|provider: &ThreadSafeRuleProvider| provider.name().to_owned())
+                .collect::<Vec<_>>();
+            Self::spawn_background_rule_provider_initializers(
+                rule_provider_registry,
+                &deferred_names,
+            );
         }
 
         Ok(deferred)

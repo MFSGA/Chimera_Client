@@ -311,13 +311,19 @@ fn full_dns_fixture_parses_expected_runtime_shape() {
 #[test]
 fn nameserver_policy_compound_selectors_fail_closed_at_yaml_conversion() {
     for enabled in [false, true] {
-        for selector in ["example.com other.test", "rule-set:private"] {
+        for (selector, expected_error) in [
+            ("example.com other.test", "selector uses unsupported syntax"),
+            (
+                "rule-set:private",
+                "requires exactly one inline domain rule-provider",
+            ),
+        ] {
             let yaml = base_config(&format!(
                 "  enable: {enabled}\n  enhanced-mode: normal\n  nameserver: [1.1.1.1]\n  default-nameserver: [1.1.1.1]\n  nameserver-policy:\n    '{selector}': 192.0.2.53\n"
             ));
             let error = parse_error(yaml);
             assert!(
-                error.to_string().contains("nameserver-policy"),
+                error.to_string().contains(expected_error),
                 "unsupported DNS selector {selector:?} must be rejected even with enable={enabled}: {error}"
             );
         }
@@ -408,6 +414,74 @@ fn nameserver_policy_array_must_reject_unusable_entries() {
                 || error.contains("invalid dns server")
                 || error.contains("unsupported scheme"),
             "unusable policy upstream {value:?} must fail closed: {error}"
+        );
+    }
+}
+
+#[test]
+fn inline_domain_rule_set_can_reach_internal_dns_policy() {
+    let yaml = format!(
+        "{}\nrule-providers:\n  private-domain:\n    type: inline\n    behavior: domain\n    payload:\n      - '+.private.example'\n",
+        base_config(
+            "  enable: true\n  enhanced-mode: normal\n  nameserver: [1.1.1.1]\n  default-nameserver: [1.1.1.1]\n  nameserver-policy:\n    'rule-set:private-domain': 192.0.2.53\n",
+        )
+    );
+    let dns = parse_dns(&yaml);
+    assert!(
+        dns.nameserver_policy
+            .contains_key("rule-set:private-domain")
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn inline_domain_rule_set_reaches_runtime_without_network_bootstrap() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let yaml = base_config(
+        "  enable: true\n  enhanced-mode: normal\n  nameserver: [192.0.2.53]\n  default-nameserver: [192.0.2.54]\n  nameserver-policy:\n    'rule-set:private-domain': 192.0.2.55\n",
+    )
+    .replacen("ipv6: true", "ipv6: false", 1)
+    .replace("dns:\n", "mmdb: null\ngeosite: null\ntun:\n  enable: false\ndns:\n");
+    let yaml = format!(
+        "{yaml}\nrule-providers:\n  private-domain:\n    type: inline\n    behavior: domain\n    payload:\n      - '+.private.example'\n"
+    );
+    Config::Str(yaml.clone())
+        .try_parse()
+        .expect("config parses");
+    let (handle, token) = clash_lib::start_scaffold_instance(Options {
+        config: Config::Str(yaml),
+        cwd: Some(temp.path().to_string_lossy().to_string()),
+        rt: Some(TokioRuntime::SingleThread),
+        log_file: None,
+        config_path: None,
+    })
+    .expect("inline domain DNS rule-set must initialize the actual runtime");
+    // start_scaffold_instance waits until startup is ready and provides a
+    // per-instance cancellation token, unlike blocking start_scaffold.
+    token.cancel();
+    handle.join().expect("runtime should shut down cleanly");
+}
+
+#[test]
+fn unsupported_dns_rule_set_kinds_fail_closed() {
+    for provider in [
+        "", // missing provider
+        "rule-providers:\n  private-domain:\n    type: file\n    behavior: domain\n    path: rules.yaml\n",
+        "rule-providers:\n  private-domain:\n    type: inline\n    behavior: ipcidr\n    payload: [192.0.2.0/24]\n",
+        "rule-providers:\n  private-domain:\n    type: inline\n    behavior: domain\n    payload: []\n",
+        "rule-providers:\n  private-domain:\n    type: inline\n    behavior: domain\n    payload: ['INVALID DOMAIN']\n",
+        "rule-providers:\n  PRIVATE-DOMAIN:\n    type: inline\n    behavior: domain\n    payload: [example.com]\n  private-domain:\n    type: inline\n    behavior: domain\n    payload: [example.org]\n",
+    ] {
+        let yaml = format!(
+            "{}\n{provider}",
+            base_config(
+                "  enable: false\n  nameserver-policy:\n    'rule-set:private-domain': 192.0.2.53\n"
+            )
+        );
+        let message = parse_error(yaml).to_string();
+        assert!(
+            message.contains("rule-set") || message.contains("domain"),
+            "unsupported DNS rule-set must fail closed: {message}"
         );
     }
 }
@@ -1175,19 +1249,30 @@ fn mihomo_nameserver_policy_multiple_domains_split_without_silent_literal_match(
 }
 
 #[test]
-fn mihomo_nameserver_policy_rejects_unsupported_ruleset_selectors() {
-    for domain in ["rule-set:protected", "example.com,rule-set:protected"] {
+fn mihomo_nameserver_policy_rejects_malformed_rulesets_and_missing_provider() {
+    for selector in ["rule-set:", "example.com,rule-set:protected"] {
         let yaml = base_config(&format!(
-            "  enable: true\n  nameserver: [1.1.1.1]\n  nameserver-policy:\n    '{domain}': 9.9.9.9\n"
+            "  enable: true\n  nameserver: [1.1.1.1]\n  nameserver-policy:\n    '{selector}': 9.9.9.9\n"
         ));
         let error = parse_error(yaml).to_string();
         assert!(
             error.contains("nameserver-policy")
                 && error.contains("unsupported")
-                && !error.contains(domain),
-            "unsupported Mihomo policy selectors must be rejected without exposing their domain: {error}",
+                && !error.contains(selector),
+            "malformed RuleSet selectors must fail without echoing input: {error}",
         );
     }
+
+    let yaml = base_config(
+        "  enable: true\n  nameserver: [1.1.1.1]\n  nameserver-policy:\n    'rule-set:protected': 9.9.9.9\n",
+    );
+    let error = parse_error(yaml).to_string();
+    assert!(
+        error.contains("nameserver-policy")
+            && error.contains("requires exactly one inline domain rule-provider")
+            && !error.contains("protected"),
+        "valid RuleSet syntax without a provider must fail generically: {error}",
+    );
 }
 
 #[test]

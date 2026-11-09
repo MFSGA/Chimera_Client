@@ -59,3 +59,51 @@ async fn ordinary_rules_keep_existing_interface_unchanged() {
         .unwrap();
     assert!(sess.iface.is_none());
 }
+
+#[tokio::test]
+async fn dns_referenced_inline_domain_rule_provider_is_ready_before_router_returns()
+{
+    use std::{collections::HashMap, sync::Arc};
+
+    use crate::{
+        app::{
+            dns::{ThreadSafeDNSResolver, resolver::EnhancedResolver},
+            remote_content_manager::providers::rule_provider::RuleSetBehavior,
+        },
+        config::internal::config::{InlineRuleProvider, RuleProviderDef},
+    };
+
+    let resolver: ThreadSafeDNSResolver =
+        Arc::new(EnhancedResolver::new_default().await);
+    let providers = HashMap::from([(
+        "Private-Domain".to_owned(),
+        RuleProviderDef::Inline(InlineRuleProvider {
+            path: "unused".to_owned(),
+            behavior: RuleSetBehavior::Domain,
+            inline_rules: vec!["+.example.com".to_owned()],
+        }),
+    )]);
+    let router = super::Router::new_with_dns_rule_sets(
+        Vec::new(),
+        providers,
+        resolver,
+        None,
+        None,
+        None,
+        ".".to_owned(),
+        &["private-domain".to_owned()],
+    )
+    .await
+    .expect("DNS-required inline domain provider must initialize before router readiness");
+    let provider = router
+        .get_rule_providers()
+        .get("Private-Domain")
+        .expect("provider remains registered");
+    assert!(
+        provider
+            .match_dns_domain("proxy.example.com")
+            .await
+            .expect("provider must already be initialized and safe to query")
+    );
+    assert!(!provider.match_dns_domain("unrelated.test").await.unwrap());
+}
