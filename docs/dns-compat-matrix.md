@@ -101,3 +101,11 @@ S01 准入必须满足：金标准用例在目标 HEAD 实际运行；未知新�
 - PR #107 在 2026-11-08 06:20:34 PST 已合并为 `master` `befdcdb9360c5b88aa1920c75ef83861fba2ffeb`。该提交与原 PR HEAD `8b3faa49c55906402e99bcb05a467afca62eee92` 的 Git tree 相同，虽提交历史 SHA 不同，但七项 DNS 变更的最终源码已进入远端 `master`。
 - 此 TTL 切片原本地提交 `7b9b2bb4649fa14836e21e4528756dadf7ef5510` 保留；已在独立分支 `codex/dns-fake-ip-ttl-post-merge-20261108` 上以新 `master` 为直接父提交单独签名移植（最终 SHA 以该分支 HEAD 为准），不重放 PR #107 已合并的七项提交。
 - 此后续提交与 PR #107 是不同审查对象，不能继承后者的 GitHub Verified、CI、Reviewer 或维护者决定；必须独立核验最终 SHA、运行相关测试并获得 L2 审查/批准。未授权修改本机 DNS、路由、TUN 或进行物理 NIC/utun 抓包。
+
+## 2026-11-09：最新 v0.29.1 主线上的独立 DNS 安全候选批次 1（L2 待审）
+
+- 基线：`origin/master` `f304da17b7eaf6a187daf03a96bb1e77a26dd049`；固定只读 `ref-mihomo` `63bd52ec794b7051569b76ede2f6cdbf4c091fda`。本地 `master` 有未提交修改且与远端分叉，因此仅在隔离集成分支 `codex/dns-master-batch1-20261109` 提交，不改写或移动 `master`。
+- 第一项：独立移植 `staged_cache_keeps_legacy_symlink_replacement_semantics`，验证 Provider 原子缓存覆盖符号链接路径而不修改其目标文件（源分支 `8cdec18`）；只移植兼容性回归，不复制不相关历史文档。
+- 第二项：内部配置将 `dns.proxy-server-nameserver` 设为显式空列表时，验证阶段直接 `InvalidConfig`，未配置 `None` 则维持旧行为。源分支 `54b80b2` 的独立 P0 修复已适配最新主线；否定测试 `explicit_empty_proxy_node_bootstrap_fails_internal_reload` 先失败（0/1），再实施修复。
+- macOS 本地验证：Rust 1.99.0（由于项目锁定的 1.99.1 安装不完整，需补跑锁定工具链），TUN+Ring、无默认 feature 核心库 834 通过、0 失败、11 忽略；`dns_config_tests` 20/20；严格 all-target Clippy（`-D warnings`）、Cargo fmt 和 Git diff 检查通过。端口占用日志是 DNS listener 失败路径的预期注入。
+- 局限：未进行 macOS 物理 NIC/utun 抓包、Mihomo 二进制互操作、独立 L2 Reviewer 或远端 required CI。不得把本地候选标成已合并至 `master` 或已通过发布审查；未修改系统 DNS、路由、TUN、Network Extension、权限或远端分支。
