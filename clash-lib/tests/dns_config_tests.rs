@@ -313,7 +313,6 @@ fn nameserver_policy_compound_selectors_fail_closed_at_yaml_conversion() {
     for enabled in [false, true] {
         for selector in [
             "example.com other.test",
-            "example.com,other.test",
             "geosite:private",
             "rule-set:private",
         ] {
@@ -329,6 +328,23 @@ fn nameserver_policy_compound_selectors_fail_closed_at_yaml_conversion() {
             );
         }
     }
+}
+
+#[test]
+fn nameserver_policy_comma_selectors_reach_internal_runtime() {
+    let yaml = base_config(
+        "  enable: true
+  enhanced-mode: normal
+  nameserver: [1.1.1.1]
+  default-nameserver: [1.1.1.1]
+  nameserver-policy:
+    'EXAMPLE.com,other.test': 192.0.2.53
+",
+    );
+    let dns = parse_dns(&yaml);
+    assert_eq!(dns.nameserver_policy.len(), 2);
+    assert!(dns.nameserver_policy.contains_key("example.com"));
+    assert!(dns.nameserver_policy.contains_key("other.test"));
 }
 
 #[test]
