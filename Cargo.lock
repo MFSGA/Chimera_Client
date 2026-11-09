@@ -750,7 +750,7 @@ dependencies = [
  "sha1 0.11.0",
  "sha2",
  "shadowsocks",
- "smoltcp 0.14.0",
+ "smoltcp",
  "sock2proc",
  "socket2",
  "subtle",
@@ -1022,15 +1022,6 @@ name = "data-encoding"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
-
-[[package]]
-name = "defmt"
-version = "0.3.101"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4deef977660e373c458df605a913d4ab121db0ccd18d1ad6976dff7d37cddb53"
-dependencies = [
- "defmt 1.2.0",
-]
 
 [[package]]
 name = "defmt"
@@ -1680,16 +1671,6 @@ dependencies = [
 
 [[package]]
 name = "heapless"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bfb9eb618601c89945a70e254898da93b13be0388091d42117462b265bb3fad"
-dependencies = [
- "hash32",
- "stable_deref_trait",
-]
-
-[[package]]
-name = "heapless"
 version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25ba4bd83f9415b58b4ed8dc5714c76e626a105be4646c02630ad730ad3b5aa4"
@@ -2238,7 +2219,7 @@ version = "0.2.38"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b2b005715dcbeb0089a3c0dab99f2ff1cc3b2525323552703d648585d342a383"
 dependencies = [
- "defmt 1.2.0",
+ "defmt",
  "jiff-core",
  "jiff-static",
  "log",
@@ -2253,7 +2234,7 @@ version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e52fe76043ccecc9005d2305ebaadf7d7fc0cc89ca6baa10a94d6bc68c7128c"
 dependencies = [
- "defmt 1.2.0",
+ "defmt",
  "log",
 ]
 
@@ -2660,6 +2641,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "netlink-packet-route"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3c407d8e95c0128ee5729728482a369f3ba9a0d9ba8335c20949a8d8989cf6b"
+dependencies = [
+ "bitflags 2.13.2",
+ "libc",
+ "log",
+ "netlink-packet-core 0.9.0",
+ "zerocopy",
+]
+
+[[package]]
 name = "netlink-packet-sock-diag"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2674,9 +2668,9 @@ dependencies = [
 
 [[package]]
 name = "netlink-proto"
-version = "0.13.0"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97e03ae6247c6cdb499e8f14e98c72b83954d85822b687056e3a21150b438f2b"
+checksum = "deb648c817503ada468a15b8fb7a37d2061079dc0905f2c6552392850279dd85"
 dependencies = [
  "bytes",
  "futures-channel",
@@ -2684,7 +2678,6 @@ dependencies = [
  "log",
  "netlink-packet-core 0.9.0",
  "netlink-sys 0.9.0",
- "thiserror",
 ]
 
 [[package]]
@@ -2713,14 +2706,14 @@ dependencies = [
 
 [[package]]
 name = "netstack-smoltcp"
-version = "0.2.4"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c38f66cdd673ff0e760752f27c6d34a7e3a140f0b1eea9efae3c46d8867c83d"
+checksum = "f5abcddf2ae2d1642c492c1043041548200a176a3b5c3db6e5169ab1ed8d62b8"
 dependencies = [
  "etherparse 0.16.0",
  "futures",
  "rand 0.8.8",
- "smoltcp 0.12.0",
+ "smoltcp",
  "spin 0.9.9",
  "tokio",
  "tokio-util",
@@ -3471,19 +3464,18 @@ dependencies = [
 
 [[package]]
 name = "rtnetlink"
-version = "0.23.0"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90f60a3ee149005c5819e03e3d73ba4a470bc18b52b0c8422cfe1bea2cae63c6"
+checksum = "3ebb223efd6a02c17e119412e8a06640abead288a44256e642377e1c09d2134c"
 dependencies = [
  "futures-channel",
  "futures-util",
  "log",
  "netlink-packet-core 0.9.0",
- "netlink-packet-route 0.33.0",
+ "netlink-packet-route 0.34.0",
  "netlink-proto",
  "netlink-sys 0.9.0",
- "nix 0.30.1",
- "thiserror",
+ "nix 0.31.3",
  "tokio",
 ]
 
@@ -3941,21 +3933,6 @@ checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
 
 [[package]]
 name = "smoltcp"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dad095989c1533c1c266d9b1e8d70a1329dd3723c3edac6d03bbd67e7bf6f4bb"
-dependencies = [
- "bitflags 1.3.2",
- "byteorder",
- "cfg-if",
- "defmt 0.3.101",
- "heapless 0.8.0",
- "log",
- "managed",
-]
-
-[[package]]
-name = "smoltcp"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f8b28ad56c6e35524a37dd492af5d1a47e31e1a4d175cd12f89c075f01980f"
@@ -3963,8 +3940,8 @@ dependencies = [
  "bitflags 1.3.2",
  "byteorder",
  "cfg-if",
- "defmt 1.2.0",
- "heapless 0.9.3",
+ "defmt",
+ "heapless",
  "log",
  "managed",
 ]
@@ -4502,9 +4479,9 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tun-rs"
-version = "2.8.17"
+version = "2.8.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95d4fdbaf6adbd494553f06512abf528caacf84e14ce93c0dd822d94a72854a7"
+checksum = "d7300c968315399fcef3b386a0690e9d772cc4005e92d3d6be1dec6774fb98fd"
 dependencies = [
  "ahash",
  "blocking",
@@ -4748,7 +4725,7 @@ dependencies = [
  "log",
  "netstack-smoltcp",
  "rand 0.10.3",
- "smoltcp 0.14.0",
+ "smoltcp",
  "socket2",
  "tokio",
  "tracing",
