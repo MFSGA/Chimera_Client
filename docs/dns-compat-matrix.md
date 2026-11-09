@@ -129,3 +129,11 @@ S01 准入必须满足：金标准用例在目标 HEAD 实际运行；未知新�
 - 独立移植旧 DNS 隐私分支 `0f3ef23` 中可审查的顶层 DNS/TUN 及 `fallback-filter` 字段诊断，并复用已验证的一编辑/相邻交换拼写比较函数。先写负向测试，旧配置会默默接受 `dns.nameserver-polcy`（0/1）；修复后明确拒绝安全敏感的近似拼写、YAML merge 后的错拼、TUN `strict-route`/`strcit-route`（尚无有效运行语义）、未实现的 `dns.fallback-filter.geosite`，同时保留普通 `vendor-extension` 兼容。
 - 验证：Rust 1.99.0、macOS；无默认 feature + TUN/Ring 核心库 **842 通过 / 0 失败 / 11 忽略**，默认 feature + TUN/Ring 核心库 **1034 通过 / 0 失败 / 11 忽略**；两组 DNS 配置集成各 21/21。严格 all-target Clippy（两组）、Cargo fmt 与 Git diff --check 均通过。
 - 此批次为仅本地签名候选，不包含在第 3 批远端推送的 SHA 内；独立 L2 审查、GitHub required CI、锁定 Rust 1.99.1 修复与复测、Mihomo 二进制互操作及 macOS NIC/utun 抓包仍待完成。未修改 `master`、系统 DNS/TUN/路由或其他工作树的未提交内容。
+
+## 2026-11-09 — 批次 5：nameserver-policy 普通域名逗号选择器（L2 待审）
+
+- 基于隔离分支 `codex/dns-master-batch4-20261109` 的 `efa18a1a2d1162e967396c9d8d4f05196b9c5f07`，上游 `origin/master` 快照 `f304da17b7eaf6a187daf03a96bb1e77a26dd049`；固定 Mihomo 只读 gitlink `63bd52ec794b7051569b76ede2f6cdbf4c091fda` 的 `config/config.go::parseNameServerPolicy` 对普通域名键以逗号拆分并共用指定 nameservers。此批仅移植 **普通域名选择器展开**，不宣称多 DNS 上游数组、GeoSite、RuleSet 或 Mihomo orderedmap 冲突优先级等价。
+- `clash-lib/src/app/dns/config.rs::parse_nameserver_policy` 将 `example.com,other.test` 展开为两条规范化小写的可匹配键；`resolver/enhanced.rs::match_policy` 将查询域名规范化后查 trie。保持原有单域名/`*.`/`+.` 语法；拒绝空 token、选择器空白、重复及大小写折叠后的冲突、`geosite:` 和 `rule-set:`，不再将普通多域名逗号键拒绝或默默当字面串。
+- 先写 `nameserver_policy_expands_comma_selectors_into_runtime_domains`，原代码确定性失败（0/1），修复后通过；另加 `nameserver_policy_rejects_ambiguous_or_unsupported_comma_keys`、YAML→内部配置集成测试，以及 `comma_delimited_nameserver_policy_uses_dedicated_upstream`，用 mock DNS 证明两个域名命中策略上游、未匹配域名仍走主上游。
+- 本地验证：macOS，Rust 1.99.0；`--no-default-features --features tun,ring` 核心库 **845 pass/0 fail/11 ignored**，默认 features + `tun,ring` 核心库 **1037 pass/0 fail/11 ignored**；两组 `dns_config_tests` **22/22**，严格 `clippy --all-targets -D warnings`、`cargo fmt --check` 和 `git diff --check` 均通过。
+- 未覆盖：policy value 多上游数组（当前 `HashMap<String,String>`）、Mihomo 有序 selector 冲突覆盖语义、实际 Mihomo 二进制互操作、macOS 物理 NIC/utun 抓包、Rust 1.99.1 锁定工具链（本机安装缺少 manifest）、远端 required CI、独立 L2 审查。本批只本地签名提交；不自动推送/合并主线，不修改系统网络。

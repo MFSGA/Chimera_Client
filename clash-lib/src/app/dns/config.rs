@@ -225,39 +225,46 @@ impl Config {
     ) -> Result<HashMap<String, NameServer>, Error> {
         let mut policy = HashMap::new();
 
-        for (domain, server) in policy_map {
-            // Mihomo interprets comma-separated domain selectors and
-            // geosite/rule-set keys. Until Chimera implements those runtime
-            // semantics, inserting them as literal trie keys would silently
-            // bypass the intended DNS policy.
-            let lower = domain.to_ascii_lowercase();
-            if domain.chars().any(char::is_whitespace)
-                || domain.contains(',')
-                || lower.starts_with("geosite:")
-                || lower.starts_with("rule-set:")
-            {
-                return Err(Error::InvalidConfig(
-                    "DNS nameserver-policy selector uses unsupported syntax".into(),
-                ));
-            }
-
+        for (selector_group, server) in policy_map {
             let nameservers =
                 Config::parse_nameserver(std::slice::from_ref(server))?;
 
             let Some(nameserver) = nameservers.first() else {
                 return Err(Error::InvalidConfig(format!(
-                    "DNS nameserver-policy for {domain} has no usable nameserver"
+                    "DNS nameserver-policy for {selector_group} has no usable nameserver"
                 )));
             };
 
-            let (_, valid) = trie::valid_and_split_domain(domain);
-            if !valid {
-                return Err(Error::InvalidConfig(format!(
-                    "DNS ResolverRule invalid domain: {}",
-                    domain
-                )));
+            // Mihomo expands comma-delimited domain keys into individual
+            // policies. Keep geosite/rule-set unsupported until their
+            // matchers exist; never register inert trie literals for them.
+            for selector in selector_group.split(',') {
+                let lower = selector.to_ascii_lowercase();
+                if selector.is_empty()
+                    || selector.chars().any(char::is_whitespace)
+                    || lower.starts_with("geosite:")
+                    || lower.starts_with("rule-set:")
+                {
+                    return Err(Error::InvalidConfig(
+                        "DNS nameserver-policy selector uses unsupported syntax"
+                            .into(),
+                    ));
+                }
+
+                let (_, valid) = trie::valid_and_split_domain(selector);
+                if !valid {
+                    return Err(Error::InvalidConfig(format!(
+                        "DNS ResolverRule invalid domain: {selector}"
+                    )));
+                }
+                if policy.insert(lower, nameserver.clone()).is_some() {
+                    // The YAML policy map is unordered; conflicting aliases
+                    // must fail closed rather than use iteration order.
+                    return Err(Error::InvalidConfig(format!(
+                        "DNS nameserver-policy has duplicate domain selector: {selector}"
+                    )));
+                }
             }
-            policy.insert(domain.into(), nameserver.clone());
         }
         Ok(policy)
     }
@@ -672,7 +679,6 @@ mod tests {
         // Chimera's plain domain trie must never accept them as inert literals.
         for selector in [
             "example.com other.test",
-            "example.com,other.test",
             "geosite:private",
             "rule-set:private",
         ] {
@@ -691,6 +697,61 @@ mod tests {
                 "existing selector {selector:?} must remain supported"
             );
         }
+    }
+
+    #[test]
+    fn nameserver_policy_expands_comma_selectors_into_runtime_domains() {
+        let policy = HashMap::from([(
+            "EXAMPLE.com,*.other.test,+.internal.test".to_owned(),
+            "192.0.2.53".to_owned(),
+        )]);
+        let parsed = Config::parse_nameserver_policy(&policy)
+            .expect("comma-delimited domain policy should expand");
+        assert_eq!(parsed.len(), 3);
+        let mut trie = crate::common::trie::StringTrie::<bool>::new();
+        for domain in parsed.keys() {
+            assert!(trie.insert(domain, std::sync::Arc::new(true)));
+        }
+        for domain in [
+            "example.com",
+            "www.other.test",
+            "internal.test",
+            "www.internal.test",
+        ] {
+            assert!(
+                trie.search(domain).is_some(),
+                "{domain} must match an expanded policy selector"
+            );
+        }
+        assert!(trie.search("unrelated.test").is_none());
+    }
+
+    #[test]
+    fn nameserver_policy_rejects_ambiguous_or_unsupported_comma_keys() {
+        for key in [
+            "example.com,",
+            ",example.com",
+            "example.com,,other.test",
+            "example.com, other.test",
+            "example.com,geosite:private",
+            "example.com,rule-set:private",
+            "example.com,example.com",
+            "EXAMPLE.COM,example.com",
+        ] {
+            let policy = HashMap::from([(key.to_owned(), "192.0.2.53".to_owned())]);
+            assert!(
+                Config::parse_nameserver_policy(&policy).is_err(),
+                "ambiguous selector {key:?} must fail closed"
+            );
+        }
+        let policy = HashMap::from([
+            ("example.com,other.test".to_owned(), "192.0.2.53".to_owned()),
+            ("OTHER.TEST".to_owned(), "192.0.2.54".to_owned()),
+        ]);
+        assert!(
+            Config::parse_nameserver_policy(&policy).is_err(),
+            "overlapping canonical selectors must not depend on map iteration order"
+        );
     }
 
     #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]

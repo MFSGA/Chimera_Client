@@ -908,7 +908,9 @@ impl EnhancedResolver {
         if let (Some(policy), Some(domain)) =
             (&self.policy, EnhancedResolver::domain_name_of_message(m))
         {
-            return policy.search(&domain).map(|n| n.get_data().unwrap());
+            return policy
+                .search(&domain.to_ascii_lowercase())
+                .map(|n| n.get_data().unwrap());
         }
         None
     }
@@ -3046,6 +3048,59 @@ mod tests {
         assert_eq!(policy_hits.load(Ordering::SeqCst), 0);
         assert_eq!(main_hits.load(Ordering::SeqCst), 0);
         assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn comma_delimited_nameserver_policy_uses_dedicated_upstream() {
+        let parsed =
+            Config::parse_nameserver_policy(&std::collections::HashMap::from([(
+                "proxy.example.com,other.test".to_owned(),
+                "192.0.2.53".to_owned(),
+            )]))
+            .expect("comma-separated selectors must compile into runtime policy");
+        let mut resolver = EnhancedResolver::new_default().await;
+        resolver.lru_cache = None;
+        let policy_hits = Arc::new(AtomicUsize::new(0));
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        let mut policy = crate::common::trie::StringTrie::new();
+        for selector in parsed.keys() {
+            assert!(policy.insert(
+                selector,
+                Arc::new(vec![Arc::new(CountingClient {
+                    response: response_with_a(Ipv4Addr::new(203, 0, 113, 10)),
+                    hits: policy_hits.clone(),
+                    id: "policy-ns",
+                }) as ThreadSafeDNSClient]),
+            ));
+        }
+        resolver.policy = Some(policy);
+        resolver.main = vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(198, 51, 100, 20)),
+            hits: main_hits.clone(),
+            id: "main-ns",
+        })];
+
+        for domain in ["PROXY.EXAMPLE.COM", "other.test"] {
+            let mut message = op::Message::query();
+            let mut q = op::Query::new();
+            q.set_name(rr::Name::from_utf8(domain).unwrap());
+            q.set_query_type(rr::RecordType::TXT);
+            message.add_query(q);
+            resolver
+                .exchange_no_cache(&message)
+                .await
+                .expect("policy-selected upstream must answer");
+        }
+        assert_eq!(policy_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(main_hits.load(Ordering::SeqCst), 0);
+
+        let mut message = op::Message::query();
+        let mut q = op::Query::new();
+        q.set_name(rr::Name::from_utf8("unrelated.test").unwrap());
+        q.set_query_type(rr::RecordType::TXT);
+        message.add_query(q);
+        resolver.exchange_no_cache(&message).await.unwrap();
+        assert_eq!(main_hits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
