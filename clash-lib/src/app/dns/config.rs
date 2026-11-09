@@ -4,8 +4,9 @@ use crate::{
     app::net::{OutboundInterface, get_interface_by_name},
     common::trie,
     config::def::{
-        DNSListen, DNSMode, DnsServiceDiscoveryMode, DohListenDef, DotListenDef,
-        EdnsClientSubnet as DefEdnsClientSubnet, FakeIpFilterMode,
+        DNSListen, DNSMode, DnsPolicyUpstreams, DnsServiceDiscoveryMode,
+        DohListenDef, DotListenDef, EdnsClientSubnet as DefEdnsClientSubnet,
+        FakeIpFilterMode,
     },
 };
 pub use chimera_dns::{DNSListenAddr, DoH3Config, DoHConfig, DoTConfig};
@@ -81,7 +82,7 @@ pub struct Config {
     pub store_fake_ip: bool,
     pub store_smart_stats: bool,
     pub hosts: Option<trie::StringTrie<IpAddr>>,
-    pub nameserver_policy: HashMap<String, NameServer>,
+    pub nameserver_policy: HashMap<String, Vec<NameServer>>,
     pub edns_client_subnet: Option<EdnsClientSubnet>,
     pub fw_mark: Option<u32>,
     pub respect_rules: bool,
@@ -211,7 +212,7 @@ impl Config {
         for (i, server) in servers.iter().enumerate() {
             let mut server = server.clone();
 
-            if server == "system" {
+            if server.eq_ignore_ascii_case("system") {
                 warn!("'system' is not supported as dns nameserver, skipping");
                 continue;
             }
@@ -335,22 +336,29 @@ impl Config {
     }
 
     pub fn parse_nameserver_policy(
-        policy_map: &HashMap<String, String>,
-    ) -> Result<HashMap<String, NameServer>, Error> {
+        policy_map: &HashMap<String, DnsPolicyUpstreams>,
+    ) -> Result<HashMap<String, Vec<NameServer>>, Error> {
         let mut policy = HashMap::new();
 
-        for (selector_group, server) in policy_map {
-            // Comma-separated ordinary domains are expanded below. Each
-            // selector is validated independently; GeoSite/RuleSet remain
-            // unsupported and cannot silently become literal trie entries.
-            let nameservers =
-                Config::parse_nameserver(std::slice::from_ref(server))?;
-
-            let Some(nameserver) = nameservers.first() else {
+        for (selector_group, servers) in policy_map {
+            // Reject skipped entries even when another server is valid. Such
+            // omissions would silently change the selected privacy boundary.
+            if servers.as_servers().is_empty()
+                || servers
+                    .as_servers()
+                    .iter()
+                    .any(|server| server.eq_ignore_ascii_case("system"))
+            {
                 return Err(Error::InvalidConfig(
                     "DNS nameserver-policy has no usable nameserver".to_owned(),
                 ));
-            };
+            }
+            let nameservers = Config::parse_nameserver(servers.as_servers())?;
+            if nameservers.len() != servers.as_servers().len() {
+                return Err(Error::InvalidConfig(
+                    "DNS nameserver-policy has no usable nameserver".to_owned(),
+                ));
+            }
 
             // Mihomo expands comma-delimited domain keys into individual
             // policies. Keep geosite/rule-set unsupported until their
@@ -373,7 +381,7 @@ impl Config {
                     ));
                 }
                 let normalized = Self::normalize_domain_selector(selector)?;
-                if policy.insert(normalized, nameserver.clone()).is_some() {
+                if policy.insert(normalized, nameservers.clone()).is_some() {
                     // The YAML policy map is unordered; conflicting aliases
                     // must fail closed rather than use iteration order.
                     return Err(Error::InvalidConfig(
@@ -1071,7 +1079,7 @@ mod tests {
             "+",
         ] {
             let policy =
-                HashMap::from([(selector.to_owned(), "9.9.9.9".to_owned())]);
+                HashMap::from([(selector.to_owned(), "9.9.9.9".to_owned().into())]);
             let error = Config::parse_nameserver_policy(&policy)
                 .expect_err("ambiguous DNS policy selector must fail closed");
             assert!(
@@ -1081,7 +1089,7 @@ mod tests {
         }
         for selector in ["example.com", "*.example.com", ".example.com"] {
             let policy =
-                HashMap::from([(selector.to_owned(), "9.9.9.9".to_owned())]);
+                HashMap::from([(selector.to_owned(), "9.9.9.9".to_owned().into())]);
             assert!(
                 Config::parse_nameserver_policy(&policy).is_ok(),
                 "valid existing selector {selector:?} must remain accepted"
@@ -1091,15 +1099,20 @@ mod tests {
 
     #[test]
     fn nameserver_policies_normalize_idna_and_reject_canonical_duplicates() {
-        let unicode =
-            HashMap::from([("bücher.example".to_owned(), "9.9.9.9".to_owned())]);
+        let unicode = HashMap::from([(
+            "bücher.example".to_owned(),
+            "9.9.9.9".to_owned().into(),
+        )]);
         let parsed = Config::parse_nameserver_policy(&unicode)
             .expect("Unicode selector should normalize to its DNS wire name");
         assert!(parsed.contains_key("xn--bcher-kva.example"));
 
         let aliases = HashMap::from([
-            ("bücher.example".to_owned(), "9.9.9.9".to_owned()),
-            ("xn--bcher-kva.example".to_owned(), "1.1.1.1".to_owned()),
+            ("bücher.example".to_owned(), "9.9.9.9".to_owned().into()),
+            (
+                "xn--bcher-kva.example".to_owned(),
+                "1.1.1.1".to_owned().into(),
+            ),
         ]);
         assert!(
             Config::parse_nameserver_policy(&aliases)
@@ -1175,7 +1188,7 @@ mod tests {
     #[test]
     fn nameserver_policy_rejects_skipped_system_entry() {
         let policy =
-            HashMap::from([("example.com".to_owned(), "system".to_owned())]);
+            HashMap::from([("example.com".to_owned(), "system".to_owned().into())]);
 
         let error = Config::parse_nameserver_policy(&policy)
             .expect_err("a policy without a usable nameserver must be rejected");
@@ -1192,8 +1205,10 @@ mod tests {
             "geosite:private",
             "rule-set:private",
         ] {
-            let policy =
-                HashMap::from([(selector.to_owned(), "192.0.2.53".to_owned())]);
+            let policy = HashMap::from([(
+                selector.to_owned(),
+                "192.0.2.53".to_owned().into(),
+            )]);
             assert!(
                 Config::parse_nameserver_policy(&policy).is_err(),
                 "unsupported selector {selector:?} must not be silently accepted"
@@ -1201,7 +1216,7 @@ mod tests {
         }
         let combined = HashMap::from([(
             "example.com,other.test".to_owned(),
-            "192.0.2.53".to_owned(),
+            "192.0.2.53".to_owned().into(),
         )]);
         let expanded = Config::parse_nameserver_policy(&combined)
             .expect("Mihomo-compatible comma domain expansion must be supported");
@@ -1210,8 +1225,10 @@ mod tests {
         assert!(expanded.contains_key("other.test"));
 
         for selector in ["example.com", "*.example.com", "+.example.com"] {
-            let policy =
-                HashMap::from([(selector.to_owned(), "192.0.2.53".to_owned())]);
+            let policy = HashMap::from([(
+                selector.to_owned(),
+                "192.0.2.53".to_owned().into(),
+            )]);
             assert!(
                 Config::parse_nameserver_policy(&policy).is_ok(),
                 "existing selector {selector:?} must remain supported"
@@ -1223,7 +1240,7 @@ mod tests {
     fn nameserver_policy_expands_comma_selectors_into_runtime_domains() {
         let policy = HashMap::from([(
             "EXAMPLE.com,*.other.test,+.internal.test".to_owned(),
-            "192.0.2.53".to_owned(),
+            "192.0.2.53".to_owned().into(),
         )]);
         let parsed = Config::parse_nameserver_policy(&policy)
             .expect("comma-delimited domain policy should expand");
@@ -1258,15 +1275,19 @@ mod tests {
             "example.com,example.com",
             "EXAMPLE.COM,example.com",
         ] {
-            let policy = HashMap::from([(key.to_owned(), "192.0.2.53".to_owned())]);
+            let policy =
+                HashMap::from([(key.to_owned(), "192.0.2.53".to_owned().into())]);
             assert!(
                 Config::parse_nameserver_policy(&policy).is_err(),
                 "ambiguous selector {key:?} must fail closed"
             );
         }
         let policy = HashMap::from([
-            ("example.com,other.test".to_owned(), "192.0.2.53".to_owned()),
-            ("OTHER.TEST".to_owned(), "192.0.2.54".to_owned()),
+            (
+                "example.com,other.test".to_owned(),
+                "192.0.2.53".to_owned().into(),
+            ),
+            ("OTHER.TEST".to_owned(), "192.0.2.54".to_owned().into()),
         ]);
         assert!(
             Config::parse_nameserver_policy(&policy).is_err(),

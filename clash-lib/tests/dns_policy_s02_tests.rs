@@ -106,6 +106,27 @@ fn s02_absent_policy_fields_retains_exact_legacy_route_and_business_rules() {
 }
 
 #[test]
+fn s02_second_nameserver_policy_upstream_forced_proxy_blocks_explicit_egress() {
+    let yaml = fixture(
+        "  policy-rules:\n    - match: {domain: example.com}\n      action: {egress: direct}\n",
+    )
+    .replace(
+        r#""+.corp.internal": 192.0.2.53"#,
+        r#""+.corp.internal": [192.0.2.53, 'https://dns.example/dns-query#proxy=DNS-OUT']"#,
+    );
+    let error = match Config::Str(yaml).try_parse() {
+        Ok(_) => panic!(
+            "second policy DNS server forced proxy must block conflicting egress"
+        ),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        error.contains("explicit egress conflicts with DNS server"),
+        "security gate must inspect every nameserver-policy upstream: {error}"
+    );
+}
+
+#[test]
 fn s02_unmatched_policy_rules_retain_nameserver_policy_and_dynamic_fallback() {
     let cfg = config(
         "  resolver-profiles:\n    trusted: {servers: [192.0.2.12]}\n  policy-rules:\n    - match: {domain: other.example, qtype: A}\n      action: {resolver: trusted}\n",

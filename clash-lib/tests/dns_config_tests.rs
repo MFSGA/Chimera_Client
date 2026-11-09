@@ -329,6 +329,67 @@ fn nameserver_policy_compound_selectors_fail_closed_at_yaml_conversion() {
 }
 
 #[test]
+fn nameserver_policy_array_values_keep_all_upstreams_in_order() {
+    let yaml = base_config(
+        "  enable: true
+  enhanced-mode: normal
+  nameserver: [1.1.1.1]
+  default-nameserver: [1.1.1.1]
+  nameserver-policy:
+    'EXAMPLE.COM,other.test': [192.0.2.53, 'tcp://192.0.2.54:5353']
+",
+    );
+    let dns = parse_dns(&yaml);
+    assert_eq!(dns.nameserver_policy.len(), 2);
+    for domain in ["example.com", "other.test"] {
+        let servers = &dns.nameserver_policy[domain];
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0].host.to_string(), "192.0.2.53");
+        assert_eq!(servers[0].port, 53);
+        assert_eq!(servers[1].host.to_string(), "192.0.2.54");
+        assert_eq!(servers[1].port, 5353);
+        assert_eq!(servers[1].net, DNSNetMode::Tcp);
+    }
+}
+
+#[test]
+fn nameserver_policy_array_checks_every_ipv6_upstream() {
+    let yaml = base_config(
+        "  enable: true\n  nameserver: [1.1.1.1]\n  default-nameserver: [1.1.1.1]\n  nameserver-policy:\n    example.com: [192.0.2.53, 'udp://[2001:db8::1]:53']\n",
+    )
+    .replacen("ipv6: true", "ipv6: false", 1);
+    let error = parse_error(yaml).to_string();
+    assert!(
+        error.contains("ipv6 is disabled") && error.contains("DNS nameserver"),
+        "the second selected upstream must not bypass IPv6 policy: {error}"
+    );
+}
+
+#[test]
+fn nameserver_policy_array_must_reject_unusable_entries() {
+    for value in [
+        "[]",
+        "[system]",
+        "[192.0.2.53, system]",
+        "[192.0.2.53, bad://bad]",
+    ] {
+        let yaml = base_config(&format!(
+            "  enable: false
+  nameserver-policy:
+    example.com: {value}
+"
+        ));
+        let error = parse_error(yaml).to_string();
+        assert!(
+            error.contains("nameserver-policy")
+                || error.contains("invalid dns server")
+                || error.contains("unsupported scheme"),
+            "unusable policy upstream {value:?} must fail closed: {error}"
+        );
+    }
+}
+
+#[test]
 fn nameserver_policy_comma_selectors_reach_internal_runtime() {
     let yaml = base_config(
         "  enable: true
@@ -424,7 +485,7 @@ fn policy_selector_diagnostics_reject_without_exposing_private_qname() {
     internal
         .dns
         .nameserver_policy
-        .insert(private_selector.into(), server.clone());
+        .insert(private_selector.into(), vec![server.clone()]);
     let error = match Config::Internal(internal).try_parse() {
         Ok(_) => panic!("unsafe internal selector unexpectedly accepted"),
         Err(error) => error.to_string(),
@@ -772,7 +833,7 @@ fn macos_non_tun_dhcp_nameserver_remains_compatible() {
             "nameserver" => &dns.nameserver[0].net,
             "fallback" => &dns.fallback[0].net,
             "direct-nameserver" => &dns.direct_nameserver.as_ref().unwrap()[0].net,
-            "nameserver-policy" => &dns.nameserver_policy["internal.example"].net,
+            "nameserver-policy" => &dns.nameserver_policy["internal.example"][0].net,
             _ => unreachable!(),
         };
         assert_eq!(*net, DNSNetMode::Dhcp, "legacy {scope} must still parse");

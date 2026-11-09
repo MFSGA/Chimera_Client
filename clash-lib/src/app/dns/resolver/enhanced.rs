@@ -1101,7 +1101,7 @@ impl EnhancedResolver {
                     ));
                 }
                 let clients = make_clients(
-                    vec![ns.to_owned()],
+                    ns.to_owned(),
                     Some(default_resolver.clone()),
                     Some(outbound_resolver.clone()),
                     outbounds.clone(),
@@ -12277,7 +12277,7 @@ mod tests {
         let parsed =
             Config::parse_nameserver_policy(&std::collections::HashMap::from([(
                 "proxy.example.com,other.test".to_owned(),
-                "192.0.2.53".to_owned(),
+                "192.0.2.53".to_owned().into(),
             )]))
             .expect("comma-separated selectors must compile into runtime policy");
         let mut resolver = EnhancedResolver::new_default().await;
@@ -12338,14 +12338,14 @@ mod tests {
         let mut config = make_proxy_nameserver_config();
         config.nameserver_policy.insert(
             "PrOtEcTeD.ExAmPlE".to_owned(),
-            NameServer {
+            vec![NameServer {
                 net: DNSNetMode::Udp,
                 host: url::Host::Ipv4("9.9.9.9".parse().unwrap()),
                 port: 53,
                 interface: None,
                 proxy: None,
                 doh_path: None,
-            },
+            }],
         );
         config.direct_nameserver = Some(vec![NameServer {
             net: DNSNetMode::Udp,
@@ -12407,6 +12407,98 @@ mod tests {
         );
         assert_eq!(protected_hits.load(Ordering::SeqCst), 1);
         assert_eq!(public_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn nameserver_policy_second_upstream_responds_after_first_failure() {
+        let mut resolver = EnhancedResolver::new_default().await;
+        resolver.lru_cache = None;
+        let selected_hits = Arc::new(AtomicUsize::new(0));
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        let mut policy = crate::common::trie::StringTrie::new();
+        policy.insert(
+            "proxy.example.com",
+            Arc::new(vec![
+                Arc::new(FailingClient {
+                    id: "policy-first",
+                    reason: "injected first-policy failure",
+                }) as ThreadSafeDNSClient,
+                Arc::new(CountingClient {
+                    response: response_with_a(Ipv4Addr::new(203, 0, 113, 12)),
+                    hits: selected_hits.clone(),
+                    id: "policy-second",
+                }) as ThreadSafeDNSClient,
+            ]),
+        );
+        resolver.policy = Some(Arc::new(policy));
+        resolver.main = vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(198, 51, 100, 12)),
+            hits: public_hits.clone(),
+            id: "public-main",
+        })];
+
+        for kind in [rr::RecordType::A, rr::RecordType::TXT] {
+            let response = resolver
+                .exchange_no_cache(&test_query_with_type(kind))
+                .await
+                .expect("second selected nameserver must answer");
+            assert_eq!(
+                EnhancedResolver::ip_list_of_message(&response),
+                vec![std::net::IpAddr::V4(Ipv4Addr::new(203, 0, 113, 12))]
+            );
+        }
+        assert_eq!(selected_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            public_hits.load(Ordering::SeqCst),
+            0,
+            "selected nameservers must not leak to public main resolver"
+        );
+    }
+
+    #[tokio::test]
+    async fn nameserver_policy_all_upstreams_failed_never_falls_back_to_main() {
+        let mut resolver = EnhancedResolver::new_default().await;
+        resolver.lru_cache = None;
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        let fallback_hits = Arc::new(AtomicUsize::new(0));
+        let mut policy = crate::common::trie::StringTrie::new();
+        policy.insert(
+            "proxy.example.com",
+            Arc::new(vec![
+                Arc::new(FailingClient {
+                    id: "policy-first",
+                    reason: "injected policy transport failure",
+                }) as ThreadSafeDNSClient,
+                Arc::new(FailingClient {
+                    id: "policy-second",
+                    reason: "injected policy TLS failure",
+                }) as ThreadSafeDNSClient,
+            ]),
+        );
+        resolver.policy = Some(Arc::new(policy));
+        resolver.main = vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(198, 51, 100, 12)),
+            hits: public_hits.clone(),
+            id: "public-main",
+        })];
+        resolver.fallback = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(198, 51, 100, 13)),
+            hits: fallback_hits.clone(),
+            id: "public-fallback",
+        })]);
+
+        for kind in [rr::RecordType::A, rr::RecordType::TXT] {
+            let err = resolver
+                .exchange_no_cache(&test_query_with_type(kind))
+                .await
+                .expect_err("failed selected nameservers must fail closed");
+            let msg = err.to_string();
+            assert!(msg.contains("all 2 DNS upstreams failed"), "{msg}");
+            assert!(msg.contains("injected policy transport failure"), "{msg}");
+            assert!(msg.contains("injected policy TLS failure"), "{msg}");
+        }
+        assert_eq!(public_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -12835,7 +12927,7 @@ mod tests {
             let mut config = make_proxy_nameserver_config();
             config
                 .nameserver_policy
-                .insert(selector.to_owned(), config.nameserver[0].clone());
+                .insert(selector.to_owned(), vec![config.nameserver[0].clone()]);
             let outcome = EnhancedResolver::new(
                 config,
                 store,

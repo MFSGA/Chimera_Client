@@ -174,7 +174,9 @@ fn s00_nameserver_policy_single_string_keeps_original_server() {
         false,
     );
     assert_eq!(dns.nameserver_policy.len(), 1);
-    let server = &dns.nameserver_policy["+.corp.internal"];
+    let servers = &dns.nameserver_policy["+.corp.internal"];
+    assert_eq!(servers.len(), 1);
+    let server = &servers[0];
     assert_eq!(server.net, DNSNetMode::Tcp);
     assert_eq!(server.host.to_string(), "192.0.2.53");
     assert_eq!(server.port, 1053);
@@ -326,17 +328,18 @@ fn s00_business_rule_order_and_no_resolve_options_are_preserved() {
 }
 
 #[test]
-fn s00_old_nameserver_policy_does_not_accept_new_array_syntax() {
-    let result = error(
+fn s00_nameserver_policy_array_preserves_legacy_scalar_and_order() {
+    let dns = load(
         r#"
   enable: true
   nameserver: [1.1.1.1]
   nameserver-policy:
     example.com: [1.1.1.1, 8.8.8.8]
 "#,
+        false,
     );
-    assert!(
-        result.contains("invalid type") || result.contains("expected a string"),
-        "unexpected error for legacy single-string policy: {result}"
-    );
+    let servers = &dns.nameserver_policy["example.com"];
+    assert_eq!(servers.len(), 2);
+    assert_eq!(servers[0].host.to_string(), "1.1.1.1");
+    assert_eq!(servers[1].host.to_string(), "8.8.8.8");
 }
