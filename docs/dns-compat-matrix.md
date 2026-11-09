@@ -122,3 +122,10 @@ S01 准入必须满足：金标准用例在目标 HEAD 实际运行；未知新�
 - 先写 `dns_listener_typo_must_not_silently_disable_listener`：旧行为会接受 `dns.listen.tpc`（否定测试 0/1）；新增合并后 YAML 校验，拒绝 DNS 监听协议和 DoH/DoT/DoH3 的证书、主机名、地址相关拼写错误，同时保持普通 `vendor-extension` 字段兼容。
 - `dns_tls_certificate_typo_must_not_silently_disable_identity` 断言诊断不会打印 `secret.example`。两个定向测试通过；TUN+Ring 无默认 feature 核心库 837 通过/0 失败/11 忽略，DNS 配置 21/21，严格 all-target Clippy、fmt 和 diff 检查通过（Rust 1.99.0，锁定 1.99.1 安装状态待修复）。
 - 固定 `ref-mihomo` gitlink `63bd52ec794b7051569b76ede2f6cdbf4c091fda` 保持只读；未实际运行 Mihomo 二进制、macOS NIC/utun 抓包、远端 CI 或独立 L2 Review。此批仅保存在隔离集成分支，不将测试结果当成主线发布批准。
+
+## 2026-11-09 — 批次 4：DNS/TUN 隐私配置字段拼写失效关闭（L2 待审）
+
+- 基线为已推送的第 3 批 HEAD `24435eacc6d79abc4e794698db270f07785edca4`，上游 `origin/master` 为 `f304da17b7eaf6a187daf03a96bb1e77a26dd049`；固定 `ref-mihomo` gitlink `63bd52ec794b7051569b76ede2f6cdbf4c091fda` 保持只读。
+- 独立移植旧 DNS 隐私分支 `0f3ef23` 中可审查的顶层 DNS/TUN 及 `fallback-filter` 字段诊断，并复用已验证的一编辑/相邻交换拼写比较函数。先写负向测试，旧配置会默默接受 `dns.nameserver-polcy`（0/1）；修复后明确拒绝安全敏感的近似拼写、YAML merge 后的错拼、TUN `strict-route`/`strcit-route`（尚无有效运行语义）、未实现的 `dns.fallback-filter.geosite`，同时保留普通 `vendor-extension` 兼容。
+- 验证：Rust 1.99.0、macOS；无默认 feature + TUN/Ring 核心库 **842 通过 / 0 失败 / 11 忽略**，默认 feature + TUN/Ring 核心库 **1034 通过 / 0 失败 / 11 忽略**；两组 DNS 配置集成各 21/21。严格 all-target Clippy（两组）、Cargo fmt 与 Git diff --check 均通过。
+- 此批次为仅本地签名候选，不包含在第 3 批远端推送的 SHA 内；独立 L2 审查、GitHub required CI、锁定 Rust 1.99.1 修复与复测、Mihomo 二进制互操作及 macOS NIC/utun 抓包仍待完成。未修改 `master`、系统 DNS/TUN/路由或其他工作树的未提交内容。
