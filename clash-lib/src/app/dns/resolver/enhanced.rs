@@ -63,6 +63,11 @@ pub struct EnhancedResolver {
     policy_is_parent_shared: bool,
 
     proxy_resolver: Option<Vec<ThreadSafeDNSClient>>,
+    /// Ordered, per-proxy-host DNS upstream overrides.
+    proxy_server_nameserver_policy:
+        Vec<(Arc<trie::StringTrie<bool>>, Vec<ThreadSafeDNSClient>)>,
+    /// Dedicated node resolver must honor the node policy at transport dial-time.
+    proxy_node_resolver: bool,
     proxy_server_domains: Option<trie::StringTrie<bool>>,
     /// Live provider-host ownership is independent of the startup static
     /// outbound trie; each refreshed provider replaces only its own names.
@@ -244,8 +249,12 @@ impl EnhancedResolver {
         nameserver_policy: Option<Arc<trie::StringTrie<Vec<ThreadSafeDNSClient>>>>,
     ) -> Self {
         let fallback = (!follow_policy).then_some(fallback_clients);
-        let mut resolver =
-            Self::from_clients_with_ipv6_policy(direct_clients, fallback, ipv6, dns_ipv6);
+        let mut resolver = Self::from_clients_with_ipv6_policy(
+            direct_clients,
+            fallback,
+            ipv6,
+            dns_ipv6,
+        );
         if follow_policy {
             resolver.policy = nameserver_policy;
             resolver.policy_is_parent_shared = resolver.policy.is_some();
@@ -293,6 +302,8 @@ impl EnhancedResolver {
             policy: None,
             policy_is_parent_shared: false,
             proxy_resolver: None,
+            proxy_server_nameserver_policy: Vec::new(),
+            proxy_node_resolver: false,
             proxy_server_domains: None,
             provider_proxy_server_domains: RwLock::new(Default::default()),
             direct_resolver: None,
@@ -347,6 +358,8 @@ impl EnhancedResolver {
             policy_is_parent_shared: false,
 
             proxy_resolver: None,
+            proxy_server_nameserver_policy: Vec::new(),
+            proxy_node_resolver: false,
             proxy_server_domains: None,
             provider_proxy_server_domains: RwLock::new(Default::default()),
             direct_resolver: None,
@@ -423,6 +436,8 @@ impl EnhancedResolver {
             policy_is_parent_shared: false,
 
             proxy_resolver: None,
+            proxy_server_nameserver_policy: Vec::new(),
+            proxy_node_resolver: false,
             proxy_server_domains: None,
             provider_proxy_server_domains: RwLock::new(Default::default()),
             direct_resolver: None,
@@ -466,6 +481,44 @@ impl EnhancedResolver {
         } else {
             None
         };
+
+        if !cfg.proxy_server_nameserver_policy.is_empty() && proxy_resolver.is_none()
+        {
+            return Err(Error::InvalidConfig(
+                "dns.proxy-server-nameserver-policy requires non-empty dns.proxy-server-nameserver"
+                    .to_owned(),
+            ));
+        }
+
+        // The node DNS resolver must not use the general nameserver path
+        // when a per-node policy matches. Keep YAML order when compiling
+        // domain matchers so the first applicable policy wins.
+        let mut proxy_server_nameserver_policy = Vec::new();
+        for (domain, servers) in &cfg.proxy_server_nameserver_policy {
+            let clients = make_clients(
+                servers.clone(),
+                Some(default_resolver.clone()),
+                Some(default_resolver.clone()),
+                Arc::new(RwLock::new(std::collections::HashMap::new())),
+                edns_client_subnet.clone(),
+                DnsClientNetworkOptions {
+                    fw_mark: cfg.fw_mark,
+                    network_path_source: network_path_source.clone(),
+                    health: Some(health.clone()),
+                    group: Some("proxy_server"),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            if clients.is_empty() {
+                return Err(Error::InvalidConfig(format!(
+                    "dns.proxy-server-nameserver-policy for {domain} has no usable clients"
+                )));
+            }
+            let mut matcher = trie::StringTrie::new();
+            matcher.insert(&domain.to_ascii_lowercase(), Arc::new(true));
+            proxy_server_nameserver_policy.push((Arc::new(matcher), clients));
+        }
 
         let outbound_resolver: Arc<dyn ClashResolver> = proxy_resolver
             .as_ref()
@@ -567,7 +620,7 @@ impl EnhancedResolver {
             if proxy_resolver.is_some() && !proxy_server_domains.is_empty() {
                 let mut domains = trie::StringTrie::new();
                 for server in proxy_server_domains {
-                    domains.insert(server, Arc::new(true));
+                    domains.insert(&server.to_ascii_lowercase(), Arc::new(true));
                     debug!("added proxy server domain: {}", server);
                 }
                 Some(domains)
@@ -662,7 +715,8 @@ impl EnhancedResolver {
                         } else {
                             Box::new(InMemStore::new(1000))
                         },
-                    })?,
+                    })?
+                    .with_filter_mode(cfg.fake_ip_filter_mode),
                 ))),
                 DNSMode::RedirHost => {
                     warn!(
@@ -678,6 +732,8 @@ impl EnhancedResolver {
                 == crate::config::def::DnsServiceDiscoveryMode::Safe,
 
             proxy_resolver,
+            proxy_server_nameserver_policy,
+            proxy_node_resolver: false,
             proxy_server_domains: proxy_server_domains_trie,
             provider_proxy_server_domains: RwLock::new(Default::default()),
             direct_resolver,
@@ -1099,7 +1155,11 @@ impl EnhancedResolver {
             && let Some(domain) = EnhancedResolver::domain_name_of_message(message)
             && (live_provider_domain
                 || self.proxy_server_domains.as_ref().is_some_and(
-                    |static_domains| static_domains.search(&domain).is_some(),
+                    |static_domains| {
+                        static_domains
+                            .search(&domain.to_ascii_lowercase())
+                            .is_some()
+                    },
                 ))
         {
             *used_dedicated_node_dns = live_provider_domain;
@@ -4081,7 +4141,7 @@ mod tests {
                 id: "policy-dns",
             }) as ThreadSafeDNSClient]),
         );
-        resolver.policy = Some(policy);
+        resolver.policy = Some(Arc::new(policy));
         resolver.main = vec![Arc::new(CountingClient {
             response: response_with_a(Ipv4Addr::new(192, 0, 2, 71)),
             hits: main_hits.clone(),
@@ -4676,7 +4736,7 @@ mod tests {
         .await;
         assert!(
             matches!(result, Err(crate::Error::InvalidConfig(message))
-                if message == "proxy-server-nameserver configured but no usable DNS clients initialized"),
+                if message == "dns.proxy-server-nameserver was explicitly configured but has no usable clients; refusing DNS bootstrap fallback"),
             "empty proxy DNS clients must fail closed with a specific configuration error"
         );
     }

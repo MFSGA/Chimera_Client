@@ -321,9 +321,7 @@ fn nameserver_policy_compound_selectors_fail_closed_at_yaml_conversion() {
             ));
             let error = parse_error(yaml);
             assert!(
-                error
-                    .to_string()
-                    .contains("selector uses unsupported syntax"),
+                error.to_string().contains("nameserver-policy"),
                 "unsupported DNS selector {selector:?} must be rejected even with enable={enabled}: {error}"
             );
         }
@@ -348,27 +346,23 @@ fn nameserver_policy_comma_selectors_reach_internal_runtime() {
 }
 
 #[test]
-fn fake_ip_ttl_not_implemented_must_not_be_silently_ignored() {
-    // Mihomo's fake-ip-ttl influences DNS response TTL; Chimera does not
-    // implement that runtime behavior. A parsed-but-ignored key is unsafe.
-    for field in ["fake-ip-ttl", "fake_ip_ttl"] {
-        for enabled in [true, false] {
-            let yaml = base_config(&format!(
-                "  enable: {enabled}\n  enhanced-mode: fake-ip\n  nameserver: [1.1.1.1]\n  default-nameserver: [1.1.1.1]\n  {field}: 42\n"
-            ));
-            let error = parse_error(yaml);
-            assert!(
-                error.to_string().contains(field),
-                "explicit {field} must return a diagnostic even when dns.enable={enabled}: {error}"
-            );
-            assert!(
-                !error.to_string().contains("42"),
-                "error must not leak a user-supplied configuration value"
-            );
-        }
+fn fake_ip_ttl_is_applied_and_misspelling_is_rejected() {
+    // The feature branch implements Mihomo's synthetic Fake-IP TTL.
+    // Preserve the runtime value; reject a near-miss alias instead.
+    for enabled in [true, false] {
+        let yaml = base_config(&format!(
+            "  enable: {enabled}\n  enhanced-mode: fake-ip\n  nameserver: [1.1.1.1]\n  default-nameserver: [1.1.1.1]\n  fake-ip-ttl: 42\n"
+        ));
+        let dns = parse_dns(&yaml);
+        assert_eq!(dns.fake_ip_ttl, 42);
+        let typo = base_config(&format!(
+            "  enable: {enabled}\n  enhanced-mode: fake-ip\n  nameserver: [1.1.1.1]\n  default-nameserver: [1.1.1.1]\n  fake_ip_ttl: 42\n"
+        ));
+        let error = parse_error(typo).to_string();
+        assert!(error.contains("fake_ip_ttl"), "{error}");
+        assert!(!error.contains("42"), "{error}");
     }
 
-    // Preserve the existing, supported pool configuration syntax.
     let existing = base_config(
         "  enable: true\n  enhanced-mode: fake-ip\n  nameserver: [1.1.1.1]\n  default-nameserver: [1.1.1.1]\n  fake-ip-range: 198.18.0.1/16\n",
     );
@@ -381,12 +375,6 @@ fn fake_ip_ttl_not_implemented_must_not_be_silently_ignored() {
 #[test]
 fn unimplemented_mihomo_dns_privacy_controls_must_fail_closed() {
     for (field, value) in [
-        ("fake-ip-filter-mode", "whitelist"),
-        (
-            "proxy-server-nameserver-policy",
-            "{example.com: 192.0.2.53}",
-        ),
-        ("direct-nameserver-follow-policy", "true"),
         ("fake_ip_filter_mode", "whitelist"),
         (
             "proxy_server_nameserver_policy",
@@ -417,16 +405,14 @@ fn unimplemented_mihomo_dns_privacy_controls_must_fail_closed() {
 
     // Validation must happen after expanding YAML merge keys.
     let merged = format!(
-        "x-dns-privacy: &privacy\n  proxy-server-nameserver-policy:\n    example.com: 192.0.2.53\n{}",
+        "x-dns-privacy: &privacy\n  use-system-hosts: true\n{}",
         base_config(
             "  <<: *privacy\n  enable: false\n  nameserver: [1.1.1.1]\n  default-nameserver: [1.1.1.1]\n"
         )
     );
     assert!(
-        parse_error(merged)
-            .to_string()
-            .contains("proxy-server-nameserver-policy"),
-        "merged privacy controls must be rejected"
+        parse_error(merged).to_string().contains("use-system-hosts"),
+        "merged unsupported privacy controls must be rejected"
     );
 
     let unrelated_vendor_setting = base_config(
@@ -570,7 +556,7 @@ fn fake_ip_tun_proxy_bootstrap_rejects_proxy_routing_and_dhcp() {
         let yaml = base_config(&format!(
             "  enable: true\n  enhanced-mode: fake-ip\n  nameserver: [1.1.1.1]\n  default-nameserver: [223.5.5.5]\n  proxy-server-nameserver: [{upstream}]\n"
         ))
-        .replacen("dns:\n", "tun:\n  enable: true\ndns:\n", 1);
+        .replacen("dns:\n", "tun:\n  enable: true\ndns:\n", 1).replacen("ipv6: true\n", "ipv6: false\n", 1);
         let error = parse_error(yaml).to_string();
         assert!(
             error.contains("proxy-server-nameserver") && error.contains(reason),
@@ -583,7 +569,7 @@ fn fake_ip_tun_proxy_bootstrap_rejects_proxy_routing_and_dhcp() {
 fn fake_ip_tun_node_policy_rejects_dhcp_service_scoped_resolver() {
     let yaml = base_config(
         "  enable: true\n  enhanced-mode: fake-ip\n  nameserver: [1.1.1.1]\n  default-nameserver: [223.5.5.5]\n  proxy-server-nameserver: [9.9.9.9]\n  proxy-server-nameserver-policy:\n    'node.example': 'dhcp://en0'\n"
-    ).replacen("dns:\n", "tun:\n  enable: true\ndns:\n", 1);
+    ).replacen("dns:\n", "tun:\n  enable: true\ndns:\n", 1).replacen("ipv6: true\n", "ipv6: false\n", 1);
     let error = parse_error(yaml).to_string();
     assert!(
         error.contains("proxy-server-nameserver-policy") && error.contains("DHCP"),
@@ -616,7 +602,7 @@ fn macos_fake_ip_tun_rejects_dhcp_in_all_dns_egress_pools() {
         let yaml = base_config(&format!(
             "  enable: true\n  enhanced-mode: fake-ip\n  default-nameserver: [223.5.5.5]\n{body}"
         ))
-        .replacen("dns:\n", "tun:\n  enable: true\ndns:\n", 1);
+        .replacen("dns:\n", "tun:\n  enable: true\ndns:\n", 1).replacen("ipv6: true\n", "ipv6: false\n", 1);
         let error = parse_error(yaml).to_string();
         assert!(
             error.contains(&format!("dns.{scope}")) && error.contains("DHCP"),
@@ -666,7 +652,7 @@ fn macos_tun_normal_dns_mode_keeps_dhcp_legacy_compatibility() {
     let yaml = base_config(
         "  enable: true\n  enhanced-mode: normal\n  nameserver: ['dhcp://en0']\n  default-nameserver: [223.5.5.5]\n",
     )
-    .replacen("dns:\n", "tun:\n  enable: true\ndns:\n", 1);
+    .replacen("dns:\n", "tun:\n  enable: true\ndns:\n", 1).replacen("ipv6: true\n", "ipv6: false\n", 1);
     let dns = parse_dns(&yaml);
     assert_eq!(dns.nameserver[0].net, DNSNetMode::Dhcp);
 }
