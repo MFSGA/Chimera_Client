@@ -253,7 +253,7 @@ windows = { version = "0.62", features = [
 sock2proc = { path = "../vendor/sock2proc" }
 
 [target.'cfg(target_os="linux")'.dependencies]
-rtnetlink = "0.23"
+rtnetlink = "0.24"
 
 [build-dependencies]
 anyhow = "1"
