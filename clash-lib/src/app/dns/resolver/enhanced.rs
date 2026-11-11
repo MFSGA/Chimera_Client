@@ -118,6 +118,92 @@ impl Drop for TransportResetGuard<'_> {
     }
 }
 
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
+struct ProxyPolicySpecificity {
+    labels_from_root: Vec<u8>,
+    explicit_apex: bool,
+}
+
+fn proxy_policy_specificity(
+    selector: &str,
+    domain: &str,
+) -> Option<ProxyPolicySpecificity> {
+    let selector_labels = selector.split('.').collect::<Vec<_>>();
+    let domain_labels = domain.split('.').collect::<Vec<_>>();
+    if selector_labels
+        .first()
+        .is_some_and(|label| *label == "+" || label.is_empty())
+    {
+        let suffix = &selector_labels[1..];
+        if domain_labels.len() < suffix.len() {
+            return None;
+        }
+        let offset = domain_labels.len() - suffix.len();
+        let mut labels_from_root = Vec::with_capacity(domain_labels.len());
+        for (pattern_label, domain_label) in suffix
+            .iter()
+            .rev()
+            .zip(domain_labels[offset..].iter().rev())
+        {
+            let specificity = match *pattern_label {
+                "*" => 1,
+                label if label.eq_ignore_ascii_case(domain_label) => 2,
+                _ => return None,
+            };
+            labels_from_root.push(specificity);
+        }
+        labels_from_root.extend(std::iter::repeat_n(0, offset));
+        return Some(ProxyPolicySpecificity {
+            labels_from_root,
+            // `+.` also matches its bare suffix. A literal selector for the
+            // apex has the same labels and must win that collision.
+            explicit_apex: offset != 0,
+        });
+    }
+
+    if selector_labels.len() != domain_labels.len() {
+        return None;
+    }
+    let mut labels_from_root = Vec::with_capacity(domain_labels.len());
+    for (pattern_label, domain_label) in
+        selector_labels.iter().rev().zip(domain_labels.iter().rev())
+    {
+        let specificity = match *pattern_label {
+            "*" => 1,
+            label if label.eq_ignore_ascii_case(domain_label) => 2,
+            _ => return None,
+        };
+        labels_from_root.push(specificity);
+    }
+    Some(ProxyPolicySpecificity {
+        labels_from_root,
+        explicit_apex: true,
+    })
+}
+
+fn normalize_proxy_server_domain(host: &str) -> Option<String> {
+    let host = host.trim_end_matches('.');
+    if host.is_empty() {
+        return None;
+    }
+    if let Ok(ip) = host.parse::<net::IpAddr>() {
+        return Some(ip.to_string());
+    }
+    crate::app::dns::config::normalize_dns_domain_pattern(host)
+}
+
+fn ordered_nameserver_policy_entries<T>(
+    policies: &std::collections::HashMap<String, T>,
+) -> Vec<(&String, &T)> {
+    let mut entries = policies.iter().collect::<Vec<_>>();
+    // StringTrie expands `+.` into both a bare apex and a suffix wildcard.
+    // Insert that broad alias first so an explicit apex rule always wins.
+    entries.sort_by(|(left, _), (right, _)| {
+        right.starts_with("+.").cmp(&left.starts_with("+."))
+    });
+    entries
+}
+
 pub struct EnhancedResolver {
     ipv6: Arc<AtomicBool>,
     dns_ipv6: bool,
@@ -167,9 +253,13 @@ pub struct EnhancedResolver {
     policy_is_parent_shared: bool,
 
     proxy_resolver: Option<Vec<ThreadSafeDNSClient>>,
-    /// Ordered, per-proxy-host DNS upstream overrides.
-    proxy_server_nameserver_policy:
-        Vec<(Arc<trie::StringTrie<bool>>, Vec<ThreadSafeDNSClient>)>,
+    /// Per-proxy-host DNS upstream overrides. Selector specificity, not YAML
+    /// map order, determines which overlapping policy applies.
+    proxy_server_nameserver_policy: Vec<(
+        String,
+        Arc<trie::StringTrie<bool>>,
+        Vec<ThreadSafeDNSClient>,
+    )>,
     /// Dedicated node resolver must honor the node policy at transport dial-time.
     proxy_node_resolver: bool,
     proxy_server_domains: Option<trie::StringTrie<bool>>,
@@ -735,6 +825,9 @@ impl EnhancedResolver {
         rule_dispatch: Option<Arc<RuleDispatch>>,
         network_path_source: Option<NetworkPathSource>,
     ) -> Result<Self, Error> {
+        crate::app::dns::config::validate_fake_ip_filter_patterns(
+            &cfg.fake_ip_filter,
+        )?;
         let global_ipv6 = cfg.global_ipv6;
         let dns_ipv6 = cfg.dns_ipv6;
         let ipv6_policy = Arc::new(AtomicBool::new(global_ipv6));
@@ -849,9 +942,10 @@ impl EnhancedResolver {
         }
 
         // The node DNS resolver must not use the general nameserver path
-        // when a per-node policy matches. Keep YAML order when compiling
-        // domain matchers so the first applicable policy wins.
+        // when a per-node policy matches. Retain selector text so the most
+        // specific matching policy wins independently of YAML/map order.
         let mut proxy_server_nameserver_policy = Vec::new();
+        let mut seen_proxy_policy_domains = std::collections::HashSet::new();
         for (domain, servers) in &cfg.proxy_server_nameserver_policy {
             // Internal callers can bypass YAML decoding/validation. A
             // selector that cannot match is a privacy-sensitive error: do
@@ -862,14 +956,31 @@ impl EnhancedResolver {
                 || lower.starts_with("rule-set:")
                 || !crate::app::dns::config::valid_nameserver_policy_domain(domain)
             {
-                return Err(Error::InvalidConfig(format!(
-                    "dns.proxy-server-nameserver-policy invalid domain selector: {domain}"
-                )));
+                return Err(Error::InvalidConfig(
+                    "dns.proxy-server-nameserver-policy contains an unsupported domain selector"
+                        .to_owned(),
+                ));
+            }
+            let normalized = crate::app::dns::config::normalize_dns_domain_pattern(
+                domain,
+            )
+            .ok_or_else(|| {
+                Error::InvalidConfig(
+                    "dns.proxy-server-nameserver-policy contains an invalid domain selector"
+                        .to_owned(),
+                )
+            })?;
+            if !seen_proxy_policy_domains.insert(normalized.clone()) {
+                return Err(Error::InvalidConfig(
+                    "dns.proxy-server-nameserver-policy contains duplicate normalized selectors"
+                        .to_owned(),
+                ));
             }
             if servers.iter().any(|server| server.proxy.is_some()) {
-                return Err(Error::InvalidConfig(format!(
-                    "dns.proxy-server-nameserver-policy for {domain} cannot use #proxy: recursive bootstrap dialer is unsupported"
-                )));
+                return Err(Error::InvalidConfig(
+                    "dns.proxy-server-nameserver-policy cannot use #proxy: recursive bootstrap dialer is unsupported"
+                        .to_owned(),
+                ));
             }
             let clients = make_clients(
                 servers.clone(),
@@ -887,17 +998,23 @@ impl EnhancedResolver {
             )
             .await?;
             if clients.is_empty() {
-                return Err(Error::InvalidConfig(format!(
-                    "dns.proxy-server-nameserver-policy for {domain} has no usable clients"
-                )));
+                return Err(Error::InvalidConfig(
+                    "dns.proxy-server-nameserver-policy has no usable clients"
+                        .to_owned(),
+                ));
             }
             let mut matcher = trie::StringTrie::new();
-            if !matcher.insert(&lower, Arc::new(true)) {
-                return Err(Error::InvalidConfig(format!(
-                    "dns.proxy-server-nameserver-policy unmatchable domain selector: {domain}"
-                )));
+            if !matcher.insert(&normalized, Arc::new(true)) {
+                return Err(Error::InvalidConfig(
+                    "dns.proxy-server-nameserver-policy contains an unmatchable domain selector"
+                        .to_owned(),
+                ));
             }
-            proxy_server_nameserver_policy.push((Arc::new(matcher), clients));
+            proxy_server_nameserver_policy.push((
+                normalized,
+                Arc::new(matcher),
+                clients,
+            ));
         }
 
         let outbound_resolver: Arc<dyn ClashResolver> = proxy_resolver
@@ -934,7 +1051,10 @@ impl EnhancedResolver {
 
         let policy = if !cfg.nameserver_policy.is_empty() {
             let mut p = trie::StringTrie::new();
-            for (domain, ns) in &cfg.nameserver_policy {
+            let mut seen = std::collections::HashSet::new();
+            for (domain, ns) in
+                ordered_nameserver_policy_entries(&cfg.nameserver_policy)
+            {
                 // Internal reload/config constructors need the same privacy
                 // validation as YAML conversion. Invalid entries must not
                 // silently miss the trie and send QNAMEs to main DNS.
@@ -946,9 +1066,26 @@ impl EnhancedResolver {
                         domain,
                     )
                 {
-                    return Err(Error::InvalidConfig(format!(
-                        "dns.nameserver-policy invalid domain selector: {domain}"
-                    )));
+                    return Err(Error::InvalidConfig(
+                        "dns.nameserver-policy contains an unsupported domain selector"
+                            .to_owned(),
+                    ));
+                }
+                let normalized =
+                    crate::app::dns::config::normalize_dns_domain_pattern(
+                        domain,
+                    )
+                    .ok_or_else(|| {
+                        Error::InvalidConfig(
+                            "dns.nameserver-policy contains an invalid domain selector"
+                                .to_owned(),
+                        )
+                    })?;
+                if !seen.insert(normalized.clone()) {
+                    return Err(Error::InvalidConfig(
+                        "dns.nameserver-policy contains duplicate normalized selectors"
+                            .to_owned(),
+                    ));
                 }
                 let clients = make_clients(
                     vec![ns.to_owned()],
@@ -965,10 +1102,11 @@ impl EnhancedResolver {
                     },
                 )
                 .await?;
-                if clients.is_empty() || !p.insert(&lower, Arc::new(clients)) {
-                    return Err(Error::InvalidConfig(format!(
-                        "dns.nameserver-policy has no usable clients or unmatchable selector: {domain}"
-                    )));
+                if clients.is_empty() || !p.insert(&normalized, Arc::new(clients)) {
+                    return Err(Error::InvalidConfig(
+                        "dns.nameserver-policy has no usable clients or an unmatchable selector"
+                            .to_owned(),
+                    ));
                 }
             }
             Some(Arc::new(p))
@@ -1022,7 +1160,19 @@ impl EnhancedResolver {
             if proxy_resolver.is_some() && !proxy_server_domains.is_empty() {
                 let mut domains = trie::StringTrie::new();
                 for server in proxy_server_domains {
-                    domains.insert(&server.to_ascii_lowercase(), Arc::new(true));
+                    let normalized = normalize_proxy_server_domain(server)
+                        .ok_or_else(|| {
+                            Error::InvalidConfig(
+                                "proxy server has an invalid DNS endpoint hostname"
+                                    .to_owned(),
+                            )
+                        })?;
+                    if !domains.insert(&normalized, Arc::new(true)) {
+                        return Err(Error::InvalidConfig(
+                            "proxy server has an unmatchable DNS endpoint hostname"
+                                .to_owned(),
+                        ));
+                    }
                     debug!("added proxy server domain: {}", server);
                 }
                 Some(domains)
@@ -1112,7 +1262,18 @@ impl EnhancedResolver {
                         skipped_hostnames: if !cfg.fake_ip_filter.is_empty() {
                             let mut host = trie::StringTrie::new();
                             for domain in cfg.fake_ip_filter.iter() {
-                                host.insert(domain.as_str(), Arc::new(true));
+                                let normalized = crate::app::dns::config::normalize_dns_domain_pattern(domain).ok_or_else(|| {
+                                    Error::InvalidConfig(
+                                        "dns.fake-ip-filter contains an invalid domain pattern"
+                                            .to_owned(),
+                                    )
+                                })?;
+                                if !host.insert(&normalized, Arc::new(true)) {
+                                    return Err(Error::InvalidConfig(
+                                        "dns.fake-ip-filter contains an unmatchable domain pattern"
+                                            .to_owned(),
+                                    ));
+                                }
                             }
                             Some(host)
                         } else {
@@ -1520,6 +1681,22 @@ impl EnhancedResolver {
         let result = self.exchange_inner(message).await;
         self.ensure_transport_dispatch_ready()?;
         result
+    }
+
+    fn proxy_server_nameserver_policy_for(
+        &self,
+        domain: &str,
+    ) -> Option<&Vec<ThreadSafeDNSClient>> {
+        let domain = crate::app::dns::config::normalize_dns_domain_pattern(domain)?;
+        self.proxy_server_nameserver_policy
+            .iter()
+            .filter_map(|(selector, matcher, clients)| {
+                matcher.search(&domain)?;
+                proxy_policy_specificity(selector, &domain)
+                    .map(|specificity| (specificity, clients))
+            })
+            .max_by(|(left, _), (right, _)| left.cmp(right))
+            .map(|(_, clients)| clients)
     }
 
     #[instrument(skip_all, level = "trace")]
@@ -1953,13 +2130,7 @@ impl EnhancedResolver {
             // bootstrap DNS for TXT/SRV and other non-address questions.
             // Never let a static endpoint's QNAME escape to generic DNS.
             used_dedicated_node_dns = true;
-            if let Some((_, clients)) = self
-                .proxy_server_nameserver_policy
-                .iter()
-                .find(|(matcher, _)| {
-                    matcher.search(&domain.to_ascii_lowercase()).is_some()
-                })
-            {
+            if let Some(clients) = self.proxy_server_nameserver_policy_for(&domain) {
                 self.batch_exchange_if_transport_usable(clients, message)
                     .await
             } else {
@@ -1973,12 +2144,8 @@ impl EnhancedResolver {
             // Non-address bootstrap questions must honor the same dedicated
             // node policy as A/AAAA. Never route them via generic DNS policy.
             if let Some(domain) = EnhancedResolver::domain_name_of_message(message) {
-                if let Some((_, clients)) = self
-                    .proxy_server_nameserver_policy
-                    .iter()
-                    .find(|(matcher, _)| {
-                        matcher.search(&domain.to_ascii_lowercase()).is_some()
-                    })
+                if let Some(clients) =
+                    self.proxy_server_nameserver_policy_for(&domain)
                 {
                     self.batch_exchange_if_transport_usable(clients, message)
                         .await
@@ -2282,14 +2449,13 @@ impl EnhancedResolver {
         if self.proxy_node_resolver {
             // This resolver is the transport's dedicated proxy node DNS
             // bootstrap context. It must not go through generic main DNS.
-            if let Some(domain) = EnhancedResolver::domain_name_of_message(message) {
-                for (matcher, clients) in &self.proxy_server_nameserver_policy {
-                    if matcher.search(&domain.to_ascii_lowercase()).is_some() {
-                        return self
-                            .batch_exchange_if_transport_usable(clients, message)
-                            .await;
-                    }
-                }
+            if let Some(domain) = EnhancedResolver::domain_name_of_message(message)
+                && let Some(clients) =
+                    self.proxy_server_nameserver_policy_for(&domain)
+            {
+                return self
+                    .batch_exchange_if_transport_usable(clients, message)
+                    .await;
             }
             return self
                 .batch_exchange_if_transport_usable(&self.main, message)
@@ -2329,16 +2495,14 @@ impl EnhancedResolver {
                 "using proxy-server-nameserver for proxy server domain: {}",
                 domain
             );
-            for (matcher, clients) in &self.proxy_server_nameserver_policy {
-                if matcher.search(&domain.to_ascii_lowercase()).is_some() {
-                    debug!(
-                        "using proxy-server-nameserver-policy for proxy domain: {}",
-                        domain
-                    );
-                    return self
-                        .batch_exchange_if_transport_usable(clients, message)
-                        .await;
-                }
+            if let Some(clients) = self.proxy_server_nameserver_policy_for(&domain) {
+                debug!(
+                    "using proxy-server-nameserver-policy for proxy domain: {}",
+                    domain
+                );
+                return self
+                    .batch_exchange_if_transport_usable(clients, message)
+                    .await;
             }
             return self
                 .batch_exchange_if_transport_usable(proxy_resolver, message)
@@ -2850,7 +3014,7 @@ impl ClashResolver for EnhancedResolver {
         if let Some(proxy_resolver) = &self.proxy_resolver {
             clients.extend(proxy_resolver.iter().cloned());
         }
-        for (_, policy_clients) in &self.proxy_server_nameserver_policy {
+        for (_, _, policy_clients) in &self.proxy_server_nameserver_policy {
             clients.extend(policy_clients.iter().cloned());
         }
         if !self.policy_is_parent_shared
@@ -3075,6 +3239,41 @@ mod tests {
         },
         proxy,
     };
+
+    #[test]
+    fn ordinary_nameserver_policy_exact_apex_beats_plus_suffix_alias() {
+        for policies in [
+            std::collections::HashMap::from([
+                ("+.example.com".to_owned(), "suffix"),
+                ("example.com".to_owned(), "exact"),
+            ]),
+            std::collections::HashMap::from([
+                ("example.com".to_owned(), "exact"),
+                ("+.example.com".to_owned(), "suffix"),
+            ]),
+        ] {
+            let mut matcher = crate::common::trie::StringTrie::new();
+            for (selector, destination) in
+                super::ordered_nameserver_policy_entries(&policies)
+            {
+                assert!(matcher.insert(selector, Arc::new(*destination)));
+            }
+
+            assert_eq!(
+                matcher
+                    .search("example.com")
+                    .and_then(|node| node.get_data()),
+                Some(&"exact"),
+                "an exact apex policy must override `+.` regardless of HashMap order"
+            );
+            assert_eq!(
+                matcher
+                    .search("node.example.com")
+                    .and_then(|node| node.get_data()),
+                Some(&"suffix")
+            );
+        }
+    }
 
     #[test]
     fn nested_resolvers_follow_global_ipv6_toggle() {
@@ -5567,9 +5766,11 @@ mod tests {
         resolver.policy = Some(Arc::new(policy));
         let mut proxy_selector = crate::common::trie::StringTrie::new();
         proxy_selector.insert("proxy.example", Arc::new(true));
-        resolver
-            .proxy_server_nameserver_policy
-            .push((Arc::new(proxy_selector), vec![client()]));
+        resolver.proxy_server_nameserver_policy.push((
+            "proxy.example".to_owned(),
+            Arc::new(proxy_selector),
+            vec![client()],
+        ));
 
         assert_eq!(resolver.reset_transports().await.unwrap(), 6);
         assert_eq!(resets.load(Ordering::SeqCst), 6);
@@ -7321,6 +7522,7 @@ mod tests {
         let mut matcher = crate::common::trie::StringTrie::new();
         matcher.insert("proxy.example.com", Arc::new(true));
         resolver.proxy_server_nameserver_policy.push((
+            "proxy.example.com".to_owned(),
             Arc::new(matcher),
             vec![Arc::new(FailingClient {
                 id: "node-policy",
@@ -10686,6 +10888,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn static_proxy_node_dns_normalizes_idna_and_absolute_hostname() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::app::profile::ThreadSafeCacheFile::new(
+            temp.path().join("cache.db").to_str().unwrap(),
+            false,
+        );
+        let mut config = make_proxy_nameserver_config();
+        config.proxy_server_nameserver_policy.push((
+            "BÜCHER.example".to_owned(),
+            vec![NameServer {
+                net: DNSNetMode::Udp,
+                host: url::Host::Ipv4("9.9.9.9".parse().unwrap()),
+                port: 53,
+                interface: None,
+                proxy: None,
+                doh_path: None,
+            }],
+        ));
+        let mut resolver = EnhancedResolver::new(
+            config,
+            store,
+            None,
+            make_outbound_registry(&[("unicode-node", "bücher.example.")]),
+            None,
+        )
+        .await
+        .expect("IDNA static node should compile into an ASCII DNS matcher");
+        resolver.lru_cache = None;
+        let node_hits = Arc::new(AtomicUsize::new(0));
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        let policy_hits = Arc::new(AtomicUsize::new(0));
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: node_hits.clone(),
+            id: "node-dns",
+        })]);
+        resolver.main = vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+            hits: main_hits.clone(),
+            id: "main-dns",
+        })];
+        resolver.proxy_server_nameserver_policy[0].2 =
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 12)),
+                hits: policy_hits.clone(),
+                id: "idna-policy-dns",
+            })];
+
+        for record_type in [rr::RecordType::A, rr::RecordType::TXT] {
+            let mut query = test_query_with_type(record_type);
+            query.queries[0]
+                .set_name(rr::Name::from_utf8("xn--bcher-kva.example.").unwrap());
+            resolver
+                .exchange_no_cache(&query)
+                .await
+                .expect("static node query should use dedicated DNS");
+        }
+
+        assert_eq!(policy_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(node_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(main_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn static_proxy_server_non_address_query_uses_dedicated_node_dns() {
         let mut resolver = EnhancedResolver::new_default().await;
         resolver.lru_cache = None;
@@ -10798,6 +11064,7 @@ mod tests {
         static_domains.insert("proxy.example.com", Arc::new(true));
         resolver.proxy_server_domains = Some(static_domains);
         resolver.proxy_server_nameserver_policy.push((
+            "proxy.example.com".to_owned(),
             Arc::new(selector),
             vec![Arc::new(FailingClient {
                 id: "node-policy",
@@ -10995,6 +11262,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proxy_server_policy_specificity_is_independent_of_insertion_order() {
+        for broad_first in [true, false] {
+            let broad_hits = Arc::new(AtomicUsize::new(0));
+            let exact_hits = Arc::new(AtomicUsize::new(0));
+            let default_hits = Arc::new(AtomicUsize::new(0));
+            let public_hits = Arc::new(AtomicUsize::new(0));
+            let mut resolver = EnhancedResolver::from_clients(
+                vec![Arc::new(CountingClient {
+                    response: response_with_a(Ipv4Addr::new(192, 0, 2, 90)),
+                    hits: public_hits.clone(),
+                    id: "public-main",
+                })],
+                false,
+            );
+            resolver.lru_cache = None;
+            resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 91)),
+                hits: default_hits.clone(),
+                id: "proxy-node-default",
+            })]);
+            let mut proxy_domains = crate::common::trie::StringTrie::new();
+            proxy_domains.insert("node.example.com", Arc::new(true));
+            resolver.proxy_server_domains = Some(proxy_domains);
+
+            let mut broad_matcher = crate::common::trie::StringTrie::new();
+            broad_matcher.insert("+.example.com", Arc::new(true));
+            let mut exact_matcher = crate::common::trie::StringTrie::new();
+            exact_matcher.insert("node.example.com", Arc::new(true));
+            let broad_policy = (
+                "+.example.com".to_owned(),
+                Arc::new(broad_matcher),
+                vec![Arc::new(CountingClient {
+                    response: response_with_a(Ipv4Addr::new(192, 0, 2, 92)),
+                    hits: broad_hits.clone(),
+                    id: "broad-node-policy",
+                }) as ThreadSafeDNSClient],
+            );
+            let exact_policy = (
+                "node.example.com".to_owned(),
+                Arc::new(exact_matcher),
+                vec![Arc::new(CountingClient {
+                    response: response_with_a(Ipv4Addr::new(192, 0, 2, 93)),
+                    hits: exact_hits.clone(),
+                    id: "exact-node-policy",
+                }) as ThreadSafeDNSClient],
+            );
+            resolver.proxy_server_nameserver_policy = if broad_first {
+                vec![broad_policy, exact_policy]
+            } else {
+                vec![exact_policy, broad_policy]
+            };
+
+            for record_type in [rr::RecordType::A, rr::RecordType::TXT] {
+                let mut query = test_query_with_type(record_type);
+                query.queries[0]
+                    .set_name(rr::Name::from_utf8("node.example.com").unwrap());
+                resolver
+                    .exchange_no_cache(&query)
+                    .await
+                    .expect("exact node-specific DNS policy must answer");
+            }
+
+            assert_eq!(exact_hits.load(Ordering::SeqCst), 2);
+            assert_eq!(broad_hits.load(Ordering::SeqCst), 0);
+            assert_eq!(default_hits.load(Ordering::SeqCst), 0);
+            assert_eq!(public_hits.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
     async fn proxy_server_policy_uses_specific_upstream_and_dedicated_default() {
         let mut resolver = EnhancedResolver::from_clients(vec![], false);
         let specific_hits = Arc::new(AtomicUsize::new(0));
@@ -11014,6 +11351,7 @@ mod tests {
         let mut specific = crate::common::trie::StringTrie::new();
         specific.insert("proxy.example.com", Arc::new(true));
         resolver.proxy_server_nameserver_policy.push((
+            "proxy.example.com".to_owned(),
             Arc::new(specific),
             vec![Arc::new(CountingClient {
                 response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
@@ -11095,6 +11433,7 @@ mod tests {
         let mut matcher = crate::common::trie::StringTrie::new();
         matcher.insert("proxy.example.com", Arc::new(true));
         resolver.proxy_server_nameserver_policy.push((
+            "proxy.example.com".to_owned(),
             Arc::new(matcher),
             vec![Arc::new(CountingClient {
                 response: response_with_a(Ipv4Addr::new(192, 0, 2, 22)),
@@ -11148,6 +11487,7 @@ mod tests {
         let mut matcher = crate::common::trie::StringTrie::new();
         matcher.insert("proxy.example.com", Arc::new(true));
         resolver.proxy_server_nameserver_policy.push((
+            "proxy.example.com".to_owned(),
             Arc::new(matcher),
             vec![Arc::new(CountingClient {
                 response: response_with_a(Ipv4Addr::new(192, 0, 2, 32)),
@@ -11210,6 +11550,7 @@ mod tests {
         let mut matcher = crate::common::trie::StringTrie::new();
         matcher.insert("proxy.example.com", Arc::new(true));
         resolver.proxy_server_nameserver_policy.push((
+            "proxy.example.com".to_owned(),
             Arc::new(matcher),
             vec![Arc::new(CountingClient {
                 response: response_with_a(Ipv4Addr::new(192, 0, 2, 32)),
@@ -11254,6 +11595,7 @@ mod tests {
         let mut matcher = crate::common::trie::StringTrie::new();
         matcher.insert("node.example.com", Arc::new(true));
         node_resolver.proxy_server_nameserver_policy.push((
+            "node.example.com".to_owned(),
             Arc::new(matcher),
             vec![Arc::new(CountingClient {
                 response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
@@ -11308,6 +11650,7 @@ mod tests {
         let mut policy = crate::common::trie::StringTrie::new();
         policy.insert("node.example.com", Arc::new(true));
         resolver.proxy_server_nameserver_policy.push((
+            "node.example.com".to_owned(),
             Arc::new(policy),
             vec![Arc::new(CountingClient {
                 response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
@@ -11353,6 +11696,7 @@ mod tests {
         let mut matcher = crate::common::trie::StringTrie::new();
         matcher.insert("node.example.com", Arc::new(true));
         resolver.proxy_server_nameserver_policy.push((
+            "node.example.com".to_owned(),
             Arc::new(matcher),
             vec![Arc::new(FailingClient {
                 id: "node-policy",
@@ -11388,6 +11732,7 @@ mod tests {
         let mut matcher = crate::common::trie::StringTrie::new();
         matcher.insert("node.example.com", Arc::new(true));
         resolver.proxy_server_nameserver_policy.push((
+            "node.example.com".to_owned(),
             Arc::new(matcher),
             vec![Arc::new(CountingClient {
                 response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
@@ -11492,6 +11837,7 @@ mod tests {
         let mut matcher = crate::common::trie::StringTrie::new();
         matcher.insert("protected-node.example.com", Arc::new(true));
         resolver.proxy_server_nameserver_policy.push((
+            "protected-node.example.com".to_owned(),
             Arc::new(matcher),
             vec![Arc::new(CountingClient {
                 response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
@@ -11556,6 +11902,7 @@ mod tests {
         let mut selector = crate::common::trie::StringTrie::new();
         selector.insert("proxy.example.com", Arc::new(true));
         resolver.proxy_server_nameserver_policy.push((
+            "proxy.example.com".to_owned(),
             Arc::new(selector),
             vec![Arc::new(FailingClient {
                 id: "proxy-policy",
@@ -11577,7 +11924,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proxy_server_policy_respects_first_matching_rule_order() {
+    async fn proxy_server_policy_prefers_specific_rule_over_wildcard() {
         let mut resolver = EnhancedResolver::from_clients(vec![], false);
         let first_hits = Arc::new(AtomicUsize::new(0));
         let second_hits = Arc::new(AtomicUsize::new(0));
@@ -11596,6 +11943,7 @@ mod tests {
             let mut selector = crate::common::trie::StringTrie::new();
             selector.insert(pattern, Arc::new(true));
             resolver.proxy_server_nameserver_policy.push((
+                pattern.to_owned(),
                 Arc::new(selector),
                 vec![Arc::new(CountingClient {
                     response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
@@ -11607,9 +11955,11 @@ mod tests {
         resolver
             .ip_exchange(&test_query_with_type(rr::RecordType::A))
             .await
-            .expect("first matching policy wins");
-        assert_eq!(first_hits.load(Ordering::SeqCst), 1);
-        assert_eq!(second_hits.load(Ordering::SeqCst), 0);
+            .expect(
+                "exact policy must win over wildcard regardless of insertion order",
+            );
+        assert_eq!(first_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(second_hits.load(Ordering::SeqCst), 1);
     }
 
     #[derive(Debug)]
@@ -12359,7 +12709,7 @@ mod tests {
         assert_eq!(resolver.proxy_server_nameserver_policy.len(), 1);
         assert!(
             resolver.proxy_server_nameserver_policy[0]
-                .0
+                .1
                 .search("proxy.example.com")
                 .is_some()
         );

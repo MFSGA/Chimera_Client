@@ -308,6 +308,21 @@ proxies:
         address: private-secondary.example
         port: 443
 "#;
+    const UNSAFE_XHTTP_UPLOAD: &[u8] = br#"
+proxies:
+  - name: leaking-xhttp-upload
+    type: vless
+    server: 192.0.2.10
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    network: xhttp
+    alpn: [http/1.1]
+    xhttp-opts:
+      mode: auto
+      upload-settings:
+        address: private-upload.example
+        port: 443
+"#;
     const SAFE_XHTTP_DOWNLINK: &[u8] = br#"
 proxies:
   - name: safe-xhttp
@@ -705,6 +720,36 @@ proxies:
             "{diagnostic}"
         );
         assert!(!diagnostic.contains("private-secondary.example"));
+
+        let after = provider.strict_content_snapshot().await.unwrap();
+        assert_eq!(before.revision, after.revision);
+        assert!(Arc::ptr_eq(&before.proxies[0], &after.proxies[0]));
+        assert_eq!(after.proxies[0].name(), "last-good");
+        assert_eq!(std::fs::read(&path).unwrap(), VALID);
+    }
+
+    #[tokio::test]
+    async fn protected_provider_rejects_xhttp_upload_dns_leak_without_replacing_last_good()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("protected-upload-provider.yaml");
+        let provider = provider_with_refresh_dns_mode(
+            path.to_string_lossy().into_owned(),
+            UNSAFE_XHTTP_UPLOAD,
+            true,
+        );
+        provider.initialize().await.expect("safe initial provider");
+        let before = provider.strict_content_snapshot().await.unwrap();
+        let error = provider
+            .update()
+            .await
+            .expect_err("unsafe XHTTP upload hostname must not enter provider");
+        let diagnostic = error.to_string();
+        assert!(
+            diagnostic.contains("xhttp") && diagnostic.contains("upload-settings"),
+            "{diagnostic}"
+        );
+        assert!(!diagnostic.contains("private-upload.example"));
 
         let after = provider.strict_content_snapshot().await.unwrap();
         assert_eq!(before.revision, after.revision);

@@ -490,6 +490,35 @@ profile: {{}}
                 "{err}"
             );
         }
+
+        let mut cfg = parse_config(
+            r#"
+tun:
+  enable: true
+proxies:
+  - name: XHTTP
+    type: vless
+    server: 192.0.2.10
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    network: xhttp
+    alpn: [http/1.1]
+    xhttp-opts:
+      mode: auto
+      upload-settings:
+        address: private-upload.example
+        port: 443
+"#,
+        );
+        cfg.dns.enable = true;
+        cfg.dns.nameserver = vec!["1.1.1.1".to_owned()];
+        cfg.dns.enhanced_mode = def::DNSMode::FakeIp;
+        let error = match convert(cfg) {
+            Ok(_) => panic!("XHTTP upload reconnect must not use OS DNS"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("xhttp upload-settings"), "{error}");
+        assert!(!error.contains("private-upload.example"), "{error}");
     }
 
     #[cfg(feature = "tun")]
@@ -588,26 +617,67 @@ proxies:
         assert!(!error.contains("hidden.example"), "{error}");
     }
 
+    #[cfg(feature = "tun")]
     #[test]
-    fn internal_dns_config_cannot_bypass_unsupported_mihomo_filter_gate() {
-        let mut cfg = parse_config("");
+    fn xhttp_upload_hostname_cannot_bypass_dns_safety_gate_after_reload() {
+        let mut cfg = parse_config(
+            r#"
+proxies:
+  - name: XHTTP
+    type: vless
+    server: 192.0.2.10
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    network: xhttp
+    alpn: [http/1.1]
+    xhttp-opts:
+      mode: auto
+      upload-settings:
+        address: hidden-upload.example
+        port: 443
+"#,
+        );
         cfg.dns.enable = true;
         cfg.dns.nameserver = vec!["1.1.1.1".to_owned()];
         cfg.dns.enhanced_mode = def::DNSMode::FakeIp;
         let mut internal =
-            convert(cfg).expect("build a valid internal Fake-IP config");
-        internal.dns.fake_ip_filter = vec!["geosite:proxy".to_owned()];
-        let err = match crate::Config::Internal(internal).try_parse() {
-            Ok(_) => {
-                panic!("internal config must reject unsupported filter expression")
-            }
-            Err(err) => err,
+            convert(cfg).expect("non-TUN keeps the existing XHTTP behavior");
+        internal.tun.enable = true;
+        let error = match crate::Config::Internal(internal).try_parse() {
+            Ok(_) => panic!("reload must reject upload endpoint system DNS"),
+            Err(error) => error.to_string(),
         };
-        assert!(
-            matches!(err, Error::InvalidConfig(msg) if msg.contains("dns.fake-ip-filter")
-                && msg.contains("unsupported") && !msg.contains("geosite:proxy")),
-            "unsupported internal filter must fail without disclosing the selector"
-        );
+        assert!(error.contains("xhttp upload-settings"), "{error}");
+        assert!(!error.contains("hidden-upload.example"), "{error}");
+    }
+
+    #[test]
+    fn internal_dns_config_cannot_bypass_unsupported_mihomo_filter_gate() {
+        for selector in [
+            "geosite:private.example",
+            "part*.private.example",
+            " private.example",
+            "private..example",
+        ] {
+            let mut cfg = parse_config("");
+            cfg.dns.enable = true;
+            cfg.dns.nameserver = vec!["1.1.1.1".to_owned()];
+            cfg.dns.enhanced_mode = def::DNSMode::FakeIp;
+            let mut internal =
+                convert(cfg).expect("build a valid internal Fake-IP config");
+            internal.dns.fake_ip_filter = vec![selector.to_owned()];
+            let err = match crate::Config::Internal(internal).try_parse() {
+                Ok(_) => panic!(
+                    "internal config must reject unsafe filter selector {selector:?}"
+                ),
+                Err(err) => err,
+            };
+            assert!(
+                matches!(err, Error::InvalidConfig(ref msg) if msg.contains("dns.fake-ip-filter")
+                    && !msg.contains(selector)),
+                "internal filter must fail without disclosing its selector: {err}"
+            );
+        }
     }
 
     #[test]

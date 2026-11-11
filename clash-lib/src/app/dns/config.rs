@@ -12,7 +12,7 @@ pub use chimera_dns::{DNSListenAddr, DoH3Config, DoHConfig, DoTConfig};
 use ipnet::{AddrParseError, Ipv4Net, Ipv6Net};
 use percent_encoding::percent_decode_str;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::Display,
     net::{IpAddr, SocketAddr},
     sync::Arc,
@@ -106,6 +106,34 @@ pub(crate) fn valid_nameserver_policy_domain(domain: &str) -> bool {
             && (!part.contains('+')
                 || (index == 0 && *part == "+" && parts.len() > 1))
     })
+}
+
+/// Normalize an accepted DNS selector to the ASCII wire representation used
+/// by Hickory query names. Wildcard labels remain syntax markers; ordinary
+/// labels pass through Hickory's IDNA conversion one label at a time.
+pub(crate) fn normalize_dns_domain_pattern(domain: &str) -> Option<String> {
+    if !valid_nameserver_policy_domain(domain) {
+        return None;
+    }
+
+    domain
+        .split('.')
+        .enumerate()
+        .map(|(index, label)| match label {
+            "*" | "+" => Some(label.to_owned()),
+            "" if index == 0 => Some(String::new()),
+            _ => {
+                let ascii =
+                    hickory_proto::rr::Name::from_utf8(label).ok()?.to_ascii();
+                let ascii = ascii.trim_end_matches('.');
+                // A single selector label must not expand into several
+                // labels (for example through a Unicode dot separator).
+                (!ascii.is_empty() && !ascii.contains('.'))
+                    .then(|| ascii.to_ascii_lowercase())
+            }
+        })
+        .collect::<Option<Vec<_>>>()
+        .map(|labels| labels.join("."))
 }
 
 impl Config {
@@ -276,7 +304,8 @@ impl Config {
                         "DNS nameserver-policy invalid domain selector".to_owned(),
                     ));
                 }
-                if policy.insert(lower, nameserver.clone()).is_some() {
+                let normalized = Self::normalize_domain_selector(selector)?;
+                if policy.insert(normalized, nameserver.clone()).is_some() {
                     // The YAML policy map is unordered; conflicting aliases
                     // must fail closed rather than use iteration order.
                     return Err(Error::InvalidConfig(
@@ -288,6 +317,14 @@ impl Config {
         Ok(policy)
     }
 
+    fn normalize_domain_selector(selector: &str) -> Result<String, Error> {
+        normalize_dns_domain_pattern(selector).ok_or_else(|| {
+            Error::InvalidConfig(
+                "DNS selector is not a valid ASCII/IDNA domain pattern".to_owned(),
+            )
+        })
+    }
+
     /// Parse Mihomo per-proxy-node DNS routing in YAML order.
     /// Scalar and list values both represent sets of DNS upstreams.
     /// GeoSite and RuleSet selectors must remain rejected until supported.
@@ -295,6 +332,7 @@ impl Config {
         mapping: &serde_yaml::Mapping,
     ) -> Result<Vec<(String, Vec<NameServer>)>, Error> {
         let mut policies = Vec::new();
+        let mut selectors = HashSet::new();
         for (raw_domain, value) in mapping {
             let domain = raw_domain.as_str().ok_or_else(|| {
                 Error::InvalidConfig(
@@ -356,7 +394,13 @@ impl Config {
                             .to_owned(),
                     ));
                 }
-                policies.push((subdomain.to_ascii_lowercase(), nameservers.clone()));
+                let normalized = Self::normalize_domain_selector(subdomain)?;
+                if !selectors.insert(normalized.clone()) {
+                    return Err(Error::InvalidConfig(
+                        "dns.proxy-server-nameserver-policy repeats a normalized domain selector".to_owned(),
+                    ));
+                }
+                policies.push((normalized, nameservers.clone()));
             }
         }
         Ok(policies)
@@ -502,6 +546,12 @@ pub(crate) fn validate_fake_ip_filter_patterns(
             // domain names and this error may be printed in startup logs.
             return Err(Error::InvalidConfig(
                 "dns.fake-ip-filter uses unsupported Mihomo rule-set/geosite/rule syntax; refusing to silently treat it as a literal domain"
+                    .to_owned(),
+            ));
+        }
+        if normalize_dns_domain_pattern(pattern).is_none() {
+            return Err(Error::InvalidConfig(
+                "dns.fake-ip-filter contains an invalid domain pattern; refusing to silently change Fake-IP behavior"
                     .to_owned(),
             ));
         }
@@ -778,6 +828,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dns_domain_patterns_normalize_idna_and_reject_invalid_labels() {
+        assert_eq!(
+            normalize_dns_domain_pattern("BÜCHER.example"),
+            Some("xn--bcher-kva.example".to_owned())
+        );
+        assert_eq!(
+            normalize_dns_domain_pattern("+.BÜCHER.example"),
+            Some("+.xn--bcher-kva.example".to_owned())
+        );
+        assert_eq!(
+            normalize_dns_domain_pattern(".BÜCHER.example"),
+            Some(".xn--bcher-kva.example".to_owned())
+        );
+        for invalid in [
+            " private.example",
+            "part*.private.example",
+            "private..example",
+            "private.example.",
+            "private。example",
+        ] {
+            assert_eq!(normalize_dns_domain_pattern(invalid), None, "{invalid:?}");
+        }
+    }
+
+    #[test]
     fn auto_nameserver_binding_is_selected_at_dial_time() {
         let nameservers =
             Config::parse_nameserver(&["192.0.2.53#auto".into()]).unwrap();
@@ -844,6 +919,26 @@ mod tests {
     }
 
     #[test]
+    fn nameserver_policies_normalize_idna_and_reject_canonical_duplicates() {
+        let unicode =
+            HashMap::from([("bücher.example".to_owned(), "9.9.9.9".to_owned())]);
+        let parsed = Config::parse_nameserver_policy(&unicode)
+            .expect("Unicode selector should normalize to its DNS wire name");
+        assert!(parsed.contains_key("xn--bcher-kva.example"));
+
+        let aliases = HashMap::from([
+            ("bücher.example".to_owned(), "9.9.9.9".to_owned()),
+            ("xn--bcher-kva.example".to_owned(), "1.1.1.1".to_owned()),
+        ]);
+        assert!(
+            Config::parse_nameserver_policy(&aliases)
+                .expect_err("Unicode/ASCII aliases must not race in the trie")
+                .to_string()
+                .contains("nameserver-policy")
+        );
+    }
+
+    #[test]
     fn proxy_nameserver_policy_rejects_selector_ambiguity_before_node_dns() {
         for selector in [
             " node.example",
@@ -865,6 +960,29 @@ mod tests {
                 "{selector:?}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn proxy_node_policies_normalize_idna_and_reject_canonical_duplicates() {
+        let mut mapping = serde_yaml::Mapping::new();
+        mapping.insert(
+            serde_yaml::Value::String("bücher.example".to_owned()),
+            serde_yaml::Value::String("9.9.9.9".to_owned()),
+        );
+        let parsed = Config::parse_proxy_server_nameserver_policy(&mapping)
+            .expect("Unicode selector should normalize to wire form");
+        assert_eq!(parsed[0].0, "xn--bcher-kva.example");
+
+        mapping.insert(
+            serde_yaml::Value::String("xn--bcher-kva.example".to_owned()),
+            serde_yaml::Value::String("1.1.1.1".to_owned()),
+        );
+        assert!(
+            Config::parse_proxy_server_nameserver_policy(&mapping)
+                .expect_err("Unicode/ASCII aliases must not race in node DNS")
+                .to_string()
+                .contains("proxy-server-nameserver-policy")
+        );
     }
 
     #[test]
