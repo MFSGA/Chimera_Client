@@ -476,6 +476,20 @@ impl RuntimeComponents {
     }
 }
 
+/// Retire the DNS owners from a successfully replaced runtime.
+///
+/// A runner shutdown only closes listeners; other Arc owners (including
+/// outbound connectors and DIRECT DNS handles) may still hold these resolvers.
+/// Do not call this during preparation or rollback: rollback reuses the active
+/// DNS owners.
+pub(super) fn retire_dns_owners(
+    primary: &ThreadSafeDNSResolver,
+    control_plane: &ThreadSafeDNSResolver,
+) {
+    primary.retire();
+    control_plane.retire();
+}
+
 #[cfg(feature = "tun")]
 pub(super) async fn restore_network_after_failed_reload(
     active_components: &RuntimeComponents,
@@ -501,5 +515,36 @@ pub(super) async fn restore_active_network_config(
         clear_net_config().await;
         network_runtime_lease.deactivate_to_neutral();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod dns_retirement_tests {
+    use super::*;
+
+    #[test]
+    fn retiring_previous_dns_owners_invalidates_both_without_touching_replacement() {
+        use crate::app::dns::MockClashResolver;
+
+        let mut old_primary = MockClashResolver::new();
+        old_primary.expect_retire().times(1).return_const(());
+        let mut old_control = MockClashResolver::new();
+        old_control.expect_retire().times(1).return_const(());
+        let old_primary: ThreadSafeDNSResolver = Arc::new(old_primary);
+        let old_control: ThreadSafeDNSResolver = Arc::new(old_control);
+        let retained_primary = Arc::clone(&old_primary);
+        let retained_control = Arc::clone(&old_control);
+
+        let mut new_primary = MockClashResolver::new();
+        new_primary.expect_retire().times(0);
+        let mut new_control = MockClashResolver::new();
+        new_control.expect_retire().times(0);
+        let _new_primary: ThreadSafeDNSResolver = Arc::new(new_primary);
+        let _new_control: ThreadSafeDNSResolver = Arc::new(new_control);
+
+        retire_dns_owners(&old_primary, &old_control);
+        // Old Arc handles deliberately remain alive after a successful swap.
+        assert_eq!(Arc::strong_count(&retained_primary), 2);
+        assert_eq!(Arc::strong_count(&retained_control), 2);
     }
 }

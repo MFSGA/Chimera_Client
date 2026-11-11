@@ -111,6 +111,14 @@ impl HealthCheck {
         expected_echo: &str,
         timeout: Option<std::time::Duration>,
     ) {
+        // A health check can dial an IP-literal endpoint and bypass resolver
+        // lookups entirely. Block probes while the owner is an uncommitted
+        // candidate or has been invalidated/retired.
+        if !proxy_manager.permits_background_egress() {
+            tracing::debug!("skipping health check: DNS owner not available");
+            return;
+        }
+
         #[cfg(not(feature = "extended-health-check"))]
         let _ = (
             minimum_bytes,

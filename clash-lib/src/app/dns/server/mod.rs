@@ -1,7 +1,7 @@
 use futures::FutureExt;
 use hickory_proto::op::Message;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, oneshot, watch};
 
 use chimera_dns::DNSListenAddr;
 
@@ -22,6 +22,8 @@ const MACOS_DNS_PROXY_BRIDGE_ADDR: SocketAddr =
 
 struct DnsMessageExchanger {
     resolver: ThreadSafeDNSResolver,
+    publication: watch::Receiver<bool>,
+    cancellation_token: tokio_util::sync::CancellationToken,
 }
 
 impl chimera_dns::DnsMessageExchanger for DnsMessageExchanger {
@@ -34,6 +36,27 @@ impl chimera_dns::DnsMessageExchanger for DnsMessageExchanger {
         &self,
         message: &Message,
     ) -> Result<Message, chimera_dns::DNSError> {
+        // Candidate listeners must be bound to prove readiness, but must not
+        // expose a new policy until the whole data plane has committed. Hold
+        // queries instead of returning SERVFAIL (which could trigger external
+        // system-resolver fallback). Failed reload cancels this wait.
+        let mut publication = self.publication.clone();
+        while !*publication.borrow_and_update() {
+            tokio::select! {
+                _ = self.cancellation_token.cancelled() => {
+                    return Err(chimera_dns::DNSError::QueryFailed(
+                        "unpublished DNS listener was cancelled".to_owned(),
+                    ));
+                }
+                changed = publication.changed() => {
+                    if changed.is_err() {
+                        return Err(chimera_dns::DNSError::QueryFailed(
+                            "DNS publication gate was closed".to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
         exchange_with_resolver(&self.resolver, message, true).await
     }
 }
@@ -45,6 +68,7 @@ pub struct DnsRunner {
     bridge_listener: Option<DNSListenAddr>,
     resolver: ThreadSafeDNSResolver,
     cwd: std::path::PathBuf,
+    publication: watch::Sender<bool>,
 
     cancellation_token: tokio_util::sync::CancellationToken,
     task:
@@ -90,6 +114,7 @@ impl DnsRunner {
             bridge_listener,
             resolver,
             cwd: cwd.to_path_buf(),
+            publication: watch::channel(true).0,
             cancellation_token: cancellation_token.unwrap_or_default(),
             task: std::sync::Mutex::new(None),
             ready_tx: std::sync::Mutex::new(Some(ready_tx)),
@@ -133,6 +158,16 @@ impl DnsRunner {
                 "DNS listener readiness was already consumed".to_owned(),
             )),
         }
+    }
+
+    /// A candidate can bind its DNS socket during readiness checks, but must
+    /// not answer with the candidate policy until the runtime swap commits.
+    pub(crate) fn pause_publication(&self) {
+        self.publication.send_replace(false);
+    }
+
+    pub(crate) fn publish(&self) {
+        self.publication.send_replace(true);
     }
 
     pub(crate) fn is_configured(&self) -> bool {
@@ -179,12 +214,15 @@ impl Runner for DnsRunner {
         let resolver = self.resolver.clone();
         let cwd = self.cwd.clone();
         let cancellation_token = self.cancellation_token.clone();
+        let publication = self.publication.subscribe();
 
         let handle = tokio::spawn(async move {
             let mut runners = Vec::with_capacity(listen_configs.len());
             for listen in listen_configs {
                 let exchanger = DnsMessageExchanger {
                     resolver: resolver.clone(),
+                    publication: publication.clone(),
+                    cancellation_token: cancellation_token.clone(),
                 };
                 match chimera_dns::get_dns_listener(listen, exchanger, &cwd).await {
                     Some(runner) => runners.push(runner),
@@ -320,6 +358,102 @@ mod tests {
         };
 
         assert!(managed_bridge_listener(&existing).is_none());
+    }
+
+    #[tokio::test]
+    async fn staged_dns_listener_waits_for_commit_without_querying_upstream() {
+        use hickory_proto::{
+            op::{Message, Query},
+            rr::{Name, RecordType},
+        };
+        let mut resolver = crate::app::dns::MockClashResolver::new();
+        resolver.expect_ipv6().return_const(false);
+        resolver.expect_fake_ip_enabled().return_const(false);
+        resolver.expect_fake_ip_v6_enabled().return_const(false);
+        resolver
+            .expect_exchange()
+            .once()
+            .returning(|message| Ok(message.clone()));
+        let resolver: ThreadSafeDNSResolver = Arc::new(resolver);
+        let temp = tempfile::tempdir().unwrap();
+        let runner = DnsRunner::new(
+            false,
+            DNSListenAddr::default(),
+            resolver.clone(),
+            temp.path(),
+            None,
+        );
+        runner.pause_publication();
+        let exchanger = DnsMessageExchanger {
+            resolver,
+            publication: runner.publication.subscribe(),
+            cancellation_token: runner.cancellation_token.clone(),
+        };
+        let mut message = Message::query();
+        message.add_query(Query::query(
+            Name::from_ascii("staged.example.").unwrap(),
+            RecordType::A,
+        ));
+        let task = tokio::spawn(async move {
+            chimera_dns::DnsMessageExchanger::exchange(&exchanger, &message).await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "staged listener returned an early DNS answer"
+        );
+        runner.publish();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_staged_dns_listener_never_queries_upstream() {
+        use hickory_proto::{
+            op::{Message, Query},
+            rr::{Name, RecordType},
+        };
+        let mut resolver = crate::app::dns::MockClashResolver::new();
+        resolver.expect_exchange().never();
+        let resolver: ThreadSafeDNSResolver = Arc::new(resolver);
+        let temp = tempfile::tempdir().unwrap();
+        let token = tokio_util::sync::CancellationToken::new();
+        let runner = DnsRunner::new(
+            false,
+            DNSListenAddr::default(),
+            resolver.clone(),
+            temp.path(),
+            Some(token.clone()),
+        );
+        runner.pause_publication();
+        let exchanger = DnsMessageExchanger {
+            resolver,
+            publication: runner.publication.subscribe(),
+            cancellation_token: runner.cancellation_token.clone(),
+        };
+        let mut message = Message::query();
+        message.add_query(Query::query(
+            Name::from_ascii("staged.example.").unwrap(),
+            RecordType::A,
+        ));
+        let task = tokio::spawn(async move {
+            chimera_dns::DnsMessageExchanger::exchange(&exchanger, &message).await
+        });
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        token.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
     }
 
     #[tokio::test]

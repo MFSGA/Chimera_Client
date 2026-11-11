@@ -42,11 +42,94 @@ use crate::{
     app::net::init_net_config, install_default_socket_protector, proxy::tun,
 };
 
+/// A protected replacement must not initiate HTTP provider DNS bootstrap
+/// before its new DNS policy is published. Proxy providers fetch synchronously
+/// during construction and rule providers start asynchronous fetch tasks.
+/// Suspending resolver access after creation is too late for both paths.
+/// Until deferred, post-commit provider initialization is supported, reject
+/// these reloads early and explicitly; ordinary startup and legacy non-TUN
+/// reloads retain their original provider semantics.
+#[cfg(target_os = "macos")]
+fn reject_uncommitted_candidate_remote_egress(
+    cwd: &std::path::Path,
+    config: &InternalConfig,
+    activate_network: bool,
+) -> Result<()> {
+    use crate::config::internal::{
+        config::RuleProviderDef, proxy::OutboundProxyProviderDef,
+    };
+
+    if !activate_network
+        && config.tun.enable
+        && config.dns.enable
+        && config.dns.enhance_mode == def::DNSMode::FakeIp
+    {
+        if config
+            .proxy_providers
+            .values()
+            .any(|provider| matches!(provider, OutboundProxyProviderDef::Http(_)))
+        {
+            return Err(Error::InvalidConfig(
+                "macOS TUN + Fake-IP candidate HTTP proxy-provider cannot fetch before DNS publication; protected reload requires post-commit provider initialization (not yet supported)".to_owned(),
+            ));
+        }
+        if config
+            .rule_providers
+            .values()
+            .any(|provider| matches!(provider, RuleProviderDef::Http(_)))
+        {
+            return Err(Error::InvalidConfig(
+                "macOS TUN + Fake-IP candidate HTTP rule-provider cannot fetch before DNS publication; protected reload requires post-commit provider initialization (not yet supported)".to_owned(),
+            ));
+        }
+        // Geo-data constructors otherwise download immediately when the
+        // local file is absent or force=true; corrupted MMDB data is removed
+        // and downloaded again. These side effects are forbidden before a
+        // candidate DNS policy commits. Validate without mutating the cache.
+        for (kind, file, download_url, is_mmdb) in [
+            (
+                "mmdb",
+                config.general.mmdb.as_ref(),
+                config.general.mmdb_download_url.as_ref(),
+                true,
+            ),
+            (
+                "asn-mmdb",
+                config.general.asn_mmdb.as_ref(),
+                config.general.asn_mmdb_download_url.as_ref(),
+                true,
+            ),
+            (
+                "geosite",
+                config.general.geosite.as_ref(),
+                config.general.geosite_download_url.as_ref(),
+                false,
+            ),
+        ] {
+            let Some(file) = file else {
+                continue;
+            };
+            let path = cwd.join(file);
+            let usable = path.is_file()
+                && !download_url.is_some_and(|url| url.contains("force=true"))
+                && (!is_mmdb || maxminddb::Reader::open_readfile(&path).is_ok());
+            if !usable {
+                return Err(Error::InvalidConfig(format!(
+                    "macOS TUN + Fake-IP candidate {kind} needs a valid cached file before DNS publication; uncommitted download or corrupt-file refresh is not allowed"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) async fn create_components(
     cwd: PathBuf,
     config: InternalConfig,
     activate_network: bool,
 ) -> Result<RuntimeComponents> {
+    #[cfg(target_os = "macos")]
+    reject_uncommitted_candidate_remote_egress(&cwd, &config, activate_network)?;
     let ipv6_allowed = !config.tun.enable || config.tun.gateway_v6.is_some();
     #[cfg(feature = "tun")]
     let network_config = RuntimeNetworkConfig {
@@ -145,6 +228,8 @@ pub(super) async fn create_components(
     let protect_provider_dns = config.tun.enable
         && dns_enable
         && config.dns.enhance_mode == crate::config::def::DNSMode::FakeIp;
+    let staged_protected_dns =
+        cfg!(target_os = "macos") && !activate_network && protect_provider_dns;
     let managed_dns_proxy_bridge = cfg!(target_os = "macos")
         && config.tun.enable
         && config.tun.dns_hijack
@@ -178,6 +263,16 @@ pub(super) async fn create_components(
         Some(network_path_source.clone()),
     )
     .await?;
+
+    // The coordinator's later pause happens after create_components returns:
+    // provider constructors and file health checks can already dispatch
+    // requests during construction. Protect newly built candidate DNS owners
+    // before any other component can use them. The coordinator publishes
+    // them only after all replacement listeners are ready.
+    if staged_protected_dns {
+        control_plane_dns_resolver.pause_publication();
+        dns_resolver.pause_publication();
+    }
 
     debug!("initializing outbound manager");
     let outbound_manager = Arc::new(

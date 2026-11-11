@@ -712,6 +712,19 @@ impl OutboundManager {
         self.proxy_providers.clone()
     }
 
+    /// Initial provider health probes may be suppressed while the candidate
+    /// DNS owner is unpublished. Run a fresh probe after the successful
+    /// protected runtime commit, without blocking the reload control loop.
+    #[cfg(all(target_os = "macos", feature = "tun"))]
+    pub(crate) fn resume_provider_health_checks_after_commit(&self) {
+        for provider in self.proxy_providers.values() {
+            let provider = Arc::clone(provider);
+            tokio::spawn(async move {
+                provider.read().await.healthcheck().await;
+            });
+        }
+    }
+
     /// S04b-l: prove that this manager's *socket path planning* source
     /// observes the same RuntimeStatus and generation as the strict DNS
     /// transaction. This is not a claim about the path that a socket won;

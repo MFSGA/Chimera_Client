@@ -11,6 +11,10 @@ use tracing::{debug, warn};
 pub struct SystemResolver {
     ipv6: AtomicBool,
     dns_ipv6: bool,
+    // System lookups can bypass managed DNS transports, so staged control
+    // plane owners must also reject lookups until the runtime publishes.
+    published: AtomicBool,
+    retired: AtomicBool,
 }
 
 /// SystemResolver is a resolver that uses libc getaddrinfo to resolve
@@ -28,7 +32,20 @@ impl SystemResolver {
         Ok(Self {
             ipv6: AtomicBool::new(global_ipv6),
             dns_ipv6,
+            published: AtomicBool::new(true),
+            retired: AtomicBool::new(false),
         })
+    }
+
+    fn ensure_published(&self) -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.retired.load(SeqCst) {
+            anyhow::bail!("system DNS resolver permanently retired");
+        }
+        if !self.published.load(SeqCst) {
+            anyhow::bail!("system DNS resolver not yet published");
+        }
+        Ok(())
     }
 }
 
@@ -39,6 +56,7 @@ impl ClashResolver for SystemResolver {
         host: &str,
         _: bool,
     ) -> anyhow::Result<Option<std::net::IpAddr>> {
+        self.ensure_published()?;
         if let Some(ip) = parse_ip_literal(host) {
             if ip.is_ipv6() && !self.ipv6() {
                 return Err(Error::DNSError(format!(
@@ -81,6 +99,7 @@ impl ClashResolver for SystemResolver {
             ))
             .into());
         }
+        self.ensure_published()?;
         Ok(address)
     }
 
@@ -89,6 +108,7 @@ impl ClashResolver for SystemResolver {
         host: &str,
         _: bool,
     ) -> anyhow::Result<Vec<std::net::IpAddr>> {
+        self.ensure_published()?;
         if let Some(ip) = parse_ip_literal(host) {
             if ip.is_ipv6() && !self.ipv6() {
                 return Err(Error::DNSError(format!(
@@ -122,6 +142,7 @@ impl ClashResolver for SystemResolver {
             ))
             .into());
         }
+        self.ensure_published()?;
         Ok(addresses)
     }
 
@@ -130,6 +151,7 @@ impl ClashResolver for SystemResolver {
         host: &str,
         _: bool,
     ) -> anyhow::Result<Option<std::net::Ipv4Addr>> {
+        self.ensure_published()?;
         if let Some(ip) = parse_ip_literal(host) {
             return match ip {
                 std::net::IpAddr::V4(ip) => Ok(Some(ip)),
@@ -149,6 +171,7 @@ impl ClashResolver for SystemResolver {
                 _ => None,
             })
             .collect::<Vec<_>>();
+        self.ensure_published()?;
         Ok(response.into_iter().choose(&mut rand::rng()))
     }
 
@@ -157,6 +180,7 @@ impl ClashResolver for SystemResolver {
         host: &str,
         _: bool,
     ) -> anyhow::Result<Option<std::net::Ipv6Addr>> {
+        self.ensure_published()?;
         if !self.ipv6() {
             return Err(Error::DNSError("IPv6 is disabled".into()).into());
         }
@@ -173,6 +197,7 @@ impl ClashResolver for SystemResolver {
                 _ => None,
             })
             .collect::<Vec<_>>();
+        self.ensure_published()?;
         Ok(response.into_iter().choose(&mut rand::rng()))
     }
 
@@ -188,6 +213,29 @@ impl ClashResolver for SystemResolver {
             "system resolver does not support advanced dns features, please enable \
              the dns server in your config"
         ))
+    }
+
+    fn permits_background_egress(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        !self.retired.load(SeqCst) && self.published.load(SeqCst)
+    }
+
+    fn pause_publication(&self) {
+        self.published
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn publish(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if !self.retired.load(SeqCst) {
+            self.published.store(true, SeqCst);
+        }
+    }
+
+    fn retire(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.retired.store(true, SeqCst);
+        self.published.store(false, SeqCst);
     }
 
     fn ipv6(&self) -> bool {
@@ -226,6 +274,33 @@ impl ClashResolver for SystemResolver {
 #[cfg(test)]
 mod tests {
     use crate::app::dns::{ClashResolver, resolver::SystemResolver};
+
+    #[tokio::test]
+    async fn staged_system_resolver_must_not_bypass_publication_with_ip_literals() {
+        let resolver = SystemResolver::new(false).unwrap();
+        assert!(resolver.permits_background_egress());
+        resolver.pause_publication();
+        assert!(!resolver.permits_background_egress());
+        assert!(
+            resolver.resolve("127.0.0.1", false).await.is_err(),
+            "staged system resolver must not return literal addresses"
+        );
+        assert!(resolver.resolve_all("127.0.0.1", false).await.is_err());
+        assert!(resolver.resolve_v4("127.0.0.1", false).await.is_err());
+        resolver.publish();
+        assert!(resolver.permits_background_egress());
+        assert_eq!(
+            resolver.resolve("127.0.0.1", false).await.unwrap(),
+            Some("127.0.0.1".parse().unwrap())
+        );
+        resolver.retire();
+        resolver.publish();
+        assert!(!resolver.permits_background_egress());
+        assert!(
+            resolver.resolve("127.0.0.1", false).await.is_err(),
+            "retired system resolver must never re-open after late publish"
+        );
+    }
 
     #[tokio::test]
     async fn test_system_resolver_default_config() {

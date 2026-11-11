@@ -111,6 +111,12 @@ impl ProxyManager {
         }
     }
 
+    /// A candidate DNS policy must not start probes over an IP literal or
+    /// DIRECT outbound merely because no hostname lookup is necessary.
+    pub(crate) fn permits_background_egress(&self) -> bool {
+        self.dns_resolver.permits_background_egress()
+    }
+
     pub(crate) async fn replace_provider_dns_domains(
         &self,
         provider: &str,
