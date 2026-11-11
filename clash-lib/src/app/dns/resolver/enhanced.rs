@@ -11847,7 +11847,7 @@ mod tests {
                 }) as ThreadSafeDNSClient]),
             ));
         }
-        resolver.policy = Some(policy);
+        resolver.policy = Some(Arc::new(policy));
         resolver.main = vec![Arc::new(CountingClient {
             response: response_with_a(Ipv4Addr::new(198, 51, 100, 20)),
             hits: main_hits.clone(),
