@@ -26,7 +26,7 @@ use std::{
     net,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed},
     },
     time::{Duration, Instant},
 };
@@ -41,6 +41,83 @@ struct NegativeEntry {
     expires: Instant,
 }
 
+/// Bounded cache for ordinary DNS answers to hostnames that previously
+/// belonged to a proxy Provider. Unlike Hickory's Question-only cache, each
+/// entry carries the ownership generation that authorized its insertion.
+#[derive(Clone)]
+struct ProviderEpochCacheEntry {
+    generation: u64,
+    response: op::Message,
+    inserted: Instant,
+    expires: Instant,
+}
+
+const PROVIDER_EPOCH_CACHE_CAPACITY: usize = 1024;
+const PROVIDER_EPOCH_CACHE_MAX_TTL: u32 = 86_400;
+
+// Deterministic, task-local cache handoff gate for concurrency regression tests.
+// Compiled out of production; unlike a global hook, parallel tests cannot
+// pause each other's queries or change the runtime resolver layout.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CacheCandidateKind {
+    Positive,
+    Negative,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct CacheCandidateTestPause {
+    kind: CacheCandidateKind,
+    selected: Arc<tokio::sync::Barrier>,
+    resume: Arc<tokio::sync::Barrier>,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static CACHE_CANDIDATE_TEST_PAUSE: CacheCandidateTestPause;
+}
+
+// Pause only the scoped query between the public entry generation snapshot
+// and the internal no-cache generation snapshot.
+#[cfg(test)]
+#[derive(Clone)]
+struct PublicHandoffTestPause {
+    selected: Arc<tokio::sync::Barrier>,
+    resume: Arc<tokio::sync::Barrier>,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static PUBLIC_HANDOFF_TEST_PAUSE: PublicHandoffTestPause;
+}
+
+// Pause inside the no-cache path after the outer entry has validated its
+// generation but before the internal path samples ownership again.
+#[cfg(test)]
+tokio::task_local! {
+    static INTERNAL_HANDOFF_TEST_PAUSE: PublicHandoffTestPause;
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static PUBLIC_CACHE_WRITE_TEST_PAUSE: PublicHandoffTestPause;
+}
+
+// Pause after internal query/cache completion, before returning to the caller.
+#[cfg(test)]
+tokio::task_local! {
+    static PUBLIC_RETURN_TEST_PAUSE: PublicHandoffTestPause;
+}
+
+struct TransportResetGuard<'a>(&'a AtomicUsize);
+
+impl Drop for TransportResetGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 pub struct EnhancedResolver {
     ipv6: Arc<AtomicBool>,
     dns_ipv6: bool,
@@ -53,10 +130,37 @@ pub struct EnhancedResolver {
     fallback_ip_filters: Option<Vec<Box<dyn FallbackIPFilter>>>,
 
     lru_cache: Option<hickory_resolver::ResponseCache>,
+    // Positive answers learned after a reset live in a separate network epoch.
+    network_positive_cache: Mutex<Option<(u64, hickory_resolver::ResponseCache)>>,
     // The positive cache keys only by Question and cannot cache a negative
     // Message with a per-response SOA TTL. Keep a bounded negative cache
     // alongside it, activated only when the positive cache is enabled.
     negative_cache: Mutex<lru_time_cache::LruCache<String, NegativeEntry>>,
+    provider_epoch_cache:
+        Mutex<lru_time_cache::LruCache<String, ProviderEpochCacheEntry>>,
+    /// Incremented during network reset while holding provider_epoch_cache;
+    /// queries from an older path cannot repopulate the cleared cache.
+    provider_epoch_network_generation: AtomicU64,
+    // Prevent new DNS requests from using transports during their reset.
+    transport_resets_in_progress: Arc<AtomicUsize>,
+    // A partial reset failure invalidates the entire transport collection.
+    transport_reset_failed: Arc<AtomicBool>,
+    // Irreversible owner retirement after successful runtime replacement.
+    // Network resets may clear a transient failure, never this flag.
+    retired: AtomicBool,
+    // Candidate resolvers are constructed usable for setup; the runtime
+    // coordinator suspends them before exposing any candidate listeners/API.
+    published: Arc<AtomicBool>,
+    // A retained DIRECT child must not publish independently of its parent.
+    parent_published: Option<Arc<AtomicBool>>,
+    /// DIRECT child: never reopen while its owning parent is still failed.
+    /// The parent is the sole authority that clears this gate after a full reset.
+    parent_transport_failed: Option<Arc<AtomicBool>>,
+    /// A queued parent reset also blocks DIRECT after an earlier reset has
+    /// temporarily cleared its failure flag.
+    parent_resets_in_progress: Option<Arc<AtomicUsize>>,
+    // Serialize recovery attempts; cancellation must leave transports invalid.
+    transport_reset_lock: tokio::sync::Mutex<()>,
     policy: Option<Arc<trie::StringTrie<Vec<ThreadSafeDNSClient>>>>,
     /// The DIRECT child shares this policy and its clients with its parent;
     /// only the parent owns the policy clients' network-reset lifecycle.
@@ -73,6 +177,12 @@ pub struct EnhancedResolver {
     /// outbound trie; each refreshed provider replaces only its own names.
     provider_proxy_server_domains:
         RwLock<std::collections::HashMap<String, std::collections::HashSet<String>>>,
+    /// Monotonic registry epoch: detects remove/re-add ABA during in-flight node DNS.
+    provider_dns_epoch: AtomicU64,
+    /// Retain each domain's generation for the lifetime of the shared cache.
+    /// Pruning this history without version-tagging/invalidation would revive
+    /// public DNS responses cached before a provider's ownership transition.
+    provider_domain_generations: RwLock<std::collections::HashMap<String, u64>>,
     direct_resolver: Option<ThreadSafeDNSResolver>,
 
     fake_dns: Option<ThreadSafeFakeDns>,
@@ -83,7 +193,26 @@ pub struct EnhancedResolver {
         Option<Arc<RwLock<lru_time_cache::LruCache<net::IpAddr, String>>>>,
 }
 
+// A DIRECT child can outlive a parent resolver if a caller holds a cloned
+// trait-object handle. Mark the shared parent recovery gate closed before
+// releasing the owner; child-only resets must not reopen orphaned DNS.
+impl Drop for EnhancedResolver {
+    fn drop(&mut self) {
+        self.transport_reset_failed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 impl EnhancedResolver {
+    #[cfg(test)]
+    async fn pause_selected_cache_candidate_for_test(kind: CacheCandidateKind) {
+        if let Ok(pause) = CACHE_CANDIDATE_TEST_PAUSE.try_with(Clone::clone) {
+            assert_eq!(pause.kind, kind, "paused the wrong cache branch");
+            pause.selected.wait().await;
+            pause.resume.wait().await;
+        }
+    }
+
     fn negative_cache_key(query: &op::Query) -> String {
         format!(
             "{}|{}|{}",
@@ -192,6 +321,162 @@ impl EnhancedResolver {
         );
     }
 
+    fn cached_provider_epoch_response(
+        &self,
+        query: &op::Query,
+        request: &op::Message,
+        generation: u64,
+        now: Instant,
+    ) -> Option<op::Message> {
+        // Callers must have independently confirmed that the QNAME is not a
+        // live Provider endpoint, and must revalidate its generation after
+        // fetching the candidate. Generation zero is reserved for ordinary
+        // negative answers after the first network reset; these entries are
+        // cleared on each reset under the cache commit lock.
+        // No cache lock is held across an await.
+        let key = Self::negative_cache_key(query);
+        let mut entries = self
+            .provider_epoch_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = entries.get(&key)?.clone();
+        if entry.generation != generation {
+            // A lagging reader must not evict a newer generation's entry.
+            return None;
+        }
+        if now >= entry.expires {
+            entries.remove(&key);
+            return None;
+        }
+        let elapsed =
+            u32::try_from(now.saturating_duration_since(entry.inserted).as_secs())
+                .unwrap_or(u32::MAX);
+        let mut response = entry.response;
+        for record in response
+            .answers
+            .iter_mut()
+            .chain(response.authorities.iter_mut())
+            .chain(response.additionals.iter_mut())
+        {
+            record.decrement_ttl(elapsed);
+        }
+        response.metadata.id = request.metadata.id;
+        response.metadata.recursion_desired = request.metadata.recursion_desired;
+        response.metadata.checking_disabled = request.metadata.checking_disabled;
+        response.queries = request.queries.clone();
+        Some(response)
+    }
+
+    #[cfg(test)]
+    fn cache_provider_epoch_response(
+        &self,
+        query: &op::Query,
+        response: &op::Message,
+        generation: u64,
+        now: Instant,
+    ) {
+        self.cache_provider_epoch_response_for_network(
+            query, response, generation, now, None,
+        );
+    }
+
+    fn cache_provider_epoch_response_for_network(
+        &self,
+        query: &op::Query,
+        response: &op::Message,
+        generation: u64,
+        now: Instant,
+        network_generation: Option<u64>,
+    ) {
+        if (generation == 0
+            && (network_generation.is_none_or(|epoch| epoch == 0)
+                || Self::negative_ttl(query, response).is_none()))
+            || response.metadata.message_type != op::MessageType::Response
+            || response.metadata.authentic_data
+            || response.edns.is_some()
+            || response.signature.is_some()
+        {
+            return;
+        }
+        // Reuse the RFC 2308 negative TTL rules and the positive-cache
+        // eligibility gates. A zero-TTL/unsigned/DNSSEC/EDNS variant must
+        // never be promoted into the epoch cache by this optimization.
+        let negative_ttl = Self::negative_ttl(query, response);
+        let ttl = if let Some(ttl) = negative_ttl {
+            ttl
+        } else {
+            if !Self::cache_safe_response(response)
+                || (query.query_type() == rr::RecordType::TXT
+                    && query.name().to_ascii().starts_with("_acme-challenge."))
+            {
+                return;
+            }
+            let ips = Self::ip_list_of_message(response);
+            if !ips.is_empty() && ips.iter().all(net::IpAddr::is_unspecified) {
+                return;
+            }
+            let Some(ttl) = response.all_sections().map(|record| record.ttl).min()
+            else {
+                return;
+            };
+            ttl
+        }
+        .min(PROVIDER_EPOCH_CACHE_MAX_TTL);
+        if ttl == 0 {
+            return;
+        }
+        let mut cached = response.clone();
+        if negative_ttl.is_some() {
+            // Negative replies use min(SOA TTL, SOA.MINIMUM) per RFC 2308.
+            for record in &mut cached.authorities {
+                if matches!(record.data, rr::RData::SOA(_)) {
+                    record.ttl = record.ttl.min(ttl);
+                }
+            }
+        } else {
+            // Match the default Hickory maximum positive TTL: do not
+            // advertise a longer lifetime than the cache retains.
+            for record in cached
+                .answers
+                .iter_mut()
+                .chain(cached.authorities.iter_mut())
+                .chain(cached.additionals.iter_mut())
+            {
+                record.ttl = record.ttl.min(PROVIDER_EPOCH_CACHE_MAX_TTL);
+            }
+        }
+        let key = Self::negative_cache_key(query);
+        let mut entries = self
+            .provider_epoch_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Reset takes the same cache lock before advancing this generation
+        // and clearing entries. A pre-reset writer cannot insert afterwards.
+        if network_generation.is_some_and(|expected| {
+            self.provider_epoch_network_generation.load(Relaxed) != expected
+        }) {
+            return;
+        }
+        // A query which began in an older Provider generation can complete
+        // after a newer query has cached its answer. Do not let an obsolete
+        // writer replace that answer (even though readers would fail closed).
+        if entries
+            .peek(&key)
+            .is_some_and(|existing| existing.generation > generation)
+        {
+            return;
+        }
+        entries.insert(
+            key,
+            ProviderEpochCacheEntry {
+                generation,
+                response: cached,
+                inserted: now,
+                expires: now + Duration::from_secs(u64::from(ttl)),
+            },
+        );
+    }
+
     // DNS responses can vary with EDNS, DNSSEC or per-query options, while
     // Hickory's ResponseCache uses only the Question as its key. Restrict
     // caching to ordinary, unsigned queries until those variants have
@@ -262,6 +547,24 @@ impl EnhancedResolver {
         resolver
     }
 
+    fn with_parent_transport_gate(
+        mut self,
+        parent_failure: Arc<AtomicBool>,
+        parent_resets: Arc<AtomicUsize>,
+    ) -> Self {
+        self.parent_transport_failed = Some(parent_failure);
+        self.parent_resets_in_progress = Some(parent_resets);
+        self
+    }
+
+    fn with_parent_publication_gate(
+        mut self,
+        parent_published: Arc<AtomicBool>,
+    ) -> Self {
+        self.parent_published = Some(parent_published);
+        self
+    }
+
     #[cfg(test)]
     fn from_clients_with_fallback(
         main: Vec<ThreadSafeDNSClient>,
@@ -296,9 +599,15 @@ impl EnhancedResolver {
             fallback_domain_filters: None,
             fallback_ip_filters: None,
             lru_cache: None,
+            network_positive_cache: Mutex::new(None),
             negative_cache: Mutex::new(lru_time_cache::LruCache::with_capacity(
                 1024,
             )),
+            provider_epoch_cache: Mutex::new(
+                lru_time_cache::LruCache::with_capacity(
+                    PROVIDER_EPOCH_CACHE_CAPACITY,
+                ),
+            ),
             policy: None,
             policy_is_parent_shared: false,
             proxy_resolver: None,
@@ -306,6 +615,17 @@ impl EnhancedResolver {
             proxy_node_resolver: false,
             proxy_server_domains: None,
             provider_proxy_server_domains: RwLock::new(Default::default()),
+            provider_dns_epoch: AtomicU64::new(0),
+            provider_epoch_network_generation: AtomicU64::new(0),
+            transport_resets_in_progress: Arc::new(AtomicUsize::new(0)),
+            transport_reset_failed: Arc::new(AtomicBool::new(false)),
+            retired: AtomicBool::new(false),
+            published: Arc::new(AtomicBool::new(true)),
+            parent_published: None,
+            parent_transport_failed: None,
+            parent_resets_in_progress: None,
+            transport_reset_lock: tokio::sync::Mutex::new(()),
+            provider_domain_generations: RwLock::new(Default::default()),
             direct_resolver: None,
             fake_dns: None,
             fake_ip_ttl: 1,
@@ -351,9 +671,15 @@ impl EnhancedResolver {
             fallback_domain_filters: None,
             fallback_ip_filters: None,
             lru_cache: None,
+            network_positive_cache: Mutex::new(None),
             negative_cache: Mutex::new(lru_time_cache::LruCache::with_capacity(
                 1024,
             )),
+            provider_epoch_cache: Mutex::new(
+                lru_time_cache::LruCache::with_capacity(
+                    PROVIDER_EPOCH_CACHE_CAPACITY,
+                ),
+            ),
             policy: None,
             policy_is_parent_shared: false,
 
@@ -362,6 +688,17 @@ impl EnhancedResolver {
             proxy_node_resolver: false,
             proxy_server_domains: None,
             provider_proxy_server_domains: RwLock::new(Default::default()),
+            provider_dns_epoch: AtomicU64::new(0),
+            provider_epoch_network_generation: AtomicU64::new(0),
+            transport_resets_in_progress: Arc::new(AtomicUsize::new(0)),
+            transport_reset_failed: Arc::new(AtomicBool::new(false)),
+            retired: AtomicBool::new(false),
+            published: Arc::new(AtomicBool::new(true)),
+            parent_published: None,
+            parent_transport_failed: None,
+            parent_resets_in_progress: None,
+            transport_reset_lock: tokio::sync::Mutex::new(()),
+            provider_domain_generations: RwLock::new(Default::default()),
             direct_resolver: None,
 
             fake_dns: None,
@@ -403,6 +740,10 @@ impl EnhancedResolver {
         let ipv6_policy = Arc::new(AtomicBool::new(global_ipv6));
         let edns_client_subnet = cfg.edns_client_subnet.clone();
         let health = Arc::new(DnsHealthTracker::default());
+        // Created before DIRECT so both resolvers share one recovery gate.
+        let parent_transport_failed = Arc::new(AtomicBool::new(false));
+        let parent_resets_in_progress = Arc::new(AtomicUsize::new(0));
+        let parent_published = Arc::new(AtomicBool::new(true));
         let default_resolver = Arc::new(EnhancedResolver {
             ipv6: ipv6_policy.clone(),
             dns_ipv6,
@@ -429,9 +770,15 @@ impl EnhancedResolver {
             fallback_domain_filters: None,
             fallback_ip_filters: None,
             lru_cache: None,
+            network_positive_cache: Mutex::new(None),
             negative_cache: Mutex::new(lru_time_cache::LruCache::with_capacity(
                 1024,
             )),
+            provider_epoch_cache: Mutex::new(
+                lru_time_cache::LruCache::with_capacity(
+                    PROVIDER_EPOCH_CACHE_CAPACITY,
+                ),
+            ),
             policy: None,
             policy_is_parent_shared: false,
 
@@ -440,6 +787,17 @@ impl EnhancedResolver {
             proxy_node_resolver: false,
             proxy_server_domains: None,
             provider_proxy_server_domains: RwLock::new(Default::default()),
+            provider_dns_epoch: AtomicU64::new(0),
+            provider_epoch_network_generation: AtomicU64::new(0),
+            transport_resets_in_progress: Arc::new(AtomicUsize::new(0)),
+            transport_reset_failed: Arc::new(AtomicBool::new(false)),
+            retired: AtomicBool::new(false),
+            published: Arc::new(AtomicBool::new(true)),
+            parent_published: None,
+            parent_transport_failed: None,
+            parent_resets_in_progress: None,
+            transport_reset_lock: tokio::sync::Mutex::new(()),
+            provider_domain_generations: RwLock::new(Default::default()),
             direct_resolver: None,
 
             fake_dns: None,
@@ -495,6 +853,24 @@ impl EnhancedResolver {
         // domain matchers so the first applicable policy wins.
         let mut proxy_server_nameserver_policy = Vec::new();
         for (domain, servers) in &cfg.proxy_server_nameserver_policy {
+            // Internal callers can bypass YAML decoding/validation. A
+            // selector that cannot match is a privacy-sensitive error: do
+            // not silently fall back from the requested per-node DNS pool.
+            let lower = domain.to_ascii_lowercase();
+            if domain.contains(',')
+                || lower.starts_with("geosite:")
+                || lower.starts_with("rule-set:")
+                || !crate::app::dns::config::valid_nameserver_policy_domain(domain)
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "dns.proxy-server-nameserver-policy invalid domain selector: {domain}"
+                )));
+            }
+            if servers.iter().any(|server| server.proxy.is_some()) {
+                return Err(Error::InvalidConfig(format!(
+                    "dns.proxy-server-nameserver-policy for {domain} cannot use #proxy: recursive bootstrap dialer is unsupported"
+                )));
+            }
             let clients = make_clients(
                 servers.clone(),
                 Some(default_resolver.clone()),
@@ -516,7 +892,11 @@ impl EnhancedResolver {
                 )));
             }
             let mut matcher = trie::StringTrie::new();
-            matcher.insert(&domain.to_ascii_lowercase(), Arc::new(true));
+            if !matcher.insert(&lower, Arc::new(true)) {
+                return Err(Error::InvalidConfig(format!(
+                    "dns.proxy-server-nameserver-policy unmatchable domain selector: {domain}"
+                )));
+            }
             proxy_server_nameserver_policy.push((Arc::new(matcher), clients));
         }
 
@@ -555,26 +935,41 @@ impl EnhancedResolver {
         let policy = if !cfg.nameserver_policy.is_empty() {
             let mut p = trie::StringTrie::new();
             for (domain, ns) in &cfg.nameserver_policy {
-                p.insert(
-                    &domain.to_ascii_lowercase(),
-                    Arc::new(
-                        make_clients(
-                            vec![ns.to_owned()],
-                            Some(default_resolver.clone()),
-                            Some(outbound_resolver.clone()),
-                            outbounds.clone(),
-                            edns_client_subnet.clone(),
-                            DnsClientNetworkOptions {
-                                fw_mark: cfg.fw_mark,
-                                rule_dispatch: rule_dispatch.clone(),
-                                network_path_source: network_path_source.clone(),
-                                health: Some(health.clone()),
-                                group: Some("policy"),
-                            },
-                        )
-                        .await?,
-                    ),
-                );
+                // Internal reload/config constructors need the same privacy
+                // validation as YAML conversion. Invalid entries must not
+                // silently miss the trie and send QNAMEs to main DNS.
+                let lower = domain.to_ascii_lowercase();
+                if domain.contains(',')
+                    || lower.starts_with("geosite:")
+                    || lower.starts_with("rule-set:")
+                    || !crate::app::dns::config::valid_nameserver_policy_domain(
+                        domain,
+                    )
+                {
+                    return Err(Error::InvalidConfig(format!(
+                        "dns.nameserver-policy invalid domain selector: {domain}"
+                    )));
+                }
+                let clients = make_clients(
+                    vec![ns.to_owned()],
+                    Some(default_resolver.clone()),
+                    Some(outbound_resolver.clone()),
+                    outbounds.clone(),
+                    edns_client_subnet.clone(),
+                    DnsClientNetworkOptions {
+                        fw_mark: cfg.fw_mark,
+                        rule_dispatch: rule_dispatch.clone(),
+                        network_path_source: network_path_source.clone(),
+                        health: Some(health.clone()),
+                        group: Some("policy"),
+                    },
+                )
+                .await?;
+                if clients.is_empty() || !p.insert(&lower, Arc::new(clients)) {
+                    return Err(Error::InvalidConfig(format!(
+                        "dns.nameserver-policy has no usable clients or unmatchable selector: {domain}"
+                    )));
+                }
             }
             Some(Arc::new(p))
         } else {
@@ -598,14 +993,21 @@ impl EnhancedResolver {
                 },
             )
             .await?;
-            Some(Arc::new(Self::direct_with_optional_ipv6_policy(
-                clients,
-                main.clone(),
-                ipv6_policy.clone(),
-                dns_ipv6,
-                cfg.direct_nameserver_follow_policy,
-                policy.clone(),
-            )) as ThreadSafeDNSResolver)
+            Some(Arc::new(
+                Self::direct_with_optional_ipv6_policy(
+                    clients,
+                    main.clone(),
+                    ipv6_policy.clone(),
+                    dns_ipv6,
+                    cfg.direct_nameserver_follow_policy,
+                    policy.clone(),
+                )
+                .with_parent_transport_gate(
+                    Arc::clone(&parent_transport_failed),
+                    Arc::clone(&parent_resets_in_progress),
+                )
+                .with_parent_publication_gate(Arc::clone(&parent_published)),
+            ) as ThreadSafeDNSResolver)
         } else {
             None
         };
@@ -691,6 +1093,12 @@ impl EnhancedResolver {
             negative_cache: Mutex::new(lru_time_cache::LruCache::with_capacity(
                 1024,
             )),
+            provider_epoch_cache: Mutex::new(
+                lru_time_cache::LruCache::with_capacity(
+                    PROVIDER_EPOCH_CACHE_CAPACITY,
+                ),
+            ),
+            network_positive_cache: Mutex::new(None),
             lru_cache: Some(hickory_resolver::ResponseCache::new(
                 4096,
                 hickory_resolver::TtlConfig::default(),
@@ -736,6 +1144,17 @@ impl EnhancedResolver {
             proxy_node_resolver: false,
             proxy_server_domains: proxy_server_domains_trie,
             provider_proxy_server_domains: RwLock::new(Default::default()),
+            provider_dns_epoch: AtomicU64::new(0),
+            provider_epoch_network_generation: AtomicU64::new(0),
+            transport_resets_in_progress: Arc::clone(&parent_resets_in_progress),
+            transport_reset_failed: Arc::clone(&parent_transport_failed),
+            retired: AtomicBool::new(false),
+            published: Arc::clone(&parent_published),
+            parent_published: None,
+            parent_transport_failed: None,
+            parent_resets_in_progress: None,
+            transport_reset_lock: tokio::sync::Mutex::new(()),
+            provider_domain_generations: RwLock::new(Default::default()),
             direct_resolver,
 
             reverse_lookup_cache: Some(Arc::new(RwLock::new(
@@ -936,24 +1355,338 @@ impl EnhancedResolver {
         Ok(ip_list)
     }
 
-    #[instrument(skip_all, level = "trace")]
+    async fn reject_mixed_proxy_node_questions(
+        &self,
+        message: &op::Message,
+    ) -> anyhow::Result<()> {
+        // A provider can register a node after the preflight but before the
+        // first-question upstream decision. When a dedicated node DNS pool
+        // exists, reject all multi-question packets: they cannot be safely
+        // classified atomically against the mutable provider registry.
+        // The dedicated bootstrap transport resolver also selects policy by
+        // the first QNAME, despite not having a proxy_resolver pool.
+        // Standard single-question DNS and ordinary deployments without
+        // either dedicated node resolver retain their existing behavior.
+        if message.queries.len() > 1
+            && (self.proxy_resolver.is_some() || self.proxy_node_resolver)
+        {
+            return Err(anyhow!(
+                "multi-question DNS packet is unsupported with dedicated node DNS"
+            ));
+        }
+        Ok(())
+    }
+
+    // Recheck after a public cache hit: provider registration may occur after
+    // the initial registry lookup but before the cached answer is returned.
+    #[cfg(test)]
+    async fn revalidate_public_cache_hit(
+        &self,
+        message: &op::Message,
+        cached: op::Message,
+    ) -> anyhow::Result<op::Message> {
+        let domain = Self::domain_name_of_message(message);
+        let generation = match domain {
+            Some(ref domain) => self.provider_domain_generation(domain).await,
+            None => 0,
+        };
+        self.revalidate_public_cache_hit_with_generation(message, cached, generation)
+            .await
+    }
+
+    async fn revalidate_public_cache_hit_with_generation(
+        &self,
+        message: &op::Message,
+        cached: op::Message,
+        selected_generation: u64,
+    ) -> anyhow::Result<op::Message> {
+        // A provider can register and disappear after a public cache entry
+        // was selected. Checking current ownership alone misses this ABA.
+        if let Some(domain) = Self::domain_name_of_message(message)
+            && self.provider_domain_generation(&domain).await != selected_generation
+        {
+            return Err(anyhow!(
+                "proxy provider DNS ownership changed during public cache hit"
+            ));
+        }
+        if self.proxy_resolver.is_some()
+            && let Some(domain) = Self::domain_name_of_message(message)
+            && self.is_registered_provider_domain(&domain).await
+        {
+            // A provider can be removed and re-added while this dedicated
+            // lookup is in flight. Cache reclassification must enforce the
+            // same generation check as the regular node-query path.
+            let generation = self.provider_domain_generation(&domain).await;
+            let result = self
+                .exchange_no_cache_with_policy(message, false, true)
+                .await;
+            if self.provider_domain_generation(&domain).await != generation
+                || !self.is_registered_provider_domain(&domain).await
+            {
+                return Err(anyhow!(
+                    "proxy provider DNS ownership changed during cached query"
+                ));
+            }
+            return result;
+        }
+        // Static endpoints do not have a mutable provider generation, but
+        // they still must never return a public cache candidate.
+        if self.proxy_resolver.is_some()
+            && let Some(domain) = Self::domain_name_of_message(message)
+            && self
+                .proxy_server_domains
+                .as_ref()
+                .is_some_and(|static_domains| {
+                    static_domains
+                        .search(&domain.to_ascii_lowercase())
+                        .is_some()
+                })
+        {
+            return self
+                .exchange_no_cache_with_policy(message, false, false)
+                .await;
+        }
+        Ok(cached)
+    }
+
+    fn ensure_not_retired(&self) -> anyhow::Result<()> {
+        if self.retired.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("DNS resolver owner permanently retired");
+        }
+        if !self.published.load(std::sync::atomic::Ordering::SeqCst)
+            || self.parent_published.as_ref().is_some_and(|parent| {
+                !parent.load(std::sync::atomic::Ordering::SeqCst)
+            })
+        {
+            anyhow::bail!("DNS resolver policy not yet published by owner");
+        }
+        Ok(())
+    }
+
+    fn ensure_parent_transport_open(&self) -> anyhow::Result<()> {
+        self.ensure_not_retired()?;
+        if self
+            .parent_transport_failed
+            .as_ref()
+            .is_some_and(|gate| gate.load(std::sync::atomic::Ordering::SeqCst))
+            || self
+                .parent_resets_in_progress
+                .as_ref()
+                .is_some_and(|pending| {
+                    pending.load(std::sync::atomic::Ordering::SeqCst) != 0
+                })
+        {
+            return Err(anyhow!(
+                "DIRECT DNS owner has not completed transport recovery"
+            ));
+        }
+        Ok(())
+    }
+
+    // Recheck immediately before every upstream dispatch. Preflight and
+    // return-time validation alone can reject an answer too late: the QNAME
+    // may already have escaped on an invalidated transport after an await.
+    fn ensure_transport_dispatch_ready(&self) -> anyhow::Result<()> {
+        self.ensure_parent_transport_open()?;
+        if self
+            .transport_resets_in_progress
+            .load(std::sync::atomic::Ordering::SeqCst)
+            != 0
+        {
+            return Err(anyhow!("DNS transport reset in progress"));
+        }
+        if self
+            .transport_reset_failed
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(anyhow!(
+                "DNS transport reset failed; retry reset before querying"
+            ));
+        }
+        Ok(())
+    }
+
+    async fn batch_exchange_if_transport_usable(
+        &self,
+        clients: &Vec<ThreadSafeDNSClient>,
+        message: &op::Message,
+    ) -> anyhow::Result<op::Message> {
+        self.ensure_transport_dispatch_ready()?;
+        Self::batch_exchange(clients, message).await
+    }
+
     async fn exchange(&self, message: &op::Message) -> anyhow::Result<op::Message> {
+        self.ensure_transport_dispatch_ready()?;
+        let result = self.exchange_inner(message).await;
+        self.ensure_transport_dispatch_ready()?;
+        result
+    }
+
+    #[instrument(skip_all, level = "trace")]
+    async fn exchange_inner(
+        &self,
+        message: &op::Message,
+    ) -> anyhow::Result<op::Message> {
         let q = message
             .queries
             .first()
             .ok_or_else(|| anyhow!("invalid query"))?;
 
+        if self
+            .transport_resets_in_progress
+            .load(std::sync::atomic::Ordering::SeqCst)
+            != 0
+        {
+            return Err(anyhow!("DNS transport reset in progress"));
+        }
+        if self
+            .transport_reset_failed
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(anyhow!(
+                "DNS transport reset failed; retry reset before querying"
+            ));
+        }
+        self.reject_mixed_proxy_node_questions(message).await?;
+
+        // Capture before classifying: a registry update anywhere during a node
+        // lookup invalidates the response, including remove/re-add ABA.
+        let provider_generation =
+            self.provider_domain_generation(&q.name().to_ascii()).await;
+        let network_generation_at_entry =
+            self.provider_epoch_network_generation.load(Relaxed);
+
         // Provider refreshes can introduce a node hostname previously cached
-        // from ordinary DNS. Never read or write that shared cache for live
-        // provider endpoint A/AAAA queries; dedicated node DNS must win.
+        // from ordinary DNS. Isolate all record types, including TXT/SRV,
+        // from the generic cache and DNS upstream.
         let provider_node_query = self.proxy_resolver.is_some()
-            && EnhancedResolver::is_ip_request(q)
             && self
                 .is_registered_provider_domain(&q.name().to_ascii())
                 .await;
+        let static_node_query = self.proxy_resolver.is_some()
+            && self
+                .proxy_server_domains
+                .as_ref()
+                .is_some_and(|static_domains| {
+                    Self::domain_name_of_message(message).is_some_and(|domain| {
+                        // Match the normalized, trailing-dot-free QNAME used
+                        // by the actual node DNS dispatch path. Otherwise
+                        // a static node can be misclassified as ordinary DNS
+                        // during cache bypass and final network-epoch checks.
+                        static_domains
+                            .search(&domain.to_ascii_lowercase())
+                            .is_some()
+                    })
+                });
 
         trace!(q = q.to_string(), "start");
+        // A prior Provider ownership transition invalidates *all* public
+        // cache entries for this QNAME. Hickory's cache has no per-key purge
+        // API or ownership provenance; continuing to read it after an ABA
+        // would resurrect answers cached before the Provider was registered.
+        // Keep ordinary never-owned domains cached; former node domains may
+        // still resolve publicly after removal, but without shared caching.
+        // Hickory's positive ResponseCache has no public clear API or network
+        // epoch in its key. After a transport reset, never consult the old
+        // cache: doing so can return an address learned on the prior network.
+        // Fail closed on cache reuse until the resolver is reconstructed.
+        let public_cache_eligible = !provider_node_query
+            && !static_node_query
+            && provider_generation == 0
+            && network_generation_at_entry == 0;
+        // The same bounded cache also holds safe negative answers for
+        // never-owned domains after a network reset. Before the first reset,
+        // ordinary negative answers continue using the legacy cache. A new
+        // negative answer must take precedence over an older positive entry;
+        // positive commits explicitly evict the corresponding negative.
         if !provider_node_query
+            && !static_node_query
+            && (provider_generation != 0 || network_generation_at_entry != 0)
+            && Self::cache_safe_request(message)
+            && self.lru_cache.is_some()
+            && let Some(cached) = self.cached_provider_epoch_response(
+                q,
+                message,
+                provider_generation,
+                Instant::now(),
+            )
+        {
+            trace!(q = q.to_string(), "provider epoch DNS cache hit");
+            #[cfg(test)]
+            Self::pause_selected_cache_candidate_for_test(
+                if cached.metadata.response_code == op::ResponseCode::NXDomain {
+                    CacheCandidateKind::Negative
+                } else {
+                    CacheCandidateKind::Positive
+                },
+            )
+            .await;
+            let reply = self
+                .revalidate_public_cache_hit_with_generation(
+                    message,
+                    cached,
+                    provider_generation,
+                )
+                .await?;
+            if self.provider_epoch_network_generation.load(Relaxed)
+                != network_generation_at_entry
+            {
+                return Err(anyhow!(
+                    "network path changed during former-provider DNS cache delivery"
+                ));
+            }
+            return Ok(reply);
+        }
+        // The legacy Hickory cache is unversioned. New network epochs use a
+        // separate cache that is replaced lazily under the reset commit lock.
+        if !provider_node_query
+            && !static_node_query
+            && provider_generation == 0
+            && network_generation_at_entry != 0
+            && Self::cache_safe_request(message)
+            && self.lru_cache.is_some()
+        {
+            let cached = {
+                let candidate = self
+                    .network_positive_cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                candidate
+                    .as_ref()
+                    .filter(|(epoch, _)| *epoch == network_generation_at_entry)
+                    .and_then(|(_, cache)| cache.get(q, Instant::now()))
+                    .and_then(Result::ok)
+            };
+            if let Some(mut cached) = cached {
+                #[cfg(test)]
+                Self::pause_selected_cache_candidate_for_test(
+                    CacheCandidateKind::Positive,
+                )
+                .await;
+                cached.metadata.id = message.metadata.id;
+                cached.metadata.recursion_desired =
+                    message.metadata.recursion_desired;
+                cached.metadata.checking_disabled =
+                    message.metadata.checking_disabled;
+                cached.queries = message.queries.clone();
+                let answer = self
+                    .revalidate_public_cache_hit_with_generation(
+                        message,
+                        cached,
+                        provider_generation,
+                    )
+                    .await?;
+                if self.provider_epoch_network_generation.load(Relaxed)
+                    != network_generation_at_entry
+                {
+                    return Err(anyhow!(
+                        "network path changed during positive DNS cache hit"
+                    ));
+                }
+                return Ok(answer);
+            }
+        }
+        if public_cache_eligible
             && Self::cache_safe_request(message)
             && let Some(lru) = &self.lru_cache
             && let Some(Ok(mut cached)) = lru.get(q, Instant::now()).map(|c| {
@@ -968,22 +1701,66 @@ impl EnhancedResolver {
             cached.metadata.recursion_desired = message.metadata.recursion_desired;
             cached.metadata.checking_disabled = message.metadata.checking_disabled;
             cached.queries = message.queries.clone();
-            return Ok(cached);
+            #[cfg(test)]
+            Self::pause_selected_cache_candidate_for_test(
+                CacheCandidateKind::Positive,
+            )
+            .await;
+            return self
+                .revalidate_public_cache_hit_with_generation(
+                    message,
+                    cached,
+                    provider_generation,
+                )
+                .await;
         }
-        if !provider_node_query
+        if public_cache_eligible
             && Self::cache_safe_request(message)
             && self.lru_cache.is_some()
             && let Some(cached) = self.cached_negative(q, message, Instant::now())
         {
             trace!(q = q.to_string(), "negative DNS cache hit");
-            return Ok(cached);
+            #[cfg(test)]
+            Self::pause_selected_cache_candidate_for_test(
+                CacheCandidateKind::Negative,
+            )
+            .await;
+            return self
+                .revalidate_public_cache_hit_with_generation(
+                    message,
+                    cached,
+                    provider_generation,
+                )
+                .await;
         }
         trace!(q = q.to_string(), "querying resolver");
+        #[cfg(test)]
+        if let Ok(pause) = PUBLIC_HANDOFF_TEST_PAUSE.try_with(Clone::clone) {
+            pause.selected.wait().await;
+            pause.resume.wait().await;
+        }
+        // The internal no-cache path takes its own generation snapshot.
+        // A provider can register and unregister between the entry snapshot
+        // and that second snapshot (ABA), otherwise laundering an obsolete
+        // public lookup into the shared cache. Reject before dispatch.
+        if !provider_node_query
+            && !static_node_query
+            && self.proxy_resolver.is_some()
+            && self.provider_domain_generation(&q.name().to_ascii()).await
+                != provider_generation
+        {
+            return Err(anyhow!(
+                "proxy provider DNS ownership changed before public query dispatch"
+            ));
+        }
+        let mut internal_used_dedicated_node_dns = false;
         let res = self
-            .exchange_no_cache_with_policy(
+            .exchange_no_cache_with_policy_and_generation(
                 message,
-                !provider_node_query,
+                !provider_node_query && !static_node_query,
                 provider_node_query,
+                Some(provider_generation),
+                Some(&mut internal_used_dedicated_node_dns),
             )
             .await
             .map(|mut r| {
@@ -993,6 +1770,88 @@ impl EnhancedResolver {
                 }
                 r
             });
+        #[cfg(test)]
+        if let Ok(pause) = PUBLIC_RETURN_TEST_PAUSE.try_with(Clone::clone) {
+            pause.selected.wait().await;
+            pause.resume.wait().await;
+        }
+        // Active provider/static proxy endpoints are network-path scoped as
+        // well as provider-generation scoped. Even a still-registered node
+        // must not return an old transport's address after a reset.
+        if self.provider_epoch_network_generation.load(Relaxed)
+            != network_generation_at_entry
+        {
+            return Err(anyhow!(
+                "network path changed during dedicated proxy node DNS query"
+            ));
+        }
+
+        // Revalidate public results after the internal cache commit too: an
+        // ownership transition can occur after the internal generation guard
+        // is released but before exchange hands the answer to its caller.
+        if !provider_node_query
+            && !static_node_query
+            && self.proxy_resolver.is_some()
+            && self.provider_domain_generation(&q.name().to_ascii()).await
+                != provider_generation
+        {
+            // A newly registered node may already have been reclassified by
+            // the internal resolver. Never return the possibly public result;
+            // resolve through the dedicated node pool with a fresh ownership
+            // snapshot instead. A completed ABA with no owner fails closed.
+            let domain = q.name().to_ascii();
+            if !self.is_registered_provider_domain(&domain).await {
+                return Err(anyhow!(
+                    "proxy provider DNS ownership changed before public answer return"
+                ));
+            }
+            let generation = self.provider_domain_generation(&domain).await;
+            // The internal query may already have reclassified the in-flight
+            // public request through the dedicated node pool. Its provenance
+            // is explicit; do not send a second bootstrap DNS query.
+            let node_result = if internal_used_dedicated_node_dns {
+                res
+            } else {
+                self.exchange_no_cache_with_policy_and_generation(
+                    message,
+                    false,
+                    true,
+                    Some(generation),
+                    None,
+                )
+                .await
+            };
+            if self.provider_domain_generation(&domain).await != generation
+                || !self.is_registered_provider_domain(&domain).await
+            {
+                return Err(anyhow!(
+                    "proxy provider DNS ownership changed during return reclassification"
+                ));
+            }
+            if self.provider_epoch_network_generation.load(Relaxed)
+                != network_generation_at_entry
+            {
+                return Err(anyhow!(
+                    "network path changed during proxy node DNS reclassification"
+                ));
+            }
+            return node_result;
+        }
+        // A provider may be removed while its dedicated DNS request is in
+        // flight. Do not return an answer for a node that is no longer owned
+        // by the provider registry. Fail closed rather than silently retrying
+        // through public DNS after a node-specific lookup.
+        if provider_node_query
+            && (self.provider_domain_generation(&q.name().to_ascii()).await
+                != provider_generation
+                || !self
+                    .is_registered_provider_domain(&q.name().to_ascii())
+                    .await)
+        {
+            return Err(anyhow!(
+                "proxy provider DNS ownership changed during query"
+            ));
+        }
         trace!(q = q.to_string(), "query completed");
         res
     }
@@ -1012,8 +1871,64 @@ impl EnhancedResolver {
         populate_shared_cache: bool,
         provider_node_snapshot: bool,
     ) -> anyhow::Result<op::Message> {
-        let q = message.queries.first().unwrap();
+        self.exchange_no_cache_with_policy_and_generation(
+            message,
+            populate_shared_cache,
+            provider_node_snapshot,
+            None,
+            None,
+        )
+        .await
+    }
 
+    async fn exchange_no_cache_with_policy_and_generation(
+        &self,
+        message: &op::Message,
+        populate_shared_cache: bool,
+        provider_node_snapshot: bool,
+        entry_generation: Option<u64>,
+        mut dedicated_source: Option<&mut bool>,
+    ) -> anyhow::Result<op::Message> {
+        // This internal entry point can be called without the public exchange
+        // preflight. Never select a bootstrap policy from only the first QNAME.
+        self.reject_mixed_proxy_node_questions(message).await?;
+        let q = message
+            .queries
+            .first()
+            .ok_or_else(|| anyhow!("invalid query"))?;
+
+        let query_network_generation =
+            self.provider_epoch_network_generation.load(Relaxed);
+        #[cfg(test)]
+        if let Ok(pause) = INTERNAL_HANDOFF_TEST_PAUSE.try_with(Clone::clone) {
+            pause.selected.wait().await;
+            pause.resume.wait().await;
+        }
+        // Carry the entry snapshot across the async internal handoff. A
+        // fresh snapshot here alone would miss an ABA between these calls.
+        if let (Some(expected), Some(domain)) =
+            (entry_generation, Self::domain_name_of_message(message))
+            && self.provider_domain_generation(&domain).await != expected
+        {
+            return Err(anyhow!(
+                "proxy provider DNS ownership changed during internal handoff"
+            ));
+        }
+        // A provider may register and unregister the same hostname while a
+        // public lookup is in flight. Checking current ownership alone misses
+        // this ABA transition and can return/cache an obsolete public answer.
+        let public_generation =
+            if self.proxy_resolver.is_some() && !provider_node_snapshot {
+                if let Some(expected) = entry_generation {
+                    Some(expected)
+                } else if let Some(domain) = Self::domain_name_of_message(message) {
+                    Some(self.provider_domain_generation(&domain).await)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
         let mut used_dedicated_node_dns = false;
         let rv = if EnhancedResolver::is_ip_request(q) {
             self.ip_exchange_with_provider_snapshot_and_source(
@@ -1022,18 +1937,196 @@ impl EnhancedResolver {
                 &mut used_dedicated_node_dns,
             )
             .await
+        } else if self.proxy_resolver.is_some()
+            && let Some(domain) = EnhancedResolver::domain_name_of_message(message)
+            && (provider_node_snapshot
+                || self.is_registered_provider_domain(&domain).await
+                || self.proxy_server_domains.as_ref().is_some_and(
+                    |static_domains| {
+                        static_domains
+                            .search(&domain.to_ascii_lowercase())
+                            .is_some()
+                    },
+                ))
+        {
+            // Static and dynamic proxy endpoints must both use dedicated
+            // bootstrap DNS for TXT/SRV and other non-address questions.
+            // Never let a static endpoint's QNAME escape to generic DNS.
+            used_dedicated_node_dns = true;
+            if let Some((_, clients)) = self
+                .proxy_server_nameserver_policy
+                .iter()
+                .find(|(matcher, _)| {
+                    matcher.search(&domain.to_ascii_lowercase()).is_some()
+                })
+            {
+                self.batch_exchange_if_transport_usable(clients, message)
+                    .await
+            } else {
+                self.batch_exchange_if_transport_usable(
+                    self.proxy_resolver.as_ref().expect("checked above"),
+                    message,
+                )
+                .await
+            }
+        } else if self.proxy_node_resolver {
+            // Non-address bootstrap questions must honor the same dedicated
+            // node policy as A/AAAA. Never route them via generic DNS policy.
+            if let Some(domain) = EnhancedResolver::domain_name_of_message(message) {
+                if let Some((_, clients)) = self
+                    .proxy_server_nameserver_policy
+                    .iter()
+                    .find(|(matcher, _)| {
+                        matcher.search(&domain.to_ascii_lowercase()).is_some()
+                    })
+                {
+                    self.batch_exchange_if_transport_usable(clients, message)
+                        .await
+                } else {
+                    self.batch_exchange_if_transport_usable(&self.main, message)
+                        .await
+                }
+            } else {
+                self.batch_exchange_if_transport_usable(&self.main, message)
+                    .await
+            }
         } else if let Some(matched) = self.match_policy(message) {
-            EnhancedResolver::batch_exchange(matched, message).await
+            self.batch_exchange_if_transport_usable(matched, message)
+                .await
         } else {
-            EnhancedResolver::batch_exchange(&self.main, message).await
+            self.batch_exchange_if_transport_usable(&self.main, message)
+                .await
         };
+
+        if let Some(source) = dedicated_source.as_deref_mut() {
+            *source = used_dedicated_node_dns;
+        }
+        if !used_dedicated_node_dns
+            && public_generation.is_some_and(|generation| generation != 0)
+            && self.provider_epoch_network_generation.load(Relaxed)
+                != query_network_generation
+        {
+            return Err(anyhow!(
+                "network path changed during former-provider public DNS lookup"
+            ));
+        }
+
+        // Provider registration can happen while a public DNS request is in
+        // flight. A response from that request is no longer authorized for
+        // the newly protected hostname: discard it and retry via the
+        // dedicated bootstrap resolver. Do not populate shared caches with
+        // the obsolete public response.
+        if !used_dedicated_node_dns
+            && self.proxy_resolver.is_some()
+            && let Some(domain) = Self::domain_name_of_message(message)
+            && self.is_registered_provider_domain(&domain).await
+        {
+            let dedicated_result =
+                Box::pin(self.exchange_no_cache_with_policy(message, false, true))
+                    .await;
+            if let Some(source) = dedicated_source {
+                *source = true;
+            }
+            return dedicated_result;
+        }
+
+        if !used_dedicated_node_dns
+            && let (Some(generation), Some(domain)) =
+                (public_generation, Self::domain_name_of_message(message))
+            && self.provider_domain_generation(&domain).await != generation
+        {
+            return Err(anyhow!(
+                "proxy provider DNS ownership changed during public query"
+            ));
+        }
+
+        #[cfg(test)]
+        if let Ok(pause) = PUBLIC_CACHE_WRITE_TEST_PAUSE.try_with(Clone::clone) {
+            pause.selected.wait().await;
+            pause.resume.wait().await;
+        }
+
+        // Hold the generation read guard through both positive and negative
+        // cache writes. Provider updates take the corresponding write guard
+        // before committing a new ownership generation, so a late ABA cannot
+        // slip between validation and insertion. No await while held.
+        let generation_guard = if public_generation.is_some() {
+            Some(self.provider_domain_generations.read().await)
+        } else {
+            None
+        };
+        if let (Some(expected), Some(generations), Some(domain)) = (
+            public_generation,
+            generation_guard.as_ref(),
+            Self::domain_name_of_message(message),
+        ) && *generations
+            .get(&domain.trim_end_matches('.').to_ascii_lowercase())
+            .unwrap_or(&0)
+            != expected
+        {
+            return Err(anyhow!(
+                "proxy provider DNS ownership changed before cache commit"
+            ));
+        }
+
+        if self.provider_epoch_network_generation.load(Relaxed)
+            != query_network_generation
+        {
+            return Err(anyhow!(
+                "network path changed before former-provider DNS cache commit"
+            ));
+        }
+
+        // The bounded, generation-tagged cache serves former Provider names
+        // and, after the first network reset, SOA-validated ordinary negative
+        // answers. Positive ordinary answers use network_positive_cache.
+        // Keep the existing pre-reset legacy negative cache unchanged.
+        if populate_shared_cache
+            && !used_dedicated_node_dns
+            && Self::cache_safe_request(message)
+            && self.lru_cache.is_some()
+            && let Ok(msg) = &rv
+            && (public_generation.is_some_and(|generation| generation != 0)
+                || (query_network_generation != 0
+                    && Self::negative_ttl(q, msg).is_some()))
+        {
+            self.cache_provider_epoch_response_for_network(
+                q,
+                msg,
+                public_generation.unwrap_or(0),
+                Instant::now(),
+                Some(query_network_generation),
+            );
+        }
 
         // Live provider ownership can change after the initial cache bypass
         // decision. Never insert a dedicated node answer into shared generic
         // DNS caches, even if the domain has since been removed.
-        let populate_shared_cache =
-            populate_shared_cache && !used_dedicated_node_dns;
+        // Responses for a name ever owned by a proxy Provider cannot be
+        // safely entered in a cache keyed only by DNS Question; later ABA
+        // changes have no way to revoke those entries. With a dedicated
+        // resolver pool, a nonzero per-domain generation marks that history.
+        let populate_shared_cache = populate_shared_cache
+            && !used_dedicated_node_dns
+            && public_generation.is_none_or(|generation| generation == 0)
+            // Never repopulate an unversioned cache after a network reset:
+            // a later query could otherwise confuse old and new entries.
+            && query_network_generation == 0;
 
+        // The unversioned caches must not accept an old-network response
+        // between the epoch check and insertion. Reset holds this same lock
+        // while advancing the epoch and clearing negative entries.
+        let mut network_commit_guard = self
+            .provider_epoch_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.provider_epoch_network_generation.load(Relaxed)
+            != query_network_generation
+        {
+            return Err(anyhow!(
+                "network path changed before public DNS cache commit"
+            ));
+        }
         if populate_shared_cache
             && let Ok(msg) = &rv
             && Self::cache_safe_request(message)
@@ -1064,6 +2157,61 @@ impl EnhancedResolver {
             lru.insert(q.clone(), Ok(msg.clone()), Instant::now());
         }
 
+        if query_network_generation != 0
+            && !used_dedicated_node_dns
+            && public_generation.is_none_or(|generation| generation == 0)
+            && Self::cache_safe_request(message)
+            && self.lru_cache.is_some()
+            && let Ok(msg) = &rv
+            && Self::cache_safe_response(msg)
+            && !(q.query_type() == rr::RecordType::TXT
+                && q.name().to_ascii().starts_with("_acme-challenge."))
+            && {
+                let ips = EnhancedResolver::ip_list_of_message(msg);
+                ips.is_empty() || ips.iter().any(|ip| !ip.is_unspecified())
+            }
+        {
+            // After a reset, normal negative entries share the generation-
+            // tagged cache with former Provider domains. Invalidate only a
+            // normal (generation zero) negative on a fresh positive answer.
+            // Hold the same commit lock across invalidation and insertion so
+            // a network reset cannot interleave and resurrect old NXDOMAIN.
+            let negative_key = Self::negative_cache_key(q);
+            if network_commit_guard
+                .peek(&negative_key)
+                .is_some_and(|entry| entry.generation == 0)
+            {
+                network_commit_guard.remove(&negative_key);
+            }
+            let mut cache = self
+                .network_positive_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if cache
+                .as_ref()
+                .is_none_or(|(epoch, _)| *epoch != query_network_generation)
+            {
+                *cache = Some((
+                    query_network_generation,
+                    hickory_resolver::ResponseCache::new(
+                        4096,
+                        hickory_resolver::TtlConfig::default(),
+                    ),
+                ));
+            }
+            if let Some((_, entries)) = cache.as_ref() {
+                entries.insert(q.clone(), Ok(msg.clone()), Instant::now());
+            }
+        }
+        drop(network_commit_guard);
+        if self.provider_epoch_network_generation.load(Relaxed)
+            != query_network_generation
+        {
+            return Err(anyhow!(
+                "network path changed during former-provider DNS query"
+            ));
+        }
+
         rv
     }
 
@@ -1078,6 +2226,16 @@ impl EnhancedResolver {
                 .map(|n| n.get_data().unwrap());
         }
         None
+    }
+
+    async fn provider_domain_generation(&self, domain: &str) -> u64 {
+        let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+        *self
+            .provider_domain_generations
+            .read()
+            .await
+            .get(&domain)
+            .unwrap_or(&0)
     }
 
     async fn is_registered_provider_domain(&self, domain: &str) -> bool {
@@ -1120,18 +2278,22 @@ impl EnhancedResolver {
         provider_node_snapshot: bool,
         used_dedicated_node_dns: &mut bool,
     ) -> anyhow::Result<op::Message> {
+        self.reject_mixed_proxy_node_questions(message).await?;
         if self.proxy_node_resolver {
             // This resolver is the transport's dedicated proxy node DNS
             // bootstrap context. It must not go through generic main DNS.
             if let Some(domain) = EnhancedResolver::domain_name_of_message(message) {
                 for (matcher, clients) in &self.proxy_server_nameserver_policy {
-                    if matcher.search(&domain).is_some() {
-                        return EnhancedResolver::batch_exchange(clients, message)
+                    if matcher.search(&domain.to_ascii_lowercase()).is_some() {
+                        return self
+                            .batch_exchange_if_transport_usable(clients, message)
                             .await;
                     }
                 }
             }
-            return EnhancedResolver::batch_exchange(&self.main, message).await;
+            return self
+                .batch_exchange_if_transport_usable(&self.main, message)
+                .await;
         }
 
         // Static proxy node domains do not change within this resolver and
@@ -1162,42 +2324,50 @@ impl EnhancedResolver {
                     },
                 ))
         {
-            *used_dedicated_node_dns = live_provider_domain;
+            *used_dedicated_node_dns = true;
             debug!(
                 "using proxy-server-nameserver for proxy server domain: {}",
                 domain
             );
             for (matcher, clients) in &self.proxy_server_nameserver_policy {
-                if matcher.search(&domain).is_some() {
+                if matcher.search(&domain.to_ascii_lowercase()).is_some() {
                     debug!(
                         "using proxy-server-nameserver-policy for proxy domain: {}",
                         domain
                     );
-                    return EnhancedResolver::batch_exchange(clients, message).await;
+                    return self
+                        .batch_exchange_if_transport_usable(clients, message)
+                        .await;
                 }
             }
-            return EnhancedResolver::batch_exchange(proxy_resolver, message).await;
+            return self
+                .batch_exchange_if_transport_usable(proxy_resolver, message)
+                .await;
         }
 
         if let Some(matched) = self.match_policy(message) {
-            return EnhancedResolver::batch_exchange(matched, message).await;
+            return self
+                .batch_exchange_if_transport_usable(matched, message)
+                .await;
         }
 
         if self.should_only_query_fallback(message) {
-            return EnhancedResolver::batch_exchange(
-                self.fallback.as_ref().unwrap(),
-                message,
-            )
-            .await;
+            return self
+                .batch_exchange_if_transport_usable(
+                    self.fallback.as_ref().unwrap(),
+                    message,
+                )
+                .await;
         }
 
-        let main_query = EnhancedResolver::batch_exchange(&self.main, message);
+        let main_query =
+            self.batch_exchange_if_transport_usable(&self.main, message);
 
         if self.fallback.is_none() {
             return main_query.await;
         }
 
-        let fallback_query = EnhancedResolver::batch_exchange(
+        let fallback_query = self.batch_exchange_if_transport_usable(
             self.fallback.as_ref().unwrap(),
             message,
         );
@@ -1290,6 +2460,7 @@ impl ClashResolver for EnhancedResolver {
         host: &str,
         enhanced: bool,
     ) -> anyhow::Result<Option<net::IpAddr>> {
+        self.ensure_not_retired()?;
         if let Some(ip) = parse_ip_literal(host) {
             if ip.is_ipv6() && !self.ipv6.load(Relaxed) {
                 return Err(Error::DNSError(format!(
@@ -1374,6 +2545,7 @@ impl ClashResolver for EnhancedResolver {
         host: &str,
         enhanced: bool,
     ) -> anyhow::Result<Vec<net::IpAddr>> {
+        self.ensure_not_retired()?;
         if let Some(ip) = parse_ip_literal(host) {
             if ip.is_ipv6() && !self.ipv6.load(Relaxed) {
                 return Err(Error::DNSError(format!(
@@ -1443,6 +2615,7 @@ impl ClashResolver for EnhancedResolver {
         host: &str,
         enhanced: bool,
     ) -> anyhow::Result<Option<net::Ipv4Addr>> {
+        self.ensure_not_retired()?;
         if let Some(ip) = parse_ip_literal(host) {
             return match ip {
                 net::IpAddr::V4(ip) => Ok(Some(ip)),
@@ -1472,6 +2645,7 @@ impl ClashResolver for EnhancedResolver {
             let mut fake_dns = self.fake_dns.as_ref().unwrap().write().await;
             if !fake_dns.should_skip(host) {
                 let ip = fake_dns.lookup(host).await;
+                self.ensure_not_retired()?;
                 debug!("fake dns lookup: {} -> {:?}", host, ip);
                 match ip {
                     Ok(net::IpAddr::V4(v4)) => return Ok(Some(v4)),
@@ -1500,6 +2674,7 @@ impl ClashResolver for EnhancedResolver {
         host: &str,
         enhanced: bool,
     ) -> anyhow::Result<Option<net::Ipv6Addr>> {
+        self.ensure_not_retired()?;
         if !self.ipv6.load(Relaxed) {
             return Err(Error::DNSError("IPv6 is disabled".into()).into());
         }
@@ -1534,9 +2709,17 @@ impl ClashResolver for EnhancedResolver {
 
     #[instrument(skip(self))]
     async fn cached_for(&self, ip: net::IpAddr) -> Option<String> {
+        // Reverse lookups can influence routing just like forward replies.
+        // Never expose a stale DIRECT mapping while its owner is invalid.
+        if self.ensure_parent_transport_open().is_err() {
+            return None;
+        }
         if let Some(lru) = &self.reverse_lookup_cache
             && let Some(cached) = lru.read().await.peek(&ip)
         {
+            if self.ensure_parent_transport_open().is_err() {
+                return None;
+            }
             trace!("reverse lookup cache hit: {cached} -> {ip}");
             return Some(cached.clone());
         }
@@ -1561,6 +2744,10 @@ impl ClashResolver for EnhancedResolver {
                 self.save_reverse_lookup(ip, hostname.clone()).await;
             }
         }
+        // The trait API may await the reverse-IP cache *after* the inherent
+        // resolver has already checked its parent gate. Revalidate before
+        // handing the answer to an independent DIRECT resolver caller.
+        self.ensure_parent_transport_open()?;
         Ok(rv)
     }
 
@@ -1576,13 +2763,86 @@ impl ClashResolver for EnhancedResolver {
         self.ipv6.store(enable, Relaxed);
     }
 
+    fn invalidate_transports(&self) {
+        self.transport_reset_failed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(direct_resolver) = &self.direct_resolver {
+            direct_resolver.invalidate_transports();
+        }
+    }
+
+    fn permits_background_egress(&self) -> bool {
+        self.ensure_transport_dispatch_ready().is_ok()
+    }
+
+    fn pause_publication(&self) {
+        self.published
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Some(direct_resolver) = &self.direct_resolver {
+            direct_resolver.pause_publication();
+        }
+    }
+
+    fn publish(&self) {
+        // A late commit must never revive an owner already retired.
+        if !self.retired.load(std::sync::atomic::Ordering::SeqCst) {
+            self.published
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(direct_resolver) = &self.direct_resolver {
+                direct_resolver.publish();
+            }
+        }
+    }
+
+    fn retire(&self) {
+        self.retired
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.published
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.invalidate_transports();
+        if let Some(direct_resolver) = &self.direct_resolver {
+            direct_resolver.retire();
+        }
+    }
+
     async fn reset_transports(&self) -> anyhow::Result<u32> {
+        self.ensure_not_retired()?;
+        self.transport_resets_in_progress
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Drop also runs on cancellation or timeout; never leave the gate stuck.
+        let _reset_guard = TransportResetGuard(&self.transport_resets_in_progress);
+        // Invalidate the parent and DIRECT child before waiting for the lock:
+        // a cancelled queued reset may never poll the child reset future.
+        self.transport_reset_failed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(direct_resolver) = &self.direct_resolver {
+            direct_resolver.invalidate_transports();
+        }
+        let _serial_reset = self.transport_reset_lock.lock().await;
+        self.ensure_not_retired()?;
+        self.transport_reset_failed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.health.invalidate();
-        // A changed network path can expose a different split-DNS zone.
-        self.negative_cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
+        // Coordinate the epoch transition and negative-cache flush with
+        // generic cache writers. Lock order: epoch cache -> negative cache.
+        {
+            let mut entries = self
+                .provider_epoch_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.provider_epoch_network_generation.fetch_add(1, Relaxed);
+            // Drop the old network's positive answers at the epoch boundary,
+            // even if no subsequent query arrives to replace this cache.
+            *self
+                .network_positive_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            self.negative_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+            entries.clear();
+        }
         let mut clients = self.main.clone();
         if let Some(fallback) = &self.fallback {
             clients.extend(fallback.iter().cloned());
@@ -1643,8 +2903,17 @@ impl ClashResolver for EnhancedResolver {
             cache.write().await.clear();
         }
         if errors.is_empty() {
+            self.ensure_not_retired()?;
+            self.transport_reset_failed
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            // An owner can retire while the final reset future completes.
+            // The retired gate remains authoritative regardless of a stale
+            // reset clearing the transient failure flag.
+            self.ensure_not_retired()?;
             Ok(reset)
         } else {
+            self.transport_reset_failed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             Err(anyhow!(errors.join("; ")))
         }
     }
@@ -1670,10 +2939,14 @@ impl ClashResolver for EnhancedResolver {
     }
 
     async fn should_fake_ip(&self, host: &str) -> bool {
+        if self.ensure_not_retired().is_err() {
+            return false;
+        }
         let Some(pool) = &self.fake_dns else {
             return false;
         };
-        !pool.read().await.should_skip(host)
+        let allowed = !pool.read().await.should_skip(host);
+        self.ensure_not_retired().is_ok() && allowed
     }
 
     fn direct_resolver(&self) -> Option<ThreadSafeDNSResolver> {
@@ -1707,46 +2980,74 @@ impl ClashResolver for EnhancedResolver {
             .flatten()
             .collect();
         let mut providers = self.provider_proxy_server_domains.write().await;
-        if domains.is_empty() {
-            providers.remove(provider);
-        } else {
-            providers.insert(provider.to_owned(), domains);
+        let previous = providers.get(provider).cloned().unwrap_or_default();
+        if previous != domains {
+            let mut generations = self.provider_domain_generations.write().await;
+            let generation = self.provider_dns_epoch.fetch_add(1, Relaxed) + 1;
+            for domain in previous.symmetric_difference(&domains) {
+                // A provider update changes the DNS ownership generation only
+                // when the domain enters or leaves the union of all providers.
+                // Other owners must not lose in-flight bootstrap responses.
+                let was_owned =
+                    providers.values().any(|names| names.contains(domain));
+                let still_owned_by_others = providers
+                    .iter()
+                    .any(|(name, names)| name != provider && names.contains(domain));
+                let will_be_owned =
+                    domains.contains(domain) || still_owned_by_others;
+                if was_owned != will_be_owned {
+                    generations.insert(domain.clone(), generation);
+                }
+            }
+            if domains.is_empty() {
+                providers.remove(provider);
+            } else {
+                providers.insert(provider.to_owned(), domains);
+            }
         }
         Ok(())
     }
 
     async fn is_fake_ip(&self, ip: std::net::IpAddr) -> bool {
-        if !self.fake_ip_enabled() {
+        if self.ensure_not_retired().is_err() || !self.fake_ip_enabled() {
             return false;
         }
 
         let mut fake_dns = self.fake_dns.as_ref().unwrap().write().await;
-        fake_dns.is_fake_ip(ip).await
+        let result = fake_dns.is_fake_ip(ip).await;
+        self.ensure_not_retired().is_ok() && result
     }
 
     async fn reverse_lookup(&self, ip: net::IpAddr) -> Option<String> {
         debug!("reverse lookup: {}", ip);
-        if !self.fake_ip_enabled() {
+        if self.ensure_not_retired().is_err() || !self.fake_ip_enabled() {
             return None;
         }
 
         let mut fake_dns = self.fake_dns.as_ref().unwrap().write().await;
-        fake_dns.reverse_lookup(ip).await
+        let result = fake_dns.reverse_lookup(ip).await;
+        self.ensure_not_retired().ok()?;
+        result
     }
 
     async fn fake_ip_for_host(&self, host: &str) -> Option<net::IpAddr> {
-        if !self.fake_ip_enabled() {
+        if self.ensure_not_retired().is_err() || !self.fake_ip_enabled() {
             return None;
         }
 
         let mut fake_dns = self.fake_dns.as_ref().unwrap().write().await;
-        fake_dns.lookup_existing(host).await
+        let result = fake_dns.lookup_existing(host).await;
+        self.ensure_not_retired().ok()?;
+        result
     }
 }
 
 #[cfg(test)]
 mod tests {
-
+    use super::{
+        CACHE_CANDIDATE_TEST_PAUSE, CacheCandidateKind, CacheCandidateTestPause,
+        PROVIDER_EPOCH_CACHE_CAPACITY, PROVIDER_EPOCH_CACHE_MAX_TTL,
+    };
     use async_trait::async_trait;
     use hickory_net::{DnsHandle, client, udp::UdpClientStream, xfer::FirstAnswer};
     use hickory_proto::{
@@ -1827,6 +3128,25 @@ mod tests {
 
         async fn exchange(&self, _msg: &op::Message) -> anyhow::Result<op::Message> {
             self.hits.fetch_add(1, Ordering::SeqCst);
+            Ok(self.response.clone())
+        }
+    }
+
+    #[derive(Debug)]
+    struct PausedClient {
+        response: op::Message,
+        entered: Arc<tokio::sync::Notify>,
+        resume: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl crate::app::dns::Client for PausedClient {
+        fn id(&self) -> String {
+            "paused-public-dns".into()
+        }
+        async fn exchange(&self, _msg: &op::Message) -> anyhow::Result<op::Message> {
+            self.entered.notify_one();
+            self.resume.notified().await;
             Ok(self.response.clone())
         }
     }
@@ -2155,6 +3475,78 @@ mod tests {
             resolver.resolve_v4("first.example", true).await.unwrap(),
             Some("198.18.0.2".parse().unwrap()),
             "existing mappings must remain stable",
+        );
+    }
+
+    #[tokio::test]
+    async fn retired_owner_must_not_return_old_fake_ip_mapping() {
+        let mut resolver = EnhancedResolver::from_clients(vec![], false);
+        resolver.fake_dns = Some(Arc::new(RwLock::new(
+            crate::app::dns::fakeip::FakeDns::new(crate::app::dns::fakeip::Opts {
+                ipnet: "198.18.0.0/30".parse().unwrap(),
+                skipped_hostnames: None,
+                store: Box::new(crate::app::dns::fakeip::InMemStore::new(2)),
+            })
+            .unwrap(),
+        )));
+        let host = "retired-fake.example";
+        let ip: Ipv4Addr = "198.18.0.2".parse().unwrap();
+        assert_eq!(resolver.resolve_v4(host, true).await.unwrap(), Some(ip));
+        assert_eq!(
+            resolver.fake_ip_for_host(host).await,
+            Some(std::net::IpAddr::V4(ip))
+        );
+        resolver.retire();
+        assert!(
+            resolver.resolve_v4(host, true).await.is_err(),
+            "old runtime must not synthesize a stale fake-IP after retirement"
+        );
+        assert!(resolver.fake_ip_for_host(host).await.is_none());
+        assert!(resolver.reverse_lookup(ip.into()).await.is_none());
+        assert!(!resolver.should_fake_ip(host).await);
+    }
+
+    #[tokio::test]
+    async fn retirement_while_fake_ip_pool_is_locked_must_not_return_old_mapping() {
+        let mut resolver = EnhancedResolver::from_clients(vec![], false);
+        resolver.fake_dns = Some(Arc::new(RwLock::new(
+            crate::app::dns::fakeip::FakeDns::new(crate::app::dns::fakeip::Opts {
+                ipnet: "198.18.0.0/30".parse().unwrap(),
+                skipped_hostnames: None,
+                store: Box::new(crate::app::dns::fakeip::InMemStore::new(2)),
+            })
+            .unwrap(),
+        )));
+        let pool = resolver.fake_dns.as_ref().unwrap().clone();
+        let owner = Arc::new(resolver);
+        let held = pool.write().await;
+        let running = {
+            let owner = owner.clone();
+            tokio::spawn(async move {
+                owner
+                    .resolve_v4("queued-before-retirement.example", true)
+                    .await
+            })
+        };
+        // The task is blocked on the pool lock; retirement must remain
+        // effective when it later resumes, not just at initial preflight.
+        tokio::task::yield_now().await;
+        owner.retire();
+        drop(held);
+        let result = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .expect("fake-IP lookup stalled")
+            .expect("fake-IP task panicked");
+        assert!(
+            result.is_err(),
+            "retired resolver returned a fake-IP: {result:?}"
+        );
+        assert!(
+            owner
+                .fake_ip_for_host("queued-before-retirement.example")
+                .await
+                .is_none(),
+            "retired owner must not disclose even a newly allocated stale mapping"
         );
     }
 
@@ -2815,6 +4207,1346 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_child_reset_failure_keeps_parent_closed_until_child_recovers() {
+        // A successful parent transport reset must not reopen queries when the
+        // DIRECT child still owns a partially reset upstream collection.
+        #[derive(Debug)]
+        struct RecoverableClient {
+            fail_reset: Arc<std::sync::atomic::AtomicBool>,
+            exchanges: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl crate::app::dns::Client for RecoverableClient {
+            fn id(&self) -> String {
+                "recoverable-direct-child".to_owned()
+            }
+            async fn exchange(
+                &self,
+                _: &op::Message,
+            ) -> anyhow::Result<op::Message> {
+                self.exchanges.fetch_add(1, Ordering::SeqCst);
+                Ok(response_with_a(Ipv4Addr::new(192, 0, 2, 55)))
+            }
+            async fn reset_transport(&self) -> anyhow::Result<u32> {
+                if self.fail_reset.load(Ordering::SeqCst) {
+                    Err(anyhow::anyhow!("injected DIRECT reset failure"))
+                } else {
+                    Ok(1)
+                }
+            }
+        }
+        let fail_reset = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let parent_exchanges = Arc::new(AtomicUsize::new(0));
+        let child_exchanges = Arc::new(AtomicUsize::new(0));
+        let mut parent = EnhancedResolver::from_clients(
+            vec![Arc::new(RecoverableClient {
+                fail_reset: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                exchanges: parent_exchanges.clone(),
+            })],
+            false,
+        );
+        let child = EnhancedResolver::from_clients(
+            vec![Arc::new(RecoverableClient {
+                fail_reset: fail_reset.clone(),
+                exchanges: child_exchanges.clone(),
+            })],
+            false,
+        );
+        parent.direct_resolver = Some(Arc::new(child));
+        let (request, _) = test_query();
+        let error = parent
+            .reset_transports()
+            .await
+            .expect_err("DIRECT reset must fail");
+        assert!(error.to_string().contains("injected DIRECT reset failure"));
+        assert!(
+            parent.exchange(&request).await.is_err(),
+            "parent must fail closed"
+        );
+        assert!(
+            parent
+                .direct_resolver
+                .as_ref()
+                .unwrap()
+                .exchange(&request)
+                .await
+                .is_err(),
+            "DIRECT child must fail closed"
+        );
+        assert_eq!(parent_exchanges.load(Ordering::SeqCst), 0);
+        assert_eq!(child_exchanges.load(Ordering::SeqCst), 0);
+
+        fail_reset.store(false, Ordering::SeqCst);
+        assert_eq!(parent.reset_transports().await.unwrap(), 2);
+        parent.exchange(&request).await.unwrap();
+        parent
+            .direct_resolver
+            .as_ref()
+            .unwrap()
+            .exchange(&request)
+            .await
+            .unwrap();
+        assert_eq!(parent_exchanges.load(Ordering::SeqCst), 1);
+        assert_eq!(child_exchanges.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn independent_direct_recovery_must_not_reopen_failed_parent() {
+        // A DIRECT child may be independently reset while its parent has a
+        // failed reset. Its recovery must not clear the parent's fail-closed
+        // state or let the parent's main upstream receive a query.
+        let parent_hits = Arc::new(AtomicUsize::new(0));
+        let child_hits = Arc::new(AtomicUsize::new(0));
+        let mut parent = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 70)),
+                hits: parent_hits.clone(),
+                id: "parent-upstream",
+            })],
+            false,
+        );
+        parent.direct_resolver = Some(Arc::new(EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 71)),
+                hits: child_hits.clone(),
+                id: "direct-upstream",
+            })],
+            false,
+        )));
+        parent.invalidate_transports();
+        let (request, _) = test_query();
+        let direct = parent.direct_resolver.as_ref().unwrap();
+        assert!(parent.exchange(&request).await.is_err());
+        assert!(direct.exchange(&request).await.is_err());
+        assert_eq!(direct.reset_transports().await.unwrap(), 0);
+        assert!(
+            parent.exchange(&request).await.is_err(),
+            "child-only recovery must not reopen the failed parent"
+        );
+        assert_eq!(parent_hits.load(Ordering::SeqCst), 0);
+        // This is deliberately not a guarantee that an independently held
+        // child handle remains closed: parent ownership is not shared yet.
+        assert_eq!(parent.reset_transports().await.unwrap(), 0);
+        parent.exchange(&request).await.unwrap();
+        assert_eq!(parent_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(child_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn independent_direct_recovery_cannot_escape_failed_parent_gate() {
+        // A DIRECT resolver may be handed to the dispatcher independently.
+        // It must remain closed while its parent owns a failed reset, even
+        // when the child itself has successfully reset its transports.
+        let parent_hits = Arc::new(AtomicUsize::new(0));
+        let child_hits = Arc::new(AtomicUsize::new(0));
+        let mut parent = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 70)),
+                hits: parent_hits.clone(),
+                id: "parent-upstream",
+            })],
+            false,
+        );
+        let child = Arc::new(
+            EnhancedResolver::from_clients(
+                vec![Arc::new(CountingClient {
+                    response: response_with_a(Ipv4Addr::new(192, 0, 2, 71)),
+                    hits: child_hits.clone(),
+                    id: "direct-upstream",
+                })],
+                false,
+            )
+            .with_parent_transport_gate(
+                Arc::clone(&parent.transport_reset_failed),
+                Arc::clone(&parent.transport_resets_in_progress),
+            ),
+        );
+        parent.direct_resolver = Some(child.clone());
+        parent.invalidate_transports();
+        let (request, _) = test_query();
+        assert!(parent.exchange(&request).await.is_err());
+        assert!(child.exchange(&request).await.is_err());
+        assert_eq!(child.reset_transports().await.unwrap(), 0);
+        assert!(
+            child.exchange(&request).await.is_err(),
+            "independent DIRECT reset must not bypass parent fail-closed ownership"
+        );
+        assert_eq!(child_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(parent.reset_transports().await.unwrap(), 0);
+        child.exchange(&request).await.unwrap();
+        assert_eq!(child_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(parent_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn parent_invalidation_during_inflight_direct_query_rejects_old_answer() {
+        // The DIRECT owner can fail while an upstream query is in flight.
+        // No response from the old transport may leave the child afterwards.
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut parent = EnhancedResolver::from_clients(vec![], false);
+        let child = Arc::new(
+            EnhancedResolver::from_clients(
+                vec![Arc::new(PausedClient {
+                    response: response_with_a(Ipv4Addr::new(192, 0, 2, 73)),
+                    entered: entered.clone(),
+                    resume: release.clone(),
+                })],
+                false,
+            )
+            .with_parent_transport_gate(
+                Arc::clone(&parent.transport_reset_failed),
+                Arc::clone(&parent.transport_resets_in_progress),
+            ),
+        );
+        parent.direct_resolver = Some(child.clone());
+        let (request, _) = test_query();
+        let pending = {
+            let child = child.clone();
+            let request = request.clone();
+            tokio::spawn(async move { child.exchange(&request).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("DIRECT query did not start");
+        parent.invalidate_transports();
+        release.notify_one();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), pending)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err(),
+            "in-flight DIRECT DNS response must not escape parent invalidation"
+        );
+        assert!(
+            child.exchange(&request).await.is_err(),
+            "DIRECT must remain closed until parent reset completes"
+        );
+        assert_eq!(parent.reset_transports().await.unwrap(), 0);
+        release.notify_one();
+        // Transport reset succeeds; the child gate is no longer owned by a
+        // failed parent. Do not require a second upstream query here because
+        // PausedClient intentionally pauses all its exchanges.
+        assert!(!parent.transport_reset_failed.load(Ordering::SeqCst));
+        assert!(
+            !child
+                .parent_transport_failed
+                .as_ref()
+                .unwrap()
+                .load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_resolve_v4_cannot_bypass_parent_failure_via_independent_reset() {
+        let direct_hits = Arc::new(AtomicUsize::new(0));
+        let mut parent = EnhancedResolver::from_clients(vec![], false);
+        let child = Arc::new(
+            EnhancedResolver::from_clients(
+                vec![Arc::new(CountingClient {
+                    response: response_with_a(Ipv4Addr::new(192, 0, 2, 74)),
+                    hits: direct_hits.clone(),
+                    id: "direct-v4-upstream",
+                })],
+                false,
+            )
+            .with_parent_transport_gate(
+                Arc::clone(&parent.transport_reset_failed),
+                Arc::clone(&parent.transport_resets_in_progress),
+            ),
+        );
+        parent.direct_resolver = Some(child);
+        let direct_handle = parent.direct_resolver().unwrap();
+        parent.invalidate_transports();
+        direct_handle.reset_transports().await.unwrap();
+        assert!(
+            direct_handle
+                .resolve_v4("proxy.example.com", false)
+                .await
+                .is_err(),
+            "independently held DIRECT resolver handle must honor parent gate"
+        );
+        assert_eq!(direct_hits.load(Ordering::SeqCst), 0);
+        parent.reset_transports().await.unwrap();
+        assert_eq!(
+            direct_handle
+                .resolve_v4("proxy.example.com", false)
+                .await
+                .unwrap(),
+            Some(Ipv4Addr::new(192, 0, 2, 74))
+        );
+        assert_eq!(direct_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn parent_failure_during_direct_reverse_cache_write_rejects_stale_reply() {
+        // The trait's exchange() does extra async reverse-IP caching after
+        // the inherent exchange() has returned. A reset in this second await
+        // must still suppress delivery of the old-network DNS answer.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut parent = EnhancedResolver::from_clients(vec![], false);
+        let mut child = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 76)),
+                hits: hits.clone(),
+                id: "direct-reverse-write",
+            })],
+            false,
+        );
+        let reverse =
+            Arc::new(RwLock::new(lru_time_cache::LruCache::with_capacity(16)));
+        child.reverse_lookup_cache = Some(reverse.clone());
+        let child = Arc::new(child.with_parent_transport_gate(
+            Arc::clone(&parent.transport_reset_failed),
+            Arc::clone(&parent.transport_resets_in_progress),
+        ));
+        parent.direct_resolver = Some(child.clone());
+        let held_reverse_writer = reverse.write().await;
+        let (request, _) = test_query();
+        let mut running = {
+            let child = child.clone();
+            tokio::spawn(async move {
+                ClashResolver::exchange(child.as_ref(), &request).await
+            })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut running)
+                .await
+                .is_err(),
+            "DIRECT response should wait for reverse cache lock"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the upstream must have responded before owner invalidation"
+        );
+        parent.invalidate_transports();
+        drop(held_reverse_writer);
+        let result = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "DIRECT trait exchange must revalidate parent after reverse caching"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_reverse_cache_must_not_expose_old_mapping_during_parent_failure()
+    {
+        let mut parent = EnhancedResolver::from_clients(vec![], false);
+        let mut child = EnhancedResolver::from_clients(vec![], false);
+        child.reverse_lookup_cache = Some(Arc::new(RwLock::new(
+            lru_time_cache::LruCache::with_capacity(16),
+        )));
+        let child = Arc::new(child.with_parent_transport_gate(
+            Arc::clone(&parent.transport_reset_failed),
+            Arc::clone(&parent.transport_resets_in_progress),
+        ));
+        parent.direct_resolver = Some(child.clone());
+        let ip = std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 76));
+        child
+            .save_reverse_lookup(ip, "old.network.example".into())
+            .await;
+        assert_eq!(
+            ClashResolver::cached_for(child.as_ref(), ip).await,
+            Some("old.network.example".into())
+        );
+        parent.invalidate_transports();
+        assert_eq!(
+            ClashResolver::cached_for(child.as_ref(), ip).await,
+            None,
+            "DIRECT reverse-IP cache must not expose old mappings while parent is closed"
+        );
+        parent.reset_transports().await.unwrap();
+        assert_eq!(
+            ClashResolver::cached_for(child.as_ref(), ip).await,
+            None,
+            "full reset must discard old-network reverse mappings"
+        );
+    }
+
+    #[tokio::test]
+    async fn orphaned_direct_handle_must_not_query_after_owner_is_dropped() {
+        // The dispatcher may retain a cloned DIRECT handle after an old
+        // resolver instance has been replaced or dropped. Such an orphan
+        // must not send DNS using the former owner's network path.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let direct_handle = {
+            let mut parent = EnhancedResolver::from_clients(vec![], false);
+            let child = Arc::new(
+                EnhancedResolver::from_clients(
+                    vec![Arc::new(CountingClient {
+                        response: response_with_a(Ipv4Addr::new(192, 0, 2, 77)),
+                        hits: hits.clone(),
+                        id: "orphaned-direct",
+                    })],
+                    false,
+                )
+                .with_parent_transport_gate(
+                    Arc::clone(&parent.transport_reset_failed),
+                    Arc::clone(&parent.transport_resets_in_progress),
+                ),
+            );
+            parent.direct_resolver = Some(child);
+            parent.direct_resolver().unwrap()
+        };
+        let (request, _) = test_query();
+        assert!(
+            direct_handle.exchange(&request).await.is_err(),
+            "orphaned DIRECT resolver must fail closed after parent Drop"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        direct_handle.reset_transports().await.unwrap();
+        assert!(
+            direct_handle
+                .resolve_v4("proxy.example.com", false)
+                .await
+                .is_err(),
+            "a child-only reset must never recreate its dropped DNS owner"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn owner_drop_during_direct_query_rejects_old_dns_response() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut parent = EnhancedResolver::from_clients(vec![], false);
+        let child = Arc::new(
+            EnhancedResolver::from_clients(
+                vec![Arc::new(PausedClient {
+                    response: response_with_a(Ipv4Addr::new(192, 0, 2, 78)),
+                    entered: entered.clone(),
+                    resume: release.clone(),
+                })],
+                false,
+            )
+            .with_parent_transport_gate(
+                Arc::clone(&parent.transport_reset_failed),
+                Arc::clone(&parent.transport_resets_in_progress),
+            ),
+        );
+        parent.direct_resolver = Some(child.clone());
+        let (request, _) = test_query();
+        let running = {
+            let child = child.clone();
+            tokio::spawn(async move { child.exchange(&request).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("DIRECT query did not start");
+        drop(parent);
+        release.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "old DNS response must not escape a dropped parent"
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_old_dns_owner_requires_explicit_retirement_on_reload() {
+        // A reload manager can retain the old owner through an Arc while
+        // publishing a new resolver. Drop alone is insufficient in this case.
+        let old_hits = Arc::new(AtomicUsize::new(0));
+        let new_hits = Arc::new(AtomicUsize::new(0));
+        let mut old_owner = EnhancedResolver::from_clients(vec![], false);
+        let old_direct = Arc::new(
+            EnhancedResolver::from_clients(
+                vec![Arc::new(CountingClient {
+                    response: response_with_a(Ipv4Addr::new(192, 0, 2, 82)),
+                    hits: old_hits.clone(),
+                    id: "retained-old-direct",
+                })],
+                false,
+            )
+            .with_parent_transport_gate(
+                Arc::clone(&old_owner.transport_reset_failed),
+                Arc::clone(&old_owner.transport_resets_in_progress),
+            ),
+        );
+        old_owner.direct_resolver = Some(old_direct.clone());
+        let retained_owner = Arc::new(old_owner);
+        let new_owner = EnhancedResolver::from_clients(vec![], false);
+        let new_direct = Arc::new(
+            EnhancedResolver::from_clients(
+                vec![Arc::new(CountingClient {
+                    response: response_with_a(Ipv4Addr::new(192, 0, 2, 83)),
+                    hits: new_hits.clone(),
+                    id: "replacement-direct",
+                })],
+                false,
+            )
+            .with_parent_transport_gate(
+                Arc::clone(&new_owner.transport_reset_failed),
+                Arc::clone(&new_owner.transport_resets_in_progress),
+            ),
+        );
+        let (request, _) = test_query();
+        old_direct.exchange(&request).await.unwrap();
+        // The reload coordinator must retire the old owner explicitly before
+        // it publishes the new one; keeping its Arc alive is intentional.
+        retained_owner.invalidate_transports();
+        assert!(old_direct.exchange(&request).await.is_err());
+        old_direct.reset_transports().await.unwrap();
+        assert!(old_direct.exchange(&request).await.is_err());
+        let answer = new_direct.exchange(&request).await.unwrap();
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&answer),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 83))]
+        );
+        assert_eq!(old_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(new_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(Arc::strong_count(&retained_owner), 1);
+    }
+
+    #[tokio::test]
+    async fn uncommitted_dns_owner_and_direct_child_must_not_query_upstream() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut owner = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 91)),
+                hits: hits.clone(),
+                id: "staged-parent",
+            })],
+            false,
+        );
+        let direct = Arc::new(
+            EnhancedResolver::from_clients(
+                vec![Arc::new(CountingClient {
+                    response: response_with_a(Ipv4Addr::new(192, 0, 2, 92)),
+                    hits: hits.clone(),
+                    id: "staged-direct",
+                })],
+                false,
+            )
+            .with_parent_transport_gate(
+                Arc::clone(&owner.transport_reset_failed),
+                Arc::clone(&owner.transport_resets_in_progress),
+            ),
+        );
+        owner.direct_resolver = Some(direct.clone());
+        let (request, _) = test_query();
+
+        owner.pause_publication();
+        assert!(owner.exchange(&request).await.is_err());
+        assert!(direct.exchange(&request).await.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        owner.publish();
+        assert!(owner.exchange(&request).await.is_ok());
+        assert!(direct.exchange(&request).await.is_ok());
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        owner.retire();
+        owner.publish();
+        assert!(owner.exchange(&request).await.is_err());
+        assert!(direct.exchange(&request).await.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn direct_child_independent_publish_must_not_bypass_staged_parent() {
+        // A retained DIRECT resolver handle must never act as an independent
+        // authority to publish DNS policy before its parent runtime commits.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut owner = EnhancedResolver::from_clients(vec![], false);
+        let direct = Arc::new(
+            EnhancedResolver::from_clients(
+                vec![Arc::new(CountingClient {
+                    response: response_with_a(Ipv4Addr::new(192, 0, 2, 91)),
+                    hits: hits.clone(),
+                    id: "staged-direct-independent-publish",
+                })],
+                false,
+            )
+            .with_parent_transport_gate(
+                Arc::clone(&owner.transport_reset_failed),
+                Arc::clone(&owner.transport_resets_in_progress),
+            )
+            .with_parent_publication_gate(Arc::clone(&owner.published)),
+        );
+        owner.direct_resolver = Some(direct.clone());
+        let (request, _) = test_query();
+
+        owner.pause_publication();
+        direct.publish();
+        assert!(
+            direct.exchange(&request).await.is_err(),
+            "DIRECT independently published before owner committed"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "uncommitted DIRECT request must never reach upstream"
+        );
+        owner.publish();
+        assert!(direct.exchange(&request).await.is_ok());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn parent_pause_during_inflight_direct_query_rejects_old_answer() {
+        // An already-dispatched DNS packet cannot be recalled, but a staged
+        // owner must not hand that stale answer back to the new runtime.
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut owner = EnhancedResolver::from_clients(vec![], false);
+        let direct = Arc::new(
+            EnhancedResolver::from_clients(
+                vec![Arc::new(PausedClient {
+                    response: response_with_a(Ipv4Addr::new(192, 0, 2, 93)),
+                    entered: entered.clone(),
+                    resume: release.clone(),
+                })],
+                false,
+            )
+            .with_parent_transport_gate(
+                Arc::clone(&owner.transport_reset_failed),
+                Arc::clone(&owner.transport_resets_in_progress),
+            )
+            .with_parent_publication_gate(Arc::clone(&owner.published)),
+        );
+        owner.direct_resolver = Some(direct.clone());
+        let (request, _) = test_query();
+        let pending = {
+            let direct = direct.clone();
+            tokio::spawn(async move { direct.exchange(&request).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("DIRECT query did not enter upstream");
+        owner.pause_publication();
+        // A separate holder cannot undo the paused owner's authority.
+        direct.publish();
+        release.notify_one();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), pending)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err(),
+            "old DIRECT answer escaped while parent publication was paused"
+        );
+        owner.publish();
+        assert_eq!(
+            direct.resolve("127.0.0.1", false).await.unwrap(),
+            Some(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST))
+        );
+    }
+
+    #[tokio::test]
+    async fn retired_dns_owner_cannot_be_reopened_by_old_parent_or_direct_reset() {
+        let old_hits = Arc::new(AtomicUsize::new(0));
+        let replacement_hits = Arc::new(AtomicUsize::new(0));
+        let mut old_owner = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 44)),
+                hits: old_hits.clone(),
+                id: "retired-parent",
+            })],
+            false,
+        );
+        let old_direct = Arc::new(
+            EnhancedResolver::from_clients(
+                vec![Arc::new(CountingClient {
+                    response: response_with_a(Ipv4Addr::new(192, 0, 2, 45)),
+                    hits: old_hits.clone(),
+                    id: "retired-direct",
+                })],
+                false,
+            )
+            .with_parent_transport_gate(
+                Arc::clone(&old_owner.transport_reset_failed),
+                Arc::clone(&old_owner.transport_resets_in_progress),
+            ),
+        );
+        old_owner.direct_resolver = Some(old_direct.clone());
+        let old_owner = Arc::new(old_owner);
+        let replacement = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 46)),
+                hits: replacement_hits.clone(),
+                id: "replacement",
+            })],
+            false,
+        );
+        let (request, _) = test_query();
+        old_owner.exchange(&request).await.unwrap();
+        old_direct.exchange(&request).await.unwrap();
+
+        // Retain both old Arc handles as if a user connection outlived reload.
+        old_owner.retire();
+        assert!(old_owner.exchange(&request).await.is_err());
+        assert!(old_direct.exchange(&request).await.is_err());
+        assert!(
+            old_owner.reset_transports().await.is_err(),
+            "retired owner must not recover with a new network reset"
+        );
+        assert!(
+            old_direct.reset_transports().await.is_err(),
+            "retired DIRECT handle must not recover separately"
+        );
+        assert!(old_owner.exchange(&request).await.is_err());
+        assert!(old_direct.exchange(&request).await.is_err());
+        assert_eq!(old_hits.load(Ordering::SeqCst), 2);
+
+        assert_eq!(replacement.reset_transports().await.unwrap(), 0);
+        replacement.exchange(&request).await.unwrap();
+        assert_eq!(replacement_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn retirement_during_inflight_reset_cannot_reopen_old_dns_owner() {
+        #[derive(Debug)]
+        struct PausedResetClient {
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+            hits: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl crate::app::dns::Client for PausedResetClient {
+            fn id(&self) -> String {
+                "paused-retired-reset".to_owned()
+            }
+
+            async fn exchange(
+                &self,
+                _: &op::Message,
+            ) -> anyhow::Result<op::Message> {
+                self.hits.fetch_add(1, Ordering::SeqCst);
+                Ok(response_with_a(Ipv4Addr::new(192, 0, 2, 47)))
+            }
+
+            async fn reset_transport(&self) -> anyhow::Result<u32> {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(1)
+            }
+        }
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let resolver = Arc::new(EnhancedResolver::from_clients(
+            vec![Arc::new(PausedResetClient {
+                entered: entered.clone(),
+                release: release.clone(),
+                hits: hits.clone(),
+            })],
+            false,
+        ));
+        let resetting = {
+            let resolver = resolver.clone();
+            tokio::spawn(async move { resolver.reset_transports().await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("DNS transport reset did not reach the test barrier");
+        resolver.retire();
+        release.notify_one();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), resetting)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err(),
+            "an in-flight successful transport reset must not revive its retired owner"
+        );
+        let (request, _) = test_query();
+        assert!(resolver.exchange(&request).await.is_err());
+        assert!(resolver.reset_transports().await.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn replacing_dns_owner_retires_old_direct_without_closing_new_owner() {
+        fn make_owner_and_direct(
+            ip: Ipv4Addr,
+            label: &'static str,
+            hits: Arc<AtomicUsize>,
+        ) -> (EnhancedResolver, Arc<EnhancedResolver>) {
+            let mut owner = EnhancedResolver::from_clients(vec![], false);
+            let child = Arc::new(
+                EnhancedResolver::from_clients(
+                    vec![Arc::new(CountingClient {
+                        response: response_with_a(ip),
+                        hits,
+                        id: label,
+                    })],
+                    false,
+                )
+                .with_parent_transport_gate(
+                    Arc::clone(&owner.transport_reset_failed),
+                    Arc::clone(&owner.transport_resets_in_progress),
+                ),
+            );
+            owner.direct_resolver = Some(child.clone());
+            (owner, child)
+        }
+        let old_hits = Arc::new(AtomicUsize::new(0));
+        let new_hits = Arc::new(AtomicUsize::new(0));
+        let (old_owner, old_direct) = make_owner_and_direct(
+            Ipv4Addr::new(192, 0, 2, 80),
+            "old-direct",
+            old_hits.clone(),
+        );
+        let (new_owner, new_direct) = make_owner_and_direct(
+            Ipv4Addr::new(192, 0, 2, 81),
+            "new-direct",
+            new_hits.clone(),
+        );
+        let (request, _) = test_query();
+        old_direct.exchange(&request).await.unwrap();
+        drop(old_owner);
+        assert!(
+            old_direct.exchange(&request).await.is_err(),
+            "old config's DIRECT handle must be retired after owner Drop"
+        );
+        let answer = new_direct.exchange(&request).await.unwrap();
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&answer),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 81))]
+        );
+        assert_eq!(old_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(new_hits.load(Ordering::SeqCst), 1);
+        drop(new_owner);
+        assert!(
+            new_direct.exchange(&request).await.is_err(),
+            "new owner must independently close its DIRECT on Drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_parent_reset_keeps_healthy_direct_child_closed() {
+        // A parent main DNS transport can fail even when DIRECT has already
+        // reset successfully. Its independently held child cannot reopen.
+        #[derive(Debug)]
+        struct ResettableClient {
+            fail: Arc<AtomicBool>,
+            resets: Arc<AtomicUsize>,
+            hits: Arc<AtomicUsize>,
+            label: &'static str,
+        }
+        #[async_trait]
+        impl crate::app::dns::Client for ResettableClient {
+            fn id(&self) -> String {
+                self.label.to_owned()
+            }
+            async fn exchange(
+                &self,
+                _: &op::Message,
+            ) -> anyhow::Result<op::Message> {
+                self.hits.fetch_add(1, Ordering::SeqCst);
+                Ok(response_with_a(Ipv4Addr::new(192, 0, 2, 75)))
+            }
+            async fn reset_transport(&self) -> anyhow::Result<u32> {
+                self.resets.fetch_add(1, Ordering::SeqCst);
+                if self.fail.load(Ordering::SeqCst) {
+                    Err(anyhow::anyhow!("injected parent main DNS reset failure"))
+                } else {
+                    Ok(1)
+                }
+            }
+        }
+        let parent_fail = Arc::new(AtomicBool::new(true));
+        let parent_hits = Arc::new(AtomicUsize::new(0));
+        let child_hits = Arc::new(AtomicUsize::new(0));
+        let child_resets = Arc::new(AtomicUsize::new(0));
+        let mut parent = EnhancedResolver::from_clients(
+            vec![Arc::new(ResettableClient {
+                fail: parent_fail.clone(),
+                resets: Arc::new(AtomicUsize::new(0)),
+                hits: parent_hits.clone(),
+                label: "failing-parent",
+            })],
+            false,
+        );
+        let child = Arc::new(
+            EnhancedResolver::from_clients(
+                vec![Arc::new(ResettableClient {
+                    fail: Arc::new(AtomicBool::new(false)),
+                    resets: child_resets.clone(),
+                    hits: child_hits.clone(),
+                    label: "working-direct",
+                })],
+                false,
+            )
+            .with_parent_transport_gate(
+                Arc::clone(&parent.transport_reset_failed),
+                Arc::clone(&parent.transport_resets_in_progress),
+            ),
+        );
+        parent.direct_resolver = Some(child.clone());
+        let (request, _) = test_query();
+        assert!(
+            parent
+                .reset_transports()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("injected parent main DNS reset failure")
+        );
+        assert_eq!(
+            child_resets.load(Ordering::SeqCst),
+            1,
+            "the healthy DIRECT transport should have completed its reset"
+        );
+        assert!(
+            child.exchange(&request).await.is_err(),
+            "healthy DIRECT cannot bypass an unsuccessful owner reset"
+        );
+        child.reset_transports().await.unwrap();
+        assert!(
+            child.exchange(&request).await.is_err(),
+            "second child-only recovery cannot reopen parent-owned DNS"
+        );
+        assert_eq!(child_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(parent_hits.load(Ordering::SeqCst), 0);
+        parent_fail.store(false, Ordering::SeqCst);
+        assert_eq!(parent.reset_transports().await.unwrap(), 2);
+        child.exchange(&request).await.unwrap();
+        assert_eq!(child_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn queued_parent_reset_window_must_keep_independent_direct_closed() {
+        // The first successful parent reset can clear its failure flag while
+        // another reset is queued. The active-reset count remains nonzero;
+        // a DIRECT handle must honor both parts of the parent's ownership.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut parent = EnhancedResolver::from_clients(vec![], false);
+        let child = Arc::new(
+            EnhancedResolver::from_clients(
+                vec![Arc::new(CountingClient {
+                    response: response_with_a(Ipv4Addr::new(192, 0, 2, 72)),
+                    hits: hits.clone(),
+                    id: "queued-direct-upstream",
+                })],
+                false,
+            )
+            .with_parent_transport_gate(
+                Arc::clone(&parent.transport_reset_failed),
+                Arc::clone(&parent.transport_resets_in_progress),
+            ),
+        );
+        parent.direct_resolver = Some(child.clone());
+        // A deterministic representation of the interval after a successful
+        // first reset clears failure while a second reset still has the gate.
+        parent
+            .transport_resets_in_progress
+            .fetch_add(1, Ordering::SeqCst);
+        let (request, _) = test_query();
+        assert!(!parent.transport_reset_failed.load(Ordering::SeqCst));
+        assert!(parent.exchange(&request).await.is_err());
+        assert!(
+            child.exchange(&request).await.is_err(),
+            "DIRECT must not use DNS while any owner reset is still pending"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        parent
+            .transport_resets_in_progress
+            .fetch_sub(1, Ordering::SeqCst);
+        child.exchange(&request).await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn parent_invalidation_during_internal_handoff_must_not_send_qname() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut owner = EnhancedResolver::from_clients(vec![], false);
+        let direct = Arc::new(
+            EnhancedResolver::from_clients(
+                vec![Arc::new(CountingClient {
+                    response: response_with_a(Ipv4Addr::new(192, 0, 2, 79)),
+                    hits: hits.clone(),
+                    id: "stale-internal-upstream",
+                })],
+                false,
+            )
+            .with_parent_transport_gate(
+                Arc::clone(&owner.transport_reset_failed),
+                Arc::clone(&owner.transport_resets_in_progress),
+            ),
+        );
+        owner.direct_resolver = Some(direct.clone());
+        let selected = Arc::new(tokio::sync::Barrier::new(2));
+        let resume = Arc::new(tokio::sync::Barrier::new(2));
+        let (request, _) = test_query();
+        let running = {
+            let direct = direct.clone();
+            let selected = selected.clone();
+            let resume = resume.clone();
+            tokio::spawn(async move {
+                super::INTERNAL_HANDOFF_TEST_PAUSE
+                    .scope(
+                        super::PublicHandoffTestPause { selected, resume },
+                        async move { direct.exchange(&request).await },
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), selected.wait())
+            .await
+            .expect("DIRECT internal handoff was not reached");
+        owner.invalidate_transports();
+        tokio::time::timeout(Duration::from_secs(5), resume.wait())
+            .await
+            .expect("DIRECT internal handoff did not resume");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), running)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "DIRECT old-network QNAME must not dispatch after internal handoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_invalidation_between_main_and_fallback_must_not_send_qname() {
+        // The second DNS path must be gated after the first upstream awaits.
+        // Returning an error alone is insufficient if fallback already saw
+        // the QNAME on an old network.
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let fallback_hits = Arc::new(AtomicUsize::new(0));
+        let main = Arc::new(PausedClient {
+            response: negative_response(
+                op::ResponseCode::NXDomain,
+                "proxy.example.com.",
+                120,
+                60,
+            ),
+            entered: entered.clone(),
+            resume: release.clone(),
+        });
+        let fallback = Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 90)),
+            hits: fallback_hits.clone(),
+            id: "forbidden-old-fallback",
+        });
+        let resolver = Arc::new(EnhancedResolver::from_clients_with_fallback(
+            vec![main],
+            Some(vec![fallback]),
+            false,
+        ));
+        let (request, _) = test_query();
+        let running = {
+            let resolver = resolver.clone();
+            tokio::spawn(async move { resolver.exchange(&request).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("main DNS upstream was not reached");
+        resolver.invalidate_transports();
+        release.notify_one();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), running)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(
+            fallback_hits.load(Ordering::SeqCst),
+            0,
+            "DNS fallback must not be dispatched on invalidated transport"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidated_dns_policy_and_node_dispatch_stay_isolated_until_recovery()
+    {
+        // Real policy, dynamic Provider and static proxy-node selection must
+        // all stop before the old upstream sees a QNAME after invalidation.
+        for case in 0..3 {
+            let main_hits = Arc::new(AtomicUsize::new(0));
+            let selected_hits = Arc::new(AtomicUsize::new(0));
+            let mut resolver = EnhancedResolver::from_clients(
+                vec![Arc::new(CountingClient {
+                    response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+                    hits: main_hits.clone(),
+                    id: "unwanted-public-dns",
+                })],
+                false,
+            );
+            let selected_client: ThreadSafeDNSClient = Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 91)),
+                hits: selected_hits.clone(),
+                id: "selected-policy-or-node-dns",
+            });
+            match case {
+                0 => {
+                    let mut policy = crate::common::trie::StringTrie::new();
+                    policy.insert(
+                        "proxy.example.com",
+                        Arc::new(vec![selected_client]),
+                    );
+                    resolver.policy = Some(Arc::new(policy));
+                }
+                1 => {
+                    resolver.proxy_resolver = Some(vec![selected_client]);
+                    resolver
+                        .replace_proxy_provider_dns_domains(
+                            "provider",
+                            vec!["proxy.example.com".to_owned()],
+                        )
+                        .await
+                        .unwrap();
+                }
+                2 => {
+                    resolver.proxy_resolver = Some(vec![selected_client]);
+                    let mut static_nodes = crate::common::trie::StringTrie::new();
+                    static_nodes.insert("proxy.example.com", Arc::new(true));
+                    resolver.proxy_server_domains = Some(static_nodes);
+                }
+                _ => unreachable!(),
+            }
+            let resolver = Arc::new(resolver);
+            let selected = Arc::new(tokio::sync::Barrier::new(2));
+            let resume = Arc::new(tokio::sync::Barrier::new(2));
+            let mut request = test_query_with_type(if case == 0 {
+                rr::RecordType::TXT
+            } else {
+                rr::RecordType::A
+            });
+            request.metadata.recursion_desired = true;
+            let running = {
+                let resolver = resolver.clone();
+                let request = request.clone();
+                let selected = selected.clone();
+                let resume = resume.clone();
+                tokio::spawn(async move {
+                    super::INTERNAL_HANDOFF_TEST_PAUSE
+                        .scope(
+                            super::PublicHandoffTestPause { selected, resume },
+                            async move { resolver.exchange(&request).await },
+                        )
+                        .await
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(5), selected.wait())
+                .await
+                .expect("internal DNS handoff not reached");
+            resolver.invalidate_transports();
+            tokio::time::timeout(Duration::from_secs(5), resume.wait())
+                .await
+                .expect("internal DNS query did not resume");
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), running)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_err(),
+                "case {case}"
+            );
+            assert_eq!(
+                main_hits.load(Ordering::SeqCst),
+                0,
+                "case {case}: public DNS leaked"
+            );
+            assert_eq!(
+                selected_hits.load(Ordering::SeqCst),
+                0,
+                "case {case}: selected upstream saw a stale QNAME"
+            );
+            resolver.reset_transports().await.unwrap();
+            assert!(
+                resolver.exchange(&request).await.is_ok(),
+                "case {case}: full reset should restore selected upstream"
+            );
+            assert_eq!(
+                main_hits.load(Ordering::SeqCst),
+                0,
+                "case {case}: selected policy/node must never downgrade to main"
+            );
+            assert_eq!(
+                selected_hits.load(Ordering::SeqCst),
+                1,
+                "case {case}: recovered selected upstream should be called once"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn own_invalidation_before_dispatch_must_not_send_qname_upstream() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let resolver = Arc::new(EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 79)),
+                hits: hits.clone(),
+                id: "stale-primary-upstream",
+            })],
+            false,
+        ));
+        let selected = Arc::new(tokio::sync::Barrier::new(2));
+        let resume = Arc::new(tokio::sync::Barrier::new(2));
+        let (request, _) = test_query();
+        let running = {
+            let resolver = resolver.clone();
+            let selected = selected.clone();
+            let resume = resume.clone();
+            tokio::spawn(async move {
+                super::PUBLIC_HANDOFF_TEST_PAUSE
+                    .scope(
+                        super::PublicHandoffTestPause { selected, resume },
+                        async move { resolver.exchange(&request).await },
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), selected.wait())
+            .await
+            .expect("public DNS handoff was not reached");
+        resolver.invalidate_transports();
+        tokio::time::timeout(Duration::from_secs(5), resume.wait())
+            .await
+            .expect("public DNS query did not resume");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), running)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err(),
+            "invalidated parentless resolver must not deliver old answer"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "invalidated parentless resolver must not leak DNS QNAME"
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_invalidation_before_direct_dispatch_does_not_send_qname_upstream()
+     {
+        // A DIRECT resolver can yield between its public preflight and
+        // no-cache dispatch. Failing closed on return is too late if the DNS
+        // QNAME was already sent on the old path during that handoff.
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let mut parent = EnhancedResolver::from_clients(vec![], false);
+        let direct = Arc::new(
+            EnhancedResolver::from_clients(
+                vec![Arc::new(CountingClient {
+                    response: response_with_a(Ipv4Addr::new(192, 0, 2, 79)),
+                    hits: upstream_hits.clone(),
+                    id: "old-direct-upstream",
+                })],
+                false,
+            )
+            .with_parent_transport_gate(
+                Arc::clone(&parent.transport_reset_failed),
+                Arc::clone(&parent.transport_resets_in_progress),
+            ),
+        );
+        parent.direct_resolver = Some(direct.clone());
+        let selected = Arc::new(tokio::sync::Barrier::new(2));
+        let resume = Arc::new(tokio::sync::Barrier::new(2));
+        let (request, _) = test_query();
+        let running = {
+            let direct = direct.clone();
+            let selected = selected.clone();
+            let resume = resume.clone();
+            tokio::spawn(async move {
+                super::PUBLIC_HANDOFF_TEST_PAUSE
+                    .scope(
+                        super::PublicHandoffTestPause { selected, resume },
+                        async move { direct.exchange(&request).await },
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), selected.wait())
+            .await
+            .expect("DIRECT DNS query did not reach pre-dispatch handoff");
+        parent.invalidate_transports();
+        tokio::time::timeout(Duration::from_secs(5), resume.wait())
+            .await
+            .expect("DIRECT query did not resume");
+        let result = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "the previous transport must not deliver DNS results"
+        );
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            0,
+            "fail-closed must prevent sending QNAME, not merely reject response"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_parent_reset_waiting_for_lock_must_close_direct_child() {
+        // The DIRECT child future has not started when the parent is waiting
+        // for its reset lock. Cancellation must still close the child.
+        #[derive(Debug)]
+        struct CountingDirectClient(Arc<AtomicUsize>);
+        #[async_trait]
+        impl crate::app::dns::Client for CountingDirectClient {
+            fn id(&self) -> String {
+                "counting-direct".to_owned()
+            }
+            async fn exchange(
+                &self,
+                _: &op::Message,
+            ) -> anyhow::Result<op::Message> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(response_with_a(Ipv4Addr::new(192, 0, 2, 60)))
+            }
+        }
+        let exchanges = Arc::new(AtomicUsize::new(0));
+        let mut parent = EnhancedResolver::from_clients(vec![], false);
+        parent.direct_resolver = Some(Arc::new(EnhancedResolver::from_clients(
+            vec![Arc::new(CountingDirectClient(exchanges.clone()))],
+            false,
+        )));
+        let parent = Arc::new(parent);
+        let held_lock = parent.transport_reset_lock.lock().await;
+        let resetting = {
+            let parent = parent.clone();
+            tokio::spawn(async move { parent.reset_transports().await })
+        };
+        tokio::task::yield_now().await;
+        resetting.abort();
+        assert!(resetting.await.unwrap_err().is_cancelled());
+        drop(held_lock);
+        let (request, _) = test_query();
+        assert!(
+            parent
+                .direct_resolver
+                .as_ref()
+                .unwrap()
+                .exchange(&request)
+                .await
+                .is_err(),
+            "cancelled parent reset must not leave DIRECT child using old transport"
+        );
+        assert_eq!(exchanges.load(Ordering::SeqCst), 0);
+        assert_eq!(parent.reset_transports().await.unwrap(), 0);
+        parent
+            .direct_resolver
+            .as_ref()
+            .unwrap()
+            .exchange(&request)
+            .await
+            .expect("full parent/child reset must restore DIRECT DNS");
+        assert_eq!(exchanges.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn reset_transports_covers_all_upstream_collections() {
         let resets = Arc::new(AtomicUsize::new(0));
         let client = || -> ThreadSafeDNSClient {
@@ -3282,6 +6014,1153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn network_reset_serializes_with_public_cache_commit_guard() {
+        let resolver = Arc::new(EnhancedResolver::from_clients(vec![], false));
+        let (mut request, query) = test_query();
+        request.metadata.recursion_desired = true;
+        let negative =
+            negative_response(op::ResponseCode::NXDomain, "example.com.", 120, 60);
+        let before = resolver
+            .provider_epoch_network_generation
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let guard = resolver.provider_epoch_cache.lock().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let other = Arc::clone(&resolver);
+        let reset = tokio::task::spawn_blocking(move || {
+            let _ = started_tx.send(());
+            // Reset must wait for the commit guard before advancing its epoch.
+            futures::executor::block_on(other.reset_transports()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        resolver.cache_negative(&query, &negative, Instant::now());
+        assert_eq!(
+            resolver
+                .provider_epoch_network_generation
+                .load(std::sync::atomic::Ordering::Relaxed),
+            before
+        );
+        drop(guard);
+        reset.await.unwrap();
+        assert_eq!(
+            resolver
+                .provider_epoch_network_generation
+                .load(std::sync::atomic::Ordering::Relaxed),
+            before + 1
+        );
+        assert!(
+            resolver
+                .cached_negative(&query, &request, Instant::now())
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn network_reset_must_not_reuse_public_positive_cache() {
+        let mut resolver = EnhancedResolver::from_clients(vec![], false);
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        let (mut request, query) = test_query();
+        request.metadata.recursion_desired = true;
+        let old = response_with_a(Ipv4Addr::new(192, 0, 2, 10));
+        resolver
+            .lru_cache
+            .as_ref()
+            .unwrap()
+            .insert(query, Ok(old), Instant::now());
+        resolver.main = vec![Arc::new(FixedClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 20)),
+        })];
+        // Prove the old entry is genuinely eligible before resetting.
+        let old_answer = resolver.exchange(&request).await.unwrap();
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&old_answer),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))]
+        );
+        resolver.reset_transports().await.unwrap();
+        let answer = resolver.exchange(&request).await.unwrap();
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&answer),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20))]
+        );
+    }
+
+    #[tokio::test]
+    async fn network_reset_new_negative_txt_answer_is_cached_only_in_current_epoch()
+    {
+        // After switching networks, a normal public TXT NXDOMAIN should be
+        // reusable within its network epoch, without contacting an upstream
+        // for each identical QNAME. A second reset must invalidate it.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: negative_response(
+                    op::ResponseCode::NXDomain,
+                    "example.com.",
+                    120,
+                    60,
+                ),
+                hits: hits.clone(),
+                id: "post-reset-negative-upstream",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        let mut request = test_query_with_type(rr::RecordType::TXT);
+        request.metadata.recursion_desired = true;
+        resolver.reset_transports().await.unwrap();
+        for (index, id) in [31, 32].into_iter().enumerate() {
+            request.metadata.id = id;
+            let result = resolver.exchange(&request).await.unwrap();
+            assert_eq!(result.metadata.response_code, op::ResponseCode::NXDomain);
+            if index > 0 {
+                assert_eq!(
+                    result.metadata.id, id,
+                    "a cache hit must echo the current DNS transaction ID"
+                );
+            }
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "normal negative DNS reply must be cached within a network epoch"
+        );
+        assert!(
+            resolver
+                .cached_provider_epoch_response(
+                    &request.queries[0],
+                    &request,
+                    0,
+                    Instant::now() + Duration::from_secs(61),
+                )
+                .is_none(),
+            "a normal negative response must expire by SOA.MINIMUM"
+        );
+        // A second network has a different authoritative answer. Distinct
+        // RCODEs ensure the test cannot pass if a stale NXDOMAIN is returned
+        // while a background fetch happens to increment a counter.
+        let new_hits = Arc::new(AtomicUsize::new(0));
+        resolver.main = vec![Arc::new(CountingClient {
+            response: negative_response(
+                op::ResponseCode::NoError,
+                "example.com.",
+                120,
+                60,
+            ),
+            hits: new_hits.clone(),
+            id: "second-network-negative-upstream",
+        })];
+        resolver.reset_transports().await.unwrap();
+        for _ in 0..2 {
+            let result = resolver.exchange(&request).await.unwrap();
+            assert_eq!(
+                result.metadata.response_code,
+                op::ResponseCode::NoError,
+                "old-network NXDOMAIN must never reappear after a reset"
+            );
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "old network must not receive fresh queries after switching"
+        );
+        assert_eq!(
+            new_hits.load(Ordering::SeqCst),
+            1,
+            "new network's NODATA should be cached in its own epoch"
+        );
+    }
+
+    #[tokio::test]
+    async fn network_reset_new_nodata_srv_uses_safe_soa_negative_ttl() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: negative_response(
+                    op::ResponseCode::NoError,
+                    "example.com.",
+                    120,
+                    30,
+                ),
+                hits: hits.clone(),
+                id: "post-reset-nodata-upstream",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        let mut request = test_query_with_type(rr::RecordType::SRV);
+        request.metadata.recursion_desired = true;
+        resolver.reset_transports().await.unwrap();
+        let first = resolver.exchange(&request).await.unwrap();
+        assert_eq!(first.metadata.response_code, op::ResponseCode::NoError);
+        request.metadata.id = 0x7345;
+        let second = resolver.exchange(&request).await.unwrap();
+        assert_eq!(second.metadata.response_code, op::ResponseCode::NoError);
+        assert!(second.answers.is_empty());
+        assert_eq!(second.authorities[0].ttl, 30);
+        assert_eq!(second.metadata.id, request.metadata.id);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn network_reset_new_negative_cache_rejects_selected_old_network_answer() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: negative_response(
+                    op::ResponseCode::NXDomain,
+                    "example.com.",
+                    120,
+                    30,
+                ),
+                hits: hits.clone(),
+                id: "post-reset-negative-upstream",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        let mut request = test_query_with_type(rr::RecordType::TXT);
+        request.metadata.recursion_desired = true;
+        resolver.reset_transports().await.unwrap();
+        resolver.exchange(&request).await.unwrap();
+        let resolver = Arc::new(resolver);
+        let selected = Arc::new(tokio::sync::Barrier::new(2));
+        let resume = Arc::new(tokio::sync::Barrier::new(2));
+        let running = {
+            let resolver = resolver.clone();
+            let selected = selected.clone();
+            let resume = resume.clone();
+            tokio::spawn(async move {
+                CACHE_CANDIDATE_TEST_PAUSE
+                    .scope(
+                        CacheCandidateTestPause {
+                            kind: CacheCandidateKind::Negative,
+                            selected,
+                            resume,
+                        },
+                        async move { resolver.exchange(&request).await },
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), selected.wait())
+            .await
+            .expect("negative epoch cache candidate not selected");
+        resolver.reset_transports().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), resume.wait())
+            .await
+            .expect("cached query did not resume");
+        let result = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "old network NXDOMAIN must not be delivered"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn network_reset_new_negative_cache_rejects_wrong_soa_and_ad_responses() {
+        for bad_response in [
+            negative_response(op::ResponseCode::NXDomain, "unrelated.org.", 120, 30),
+            {
+                let mut response = negative_response(
+                    op::ResponseCode::NXDomain,
+                    "example.com.",
+                    120,
+                    30,
+                );
+                response.metadata.authentic_data = true;
+                response
+            },
+        ] {
+            let hits = Arc::new(AtomicUsize::new(0));
+            let mut resolver = EnhancedResolver::from_clients(
+                vec![Arc::new(CountingClient {
+                    response: bad_response.clone(),
+                    hits: hits.clone(),
+                    id: "unsafe-negative-dns",
+                })],
+                false,
+            );
+            resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+            let mut request = test_query_with_type(rr::RecordType::TXT);
+            request.metadata.recursion_desired = true;
+            resolver.reset_transports().await.unwrap();
+            for _ in 0..2 {
+                let answer = resolver.exchange(&request).await.unwrap();
+                assert_eq!(
+                    answer.metadata.response_code,
+                    op::ResponseCode::NXDomain
+                );
+            }
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                2,
+                "a wrong-zone SOA or AD response must not enter post-reset negative cache"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn network_reset_negative_cache_candidate_rejects_provider_registration_aba()
+     {
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        let node_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: negative_response(
+                    op::ResponseCode::NXDomain,
+                    "example.com.",
+                    120,
+                    60,
+                ),
+                hits: public_hits.clone(),
+                id: "post-reset-public-dns",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: node_hits.clone(),
+            id: "dedicated-node-dns",
+        })]);
+        let mut request = test_query_with_type(rr::RecordType::TXT);
+        request.metadata.recursion_desired = true;
+        resolver.reset_transports().await.unwrap();
+        resolver.exchange(&request).await.unwrap();
+        assert_eq!(public_hits.load(Ordering::SeqCst), 1);
+        let resolver = Arc::new(resolver);
+        let selected = Arc::new(tokio::sync::Barrier::new(2));
+        let resume = Arc::new(tokio::sync::Barrier::new(2));
+        let running = {
+            let resolver = resolver.clone();
+            let selected = selected.clone();
+            let resume = resume.clone();
+            tokio::spawn(async move {
+                CACHE_CANDIDATE_TEST_PAUSE
+                    .scope(
+                        CacheCandidateTestPause {
+                            kind: CacheCandidateKind::Negative,
+                            selected,
+                            resume,
+                        },
+                        async move { resolver.exchange(&request).await },
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), selected.wait())
+            .await
+            .expect("normal negative cache candidate not selected");
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), resume.wait())
+            .await
+            .expect("candidate did not resume");
+        let result = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "old normal DNS cache candidate must fail closed after Provider ABA"
+        );
+        assert_eq!(public_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(node_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn network_reset_new_negative_with_cache_disabled_stays_uncached() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: negative_response(
+                    op::ResponseCode::NXDomain,
+                    "example.com.",
+                    120,
+                    60,
+                ),
+                hits: hits.clone(),
+                id: "ordinary-negative-no-cache",
+            })],
+            false,
+        );
+        assert!(resolver.lru_cache.is_none());
+        let mut request = test_query_with_type(rr::RecordType::TXT);
+        request.metadata.recursion_desired = true;
+        resolver.reset_transports().await.unwrap();
+        for _ in 0..2 {
+            let result = resolver.exchange(&request).await.unwrap();
+            assert_eq!(result.metadata.response_code, op::ResponseCode::NXDomain);
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "cache-disabled config must never activate the new network cache"
+        );
+        assert!(resolver.provider_epoch_cache.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn new_network_negative_answer_supersedes_older_positive_cache_entry() {
+        // A newer NXDOMAIN can arrive on the same network via a forced
+        // refresh. It must not be hidden behind a previously cached positive
+        // record; otherwise the old address will be reused until its TTL.
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(FixedClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        let (mut request, _) = test_query();
+        request.metadata.recursion_desired = true;
+        resolver.reset_transports().await.unwrap();
+        let positive = resolver.exchange(&request).await.unwrap();
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&positive),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))]
+        );
+        resolver.main = vec![Arc::new(FixedClient {
+            response: negative_response(
+                op::ResponseCode::NXDomain,
+                "example.com.",
+                120,
+                60,
+            ),
+        })];
+        let negative = resolver.exchange_no_cache(&request).await.unwrap();
+        assert_eq!(negative.metadata.response_code, op::ResponseCode::NXDomain);
+        let current = resolver.exchange(&request).await.unwrap();
+        assert_eq!(
+            current.metadata.response_code,
+            op::ResponseCode::NXDomain,
+            "fresh negative answer must override obsolete positive cache entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_network_positive_answer_invalidates_older_negative_epoch_entry() {
+        // A fresh successful public answer must invalidate an earlier
+        // NXDOMAIN for the same Question. Otherwise the negative can reappear
+        // after the positive TTL expires, exactly as in the legacy cache.
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(FixedClient {
+                response: negative_response(
+                    op::ResponseCode::NXDomain,
+                    "example.com.",
+                    120,
+                    60,
+                ),
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        let (mut request, _) = test_query();
+        request.metadata.recursion_desired = true;
+        resolver.reset_transports().await.unwrap();
+        let negative = resolver.exchange(&request).await.unwrap();
+        assert_eq!(negative.metadata.response_code, op::ResponseCode::NXDomain);
+        assert!(
+            resolver
+                .cached_provider_epoch_response(
+                    &request.queries[0],
+                    &request,
+                    0,
+                    Instant::now(),
+                )
+                .is_some(),
+            "the first NXDOMAIN must actually be present in the epoch cache"
+        );
+        resolver.main = vec![Arc::new(FixedClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 50)),
+        })];
+        let positive = resolver.exchange_no_cache(&request).await.unwrap();
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&positive),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 50))]
+        );
+        assert!(
+            resolver
+                .cached_provider_epoch_response(
+                    &request.queries[0],
+                    &request,
+                    0,
+                    Instant::now(),
+                )
+                .is_none(),
+            "a new positive response must revoke an obsolete negative epoch entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_reset_negative_cache_does_not_merge_dnssec_or_edns_requests() {
+        for use_edns in [false, true] {
+            let hits = Arc::new(AtomicUsize::new(0));
+            let mut resolver = EnhancedResolver::from_clients(
+                vec![Arc::new(CountingClient {
+                    response: negative_response(
+                        op::ResponseCode::NXDomain,
+                        "example.com.",
+                        120,
+                        60,
+                    ),
+                    hits: hits.clone(),
+                    id: "privacy-variant-negative-dns",
+                })],
+                false,
+            );
+            resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+            let mut request = test_query_with_type(rr::RecordType::TXT);
+            request.metadata.recursion_desired = true;
+            if use_edns {
+                request.set_edns(op::Edns::new());
+            } else {
+                request.metadata.checking_disabled = true;
+            }
+            resolver.reset_transports().await.unwrap();
+            for _ in 0..2 {
+                let result = resolver.exchange(&request).await.unwrap();
+                assert_eq!(
+                    result.metadata.response_code,
+                    op::ResponseCode::NXDomain
+                );
+            }
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                2,
+                "EDNS or CD-specific queries must bypass the Question-only cache"
+            );
+            assert!(resolver.provider_epoch_cache.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn network_reset_new_positive_answer_is_cached_within_new_epoch() {
+        let mut resolver = EnhancedResolver::from_clients(vec![], false);
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        let (mut request, _) = test_query();
+        request.metadata.recursion_desired = true;
+        let hits = Arc::new(AtomicUsize::new(0));
+        resolver.main = vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 20)),
+            hits: hits.clone(),
+            id: "new-network",
+        })];
+        resolver.reset_transports().await.unwrap();
+        for _ in 0..2 {
+            let answer = resolver.exchange(&request).await.unwrap();
+            assert_eq!(
+                EnhancedResolver::ip_list_of_message(&answer),
+                vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20))]
+            );
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "new-network cache must be reusable"
+        );
+        let third_hits = Arc::new(AtomicUsize::new(0));
+        resolver.main = vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 30)),
+            hits: third_hits.clone(),
+            id: "third-network",
+        })];
+        resolver.reset_transports().await.unwrap();
+        for _ in 0..2 {
+            let answer = resolver.exchange(&request).await.unwrap();
+            assert_eq!(
+                EnhancedResolver::ip_list_of_message(&answer),
+                vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 30))]
+            );
+        }
+        assert_eq!(third_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn network_reset_rejects_selected_new_epoch_positive_cache_candidate() {
+        let mut resolver = EnhancedResolver::from_clients(vec![], false);
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        let (mut request, _) = test_query();
+        request.metadata.recursion_desired = true;
+        resolver.main = vec![Arc::new(FixedClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 20)),
+        })];
+        resolver.reset_transports().await.unwrap();
+        resolver.exchange(&request).await.unwrap();
+        let resolver = Arc::new(resolver);
+        let selected = Arc::new(tokio::sync::Barrier::new(2));
+        let resume = Arc::new(tokio::sync::Barrier::new(2));
+        let running = {
+            let resolver = resolver.clone();
+            let selected = selected.clone();
+            let resume = resume.clone();
+            tokio::spawn(async move {
+                CACHE_CANDIDATE_TEST_PAUSE
+                    .scope(
+                        CacheCandidateTestPause {
+                            kind: CacheCandidateKind::Positive,
+                            selected,
+                            resume,
+                        },
+                        async move { resolver.exchange(&request).await },
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), selected.wait())
+            .await
+            .expect("new-epoch positive cache candidate not selected");
+        resolver.reset_transports().await.unwrap();
+        resume.wait().await;
+        assert!(
+            running.await.unwrap().is_err(),
+            "candidate selected before reset must not survive network epoch change"
+        );
+    }
+
+    #[tokio::test]
+    async fn network_reset_during_public_return_handoff_rejects_positive_answer() {
+        // Exercise the final outer handoff, not only the internal cache
+        // commit guard. A reset after the internal resolver finishes must
+        // invalidate its answer before it reaches the caller.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 20)),
+                hits: hits.clone(),
+                id: "prior-network",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        let resolver = Arc::new(resolver);
+        let selected = Arc::new(tokio::sync::Barrier::new(2));
+        let resume = Arc::new(tokio::sync::Barrier::new(2));
+        let (mut request, _) = test_query();
+        request.metadata.recursion_desired = true;
+        let running = {
+            let resolver = resolver.clone();
+            let selected = selected.clone();
+            let resume = resume.clone();
+            tokio::spawn(async move {
+                super::PUBLIC_RETURN_TEST_PAUSE
+                    .scope(
+                        super::PublicHandoffTestPause { selected, resume },
+                        async move { resolver.exchange(&request).await },
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), selected.wait())
+            .await
+            .expect("public response did not reach return handoff");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        resolver.reset_transports().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), resume.wait())
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "old-network positive answer escaped after reset"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_during_transport_reset_must_fail_closed() {
+        #[derive(Debug)]
+        struct BlockingResetClient {
+            entered: Arc<tokio::sync::Barrier>,
+            resume: Arc<tokio::sync::Barrier>,
+            exchanges: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl crate::app::dns::Client for BlockingResetClient {
+            fn id(&self) -> String {
+                "blocking-reset".to_owned()
+            }
+            async fn exchange(
+                &self,
+                _msg: &op::Message,
+            ) -> anyhow::Result<op::Message> {
+                self.exchanges.fetch_add(1, Ordering::SeqCst);
+                Ok(response_with_a(Ipv4Addr::new(192, 0, 2, 10)))
+            }
+            async fn reset_transport(&self) -> anyhow::Result<u32> {
+                self.entered.wait().await;
+                self.resume.wait().await;
+                Ok(1)
+            }
+        }
+
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let resume = Arc::new(tokio::sync::Barrier::new(2));
+        let exchanges = Arc::new(AtomicUsize::new(0));
+        let resolver = Arc::new(EnhancedResolver::from_clients(
+            vec![Arc::new(BlockingResetClient {
+                entered: entered.clone(),
+                resume: resume.clone(),
+                exchanges: exchanges.clone(),
+            })],
+            false,
+        ));
+        let resetting = {
+            let resolver = resolver.clone();
+            tokio::spawn(async move { resolver.reset_transports().await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), entered.wait())
+            .await
+            .unwrap();
+        let (request, _) = test_query();
+        let result = resolver.exchange(&request).await;
+        resume.wait().await;
+        tokio::time::timeout(Duration::from_secs(5), resetting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err(), "DNS query used old transport during reset");
+        assert_eq!(
+            exchanges.load(Ordering::SeqCst),
+            0,
+            "query must not reach an upstream transport while it is resetting"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_transport_reset_releases_query_gate_and_invalidates_cache() {
+        // A cancelled reset must release the fail-closed gate. The old
+        // network's positive cache must still be unavailable afterwards.
+        #[derive(Debug)]
+        struct PendingResetClient {
+            entered: Arc<tokio::sync::Notify>,
+            exchanges: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl crate::app::dns::Client for PendingResetClient {
+            fn id(&self) -> String {
+                "pending-reset".to_owned()
+            }
+
+            async fn exchange(
+                &self,
+                _: &op::Message,
+            ) -> anyhow::Result<op::Message> {
+                self.exchanges.fetch_add(1, Ordering::SeqCst);
+                Ok(response_with_a(Ipv4Addr::new(192, 0, 2, 10)))
+            }
+
+            async fn reset_transport(&self) -> anyhow::Result<u32> {
+                self.entered.notify_one();
+                std::future::pending().await
+            }
+        }
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let exchanges = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(PendingResetClient {
+                entered: entered.clone(),
+                exchanges: exchanges.clone(),
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        let resolver = Arc::new(resolver);
+        let (mut request, _) = test_query();
+        request.metadata.recursion_desired = true;
+        resolver.exchange(&request).await.unwrap();
+        resolver.exchange(&request).await.unwrap();
+        assert_eq!(exchanges.load(Ordering::SeqCst), 1);
+        let resetting = {
+            let resolver = resolver.clone();
+            tokio::spawn(async move { resolver.reset_transports().await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        assert!(resolver.exchange(&request).await.is_err());
+        resetting.abort();
+        assert!(resetting.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            resolver.transport_resets_in_progress.load(Ordering::SeqCst),
+            0,
+            "cancelled reset must release the query gate"
+        );
+        assert_eq!(
+            resolver
+                .provider_epoch_network_generation
+                .load(Ordering::Relaxed),
+            1,
+            "cancelled reset must retain the advanced network generation"
+        );
+        assert!(resolver.network_positive_cache.lock().unwrap().is_none());
+        // The query may resume after cancellation; it must not reuse the
+        // original pre-reset positive cache.
+        assert!(
+            resolver.exchange(&request).await.is_err(),
+            "cancelled reset must remain fail closed"
+        );
+        assert_eq!(
+            exchanges.load(Ordering::SeqCst),
+            1,
+            "old transport must not be reused"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_partial_reset_stays_fail_closed_until_successful_recovery() {
+        #[derive(Debug)]
+        struct CancelOnceClient {
+            entered: Arc<tokio::sync::Notify>,
+            attempts: AtomicUsize,
+            exchanges: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl crate::app::dns::Client for CancelOnceClient {
+            fn id(&self) -> String {
+                "cancel-once".to_owned()
+            }
+            async fn exchange(
+                &self,
+                _: &op::Message,
+            ) -> anyhow::Result<op::Message> {
+                self.exchanges.fetch_add(1, Ordering::SeqCst);
+                Ok(response_with_a(Ipv4Addr::new(192, 0, 2, 10)))
+            }
+            async fn reset_transport(&self) -> anyhow::Result<u32> {
+                if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.entered.notify_one();
+                    std::future::pending().await
+                } else {
+                    Ok(1)
+                }
+            }
+        }
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let exchanges = Arc::new(AtomicUsize::new(0));
+        let resolver = Arc::new(EnhancedResolver::from_clients(
+            vec![Arc::new(CancelOnceClient {
+                entered: entered.clone(),
+                attempts: AtomicUsize::new(0),
+                exchanges: exchanges.clone(),
+            })],
+            false,
+        ));
+        let resetting = {
+            let resolver = resolver.clone();
+            tokio::spawn(async move { resolver.reset_transports().await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        resetting.abort();
+        assert!(resetting.await.unwrap_err().is_cancelled());
+        let (request, _) = test_query();
+        assert!(
+            resolver.exchange(&request).await.is_err(),
+            "cancelled reset must fail closed"
+        );
+        assert_eq!(exchanges.load(Ordering::SeqCst), 0);
+        assert_eq!(resolver.reset_transports().await.unwrap(), 1);
+        assert!(
+            resolver.exchange(&request).await.is_ok(),
+            "successful reset must restore DNS"
+        );
+        assert_eq!(exchanges.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn queued_reset_after_cancel_keeps_dns_closed_until_recovery_finishes() {
+        #[derive(Debug)]
+        struct TwoPhaseResetClient {
+            first_entered: Arc<tokio::sync::Notify>,
+            second_entered: Arc<tokio::sync::Notify>,
+            second_release: Arc<tokio::sync::Notify>,
+            attempts: AtomicUsize,
+            exchanges: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl crate::app::dns::Client for TwoPhaseResetClient {
+            fn id(&self) -> String {
+                "two-phase-reset".to_owned()
+            }
+            async fn exchange(
+                &self,
+                _: &op::Message,
+            ) -> anyhow::Result<op::Message> {
+                self.exchanges.fetch_add(1, Ordering::SeqCst);
+                Ok(response_with_a(Ipv4Addr::new(192, 0, 2, 10)))
+            }
+            async fn reset_transport(&self) -> anyhow::Result<u32> {
+                match self.attempts.fetch_add(1, Ordering::SeqCst) {
+                    0 => {
+                        self.first_entered.notify_one();
+                        std::future::pending().await
+                    }
+                    1 => {
+                        self.second_entered.notify_one();
+                        self.second_release.notified().await;
+                        Ok(1)
+                    }
+                    _ => panic!("unexpected third transport reset"),
+                }
+            }
+        }
+
+        let first_entered = Arc::new(tokio::sync::Notify::new());
+        let second_entered = Arc::new(tokio::sync::Notify::new());
+        let second_release = Arc::new(tokio::sync::Notify::new());
+        let exchanges = Arc::new(AtomicUsize::new(0));
+        let mut owner = EnhancedResolver::from_clients(
+            vec![Arc::new(TwoPhaseResetClient {
+                first_entered: first_entered.clone(),
+                second_entered: second_entered.clone(),
+                second_release: second_release.clone(),
+                attempts: AtomicUsize::new(0),
+                exchanges: exchanges.clone(),
+            })],
+            false,
+        );
+        let direct_hits = Arc::new(AtomicUsize::new(0));
+        let direct = Arc::new(
+            EnhancedResolver::from_clients(
+                vec![Arc::new(CountingClient {
+                    response: response_with_a(Ipv4Addr::new(192, 0, 2, 16)),
+                    hits: direct_hits.clone(),
+                    id: "queued-direct",
+                })],
+                false,
+            )
+            .with_parent_transport_gate(
+                Arc::clone(&owner.transport_reset_failed),
+                Arc::clone(&owner.transport_resets_in_progress),
+            ),
+        );
+        owner.direct_resolver = Some(direct.clone());
+        let resolver = Arc::new(owner);
+        let first = {
+            let resolver = resolver.clone();
+            tokio::spawn(async move { resolver.reset_transports().await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), first_entered.notified())
+            .await
+            .unwrap();
+        let second = {
+            let resolver = resolver.clone();
+            tokio::spawn(async move { resolver.reset_transports().await })
+        };
+        // The second reset is queued behind the first. Neither may reopen DNS.
+        tokio::task::yield_now().await;
+        let (request, _) = test_query();
+        assert!(resolver.exchange(&request).await.is_err());
+        assert!(direct.exchange(&request).await.is_err());
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(5), second_entered.notified())
+            .await
+            .unwrap();
+        assert!(resolver.exchange(&request).await.is_err());
+        direct.reset_transports().await.unwrap();
+        assert!(
+            direct.exchange(&request).await.is_err(),
+            "independent DIRECT reset during queued parent recovery cannot reopen DNS"
+        );
+        assert_eq!(direct_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(exchanges.load(Ordering::SeqCst), 0);
+        second_release.notify_one();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), second)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            resolver.transport_resets_in_progress.load(Ordering::SeqCst),
+            0
+        );
+        assert!(resolver.exchange(&request).await.is_ok());
+        assert!(direct.exchange(&request).await.is_ok());
+        assert_eq!(direct_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(exchanges.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_transport_reset_invalidates_positive_cache_before_returning_error()
+     {
+        // A failed transport reset must never preserve a successful old-network
+        // cache hit: callers may retry, but cannot trust the prior answer.
+        #[derive(Debug)]
+        struct FailingResetClient {
+            exchanges: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl crate::app::dns::Client for FailingResetClient {
+            fn id(&self) -> String {
+                "failing-reset-client".to_owned()
+            }
+
+            async fn exchange(
+                &self,
+                _msg: &op::Message,
+            ) -> anyhow::Result<op::Message> {
+                self.exchanges.fetch_add(1, Ordering::SeqCst);
+                Ok(response_with_a(Ipv4Addr::new(192, 0, 2, 10)))
+            }
+
+            async fn reset_transport(&self) -> anyhow::Result<u32> {
+                Err(anyhow::anyhow!("transport reset unavailable"))
+            }
+        }
+
+        let exchanges = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(FailingResetClient {
+                exchanges: exchanges.clone(),
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        let (mut request, _) = test_query();
+        request.metadata.recursion_desired = true;
+        resolver.exchange(&request).await.unwrap();
+        resolver.exchange(&request).await.unwrap();
+        assert_eq!(
+            exchanges.load(Ordering::SeqCst),
+            1,
+            "pre-reset positive cache must actually be hit"
+        );
+        resolver.reset_transports().await.unwrap_err();
+        assert_eq!(
+            resolver
+                .provider_epoch_network_generation
+                .load(Ordering::Relaxed),
+            1,
+            "failed reset must still advance the cache isolation epoch"
+        );
+        assert!(
+            resolver.network_positive_cache.lock().unwrap().is_none(),
+            "failed reset must not retain the old positive cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_transport_reset_failure_must_block_old_upstream_until_recovery()
+    {
+        // One client resets successfully while another fails. A subsequent
+        // query must not silently use the partially reset transport set.
+        #[derive(Debug)]
+        struct PartialResetClient {
+            fail: bool,
+            exchanges: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl crate::app::dns::Client for PartialResetClient {
+            fn id(&self) -> String {
+                format!("partial-reset-{}", self.fail)
+            }
+            async fn exchange(
+                &self,
+                _: &op::Message,
+            ) -> anyhow::Result<op::Message> {
+                self.exchanges.fetch_add(1, Ordering::SeqCst);
+                Ok(response_with_a(Ipv4Addr::new(192, 0, 2, 10)))
+            }
+            async fn reset_transport(&self) -> anyhow::Result<u32> {
+                if self.fail {
+                    Err(anyhow::anyhow!("injected reset failure"))
+                } else {
+                    Ok(1)
+                }
+            }
+        }
+        let exchanges = Arc::new(AtomicUsize::new(0));
+        let resolver = EnhancedResolver::from_clients(
+            vec![
+                Arc::new(PartialResetClient {
+                    fail: false,
+                    exchanges: exchanges.clone(),
+                }),
+                Arc::new(PartialResetClient {
+                    fail: true,
+                    exchanges: exchanges.clone(),
+                }),
+            ],
+            false,
+        );
+        assert!(resolver.reset_transports().await.is_err());
+        let (request, _) = test_query();
+        assert!(
+            resolver.exchange(&request).await.is_err(),
+            "partially reset DNS transports must fail closed until a successful reset"
+        );
+        assert_eq!(exchanges.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn network_reset_eagerly_drops_prior_epoch_positive_cache() {
+        let mut resolver = EnhancedResolver::from_clients(vec![], false);
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        let (mut request, _) = test_query();
+        request.metadata.recursion_desired = true;
+        resolver.main = vec![Arc::new(FixedClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 20)),
+        })];
+        resolver.reset_transports().await.unwrap();
+        resolver.exchange(&request).await.unwrap();
+        assert!(resolver.network_positive_cache.lock().unwrap().is_some());
+        resolver.reset_transports().await.unwrap();
+        assert!(
+            resolver.network_positive_cache.lock().unwrap().is_none(),
+            "reset must release old-network positive answers before another query"
+        );
+    }
+
+    #[tokio::test]
+    async fn network_reset_does_not_enable_disabled_positive_cache() {
+        // Cache isolation must not silently turn caching on when the caller
+        // deliberately disabled the legacy positive cache.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 20)),
+                hits: hits.clone(),
+                id: "uncached-network",
+            })],
+            false,
+        );
+        assert!(resolver.lru_cache.is_none());
+        resolver.reset_transports().await.unwrap();
+        let (mut request, _) = test_query();
+        request.metadata.recursion_desired = true;
+        resolver.exchange(&request).await.unwrap();
+        resolver.exchange(&request).await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert!(resolver.network_positive_cache.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn network_reset_flushes_negative_cache() {
         let resolver = EnhancedResolver::from_clients(vec![], false);
         let (mut request, query) = test_query();
@@ -3360,6 +7239,109 @@ mod tests {
         );
         assert_eq!(proxy_hits.load(Ordering::SeqCst), 1);
         assert_eq!(main_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn provider_node_txt_query_must_not_use_public_dns_or_shared_cache() {
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        let node_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+                hits: public_hits.clone(),
+                id: "public-dns",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: node_hits.clone(),
+            id: "node-dns",
+        })]);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "provider",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        let query = test_query_with_type(rr::RecordType::TXT);
+        resolver.exchange(&query).await.unwrap();
+        assert_eq!(node_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(public_hits.load(Ordering::SeqCst), 0);
+        resolver
+            .replace_proxy_provider_dns_domains("provider", vec![])
+            .await
+            .unwrap();
+        resolver.exchange(&query).await.unwrap();
+        assert_eq!(
+            public_hits.load(Ordering::SeqCst),
+            1,
+            "node TXT response must not poison generic DNS cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_dns_entry_rejects_empty_question_without_panicking() {
+        let resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(FailingClient {
+                id: "unreachable-upstream",
+                reason: "should not be called",
+            })],
+            false,
+        );
+        let empty = op::Message::query();
+        let error = resolver
+            .exchange_no_cache_with_policy(&empty, true, false)
+            .await
+            .expect_err(
+                "empty DNS question must be rejected before upstream selection",
+            );
+        assert!(error.to_string().contains("invalid query"));
+    }
+
+    #[tokio::test]
+    async fn provider_node_txt_policy_failure_never_falls_back_to_public_dns() {
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        let default_node_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+                hits: public_hits.clone(),
+                id: "public-dns",
+            })],
+            false,
+        );
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: default_node_hits.clone(),
+            id: "default-node-dns",
+        })]);
+        let mut matcher = crate::common::trie::StringTrie::new();
+        matcher.insert("proxy.example.com", Arc::new(true));
+        resolver.proxy_server_nameserver_policy.push((
+            Arc::new(matcher),
+            vec![Arc::new(FailingClient {
+                id: "node-policy",
+                reason: "dedicated upstream unavailable",
+            })],
+        ));
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "provider",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        let request = test_query_with_type(rr::RecordType::TXT);
+        let error = resolver
+            .exchange(&request)
+            .await
+            .expect_err("dedicated policy failure must fail closed");
+        assert!(error.to_string().contains("dedicated upstream unavailable"));
+        assert_eq!(public_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(default_node_hits.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -3498,6 +7480,1515 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_handoff_provider_aba_rejects_obsolete_public_answer() {
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        let node_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+                hits: public_hits.clone(),
+                id: "public-dns",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: node_hits.clone(),
+            id: "node-dns",
+        })]);
+        let resolver = Arc::new(resolver);
+        let selected = Arc::new(tokio::sync::Barrier::new(2));
+        let resume = Arc::new(tokio::sync::Barrier::new(2));
+        let mut query = test_query_with_type(rr::RecordType::A);
+        query.metadata.recursion_desired = true;
+        let running = {
+            let resolver = resolver.clone();
+            let selected = selected.clone();
+            let resume = resume.clone();
+            tokio::spawn(async move {
+                super::PUBLIC_HANDOFF_TEST_PAUSE
+                    .scope(
+                        super::PublicHandoffTestPause { selected, resume },
+                        async move { resolver.exchange(&query).await },
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), selected.wait())
+            .await
+            .expect("public handoff did not pause");
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), resume.wait())
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err(), "ABA must not return a public DNS answer");
+        assert_eq!(
+            public_hits.load(Ordering::SeqCst),
+            0,
+            "public DNS must not be queried"
+        );
+        assert_eq!(node_hits.load(Ordering::SeqCst), 0);
+        assert!(
+            resolver
+                .lru_cache
+                .as_ref()
+                .unwrap()
+                .get(
+                    &test_query_with_type(rr::RecordType::A).queries[0],
+                    Instant::now()
+                )
+                .is_none(),
+            "no stale shared positive cache entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_aba_after_public_cache_commit_must_reject_returned_answer() {
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+                hits: public_hits.clone(),
+                id: "public-dns",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: Arc::new(AtomicUsize::new(0)),
+            id: "node-dns",
+        })]);
+        let resolver = Arc::new(resolver);
+        let selected = Arc::new(tokio::sync::Barrier::new(2));
+        let resume = Arc::new(tokio::sync::Barrier::new(2));
+        let mut query = test_query_with_type(rr::RecordType::A);
+        query.metadata.recursion_desired = true;
+        let running = {
+            let resolver = resolver.clone();
+            let selected = selected.clone();
+            let resume = resume.clone();
+            tokio::spawn(async move {
+                super::PUBLIC_RETURN_TEST_PAUSE
+                    .scope(
+                        super::PublicHandoffTestPause { selected, resume },
+                        async move { resolver.exchange(&query).await },
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), selected.wait())
+            .await
+            .expect("public return handoff did not pause");
+        assert_eq!(public_hits.load(Ordering::SeqCst), 1);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), resume.wait())
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "post-cache ABA must not return obsolete public DNS answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_aba_between_final_check_and_cache_write_rejects_public_answer()
+    {
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+                hits: public_hits.clone(),
+                id: "public-dns",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: Arc::new(AtomicUsize::new(0)),
+            id: "node-dns",
+        })]);
+        let resolver = Arc::new(resolver);
+        let selected = Arc::new(tokio::sync::Barrier::new(2));
+        let resume = Arc::new(tokio::sync::Barrier::new(2));
+        let mut query = test_query_with_type(rr::RecordType::A);
+        query.metadata.recursion_desired = true;
+        let running = {
+            let resolver = resolver.clone();
+            let selected = selected.clone();
+            let resume = resume.clone();
+            tokio::spawn(async move {
+                super::PUBLIC_CACHE_WRITE_TEST_PAUSE
+                    .scope(
+                        super::PublicHandoffTestPause { selected, resume },
+                        async move { resolver.exchange(&query).await },
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), selected.wait())
+            .await
+            .unwrap();
+        assert_eq!(public_hits.load(Ordering::SeqCst), 1);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), resume.wait())
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err(), "late ABA must reject public answer");
+        assert!(
+            resolver
+                .lru_cache
+                .as_ref()
+                .unwrap()
+                .get(
+                    &test_query_with_type(rr::RecordType::A).queries[0],
+                    Instant::now()
+                )
+                .is_none(),
+            "late ABA must not poison shared positive cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_aba_before_negative_cache_write_rejects_nxdomain() {
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: negative_response(
+                    op::ResponseCode::NXDomain,
+                    "example.com.",
+                    300,
+                    60,
+                ),
+                hits: public_hits.clone(),
+                id: "public-dns",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: Arc::new(AtomicUsize::new(0)),
+            id: "node-dns",
+        })]);
+        let resolver = Arc::new(resolver);
+        let selected = Arc::new(tokio::sync::Barrier::new(2));
+        let resume = Arc::new(tokio::sync::Barrier::new(2));
+        let mut query = test_query_with_type(rr::RecordType::A);
+        query.metadata.recursion_desired = true;
+        let running = {
+            let resolver = resolver.clone();
+            let selected = selected.clone();
+            let resume = resume.clone();
+            tokio::spawn(async move {
+                super::PUBLIC_CACHE_WRITE_TEST_PAUSE
+                    .scope(
+                        super::PublicHandoffTestPause { selected, resume },
+                        async move { resolver.exchange(&query).await },
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), selected.wait())
+            .await
+            .unwrap();
+        assert_eq!(public_hits.load(Ordering::SeqCst), 1);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), resume.wait())
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err(), "late ABA must reject public answer");
+        assert!(
+            resolver
+                .cached_negative(
+                    &test_query_with_type(rr::RecordType::A).queries[0],
+                    &test_query_with_type(rr::RecordType::A),
+                    Instant::now()
+                )
+                .is_none(),
+            "late ABA must not poison shared negative cache"
+        );
+        assert!(
+            resolver
+                .lru_cache
+                .as_ref()
+                .unwrap()
+                .get(
+                    &test_query_with_type(rr::RecordType::A).queries[0],
+                    Instant::now()
+                )
+                .is_none(),
+            "late ABA must not poison shared positive cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_handoff_provider_aba_rejects_obsolete_public_answer() {
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+                hits: public_hits.clone(),
+                id: "public-dns",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: Arc::new(AtomicUsize::new(0)),
+            id: "node-dns",
+        })]);
+        let resolver = Arc::new(resolver);
+        let selected = Arc::new(tokio::sync::Barrier::new(2));
+        let resume = Arc::new(tokio::sync::Barrier::new(2));
+        let mut query = test_query_with_type(rr::RecordType::A);
+        query.metadata.recursion_desired = true;
+        let running = {
+            let resolver = resolver.clone();
+            let selected = selected.clone();
+            let resume = resume.clone();
+            tokio::spawn(async move {
+                super::INTERNAL_HANDOFF_TEST_PAUSE
+                    .scope(
+                        super::PublicHandoffTestPause { selected, resume },
+                        async move { resolver.exchange(&query).await },
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), selected.wait())
+            .await
+            .expect("internal handoff did not pause");
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), resume.wait())
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "ABA between entry and internal snapshot must fail closed"
+        );
+        assert_eq!(public_hits.load(Ordering::SeqCst), 0);
+        assert!(
+            resolver
+                .lru_cache
+                .as_ref()
+                .unwrap()
+                .get(
+                    &test_query_with_type(rr::RecordType::A).queries[0],
+                    Instant::now(),
+                )
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_registered_during_public_query_must_not_receive_public_answer()
+    {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let node_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(PausedClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+                entered: entered.clone(),
+                resume: resume.clone(),
+            })],
+            false,
+        );
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: node_hits.clone(),
+            id: "node-dns",
+        })]);
+        let resolver = Arc::new(resolver);
+        let mut query = test_query_with_type(rr::RecordType::A);
+        query.metadata.recursion_desired = true;
+        let running = {
+            let resolver = resolver.clone();
+            tokio::spawn(async move { resolver.exchange(&query).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "new-provider",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        resume.notify_one();
+        let answer = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&answer),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11))],
+            "a newly registered node must not receive an in-flight ordinary DNS answer"
+        );
+        // A reclassified public query must use the dedicated pool exactly
+        // once; provenance is required to avoid redundant bootstrap traffic.
+        assert_eq!(node_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn provider_reclassification_txt_and_nxdomain_use_dedicated_once() {
+        for negative in [false, true] {
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let resume = Arc::new(tokio::sync::Notify::new());
+            let node_hits = Arc::new(AtomicUsize::new(0));
+            let mut public_response = op::Message::response(0, op::OpCode::Query);
+            let mut node_response = op::Message::response(0, op::OpCode::Query);
+            if negative {
+                public_response.metadata.response_code = op::ResponseCode::NXDomain;
+                node_response.metadata.response_code = op::ResponseCode::NXDomain;
+            } else {
+                let name = rr::Name::from_str_relaxed("proxy.example.com")
+                    .unwrap()
+                    .append_domain(&rr::Name::root())
+                    .unwrap();
+                public_response.add_answer(rr::Record::from_rdata(
+                    name.clone(),
+                    300,
+                    rr::RData::TXT(rr::rdata::TXT::new(vec!["public".into()])),
+                ));
+                node_response.add_answer(rr::Record::from_rdata(
+                    name,
+                    300,
+                    rr::RData::TXT(rr::rdata::TXT::new(vec!["dedicated".into()])),
+                ));
+            }
+            let mut resolver = EnhancedResolver::from_clients(
+                vec![Arc::new(PausedClient {
+                    response: public_response.clone(),
+                    entered: entered.clone(),
+                    resume: resume.clone(),
+                })],
+                false,
+            );
+            resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+            resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+                response: node_response.clone(),
+                hits: node_hits.clone(),
+                id: "node-dns",
+            })]);
+            let resolver = Arc::new(resolver);
+            let query = test_query_with_type(rr::RecordType::TXT);
+            let running = {
+                let resolver = resolver.clone();
+                tokio::spawn(async move { resolver.exchange(&query).await })
+            };
+            tokio::time::timeout(Duration::from_secs(5), entered.notified())
+                .await
+                .unwrap();
+            resolver
+                .replace_proxy_provider_dns_domains(
+                    "owner",
+                    vec!["proxy.example.com".into()],
+                )
+                .await
+                .unwrap();
+            resume.notify_one();
+            let answer = tokio::time::timeout(Duration::from_secs(5), running)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                answer.metadata.response_code,
+                node_response.metadata.response_code
+            );
+            assert_eq!(
+                answer.answers, node_response.answers,
+                "must return dedicated TXT/NXDOMAIN, not public"
+            );
+            assert_eq!(
+                node_hits.load(Ordering::SeqCst),
+                1,
+                "dedicated lookup must occur once (negative={negative})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn public_cache_candidate_rejects_provider_registration_aba() {
+        // A cache hit can be selected while the provider registry is empty.
+        // Registration and removal before delivery must not resurrect it.
+        let mut resolver = EnhancedResolver::from_clients(vec![], false);
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: Arc::new(AtomicUsize::new(0)),
+            id: "node-dns",
+        })]);
+        let query = test_query_with_type(rr::RecordType::A);
+        let domain = "proxy.example.com";
+        let selected_generation = resolver.provider_domain_generation(domain).await;
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![domain.into()])
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        let result = resolver
+            .revalidate_public_cache_hit_with_generation(
+                &query,
+                response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+                selected_generation,
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "public cache candidate must reject provider ABA"
+        );
+    }
+
+    #[tokio::test]
+    async fn negative_cache_candidate_rejects_provider_registration_aba() {
+        // RFC 2308 negative cache is independent from the positive response
+        // cache. The same generation guard must protect both paths.
+        let mut resolver = EnhancedResolver::from_clients(vec![], false);
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: Arc::new(AtomicUsize::new(0)),
+            id: "node-dns",
+        })]);
+        let query = test_query_with_type(rr::RecordType::TXT);
+        let domain = "proxy.example.com";
+        let negative = negative_response(
+            op::ResponseCode::NXDomain,
+            "proxy.example.com.",
+            300,
+            60,
+        );
+        resolver.cache_negative(&query.queries[0], &negative, Instant::now());
+        let selected_generation = resolver.provider_domain_generation(domain).await;
+        let selected = resolver
+            .cached_negative(&query.queries[0], &query, Instant::now())
+            .expect("negative cache entry must be present");
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![domain.into()])
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        let result = resolver
+            .revalidate_public_cache_hit_with_generation(
+                &query,
+                selected,
+                selected_generation,
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "negative cache candidate must reject Provider ABA"
+        );
+    }
+
+    #[tokio::test]
+    async fn registered_provider_bypasses_existing_negative_cache_in_exchange() {
+        // Exercise the real exchange path: cached NXDOMAIN cannot mask a node.
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        let node_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: negative_response(
+                    op::ResponseCode::NXDomain,
+                    "proxy.example.com.",
+                    300,
+                    60,
+                ),
+                hits: public_hits.clone(),
+                id: "public-dns",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: node_hits.clone(),
+            id: "node-dns",
+        })]);
+        let mut query = test_query_with_type(rr::RecordType::A);
+        query.metadata.recursion_desired = true;
+        let negative = negative_response(
+            op::ResponseCode::NXDomain,
+            "proxy.example.com.",
+            300,
+            60,
+        );
+        resolver.cache_negative(&query.queries[0], &negative, Instant::now());
+        assert!(
+            resolver
+                .cached_negative(&query.queries[0], &query, Instant::now())
+                .is_some()
+        );
+        let first = resolver.exchange(&query).await.unwrap();
+        assert_eq!(first.metadata.response_code, op::ResponseCode::NXDomain);
+        assert_eq!(
+            public_hits.load(Ordering::SeqCst),
+            0,
+            "first query must be a genuine negative cache hit, not a public DNS request"
+        );
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        let answer = resolver.exchange(&query).await.unwrap();
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&answer),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11))]
+        );
+        assert_eq!(node_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(public_hits.load(Ordering::SeqCst), 0);
+    }
+
+    // The gate sits *inside* the real cache-hit branch after cache selection,
+    // before generation revalidation. A generic upstream hook would not prove
+    // which path ran, and could yield a false-positive regression test.
+    async fn assert_exchange_cache_candidate_rejects_provider_change(
+        kind: CacheCandidateKind,
+        record_type: rr::RecordType,
+        remove_after_registration: bool,
+    ) {
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        let node_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+                hits: public_hits.clone(),
+                id: "public-dns",
+            })],
+            false,
+        );
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: node_hits.clone(),
+            id: "node-dns",
+        })]);
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        let mut query = test_query_with_type(record_type);
+        query.metadata.recursion_desired = true;
+        match kind {
+            CacheCandidateKind::Positive => {
+                let mut answer = response_with_a(Ipv4Addr::new(192, 0, 2, 10));
+                answer.answers[0].ttl = 120;
+                resolver.lru_cache.as_ref().unwrap().insert(
+                    query.queries[0].clone(),
+                    Ok(answer),
+                    Instant::now(),
+                );
+            }
+            CacheCandidateKind::Negative => {
+                let negative = negative_response(
+                    op::ResponseCode::NXDomain,
+                    "proxy.example.com.",
+                    120,
+                    60,
+                );
+                resolver.cache_negative(
+                    &query.queries[0],
+                    &negative,
+                    Instant::now(),
+                );
+            }
+        }
+        let resolver = Arc::new(resolver);
+        let selected = Arc::new(tokio::sync::Barrier::new(2));
+        let resume = Arc::new(tokio::sync::Barrier::new(2));
+        let running = {
+            let resolver = resolver.clone();
+            let selected = selected.clone();
+            let resume = resume.clone();
+            tokio::spawn(async move {
+                CACHE_CANDIDATE_TEST_PAUSE
+                    .scope(
+                        CacheCandidateTestPause {
+                            kind,
+                            selected,
+                            resume,
+                        },
+                        async move { resolver.exchange(&query).await },
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), selected.wait())
+            .await
+            .expect("actual cache candidate was not selected");
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        if remove_after_registration {
+            resolver
+                .replace_proxy_provider_dns_domains("owner", vec![])
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), resume.wait())
+            .await
+            .expect("cache candidate resume barrier timed out");
+        let result = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "{kind:?} cache candidate escaped provider ownership change"
+        );
+        assert_eq!(public_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(node_hits.load(Ordering::SeqCst), 0);
+        if !remove_after_registration {
+            // Rejection must not poison subsequent dedicated node DNS.
+            let mut retry = test_query_with_type(record_type);
+            retry.metadata.recursion_desired = true;
+            let recovered = resolver.exchange(&retry).await.unwrap();
+            assert_eq!(
+                EnhancedResolver::ip_list_of_message(&recovered),
+                vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11))],
+            );
+            assert_eq!(node_hits.load(Ordering::SeqCst), 1);
+            assert_eq!(public_hits.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn exchange_negative_cache_candidate_rejects_provider_registration_aba() {
+        assert_exchange_cache_candidate_rejects_provider_change(
+            CacheCandidateKind::Negative,
+            rr::RecordType::A,
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn exchange_negative_txt_cache_candidate_rejects_provider_registration_aba()
+     {
+        // Non-address records cannot use Fake-IP answers. They still must
+        // reject stale generic negative cache entries after provider ABA.
+        assert_exchange_cache_candidate_rejects_provider_change(
+            CacheCandidateKind::Negative,
+            rr::RecordType::TXT,
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn exchange_negative_srv_cache_candidate_rejects_provider_registration_aba()
+     {
+        // Game/service-discovery SRV records require real DNS semantics,
+        // but must still reject stale ordinary negative cache after ABA.
+        assert_exchange_cache_candidate_rejects_provider_change(
+            CacheCandidateKind::Negative,
+            rr::RecordType::SRV,
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn exchange_positive_cache_candidate_rejects_provider_registration_aba() {
+        assert_exchange_cache_candidate_rejects_provider_change(
+            CacheCandidateKind::Positive,
+            rr::RecordType::A,
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn exchange_negative_cache_candidate_rejects_new_provider_and_recovers() {
+        assert_exchange_cache_candidate_rejects_provider_change(
+            CacheCandidateKind::Negative,
+            rr::RecordType::A,
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn exchange_positive_cache_candidate_rejects_new_provider_and_recovers() {
+        assert_exchange_cache_candidate_rejects_provider_change(
+            CacheCandidateKind::Positive,
+            rr::RecordType::A,
+            false,
+        )
+        .await;
+    }
+
+    // A provider refresh for an unrelated name must not invalidate a valid
+    // cache entry for this QNAME. This guards against replacing per-domain
+    // epochs with a globally changing epoch (excessive fail-closed behavior).
+    async fn assert_unrelated_provider_refresh_preserves_cache_candidate(
+        kind: CacheCandidateKind,
+    ) {
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        let node_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 99)),
+                hits: public_hits.clone(),
+                id: "public-dns",
+            })],
+            false,
+        );
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 98)),
+            hits: node_hits.clone(),
+            id: "node-dns",
+        })]);
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        let mut query = test_query_with_type(rr::RecordType::A);
+        query.metadata.recursion_desired = true;
+        match kind {
+            CacheCandidateKind::Positive => {
+                let mut answer = response_with_a(Ipv4Addr::new(192, 0, 2, 10));
+                answer.answers[0].ttl = 120;
+                resolver.lru_cache.as_ref().unwrap().insert(
+                    query.queries[0].clone(),
+                    Ok(answer),
+                    Instant::now(),
+                );
+            }
+            CacheCandidateKind::Negative => {
+                let negative = negative_response(
+                    op::ResponseCode::NXDomain,
+                    "proxy.example.com.",
+                    120,
+                    60,
+                );
+                resolver.cache_negative(
+                    &query.queries[0],
+                    &negative,
+                    Instant::now(),
+                );
+            }
+        }
+        let resolver = Arc::new(resolver);
+        let selected = Arc::new(tokio::sync::Barrier::new(2));
+        let resume = Arc::new(tokio::sync::Barrier::new(2));
+        let running = {
+            let resolver = resolver.clone();
+            let selected = selected.clone();
+            let resume = resume.clone();
+            tokio::spawn(async move {
+                CACHE_CANDIDATE_TEST_PAUSE
+                    .scope(
+                        CacheCandidateTestPause {
+                            kind,
+                            selected,
+                            resume,
+                        },
+                        async move { resolver.exchange(&query).await },
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), selected.wait())
+            .await
+            .expect("unrelated refresh test did not enter the cache-hit branch");
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["unrelated.example.com".into()],
+            )
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), resume.wait())
+            .await
+            .expect("cache candidate resume barrier timed out");
+        let result = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("unrelated provider update must not invalidate cache");
+        match kind {
+            CacheCandidateKind::Positive => assert_eq!(
+                EnhancedResolver::ip_list_of_message(&result),
+                vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))],
+            ),
+            CacheCandidateKind::Negative => {
+                assert_eq!(result.metadata.response_code, op::ResponseCode::NXDomain,)
+            }
+        }
+        assert_eq!(public_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(node_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn exchange_negative_cache_candidate_survives_unrelated_provider_aba() {
+        assert_unrelated_provider_refresh_preserves_cache_candidate(
+            CacheCandidateKind::Negative,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn exchange_positive_cache_candidate_survives_unrelated_provider_aba() {
+        assert_unrelated_provider_refresh_preserves_cache_candidate(
+            CacheCandidateKind::Positive,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn provider_registration_aba_during_public_query_rejects_stale_answer() {
+        for record_type in [rr::RecordType::A, rr::RecordType::TXT] {
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let resume = Arc::new(tokio::sync::Notify::new());
+            let mut resolver = EnhancedResolver::from_clients(
+                vec![Arc::new(PausedClient {
+                    response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+                    entered: entered.clone(),
+                    resume: resume.clone(),
+                })],
+                false,
+            );
+            resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+            resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+                hits: Arc::new(AtomicUsize::new(0)),
+                id: "node-dns",
+            })]);
+            let resolver = Arc::new(resolver);
+            let query = test_query_with_type(record_type);
+            let running = {
+                let resolver = resolver.clone();
+                tokio::spawn(async move { resolver.exchange(&query).await })
+            };
+            tokio::time::timeout(Duration::from_secs(5), entered.notified())
+                .await
+                .unwrap();
+            resolver
+                .replace_proxy_provider_dns_domains(
+                    "owner",
+                    vec!["proxy.example.com".into()],
+                )
+                .await
+                .unwrap();
+            resolver
+                .replace_proxy_provider_dns_domains("owner", vec![])
+                .await
+                .unwrap();
+            resume.notify_one();
+            let result = tokio::time::timeout(Duration::from_secs(5), running)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                result.is_err(),
+                "public answer from before provider ownership ABA must be rejected"
+            );
+            assert!(
+                resolver
+                    .lru_cache
+                    .as_ref()
+                    .unwrap()
+                    .get(
+                        &test_query_with_type(record_type).queries[0],
+                        Instant::now(),
+                    )
+                    .is_none(),
+                "provider ABA must not leave an obsolete public DNS answer in shared cache for {record_type:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_removed_during_node_query_must_not_return_stale_node_answer() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+                hits: Arc::new(AtomicUsize::new(0)),
+                id: "public-dns",
+            })],
+            false,
+        );
+        resolver.proxy_resolver = Some(vec![Arc::new(PausedClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            entered: entered.clone(),
+            resume: resume.clone(),
+        })]);
+        let resolver = Arc::new(resolver);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        let query = test_query_with_type(rr::RecordType::TXT);
+        let running = {
+            let resolver = resolver.clone();
+            tokio::spawn(async move { resolver.exchange(&query).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        resume.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "removed provider must not receive stale dedicated DNS answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_removed_and_reregistered_during_node_query_rejects_old_generation()
+     {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let mut resolver = EnhancedResolver::from_clients(vec![], false);
+        resolver.proxy_resolver = Some(vec![Arc::new(PausedClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            entered: entered.clone(),
+            resume: resume.clone(),
+        })]);
+        let resolver = Arc::new(resolver);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        let query = test_query_with_type(rr::RecordType::TXT);
+        let running = {
+            let resolver = resolver.clone();
+            tokio::spawn(async move { resolver.exchange(&query).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        resume.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "a new provider generation must not accept a prior generation's DNS response"
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_provider_refresh_must_not_invalidate_inflight_node_dns() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let mut resolver = EnhancedResolver::from_clients(vec![], false);
+        resolver.proxy_resolver = Some(vec![Arc::new(PausedClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            entered: entered.clone(),
+            resume: resume.clone(),
+        })]);
+        let resolver = Arc::new(resolver);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        let query = test_query_with_type(rr::RecordType::TXT);
+        let running = {
+            let resolver = resolver.clone();
+            tokio::spawn(async move { resolver.exchange(&query).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "unrelated",
+                vec!["other.example.net".into()],
+            )
+            .await
+            .unwrap();
+        resume.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_ok(),
+            "unrelated provider refresh must not invalidate the query's ownership"
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_one_of_two_owners_does_not_invalidate_inflight_node_dns() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let mut resolver = EnhancedResolver::from_clients(vec![], false);
+        resolver.proxy_resolver = Some(vec![Arc::new(PausedClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            entered: entered.clone(),
+            resume: resume.clone(),
+        })]);
+        let resolver = Arc::new(resolver);
+        for owner in ["owner-a", "owner-b"] {
+            resolver
+                .replace_proxy_provider_dns_domains(
+                    owner,
+                    vec!["proxy.example.com".into()],
+                )
+                .await
+                .unwrap();
+        }
+        let query = test_query_with_type(rr::RecordType::TXT);
+        let running = {
+            let resolver = resolver.clone();
+            tokio::spawn(async move { resolver.exchange(&query).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains("owner-a", vec![])
+            .await
+            .unwrap();
+        resume.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_ok(),
+            "another provider still owns the dedicated node DNS domain"
+        );
+    }
+
+    #[tokio::test]
+    async fn identical_provider_refresh_does_not_invalidate_inflight_node_dns() {
+        // A provider refresh with an identical endpoint set is not a new
+        // ownership generation. Avoid breaking healthy in-flight node DNS.
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let mut resolver = EnhancedResolver::from_clients(vec![], false);
+        resolver.proxy_resolver = Some(vec![Arc::new(PausedClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            entered: entered.clone(),
+            resume: resume.clone(),
+        })]);
+        let resolver = Arc::new(resolver);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        let query = test_query_with_type(rr::RecordType::TXT);
+        let running = {
+            let resolver = resolver.clone();
+            tokio::spawn(async move { resolver.exchange(&query).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["PROXY.EXAMPLE.COM.".into()],
+            )
+            .await
+            .unwrap();
+        resume.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_ok(),
+            "equivalent provider refresh must preserve in-flight DNS"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_public_answer_must_be_reclassified_after_provider_registration()
+    {
+        // Simulate a cache hit selected before a concurrent provider refresh.
+        // A late cache return must not expose the public answer.
+        let node_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(vec![], false);
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: node_hits.clone(),
+            id: "node-dns",
+        })]);
+        let query = test_query_with_type(rr::RecordType::A);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        let cached = response_with_a(Ipv4Addr::new(192, 0, 2, 10));
+        let result = resolver
+            .revalidate_public_cache_hit(&query, cached)
+            .await
+            .unwrap();
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&result),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11))]
+        );
+        assert_eq!(node_hits.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn cached_negative_answer_must_be_reclassified_after_provider_registration()
+     {
+        // NXDOMAIN/NODATA are privacy-sensitive too: a stale negative public
+        // response must not hide the dedicated node resolver after registration.
+        let node_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(vec![], false);
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: node_hits.clone(),
+            id: "node-dns",
+        })]);
+        let query = test_query_with_type(rr::RecordType::TXT);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        let cached =
+            negative_response(op::ResponseCode::NXDomain, "example.com.", 300, 60);
+        let result = resolver
+            .revalidate_public_cache_hit(&query, cached)
+            .await
+            .unwrap();
+        assert_ne!(result.metadata.response_code, op::ResponseCode::NXDomain);
+        assert_eq!(node_hits.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn cache_reclassification_rejects_provider_aba_during_node_lookup() {
+        // Cover both address and non-address negative answers: a dedicated
+        // response from an obsolete owner must never be delivered after ABA.
+        for record_type in [rr::RecordType::A, rr::RecordType::TXT] {
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let resume = Arc::new(tokio::sync::Notify::new());
+            let mut node_response = response_with_a(Ipv4Addr::new(192, 0, 2, 11));
+            let mut stale_public = response_with_a(Ipv4Addr::new(192, 0, 2, 10));
+            if record_type == rr::RecordType::TXT {
+                node_response.answers.clear();
+                node_response.metadata.response_code = op::ResponseCode::NXDomain;
+                stale_public.answers.clear();
+                stale_public.metadata.response_code = op::ResponseCode::NXDomain;
+            }
+            let mut resolver = EnhancedResolver::from_clients(vec![], false);
+            resolver.proxy_resolver = Some(vec![Arc::new(PausedClient {
+                response: node_response,
+                entered: entered.clone(),
+                resume: resume.clone(),
+            })]);
+            let resolver = Arc::new(resolver);
+            resolver
+                .replace_proxy_provider_dns_domains(
+                    "owner",
+                    vec!["proxy.example.com".into()],
+                )
+                .await
+                .unwrap();
+            let query = test_query_with_type(record_type);
+            let running = {
+                let resolver = resolver.clone();
+                tokio::spawn(async move {
+                    resolver
+                        .revalidate_public_cache_hit(&query, stale_public)
+                        .await
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(5), entered.notified())
+                .await
+                .unwrap();
+            resolver
+                .replace_proxy_provider_dns_domains("owner", vec![])
+                .await
+                .unwrap();
+            resolver
+                .replace_proxy_provider_dns_domains(
+                    "owner",
+                    vec!["proxy.example.com".into()],
+                )
+                .await
+                .unwrap();
+            resume.notify_one();
+            let result = tokio::time::timeout(Duration::from_secs(5), running)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                result.is_err(),
+                "obsolete dedicated {record_type:?} response must fail closed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn network_reset_rejects_inflight_public_txt_nxdomain_and_cache_write() {
+        // A public DNS request is also network-scoped: a reset must not
+        // deliver or cache a negative answer from the previous network.
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let mut negative = response_with_a(Ipv4Addr::new(192, 0, 2, 11));
+        negative.answers.clear();
+        negative.metadata.response_code = op::ResponseCode::NXDomain;
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(PausedClient {
+                response: negative,
+                entered: entered.clone(),
+                resume: resume.clone(),
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        let resolver = Arc::new(resolver);
+        let query = test_query_with_type(rr::RecordType::TXT);
+        let running = {
+            let resolver = resolver.clone();
+            tokio::spawn(async move { resolver.exchange(&query).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        resolver.reset_transports().await.unwrap();
+        resume.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "old-network public NXDOMAIN must fail closed"
+        );
+        assert!(
+            resolver
+                .lru_cache
+                .as_ref()
+                .unwrap()
+                .get(
+                    &test_query_with_type(rr::RecordType::TXT).queries[0],
+                    Instant::now()
+                )
+                .is_none(),
+            "old-network public NXDOMAIN must not enter shared cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_aba_and_network_reset_during_dedicated_negative_lookup_fail_closed()
+     {
+        // A node's NXDOMAIN from an obsolete owner and network must never
+        // become a valid response after both ownership and transport change.
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let mut negative = response_with_a(Ipv4Addr::new(192, 0, 2, 11));
+        negative.answers.clear();
+        negative.metadata.response_code = op::ResponseCode::NXDomain;
+        // The new network has a healthy public resolver; the old dedicated
+        // NXDOMAIN must not shadow it after ownership is removed.
+        let fresh_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 77)),
+                hits: fresh_hits.clone(),
+                id: "new-network-public",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        resolver.proxy_resolver = Some(vec![Arc::new(PausedClient {
+            response: negative,
+            entered: entered.clone(),
+            resume: resume.clone(),
+        })]);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        let resolver = Arc::new(resolver);
+        let mut query = test_query_with_type(rr::RecordType::TXT);
+        query.metadata.recursion_desired = true;
+        let running = {
+            let resolver = resolver.clone();
+            tokio::spawn(async move { resolver.exchange(&query).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        resolver.reset_transports().await.unwrap();
+        resume.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "obsolete NXDOMAIN must not survive provider ABA and network reset"
+        );
+        assert!(
+            resolver
+                .lru_cache
+                .as_ref()
+                .unwrap()
+                .get(
+                    &test_query_with_type(rr::RecordType::TXT).queries[0],
+                    Instant::now(),
+                )
+                .is_none(),
+            "obsolete NXDOMAIN must not contaminate the shared negative cache"
+        );
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        let fresh = tokio::time::timeout(
+            Duration::from_secs(5),
+            resolver.exchange(&test_query_with_type(rr::RecordType::TXT)),
+        )
+        .await
+        .expect("new-network query must finish")
+        .expect("new-network public DNS must be usable");
+        assert_eq!(fresh.metadata.response_code, op::ResponseCode::NoError);
+        assert_eq!(
+            fresh_hits.load(Ordering::SeqCst),
+            1,
+            "new-network DNS must actually be queried, not served from stale negative cache"
+        );
+    }
+
+    #[tokio::test]
     async fn provider_node_dns_never_reuses_public_answer_cached_before_registration()
      {
         // A public DNS answer could have been cached before this hostname
@@ -3540,6 +9031,1563 @@ mod tests {
         );
         assert_eq!(main_hits.load(Ordering::SeqCst), 1);
         assert_eq!(node_hits.load(Ordering::SeqCst), 1);
+    }
+
+    // Public cache entries written before a domain ever became a Provider
+    // endpoint carry no ownership epoch. They must not be resurrected once
+    // the Provider registers and is later removed (historical ABA).
+    async fn assert_provider_ownership_aba_invalidates_old_public_cache(
+        negative: bool,
+    ) {
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        let node_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 12)),
+                hits: public_hits.clone(),
+                id: "new-public-dns",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: node_hits.clone(),
+            id: "node-dns",
+        })]);
+        let mut query = test_query_with_type(rr::RecordType::A);
+        query.metadata.recursion_desired = true;
+        if negative {
+            let nx = negative_response(
+                op::ResponseCode::NXDomain,
+                "proxy.example.com.",
+                300,
+                60,
+            );
+            resolver.cache_negative(&query.queries[0], &nx, Instant::now());
+            assert!(
+                resolver
+                    .cached_negative(&query.queries[0], &query, Instant::now())
+                    .is_some()
+            );
+        } else {
+            let mut old = response_with_a(Ipv4Addr::new(192, 0, 2, 10));
+            old.answers[0].ttl = 120;
+            resolver.lru_cache.as_ref().unwrap().insert(
+                query.queries[0].clone(),
+                Ok(old),
+                Instant::now(),
+            );
+        }
+        // After the entire Provider ABA, the current owner registry is empty.
+        // Checking only the current owner/generation accepts an old answer.
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        let result = resolver.exchange(&query).await.unwrap();
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&result),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 12))],
+            "reusing a pre-Provider public cache entry after ownership ABA is unsafe"
+        );
+        assert_eq!(public_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(node_hits.load(Ordering::SeqCst), 0);
+        // Subsequent ordinary queries can reuse the new generation-tagged
+        // entry, without reviving the old pre-registration public answer.
+        let again = resolver.exchange(&query).await.unwrap();
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&again),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 12))]
+        );
+        assert_eq!(public_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(node_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn old_public_positive_cache_is_not_reused_after_provider_ownership_aba() {
+        assert_provider_ownership_aba_invalidates_old_public_cache(false).await;
+    }
+
+    #[tokio::test]
+    async fn old_public_negative_cache_is_not_reused_after_provider_ownership_aba() {
+        assert_provider_ownership_aba_invalidates_old_public_cache(true).await;
+    }
+
+    #[tokio::test]
+    async fn former_provider_domain_uses_generation_tagged_negative_cache() {
+        // After a provider relinquishes the name, an ordinary NXDOMAIN
+        // response can be cached with provenance without reviving old data.
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: negative_response(
+                    op::ResponseCode::NXDomain,
+                    "proxy.example.com.",
+                    300,
+                    60,
+                ),
+                hits: main_hits.clone(),
+                id: "ordinary-negative-dns",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: Arc::new(AtomicUsize::new(0)),
+            id: "node-dns",
+        })]);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        let mut query = test_query_with_type(rr::RecordType::TXT);
+        query.metadata.recursion_desired = true;
+        for _ in 0..2 {
+            let response = resolver.exchange(&query).await.unwrap();
+            assert_eq!(response.metadata.response_code, op::ResponseCode::NXDomain);
+            assert_eq!(main_hits.load(Ordering::SeqCst), 1);
+            assert!(
+                resolver
+                    .cached_negative(&query.queries[0], &query, Instant::now())
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn last_provider_owner_removal_invalidates_preexisting_public_cache() {
+        // Two provider sets can own the same endpoint concurrently. Dropping
+        // one owner must not reclassify the hostname as public; dropping the
+        // final owner must not resurrect a pre-registration cache entry.
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        let node_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 12)),
+                hits: main_hits.clone(),
+                id: "ordinary-public-dns",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: node_hits.clone(),
+            id: "node-dns",
+        })]);
+        let mut query = test_query_with_type(rr::RecordType::A);
+        query.metadata.recursion_desired = true;
+        let mut stale = response_with_a(Ipv4Addr::new(192, 0, 2, 10));
+        stale.answers[0].ttl = 120;
+        resolver.lru_cache.as_ref().unwrap().insert(
+            query.queries[0].clone(),
+            Ok(stale),
+            Instant::now(),
+        );
+        for owner in ["owner-a", "owner-b"] {
+            resolver
+                .replace_proxy_provider_dns_domains(
+                    owner,
+                    vec!["proxy.example.com".into()],
+                )
+                .await
+                .unwrap();
+        }
+        resolver
+            .replace_proxy_provider_dns_domains("owner-a", vec![])
+            .await
+            .unwrap();
+        let node = resolver.exchange(&query).await.unwrap();
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&node),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11))]
+        );
+        assert_eq!(main_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(node_hits.load(Ordering::SeqCst), 1);
+        resolver
+            .replace_proxy_provider_dns_domains("owner-b", vec![])
+            .await
+            .unwrap();
+        let public = resolver.exchange(&query).await.unwrap();
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&public),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 12))]
+        );
+        assert_eq!(main_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(node_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn former_provider_public_positive_answer_hits_current_generation_cache() {
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        let node_hits = Arc::new(AtomicUsize::new(0));
+        let mut answer = response_with_a(Ipv4Addr::new(192, 0, 2, 42));
+        answer.answers[0].ttl = 180;
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: answer,
+                hits: main_hits.clone(),
+                id: "public-new-epoch",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: node_hits.clone(),
+            id: "dedicated-node",
+        })]);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        let mut query = test_query_with_type(rr::RecordType::A);
+        query.metadata.recursion_desired = true;
+        for (index, id) in [37, 38].into_iter().enumerate() {
+            query.metadata.id = id;
+            let answer = resolver.exchange(&query).await.unwrap();
+            if index > 0 {
+                // The synthetic CountingClient fixture does not echo IDs;
+                // only the cached response must copy the requesting ID.
+                assert_eq!(answer.metadata.id, id);
+            }
+            assert_eq!(
+                EnhancedResolver::ip_list_of_message(&answer),
+                vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 42))]
+            );
+        }
+        assert_eq!(
+            main_hits.load(Ordering::SeqCst),
+            1,
+            "a former provider hostname should reuse only answers from its current generation"
+        );
+        assert_eq!(node_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn former_provider_public_negative_answer_hits_current_generation_cache() {
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: negative_response(
+                    op::ResponseCode::NXDomain,
+                    "proxy.example.com.",
+                    120,
+                    60,
+                ),
+                hits: main_hits.clone(),
+                id: "public-negative-new-epoch",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: Arc::new(AtomicUsize::new(0)),
+            id: "dedicated-node",
+        })]);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        let mut query = test_query_with_type(rr::RecordType::TXT);
+        query.metadata.recursion_desired = true;
+        for (index, id) in [91, 92].into_iter().enumerate() {
+            query.metadata.id = id;
+            let response = resolver.exchange(&query).await.unwrap();
+            if index > 0 {
+                assert_eq!(response.metadata.id, id);
+            }
+            assert_eq!(response.metadata.response_code, op::ResponseCode::NXDomain);
+        }
+        assert_eq!(
+            main_hits.load(Ordering::SeqCst),
+            1,
+            "the current-epoch negative cache should obey RFC 2308 TTL"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_epoch_cache_survives_unrelated_provider_registry_updates() {
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 42)),
+                hits: main_hits.clone(),
+                id: "ordinary-public-dns",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: Arc::new(AtomicUsize::new(0)),
+            id: "dedicated-node",
+        })]);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        let mut query = test_query_with_type(rr::RecordType::A);
+        query.metadata.recursion_desired = true;
+        resolver.exchange(&query).await.unwrap();
+        assert_eq!(main_hits.load(Ordering::SeqCst), 1);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "other-owner",
+                vec!["unrelated.example.com".into(), "another.example.com".into()],
+            )
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains("other-owner", vec![])
+            .await
+            .unwrap();
+        resolver.exchange(&query).await.unwrap();
+        assert_eq!(
+            main_hits.load(Ordering::SeqCst),
+            1,
+            "other domains' ownership updates must not invalidate this epoch"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_epoch_cache_preserves_cache_safe_request_policy() {
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 42)),
+                hits: main_hits.clone(),
+                id: "ordinary-public-dns",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: Arc::new(AtomicUsize::new(0)),
+            id: "dedicated-node",
+        })]);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        let mut query = test_query_with_type(rr::RecordType::A);
+        query.metadata.recursion_desired = true;
+        query.metadata.checking_disabled = true;
+        assert!(!EnhancedResolver::cache_safe_request(&query));
+        resolver.exchange(&query).await.unwrap();
+        resolver.exchange(&query).await.unwrap();
+        assert_eq!(
+            main_hits.load(Ordering::SeqCst),
+            2,
+            "requests with different CD semantics must not share Question-only cached answers"
+        );
+        assert_eq!(resolver.provider_epoch_cache.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn provider_epoch_cache_is_invalidated_on_next_ownership_cycle() {
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        let node_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 42)),
+                hits: main_hits.clone(),
+                id: "new-public-dns",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: node_hits.clone(),
+            id: "dedicated-node",
+        })]);
+        let mut query = test_query_with_type(rr::RecordType::A);
+        query.metadata.recursion_desired = true;
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        resolver.exchange(&query).await.unwrap();
+        resolver.exchange(&query).await.unwrap();
+        assert_eq!(main_hits.load(Ordering::SeqCst), 1);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        let node = resolver.exchange(&query).await.unwrap();
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&node),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11))]
+        );
+        assert_eq!(main_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(node_hits.load(Ordering::SeqCst), 1);
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        resolver.exchange(&query).await.unwrap();
+        assert_eq!(
+            main_hits.load(Ordering::SeqCst),
+            2,
+            "the prior ownership generation's cached public answer must not survive ABA"
+        );
+        resolver.exchange(&query).await.unwrap();
+        assert_eq!(
+            main_hits.load(Ordering::SeqCst),
+            2,
+            "the latest generation must be independently cacheable"
+        );
+    }
+
+    // The epoch cache uses the same final revalidation as shared cache hits.
+    // A provider ABA after selecting a cached candidate must invalidate it.
+    async fn assert_provider_epoch_cache_candidate_rejects_aba(negative: bool) {
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        let node_hits = Arc::new(AtomicUsize::new(0));
+        let response = if negative {
+            negative_response(
+                op::ResponseCode::NXDomain,
+                "proxy.example.com.",
+                120,
+                60,
+            )
+        } else {
+            response_with_a(Ipv4Addr::new(192, 0, 2, 42))
+        };
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response,
+                hits: main_hits.clone(),
+                id: "public-epoch-dns",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: node_hits.clone(),
+            id: "dedicated-node",
+        })]);
+        let resolver = Arc::new(resolver);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        let mut request = test_query_with_type(if negative {
+            rr::RecordType::TXT
+        } else {
+            rr::RecordType::A
+        });
+        request.metadata.recursion_desired = true;
+        // Populate only the current epoch (no pre-provider shared entry).
+        resolver.exchange(&request).await.unwrap();
+        assert_eq!(main_hits.load(Ordering::SeqCst), 1);
+        let selected = Arc::new(tokio::sync::Barrier::new(2));
+        let resume = Arc::new(tokio::sync::Barrier::new(2));
+        let running = {
+            let resolver = resolver.clone();
+            let selected = selected.clone();
+            let resume = resume.clone();
+            tokio::spawn(async move {
+                CACHE_CANDIDATE_TEST_PAUSE
+                    .scope(
+                        CacheCandidateTestPause {
+                            kind: if negative {
+                                CacheCandidateKind::Negative
+                            } else {
+                                CacheCandidateKind::Positive
+                            },
+                            selected,
+                            resume,
+                        },
+                        async move { resolver.exchange(&request).await },
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), selected.wait())
+            .await
+            .expect("epoch cache hit was not selected");
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), resume.wait())
+            .await
+            .expect("epoch cache handoff did not resume");
+        let result = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err(), "obsolete cached epoch must fail closed");
+        assert_eq!(main_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(node_hits.load(Ordering::SeqCst), 0);
+        let mut retry = test_query_with_type(if negative {
+            rr::RecordType::TXT
+        } else {
+            rr::RecordType::A
+        });
+        retry.metadata.recursion_desired = true;
+        resolver.exchange(&retry).await.unwrap();
+        assert_eq!(
+            main_hits.load(Ordering::SeqCst),
+            2,
+            "a new epoch needs an independent ordinary DNS lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_query_started_in_former_provider_epoch_rejects_later_aba() {
+        // An ordinary DNS lookup can be in flight while a former node is
+        // re-registered and removed again. The result must neither return
+        // nor enter a newly authorized epoch cache after this transition.
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(PausedClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 42)),
+                entered: entered.clone(),
+                resume: resume.clone(),
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: Arc::new(AtomicUsize::new(0)),
+            id: "dedicated-node",
+        })]);
+        let resolver = Arc::new(resolver);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        let mut query = test_query_with_type(rr::RecordType::A);
+        query.metadata.recursion_desired = true;
+        let running = {
+            let resolver = resolver.clone();
+            let query = query.clone();
+            tokio::spawn(async move { resolver.exchange(&query).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("public lookup did not start");
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        resume.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err(), "pre-transition answer must be rejected");
+        let latest = resolver
+            .provider_domain_generation("proxy.example.com")
+            .await;
+        assert!(
+            resolver
+                .cached_provider_epoch_response(
+                    &query.queries[0],
+                    &query,
+                    latest,
+                    Instant::now(),
+                )
+                .is_none(),
+            "rejected response must not poison current epoch cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_epoch_positive_cache_handoff_rejects_aba() {
+        assert_provider_epoch_cache_candidate_rejects_aba(false).await;
+    }
+
+    #[tokio::test]
+    async fn provider_epoch_negative_cache_handoff_rejects_aba() {
+        assert_provider_epoch_cache_candidate_rejects_aba(true).await;
+    }
+
+    #[test]
+    fn provider_epoch_nodata_txt_cache_uses_soa_minimum_and_expires() {
+        // Service-discovery TXT/NODATA must preserve NoError and respect
+        // the RFC 2308 SOA minimum, not retain an outdated negative forever.
+        let resolver = EnhancedResolver::from_clients(vec![], false);
+        let mut query = test_query_with_type(rr::RecordType::TXT);
+        query.metadata.recursion_desired = true;
+        let now = Instant::now();
+        let nodata = negative_response(
+            op::ResponseCode::NoError,
+            "proxy.example.com.",
+            120,
+            30,
+        );
+        resolver.cache_provider_epoch_response(&query.queries[0], &nodata, 9, now);
+        let fresh = resolver
+            .cached_provider_epoch_response(
+                &query.queries[0],
+                &query,
+                9,
+                now + Duration::from_secs(10),
+            )
+            .expect("fresh NODATA should be cached within SOA lifetime");
+        assert_eq!(fresh.metadata.response_code, op::ResponseCode::NoError);
+        assert!(fresh.answers.is_empty());
+        assert_eq!(fresh.authorities[0].ttl, 20);
+        assert!(
+            resolver
+                .cached_provider_epoch_response(
+                    &query.queries[0],
+                    &query,
+                    9,
+                    now + Duration::from_secs(30),
+                )
+                .is_none(),
+            "NODATA should expire at min(SOA TTL, SOA.MINIMUM)"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_epoch_cache_enforces_ttl_and_owner_generation() {
+        let resolver = EnhancedResolver::from_clients(vec![], false);
+        let request = test_query_with_type(rr::RecordType::A);
+        let query = &request.queries[0];
+        let now = Instant::now();
+        let mut positive = response_with_a(Ipv4Addr::new(192, 0, 2, 42));
+        positive.answers[0].ttl = 2;
+        resolver.cache_provider_epoch_response(query, &positive, 7, now);
+        let at_one = resolver
+            .cached_provider_epoch_response(
+                query,
+                &request,
+                7,
+                now + Duration::from_secs(1),
+            )
+            .expect("TTL=2 public answer should be valid after one second");
+        assert_eq!(at_one.answers[0].ttl, 1);
+        assert!(
+            resolver
+                .cached_provider_epoch_response(
+                    query,
+                    &request,
+                    7,
+                    now + Duration::from_secs(2),
+                )
+                .is_none(),
+            "expired answers must fail closed"
+        );
+        resolver.cache_provider_epoch_response(query, &positive, 7, now);
+        assert!(
+            resolver
+                .cached_provider_epoch_response(query, &request, 8, now)
+                .is_none(),
+            "a new ownership generation must reject an old cached answer"
+        );
+
+        let mut txt_request = test_query_with_type(rr::RecordType::TXT);
+        txt_request.metadata.recursion_desired = true;
+        let negative = negative_response(
+            op::ResponseCode::NXDomain,
+            "proxy.example.com.",
+            120,
+            2,
+        );
+        let txt_query = &txt_request.queries[0];
+        resolver.cache_provider_epoch_response(txt_query, &negative, 8, now);
+        let at_one = resolver
+            .cached_provider_epoch_response(
+                txt_query,
+                &txt_request,
+                8,
+                now + Duration::from_secs(1),
+            )
+            .expect("RFC 2308 negative TTL=2 must be valid at one second");
+        assert_eq!(at_one.metadata.response_code, op::ResponseCode::NXDomain);
+        assert!(
+            resolver
+                .cached_provider_epoch_response(
+                    txt_query,
+                    &txt_request,
+                    8,
+                    now + Duration::from_secs(2),
+                )
+                .is_none(),
+            "negative SOA minimum expiry must be enforced"
+        );
+    }
+
+    #[tokio::test]
+    async fn static_node_uses_normalized_qname_before_public_cache_selection() {
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        let node_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 42)),
+                hits: public_hits.clone(),
+                id: "public-dns",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: node_hits.clone(),
+            id: "dedicated-node-dns",
+        })]);
+        let mut domains = crate::common::trie::StringTrie::new();
+        domains.insert("proxy.example.com", Arc::new(true));
+        resolver.proxy_server_domains = Some(domains);
+        let mut query = test_query_with_type(rr::RecordType::A);
+        query.queries[0]
+            .set_name(rr::Name::from_ascii("PrOxY.ExAmPlE.CoM.").unwrap());
+        query.metadata.recursion_desired = true;
+        let mut old_public = response_with_a(Ipv4Addr::new(192, 0, 2, 10));
+        old_public.answers[0].ttl = 120;
+        resolver.lru_cache.as_ref().unwrap().insert(
+            query.queries[0].clone(),
+            Ok(old_public),
+            Instant::now(),
+        );
+        // This gate is intentionally never opened. If static classification
+        // misses the QNAME, the generic-cache branch will deadlock at the
+        // deterministic test pause and the timeout will reveal the bypass.
+        let paused = CacheCandidateTestPause {
+            kind: CacheCandidateKind::Positive,
+            selected: Arc::new(tokio::sync::Barrier::new(2)),
+            resume: Arc::new(tokio::sync::Barrier::new(2)),
+        };
+        let reply = tokio::time::timeout(
+            Duration::from_secs(3),
+            CACHE_CANDIDATE_TEST_PAUSE
+                .scope(paused, async { resolver.exchange(&query).await }),
+        )
+        .await
+        .expect(
+            "static node must bypass the generic cache before candidate selection",
+        )
+        .unwrap();
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&reply),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11))]
+        );
+        assert_eq!(node_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(public_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn network_reset_during_static_proxy_node_query_fails_closed() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 42)),
+                hits: public_hits.clone(),
+                id: "public-dns",
+            })],
+            false,
+        );
+        resolver.proxy_resolver = Some(vec![Arc::new(PausedClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            entered: entered.clone(),
+            resume: resume.clone(),
+        })]);
+        let mut domains = crate::common::trie::StringTrie::new();
+        domains.insert("proxy.example.com", Arc::new(true));
+        resolver.proxy_server_domains = Some(domains);
+        let resolver = Arc::new(resolver);
+        let mut query = test_query_with_type(rr::RecordType::A);
+        query.metadata.recursion_desired = true;
+        let running = {
+            let resolver = resolver.clone();
+            tokio::spawn(async move { resolver.exchange(&query).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("static node DNS query did not begin");
+        resolver.reset_transports().await.unwrap();
+        resume.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "old-network static node DNS response must fail closed"
+        );
+        assert_eq!(
+            public_hits.load(Ordering::SeqCst),
+            0,
+            "static node DNS must not downgrade to public DNS after reset"
+        );
+    }
+
+    #[tokio::test]
+    async fn network_reset_during_active_provider_node_query_fails_closed() {
+        // A dedicated node-DNS request started on an old network must not
+        // return that network's IP after a transport reset completes.
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 42)),
+                hits: public_hits.clone(),
+                id: "public-dns",
+            })],
+            false,
+        );
+        resolver.proxy_resolver = Some(vec![Arc::new(PausedClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            entered: entered.clone(),
+            resume: resume.clone(),
+        })]);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        let resolver = Arc::new(resolver);
+        let mut query = test_query_with_type(rr::RecordType::A);
+        query.metadata.recursion_desired = true;
+        let running = {
+            let resolver = resolver.clone();
+            tokio::spawn(async move { resolver.exchange(&query).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("node DNS query did not start");
+        resolver.reset_transports().await.unwrap();
+        resume.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "old-network node DNS result must fail closed"
+        );
+        assert_eq!(
+            public_hits.load(Ordering::SeqCst),
+            0,
+            "node DNS failure must not fall back to public DNS"
+        );
+    }
+
+    #[tokio::test]
+    async fn network_reset_does_not_downgrade_active_provider_to_public_dns() {
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        let node_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 42)),
+                hits: public_hits.clone(),
+                id: "public-dns",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: node_hits.clone(),
+            id: "node-dns",
+        })]);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        resolver.reset_transports().await.unwrap();
+        let mut query = test_query_with_type(rr::RecordType::A);
+        query.metadata.recursion_desired = true;
+        let response = resolver.exchange(&query).await.unwrap();
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&response),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11))]
+        );
+        assert_eq!(public_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(node_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn new_network_former_provider_query_caches_after_reset() {
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        let node_hits = Arc::new(AtomicUsize::new(0));
+        let mut answer = response_with_a(Ipv4Addr::new(192, 0, 2, 42));
+        answer.answers[0].ttl = 120;
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: answer,
+                hits: public_hits.clone(),
+                id: "post-reset-public-dns",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: node_hits.clone(),
+            id: "dedicated-node-dns",
+        })]);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        resolver.reset_transports().await.unwrap();
+        let mut query = test_query_with_type(rr::RecordType::A);
+        query.metadata.recursion_desired = true;
+        for _ in 0..2 {
+            let result = resolver.exchange(&query).await.unwrap();
+            assert_eq!(
+                EnhancedResolver::ip_list_of_message(&result),
+                vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 42))]
+            );
+        }
+        assert_eq!(
+            public_hits.load(Ordering::SeqCst),
+            1,
+            "fresh network must retain legitimate current-epoch cache acceleration"
+        );
+        assert_eq!(node_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn network_reset_rejects_stale_epoch_cache_writer_under_same_lock() {
+        let resolver = EnhancedResolver::from_clients(vec![], false);
+        let request = test_query_with_type(rr::RecordType::A);
+        let now = Instant::now();
+        let mut answer = response_with_a(Ipv4Addr::new(192, 0, 2, 42));
+        answer.answers[0].ttl = 120;
+        let old_network = resolver
+            .provider_epoch_network_generation
+            .load(Ordering::Relaxed);
+        resolver.reset_transports().await.unwrap();
+        resolver.cache_provider_epoch_response_for_network(
+            &request.queries[0],
+            &answer,
+            7,
+            now,
+            Some(old_network),
+        );
+        assert!(
+            resolver
+                .cached_provider_epoch_response(
+                    &request.queries[0],
+                    &request,
+                    7,
+                    now,
+                )
+                .is_none(),
+            "a pre-reset writer must not repopulate the new network cache"
+        );
+        let new_network = resolver
+            .provider_epoch_network_generation
+            .load(Ordering::Relaxed);
+        assert_ne!(new_network, old_network);
+        resolver.cache_provider_epoch_response_for_network(
+            &request.queries[0],
+            &answer,
+            7,
+            now,
+            Some(new_network),
+        );
+        assert!(
+            resolver
+                .cached_provider_epoch_response(
+                    &request.queries[0],
+                    &request,
+                    7,
+                    now,
+                )
+                .is_some(),
+            "a fresh-network response should remain cacheable"
+        );
+    }
+
+    #[tokio::test]
+    async fn network_reset_during_former_provider_lookup_must_not_reseed_epoch_cache()
+     {
+        // The upstream may finish after network-path reset has cleared the
+        // epoch cache. Its answer belongs to the old network and must not
+        // repopulate a cache for the new split-DNS path.
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(PausedClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 42)),
+                entered: entered.clone(),
+                resume: resume.clone(),
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: Arc::new(AtomicUsize::new(0)),
+            id: "dedicated-node-dns",
+        })]);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        let resolver = Arc::new(resolver);
+        let mut request = test_query_with_type(rr::RecordType::A);
+        request.metadata.recursion_desired = true;
+        let pending = {
+            let resolver = resolver.clone();
+            let query = request.clone();
+            tokio::spawn(async move { resolver.exchange(&query).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("ordinary lookup did not begin");
+        resolver.reset_transports().await.unwrap();
+        resume.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "old network's public DNS answer must fail closed after reset"
+        );
+        let generation = resolver
+            .provider_domain_generation("proxy.example.com")
+            .await;
+        assert!(
+            resolver
+                .cached_provider_epoch_response(
+                    &request.queries[0],
+                    &request,
+                    generation,
+                    Instant::now(),
+                )
+                .is_none(),
+            "stale old-network response must not reseed the cache"
+        );
+    }
+
+    async fn assert_network_reset_rejects_selected_provider_epoch_cache(
+        negative: bool,
+    ) {
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        let response = if negative {
+            negative_response(
+                op::ResponseCode::NXDomain,
+                "proxy.example.com.",
+                120,
+                60,
+            )
+        } else {
+            response_with_a(Ipv4Addr::new(192, 0, 2, 42))
+        };
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response,
+                hits: main_hits.clone(),
+                id: "public-dns",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: Arc::new(AtomicUsize::new(0)),
+            id: "dedicated-node-dns",
+        })]);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        let resolver = Arc::new(resolver);
+        let mut query = test_query_with_type(if negative {
+            rr::RecordType::TXT
+        } else {
+            rr::RecordType::A
+        });
+        query.metadata.recursion_desired = true;
+        resolver.exchange(&query).await.unwrap();
+        assert_eq!(main_hits.load(Ordering::SeqCst), 1);
+        let selected = Arc::new(tokio::sync::Barrier::new(2));
+        let resume = Arc::new(tokio::sync::Barrier::new(2));
+        let running = {
+            let resolver = resolver.clone();
+            let selected = selected.clone();
+            let resume = resume.clone();
+            tokio::spawn(async move {
+                CACHE_CANDIDATE_TEST_PAUSE
+                    .scope(
+                        CacheCandidateTestPause {
+                            kind: if negative {
+                                CacheCandidateKind::Negative
+                            } else {
+                                CacheCandidateKind::Positive
+                            },
+                            selected,
+                            resume,
+                        },
+                        async move { resolver.exchange(&query).await },
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), selected.wait())
+            .await
+            .expect("the epoch cache candidate was not selected");
+        resolver.reset_transports().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), resume.wait())
+            .await
+            .expect("cached query did not resume");
+        let result = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "a previously selected epoch cache response cannot survive network reset"
+        );
+        assert_eq!(main_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn network_reset_rejects_selected_positive_provider_epoch_cache() {
+        assert_network_reset_rejects_selected_provider_epoch_cache(false).await;
+    }
+
+    #[tokio::test]
+    async fn network_reset_rejects_selected_negative_provider_epoch_cache() {
+        assert_network_reset_rejects_selected_provider_epoch_cache(true).await;
+    }
+
+    #[test]
+    fn stale_writer_must_not_replace_newer_provider_epoch_cache_entry() {
+        // An older public query can finish just after a newer generation's
+        // response has been cached. The stale writer must not replace it.
+        let resolver = EnhancedResolver::from_clients(vec![], false);
+        let request = test_query_with_type(rr::RecordType::A);
+        let now = Instant::now();
+        let mut newer = response_with_a(Ipv4Addr::new(192, 0, 2, 42));
+        newer.answers[0].ttl = 120;
+        resolver.cache_provider_epoch_response(&request.queries[0], &newer, 8, now);
+        let mut older = response_with_a(Ipv4Addr::new(192, 0, 2, 43));
+        older.answers[0].ttl = 120;
+        resolver.cache_provider_epoch_response(&request.queries[0], &older, 7, now);
+        let cached = resolver
+            .cached_provider_epoch_response(&request.queries[0], &request, 8, now)
+            .expect("a stale writer must not remove a newer valid answer");
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&cached),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 42))]
+        );
+    }
+
+    #[test]
+    fn stale_reader_must_not_evict_newer_provider_epoch_cache_entry() {
+        // An older in-flight query can hold generation 7 while another
+        // query has already populated generation 8. A stale lookup should
+        // miss, but it must not evict generation 8's valid response.
+        let resolver = EnhancedResolver::from_clients(vec![], false);
+        let request = test_query_with_type(rr::RecordType::A);
+        let now = Instant::now();
+        let mut current = response_with_a(Ipv4Addr::new(192, 0, 2, 42));
+        current.answers[0].ttl = 120;
+        resolver.cache_provider_epoch_response(
+            &request.queries[0],
+            &current,
+            8,
+            now,
+        );
+        assert!(
+            resolver
+                .cached_provider_epoch_response(
+                    &request.queries[0],
+                    &request,
+                    7,
+                    now,
+                )
+                .is_none()
+        );
+        assert!(
+            resolver
+                .cached_provider_epoch_response(
+                    &request.queries[0],
+                    &request,
+                    8,
+                    now,
+                )
+                .is_some(),
+            "stale generation must not evict newer valid cache entry"
+        );
+    }
+
+    #[test]
+    fn provider_epoch_positive_ttl_is_clamped_to_hickory_default_max() {
+        let resolver = EnhancedResolver::from_clients(vec![], false);
+        let request = test_query_with_type(rr::RecordType::A);
+        let now = Instant::now();
+        let mut long_ttl = response_with_a(Ipv4Addr::new(192, 0, 2, 42));
+        long_ttl.answers[0].ttl = PROVIDER_EPOCH_CACHE_MAX_TTL + 60;
+        resolver.cache_provider_epoch_response(
+            &request.queries[0],
+            &long_ttl,
+            1,
+            now,
+        );
+        let cached = resolver
+            .cached_provider_epoch_response(&request.queries[0], &request, 1, now)
+            .expect("cache entry should exist at insertion time");
+        assert_eq!(cached.answers[0].ttl, PROVIDER_EPOCH_CACHE_MAX_TTL);
+    }
+
+    #[test]
+    fn provider_epoch_cache_keys_names_case_insensitively_and_separates_record_types()
+     {
+        let resolver = EnhancedResolver::from_clients(vec![], false);
+        let mut lower = test_query_with_type(rr::RecordType::A);
+        lower.metadata.recursion_desired = true;
+        let now = Instant::now();
+        let mut response = response_with_a(Ipv4Addr::new(192, 0, 2, 42));
+        response.answers[0].ttl = 120;
+        resolver.cache_provider_epoch_response(&lower.queries[0], &response, 5, now);
+        let mut upper = test_query_with_type(rr::RecordType::A);
+        upper.queries[0]
+            .set_name(rr::Name::from_ascii("PrOxY.ExAmPlE.CoM.").unwrap());
+        upper.metadata.id = 3456;
+        let hit = resolver
+            .cached_provider_epoch_response(&upper.queries[0], &upper, 5, now)
+            .expect("case variants of a DNS QNAME must share an epoch entry");
+        assert_eq!(hit.metadata.id, 3456);
+        assert_eq!(hit.queries, upper.queries);
+        let txt = test_query_with_type(rr::RecordType::TXT);
+        assert!(
+            resolver
+                .cached_provider_epoch_response(&txt.queries[0], &txt, 5, now,)
+                .is_none(),
+            "different record types must not share an epoch answer"
+        );
+    }
+
+    #[test]
+    fn provider_epoch_cache_does_not_store_zero_ttl_or_untrusted_responses() {
+        let resolver = EnhancedResolver::from_clients(vec![], false);
+        let request = test_query_with_type(rr::RecordType::A);
+        let query = &request.queries[0];
+        let now = Instant::now();
+        let mut zero_ttl = response_with_a(Ipv4Addr::new(192, 0, 2, 42));
+        zero_ttl.answers[0].ttl = 0;
+        resolver.cache_provider_epoch_response(query, &zero_ttl, 5, now);
+        assert!(
+            resolver
+                .cached_provider_epoch_response(query, &request, 5, now)
+                .is_none()
+        );
+        let negative = negative_response(
+            op::ResponseCode::NXDomain,
+            "proxy.example.com.",
+            300,
+            0,
+        );
+        resolver.cache_provider_epoch_response(query, &negative, 5, now);
+        assert!(
+            resolver
+                .cached_provider_epoch_response(query, &request, 5, now)
+                .is_none()
+        );
+        let mut invalid = response_with_a(Ipv4Addr::new(192, 0, 2, 42));
+        invalid.metadata.truncation = true;
+        resolver.cache_provider_epoch_response(query, &invalid, 5, now);
+        assert!(
+            resolver
+                .cached_provider_epoch_response(query, &request, 5, now)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn provider_epoch_cache_rejects_authenticated_negative_and_non_response_messages()
+     {
+        let resolver = EnhancedResolver::from_clients(vec![], false);
+        let request = test_query_with_type(rr::RecordType::A);
+        let query = &request.queries[0];
+        let now = Instant::now();
+        let mut negative = negative_response(
+            op::ResponseCode::NXDomain,
+            "proxy.example.com.",
+            120,
+            60,
+        );
+        negative.metadata.authentic_data = true;
+        resolver.cache_provider_epoch_response(query, &negative, 5, now);
+        assert!(
+            resolver
+                .cached_provider_epoch_response(query, &request, 5, now)
+                .is_none(),
+            "an AD response cannot be merged into an unsigned Question-only cache"
+        );
+        let mut not_response = response_with_a(Ipv4Addr::new(192, 0, 2, 42));
+        not_response.metadata.message_type = op::MessageType::Query;
+        resolver.cache_provider_epoch_response(query, &not_response, 5, now);
+        assert!(
+            resolver
+                .cached_provider_epoch_response(query, &request, 5, now)
+                .is_none(),
+            "invalid DNS message type cannot enter the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn former_provider_domain_with_cache_disabled_still_queries_live_dns() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 42)),
+                hits: hits.clone(),
+                id: "ordinary-uncached-dns",
+            })],
+            false,
+        );
+        assert!(resolver.lru_cache.is_none());
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: Arc::new(AtomicUsize::new(0)),
+            id: "dedicated-node",
+        })]);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        let mut query = test_query_with_type(rr::RecordType::A);
+        query.metadata.recursion_desired = true;
+        resolver.exchange(&query).await.unwrap();
+        resolver.exchange(&query).await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(resolver.provider_epoch_cache.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn provider_epoch_cache_has_bounded_capacity_and_network_reset_flushes() {
+        let resolver = EnhancedResolver::from_clients(vec![], false);
+        let now = Instant::now();
+        let mut request = test_query_with_type(rr::RecordType::A);
+        let mut response = response_with_a(Ipv4Addr::new(192, 0, 2, 42));
+        response.answers[0].ttl = 120;
+        for index in 0..=PROVIDER_EPOCH_CACHE_CAPACITY {
+            request.queries[0].set_name(
+                rr::Name::from_ascii(format!("unique-{index}.example.com."))
+                    .unwrap(),
+            );
+            resolver.cache_provider_epoch_response(
+                &request.queries[0],
+                &response,
+                1,
+                now,
+            );
+        }
+        let len = resolver.provider_epoch_cache.lock().unwrap().len();
+        assert_eq!(len, PROVIDER_EPOCH_CACHE_CAPACITY);
+        request.queries[0]
+            .set_name(rr::Name::from_ascii("unique-0.example.com.").unwrap());
+        assert!(
+            resolver
+                .cached_provider_epoch_response(
+                    &request.queries[0],
+                    &request,
+                    1,
+                    now,
+                )
+                .is_none(),
+            "LRU must evict its oldest entry"
+        );
+        request.queries[0].set_name(
+            rr::Name::from_ascii(format!(
+                "unique-{}.example.com.",
+                PROVIDER_EPOCH_CACHE_CAPACITY
+            ))
+            .unwrap(),
+        );
+        assert!(
+            resolver
+                .cached_provider_epoch_response(
+                    &request.queries[0],
+                    &request,
+                    1,
+                    now,
+                )
+                .is_some(),
+            "newest entry should remain cached"
+        );
+        resolver.reset_transports().await.unwrap();
+        assert!(
+            resolver
+                .cached_provider_epoch_response(
+                    &request.queries[0],
+                    &request,
+                    1,
+                    now,
+                )
+                .is_none(),
+            "network transitions must flush policy-sensitive entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_public_cache_still_hits_after_provider_ownership_aba() {
+        // Cache suppression must be domain-scoped. An unrelated ordinary
+        // hostname keeps the existing shared-cache behavior and performance.
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 22)),
+                hits: main_hits.clone(),
+                id: "ordinary-public-dns",
+            })],
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: Arc::new(AtomicUsize::new(0)),
+            id: "node-dns",
+        })]);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        let mut query = test_query_with_type(rr::RecordType::A);
+        query.queries[0]
+            .set_name(rr::Name::from_ascii("ordinary.example.com.").unwrap());
+        query.metadata.recursion_desired = true;
+        let first = resolver.exchange(&query).await.unwrap();
+        let second = resolver.exchange(&query).await.unwrap();
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&second),
+            EnhancedResolver::ip_list_of_message(&first)
+        );
+        assert_eq!(main_hits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -3638,7 +10686,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_proxy_server_nameserver_only_handles_ip_queries() {
+    async fn static_proxy_server_non_address_query_uses_dedicated_node_dns() {
         let mut resolver = EnhancedResolver::new_default().await;
         resolver.lru_cache = None;
 
@@ -3676,9 +10724,136 @@ mod tests {
         resolver
             .exchange_no_cache(&txt_request)
             .await
-            .expect("TXT query should resolve through main nameserver");
-        assert_eq!(proxy_hits.load(Ordering::SeqCst), 1);
-        assert_eq!(main_hits.load(Ordering::SeqCst), 1);
+            .expect("TXT query for a static proxy endpoint must use dedicated DNS");
+        assert_eq!(proxy_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(main_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn static_proxy_node_must_not_return_preexisting_public_cache_answer() {
+        // Static node bootstrap must never reuse a cached public response.
+        let mut resolver = EnhancedResolver::from_clients(vec![], false);
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        let node_hits = Arc::new(AtomicUsize::new(0));
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: node_hits.clone(),
+            id: "node-dns",
+        })]);
+        resolver.main = vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+            hits: main_hits.clone(),
+            id: "public-dns",
+        })];
+        let request = test_query_with_type(rr::RecordType::A);
+        resolver.lru_cache.as_ref().unwrap().insert(
+            request.queries[0].clone(),
+            Ok(response_with_a(Ipv4Addr::new(192, 0, 2, 10))),
+            Instant::now(),
+        );
+        let mut domains = crate::common::trie::StringTrie::new();
+        domains.insert("proxy.example.com", Arc::new(true));
+        resolver.proxy_server_domains = Some(domains);
+        let answer = resolver
+            .revalidate_public_cache_hit(
+                &request,
+                response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            EnhancedResolver::ip_list_of_message(&answer),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11))]
+        );
+        assert_eq!(node_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(main_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn static_proxy_txt_specific_policy_failure_must_not_fallback() {
+        let mut resolver = EnhancedResolver::from_clients(vec![], false);
+        resolver.lru_cache = None;
+        let default_hits = Arc::new(AtomicUsize::new(0));
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        let fallback_hits = Arc::new(AtomicUsize::new(0));
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+            hits: default_hits.clone(),
+            id: "node-default",
+        })]);
+        resolver.main = vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 12)),
+            hits: main_hits.clone(),
+            id: "public-main",
+        })];
+        resolver.fallback = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 13)),
+            hits: fallback_hits.clone(),
+            id: "public-fallback",
+        })]);
+        let mut selector = crate::common::trie::StringTrie::new();
+        selector.insert("proxy.example.com", Arc::new(true));
+        let mut static_domains = crate::common::trie::StringTrie::new();
+        static_domains.insert("proxy.example.com", Arc::new(true));
+        resolver.proxy_server_domains = Some(static_domains);
+        resolver.proxy_server_nameserver_policy.push((
+            Arc::new(selector),
+            vec![Arc::new(FailingClient {
+                id: "node-policy",
+                reason: "injected dedicated policy outage",
+            })],
+        ));
+        for kind in [rr::RecordType::TXT, rr::RecordType::SRV] {
+            let err = resolver
+                .exchange(&test_query_with_type(kind))
+                .await
+                .expect_err("static node policy outage must fail closed");
+            assert!(
+                err.to_string().contains("injected dedicated policy outage"),
+                "{err}"
+            );
+        }
+        assert_eq!(default_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(main_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn static_proxy_txt_bootstrap_failure_must_not_use_public_dns() {
+        let mut resolver = EnhancedResolver::new_default().await;
+        resolver.lru_cache = None;
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        let fallback_hits = Arc::new(AtomicUsize::new(0));
+        resolver.proxy_resolver = Some(vec![Arc::new(FailingClient {
+            id: "node-only",
+            reason: "injected static node DNS outage",
+        })]);
+        resolver.main = vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(198, 51, 100, 11)),
+            hits: main_hits.clone(),
+            id: "public-main",
+        })];
+        resolver.fallback = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(198, 51, 100, 12)),
+            hits: fallback_hits.clone(),
+            id: "public-fallback",
+        })]);
+        let mut domains = crate::common::trie::StringTrie::new();
+        domains.insert("proxy.example.com", Arc::new(true));
+        resolver.proxy_server_domains = Some(domains);
+        for kind in [rr::RecordType::TXT, rr::RecordType::SRV] {
+            let err = resolver
+                .exchange_no_cache(&test_query_with_type(kind))
+                .await
+                .expect_err("dedicated static node DNS failure must fail closed");
+            assert!(
+                err.to_string().contains("injected static node DNS outage"),
+                "{err}"
+            );
+        }
+        assert_eq!(main_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -3813,7 +10988,8 @@ mod tests {
                 op::ResponseCode::NXDomain
             );
         }
-        assert_eq!(proxy_hits.load(Ordering::SeqCst), 1);
+        // Static node answers must not enter the unpartitioned public cache.
+        assert_eq!(proxy_hits.load(Ordering::SeqCst), 2);
         assert_eq!(policy_hits.load(Ordering::SeqCst), 0);
         assert_eq!(main_hits.load(Ordering::SeqCst), 0);
     }
@@ -3889,6 +11065,175 @@ mod tests {
         assert_eq!(default_hits.load(Ordering::SeqCst), 1);
         assert_eq!(specific_hits.load(Ordering::SeqCst), 2);
         assert_eq!(main_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn mixed_case_proxy_server_nameserver_policy_selects_specific_dns_for_a_and_txt()
+     {
+        // DNS owner names are case-insensitive. Node bootstrap policy is an
+        // egress boundary, not a best-effort hint: mixed case must never
+        // silently fall through to the default node DNS server.
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        let default_hits = Arc::new(AtomicUsize::new(0));
+        let policy_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 20)),
+                hits: public_hits.clone(),
+                id: "generic-main",
+            })],
+            false,
+        );
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 21)),
+            hits: default_hits.clone(),
+            id: "generic-proxy-node-dns",
+        })]);
+        let mut node_domain = crate::common::trie::StringTrie::new();
+        node_domain.insert("proxy.example.com", Arc::new(true));
+        resolver.proxy_server_domains = Some(node_domain);
+        let mut matcher = crate::common::trie::StringTrie::new();
+        matcher.insert("proxy.example.com", Arc::new(true));
+        resolver.proxy_server_nameserver_policy.push((
+            Arc::new(matcher),
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 22)),
+                hits: policy_hits.clone(),
+                id: "specific-proxy-node-dns",
+            })],
+        ));
+        for record_type in [rr::RecordType::A, rr::RecordType::TXT] {
+            let mut query = test_query_with_type(record_type);
+            query.queries[0]
+                .set_name(rr::Name::from_ascii("PrOxY.ExAmPlE.CoM.").unwrap());
+            query.metadata.recursion_desired = true;
+            assert!(resolver.exchange(&query).await.is_ok());
+        }
+        assert_eq!(
+            policy_hits.load(Ordering::SeqCst),
+            2,
+            "mixed-case node domain must retain its exact per-host DNS policy"
+        );
+        assert_eq!(
+            default_hits.load(Ordering::SeqCst),
+            0,
+            "per-host node DNS policy must not downgrade to node default"
+        );
+        assert_eq!(
+            public_hits.load(Ordering::SeqCst),
+            0,
+            "proxy node QNAME must not reach public DNS"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_case_dynamic_provider_node_policy_stays_isolated_through_refresh()
+    {
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        let default_hits = Arc::new(AtomicUsize::new(0));
+        let specific_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 30)),
+                hits: public_hits.clone(),
+                id: "public-after-provider-removal",
+            })],
+            false,
+        );
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 31)),
+            hits: default_hits.clone(),
+            id: "default-node-upstream",
+        })]);
+        let mut matcher = crate::common::trie::StringTrie::new();
+        matcher.insert("proxy.example.com", Arc::new(true));
+        resolver.proxy_server_nameserver_policy.push((
+            Arc::new(matcher),
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 32)),
+                hits: specific_hits.clone(),
+                id: "specific-node-upstream",
+            })],
+        ));
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "provider",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        for record_type in [rr::RecordType::A, rr::RecordType::TXT] {
+            let mut query = test_query_with_type(record_type);
+            query.queries[0]
+                .set_name(rr::Name::from_ascii("PrOxY.ExAmPlE.CoM.").unwrap());
+            query.metadata.recursion_desired = true;
+            resolver.exchange(&query).await.unwrap();
+        }
+        assert_eq!(specific_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(default_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            public_hits.load(Ordering::SeqCst),
+            0,
+            "registered Provider node QNAME must never reach public DNS"
+        );
+        resolver
+            .replace_proxy_provider_dns_domains("provider", vec![])
+            .await
+            .unwrap();
+        let query = test_query_with_type(rr::RecordType::A);
+        resolver.exchange(&query).await.unwrap();
+        assert_eq!(
+            public_hits.load(Ordering::SeqCst),
+            1,
+            "an unregistered node should regain ordinary routing without stale policy cache"
+        );
+        assert_eq!(specific_hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn mixed_case_dedicated_outbound_resolver_preserves_node_policy_for_a_and_txt()
+     {
+        // Outbound DNS dial bootstrap uses a separate EnhancedResolver where
+        // `proxy_node_resolver` is true. It must honor the same case-insensitive
+        // policy as queries entering the public DNS listener.
+        let default_hits = Arc::new(AtomicUsize::new(0));
+        let specific_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 31)),
+                hits: default_hits.clone(),
+                id: "fallback-node-bootstrap",
+            })],
+            false,
+        );
+        resolver.proxy_node_resolver = true;
+        let mut matcher = crate::common::trie::StringTrie::new();
+        matcher.insert("proxy.example.com", Arc::new(true));
+        resolver.proxy_server_nameserver_policy.push((
+            Arc::new(matcher),
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 32)),
+                hits: specific_hits.clone(),
+                id: "specific-node-bootstrap",
+            })],
+        ));
+        for record_type in [rr::RecordType::A, rr::RecordType::TXT] {
+            let mut query = test_query_with_type(record_type);
+            query.queries[0]
+                .set_name(rr::Name::from_ascii("PrOxY.ExAmPlE.CoM.").unwrap());
+            query.metadata.recursion_desired = true;
+            resolver.exchange(&query).await.unwrap();
+        }
+        assert_eq!(
+            specific_hits.load(Ordering::SeqCst),
+            2,
+            "bootstrap A and TXT must use the per-host resolver policy"
+        );
+        assert_eq!(
+            default_hits.load(Ordering::SeqCst),
+            0,
+            "node bootstrap QNAME must not fall back to default resolver"
+        );
     }
 
     #[tokio::test]
@@ -4027,6 +11372,175 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_address_bootstrap_question_respects_dedicated_node_policy() {
+        // TXT/SRV lookups must not silently escape a node-specific DNS policy.
+        let default_hits = Arc::new(AtomicUsize::new(0));
+        let policy_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+                hits: default_hits.clone(),
+                id: "bootstrap-default",
+            })],
+            false,
+        );
+        resolver.proxy_node_resolver = true;
+        let mut matcher = crate::common::trie::StringTrie::new();
+        matcher.insert("node.example.com", Arc::new(true));
+        resolver.proxy_server_nameserver_policy.push((
+            Arc::new(matcher),
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+                hits: policy_hits.clone(),
+                id: "bootstrap-policy",
+            })],
+        ));
+        let mut request = test_query_with_type(rr::RecordType::TXT);
+        request.queries[0]
+            .set_name(rr::Name::from_ascii("node.example.com.").unwrap());
+        resolver.exchange(&request).await.unwrap();
+        assert_eq!(policy_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(default_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn non_address_bootstrap_multi_question_must_fail_closed() {
+        // TXT/SRV takes a separate exchange path from A/AAAA; the second
+        // question must not escape its dedicated bootstrap policy.
+        let default_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+                hits: default_hits.clone(),
+                id: "node-default",
+            })],
+            false,
+        );
+        resolver.proxy_node_resolver = true;
+        let mut request = op::Message::query();
+        for (name, record_type) in [
+            ("ordinary-node.example.com.", rr::RecordType::TXT),
+            ("protected-node.example.com.", rr::RecordType::SRV),
+        ] {
+            let mut query = op::Query::new();
+            query.set_name(rr::Name::from_ascii(name).unwrap());
+            query.set_query_type(record_type);
+            request.add_query(query);
+        }
+        resolver.exchange_no_cache_with_policy(&request, true, false).await.expect_err(
+            "non-address multi-question bootstrap must reject before selecting an upstream",
+        );
+        assert_eq!(default_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn multi_question_with_later_proxy_node_must_not_reach_public_dns() {
+        // A mixed-question packet can put an ordinary name first and a
+        // dedicated node hostname second. Never route the whole packet to
+        // the ordinary resolver based only on the first question.
+        let mut resolver = EnhancedResolver::from_clients(vec![], false);
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        let node_hits = Arc::new(AtomicUsize::new(0));
+        resolver.main = vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 99)),
+            hits: main_hits.clone(),
+            id: "public-main",
+        })];
+        resolver.proxy_resolver = Some(vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+            hits: node_hits.clone(),
+            id: "node-only",
+        })]);
+        let mut domains = crate::common::trie::StringTrie::new();
+        domains.insert("proxy.example.com", Arc::new(true));
+        resolver.proxy_server_domains = Some(domains);
+        let mut request = op::Message::query();
+        let mut ordinary = op::Query::new();
+        ordinary.set_name(rr::Name::from_ascii("ordinary.example.com.").unwrap());
+        ordinary.set_query_type(rr::RecordType::A);
+        request.add_query(ordinary);
+        request
+            .add_query(test_query_with_type(rr::RecordType::A).queries[0].clone());
+
+        resolver
+            .ip_exchange(&request)
+            .await
+            .expect_err("mixed node query must fail closed");
+        resolver
+            .exchange(&request)
+            .await
+            .expect_err("the public exchange entry must reject before cache lookup");
+        assert_eq!(main_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(node_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn dedicated_bootstrap_policy_rejects_multi_question_before_upstream() {
+        // The transport bootstrap resolver has no proxy_resolver pool; its
+        // policy still chooses an upstream based on the first QNAME only.
+        let default_hits = Arc::new(AtomicUsize::new(0));
+        let policy_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 10)),
+                hits: default_hits.clone(),
+                id: "node-default",
+            })],
+            false,
+        );
+        resolver.proxy_node_resolver = true;
+        let mut matcher = crate::common::trie::StringTrie::new();
+        matcher.insert("protected-node.example.com", Arc::new(true));
+        resolver.proxy_server_nameserver_policy.push((
+            Arc::new(matcher),
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 11)),
+                hits: policy_hits.clone(),
+                id: "node-policy",
+            })],
+        ));
+        let mut request = op::Message::query();
+        for name in ["ordinary-node.example.com.", "protected-node.example.com."] {
+            let mut query = op::Query::new();
+            query.set_name(rr::Name::from_ascii(name).unwrap());
+            query.set_query_type(rr::RecordType::A);
+            request.add_query(query);
+        }
+        resolver.ip_exchange(&request).await.expect_err(
+            "multi-question bootstrap must not bypass a later QNAME's node policy",
+        );
+        assert_eq!(default_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(policy_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn multi_question_with_node_pool_must_fail_closed_before_provider_registration()
+     {
+        // A provider can publish a node between the multi-question preflight
+        // and upstream selection. Reject ambiguous packets even when neither
+        // QNAME is registered yet, rather than allowing a time-of-check race.
+        let mut resolver = EnhancedResolver::from_clients(vec![], false);
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        resolver.main = vec![Arc::new(CountingClient {
+            response: response_with_a(Ipv4Addr::new(192, 0, 2, 99)),
+            hits: public_hits.clone(),
+            id: "public-main",
+        })];
+        resolver.proxy_resolver = Some(vec![]);
+        let mut request = op::Message::query();
+        for name in ["ordinary.example.com.", "future-node.example.com."] {
+            let mut q = op::Query::new();
+            q.set_name(rr::Name::from_ascii(name).unwrap());
+            q.set_query_type(rr::RecordType::A);
+            request.add_query(q);
+        }
+        resolver.exchange(&request).await.expect_err(
+            "multi-question queries must not race provider node publication",
+        );
+        assert_eq!(public_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn proxy_server_specific_policy_failure_never_falls_back_to_public_dns() {
         let mut resolver = EnhancedResolver::from_clients(vec![], false);
         let default_hits = Arc::new(AtomicUsize::new(0));
@@ -4113,6 +11627,150 @@ mod tests {
             self.hits.fetch_add(1, Ordering::SeqCst);
             Err(anyhow::anyhow!("injected bootstrap timeout"))
         }
+    }
+
+    // An actual pending upstream is different from a client that immediately
+    // returns a timeout error: cancellation must not trigger a public retry.
+    #[derive(Debug)]
+    struct PendingBootstrapClient {
+        hits: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::app::dns::Client for PendingBootstrapClient {
+        fn id(&self) -> String {
+            "pending-bootstrap".to_owned()
+        }
+
+        async fn exchange(&self, _msg: &op::Message) -> anyhow::Result<op::Message> {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<anyhow::Result<op::Message>>().await
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_bootstrap_timeout_cancellation_never_uses_public_dns() {
+        let dedicated_hits = Arc::new(AtomicUsize::new(0));
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients_with_fallback(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 91)),
+                hits: public_hits.clone(),
+                id: "public-main",
+            })],
+            Some(vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 92)),
+                hits: public_hits.clone(),
+                id: "public-fallback",
+            })]),
+            false,
+        );
+        let mut domains = crate::common::trie::StringTrie::new();
+        domains.insert("proxy.example.com", Arc::new(true));
+        resolver.proxy_server_domains = Some(domains);
+        resolver.proxy_resolver = Some(vec![Arc::new(PendingBootstrapClient {
+            hits: dedicated_hits.clone(),
+        })]);
+        // An overlapping generic policy must not become an escape hatch when
+        // the dedicated node bootstrap future is cancelled.
+        let mut generic_policy = crate::common::trie::StringTrie::new();
+        generic_policy.insert(
+            "proxy.example.com",
+            Arc::new(vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 93)),
+                hits: public_hits.clone(),
+                id: "generic-policy",
+            }) as ThreadSafeDNSClient]),
+        );
+        resolver.policy = Some(Arc::new(generic_policy));
+        for record_type in
+            [rr::RecordType::A, rr::RecordType::AAAA, rr::RecordType::TXT]
+        {
+            let result = tokio::time::timeout(
+                Duration::from_millis(100),
+                resolver.exchange_no_cache(&test_query_with_type(record_type)),
+            )
+            .await;
+            assert!(
+                result.is_err(),
+                "pending dedicated bootstrap must not return public DNS"
+            );
+        }
+        assert_eq!(dedicated_hits.load(Ordering::SeqCst), 3);
+        assert_eq!(public_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_provider_bootstrap_during_ownership_reload_never_uses_public_dns()
+     {
+        // A cancelled in-flight bootstrap must not schedule a retry through
+        // generic DNS, even when the provider is removed and re-registered.
+        let dedicated_hits = Arc::new(AtomicUsize::new(0));
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        let mut resolver = EnhancedResolver::from_clients_with_fallback(
+            vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 91)),
+                hits: public_hits.clone(),
+                id: "public-main",
+            })],
+            Some(vec![Arc::new(CountingClient {
+                response: response_with_a(Ipv4Addr::new(192, 0, 2, 92)),
+                hits: public_hits.clone(),
+                id: "public-fallback",
+            })]),
+            false,
+        );
+        resolver.lru_cache = Some(ResponseCache::new(16, TtlConfig::default()));
+        resolver.proxy_resolver = Some(vec![Arc::new(PendingBootstrapClient {
+            hits: dedicated_hits.clone(),
+        })]);
+        let resolver = Arc::new(resolver);
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        let query = test_query_with_type(rr::RecordType::TXT);
+        let running = {
+            let resolver = resolver.clone();
+            tokio::spawn(async move { resolver.exchange(&query).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while dedicated_hits.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dedicated DNS must start");
+        resolver
+            .replace_proxy_provider_dns_domains("owner", vec![])
+            .await
+            .unwrap();
+        resolver
+            .replace_proxy_provider_dns_domains(
+                "owner",
+                vec!["proxy.example.com".into()],
+            )
+            .await
+            .unwrap();
+        running.abort();
+        assert!(running.await.unwrap_err().is_cancelled());
+        assert_eq!(dedicated_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(public_hits.load(Ordering::SeqCst), 0);
+        assert!(
+            resolver
+                .lru_cache
+                .as_ref()
+                .unwrap()
+                .get(
+                    &test_query_with_type(rr::RecordType::TXT).queries[0],
+                    Instant::now(),
+                )
+                .is_none(),
+            "cancelled node answer must not enter public cache"
+        );
     }
 
     #[tokio::test]
@@ -4716,6 +12374,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_dns_constructor_rejects_unmatchable_public_policy_selectors() {
+        // An internal app::dns::Config can bypass YAML conversion. An invalid
+        // public nameserver-policy selector must fail startup, not silently
+        // install a nonmatching trie and leak the query to default DNS.
+        for selector in ["policy..example.com", "policy.example.com "] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = crate::app::profile::ThreadSafeCacheFile::new(
+                temp.path().join("cache.db").to_str().unwrap(),
+                false,
+            );
+            let mut config = make_proxy_nameserver_config();
+            config
+                .nameserver_policy
+                .insert(selector.to_owned(), config.nameserver[0].clone());
+            let outcome = EnhancedResolver::new(
+                config,
+                store,
+                None,
+                Arc::new(RwLock::new(std::collections::HashMap::new())),
+                None,
+            )
+            .await;
+            assert!(
+                matches!(outcome,
+                Err(crate::Error::InvalidConfig(message))
+                    if message.contains("nameserver-policy")),
+                "invalid public policy selector {selector:?} must fail closed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_dns_constructor_rejects_unmatchable_proxy_node_policy_selectors()
+    {
+        // Internal callers can construct app::dns::Config directly, bypassing
+        // YAML conversion. A malformed per-node selector must not silently
+        // install an empty trie and downgrade to default node DNS.
+        for selector in ["proxy..example.com", "proxy.example.com "] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = crate::app::profile::ThreadSafeCacheFile::new(
+                temp.path().join("cache.db").to_str().unwrap(),
+                false,
+            );
+            let mut config = make_proxy_nameserver_config();
+            let servers = config.proxy_server_nameserver.as_ref().unwrap().clone();
+            config
+                .proxy_server_nameserver_policy
+                .push((selector.into(), servers));
+            let outcome = EnhancedResolver::new(
+                config,
+                store,
+                None,
+                Arc::new(RwLock::new(std::collections::HashMap::new())),
+                None,
+            )
+            .await;
+            assert!(
+                matches!(outcome,
+                Err(crate::Error::InvalidConfig(message))
+                    if message.contains("proxy-server-nameserver-policy")),
+                "invalid selector {selector:?} must be rejected before DNS startup"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn node_policy_rejects_proxy_override_but_default_preserves_legacy_non_tun()
+     {
+        // Keep the established non-TUN default bootstrap #proxy behavior.
+        // Per-node proxy-server-nameserver-policy #proxy remains unsupported
+        // even when internal callers bypass YAML conversion.
+        for per_node_policy in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = crate::app::profile::ThreadSafeCacheFile::new(
+                temp.path().join("cache.db").to_str().unwrap(),
+                false,
+            );
+            let mut config = make_proxy_nameserver_config();
+            let mut server =
+                config.proxy_server_nameserver.as_ref().unwrap()[0].clone();
+            server.proxy = Some("bootstrap-cycle".to_owned());
+            if per_node_policy {
+                config
+                    .proxy_server_nameserver_policy
+                    .push(("proxy.example.com".to_owned(), vec![server]));
+            } else {
+                config.proxy_server_nameserver = Some(vec![server]);
+            }
+            let outcome = EnhancedResolver::new(
+                config,
+                store,
+                None,
+                Arc::new(RwLock::new(std::collections::HashMap::new())),
+                None,
+            )
+            .await;
+            if per_node_policy {
+                assert!(
+                    matches!(outcome,
+                    Err(crate::Error::InvalidConfig(message))
+                        if message.contains("proxy-server-nameserver-policy")
+                            && message.contains("#proxy")),
+                    "per-node node-DNS #proxy override must fail closed"
+                );
+            } else {
+                assert!(
+                    outcome.is_ok(),
+                    "legacy non-TUN default proxy-server-nameserver #proxy must remain supported"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn configured_proxy_nameserver_with_no_runtime_clients_fails_closed() {
         let temp_dir = tempfile::tempdir().unwrap();
         let cache_store = crate::app::profile::ThreadSafeCacheFile::new(
@@ -4820,6 +12592,141 @@ mod tests {
         .expect("direct nameserver config should initialize");
 
         assert!(resolver.direct_resolver().is_some());
+    }
+
+    #[tokio::test]
+    async fn configured_direct_resolver_inherits_parent_owner_gate() {
+        // Exercise the actual Config -> resolver constructor, not only the
+        // test helper that manually wires DIRECT. Use localhost exclusively
+        // so a failed gate cannot send traffic to an external DNS server.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_store = crate::app::profile::ThreadSafeCacheFile::new(
+            temp_dir.path().join("cache.db").to_str().unwrap(),
+            false,
+        );
+        let mut config = make_proxy_nameserver_config();
+        config.direct_nameserver = Some(vec![NameServer {
+            net: DNSNetMode::Udp,
+            host: url::Host::Ipv4(Ipv4Addr::LOCALHOST),
+            port: 9,
+            interface: None,
+            proxy: None,
+            doh_path: None,
+        }]);
+        let resolver = EnhancedResolver::new(
+            config,
+            cache_store,
+            None,
+            Arc::new(RwLock::new(std::collections::HashMap::new())),
+            None,
+        )
+        .await
+        .expect("loopback DIRECT nameserver should initialize");
+        let direct = resolver
+            .direct_resolver()
+            .expect("DIRECT handle must exist");
+        resolver.invalidate_transports();
+        // Child reset succeeds but cannot clear the separately shared owner gate.
+        direct.reset_transports().await.unwrap();
+        let (request, _) = test_query();
+        let error = direct.exchange(&request).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("DIRECT DNS owner has not completed transport recovery"),
+            "actual configuration must wire parent owner gate: {error}"
+        );
+        drop(resolver);
+        let error = direct.exchange(&request).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("DIRECT DNS owner has not completed transport recovery"),
+            "a cloned DIRECT handle cannot outlive its configured owner: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_direct_cannot_publish_without_parent_commit() {
+        // Exercise the production Config -> DIRECT constructor rather than
+        // relying solely on manually wired parent-child test fixtures.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_store = crate::app::profile::ThreadSafeCacheFile::new(
+            temp_dir.path().join("cache.db").to_str().unwrap(),
+            false,
+        );
+        let mut config = make_proxy_nameserver_config();
+        config.direct_nameserver = Some(vec![NameServer {
+            net: DNSNetMode::Udp,
+            host: url::Host::Ipv4(Ipv4Addr::LOCALHOST),
+            port: 9,
+            interface: None,
+            proxy: None,
+            doh_path: None,
+        }]);
+        let owner = EnhancedResolver::new(
+            config,
+            cache_store,
+            None,
+            Arc::new(RwLock::new(std::collections::HashMap::new())),
+            None,
+        )
+        .await
+        .unwrap();
+        let direct = owner.direct_resolver().unwrap();
+        owner.pause_publication();
+        direct.publish();
+        let (request, _) = test_query();
+        let denied = direct.exchange(&request).await.unwrap_err();
+        assert!(
+            denied.to_string().contains("not yet published"),
+            "production DIRECT handle bypassed parent publication: {denied}"
+        );
+        // Do not send real DNS requests. An IP literal proves that both
+        // publication gates reopen after a successful parent commit.
+        owner.publish();
+        assert_eq!(
+            direct.resolve("127.0.0.1", false).await.unwrap(),
+            Some(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST))
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_parent_invalidation_cannot_reopen_configured_direct_resolver()
+    {
+        // Repeated failure notifications must be idempotent, including when a
+        // child handle survives independently of its parent owner.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_store = crate::app::profile::ThreadSafeCacheFile::new(
+            temp_dir.path().join("cache.db").to_str().unwrap(),
+            false,
+        );
+        let mut config = make_proxy_nameserver_config();
+        config.direct_nameserver = Some(vec![NameServer {
+            net: DNSNetMode::Udp,
+            host: url::Host::Ipv4(Ipv4Addr::LOCALHOST),
+            port: 9,
+            interface: None,
+            proxy: None,
+            doh_path: None,
+        }]);
+        let resolver = EnhancedResolver::new(
+            config,
+            cache_store,
+            None,
+            Arc::new(RwLock::new(std::collections::HashMap::new())),
+            None,
+        )
+        .await
+        .unwrap();
+        let direct = resolver.direct_resolver().unwrap();
+        resolver.invalidate_transports();
+        resolver.invalidate_transports();
+        direct.reset_transports().await.unwrap();
+        let (request, _) = test_query();
+        assert!(direct.exchange(&request).await.is_err());
+        drop(resolver);
+        assert!(direct.exchange(&request).await.is_err());
     }
 
     #[tokio::test]

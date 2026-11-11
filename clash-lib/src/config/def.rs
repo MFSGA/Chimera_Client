@@ -299,11 +299,19 @@ fn unknown_sensitive_dns_field(field: &str) -> bool {
     }
     let lower = field.to_ascii_lowercase();
     const SENSITIVE_PREFIXES: &[&str] = &[
+        "ipv6",
+        "listen",
+        "enable-",
+        "enable_",
         "name",
         "proxy-server",
+        "proxy_server",
         "direct-name",
+        "direct_name",
         "default-name",
+        "default_name",
         "fake-ip",
+        "fake_ip",
         "fakeip",
         "fallback",
         "respect",
@@ -312,6 +320,10 @@ fn unknown_sensitive_dns_field(field: &str) -> bool {
         "resolver-profile",
         "policy-rule",
         "dns-hijack",
+        "use-system-host",
+        "use_system_host",
+        "use-host",
+        "use_host",
     ];
     SENSITIVE_PREFIXES
         .iter()
@@ -406,6 +418,8 @@ fn unknown_sensitive_fallback_filter_field(field: &str) -> bool {
     let lower = field.to_ascii_lowercase();
     lower.starts_with("geo")
         || lower.starts_with("ipci")
+        || lower.starts_with("ip-cidr")
+        || lower.starts_with("ip_cidr")
         || lower.starts_with("domain")
         || KNOWN
             .iter()
@@ -561,15 +575,30 @@ impl FromStr for Config {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut val: Value = serde_yaml::from_str(s).map_err(|e| {
+            // Neither the raw YAML nor the parser's free-form message is safe
+            // to log: either may include proxy credentials or private QNAMEs.
+            // Line and column identify the failure without exposing values.
+            let location = e
+                .location()
+                .map(|location| {
+                    format!(
+                        " at line {}, column {}",
+                        location.line(),
+                        location.column()
+                    )
+                })
+                .unwrap_or_default();
             Error::InvalidConfig(format!(
-                "couldn't not parse config content {s}: {e}"
+                "could not parse config YAML syntax{location}"
             ))
         })?;
 
-        val.apply_merge().map_err(|e| {
-            Error::InvalidConfig(format!(
-                "failed to process anchors in config content {s}: {e}"
-            ))
+        val.apply_merge().map_err(|_error| {
+            // A merge diagnostic can include a rejected scalar. Do not echo it.
+            Error::InvalidConfig(
+                "failed to process config YAML anchors: invalid merge value (details omitted for privacy)"
+                    .to_owned(),
+            )
         })?;
 
         reject_unsupported_mihomo_privacy_fields(&val)?;
@@ -641,8 +670,33 @@ impl FromStr for Config {
             }
         }
 
-        serde_yaml::from_value(val).map_err(|e| {
-            Error::InvalidConfig(format!("could not parse config content: {e}"))
+        serde_path_to_error::deserialize(val).map_err(|error| {
+            // Serde's default "invalid type" diagnostics may print the
+            // rejected scalar verbatim. Report a safe top-level section but
+            // never expose arbitrary map keys, hostnames, tokens or values.
+            let path = error.path().to_string();
+            let section = path.split(['.', '[']).next().unwrap_or("");
+            let context = match section {
+                "dns" => " in dns",
+                "tun" => " in tun",
+                "profile" => " in profile",
+                "proxies" => " in proxies",
+                "proxy-groups" => " in proxy-groups",
+                "proxy-providers" => " in proxy-providers",
+                "rule-providers" => " in rule-providers",
+                "listeners" => " in listeners",
+                _ => "",
+            };
+            // Preserve safe schema diagnostics for typo recovery while
+            // redacting the unknown field name and rejected scalar itself.
+            let kind = if error.inner().to_string().contains("unknown field") {
+                "unknown field"
+            } else {
+                "invalid type or value"
+            };
+            Error::InvalidConfig(format!(
+                "could not parse config content{context}: {kind} (details omitted for privacy)"
+            ))
         })
     }
 }
@@ -1263,6 +1317,80 @@ proxy:
     }
 
     #[test]
+    fn unknown_dns_object_field_never_echoes_private_key() {
+        let yaml = "dns:\n  resolver-profiles:\n    secure:\n      servers: [1.1.1.1]\n      private-unknown-key-4839: true\n";
+        let error = match yaml.parse::<Config>() {
+            Ok(_) => panic!("unknown strict resolver field unexpectedly accepted"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("unknown field") && error.contains("dns"),
+            "{error}"
+        );
+        assert!(!error.contains("private-unknown-key-4839"));
+    }
+
+    #[test]
+    fn invalid_dns_value_diagnostic_never_echoes_private_scalar() {
+        let yaml = "dns:\n  enable: fixture-sensitive-enable-token-4839\n";
+        let error = match yaml.parse::<Config>() {
+            Ok(_) => panic!("invalid bool unexpectedly parsed"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("parse config"),
+            "missing config diagnostic: {error}"
+        );
+        assert!(!error.contains("fixture-sensitive-enable-token-4839"));
+    }
+
+    #[test]
+    fn invalid_yaml_merge_scalar_never_echoes_private_value() {
+        let yaml = "dns:\n  <<: private-merge-secret-4839\n";
+        let error = match yaml.parse::<Config>() {
+            Ok(_) => panic!("invalid YAML merge scalar unexpectedly parsed"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("anchors"),
+            "missing merge diagnostic: {error}"
+        );
+        assert!(!error.contains("private-merge-secret-4839"));
+    }
+
+    #[test]
+    fn invalid_yaml_merge_diagnostic_never_echoes_config_values() {
+        let yaml = "secret: fixture-merge-token-4839\ndns:\n  <<: [false, true]\n  nameserver: [private.internal.example]\n";
+        let error = match yaml.parse::<Config>() {
+            Ok(_) => panic!("invalid YAML merge unexpectedly parsed"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("anchors"),
+            "missing anchor diagnostic: {error}"
+        );
+        assert!(!error.contains("fixture-merge-token-4839"));
+        assert!(!error.contains("private.internal.example"));
+    }
+
+    #[test]
+    fn malformed_dns_yaml_diagnostic_never_echoes_config_values() {
+        // Parsing failures may be surfaced in startup logs. A malformed DNS
+        // section must not dump unrelated proxy credentials or private names.
+        let yaml = "secret: fixture-sensitive-token-4839\ndns:\n  nameserver: ['private.internal.example'\n";
+        let error = match yaml.parse::<Config>() {
+            Ok(_) => panic!("malformed YAML unexpectedly parsed"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("parse config"),
+            "missing actionable diagnostic: {error}"
+        );
+        assert!(!error.contains("fixture-sensitive-token-4839"));
+        assert!(!error.contains("private.internal.example"));
+    }
+
+    #[test]
     fn missing_mmdb_stays_disabled() {
         let cfg: Config = "port: 7890".parse().expect("config should parse");
 
@@ -1344,10 +1472,20 @@ proxy:
             "namserver-policy",
             "proxy-server-nameserver-policiy",
             "fake-ip-filtre-mode",
+            "fake_ip_filter_mode",
+            "fake_ip_range",
             "drect-nameserver-follow-policy",
             "respec-rules",
             "enhance-mode",
             "edns-clinet-subnet",
+            "use_system_hosts",
+            "use-system-host",
+            "use-hosts-enabled",
+            "proxy_server_nameserver_policy",
+            "direct_nameserver_follow_policy",
+            "ipv6-enabled",
+            "listen-udp",
+            "enable-dns",
         ] {
             let yaml = format!("dns:\n  enable: false\n  {field}: secret.example\n");
             let error = match yaml.parse::<Config>() {
@@ -1466,7 +1604,19 @@ proxy:
 
     #[test]
     fn fallback_filter_unknown_privacy_fields_fail_closed() {
-        for field in ["geoiip", "geoip-cod", "ipcid", "domai", "geosit"] {
+        for field in [
+            "geoiip",
+            "geoip-cod",
+            "ipcid",
+            "domai",
+            "geosit",
+            "ip-cidr",
+            "ip_cidr",
+            "geo-ip",
+            "geo_ip",
+            "ip-cidr-list",
+            "ip_cidr_list",
+        ] {
             let yaml = format!(
                 "dns:\n  enable: false\n  fallback-filter:\n    {field}: secret.example\n"
             );
