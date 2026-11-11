@@ -258,9 +258,9 @@ impl Config {
                 || domain.contains(',')
                 || !dns::config::valid_nameserver_policy_domain(domain)
             {
-                return Err(Error::InvalidConfig(format!(
-                    "dns.nameserver-policy unsupported or unexpanded domain selector: {domain}"
-                )));
+                return Err(Error::InvalidConfig(
+                    "dns.nameserver-policy unsupported or unexpanded domain selector".to_owned(),
+                ));
             }
         }
 
@@ -302,16 +302,17 @@ impl Config {
                 || domain.contains(',')
                 || !dns::config::valid_nameserver_policy_domain(domain)
             {
-                return Err(Error::InvalidConfig(format!(
-                    "dns.proxy-server-nameserver-policy unsupported selector: {domain}"
-                )));
+                return Err(Error::InvalidConfig(
+                    "dns.proxy-server-nameserver-policy unsupported domain selector"
+                        .to_owned(),
+                ));
             }
             if servers.is_empty()
                 || servers.iter().any(|server| server.proxy.is_some())
             {
-                return Err(Error::InvalidConfig(format!(
-                    "dns.proxy-server-nameserver-policy for {domain} has no usable upstream or an unsupported #proxy dialer"
-                )));
+                return Err(Error::InvalidConfig(
+                    "dns.proxy-server-nameserver-policy has no usable upstream or an unsupported #proxy dialer".to_owned(),
+                ));
             }
             if self.tun.enable
                 && self.dns.enable
@@ -320,9 +321,9 @@ impl Config {
                     .iter()
                     .any(|server| server.net == dns::config::DNSNetMode::Dhcp)
             {
-                return Err(Error::InvalidConfig(format!(
-                    "dns.proxy-server-nameserver-policy for {domain} cannot use DHCP in TUN + Fake-IP; DHCP resolver discovery is outside managed node DNS"
-                )));
+                return Err(Error::InvalidConfig(
+                    "dns.proxy-server-nameserver-policy cannot use DHCP in TUN + Fake-IP; DHCP resolver discovery is outside managed node DNS".to_owned(),
+                ));
             }
         }
 

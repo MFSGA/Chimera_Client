@@ -373,6 +373,115 @@ fn fake_ip_ttl_is_applied_and_misspelling_is_rejected() {
 }
 
 #[test]
+fn invalid_upstream_diagnostics_do_not_echo_private_uri_parts() {
+    for server in [
+        "udp://[private-upstream-token-4839",
+        "private-upstream-token-4839://1.1.1.1",
+    ] {
+        let yaml = base_config(&format!(
+            "  enable: true\n  nameserver: ['{server}']\n  default-nameserver: [223.5.5.5]\n"
+        ));
+        let error = parse_error(yaml).to_string();
+        assert!(
+            error.contains("nameserver") || error.contains("dns server"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("private-upstream-token-4839"),
+            "upstream URI diagnostic leaked a private token"
+        );
+    }
+}
+
+#[test]
+fn policy_selector_diagnostics_reject_without_exposing_private_qname() {
+    let private_selector = "geosite:private-dns-secret.example";
+    let yaml = base_config(&format!(
+        "  enable: true\n  nameserver: [1.1.1.1]\n  default-nameserver: [223.5.5.5]\n  nameserver-policy:\n    '{private_selector}': 9.9.9.9\n"
+    ));
+    let error = parse_error(yaml).to_string();
+    assert!(error.contains("nameserver-policy"), "{error}");
+    assert!(
+        !error.contains("private-dns-secret.example"),
+        "policy error leaked private QNAME"
+    );
+
+    let node_yaml = base_config(&format!(
+        "  enable: true\n  nameserver: [1.1.1.1]\n  proxy-server-nameserver: [8.8.8.8]\n  proxy-server-nameserver-policy:\n    '{private_selector}': 9.9.9.9\n"
+    ));
+    let error = parse_error(node_yaml).to_string();
+    assert!(error.contains("proxy-server-nameserver-policy"), "{error}");
+    assert!(
+        !error.contains("private-dns-secret.example"),
+        "YAML node-policy error leaked private QNAME"
+    );
+
+    let valid_yaml = base_config(
+        "  enable: true\n  nameserver: [1.1.1.1]\n  default-nameserver: [223.5.5.5]\n  proxy-server-nameserver: [8.8.8.8]\n",
+    );
+    let mut internal = Config::Str(valid_yaml).try_parse().unwrap();
+    let server = internal.dns.nameserver[0].clone();
+    internal
+        .dns
+        .nameserver_policy
+        .insert(private_selector.into(), server.clone());
+    let error = match Config::Internal(internal).try_parse() {
+        Ok(_) => panic!("unsafe internal selector unexpectedly accepted"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("nameserver-policy"), "{error}");
+    assert!(
+        !error.contains("private-dns-secret.example"),
+        "internal policy error leaked private QNAME"
+    );
+
+    let mut internal = Config::Str(base_config(
+        "  enable: true\n  nameserver: [1.1.1.1]\n  default-nameserver: [223.5.5.5]\n  proxy-server-nameserver: [8.8.8.8]\n"
+    )).try_parse().unwrap();
+    internal
+        .dns
+        .proxy_server_nameserver_policy
+        .push((private_selector.into(), vec![server]));
+    let error = match Config::Internal(internal).try_parse() {
+        Ok(_) => panic!("unsafe node-policy selector unexpectedly accepted"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("proxy-server-nameserver-policy"), "{error}");
+    assert!(
+        !error.contains("private-dns-secret.example"),
+        "node-policy error leaked private QNAME"
+    );
+}
+
+#[test]
+fn unsupported_fake_ip_filter_rejects_without_echoing_private_selector() {
+    // Mihomo rule/RuleSet/GeoSite expressions are not compatible with the
+    // current literal trie. Reject them without exposing private DNS names
+    // in a config diagnostic (which may be logged during startup/reload).
+    for selector in [
+        "rule-set:private-secret.example",
+        "geosite:private-secret.example",
+        "domain-suffix,private-secret.example",
+    ] {
+        for enabled in [true, false] {
+            let yaml = base_config(&format!(
+                "  enable: {enabled}\n  nameserver: [1.1.1.1]\n  fake-ip-filter: ['{selector}']\n"
+            ));
+            let error = parse_error(yaml).to_string();
+            assert!(
+                error.contains("dns.fake-ip-filter")
+                    && error.contains("unsupported"),
+                "unsupported filter must fail explicitly: {error}"
+            );
+            assert!(
+                !error.contains("private-secret.example"),
+                "privacy diagnostics must not echo secret domain names"
+            );
+        }
+    }
+}
+
+#[test]
 fn unimplemented_mihomo_dns_privacy_controls_must_fail_closed() {
     for (field, value) in [
         ("fake_ip_filter_mode", "whitelist"),
@@ -970,8 +1079,10 @@ fn mihomo_nameserver_policy_rejects_unsupported_geosite_and_ruleset_selectors() 
         ));
         let error = parse_error(yaml).to_string();
         assert!(
-            error.contains("nameserver-policy") && error.contains(domain),
-            "unsupported Mihomo policy selectors must not be literal domain matches: {error}",
+            error.contains("nameserver-policy")
+                && error.contains("unsupported")
+                && !error.contains(domain),
+            "unsupported Mihomo policy selectors must be rejected without exposing their domain: {error}",
         );
     }
 }

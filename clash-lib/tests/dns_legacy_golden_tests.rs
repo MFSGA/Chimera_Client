@@ -154,8 +154,9 @@ fn mihomo_unsupported_fake_ip_filter_sources_fail_instead_of_leaking() {
         let diagnostic = error(&body);
         assert!(
             diagnostic.contains("dns.fake-ip-filter")
-                && diagnostic.contains(pattern),
-            "unsupported Mihomo filter `{pattern}` was not rejected clearly: {diagnostic}"
+                && diagnostic.contains("unsupported")
+                && !diagnostic.contains(pattern),
+            "unsupported Mihomo filter must be rejected without exposing the private selector: {diagnostic}"
         );
     }
 }
@@ -232,12 +233,27 @@ fn s00_proxy_and_direct_nameservers_remain_distinct() {
 }
 
 #[test]
+fn s00_respect_rules_without_proxy_bootstrap_is_rejected() {
+    // Fixed Mihomo ref 63bd52e: config/config.go::parseDNS rejects this
+    // before constructing a resolver, even if nameserver has #proxy.
+    let diagnostic = error(
+        "  enable: true\n  nameserver: ['udp://1.1.1.1#proxy=PROXY']\n  respect-rules: true\n",
+    );
+    assert!(diagnostic.contains("dns.respect-rules"), "{diagnostic}");
+    assert!(
+        diagnostic.contains("dns.proxy-server-nameserver"),
+        "{diagnostic}"
+    );
+}
+
+#[test]
 fn s00_respect_rules_and_legacy_proxy_modifier_are_preserved() {
     let dns = load(
         r#"
   enable: true
   nameserver: ["udp://1.1.1.1#proxy=PROXY"]
   default-nameserver: [223.5.5.5]
+  proxy-server-nameserver: [9.9.9.9]
   respect-rules: true
 "#,
         false,

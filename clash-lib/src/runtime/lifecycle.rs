@@ -12,7 +12,7 @@ use super::components::{
     restore_active_network_config, restore_network_after_failed_reload,
 };
 use super::{
-    components::refresh_runtime_health,
+    components::{refresh_runtime_health, retire_dns_owners},
     factory::create_components,
     network::{
         NetworkRecoveryRequest, NetworkRuntimeLease, finish_reload_status,
@@ -497,6 +497,13 @@ async fn start_with_shutdown_token(
                             }
                         };
 
+                    // A candidate DNS listener may bind while we check inbound/TUN
+                    // readiness. It must not answer queries using an uncommitted
+                    // policy: a later failure must leave the old DNS policy live.
+                    new_components.dns_resolver.pause_publication();
+                    new_components.control_plane_dns_resolver.pause_publication();
+                    new_components.dns_listener.pause_publication();
+
                     // Validate and install the replacement interface/mark only after
                     // the complete candidate runtime has been prepared. A failure at
                     // this point still leaves every old listener and task running.
@@ -758,12 +765,38 @@ async fn start_with_shutdown_token(
                         continue;
                     }
 
+                    // The replacement data plane is ready, so rollback to the
+                    // previous DNS owners is no longer needed. Retire them before
+                    // publishing the new runtime: stopped listeners do not revoke
+                    // DNS access through retained outbound or DIRECT Arc handles.
+                    // Earlier failure paths must keep the old owners usable.
+                    retire_dns_owners(
+                        &active_components.dns_resolver,
+                        &active_components.control_plane_dns_resolver,
+                    );
+
                     let mut g = global_state.lock().await;
                     #[cfg(feature = "tun")]
                     {
                         g.tunnel_runner = new_components.tun_runner.clone();
                     }
                     g.dns_listener = new_components.dns_listener.clone();
+                    new_components.dns_resolver.publish();
+                    new_components.control_plane_dns_resolver.publish();
+                    new_components.dns_listener.publish();
+                    // Only a protected macOS TUN + Fake-IP candidate pauses
+                    // its DNS owners *during construction*. It may skip eager
+                    // file-provider health probes, so resume them once after
+                    // commit. Other reloads keep their original probe behavior.
+                    #[cfg(all(target_os = "macos", feature = "tun"))]
+                    if new_components.network_config.tun_enabled
+                        && new_components.dns_enabled
+                        && new_components.dns_resolver.fake_ip_enabled()
+                    {
+                        new_components
+                            .outbound_manager
+                            .resume_provider_health_checks_after_commit();
+                    }
 
                     *observed_tun_exclusion.write().await =
                         new_components.tun_candidate_exclusion();

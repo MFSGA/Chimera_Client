@@ -178,6 +178,34 @@ pub trait ClashResolver: Sync + Send {
         self.ipv6()
     }
 
+    /// Synchronously invalidate managed transports before an asynchronous reset
+    /// can be cancelled. Legacy/system resolvers have no managed state.
+    fn invalidate_transports(&self) {}
+
+    /// Withhold DNS answers and outbound lookups from a prepared but
+    /// uncommitted runtime. Legacy/system implementations keep their default
+    /// behavior; enhanced resolvers enforce an internal publication gate.
+    /// Background probes can dial an IP literal without invoking DNS. The
+    /// runtime still needs a synchronous publication/retirement gate before
+    /// these probes reach a socket. Legacy resolver implementations keep
+    /// the original probe behavior.
+    fn permits_background_egress(&self) -> bool {
+        true
+    }
+
+    fn pause_publication(&self) {}
+
+    /// Make a prepared DNS owner active after the runtime swap commits.
+    fn publish(&self) {}
+
+    /// Permanently revoke access to this resolver when a replacement runtime
+    /// becomes active. Unlike a transient transport invalidation, retirement
+    /// must not be undone by a later network reset. Legacy implementations
+    /// fall back to their existing invalidation contract.
+    fn retire(&self) {
+        self.invalidate_transports();
+    }
+
     /// Drop all live upstream transports owned by this resolver. The resolver
     /// remains usable and reconnects lazily on the next query.
     async fn reset_transports(&self) -> anyhow::Result<u32> {

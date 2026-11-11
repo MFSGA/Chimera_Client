@@ -672,7 +672,9 @@ proxies:
             Err(err) => err,
         };
         assert!(
-            matches!(err, Error::InvalidConfig(msg) if msg.contains("dns.fake-ip-filter") && msg.contains("geosite:proxy"))
+            matches!(err, Error::InvalidConfig(msg) if msg.contains("dns.fake-ip-filter")
+                && msg.contains("unsupported") && !msg.contains("geosite:proxy")),
+            "unsupported internal filter must fail without disclosing the selector"
         );
     }
 
@@ -723,7 +725,8 @@ proxies:
         };
         assert!(
             err.contains("proxy-server-nameserver-policy")
-                && err.contains("geosite:private"),
+                && err.contains("unsupported")
+                && !err.contains("geosite:private"),
             "{err}"
         );
     }
@@ -774,7 +777,9 @@ proxies:
                 Err(error) => error.to_string(),
             };
             assert!(
-                error.contains("dns.nameserver-policy") && error.contains(selector),
+                error.contains("dns.nameserver-policy")
+                    && error.contains("unsupported")
+                    && !error.contains(selector),
                 "{error}"
             );
         }

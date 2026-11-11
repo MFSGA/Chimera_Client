@@ -448,3 +448,576 @@ fn network_runtime_lease_rejects_concurrent_owner() {
     drop(second_neutral);
     drop(first_neutral);
 }
+
+#[cfg(all(target_os = "macos", feature = "tun"))]
+#[tokio::test]
+async fn protected_candidate_http_provider_must_not_fetch_before_commit() {
+    // An uncommitted DNS policy must not make a provider HTTP request.
+    // Using an IP-literal loopback server guarantees no OS DNS or real NIC
+    // traffic is required even when this test fails in the red phase.
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    initialize();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("loopback provider listener");
+    let port = listener.local_addr().unwrap().port();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_for_server = hits.clone();
+    let provider_server = tokio::spawn(async move {
+        if let Ok(Ok((mut conn, _))) = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            listener.accept(),
+        )
+        .await
+        {
+            hits_for_server.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0; 2048];
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                conn.read(&mut buf),
+            )
+            .await;
+            let body = b"proxies: []\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = conn.write_all(response.as_bytes()).await;
+            let _ = conn.write_all(body).await;
+        }
+    });
+
+    let temp = tempfile::tempdir().unwrap();
+    let config = crate::Config::Str(format!(
+        r#"ipv6: false
+mode: direct
+mmdb: null
+tun:
+  enable: true
+  dns-hijack: false
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: fake-ip
+  nameserver: ['udp://127.0.0.1:9']
+  default-nameserver: ['udp://127.0.0.1:9']
+proxy-providers:
+  candidate:
+    type: http
+    url: http://127.0.0.1:{port}/candidate.yaml
+    path: provider-cache.yaml
+    interval: 3600
+    health-check:
+      enable: false
+proxies: []
+rules:
+  - MATCH,DIRECT
+"#
+    ))
+    .try_parse()
+    .expect("protected candidate fixture must parse");
+
+    // false means we are *preparing* a candidate for reload rather than
+    // starting a live runtime; it must be side-effect-free.
+    let result =
+        super::create_components(temp.path().to_path_buf(), config, false).await;
+    provider_server.abort();
+    let _ = provider_server.await;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "uncommitted candidate contacted its HTTP provider before publication"
+    );
+    let err = match result {
+        Ok(_) => panic!("candidate HTTP bootstrap must be deferred or rejected"),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        err.contains("proxy-provider") && err.contains("before DNS publication"),
+        "unexpected candidate provider failure: {err}"
+    );
+}
+
+#[cfg(all(target_os = "macos", feature = "tun"))]
+#[tokio::test]
+async fn nonprotected_candidate_preserves_legacy_http_provider_bootstrap() {
+    // Legacy non-TUN reloads must still fetch their HTTP provider normally.
+    // This exercises only loopback HTTP, without a DNS lookup or TUN start.
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    initialize();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = hits.clone();
+    let server = tokio::spawn(async move {
+        if let Ok(Ok((mut conn, _))) = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            listener.accept(),
+        )
+        .await
+        {
+            seen.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0; 2048];
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                conn.read(&mut buf),
+            )
+            .await;
+            let body = b"proxies: []\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = conn.write_all(response.as_bytes()).await;
+            let _ = conn.write_all(body).await;
+        }
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let config = crate::Config::Str(format!(
+        r#"ipv6: false
+mode: direct
+mmdb: null
+tun:
+  enable: false
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: fake-ip
+  nameserver: ['udp://127.0.0.1:9']
+  default-nameserver: ['udp://127.0.0.1:9']
+proxy-providers:
+  legacy:
+    type: http
+    url: http://127.0.0.1:{port}/legacy.yaml
+    path: legacy-provider-cache.yaml
+    interval: 3600
+    health-check:
+      enable: false
+proxies: []
+rules:
+  - MATCH,DIRECT
+"#
+    ))
+    .try_parse()
+    .unwrap();
+    let result =
+        super::create_components(temp.path().to_path_buf(), config, false).await;
+    server.abort();
+    let _ = server.await;
+    if let Err(err) = result {
+        panic!("legacy candidate setup failed: {err}");
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "nonprotected reload must preserve HTTP provider initialization"
+    );
+}
+
+#[cfg(all(target_os = "macos", feature = "tun"))]
+#[tokio::test]
+async fn protected_candidate_http_rule_provider_must_not_start_before_commit() {
+    // HTTP rule-provider initialization is spawned in Router::new, before the
+    // reload coordinator can suspend the candidate DNS owner. Reject safely
+    // before any asynchronous candidate fetch is scheduled.
+    initialize();
+    let temp = tempfile::tempdir().unwrap();
+    let config = crate::Config::Str(
+        r#"ipv6: false
+mode: direct
+mmdb: null
+tun:
+  enable: true
+  dns-hijack: false
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: fake-ip
+  nameserver: ['udp://127.0.0.1:9']
+  default-nameserver: ['udp://127.0.0.1:9']
+rule-providers:
+  candidate-rules:
+    type: http
+    url: http://127.0.0.1:9/candidate.rules
+    path: candidate-rules.yaml
+    interval: 3600
+    behavior: domain
+proxies: []
+rules:
+  - MATCH,DIRECT
+"#
+        .to_owned(),
+    )
+    .try_parse()
+    .unwrap();
+    let result =
+        super::create_components(temp.path().to_path_buf(), config, false).await;
+    let err = match result {
+        Ok(_) => panic!("uncommitted protected HTTP rule provider was scheduled"),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        err.contains("rule-provider") && err.contains("before DNS publication"),
+        "unexpected candidate rule provider failure: {err}"
+    );
+}
+
+#[cfg(all(target_os = "macos", feature = "tun"))]
+#[tokio::test]
+async fn protected_candidate_missing_mmdb_must_not_download_before_commit() {
+    // Candidate country MMDB downloads occur in create_components, before
+    // the DNS owner can be paused. Observe via loopback-only HTTP; no public
+    // host is used, even in the intentional red test.
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    initialize();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = hits.clone();
+    let server = tokio::spawn(async move {
+        if let Ok(Ok((mut conn, _))) = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            listener.accept(),
+        )
+        .await
+        {
+            seen.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0; 2048];
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                conn.read(&mut buf),
+            )
+            .await;
+            let body = b"not an mmdb";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = conn.write_all(response.as_bytes()).await;
+            let _ = conn.write_all(body).await;
+        }
+    });
+
+    let temp = tempfile::tempdir().unwrap();
+    let config = crate::Config::Str(format!(
+        r#"ipv6: false
+mode: direct
+mmdb: missing.mmdb
+mmdb-download-url: http://127.0.0.1:{port}/missing.mmdb
+tun:
+  enable: true
+  dns-hijack: false
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: fake-ip
+  nameserver: ['udp://127.0.0.1:9']
+  default-nameserver: ['udp://127.0.0.1:9']
+proxies: []
+rules:
+  - MATCH,DIRECT
+"#
+    ))
+    .try_parse()
+    .unwrap();
+    let result =
+        super::create_components(temp.path().to_path_buf(), config, false).await;
+    server.abort();
+    let _ = server.await;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "uncommitted candidate downloaded a country MMDB before DNS publication"
+    );
+    let err = match result {
+        Ok(_) => panic!("protected candidate attempted missing country MMDB load"),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        err.contains("mmdb") && err.contains("before DNS publication"),
+        "unexpected candidate MMDB error: {err}"
+    );
+}
+
+#[cfg(all(target_os = "macos", feature = "tun"))]
+fn protected_geo_candidate_config(extra: &str) -> crate::Config {
+    crate::Config::Str(format!(
+        r#"ipv6: false
+mode: direct
+{extra}
+tun:
+  enable: true
+  dns-hijack: false
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: fake-ip
+  nameserver: ['udp://127.0.0.1:9']
+  default-nameserver: ['udp://127.0.0.1:9']
+proxies: []
+rules:
+  - MATCH,DIRECT
+"#
+    ))
+}
+
+#[cfg(all(target_os = "macos", feature = "tun"))]
+#[tokio::test]
+async fn protected_candidate_corrupt_mmdb_remains_intact_without_refetch() {
+    initialize();
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("corrupt.mmdb");
+    let original = b"invalid mmdb; must not be deleted during candidate build";
+    std::fs::write(&path, original).unwrap();
+    let config = protected_geo_candidate_config(
+        "mmdb: corrupt.mmdb\nmmdb-download-url: http://127.0.0.1:9/refetch.mmdb",
+    )
+    .try_parse()
+    .unwrap();
+    let outcome =
+        super::create_components(temp.path().to_path_buf(), config, false).await;
+    let error = match outcome {
+        Ok(_) => panic!("corrupt MMDB must not be removed and refetched precommit"),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        error.contains("mmdb") && error.contains("before DNS publication"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read(path).unwrap(),
+        original,
+        "preflight must not delete the user's local cached database"
+    );
+}
+
+#[cfg(all(target_os = "macos", feature = "tun"))]
+#[tokio::test]
+async fn protected_candidate_geosite_download_requires_published_dns() {
+    initialize();
+    for existing_forced in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        if existing_forced {
+            std::fs::write(temp.path().join("site.dat"), []).unwrap();
+        }
+        let extra = if existing_forced {
+            "mmdb: null\ngeosite: site.dat\ngeosite-download-url: http://127.0.0.1:9/geo?force=true"
+        } else {
+            "mmdb: null\ngeosite: site.dat\ngeosite-download-url: http://127.0.0.1:9/geo"
+        };
+        let config = protected_geo_candidate_config(extra).try_parse().unwrap();
+        let outcome =
+            super::create_components(temp.path().to_path_buf(), config, false).await;
+        let error = match outcome {
+            Ok(_) => panic!("missing or forced geosite was initialized precommit"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            error.contains("geosite") && error.contains("before DNS publication"),
+            "geosite case {existing_forced}: {error}"
+        );
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "tun"))]
+#[tokio::test]
+async fn protected_candidate_asn_missing_or_forced_mmdb_rejected_before_download() {
+    initialize();
+    for (data, expected) in [
+        (
+            "mmdb: null\nasn-mmdb: missing-asn.mmdb\nasn-mmdb-download-url: http://127.0.0.1:9/asn",
+            "asn-mmdb",
+        ),
+        (
+            "mmdb: missing-country.mmdb\nmmdb-download-url: http://127.0.0.1:9/country?force=true",
+            "mmdb",
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let config = protected_geo_candidate_config(data).try_parse().unwrap();
+        let error =
+            match super::create_components(temp.path().to_path_buf(), config, false)
+                .await
+            {
+                Ok(_) => panic!("uncommitted geo-data candidate was not rejected"),
+                Err(error) => error.to_string(),
+            };
+        assert!(
+            error.contains(expected) && error.contains("before DNS publication"),
+            "bad {expected} candidate failure: {error}"
+        );
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "tun"))]
+#[tokio::test]
+async fn protected_candidate_valid_cached_geosite_remains_supported() {
+    initialize();
+    let temp = tempfile::tempdir().unwrap();
+    // A zero-length protobuf encodes an empty but valid GeoSiteList.
+    std::fs::write(temp.path().join("cached.dat"), []).unwrap();
+    let config = protected_geo_candidate_config(
+        "mmdb: null\ngeosite: cached.dat\ngeosite-download-url: http://127.0.0.1:9/geo",
+    )
+    .try_parse()
+    .unwrap();
+    let outcome =
+        super::create_components(temp.path().to_path_buf(), config, false).await;
+    if let Err(error) = outcome {
+        panic!(
+            "cached local geosite must remain valid for protected reload: {error}"
+        );
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "tun"))]
+#[tokio::test]
+async fn protected_candidate_resolvers_are_staged_before_factory_returns() {
+    // No candidate owner should be addressable in the gap between factory
+    // completion and the coordinator's subsequent pause. IP literals ensure
+    // this test does not perform any DNS packet or system network changes.
+    initialize();
+    let temp = tempfile::tempdir().unwrap();
+    let config = protected_geo_candidate_config("mmdb: null")
+        .try_parse()
+        .unwrap();
+    let components =
+        super::create_components(temp.path().to_path_buf(), config, false)
+            .await
+            .unwrap();
+
+    let query = "127.0.0.1";
+    assert!(
+        components.dns_resolver.resolve(query, false).await.is_err(),
+        "factory exposed candidate primary DNS before publication"
+    );
+    assert!(
+        components
+            .control_plane_dns_resolver
+            .resolve(query, false)
+            .await
+            .is_err(),
+        "factory exposed candidate control-plane DNS before publication"
+    );
+    components.dns_resolver.publish();
+    components.control_plane_dns_resolver.publish();
+    assert_eq!(
+        components.dns_resolver.resolve(query, false).await.unwrap(),
+        Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+    );
+    assert_eq!(
+        components
+            .control_plane_dns_resolver
+            .resolve(query, false)
+            .await
+            .unwrap(),
+        Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+    );
+}
+
+#[cfg(all(target_os = "macos", feature = "tun"))]
+#[tokio::test]
+async fn protected_candidate_file_provider_health_check_has_no_precommit_egress() {
+    // File-backed proxies are local inputs, but an eager health probe can
+    // issue outbound HTTP before the candidate DNS owner is committed.
+    // Observe any probe using a loopback socket and a bounded join.
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    initialize();
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("local-proxies.yaml"),
+        "proxies:\n  - name: LOCAL_DIRECT\n    type: direct\n",
+    )
+    .unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = hits.clone();
+    let mut probe = tokio::spawn(async move {
+        if let Ok(Ok((_conn, _))) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            listener.accept(),
+        )
+        .await
+        {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+
+    let config = protected_geo_candidate_config(&format!(
+        r#"mmdb: null
+proxy-providers:
+  local:
+    type: file
+    path: local-proxies.yaml
+    interval: 1
+    health-check:
+      enable: true
+      lazy: false
+      interval: 1
+      url: http://127.0.0.1:{port}/health
+"#
+    ))
+    .try_parse()
+    .unwrap();
+    let components =
+        super::create_components(temp.path().to_path_buf(), config, false)
+            .await
+            .unwrap();
+    assert!(
+        components
+            .outbound_manager
+            .get_proxy_provider("local")
+            .is_some(),
+        "file-backed provider was unexpectedly discarded"
+    );
+    let precommit_probe =
+        tokio::time::timeout(std::time::Duration::from_millis(350), &mut probe)
+            .await;
+    assert!(
+        precommit_probe.is_err(),
+        "candidate probe reached local HTTP listener before publication"
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "candidate file-provider health check contacted an upstream before DNS publication"
+    );
+    // The post-commit hook must restore the initial probe that was blocked
+    // while the candidate was unpublished.
+    components.dns_resolver.publish();
+    components.control_plane_dns_resolver.publish();
+    components
+        .outbound_manager
+        .resume_provider_health_checks_after_commit();
+    let resumed =
+        tokio::time::timeout(std::time::Duration::from_secs(2), &mut probe).await;
+    if resumed.is_err() {
+        probe.abort();
+        let _ = probe.await;
+    }
+    assert!(
+        resumed.is_ok() && hits.load(Ordering::SeqCst) == 1,
+        "committed candidate did not resume its provider health probe"
+    );
+}

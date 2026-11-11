@@ -129,17 +129,17 @@ impl Config {
                 }
             }
 
-            let url = Url::parse(&server).map_err(|_x| {
+            let url = Url::parse(&server).map_err(|_error| {
+                // A malformed DoH URI may contain credentials or a signed
+                // query in its authority/query. The index is safe to log.
                 Error::InvalidConfig(format!(
-                    "invalid dns server: {}",
-                    server.as_str()
+                    "invalid dns server at index {i}: malformed URI"
                 ))
             })?;
 
             let host = url.host().ok_or_else(|| {
                 Error::InvalidConfig(format!(
-                    "invalid dns server: no host found in {}",
-                    server.as_str()
+                    "invalid dns server at index {i}: no host found"
                 ))
             })?;
 
@@ -212,9 +212,7 @@ impl Config {
 
                 _ => {
                     return Err(Error::InvalidConfig(format!(
-                        "DNS nameserver [{}] unsupported scheme: {}",
-                        i,
-                        url.scheme()
+                        "DNS nameserver [{i}] unsupported scheme"
                     )));
                 }
             }
@@ -228,9 +226,7 @@ impl Config {
                     .filter(|name| name != "auto")
                     .map(|name| {
                         get_interface_by_name(&name).ok_or(Error::InvalidConfig(
-                            format!(
-                                "DNS nameserver [{i}] invalid interface: {name}"
-                            ),
+                            format!("DNS nameserver [{i}] invalid interface"),
                         ))
                     })
                     .transpose()?,
@@ -255,9 +251,9 @@ impl Config {
                 Config::parse_nameserver(std::slice::from_ref(server))?;
 
             let Some(nameserver) = nameservers.first() else {
-                return Err(Error::InvalidConfig(format!(
-                    "DNS nameserver-policy for {selector_group} has no usable nameserver"
-                )));
+                return Err(Error::InvalidConfig(
+                    "DNS nameserver-policy has no usable nameserver".to_owned(),
+                ));
             };
 
             // Mihomo expands comma-delimited domain keys into individual
@@ -276,16 +272,16 @@ impl Config {
                     ));
                 }
                 if !valid_nameserver_policy_domain(selector) {
-                    return Err(Error::InvalidConfig(format!(
-                        "DNS ResolverRule invalid domain: {selector}"
-                    )));
+                    return Err(Error::InvalidConfig(
+                        "DNS nameserver-policy invalid domain selector".to_owned(),
+                    ));
                 }
                 if policy.insert(lower, nameserver.clone()).is_some() {
                     // The YAML policy map is unordered; conflicting aliases
                     // must fail closed rather than use iteration order.
-                    return Err(Error::InvalidConfig(format!(
-                        "DNS nameserver-policy has duplicate domain selector: {selector}"
-                    )));
+                    return Err(Error::InvalidConfig(
+                        "dns.nameserver-policy repeats domain selector".to_owned(),
+                    ));
                 }
             }
         }
@@ -312,16 +308,12 @@ impl Config {
                     .iter()
                     .map(|entry| {
                         entry.as_str().map(str::to_owned).ok_or_else(|| {
-                            Error::InvalidConfig(format!(
-                                "dns.proxy-server-nameserver-policy for {domain} requires DNS server strings"
-                            ))
+                            Error::InvalidConfig("dns.proxy-server-nameserver-policy requires DNS server strings".to_owned())
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?,
                 _ => {
-                    return Err(Error::InvalidConfig(format!(
-                        "dns.proxy-server-nameserver-policy for {domain} requires a server or list"
-                    )));
+                    return Err(Error::InvalidConfig("dns.proxy-server-nameserver-policy requires a server or list".to_owned()));
                 }
             };
 
@@ -329,38 +321,40 @@ impl Config {
                 .iter()
                 .any(|server| server.trim().eq_ignore_ascii_case("system"))
             {
-                return Err(Error::InvalidConfig(format!(
-                    "dns.proxy-server-nameserver-policy for {domain} cannot use unsupported system DNS upstream"
-                )));
+                return Err(Error::InvalidConfig(
+                    "dns.proxy-server-nameserver-policy cannot use unsupported system DNS upstream".to_owned(),
+                ));
             }
             let nameservers = Self::parse_nameserver(&server_strings)?;
             if nameservers.is_empty() {
-                return Err(Error::InvalidConfig(format!(
-                    "dns.proxy-server-nameserver-policy for {domain} has no usable DNS clients"
-                )));
+                return Err(Error::InvalidConfig(
+                    "dns.proxy-server-nameserver-policy has no usable DNS clients"
+                        .to_owned(),
+                ));
             }
             if nameservers
                 .iter()
                 .any(|nameserver| nameserver.proxy.is_some())
             {
-                return Err(Error::InvalidConfig(format!(
-                    "dns.proxy-server-nameserver-policy for {domain} cannot use #proxy until explicit node-DNS dialer routing is supported"
-                )));
+                return Err(Error::InvalidConfig(
+                    "dns.proxy-server-nameserver-policy cannot use #proxy until explicit node-DNS dialer routing is supported".to_owned(),
+                ));
             }
             let lower = domain.to_ascii_lowercase();
             if lower.starts_with("geosite:") || lower.starts_with("rule-set:") {
-                return Err(Error::InvalidConfig(format!(
-                    "dns.proxy-server-nameserver-policy selector {domain} requires unsupported GeoSite/RuleSet matching"
-                )));
+                return Err(Error::InvalidConfig(
+                    "dns.proxy-server-nameserver-policy requires unsupported GeoSite/RuleSet matching".to_owned(),
+                ));
             }
 
             for subdomain in domain.split(',') {
                 // Keep the original key: Mihomo validates each token rather
                 // than silently trimming a privacy-sensitive DNS selector.
                 if !valid_nameserver_policy_domain(subdomain) {
-                    return Err(Error::InvalidConfig(format!(
-                        "dns.proxy-server-nameserver-policy invalid domain: {subdomain}"
-                    )));
+                    return Err(Error::InvalidConfig(
+                        "dns.proxy-server-nameserver-policy invalid domain selector"
+                            .to_owned(),
+                    ));
                 }
                 policies.push((subdomain.to_ascii_lowercase(), nameservers.clone()));
             }
@@ -504,9 +498,12 @@ pub(crate) fn validate_fake_ip_filter_patterns(
             .iter()
             .any(|prefix| lower.starts_with(prefix))
         {
-            return Err(Error::InvalidConfig(format!(
-                "dns.fake-ip-filter `{pattern}` uses unsupported Mihomo rule-set/geosite/rule syntax; refusing to silently treat it as a literal domain"
-            )));
+            // Do not include the rejected pattern: it can contain private
+            // domain names and this error may be printed in startup logs.
+            return Err(Error::InvalidConfig(
+                "dns.fake-ip-filter uses unsupported Mihomo rule-set/geosite/rule syntax; refusing to silently treat it as a literal domain"
+                    .to_owned(),
+            ));
         }
     }
     Ok(())
