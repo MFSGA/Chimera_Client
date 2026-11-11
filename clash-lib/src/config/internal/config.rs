@@ -233,6 +233,9 @@ impl Config {
             dns::config::normalize_fallback_domain_patterns(
                 &self.dns.fallback_filter.domain,
             )?;
+        if let Some(hosts) = &self.dns.hosts {
+            dns::config::validate_dns_hosts_trie(hosts)?;
+        }
         #[cfg(not(feature = "tun"))]
         if self.tun.enable {
             return Err(Error::InvalidConfig(
@@ -995,6 +998,25 @@ mod tests {
         };
         assert!(error.contains("dns.fallback-filter.domain"), "{error}");
         assert!(!error.contains("geosite:private.example"), "{error}");
+    }
+
+    #[test]
+    fn internal_config_rejects_unnormalized_hosts_trie_keys() {
+        let yaml = "dns:\n  enable: true\n  nameserver: [1.1.1.1]\n";
+        let mut config = crate::Config::Str(yaml.to_owned()).try_parse().unwrap();
+        let mut hosts = crate::common::trie::StringTrie::new();
+        hosts.insert(
+            "bücher.example",
+            std::sync::Arc::new("192.0.2.25".parse::<IpAddr>().unwrap()),
+        );
+        config.dns.hosts = Some(hosts);
+
+        let error = match config.validate() {
+            Ok(_) => panic!("Internal config must reject non-canonical host keys"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("hosts"), "{error}");
+        assert!(!error.contains("bücher.example"), "{error}");
     }
 
     #[cfg(target_os = "macos")]

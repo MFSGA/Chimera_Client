@@ -834,6 +834,9 @@ impl EnhancedResolver {
         crate::app::dns::config::validate_fake_ip_filter_patterns(
             &cfg.fake_ip_filter,
         )?;
+        if let Some(hosts) = &cfg.hosts {
+            crate::app::dns::config::validate_dns_hosts_trie(hosts)?;
+        }
         let fallback_domain_patterns =
             crate::app::dns::config::normalize_fallback_domain_patterns(
                 &cfg.fallback_filter.domain,

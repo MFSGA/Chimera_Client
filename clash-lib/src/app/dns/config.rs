@@ -136,6 +136,33 @@ pub(crate) fn normalize_dns_domain_pattern(domain: &str) -> Option<String> {
         .map(|labels| labels.join("."))
 }
 
+/// Validate a hosts trie supplied through an internal/programmatic config.
+/// The YAML path builds an already-normalized trie, but this boundary must
+/// reject non-canonical keys that would miss ASCII DNS QNAMEs at runtime.
+pub(crate) fn validate_dns_hosts_trie(
+    hosts: &trie::StringTrie<IpAddr>,
+) -> Result<(), Error> {
+    let mut selectors = HashSet::new();
+    let mut invalid = false;
+    hosts.traverse(|selector, _| {
+        let Some(normalized) = normalize_dns_domain_pattern(selector) else {
+            invalid = true;
+            return false;
+        };
+        if normalized != selector || !selectors.insert(normalized) {
+            invalid = true;
+            return false;
+        }
+        true
+    });
+    if invalid {
+        return Err(Error::InvalidConfig(
+            "hosts contains a non-canonical or ambiguous domain selector".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Normalize fallback-filter patterns to the ASCII form used by DNS QNAMEs.
 /// This fallback implementation supports domain patterns, not Mihomo
 /// GeoSite/RuleSet or comma-delimited rule expressions.
@@ -972,6 +999,28 @@ mod tests {
         };
         assert!(error.contains("invalid domain selector"), "{error}");
         assert!(!error.contains("bad..private.example"), "{error}");
+    }
+
+    #[test]
+    fn internal_hosts_trie_requires_canonical_idna_keys() {
+        let mut canonical = trie::StringTrie::new();
+        assert!(canonical.insert(
+            "xn--bcher-kva.example",
+            Arc::new("192.0.2.25".parse::<IpAddr>().unwrap())
+        ));
+        validate_dns_hosts_trie(&canonical)
+            .expect("ASCII wire-form internal host should validate");
+
+        let mut unicode = trie::StringTrie::new();
+        assert!(unicode.insert(
+            "bücher.example",
+            Arc::new("192.0.2.25".parse::<IpAddr>().unwrap())
+        ));
+        let error = validate_dns_hosts_trie(&unicode)
+            .expect_err("Unicode keys must not miss ASCII DNS QNAMEs")
+            .to_string();
+        assert!(error.contains("hosts"), "{error}");
+        assert!(!error.contains("bücher.example"), "{error}");
     }
 
     #[test]
