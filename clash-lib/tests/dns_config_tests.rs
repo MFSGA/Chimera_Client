@@ -482,6 +482,30 @@ fn unsupported_fake_ip_filter_rejects_without_echoing_private_selector() {
 }
 
 #[test]
+fn malformed_fake_ip_filter_patterns_reject_without_echoing_selector() {
+    for selector in [
+        " private.example",
+        "part*.private.example",
+        "node.+.private.example",
+        "private..example",
+        "private.example.",
+    ] {
+        let yaml = base_config(&format!(
+            "  enable: true\n  nameserver: [1.1.1.1]\n  fake-ip-filter: ['{selector}']\n"
+        ));
+        let error = parse_error(yaml).to_string();
+        assert!(
+            error.contains("dns.fake-ip-filter") && error.contains("invalid"),
+            "malformed Fake-IP pattern must fail validation: {error}"
+        );
+        assert!(
+            !error.contains(selector.trim()),
+            "Fake-IP pattern diagnostic exposed the configured domain: {error}"
+        );
+    }
+}
+
+#[test]
 fn unimplemented_mihomo_dns_privacy_controls_must_fail_closed() {
     for (field, value) in [
         ("fake_ip_filter_mode", "whitelist"),

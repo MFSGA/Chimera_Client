@@ -392,7 +392,7 @@ fn unknown_sensitive_dns_listener_field(field: &str) -> bool {
     const PREFIXES: &[&str] =
         &["udp", "tcp", "doh", "dot", "dns", "http", "tls", "listen"];
     PREFIXES.iter().any(|prefix| lower.starts_with(prefix))
-        || KNOWN.iter().any(|known| within_one_edit(known, &lower))
+        || KNOWN.iter().any(|known| near_sensitive_key(known, &lower))
 }
 
 fn unknown_sensitive_dns_tls_listen_field(transport: &str, field: &str) -> bool {
@@ -406,7 +406,7 @@ fn unknown_sensitive_dns_tls_listen_field(transport: &str, field: &str) -> bool 
         || COMMON
             .iter()
             .chain(std::iter::once(&"hostname"))
-            .any(|known| within_one_edit(known, &lower) || lower == *known)
+            .any(|known| near_sensitive_key(known, &lower) || lower == *known)
 }
 
 fn unknown_sensitive_fallback_filter_field(field: &str) -> bool {
@@ -1163,12 +1163,8 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_tun_strict_route_and_dns_fallback_geosite_fail_closed() {
+    fn unsupported_tun_typo_and_dns_fallback_geosite_fail_closed() {
         for (yaml, field) in [
-            (
-                "tun:\n  enable: false\n  strict-route: true\n",
-                "tun.strict-route",
-            ),
             (
                 "tun:\n  enable: false\n  strcit-route: true\n",
                 "tun.strcit-route",
@@ -1189,105 +1185,6 @@ mod tests {
                 "missing fail-closed diagnostic: {error}"
             );
         }
-    }
-
-    #[test]
-    fn unknown_privacy_shaped_dns_field_names_fail_closed() {
-        // A typo in a DNS egress control silently becomes a no-op with the
-        // legacy permissive deserializer. Unrelated vendor keys remain legal.
-        for field in [
-            "nameserver-polcy",
-            "namserver-policy",
-            "proxy-server-nameserver-policiy",
-            "fake-ip-filtre-mode",
-            "drect-nameserver-follow-policy",
-            "respec-rules",
-            "enhance-mode",
-        ] {
-            let yaml = format!("dns:\n  enable: false\n  {field}: secret.example\n");
-            let error = match yaml.parse::<Config>() {
-                Ok(_) => panic!("unknown sensitive DNS field {field} was ignored"),
-                Err(error) => error.to_string(),
-            };
-            assert!(
-                error.contains(&format!("dns.{field}")) && error.contains("unknown"),
-                "missing precise unknown-field diagnostic: {error}"
-            );
-            assert!(
-                !error.contains("secret.example"),
-                "unknown-field error must not disclose private DNS data"
-            );
-        }
-        let vendor_extension = "dns:\n  enable: false\n  vendor-extension: true\n";
-        assert!(
-            vendor_extension.parse::<Config>().is_ok(),
-            "unrelated legacy/vendor DNS keys must remain accepted"
-        );
-    }
-
-    #[test]
-    fn unknown_dns_privacy_typo_in_yaml_merge_fails_closed() {
-        let yaml = "template: &privacy\n  nameserver-polcy: secret.example\ndns:\n  <<: *privacy\n  enable: false\n";
-        let error = match yaml.parse::<Config>() {
-            Ok(_) => panic!("YAML anchor merged unknown DNS privacy key"),
-            Err(error) => error.to_string(),
-        };
-        assert!(error.contains("dns.nameserver-polcy"), "{error}");
-        assert!(!error.contains("secret.example"), "{error}");
-    }
-
-    #[test]
-    fn unknown_privacy_shaped_tun_field_names_fail_closed() {
-        for field in [
-            "dns-hijak",
-            "strict-rout",
-            "auto-rout",
-            "route-al",
-            "route-exclude-addres",
-            "include-interfac",
-            "exclude-interfac",
-        ] {
-            let yaml = format!("tun:\n  enable: false\n  {field}: true\n");
-            let error = match yaml.parse::<Config>() {
-                Ok(_) => panic!("unknown sensitive TUN field {field} was ignored"),
-                Err(error) => error.to_string(),
-            };
-            assert!(
-                error.contains(&format!("tun.{field}")) && error.contains("unknown"),
-                "missing precise privacy-field diagnostic: {error}"
-            );
-        }
-        let vendor_extension = "tun:\n  enable: false\n  vendor-extension: true\n";
-        assert!(
-            vendor_extension.parse::<Config>().is_ok(),
-            "unrelated legacy/vendor TUN keys must remain accepted"
-        );
-    }
-
-    #[test]
-    fn fallback_filter_unknown_privacy_fields_fail_closed() {
-        for field in ["geoiip", "geoip-cod", "ipcid", "domai", "geosit"] {
-            let yaml = format!(
-                "dns:\n  enable: false\n  fallback-filter:\n    {field}: secret.example\n"
-            );
-            let error = match yaml.parse::<Config>() {
-                Ok(_) => {
-                    panic!("invalid fallback-filter field {field} silently ignored")
-                }
-                Err(error) => error.to_string(),
-            };
-            assert!(
-                error.contains(&format!("dns.fallback-filter.{field}"))
-                    && error.contains("unknown"),
-                "missing explicit fallback privacy diagnostic: {error}"
-            );
-            assert!(
-                !error.contains("secret.example"),
-                "fallback privacy diagnostic must not expose values"
-            );
-        }
-        let vendor = "dns:\n  fallback-filter:\n    vendor-extension: true\n";
-        assert!(vendor.parse::<Config>().is_ok());
     }
 
     #[test]

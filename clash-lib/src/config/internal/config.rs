@@ -86,6 +86,12 @@ fn xhttp_secondary_system_dns_risk(
         }
     }
     if matches!(vless.alpn.as_deref(), Some([version]) if version == "http/1.1")
+        && let Some(upload) = opts.upload_settings.as_ref()
+        && upload.address.parse::<IpAddr>().is_err()
+    {
+        return Some("upload-settings");
+    }
+    if matches!(vless.alpn.as_deref(), Some([version]) if version == "http/1.1")
         && vless.common_opts.server.parse::<IpAddr>().is_err()
     {
         return Some("http/1.1");
@@ -140,9 +146,18 @@ fn validate_default_nameserver_bootstrap(
 fn validate_macos_fake_ip_dns_egress(
     dns: &dns::Config,
     tun: &TunConfig,
+    external_controller: Option<&str>,
 ) -> Result<(), Error> {
     if !tun.enable || !dns.enable || dns.enhance_mode != def::DNSMode::FakeIp {
         return Ok(());
+    }
+    if external_controller
+        .is_some_and(|address| address.parse::<SocketAddr>().is_err())
+    {
+        return Err(Error::InvalidConfig(
+            "external-controller must use an IP-literal socket address in macOS TUN + Fake-IP; hostname resolution uses the system resolver"
+                .to_owned(),
+        ));
     }
     let is_dhcp = |server: &dns::config::NameServer| {
         server.net == dns::config::DNSNetMode::Dhcp
@@ -211,9 +226,16 @@ fn validate_macos_fake_ip_dns_egress(
 }
 
 impl Config {
-    pub fn validate(self) -> Result<Self, crate::Error> {
+    pub fn validate(mut self) -> Result<Self, crate::Error> {
         validate_default_nameserver_bootstrap(&self.dns.default_nameserver)?;
         dns::config::validate_fake_ip_filter_patterns(&self.dns.fake_ip_filter)?;
+        self.dns.fallback_filter.domain =
+            dns::config::normalize_fallback_domain_patterns(
+                &self.dns.fallback_filter.domain,
+            )?;
+        if let Some(hosts) = &self.dns.hosts {
+            dns::config::validate_dns_hosts_trie(hosts)?;
+        }
         #[cfg(not(feature = "tun"))]
         if self.tun.enable {
             return Err(Error::InvalidConfig(
@@ -236,7 +258,11 @@ impl Config {
         }
 
         #[cfg(target_os = "macos")]
-        validate_macos_fake_ip_dns_egress(&self.dns, &self.tun)?;
+        validate_macos_fake_ip_dns_egress(
+            &self.dns,
+            &self.tun,
+            self.general.controller.external_controller.as_deref(),
+        )?;
 
         // YAML conversion expands comma-delimited main DNS policy selectors
         // and rejects Mihomo GeoSite/RuleSet patterns. Internal configs and
@@ -244,15 +270,9 @@ impl Config {
         // The internal map can contain multiple spellings of the same DNS
         // name, while the runtime trie lowercases keys and would pick an
         // arbitrary policy based on HashMap iteration order.
-        let mut seen_policy_domains = std::collections::HashSet::new();
+        let mut seen_policy_domains = HashSet::new();
         for domain in self.dns.nameserver_policy.keys() {
             let lower = domain.to_ascii_lowercase();
-            if !seen_policy_domains.insert(lower.clone()) {
-                return Err(Error::InvalidConfig(
-                    "dns.nameserver-policy contains duplicate case-insensitive selectors"
-                        .to_owned(),
-                ));
-            }
             if lower.starts_with("geosite:")
                 || lower.starts_with("rule-set:")
                 || domain.contains(',')
@@ -260,6 +280,19 @@ impl Config {
             {
                 return Err(Error::InvalidConfig(
                     "dns.nameserver-policy unsupported or unexpanded domain selector".to_owned(),
+                ));
+            }
+            let normalized = dns::config::normalize_dns_domain_pattern(domain)
+                .ok_or_else(|| {
+                    Error::InvalidConfig(
+                        "dns.nameserver-policy contains an invalid domain selector"
+                            .to_owned(),
+                    )
+                })?;
+            if !seen_policy_domains.insert(normalized) {
+                return Err(Error::InvalidConfig(
+                    "dns.nameserver-policy contains duplicate normalized selectors"
+                        .to_owned(),
                 ));
             }
         }
@@ -295,6 +328,7 @@ impl Config {
         // Internal configs and reloads bypass the YAML parser. Reject node
         // policy selectors and dialer overrides whose semantics are not yet
         // supported, rather than silently treating them as literal domains.
+        let mut seen_proxy_policy_domains = HashSet::new();
         for (domain, servers) in &self.dns.proxy_server_nameserver_policy {
             let lower = domain.to_ascii_lowercase();
             if lower.starts_with("geosite:")
@@ -304,6 +338,19 @@ impl Config {
             {
                 return Err(Error::InvalidConfig(
                     "dns.proxy-server-nameserver-policy unsupported domain selector"
+                        .to_owned(),
+                ));
+            }
+            let normalized = dns::config::normalize_dns_domain_pattern(domain)
+                .ok_or_else(|| {
+                    Error::InvalidConfig(
+                        "dns.proxy-server-nameserver-policy contains an invalid domain selector"
+                            .to_owned(),
+                    )
+                })?;
+            if !seen_proxy_policy_domains.insert(normalized) {
+                return Err(Error::InvalidConfig(
+                    "dns.proxy-server-nameserver-policy contains duplicate normalized selectors"
                         .to_owned(),
                 ));
             }
@@ -907,6 +954,71 @@ mod tests {
         }
     }
 
+    #[test]
+    fn internal_proxy_server_policy_accepts_dot_and_plus_suffix_selectors() {
+        let yaml = "dns:\n  enable: true\n  nameserver: [1.1.1.1]\n";
+        let server = crate::app::dns::config::Config::parse_nameserver(&[
+            "9.9.9.9".to_owned()
+        ])
+        .unwrap()
+        .remove(0);
+        let mut config = crate::Config::Str(yaml.to_owned()).try_parse().unwrap();
+        config.dns.proxy_server_nameserver = Some(vec![server.clone()]);
+        config
+            .dns
+            .proxy_server_nameserver_policy
+            .push(("+.example.com".to_owned(), vec![server.clone()]));
+        config
+            .dns
+            .proxy_server_nameserver_policy
+            .push((".example.com".to_owned(), vec![server]));
+
+        let config = config
+            .validate()
+            .expect("overlapping suffix selectors have a stable precedence");
+        assert_eq!(config.dns.proxy_server_nameserver_policy.len(), 2);
+    }
+
+    #[test]
+    fn internal_fallback_filter_normalizes_idna_and_rejects_invalid_patterns() {
+        let yaml = "dns:\n  enable: true\n  nameserver: [1.1.1.1]\n";
+        let mut config = crate::Config::Str(yaml.to_owned()).try_parse().unwrap();
+        config.dns.fallback_filter.domain = vec!["bücher.example".to_owned()];
+        let config = config.validate().expect("valid IDNA fallback selector");
+        assert_eq!(config.dns.fallback_filter.domain, ["xn--bcher-kva.example"]);
+
+        let mut config = crate::Config::Str(yaml.to_owned()).try_parse().unwrap();
+        config.dns.fallback_filter.domain =
+            vec!["geosite:private.example".to_owned()];
+        let error = match config.validate() {
+            Ok(_) => {
+                panic!("unsupported fallback rule must not be silently ignored")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("dns.fallback-filter.domain"), "{error}");
+        assert!(!error.contains("geosite:private.example"), "{error}");
+    }
+
+    #[test]
+    fn internal_config_rejects_unnormalized_hosts_trie_keys() {
+        let yaml = "dns:\n  enable: true\n  nameserver: [1.1.1.1]\n";
+        let mut config = crate::Config::Str(yaml.to_owned()).try_parse().unwrap();
+        let mut hosts = crate::common::trie::StringTrie::new();
+        hosts.insert(
+            "bücher.example",
+            std::sync::Arc::new("192.0.2.25".parse::<IpAddr>().unwrap()),
+        );
+        config.dns.hosts = Some(hosts);
+
+        let error = match config.validate() {
+            Ok(_) => panic!("Internal config must reject non-canonical host keys"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("hosts"), "{error}");
+        assert!(!error.contains("bücher.example"), "{error}");
+    }
+
     #[cfg(target_os = "macos")]
     fn fake_physical_dns_iface() -> crate::app::net::OutboundInterface {
         // A synthetic interface: never inspect or mutate the host NIC.
@@ -987,6 +1099,23 @@ mod tests {
                 "{scope}: {error}"
             );
         }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "tun"))]
+    #[test]
+    fn internal_macos_fake_ip_tun_rejects_hostname_controller_bind() {
+        let yaml = "external-controller: api.private.example:9090\ntun:\n  enable: true\ndns:\n  enable: true\n  enhanced-mode: fake-ip\n  nameserver: [1.1.1.1]\n  default-nameserver: [223.5.5.5]\n";
+        let error = match crate::Config::Str(yaml.to_owned()).try_parse() {
+            Ok(_) => panic!("Fake-IP TUN must not resolve an API bind hostname"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("external-controller"), "{error}");
+        assert!(!error.contains("api.private.example"), "{error}");
+
+        let literal = yaml.replace("api.private.example:9090", "127.0.0.1:9090");
+        crate::Config::Str(literal)
+            .try_parse()
+            .expect("IP-literal API bind should stay supported");
     }
 
     #[cfg(target_os = "macos")]
