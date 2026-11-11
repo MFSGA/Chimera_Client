@@ -681,6 +681,17 @@ proxies:
     }
 
     #[test]
+    fn converted_fallback_domain_selector_is_normalized_to_dns_wire_name() {
+        let mut cfg = parse_config("");
+        cfg.dns.fallback_filter.domain = vec!["BÜCHER.example".to_owned()];
+        let internal = convert(cfg).expect("IDNA fallback domain should normalize");
+        assert_eq!(
+            internal.dns.fallback_filter.domain,
+            ["xn--bcher-kva.example"]
+        );
+    }
+
+    #[test]
     fn internal_proxy_server_dns_policy_requires_dedicated_nameserver() {
         let mut cfg = parse_config("");
         cfg.dns.enable = true;

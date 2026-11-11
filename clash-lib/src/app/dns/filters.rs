@@ -61,17 +61,47 @@ pub trait FallbackDomainFilter: Sync + Send {
 pub struct DomainFilter(trie::StringTrie<Option<String>>);
 
 impl DomainFilter {
-    pub fn new(domains: Vec<&str>) -> Self {
-        let mut f = DomainFilter(trie::StringTrie::new());
-        for d in domains {
-            f.0.insert(d, Arc::new(None));
+    pub fn new(domains: &[String]) -> Result<Self, crate::Error> {
+        let mut filter = DomainFilter(trie::StringTrie::new());
+        for domain in domains {
+            if !filter.0.insert(domain, Arc::new(None)) {
+                return Err(crate::Error::InvalidConfig(
+                    "dns.fallback-filter.domain contains an unmatchable pattern"
+                        .to_owned(),
+                ));
+            }
         }
-        f
+        Ok(filter)
     }
 }
 
 impl FallbackDomainFilter for DomainFilter {
     fn apply(&self, domain: &str) -> bool {
         self.0.search(domain).is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn domain_filter_matches_normalized_idna_query_names() {
+        let patterns =
+            crate::app::dns::config::normalize_fallback_domain_patterns(&[
+                "bücher.example".to_owned(),
+            ])
+            .unwrap();
+        let filter = DomainFilter::new(&patterns).unwrap();
+        assert!(filter.apply("xn--bcher-kva.example"));
+    }
+
+    #[test]
+    fn checked_domain_filter_rejects_unmatchable_patterns() {
+        let error = match DomainFilter::new(&["bad..example".to_owned()]) {
+            Ok(_) => panic!("invalid selector must not be silently dropped"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("unmatchable pattern"), "{error}");
     }
 }

@@ -226,9 +226,13 @@ fn validate_macos_fake_ip_dns_egress(
 }
 
 impl Config {
-    pub fn validate(self) -> Result<Self, crate::Error> {
+    pub fn validate(mut self) -> Result<Self, crate::Error> {
         validate_default_nameserver_bootstrap(&self.dns.default_nameserver)?;
         dns::config::validate_fake_ip_filter_patterns(&self.dns.fake_ip_filter)?;
+        self.dns.fallback_filter.domain =
+            dns::config::normalize_fallback_domain_patterns(
+                &self.dns.fallback_filter.domain,
+            )?;
         #[cfg(not(feature = "tun"))]
         if self.tun.enable {
             return Err(Error::InvalidConfig(
@@ -945,6 +949,52 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn internal_proxy_server_policy_accepts_dot_and_plus_suffix_selectors() {
+        let yaml = "dns:\n  enable: true\n  nameserver: [1.1.1.1]\n";
+        let server = crate::app::dns::config::Config::parse_nameserver(&[
+            "9.9.9.9".to_owned()
+        ])
+        .unwrap()
+        .remove(0);
+        let mut config = crate::Config::Str(yaml.to_owned()).try_parse().unwrap();
+        config.dns.proxy_server_nameserver = Some(vec![server.clone()]);
+        config
+            .dns
+            .proxy_server_nameserver_policy
+            .push(("+.example.com".to_owned(), vec![server.clone()]));
+        config
+            .dns
+            .proxy_server_nameserver_policy
+            .push((".example.com".to_owned(), vec![server]));
+
+        let config = config
+            .validate()
+            .expect("overlapping suffix selectors have a stable precedence");
+        assert_eq!(config.dns.proxy_server_nameserver_policy.len(), 2);
+    }
+
+    #[test]
+    fn internal_fallback_filter_normalizes_idna_and_rejects_invalid_patterns() {
+        let yaml = "dns:\n  enable: true\n  nameserver: [1.1.1.1]\n";
+        let mut config = crate::Config::Str(yaml.to_owned()).try_parse().unwrap();
+        config.dns.fallback_filter.domain = vec!["bücher.example".to_owned()];
+        let config = config.validate().expect("valid IDNA fallback selector");
+        assert_eq!(config.dns.fallback_filter.domain, ["xn--bcher-kva.example"]);
+
+        let mut config = crate::Config::Str(yaml.to_owned()).try_parse().unwrap();
+        config.dns.fallback_filter.domain =
+            vec!["geosite:private.example".to_owned()];
+        let error = match config.validate() {
+            Ok(_) => {
+                panic!("unsupported fallback rule must not be silently ignored")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("dns.fallback-filter.domain"), "{error}");
+        assert!(!error.contains("geosite:private.example"), "{error}");
     }
 
     #[cfg(target_os = "macos")]
