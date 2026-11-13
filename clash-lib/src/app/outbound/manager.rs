@@ -78,6 +78,7 @@ pub struct OutboundManager {
     /// proxy_names: Vec<String>,
     /// name -> provider
     proxy_providers: HashMap<String, ThreadSafeProxyProvider>,
+    deferred_proxy_providers: Vec<ThreadSafeProxyProvider>,
     proxy_manager: ProxyManager,
     selector_control: HashMap<String, ThreadSafeSelectorControl>,
     cache_store: ThreadSafeCacheFile,
@@ -270,6 +271,7 @@ impl OutboundManager {
             registry,
             NetworkPathSource::default(),
             false,
+            false,
         )
         .await
     }
@@ -286,6 +288,7 @@ impl OutboundManager {
         registry: OutboundHandlerRegistry,
         network_path_source: NetworkPathSource,
         protect_provider_dns: bool,
+        defer_http_provider_initialization: bool,
     ) -> Result<Self, Error> {
         // Build all handlers in a plain HashMap during initialization.
         // Once fully assembled it is written into the shared registry so that
@@ -301,6 +304,7 @@ impl OutboundManager {
             proxy_manager,
             selector_control,
             proxy_providers: provider_registry,
+            deferred_proxy_providers: Vec::new(),
             cache_store: cache_store.clone(),
             network_path_source,
             pool_reset_gate: Mutex::new(()),
@@ -309,13 +313,15 @@ impl OutboundManager {
         };
 
         debug!("initializing proxy providers");
-        m.load_proxy_providers(
-            cwd,
-            proxy_providers,
-            dns_resolver,
-            protect_provider_dns,
-        )
-        .await?;
+        m.deferred_proxy_providers = m
+            .load_proxy_providers(
+                cwd,
+                proxy_providers,
+                dns_resolver,
+                protect_provider_dns,
+                defer_http_provider_initialization,
+            )
+            .await?;
 
         debug!("initializing handlers");
         m.load_handlers(
@@ -710,6 +716,22 @@ impl OutboundManager {
 
     pub fn get_proxy_providers(&self) -> HashMap<String, ThreadSafeProxyProvider> {
         self.proxy_providers.clone()
+    }
+
+    pub(crate) fn activate_deferred_providers_after_commit(&self) {
+        for provider in &self.deferred_proxy_providers {
+            let provider = provider.clone();
+            tokio::spawn(async move {
+                let provider = provider.read().await;
+                if let Err(error) = provider.activate_after_commit().await {
+                    error!(
+                        provider = provider.name(),
+                        %error,
+                        "deferred proxy provider initialization failed after bounded retries; provider remains registered"
+                    );
+                }
+            });
+        }
     }
 
     /// Initial provider health probes may be suppressed while the candidate
@@ -1385,8 +1407,11 @@ impl OutboundManager {
         proxy_providers: HashMap<String, OutboundProxyProviderDef>,
         resolver: ThreadSafeDNSResolver,
         protect_provider_dns: bool,
-    ) -> Result<(), Error> {
+        defer_http_provider_initialization: bool,
+    ) -> Result<Vec<ThreadSafeProxyProvider>, Error> {
         let provider_registry = &mut self.proxy_providers;
+        let mut deferred_provider_names = HashSet::new();
+        let mut deferred_providers = Vec::new();
         for (name, provider) in proxy_providers.into_iter() {
             match provider {
                 OutboundProxyProviderDef::Http(http) => {
@@ -1430,6 +1455,20 @@ impl OutboundManager {
                             ))
                         })?,
                     ));
+                    if defer_http_provider_initialization {
+                        provider
+                            .read()
+                            .await
+                            .prepare_candidate_from_cache()
+                            .await
+                            .map_err(|error| {
+                                Error::Operation(format!(
+                                    "failed to prepare cached HTTP proxy provider {name}: {error}"
+                                ))
+                            })?;
+                        deferred_provider_names.insert(name.clone());
+                        deferred_providers.push(provider.clone());
+                    }
                     provider_registry.insert(name, provider);
                 }
                 OutboundProxyProviderDef::File(file) => {
@@ -1557,6 +1596,9 @@ impl OutboundManager {
             .collect();
         let mut failed = Vec::new();
         for (name, provider) in providers {
+            if deferred_provider_names.contains(&name) {
+                continue;
+            }
             info!("initializing provider {}", name);
             if let Err(err) = provider.read().await.initialize().await {
                 error!("failed to initialize proxy provider {}: {}", name, err);
@@ -1569,7 +1611,7 @@ impl OutboundManager {
             provider_registry.remove(&name);
         }
 
-        Ok(())
+        Ok(deferred_providers)
     }
 }
 
@@ -1878,6 +1920,7 @@ ip: not-an-ip
             .collect::<HashMap<_, _>>();
         OutboundManager {
             proxy_providers: HashMap::new(),
+            deferred_proxy_providers: Vec::new(),
             proxy_manager: ProxyManager::new(dns, None),
             selector_control: HashMap::new(),
             cache_store: ThreadSafeCacheFile::new(

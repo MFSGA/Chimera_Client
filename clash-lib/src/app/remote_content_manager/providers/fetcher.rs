@@ -96,6 +96,7 @@ pub struct Fetcher<U, P> {
     parser: Arc<P>,
     pub on_update: Option<Arc<U>>,
     cancel_token: CancellationToken,
+    initialized: AtomicBool,
     initial_immediate_refresh: AtomicBool,
     polling_started: AtomicBool,
 }
@@ -131,6 +132,7 @@ where
             parser: Arc::new(parser),
             on_update: on_update.map(Arc::new),
             cancel_token: CancellationToken::new(),
+            initialized: AtomicBool::new(false),
             initial_immediate_refresh: AtomicBool::new(false),
             polling_started: AtomicBool::new(false),
         }
@@ -160,6 +162,9 @@ where
         let vehicle_path = self.vehicle.path().to_owned();
 
         let mut inner = self.inner.write().await;
+        if self.initialized.load(Ordering::Acquire) {
+            return Ok(());
+        }
 
         let mut content = match metadata(&vehicle_path) {
             Ok(meta) => {
@@ -221,7 +226,58 @@ where
 
         self.initial_immediate_refresh
             .store(immediately_update, Ordering::Release);
+        self.initialized.store(true, Ordering::Release);
         Ok(())
+    }
+
+    /// Publish an already-valid HTTP cache without reading from its remote
+    /// vehicle. A missing or invalid cache is left untouched so normal
+    /// initialization can fetch it after the runtime candidate is committed.
+    pub async fn prepare_candidate_from_cache(&self) -> anyhow::Result<bool> {
+        if self.vehicle.typ() != ProviderVehicleType::Http {
+            return Ok(false);
+        }
+
+        let mut inner = self.inner.write().await;
+        if self.initialized.load(Ordering::Acquire) {
+            return Ok(true);
+        }
+
+        let vehicle_path = Path::new(self.vehicle.path());
+        let meta = match metadata(vehicle_path) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let content = fs::read(vehicle_path)?;
+        let items = match (self.parser)(&content) {
+            Ok(items) => items,
+            Err(_) => {
+                warn!(
+                    provider = self.name.as_str(),
+                    "provider cache is invalid; deferring remote recovery until candidate commit"
+                );
+                return Ok(false);
+            }
+        };
+
+        if let Some(on_update) = self.on_update.as_ref() {
+            on_update(items).await?;
+        }
+
+        let modified = meta.modified()?;
+        inner.updated_at = modified;
+        inner.hash = utils::md5(&content)[..16]
+            .try_into()
+            .expect("md5 must be 16 bytes");
+        self.initial_immediate_refresh.store(
+            cache_needs_immediate_update(SystemTime::now(), modified, self.interval),
+            Ordering::Release,
+        );
+        self.initialized.store(true, Ordering::Release);
+        Ok(true)
     }
 
     /// Start background refresh only after the initial updater has installed
