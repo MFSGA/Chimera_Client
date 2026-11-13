@@ -12,7 +12,7 @@ use crate::{
     app::{
         dns::ThreadSafeDNSResolver,
         remote_content_manager::providers::{
-            file_vehicle, http_vehicle,
+            ProviderVehicleType, file_vehicle, http_vehicle,
             rule_provider::{RuleProviderImpl, ThreadSafeRuleProvider},
         },
         router::rules::{
@@ -74,9 +74,18 @@ pub struct Router {
     country_mmdb: Option<MmdbLookup>,
     asn_mmdb: Option<MmdbLookup>,
     rule_providers: HashMap<String, ThreadSafeRuleProvider>,
+    deferred_rule_providers: Vec<ThreadSafeRuleProvider>,
 }
 
 pub type ThreadSafeRouter = Arc<Router>;
+
+pub(crate) struct RouterProviderInitOptions {
+    pub(crate) country_mmdb: Option<MmdbLookup>,
+    pub(crate) asn_mmdb: Option<MmdbLookup>,
+    pub(crate) geodata: Option<GeoDataLookup>,
+    pub(crate) cwd: String,
+    pub(crate) defer_http_providers: bool,
+}
 
 /// A rule's interface is a hard egress constraint. Failure must never silently
 /// fall back to a system/default interface, even during DNS rule dispatch.
@@ -130,14 +139,43 @@ impl Router {
         geodata: Option<GeoDataLookup>,
         cwd: String,
     ) -> Result<Self, crate::Error> {
+        Self::new_with_provider_initialization(
+            rules,
+            rule_providers,
+            dns_resolver,
+            RouterProviderInitOptions {
+                country_mmdb,
+                asn_mmdb,
+                geodata,
+                cwd,
+                defer_http_providers: false,
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn new_with_provider_initialization(
+        rules: Vec<RuleType>,
+        rule_providers: HashMap<String, RuleProviderDef>,
+        dns_resolver: ThreadSafeDNSResolver,
+        options: RouterProviderInitOptions,
+    ) -> Result<Self, crate::Error> {
+        let RouterProviderInitOptions {
+            country_mmdb,
+            asn_mmdb,
+            geodata,
+            cwd,
+            defer_http_providers,
+        } = options;
         let mut rule_provider_registry = HashMap::new();
-        Self::load_rule_providers(
+        let deferred_rule_providers = Self::load_rule_providers(
             rule_providers,
             &mut rule_provider_registry,
             dns_resolver.clone(),
             country_mmdb.clone(),
             geodata.clone(),
             cwd,
+            defer_http_providers,
         )
         .await?;
 
@@ -159,7 +197,23 @@ impl Router {
             country_mmdb,
             asn_mmdb,
             rule_providers: rule_provider_registry,
+            deferred_rule_providers,
         })
+    }
+
+    pub(crate) fn activate_deferred_providers_after_commit(&self) {
+        for provider in &self.deferred_rule_providers {
+            let provider = provider.clone();
+            tokio::spawn(async move {
+                if let Err(error) = provider.activate_after_commit().await {
+                    error!(
+                        provider = provider.name(),
+                        %error,
+                        "deferred rule provider initialization failed after bounded retries; provider remains registered"
+                    );
+                }
+            });
+        }
     }
 
     pub fn get_rule_providers(&self) -> &HashMap<String, ThreadSafeRuleProvider> {
@@ -296,7 +350,8 @@ impl Router {
         mmdb: Option<MmdbLookup>,
         geodata: Option<GeoDataLookup>,
         cwd: String,
-    ) -> Result<(), crate::Error> {
+        defer_http_providers: bool,
+    ) -> Result<Vec<ThreadSafeRuleProvider>, crate::Error> {
         for (name, provider) in rule_providers.into_iter() {
             match provider {
                 RuleProviderDef::Http(http) => {
@@ -360,7 +415,24 @@ impl Router {
             }
         }
 
+        let mut deferred = Vec::new();
         for provider in rule_provider_registry.values() {
+            if defer_http_providers
+                && provider.vehicle_type() == ProviderVehicleType::Http
+            {
+                provider
+                    .prepare_candidate_from_cache()
+                    .await
+                    .map_err(|error| {
+                        crate::Error::Operation(format!(
+                            "failed to prepare cached HTTP rule provider {}: {error}",
+                            provider.name()
+                        ))
+                    })?;
+                deferred.push(provider.clone());
+                continue;
+            }
+
             let provider = provider.clone();
             tokio::spawn(async move {
                 info!("initializing rule provider {}", provider.name());
@@ -375,7 +447,7 @@ impl Router {
             });
         }
 
-        Ok(())
+        Ok(deferred)
     }
 }
 

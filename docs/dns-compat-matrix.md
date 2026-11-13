@@ -14,6 +14,15 @@
 - macOS ARM64 / Rust 1.99.1：修复前定向 0/1、修复后 1/1；transport-reset 定向回归 5/5；默认特性 + tun/ring 核心库 1199 通过、0 失败、11 忽略，DNS 配置集成 46/46；严格 Clippy（all-targets）、fmt 与 diff --check 通过。最小特性（no-default + tun/ring）严格 Clippy 和新增定向测试 1/1 通过。
 - 仍需 L2 独立审查、并发 reset 确定性测试、完整 feature/跨平台回归、macOS 物理 NIC/utun 抓包。未修改系统网络。
 
+
+## 2026-11-13 15:10 PST — 受保护候选 HTTP Provider 缓存预热与提交后激活（L2 待审）
+
+- **基线**：在本地 `master` 的 `2e5ac13350f5ffa329bfd8014a8b54fe9a1460f5` 上迭代，开工时 `origin/master` 与远端 `master` 同 SHA；固定 Mihomo `ref-mihomo` 为 `63bd52ec794b7051569b76ede2f6cdbf4c091fda`。本改动没有对应的上游发布/提交事务 API，因此只实现 Chimera 本地运行时语义，没有改动参考子模块。
+- **能力变化**：macOS + TUN + DNS Fake-IP 的未提交热更新候选，现在可解析并应用本地有效的 HTTP proxy/rule provider 缓存；候选构建阶段不启动 HTTP 拉取、轮询、文件写入或远端健康探测。缓存缺失或解析无效时保留原文件并延迟首次拉取。仅在旧 DNS owner 退休且新 DNS resolver/listener 发布后，异步启动这些 provider 的远端初始化；首次初始化采用 3 次尝试（含两次 250ms、1s 退避）。若三次均失败，非零 interval 继续走已有轮询；interval 为 0 时不启用周期刷新，provider 仍保留注册。对有效缓存，interval 为 0 保持原有“只用缓存、不远端刷新”语义；缺失/无效缓存仍会在提交后首次拉取。其他普通/非受保护配置沿用原初始化路径。
+- **回归覆盖**：`protected_candidate_http_provider_fetches_only_after_commit` 验证损坏缓存提交前不改写、commit 后恢复节点并保存有效响应；`protected_candidate_http_proxy_provider_uses_cache_and_keeps_it_on_refresh_failure` 验证有效代理缓存和 selector 在提交前可用、提交后 503 不清空现有缓存/节点；三个 HTTP rule-provider 用例分别验证无缓存的提交后抓取、首次 503 后重试成功，以及有效缓存且 interval=0 时提交前后均不远端访问；`nonprotected_candidate_preserves_legacy_http_provider_bootstrap` 覆盖旧路径；既有受保护文件 provider health-check 用例继续覆盖候选期禁止探测及提交后恢复。测试服务只绑定 loopback，不查询公网 DNS，不启动真实 TUN 或修改系统网络。
+- **验证**（macOS ARM64，Rust 1.99.1）：定向过滤 `candidate_` **28/28**；最小 `--no-default-features --features tun,ring` 的 `clash-lib --lib` **1098 通过、0 失败、11 忽略**；带默认 feature 的 `clash-lib --lib` **1290 通过、0 失败、11 忽略**；带默认 feature 的严格 `cargo clippy -p clash-lib --features tun,ring --all-targets --locked -j 2 -- -D warnings` 通过；`cargo fmt --all -- --check` 与 `git diff --check` 通过。独立 Reviewer 指出 interval=0 的首次失败没有自动恢复后，新增 `protected_candidate_http_rule_provider_retries_zero_interval_bootstrap`，首请求 503、第二请求成功的用例连续 **5/5** 通过；没有通过 lint 例外压制警告。
+- **限制**：本轮没有 Linux/Windows 编译或运行、真实 macOS NIC/utun 抓包、系统 DNS 接管测试、外网服务实测或 GitHub CI。只有 HTTP provider 获得该两阶段行为；MMDB/GeoSite 候选下载仍由之前的保护逻辑拒绝。提交后启动的 provider 请求是异步的，reload 成功只表示运行时候选已发布，不保证远端 provider 当时可达；失败保留当前缓存/可用节点，interval 非零时已有轮询继续重试，interval 为 0 时仅完成 3 次无缓存/无效缓存的首次尝试，后续需显式刷新。最终 SHA 尚未形成，独立 L2 审查与维护者验收待完成；回滚本轮时需一并恢复 `factory.rs` 的受保护 HTTP 拒绝逻辑与 provider 延后激活调用，避免重新打开候选期出站窗口。
+
 # DNS 兼容契约矩阵（S00 / 开发基线）
 
 ## 2026-11-10 — 网络重置不得隐式启用 DNS 正缓存（P0 回归）
