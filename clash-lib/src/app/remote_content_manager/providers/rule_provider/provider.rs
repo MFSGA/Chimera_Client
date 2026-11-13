@@ -18,7 +18,7 @@ use crate::{
     app::{
         remote_content_manager::providers::{
             Provider, ProviderType, ProviderVehicleType, ThreadSafeProviderVehicle,
-            fetcher::Fetcher,
+            fetcher::Fetcher, initialize_provider_with_retry,
         },
         router::{RuleMatcher, map_rule_type},
     },
@@ -376,6 +376,28 @@ impl Provider for RuleProviderImpl {
             }
         }
         Ok(())
+    }
+
+    async fn prepare_candidate_from_cache(&self) -> std::io::Result<bool> {
+        let Some(fetcher) = &self.fetcher else {
+            return Ok(false);
+        };
+        fetcher
+            .prepare_candidate_from_cache()
+            .await
+            .map_err(map_io_error)
+    }
+
+    async fn activate_after_commit(&self) -> std::io::Result<()> {
+        let result = initialize_provider_with_retry(self).await;
+        if result.is_err()
+            && let Some(fetcher) = &self.fetcher
+        {
+            // The provider remains registered after bounded bootstrap
+            // retries; a configured refresh interval may retry again.
+            fetcher.start_polling().await;
+        }
+        result
     }
 
     async fn update(&self) -> std::io::Result<()> {

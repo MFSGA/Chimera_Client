@@ -451,15 +451,18 @@ fn network_runtime_lease_rejects_concurrent_owner() {
 
 #[cfg(all(target_os = "macos", feature = "tun"))]
 #[tokio::test]
-async fn protected_candidate_http_provider_must_not_fetch_before_commit() {
-    // An uncommitted DNS policy must not make a provider HTTP request.
+async fn protected_candidate_http_provider_fetches_only_after_commit() {
     // Using an IP-literal loopback server guarantees no OS DNS or real NIC
-    // traffic is required even when this test fails in the red phase.
+    // traffic is required. Candidate construction must not fetch; publication
+    // of its DNS owners enables deferred provider initialization.
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const FETCHED_PROVIDER: &[u8] =
+        b"proxies:\n  - name: fetched-node\n    type: socks5\n    server: 127.0.0.1\n    port: 1881\n";
 
     initialize();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -482,7 +485,7 @@ async fn protected_candidate_http_provider_must_not_fetch_before_commit() {
                 conn.read(&mut buf),
             )
             .await;
-            let body = b"proxies: []\n";
+            let body = FETCHED_PROVIDER;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
@@ -493,6 +496,8 @@ async fn protected_candidate_http_provider_must_not_fetch_before_commit() {
     });
 
     let temp = tempfile::tempdir().unwrap();
+    let invalid_cache = b"not a proxy provider document";
+    std::fs::write(temp.path().join("provider-cache.yaml"), invalid_cache).unwrap();
     let config = crate::Config::Str(format!(
         r#"ipv6: false
 mode: direct
@@ -514,9 +519,13 @@ proxy-providers:
     interval: 3600
     health-check:
       enable: false
+proxy-groups:
+  - name: provider-group
+    type: select
+    use: [candidate]
 proxies: []
 rules:
-  - MATCH,DIRECT
+  - MATCH,provider-group
 "#
     ))
     .try_parse()
@@ -524,22 +533,175 @@ rules:
 
     // false means we are *preparing* a candidate for reload rather than
     // starting a live runtime; it must be side-effect-free.
-    let result =
-        super::create_components(temp.path().to_path_buf(), config, false).await;
-    provider_server.abort();
-    let _ = provider_server.await;
+    let components =
+        super::create_components(temp.path().to_path_buf(), config, false)
+            .await
+            .expect("protected candidate should defer HTTP provider initialization");
     assert_eq!(
         hits.load(Ordering::SeqCst),
         0,
         "uncommitted candidate contacted its HTTP provider before publication"
     );
-    let err = match result {
-        Ok(_) => panic!("candidate HTTP bootstrap must be deferred or rejected"),
-        Err(err) => err.to_string(),
+    assert_eq!(
+        std::fs::read(temp.path().join("provider-cache.yaml")).unwrap(),
+        invalid_cache,
+        "candidate must not replace an invalid cache before commit"
+    );
+
+    components.dns_resolver.publish();
+    components.control_plane_dns_resolver.publish();
+    components.dns_listener.publish();
+    components
+        .outbound_manager
+        .activate_deferred_providers_after_commit();
+    tokio::time::timeout(std::time::Duration::from_secs(3), provider_server)
+        .await
+        .expect("deferred provider fetch did not start after commit")
+        .expect("provider server task panicked");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let group = components
+        .outbound_manager
+        .get_outbound("provider-group")
+        .await
+        .expect("provider-backed selector should remain registered");
+    let group = group
+        .try_as_group_handler()
+        .expect("provider-backed outbound should be a group");
+    let mut proxies = group.get_proxies().await;
+    for _ in 0..20 {
+        if !proxies.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        proxies = group.get_proxies().await;
+    }
+    assert_eq!(proxies.len(), 1);
+    assert_eq!(proxies[0].name(), "fetched-node");
+    assert_eq!(
+        std::fs::read(temp.path().join("provider-cache.yaml")).unwrap(),
+        FETCHED_PROVIDER
+    );
+}
+
+#[cfg(all(target_os = "macos", feature = "tun"))]
+#[tokio::test]
+async fn protected_candidate_http_proxy_provider_uses_cache_and_keeps_it_on_refresh_failure()
+ {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
     };
-    assert!(
-        err.contains("proxy-provider") && err.contains("before DNS publication"),
-        "unexpected candidate provider failure: {err}"
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    initialize();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = hits.clone();
+    let server = tokio::spawn(async move {
+        if let Ok(Ok((mut conn, _))) = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            listener.accept(),
+        )
+        .await
+        {
+            seen.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0; 2048];
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                conn.read(&mut buf),
+            )
+            .await;
+            let body = b"refresh unavailable";
+            let response = format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = conn.write_all(response.as_bytes()).await;
+            let _ = conn.write_all(body).await;
+        }
+    });
+
+    let temp = tempfile::tempdir().unwrap();
+    let cached = b"proxies:\n  - name: cached-node\n    type: socks5\n    server: 127.0.0.1\n    port: 1880\n";
+    std::fs::write(temp.path().join("provider-cache.yaml"), cached).unwrap();
+    let config = crate::Config::Str(format!(
+        r#"ipv6: false
+mode: direct
+mmdb: null
+tun:
+  enable: true
+  dns-hijack: false
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: fake-ip
+  nameserver: ['udp://127.0.0.1:9']
+  default-nameserver: ['udp://127.0.0.1:9']
+proxy-providers:
+  candidate:
+    type: http
+    url: http://127.0.0.1:{port}/candidate.yaml
+    path: provider-cache.yaml
+    interval: 3600
+    health-check:
+      enable: true
+      lazy: false
+      url: http://127.0.0.1:{port}/health
+proxy-groups:
+  - name: provider-group
+    type: select
+    use: [candidate]
+proxies: []
+rules:
+  - MATCH,provider-group
+"#
+    ))
+    .try_parse()
+    .unwrap();
+
+    let components =
+        super::create_components(temp.path().to_path_buf(), config, false)
+            .await
+            .expect(
+                "cached protected provider should prepare without remote access",
+            );
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    let provider = components
+        .outbound_manager
+        .get_proxy_provider("candidate")
+        .expect("candidate provider should remain registered");
+    let cached_proxies = provider.read().await.proxies().await;
+    assert_eq!(cached_proxies.len(), 1);
+    assert_eq!(cached_proxies[0].name(), "cached-node");
+    let group = components
+        .outbound_manager
+        .get_outbound("provider-group")
+        .await
+        .expect("cached provider-backed selector should remain registered");
+    let group = group
+        .try_as_group_handler()
+        .expect("cached provider-backed outbound should be a group");
+    assert_eq!(group.get_proxies().await[0].name(), "cached-node");
+
+    components.dns_resolver.publish();
+    components.control_plane_dns_resolver.publish();
+    components.dns_listener.publish();
+    components
+        .outbound_manager
+        .activate_deferred_providers_after_commit();
+    tokio::time::timeout(std::time::Duration::from_secs(3), server)
+        .await
+        .expect("post-commit refresh did not start")
+        .expect("provider server task panicked");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let retained = provider.read().await.proxies().await;
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].name(), "cached-node");
+    assert_eq!(group.get_proxies().await[0].name(), "cached-node");
+    assert_eq!(
+        std::fs::read(temp.path().join("provider-cache.yaml")).unwrap(),
+        cached
     );
 }
 
@@ -626,13 +788,46 @@ rules:
 
 #[cfg(all(target_os = "macos", feature = "tun"))]
 #[tokio::test]
-async fn protected_candidate_http_rule_provider_must_not_start_before_commit() {
-    // HTTP rule-provider initialization is spawned in Router::new, before the
-    // reload coordinator can suspend the candidate DNS owner. Reject safely
-    // before any asynchronous candidate fetch is scheduled.
+async fn protected_candidate_http_rule_provider_starts_only_after_commit() {
+    // HTTP rule-provider initialization used to be spawned inside Router::new.
+    // A protected candidate now retains the provider and starts it only after
+    // its DNS owners are published.
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     initialize();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = hits.clone();
+    let server = tokio::spawn(async move {
+        if let Ok(Ok((mut conn, _))) = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            listener.accept(),
+        )
+        .await
+        {
+            seen.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0; 2048];
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                conn.read(&mut buf),
+            )
+            .await;
+            let body = b"payload:\n  - example.test\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = conn.write_all(response.as_bytes()).await;
+            let _ = conn.write_all(body).await;
+        }
+    });
     let temp = tempfile::tempdir().unwrap();
-    let config = crate::Config::Str(
+    let config = crate::Config::Str(format!(
         r#"ipv6: false
 mode: direct
 mmdb: null
@@ -648,7 +843,7 @@ dns:
 rule-providers:
   candidate-rules:
     type: http
-    url: http://127.0.0.1:9/candidate.rules
+    url: http://127.0.0.1:{port}/candidate.rules
     path: candidate-rules.yaml
     interval: 3600
     behavior: domain
@@ -656,20 +851,259 @@ proxies: []
 rules:
   - MATCH,DIRECT
 "#
-        .to_owned(),
-    )
+    ))
     .try_parse()
     .unwrap();
-    let result =
-        super::create_components(temp.path().to_path_buf(), config, false).await;
-    let err = match result {
-        Ok(_) => panic!("uncommitted protected HTTP rule provider was scheduled"),
-        Err(err) => err.to_string(),
+    let components =
+        super::create_components(temp.path().to_path_buf(), config, false)
+            .await
+            .expect(
+                "protected candidate should defer HTTP rule-provider initialization",
+            );
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+    components.dns_resolver.publish();
+    components.control_plane_dns_resolver.publish();
+    components.dns_listener.publish();
+    components.router.activate_deferred_providers_after_commit();
+    tokio::time::timeout(std::time::Duration::from_secs(3), server)
+        .await
+        .expect("deferred rule-provider fetch did not start after commit")
+        .expect("rule-provider server task panicked");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    use crate::{Session, session::SocksAddr};
+    let provider = components
+        .router
+        .get_rule_providers()
+        .get("candidate-rules")
+        .expect("candidate rule provider should remain registered");
+    let session = Session {
+        destination: SocksAddr::Domain("example.test".to_owned(), 443),
+        ..Default::default()
+    };
+    for _ in 0..20 {
+        if provider.search(&session) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        provider.search(&session),
+        "post-commit rule update not visible"
+    );
+}
+
+#[cfg(all(target_os = "macos", feature = "tun"))]
+#[tokio::test]
+async fn protected_candidate_http_rule_provider_retries_zero_interval_bootstrap() {
+    use crate::{Session, session::SocksAddr};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    initialize();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = hits.clone();
+    let server = tokio::spawn(async move {
+        for attempt in 0..2 {
+            let Ok(Ok((mut conn, _))) = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                listener.accept(),
+            )
+            .await
+            else {
+                return;
+            };
+            seen.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0; 2048];
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                conn.read(&mut buf),
+            )
+            .await;
+            let (status, body) = if attempt == 0 {
+                ("503 Service Unavailable", b"temporary failure".as_slice())
+            } else {
+                ("200 OK", b"payload:\n  - retry.example.test\n".as_slice())
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = conn.write_all(response.as_bytes()).await;
+            let _ = conn.write_all(body).await;
+        }
+    });
+
+    let temp = tempfile::tempdir().unwrap();
+    let config = crate::Config::Str(format!(
+        r#"ipv6: false
+mode: direct
+mmdb: null
+tun:
+  enable: true
+  dns-hijack: false
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: fake-ip
+  nameserver: ['udp://127.0.0.1:9']
+  default-nameserver: ['udp://127.0.0.1:9']
+rule-providers:
+  candidate-rules:
+    type: http
+    url: http://127.0.0.1:{port}/candidate.rules
+    path: candidate-rules.yaml
+    behavior: domain
+proxies: []
+rules:
+  - MATCH,DIRECT
+"#
+    ))
+    .try_parse()
+    .expect("zero-interval rule-provider fixture must parse");
+    let components =
+        super::create_components(temp.path().to_path_buf(), config, false)
+            .await
+            .expect("protected candidate should defer rule-provider initialization");
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+    components.dns_resolver.publish();
+    components.control_plane_dns_resolver.publish();
+    components.dns_listener.publish();
+    components.router.activate_deferred_providers_after_commit();
+    tokio::time::timeout(std::time::Duration::from_secs(4), server)
+        .await
+        .expect("zero-interval bootstrap retry did not occur")
+        .expect("rule-provider server task panicked");
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+    let provider = components
+        .router
+        .get_rule_providers()
+        .get("candidate-rules")
+        .expect("candidate rule provider should remain registered");
+    let session = Session {
+        destination: SocksAddr::Domain("retry.example.test".to_owned(), 443),
+        ..Default::default()
+    };
+    for _ in 0..20 {
+        if provider.search(&session) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        provider.search(&session),
+        "retried rule content not visible"
+    );
+}
+
+#[cfg(all(target_os = "macos", feature = "tun"))]
+#[tokio::test]
+async fn protected_candidate_http_rule_provider_keeps_zero_interval_cache_after_commit()
+ {
+    use crate::{Session, session::SocksAddr};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    initialize();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = hits.clone();
+    let mut server = tokio::spawn(async move {
+        if let Ok(Ok((_conn, _))) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            listener.accept(),
+        )
+        .await
+        {
+            seen.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+
+    let temp = tempfile::tempdir().unwrap();
+    let cached = b"payload:\n  - cached.example.test\n";
+    std::fs::write(temp.path().join("candidate-rules.yaml"), cached).unwrap();
+    let config = crate::Config::Str(format!(
+        r#"ipv6: false
+mode: direct
+mmdb: null
+tun:
+  enable: true
+  dns-hijack: false
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: fake-ip
+  nameserver: ['udp://127.0.0.1:9']
+  default-nameserver: ['udp://127.0.0.1:9']
+rule-providers:
+  candidate-rules:
+    type: http
+    url: http://127.0.0.1:{port}/candidate.rules
+    path: candidate-rules.yaml
+    interval: 0
+    behavior: domain
+proxies: []
+rules:
+  - MATCH,DIRECT
+"#
+    ))
+    .try_parse()
+    .unwrap();
+    let components = super::create_components(
+        temp.path().to_path_buf(),
+        config,
+        false,
+    )
+    .await
+    .expect("cached protected rule provider should prepare without remote access");
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    let provider = components
+        .router
+        .get_rule_providers()
+        .get("candidate-rules")
+        .expect("candidate rule provider should remain registered");
+    let session = Session {
+        destination: SocksAddr::Domain("cached.example.test".to_owned(), 443),
+        ..Default::default()
     };
     assert!(
-        err.contains("rule-provider") && err.contains("before DNS publication"),
-        "unexpected candidate rule provider failure: {err}"
+        provider.search(&session),
+        "cached rule content was not staged"
     );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut server)
+            .await
+            .is_err(),
+        "candidate contacted the remote rule provider before commit"
+    );
+    components.dns_resolver.publish();
+    components.control_plane_dns_resolver.publish();
+    components.dns_listener.publish();
+    components.router.activate_deferred_providers_after_commit();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut server)
+            .await
+            .is_err(),
+        "zero-interval cached provider unexpectedly refreshed after commit"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    assert!(
+        provider.search(&session),
+        "zero-interval provider should retain its cached rules"
+    );
+    server.abort();
+    let _ = server.await;
 }
 
 #[cfg(all(target_os = "macos", feature = "tun"))]

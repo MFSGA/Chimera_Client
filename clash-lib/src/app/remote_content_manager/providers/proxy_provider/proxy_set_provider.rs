@@ -8,6 +8,7 @@ use crate::{
             providers::{
                 Provider, ProviderType, ProviderVehicleType,
                 ThreadSafeProviderVehicle, fetcher::Fetcher,
+                initialize_provider_with_retry,
             },
         },
     },
@@ -218,6 +219,23 @@ impl Provider for ProxySetProvider {
             );
         }
         Ok(())
+    }
+
+    async fn prepare_candidate_from_cache(&self) -> std::io::Result<bool> {
+        self.fetcher
+            .prepare_candidate_from_cache()
+            .await
+            .map_err(map_io_error)
+    }
+
+    async fn activate_after_commit(&self) -> std::io::Result<()> {
+        let result = initialize_provider_with_retry(self).await;
+        if result.is_err() {
+            // Keep the provider handle available to groups. If periodic
+            // refresh is configured, its first tick provides another retry.
+            self.fetcher.start_polling().await;
+        }
+        result
     }
 
     async fn update(&self) -> std::io::Result<()> {

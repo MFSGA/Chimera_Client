@@ -784,6 +784,16 @@ async fn start_with_shutdown_token(
                     new_components.dns_resolver.publish();
                     new_components.control_plane_dns_resolver.publish();
                     new_components.dns_listener.publish();
+                    // HTTP proxy/rule providers in a protected macOS
+                    // candidate may use only local cache data before this
+                    // point. Start their first remote read after publishing
+                    // the committed DNS owners.
+                    new_components
+                        .outbound_manager
+                        .activate_deferred_providers_after_commit();
+                    new_components
+                        .router
+                        .activate_deferred_providers_after_commit();
                     // Only a protected macOS TUN + Fake-IP candidate pauses
                     // its DNS owners *during construction*. It may skip eager
                     // file-provider health probes, so resume them once after

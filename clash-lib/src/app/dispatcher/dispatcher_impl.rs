@@ -3767,6 +3767,7 @@ mod tests {
             registry,
             network_path_source,
             false,
+            false,
         )
         .await
         .expect("failed to construct outbound manager");
@@ -3974,6 +3975,7 @@ mod tests {
             None,
             registry,
             network_path_source,
+            false,
             false,
         )
         .await

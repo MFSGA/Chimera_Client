@@ -21,7 +21,7 @@ use crate::{
         inbound::manager::InboundManager,
         outbound::manager::OutboundManager,
         profile,
-        router::Router,
+        router::{Router, RouterProviderInitOptions},
     },
     common::{
         auth,
@@ -42,46 +42,20 @@ use crate::{
     app::net::init_net_config, install_default_socket_protector, proxy::tun,
 };
 
-/// A protected replacement must not initiate HTTP provider DNS bootstrap
-/// before its new DNS policy is published. Proxy providers fetch synchronously
-/// during construction and rule providers start asynchronous fetch tasks.
-/// Suspending resolver access after creation is too late for both paths.
-/// Until deferred, post-commit provider initialization is supported, reject
-/// these reloads early and explicitly; ordinary startup and legacy non-TUN
-/// reloads retain their original provider semantics.
+/// Geo-data constructors may download or remove cached files during
+/// construction. These filesystem and network side effects are still rejected
+/// for a protected candidate until they have deferred post-commit support.
 #[cfg(target_os = "macos")]
-fn reject_uncommitted_candidate_remote_egress(
+fn validate_protected_candidate_geo_data(
     cwd: &std::path::Path,
     config: &InternalConfig,
     activate_network: bool,
 ) -> Result<()> {
-    use crate::config::internal::{
-        config::RuleProviderDef, proxy::OutboundProxyProviderDef,
-    };
-
     if !activate_network
         && config.tun.enable
         && config.dns.enable
         && config.dns.enhance_mode == def::DNSMode::FakeIp
     {
-        if config
-            .proxy_providers
-            .values()
-            .any(|provider| matches!(provider, OutboundProxyProviderDef::Http(_)))
-        {
-            return Err(Error::InvalidConfig(
-                "macOS TUN + Fake-IP candidate HTTP proxy-provider cannot fetch before DNS publication; protected reload requires post-commit provider initialization (not yet supported)".to_owned(),
-            ));
-        }
-        if config
-            .rule_providers
-            .values()
-            .any(|provider| matches!(provider, RuleProviderDef::Http(_)))
-        {
-            return Err(Error::InvalidConfig(
-                "macOS TUN + Fake-IP candidate HTTP rule-provider cannot fetch before DNS publication; protected reload requires post-commit provider initialization (not yet supported)".to_owned(),
-            ));
-        }
         // Geo-data constructors otherwise download immediately when the
         // local file is absent or force=true; corrupted MMDB data is removed
         // and downloaded again. These side effects are forbidden before a
@@ -129,7 +103,7 @@ pub(super) async fn create_components(
     activate_network: bool,
 ) -> Result<RuntimeComponents> {
     #[cfg(target_os = "macos")]
-    reject_uncommitted_candidate_remote_egress(&cwd, &config, activate_network)?;
+    validate_protected_candidate_geo_data(&cwd, &config, activate_network)?;
     let ipv6_allowed = !config.tun.enable || config.tun.gateway_v6.is_some();
     #[cfg(feature = "tun")]
     let network_config = RuntimeNetworkConfig {
@@ -295,6 +269,7 @@ pub(super) async fn create_components(
             outbound_registry.clone(),
             network_path_source.clone(),
             protect_provider_dns,
+            staged_protected_dns,
         )
         .await?,
     );
@@ -378,14 +353,17 @@ pub(super) async fn create_components(
 
     debug!("initializing router");
     let router = Arc::new(
-        Router::new(
+        Router::new_with_provider_initialization(
             config.rules,
             config.rule_providers,
             dns_resolver.clone(),
-            country_mmdb,
-            asn_mmdb,
-            geodata,
-            cwd.to_string_lossy().to_string(),
+            RouterProviderInitOptions {
+                country_mmdb,
+                asn_mmdb,
+                geodata,
+                cwd: cwd.to_string_lossy().to_string(),
+                defer_http_providers: staged_protected_dns,
+            },
         )
         .await?,
     );
