@@ -723,11 +723,10 @@ impl OutboundManager {
             let provider = provider.clone();
             tokio::spawn(async move {
                 let provider = provider.read().await;
-                if let Err(error) = provider.activate_after_commit().await {
+                if provider.activate_after_commit().await.is_err() {
                     error!(
                         provider = provider.name(),
-                        %error,
-                        "deferred proxy provider initialization failed after bounded retries; provider remains registered"
+                        "deferred proxy provider initialization failed after bounded retries; provider remains registered (details withheld)"
                     );
                 }
             });

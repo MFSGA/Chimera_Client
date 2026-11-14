@@ -80,6 +80,11 @@ fn write_cache_atomically(path: &Path, content: &[u8]) -> io::Result<()> {
 pub(crate) type CacheCommitRollback =
     Arc<dyn Fn() -> BoxFuture<'static, anyhow::Result<()>> + Send + Sync>;
 
+/// Release readers inside an unpublished candidate after its durable cache
+/// and provider data have been validated. Health checks remain deferred.
+pub(crate) type CacheCandidatePrepared =
+    Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
+
 /// Release the previous revision retained for rollback after the cache
 /// commit is durable (or when the source is a local file).
 pub(crate) type CacheCommitAccepted =
@@ -152,8 +157,10 @@ pub struct Fetcher<U, P> {
     parser: Arc<P>,
     pub on_update: Option<Arc<U>>,
     on_cache_commit_rollback: Option<CacheCommitRollback>,
+    on_cache_candidate_prepared: Option<CacheCandidatePrepared>,
     on_cache_commit_accepted: Option<CacheCommitAccepted>,
-    prepared_cache_pending_acceptance: AtomicBool,
+    prepared_cache_pending_acceptance: Arc<tokio::sync::Mutex<bool>>,
+    prepared_cache_acceptance_lock: tokio::sync::Mutex<()>,
     cancel_token: CancellationToken,
     initialized: Arc<AtomicBool>,
     initial_immediate_refresh: Arc<AtomicBool>,
@@ -192,8 +199,12 @@ where
             parser: Arc::new(parser),
             on_update: on_update.map(Arc::new),
             on_cache_commit_rollback: None,
+            on_cache_candidate_prepared: None,
             on_cache_commit_accepted: None,
-            prepared_cache_pending_acceptance: AtomicBool::new(false),
+            prepared_cache_pending_acceptance: Arc::new(tokio::sync::Mutex::new(
+                false,
+            )),
+            prepared_cache_acceptance_lock: tokio::sync::Mutex::new(()),
             cancel_token: CancellationToken::new(),
             initialized: Arc::new(AtomicBool::new(false)),
             initial_immediate_refresh: Arc::new(AtomicBool::new(false)),
@@ -201,14 +212,15 @@ where
         }
     }
 
-    /// Configure transactional rollback for provider updates that must keep
-    /// their DNS ownership and visible revision aligned with durable cache.
+    /// Configure cache transaction hooks and deferred candidate activation.
     pub(crate) fn with_cache_commit_hooks(
         mut self,
         rollback: CacheCommitRollback,
+        candidate_prepared: CacheCandidatePrepared,
         accepted: CacheCommitAccepted,
     ) -> Self {
         self.on_cache_commit_rollback = Some(rollback);
+        self.on_cache_candidate_prepared = Some(candidate_prepared);
         self.on_cache_commit_accepted = Some(accepted);
         self
     }
@@ -334,7 +346,7 @@ where
             return Ok(false);
         }
 
-        let mut inner = self.inner.write().await;
+        let mut inner = self.inner.clone().write_owned().await;
         if self.initialized.load(Ordering::Acquire) {
             return Ok(true);
         }
@@ -360,38 +372,53 @@ where
             }
         };
 
-        let published = if let Some(on_update) = self.on_update.as_ref() {
-            on_update(items).await?;
-            true
-        } else {
-            false
-        };
-
-        inner.updated_at = modified;
-        inner.hash = utils::md5(&content)[..16]
+        let hash = utils::md5(&content)[..16]
             .try_into()
             .expect("md5 must be 16 bytes");
-        self.initial_immediate_refresh.store(
-            cache_needs_immediate_update(SystemTime::now(), modified, self.interval),
-            Ordering::Release,
-        );
-        self.initialized.store(true, Ordering::Release);
-        self.prepared_cache_pending_acceptance.store(
-            published && self.on_cache_commit_accepted.is_some(),
-            Ordering::Release,
-        );
-        Ok(true)
+        let on_update = self.on_update.clone();
+        let candidate_prepared = self.on_cache_candidate_prepared.clone();
+        let has_acceptance_hook = self.on_cache_commit_accepted.is_some();
+        let pending_acceptance = self.prepared_cache_pending_acceptance.clone();
+        let initial_immediate_refresh = self.initial_immediate_refresh.clone();
+        let initialized = self.initialized.clone();
+        let interval = self.interval;
+
+        finish_published_transaction(async move {
+            let published = if let Some(on_update) = on_update {
+                on_update(items).await?;
+                true
+            } else {
+                false
+            };
+
+            inner.updated_at = modified;
+            inner.hash = hash;
+            initial_immediate_refresh.store(
+                cache_needs_immediate_update(SystemTime::now(), modified, interval),
+                Ordering::Release,
+            );
+            initialized.store(true, Ordering::Release);
+            *pending_acceptance.lock().await = published && has_acceptance_hook;
+
+            if published && let Some(candidate_prepared) = candidate_prepared {
+                candidate_prepared().await;
+            }
+            Ok(true)
+        })
+        .await
     }
 
-    /// Finish publishing a cached candidate once its runtime becomes active.
-    /// The caller must invoke this only after the candidate runtime commits.
+    /// Run deferred post-commit work for a cached candidate. Provider data is
+    /// available to internal candidate builders after cache validation; this
+    /// callback keeps health checks deferred until the runtime commits.
     pub async fn accept_prepared_candidate_after_commit(&self) {
-        if self
-            .prepared_cache_pending_acceptance
-            .swap(false, Ordering::AcqRel)
-            && let Some(accepted) = self.on_cache_commit_accepted.as_ref()
-        {
-            accepted().await;
+        let _guard = self.prepared_cache_acceptance_lock.lock().await;
+        let mut pending = self.prepared_cache_pending_acceptance.lock().await;
+        if *pending {
+            if let Some(accepted) = self.on_cache_commit_accepted.as_ref() {
+                accepted().await;
+            }
+            *pending = false;
         }
     }
 
@@ -1060,6 +1087,60 @@ mod tests {
         assert!(log.contains("provider update failed"), "{log}");
         assert!(!log.contains("private-provider.internal"), "{log}");
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn cancelled_prepared_candidate_acceptance_can_be_retried() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut vehicle = MockProviderVehicle::new();
+        vehicle
+            .expect_path()
+            .return_const("unused-cache.yaml".to_owned());
+        vehicle.expect_typ().return_const(ProviderVehicleType::Http);
+        let updater = |_payload: Vec<u8>| -> BoxFuture<'static, anyhow::Result<()>> {
+            Box::pin(async { Ok(()) })
+        };
+        let mut fetcher = Fetcher::new(
+            "prepared-acceptance-cancel".into(),
+            Duration::ZERO,
+            Arc::new(vehicle),
+            |bytes| Ok(bytes.to_vec()),
+            Some(updater),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let signal = entered.clone();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let resume = release.clone();
+        fetcher.on_cache_commit_accepted = Some(Arc::new(move || {
+            let count = count.clone();
+            let signal = signal.clone();
+            let resume = resume.clone();
+            Box::pin(async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                signal.notify_one();
+                resume.notified().await;
+            })
+        }));
+        *fetcher.prepared_cache_pending_acceptance.lock().await = true;
+        let fetcher = Arc::new(fetcher);
+
+        let activating = fetcher.clone();
+        let activation = tokio::spawn(async move {
+            activating.accept_prepared_candidate_after_commit().await;
+        });
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("accepted hook must start");
+        activation.abort();
+        assert!(activation.await.unwrap_err().is_cancelled());
+
+        release.notify_one();
+        fetcher.accept_prepared_candidate_after_commit().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(!*fetcher.prepared_cache_pending_acceptance.lock().await);
     }
 
     #[tokio::test]

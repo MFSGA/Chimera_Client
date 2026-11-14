@@ -8,7 +8,10 @@ use crate::{
             providers::{
                 Provider, ProviderType, ProviderVehicleType,
                 ThreadSafeProviderVehicle,
-                fetcher::{CacheCommitAccepted, CacheCommitRollback, Fetcher},
+                fetcher::{
+                    CacheCandidatePrepared, CacheCommitAccepted,
+                    CacheCommitRollback, Fetcher,
+                },
                 initialize_provider_with_retry,
             },
         },
@@ -158,8 +161,7 @@ impl ProxySetProvider {
                         // ownership could not be installed beforehand.
                         warn!(
                             provider = name.as_str(),
-                            error = %error,
-                            "retaining previous provider revision: node DNS domain registration failed"
+                            "retaining previous provider revision: node DNS domain registration failed (details withheld)"
                         );
                         pending_publication.lock().await.take();
                         return Err(error);
@@ -279,8 +281,21 @@ impl ProxySetProvider {
                 Ok(())
             })
         });
-        let accepted_slot = rollback_revision;
-        let accepted_admission = pending_publication;
+        let accepted_slot = rollback_revision.clone();
+        let accepted_admission = pending_publication.clone();
+        let prepared_slot = rollback_revision;
+        let prepared_admission = pending_publication;
+        let candidate_prepared: CacheCandidatePrepared = Arc::new(move || {
+            let slot = prepared_slot.clone();
+            let admission = prepared_admission.clone();
+            Box::pin(async move {
+                // The cache already exists durably and this runtime is still
+                // unpublished. Its selector builders need to read the
+                // candidate provider now; health checks remain deferred.
+                slot.lock().await.take();
+                admission.lock().await.take();
+            })
+        });
         let accepted_inner = inner.clone();
         let accepted_hc = hc.clone();
         let accepted: CacheCommitAccepted = Arc::new(move || {
@@ -304,7 +319,7 @@ impl ProxySetProvider {
             })
         });
         let fetcher = Fetcher::new(name, interval, vehicle, parser, Some(updater))
-            .with_cache_commit_hooks(rollback, accepted);
+            .with_cache_commit_hooks(rollback, candidate_prepared, accepted);
         Ok(Self {
             fetcher,
             hc,
@@ -501,6 +516,19 @@ proxies:
       mode: auto
 "#;
 
+    struct CaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     fn provider_with_refresh(
         path: String,
         refreshed_content: &'static [u8],
@@ -580,15 +608,15 @@ proxies:
         .unwrap();
 
         assert!(provider.prepare_candidate_from_cache().await.unwrap());
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(50),
-                provider.strict_content_snapshot()
-            )
-            .await
-            .is_err(),
-            "candidate contents remain gated before runtime commit"
-        );
+        let candidate = tokio::time::timeout(
+            Duration::from_secs(1),
+            provider.strict_content_snapshot(),
+        )
+        .await
+        .expect("candidate selectors must read the durable cache before commit")
+        .expect("valid cached provider must expose its candidate revision");
+        assert_eq!(candidate.revision, 1);
+        assert_eq!(candidate.proxies[0].server_name(), Some("198.51.100.10"));
 
         provider.activate_after_commit().await.unwrap();
         let accepted = tokio::time::timeout(
@@ -690,6 +718,15 @@ proxies:
 
     #[tokio::test]
     async fn provider_dns_registration_failure_preserves_last_visible_revision() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || CaptureWriter(writer.clone()))
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+
         const NEW_HOST: &[u8] = b"proxies:\n  - name: new-proxy\n    type: socks5\n    server: dynamic-node.example\n    port: 1080\n";
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("registrar-failure.yaml");
@@ -715,7 +752,9 @@ proxies:
             .times(3)
             .returning(move |_, _| match hits.fetch_add(1, Ordering::SeqCst) {
                 0 | 2 => Ok(()),
-                _ => Err(anyhow::anyhow!("synthetic registrar outage")),
+                _ => Err(anyhow::anyhow!(
+                    "synthetic private-node.example registrar outage"
+                )),
             });
         let health = HealthCheck::new(
             vec![],
@@ -737,10 +776,7 @@ proxies:
         let diagnostic = provider.update().await.expect_err(
             "a failed DNS node registration must not report successful provider refresh"
         ).to_string();
-        assert!(
-            diagnostic.contains("synthetic registrar outage"),
-            "{diagnostic}"
-        );
+        assert!(diagnostic.contains("private-node.example"), "{diagnostic}");
         assert_eq!(
             std::fs::read(&path).unwrap(),
             VALID,
@@ -767,6 +803,11 @@ proxies:
         );
         assert_eq!(std::fs::read(&path).unwrap(), NEW_HOST);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let log = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(
+            !log.contains("private-node.example"),
+            "provider registration logs must omit endpoint details"
+        );
     }
 
     #[tokio::test]

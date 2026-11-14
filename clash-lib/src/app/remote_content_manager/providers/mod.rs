@@ -109,12 +109,98 @@ where
                     provider = provider.name(),
                     attempt,
                     retry_in_ms = delay.as_millis(),
-                    %error,
-                    "deferred provider initialization failed; retrying"
+                    "deferred provider initialization failed; retrying (details withheld)"
                 );
                 attempt += 1;
                 tokio::time::sleep(*delay).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Provider, ProviderType, ProviderVehicleType, initialize_provider_with_retry,
+    };
+    use async_trait::async_trait;
+    use erased_serde::Serialize;
+    use std::{
+        collections::HashMap,
+        io,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    struct CaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl io::Write for CaptureWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct RetryOnceProvider {
+        attempts: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for RetryOnceProvider {
+        fn name(&self) -> &str {
+            "private-provider"
+        }
+
+        fn vehicle_type(&self) -> ProviderVehicleType {
+            ProviderVehicleType::Http
+        }
+
+        fn typ(&self) -> ProviderType {
+            ProviderType::Proxy
+        }
+
+        async fn initialize(&self) -> io::Result<()> {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(io::Error::other("private-node.example resolution failed"))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn update(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        async fn as_map(&self) -> HashMap<String, Box<dyn Serialize + Send>> {
+            HashMap::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_initialization_retry_log_withholds_error_text() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || CaptureWriter(writer.clone()))
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let provider = RetryOnceProvider {
+            attempts: AtomicUsize::new(0),
+        };
+
+        initialize_provider_with_retry(&provider).await.unwrap();
+
+        let log = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("details withheld"), "{log}");
+        assert!(!log.contains("private-node.example"), "{log}");
+        assert_eq!(provider.attempts.load(Ordering::SeqCst), 2);
     }
 }
