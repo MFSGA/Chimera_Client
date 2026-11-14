@@ -13,6 +13,25 @@ configuration.
 | CLI standard, headless | `cargo build -p clash-rs --no-default-features --features standard,aws-lc-rs --locked` | Enables the standard protocol and listener bundle with AWS-LC, without embedding the Dashboard or requiring Node.js. |
 | CLI plus | `cargo build -p clash-rs --features plus --locked` | Adds the `onion` compatibility feature to `standard`; the `onion` feature is empty and does not implement Tor. |
 
+## Protocol coverage compared with the local reference
+
+This comparison uses the checked-out `ref/` snapshot at
+`39d06a49ccb5c812ed7cd70b3028f3efcebeae6b` (2026-09-21). It describes source
+and feature coverage, not interoperability or runtime support on every target.
+
+| Area | Chimera Client | Local `ref/` snapshot |
+| --- | --- | --- |
+| Always-present outbound variants | Direct, Reject, SOCKS5, and VLESS | Direct, Reject, SOCKS5, AnyTLS, Trojan, VMess, VLESS, and Hysteria2 |
+| CLI `standard` feature bundle | Adds Shadowsocks, WireGuard, Trojan, AnyTLS, Hysteria2, TUN, and listener features | Adds Shadowsocks, TUIC, SSH, ShadowQUIC, WireGuard, Tailscale, TUN, TProxy, and Redir |
+| Chimera transport features | WebSocket, Reality, VLESS encryption, and XHTTP/H3 | No matching Reality, VLESS encryption, or XHTTP/H3 feature in this snapshot |
+| Additional reference protocols | — | Tor is enabled by `plus`; Tailscale, TUIC, SSH, and ShadowQUIC are feature-gated |
+| `onion` feature | Empty compatibility feature; no Tor implementation | Enables the Tor client dependencies |
+
+The local capability endpoint reports protocols compiled into the running
+binary. Keep that runtime result as the authority for a particular build. A
+reference-only protocol is a compatibility gap to prioritize from actual
+configuration demand; do not add an empty Cargo feature to represent it.
+
 Build Dashboard assets before using a Dashboard-enabled profile:
 
 ```bash
