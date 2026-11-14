@@ -342,6 +342,20 @@ impl Config {
     pub fn parse_nameserver_policy(
         policy_map: &HashMap<String, String>,
     ) -> Result<HashMap<String, NameServer>, Error> {
+        // Legacy HashMap callers have no declaration order to resolve
+        // canonical aliases. Keep their previous fail-closed behavior while
+        // the YAML-facing ordered API follows last-declaration precedence.
+        let mut selectors = HashSet::new();
+        for selector_group in policy_map.keys() {
+            for selector in selector_group.split(',') {
+                let normalized = Self::normalize_domain_selector(selector)?;
+                if !selectors.insert(normalized) {
+                    return Err(Error::InvalidConfig(
+                        "dns.nameserver-policy repeats domain selector".to_owned(),
+                    ));
+                }
+            }
+        }
         let ordered = policy_map
             .iter()
             .map(|(selector, value)| {
@@ -352,9 +366,9 @@ impl Config {
             .into_iter()
             .map(|(selector, upstreams)| {
                 let upstream = upstreams.into_iter().next().ok_or_else(|| {
-                    Error::InvalidConfig(format!(
-                        "DNS nameserver-policy for {selector} has no usable nameserver"
-                    ))
+                    Error::InvalidConfig(
+                        "DNS nameserver-policy has no usable nameserver".to_owned(),
+                    )
                 })?;
                 Ok((selector, upstream))
             })
@@ -1281,6 +1295,14 @@ mod tests {
             "192.0.2.53".to_owned(),
         )]);
         assert!(Config::parse_nameserver_policy(&invalid).is_err());
+        let aliases = std::collections::HashMap::from([
+            ("bücher.example".to_owned(), "192.0.2.53".to_owned()),
+            ("xn--bcher-kva.example".to_owned(), "192.0.2.54".to_owned()),
+        ]);
+        assert!(
+            Config::parse_nameserver_policy(&aliases).is_err(),
+            "unordered legacy API must reject colliding normalized selectors"
+        );
     }
 
     #[test]
