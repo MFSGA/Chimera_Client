@@ -240,3 +240,12 @@ System DNS 指向一个与 fake-IP 池、TUN 网关子网及 route exclusions �
 - 为使物理出口可观测性有主动、可复现的基准，新增 `physical_calibration_qname`：需要在**有权限的专用测试机**上单独授权、人工向每张受测物理接口发出专用允许直连的 DNS 校准查询；审计器不发送网络流量，只核查 QNAME 是否在本次受保护 canary 的刺激后、观察截止前出现在物理捕获中。若缺少校准、旧校准先于刺激，或与被保护的 canary 重名，则阴性结果降级或拒绝。报告只输出校准域名 SHA-256 和各接口命中数；内置多场景矩阵禁止复用同一校准域名来冒充不同测试。真实 NIC、Network Extension、系统 DNS、路由均未触及。
 - 最终离线异常输入巡检额外发现超长证据路径的原始 macOS `OSError`；现在预先拒绝超过 255 UTF-8 字节的路径分量与 NUL 路径，并加入回归测试。在固定随机种子下，额外对单 case 完整离线分析执行 1000 次 JSON 字段类型变异，972 项受控拒绝、28 项安全接受、0 个未处理异常；加上已有正常/异常证据用例，Python 回归达到 149 项通过。`--no-default-features --features ring` 的额外 Cargo 单测及 check 因隔离工作树磁盘空间不足（rustc exit 101）未完成，不能报为测试通过；只清理本工作树可再生的 `target/debug/incremental` 构建缓存，回收约 1.8 GiB，不涉及其它分支、worktree、宿主机 DNS/路由或 TUN。
 - 进一步修复恶意输入清单的类型混淆：单 case 与矩阵两处 JSON 解析都拒绝重复键（包括嵌套 `captures`/`cases`）、非标准 `NaN`/`Infinity` 数值以及布尔型 `schema_version:true` 冒充整数 `1`；对 tcpdump 原始退出统计过长数值做有界解析，避免跨 Python 版本的无控制异常。又新增过深 JSON 嵌套、超长整数和不受支持的浮点 JSON 输入的红灯测试，统一走有界/拒绝的解析路径，不会抛出未处理的 `RecursionError`。再将原始 manifest/矩阵/scutil/统计读取改为有界读取，并对流式抓包和文件 SHA-256 增加运行中大小上限；拒绝二进制 NUL 冒充文本的抓包、tcpdump 统计和 scutil 快照。进一步拒绝 manifest 中多个末尾 DNS 根点及 tcpdump QNAME 对同一畸形形式的静默归一化，确保只有合法查询可作为受保护 canary 或物理校准的覆盖证据。最终 148 项离线测试通过，未发起真实 DNS/网络操作。
+
+
+## 2026-11-15 TUN 慢 DNS 与普通 UDP 并发处理（L2）
+
+- 基线：本地 `master`、`HEAD`、`origin/master` 均为 `77f2085221d9e7dcca0c2b68709e73d0c19c45a8`；`ref/` 为 `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`。开始时工作区有独立的 TLS/VLESS/Hysteria2 未提交改动，本切片未触碰这些文件。
+- 修复前回归用例将 DNS resolver 挂起，并检查普通 UDP 是否仍能进入 dispatcher；旧收包循环在 200 ms 内未转发普通 UDP，复现了串行等待导致的队头阻塞。最终用例将等待放宽至 1 秒以减少 CI 调度抖动。
+- 收包循环现在用 `FuturesUnordered` 并发处理 TUN DNS：最多 8 个活动请求、最多 32 个排队请求。队列满时有效请求得到 `SERVFAIL`；TUN 输入关闭后，未完成的 DNS futures 随处理循环退出而取消。普通 UDP 仍走原有 dispatcher 队列，DNS 上游、Fake-IP 与路由策略未改变。
+- 内存通道定向回归覆盖慢 DNS 与普通 UDP 并发、队列上限/`SERVFAIL`、输入关闭时取消和既有 TUN UDP/DNS 行为：`cargo test -p clash-lib --lib --no-default-features --features tun,ring proxy::tun::datagram::tests -- --nocapture` 为 12 passed / 0 failed / 0 ignored。`cargo check -p clash-lib --no-default-features --features tun,ring --locked`、严格 all-target Clippy、`cargo fmt --all -- --check`、`git diff --check` 通过。
+- 独立 Reviewer 对最终代码与记录给出 `APPROVE_WITH_EVIDENCE`，没有未解决发现。没有启动真实 TUN、创建系统 socket、修改宿主机 DNS/路由或运行 Docker；实际 TUN 下的 p95/p99、丢包率、CPU/RSS 与吞吐收益仍需后续隔离 client-server 实测。当前单测证明收包循环不再串行等待一个 DNS 查询，不能据此宣称真实网络性能改善幅度。
