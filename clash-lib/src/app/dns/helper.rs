@@ -114,6 +114,19 @@ pub async fn make_clients(
         }
     }
 
+    // A node bootstrap policy must not silently lose one of its configured
+    // upstreams. Partial initialization would change the effective policy
+    // without notifying the operator, especially after network transitions.
+    // Keep the legacy best-effort behavior for ordinary DNS groups.
+    if network_options.group == Some("proxy_server")
+        && !initialization_errors.is_empty()
+    {
+        return Err(crate::Error::InvalidConfig(format!(
+            "proxy-server DNS bootstrap has unusable clients: {}",
+            initialization_errors.join("; ")
+        )));
+    }
+
     if had_configured_servers && rv.is_empty() {
         return Err(crate::Error::InvalidConfig(format!(
             "DNS upstream configuration contains no usable clients: {}",
@@ -376,6 +389,82 @@ mod tests {
             error.to_string().contains("unresolvable.example"),
             "bootstrap failure must name the unusable upstream: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn proxy_bootstrap_rejects_partially_unusable_upstreams() {
+        let mut resolver = MockClashResolver::new();
+        resolver.expect_resolve().once().returning(|_, _| Ok(None));
+        let upstream = |host: url::Host<String>| NameServer {
+            net: DNSNetMode::Udp,
+            host,
+            port: 53,
+            interface: None,
+            proxy: None,
+            doh_path: None,
+        };
+        let result = make_clients(
+            vec![
+                upstream(url::Host::Ipv4(std::net::Ipv4Addr::LOCALHOST)),
+                upstream(url::Host::Domain("bootstrap.invalid".to_owned())),
+            ],
+            Some(Arc::new(resolver)),
+            Some(Arc::new(MockClashResolver::new())),
+            Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            None,
+            DnsClientNetworkOptions {
+                group: Some("proxy_server"),
+                ..Default::default()
+            },
+        )
+        .await;
+        let error = match result {
+            Err(error) => error.to_string(),
+            Ok(_) => {
+                panic!("node DNS must not silently drop a failed bootstrap upstream")
+            }
+        };
+        assert!(error.contains("bootstrap.invalid"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn proxy_bootstrap_timeout_does_not_keep_a_partial_dns_group() {
+        let mut resolver = MockClashResolver::new();
+        resolver.expect_resolve().once().returning(|host, _| {
+            assert_eq!(host, "timeout.invalid");
+            Err(anyhow::anyhow!("bootstrap timed out"))
+        });
+        let upstream = |host: url::Host<String>| NameServer {
+            net: DNSNetMode::Udp,
+            host,
+            port: 53,
+            interface: None,
+            proxy: None,
+            doh_path: None,
+        };
+        let result = make_clients(
+            vec![
+                upstream(url::Host::Ipv4(std::net::Ipv4Addr::LOCALHOST)),
+                upstream(url::Host::Domain("timeout.invalid".to_owned())),
+            ],
+            Some(Arc::new(resolver)),
+            Some(Arc::new(MockClashResolver::new())),
+            Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            None,
+            DnsClientNetworkOptions {
+                group: Some("proxy_server"),
+                ..Default::default()
+            },
+        )
+        .await;
+        let error = match result {
+            Err(error) => error.to_string(),
+            Ok(_) => {
+                panic!("bootstrap timeout must invalidate the whole node DNS group")
+            }
+        };
+        assert!(error.contains("timeout.invalid"), "{error}");
+        assert!(error.contains("bootstrap timed out"), "{error}");
     }
 
     #[tokio::test]
