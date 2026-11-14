@@ -1127,3 +1127,9 @@ S01 准入必须满足：金标准用例在目标 HEAD 实际运行；未知新�
 
 固定只读 `ref-mihomo` 基线 `63bd52ec794b7051569b76ede2f6cdbf4c091fda` 的 `config/config.go` 声明 `dns.prefer-h3` 和 `dns.cache-algorithm`，并在解析 DNS 配置时使用它们。Chimera 尚未实现对应 HTTP/3 优先选择及缓存算法的运行时语义。新增 `mihomo_dns_transport_preferences_must_not_be_silent_noops` 负例：修复前 `prefer-h3: true` 被静默接受（红灯）；现在两字段均在配置解析时明确拒绝，不把 YAML 兼容误报为语义兼容。既有 vendor 扩展仍可保留。该切片不改变任何系统 DNS、路由或 TUN 状态，也不证明 Mihomo 二进制互操作。
 - 2026-11-14 rebased-candidate validation: `cargo test -p clash-lib --lib --no-default-features --features tun,ring config::def::tests::mihomo_dns_transport_preferences_must_not_be_silent_noops -- --exact --test-threads=1` passed (1/1); `cargo clippy -p clash-lib --no-default-features --features tun,ring --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check master..HEAD` passed. Independent review of code candidate `a94e408da567e373987526d33a9b54da680e44c9` passed; no Mihomo binary interoperability or real DNS/TUN network test was run.
+
+## 2026-11-14: fail closed on partial node DNS bootstrap initialization
+
+- In `make_clients`, `proxy_server` groups now reject the entire group if any configured bootstrap upstream cannot initialize, rather than silently keeping only a subset. Ordinary DNS groups retain their existing best-effort behavior.
+- Added deterministic resolver-mock regressions for an unresolved hostname and a bootstrap timeout, each paired with a healthy IP-literal upstream. Both cases must return an error containing the failed hostname and reason. These tests do not exercise a real network timeout or NIC/TUN packet capture.
+- The change affects DNS configuration/runtime behavior (L2). Independent review, maintainer acceptance and cross-platform/real-network validation remain pending; no system DNS, routes or TUN state were changed.
