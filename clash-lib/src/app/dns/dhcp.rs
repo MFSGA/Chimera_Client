@@ -14,6 +14,7 @@ use futures::FutureExt;
 use std::{
     env,
     fmt::{Debug, Formatter},
+    future::Future,
     io,
     net::Ipv4Addr,
     ops::Add,
@@ -31,6 +32,18 @@ const IFACE_TTL: Duration = Duration::from_secs(20);
 const DHCP_TTL: Duration = Duration::from_secs(3600);
 const DHCP_TIMEOUT: Duration = Duration::from_secs(60);
 
+fn interface_ipv4_network(iface: &OutboundInterface) -> io::Result<ipnet::IpNet> {
+    let addr = iface.addr_v4.ok_or_else(|| {
+        io::Error::other(format!("no address on DHCP interface: {}", iface.name))
+    })?;
+    let mask = iface.netmask_v4.ok_or_else(|| {
+        io::Error::other(format!("no netmask on DHCP interface: {}", iface.name))
+    })?;
+    ipnet::IpNet::new(addr.into(), u32::from(mask).count_ones() as _).map_err(
+        |error| io::Error::other(format!("invalid DHCP interface netmask: {error}")),
+    )
+}
+
 struct Inner {
     clients: Vec<ThreadSafeDNSClient>,
     // Incremented on every network reset; in-flight DHCP probes must not
@@ -46,6 +59,9 @@ pub struct DhcpClient {
     fw_mark: Option<u32>,
     network_path_source: Option<NetworkPathSource>,
 
+    // Coalesce empty-cache and lease-expiry lookups so concurrent queries do
+    // not issue overlapping DHCP discovery and race to install DNS servers.
+    discovery: Mutex<()>,
     inner: Mutex<Inner>,
 }
 
@@ -138,6 +154,7 @@ impl DhcpClient {
         })?;
         Ok(Self {
             iface,
+            discovery: Mutex::new(()),
             inner: Mutex::new(Inner {
                 clients: vec![],
                 generation: 0,
@@ -151,10 +168,7 @@ impl DhcpClient {
     }
 
     async fn resolve(&self) -> io::Result<Vec<ThreadSafeDNSClient>> {
-        // The lease check returns its generation while still holding the
-        // cache lock. A reset after that snapshot makes this discovery stale.
-        let (expired, generation) = self.update_if_lease_expired().await?;
-        if expired {
+        self.resolve_with_discovery(|_generation| async move {
             let iface =
                 get_interface_by_name(&self.iface.name).ok_or_else(|| {
                     io::Error::new(
@@ -162,6 +176,7 @@ impl DhcpClient {
                         "DHCP interface disappeared",
                     )
                 })?;
+            let iface_network = interface_ipv4_network(&iface)?;
             let dns = probe_dns_server(&iface).await?;
             let discovered_clients = make_clients(
                 Self::discovered_upstreams(&iface, dns),
@@ -180,8 +195,32 @@ impl DhcpClient {
             )
             .await
             .map_err(|err| io::Error::other(err.to_string()))?;
-            self.install_discovered_clients(generation, discovered_clients)
-                .await?;
+            Ok((iface_network, discovered_clients))
+        })
+        .await
+    }
+
+    async fn resolve_with_discovery<F, Fut>(
+        &self,
+        discover: F,
+    ) -> io::Result<Vec<ThreadSafeDNSClient>>
+    where
+        F: FnOnce(u64) -> Fut + Send,
+        Fut: Future<Output = io::Result<(ipnet::IpNet, Vec<ThreadSafeDNSClient>)>>
+            + Send,
+    {
+        let _discovery = self.discovery.lock().await;
+        // The lease check returns its generation while still holding the
+        // cache lock. A reset after that snapshot makes this discovery stale.
+        let (expired, generation) = self.update_if_lease_expired().await?;
+        if expired {
+            let (iface_network, discovered_clients) = discover(generation).await?;
+            self.install_discovered_clients(
+                generation,
+                iface_network,
+                discovered_clients,
+            )
+            .await?;
         }
 
         Ok(self.inner.lock().await.clients.clone())
@@ -210,6 +249,7 @@ impl DhcpClient {
     async fn install_discovered_clients(
         &self,
         generation: u64,
+        iface_addr: ipnet::IpNet,
         discovered_clients: Vec<ThreadSafeDNSClient>,
     ) -> io::Result<()> {
         let mut inner = self.inner.lock().await;
@@ -220,6 +260,12 @@ impl DhcpClient {
             ));
         }
         inner.clients = discovered_clients;
+        // The interface and DNS leases begin when this result is successfully
+        // installed, not before the DHCP probe and client construction finish.
+        let now = Instant::now();
+        inner.iface_addr = iface_addr;
+        inner.iface_expires_at = now.add(IFACE_TTL);
+        inner.dns_expires_at = now.add(DHCP_TTL);
         Ok(())
     }
 
@@ -249,21 +295,7 @@ impl DhcpClient {
             let iface = lookup(&self.iface.name).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "DHCP interface disappeared")
             })?;
-            let addr = iface.addr_v4.ok_or_else(|| {
-                io::Error::other(format!(
-                    "no address on interface: {:?}",
-                    self.iface
-                ))
-            })?;
-            let mask = iface.netmask_v4.ok_or_else(|| {
-                io::Error::other(format!("no netmask on iface: {:?}", self.iface))
-            })?;
-            ipnet::IpNet::new(addr.into(), u32::from(mask).count_ones() as _)
-                .map_err(|error| {
-                    io::Error::other(format!(
-                        "invalid DHCP interface netmask: {error}"
-                    ))
-                })
+            interface_ipv4_network(&iface)
         })();
 
         let observed_net = match observed_net {
@@ -450,7 +482,7 @@ mod test {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[derive(Debug)]
     struct ResetProbe {
@@ -498,6 +530,7 @@ mod tests {
             },
             fw_mark: None,
             network_path_source: None,
+            discovery: Mutex::new(()),
             inner: Mutex::new(Inner {
                 clients: handlers,
                 generation: 0,
@@ -532,7 +565,11 @@ mod tests {
         let attempted = Arc::new(AtomicBool::new(false));
         let stale = probe("old-network-dns", attempted, false, false);
         let error = client
-            .install_discovered_clients(old_generation, vec![stale])
+            .install_discovered_clients(
+                old_generation,
+                "192.0.2.1/24".parse().unwrap(),
+                vec![stale],
+            )
             .await
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
@@ -708,12 +745,88 @@ mod tests {
         let attempted = Arc::new(AtomicBool::new(false));
         let resolved = probe("current-network-dns", attempted, false, false);
         client
-            .install_discovered_clients(generation, vec![resolved])
+            .install_discovered_clients(
+                generation,
+                "192.0.2.1/24".parse().unwrap(),
+                vec![resolved],
+            )
             .await
             .unwrap();
         assert_eq!(client.inner.lock().await.clients.len(), 1);
         assert_eq!(client.reset_transport().await.unwrap(), 3);
         assert!(client.inner.lock().await.clients.is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_dhcp_queries_share_one_discovery_and_refresh_lease_ttl() {
+        let client = Arc::new(test_client(Vec::new()));
+        let discovery_count = Arc::new(AtomicUsize::new(0));
+        let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
+        let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel();
+
+        let first_client = Arc::clone(&client);
+        let first_discovery_count = Arc::clone(&discovery_count);
+        let first = tokio::spawn(async move {
+            first_client
+                .resolve_with_discovery(|_generation| async move {
+                    first_discovery_count.fetch_add(1, Ordering::SeqCst);
+                    let _ = first_started_tx.send(());
+                    release_first_rx.await.map_err(|_| {
+                        io::Error::other("first DHCP discovery was cancelled")
+                    })?;
+                    Ok((
+                        "192.0.2.1/24".parse().unwrap(),
+                        vec![probe(
+                            "first-dns",
+                            Arc::new(AtomicBool::new(false)),
+                            false,
+                            false,
+                        )],
+                    ))
+                })
+                .await
+        });
+        first_started_rx.await.unwrap();
+
+        let second_client = Arc::clone(&client);
+        let second_discovery_count = Arc::clone(&discovery_count);
+        let (second_started_tx, second_started_rx) = tokio::sync::oneshot::channel();
+        let mut second = tokio::spawn(async move {
+            let _ = second_started_tx.send(());
+            second_client
+                .resolve_with_discovery(|_generation| async move {
+                    second_discovery_count.fetch_add(1, Ordering::SeqCst);
+                    Ok((
+                        "198.51.100.1/24".parse().unwrap(),
+                        vec![probe(
+                            "second-dns",
+                            Arc::new(AtomicBool::new(false)),
+                            false,
+                            false,
+                        )],
+                    ))
+                })
+                .await
+        });
+        second_started_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut second)
+                .await
+                .is_err(),
+            "second query must wait for the in-flight DHCP discovery"
+        );
+
+        release_first_tx.send(()).unwrap();
+        let first_clients = first.await.unwrap().unwrap();
+        let second_clients = second.await.unwrap().unwrap();
+        assert_eq!(discovery_count.load(Ordering::SeqCst), 1);
+        assert_eq!(first_clients[0].id(), "first-dns");
+        assert_eq!(second_clients[0].id(), "first-dns");
+
+        let inner = client.inner.lock().await;
+        assert_eq!(inner.iface_addr, "192.0.2.1/24".parse().unwrap());
+        assert!(inner.iface_expires_at > Instant::now());
+        assert!(inner.dns_expires_at > Instant::now());
     }
 
     #[tokio::test]
