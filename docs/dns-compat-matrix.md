@@ -184,6 +184,7 @@
 - 基线：独立工作树从 `a734515f5e33027013cc0bb3652272ed49a120e3` 建立；原指定工作树分支已前进到 `9dfd4b327eb6a67f1adfc84796473c518face9cb`，未改动其工作区。固定 Mihomo gitlink 为 `63bd52ec794b7051569b76ede2f6cdbf4c091fda`，本工作树未检出子模块，无法直接读取该提交源码；参考行为只以本地配置字段及已有路由实现为依据，不宣称完整 Mihomo 对照验证。
 - macOS `proxy/tun/routes/mod.rs` 在 `route-all` 下对 `route-exclude-address` 仅警告并忽略；此前转换层仍接受该值。现在 macOS 转换阶段拒绝非空 `route-exclude-address`、`inet4-route-exclude-address`、`inet6-route-exclude-address`，包括 `route-all: false`，避免配置通过后不按预期排除路由。空列表保持旧行为；其他平台转换行为不变。
 - 先增加 `macos_route_exclusions_fail_closed_before_tun_startup` 否定测试并确认旧代码失败；修复后需复测。该切片不实现 macOS 排除路由，也不保证系统 DNS ownership、真实物理网卡无泄漏。L2 审查、维护者批准和实机抓包仍待完成。
+- 2026-11-14 将该单项提交重放到本地 `master` 后，重新运行 `cargo test -p clash-lib --lib --no-default-features --features tun,ring config::internal::convert::tun::tests::macos_route_exclusions_fail_closed_before_tun_startup -- --exact --test-threads=1`，**1 项通过**；严格 `cargo clippy -p clash-lib --no-default-features --features tun,ring --all-targets -- -D warnings`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。测试只转换合成配置，未启动 TUN、安装路由或接触真实网卡；本地结果不证明系统级路由隔离。最终 SHA 独立复审与维护者验收仍待完成。
 
 ## 3. 变更管理与 S01 准入
 
