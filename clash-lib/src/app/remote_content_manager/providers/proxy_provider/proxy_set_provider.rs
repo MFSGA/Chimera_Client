@@ -354,6 +354,7 @@ impl Provider for ProxySetProvider {
     }
 
     async fn activate_after_commit(&self) -> std::io::Result<()> {
+        self.fetcher.accept_prepared_candidate_after_commit().await;
         let result = initialize_provider_with_retry(self).await;
         if result.is_err() {
             // Keep the provider handle available to groups. If periodic
@@ -543,6 +544,62 @@ proxies:
             protect_provider_dns,
         )
         .expect("offline provider should construct")
+    }
+
+    #[tokio::test]
+    async fn deferred_cached_provider_releases_readers_after_runtime_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deferred-cached-provider.yaml");
+        std::fs::write(&path, VALID).unwrap();
+
+        let mut vehicle = MockProviderVehicle::new();
+        vehicle
+            .expect_path()
+            .return_const(path.to_string_lossy().into_owned());
+        vehicle.expect_typ().return_const(ProviderVehicleType::Http);
+
+        let mut resolver = MockClashResolver::new();
+        resolver
+            .expect_replace_proxy_provider_dns_domains()
+            .times(1)
+            .returning(|_, _| Ok(()));
+        let health = HealthCheck::new(
+            vec![],
+            "http://example.invalid/check".to_owned(),
+            0,
+            true,
+            ProxyManager::new(Arc::new(resolver), None),
+        );
+        let provider = ProxySetProvider::new_with_dns_privacy(
+            "deferred-cached-provider".to_owned(),
+            Duration::ZERO,
+            Arc::new(vehicle),
+            health,
+            true,
+        )
+        .unwrap();
+
+        assert!(provider.prepare_candidate_from_cache().await.unwrap());
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                provider.strict_content_snapshot()
+            )
+            .await
+            .is_err(),
+            "candidate contents remain gated before runtime commit"
+        );
+
+        provider.activate_after_commit().await.unwrap();
+        let accepted = tokio::time::timeout(
+            Duration::from_secs(1),
+            provider.strict_content_snapshot(),
+        )
+        .await
+        .expect("committed cached provider must release its readers")
+        .expect("valid cached provider must expose its accepted revision");
+        assert_eq!(accepted.revision, 1);
+        assert_eq!(accepted.proxies[0].server_name(), Some("198.51.100.10"));
     }
 
     async fn assert_provider_registers_new_proxy_host_before_refresh(

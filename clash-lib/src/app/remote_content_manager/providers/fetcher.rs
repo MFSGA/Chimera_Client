@@ -153,6 +153,7 @@ pub struct Fetcher<U, P> {
     pub on_update: Option<Arc<U>>,
     on_cache_commit_rollback: Option<CacheCommitRollback>,
     on_cache_commit_accepted: Option<CacheCommitAccepted>,
+    prepared_cache_pending_acceptance: AtomicBool,
     cancel_token: CancellationToken,
     initialized: Arc<AtomicBool>,
     initial_immediate_refresh: Arc<AtomicBool>,
@@ -192,6 +193,7 @@ where
             on_update: on_update.map(Arc::new),
             on_cache_commit_rollback: None,
             on_cache_commit_accepted: None,
+            prepared_cache_pending_acceptance: AtomicBool::new(false),
             cancel_token: CancellationToken::new(),
             initialized: Arc::new(AtomicBool::new(false)),
             initial_immediate_refresh: Arc::new(AtomicBool::new(false)),
@@ -346,6 +348,7 @@ where
             Err(error) => return Err(error.into()),
         };
         let content = fs::read(vehicle_path)?;
+        let modified = meta.modified()?;
         let items = match (self.parser)(&content) {
             Ok(items) => items,
             Err(_) => {
@@ -357,11 +360,13 @@ where
             }
         };
 
-        if let Some(on_update) = self.on_update.as_ref() {
+        let published = if let Some(on_update) = self.on_update.as_ref() {
             on_update(items).await?;
-        }
+            true
+        } else {
+            false
+        };
 
-        let modified = meta.modified()?;
         inner.updated_at = modified;
         inner.hash = utils::md5(&content)[..16]
             .try_into()
@@ -371,7 +376,23 @@ where
             Ordering::Release,
         );
         self.initialized.store(true, Ordering::Release);
+        self.prepared_cache_pending_acceptance.store(
+            published && self.on_cache_commit_accepted.is_some(),
+            Ordering::Release,
+        );
         Ok(true)
+    }
+
+    /// Finish publishing a cached candidate once its runtime becomes active.
+    /// The caller must invoke this only after the candidate runtime commits.
+    pub async fn accept_prepared_candidate_after_commit(&self) {
+        if self
+            .prepared_cache_pending_acceptance
+            .swap(false, Ordering::AcqRel)
+            && let Some(accepted) = self.on_cache_commit_accepted.as_ref()
+        {
+            accepted().await;
+        }
     }
 
     /// Start background refresh only after the initial updater has installed
@@ -509,7 +530,9 @@ where
         {
             Ok(true) => trace!("fetcher {} no update", name),
             Ok(false) => info!("fetcher {} updated", name),
-            Err(error) => warn!("{} update failed: {}", name, error),
+            Err(_) => {
+                warn!(provider = name, "provider update failed; details withheld")
+            }
         }
     }
 
@@ -985,6 +1008,58 @@ mod tests {
             !path.exists(),
             "failed update may not leave a persisted revision"
         );
+    }
+
+    #[tokio::test]
+    async fn background_update_failure_omits_sensitive_error_text() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || CaptureWriter(writer.clone()))
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("failed-background-update.yaml");
+        let mut vehicle = MockProviderVehicle::new();
+        vehicle
+            .expect_path()
+            .return_const(path.to_string_lossy().into_owned());
+        vehicle.expect_typ().return_const(ProviderVehicleType::Http);
+        vehicle
+            .expect_read()
+            .times(1)
+            .returning(|| Ok(b"candidate".to_vec()));
+        let updater = |_payload: String| -> BoxFuture<'static, anyhow::Result<()>> {
+            Box::pin(async {
+                anyhow::bail!("synthetic private-provider.internal rejected")
+            })
+        };
+        let fetcher = Fetcher::new(
+            "background-failure".into(),
+            Duration::ZERO,
+            Arc::new(vehicle),
+            |bytes| Ok(String::from_utf8(bytes.to_vec())?),
+            Some(updater),
+        );
+
+        Fetcher::<_, _>::run_update(
+            fetcher.inner.clone(),
+            fetcher.vehicle.clone(),
+            fetcher.parser.clone(),
+            fetcher.on_update.clone(),
+            fetcher.on_cache_commit_rollback.clone(),
+            fetcher.on_cache_commit_accepted.clone(),
+            fetcher.name.as_str(),
+        )
+        .await;
+
+        let log = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("provider update failed"), "{log}");
+        assert!(!log.contains("private-provider.internal"), "{log}");
+        assert!(!path.exists());
     }
 
     #[tokio::test]
