@@ -8,8 +8,17 @@ use crate::{
     proxy::datagram::UdpPacket,
     session::{Network, Session, Type},
 };
-use futures::{Sink, Stream, future::BoxFuture, ready};
-use std::{fmt, net::IpAddr, sync::Arc, task::Poll};
+use futures::{
+    FutureExt, Sink, Stream, StreamExt, future::BoxFuture, ready,
+    stream::FuturesUnordered,
+};
+use std::{
+    collections::VecDeque,
+    fmt,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    task::Poll,
+};
 use tracing::{debug, trace, warn};
 
 type PendingPermitFuture = BoxFuture<
@@ -19,6 +28,16 @@ type PendingPermitFuture = BoxFuture<
         tokio::sync::mpsc::error::SendError<()>,
     >,
 >;
+
+type DnsHijackReplySender = Arc<
+    dyn Fn(Vec<u8>, SocketAddr, SocketAddr) -> BoxFuture<'static, ()> + Send + Sync,
+>;
+
+type DnsHijackReply = (Vec<u8>, SocketAddr, SocketAddr);
+type DnsHijackQuery = BoxFuture<'static, Option<DnsHijackReply>>;
+
+const MAX_CONCURRENT_TUN_DNS_QUERIES: usize = 8;
+const MAX_QUEUED_TUN_DNS_QUERIES: usize = 32;
 
 /// Flush state for a pending dispatcher-to-TUN UDP packet.
 ///
@@ -89,8 +108,8 @@ pub(crate) async fn handle_inbound_datagram(
     // tun i/o
     // lr: app packets went into tun will be accessed from lr
     // ls: packet written into ls will go back to app from tun
-    let (mut lr, mut ls) = socket.split();
-    let mut ls_dns = ls.clone(); // for dns hijack
+    let (lr, mut ls) = socket.split();
+    let ls_dns = ls.clone(); // for dns hijack
     let resolver_dns = resolver.clone(); // for dns hijack
 
     // dispatcher <-> tun communications
@@ -140,72 +159,159 @@ pub(crate) async fn handle_inbound_datagram(
         }
     });
 
-    // tun -> dispatcher
-    let fut2 = tokio::spawn(async move {
-        'read_packet: while let Some(watfaq_netstack::UdpPacket {
-            data,
-            local_addr,
-            remote_addr,
-        }) = lr.recv().await
-        {
-            if is_noise_datagram(
-                local_addr.ip(),
-                remote_addr.ip(),
-                remote_addr.port(),
-            ) {
-                trace!(
-                    source = %local_addr,
-                    destination = %remote_addr,
-                    "dropping tun UDP system noise"
-                );
-                continue;
-            }
-            let pkt = UdpPacket {
-                data: data.data().into(),
-                src_addr: local_addr.into(),
-                dst_addr: remote_addr.into(),
-                inbound_user: None,
-            };
-
-            trace!("tun -> dispatcher: {:?}", pkt);
-
-            if should_hijack_udp_dns(dns_hijack, &dns_hijack_rules, remote_addr) {
-                trace!("got dns packet: {:?}, returning from Clash DNS server", pkt);
-
-                if let Some(reply) =
-                    exchange_hijacked_udp_dns(&resolver_dns, &pkt.data).await
-                    && let Err(error) = ls_dns
-                        .send(
-                            (
-                                reply,
-                                pkt.dst_addr.clone().must_into_socket_addr(),
-                                pkt.src_addr.clone().must_into_socket_addr(),
-                            )
-                                .into(),
-                        )
-                        .await
+    let dns_reply_sender: DnsHijackReplySender = {
+        let ls_dns = ls_dns.clone();
+        Arc::new(move |data, source, destination| {
+            let mut ls_dns = ls_dns.clone();
+            Box::pin(async move {
+                if let Err(error) =
+                    ls_dns.send((data, source, destination).into()).await
                 {
                     warn!("failed to send hijacked DNS reply to netstack: {error}");
                 }
+            })
+        })
+    };
 
-                // don't forward dns packet to dispatcher
-                continue 'read_packet;
-            }
-
-            match d_tx.send(pkt).await {
-                Ok(_) => {}
-                Err(e) => {
-                    warn!("failed to send udp packet to proxy: {}", e);
-                }
-            }
-        }
-
+    // tun -> dispatcher
+    let fut2 = tokio::spawn(async move {
+        let incoming = futures::stream::unfold(lr, |mut reader| async move {
+            reader.recv().await.map(|packet| (packet, reader))
+        });
+        process_inbound_udp_packets(
+            incoming,
+            d_tx,
+            resolver_dns,
+            dns_reply_sender,
+            dns_hijack,
+            dns_hijack_rules,
+        )
+        .await;
         closer.send(0).ok();
     });
 
     debug!("tun UDP ready");
 
     let _ = futures::future::join(fut1, fut2).await;
+}
+
+async fn process_inbound_udp_packets<S>(
+    incoming: S,
+    d_tx: tokio::sync::mpsc::Sender<UdpPacket>,
+    resolver_dns: ThreadSafeDNSResolver,
+    dns_reply_sender: DnsHijackReplySender,
+    dns_hijack: bool,
+    dns_hijack_rules: Vec<DnsHijackRule>,
+) where
+    S: Stream<Item = watfaq_netstack::UdpPacket>,
+{
+    tokio::pin!(incoming);
+    let mut active_dns_queries = FuturesUnordered::<DnsHijackQuery>::new();
+    let mut pending_dns_queries = VecDeque::<DnsHijackQuery>::new();
+
+    loop {
+        while active_dns_queries.len() < MAX_CONCURRENT_TUN_DNS_QUERIES {
+            let Some(query) = pending_dns_queries.pop_front() else {
+                break;
+            };
+            active_dns_queries.push(query);
+        }
+
+        tokio::select! {
+            completed = active_dns_queries.next(), if !active_dns_queries.is_empty() => {
+                if let Some(Some((reply, source, destination))) = completed {
+                    (dns_reply_sender)(reply, source, destination).await;
+                }
+            }
+            incoming_packet = incoming.next() => {
+                let Some(watfaq_netstack::UdpPacket {
+                    data,
+                    local_addr,
+                    remote_addr,
+                }) = incoming_packet else {
+                    break;
+                };
+
+                if is_noise_datagram(
+                    local_addr.ip(),
+                    remote_addr.ip(),
+                    remote_addr.port(),
+                ) {
+                    trace!(
+                        source = %local_addr,
+                        destination = %remote_addr,
+                        "dropping tun UDP system noise"
+                    );
+                    continue;
+                }
+                let pkt = UdpPacket {
+                    data: data.data().into(),
+                    src_addr: local_addr.into(),
+                    dst_addr: remote_addr.into(),
+                    inbound_user: None,
+                };
+
+                trace!("tun -> dispatcher: {:?}", pkt);
+
+                if should_hijack_udp_dns(
+                    dns_hijack,
+                    &dns_hijack_rules,
+                    remote_addr,
+                ) {
+                    trace!(
+                        "got dns packet: {:?}, returning from Clash DNS server",
+                        pkt
+                    );
+
+                    if pending_dns_queries.len()
+                        >= MAX_QUEUED_TUN_DNS_QUERIES
+                    {
+                        warn!(
+                            "TUN DNS queue is full; returning SERVFAIL for the query"
+                        );
+                        if let Some(reply) = dns_queue_full_response(&pkt.data) {
+                            (dns_reply_sender)(
+                                reply,
+                                pkt.dst_addr.must_into_socket_addr(),
+                                pkt.src_addr.must_into_socket_addr(),
+                            )
+                            .await;
+                        }
+                        continue;
+                    }
+
+                    let resolver = resolver_dns.clone();
+                    let source = pkt.src_addr.must_into_socket_addr();
+                    let destination = pkt.dst_addr.must_into_socket_addr();
+                    let payload = pkt.data;
+                    pending_dns_queries.push_back(
+                        async move {
+                            let reply =
+                                exchange_hijacked_udp_dns(&resolver, &payload)
+                                    .await?;
+                            Some((reply, destination, source))
+                        }
+                        .boxed(),
+                    );
+                    // DNS resolution proceeds independently while this loop
+                    // continues receiving ordinary UDP packets.
+                    continue;
+                }
+
+                if let Err(error) = d_tx.send(pkt).await {
+                    warn!("failed to send udp packet to proxy: {}", error);
+                }
+            }
+        }
+    }
+}
+
+fn dns_queue_full_response(payload: &[u8]) -> Option<Vec<u8>> {
+    let request = hickory_proto::op::Message::from_vec(payload).ok()?;
+    let mut response =
+        dns_error_response(&request, hickory_proto::op::ResponseCode::ServFail);
+    response.metadata.id = request.metadata.id;
+    response.to_vec().ok()
 }
 
 fn is_noise_datagram(src: IpAddr, dst: IpAddr, dst_port: u16) -> bool {
@@ -369,11 +475,14 @@ impl Sink<UdpPacket> for TunDatagram {
 #[cfg(test)]
 mod tests {
     use super::{
-        TunDatagram, exchange_hijacked_udp_dns, is_noise_datagram,
-        should_hijack_udp_dns,
+        DnsHijackReplySender, MAX_CONCURRENT_TUN_DNS_QUERIES,
+        MAX_QUEUED_TUN_DNS_QUERIES, TunDatagram, exchange_hijacked_udp_dns,
+        is_noise_datagram, process_inbound_udp_packets, should_hijack_udp_dns,
     };
     use crate::{
-        app::dns::{MockClashResolver, ThreadSafeDNSResolver},
+        app::dns::{
+            ClashResolver, MockClashResolver, ResolverKind, ThreadSafeDNSResolver,
+        },
         config::internal::config::{
             DnsHijackAddress, DnsHijackProtocol, DnsHijackRule,
         },
@@ -392,8 +501,96 @@ mod tests {
         task::{Context, Poll},
         time::Duration,
     };
-    use tokio::sync::mpsc;
+    use tokio::sync::{Semaphore, mpsc};
     use watfaq_netstack::{Packet as NetPacket, UdpSocket as NetUdpSocket};
+
+    struct GatedDnsResolver {
+        entered: mpsc::UnboundedSender<()>,
+        permits: Arc<Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl ClashResolver for GatedDnsResolver {
+        async fn resolve(
+            &self,
+            _host: &str,
+            _enhanced: bool,
+        ) -> anyhow::Result<Option<IpAddr>> {
+            Ok(None)
+        }
+
+        async fn resolve_v4(
+            &self,
+            _host: &str,
+            _enhanced: bool,
+        ) -> anyhow::Result<Option<Ipv4Addr>> {
+            Ok(None)
+        }
+
+        async fn resolve_v6(
+            &self,
+            _host: &str,
+            _enhanced: bool,
+        ) -> anyhow::Result<Option<std::net::Ipv6Addr>> {
+            Ok(None)
+        }
+
+        async fn cached_for(&self, _ip: IpAddr) -> Option<String> {
+            None
+        }
+
+        async fn exchange(&self, message: &Message) -> anyhow::Result<Message> {
+            let _ = self.entered.send(());
+            self.permits
+                .acquire()
+                .await
+                .map_err(|_| anyhow::anyhow!("DNS release gate was closed"))?
+                .forget();
+
+            let mut response =
+                Message::response(message.metadata.id, message.metadata.op_code);
+            response.add_queries(message.queries.iter().cloned());
+            Ok(response)
+        }
+
+        async fn reverse_lookup(&self, _ip: IpAddr) -> Option<String> {
+            None
+        }
+
+        async fn is_fake_ip(&self, _ip: IpAddr) -> bool {
+            false
+        }
+
+        async fn fake_ip_for_host(&self, _host: &str) -> Option<IpAddr> {
+            None
+        }
+
+        fn fake_ip_enabled(&self) -> bool {
+            false
+        }
+
+        fn ipv6(&self) -> bool {
+            false
+        }
+
+        fn set_ipv6(&self, _enable: bool) {}
+
+        fn kind(&self) -> ResolverKind {
+            ResolverKind::Clash
+        }
+    }
+
+    fn net_udp_packet(
+        data: Vec<u8>,
+        local_addr: &str,
+        remote_addr: &str,
+    ) -> watfaq_netstack::UdpPacket {
+        watfaq_netstack::UdpPacket {
+            data: NetPacket::new(data),
+            local_addr: local_addr.parse().unwrap(),
+            remote_addr: remote_addr.parse().unwrap(),
+        }
+    }
 
     fn dns_query(name: &str, typ: RecordType, id: u16) -> Message {
         let mut query = Message::new(id, MessageType::Query, OpCode::Query);
@@ -542,6 +739,155 @@ mod tests {
         assert_eq!(reply.metadata.id, 0x1234);
         assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
         assert_eq!(reply.queries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn slow_hijacked_dns_does_not_block_forwarding_other_udp_packets() {
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let permits = Arc::new(Semaphore::new(0));
+        let resolver: ThreadSafeDNSResolver = Arc::new(GatedDnsResolver {
+            entered: entered_tx,
+            permits: permits.clone(),
+        });
+        let (packet_tx, packet_rx) = mpsc::channel(4);
+        let (dispatcher_tx, mut dispatcher_rx) = mpsc::channel(4);
+        let (dns_reply_tx, mut dns_reply_rx) = mpsc::channel(4);
+        let dns_reply_sender: DnsHijackReplySender =
+            Arc::new(move |data, source, destination| {
+                let dns_reply_tx = dns_reply_tx.clone();
+                Box::pin(async move {
+                    let _ = dns_reply_tx.send((data, source, destination)).await;
+                })
+            });
+        let incoming =
+            futures::stream::unfold(packet_rx, |mut receiver| async move {
+                receiver.recv().await.map(|packet| (packet, receiver))
+            });
+        let task = tokio::spawn(process_inbound_udp_packets(
+            incoming,
+            dispatcher_tx,
+            resolver,
+            dns_reply_sender,
+            true,
+            vec![],
+        ));
+
+        let dns_request = dns_query("slow.example.", RecordType::A, 0x4d21);
+        packet_tx
+            .send(net_udp_packet(
+                dns_request.to_vec().unwrap(),
+                "192.0.2.10:43000",
+                "192.0.2.53:53",
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), entered_rx.recv())
+            .await
+            .expect("DNS resolver did not receive the hijacked query")
+            .expect("DNS resolver entry channel closed");
+
+        let ordinary_udp = net_udp_packet(
+            b"voice packet".to_vec(),
+            "192.0.2.10:43001",
+            "198.51.100.8:9000",
+        );
+        packet_tx.send(ordinary_udp).await.unwrap();
+        let forwarded =
+            tokio::time::timeout(Duration::from_secs(1), dispatcher_rx.recv()).await;
+
+        permits.add_permits(1);
+        let (reply_bytes, reply_source, reply_destination) =
+            tokio::time::timeout(Duration::from_secs(2), dns_reply_rx.recv())
+                .await
+                .expect("DNS response was not returned")
+                .expect("DNS reply channel closed");
+        let reply = Message::from_vec(&reply_bytes).unwrap();
+        drop(packet_tx);
+        task.await.unwrap();
+
+        assert_eq!(reply.metadata.id, 0x4d21);
+        assert_eq!(reply_source, "192.0.2.53:53".parse().unwrap());
+        assert_eq!(reply_destination, "192.0.2.10:43000".parse().unwrap());
+        let forwarded = forwarded
+            .expect("slow DNS blocked the TUN UDP receive loop")
+            .expect("dispatcher channel closed before forwarding ordinary UDP");
+        assert_eq!(forwarded.data, b"voice packet");
+        assert_eq!(
+            forwarded.dst_addr,
+            SocksAddr::Ip("198.51.100.8:9000".parse().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn tun_dns_queue_is_bounded_and_returns_servfail_when_full() {
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let permits = Arc::new(Semaphore::new(0));
+        let resolver: ThreadSafeDNSResolver = Arc::new(GatedDnsResolver {
+            entered: entered_tx,
+            permits,
+        });
+        let request_count =
+            MAX_CONCURRENT_TUN_DNS_QUERIES + MAX_QUEUED_TUN_DNS_QUERIES + 1;
+        let (packet_tx, packet_rx) = mpsc::channel(request_count);
+        let (dispatcher_tx, _dispatcher_rx) = mpsc::channel(1);
+        let (dns_reply_tx, mut dns_reply_rx) = mpsc::channel(1);
+        let dns_reply_sender: DnsHijackReplySender =
+            Arc::new(move |data, source, destination| {
+                let dns_reply_tx = dns_reply_tx.clone();
+                Box::pin(async move {
+                    let _ = dns_reply_tx.send((data, source, destination)).await;
+                })
+            });
+        let incoming =
+            futures::stream::unfold(packet_rx, |mut receiver| async move {
+                receiver.recv().await.map(|packet| (packet, receiver))
+            });
+        let task = tokio::spawn(process_inbound_udp_packets(
+            incoming,
+            dispatcher_tx,
+            resolver,
+            dns_reply_sender,
+            true,
+            vec![],
+        ));
+
+        for index in 0..request_count {
+            let id = if index + 1 == request_count {
+                0x7fff
+            } else {
+                index as u16
+            };
+            let request = dns_query("queued.example.", RecordType::A, id);
+            packet_tx
+                .send(net_udp_packet(
+                    request.to_vec().unwrap(),
+                    &format!("192.0.2.10:{}", 43000 + index),
+                    "192.0.2.53:53",
+                ))
+                .await
+                .unwrap();
+        }
+
+        let (reply_bytes, _, _) =
+            tokio::time::timeout(Duration::from_secs(2), dns_reply_rx.recv())
+                .await
+                .expect("full TUN DNS queue did not respond")
+                .expect("DNS reply channel closed");
+        let reply = Message::from_vec(&reply_bytes).unwrap();
+        assert_eq!(reply.metadata.id, 0x7fff);
+        assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+
+        for _ in 0..MAX_CONCURRENT_TUN_DNS_QUERIES {
+            tokio::time::timeout(Duration::from_secs(2), entered_rx.recv())
+                .await
+                .expect("DNS worker did not start within the concurrency limit")
+                .expect("DNS worker entry channel closed");
+        }
+        drop(packet_tx);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("TUN shutdown waited for pending DNS queries")
+            .unwrap();
     }
 
     #[tokio::test]
