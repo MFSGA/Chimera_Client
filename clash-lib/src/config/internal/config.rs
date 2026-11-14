@@ -318,9 +318,7 @@ impl Config {
                 if inline.behavior != RuleSetBehavior::Domain
                     || inline.inline_rules.is_empty()
                     || inline.inline_rules.iter().any(|selector| {
-                        selector.chars().any(char::is_whitespace)
-                            || !crate::common::trie::valid_and_split_domain(selector)
-                                .1
+                        dns::config::normalize_dns_domain_pattern(selector).is_none()
                     })
                 {
                     return Err(Error::InvalidConfig(

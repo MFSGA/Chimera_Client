@@ -799,8 +799,7 @@ impl TryFrom<&crate::config::def::Config> for Config {
                     != crate::app::remote_content_manager::providers::rule_provider::RuleSetBehavior::Domain
                     || inline.inline_rules.is_empty()
                     || inline.inline_rules.iter().any(|domain| {
-                        domain.chars().any(char::is_whitespace)
-                            || !trie::valid_and_split_domain(domain).1
+                        normalize_dns_domain_pattern(domain).is_none()
                     })
                 {
                     return Err(Error::InvalidConfig(

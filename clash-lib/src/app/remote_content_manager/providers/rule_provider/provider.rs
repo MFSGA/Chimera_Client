@@ -507,7 +507,18 @@ fn make_rules(
 fn make_domain_rules(rules: Vec<String>) -> Result<trie::StringTrie<bool>, Error> {
     let mut trie = trie::StringTrie::new();
     for rule in rules {
-        trie.insert(&rule, Arc::new(true));
+        // DomainSet::has receives DNS wire names in lowercase ASCII. Store
+        // selectors in the same form so uppercase and U-label payloads cannot
+        // be accepted as rules that silently never match.
+        let normalized =
+            crate::app::dns::config::normalize_dns_domain_pattern(&rule)
+                .ok_or_else(|| {
+                    Error::InvalidConfig(
+                        "rule provider contains an invalid domain selector"
+                            .to_owned(),
+                    )
+                })?;
+        trie.insert(&normalized, Arc::new(true));
     }
     Ok(trie)
 }
@@ -635,6 +646,39 @@ mod tests {
         );
         drop(guard);
         assert!(read.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn dns_domain_match_normalizes_case_and_idna_domain_rules() {
+        let provider = RuleProviderImpl::new(
+            "private-domain".to_owned(),
+            RuleSetBehavior::Domain,
+            RuleSetFormat::Yaml,
+            None,
+            None,
+            None,
+            None,
+            Some(vec![
+                "PRIVATE.EXAMPLE".to_owned(),
+                "bücher.example".to_owned(),
+            ]),
+        );
+        provider
+            .initialize()
+            .await
+            .expect("valid inline domain rules should initialize");
+
+        assert!(
+            provider.match_dns_domain("private.example").await.unwrap(),
+            "ASCII case variants must match the same DNS name"
+        );
+        assert!(
+            provider
+                .match_dns_domain("xn--bcher-kva.example")
+                .await
+                .unwrap(),
+            "Unicode rules must match their canonical IDNA wire name"
+        );
     }
 
     #[tokio::test]

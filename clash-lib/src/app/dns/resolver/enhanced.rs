@@ -12680,7 +12680,10 @@ mod tests {
             None,
             None,
             None,
-            Some(vec!["+.example.com".to_owned()]),
+            Some(vec![
+                "+.EXAMPLE.COM".to_owned(),
+                "bücher.example".to_owned(),
+            ]),
         );
         provider.initialize().await.expect("inline rules init");
         let provider: ThreadSafeRuleProvider = Arc::new(provider);
@@ -12714,6 +12717,16 @@ mod tests {
             .expect("rule-set first");
         assert_eq!(ruleset_hits.load(Ordering::SeqCst), 1);
         assert_eq!(domain_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(main_hits.load(Ordering::SeqCst), 0);
+
+        let mut idna_query = test_query_with_type(rr::RecordType::TXT);
+        idna_query.queries[0]
+            .set_name(rr::Name::from_utf8("xn--bcher-kva.example.").unwrap());
+        resolver
+            .exchange_no_cache(&idna_query)
+            .await
+            .expect("canonical IDNA DNS name should match its U-label RuleSet");
+        assert_eq!(ruleset_hits.load(Ordering::SeqCst), 2);
         assert_eq!(main_hits.load(Ordering::SeqCst), 0);
     }
 
