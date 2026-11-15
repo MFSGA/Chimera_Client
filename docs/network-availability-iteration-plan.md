@@ -1167,3 +1167,11 @@ TCP 临时端口，再尝试绑定同号 UDP 端口；当该端口属于 Windows
 端口，再绑定同号 TCP；任一协议的候选端口绑定返回 `AddrInUse`、`AddrNotAvailable` 或
 `PermissionDenied` 时释放已打开的 socket 并最多重试 64 次。此修改只影响测试准备；仍需在
 新提交上重新运行 Windows CI。
+
+### 2026-11-15：抽出 OutboundManager 连接池退休机制（L2）
+
+- 基线：本地 `master` `f751d8a5c85bbf77467ec09b82838b960021fec8`，`origin/master` `d61be5b2de5afec5cd4bc4198318675f6ab92b6f`，`ref/` `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`。
+- 将 handler 身份去重、连接池重置结果汇总、退休状态记录及网络代次有界重试移到 `clash-lib/src/app/outbound/manager/pool_retirement.rs`。`OutboundManager` 仍负责触发恢复和访问 provider；调用顺序、超时、代次校验及失败行为不变。
+- 这是相对 `ref/` 的本地结构偏离：参考版本没有 Chimera 的网络代次池退休逻辑，因此保留行为实现，只抽出其内聚辅助模块。provider 加载、代理组构建和 API 门面仍留在 manager，后续按独立边界处理。
+- 基线与修改后均运行 `cargo test -p clash-lib --lib --no-default-features --locked app::outbound::manager::tests`：29 passed、0 failed、0 ignored；修改后 `cargo check -p clash-lib --no-default-features --locked`、目标文件 `rustfmt --check` 与 `git diff --check` 通过。未运行全 workspace 检查或跨平台运行验证。
+- 仅移动内部代码和测试可见性，没有更改配置、协议或网络恢复语义。最终 SHA 的独立 Reviewer 与维护者验收需在提交后记录。
