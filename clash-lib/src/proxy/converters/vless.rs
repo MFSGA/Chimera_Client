@@ -131,7 +131,7 @@ fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
     }
 
     #[cfg(not(feature = "reality"))]
-    if vless_top_level_reality_is_selected(s) {
+    if s.network.as_deref() != Some("xhttp") && s.reality_opts.is_some() {
         return Err(Error::InvalidConfig(
             "VLESS REALITY requires the reality feature".to_owned(),
         ));
@@ -270,36 +270,6 @@ fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
     }
 
     Ok(())
-}
-
-fn vless_top_level_reality_is_selected(s: &OutboundVless) -> bool {
-    if s.reality_opts.is_none() {
-        return false;
-    }
-
-    if s.network.as_deref() != Some("xhttp") {
-        return true;
-    }
-
-    let Some(xhttp_opts) = s.xhttp_opts.as_ref() else {
-        return true;
-    };
-    let upload_security = xhttp_opts
-        .upload_settings
-        .as_ref()
-        .and_then(|settings| settings.security.as_deref());
-    if !matches!(upload_security, Some("tls" | "none")) {
-        return true;
-    }
-
-    let Some(download_settings) = resolve_xhttp_download_settings(xhttp_opts) else {
-        return false;
-    };
-    match download_settings.security.as_deref() {
-        Some("tls" | "none") => false,
-        Some("reality") | None => true,
-        Some(_) => false,
-    }
 }
 
 /// Accept the common Mihomo `chrome` hint for non-Reality TLS without
@@ -1439,7 +1409,10 @@ fn validate_xhttp_endpoint_settings(
 
     #[cfg(not(feature = "reality"))]
     if matches!(settings.security.as_deref(), Some("reality"))
-        || settings.reality_opts.is_some()
+        || settings
+            .reality_opts
+            .as_ref()
+            .is_some_and(|opts| !opts.public_key.trim().is_empty())
     {
         return Err(Error::InvalidConfig(format!(
             "xhttp {label} reality requires reality feature"
@@ -2847,6 +2820,29 @@ udp: true
                 .expect("XHTTP owns explicit endpoint TLS")
                 .is_none()
         );
+
+        let mut cleared_download_reality = outbound;
+        cleared_download_reality.tls = Some(true);
+        cleared_download_reality.reality_opts = Some(OutboundTrojanRealityOpts {
+            public_key: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".to_owned(),
+            ..Default::default()
+        });
+        let download_settings = cleared_download_reality
+            .xhttp_opts
+            .as_mut()
+            .and_then(|opts| opts.download_settings.as_mut())
+            .expect("download settings should be present");
+        download_settings.security = None;
+        download_settings.reality_opts = Some(OutboundTrojanRealityOpts {
+            public_key: String::new(),
+            ..Default::default()
+        });
+
+        validate_vless_config(&cleared_download_reality).expect(
+            "an empty endpoint Reality key should clear inherited top-level Reality",
+        );
+        crate::proxy::vless::Handler::try_from(&cleared_download_reality)
+            .expect("XHTTP TLS should build after download Reality is cleared");
     }
 
     #[cfg(not(any(feature = "aws-lc-rs", feature = "ring")))]

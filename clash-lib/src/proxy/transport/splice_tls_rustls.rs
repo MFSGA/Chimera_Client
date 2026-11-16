@@ -279,6 +279,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::{SplicableRustlsStream, TlsRecordBoundaryIo};
+    use crate::proxy::transport::tls::ensure_vision_tls13;
     use crate::proxy::{AnyStream, transport::VisionOptions};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -403,50 +404,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rustls_tls12_read_splice_preserves_raw_bytes_after_tls_record() {
-        let (mut client, mut server, options) = connected_tls_pair(true).await;
+    async fn rustls_tls12_outer_connection_is_rejected_for_vision() {
+        let (_, server, _) = connected_tls_pair(true).await;
         assert_eq!(
             server.get_ref().1.protocol_version(),
             Some(rustls::ProtocolVersion::TLSv1_2)
         );
-        server.write_all(b"vision-direct-frame").await.unwrap();
-        server.flush().await.unwrap();
-
-        let mut frame = [0u8; 19];
-        client.read_exact(&mut frame).await.unwrap();
-        assert_eq!(&frame, b"vision-direct-frame");
-
-        options
-            .read_flag
-            .store(true, std::sync::atomic::Ordering::Release);
-        server.get_mut().0.write_all(b"raw-downlink").await.unwrap();
-        let mut raw = [0u8; 12];
-        client.read_exact(&mut raw).await.unwrap();
-        assert_eq!(&raw, b"raw-downlink");
-    }
-
-    #[tokio::test]
-    async fn rustls_tls12_write_splice_flushes_tls_before_raw_bytes() {
-        let (mut client, mut server, options) = connected_tls_pair(true).await;
-        assert_eq!(
-            server.get_ref().1.protocol_version(),
-            Some(rustls::ProtocolVersion::TLSv1_2)
-        );
-        client.write_all(b"vision-direct-frame").await.unwrap();
-        client.flush().await.unwrap();
-
-        let mut frame = [0u8; 19];
-        server.read_exact(&mut frame).await.unwrap();
-        assert_eq!(&frame, b"vision-direct-frame");
-
-        options
-            .write_flag
-            .store(true, std::sync::atomic::Ordering::Release);
-        client.write_all(b"raw-uplink").await.unwrap();
-        client.flush().await.unwrap();
-        let server_io = &mut server.get_mut().0;
-        let mut raw = [0u8; 10];
-        server_io.read_exact(&mut raw).await.unwrap();
-        assert_eq!(&raw, b"raw-uplink");
+        let err = ensure_vision_tls13(server.get_ref().1.protocol_version())
+            .expect_err("Vision must reject outer TLS 1.2");
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
     }
 }

@@ -18,6 +18,19 @@ use crate::{
     proxy::AnyStream,
 };
 
+pub(super) fn ensure_vision_tls13(
+    version: Option<rustls::ProtocolVersion>,
+) -> io::Result<()> {
+    if version == Some(rustls::ProtocolVersion::TLSv1_3) {
+        return Ok(());
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "VLESS Vision requires the outer TLS connection to negotiate TLS 1.3",
+    ))
+}
+
 #[cfg(feature = "anytls")]
 use crate::common::tls::build_tls_client_config;
 
@@ -349,6 +362,7 @@ impl Transport for Client {
         let options = VisionOptions::default();
         let boundary_io = TlsRecordBoundaryIo::new(stream);
         let tls = self.connect(boundary_io).await?;
+        ensure_vision_tls13(tls.get_ref().1.protocol_version())?;
         let stream = SplicableRustlsStream::new(tls, &options);
         Ok((Box::new(stream), Some(options)))
     }
@@ -362,7 +376,17 @@ mod tests {
 
     #[cfg(not(feature = "anytls"))]
     use super::load_client_auth_material;
-    use super::{Client, VerifyNameOverride};
+    use super::{Client, VerifyNameOverride, ensure_vision_tls13};
+
+    #[test]
+    fn vision_requires_outer_tls13() {
+        assert!(ensure_vision_tls13(Some(rustls::ProtocolVersion::TLSv1_3)).is_ok());
+
+        let err = ensure_vision_tls13(Some(rustls::ProtocolVersion::TLSv1_2))
+            .expect_err("Mihomo Vision requires an outer TLS 1.3 connection");
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert!(ensure_vision_tls13(None).is_err());
+    }
 
     #[test]
     fn tls_client_preserves_certificate_fingerprint() {
