@@ -131,7 +131,7 @@ fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
     }
 
     #[cfg(not(feature = "reality"))]
-    if s.reality_opts.is_some() {
+    if s.network.as_deref() != Some("xhttp") && s.reality_opts.is_some() {
         return Err(Error::InvalidConfig(
             "VLESS REALITY requires the reality feature".to_owned(),
         ));
@@ -1409,7 +1409,10 @@ fn validate_xhttp_endpoint_settings(
 
     #[cfg(not(feature = "reality"))]
     if matches!(settings.security.as_deref(), Some("reality"))
-        || settings.reality_opts.is_some()
+        || settings
+            .reality_opts
+            .as_ref()
+            .is_some_and(|opts| !opts.public_key.trim().is_empty())
     {
         return Err(Error::InvalidConfig(format!(
             "xhttp {label} reality requires reality feature"
@@ -2756,6 +2759,90 @@ udp: true
                 .contains("VLESS REALITY requires the reality feature"),
             "unexpected error: {err}"
         );
+    }
+
+    #[cfg(all(
+        not(feature = "reality"),
+        any(feature = "aws-lc-rs", feature = "ring")
+    ))]
+    #[test]
+    fn vless_xhttp_tls_endpoints_override_unused_top_level_reality() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp-tls-overrides-reality".to_owned(),
+                server: "upload.example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            network: Some("xhttp".to_owned()),
+            alpn: Some(vec!["h2".to_owned()]),
+            reality_opts: Some(OutboundTrojanRealityOpts::default()),
+            xhttp_opts: Some(XhttpOpt {
+                path: Some("/upload/".to_owned()),
+                mode: Some("packet-up".to_owned()),
+                upload_settings: Some(XhttpUploadSettings {
+                    address: "upload.example.com".to_owned(),
+                    port: 443,
+                    network: "xhttp".to_owned(),
+                    security: Some("tls".to_owned()),
+                    xhttp_settings: Some(XhttpDownloadXhttpSettings {
+                        path: Some("/upload/".to_owned()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                download_settings: Some(XhttpDownloadSettings {
+                    address: "download.example.com".to_owned(),
+                    port: 443,
+                    network: "xhttp".to_owned(),
+                    security: Some("tls".to_owned()),
+                    xhttp_settings: Some(XhttpDownloadXhttpSettings {
+                        path: Some("/download/".to_owned()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        validate_vless_config(&outbound)
+            .expect("explicit XHTTP TLS endpoint security should override Reality");
+        assert!(
+            build_transport(outbound.network.as_deref(), &outbound)
+                .expect("XHTTP TLS transport should build")
+                .is_some()
+        );
+        assert!(
+            build_tls_transport(outbound.network.as_deref(), &outbound, false)
+                .expect("XHTTP owns explicit endpoint TLS")
+                .is_none()
+        );
+
+        let mut cleared_download_reality = outbound;
+        cleared_download_reality.tls = Some(true);
+        cleared_download_reality.reality_opts = Some(OutboundTrojanRealityOpts {
+            public_key: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".to_owned(),
+            ..Default::default()
+        });
+        let download_settings = cleared_download_reality
+            .xhttp_opts
+            .as_mut()
+            .and_then(|opts| opts.download_settings.as_mut())
+            .expect("download settings should be present");
+        download_settings.security = None;
+        download_settings.reality_opts = Some(OutboundTrojanRealityOpts {
+            public_key: String::new(),
+            ..Default::default()
+        });
+
+        validate_vless_config(&cleared_download_reality).expect(
+            "an empty endpoint Reality key should clear inherited top-level Reality",
+        );
+        crate::proxy::vless::Handler::try_from(&cleared_download_reality)
+            .expect("XHTTP TLS should build after download Reality is cleared");
     }
 
     #[cfg(not(any(feature = "aws-lc-rs", feature = "ring")))]
