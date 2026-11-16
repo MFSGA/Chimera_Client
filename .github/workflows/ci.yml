@@ -25,6 +25,7 @@ env:
   SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
   CROSS_CONTAINER_UID: 1001
   CROSS_CONTAINER_GID: 118
+  CROSS_REF: a9301e91f72bba3850460512685f6b16062015ff
 
 # Arm builder https://github.blog/changelog/2024-09-03-github-actions-arm64-linux-and-windows-runners-are-now-generally-available/
 jobs:
@@ -218,9 +219,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             /target
-          key: compile-${{ matrix.os || 'ubuntu-latest' }}-${{ matrix.release-name || matrix.target }}-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', '.cargo/config.toml') }}
+          key: compile-${{ matrix.os || 'ubuntu-latest' }}-${{ matrix.release-name || matrix.target }}-${{ steps.rust-version.outputs.version }}-${{ matrix.tool || 'native' }}-${{ env.CROSS_REF }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', '.cargo/config.toml') }}
           restore-keys: |
-            compile-${{ matrix.os || 'ubuntu-latest' }}-${{ matrix.release-name || matrix.target }}-${{ steps.rust-version.outputs.version }}-
+            compile-${{ matrix.os || 'ubuntu-latest' }}-${{ matrix.release-name || matrix.target }}-${{ steps.rust-version.outputs.version }}-${{ matrix.tool || 'native' }}-${{ env.CROSS_REF }}-
 
       - name: Cache Docker images.
         uses: ScribeMD/docker-cache@fb28c93772363301b8d0a6072ce850224b73f74e # 0.5.0
@@ -243,9 +244,7 @@ jobs:
 
       - name: Install cross-rs/cross
         if: matrix.tool == 'cross'
-        run: |
-          rm -f ~/.cargo/bin/cross*
-          cargo install cross --git https://github.com/cross-rs/cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --rev "${CROSS_REF}" --locked
 
       - name: Install Protoc
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
@@ -290,6 +289,7 @@ jobs:
           RUSTFLAGS: ${{ matrix.rustflags || '--cfg tokio_unstable' }}
 
       - name: Cargo build
+        if: github.event_name != 'pull_request'
         uses: clechasseur/rs-cargo@62dc8b04d9946cc72018b0c80bd0695ba1f89426 # v5.1.1
         with:
           tool: ${{ matrix.tool }}
@@ -301,7 +301,7 @@ jobs:
 
       - name: Package macOS release archive
         id: package_macos
-        if: ${{ contains(matrix.target, 'apple-darwin') }}
+        if: ${{ github.event_name != 'pull_request' && contains(matrix.target, 'apple-darwin') }}
         run: |
           set -euo pipefail
           version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "clash-rs"))')"
@@ -324,7 +324,7 @@ jobs:
 
       - name: Rename binary
         id: rename_binary
-        if: ${{ !contains(matrix.target, 'apple-darwin') }}
+        if: ${{ github.event_name != 'pull_request' && !contains(matrix.target, 'apple-darwin') }}
         run: |
           binary="${PACKAGE}-${{ matrix.release-name || matrix.target }}${{ matrix.postfix }}"
           mv "target/${{ matrix.target }}/release/clash-rs${{ matrix.postfix }}" "${binary}"
@@ -332,7 +332,7 @@ jobs:
 
       - name: Upload binaries
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        if: ${{ !matrix.no-release }}
+        if: ${{ github.event_name != 'pull_request' && !matrix.no-release }}
         with:
           name: binary-${{ matrix.release-name || matrix.target }}
           path: ${{ steps.package_macos.outputs.archive || steps.rename_binary.outputs.binary }}
@@ -350,6 +350,7 @@ jobs:
 
   release:
     name: Release
+    if: github.event_name != 'pull_request'
     needs: [compile]
     runs-on: ubuntu-latest
     permissions:
