@@ -156,13 +156,15 @@ impl VisionStream {
                         || non_tls_filtering_ended
                         || finish_padding_for_legacy_compat
                     {
-                        let command = if self.traffic_filter.supports_xtls() {
-                            self.pending_write_switch = PendingWriteSwitch::Raw;
-                            CMD_PADDING_DIRECT
-                        } else {
-                            self.pending_write_switch = PendingWriteSwitch::Tls;
-                            CMD_PADDING_END
-                        };
+                        let can_splice = self.write_splice_flag.is_some();
+                        let command =
+                            if self.traffic_filter.supports_xtls() && can_splice {
+                                self.pending_write_switch = PendingWriteSwitch::Raw;
+                                CMD_PADDING_DIRECT
+                            } else {
+                                self.pending_write_switch = PendingWriteSwitch::Tls;
+                                CMD_PADDING_END
+                            };
                         self.pad_frame(&record, command, true);
                         self.write_deframer.clear();
                         return Ok(processed_len.saturating_sub(existing_inner_len));
@@ -472,6 +474,24 @@ mod tests {
         )
     }
 
+    fn make_vision_pair_with_splice_flags() -> (VisionStream, tokio::io::DuplexStream)
+    {
+        let (client, server) = tokio::io::duplex(65536);
+        let opts = VisionOptions {
+            read_flag: Arc::new(AtomicBool::new(false)),
+            write_flag: Arc::new(AtomicBool::new(false)),
+        };
+        (
+            VisionStream::new(
+                Box::new(client),
+                TEST_UUID_STR.to_owned(),
+                Some(opts),
+            )
+            .unwrap(),
+            server,
+        )
+    }
+
     fn make_vision_with_read_splice_flag() -> (VisionStream, Arc<AtomicBool>) {
         let (client, _server) = tokio::io::duplex(65536);
         let read_flag = Arc::new(AtomicBool::new(false));
@@ -579,7 +599,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_direct_after_tls13_server_hello_and_app_data() {
-        let (mut vs, mut server) = make_vision_pair();
+        let (mut vs, mut server) = make_vision_pair_with_splice_flags();
         let client_hello = tls_record(0x16, Some(0x01), &[0; 32]);
         let server_hello = tls13_server_hello();
         let app_data = tls_record(TLS_APPLICATION_DATA, None, b"hello");
@@ -608,8 +628,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_downlink_server_hello_enables_uplink_direct() {
+    async fn test_tls13_without_splice_ends_vision_inside_tls() {
         let (mut vs, mut server) = make_vision_pair();
+        let client_hello = tls_record(0x16, Some(0x01), &[0; 32]);
+        let server_hello = tls13_server_hello();
+        let app_data = tls_record(TLS_APPLICATION_DATA, None, b"hello");
+
+        vs.write_all(&client_hello).await.unwrap();
+        vs.write_all(&server_hello).await.unwrap();
+        vs.write_all(&app_data).await.unwrap();
+        vs.flush().await.unwrap();
+
+        let mut buf = vec![0u8; 65536];
+        let n = server.read(&mut buf).await.unwrap();
+        let received = &buf[..n];
+        let (_, _, _, next) = parse_frame(received, 16);
+        let (_, _, _, next) = parse_frame(received, next);
+        let (command, content, _, _) = parse_frame(received, next);
+
+        assert_eq!(command, CMD_PADDING_END);
+        assert_eq!(content, app_data);
+        assert_eq!(vs.write_mode, WriteMode::DirectTls);
+    }
+
+    #[tokio::test]
+    async fn test_downlink_server_hello_enables_uplink_direct() {
+        let (mut vs, mut server) = make_vision_pair_with_splice_flags();
         let client_hello = tls_record(0x16, Some(0x01), &[0; 32]);
         let server_hello = tls13_server_hello();
         let app_data = tls_record(TLS_APPLICATION_DATA, None, b"request");
