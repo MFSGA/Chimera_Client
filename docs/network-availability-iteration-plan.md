@@ -1191,3 +1191,9 @@ TCP 临时端口，再尝试绑定同号 UDP 端口；当该端口属于 Windows
 - 基线：本地 `master` / `origin/master` `cc8f529823d326f782387474704762244f77a97d`；Mihomo 参考 `ref-mihomo` `63bd52ec794b7051569b76ede2f6cdbf4c091fda`。非 Vision VLESS 流此前只在首次应用写入时发送请求头；SSH/SMTP 等先读欢迎语的协议会等服务端回复，而服务端还在等 VLESS 请求头，造成互相等待。Mihomo 的 `tunnel/tunnel.go` 在转发前通过空写触发协议握手。
 - `VlessStream::poll_read` 现在在首次读取时发送空 payload 的 VLESS 请求头，然后按既有逻辑读取响应头；首次 `poll_write` 的部分写入状态仍复用同一个 pending buffer。新增 duplex 回归验证先读到 `SSH-2.0-test` banner。
 - `cargo test -p clash-lib --lib --locked read_first_sends_vless_handshake_for_server_first_protocols`：1 passed。该用例验证本地握手次序，不代表第三方 VLESS 服务端互操作或实际 SSH/SMTP 服务器测试。
+
+### 2026-11-16：HTTP Upgrade 空 header 的 early-data 回退（L2）
+
+- 基线：本地 `master` `aaaf58f684d290b281f1ca1ad49eaeb86db5d4d9`；Mihomo 参考 `ref-mihomo` `63bd52ec794b7051569b76ede2f6cdbf4c091fda`。其 `transport/vmess/websocket.go` 在 `early-data-header-name` 为空时把 URL-safe Base64 early data 追加到 URI path；当前 HTTP Upgrade 分支却把空字段当作非法 HTTP header 名并失败。
+- HTTP Upgrade 现在复用 WebSocket 的 early-data 编码逻辑：有 header 名时以 `HeaderMap::insert` 替换所有已有同名值，避免残留用户 header/占位符导致重复 header；为空时把数据追加到 path 且保留 query。新增重复配置 header、路径含 query 的握手、尾部数据与回包回归。
+- `cargo test -p clash-lib --lib --features ws --locked early_data_`：8 passed；包含 HTTP Upgrade header/path 两种模式与原 WebSocket early-data 用例。未进行 Mihomo/Xray 远端互操作或长连接压测。

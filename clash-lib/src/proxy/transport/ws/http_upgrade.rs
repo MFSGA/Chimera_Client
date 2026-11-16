@@ -1,15 +1,13 @@
 use std::{
-    cmp,
     future::Future,
     io,
     pin::Pin,
     task::{Context, Poll, Waker},
 };
 
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::{Buf, Bytes, BytesMut};
 use futures::ready;
-use http::{HeaderMap, HeaderName, HeaderValue, Request};
+use http::{HeaderMap, Request};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::{common::errors::new_io_error, proxy::AnyStream};
@@ -75,17 +73,13 @@ impl HttpUpgradeEarlyDataConn {
         let mut request = self.request.take().ok_or_else(|| {
             new_io_error("http upgrade early-data request is missing")
         })?;
-        let header_name = HeaderName::from_bytes(
-            self.early_data_header_name.as_bytes(),
-        )
-        .map_err(|_| new_io_error("invalid http upgrade early-data header name"))?;
-
-        self.early_data_len = cmp::min(self.max_early_data, buf.len());
-        let header_value = URL_SAFE_NO_PAD.encode(&buf[..self.early_data_len]);
-        let header_value = HeaderValue::from_str(&header_value).map_err(|_| {
-            new_io_error("invalid http upgrade early-data header value")
-        })?;
-        request.headers_mut().insert(header_name, header_value);
+        self.early_data_len =
+            super::websocket_early_data::WebsocketEarlyDataConn::apply_early_data(
+                &mut request,
+                &self.early_data_header_name,
+                buf,
+                self.max_early_data,
+            )?;
 
         let stream = self.stream.take().ok_or_else(|| {
             new_io_error("http upgrade early-data stream is missing")
@@ -451,6 +445,19 @@ mod tests {
             .unwrap()
     }
 
+    fn early_data_request() -> Request<()> {
+        let mut request = request();
+        request.headers_mut().append(
+            "Sec-WebSocket-Protocol",
+            http::HeaderValue::from_static("configured-subprotocol"),
+        );
+        request.headers_mut().append(
+            "Sec-WebSocket-Protocol",
+            http::HeaderValue::from_static("another-configured-value"),
+        );
+        request
+    }
+
     async fn read_headers(stream: &mut tokio::io::DuplexStream) -> Vec<u8> {
         let mut buf = Vec::new();
         loop {
@@ -493,6 +500,7 @@ mod tests {
             let headers = read_headers(&mut server).await;
             let text = String::from_utf8(headers).unwrap();
             assert!(text.contains("sec-websocket-protocol: ZWFybHk\r\n"));
+            assert_eq!(text.matches("sec-websocket-protocol:").count(), 1);
 
             server
                 .write_all(
@@ -509,7 +517,7 @@ mod tests {
 
         let mut upgraded = HttpUpgradeEarlyDataConn::new(
             Box::new(client),
-            request(),
+            early_data_request(),
             false,
             "Sec-WebSocket-Protocol".to_owned(),
             5,
@@ -544,9 +552,60 @@ mod tests {
 
         let mut upgraded = HttpUpgradeEarlyDataConn::new(
             Box::new(client),
-            request(),
+            early_data_request(),
             true,
             "Sec-WebSocket-Protocol".to_owned(),
+            5,
+        );
+        upgraded.write_all(b"earlytail").await.unwrap();
+        upgraded.flush().await.unwrap();
+
+        let mut reply = [0u8; 5];
+        upgraded.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"reply");
+    }
+
+    #[tokio::test]
+    async fn early_data_without_header_is_appended_before_query() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let headers = read_headers(&mut server).await;
+            let text = String::from_utf8(headers).unwrap();
+            assert!(
+                text.starts_with("GET /http-upgradeZWFybHk?token=1 HTTP/1.1\r\n")
+            );
+            assert!(
+                !text
+                    .to_ascii_lowercase()
+                    .contains("sec-websocket-protocol:")
+            );
+
+            server
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+                )
+                .await
+                .unwrap();
+
+            let mut tail = [0u8; 4];
+            server.read_exact(&mut tail).await.unwrap();
+            assert_eq!(&tail, b"tail");
+            server.write_all(b"reply").await.unwrap();
+        });
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("ws://example.com:443/http-upgrade?token=1")
+            .header("Host", "example.com")
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .body(())
+            .unwrap();
+        let mut upgraded = HttpUpgradeEarlyDataConn::new(
+            Box::new(client),
+            request,
+            false,
+            String::new(),
             5,
         );
         upgraded.write_all(b"earlytail").await.unwrap();
