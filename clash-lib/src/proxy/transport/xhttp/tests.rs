@@ -2517,6 +2517,8 @@ async fn xhttp_h2_pool_rejects_a_connection_from_an_older_network_generation() {
         eligible_path_ids: Some(
             [path_a.clone(), path_b.clone()].into_iter().collect(),
         ),
+        generation_only_local_route: false,
+        direct_local_route_pooling_supported: false,
         reporter: None,
     };
 
@@ -2569,6 +2571,8 @@ async fn xhttp_h2_pool_rejects_a_connection_from_an_older_network_generation() {
         network_generation: Some(20),
         path_id: None,
         eligible_path_ids: Some([path_b].into_iter().collect()),
+        generation_only_local_route: false,
+        direct_local_route_pooling_supported: false,
         reporter: None,
     };
     assert!(

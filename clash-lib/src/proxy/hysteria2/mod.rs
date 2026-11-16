@@ -397,6 +397,16 @@ impl Handler {
         tokio::task::JoinHandle<()>,
         NetworkPoolContext,
     )> {
+        let local_route_pooling_connector =
+            if self.opts.obfs.is_none() && self.opts.ports.is_some() {
+                hop_connector.as_deref()
+            } else {
+                Some(connector)
+            };
+        let supports_generation_only_local_route_pooling =
+            local_route_pooling_connector.is_some_and(|connector| {
+                connector.supports_generation_only_local_route_pooling()
+            });
         let (udp_socket, mut pool_context): (
             Arc<dyn quinn::AsyncUdpSocket>,
             NetworkPoolContext,
@@ -458,6 +468,8 @@ impl Handler {
             .as_ref()
             .map(|path| path.network_generation)
             .or(pool_context.network_generation);
+        pool_context.direct_local_route_pooling_supported =
+            supports_generation_only_local_route_pooling;
         let mut ep = quinn::Endpoint::new_with_abstract_socket(
             self.ep_config.clone(),
             None,
@@ -656,7 +668,12 @@ impl Handler {
                     tracing::debug!("old connection closed: {:?}", reason);
                     false
                 }
-                None => pool_context_is_current(&current_context, &s.pool_context),
+                None => pool_context_is_current(
+                    &current_context,
+                    &s.pool_context,
+                    sess.iface.is_some(),
+                    pool_connector.supports_generation_only_local_route_pooling(),
+                ),
             }
         }) {
             Some(s) => {
@@ -664,6 +681,8 @@ impl Handler {
                     &current_context,
                     &s.pool_context,
                     &cancellation,
+                    sess.iface.is_some(),
+                    pool_connector.supports_generation_only_local_route_pooling(),
                 )?;
                 Ok(s.clone())
             }
@@ -705,6 +724,8 @@ impl Handler {
                     &latest_context,
                     &pool_context,
                     &cancellation,
+                    sess.iface.is_some(),
+                    pool_connector.supports_generation_only_local_route_pooling(),
                 )
                 .is_err()
                 {
@@ -867,8 +888,17 @@ fn ensure_hysteria_connection_current(
     current: &NetworkPoolContext,
     connected: &NetworkPoolContext,
     cancellation: &tokio_util::sync::CancellationToken,
+    session_has_explicit_interface: bool,
+    current_supports_generation_only_local_route_pooling: bool,
 ) -> io::Result<()> {
-    if cancellation.is_cancelled() || !pool_context_is_current(current, connected) {
+    if cancellation.is_cancelled()
+        || !pool_context_is_current(
+            current,
+            connected,
+            session_has_explicit_interface,
+            current_supports_generation_only_local_route_pooling,
+        )
+    {
         return Err(io::Error::new(
             io::ErrorKind::Interrupted,
             "network path changed before Hysteria2 pool publication",
@@ -880,10 +910,22 @@ fn ensure_hysteria_connection_current(
 fn pool_context_is_current(
     current: &NetworkPoolContext,
     cached: &NetworkPoolContext,
+    session_has_explicit_interface: bool,
+    current_supports_generation_only_local_route_pooling: bool,
 ) -> bool {
-    // A missing physical path is NOT permission to bypass an explicit set of
-    // eligible interfaces. Generation-only reuse remains valid solely for
-    // connectors without an observed candidate set.
+    if cached.generation_only_local_route {
+        // Unknown connectors stay fail-closed. The current and cached contexts
+        // must both explicitly identify a direct loopback-capable connector.
+        return !session_has_explicit_interface
+            && current_supports_generation_only_local_route_pooling
+            && current.direct_local_route_pooling_supported
+            && cached.direct_local_route_pooling_supported
+            && cached.path_id.is_none()
+            && current.network_generation == cached.network_generation;
+    }
+    // A missing physical path is not permission to bypass an explicit set of
+    // eligible interfaces, except for a direct loopback route with no
+    // physical interface identity.
     current.permits(cached.network_generation, cached.path_id.as_ref())
 }
 
@@ -1607,6 +1649,8 @@ mod network_path_tests {
             network_generation: Some(7),
             path_id: None,
             eligible_path_ids: Some([ethernet.clone()].into_iter().collect()),
+            generation_only_local_route: false,
+            direct_local_route_pooling_supported: false,
             reporter: None,
         };
 
@@ -1616,7 +1660,9 @@ mod network_path_tests {
                 network_generation: Some(7),
                 path_id: Some(wifi),
                 ..Default::default()
-            }
+            },
+            false,
+            false,
         ));
         assert!(pool_context_is_current(
             &current,
@@ -1624,7 +1670,9 @@ mod network_path_tests {
                 network_generation: Some(7),
                 path_id: Some(ethernet.clone()),
                 ..Default::default()
-            }
+            },
+            false,
+            false,
         ));
         assert!(!pool_context_is_current(
             &current,
@@ -1632,7 +1680,9 @@ mod network_path_tests {
                 network_generation: Some(6),
                 path_id: Some(ethernet),
                 ..Default::default()
-            }
+            },
+            false,
+            false,
         ));
     }
 
@@ -1643,6 +1693,8 @@ mod network_path_tests {
             network_generation: Some(7),
             path_id: None,
             eligible_path_ids: Some([reported.clone()].into_iter().collect()),
+            generation_only_local_route: false,
+            direct_local_route_pooling_supported: false,
             reporter: None,
         };
         let unreported = NetworkPoolContext {
@@ -1650,17 +1702,81 @@ mod network_path_tests {
             path_id: None,
             ..Default::default()
         };
-        assert!(!pool_context_is_current(&current, &unreported));
+        assert!(!pool_context_is_current(
+            &current,
+            &unreported,
+            false,
+            false
+        ));
         // Older, non-path-aware connectors remain generation-only.
         let generation_only = NetworkPoolContext::for_generation(Some(7));
-        assert!(pool_context_is_current(&generation_only, &unreported));
+        assert!(pool_context_is_current(
+            &generation_only,
+            &unreported,
+            false,
+            false,
+        ));
         assert!(pool_context_is_current(
             &current,
             &NetworkPoolContext {
                 network_generation: Some(7),
                 path_id: Some(reported),
                 ..Default::default()
-            }
+            },
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn hysteria_loopback_route_uses_generation_scoped_pooling() {
+        let physical = path("eth0", 5, Ipv4Addr::new(198, 51, 100, 10));
+        let current = NetworkPoolContext {
+            network_generation: Some(7),
+            path_id: None,
+            eligible_path_ids: Some([physical].into_iter().collect()),
+            generation_only_local_route: false,
+            direct_local_route_pooling_supported: true,
+            reporter: None,
+        };
+        let loopback = NetworkPoolContext {
+            network_generation: Some(7),
+            generation_only_local_route: true,
+            direct_local_route_pooling_supported: true,
+            ..Default::default()
+        };
+
+        assert!(pool_context_is_current(&current, &loopback, false, true));
+        assert!(!pool_context_is_current(&current, &loopback, true, true));
+        // A third-party connector may delegate to DirectConnector and return
+        // its context, but its default trait capability remains fail-closed.
+        assert!(!pool_context_is_current(&current, &loopback, false, false));
+        assert!(!pool_context_is_current(
+            &NetworkPoolContext {
+                direct_local_route_pooling_supported: false,
+                ..current.clone()
+            },
+            &loopback,
+            false,
+            true,
+        ));
+        assert!(!pool_context_is_current(
+            &NetworkPoolContext {
+                network_generation: Some(8),
+                ..current.clone()
+            },
+            &loopback,
+            false,
+            true,
+        ));
+        assert!(!pool_context_is_current(
+            &current,
+            &NetworkPoolContext {
+                generation_only_local_route: false,
+                ..loopback
+            },
+            false,
+            true,
         ));
     }
 
@@ -1686,16 +1802,22 @@ mod network_path_tests {
         release.send(()).unwrap();
         let connected = NetworkPoolContext::for_generation(Some(7));
         let latest = dial.await.unwrap();
-        let err = ensure_hysteria_connection_current(&latest, &connected, &token)
-            .unwrap_err();
+        let err = ensure_hysteria_connection_current(
+            &latest, &connected, &token, false, false,
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Interrupted);
         assert!(
-            ensure_hysteria_connection_current(&connected, &connected, &token)
-                .is_ok()
+            ensure_hysteria_connection_current(
+                &connected, &connected, &token, false, false,
+            )
+            .is_ok()
         );
         token.cancel();
-        let err = ensure_hysteria_connection_current(&connected, &connected, &token)
-            .unwrap_err();
+        let err = ensure_hysteria_connection_current(
+            &connected, &connected, &token, false, false,
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Interrupted);
     }
 
