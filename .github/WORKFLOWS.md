@@ -8,7 +8,7 @@
 
 | 文件                                 | 现有触发器                                                   | 实际重点与限制                                                                                                                                                                                |
 | ------------------------------------ | ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ci.yml` — CI                        | push/PR 到 `master`；`v*` tag push；手工 `workflow_dispatch` | Dashboard 在 Ubuntu 从 `clash-dashboard/.node-version` 与 `package.json` 读取 Node.js/pnpm 版本，执行 frozen install、lint、build 并上传 `dist/`；Rust quality 下载产物后在 Ubuntu/Windows/macOS 跑 Clippy 与 LAN proxy；compile 依赖 dashboard+quality，按目标平台交叉编译；release 依赖 compile |
+| `ci.yml` — CI                        | push/PR 到 `master`；`v*` tag push；手工 `workflow_dispatch` | Dashboard 在 Ubuntu 从 `clash-dashboard/.node-version` 与 `package.json` 读取 Node.js/pnpm 版本，执行 frozen install、lint、build 并上传 `dist/`；Rust quality 下载产物后在 Ubuntu/Windows/macOS 跑 Clippy 与 LAN proxy；PR 的 compile 运行多目标 Clippy/测试但跳过发行构建和打包；push/tag/手工运行保留完整目标构建与 release 汇总 |
 | `coverage.yml`                       | 以 YAML 为准的 push/PR                                       | 覆盖率独立作业；并不等价于全功能/全平台验证                                                                                                                                                   |
 | `windows-network-regression.yml`     | `master` 上相关路径 push/PR、手动                            | Windows 上的 TCP/UDP loopback、pool/selector/dispatcher 回归；触发路径包含 Rust 工具链读取器；代码明确不做特权 TUN/NIC 真实变更                                                                 |
 | `proxy-throughput.yml`               | 指定路径 PR、`throughput` 分支 push、`v*` tag push、手工      | 性能/吞吐专用验证；PR 路径涵盖 Rust 工具链和 Dashboard 构建输入；通过共享步骤安装版本文件指定的 Node.js/pnpm 并构建 Dashboard 资源与测试子进程；与普通 Rust 单元测试边界不同                       |
@@ -28,7 +28,7 @@
 - **Actions 固定**：工作流第三方 action 使用完整提交 SHA；有对应 release tag 或分支时在行尾标注；Dependabot 每日检查 GitHub Actions 更新。
 - **Rust quality**：所有 Rust workflow 从 `rust-toolchain.toml` 读取固定工具链版本；`cargo fmt --all -- --check` 与 CLI feature 转发检查（均仅 Linux），`cargo clippy -p clash-lib --all-targets --all-features -- -D warnings`（Linux、Windows、macOS）及 LAN proxy 集成测试。查 job 时同时确认平台与选中的 feature。
 - **Rust cache**：直接使用 `actions/cache` 的 quality、compile、coverage、macOS build 和 Windows network job 按操作系统/目标、Rust 版本、`Cargo.lock`、Cargo 清单与 `.cargo/config.toml` 区分缓存；吞吐工作流使用 rust-cache action 自带的工具链与锁文件键。
-- **Compile**：多个 Linux/Windows/macOS 目标、部分 `cross`/不同 feature，`no-test` 与 PR 条件使某些目标不会运行测试。构建成功不等于真实运行或网卡/TUN 权限验证通过。
+- **Compile**：多个 Linux/Windows/macOS 目标、部分 `cross`/不同 feature；PR 运行多目标 Clippy/测试，不生成发行二进制；push/tag/手工运行执行发行构建与 release 汇总。`cross` 固定到已通过上一轮 CI 的上游提交，缓存键包含该提交。`no-test` 目标不会运行测试。构建成功不等于真实运行或网卡/TUN 权限验证通过。
 - **Windows network**：测试明确使用本地 loopback；不覆盖真实 NIC 修改、安装网络驱动或生产路由权限。
 - **Coverage / throughput / spell / email**：是不同独立工作流；PR checks 未完成或按路径跳过时均需说明，不可混为全绿。
 
