@@ -259,7 +259,7 @@ jobs:
 
       - name: Cargo fmt
         if: ${{ github.event_name == 'pull_request' }}
-        uses: clechasseur/rs-cargo@62dc8b04d9946cc72018b0c80bd0695ba1f89426 # v5.1.1
+        uses: clechasseur/rs-cargo@95d06e9c9dfee0281fe6450f675ed7a40e551f3f # v5.1.2
         with:
           command: fmt
           args: --all -- --check
@@ -268,7 +268,7 @@ jobs:
 
       - name: Cargo clippy
         if: ${{ github.event_name == 'pull_request' }}
-        uses: clechasseur/rs-cargo@62dc8b04d9946cc72018b0c80bd0695ba1f89426 # v5.1.1
+        uses: clechasseur/rs-cargo@95d06e9c9dfee0281fe6450f675ed7a40e551f3f # v5.1.2
         with:
           tool: ${{ matrix.tool }}
           command: clippy
@@ -277,7 +277,7 @@ jobs:
           CLASH_DOCKER_TEST: "true"
 
       - name: Cargo test
-        uses: clechasseur/rs-cargo@62dc8b04d9946cc72018b0c80bd0695ba1f89426 # v5.1.1
+        uses: clechasseur/rs-cargo@95d06e9c9dfee0281fe6450f675ed7a40e551f3f # v5.1.2
         if: ${{ !matrix.no-test &&  github.event_name == 'pull_request' }}
         with:
           tool: ${{ matrix.tool }}
@@ -290,7 +290,7 @@ jobs:
 
       - name: Cargo build
         if: github.event_name != 'pull_request'
-        uses: clechasseur/rs-cargo@62dc8b04d9946cc72018b0c80bd0695ba1f89426 # v5.1.1
+        uses: clechasseur/rs-cargo@95d06e9c9dfee0281fe6450f675ed7a40e551f3f # v5.1.2
         with:
           tool: ${{ matrix.tool }}
           command: build
