@@ -85,18 +85,8 @@ impl TryFrom<&OutboundVless> for Handler {
 
         let transport = build_transport(network, s)?;
 
-        // Do not send native VLESS UDP packets to an XUDP-only endpoint.
-        // TCP remains available while XUDP encoding is not implemented.
-        let udp = if s.packet_encoding.as_deref() == Some("xudp") {
-            if s.udp.unwrap_or(true) {
-                warn!(
-                    "VLESS packet-encoding: xudp is not implemented; disabling UDP for this endpoint while preserving TCP"
-                );
-            }
-            false
-        } else {
-            s.udp.unwrap_or(true)
-        };
+        let xudp = s.packet_encoding.as_deref() == Some("xudp");
+        let udp = s.udp.unwrap_or(true);
         if s.smux.as_ref().and_then(|smux| smux.enabled) == Some(true) {
             warn!(
                 "VLESS smux.enabled is accepted for compatibility but multiplexing is not implemented"
@@ -117,7 +107,8 @@ impl TryFrom<&OutboundVless> for Handler {
             tls: build_tls_transport(network, s, skip_cert_verify)?,
             flow: s.flow.clone(),
             encryption,
-        }))
+        })
+        .with_xudp(xudp))
     }
 }
 
@@ -2040,8 +2031,8 @@ rules: []
             assert_eq!(handler.name(), name);
             if name == "xudp-contract" {
                 assert!(
-                    !handler.support_udp().await,
-                    "unsupported XUDP must not silently fall back to native UDP"
+                    handler.support_udp().await,
+                    "implemented XUDP must advertise UDP support"
                 );
             }
         }
@@ -2321,7 +2312,7 @@ rules: []
     }
 
     #[tokio::test]
-    async fn vless_xudp_keeps_tcp_but_disables_unsupported_udp() {
+    async fn vless_xudp_enables_udp_without_changing_tcp_configuration() {
         use crate::proxy::OutboundHandler;
 
         let outbound: OutboundVless = serde_yaml::from_str(
@@ -2346,11 +2337,42 @@ udp: true
             .expect("xudp should not block TCP configuration");
         let handler: crate::proxy::vless::Handler = (&outbound)
             .try_into()
-            .expect("xudp should preserve VLESS TCP handler");
+            .expect("xudp should preserve VLESS handler");
         assert!(
-            !handler.support_udp().await,
-            "XUDP must not be sent as native UDP"
+            handler.support_udp().await,
+            "implemented XUDP should be advertised as UDP-capable"
         );
+    }
+
+    #[tokio::test]
+    async fn vless_xudp_respects_udp_false() {
+        use crate::proxy::OutboundHandler;
+
+        let outbound: OutboundVless = serde_yaml::from_str(
+            "name: disabled-xudp\nserver: example.invalid\nport: 443\n\
+             uuid: b831381d-6324-4d53-ad4f-8cda48b30811\n\
+             packet-encoding: xudp\nudp: false\n",
+        )
+        .expect("Mihomo config should deserialize");
+        let handler = crate::proxy::vless::Handler::try_from(&outbound)
+            .expect("XUDP handler should build");
+        assert!(!handler.support_udp().await);
+    }
+
+    #[tokio::test]
+    async fn vless_native_udp_encoding_remains_the_default() {
+        use crate::proxy::OutboundHandler;
+
+        for packet_encoding in [None, Some("none"), Some("")] {
+            let outbound = OutboundVless {
+                packet_encoding: packet_encoding.map(str::to_owned),
+                uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+                ..Default::default()
+            };
+            let handler = crate::proxy::vless::Handler::try_from(&outbound)
+                .expect("native VLESS handler should build");
+            assert!(handler.support_udp().await);
+        }
     }
 
     #[test]
@@ -2381,7 +2403,7 @@ udp: true
 
     #[cfg(feature = "vless-encryption")]
     #[tokio::test]
-    async fn vless_mihomo_xudp_with_random_encryption_keeps_tcp_and_disables_udp() {
+    async fn vless_mihomo_xudp_with_random_encryption_enables_udp() {
         use crate::proxy::OutboundHandler;
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
@@ -2396,10 +2418,10 @@ udp: true
         let outbound: OutboundVless =
             serde_yaml::from_str(&yaml).expect("Mihomo config deserialization");
         let handler = crate::proxy::vless::Handler::try_from(&outbound)
-            .expect("random 1-RTT with XUDP must still create TCP handler");
+            .expect("random 1-RTT with XUDP should create a handler");
         assert!(
-            !handler.support_udp().await,
-            "XUDP must never silently downgrade to native encrypted UDP"
+            handler.support_udp().await,
+            "XUDP with supported 1-RTT encryption should advertise UDP"
         );
     }
 

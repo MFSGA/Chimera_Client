@@ -17,7 +17,7 @@
 | --- | --- | --- |
 | `vless.client-fingerprint: chrome`（10 个） | Reality 端点维持既有 Chrome 握手支持；**非 Reality TLS** 现仅接收此 Mihomo 字段并明确警告，使用普通 TLS，**不伪装 Chrome**。其他未实现值仍拒绝，Reality `none` 仍拒绝以防降级。 | 为标准 TLS 与各传输实现真实且可测的 ClientHello 指纹；验证证书检查和 ALPN 行为。 |
 | `trojan.client-fingerprint: chrome`（2 个）及 `hysteria2.client-fingerprint: chrome`（2 个） | 作为结构化兼容字段接收，给出未实现警告；**不修改 TLS 证书校验、QUIC/TLS 或加密行为**。 | 分别实现/验证 ClientHello 指纹能力，评估 QUIC 兼容性。 |
-| `vless.packet-encoding: xudp`（10 个） | 接收 `xudp`，**TCP 保留、UDP 禁用**；不能把原生 UDP 错当成 XUDP。`none` / 空值保持既有逻辑；其它未知编码继续报配置错误。 | 实现 XUDP wire 编解码、端到端 UDP 数据和错误路径测试，再启用 UDP。 |
+| `vless.packet-encoding: xudp`（10 个） | 使用 VLESS Mux command 与单子连接 XUDP 帧；每包携带目标地址，首帧带 Global ID；不回退到原生 VLESS UDP。`none` / 空值保持既有逻辑；其它未知编码继续报配置错误。 | 继续做 Xray/Mihomo 真实节点互操作与跨平台运行验收。 |
 | `vless.smux.enabled: false`（3 个） | 结构化解析；false 没有实际副作用，true 目前仅警告，不启用多路复用。 | 实现和验证 SMUX（并发、流控、重连与取消）。 |
 | `xhttp-opts`（5 个） | 已有 `stream-one` / `stream-up`、基础下载端点和 `reuse-settings` 的配置/运行时路径；一个下载端点显式配置 Reality。**未对本订阅做真实互操作**。 | 覆盖实际 Xray/Mihomo H2/H3、download-settings、复用和安全切换。 |
 | `trojan.network: ws`（2 个） | 配置和运行时已有 WebSocket 分支；取决于是否编译 `ws` feature。 | 真实 WebSocket 互操作。 |
@@ -26,8 +26,8 @@
 ## 保持安全边界
 
 1. 所有 `client-fingerprint` 的无实现兼容都必须**有明确警告**；不得把 Chrome 伪装误报为完成。标准 TLS 仍使用原有证书验证策略；订阅中若显式含 `skip-cert-verify: true`，行为与安全风险原样保留，由用户审查。
-2. XUDP 没有真实封包实现时禁止发送普通 VLESS UDP 来假装支持：**禁用受影响节点的 UDP**，避免静默错误；TCP 与其他节点仍可正常配置。
-3. `smux`、Trojan/Hysteria2 指纹和 XUDP 均为“兼容接收/待实现”，不是“协议已支持”。
+2. `packet-encoding: xudp` 使用独立的 Mux/XUDP wire path，不得回退到原生 VLESS UDP；真实节点互操作仍需单独验收。
+3. `smux` 与 Trojan/Hysteria2 指纹仍是“兼容接收/待实现”；XUDP wire path 已实现，但真实节点互操作未验证。
 4. 缺少 `hysteria`、`trojan`、`ws`、`reality` 等编译 feature，或下载端点/路由格式本身无效时，核心仍可能拒绝配置；**不允许**靠降级加密、无凭据代理或静默替换节点绕过。
 5. 使用虚构节点/测试密钥编写回归用例，不引入真实订阅内容。后续验收需分别测试纯解析、代理创建、网络连通、UDP、跨平台与安全错误分支。
 
@@ -49,6 +49,17 @@
 - **验证**：修复前 `vless_rejects_malformed_uuid_before_outbound_runtime` 失败、修复后通过；默认 feature 的 VLESS 转换器测试 **95 passed**；`--no-default-features` 下 UUID 拒绝测试 **1 passed**；`cargo clippy -p clash-lib --lib --locked --offline -- -D warnings` 通过。
 - **相关 CI 修复**：此前主线提交 `43679c3` 的 Rust quality CI 因 `encryption_stream.rs` 中 2 个 `collapsible_if` 和 3 个 `chunks_exact_to_as_chunks` 告警失败（Windows Network Regression 已成功）。修复这些告警后，复用了已有 Dashboard 构建产物运行的本地 `cargo clippy -p clash-lib --all-targets --all-features --locked --offline -- -D warnings` 通过；本地**未重新构建 Dashboard**，新提交的远端 CI 仍需单独验收。
 - **限制**：没有测试真实节点、XUDP wire 协议、真实订阅，亦未验证完整 Mihomo 订阅在所有平台的运行行为；这些仍需后续独立验收。以上测试只使用虚构 UUID、地址和密钥材料。
+
+## 2026-11-16：VLESS XUDP UDP 数据面实现
+
+- **基线**：隔离分支 `codex/vless-xudp` 从 `origin/master` `dadb991f7c42510265d9d95dc41e76634c24b8ab` 创建；只读参考固定为 `ref-mihomo` `63bd52ec794b7051569b76ede2f6cdbf4c091fda`、`ref/` `39d06a49ccb5c812ed7cd70b3028f3efcebeae6b`。主工作区的未提交文件未触碰。
+- **实现**：显式 `packet-encoding: xudp` 现在通过 VLESS command 3（Mux）启动单 XUDP 子连接；首包编码 New 并带目标和 8 字节 per-process opaque Global ID，后续包编码 Keep 并携带各自目标地址。响应解析支持 IPv4、域名、IPv6、KeepAlive、分片读取和有界帧缓冲；未知状态、选项、地址或截断帧会关闭该数据流，不会切换到普通 VLESS UDP。
+- **兼容边界**：未配置、空值和 `none` 继续走现有原生 VLESS UDP 路径；`udp: false` 仍禁用 UDP。SMUX 仍未实现。真实 Xray/Mihomo 节点互操作及 Windows/Linux/macOS 运行尚未验证。
+- **Xray 单包上限**：发送端最多接受 **8192 字节** UDP payload，不拆分更大的数据报。Xray 的 XUDP `PacketReader` 将 payload 读入固定 8192 字节的 `buf.New()` 缓冲区，超出缓冲区时 `ReadFullFrom` 返回错误；实现与边界测试据此限制在 8192 字节。[Xray XUDP reader](https://github.com/XTLS/Xray-core/blob/main/common/xudp/xudp.go) · [Xray buffer limit](https://github.com/XTLS/Xray-core/blob/main/common/buf/buffer.go)
+- **协议依据**：本实现按 Mihomo 固定参考的 VLESS `Mux` 命令/`parseVlessAddr` 和 Xray Mux.Cool Single XUDP 帧结构实现；不复制 GPL 依赖源码。
+- **验证**：定向 XUDP codec 测试 **8 passed**（含 8192/8193 字节边界）；`proxy::vless::` 回归 **94 passed**；VLESS 转换器 **88 passed**；均使用 `--no-default-features --features aws-lc-rs,ws,tun,vless-encryption --locked`。全目标严格 Clippy `cargo clippy -p clash-lib --all-targets --locked --no-default-features --features aws-lc-rs,ws,tun,vless-encryption -- -D warnings` 通过；Rustfmt 与 `git diff --check` 通过。
+- **独立审查**：提交 `126e724366214b710ac8f551d22e7645253e9fd7` 已获独立 L2 `APPROVE_WITH_EVIDENCE`，原 MEDIUM 互操作问题已修复，未发现阻断项。该复审依据静态代码和合成测试证据，不包含真实节点或平台运行。
+- **限制**：这些是合成帧和内存 duplex 测试，尚未连接真实 Xray/Mihomo 节点；Windows/Linux/macOS 运行、网络切换与端到端 UDP 仍为 `not run`。当前分支未推送或合入 `master`。
 
 ## 2026-10-16：XHTTP XMUX 显式零值兼容性
 

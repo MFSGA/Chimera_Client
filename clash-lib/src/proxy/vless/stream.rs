@@ -13,6 +13,7 @@ use crate::{proxy::AnyStream, session::SocksAddr};
 const VLESS_VERSION: u8 = 0;
 const VLESS_COMMAND_TCP: u8 = 1;
 const VLESS_COMMAND_UDP: u8 = 2;
+const VLESS_COMMAND_MUX: u8 = 3;
 const XTLS_VISION_FLOW: &str = "xtls-rprx-vision";
 
 struct PendingWrite {
@@ -33,6 +34,7 @@ pub struct VlessStream {
     uuid: uuid::Uuid,
     destination: SocksAddr,
     is_udp: bool,
+    xudp: bool,
     flow: Option<String>,
 }
 
@@ -44,6 +46,32 @@ impl VlessStream {
         is_udp: bool,
         flow: Option<String>,
     ) -> io::Result<Self> {
+        Self::new_with_xudp(stream, uuid, destination, is_udp, false, flow)
+    }
+
+    pub fn new_xudp(
+        stream: AnyStream,
+        uuid: &str,
+        destination: &SocksAddr,
+        flow: Option<String>,
+    ) -> io::Result<Self> {
+        Self::new_with_xudp(stream, uuid, destination, true, true, flow)
+    }
+
+    fn new_with_xudp(
+        stream: AnyStream,
+        uuid: &str,
+        destination: &SocksAddr,
+        is_udp: bool,
+        xudp: bool,
+        flow: Option<String>,
+    ) -> io::Result<Self> {
+        if xudp && !is_udp {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "VLESS XUDP requires a UDP session",
+            ));
+        }
         let uuid = uuid::Uuid::parse_str(uuid).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "invalid UUID format")
         })?;
@@ -62,6 +90,7 @@ impl VlessStream {
             uuid,
             destination: destination.clone(),
             is_udp,
+            xudp,
             flow,
         })
     }
@@ -79,13 +108,17 @@ impl VlessStream {
         buf.put_u8(addons.len() as u8);
         buf.put_slice(&addons);
 
-        if self.is_udp {
+        if self.xudp {
+            buf.put_u8(VLESS_COMMAND_MUX);
+        } else if self.is_udp {
             buf.put_u8(VLESS_COMMAND_UDP);
         } else {
             buf.put_u8(VLESS_COMMAND_TCP);
         }
 
-        self.destination.write_to_buf_vmess(&mut buf);
+        if !self.xudp {
+            self.destination.write_to_buf_vmess(&mut buf);
+        }
         buf
     }
 
@@ -318,7 +351,7 @@ impl AsyncWrite for VlessStream {
 mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use super::{VlessStream, XTLS_VISION_FLOW};
+    use super::{VLESS_COMMAND_MUX, VlessStream, XTLS_VISION_FLOW};
     use crate::session::SocksAddr;
 
     const TEST_UUID: &str = "5415d8e0-df92-3655-afa4-b79de66413f5";
@@ -347,6 +380,24 @@ mod tests {
         assert_eq!(header[17], 18, "vision flow protobuf should be 18 bytes");
         assert_eq!(&header[18..20], &[0x0a, 16]);
         assert_eq!(&header[20..36], XTLS_VISION_FLOW.as_bytes());
+    }
+
+    #[test]
+    fn xudp_uses_mux_command_without_a_vless_destination() {
+        let (io, _) = tokio::io::duplex(1);
+        let stream = VlessStream::new_xudp(
+            Box::new(io),
+            TEST_UUID,
+            &SocksAddr::Domain("example.com".to_owned(), 443),
+            None,
+        )
+        .expect("XUDP stream should build");
+
+        let header = stream.build_handshake_header();
+
+        assert_eq!(header.len(), 19);
+        assert_eq!(header[17], 0, "no VLESS addons are configured");
+        assert_eq!(header[18], VLESS_COMMAND_MUX);
     }
 
     #[tokio::test]
