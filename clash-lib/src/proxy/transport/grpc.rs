@@ -1084,6 +1084,8 @@ mod tests {
             eligible_path_ids: Some(
                 [path_a.clone(), path_b.clone()].into_iter().collect(),
             ),
+            generation_only_local_route: false,
+            direct_local_route_pooling_supported: false,
             reporter: None,
         };
         let raw = TcpStream::connect(addr)
@@ -1126,6 +1128,8 @@ mod tests {
             network_generation: Some(10),
             path_id: None,
             eligible_path_ids: Some([path_b].into_iter().collect()),
+            generation_only_local_route: false,
+            direct_local_route_pooling_supported: false,
             reporter: None,
         };
         assert!(

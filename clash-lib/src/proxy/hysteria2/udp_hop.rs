@@ -532,6 +532,8 @@ mod tests {
             network_generation: Some(12),
             path_id: Some(wifi.clone()),
             eligible_path_ids: Some([wifi.clone(), ethernet].into_iter().collect()),
+            generation_only_local_route: false,
+            direct_local_route_pooling_supported: false,
             reporter: None,
         };
 
@@ -570,6 +572,8 @@ mod tests {
             network_generation: Some(12),
             path_id: None,
             eligible_path_ids: Some([wifi].into_iter().collect()),
+            generation_only_local_route: false,
+            direct_local_route_pooling_supported: false,
             reporter: None,
         };
 
