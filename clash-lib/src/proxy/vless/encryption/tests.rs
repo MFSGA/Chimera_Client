@@ -957,10 +957,10 @@ async fn encryption_stream_one_rtt_round_trips_records(appearance: &str, udp: bo
         )
         .expect("server record codec");
 
-        // Five TCP records or three UDP records (the separate VLESS request
-        // handshake plus two records carrying the >8 KiB UDP frame) cross
-        // AES-CTR block boundaries. Reference bytes are derived independently
-        // of runtime mask state.
+        // Five TCP records cross AES-CTR header-mask blocks. UDP uses three
+        // records: the separate VLESS request handshake plus two records
+        // carrying the >8 KiB UDP frame. Reference bytes are derived
+        // independently of runtime mask state.
         let mut received_udp = Vec::new();
         for index in 0..if udp { 3 } else { 5 } {
             let mut header = [0u8; RECORD_HEADER_LEN];
