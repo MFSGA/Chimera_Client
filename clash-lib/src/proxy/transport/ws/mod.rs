@@ -116,6 +116,10 @@ impl Client {
         {
             request = request.header("Host", self.host.as_str());
         }
+        if self.max_early_data > 0 && !self.early_data_header_name.is_empty() {
+            // The lazy early-data stream replaces this placeholder later.
+            request = request.header(self.early_data_header_name.as_str(), "xxoo");
+        }
         let mut request = request.body(()).map_err(|error| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
         })?;
@@ -326,6 +330,30 @@ mod tests {
             Some("websocket")
         );
         assert!(request.headers().get("Sec-WebSocket-Key").is_none());
+    }
+
+    #[test]
+    fn http_upgrade_request_adds_early_data_header_placeholder() {
+        let request = Client::new(
+            "example.com".to_owned(),
+            443,
+            "/upgrade".to_owned(),
+            HashMap::new(),
+            None,
+            8,
+            "Sec-WebSocket-Protocol".to_owned(),
+        )
+        .with_http_upgrade(true, false)
+        .http_upgrade_req()
+        .expect("http upgrade early-data request should build");
+
+        assert_eq!(
+            request
+                .headers()
+                .get("Sec-WebSocket-Protocol")
+                .and_then(|value| value.to_str().ok()),
+            Some("xxoo")
+        );
     }
 
     #[test]

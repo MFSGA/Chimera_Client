@@ -70,7 +70,7 @@ impl WebsocketEarlyDataConn {
         }
     }
 
-    fn apply_early_data(
+    pub(super) fn apply_early_data(
         req: &mut Request<()>,
         header_name: &str,
         buf: &[u8],
