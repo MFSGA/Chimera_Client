@@ -88,26 +88,39 @@ jobs:
           Write-Host "Target: x86_64-pc-windows-msvc"
           Write-Host "Tests use loopback sockets and simulated network changes; no privileged TUN or NIC changes."
 
+      # Gate the test stage on successful setup, then continue collecting the
+      # independent regression results even if an earlier test command fails.
+      # A failing test still fails the job; this only avoids masking later tests.
+      - name: Prepare test stage
+        id: test_stage
+        run: Write-Host "Windows test environment is ready."
+
       # Default features compile the regular TUN code, but unit tests never
       # create a privileged Windows TUN adapter in this workflow.
       - name: Run library unit tests (default features)
+        if: ${{ !cancelled() && steps.test_stage.outcome == 'success' }}
         run: cargo test -p clash-lib --lib --locked -- --test-threads=1
 
       # These two integration tests use local TCP/UDP sockets. In particular,
       # the UDP test exercises repeated /network/reset without changing NICs.
       - name: Run UDP recovery integration tests (loopback)
+        if: ${{ !cancelled() && steps.test_stage.outcome == 'success' }}
         run: cargo test -p clash-lib --test direct_udp_integration_tests --locked -- --test-threads=1
 
       - name: Run LAN proxy integration tests (TCP)
+        if: ${{ !cancelled() && steps.test_stage.outcome == 'success' }}
         run: cargo test -p clash-lib --test lan_proxy_tests --locked -- --test-threads=1
 
       # Catch accidental feature-gating regressions in the connection-pool
       # and selector fixes without requiring QUIC, dashboard, or TUN.
       - name: Run minimal-feature pool isolation tests
+        if: ${{ !cancelled() && steps.test_stage.outcome == 'success' }}
         run: 'cargo test -p clash-lib --lib --no-default-features --locked app::outbound::manager::tests:: -- --test-threads=1'
 
       - name: Run minimal-feature proxy group path tests
+        if: ${{ !cancelled() && steps.test_stage.outcome == 'success' }}
         run: 'cargo test -p clash-lib --lib --no-default-features --locked proxy::group::selector::path_selection_tests:: -- --test-threads=1'
 
       - name: Run minimal-feature dispatcher path tests
+        if: ${{ !cancelled() && steps.test_stage.outcome == 'success' }}
         run: 'cargo test -p clash-lib --lib --no-default-features --locked app::dispatcher::dispatcher_impl::tests:: -- --test-threads=1'
