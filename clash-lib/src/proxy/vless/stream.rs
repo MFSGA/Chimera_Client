@@ -411,10 +411,10 @@ mod tests {
         let mut pending_tx = Some(pending_tx);
         poll_fn(|cx| {
             let result = future.as_mut().poll(cx);
-            if result.is_pending() {
-                if let Some(pending_tx) = pending_tx.take() {
-                    let _ = pending_tx.send(());
-                }
+            if result.is_pending()
+                && let Some(pending_tx) = pending_tx.take()
+            {
+                let _ = pending_tx.send(());
             }
             result
         })
