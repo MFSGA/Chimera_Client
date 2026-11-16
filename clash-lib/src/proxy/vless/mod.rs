@@ -19,7 +19,11 @@ use crate::{
         dns::ThreadSafeDNSResolver,
     },
     impl_default_connector,
-    proxy::vless::{datagram::OutboundDatagramVless, vision::VisionStream},
+    proxy::vless::{
+        datagram::OutboundDatagramVless,
+        vision::VisionStream,
+        xudp::{OutboundDatagramXudp, global_id_for_session},
+    },
     session::Session,
 };
 use async_trait::async_trait;
@@ -38,6 +42,7 @@ mod vision;
 mod vision_filter;
 mod vision_pad;
 mod vision_unpad;
+mod xudp;
 
 pub struct HandlerOptions {
     pub name: String,
@@ -54,6 +59,7 @@ pub struct HandlerOptions {
 
 pub struct Handler {
     opts: HandlerOptions,
+    xudp: bool,
     connector: tokio::sync::RwLock<Option<Arc<dyn RemoteConnector>>>,
 }
 
@@ -71,8 +77,14 @@ impl Handler {
     pub fn new(opts: HandlerOptions) -> Self {
         Self {
             opts,
+            xudp: false,
             connector: Default::default(),
         }
+    }
+
+    pub(crate) fn with_xudp(mut self, enabled: bool) -> Self {
+        self.xudp = enabled;
+        self
     }
 
     fn wrap_vless_stream(
@@ -85,8 +97,8 @@ impl Handler {
     ) -> io::Result<AnyStream> {
         let s = if let Some(config) = self.opts.encryption.as_ref() {
             // UDP shares the 1-RTT encrypted byte stream. The outer VLESS
-            // layer selects UDP command 2 and datagram.rs preserves packet
-            // boundaries across the underlying encrypted records.
+            // layer selects command 2 or XUDP's Mux command 3, and the
+            // datagram wrapper preserves packet boundaries over that stream.
             #[cfg(feature = "vless-encryption")]
             {
                 let prepared = config.prepare_crypto()?;
@@ -104,13 +116,22 @@ impl Handler {
             s
         };
 
-        let vless_stream = VlessStream::new(
-            s,
-            &self.opts.uuid,
-            &sess.destination,
-            is_udp,
-            self.opts.flow.clone(),
-        )?;
+        let vless_stream = if self.xudp && is_udp {
+            VlessStream::new_xudp(
+                s,
+                &self.opts.uuid,
+                &sess.destination,
+                self.opts.flow.clone(),
+            )?
+        } else {
+            VlessStream::new(
+                s,
+                &self.opts.uuid,
+                &sess.destination,
+                is_udp,
+                self.opts.flow.clone(),
+            )?
+        };
 
         let stream: AnyStream =
             if self.opts.flow.as_deref() == Some("xtls-rprx-vision") {
@@ -173,6 +194,34 @@ impl Handler {
             )?,
             path_ids,
         )))
+    }
+
+    async fn wrap_vless_datagram(
+        &self,
+        stream: AnyStream,
+        sess: &Session,
+        path_ids: Vec<crate::app::flow::NetworkPathId>,
+    ) -> BoxedChainedDatagram {
+        if self.xudp {
+            let datagram = OutboundDatagramXudp::new(
+                stream,
+                sess.destination.clone(),
+                global_id_for_session(sess),
+            );
+            let chained = ChainedDatagramWrapper::new_with_network_path_ids(
+                datagram, path_ids,
+            );
+            chained.append_to_chain(self.name()).await;
+            Box::new(chained)
+        } else {
+            let datagram =
+                OutboundDatagramVless::new(stream, sess.destination.clone());
+            let chained = ChainedDatagramWrapper::new_with_network_path_ids(
+                datagram, path_ids,
+            );
+            chained.append_to_chain(self.name()).await;
+            Box::new(chained)
+        }
     }
 
     async fn try_transport_owned_stream(
@@ -384,25 +433,13 @@ impl OutboundHandler for Handler {
             .try_reuse_transport_stream(sess, true, &pool_context, connector)
             .await?
         {
-            let datagram =
-                OutboundDatagramVless::new(stream, sess.destination.clone());
-            let chained = ChainedDatagramWrapper::new_with_network_path_ids(
-                datagram, path_ids,
-            );
-            chained.append_to_chain(self.name()).await;
-            return Ok(Box::new(chained));
+            return Ok(self.wrap_vless_datagram(stream, sess, path_ids).await);
         }
         if let Some((stream, path_ids)) = self
             .try_transport_owned_stream(sess, resolver.clone(), connector, true)
             .await?
         {
-            let datagram =
-                OutboundDatagramVless::new(stream, sess.destination.clone());
-            let chained = ChainedDatagramWrapper::new_with_network_path_ids(
-                datagram, path_ids,
-            );
-            chained.append_to_chain(self.name()).await;
-            return Ok(Box::new(chained));
+            return Ok(self.wrap_vless_datagram(stream, sess, path_ids).await);
         }
 
         let (stream, connected_pool_context) = connector
@@ -421,21 +458,91 @@ impl OutboundHandler for Handler {
         let stream = self
             .inner_proxy_stream(stream, sess, true, connected_pool_context)
             .await?;
-        let d = OutboundDatagramVless::new(stream, sess.destination.clone());
-
-        let chained = ChainedDatagramWrapper::new_with_network_path_ids(d, path_ids);
-        chained.append_to_chain(self.name()).await;
-        Ok(Box::new(chained))
+        Ok(self.wrap_vless_datagram(stream, sess, path_ids).await)
     }
 }
 
 #[cfg(test)]
 mod reuse_tests {
+    use futures::SinkExt;
     use std::{net::SocketAddr, sync::Arc};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
-    use crate::{app::dns::MockClashResolver, proxy::utils::DirectConnector};
+    use crate::{
+        app::dns::MockClashResolver,
+        proxy::{datagram::UdpPacket, utils::DirectConnector},
+        session::Network,
+    };
+
+    #[tokio::test]
+    async fn xudp_handler_sends_mux_handshake_and_single_xudp_frame() {
+        let destination: crate::session::SocksAddr =
+            "203.0.113.11:53".parse().expect("destination");
+        let session = Session {
+            network: Network::Udp,
+            source: "192.0.2.55:45678".parse().expect("source"),
+            destination: destination.clone(),
+            ..Session::default()
+        };
+
+        let handler = Handler::new(HandlerOptions {
+            name: "xudp-test".to_owned(),
+            common_opts: HandlerCommonOptions::default(),
+            server: "example.invalid".to_owned(),
+            port: 443,
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            udp: true,
+            transport: None,
+            tls: None,
+            flow: None,
+            encryption: None,
+        })
+        .with_xudp(true);
+
+        let (client, mut server) = tokio::io::duplex(1);
+        let stream = handler
+            .wrap_vless_stream(Box::new(client), &session, true, None, None)
+            .expect("wrap XUDP VLESS stream");
+        let mut datagram = handler
+            .wrap_vless_datagram(stream, &session, Vec::new())
+            .await;
+        let payload = b"dns";
+        let outgoing = UdpPacket::new(
+            payload.to_vec(),
+            session.source.into(),
+            destination.clone(),
+        );
+        let send = tokio::spawn(async move {
+            datagram.send(outgoing).await.expect("send XUDP packet");
+        });
+
+        let mut bytes = vec![0; 19 + 27];
+        server
+            .read_exact(&mut bytes)
+            .await
+            .expect("handshake and frame");
+        send.await.expect("send task");
+
+        assert_eq!(
+            &bytes[..18],
+            &[
+                0, 0xb8, 0x31, 0x38, 0x1d, 0x63, 0x24, 0x4d, 0x53, 0xad, 0x4f, 0x8c,
+                0xda, 0x48, 0xb3, 0x08, 0x11, 0
+            ]
+        );
+        assert_eq!(bytes[18], 3, "VLESS must select the Mux command");
+        assert_eq!(&bytes[19..21], &[0, 20], "XUDP metadata length");
+        assert_eq!(&bytes[21..25], &[0, 0, 1, 1], "session New metadata");
+        assert_eq!(bytes[25], 2, "XUDP network is UDP");
+        assert_eq!(&bytes[26..33], &[0, 53, 1, 203, 0, 113, 11]);
+        assert_eq!(
+            &bytes[33..41],
+            &global_id_for_session(&session),
+            "first frame carries the inbound source Global ID"
+        );
+        assert_eq!(&bytes[41..], &[0, 3, b'd', b'n', b's']);
+    }
 
     #[tokio::test]
     async fn encrypted_vless_advertises_udp_only_with_crypto_feature() {

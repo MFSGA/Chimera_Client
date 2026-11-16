@@ -559,7 +559,7 @@ pub struct OutboundVless {
     #[serde(flatten)]
     pub common_opts: CommonConfigOptions,
     pub uuid: String,
-    /// Mihomo packet-encoding compatibility. The XUDP wire format is not yet implemented.
+    /// Mihomo UDP packet encoding. `xudp` uses VLESS Mux command framing.
     pub packet_encoding: Option<String>,
     /// Mihomo stream multiplexing settings. Parsed but not applied at runtime.
     pub smux: Option<SmuxCompat>,
