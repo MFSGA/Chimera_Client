@@ -7,7 +7,7 @@ use std::{
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures::{Future, ready};
-use http::{HeaderValue, Request, Uri, uri::PathAndQuery};
+use http::{HeaderName, HeaderValue, Request, Uri, uri::PathAndQuery};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
@@ -107,15 +107,14 @@ impl WebsocketEarlyDataConn {
                     format!("invalid websocket early-data header value: {err}"),
                 )
             })?;
-            let header = req.headers_mut().get_mut(header_name).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "websocket early-data header placeholder is missing: {header_name}"
-                    ),
-                )
-            })?;
-            *header = value;
+            let header_name = HeaderName::from_bytes(header_name.as_bytes())
+                .map_err(|err| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid websocket early-data header name: {err}"),
+                    )
+                })?;
+            req.headers_mut().insert(header_name, value);
         }
 
         Ok(early_data_len)
@@ -157,14 +156,26 @@ mod tests {
     fn request() -> Request<()> {
         Request::builder()
             .uri("ws://example.com:80/ws?token=1")
-            .header("Sec-WebSocket-Protocol", "placeholder")
             .body(())
             .unwrap()
     }
 
+    fn request_with_early_data_headers() -> Request<()> {
+        let mut request = request();
+        request.headers_mut().append(
+            "Sec-WebSocket-Protocol",
+            HeaderValue::from_static("configured-subprotocol"),
+        );
+        request.headers_mut().append(
+            "Sec-WebSocket-Protocol",
+            HeaderValue::from_static("another-configured-value"),
+        );
+        request
+    }
+
     #[test]
     fn early_data_uses_configured_header() {
-        let mut req = request();
+        let mut req = request_with_early_data_headers();
 
         let consumed = WebsocketEarlyDataConn::apply_early_data(
             &mut req,
@@ -183,6 +194,14 @@ mod tests {
                 .unwrap(),
             "aGVsbG8"
         );
+        assert_eq!(
+            req.headers()
+                .get_all("Sec-WebSocket-Protocol")
+                .iter()
+                .count(),
+            1,
+            "early data must replace every configured value"
+        );
         assert_eq!(req.uri().path_and_query().unwrap().as_str(), "/ws?token=1");
     }
 
@@ -199,14 +218,7 @@ mod tests {
             req.uri().path_and_query().unwrap().as_str(),
             "/wsaGVsbG8?token=1"
         );
-        assert_eq!(
-            req.headers()
-                .get("Sec-WebSocket-Protocol")
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            "placeholder"
-        );
+        assert_eq!(req.headers().get("Sec-WebSocket-Protocol"), None);
     }
 }
 

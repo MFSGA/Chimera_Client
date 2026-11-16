@@ -447,9 +447,13 @@ mod tests {
 
     fn early_data_request() -> Request<()> {
         let mut request = request();
-        request.headers_mut().insert(
+        request.headers_mut().append(
             "Sec-WebSocket-Protocol",
-            http::HeaderValue::from_static("xxoo"),
+            http::HeaderValue::from_static("configured-subprotocol"),
+        );
+        request.headers_mut().append(
+            "Sec-WebSocket-Protocol",
+            http::HeaderValue::from_static("another-configured-value"),
         );
         request
     }
@@ -496,6 +500,7 @@ mod tests {
             let headers = read_headers(&mut server).await;
             let text = String::from_utf8(headers).unwrap();
             assert!(text.contains("sec-websocket-protocol: ZWFybHk\r\n"));
+            assert_eq!(text.matches("sec-websocket-protocol:").count(), 1);
 
             server
                 .write_all(

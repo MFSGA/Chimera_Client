@@ -1196,7 +1196,7 @@ TCP 临时端口，再尝试绑定同号 UDP 端口；当该端口属于 Windows
 ### 2026-11-16：HTTP Upgrade 空 header 的 early-data 回退（L2）
 
 - 基线：本地 `master` `aaaf58f684d290b281f1ca1ad49eaeb86db5d4d9`；Mihomo 参考 `ref-mihomo` `63bd52ec794b7051569b76ede2f6cdbf4c091fda`。其 `transport/vmess/websocket.go` 在 `early-data-header-name` 为空时把 URL-safe Base64 early data 追加到 URI path；当前 HTTP Upgrade 分支却把空字段当作非法 HTTP header 名并失败。
-- HTTP Upgrade 现在复用 WebSocket 的 early-data 编码逻辑：有 header 名时替换请求中的占位 header；为空时把数据追加到 path 且保留 query。生产请求构造会为配置的 header 加占位值。新增路径含 query 的握手、尾部数据与回包回归。
+- HTTP Upgrade 现在复用 WebSocket 的 early-data 编码逻辑：有 header 名时以 `HeaderMap::insert` 替换所有已有同名值，避免残留用户 header/占位符导致重复 header；为空时把数据追加到 path 且保留 query。新增重复配置 header、路径含 query 的握手、尾部数据与回包回归。
 - `cargo test -p clash-lib --lib --features ws --locked early_data_`：8 passed；包含 HTTP Upgrade header/path 两种模式与原 WebSocket early-data 用例。未进行 Mihomo/Xray 远端互操作或长连接压测。
 
 ### 2026-11-16：REALITY 调试日志移除密钥材料（L2）
