@@ -1203,3 +1203,9 @@ TCP 临时端口，再尝试绑定同号 UDP 端口；当该端口属于 Windows
 - 基线：本地 `master` `f29a1d9164c9735ff2079d8786d0b52f32c8eacf`。REALITY 的 debug 日志此前输出认证密钥、nonce、Session ID 明文/密文、握手流量密钥、TLS 派生 secret、Finished 校验数据及证书 HMAC 内容；启用 debug 并保留日志会暴露可用于还原会话加密材料的数据。
 - 移除上述字节内容日志，保留 cipher suite、长度、消息阶段及验证成功/失败状态，分别覆盖 ClientHello/握手、TLS 1.3 key schedule 与证书验证代码；不改变握手计算和验证行为。
 - `cargo test -p clash-lib --lib --locked reality`：151 passed。对 REALITY 目录执行字节格式占位符与关键字段日志静态检索，未发现原始密钥/secret 输出。未做运行时日志采集或远端互操作验证。
+
+### 2026-11-16：REALITY Session ID 客户端版本对齐（L2）
+
+- 基线：本地 `master` `6d929fbc87ca9f3feb1aafb041d08bc3b656ae28`；`ref-mihomo` `63bd52ec794b7051569b76ede2f6cdbf4c091fda`。当前实现写入 `[1, 8, 0]`，固定 Mihomo 源码写入 `[1, 8, 2]`。REALITY 服务端支持 `minClientVer` 并以 Session ID 中解密出的客户端版本作比较，因此第三个版本字节的差异会影响设置最低版本为 `1.8.1` 或 `1.8.2` 的服务端；这里仅做 Mihomo metadata parity。
+- 提取 Session ID 生成函数并将版本改为 `[1, 8, 2]`，保留时间戳、Short ID 和长度拒绝行为。它不能满足高于 `1.8.2` 的最低版本门槛（例如 `26.3.27`）；尚未在配置此门槛的 Xray 服务端做互操作验证。
+- `cargo test -p clash-lib --lib --locked reality`：153 passed，包含版本布局、Short ID 上限和既有 ClientHello/REALITY 回归。

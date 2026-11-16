@@ -41,6 +41,30 @@ use super::reality_util::{
 use super::slide_buffer::SlideBuffer;
 use super::util::allocate_vec;
 
+const MIHOMO_REALITY_CLIENT_VERSION: [u8; 3] = [1, 8, 2];
+
+fn build_reality_session_plaintext(
+    short_id: &[u8],
+    timestamp: u32,
+) -> io::Result<[u8; 16]> {
+    if short_id.len() > 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "REALITY short-id too long: {} bytes (max 8)",
+                short_id.len()
+            ),
+        ));
+    }
+
+    let mut plaintext = [0u8; 16];
+    plaintext[..3].copy_from_slice(&MIHOMO_REALITY_CLIENT_VERSION);
+    plaintext[3] = 0;
+    plaintext[4..8].copy_from_slice(&timestamp.to_be_bytes());
+    plaintext[8..8 + short_id.len()].copy_from_slice(short_id);
+    Ok(plaintext)
+}
+
 /// Configuration for REALITY client connections
 #[derive(Clone)]
 pub struct RealityClientConfig {
@@ -193,26 +217,11 @@ impl RealityClientConnection {
             .map_err(|_| io::Error::other("System time error"))?
             .as_secs();
 
-        let mut session_id_plaintext = [0u8; 16];
-        session_id_plaintext[0] = 1; // Protocol version major
-        session_id_plaintext[1] = 8; // Protocol version minor
-        session_id_plaintext[2] = 0; // Protocol version patch
-        session_id_plaintext[3] = 0; // Padding byte
-        // Timestamp (4 bytes as uint32, in seconds)
-        session_id_plaintext[4..8]
-            .copy_from_slice(&(timestamp as u32).to_be_bytes());
-        // Short ID (0-8 bytes), followed by zero padding.
-        if self.config.short_id.len() > 8 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "REALITY short-id too long: {} bytes (max 8)",
-                    self.config.short_id.len()
-                ),
-            ));
-        }
-        session_id_plaintext[8..8 + self.config.short_id.len()]
-            .copy_from_slice(&self.config.short_id);
+        // Match Mihomo's REALITY version metadata in the encrypted Session ID.
+        let session_id_plaintext = build_reality_session_plaintext(
+            &self.config.short_id,
+            timestamp as u32,
+        )?;
 
         // Create a 32-byte SessionId (16 bytes plaintext + 16 bytes zeros for padding)
         let mut session_id_for_hello = [0u8; 32];
@@ -1144,6 +1153,27 @@ mod tests {
         let mut server_public = [0u8; 32];
         server_public.copy_from_slice(server_public_key.as_ref());
         server_public
+    }
+
+    #[test]
+    fn reality_session_plaintext_matches_mihomo_client_version() {
+        let timestamp = 0x1234_5678;
+        let short_id = [0xaa, 0xbb, 0xcc, 0xdd];
+
+        let plaintext =
+            build_reality_session_plaintext(&short_id, timestamp).unwrap();
+
+        assert_eq!(&plaintext[..4], &[1, 8, 2, 0]);
+        assert_eq!(&plaintext[4..8], &timestamp.to_be_bytes());
+        assert_eq!(&plaintext[8..12], &short_id);
+        assert_eq!(&plaintext[12..], &[0; 4]);
+    }
+
+    #[test]
+    fn reality_session_plaintext_rejects_long_short_id() {
+        let err = build_reality_session_plaintext(&[0u8; 9], 0)
+            .expect_err("REALITY short-id is limited to 8 bytes");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
