@@ -23,7 +23,7 @@ use std::{
 use anyhow::anyhow;
 use bytes::{Bytes, BytesMut};
 use codec::{Fragments, Hy2TcpCodec};
-use congestion::{Brutal, DynController};
+use congestion::{Brutal, DynCongestion, DynController};
 use futures::{SinkExt, StreamExt};
 use h3::client::SendRequest;
 use h3_quinn::OpenStreams;
@@ -236,8 +236,8 @@ impl Handler {
             tracing::debug!("disable mtu discovery");
             transport.mtu_discovery_config(None);
         }
-        // TODO
-        // transport.congestion_controller_factory(DynCongestion);
+        transport
+            .congestion_controller_factory(Arc::new(DynCongestion::new(opts.cwnd)));
         transport.max_idle_timeout(Some(
             Self::DEFAULT_MAX_IDLE_TIMEOUT.try_into().unwrap(),
         ));
