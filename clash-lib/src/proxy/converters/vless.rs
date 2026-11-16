@@ -131,7 +131,7 @@ fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
     }
 
     #[cfg(not(feature = "reality"))]
-    if s.reality_opts.is_some() {
+    if vless_top_level_reality_is_selected(s) {
         return Err(Error::InvalidConfig(
             "VLESS REALITY requires the reality feature".to_owned(),
         ));
@@ -270,6 +270,36 @@ fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
     }
 
     Ok(())
+}
+
+fn vless_top_level_reality_is_selected(s: &OutboundVless) -> bool {
+    if s.reality_opts.is_none() {
+        return false;
+    }
+
+    if s.network.as_deref() != Some("xhttp") {
+        return true;
+    }
+
+    let Some(xhttp_opts) = s.xhttp_opts.as_ref() else {
+        return true;
+    };
+    let upload_security = xhttp_opts
+        .upload_settings
+        .as_ref()
+        .and_then(|settings| settings.security.as_deref());
+    if !matches!(upload_security, Some("tls" | "none")) {
+        return true;
+    }
+
+    let Some(download_settings) = resolve_xhttp_download_settings(xhttp_opts) else {
+        return false;
+    };
+    match download_settings.security.as_deref() {
+        Some("tls" | "none") => false,
+        Some("reality") | None => true,
+        Some(_) => false,
+    }
 }
 
 /// Accept the common Mihomo `chrome` hint for non-Reality TLS without
@@ -2755,6 +2785,67 @@ udp: true
             err.to_string()
                 .contains("VLESS REALITY requires the reality feature"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(all(
+        not(feature = "reality"),
+        any(feature = "aws-lc-rs", feature = "ring")
+    ))]
+    #[test]
+    fn vless_xhttp_tls_endpoints_override_unused_top_level_reality() {
+        let outbound = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "xhttp-tls-overrides-reality".to_owned(),
+                server: "upload.example.com".to_owned(),
+                port: 443,
+                connect_via: None,
+            },
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
+            network: Some("xhttp".to_owned()),
+            alpn: Some(vec!["h2".to_owned()]),
+            reality_opts: Some(OutboundTrojanRealityOpts::default()),
+            xhttp_opts: Some(XhttpOpt {
+                path: Some("/upload/".to_owned()),
+                mode: Some("packet-up".to_owned()),
+                upload_settings: Some(XhttpUploadSettings {
+                    address: "upload.example.com".to_owned(),
+                    port: 443,
+                    network: "xhttp".to_owned(),
+                    security: Some("tls".to_owned()),
+                    xhttp_settings: Some(XhttpDownloadXhttpSettings {
+                        path: Some("/upload/".to_owned()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                download_settings: Some(XhttpDownloadSettings {
+                    address: "download.example.com".to_owned(),
+                    port: 443,
+                    network: "xhttp".to_owned(),
+                    security: Some("tls".to_owned()),
+                    xhttp_settings: Some(XhttpDownloadXhttpSettings {
+                        path: Some("/download/".to_owned()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        validate_vless_config(&outbound)
+            .expect("explicit XHTTP TLS endpoint security should override Reality");
+        assert!(
+            build_transport(outbound.network.as_deref(), &outbound)
+                .expect("XHTTP TLS transport should build")
+                .is_some()
+        );
+        assert!(
+            build_tls_transport(outbound.network.as_deref(), &outbound, false)
+                .expect("XHTTP owns explicit endpoint TLS")
+                .is_none()
         );
     }
 

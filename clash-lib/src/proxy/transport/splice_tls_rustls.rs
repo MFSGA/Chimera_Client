@@ -283,7 +283,9 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-    async fn connected_tls_pair() -> (
+    async fn connected_tls_pair(
+        tls12_only: bool,
+    ) -> (
         SplicableRustlsStream,
         tokio_rustls::server::TlsStream<tokio::io::DuplexStream>,
         VisionOptions,
@@ -307,7 +309,14 @@ mod tests {
         roots
             .add(cert_der)
             .expect("test certificate should be trusted");
-        let client_config = rustls::ClientConfig::builder()
+        let client_builder = if tls12_only {
+            rustls::ClientConfig::builder_with_protocol_versions(&[
+                &rustls::version::TLS12,
+            ])
+        } else {
+            rustls::ClientConfig::builder()
+        };
+        let client_config = client_builder
             .with_root_certificates(roots)
             .with_no_client_auth();
 
@@ -352,7 +361,7 @@ mod tests {
 
     #[tokio::test]
     async fn rustls_read_splice_preserves_raw_bytes_after_tls_record() {
-        let (mut client, mut server, options) = connected_tls_pair().await;
+        let (mut client, mut server, options) = connected_tls_pair(false).await;
         server.write_all(b"vision-direct-frame").await.unwrap();
         server.flush().await.unwrap();
         server.get_mut().0.write_all(b"raw-downlink").await.unwrap();
@@ -371,7 +380,7 @@ mod tests {
 
     #[tokio::test]
     async fn rustls_write_splice_flushes_tls_before_raw_bytes() {
-        let (mut client, mut server, options) = connected_tls_pair().await;
+        let (mut client, mut server, options) = connected_tls_pair(false).await;
         client.write_all(b"vision-direct-frame").await.unwrap();
         client.flush().await.unwrap();
         options
@@ -388,6 +397,54 @@ mod tests {
         let mut body = vec![0u8; body_len];
         server_io.read_exact(&mut body).await.unwrap();
 
+        let mut raw = [0u8; 10];
+        server_io.read_exact(&mut raw).await.unwrap();
+        assert_eq!(&raw, b"raw-uplink");
+    }
+
+    #[tokio::test]
+    async fn rustls_tls12_read_splice_preserves_raw_bytes_after_tls_record() {
+        let (mut client, mut server, options) = connected_tls_pair(true).await;
+        assert_eq!(
+            server.get_ref().1.protocol_version(),
+            Some(rustls::ProtocolVersion::TLSv1_2)
+        );
+        server.write_all(b"vision-direct-frame").await.unwrap();
+        server.flush().await.unwrap();
+
+        let mut frame = [0u8; 19];
+        client.read_exact(&mut frame).await.unwrap();
+        assert_eq!(&frame, b"vision-direct-frame");
+
+        options
+            .read_flag
+            .store(true, std::sync::atomic::Ordering::Release);
+        server.get_mut().0.write_all(b"raw-downlink").await.unwrap();
+        let mut raw = [0u8; 12];
+        client.read_exact(&mut raw).await.unwrap();
+        assert_eq!(&raw, b"raw-downlink");
+    }
+
+    #[tokio::test]
+    async fn rustls_tls12_write_splice_flushes_tls_before_raw_bytes() {
+        let (mut client, mut server, options) = connected_tls_pair(true).await;
+        assert_eq!(
+            server.get_ref().1.protocol_version(),
+            Some(rustls::ProtocolVersion::TLSv1_2)
+        );
+        client.write_all(b"vision-direct-frame").await.unwrap();
+        client.flush().await.unwrap();
+
+        let mut frame = [0u8; 19];
+        server.read_exact(&mut frame).await.unwrap();
+        assert_eq!(&frame, b"vision-direct-frame");
+
+        options
+            .write_flag
+            .store(true, std::sync::atomic::Ordering::Release);
+        client.write_all(b"raw-uplink").await.unwrap();
+        client.flush().await.unwrap();
+        let server_io = &mut server.get_mut().0;
         let mut raw = [0u8; 10];
         server_io.read_exact(&mut raw).await.unwrap();
         assert_eq!(&raw, b"raw-uplink");

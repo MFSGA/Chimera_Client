@@ -349,14 +349,6 @@ impl Transport for Client {
         let options = VisionOptions::default();
         let boundary_io = TlsRecordBoundaryIo::new(stream);
         let tls = self.connect(boundary_io).await?;
-        if tls.get_ref().1.protocol_version()
-            != Some(rustls::ProtocolVersion::TLSv1_3)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "VLESS Vision requires the outer TLS connection to negotiate TLS 1.3",
-            ));
-        }
         let stream = SplicableRustlsStream::new(tls, &options);
         Ok((Box::new(stream), Some(options)))
     }
