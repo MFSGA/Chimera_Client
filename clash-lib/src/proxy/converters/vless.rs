@@ -130,6 +130,19 @@ fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
         }
     }
 
+    if s.flow.as_deref() == Some("xtls-rprx-vision") {
+        if !matches!(s.network.as_deref(), None | Some("tcp")) {
+            return Err(Error::InvalidConfig(
+                "VLESS xtls-rprx-vision requires the TCP network".to_owned(),
+            ));
+        }
+        if !s.tls.unwrap_or_default() && s.reality_opts.is_none() {
+            return Err(Error::InvalidConfig(
+                "VLESS xtls-rprx-vision requires TLS or REALITY".to_owned(),
+            ));
+        }
+    }
+
     if let Some(encryption) = s.encryption.as_deref() {
         let encryption = encryption.trim();
         if !encryption.is_empty() && encryption != "none" {
@@ -2658,11 +2671,40 @@ udp: true
             },
             uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
             flow: Some("xtls-rprx-vision".to_owned()),
+            tls: Some(true),
             ..Default::default()
         };
 
         validate_vless_config(&outbound)
             .expect("vision flow should remain supported");
+    }
+
+    #[test]
+    fn vless_vision_rejects_non_tcp_transports_at_config_load() {
+        let outbound = OutboundVless {
+            flow: Some("xtls-rprx-vision".to_owned()),
+            network: Some("grpc".to_owned()),
+            tls: Some(true),
+            ..Default::default()
+        };
+
+        let err = validate_vless_config(&outbound)
+            .expect_err("Vision requires a direct TCP transport");
+        assert!(err.to_string().contains("requires the TCP network"));
+    }
+
+    #[test]
+    fn vless_vision_requires_tls_or_reality_at_config_load() {
+        let outbound = OutboundVless {
+            flow: Some("xtls-rprx-vision".to_owned()),
+            network: Some("tcp".to_owned()),
+            tls: Some(false),
+            ..Default::default()
+        };
+
+        let err = validate_vless_config(&outbound)
+            .expect_err("Vision without TLS or REALITY cannot splice");
+        assert!(err.to_string().contains("requires TLS or REALITY"));
     }
 
     #[test]

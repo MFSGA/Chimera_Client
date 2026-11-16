@@ -10,8 +10,9 @@ use rustls::{
 };
 use serde::Serialize;
 use std::{io, sync::Arc};
+use tokio::io::{AsyncRead, AsyncWrite};
 
-use super::Transport;
+use super::{SplicableRustlsStream, TlsRecordBoundaryIo, Transport, VisionOptions};
 use crate::{
     common::{errors::map_io_error, tls::DefaultTlsVerifier},
     proxy::AnyStream,
@@ -304,31 +305,60 @@ impl Client {
 
         Ok(tls_config)
     }
-}
 
-#[async_trait]
-impl Transport for Client {
-    async fn proxy_stream(&self, stream: AnyStream) -> io::Result<AnyStream> {
+    async fn connect<S>(
+        &self,
+        stream: S,
+    ) -> io::Result<tokio_rustls::client::TlsStream<S>>
+    where
+        S: AsyncRead + AsyncWrite + Send + Sync + Unpin,
+    {
         let tls_config = self.rustls_client_config()?;
         let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
         let dns_name =
             rustls::pki_types::ServerName::try_from(self.sni.as_str().to_owned())
                 .map_err(map_io_error)?;
 
-        let c = connector.connect(dns_name, stream).await.and_then(|x| {
-            if let Some(expected_alpn) = self.expected_alpn.as_ref()
-                && x.get_ref().1.alpn_protocol() != Some(expected_alpn.as_bytes())
-            {
-                return Err(io::Error::other(format!(
-                    "unexpected alpn protocol: {:?}, expected: {:?}",
-                    x.get_ref().1.alpn_protocol(),
-                    expected_alpn
-                )));
-            }
+        let stream = connector.connect(dns_name, stream).await?;
+        if let Some(expected_alpn) = self.expected_alpn.as_ref()
+            && stream.get_ref().1.alpn_protocol() != Some(expected_alpn.as_bytes())
+        {
+            return Err(io::Error::other(format!(
+                "unexpected alpn protocol: {:?}, expected: {:?}",
+                stream.get_ref().1.alpn_protocol(),
+                expected_alpn
+            )));
+        }
 
-            Ok(x)
-        });
-        c.map(|x| Box::new(x) as _)
+        Ok(stream)
+    }
+}
+
+#[async_trait]
+impl Transport for Client {
+    async fn proxy_stream(&self, stream: AnyStream) -> io::Result<AnyStream> {
+        self.connect(stream)
+            .await
+            .map(|stream| Box::new(stream) as _)
+    }
+
+    async fn proxy_stream_spliced(
+        &self,
+        stream: AnyStream,
+    ) -> io::Result<(AnyStream, Option<VisionOptions>)> {
+        let options = VisionOptions::default();
+        let boundary_io = TlsRecordBoundaryIo::new(stream);
+        let tls = self.connect(boundary_io).await?;
+        if tls.get_ref().1.protocol_version()
+            != Some(rustls::ProtocolVersion::TLSv1_3)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "VLESS Vision requires the outer TLS connection to negotiate TLS 1.3",
+            ));
+        }
+        let stream = SplicableRustlsStream::new(tls, &options);
+        Ok((Box::new(stream), Some(options)))
     }
 }
 
