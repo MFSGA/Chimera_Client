@@ -1185,3 +1185,9 @@ TCP 临时端口，再尝试绑定同号 UDP 端口；当该端口属于 Windows
 - 一次非标准 feature 组合 `--no-default-features --features ring,tls,port` 的单测构建被既有 `TunCandidateExclusion::Named` dead-code 警告阻断；未为此放宽 lint 或改无关代码。带 TUN 的受支持 `ring,tun,port` profile 和文档化的无默认 feature `cargo check` 均通过。
 - 独立 L2 审查发现 no-Reality 构建会接受普通 VLESS Reality 配置并静默降级为明文；现在普通 VLESS 路径在配置转换时 fail-closed，XHTTP 则由 endpoint 转换器按实际 security 决定，避免重复推断继承规则。XHTTP endpoint 的空 `reality_opts.public_key` 按现有转换语义清除继承值，feature 检查与回归用例现保持一致；显式 TLS/none endpoint 可忽略未使用的顶层 Reality。另对没有 `aws-lc-rs`/`ring` crypto provider 的标准 TLS Vision 增加显式配置拒绝。无 crypto provider 的专用单测组合仍被既有 DNS/TLS/XHTTP `dead_code` deny 阻断；没有放宽 lint。该未支持组合的错误分支未声称已执行。
 - TLS 切换回归使用进程内 rustls client/server 与 duplex I/O，覆盖 TLS 1.3 读写记录边界和 TLS 1.2 实际握手后的拒绝；未运行 Xray/Mihomo 远端互操作、真实 TCP/公网场景或跨平台运行测试。这些仍是验收边界。最终 SHA 的独立 Reviewer、维护者验收与本地 master 集成状态在最终交付中记录。
+
+### 2026-11-16：VLESS server-first 首读握手（L2）
+
+- 基线：本地 `master` / `origin/master` `cc8f529823d326f782387474704762244f77a97d`；Mihomo 参考 `ref-mihomo` `63bd52ec794b7051569b76ede2f6cdbf4c091fda`。非 Vision VLESS 流此前只在首次应用写入时发送请求头；SSH/SMTP 等先读欢迎语的协议会等服务端回复，而服务端还在等 VLESS 请求头，造成互相等待。Mihomo 的 `tunnel/tunnel.go` 在转发前通过空写触发协议握手。
+- `VlessStream::poll_read` 现在在首次读取时发送空 payload 的 VLESS 请求头，然后按既有逻辑读取响应头；首次 `poll_write` 的部分写入状态仍复用同一个 pending buffer。新增 duplex 回归验证先读到 `SSH-2.0-test` banner。
+- `cargo test -p clash-lib --lib --locked read_first_sends_vless_handshake_for_server_first_protocols`：1 passed。该用例验证本地握手次序，不代表第三方 VLESS 服务端互操作或实际 SSH/SMTP 服务器测试。
