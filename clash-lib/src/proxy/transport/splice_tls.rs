@@ -23,16 +23,6 @@ use crate::proxy::transport::reality::CryptoTlsStream;
 
 type RealityTlsStream = CryptoTlsStream<AnyStream>;
 
-/// Options passed to `VisionStream` when XTLS-splice mode is active.
-///
-/// Shared `Arc<AtomicBool>` flags are written by `VisionStream` when it
-/// detects `CMD_PADDING_DIRECT`, and read by `SplicableTlsStream` to know
-/// when to bypass the Reality TLS layer.
-pub struct VisionOptions {
-    pub read_flag: Arc<AtomicBool>,
-    pub write_flag: Arc<AtomicBool>,
-}
-
 pub struct SplicableTlsStream {
     tls: RealityTlsStream,
 

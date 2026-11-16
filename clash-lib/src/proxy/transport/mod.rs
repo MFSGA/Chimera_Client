@@ -1,6 +1,7 @@
 mod grpc;
 mod tls;
 
+mod splice_tls_rustls;
 #[cfg(feature = "ws")]
 mod ws;
 mod xhttp;
@@ -41,9 +42,8 @@ pub use simple_obfs::{
     SimpleOBFSMode, SimpleOBFSOption, SimpleObfsHttp, SimpleObfsTLS,
 };
 pub use sip003::Sip003Plugin;
-#[cfg(feature = "reality")]
-pub use splice_tls::VisionOptions;
-#[cfg(not(feature = "reality"))]
+use splice_tls_rustls::{SplicableRustlsStream, TlsRecordBoundaryIo};
+
 #[derive(Clone, Debug, Default)]
 pub struct VisionOptions {
     pub read_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,

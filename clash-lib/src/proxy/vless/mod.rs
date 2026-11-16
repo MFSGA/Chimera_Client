@@ -262,6 +262,16 @@ impl Handler {
             self.opts.flow.as_deref() == Some("xtls-rprx-vision");
         let mut vision_opts = None;
 
+        if wants_vision_splice
+            && self.opts.tls.is_some()
+            && self.opts.transport.is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "VLESS Vision cannot combine a TLS transport with an additional transport",
+            ));
+        }
+
         let s = if let Some(tls) = self.opts.tls.as_ref() {
             if wants_vision_splice {
                 let (stream, opts) = tls.proxy_stream_spliced(s).await?;
@@ -287,6 +297,13 @@ impl Handler {
         } else {
             s
         };
+
+        if wants_vision_splice && vision_opts.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "VLESS Vision requires a splice-capable TLS or Reality transport",
+            ));
+        }
 
         self.wrap_vless_stream(s, sess, is_udp, vision_opts, Some(&pool_context))
     }
