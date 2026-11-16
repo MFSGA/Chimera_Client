@@ -1197,3 +1197,9 @@ TCP 临时端口，再尝试绑定同号 UDP 端口；当该端口属于 Windows
 - 基线：本地 `master` `aaaf58f684d290b281f1ca1ad49eaeb86db5d4d9`；Mihomo 参考 `ref-mihomo` `63bd52ec794b7051569b76ede2f6cdbf4c091fda`。其 `transport/vmess/websocket.go` 在 `early-data-header-name` 为空时把 URL-safe Base64 early data 追加到 URI path；当前 HTTP Upgrade 分支却把空字段当作非法 HTTP header 名并失败。
 - HTTP Upgrade 现在复用 WebSocket 的 early-data 编码逻辑：有 header 名时替换请求中的占位 header；为空时把数据追加到 path 且保留 query。生产请求构造会为配置的 header 加占位值。新增路径含 query 的握手、尾部数据与回包回归。
 - `cargo test -p clash-lib --lib --features ws --locked early_data_`：8 passed；包含 HTTP Upgrade header/path 两种模式与原 WebSocket early-data 用例。未进行 Mihomo/Xray 远端互操作或长连接压测。
+
+### 2026-11-16：REALITY 调试日志移除密钥材料（L2）
+
+- 基线：本地 `master` `f29a1d9164c9735ff2079d8786d0b52f32c8eacf`。REALITY 的 debug 日志此前输出认证密钥、nonce、Session ID 明文/密文、握手流量密钥、TLS 派生 secret、Finished 校验数据及证书 HMAC 内容；启用 debug 并保留日志会暴露可用于还原会话加密材料的数据。
+- 移除上述字节内容日志，保留 cipher suite、长度、消息阶段及验证成功/失败状态，分别覆盖 ClientHello/握手、TLS 1.3 key schedule 与证书验证代码；不改变握手计算和验证行为。
+- `cargo test -p clash-lib --lib --locked reality`：151 passed。对 REALITY 目录执行字节格式占位符与关键字段日志静态检索，未发现原始密钥/secret 输出。未做运行时日志采集或远端互操作验证。
