@@ -1189,8 +1189,9 @@ TCP 临时端口，再尝试绑定同号 UDP 端口；当该端口属于 Windows
 ### 2026-11-16：VLESS server-first 首读握手（L2）
 
 - 基线：本地 `master` / `origin/master` `cc8f529823d326f782387474704762244f77a97d`；Mihomo 参考 `ref-mihomo` `63bd52ec794b7051569b76ede2f6cdbf4c091fda`。非 Vision VLESS 流此前只在首次应用写入时发送请求头；SSH/SMTP 等先读欢迎语的协议会等服务端回复，而服务端还在等 VLESS 请求头，造成互相等待。Mihomo 的 `tunnel/tunnel.go` 在转发前通过空写触发协议握手。
-- `VlessStream::poll_read` 现在在首次读取时发送空 payload 的 VLESS 请求头，然后按既有逻辑读取响应头；首次 `poll_write` 的部分写入状态仍复用同一个 pending buffer。新增 duplex 回归验证先读到 `SSH-2.0-test` banner。
-- `cargo test -p clash-lib --lib --locked read_first_sends_vless_handshake_for_server_first_protocols`：1 passed。该用例验证本地握手次序，不代表第三方 VLESS 服务端互操作或实际 SSH/SMTP 服务器测试。
+- `VlessStream::poll_read` 现在在首次读取时发送空 payload 的 VLESS 请求头，然后按既有逻辑读取响应头；header 有独立 pending 状态，读写两侧完成时互相唤醒，应用 payload 只由 `poll_write` 写入。新增 duplex 回归验证先读到 `SSH-2.0-test` banner。
+- 对首版实现的 L2 复核发现 read/write 同时进行时，读路径可能代发 pending 首写 payload 并造成重发；反向时序还可能把空握手误报为 `Ok(0)`。现以小缓冲双向回归覆盖这两种时序，确认 payload 恰好发送一次且 read-first 后的首写成功。
+- `cargo test -p clash-lib --lib --locked first_`：11 passed，包含上述两项并发回归、server-first 首读与首次写入既有用例。只验证本机 duplex 时序，不代表第三方 VLESS 服务端互操作或实际 SSH/SMTP 服务器测试。
 
 ### 2026-11-16：HTTP Upgrade 空 header 的 early-data 回退（L2）
 
