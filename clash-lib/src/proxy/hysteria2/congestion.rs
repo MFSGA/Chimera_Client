@@ -5,14 +5,18 @@ use std::{
 
 use quinn_proto::congestion::{Bbr, BbrConfig, Controller, ControllerFactory};
 
+const DEFAULT_CWND_PACKETS: u64 = 32;
+
 pub struct DynCongestion {
-    cwnd_packets: Option<u64>,
+    cwnd_packets: u64,
 }
 
 impl DynCongestion {
     pub fn new(cwnd_packets: Option<u64>) -> Self {
         Self {
-            cwnd_packets: cwnd_packets.filter(|value| *value > 0),
+            cwnd_packets: cwnd_packets
+                .filter(|value| *value > 0)
+                .unwrap_or(DEFAULT_CWND_PACKETS),
         }
     }
 }
@@ -24,11 +28,9 @@ impl ControllerFactory for DynCongestion {
         current_mtu: u16,
     ) -> Box<dyn Controller> {
         let mut bbr_config = BbrConfig::default();
-        if let Some(cwnd_packets) = self.cwnd_packets {
-            let cwnd_bytes = cwnd_packets.saturating_mul(current_mtu as u64);
-            let min_cwnd_bytes = 2 * current_mtu as u64;
-            bbr_config.initial_window(cwnd_bytes.max(min_cwnd_bytes));
-        }
+        let cwnd_bytes = self.cwnd_packets.saturating_mul(current_mtu as u64);
+        let min_cwnd_bytes = 2 * current_mtu as u64;
+        bbr_config.initial_window(cwnd_bytes.max(min_cwnd_bytes));
 
         let bbr = Bbr::new(Arc::new(bbr_config), current_mtu);
         Box::new(DynController::new(Box::new(bbr)))
@@ -323,5 +325,35 @@ mod tests {
         let controller =
             Arc::new(DynCongestion::new(Some(8))).build(Instant::now(), mtu);
         assert_eq!(controller.initial_window(), 8 * mtu as u64);
+    }
+
+    #[test]
+    fn dyn_congestion_uses_mihomo_default_cwnd_packets() {
+        let mtu = 1_250;
+        let controller =
+            Arc::new(DynCongestion::new(None)).build(Instant::now(), mtu);
+        assert_eq!(
+            controller.initial_window(),
+            DEFAULT_CWND_PACKETS * mtu as u64
+        );
+    }
+
+    #[test]
+    fn dyn_congestion_treats_zero_cwnd_as_default() {
+        let mtu = 1_250;
+        let controller =
+            Arc::new(DynCongestion::new(Some(0))).build(Instant::now(), mtu);
+        assert_eq!(
+            controller.initial_window(),
+            DEFAULT_CWND_PACKETS * mtu as u64
+        );
+    }
+
+    #[test]
+    fn dyn_congestion_enforces_two_packet_minimum() {
+        let mtu = 1_250;
+        let controller =
+            Arc::new(DynCongestion::new(Some(1))).build(Instant::now(), mtu);
+        assert_eq!(controller.initial_window(), 2 * mtu as u64);
     }
 }
