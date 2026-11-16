@@ -141,6 +141,20 @@ fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
                 "VLESS xtls-rprx-vision requires TLS or REALITY".to_owned(),
             ));
         }
+        #[cfg(not(feature = "reality"))]
+        if s.reality_opts.is_some() {
+            return Err(Error::InvalidConfig(
+                "VLESS xtls-rprx-vision with REALITY requires the reality feature"
+                    .to_owned(),
+            ));
+        }
+        #[cfg(not(any(feature = "aws-lc-rs", feature = "ring")))]
+        if s.reality_opts.is_none() {
+            return Err(Error::InvalidConfig(
+                "VLESS xtls-rprx-vision with TLS requires a TLS crypto provider feature (aws-lc-rs or ring)"
+                    .to_owned(),
+            ));
+        }
     }
 
     if let Some(encryption) = s.encryption.as_deref() {
@@ -2660,6 +2674,7 @@ udp: true
         );
     }
 
+    #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
     #[test]
     fn vless_accepts_vision_flow() {
         let outbound = OutboundVless {
@@ -2705,6 +2720,42 @@ udp: true
         let err = validate_vless_config(&outbound)
             .expect_err("Vision without TLS or REALITY cannot splice");
         assert!(err.to_string().contains("requires TLS or REALITY"));
+    }
+
+    #[cfg(not(feature = "reality"))]
+    #[test]
+    fn vless_vision_reality_requires_reality_feature_at_config_load() {
+        let outbound = OutboundVless {
+            flow: Some("xtls-rprx-vision".to_owned()),
+            network: Some("tcp".to_owned()),
+            reality_opts: Some(OutboundTrojanRealityOpts::default()),
+            ..Default::default()
+        };
+
+        let err = validate_vless_config(&outbound)
+            .expect_err("Vision REALITY cannot run when its feature is disabled");
+        assert!(
+            err.to_string().contains("requires the reality feature"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(not(any(feature = "aws-lc-rs", feature = "ring")))]
+    #[test]
+    fn vless_vision_tls_requires_crypto_provider_at_config_load() {
+        let outbound = OutboundVless {
+            flow: Some("xtls-rprx-vision".to_owned()),
+            network: Some("tcp".to_owned()),
+            tls: Some(true),
+            ..Default::default()
+        };
+
+        let err = validate_vless_config(&outbound)
+            .expect_err("Vision TLS needs a compiled Rustls crypto provider");
+        assert!(
+            err.to_string().contains("TLS crypto provider feature"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
