@@ -130,6 +130,13 @@ fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
         }
     }
 
+    #[cfg(not(feature = "reality"))]
+    if s.reality_opts.is_some() {
+        return Err(Error::InvalidConfig(
+            "VLESS REALITY requires the reality feature".to_owned(),
+        ));
+    }
+
     if s.flow.as_deref() == Some("xtls-rprx-vision") {
         if !matches!(s.network.as_deref(), None | Some("tcp")) {
             return Err(Error::InvalidConfig(
@@ -139,13 +146,6 @@ fn validate_vless_config(s: &OutboundVless) -> Result<(), Error> {
         if !s.tls.unwrap_or_default() && s.reality_opts.is_none() {
             return Err(Error::InvalidConfig(
                 "VLESS xtls-rprx-vision requires TLS or REALITY".to_owned(),
-            ));
-        }
-        #[cfg(not(feature = "reality"))]
-        if s.reality_opts.is_some() {
-            return Err(Error::InvalidConfig(
-                "VLESS xtls-rprx-vision with REALITY requires the reality feature"
-                    .to_owned(),
             ));
         }
         #[cfg(not(any(feature = "aws-lc-rs", feature = "ring")))]
@@ -2736,6 +2736,24 @@ udp: true
             .expect_err("Vision REALITY cannot run when its feature is disabled");
         assert!(
             err.to_string().contains("requires the reality feature"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(not(feature = "reality"))]
+    #[test]
+    fn vless_reality_requires_reality_feature_at_config_load() {
+        let outbound = OutboundVless {
+            tls: Some(true),
+            reality_opts: Some(OutboundTrojanRealityOpts::default()),
+            ..Default::default()
+        };
+
+        let err = validate_vless_config(&outbound)
+            .expect_err("VLESS REALITY cannot downgrade to a plain connection");
+        assert!(
+            err.to_string()
+                .contains("VLESS REALITY requires the reality feature"),
             "unexpected error: {err}"
         );
     }
