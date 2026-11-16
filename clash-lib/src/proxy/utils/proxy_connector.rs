@@ -96,6 +96,12 @@ pub struct NetworkPoolContext {
     /// reusable connection. `None` keeps generation-only behavior when the
     /// connector has no shared observation source.
     pub eligible_path_ids: Option<HashSet<NetworkPathId>>,
+    /// The socket intentionally used a local loopback route, which has no
+    /// physical interface identity. Pool reuse still checks its generation.
+    pub(crate) generation_only_local_route: bool,
+    /// The connector explicitly confirmed that pathless local loopback sockets
+    /// may use generation-scoped pooling.
+    pub(crate) direct_local_route_pooling_supported: bool,
     pub(crate) reporter: Option<crate::app::runtime_state::TrafficReporter>,
 }
 
@@ -140,11 +146,21 @@ impl NetworkPoolContext {
 
     /// Replace pre-dial planning identity with the *completed chain's*
     /// reported socket path. If no hop reports a physical path, clear any
-    /// stale planned path AND generation; neither may be forwarded as proof.
+    /// stale planned path and generation, except for an explicitly identified
+    /// local loopback route whose generation still scopes pool reuse.
     pub(crate) fn record_connected_paths(&mut self, paths: &[NetworkPathId]) {
         self.path_id = paths.first().cloned();
-        self.network_generation =
-            self.path_id.as_ref().map(|path| path.network_generation);
+        self.network_generation = self
+            .path_id
+            .as_ref()
+            .map(|path| path.network_generation)
+            .or_else(|| {
+                self.generation_only_local_route
+                    .then_some(self.network_generation)
+                    .flatten()
+            });
+        self.generation_only_local_route =
+            self.generation_only_local_route && self.path_id.is_none();
     }
 
     pub fn can_pool_connected_path(&self) -> bool {
@@ -523,6 +539,13 @@ pub trait RemoteConnector: Send + Sync + Debug {
         NetworkPoolContext::for_generation(self.network_generation().await)
     }
 
+    /// Opt in only when this connector can prove that a pathless pooled socket
+    /// is a direct local loopback route. Unknown connectors stay fail-closed.
+    #[doc(hidden)]
+    fn supports_generation_only_local_route_pooling(&self) -> bool {
+        false
+    }
+
     async fn connect_stream(
         &self,
         resolver: ThreadSafeDNSResolver,
@@ -702,7 +725,9 @@ impl RemoteConnector for ProxyConnector {
         &self,
         iface: Option<&OutboundInterface>,
     ) -> NetworkPoolContext {
-        self.connector.connection_pool_context(iface).await
+        let mut context = self.connector.connection_pool_context(iface).await;
+        context.direct_local_route_pooling_supported = false;
+        context
     }
 
     async fn connect_stream(
@@ -746,6 +771,7 @@ impl RemoteConnector for ProxyConnector {
             .await?;
         // Never retain a pre-dial candidate when the completed physical
         // chain supplied no path evidence.
+        pool_context.direct_local_route_pooling_supported = false;
         pool_context.record_connected_paths(&path_ids);
         Ok((stream, pool_context))
     }
@@ -787,6 +813,7 @@ impl RemoteConnector for ProxyConnector {
                 so_mark,
             )
             .await?;
+        pool_context.direct_local_route_pooling_supported = false;
         pool_context.record_connected_paths(&path_ids);
         Ok((datagram, pool_context))
     }

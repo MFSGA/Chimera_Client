@@ -651,6 +651,10 @@ fn uses_local_or_group_route(address: IpAddr) -> bool {
 
 #[async_trait]
 impl RemoteConnector for DirectConnector {
+    fn supports_generation_only_local_route_pooling(&self) -> bool {
+        true
+    }
+
     async fn network_generation(&self) -> Option<u64> {
         self.path_source
             .as_ref()?
@@ -664,15 +668,24 @@ impl RemoteConnector for DirectConnector {
         iface: Option<&OutboundInterface>,
     ) -> NetworkPoolContext {
         let Some(source) = self.path_source.as_ref() else {
-            return NetworkPoolContext::default();
+            return NetworkPoolContext {
+                direct_local_route_pooling_supported: true,
+                ..Default::default()
+            };
         };
         let Some((generation, observations, tun_enabled, status, base_intent)) =
             source.snapshot().await
         else {
-            return NetworkPoolContext::for_generation(None);
+            return NetworkPoolContext {
+                direct_local_route_pooling_supported: true,
+                ..NetworkPoolContext::for_generation(None)
+            };
         };
         if tun_enabled {
-            return NetworkPoolContext::for_generation(Some(generation));
+            return NetworkPoolContext {
+                direct_local_route_pooling_supported: true,
+                ..NetworkPoolContext::for_generation(Some(generation))
+            };
         }
 
         let mut intent = base_intent;
@@ -708,6 +721,8 @@ impl RemoteConnector for DirectConnector {
             network_generation: Some(generation),
             path_id: None,
             eligible_path_ids: Some(eligible_path_ids),
+            generation_only_local_route: false,
+            direct_local_route_pooling_supported: true,
             reporter: source.traffic_reporter().await,
         }
     }
@@ -1125,6 +1140,8 @@ impl RemoteConnector for DirectConnector {
         let target = destination
             .ip()
             .map(|ip| SocketAddr::new(ip, destination.port()));
+        let generation_only_local_route = iface.is_none()
+            && target.is_some_and(|target| target.ip().is_loopback());
         let check_epoch = requires_proxy_udp_generation_check(target, iface);
         if check_epoch
             && let Some((planned, _, _, status, _)) = path_snapshot.as_ref()
@@ -1324,6 +1341,8 @@ impl RemoteConnector for DirectConnector {
             .map(|path| path.id.network_generation)
             .or_else(|| path_snapshot.as_ref().map(|(generation, ..)| *generation))
             .or(pool_context.network_generation);
+        pool_context.generation_only_local_route = generation_only_local_route;
+        pool_context.direct_local_route_pooling_supported = true;
         let dgram = ChainedDatagramWrapper::new_with_network_path_id(
             dgram,
             pool_context.path_id.clone(),
@@ -1869,12 +1888,30 @@ mod tests {
             observed_path("planned0", 7, "192.0.2.10".parse().unwrap(), 41).id;
         let physical =
             observed_path("actual0", 8, "198.51.100.10".parse().unwrap(), 42).id;
+        let direct = DirectConnector::new();
+        assert!(direct.supports_generation_only_local_route_pooling());
+        assert!(
+            direct
+                .connection_pool_context(None)
+                .await
+                .direct_local_route_pooling_supported
+        );
         for paths in [vec![], vec![physical.clone()]] {
             let connector = super::ProxyConnector::new(
                 Arc::new(S04boNestedProxy {
                     reported_paths: paths.clone(),
                 }),
                 Box::new(DirectConnector::new()),
+            );
+            assert!(
+                !connector.supports_generation_only_local_route_pooling(),
+                "proxy chains must not inherit direct loopback pooling"
+            );
+            assert!(
+                !connector
+                    .connection_pool_context(None)
+                    .await
+                    .direct_local_route_pooling_supported
             );
             let context = NetworkPoolContext {
                 path_id: Some(planned.clone()),
@@ -1916,6 +1953,10 @@ mod tests {
                     actual.path_id,
                     Some(planned.clone()),
                     "pre-dial plan must never masquerade as completed socket evidence"
+                );
+                assert!(
+                    !actual.direct_local_route_pooling_supported,
+                    "completed proxy chain must not be marked as a direct loopback socket"
                 );
             }
         }
@@ -1961,6 +2002,7 @@ mod tests {
             ..Default::default()
         };
         let connector = S04bpUnawareConnector;
+        assert!(!connector.supports_generation_only_local_route_pooling());
         let resolver = Arc::new(MockClashResolver::new());
         let (_, tcp) = connector
             .connect_stream_with_pool_context(
@@ -2045,6 +2087,8 @@ mod tests {
             network_generation: Some(7),
             path_id: None,
             eligible_path_ids: Some([path_b.clone()].into_iter().collect()),
+            generation_only_local_route: false,
+            direct_local_route_pooling_supported: false,
             reporter: None,
         };
 
@@ -2127,6 +2171,8 @@ mod tests {
             network_generation: Some(0),
             path_id: Some(path_id),
             eligible_path_ids: None,
+            generation_only_local_route: false,
+            direct_local_route_pooling_supported: false,
             reporter: source.traffic_reporter().await,
         };
 
@@ -2195,6 +2241,8 @@ mod tests {
             network_generation: Some(0),
             path_id: Some(path_id),
             eligible_path_ids: None,
+            generation_only_local_route: false,
+            direct_local_route_pooling_supported: false,
             reporter: source.traffic_reporter().await,
         };
         let local = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -2225,6 +2273,49 @@ mod tests {
         assert_eq!(value["pathHealth"][0]["state"], "available");
         assert_eq!(value["pathHealth"][0]["path"]["interface"]["name"], "wifi0");
         assert_eq!(value["destinationPathHealth"][0]["family"], "ipv4");
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[tokio::test]
+    async fn hysteria_loopback_endpoint_keeps_generation_without_physical_path() {
+        let mut status = NetworkStatus::default();
+        status.observed(&NetworkSnapshot {
+            path_candidates: vec![candidate(
+                "eth0",
+                5,
+                Ipv4Addr::new(192, 0, 2, 10),
+                DefaultRouteEvidence::PrimaryDefaultRoute,
+                BindingStatus::Verified,
+            )],
+            ..Default::default()
+        });
+        let status = Arc::new(tokio::sync::RwLock::new(status));
+        let source = NetworkPathSource::default();
+        source.attach(status).await;
+        let connector = DirectConnector::with_path_source(source);
+        let planned = connector.connection_pool_context(None).await;
+        assert!(planned.eligible_path_ids.is_some());
+
+        let endpoint = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let destination = endpoint.local_addr().unwrap();
+        let mut resolver = MockClashResolver::new();
+        resolver.expect_ipv6().return_const(false);
+        let (_, connected) = connector
+            .connect_datagram_with_pool_context(
+                Arc::new(resolver),
+                None,
+                SocksAddr::Ip(destination),
+                None,
+                #[cfg(target_os = "linux")]
+                None,
+                planned.clone(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(connected.path_id, None);
+        assert_eq!(connected.network_generation, planned.network_generation);
+        assert!(connected.generation_only_local_route);
     }
 
     fn candidate(

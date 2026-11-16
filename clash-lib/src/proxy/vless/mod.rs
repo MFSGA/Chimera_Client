@@ -948,6 +948,8 @@ mod reuse_tests {
             network_generation: Some(0),
             path_id: Some(path_id),
             eligible_path_ids: None,
+            generation_only_local_route: false,
+            direct_local_route_pooling_supported: false,
             reporter: Some(reporter),
         };
         let handler = Handler::new(HandlerOptions {
