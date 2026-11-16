@@ -1,7 +1,7 @@
 use std::{
     io,
     pin::Pin,
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 
 use bytes::{BufMut, BytesMut};
@@ -16,10 +16,9 @@ const VLESS_COMMAND_UDP: u8 = 2;
 const VLESS_COMMAND_MUX: u8 = 3;
 const XTLS_VISION_FLOW: &str = "xtls-rprx-vision";
 
-struct PendingWrite {
+struct PendingHandshake {
     data: BytesMut,
     written: usize,
-    user_len: usize,
 }
 
 pub struct VlessStream {
@@ -27,7 +26,9 @@ pub struct VlessStream {
     handshake_done: bool,
     handshake_sent: bool,
     response_received: bool,
-    pending_write: Option<PendingWrite>,
+    pending_handshake: Option<PendingHandshake>,
+    read_waker: Option<Waker>,
+    write_waker: Option<Waker>,
     response_header: [u8; 2],
     response_header_read: usize,
     response_additional_remaining: Option<usize>,
@@ -83,7 +84,9 @@ impl VlessStream {
             handshake_done: false,
             handshake_sent: false,
             response_received: false,
-            pending_write: None,
+            pending_handshake: None,
+            read_waker: None,
+            write_waker: None,
             response_header: [0; 2],
             response_header_read: 0,
             response_additional_remaining: None,
@@ -129,27 +132,24 @@ impl VlessStream {
         }
     }
 
-    fn prepare_handshake_with_data(&mut self, data: &[u8]) {
+    fn prepare_handshake(&mut self) {
         debug!(
             "VLESS handshake starting for destination: {}",
             self.destination
         );
 
-        let mut out = self.build_handshake_header();
-        out.put_slice(data);
-        self.pending_write = Some(PendingWrite {
-            data: out,
+        self.pending_handshake = Some(PendingHandshake {
+            data: self.build_handshake_header(),
             written: 0,
-            user_len: data.len(),
         });
     }
 
     fn poll_send_pending_handshake(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<io::Result<usize>> {
-        let Some(mut pending) = self.pending_write.take() else {
-            return Poll::Ready(Ok(0));
+    ) -> Poll<io::Result<()>> {
+        let Some(mut pending) = self.pending_handshake.take() else {
+            return Poll::Ready(Ok(()));
         };
 
         while pending.written < pending.data.len() {
@@ -157,7 +157,7 @@ impl VlessStream {
                 .poll_write(cx, &pending.data[pending.written..])
             {
                 Poll::Ready(Ok(0)) => {
-                    self.pending_write = Some(pending);
+                    self.pending_handshake = Some(pending);
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::WriteZero,
                         "failed to write VLESS handshake",
@@ -165,23 +165,26 @@ impl VlessStream {
                 }
                 Poll::Ready(Ok(n)) => pending.written += n,
                 Poll::Ready(Err(e)) => {
-                    self.pending_write = Some(pending);
+                    self.pending_handshake = Some(pending);
                     error!("Failed to send VLESS handshake: {}", e);
                     return Poll::Ready(Err(e));
                 }
                 Poll::Pending => {
-                    self.pending_write = Some(pending);
+                    self.pending_handshake = Some(pending);
                     return Poll::Pending;
                 }
             }
         }
 
         self.handshake_sent = true;
-        debug!(
-            "VLESS handshake sent with {} bytes of data",
-            pending.user_len
-        );
-        Poll::Ready(Ok(pending.user_len))
+        debug!("VLESS handshake sent");
+        if let Some(waker) = self.read_waker.take() {
+            waker.wake();
+        }
+        if let Some(waker) = self.write_waker.take() {
+            waker.wake();
+        }
+        Poll::Ready(Ok(()))
     }
 
     fn poll_receive_response(
@@ -304,13 +307,16 @@ impl AsyncRead for VlessStream {
         // any payload. Send the VLESS request header first so the proxy can
         // open the upstream connection and return its banner.
         if !self.handshake_sent {
-            if self.pending_write.is_none() {
-                self.prepare_handshake_with_data(&[]);
+            if self.pending_handshake.is_none() {
+                self.prepare_handshake();
             }
             match self.poll_send_pending_handshake(cx) {
                 Poll::Ready(Ok(_)) => {}
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    self.read_waker = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
             }
         }
 
@@ -333,14 +339,21 @@ impl AsyncWrite for VlessStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
-        // Send handshake with first write. Keep the composed handshake buffer in
-        // the stream state so retries after Pending do not duplicate or lose the
-        // VLESS header / first payload bytes.
+        // Send the VLESS header before application data. Keeping them separate
+        // lets a concurrent first read finish the header without consuming or
+        // duplicating the pending first write's payload.
         if !self.handshake_sent {
-            if self.pending_write.is_none() {
-                self.prepare_handshake_with_data(buf);
+            if self.pending_handshake.is_none() {
+                self.prepare_handshake();
             }
-            return self.poll_send_pending_handshake(cx);
+            match self.poll_send_pending_handshake(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => {
+                    self.write_waker = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
+            }
         }
 
         Pin::new(&mut self.inner).poll_write(cx, buf)
@@ -363,7 +376,13 @@ impl AsyncWrite for VlessStream {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        future::{Future, poll_fn},
+        time::Duration,
+    };
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::oneshot;
 
     use super::{VLESS_COMMAND_MUX, VlessStream, XTLS_VISION_FLOW};
     use crate::session::SocksAddr;
@@ -382,6 +401,24 @@ mod tests {
             flow,
         )
         .expect("stream should build")
+    }
+
+    async fn notify_when_pending<F: Future>(
+        future: F,
+        pending_tx: oneshot::Sender<()>,
+    ) -> F::Output {
+        let mut future = Box::pin(future);
+        let mut pending_tx = Some(pending_tx);
+        poll_fn(|cx| {
+            let result = future.as_mut().poll(cx);
+            if result.is_pending() {
+                if let Some(pending_tx) = pending_tx.take() {
+                    let _ = pending_tx.send(());
+                }
+            }
+            result
+        })
+        .await
     }
 
     #[test]
@@ -470,6 +507,156 @@ mod tests {
             .expect("server-first banner should arrive after implicit handshake");
 
         assert_eq!(&banner, b"SSH-2.0-test\r\n");
+        server_task.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_read_does_not_duplicate_pending_write_payload() {
+        let (client, mut server) = tokio::io::duplex(1);
+        let stream = test_stream(client, None);
+        let expected_header = stream.build_handshake_header().to_vec();
+        let (mut reader, mut writer) = tokio::io::split(stream);
+        let payload = b"first application payload".to_vec();
+        let expected_payload = payload.clone();
+
+        let (start_server_tx, start_server_rx) = oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            start_server_rx.await.expect("start server");
+
+            let mut request_header = vec![0; expected_header.len()];
+            server
+                .read_exact(&mut request_header)
+                .await
+                .expect("request header");
+            assert_eq!(request_header, expected_header);
+
+            let mut received_payload = vec![0; expected_payload.len()];
+            server
+                .read_exact(&mut received_payload)
+                .await
+                .expect("first application payload");
+            assert_eq!(received_payload, expected_payload);
+
+            server
+                .write_all(&[0, 0])
+                .await
+                .expect("VLESS response header");
+            server
+                .write_all(b"SSH-2.0-test\r\n")
+                .await
+                .expect("server-first banner");
+        });
+
+        let (write_pending_tx, write_pending_rx) = oneshot::channel();
+        let writer_task = tokio::spawn(async move {
+            notify_when_pending(writer.write_all(&payload), write_pending_tx).await
+        });
+        tokio::time::timeout(Duration::from_secs(2), write_pending_rx)
+            .await
+            .expect("first write should wait on the small duplex buffer")
+            .expect("first write pending notification");
+
+        let (read_pending_tx, read_pending_rx) = oneshot::channel();
+        let reader_task = tokio::spawn(async move {
+            let mut banner = vec![0; b"SSH-2.0-test\r\n".len()];
+            notify_when_pending(reader.read_exact(&mut banner), read_pending_tx)
+                .await
+                .expect("server-first banner");
+            banner
+        });
+        tokio::time::timeout(Duration::from_secs(2), read_pending_rx)
+            .await
+            .expect("read should wait while the request header is blocked")
+            .expect("read pending notification");
+
+        start_server_tx.send(()).expect("start server task");
+        tokio::time::timeout(Duration::from_secs(2), writer_task)
+            .await
+            .expect("write should complete after the header and payload are sent")
+            .expect("writer task")
+            .expect("first write");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), reader_task)
+                .await
+                .expect("read should resume after the response")
+                .expect("reader task"),
+            b"SSH-2.0-test\r\n"
+        );
+        server_task.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn read_first_partial_handshake_allows_concurrent_first_write() {
+        let (client, mut server) = tokio::io::duplex(1);
+        let stream = test_stream(client, None);
+        let expected_header = stream.build_handshake_header().to_vec();
+        let (mut reader, mut writer) = tokio::io::split(stream);
+        let payload = b"first application payload".to_vec();
+        let expected_payload = payload.clone();
+
+        let (start_server_tx, start_server_rx) = oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            start_server_rx.await.expect("start server");
+
+            let mut request_header = vec![0; expected_header.len()];
+            server
+                .read_exact(&mut request_header)
+                .await
+                .expect("request header");
+            assert_eq!(request_header, expected_header);
+
+            let mut received_payload = vec![0; expected_payload.len()];
+            server
+                .read_exact(&mut received_payload)
+                .await
+                .expect("first application payload");
+            assert_eq!(received_payload, expected_payload);
+
+            server
+                .write_all(&[0, 0])
+                .await
+                .expect("VLESS response header");
+            server
+                .write_all(b"SSH-2.0-test\r\n")
+                .await
+                .expect("server-first banner");
+        });
+
+        let (read_pending_tx, read_pending_rx) = oneshot::channel();
+        let reader_task = tokio::spawn(async move {
+            let mut banner = vec![0; b"SSH-2.0-test\r\n".len()];
+            notify_when_pending(reader.read_exact(&mut banner), read_pending_tx)
+                .await
+                .expect("server-first banner");
+            banner
+        });
+        tokio::time::timeout(Duration::from_secs(2), read_pending_rx)
+            .await
+            .expect("read-first handshake should block on the small buffer")
+            .expect("read pending notification");
+
+        let (write_pending_tx, write_pending_rx) = oneshot::channel();
+        let writer_task = tokio::spawn(async move {
+            notify_when_pending(writer.write_all(&payload), write_pending_tx).await
+        });
+        tokio::time::timeout(Duration::from_secs(2), write_pending_rx)
+            .await
+            .expect("first write should wait for the partial handshake")
+            .expect("write pending notification");
+
+        start_server_tx.send(()).expect("start server task");
+        tokio::time::timeout(Duration::from_secs(2), writer_task)
+            .await
+            .expect("write should send its payload after the header")
+            .expect("writer task")
+            .expect("first write must not return WriteZero");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), reader_task)
+                .await
+                .expect("read should resume after the response")
+                .expect("reader task"),
+            b"SSH-2.0-test\r\n"
+        );
         server_task.await.expect("server task");
     }
 
