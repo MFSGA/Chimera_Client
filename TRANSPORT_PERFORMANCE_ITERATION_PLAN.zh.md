@@ -15,7 +15,7 @@
 |---|---|---|---|---|
 | 0 | 稳定基准，分别核对默认配置与固定会话/拥塞控制配置 | 测试工具与客户端/服务端 | 回环和 远端节点 分组；逐轮完整校验；记录 CPU、完成率、会话数及混合负载 p95/p99 | 已有回环结果，远端节点 有效吞吐待补 |
 | 1a | 解除 Brutal 丢包回调重入锁；以 ACK 字节和丢失字节计算补偿比例 | Client HY2 congestion controller | 定向单测；受控丢包下连接继续交付；Brutal 前后吞吐、延迟和恢复行为无回退 | 代码与单测已完成，受控丢包运行验证待做 |
-| 1b | 修正 HY2 上下行速率独立解析及认证协商 | Client converter、HY2 auth/controller | 仅上行、仅下行、双向和 auto 四组行为对齐固定官方实现 | 待执行 |
+| 1b | 修正 HY2 上下行速率独立解析及认证协商 | Client converter、HY2 auth/controller | 仅上行、仅下行、双向和 auto 四组行为对齐固定官方实现 | 代码及定向验证完成 |
 | 2 | 普通直连将已按路由/网卡/mark 选出的 UDP socket 原生交给 Quinn | Client connector、HY2 建连 | 对照通用适配器提升吞吐并降低 CPU；覆盖切网、保护、代理链、混淆和平台回退 | 待执行 |
 | 3 | HY2 连接、认证、驱动、取消及路径代际收敛为单个会话所有者 | Client HY2 lifecycle | 并发冷启动只产生必要握手；切网后旧槽不能复用；取消、重连及 UDP 亲和性通过 | 待执行 |
 | 4 | 添加可选 K=1/2/4 QUIC 会话池，懒建、轮询分配、故障降级 | Client HY2 pool | K=1 保持旧语义；记录实际连接数、认证、用户计量、单流及多流结果；混合负载没有明显尾延迟回退 | 待执行 |
@@ -34,3 +34,11 @@
 - 实际验证：`cargo fmt --all`、`cargo fmt --all -- --check` 通过；`cargo test -p clash-lib --all-features --lib proxy::hysteria2::congestion::tests` 通过，6 个测试。普通 feature 组合下测试模块未编译入目标，因此使用 all-features 明确覆盖 HY2。受控丢包实际连接验证尚未运行，不能宣称运行期死锁已实测排除。此任务不启动系统路由/TUN 测试。
 - 回退：恢复 `Brutal` 回调和字段，默认 BBR 路径不受本项影响。
 - 外部基线：Chimera Client `c450cf8e`；参考 Hysteria 源码提交 `c2b181e0`。本项仅改变内部 Brutal 采样方式，不改变线协议。
+
+
+**阶段 1b，风险 L2。**
+
+- 独立保存上行和下行配置，单方向限速不再因 zip() 被丢弃；认证请求按下行限速生成 Hysteria-CC-RX。
+- 依据固定的 Hysteria 客户端参考规则，服务端选择 auto 时保留客户端配置的拥塞控制；固定速率时采用服务端接收速率与客户端发送上限中的较小值，缺省/零值按官方行为处理。
+- 实际验证：cargo fmt --all -- --check、cargo clippy -p clash-lib --all-targets --all-features -- -D warnings 通过；cargo test -p clash-lib --all-features --lib hysteria_ 9 个通过，配置转换用例 cargo test -p clash-lib --all-features --lib convert_hysteria2_config 1 个通过。未运行真实网络 Brutal/auto 组合。
+- 本轮未改变协议字段格式或带宽输入单位，仍使用现有配置解析后得到的数值。

@@ -149,7 +149,8 @@ impl TryFrom<OutboundHysteria2> for Handler {
             disable_mtu_discovery: value.disable_mtu_discovery.unwrap_or(false),
             ca: value.ca,
             ca_str: value.ca_str,
-            up_down: value.up.zip(value.down),
+            up: value.up,
+            down: value.down,
             cwnd: value.cwnd,
             udp_mtu: value.udp_mtu,
         }))
