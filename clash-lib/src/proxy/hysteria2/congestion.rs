@@ -38,7 +38,7 @@ impl ControllerFactory for DynCongestion {
 }
 
 const SLOT_COUNT: u64 = 5;
-const MIN_SAMPLE_COUNT: u64 = 50;
+const MIN_SAMPLE_PACKETS: u64 = 50;
 const MIN_ACK_RATE: f64 = 0.8;
 const CONGESTION_WINDOW_MULTIPLIER: u64 = 2;
 const INITIAL_PACKET_SIZE_IPV4: u64 = 1252;
@@ -46,16 +46,14 @@ const INITIAL_PACKET_SIZE_IPV4: u64 = 1252;
 #[derive(Copy, Clone)]
 struct SlotInfo {
     time: u64,
-    ack: u64,
-    lost: u64,
+    acked_bytes: u64,
+    lost_bytes: u64,
 }
 
 #[derive(Clone)]
 pub struct Brutal {
     bps: u64,
-    connection: quinn::Connection,
-    ack: u64,
-    last_lost_packet_num: u64,
+    acked_bytes: u64,
     slots: [SlotInfo; SLOT_COUNT as usize],
     ack_rate: f64,
     max_datagram_size: u64,
@@ -67,16 +65,14 @@ pub struct Brutal {
 }
 
 impl Brutal {
-    pub fn new(bps: u64, connection: quinn::Connection) -> Self {
+    pub fn new(bps: u64) -> Self {
         Self {
             bps,
-            connection,
-            ack: 0,
-            last_lost_packet_num: 0,
+            acked_bytes: 0,
             slots: [SlotInfo {
                 time: 0,
-                ack: 0,
-                lost: 0,
+                acked_bytes: 0,
+                lost_bytes: 0,
             }; SLOT_COUNT as usize],
             ack_rate: 1.0,
             max_datagram_size: INITIAL_PACKET_SIZE_IPV4,
@@ -94,6 +90,47 @@ impl Brutal {
         } else {
             self.bps as f64 / self.ack_rate
         }
+    }
+
+    fn record_congestion_sample(&mut self, now: Instant, lost_bytes: u64) {
+        let slot_time = now.saturating_duration_since(self.start_time).as_secs();
+        let slot_idx = (slot_time % SLOT_COUNT) as usize;
+
+        if self.slots[slot_idx].time != slot_time {
+            self.slots[slot_idx] = SlotInfo {
+                time: slot_time,
+                acked_bytes: self.acked_bytes,
+                lost_bytes,
+            };
+        } else {
+            self.slots[slot_idx].acked_bytes = self.slots[slot_idx]
+                .acked_bytes
+                .saturating_add(self.acked_bytes);
+            self.slots[slot_idx].lost_bytes =
+                self.slots[slot_idx].lost_bytes.saturating_add(lost_bytes);
+        }
+
+        self.acked_bytes = 0;
+
+        let (acked_bytes, lost_bytes) = self
+            .slots
+            .iter()
+            .filter(|slot| slot_time.saturating_sub(slot.time) < SLOT_COUNT)
+            .fold((0_u64, 0_u64), |(acked, lost), slot| {
+                (
+                    acked.saturating_add(slot.acked_bytes),
+                    lost.saturating_add(slot.lost_bytes),
+                )
+            });
+
+        let sample_bytes = acked_bytes.saturating_add(lost_bytes);
+        let min_sample_bytes =
+            MIN_SAMPLE_PACKETS.saturating_mul(self.max_datagram_size);
+        self.ack_rate = if sample_bytes < min_sample_bytes {
+            1.0
+        } else {
+            (acked_bytes as f64 / sample_bytes as f64).max(MIN_ACK_RATE)
+        };
     }
 }
 
@@ -158,59 +195,21 @@ impl Controller for Brutal {
         now: Instant,
         _sent: Instant,
         _is_persistent_congestion: bool,
-        _lost_bytes: u64,
+        lost_bytes: u64,
     ) {
-        let slot_time = now.saturating_duration_since(self.start_time).as_secs();
-        let slot_idx = (slot_time % SLOT_COUNT) as usize;
-        let current_lost_packet_num = self.connection.stats().path.lost_packets;
-        let lost_delta =
-            current_lost_packet_num.saturating_sub(self.last_lost_packet_num);
-
-        if self.slots[slot_idx].time != slot_time {
-            self.slots[slot_idx] = SlotInfo {
-                time: slot_time,
-                ack: self.ack,
-                lost: lost_delta,
-            };
-        } else {
-            self.slots[slot_idx].ack =
-                self.slots[slot_idx].ack.saturating_add(self.ack);
-            self.slots[slot_idx].lost =
-                self.slots[slot_idx].lost.saturating_add(lost_delta);
-        }
-
-        self.last_lost_packet_num = current_lost_packet_num;
-        self.ack = 0;
-
-        let (acked, lost) = self
-            .slots
-            .iter()
-            .filter(|slot| slot_time.saturating_sub(slot.time) < SLOT_COUNT)
-            .fold((0_u64, 0_u64), |(acked, lost), slot| {
-                (
-                    acked.saturating_add(slot.ack),
-                    lost.saturating_add(slot.lost),
-                )
-            });
-
-        let sample_total = acked.saturating_add(lost);
-        if sample_total < MIN_SAMPLE_COUNT {
-            self.ack_rate = 1.0;
-        } else {
-            self.ack_rate = (acked as f64 / sample_total as f64).max(MIN_ACK_RATE);
-        }
+        self.record_congestion_sample(now, lost_bytes);
     }
 
     fn on_ack(
         &mut self,
         _now: Instant,
         _sent: Instant,
-        _bytes: u64,
+        bytes: u64,
         _app_limited: bool,
         rtt: &quinn_proto::RttEstimator,
     ) {
         self.rtt = rtt.get();
-        self.ack = self.ack.saturating_add(1);
+        self.acked_bytes = self.acked_bytes.saturating_add(bytes);
     }
 
     fn clone_box(&self) -> Box<dyn Controller> {
@@ -318,6 +317,30 @@ impl Controller for DynController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn brutal_records_acknowledged_and_lost_bytes_without_connection_stats() {
+        let mut controller = Brutal::new(1_000_000);
+        let now = Instant::now();
+        controller.acked_bytes = 45 * INITIAL_PACKET_SIZE_IPV4;
+
+        controller.record_congestion_sample(now, 5 * INITIAL_PACKET_SIZE_IPV4);
+
+        assert!((controller.ack_rate - 0.9).abs() < f64::EPSILON);
+        assert_eq!(controller.acked_bytes, 0);
+    }
+
+    #[test]
+    fn brutal_ignores_small_byte_samples_until_enough_data_is_observed() {
+        let mut controller = Brutal::new(1_000_000);
+        let now = Instant::now();
+        controller.acked_bytes =
+            MIN_SAMPLE_PACKETS * controller.max_datagram_size - 1;
+
+        controller.record_congestion_sample(now, 0);
+
+        assert_eq!(controller.ack_rate, 1.0);
+    }
 
     #[test]
     fn dyn_congestion_applies_cwnd_packets() {
