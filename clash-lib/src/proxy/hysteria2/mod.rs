@@ -305,8 +305,7 @@ impl Handler {
             .downcast::<DynController>()
         {
             Ok(controller) => {
-                controller
-                    .set_controller(Box::new(Brutal::new(brutal_bps, conn.clone())));
+                controller.set_controller(Box::new(Brutal::new(brutal_bps)));
                 debug!(brutal_bps, "hysteria2 enabled brutal congestion control");
             }
             Err(_) => {
