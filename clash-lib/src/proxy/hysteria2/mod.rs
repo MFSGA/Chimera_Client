@@ -85,7 +85,8 @@ pub struct HystOption {
     pub disable_mtu_discovery: bool,
     pub ca: Option<String>,
     pub ca_str: Option<String>,
-    pub up_down: Option<(u64, u64)>,
+    pub up: Option<u64>,
+    pub down: Option<u64>,
     pub cwnd: Option<u64>,
     pub udp_mtu: Option<u32>,
 }
@@ -106,6 +107,25 @@ impl std::str::FromStr for CcRx {
             Ok(Self::Fixed(value.parse::<u64>()?))
         }
     }
+}
+
+fn client_cc_rx_header(down_bps: Option<u64>) -> String {
+    down_bps.unwrap_or_default().to_string()
+}
+
+fn select_brutal_bps(max_tx_bps: Option<u64>, cc_rx: CcRx) -> Option<u64> {
+    let max_tx_bps = max_tx_bps.unwrap_or_default();
+    let actual_tx_bps = match cc_rx {
+        CcRx::Auto => return None,
+        CcRx::Fixed(server_rx_bps)
+            if server_rx_bps == 0 || server_rx_bps > max_tx_bps =>
+        {
+            max_tx_bps
+        }
+        CcRx::Fixed(server_rx_bps) => server_rx_bps,
+    };
+
+    (actual_tx_bps > 0).then_some(actual_tx_bps)
 }
 
 pub struct Handler {
@@ -280,18 +300,8 @@ impl Handler {
         }
     }
 
-    fn client_cc_rx_header(&self) -> String {
-        self.opts
-            .up_down
-            .map(|(_, down)| down.to_string())
-            .unwrap_or_else(|| "0".to_owned())
-    }
-
     fn select_brutal_bps(&self, cc_rx: CcRx) -> Option<u64> {
-        match cc_rx {
-            CcRx::Fixed(rate) if rate > 0 => Some(rate),
-            _ => self.opts.up_down.map(|(up, _)| up).filter(|up| *up > 0),
-        }
+        select_brutal_bps(self.opts.up, cc_rx)
     }
 
     fn configure_brutal_cc(conn: &Connection, brutal_bps: Option<u64>) {
@@ -484,7 +494,7 @@ impl Handler {
         let session = connecting.await?;
         tracing::trace!("hysteria2 QUIC connection established");
         let (guard, driver_task, cc_rx, udp) =
-            Self::auth(&session, &self.opts.password).await?;
+            Self::auth(&session, &self.opts.password, self.opts.down).await?;
         let current_context =
             connector.connection_pool_context(sess.iface.as_ref()).await;
         let stale = match pool_context.path_id.as_ref() {
@@ -513,6 +523,7 @@ impl Handler {
     async fn auth(
         conn: &quinn::Connection,
         passwd: &str,
+        down_bps: Option<u64>,
     ) -> anyhow::Result<(
         SendRequest<OpenStreams, Bytes>,
         tokio::task::JoinHandle<()>,
@@ -530,7 +541,7 @@ impl Handler {
 
         let req = http::Request::post("https://hysteria/auth")
             .header("Hysteria-Auth", passwd)
-            .header("Hysteria-CC-RX", "0")
+            .header("Hysteria-CC-RX", client_cc_rx_header(down_bps))
             .header("Hysteria-Padding", codec::padding(64..=512))
             .body(())
             .unwrap();
@@ -1425,7 +1436,8 @@ rules:
                     disable_mtu_discovery: false,
                     ca: None,
                     ca_str: None,
-                    up_down: None,
+                    up: None,
+                    down: None,
                     cwnd: None,
                     udp_mtu: None,
                 }));
@@ -1627,6 +1639,50 @@ mod network_path_tests {
 
     use super::*;
     use crate::app::flow::{AddressFamily, InterfaceId, NetworkPathId};
+    use crate::config::internal::proxy::OutboundHysteria2;
+
+    #[test]
+    fn hysteria_config_preserves_independent_bandwidth_limits() {
+        crate::setup_default_crypto_provider();
+
+        for (up, down) in [
+            (Some(8_000_000), None),
+            (None, Some(12_000_000)),
+            (Some(8_000_000), Some(12_000_000)),
+            (None, None),
+        ] {
+            let handler: Handler = OutboundHysteria2 {
+                name: "hy2-bandwidth-test".to_owned(),
+                server: "127.0.0.1".to_owned(),
+                port: 443,
+                password: "test".to_owned(),
+                up,
+                down,
+                ..Default::default()
+            }
+            .try_into()
+            .expect("Hysteria2 config should convert");
+
+            assert_eq!(handler.opts.up, up);
+            assert_eq!(handler.opts.down, down);
+        }
+    }
+
+    #[test]
+    fn hysteria_auth_advertises_client_receive_limit() {
+        assert_eq!(client_cc_rx_header(None), "0");
+        assert_eq!(client_cc_rx_header(Some(12_000_000)), "12000000");
+    }
+
+    #[test]
+    fn hysteria_brutal_rate_matches_peer_limits() {
+        assert_eq!(select_brutal_bps(Some(10), CcRx::Auto), None);
+        assert_eq!(select_brutal_bps(Some(10), CcRx::Fixed(8)), Some(8));
+        assert_eq!(select_brutal_bps(Some(10), CcRx::Fixed(12)), Some(10));
+        assert_eq!(select_brutal_bps(Some(10), CcRx::Fixed(0)), Some(10));
+        assert_eq!(select_brutal_bps(None, CcRx::Fixed(8)), None);
+        assert_eq!(select_brutal_bps(None, CcRx::Fixed(0)), None);
+    }
 
     fn path(name: &str, index: u32, address: Ipv4Addr) -> NetworkPathId {
         NetworkPathId {
