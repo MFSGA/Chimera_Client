@@ -101,3 +101,48 @@
   第一条缺少内嵌 Dashboard 构建产物；第二条被现有 DNS/TLS dead-code warnings 阻断。本次标准 hysteria feature 下的定向编译、测试和 Clippy 均通过。
 - 独立 L2 Reviewer 检查实际 diff 和测量设置，未发现阻塞性 correctness 问题，建议推送至 codex/hy2-native-udp 供维护者审查。Reviewer 结论不等于维护者批准，也不授权并入 master。
 - 下一步继续验证新 socket 下的多网卡/mark、切网、混淆与端口跳跃，再用 bsy 线路复测。阶段 2 的组合兼容和远端结果补齐前，不标记为完全完成；随后进入阶段 3 的会话所有者、取消与重连问题。
+
+**阶段 2 补充：Salamander 收包正确性及回环对照，风险 L2。**
+
+- 客户端基线为 `f599e19a08dd302132dcc860443fd2dc690effe1`；候选在此基础上修改 `clash-lib/src/proxy/hysteria2/salamander.rs`。基线和候选 release 二进制 SHA-256 分别为 `e22629c21248c49ccc774d8571048d3217f483229a5afa036a44a4f9837d9496` 和 `d657f6b89ca7f43609a65e9c99cf430edeb69d0837f275859dae22bf1c1217fa`。
+- 根因：旧实现会缩短可复用的接收切片，后续较大数据报可能被截断或导致错误；它还把 GRO 聚合后的多段当成一段解混淆，且未将底层 GRO 接收容量告知 Quinn。修复保留切片容量、逐段解混淆并压紧数据，同时为每段盐预留 8 字节。
+- Quinn 0.11.12 当前按最大 UDP payload 与 `max_receive_segments` 的乘积分配接收区，且前者至少为 1200 字节。包装器以保守的段数上界预留盐空间，不改变 QUIC 通告参数；升级 Quinn 时必须重跑真实 endpoint 缓冲分配测试。`ConnectorUdpSocket` 对异常超大包返回错误并可能终止 endpoint 的既有问题单列，不纳入本项已修复范围。
+- 参考 `ref/` 的同路径实现已处理 GRO 分段，但未传递 `max_receive_segments`；本轮额外保留无效数据报计数以维持 Quinn 的工作量限制，并覆盖缓冲复用。候选 worktree 的参考子模块未检出，固定 gitlink 为 `39d06a49`；只读比较使用主检出参考目录当前 `2f624526`，二者不是同一参考版本。
+- 服务端使用 Hysteria 官方 v2.14.0、相同的本地 Salamander 配置。测试机与 CPU 亲和性同上；源站、代理和客户端均在同一 Linux 主机，且每个进程限定 2 个物理核心。每方向合计 128 MiB，先预热一次，五对按顺序交替，完整检查内容；以下为每项吞吐中位数和配对变化。结果是固定资源条件下的回环对照，不是不限资源的硬件极限。
+
+| 负载 | 基线上行 / 下行 Mbps | 候选上行 / 下行 Mbps | 上行 / 下行配对中位变化 |
+|---|---:|---:|---:|
+| 单流 | 1246 / 932 | 1244 / 1268 | +0.95% / +37.58% |
+| 8 并发 | 1329 / 905 | 1334 / 1276 | −1.35% / +41.31% |
+
+- 下行五对范围：单流 +34.55% 至 +38.42%，8 并发 +38.30% 至 +43.40%；8 并发上行一对低至 −17.15%，其余轮次和更长负载仍需继续检查。GRO 容量和分段解混淆共同改变，不能把收益归因于其中某一项。
+- 通过 8 个普通定向测试，以及显式执行的 Linux 内核 GSO/GRO 测试：内核实际合并四个 1208 字节混淆数据报，解混淆后 4800 字节逐字节一致。官方服务端上，普通 HY2 和 Salamander 的 TCP/UDP 在 `/network/reset` 前后均可用，并观察到重新认证的连接。上述测试未覆盖真正的代理链；该配置的负向对照发现 HY2 `dialer-proxy` 被静默忽略，须作为独立问题处理，不能将此前所谓代理链结果视为有效。
+- Linux 上真实底层最多 64 段时，Quinn 每 endpoint 的接收区理论分配从 47,104 字节变为 3,061,760 字节；这是分配量，不等于 RSS。三对 16 节点顺序激活测试确认各自存在 16 个 UDP socket；扣除空闲进程后，候选相对基线 RSS 差值为 −416、1516、2572 KiB，中位 1516 KiB。该短测存在明显波动，不能作为大量节点同时满载的内存上限。
+- 通过 `cargo fmt --all -- --check`、`CARGO_TARGET_DIR=/tmp/chimera-client-hy2-native-target cargo test --locked -p clash-lib --features hysteria --lib proxy::hysteria2::salamander::tests -- --test-threads=1`、以及 `cargo clippy --locked -p clash-lib --all-targets --features hysteria -- -D warnings`。真实 GSO/GRO 用例默认忽略，另以 `cargo test --locked -p clash-lib --features hysteria --lib proxy::hysteria2::salamander::tests::native_socket_decrypts_real_gro_segments -- --exact --ignored --nocapture` 实际运行一次并通过。
+- 独立 Reviewer 已审查修复思路；最终提交 SHA 仍需重新核验。Windows/macOS、混合负载 p95/p99、模拟丢包、多节点同时满载及实际线路均未验证。回退此项提交可恢复先前收包行为；回退也会恢复前述既有正确性问题。
+
+**HY2 无混淆本地交叉矩阵。**
+
+使用同一主机、相同两物理核心分配和 SOCKS5 入口，每单元预热一次、正式重复三次；单流每方向 128 MiB，8 并发为每流每方向 16 MiB，均做内容校验。客户端包括 Chimera、meow-rs 0.29.0、Mihomo Meta v1.19.33、Hysteria 2 v2.14.0 和 Xray 26.11.9；服务端包括官方 Hysteria、Chimera Server `3c636e4a` 与 Xray。meow 配置固定 `quic-connections: 1`，各单元客户端实际观察到 1 个 UDP socket，官方服务端对应日志各有 1 次认证；其默认配置在另一组测试中建立了 2 个连接，不能将不同会话宽度直接归因于架构。以下为上传 / 下载吞吐中位数，单位十进制 Gbps：
+
+| 服务端 | 客户端 | 单流 | 8 并发 |
+|---|---|---:|---:|
+| 官方 Hysteria | Chimera | 3.48 / 4.87 | 3.65 / 5.47 |
+| 官方 Hysteria | meow K=1 | 1.53 / 3.33 | 1.66 / 4.29 |
+| 官方 Hysteria | Mihomo | 3.98 / 4.00 | 4.30 / 4.13 |
+| 官方 Hysteria | 官方 Hysteria | 4.61 / 4.40 | 4.23 / 4.25 |
+| 官方 Hysteria | Xray | 3.56 / 4.12 | 3.73 / 4.12 |
+| Chimera | Chimera | 4.29 / 5.45 | 5.06 / 5.76 |
+| Chimera | meow K=1 | 1.54 / 4.32 | 1.55 / 4.17 |
+| Chimera | Mihomo | 5.19 / 3.13 | 6.07 / 3.19 |
+| Chimera | 官方 Hysteria | 5.22 / 3.42 | 6.26 / 3.38 |
+| Chimera | Xray | 4.07 / 2.95 | 5.41 / 2.95 |
+| Xray | Chimera | 3.36 / 3.91 | 3.36 / 4.96 |
+| Xray | meow K=1 | 1.54 / 3.08 | 1.64 / 3.62 |
+| Xray | Mihomo | 3.76 / 2.87 | 4.22 / 3.74 |
+| Xray | 官方 Hysteria | 4.04 / 3.44 | 3.93 / 3.62 |
+| Xray | Xray | 3.36 / 3.38 | 3.73 / 3.56 |
+
+表中不同客户端的 QUIC 流控和拥塞控制实现仍有差异，不能作为单一实现效率排名。单独的长流重试中，meow→Chimera Server 在 K=1 的 3 次中有 1 次、K=2 的 3 次中有 2 次未能在 8 秒内完成每方向 128 MiB 的预热请求；对应 meow→官方服务端 6 次均完成。日志显示失败轮认证已接受，但故障阶段和根因未确定，不能仅用成功轮吞吐掩盖失败。逐轮数据、二进制哈希和失败记录保存在 `bench/results/hy2-local-cross-2026-11-21.jsonl`；各客户端批次不是同一时间同时运行，数字有机器状态和构建差异。
+
+额外的阶段定位工具不进行内容校验，因此只用于诊断：相同连接上先上传 128 MiB、收到源站确认后再下载 128 MiB，meow K=1 与 Chimera Server 八轮中有两轮在下行约 23.4 MB 后触发 8 秒总超时，官方服务端八轮均完成；失败时客户端与服务端 UDP socket 的丢包计数均为零。失败轮服务端一次 5 秒采样中拥塞窗口为 5808 字节，QUIC 丢包和服务端发送的两类流控阻塞帧增量为零；这是单个时间窗口的观测，尚不能排除其他时间点的丢包、流控或应用调度问题，更不能单凭它断定责任端。独立上传和独立下载各三轮暂未复现，后续应控制接收窗口和拥塞控制做 A/B。
