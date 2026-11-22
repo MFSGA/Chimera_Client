@@ -1092,8 +1092,50 @@ fn build_request_for_version<B>(
     http_version: XhttpHttpVersion,
 ) -> io::Result<Request<B>> {
     let scheme = if use_tls { "https" } else { "http" };
-    let mut uri = format!("{scheme}://{server}:{port}{path}");
+    let server_host = if server.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{server}]")
+    } else {
+        server.to_owned()
+    };
+    let host = host.filter(|value| !value.is_empty());
     let mut headers = headers.clone();
+    headers
+        .retain(|key, value| !key.eq_ignore_ascii_case("host") || !value.is_empty());
+    if padding.obfs_mode
+        && matches!(
+            padding.placement,
+            XhttpPaddingPlacement::Header | XhttpPaddingPlacement::QueryInHeader
+        )
+        && padding.header.eq_ignore_ascii_case("host")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "xhttp padding cannot overwrite the Host header",
+        ));
+    }
+    // HTTP/2 and HTTP/3 derive :authority from the URI, not the Host header.
+    // Honor an explicit Host header first, matching the existing precedence
+    // below, then the XHTTP host option. Dialing still uses server and port.
+    let mut host_headers = headers
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case("host"));
+    let host_override = host_headers
+        .next()
+        .map(|(_, value)| value.as_str())
+        .or(host);
+    if host_headers.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "xhttp request has multiple Host headers",
+        ));
+    }
+    let mut uri = match (http_version, host_override) {
+        (XhttpHttpVersion::Http2 | XhttpHttpVersion::Http3, Some(authority)) => {
+            validate_request_authority(authority)?;
+            format!("{scheme}://{authority}{path}")
+        }
+        _ => format!("{scheme}://{server_host}:{port}{path}"),
+    };
     padding.apply(&mut uri, &mut headers)?;
 
     let parsed_uri: http::Uri = uri.parse().map_err(map_io_error)?;
@@ -1133,9 +1175,9 @@ fn build_request_for_version<B>(
         } else if matches!(http_version, XhttpHttpVersion::Http1) {
             let default_port = if use_tls { 443 } else { 80 };
             let authority = if port == default_port {
-                server.to_owned()
+                server_host
             } else {
-                format!("{server}:{port}")
+                format!("{server_host}:{port}")
             };
             request = request.header("Host", authority);
         }
@@ -1146,6 +1188,64 @@ fn build_request_for_version<B>(
     }
 
     request.body(body).map_err(map_io_error)
+}
+
+fn validate_request_authority(value: &str) -> io::Result<()> {
+    let authority = value.parse::<http::uri::Authority>().map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "invalid xhttp authority")
+    })?;
+    let host = authority.host();
+    let suffix = value.strip_prefix(host).unwrap_or(value);
+    let invalid_ipv6 = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .is_some_and(|literal| {
+            let (address, zone) = literal
+                .split_once("%25")
+                .map_or((literal, None), |(address, zone)| (address, Some(zone)));
+            address.parse::<std::net::Ipv6Addr>().is_err()
+                || zone.is_some_and(|value| !valid_ipv6_zone(value))
+        });
+    if value.contains('@')
+        || host.is_empty()
+        || invalid_ipv6
+        || (!host.starts_with('[') && host.contains(['[', ']']))
+        || (!suffix.is_empty()
+            && suffix
+                .strip_prefix(':')
+                .filter(|port| {
+                    !port.is_empty() && port.bytes().all(|c| c.is_ascii_digit())
+                })
+                .and_then(|port| port.parse::<u16>().ok())
+                .is_none())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid xhttp authority",
+        ));
+    }
+    Ok(())
+}
+
+fn valid_ipv6_zone(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
+        {
+            index += 1;
+        } else if byte == b'%'
+            && index + 2 < bytes.len()
+            && bytes[index + 1].is_ascii_hexdigit()
+            && bytes[index + 2].is_ascii_hexdigit()
+        {
+            index += 3;
+        } else {
+            return false;
+        }
+    }
+    !bytes.is_empty()
 }
 
 async fn open_xhttp_logical_stream(

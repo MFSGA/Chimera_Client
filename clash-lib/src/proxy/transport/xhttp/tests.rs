@@ -1,10 +1,11 @@
 use super::{
     Client, GlobalIpv6Policy, MetadataPlacement, UplinkDataPlacement,
     XhttpChunkSizeRange, XhttpDownloadConfig, XhttpEndpointConfig, XhttpHttpVersion,
-    XhttpMetadataConfig, XhttpMode, XhttpPaddingConfig, XhttpReusePolicy,
-    XhttpReuseValueRange, XhttpSecurity, XhttpUplinkConfig, build_request,
-    connect_download_stream, endpoint_allowed_for_global_policy,
-    open_separate_downlink_response, remaining_post_interval,
+    XhttpMetadataConfig, XhttpMode, XhttpPaddingConfig, XhttpPaddingPlacement,
+    XhttpReusePolicy, XhttpReuseValueRange, XhttpSecurity, XhttpUplinkConfig,
+    build_request, build_request_for_version, connect_download_stream,
+    endpoint_allowed_for_global_policy, open_separate_downlink_response,
+    remaining_post_interval,
 };
 #[cfg(feature = "xhttp-h3")]
 use crate::{
@@ -372,6 +373,7 @@ async fn spawn_h3_download_settings_servers() -> (
 #[cfg(feature = "xhttp-h3")]
 async fn spawn_h3_stream_one_echo_server(
     request_count: usize,
+    expected_authority: Option<&'static str>,
 ) -> std::net::SocketAddr {
     crate::setup_default_crypto_provider();
 
@@ -418,6 +420,12 @@ async fn spawn_h3_stream_one_echo_server(
                 .expect("test HTTP/3 request should resolve");
             assert_eq!(request.version(), Version::HTTP_3);
             assert_eq!(request.method(), Method::POST);
+            if let Some(expected) = expected_authority {
+                assert_eq!(
+                    request.uri().authority().map(|value| value.as_str()),
+                    Some(expected)
+                );
+            }
             stream
                 .send_response(
                     Response::builder().status(StatusCode::OK).body(()).unwrap(),
@@ -788,10 +796,247 @@ fn xhttp_request_adds_default_padding_referer() {
     );
 }
 
+#[test]
+fn xhttp_request_uses_configured_host_for_http_authority() {
+    for version in [XhttpHttpVersion::Http2, XhttpHttpVersion::Http3] {
+        for (host, headers, expected) in [
+            (None, HashMap::new(), "127.0.0.1:8443"),
+            (Some(""), HashMap::new(), "127.0.0.1:8443"),
+            (
+                Some("proxy.example.test"),
+                HashMap::new(),
+                "proxy.example.test",
+            ),
+            (
+                Some("proxy.example.test"),
+                HashMap::from([(
+                    "HOST".to_owned(),
+                    "header.example.test:9443".to_owned(),
+                )]),
+                "header.example.test:9443",
+            ),
+            (Some("[::1]:9443"), HashMap::new(), "[::1]:9443"),
+            (
+                Some("[fe80::1%25eth0]:8443"),
+                HashMap::new(),
+                "[fe80::1%25eth0]:8443",
+            ),
+            (
+                Some("[fe80::1%25eth%2D0]:8443"),
+                HashMap::new(),
+                "[fe80::1%25eth%2D0]:8443",
+            ),
+        ] {
+            let request = build_request_for_version(
+                "127.0.0.1",
+                8443,
+                "/xhttp/",
+                host,
+                &headers,
+                true,
+                None,
+                "POST",
+                (),
+                &XhttpPaddingConfig::default(),
+                version,
+            )
+            .expect("request should build");
+            assert_eq!(request.uri().authority().unwrap().as_str(), expected);
+            if host.is_some_and(|value| !value.is_empty()) {
+                assert_eq!(request.headers().get("host").unwrap(), expected);
+            } else {
+                assert!(request.headers().get("host").is_none());
+            }
+        }
+    }
+
+    let request = build_request_for_version(
+        "127.0.0.1",
+        8443,
+        "/xhttp/",
+        Some("proxy.example.test"),
+        &HashMap::new(),
+        true,
+        None,
+        "POST",
+        (),
+        &XhttpPaddingConfig::default(),
+        XhttpHttpVersion::Http1,
+    )
+    .expect("HTTP/1 request should build");
+    assert_eq!(request.uri().path(), "/xhttp/");
+    assert_eq!(request.headers().get("host").unwrap(), "proxy.example.test");
+}
+
+#[test]
+fn xhttp_request_rejects_invalid_authority_and_padding_host() {
+    for version in [XhttpHttpVersion::Http2, XhttpHttpVersion::Http3] {
+        let conflicting_hosts = HashMap::from([
+            ("Host".to_owned(), "first.example.test".to_owned()),
+            ("hOsT".to_owned(), "second.example.test".to_owned()),
+        ]);
+        assert!(
+            build_request_for_version(
+                "127.0.0.1",
+                8443,
+                "/xhttp/",
+                None,
+                &conflicting_hosts,
+                true,
+                None,
+                "POST",
+                (),
+                &XhttpPaddingConfig::default(),
+                version,
+            )
+            .is_err(),
+            "multiple Host headers must not select a random authority"
+        );
+        for host in [
+            "proxy.example.test/other",
+            "proxy.example.test?query=1",
+            "proxy.example.test#fragment",
+            "user@proxy.example.test",
+            "proxy.example.test:not-a-port",
+            "proxy.example.test:+443",
+            "proxy.example.test:65536",
+            "proxy.example.test:",
+            ":443",
+            "[]",
+            "[not-ip]",
+            "[2001:db8::gg]",
+            "[fe80::1%25]",
+            "[fe80::1%25eth%ZZ]",
+            "example.test[]",
+            "example.test[foo]",
+        ] {
+            let result = build_request_for_version(
+                "127.0.0.1",
+                8443,
+                "/xhttp/",
+                Some(host),
+                &HashMap::new(),
+                true,
+                None,
+                "POST",
+                (),
+                &XhttpPaddingConfig::default(),
+                version,
+            );
+            assert!(result.is_err(), "invalid authority was accepted: {host}");
+        }
+        for placement in [
+            XhttpPaddingPlacement::Header,
+            XhttpPaddingPlacement::QueryInHeader,
+        ] {
+            let padding = XhttpPaddingConfig {
+                obfs_mode: true,
+                header: "hOsT".to_owned(),
+                placement,
+                ..XhttpPaddingConfig::default()
+            };
+            let result = build_request_for_version(
+                "127.0.0.1",
+                8443,
+                "/xhttp/",
+                Some("proxy.example.test"),
+                &HashMap::new(),
+                true,
+                None,
+                "POST",
+                (),
+                &padding,
+                version,
+            );
+            assert!(result.is_err(), "padding must not overwrite Host");
+        }
+    }
+}
+
+#[test]
+fn xhttp_request_formats_ipv6_authority() {
+    for version in [
+        XhttpHttpVersion::Http1,
+        XhttpHttpVersion::Http2,
+        XhttpHttpVersion::Http3,
+    ] {
+        let request = build_request_for_version(
+            "::1",
+            8443,
+            "/xhttp/",
+            None,
+            &HashMap::new(),
+            true,
+            None,
+            "POST",
+            (),
+            &XhttpPaddingConfig::default(),
+            version,
+        )
+        .expect("IPv6 request should build");
+        if version == XhttpHttpVersion::Http1 {
+            assert_eq!(request.headers().get("host").unwrap(), "[::1]:8443");
+        } else {
+            assert_eq!(request.uri().authority().unwrap().as_str(), "[::1]:8443");
+        }
+    }
+}
+
+#[tokio::test]
+async fn xhttp_http2_sends_configured_host_as_authority() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let service =
+            hyper::service::service_fn(|req: Request<Incoming>| async move {
+                if req.uri().authority().map(|v| v.as_str())
+                    != Some("proxy.example.test")
+                {
+                    return Ok(Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(Empty::<Bytes>::new().boxed())
+                        .unwrap());
+                }
+                handle_stream_one(req).await
+            });
+        let _ = auto::Builder::new(TokioExecutor::new())
+            .http2_only()
+            .serve_connection(TokioIo::new(tcp), service)
+            .await;
+    });
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let client = Client::new(
+        "127.0.0.1".to_owned(),
+        addr.port(),
+        "/xhttp/".to_owned(),
+        Some("proxy.example.test".to_owned()),
+        HashMap::new(),
+        false,
+        XhttpMode::StreamOne,
+        1_000_000,
+        false,
+        None,
+        None,
+    );
+    let mut proxied = client
+        .proxy_stream(Box::new(stream))
+        .await
+        .expect("server should accept the configured authority");
+    proxied.write_all(b"ping").await.unwrap();
+    proxied.flush().await.unwrap();
+    let mut response = [0; 4];
+    timeout(Duration::from_secs(2), proxied.read_exact(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&response, b"ping");
+}
+
 #[cfg(feature = "xhttp-h3")]
 #[tokio::test]
 async fn xhttp_http3_stream_one_echoes_bytes_through_connector_udp() {
-    let addr = spawn_h3_stream_one_echo_server(1).await;
+    let addr = spawn_h3_stream_one_echo_server(1, Some("proxy.example.test")).await;
     let endpoint = XhttpEndpointConfig {
         server: "127.0.0.1".to_owned(),
         port: addr.port(),
@@ -809,7 +1054,7 @@ async fn xhttp_http3_stream_one_echoes_bytes_through_connector_udp() {
         "127.0.0.1".to_owned(),
         addr.port(),
         "/xhttp/".to_owned(),
-        None,
+        Some("proxy.example.test".to_owned()),
         HashMap::new(),
         true,
         XhttpMode::StreamOne,
@@ -841,7 +1086,7 @@ async fn xhttp_http3_stream_one_echoes_bytes_through_connector_udp() {
 #[cfg(feature = "xhttp-h3")]
 #[tokio::test]
 async fn xhttp_http3_reuses_one_quic_connection_for_logical_streams() {
-    let addr = spawn_h3_stream_one_echo_server(2).await;
+    let addr = spawn_h3_stream_one_echo_server(2, None).await;
     let endpoint = XhttpEndpointConfig {
         server: "127.0.0.1".to_owned(),
         port: addr.port(),
@@ -1718,7 +1963,7 @@ async fn s04bt_abort_between_h3_sender_acquisition_and_handoff_releases_both_slo
 #[cfg(feature = "xhttp-h3")]
 #[tokio::test]
 async fn s04bt_failed_h3_downlink_setup_releases_previously_acquired_upload() {
-    let upload_addr = spawn_h3_stream_one_echo_server(0).await;
+    let upload_addr = spawn_h3_stream_one_echo_server(0, None).await;
     let endpoint = XhttpEndpointConfig {
         server: "127.0.0.1".to_owned(),
         port: upload_addr.port(),
@@ -1805,7 +2050,7 @@ async fn s04bt_failed_h3_downlink_setup_releases_previously_acquired_upload() {
 #[cfg(feature = "xhttp-h3")]
 #[tokio::test]
 async fn xhttp_http3_reuses_separate_download_connection() {
-    let addr = spawn_h3_stream_one_echo_server(2).await;
+    let addr = spawn_h3_stream_one_echo_server(2, None).await;
     let reuse_policy = XhttpReusePolicy {
         max_concurrency: Some(XhttpReuseValueRange { min: 1, max: 1 }),
         max_connections: None,
