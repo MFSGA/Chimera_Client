@@ -46,6 +46,81 @@ type TestSessions =
     Arc<Mutex<HashMap<String, mpsc::Sender<Result<Frame<Bytes>, Infallible>>>>>;
 
 #[cfg(feature = "xhttp-h3")]
+#[test]
+fn h3_direct_loopback_accepts_only_current_proven_local_route() {
+    let current = NetworkPoolContext {
+        network_generation: Some(7),
+        eligible_path_ids: Some(Default::default()),
+        direct_local_route_pooling_supported: true,
+        ..Default::default()
+    };
+    let connected = NetworkPoolContext {
+        network_generation: Some(7),
+        generation_only_local_route: true,
+        direct_local_route_pooling_supported: true,
+        ..Default::default()
+    };
+    let check = super::h3_connected_path_is_current;
+    assert!(check(&current, &connected, false, true));
+    assert!(!check(&current, &connected, true, true));
+    assert!(!check(&current, &connected, false, false));
+    assert!(!check(
+        &NetworkPoolContext {
+            network_generation: Some(8),
+            ..current.clone()
+        },
+        &connected,
+        false,
+        true,
+    ));
+    assert!(!check(
+        &NetworkPoolContext {
+            direct_local_route_pooling_supported: false,
+            ..current.clone()
+        },
+        &connected,
+        false,
+        true,
+    ));
+    assert!(!check(
+        &current,
+        &NetworkPoolContext {
+            direct_local_route_pooling_supported: false,
+            ..connected.clone()
+        },
+        false,
+        true,
+    ));
+    let forged_path = crate::app::flow::NetworkPathId {
+        interface: crate::app::flow::InterfaceId {
+            name: "eth0".into(),
+            index: 5,
+        },
+        family: crate::app::flow::AddressFamily::Ipv4,
+        source_address: Some(std::net::Ipv4Addr::new(192, 0, 2, 10).into()),
+        network_generation: 7,
+    };
+    assert!(!check(
+        &current,
+        &NetworkPoolContext {
+            path_id: Some(forged_path),
+            ..connected.clone()
+        },
+        false,
+        true,
+    ));
+    assert!(!check(
+        &current,
+        &NetworkPoolContext {
+            generation_only_local_route: false,
+            ..connected
+        },
+        false,
+        true,
+    ));
+}
+
+#[cfg(feature = "xhttp-h3")]
 async fn spawn_h3_packet_up_echo_server() -> std::net::SocketAddr {
     crate::setup_default_crypto_provider();
 
@@ -1240,6 +1315,115 @@ async fn spawn_s04bv_observed_h3_server() -> (
         }
     });
     (addr, closed_rx)
+}
+
+#[cfg(feature = "xhttp-h3")]
+#[tokio::test]
+async fn h3_loopback_dial_with_observed_physical_paths_stays_unpooled() {
+    use crate::app::{
+        flow::{AddressFamily, InterfaceId, InterfaceKind},
+        network::{
+            BindingStatus, DefaultRouteEvidence, NetworkSnapshot, NetworkStatus,
+            PathCandidateObservation,
+        },
+    };
+    use crate::proxy::utils::{NetworkPathSource, RemoteConnector};
+
+    let mut status = NetworkStatus::default();
+    status.set_automatic_supported_for_test(true);
+    status.observed(&NetworkSnapshot {
+        path_candidates: vec![PathCandidateObservation {
+            interface: InterfaceId {
+                name: "eth0".into(),
+                index: 5,
+            },
+            interface_kind: InterfaceKind::Unknown,
+            family: AddressFamily::Ipv4,
+            source_address: std::net::Ipv4Addr::new(192, 0, 2, 10).into(),
+            scope_id: None,
+            gateway: None,
+            default_route: DefaultRouteEvidence::PrimaryDefaultRoute,
+            binding: BindingStatus::Verified,
+            binding_error: None,
+        }],
+        ..Default::default()
+    });
+    let source = NetworkPathSource::default();
+    source
+        .attach(Arc::new(tokio::sync::RwLock::new(status)))
+        .await;
+    let connector = DirectConnector::with_path_source(source);
+    let context = connector.connection_pool_context(None).await;
+    assert!(
+        context
+            .eligible_path_ids
+            .as_ref()
+            .is_some_and(|ids| !ids.is_empty())
+    );
+
+    let (addr, closed_rx) = spawn_s04bv_observed_h3_server().await;
+    let endpoint = XhttpEndpointConfig {
+        server: "127.0.0.1".into(),
+        port: addr.port(),
+        security: XhttpSecurity::Tls,
+        server_name: "xhttp.example.com".into(),
+        alpn_protocols: vec!["h3".into()],
+        skip_cert_verify: true,
+        fingerprint: None,
+        verify_name: None,
+        tls_cert: None,
+        tls_key: None,
+        reality: None,
+    };
+    let client = Client::new(
+        "127.0.0.1".into(),
+        addr.port(),
+        "/xhttp/".into(),
+        None,
+        HashMap::new(),
+        true,
+        XhttpMode::StreamOne,
+        1_000_000,
+        false,
+        None,
+        None,
+    )
+    .with_upload_endpoint(Some(endpoint))
+    .with_http_version(XhttpHttpVersion::Http3)
+    .with_reuse_policy(Some(XhttpReusePolicy {
+        max_concurrency: Some(XhttpReuseValueRange { min: 1, max: 1 }),
+        max_connections: None,
+        c_max_reuse_times: None,
+        h_max_request_times: None,
+        h_max_reusable_secs: None,
+        h_keep_alive_period: 0,
+    }));
+    let mut stream = timeout(
+        Duration::from_secs(3),
+        client.connect_stream_with_connector(
+            &Session::default(),
+            ipv6_enabled_mock_resolver(),
+            &connector,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    stream.write_all(b"loopback-h3").await.unwrap();
+    stream.flush().await.unwrap();
+    let mut response = [0u8; 11];
+    timeout(Duration::from_secs(3), stream.read_exact(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&response, b"loopback-h3");
+    assert!(client.h3_reuse_pool.lock().await.is_empty());
+    drop(stream);
+    timeout(Duration::from_secs(3), closed_rx)
+        .await
+        .expect("unpooled H3 connection must close")
+        .unwrap();
 }
 
 #[cfg(feature = "xhttp-h3")]

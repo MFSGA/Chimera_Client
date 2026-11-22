@@ -1795,6 +1795,27 @@ impl Drop for PendingH3Socket {
 }
 
 #[cfg(feature = "xhttp-h3")]
+fn h3_connected_path_is_current(
+    current: &NetworkPoolContext,
+    connected: &NetworkPoolContext,
+    has_explicit_interface: bool,
+    connector_supports_local_route: bool,
+) -> bool {
+    if connected.generation_only_local_route {
+        // A trusted direct loopback socket has no physical path ID. Keep the
+        // generation check and fail closed for explicit interfaces and
+        // connectors that cannot prove this local-route property.
+        return !has_explicit_interface
+            && connector_supports_local_route
+            && current.direct_local_route_pooling_supported
+            && connected.direct_local_route_pooling_supported
+            && connected.path_id.is_none()
+            && current.network_generation == connected.network_generation;
+    }
+    current.permits(connected.network_generation, connected.path_id.as_ref())
+}
+
+#[cfg(feature = "xhttp-h3")]
 async fn connect_h3_sender(
     endpoint_config: &XhttpEndpointConfig,
     sess: &Session,
@@ -1907,9 +1928,11 @@ async fn connect_h3_sender(
         let pending = PendingH3Socket::new(endpoint, connection);
         let current_context =
             connector.connection_pool_context(sess.iface.as_ref()).await;
-        if !current_context.permits(
-            connected_context.network_generation,
-            connected_context.path_id.as_ref(),
+        if !h3_connected_path_is_current(
+            &current_context,
+            &connected_context,
+            sess.iface.is_some(),
+            connector.supports_generation_only_local_route_pooling(),
         ) {
             // The PendingH3Socket Drop closes both handles, even when the
             // connector supplies an unlabelled path but eligible NICs exist.
