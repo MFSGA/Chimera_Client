@@ -16,7 +16,7 @@ use tracing::{debug, warn};
 use crate::app::api::{
     AppState,
     handlers::{
-        connection::GetConnectionsQuery, flows::ws_handle as flows_ws_handle,
+        connection::GetConnectionsQuery, flows::ws_handle as flows_ws_handle, logs,
         memory::GetMemoryResponse,
     },
 };
@@ -26,7 +26,7 @@ pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/connections", get(connections))
         .route("/traffic", get(traffic))
         .route("/memory", get(memory))
-        .route("/logs", get(log))
+        .route("/logs", get(logs::handle))
         .route("/flows", get(flows_ws_handle))
         .with_state(state)
 }
@@ -140,28 +140,4 @@ pub async fn memory(
 
     ws.on_failed_upgrade(|err| warn!("ws upgrade error: {}", err))
         .on_upgrade(async move |socket| callback(socket).await)
-}
-
-pub async fn log(
-    ws: WebSocketUpgrade,
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
-    ws.on_failed_upgrade(|err| warn!("ws upgrade error: {}", err))
-        .on_upgrade(move |mut socket| async move {
-            let mut rx = state.log_source_tx.subscribe();
-            while let Ok(evt) = rx.recv().await {
-                let body = match serde_json::to_string(&evt) {
-                    Ok(body) => body,
-                    Err(err) => {
-                        warn!("failed to serialize log event: {}", err);
-                        continue;
-                    }
-                };
-
-                if let Err(err) = socket.send(Message::Text(body.into())).await {
-                    warn!("ws send error: {}", err);
-                    break;
-                }
-            }
-        })
 }
