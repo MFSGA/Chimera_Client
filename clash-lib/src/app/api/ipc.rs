@@ -6,10 +6,13 @@ pub async fn serve_ipc(
     path: &str,
     ready_signal: super::runner::ApiReadySignal,
 ) -> crate::Result<()> {
+    use axum::body::Body;
     use hyper_util::rt::TokioIo;
     use tokio::net::windows::named_pipe;
     use tower::Service as _;
     use tracing::info;
+
+    use super::middlewares::websocket_uri_rewrite::rewrite_websocket_uri;
 
     info!("Starting API server on NamedPipe {path}");
 
@@ -39,12 +42,16 @@ pub async fn serve_ipc(
         let router = router.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(connected_client);
-            let hyper_service = hyper::service::service_fn(move |request: _| {
-                router.clone().call(request)
-            });
+            let hyper_service = hyper::service::service_fn(
+                move |request: http::Request<hyper::body::Incoming>| {
+                    let request = rewrite_websocket_uri(request.map(Body::new));
+                    router.clone().call(request)
+                },
+            );
 
             if let Err(e) = hyper::server::conn::http1::Builder::new()
                 .serve_connection(io, hyper_service)
+                .with_upgrades()
                 .await
             {
                 error!("NamedPipe error: {}", e);
@@ -61,9 +68,14 @@ pub async fn serve_ipc(
 ) -> crate::Result<()> {
     use std::{path::PathBuf, sync::Arc};
 
-    use axum::{extract::connect_info::Connected, serve::IncomingStream};
+    use axum::{
+        ServiceExt, extract::connect_info::Connected, serve::IncomingStream,
+    };
     use tokio::net::UnixListener;
+    use tower::{Layer, util::MapRequestLayer};
     use tracing::info;
+
+    use super::middlewares::websocket_uri_rewrite::rewrite_websocket_uri;
 
     let path = PathBuf::from(path);
 
@@ -134,9 +146,10 @@ pub async fn serve_ipc(
         }
     }
 
+    let app = MapRequestLayer::new(rewrite_websocket_uri).layer(router);
     axum::serve(
         uds,
-        router.into_make_service_with_connect_info::<UdsConnectInfo>(),
+        app.into_make_service_with_connect_info::<UdsConnectInfo>(),
     )
     .await
     .map_err(|e| {

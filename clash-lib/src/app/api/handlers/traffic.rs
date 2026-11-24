@@ -1,7 +1,7 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::sync::Arc;
 
 use axum::{
-    extract::{ConnectInfo, State, WebSocketUpgrade, ws::Message},
+    extract::{State, WebSocketUpgrade, ws::Message},
     response::IntoResponse,
 };
 use serde::Serialize;
@@ -21,11 +21,10 @@ struct TrafficResponse {
 
 pub async fn handle(
     ws: WebSocketUpgrade,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    ws.on_failed_upgrade(move |e| {
-        warn!("ws upgrade error: {} with {}", e, addr);
+    ws.on_failed_upgrade(|e| {
+        warn!("ws upgrade error: {}", e);
     })
     .on_upgrade(move |mut socket| async move {
         let mgr = state.statistics_manager.clone();
