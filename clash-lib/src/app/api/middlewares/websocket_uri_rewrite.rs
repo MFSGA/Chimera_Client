@@ -1,12 +1,9 @@
 use axum::{body::Body, http::Request};
 
-#[allow(dead_code)]
+use crate::app::api::handlers::utils::is_request_websocket;
+
 pub fn rewrite_websocket_uri(mut req: Request<Body>) -> Request<Body> {
-    let is_websocket = req
-        .headers()
-        .get("upgrade")
-        .map(|upgrade| upgrade == "websocket")
-        .unwrap_or(false);
+    let is_websocket = is_request_websocket(req.headers());
 
     if !is_websocket {
         return req;
