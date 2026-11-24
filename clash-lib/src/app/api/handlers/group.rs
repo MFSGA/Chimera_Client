@@ -29,9 +29,11 @@ struct GroupState {
 pub fn routes(outbound_manager: ThreadSafeOutboundManager) -> Router<Arc<AppState>> {
     let state = GroupState { outbound_manager };
     Router::new()
+        .route("/", get(get_groups))
         .nest(
             "/{name}",
             Router::new()
+                .route("/", get(get_group))
                 .route("/delay", get(get_group_delay))
                 .route_layer(middleware::from_fn_with_state(
                     state.clone(),
@@ -42,6 +44,18 @@ pub fn routes(outbound_manager: ThreadSafeOutboundManager) -> Router<Arc<AppStat
         .with_state(state)
 }
 
+async fn get_groups(State(state): State<GroupState>) -> impl IntoResponse {
+    let groups = state.outbound_manager.get_groups().await;
+    Json(HashMap::from([("proxies", groups)]))
+}
+
+async fn get_group(
+    State(state): State<GroupState>,
+    Extension(proxy): Extension<AnyOutboundHandler>,
+) -> impl IntoResponse {
+    Json(state.outbound_manager.get_proxy(&proxy).await)
+}
+
 async fn find_group_by_name(
     State(state): State<GroupState>,
     Path(name): Path<String>,
@@ -49,11 +63,11 @@ async fn find_group_by_name(
     next: Next,
 ) -> Response {
     match state.outbound_manager.get_outbound(&name).await {
-        Some(proxy) => {
+        Some(proxy) if proxy.try_as_group_handler().is_some() => {
             req.extensions_mut().insert(proxy);
             next.run(req).await
         }
-        None => (StatusCode::NOT_FOUND, format!("group {name} not found"))
+        _ => (StatusCode::NOT_FOUND, format!("group {name} not found"))
             .into_response(),
     }
 }

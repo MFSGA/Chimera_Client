@@ -513,6 +513,26 @@ impl OutboundManager {
         r
     }
 
+    /// List group handlers only, using the same metadata as /proxies.
+    pub async fn get_groups(
+        &self,
+    ) -> Vec<HashMap<String, Box<dyn Serialize + Send>>> {
+        let mut handlers: Vec<_> = self
+            .registry
+            .read()
+            .await
+            .iter()
+            .filter(|(_, handler)| handler.try_as_group_handler().is_some())
+            .map(|(name, handler)| (name.clone(), handler.clone()))
+            .collect();
+        handlers.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let mut groups = Vec::with_capacity(handlers.len());
+        for (_, handler) in handlers {
+            groups.push(self.get_proxy(&handler).await);
+        }
+        groups
+    }
+
     pub async fn get_proxy(
         &self,
         proxy: &AnyOutboundHandler,
