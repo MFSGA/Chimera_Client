@@ -1,0 +1,23 @@
+[package]
+name = "chimera-reality-protocol-perf-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = ["vision"]
+vision = ["chimera-reality-core/vision"]
+
+[dependencies]
+anyhow = "1"
+chimera-reality-core = { path = "../../../crates/reality-core", default-features = false, features = ["reality", "vless"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread"] }
+uuid = "1"
+
+[[bin]]
+name = "chimera-reality-protocol-perf-client"
+path = "src/main.rs"
+
+[lints]
+workspace = true
