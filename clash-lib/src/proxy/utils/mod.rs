@@ -15,6 +15,11 @@ mod platform;
 
 mod proxy_connector;
 
+#[cfg(all(target_os = "linux", feature = "zero_copy", feature = "reality"))]
+pub(crate) use proxy_connector::{
+    is_vision_splice_candidate, vision_spliced_tcp_stream_mut,
+};
+
 pub mod provider_helper;
 mod shared_handler;
 

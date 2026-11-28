@@ -349,6 +349,11 @@ impl ReadTracker {
         self.tracker
             .download_total
             .fetch_add(download as u64, std::sync::atomic::Ordering::Release);
+        if self.tracker.session_holder.inbound_user.is_some() {
+            self.tracker
+                .user_download
+                .fetch_add(download as u64, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -369,6 +374,11 @@ impl WriteTracker {
         self.tracker
             .upload_total
             .fetch_add(upload as u64, std::sync::atomic::Ordering::Release);
+        if self.tracker.session_holder.inbound_user.is_some() {
+            self.tracker
+                .user_upload
+                .fetch_add(upload as u64, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -395,17 +405,20 @@ impl AsyncRead for TrackedStream {
         let before = buf.filled().len();
         let v = Pin::new(self.inner.as_mut()).poll_read(cx, buf);
         let download = buf.filled().len().saturating_sub(before);
-        if let Some(proof) = &self.traffic_proof {
-            proof.received(download);
-        }
-        self.manager.push_downloaded(download);
-        self.tracker
-            .download_total
-            .fetch_add(download as u64, std::sync::atomic::Ordering::Release);
-        if self.tracker.session_holder.inbound_user.is_some() {
+        if download > 0 {
+            if let Some(proof) = &self.traffic_proof {
+                proof.received(download);
+            }
+            self.manager.push_downloaded(download);
             self.tracker
-                .user_download
-                .fetch_add(download as u64, std::sync::atomic::Ordering::Relaxed);
+                .download_total
+                .fetch_add(download as u64, std::sync::atomic::Ordering::Release);
+            if self.tracker.session_holder.inbound_user.is_some() {
+                self.tracker.user_download.fetch_add(
+                    download as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
         }
 
         v
@@ -433,14 +446,16 @@ impl AsyncWrite for TrackedStream {
             Poll::Ready(Ok(n)) => n,
             _ => return v,
         };
-        self.manager.push_uploaded(upload);
-        self.tracker
-            .upload_total
-            .fetch_add(upload as u64, std::sync::atomic::Ordering::Release);
-        if self.tracker.session_holder.inbound_user.is_some() {
+        if upload > 0 {
+            self.manager.push_uploaded(upload);
             self.tracker
-                .user_upload
-                .fetch_add(upload as u64, std::sync::atomic::Ordering::Relaxed);
+                .upload_total
+                .fetch_add(upload as u64, std::sync::atomic::Ordering::Release);
+            if self.tracker.session_holder.inbound_user.is_some() {
+                self.tracker
+                    .user_upload
+                    .fetch_add(upload as u64, std::sync::atomic::Ordering::Relaxed);
+            }
         }
 
         v
@@ -807,6 +822,7 @@ mod flow_context_tests {
         },
         session::{Network, Session, SocksAddr, Type},
     };
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
     use super::{
         BoxedChainedDatagram, BoxedChainedStream, ChainedDatagramWrapper,
@@ -856,6 +872,130 @@ mod flow_context_tests {
         ) -> Poll<Result<(), Self::Error>> {
             Poll::Ready(Ok(()))
         }
+    }
+
+    #[tokio::test]
+    async fn tracked_stream_counts_only_transferred_bytes() {
+        let manager = StatisticsManager::new();
+        let (io, mut peer) = tokio::io::duplex(64);
+        let inner: BoxedChainedStream = Box::new(ChainedStreamWrapper::new(io));
+        let mut tracked =
+            TrackedStream::new(inner, manager.clone(), Session::default(), None)
+                .await;
+        let tracker = tracked.tracker_info();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+
+        let mut pending_storage = [0; 4];
+        let mut pending_read = ReadBuf::new(&mut pending_storage);
+        assert!(
+            Pin::new(&mut tracked)
+                .poll_read(&mut cx, &mut pending_read)
+                .is_pending()
+        );
+        assert_eq!(
+            tracker
+                .download_total
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        assert_eq!(manager.summary().await.download_total, 0);
+
+        assert!(matches!(
+            Pin::new(&mut tracked).poll_write(&mut cx, &[]),
+            Poll::Ready(Ok(0))
+        ));
+        assert_eq!(
+            tracker
+                .upload_total
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        assert_eq!(manager.summary().await.upload_total, 0);
+
+        peer.write_all(b"down").await.unwrap();
+        let mut download_storage = [0; 4];
+        let mut download = ReadBuf::new(&mut download_storage);
+        assert!(matches!(
+            Pin::new(&mut tracked).poll_read(&mut cx, &mut download),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(download.filled(), b"down");
+        assert_eq!(
+            tracker
+                .download_total
+                .load(std::sync::atomic::Ordering::Acquire),
+            4
+        );
+        assert_eq!(manager.summary().await.download_total, 4);
+
+        assert!(matches!(
+            Pin::new(&mut tracked).poll_write(&mut cx, b"up"),
+            Poll::Ready(Ok(2))
+        ));
+        let mut upload = [0; 2];
+        peer.read_exact(&mut upload).await.unwrap();
+        assert_eq!(&upload, b"up");
+        assert_eq!(
+            tracker
+                .upload_total
+                .load(std::sync::atomic::Ordering::Acquire),
+            2
+        );
+        assert_eq!(manager.summary().await.upload_total, 2);
+
+        drop(peer);
+        let mut eof_storage = [0; 4];
+        let mut eof = ReadBuf::new(&mut eof_storage);
+        assert!(matches!(
+            Pin::new(&mut tracked).poll_read(&mut cx, &mut eof),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(eof.filled().is_empty());
+        assert!(matches!(
+            Pin::new(&mut tracked).poll_write(&mut cx, b"error"),
+            Poll::Ready(Err(_))
+        ));
+        assert_eq!(
+            tracker
+                .download_total
+                .load(std::sync::atomic::Ordering::Acquire),
+            4
+        );
+        assert_eq!(
+            tracker
+                .upload_total
+                .load(std::sync::atomic::Ordering::Acquire),
+            2
+        );
+        let summary = manager.summary().await;
+        assert_eq!(summary.download_total, 4);
+        assert_eq!(summary.upload_total, 2);
+    }
+
+    #[cfg(all(target_os = "linux", feature = "zero_copy"))]
+    #[tokio::test]
+    async fn splice_trackers_include_authenticated_user_totals() {
+        let manager = StatisticsManager::new();
+        let (io, _peer) = tokio::io::duplex(64);
+        let inner: BoxedChainedStream = Box::new(ChainedStreamWrapper::new(io));
+        let session = Session {
+            inbound_user: Some("alice".to_owned()),
+            ..Default::default()
+        };
+        let tracked =
+            TrackedStream::new(inner, manager.clone(), session, None).await;
+        let (read_tracker, write_tracker) = tracked.trackers();
+
+        read_tracker.track(19);
+        write_tracker.track(7);
+
+        let summary = manager.summary().await;
+        assert_eq!(summary.download_total, 19);
+        assert_eq!(summary.upload_total, 7);
+        let user_stats = manager.drain_user_stats().await;
+        let alice = user_stats.get("alice").expect("authenticated user stats");
+        assert_eq!(alice.download, 19);
+        assert_eq!(alice.upload, 7);
     }
 
     #[tokio::test]

@@ -825,6 +825,7 @@ async fn encryption_stream_one_rtt_round_trips_records(appearance: &str, udp: bo
         stream::VlessStream,
     };
     use crate::{proxy::datagram::UdpPacket, session::SocksAddr};
+    use chimera_reality_core::TargetAddr;
 
     // The spawned server task must own this value ('static future).
     let appearance = appearance.to_owned();
@@ -1064,10 +1065,16 @@ async fn encryption_stream_one_rtt_round_trips_records(appearance: &str, udp: bo
         EncryptionStream::new(Box::new(client), prepared).expect("stream");
     if udp {
         let remote: SocksAddr = "1.1.1.1:53".parse().expect("test endpoint");
+        let vless_destination = match &remote {
+            SocksAddr::Ip(address) => TargetAddr::Ip(*address),
+            SocksAddr::Domain(domain, port) => {
+                TargetAddr::Domain(domain.clone(), *port)
+            }
+        };
         let vless = VlessStream::new(
             Box::new(stream),
             "b831381d-6324-4d53-ad4f-8cda48b30811",
-            &remote,
+            &vless_destination,
             true,
             None,
         )

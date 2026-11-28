@@ -40,6 +40,8 @@ quinn = { version = "0.11", default-features = false, features = [
 h3 = { version = "0.0.8", optional = true }
 h3-quinn = { version = "0.0.10", optional = true }
 quinn-proto = { version = "0.11.14", default-features = false, optional = true }
+chimera-hysteria2-core = { path = "../crates/hysteria2-core", optional = true }
+chimera-reality-core = { path = "../crates/reality-core", default-features = false, features = ["vision"] }
 maxminddb = "0.32"
 
 hickory-net = { version = "0.26", default-features = false }
@@ -174,12 +176,15 @@ zero_copy = []
 tls = []
 
 extended-health-check = []
+transport-bench-api = []
+splice-diagnostics = ["chimera-reality-core/splice-diagnostics"]
 
 aws-lc-rs = [
     "tls",
     "dep:aws-lc-rs",
     "rustls/aws-lc-rs",
     "quinn-proto?/rustls-aws-lc-rs",
+    "chimera-hysteria2-core?/aws-lc-rs",
     "hickory-net/https-aws-lc-rs",
     "chimera-dns/aws-lc-rs",
     "dep:log",
@@ -206,11 +211,10 @@ trojan = ["tls"]
 hysteria = [
     "tls",
     "dep:quinn",
-    "dep:h3",
-    "dep:h3-quinn",
     "dep:quinn-proto",
     "dep:blake2",
     "dep:digest",
+    "dep:chimera-hysteria2-core",
 ]
 xhttp-h3 = [
     "tls",
@@ -234,7 +238,12 @@ tracing = ["tokio/tracing"]
 
 port = ["http_port", "mixed_port"]
 
-reality = ["tls", "aws-lc-rs", "dep:aws-lc-rs"]
+reality = [
+    "tls",
+    "aws-lc-rs",
+    "dep:aws-lc-rs",
+    "chimera-reality-core/reality",
+]
 vless-encryption = [
     "dep:aws-lc-rs",
     "aws-lc-rs/aws-lc-sys",

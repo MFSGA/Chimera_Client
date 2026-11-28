@@ -611,6 +611,116 @@ dependencies = [
 ]
 
 [[package]]
+name = "chimera-hy2-core-perf-client"
+version = "0.29.1"
+dependencies = [
+ "chimera-transport-bench-bootstrap",
+ "clash-lib",
+]
+
+[[package]]
+name = "chimera-hy2-perf-client"
+version = "0.29.1"
+dependencies = [
+ "chimera-minimal-client-bootstrap",
+ "clash-lib",
+]
+
+[[package]]
+name = "chimera-hy2-protocol-perf-client"
+version = "0.29.1"
+dependencies = [
+ "anyhow",
+ "chimera-hysteria2-core",
+ "quinn",
+ "rustls",
+ "rustls-pemfile",
+ "socket2",
+ "tokio",
+]
+
+[[package]]
+name = "chimera-hysteria2-core"
+version = "0.29.1"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "futures",
+ "h3",
+ "h3-quinn",
+ "http",
+ "quinn",
+ "quinn-proto",
+ "rand 0.10.3",
+ "rcgen",
+ "rustls",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "chimera-minimal-client-bootstrap"
+version = "0.29.1"
+dependencies = [
+ "clash-lib",
+]
+
+[[package]]
+name = "chimera-reality-core"
+version = "0.29.1"
+dependencies = [
+ "aws-lc-rs",
+ "base64 0.23.1",
+ "bytes",
+ "log",
+ "rand 0.10.3",
+ "rcgen",
+ "rustls",
+ "subtle",
+ "tokio",
+ "tracing",
+ "uuid",
+ "x509-parser",
+]
+
+[[package]]
+name = "chimera-reality-core-perf-client"
+version = "0.29.1"
+dependencies = [
+ "chimera-transport-bench-bootstrap",
+ "clash-lib",
+]
+
+[[package]]
+name = "chimera-reality-perf-client"
+version = "0.29.1"
+dependencies = [
+ "chimera-minimal-client-bootstrap",
+ "clash-lib",
+]
+
+[[package]]
+name = "chimera-reality-protocol-perf-client"
+version = "0.29.1"
+dependencies = [
+ "anyhow",
+ "chimera-reality-core",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "chimera-transport-bench-bootstrap"
+version = "0.29.1"
+dependencies = [
+ "anyhow",
+ "clash-lib",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -700,6 +810,8 @@ dependencies = [
  "byteorder",
  "bytes",
  "chimera-dns",
+ "chimera-hysteria2-core",
+ "chimera-reality-core",
  "chrono",
  "dhcproto",
  "digest 0.11.3",

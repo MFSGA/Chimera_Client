@@ -9,7 +9,9 @@ members = [
     "clash-netstack",
     "vendor/boring-noise",
     "vendor/sock2proc",
-    "xhttp-h2-phaseb"
+    "xhttp-h2-phaseb",
+    "crates/hysteria2-core",
+    "crates/reality-core",
 ]
 
 

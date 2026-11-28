@@ -1,42 +1,34 @@
 #![allow(dead_code)]
 
 mod codec;
-mod congestion;
 mod salamander;
 mod udp_hop;
 
 mod datagram;
 
+#[cfg(feature = "transport-bench-api")]
+use std::sync::atomic::AtomicBool;
 use std::{
     collections::HashMap,
     fmt::{Debug, Formatter},
     fs,
+    future::Future,
     io::{self, BufReader},
     net::SocketAddr,
-    num::ParseIntError,
+    num::NonZeroUsize,
     path::Path,
-    pin::Pin,
-    sync::{Arc, RwLock, atomic::AtomicU32},
-    task::{Context, Poll},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicU32, AtomicUsize, Ordering},
+    },
 };
 
 use anyhow::anyhow;
 use bytes::{Bytes, BytesMut};
-use codec::{Fragments, Hy2TcpCodec};
-use congestion::{Brutal, DynCongestion, DynController};
-use futures::{SinkExt, StreamExt};
-use h3::client::SendRequest;
-use h3_quinn::OpenStreams;
-use quinn::{
-    ClientConfig, Connection, EndpointConfig, TokioRuntime,
-    crypto::rustls::QuicClientConfig,
-};
-use quinn_proto::TransportConfig;
+use chimera_hysteria2_core::{AuthenticatedConnection, HysteriaClient};
+use codec::Fragments;
 use rustls::{ClientConfig as RustlsClientConfig, RootCertStore};
-use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
-    sync::Mutex,
-};
+use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 use crate::{
@@ -55,7 +47,8 @@ use crate::{
         hysteria2::datagram::{HysteriaDatagramOutbound, UdpSession},
         transport::ConnectorUdpSocket,
         utils::{
-            NetworkPoolContext, RemoteConnector, observe_proxy_target_datagram,
+            NetworkPoolContext, RemoteConnector, UdpSocketConnectOptions,
+            observe_proxy_target_datagram,
         },
     },
     session::{Session, SocksAddr},
@@ -89,57 +82,48 @@ pub struct HystOption {
     pub down: Option<u64>,
     pub cwnd: Option<u64>,
     pub udp_mtu: Option<u32>,
-}
-
-#[derive(Debug, Copy, Clone)]
-enum CcRx {
-    Auto,
-    Fixed(u64),
-}
-
-impl std::str::FromStr for CcRx {
-    type Err = ParseIntError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if value.eq_ignore_ascii_case("auto") {
-            Ok(Self::Auto)
-        } else {
-            Ok(Self::Fixed(value.parse::<u64>()?))
-        }
-    }
-}
-
-fn client_cc_rx_header(down_bps: Option<u64>) -> String {
-    down_bps.unwrap_or_default().to_string()
-}
-
-fn select_brutal_bps(max_tx_bps: Option<u64>, cc_rx: CcRx) -> Option<u64> {
-    let max_tx_bps = max_tx_bps.unwrap_or_default();
-    let actual_tx_bps = match cc_rx {
-        CcRx::Auto => return None,
-        CcRx::Fixed(server_rx_bps)
-            if server_rx_bps == 0 || server_rx_bps > max_tx_bps =>
-        {
-            max_tx_bps
-        }
-        CcRx::Fixed(server_rx_bps) => server_rx_bps,
-    };
-
-    (actual_tx_bps > 0).then_some(actual_tx_bps)
+    pub quic_connections: NonZeroUsize,
+    pub udp_recv_buffer_size: Option<usize>,
 }
 
 pub struct Handler {
     opts: HystOption,
-    ep_config: EndpointConfig,
-    client_config: ClientConfig,
-    conn: Mutex<Option<Arc<HysteriaConnection>>>,
+    core_client: HysteriaClient,
+    conn: Mutex<Vec<Arc<HysteriaConnection>>>,
+    next_connection_index: AtomicUsize,
     next_session_id: AtomicU32,
-    /// a send request guard to keep the connection alive
-    guard: Mutex<Option<SendRequest<OpenStreams, Bytes>>>,
+    #[cfg(feature = "transport-bench-api")]
+    bench_udp_receive_task_enabled: AtomicBool,
+    #[cfg(feature = "transport-bench-api")]
+    bench_socket2_abstract_socket: AtomicBool,
     connector: tokio::sync::RwLock<Option<Arc<dyn RemoteConnector>>>,
     recovery_cancellation: tokio::sync::RwLock<tokio_util::sync::CancellationToken>,
     /// support udp is decided by server
     support_udp: RwLock<bool>,
+}
+
+#[cfg(feature = "transport-bench-api")]
+fn validate_socket2_abstract_socket_bench_context(
+    server_socket_addr: SocketAddr,
+    has_interface: bool,
+    has_port_hopping: bool,
+    has_obfuscation: bool,
+    #[cfg(target_os = "linux")] has_socket_mark: bool,
+) -> anyhow::Result<()> {
+    if !server_socket_addr.ip().is_loopback()
+        || has_interface
+        || has_port_hopping
+        || has_obfuscation
+    {
+        anyhow::bail!(
+            "benchmark socket2 override is limited to unpinned loopback HY2 endpoints without port hopping or obfuscation"
+        );
+    }
+    #[cfg(target_os = "linux")]
+    if has_socket_mark {
+        anyhow::bail!("benchmark socket2 override does not support a socket mark");
+    }
+    Ok(())
 }
 
 impl Debug for Handler {
@@ -151,10 +135,6 @@ impl Debug for Handler {
 }
 
 impl Handler {
-    const DEFAULT_MAX_IDLE_TIMEOUT: std::time::Duration =
-        std::time::Duration::from_secs(300);
-    const MIN_INITIAL_CWND_PACKETS: u64 = 2;
-
     fn append_custom_ca(
         root_store: &mut RootCertStore,
         source: &str,
@@ -237,50 +217,70 @@ impl Handler {
         }
         let verify =
             DefaultTlsVerifier::new(opts.fingerprint.clone(), opts.skip_cert_verify);
-        let mut tls_config = RustlsClientConfig::builder()
+        let tls_config = RustlsClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(verify))
             .with_no_client_auth();
 
-        // should set alpn_protocol `h3` default
-        tls_config.alpn_protocols = if opts.alpn.is_empty() {
-            vec![b"h3".to_vec()]
-        } else {
-            opts.alpn.iter().map(|x| x.as_bytes().to_vec()).collect()
-        };
-
-        let mut transport = TransportConfig::default();
-        #[cfg(target_os = "android")]
-        transport.enable_segmentation_offload(false);
-        if opts.disable_mtu_discovery {
-            tracing::debug!("disable mtu discovery");
-            transport.mtu_discovery_config(None);
-        }
-        transport
-            .congestion_controller_factory(Arc::new(DynCongestion::new(opts.cwnd)));
-        transport.max_idle_timeout(Some(
-            Self::DEFAULT_MAX_IDLE_TIMEOUT.try_into().unwrap(),
-        ));
-        transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
-
-        let quic_config: QuicClientConfig = tls_config.try_into().unwrap();
-        let mut client_config = ClientConfig::new(Arc::new(quic_config));
-        client_config.transport_config(Arc::new(transport));
-        let ep_config = quinn::EndpointConfig::default();
+        let core_client = HysteriaClient::new(
+            tls_config,
+            &opts.alpn,
+            opts.password.clone(),
+            opts.up,
+            opts.down,
+            opts.cwnd,
+            opts.disable_mtu_discovery,
+        )
+        .expect("valid Hysteria 2 client transport configuration");
 
         Self {
             opts,
-            ep_config,
-            client_config,
+            core_client,
             next_session_id: AtomicU32::new(0),
-            conn: Mutex::new(None),
-            guard: Mutex::new(None),
+            #[cfg(feature = "transport-bench-api")]
+            bench_udp_receive_task_enabled: AtomicBool::new(true),
+            #[cfg(feature = "transport-bench-api")]
+            bench_socket2_abstract_socket: AtomicBool::new(false),
+            conn: Mutex::new(Vec::new()),
+            next_connection_index: AtomicUsize::new(0),
             connector: tokio::sync::RwLock::new(None),
             recovery_cancellation: tokio::sync::RwLock::new(
                 tokio_util::sync::CancellationToken::new(),
             ),
             support_udp: RwLock::new(true),
         }
+    }
+
+    /// Toggle the idle HY2 UDP receive task for TCP-only benchmark ablations.
+    /// Must be set before the first connection is opened.
+    #[cfg(feature = "transport-bench-api")]
+    pub fn set_udp_receive_task_for_bench(&self, enabled: bool) {
+        self.bench_udp_receive_task_enabled
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    /// Use the standalone benchmark's socket2-to-Quinn setup for local HY2
+    /// endpoint ablations. This is unavailable in product builds.
+    #[cfg(feature = "transport-bench-api")]
+    pub fn set_socket2_abstract_socket_for_bench(&self, enabled: bool) {
+        self.bench_socket2_abstract_socket
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    fn should_spawn_udp_receive_task(&self) -> bool {
+        #[cfg(feature = "transport-bench-api")]
+        {
+            self.bench_udp_receive_task_enabled.load(Ordering::Relaxed)
+        }
+        #[cfg(not(feature = "transport-bench-api"))]
+        {
+            true
+        }
+    }
+
+    #[cfg(feature = "transport-bench-api")]
+    fn should_use_socket2_abstract_socket_for_bench(&self) -> bool {
+        self.bench_socket2_abstract_socket.load(Ordering::Relaxed)
     }
 
     fn tls_server_name(&self, server_addr: SocketAddr) -> String {
@@ -300,30 +300,6 @@ impl Handler {
         }
     }
 
-    fn select_brutal_bps(&self, cc_rx: CcRx) -> Option<u64> {
-        select_brutal_bps(self.opts.up, cc_rx)
-    }
-
-    fn configure_brutal_cc(conn: &Connection, brutal_bps: Option<u64>) {
-        let Some(brutal_bps) = brutal_bps else {
-            return;
-        };
-
-        match conn
-            .congestion_state()
-            .into_any()
-            .downcast::<DynController>()
-        {
-            Ok(controller) => {
-                controller.set_controller(Box::new(Brutal::new(brutal_bps)));
-                debug!(brutal_bps, "hysteria2 enabled brutal congestion control");
-            }
-            Err(_) => {
-                warn!("hysteria2 failed to switch congestion controller to brutal");
-            }
-        }
-    }
-
     // connect and auth
     async fn new_authed_connection_inner(
         &self,
@@ -332,12 +308,7 @@ impl Handler {
         connector: &dyn RemoteConnector,
         hop_connector: Option<Arc<dyn RemoteConnector>>,
         cancellation: tokio_util::sync::CancellationToken,
-    ) -> anyhow::Result<(
-        Connection,
-        SendRequest<OpenStreams, Bytes>,
-        tokio::task::JoinHandle<()>,
-        NetworkPoolContext,
-    )> {
+    ) -> anyhow::Result<(Vec<AuthenticatedConnection>, NetworkPoolContext)> {
         tracing::trace!(
             "hysteria2 new_authed_connection_inner: starting connection to {:?}",
             self.opts.addr
@@ -392,6 +363,34 @@ impl Handler {
         }))
     }
 
+    #[cfg(feature = "transport-bench-api")]
+    async fn socket2_abstract_udp_socket_for_bench(
+        &self,
+        sess: &Session,
+        connector: &dyn RemoteConnector,
+        server_socket_addr: SocketAddr,
+    ) -> anyhow::Result<(Arc<dyn quinn::AsyncUdpSocket>, NetworkPoolContext)> {
+        use quinn::Runtime;
+
+        let requested_context =
+            connector.connection_pool_context(sess.iface.as_ref()).await;
+        let socket = socket2::Socket::new(
+            socket2::Domain::for_address(server_socket_addr),
+            socket2::Type::DGRAM,
+            None,
+        )?;
+        socket.set_broadcast(true)?;
+        socket.set_nonblocking(true)?;
+        let socket: std::net::UdpSocket = socket.into();
+        let socket = tokio::net::UdpSocket::from_std(socket)?;
+        let socket = socket.into_std()?;
+        let socket = quinn::TokioRuntime.wrap_udp_socket(socket)?;
+        let mut pool_context = requested_context;
+        pool_context.generation_only_local_route = true;
+        pool_context.direct_local_route_pooling_supported = true;
+        Ok((socket, pool_context))
+    }
+
     async fn new_authed_connection_to(
         &self,
         sess: &Session,
@@ -400,12 +399,19 @@ impl Handler {
         hop_connector: Option<Arc<dyn RemoteConnector>>,
         cancellation: tokio_util::sync::CancellationToken,
         server_socket_addr: SocketAddr,
-    ) -> anyhow::Result<(
-        Connection,
-        SendRequest<OpenStreams, Bytes>,
-        tokio::task::JoinHandle<()>,
-        NetworkPoolContext,
-    )> {
+    ) -> anyhow::Result<(Vec<AuthenticatedConnection>, NetworkPoolContext)> {
+        #[cfg(feature = "transport-bench-api")]
+        if self.should_use_socket2_abstract_socket_for_bench() {
+            validate_socket2_abstract_socket_bench_context(
+                server_socket_addr,
+                sess.iface.is_some(),
+                self.opts.ports.is_some(),
+                self.opts.obfs.is_some(),
+                #[cfg(target_os = "linux")]
+                sess.so_mark.is_some(),
+            )?;
+        }
+
         let local_route_pooling_connector =
             if self.opts.obfs.is_none() && self.opts.ports.is_some() {
                 hop_connector.as_deref()
@@ -422,7 +428,7 @@ impl Handler {
         ) = if self.opts.obfs.is_none()
             && let Some(port_gen) = self.opts.ports.as_ref()
         {
-            let hop_connector = hop_connector.ok_or_else(|| {
+            let hop_connector = hop_connector.clone().ok_or_else(|| {
                 anyhow!("Hysteria2 port hopping requires a registered connector")
             })?;
             let requested_context = hop_connector
@@ -433,10 +439,11 @@ impl Handler {
                     server_addr: server_socket_addr,
                     port_range: port_gen.clone(),
                     resolver,
-                    connector: hop_connector,
+                    connector: hop_connector.clone(),
                     iface: sess.iface.clone(),
                     #[cfg(target_os = "linux")]
                     so_mark: sess.so_mark,
+                    udp_recv_buffer_size: self.opts.udp_recv_buffer_size,
                     requested_context,
                     connection_cancellation: cancellation,
                     interval: None,
@@ -444,53 +451,87 @@ impl Handler {
                 .await?;
             (Arc::new(udp_hop), pool_context)
         } else {
-            let requested_context =
-                connector.connection_pool_context(sess.iface.as_ref()).await;
-            let destination = SocksAddr::Ip(server_socket_addr);
-            let native_socket = connector
-                .connect_quinn_udp_socket_with_pool_context(
-                    resolver.clone(),
-                    None,
-                    destination.clone(),
-                    sess.iface.as_ref(),
-                    #[cfg(target_os = "linux")]
-                    sess.so_mark,
-                    requested_context.clone(),
-                )
-                .await?;
-            let (socket, pool_context): (
+            let bench_socket: Option<(
                 Arc<dyn quinn::AsyncUdpSocket>,
                 NetworkPoolContext,
-            ) = if let Some(native_socket) = native_socket {
-                native_socket
+            )> = {
+                #[cfg(feature = "transport-bench-api")]
+                {
+                    if self.should_use_socket2_abstract_socket_for_bench() {
+                        Some(
+                            self.socket2_abstract_udp_socket_for_bench(
+                                sess,
+                                connector,
+                                server_socket_addr,
+                            )
+                            .await?,
+                        )
+                    } else {
+                        None
+                    }
+                }
+                #[cfg(not(feature = "transport-bench-api"))]
+                {
+                    None
+                }
+            };
+            if let Some(bench_socket) = bench_socket {
+                bench_socket
             } else {
-                let (datagram, pool_context) = connector
-                    .connect_datagram_with_pool_context(
-                        resolver,
+                let requested_context =
+                    connector.connection_pool_context(sess.iface.as_ref()).await;
+                let destination = SocksAddr::Ip(server_socket_addr);
+                let native_socket = connector
+                    .connect_quinn_udp_socket_with_recv_buffer_size_and_pool_context(
+                        resolver.clone(),
                         None,
-                        destination,
+                        destination.clone(),
                         sess.iface.as_ref(),
                         #[cfg(target_os = "linux")]
                         sess.so_mark,
-                        requested_context,
+                        UdpSocketConnectOptions {
+                            udp_recv_buffer_size: self.opts.udp_recv_buffer_size,
+                            pool_context: requested_context.clone(),
+                        },
                     )
                     .await?;
-                (
-                    ConnectorUdpSocket::new(datagram, server_socket_addr),
-                    pool_context,
-                )
-            };
-            let socket = if let Some(Obfs::Salamander(salamander_obfs)) =
-                self.opts.obfs.as_ref()
-            {
-                Arc::new(salamander::Salamander::with_inner(
-                    socket,
-                    salamander_obfs.key.to_vec(),
-                ))
-            } else {
-                socket
-            };
-            (socket, pool_context)
+                let (socket, pool_context): (
+                    Arc<dyn quinn::AsyncUdpSocket>,
+                    NetworkPoolContext,
+                ) = if let Some(native_socket) = native_socket {
+                    native_socket
+                } else {
+                    let (datagram, pool_context) = connector
+                        .connect_datagram_with_recv_buffer_size_and_pool_context(
+                            resolver,
+                            None,
+                            destination,
+                            sess.iface.as_ref(),
+                            #[cfg(target_os = "linux")]
+                            sess.so_mark,
+                            UdpSocketConnectOptions {
+                                udp_recv_buffer_size: self.opts.udp_recv_buffer_size,
+                                pool_context: requested_context,
+                            },
+                        )
+                        .await?;
+                    (
+                        ConnectorUdpSocket::new(datagram, server_socket_addr),
+                        pool_context,
+                    )
+                };
+                let socket = if let Some(Obfs::Salamander(salamander_obfs)) =
+                    self.opts.obfs.as_ref()
+                {
+                    Arc::new(salamander::Salamander::with_inner(
+                        socket,
+                        salamander_obfs.key.to_vec(),
+                    ))
+                } else {
+                    socket
+                };
+                (socket, pool_context)
+            }
         };
         pool_context.network_generation = pool_context
             .path_id
@@ -499,131 +540,61 @@ impl Handler {
             .or(pool_context.network_generation);
         pool_context.direct_local_route_pooling_supported =
             supports_generation_only_local_route_pooling;
-        let mut ep = quinn::Endpoint::new_with_abstract_socket(
-            self.ep_config.clone(),
-            None,
-            udp_socket,
-            Arc::new(TokioRuntime),
-        )?;
-
-        ep.set_default_client_config(self.client_config.clone());
-
         tracing::trace!("hysteria2 connecting to server: {:?}", server_socket_addr);
-        let connecting =
-            ep.connect(server_socket_addr, self.opts.sni.as_deref().unwrap_or(""))?;
-        let session = connecting.await?;
-        tracing::trace!("hysteria2 QUIC connection established");
-        let (guard, driver_task, cc_rx, udp) =
-            Self::auth(&session, &self.opts.password, self.opts.down).await?;
-        let current_context =
-            connector.connection_pool_context(sess.iface.as_ref()).await;
-        let stale = match pool_context.path_id.as_ref() {
-            Some(path_id) => !current_context
-                .permits(pool_context.network_generation, Some(path_id)),
-            None => {
-                current_context.network_generation != pool_context.network_generation
-            }
-        };
-        if stale {
-            session.close(
-                quinn::VarInt::from_u32(0),
+        let authenticated = self
+            .core_client
+            .connect_many(
+                udp_socket,
+                server_socket_addr,
+                self.opts.sni.as_deref().unwrap_or(""),
+                self.opts.quic_connections,
+            )
+            .await?;
+        let pool_context_connector =
+            if self.opts.obfs.is_none() && self.opts.ports.is_some() {
+                hop_connector.as_deref().unwrap_or(connector)
+            } else {
+                connector
+            };
+        let current_context = pool_context_connector
+            .connection_pool_context(sess.iface.as_ref())
+            .await;
+        if !pool_context_is_current(
+            &current_context,
+            &pool_context,
+            sess.iface.is_some(),
+            supports_generation_only_local_route_pooling,
+        ) {
+            close_authenticated_connections(
+                &authenticated,
                 b"network path changed during Hysteria2 setup",
             );
             return Err(anyhow!(
                 "network path changed while connecting to Hysteria2 endpoint"
             ));
         }
-        tracing::trace!("hysteria2 authentication successful, udp={}", udp);
-        *self.support_udp.write().unwrap() = udp;
-        Self::configure_brutal_cc(&session, self.select_brutal_bps(cc_rx));
 
-        Ok((session, guard, driver_task, pool_context))
-    }
-
-    async fn auth(
-        conn: &quinn::Connection,
-        passwd: &str,
-        down_bps: Option<u64>,
-    ) -> anyhow::Result<(
-        SendRequest<OpenStreams, Bytes>,
-        tokio::task::JoinHandle<()>,
-        CcRx,
-        bool,
-    )> {
-        let h3_conn = h3_quinn::Connection::new(conn.clone());
-
-        let (mut driver, mut sender) =
-            h3::client::builder().build::<_, _, Bytes>(h3_conn).await?;
-        let driver_task = tokio::spawn(async move {
-            let err = driver.wait_idle().await;
-            tracing::debug!("hysteria2 h3 driver ended: {err}");
-        });
-
-        let req = http::Request::post("https://hysteria/auth")
-            .header("Hysteria-Auth", passwd)
-            .header("Hysteria-CC-RX", client_cc_rx_header(down_bps))
-            .header("Hysteria-Padding", codec::padding(64..=512))
-            .body(())
-            .unwrap();
-        let mut r = sender.send_request(req).await?;
-        r.finish().await?;
-
-        let r = r.recv_response().await?;
-
-        const HYSTERIA_STATUS_OK: u16 = 233;
-        if r.status() != HYSTERIA_STATUS_OK {
-            return Err(anyhow!("auth failed: response status code {}", r.status()));
+        let Some(first) = authenticated.first() else {
+            return Err(anyhow!("Hysteria2 connection pool was empty"));
+        };
+        let supports_udp = first.supports_udp();
+        let brutal_bps = first.brutal_bps();
+        if authenticated.iter().any(|connection| {
+            connection.supports_udp() != supports_udp
+                || connection.brutal_bps() != brutal_bps
+        }) {
+            close_authenticated_connections(
+                &authenticated,
+                b"inconsistent Hysteria2 pool negotiation",
+            );
+            return Err(anyhow!(
+                "Hysteria2 connections in one pool negotiated inconsistent UDP or congestion settings"
+            ));
         }
+        tracing::trace!("hysteria2 authentication successful, udp={}", supports_udp);
+        *self.support_udp.write().unwrap() = supports_udp;
 
-        // MUST have Hysteria-CC-RX and Hysteria-UDP headers according to hysteria2
-        // document
-        let cc_rx = r
-            .headers()
-            .get("Hysteria-CC-RX")
-            .ok_or_else(|| anyhow!("auth failed: missing Hysteria-CC-RX header"))?
-            .to_str()?
-            .parse()?;
-
-        let support_udp = r
-            .headers()
-            .get("Hysteria-UDP")
-            .ok_or_else(|| anyhow!("auth failed: missing Hysteria-UDP header"))?
-            .to_str()?
-            .parse()?;
-
-        Ok((sender, driver_task, cc_rx, support_udp))
-    }
-
-    async fn connect_tcp(
-        conn: &Connection,
-        sess: &Session,
-    ) -> io::Result<HystStream> {
-        let (mut send, mut recv) = conn.open_bi().await?;
-
-        tokio_util::codec::FramedWrite::new(&mut send, Hy2TcpCodec)
-            .send(&sess.destination)
-            .await?;
-
-        match tokio_util::codec::FramedRead::new(&mut recv, Hy2TcpCodec)
-            .next()
-            .await
-        {
-            Some(Ok(response)) if response.status == 0x00 => {}
-            Some(Ok(response)) => {
-                return Err(io::Error::other(format!(
-                    "hysteria2 server rejected stream: status={}, message={}",
-                    response.status, response.msg
-                )));
-            }
-            Some(Err(err)) => return Err(err),
-            None => {
-                return Err(io::Error::other(
-                    "hysteria2 server closed stream before response",
-                ));
-            }
-        }
-
-        Ok(HystStream { send, recv })
+        Ok((authenticated, pool_context))
     }
 
     pub async fn new_authed_connection(
@@ -643,6 +614,40 @@ impl Handler {
             self.recovery_cancellation.read().await.clone(),
         )
         .await
+    }
+
+    /// Open a HY2 TCP stream without the normal chain metadata wrapper.
+    ///
+    /// This exists only for transport benchmarks that compare the core stream
+    /// with the production `ChainedStreamWrapper` path. Product callers should
+    /// use `OutboundHandler::connect_stream` so network-path metadata is kept.
+    #[cfg(feature = "transport-bench-api")]
+    pub async fn connect_stream_raw_for_bench(
+        &self,
+        sess: &Session,
+        resolver: ThreadSafeDNSResolver,
+    ) -> io::Result<Box<dyn crate::proxy::ClientStream>> {
+        let stream = self
+            .connect_stream_concrete_for_bench(sess, resolver)
+            .await?;
+        Ok(Box::new(stream))
+    }
+
+    /// Open a HY2 stream as its concrete type for benchmark-only dispatch
+    /// ablations. Product callers must use `OutboundHandler::connect_stream`
+    /// so chain and network-path metadata are preserved.
+    #[cfg(feature = "transport-bench-api")]
+    pub async fn connect_stream_concrete_for_bench(
+        &self,
+        sess: &Session,
+        resolver: ThreadSafeDNSResolver,
+    ) -> io::Result<chimera_hysteria2_core::Hy2TcpStream> {
+        let conn = self.new_authed_connection(sess, resolver).await?;
+        let stream = self
+            .core_client
+            .open_tcp_stream(&conn.authenticated, &sess.destination.to_string())
+            .await?;
+        Ok(stream)
     }
 
     async fn new_authed_connection_with_connector(
@@ -691,104 +696,137 @@ impl Handler {
             ));
         }
 
-        match (*quinn_conn_lock).as_ref().filter(|s| {
-            match s.conn.close_reason() {
-                // rust should have inspect method on Option and Result!
-                Some(reason) => {
-                    tracing::debug!("old connection closed: {:?}", reason);
-                    false
-                }
-                None => pool_context_is_current(
-                    &current_context,
-                    &s.pool_context,
-                    sess.iface.is_some(),
-                    pool_connector.supports_generation_only_local_route_pooling(),
-                ),
-            }
-        }) {
-            Some(s) => {
+        let supports_generation_only_local_route_pooling =
+            pool_connector.supports_generation_only_local_route_pooling();
+        let pool_is_current = quinn_conn_lock.len()
+            == self.opts.quic_connections.get()
+            && quinn_conn_lock.iter().all(|connection| {
+                connection.conn.close_reason().is_none()
+                    && pool_context_is_current(
+                        &current_context,
+                        &connection.pool_context,
+                        sess.iface.is_some(),
+                        supports_generation_only_local_route_pooling,
+                    )
+            });
+
+        if pool_is_current {
+            for connection in quinn_conn_lock.iter() {
                 ensure_hysteria_connection_current(
                     &current_context,
-                    &s.pool_context,
+                    &connection.pool_context,
                     &cancellation,
                     sess.iface.is_some(),
-                    pool_connector.supports_generation_only_local_route_pooling(),
+                    supports_generation_only_local_route_pooling,
                 )?;
-                Ok(s.clone())
             }
-            None => {
-                if let Some(stale) = quinn_conn_lock.take() {
-                    stale
-                        .conn
-                        .close(quinn::VarInt::from_u32(0), b"network path retired");
-                    stale.udp_sessions.lock().await.clear();
-                    self.guard.lock().await.take();
-                }
-                let connecting = async {
-                    self.new_authed_connection_inner(
-                        sess,
-                        resolver,
-                        connector,
-                        hop_connector.clone(),
-                        cancellation.clone(),
-                    )
-                    .await
-                    .map_err(|error| {
-                        io::Error::other(format!(
-                            "connect to {} failed: {error}",
-                            self.opts.addr
-                        ))
-                    })
-                };
-                let (session, guard, driver_task, pool_context) =
-                    cancel_on_network_change(cancellation.clone(), connecting)
-                        .await?;
-
-                // The QUIC dial (including authentication) can span a path
-                // change that is observed before the cancellation signal.
-                // Do not publish a stale connection into the reusable pool.
-                let latest_context = pool_connector
-                    .connection_pool_context(sess.iface.as_ref())
-                    .await;
-                if ensure_hysteria_connection_current(
-                    &latest_context,
-                    &pool_context,
-                    &cancellation,
-                    sess.iface.is_some(),
-                    pool_connector.supports_generation_only_local_route_pooling(),
-                )
-                .is_err()
-                {
-                    session.close(
-                        quinn::VarInt::from_u32(0),
-                        b"network path changed during QUIC dial",
-                    );
-                    driver_task.abort();
-                    return Err(io::Error::new(
-                        io::ErrorKind::Interrupted,
-                        "network path changed before Hysteria2 pool publication",
-                    ));
-                }
-
-                let session = Arc::new(session);
-                let hyst_conn = HysteriaConnection::new_with_task_loop(
-                    session,
-                    self.opts.udp_mtu,
-                    driver_task,
-                    pool_context,
-                );
-                *quinn_conn_lock = Some(hyst_conn.clone());
-                *self.guard.lock().await = Some(guard);
-                Ok(hyst_conn)
-            }
+            return Ok(select_hysteria_connection(
+                &self.next_connection_index,
+                &quinn_conn_lock,
+            ));
         }
+
+        for stale in std::mem::take(&mut *quinn_conn_lock) {
+            stale
+                .conn
+                .close(quinn::VarInt::from_u32(0), b"network path retired");
+            stale.udp_sessions.lock().await.clear();
+        }
+
+        let connecting = async {
+            self.new_authed_connection_inner(
+                sess,
+                resolver,
+                connector,
+                hop_connector.clone(),
+                cancellation.clone(),
+            )
+            .await
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "connect to {} failed: {error}",
+                    self.opts.addr
+                ))
+            })
+        };
+        let (authenticated, pool_context) =
+            cancel_on_network_change(cancellation.clone(), connecting).await?;
+
+        // The QUIC dial (including authentication) can span a path
+        // change that is observed before the cancellation signal.
+        // Do not publish a stale connection into the reusable pool.
+        let latest_context = pool_connector
+            .connection_pool_context(sess.iface.as_ref())
+            .await;
+        if cancellation.is_cancelled()
+            || !pool_context_is_current(
+                &latest_context,
+                &pool_context,
+                sess.iface.is_some(),
+                supports_generation_only_local_route_pooling,
+            )
+        {
+            close_authenticated_connections(
+                &authenticated,
+                b"network path changed during QUIC dial",
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "network path changed before Hysteria2 pool publication",
+            ));
+        }
+
+        let mut connections = Vec::with_capacity(authenticated.len());
+        for authenticated in authenticated {
+            connections.push(
+                HysteriaConnection::new_with_task_loop_and_udp_receiver(
+                    Arc::new(authenticated),
+                    self.opts.udp_mtu,
+                    pool_context.clone(),
+                    self.should_spawn_udp_receive_task(),
+                ),
+            );
+        }
+        *quinn_conn_lock = connections;
+        Ok(select_hysteria_connection(
+            &self.next_connection_index,
+            &quinn_conn_lock,
+        ))
+    }
+}
+
+fn select_hysteria_connection(
+    next_connection_index: &AtomicUsize,
+    connections: &[Arc<HysteriaConnection>],
+) -> Arc<HysteriaConnection> {
+    let index =
+        next_hysteria_connection_index(next_connection_index, connections.len());
+    connections[index].clone()
+}
+
+fn next_hysteria_connection_index(
+    next_connection_index: &AtomicUsize,
+    connection_count: usize,
+) -> usize {
+    debug_assert!(connection_count > 0);
+    next_connection_index.fetch_add(1, Ordering::Relaxed) % connection_count
+}
+
+fn close_authenticated_connections(
+    connections: &[AuthenticatedConnection],
+    reason: &[u8],
+) {
+    for connection in connections {
+        connection
+            .connection()
+            .close(quinn::VarInt::from_u32(0), reason);
     }
 }
 
 pub struct HysteriaConnection {
     pub conn: Arc<quinn::Connection>,
     pub udp_sessions: Arc<tokio::sync::Mutex<HashMap<u32, UdpSession>>>,
-    h3_driver_task: Option<tokio::task::JoinHandle<()>>,
+    authenticated: Arc<AuthenticatedConnection>,
     pool_context: NetworkPoolContext,
 
     // config
@@ -797,19 +835,34 @@ pub struct HysteriaConnection {
 
 impl HysteriaConnection {
     pub fn new_with_task_loop(
-        conn: Arc<quinn::Connection>,
+        authenticated: Arc<AuthenticatedConnection>,
         udp_mtu: Option<u32>,
-        h3_driver_task: tokio::task::JoinHandle<()>,
         pool_context: NetworkPoolContext,
     ) -> Arc<Self> {
+        Self::new_with_task_loop_and_udp_receiver(
+            authenticated,
+            udp_mtu,
+            pool_context,
+            true,
+        )
+    }
+
+    fn new_with_task_loop_and_udp_receiver(
+        authenticated: Arc<AuthenticatedConnection>,
+        udp_mtu: Option<u32>,
+        pool_context: NetworkPoolContext,
+        spawn_udp_receiver: bool,
+    ) -> Arc<Self> {
         let s = Arc::new(Self {
-            conn,
+            conn: Arc::new(authenticated.connection().clone()),
             udp_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             udp_mtu: udp_mtu.map(|x| x as usize),
-            h3_driver_task: Some(h3_driver_task),
+            authenticated,
             pool_context,
         });
-        tokio::spawn(Self::spawn_tasks(s.clone()));
+        if spawn_udp_receiver {
+            tokio::spawn(Self::spawn_tasks(s.clone()));
+        }
 
         s
     }
@@ -876,41 +929,153 @@ impl HysteriaConnection {
         let mut buf: BytesMut = pkt.into();
         let pkt = codec::HysUdpPacket::decode(&mut buf).unwrap();
         let session_id = pkt.session_id;
-        let mut udp_sessions = self.udp_sessions.lock().await;
-        match udp_sessions.get_mut(&session_id) {
-            Some(session) => {
+        let disposition = {
+            let mut udp_sessions = self.udp_sessions.lock().await;
+            prepare_udp_delivery(&mut udp_sessions, pkt)
+        };
+
+        match disposition {
+            UdpPacketDisposition::Delivery(delivery) => {
                 tracing::trace!(
                     "hysteria2 found session {}, feeding packet",
                     session_id
                 );
-                if let Some(pkt) = session.feed(pkt) {
-                    tracing::trace!(
-                        "hysteria2 complete packet received for session {}: {} \
-                         bytes to {:?}",
-                        session_id,
-                        pkt.data.len(),
-                        session.local_addr
-                    );
-                    let _ = session
-                        .incoming
-                        .send(UdpPacket {
-                            data: pkt.data,
-                            src_addr: pkt.addr,
-                            dst_addr: session.local_addr.clone(),
-                            inbound_user: None,
-                        })
-                        .await;
-                } else {
-                    tracing::trace!(
-                        "hysteria2 packet fragment buffered for session {}",
-                        session_id
-                    );
-                }
+                tracing::trace!(
+                    "hysteria2 complete packet received for session {}: {} bytes",
+                    session_id,
+                    delivery.packet.data.len(),
+                );
+                deliver_udp_packet(delivery, self.conn.closed()).await;
             }
-            _ => {
+            UdpPacketDisposition::FragmentBuffered => {
+                tracing::trace!(
+                    "hysteria2 packet fragment buffered for session {}",
+                    session_id
+                );
+            }
+            UdpPacketDisposition::MissingSession => {
                 tracing::warn!("hysteria2 udp session not found: {}", session_id);
             }
         }
+    }
+}
+
+struct PendingUdpDelivery {
+    incoming: tokio::sync::mpsc::Sender<UdpPacket>,
+    packet: UdpPacket,
+}
+
+enum UdpPacketDisposition {
+    Delivery(PendingUdpDelivery),
+    FragmentBuffered,
+    MissingSession,
+}
+
+fn prepare_udp_delivery(
+    udp_sessions: &mut HashMap<u32, UdpSession>,
+    packet: codec::HysUdpPacket,
+) -> UdpPacketDisposition {
+    let Some(session) = udp_sessions.get_mut(&packet.session_id) else {
+        return UdpPacketDisposition::MissingSession;
+    };
+    let Some(packet) = session.feed(packet) else {
+        return UdpPacketDisposition::FragmentBuffered;
+    };
+
+    UdpPacketDisposition::Delivery(PendingUdpDelivery {
+        incoming: session.incoming.clone(),
+        packet: UdpPacket {
+            data: packet.data,
+            src_addr: packet.addr,
+            dst_addr: session.local_addr.clone(),
+            inbound_user: None,
+        },
+    })
+}
+
+async fn deliver_udp_packet(
+    delivery: PendingUdpDelivery,
+    connection_closed: impl Future,
+) {
+    tokio::select! {
+        _ = connection_closed => {}
+        result = delivery.incoming.send(delivery.packet) => {
+            if result.is_err() {
+                tracing::trace!("hysteria2 udp session receiver was dropped");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod udp_receive_tests {
+    use std::{collections::HashMap, time::Duration};
+
+    use super::{
+        UdpPacketDisposition, codec, datagram::UdpSession, deliver_udp_packet,
+        prepare_udp_delivery,
+    };
+    use crate::{proxy::datagram::UdpPacket, session::SocksAddr};
+
+    #[tokio::test]
+    async fn blocked_udp_delivery_releases_map_and_stops_after_connection_close() {
+        let (incoming, _receiver) = tokio::sync::mpsc::channel(1);
+        incoming
+            .send(UdpPacket::default())
+            .await
+            .expect("fill the receive queue");
+
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            7,
+            UdpSession {
+                incoming,
+                local_addr: SocksAddr::any_ipv4(),
+                defragger: Default::default(),
+            },
+        );
+        let session_map = tokio::sync::Mutex::new(sessions);
+        let packet = codec::HysUdpPacket {
+            session_id: 7,
+            pkt_id: 1,
+            frag_id: 0,
+            frag_count: 1,
+            addr: SocksAddr::any_ipv4(),
+            data: vec![1, 2, 3],
+        };
+        let delivery = {
+            let mut sessions = session_map.lock().await;
+            match prepare_udp_delivery(&mut sessions, packet) {
+                UdpPacketDisposition::Delivery(delivery) => delivery,
+                UdpPacketDisposition::FragmentBuffered => {
+                    panic!("single-fragment packet should be complete")
+                }
+                UdpPacketDisposition::MissingSession => {
+                    panic!("test UDP session should exist")
+                }
+            }
+        };
+
+        let connection_closed = tokio_util::sync::CancellationToken::new();
+        let cancel_delivery = connection_closed.clone();
+        let delivery_task = tokio::spawn(async move {
+            deliver_udp_packet(delivery, cancel_delivery.cancelled_owned()).await;
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !delivery_task.is_finished(),
+            "delivery should wait while the receive queue is full"
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), session_map.lock())
+            .await
+            .expect("blocked channel send must not retain the session map lock")
+            .clear();
+        connection_closed.cancel();
+        tokio::time::timeout(Duration::from_secs(1), delivery_task)
+            .await
+            .expect("connection closure should release blocked UDP delivery")
+            .expect("delivery task should not panic");
     }
 }
 
@@ -973,14 +1138,6 @@ async fn cancel_on_network_change<T>(
     }
 }
 
-impl Drop for HysteriaConnection {
-    fn drop(&mut self) {
-        if let Some(driver_task) = self.h3_driver_task.take() {
-            driver_task.abort();
-        }
-    }
-}
-
 #[async_trait::async_trait]
 impl DialWithConnector for Handler {
     async fn register_connector(&self, connector: Arc<dyn RemoteConnector>) {
@@ -1009,20 +1166,18 @@ impl OutboundHandler for Handler {
     async fn reset_connection_pool(&self) -> io::Result<u32> {
         let cancellation = self.recovery_cancellation.read().await.clone();
         cancellation.cancel();
-        let cached = self.conn.lock().await.take();
-        self.guard.lock().await.take();
-        let count = if let Some(cached) = cached {
+        let cached = std::mem::take(&mut *self.conn.lock().await);
+        let count = cached.len();
+        for cached in cached {
             cached
                 .conn
                 .close(quinn::VarInt::from_u32(0), b"network changed");
             cached.udp_sessions.lock().await.clear();
-            1
-        } else {
-            0
-        };
+        }
         *self.recovery_cancellation.write().await =
             tokio_util::sync::CancellationToken::new();
-        Ok(count)
+        u32::try_from(count)
+            .map_err(|_| io::Error::other("Hysteria2 pool size exceeds reset count"))
     }
 
     async fn connect_stream(
@@ -1031,7 +1186,10 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
     ) -> io::Result<BoxedChainedStream> {
         let conn = self.new_authed_connection(sess, resolver).await?;
-        let stream = Self::connect_tcp(&conn.conn, sess).await?;
+        let stream = self
+            .core_client
+            .open_tcp_stream(&conn.authenticated, &sess.destination.to_string())
+            .await?;
         let chained = ChainedStreamWrapper::new_with_network_path_id(
             Box::new(stream),
             conn.pool_context.path_id.clone(),
@@ -1071,7 +1229,10 @@ impl OutboundHandler for Handler {
         let conn = self
             .new_authed_connection_with_connector(sess, resolver, connector)
             .await?;
-        let stream = Self::connect_tcp(&conn.conn, sess).await?;
+        let stream = self
+            .core_client
+            .open_tcp_stream(&conn.authenticated, &sess.destination.to_string())
+            .await?;
         let chained = ChainedStreamWrapper::new_with_network_path_id(
             Box::new(stream),
             conn.pool_context.path_id.clone(),
@@ -1105,57 +1266,11 @@ impl OutboundHandler for Handler {
     }
 }
 
-pub struct HystStream {
-    send: quinn::SendStream,
-    recv: quinn::RecvStream,
-}
-
-impl Debug for HystStream {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HystStream").finish()
-    }
-}
-
-impl AsyncRead for HystStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().recv).poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for HystStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().send)
-            .poll_write(cx, buf)
-            .map(|result| result.map_err(io::Error::other))
-    }
-
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().send).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().send).poll_shutdown(cx)
-    }
-}
-
 #[cfg(all(test, docker_test, throughput_test))]
 mod e2e {
     use std::{io::Write as _, sync::Arc, time::Duration};
 
+    use anyhow::Context as _;
     use futures::{SinkExt as _, StreamExt as _};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -1413,6 +1528,41 @@ rules:
         Ok(())
     }
 
+    async fn fill_udp_receive_queue(
+        datagram: &mut BoxedChainedDatagram,
+        pool: &[Arc<HysteriaConnection>],
+        target: &str,
+        session_id: u32,
+    ) -> anyhow::Result<()> {
+        let destination =
+            format!("{target}:{UDP_ECHO_PORT}").parse::<SocksAddr>()?;
+        for sequence in 0..40u32 {
+            datagram
+                .send(UdpPacket {
+                    data: sequence.to_be_bytes().to_vec(),
+                    dst_addr: destination.clone(),
+                    ..Default::default()
+                })
+                .await?;
+        }
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                for connection in pool {
+                    let sessions = connection.udp_sessions.lock().await;
+                    if let Some(session) = sessions.get(&session_id)
+                        && session.incoming.capacity() == 0
+                    {
+                        return Ok(());
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("UDP echo did not fill the receive queue")?
+    }
+
     #[tokio::test]
     async fn e2e_network_reset_reauthenticates_hysteria2() -> anyhow::Result<()> {
         initialize();
@@ -1460,11 +1610,20 @@ rules:
                     down: None,
                     cwnd: None,
                     udp_mtu: None,
+                    quic_connections: std::num::NonZeroUsize::new(4)
+                        .expect("four is non-zero"),
+                    udp_recv_buffer_size: None,
                 }));
                 let resolver = config_helper::build_dns_resolver().await?;
                 let session = Session::default();
 
-                let first = connect_until_ready(&handler, &session, resolver.clone()).await?;
+                let _first =
+                    connect_until_ready(&handler, &session, resolver.clone()).await?;
+                let first_pool = handler.conn.lock().await.clone();
+                anyhow::ensure!(
+                    first_pool.len() == 4,
+                    "hysteria2 did not establish the requested four-connection pool"
+                );
                 tcp_echo_roundtrip(handler.clone(), resolver.clone(), &echo_ip)
                     .await
                     .map_err(|error| anyhow::anyhow!("pre-reset TCP roundtrip failed: {error:#}"))?;
@@ -1477,38 +1636,54 @@ rules:
                 )
                 .await
                 .map_err(|error| anyhow::anyhow!("pre-reset UDP roundtrip failed: {error:#}"))?;
+                fill_udp_receive_queue(&mut first_udp, &first_pool, &echo_ip, 0)
+                    .await?;
+                let mut pre_reset_udp_sessions = 0;
+                for connection in &first_pool {
+                    pre_reset_udp_sessions +=
+                        connection.udp_sessions.lock().await.len();
+                }
                 anyhow::ensure!(
-                    first.udp_sessions.lock().await.len() == 1,
-                    "hysteria2 did not register the pre-reset UDP session"
+                    pre_reset_udp_sessions == 1,
+                    "hysteria2 did not register exactly one pre-reset UDP session"
                 );
                 let cached = handler
                     .new_authed_connection(&session, resolver.clone())
                     .await?;
                 anyhow::ensure!(
-                    Arc::ptr_eq(&first, &cached),
-                    "hysteria2 did not reuse the authenticated connection"
+                    first_pool.iter().any(|connection| Arc::ptr_eq(connection, &cached)),
+                    "hysteria2 did not reuse a connection from the authenticated pool"
                 );
 
+                let reset_count = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    handler.reset_connection_pool(),
+                )
+                .await??;
                 anyhow::ensure!(
-                    handler.reset_connection_pool().await? == 1,
-                    "network reset did not invalidate the cached hysteria2 connection"
+                    reset_count == 4,
+                    "network reset did not invalidate all four cached hysteria2 connections"
                 );
                 tokio::time::timeout(Duration::from_secs(2), async {
-                    while first.conn.close_reason().is_none() {
+                    while first_pool
+                        .iter()
+                        .any(|connection| connection.conn.close_reason().is_none())
+                    {
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                 })
                 .await?;
-                anyhow::ensure!(
-                    first.udp_sessions.lock().await.is_empty(),
-                    "network reset retained the old hysteria2 UDP session"
-                );
-                anyhow::ensure!(
-                    tokio::time::timeout(Duration::from_secs(2), first_udp.next())
-                        .await?
-                        .is_none(),
-                    "old hysteria2 UDP datagram remained readable after network reset"
-                );
+                for connection in &first_pool {
+                    anyhow::ensure!(
+                        connection.udp_sessions.lock().await.is_empty(),
+                        "network reset retained an old hysteria2 UDP session"
+                    );
+                }
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while first_udp.next().await.is_some() {}
+                })
+                .await
+                .context("old Hysteria UDP session did not close after reset")?;
 
                 let mut second_udp =
                     connect_udp_datagram(handler.clone(), resolver.clone(), &echo_ip).await?;
@@ -1519,23 +1694,26 @@ rules:
                 )
                 .await
                 .map_err(|error| anyhow::anyhow!("post-reset UDP roundtrip failed: {error:#}"))?;
-                let second = handler
-                    .conn
-                    .lock()
-                    .await
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("hysteria2 did not cache replacement connection"))?;
+                let replacement_pool = handler.conn.lock().await.clone();
                 anyhow::ensure!(
-                    !Arc::ptr_eq(&first, &second),
-                    "hysteria2 reused the connection closed by network reset"
+                    replacement_pool.len() == 4,
+                    "hysteria2 did not recreate the four-connection pool after reset"
                 );
                 anyhow::ensure!(
-                    second.conn.close_reason().is_none(),
-                    "replacement hysteria2 connection was already closed"
+                    replacement_pool.iter().all(|replacement| {
+                        first_pool.iter().all(|old| !Arc::ptr_eq(old, replacement))
+                    }),
+                    "hysteria2 reused a connection closed by network reset"
                 );
                 anyhow::ensure!(
-                    second.udp_sessions.lock().await.len() == 1,
-                    "replacement hysteria2 connection did not register a new UDP session"
+                    replacement_pool
+                        .iter()
+                        .all(|replacement| replacement.conn.close_reason().is_none()),
+                    "a replacement hysteria2 connection was already closed"
+                );
+                anyhow::ensure!(
+                    replacement_pool[0].udp_sessions.lock().await.len() == 1,
+                    "replacement hysteria2 pool did not register a new UDP session"
                 );
                 tcp_echo_roundtrip(handler.clone(), resolver.clone(), &echo_ip)
                     .await
@@ -1543,8 +1721,10 @@ rules:
 
                 let second_cached = handler.new_authed_connection(&session, resolver).await?;
                 anyhow::ensure!(
-                    Arc::ptr_eq(&second, &second_cached),
-                    "replacement hysteria2 connection was not cached"
+                    replacement_pool
+                        .iter()
+                        .any(|connection| Arc::ptr_eq(connection, &second_cached)),
+                    "replacement hysteria2 connection pool was not reused"
                 );
                 Ok(())
             })
@@ -1653,13 +1833,44 @@ mod network_path_tests {
         net::Ipv4Addr,
         sync::{
             Arc,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
     };
 
     use super::*;
     use crate::app::flow::{AddressFamily, InterfaceId, NetworkPathId};
     use crate::config::internal::proxy::OutboundHysteria2;
+
+    #[cfg(feature = "transport-bench-api")]
+    #[test]
+    fn benchmark_socket2_override_rejects_nonlocal_or_pinned_contexts() {
+        let loopback = SocketAddr::from(([127, 0, 0, 1], 443));
+        let public = SocketAddr::from(([192, 0, 2, 10], 443));
+        let validate =
+            |address, has_interface, has_port_hopping, has_obfuscation| {
+                validate_socket2_abstract_socket_bench_context(
+                    address,
+                    has_interface,
+                    has_port_hopping,
+                    has_obfuscation,
+                    #[cfg(target_os = "linux")]
+                    false,
+                )
+            };
+
+        assert!(validate(loopback, false, false, false).is_ok());
+        assert!(validate(public, false, false, false).is_err());
+        assert!(validate(loopback, true, false, false).is_err());
+        assert!(validate(loopback, false, true, false).is_err());
+        assert!(validate(loopback, false, false, true).is_err());
+        #[cfg(target_os = "linux")]
+        assert!(
+            validate_socket2_abstract_socket_bench_context(
+                loopback, false, false, false, true
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn hysteria_config_preserves_independent_bandwidth_limits() {
@@ -1685,23 +1896,39 @@ mod network_path_tests {
 
             assert_eq!(handler.opts.up, up);
             assert_eq!(handler.opts.down, down);
+            assert_eq!(handler.opts.quic_connections.get(), 1);
         }
     }
 
     #[test]
-    fn hysteria_auth_advertises_client_receive_limit() {
-        assert_eq!(client_cc_rx_header(None), "0");
-        assert_eq!(client_cc_rx_header(Some(12_000_000)), "12000000");
+    fn hysteria_config_preserves_optional_udp_receive_buffer_size() {
+        crate::setup_default_crypto_provider();
+
+        for size in [None, Some(1024 * 1024), Some(4 * 1024 * 1024)] {
+            let handler: Handler = OutboundHysteria2 {
+                name: "hy2-receive-buffer-test".to_owned(),
+                server: "127.0.0.1".to_owned(),
+                port: 443,
+                password: "test".to_owned(),
+                udp_recv_buffer_size: size,
+                ..Default::default()
+            }
+            .try_into()
+            .expect("Hysteria2 receive buffer config should convert");
+
+            assert_eq!(handler.opts.udp_recv_buffer_size, size);
+        }
     }
 
     #[test]
-    fn hysteria_brutal_rate_matches_peer_limits() {
-        assert_eq!(select_brutal_bps(Some(10), CcRx::Auto), None);
-        assert_eq!(select_brutal_bps(Some(10), CcRx::Fixed(8)), Some(8));
-        assert_eq!(select_brutal_bps(Some(10), CcRx::Fixed(12)), Some(10));
-        assert_eq!(select_brutal_bps(Some(10), CcRx::Fixed(0)), Some(10));
-        assert_eq!(select_brutal_bps(None, CcRx::Fixed(8)), None);
-        assert_eq!(select_brutal_bps(None, CcRx::Fixed(0)), None);
+    fn hysteria_connection_selection_is_round_robin() {
+        let next = AtomicUsize::new(0);
+        let connection_count = NonZeroUsize::new(4).expect("four is non-zero");
+        let selected = (0..9)
+            .map(|_| next_hysteria_connection_index(&next, connection_count.get()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(selected, [0, 1, 2, 3, 0, 1, 2, 3, 0]);
     }
 
     fn path(name: &str, index: u32, address: Ipv4Addr) -> NetworkPathId {

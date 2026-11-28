@@ -1,0 +1,673 @@
+use aws_lc_rs::agreement;
+use base64::engine::{Engine as _, general_purpose::URL_SAFE_NO_PAD};
+use rand::Rng;
+
+use super::buf_reader::BufReader;
+use super::reality_cipher_suite::CipherSuite;
+
+pub(super) const X25519_GROUP: u16 = 0x001d;
+pub(super) const X25519_MLKEM768_GROUP: u16 = 0x11ec;
+pub(super) const X25519_KEY_SHARE_LEN: usize = 32;
+pub(super) const X25519_MLKEM768_CLIENT_KEY_SHARE_LEN: usize =
+    1184 + X25519_KEY_SHARE_LEN;
+const X25519_MLKEM768_SERVER_KEY_SHARE_LEN: usize = 1088 + X25519_KEY_SHARE_LEN;
+
+/// Parsed TLS 1.3 ServerHello key share. Hybrid key exchange is not enabled
+/// until the handshake derives both the ML-KEM and X25519 shared secrets.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RealityKeyShare {
+    pub group: u16,
+    pub data: Vec<u8>,
+}
+
+/// Decodes a base64url-encoded public key
+pub fn decode_public_key(encoded: &str) -> Result<[u8; 32], std::io::Error> {
+    let decoded = URL_SAFE_NO_PAD.decode(encoded).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Invalid base64: {}", e),
+        )
+    })?;
+
+    if decoded.len() != 32 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Invalid public key length: {} (expected 32)", decoded.len()),
+        ));
+    }
+
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&decoded);
+    Ok(key)
+}
+
+/// Decodes a base64url-encoded private key
+pub fn decode_private_key(encoded: &str) -> Result<[u8; 32], std::io::Error> {
+    let decoded = URL_SAFE_NO_PAD.decode(encoded).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Invalid base64: {}", e),
+        )
+    })?;
+
+    if decoded.len() != 32 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Invalid private key length: {} (expected 32)",
+                decoded.len()
+            ),
+        ));
+    }
+
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&decoded);
+    Ok(key)
+}
+
+/// Decodes a hex-encoded short ID with zero-padding
+///
+/// Short IDs can be 0-16 hex characters (0-8 bytes).
+/// Shorter IDs remain variable-length to match Xray REALITY shortIds.
+pub fn decode_short_id(hex: &str) -> Result<Vec<u8>, std::io::Error> {
+    if hex.len() > 16 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Short ID too long: {} (max 16 hex chars)", hex.len()),
+        ));
+    }
+
+    if !hex.len().is_multiple_of(2) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Short ID hex length must be even: {}", hex.len()),
+        ));
+    }
+
+    let mut short_id = vec![0u8; hex.len() / 2];
+    decode_hex_to_slice(hex, &mut short_id).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Invalid hex: {}", e),
+        )
+    })?;
+
+    Ok(short_id)
+}
+
+/// Decode hex string to byte slice
+fn decode_hex_to_slice(hex: &str, output: &mut [u8]) -> Result<(), &'static str> {
+    if hex.len() != output.len() * 2 {
+        return Err("Invalid hex length");
+    }
+
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let high = hex_char_to_value(chunk[0])?;
+        let low = hex_char_to_value(chunk[1])?;
+        output[i] = (high << 4) | low;
+    }
+
+    Ok(())
+}
+
+/// Convert hex character to its numeric value
+fn hex_char_to_value(c: u8) -> Result<u8, &'static str> {
+    match c {
+        b'0'..=b'9' => Ok(c - b'0'),
+        b'a'..=b'f' => Ok(c - b'a' + 10),
+        b'A'..=b'F' => Ok(c - b'A' + 10),
+        _ => Err("Invalid hex character"),
+    }
+}
+
+/// Extracts ClientRandom from ClientHello
+///
+/// ClientHello structure (simplified):
+/// - TLS Header: 5 bytes
+/// - Handshake Type: 1 byte
+/// - Length: 3 bytes
+/// - Protocol Version: 2 bytes
+/// - ClientRandom: 32 bytes (starts at offset 11)
+pub fn extract_client_random(
+    client_hello: &[u8],
+) -> Result<[u8; 32], std::io::Error> {
+    const TLS_HEADER_LEN: usize = 5;
+    const HANDSHAKE_HEADER_LEN: usize = 4; // type(1) + length(3)
+    const PROTOCOL_VERSION_LEN: usize = 2;
+    const RANDOM_OFFSET: usize =
+        TLS_HEADER_LEN + HANDSHAKE_HEADER_LEN + PROTOCOL_VERSION_LEN;
+
+    if client_hello.len() < RANDOM_OFFSET + 32 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ClientHello too short to extract random",
+        ));
+    }
+
+    let mut random = [0u8; 32];
+    random.copy_from_slice(&client_hello[RANDOM_OFFSET..RANDOM_OFFSET + 32]);
+    Ok(random)
+}
+
+/// Extracts SessionId slice from ClientHello without allocation
+///
+/// SessionId comes after ClientRandom and has a 1-byte length prefix.
+/// Returns a slice pointing into the original buffer.
+pub fn extract_session_id_slice(
+    client_hello: &[u8],
+) -> Result<&[u8], std::io::Error> {
+    const TLS_HEADER_LEN: usize = 5;
+    const HANDSHAKE_HEADER_LEN: usize = 4;
+    const PROTOCOL_VERSION_LEN: usize = 2;
+    const RANDOM_LEN: usize = 32;
+    const SESSION_ID_LEN_OFFSET: usize =
+        TLS_HEADER_LEN + HANDSHAKE_HEADER_LEN + PROTOCOL_VERSION_LEN + RANDOM_LEN;
+
+    if client_hello.len() < SESSION_ID_LEN_OFFSET + 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ClientHello too short to extract session ID",
+        ));
+    }
+
+    let session_id_len = client_hello[SESSION_ID_LEN_OFFSET] as usize;
+
+    if client_hello.len() < SESSION_ID_LEN_OFFSET + 1 + session_id_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ClientHello session ID extends past end",
+        ));
+    }
+
+    Ok(&client_hello
+        [SESSION_ID_LEN_OFFSET + 1..SESSION_ID_LEN_OFFSET + 1 + session_id_len])
+}
+
+/// Extracts X25519 public key from ClientHello KeyShare extension
+///
+/// This parses the TLS 1.3 extensions to find the KeyShare extension
+/// and extracts the X25519 public key (group 0x001d).
+pub fn extract_client_public_key(
+    client_hello: &[u8],
+) -> Result<[u8; 32], std::io::Error> {
+    const TLS_HEADER_LEN: usize = 5;
+
+    if client_hello.len() < TLS_HEADER_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ClientHello too short",
+        ));
+    }
+
+    let mut reader = BufReader::new(&client_hello[TLS_HEADER_LEN..]);
+
+    // Parse handshake header
+    let _handshake_type = reader.read_u8()?;
+    let _handshake_len = reader.read_u24_be()?;
+    let _protocol_version = reader.read_u16_be()?;
+
+    // Skip random
+    reader.skip(32)?;
+
+    // Read session ID
+    let session_id_len = reader.read_u8()? as usize;
+    reader.skip(session_id_len)?;
+
+    // Read cipher suites
+    let cipher_suites_len = reader.read_u16_be()? as usize;
+    reader.skip(cipher_suites_len)?;
+
+    // Read compression methods
+    let compression_len = reader.read_u8()? as usize;
+    reader.skip(compression_len)?;
+
+    // Parse extensions
+    let extensions_len = reader.read_u16_be()? as usize;
+    let extensions_start = reader.position();
+    let extensions_end = extensions_start + extensions_len;
+
+    while reader.position() < extensions_end {
+        let ext_type = reader.read_u16_be()?;
+        let ext_len = reader.read_u16_be()? as usize;
+
+        if ext_type == 51 {
+            // KeyShare extension (0x0033)
+            return parse_keyshare_extension(reader.read_slice(ext_len)?);
+        } else {
+            reader.skip(ext_len)?;
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "KeyShare extension not found in ClientHello",
+    ))
+}
+
+/// Parses the KeyShare extension to extract X25519 public key
+fn parse_keyshare_extension(data: &[u8]) -> Result<[u8; 32], std::io::Error> {
+    let mut reader = BufReader::new(data);
+
+    // KeyShare extension format (client):
+    // - Client Key Share Length: 2 bytes
+    // - Key Share Entries (repeated):
+    //   - Group: 2 bytes
+    //   - Key Exchange Length: 2 bytes
+    //   - Key Exchange Data: variable
+
+    let _client_shares_len = reader.read_u16_be()?;
+
+    // Find X25519 key share (group 0x001d = 29)
+    loop {
+        // Check if we have at least 4 bytes for group and length
+        if reader.position() + 4 > data.len() {
+            break;
+        }
+
+        let group = reader.read_u16_be()?;
+        let key_len = reader.read_u16_be()? as usize;
+
+        if reader.position() + key_len > data.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "KeyShare entry extends past end",
+            ));
+        }
+
+        if group == 0x001d {
+            // X25519
+            if key_len != 32 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Invalid X25519 key length: {}", key_len),
+                ));
+            }
+
+            let key_bytes = reader.read_slice(32)?;
+            let mut key = [0u8; 32];
+            key.copy_from_slice(key_bytes);
+            return Ok(key);
+        } else {
+            reader.skip(key_len)?;
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "X25519 key share not found in KeyShare extension",
+    ))
+}
+
+/// Extract server's X25519 public key from ServerHello message
+///
+/// This parses the TLS 1.3 ServerHello to find the KeyShare extension
+/// and extracts the X25519 public key (group 0x001d).
+pub fn extract_server_public_key(
+    server_hello: &[u8],
+) -> Result<[u8; 32], std::io::Error> {
+    let key_share = extract_server_key_share(server_hello)?;
+    // The current handshake only derives X25519. Never treat the X25519
+    // component of a hybrid share as a complete TLS shared secret.
+    if key_share.group != X25519_GROUP {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "REALITY hybrid key share requires hybrid key exchange support",
+        ));
+    }
+    let mut key = [0u8; X25519_KEY_SHARE_LEN];
+    key.copy_from_slice(&key_share.data);
+    Ok(key)
+}
+
+/// Parse the negotiated ServerHello key share without deriving secrets.
+pub fn extract_server_key_share(
+    server_hello: &[u8],
+) -> Result<RealityKeyShare, std::io::Error> {
+    const TLS_HEADER_LEN: usize = 5;
+
+    if server_hello.len() < TLS_HEADER_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ServerHello too short",
+        ));
+    }
+
+    let mut reader = BufReader::new(&server_hello[TLS_HEADER_LEN..]);
+
+    // Parse handshake header
+    let _handshake_type = reader.read_u8()?;
+    let _handshake_len = reader.read_u24_be()?;
+    let _protocol_version = reader.read_u16_be()?;
+
+    // Skip random
+    reader.skip(32)?;
+
+    // Read session ID (ServerHello can echo it back)
+    let session_id_len = reader.read_u8()? as usize;
+    reader.skip(session_id_len)?;
+
+    // Read cipher suite (single 2-byte value in ServerHello)
+    reader.skip(2)?;
+
+    // Read compression method (single byte in ServerHello)
+    reader.skip(1)?;
+
+    // Parse extensions
+    let extensions_len = reader.read_u16_be()? as usize;
+    let extensions_start = reader.position();
+    let extensions_end = extensions_start + extensions_len;
+
+    while reader.position() < extensions_end {
+        let ext_type = reader.read_u16_be()?;
+        let ext_len = reader.read_u16_be()? as usize;
+
+        if ext_type == 51 {
+            // KeyShare extension (0x0033)
+            return parse_server_keyshare_extension(reader.read_slice(ext_len)?);
+        } else {
+            reader.skip(ext_len)?;
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "KeyShare extension not found in ServerHello",
+    ))
+}
+
+/// Parse and validate the ServerHello KeyShare extension (RFC 8446).
+fn parse_server_keyshare_extension(
+    data: &[u8],
+) -> Result<RealityKeyShare, std::io::Error> {
+    let mut reader = BufReader::new(data);
+    let group = reader.read_u16_be()?;
+    let key_len = reader.read_u16_be()? as usize;
+    let expected_len = match group {
+        X25519_GROUP => X25519_KEY_SHARE_LEN,
+        X25519_MLKEM768_GROUP => X25519_MLKEM768_SERVER_KEY_SHARE_LEN,
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Unsupported REALITY ServerHello key share group: 0x{group:04x}"
+                ),
+            ));
+        }
+    };
+    if key_len != expected_len || data.len() != 4 + key_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Invalid REALITY ServerHello key share length for group 0x{group:04x}: declared {key_len}, available {}",
+                data.len().saturating_sub(4)
+            ),
+        ));
+    }
+    Ok(RealityKeyShare {
+        group,
+        data: reader.read_slice(key_len)?.to_vec(),
+    })
+}
+
+/// Extract the cipher suite selected by the server from ServerHello message
+///
+/// This parses the TLS 1.3 ServerHello to find the cipher suite.
+/// ServerHello contains a single cipher suite (the server's choice).
+pub fn extract_server_cipher_suite(
+    server_hello: &[u8],
+) -> Result<u16, std::io::Error> {
+    const TLS_HEADER_LEN: usize = 5;
+
+    if server_hello.len() < TLS_HEADER_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ServerHello too short",
+        ));
+    }
+
+    let mut reader = BufReader::new(&server_hello[TLS_HEADER_LEN..]);
+
+    // Parse handshake header
+    let _handshake_type = reader.read_u8()?;
+    let _handshake_len = reader.read_u24_be()?;
+    let _protocol_version = reader.read_u16_be()?;
+
+    // Skip random (32 bytes)
+    reader.skip(32)?;
+
+    // Read session ID (ServerHello can echo it back)
+    let session_id_len = reader.read_u8()? as usize;
+    reader.skip(session_id_len)?;
+
+    // Read cipher suite (single 2-byte value in ServerHello)
+    let cipher_suite = reader.read_u16_be()?;
+
+    Ok(cipher_suite)
+}
+
+/// Extracts cipher suites offered by client from ClientHello
+///
+/// Returns a Vec of cipher suite IDs in the order they appear in the ClientHello.
+pub fn extract_client_cipher_suites(
+    client_hello: &[u8],
+) -> Result<Vec<u16>, std::io::Error> {
+    const TLS_HEADER_LEN: usize = 5;
+
+    if client_hello.len() < TLS_HEADER_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ClientHello too short",
+        ));
+    }
+
+    let mut reader = BufReader::new(&client_hello[TLS_HEADER_LEN..]);
+
+    // Parse handshake header
+    let _handshake_type = reader.read_u8()?;
+    let _handshake_len = reader.read_u24_be()?;
+    let _protocol_version = reader.read_u16_be()?;
+
+    // Skip random (32 bytes)
+    reader.skip(32)?;
+
+    // Skip session ID
+    let session_id_len = reader.read_u8()? as usize;
+    reader.skip(session_id_len)?;
+
+    // Read cipher suites
+    let cipher_suites_len = reader.read_u16_be()? as usize;
+    if !cipher_suites_len.is_multiple_of(2) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Invalid cipher suites length (not even)",
+        ));
+    }
+
+    let cipher_suites_data = reader.read_slice(cipher_suites_len)?;
+    let mut cipher_suites = Vec::with_capacity(cipher_suites_len / 2);
+
+    for chunk in cipher_suites_data.chunks(2) {
+        let suite = u16::from_be_bytes([chunk[0], chunk[1]]);
+        cipher_suites.push(suite);
+    }
+
+    Ok(cipher_suites)
+}
+
+/// Negotiate cipher suite between server preferences and client offers (CipherSuite version)
+///
+/// Returns the first CipherSuite from server_preferences that the client supports,
+/// or None if no common cipher suite is found.
+pub fn negotiate_cipher_suite(
+    server_preferences: &[CipherSuite],
+    client_cipher_suite_ids: &[u16],
+) -> Option<CipherSuite> {
+    for server_suite in server_preferences {
+        if client_cipher_suite_ids.contains(&server_suite.id()) {
+            return Some(*server_suite);
+        }
+    }
+    None
+}
+
+pub fn generate_keypair() -> std::io::Result<(String, String)> {
+    // Generate 32 random bytes for private key
+    let mut private_key_bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut private_key_bytes);
+
+    // Create X25519 private key from the random bytes
+    let private_key = agreement::PrivateKey::from_private_key(
+        &agreement::X25519,
+        &private_key_bytes,
+    )
+    .map_err(|_| std::io::Error::other("Failed to create X25519 key"))?;
+
+    // Derive public key from private key
+    let public_key_bytes = private_key
+        .compute_public_key()
+        .map_err(|_| std::io::Error::other("Failed to compute public key"))?;
+
+    // Encode both keys as base64url (no padding)
+    let private_key_b64 = URL_SAFE_NO_PAD.encode(private_key_bytes);
+    let public_key_b64 = URL_SAFE_NO_PAD.encode(public_key_bytes.as_ref());
+
+    Ok((private_key_b64, public_key_b64))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reality_server_key_share_accepts_classic_and_hybrid_lengths() {
+        for (group, size) in [
+            (X25519_GROUP, X25519_KEY_SHARE_LEN),
+            (X25519_MLKEM768_GROUP, X25519_MLKEM768_SERVER_KEY_SHARE_LEN),
+        ] {
+            let mut encoded = Vec::from(group.to_be_bytes());
+            encoded.extend_from_slice(&(size as u16).to_be_bytes());
+            encoded.extend(std::iter::repeat_n(0xa5, size));
+            let share = parse_server_keyshare_extension(&encoded).unwrap();
+            assert_eq!(share.group, group);
+            assert_eq!(share.data, vec![0xa5; size]);
+
+            for bad in [size - 1, size + 1] {
+                let mut malformed = Vec::from(group.to_be_bytes());
+                malformed.extend_from_slice(&(bad as u16).to_be_bytes());
+                malformed.extend(std::iter::repeat_n(0xa5, bad));
+                assert!(parse_server_keyshare_extension(&malformed).is_err());
+            }
+            assert!(
+                parse_server_keyshare_extension(&encoded[..encoded.len() - 1])
+                    .is_err()
+            );
+            let mut extra = encoded.clone();
+            extra.push(0);
+            assert!(parse_server_keyshare_extension(&extra).is_err());
+        }
+        assert!(parse_server_keyshare_extension(&[0x12, 0x34, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn reality_server_hello_keeps_classic_runtime_and_rejects_hybrid_until_enabled()
+    {
+        use super::super::reality_tls13_messages::construct_server_hello;
+
+        for (group, size) in [
+            (X25519_GROUP, X25519_KEY_SHARE_LEN),
+            (X25519_MLKEM768_GROUP, X25519_MLKEM768_SERVER_KEY_SHARE_LEN),
+        ] {
+            let data = vec![0x5a; size];
+            let mut hello =
+                construct_server_hello(&[0; 32], &[], 0x1301, &data).unwrap();
+            // construct_server_hello places key_share as the final extension.
+            let group_offset = hello.len() - size - 4;
+            hello[group_offset..group_offset + 2]
+                .copy_from_slice(&group.to_be_bytes());
+            let mut record = vec![0x16, 0x03, 0x03];
+            record.extend_from_slice(&(hello.len() as u16).to_be_bytes());
+            record.extend_from_slice(&hello);
+
+            let parsed = extract_server_key_share(&record).unwrap();
+            assert_eq!(parsed.group, group);
+            assert_eq!(parsed.data, data);
+            if group == X25519_GROUP {
+                assert_eq!(extract_server_public_key(&record).unwrap(), [0x5a; 32]);
+            } else {
+                assert!(extract_server_public_key(&record).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn test_decode_short_id() {
+        // Full 16-char hex
+        let short_id = decode_short_id("0123456789abcdef").unwrap();
+        assert_eq!(
+            short_id,
+            vec![0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]
+        );
+
+        // Partial hex remains variable-length, matching Xray REALITY shortIds.
+        let short_id2 = decode_short_id("85144f63").unwrap();
+        assert_eq!(short_id2, vec![0x85, 0x14, 0x4f, 0x63]);
+
+        // Empty short ID is valid and remains empty.
+        let short_id3 = decode_short_id("").unwrap();
+        assert!(short_id3.is_empty());
+
+        let odd_len = decode_short_id("abc");
+        assert!(odd_len.is_err());
+
+        // Too long should error
+        let result = decode_short_id("0123456789abcdef0");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_client_random() {
+        // Create a minimal ClientHello with random
+        let mut client_hello = vec![0u8; 100];
+
+        // TLS Header
+        client_hello[0] = 0x16; // Handshake
+        client_hello[1] = 0x03; // Version major
+        client_hello[2] = 0x03; // Version minor (TLS 1.2)
+
+        // Handshake header
+        client_hello[5] = 0x01; // ClientHello type
+
+        // Protocol version in handshake
+        client_hello[9] = 0x03; // Major
+        client_hello[10] = 0x03; // Minor
+
+        // ClientRandom starts at offset 11
+        for i in 0..32 {
+            client_hello[11 + i] = (i + 1) as u8;
+        }
+
+        let random = extract_client_random(&client_hello).unwrap();
+        for (index, byte) in random.iter().enumerate() {
+            assert_eq!(*byte, (index + 1) as u8);
+        }
+    }
+
+    #[test]
+    fn test_decode_public_key() {
+        use base64::engine::{Engine as _, general_purpose::URL_SAFE_NO_PAD};
+
+        // Valid 32-byte key
+        let key_bytes = [0x42u8; 32];
+        let encoded = URL_SAFE_NO_PAD.encode(key_bytes);
+        let decoded = decode_public_key(&encoded).unwrap();
+        assert_eq!(decoded, key_bytes);
+
+        // Invalid length
+        let short_key = [0x42u8; 16];
+        let encoded_short = URL_SAFE_NO_PAD.encode(short_key);
+        assert!(decode_public_key(&encoded_short).is_err());
+
+        // Invalid base64
+        assert!(decode_public_key("not-valid-base64!!!").is_err());
+    }
+}

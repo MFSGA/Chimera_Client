@@ -1,0 +1,734 @@
+use std::{
+    io,
+    pin::Pin,
+    task::{Context, Poll, Waker},
+};
+
+use bytes::{BufMut, BytesMut};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tracing::{debug, error};
+
+use crate::{AnyStream, TargetAddr};
+
+const VLESS_VERSION: u8 = 0;
+const VLESS_COMMAND_TCP: u8 = 1;
+const VLESS_COMMAND_UDP: u8 = 2;
+const VLESS_COMMAND_MUX: u8 = 3;
+const XTLS_VISION_FLOW: &str = "xtls-rprx-vision";
+
+struct PendingHandshake {
+    data: BytesMut,
+    written: usize,
+}
+
+pub struct VlessStream {
+    inner: AnyStream,
+    handshake_done: bool,
+    handshake_sent: bool,
+    response_received: bool,
+    pending_handshake: Option<PendingHandshake>,
+    read_waker: Option<Waker>,
+    write_waker: Option<Waker>,
+    response_header: [u8; 2],
+    response_header_read: usize,
+    response_additional_remaining: Option<usize>,
+    uuid: uuid::Uuid,
+    destination: TargetAddr,
+    is_udp: bool,
+    xudp: bool,
+    flow: Option<String>,
+}
+
+impl VlessStream {
+    pub fn new(
+        stream: AnyStream,
+        uuid: &str,
+        destination: &TargetAddr,
+        is_udp: bool,
+        flow: Option<String>,
+    ) -> io::Result<Self> {
+        Self::new_with_xudp(stream, uuid, destination, is_udp, false, flow)
+    }
+
+    pub fn new_xudp(
+        stream: AnyStream,
+        uuid: &str,
+        destination: &TargetAddr,
+        flow: Option<String>,
+    ) -> io::Result<Self> {
+        Self::new_with_xudp(stream, uuid, destination, true, true, flow)
+    }
+
+    fn new_with_xudp(
+        stream: AnyStream,
+        uuid: &str,
+        destination: &TargetAddr,
+        is_udp: bool,
+        xudp: bool,
+        flow: Option<String>,
+    ) -> io::Result<Self> {
+        if xudp && !is_udp {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "VLESS XUDP requires a UDP session",
+            ));
+        }
+        let uuid = uuid::Uuid::parse_str(uuid).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid UUID format")
+        })?;
+
+        debug!("VLESS stream created for destination: {}", destination);
+
+        Ok(Self {
+            inner: stream,
+            handshake_done: false,
+            handshake_sent: false,
+            response_received: false,
+            pending_handshake: None,
+            read_waker: None,
+            write_waker: None,
+            response_header: [0; 2],
+            response_header_read: 0,
+            response_additional_remaining: None,
+            uuid,
+            destination: destination.clone(),
+            is_udp,
+            xudp,
+            flow,
+        })
+    }
+
+    #[cfg(all(feature = "reality", feature = "vision"))]
+    pub(crate) fn raw_io_mut_for_vision(&mut self) -> Option<&mut AnyStream> {
+        let is_vision = self.flow.as_deref() == Some(XTLS_VISION_FLOW);
+        let is_tcp = !self.is_udp && !self.xudp;
+        let handshake_sent = self.handshake_sent;
+        let handshake_drained = self.pending_handshake.is_none();
+        if !is_vision || !is_tcp || !handshake_sent || !handshake_drained {
+            #[cfg(feature = "splice-diagnostics")]
+            tracing::trace!(
+                is_vision,
+                is_tcp,
+                handshake_sent,
+                handshake_drained,
+                "VLESS stream is not ready for a raw Vision socket"
+            );
+            return None;
+        }
+
+        if !self
+            .inner
+            .as_mut()
+            .as_any_mut()
+            .is::<crate::SplicableTlsStream<AnyStream>>()
+        {
+            #[cfg(feature = "splice-diagnostics")]
+            tracing::trace!(
+                "VLESS stream is ready but its inner TLS stream is not splice-capable"
+            );
+            return None;
+        }
+        let reality = self
+            .inner
+            .as_mut()
+            .as_any_mut()
+            .downcast_mut::<crate::SplicableTlsStream<AnyStream>>()?;
+        let raw_io = reality.raw_io_mut_if_spliced();
+        #[cfg(feature = "splice-diagnostics")]
+        if raw_io.is_none() {
+            tracing::trace!(
+                "VLESS and Vision are ready but REALITY TLS still has pending splice state"
+            );
+        }
+        raw_io
+    }
+
+    fn build_handshake_header(&self) -> BytesMut {
+        let mut buf = BytesMut::new();
+        let addons = self.encode_request_addons();
+
+        // VLESS request header:
+        // Version (1 byte) + UUID (16 bytes) + Additional info length (1 byte)
+        // + Command (1 byte) + Port (2 bytes) + Address type + Address + Additional
+        //   info
+        buf.put_u8(VLESS_VERSION);
+        buf.put_slice(self.uuid.as_bytes());
+        buf.put_u8(addons.len() as u8);
+        buf.put_slice(&addons);
+
+        if self.xudp {
+            buf.put_u8(VLESS_COMMAND_MUX);
+        } else if self.is_udp {
+            buf.put_u8(VLESS_COMMAND_UDP);
+        } else {
+            buf.put_u8(VLESS_COMMAND_TCP);
+        }
+
+        if !self.xudp {
+            self.destination.write_to_vless_buffer(&mut buf);
+        }
+        buf
+    }
+
+    fn encode_request_addons(&self) -> Vec<u8> {
+        match self.flow.as_deref() {
+            Some(XTLS_VISION_FLOW) => encode_flow_addon(XTLS_VISION_FLOW),
+            _ => Vec::new(),
+        }
+    }
+
+    fn prepare_handshake(&mut self) {
+        debug!(
+            "VLESS handshake starting for destination: {}",
+            self.destination
+        );
+
+        self.pending_handshake = Some(PendingHandshake {
+            data: self.build_handshake_header(),
+            written: 0,
+        });
+    }
+
+    fn poll_send_pending_handshake(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        let Some(mut pending) = self.pending_handshake.take() else {
+            return Poll::Ready(Ok(()));
+        };
+
+        while pending.written < pending.data.len() {
+            match Pin::new(&mut self.inner)
+                .poll_write(cx, &pending.data[pending.written..])
+            {
+                Poll::Ready(Ok(0)) => {
+                    self.pending_handshake = Some(pending);
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to write VLESS handshake",
+                    )));
+                }
+                Poll::Ready(Ok(n)) => pending.written += n,
+                Poll::Ready(Err(e)) => {
+                    self.pending_handshake = Some(pending);
+                    error!("Failed to send VLESS handshake: {}", e);
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Pending => {
+                    self.pending_handshake = Some(pending);
+                    return Poll::Pending;
+                }
+            }
+        }
+
+        self.handshake_sent = true;
+        debug!("VLESS handshake sent");
+        if let Some(waker) = self.read_waker.take() {
+            waker.wake();
+        }
+        if let Some(waker) = self.write_waker.take() {
+            waker.wake();
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_receive_response(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.response_received {
+            return Poll::Ready(Ok(()));
+        }
+
+        debug!("VLESS waiting for response");
+
+        while self.response_header_read < self.response_header.len() {
+            let mut read_buf =
+                ReadBuf::new(&mut self.response_header[self.response_header_read..]);
+            match Pin::new(&mut self.inner).poll_read(cx, &mut read_buf) {
+                Poll::Ready(Ok(())) => {
+                    let n = read_buf.filled().len();
+                    if n == 0 {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "unexpected EOF while reading VLESS response header",
+                        )));
+                    }
+                    self.response_header_read += n;
+                }
+                Poll::Ready(Err(e)) => {
+                    error!("Failed to read VLESS response: {}", e);
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        if self.response_header[0] != VLESS_VERSION {
+            error!(
+                "Invalid VLESS response version: {}",
+                self.response_header[0]
+            );
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid VLESS response version: {}",
+                    self.response_header[0]
+                ),
+            )));
+        }
+
+        let mut remaining = self
+            .response_additional_remaining
+            .get_or_insert(self.response_header[1] as usize)
+            .to_owned();
+        let original_additional_len = self.response_header[1] as usize;
+
+        while remaining > 0 {
+            let mut discard = [0u8; 256];
+            let len = remaining.min(discard.len());
+            let mut read_buf = ReadBuf::new(&mut discard[..len]);
+            match Pin::new(&mut self.inner).poll_read(cx, &mut read_buf) {
+                Poll::Ready(Ok(())) => {
+                    let n = read_buf.filled().len();
+                    if n == 0 {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "unexpected EOF while reading VLESS additional info",
+                        )));
+                    }
+                    remaining -= n;
+                    self.response_additional_remaining = Some(remaining);
+                }
+                Poll::Ready(Err(e)) => {
+                    error!("Failed to read VLESS additional info: {}", e);
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        if original_additional_len > 0 {
+            debug!(
+                "VLESS additional info received: {} bytes",
+                original_additional_len
+            );
+        }
+
+        self.response_received = true;
+        self.handshake_done = true;
+        debug!("VLESS handshake completed successfully");
+
+        Poll::Ready(Ok(()))
+    }
+}
+
+fn encode_flow_addon(flow: &str) -> Vec<u8> {
+    let flow_bytes = flow.as_bytes();
+    let flow_len = flow_bytes.len();
+    assert!(
+        flow_len < 128,
+        "xtls vision flow string must fit in a single-byte protobuf varint"
+    );
+
+    let mut result = Vec::with_capacity(2 + flow_len);
+    result.push(0x0a);
+    result.push(flow_len as u8);
+    result.extend_from_slice(flow_bytes);
+    result
+}
+
+impl AsyncRead for VlessStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        // Vision handles the response header itself because the first response
+        // bytes are followed by Vision-framed body data in the same stream.
+        let vision_flow = self.flow.as_deref() == Some(XTLS_VISION_FLOW);
+
+        // Server-first protocols may read before the application has written
+        // any payload. Send the VLESS request header first so the proxy can
+        // open the upstream connection and return its banner.
+        if !self.handshake_sent {
+            if self.pending_handshake.is_none() {
+                self.prepare_handshake();
+            }
+            match self.poll_send_pending_handshake(cx) {
+                Poll::Ready(Ok(_)) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => {
+                    self.read_waker = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
+            }
+        }
+
+        // Must receive response before reading for non-Vision flows.
+        if !self.response_received && !vision_flow {
+            match self.poll_receive_response(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for VlessStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        // Send the VLESS header before application data. Keeping them separate
+        // lets a concurrent first read finish the header without consuming or
+        // duplicating the pending first write's payload.
+        if !self.handshake_sent {
+            if self.pending_handshake.is_none() {
+                self.prepare_handshake();
+            }
+            match self.poll_send_pending_handshake(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => {
+                    self.write_waker = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
+            }
+        }
+
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        future::{Future, poll_fn},
+        time::Duration,
+    };
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::oneshot;
+
+    use super::{VLESS_COMMAND_MUX, VlessStream, XTLS_VISION_FLOW};
+    use crate::TargetAddr;
+
+    const TEST_UUID: &str = "5415d8e0-df92-3655-afa4-b79de66413f5";
+
+    fn test_stream(
+        io: tokio::io::DuplexStream,
+        flow: Option<String>,
+    ) -> VlessStream {
+        VlessStream::new(
+            Box::new(io),
+            TEST_UUID,
+            &TargetAddr::Domain("example.com".to_owned(), 443),
+            false,
+            flow,
+        )
+        .expect("stream should build")
+    }
+
+    async fn notify_when_pending<F: Future>(
+        future: F,
+        pending_tx: oneshot::Sender<()>,
+    ) -> F::Output {
+        let mut future = Box::pin(future);
+        let mut pending_tx = Some(pending_tx);
+        poll_fn(|cx| {
+            let result = future.as_mut().poll(cx);
+            if result.is_pending()
+                && let Some(pending_tx) = pending_tx.take()
+            {
+                let _ = pending_tx.send(());
+            }
+            result
+        })
+        .await
+    }
+
+    #[test]
+    fn vless_vision_flow_addon_is_encoded_into_request_header() {
+        let (io, _) = tokio::io::duplex(1);
+        let stream = test_stream(io, Some(XTLS_VISION_FLOW.to_owned()));
+
+        let header = stream.build_handshake_header();
+
+        assert_eq!(header[17], 18, "vision flow protobuf should be 18 bytes");
+        assert_eq!(&header[18..20], &[0x0a, 16]);
+        assert_eq!(&header[20..36], XTLS_VISION_FLOW.as_bytes());
+    }
+
+    #[test]
+    fn xudp_uses_mux_command_without_a_vless_destination() {
+        let (io, _) = tokio::io::duplex(1);
+        let stream = VlessStream::new_xudp(
+            Box::new(io),
+            TEST_UUID,
+            &TargetAddr::Domain("example.com".to_owned(), 443),
+            None,
+        )
+        .expect("XUDP stream should build");
+
+        let header = stream.build_handshake_header();
+
+        assert_eq!(header.len(), 19);
+        assert_eq!(header[17], 0, "no VLESS addons are configured");
+        assert_eq!(header[18], VLESS_COMMAND_MUX);
+    }
+
+    #[tokio::test]
+    async fn pending_first_write_sends_handshake_and_payload_once() {
+        let (client, mut server) = tokio::io::duplex(1);
+        let mut stream = test_stream(client, Some(XTLS_VISION_FLOW.to_owned()));
+        let expected_header = stream.build_handshake_header().to_vec();
+        let payload = b"first application payload";
+        let expected_len = expected_header.len() + payload.len();
+
+        let server_task = tokio::spawn(async move {
+            let mut received = vec![0; expected_len];
+            server
+                .read_exact(&mut received)
+                .await
+                .expect("complete request");
+            received
+        });
+
+        stream.write_all(payload).await.expect("first write");
+        stream.flush().await.expect("flush");
+        let received = server_task.await.expect("server task");
+
+        assert_eq!(&received[..expected_header.len()], expected_header);
+        assert_eq!(&received[expected_header.len()..], payload);
+    }
+
+    #[tokio::test]
+    async fn read_first_sends_vless_handshake_for_server_first_protocols() {
+        let (client, mut server) = tokio::io::duplex(1024);
+        let mut stream = test_stream(client, None);
+        let expected_header = stream.build_handshake_header().to_vec();
+
+        let server_task = tokio::spawn(async move {
+            let mut request = vec![0u8; expected_header.len()];
+            server
+                .read_exact(&mut request)
+                .await
+                .expect("server should receive the VLESS request header first");
+            assert_eq!(request, expected_header);
+
+            server
+                .write_all(&[0, 0])
+                .await
+                .expect("VLESS response header");
+            server
+                .write_all(b"SSH-2.0-test\r\n")
+                .await
+                .expect("server-first banner");
+        });
+
+        let mut banner = vec![0u8; b"SSH-2.0-test\r\n".len()];
+        stream
+            .read_exact(&mut banner)
+            .await
+            .expect("server-first banner should arrive after implicit handshake");
+
+        assert_eq!(&banner, b"SSH-2.0-test\r\n");
+        server_task.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_read_does_not_duplicate_pending_write_payload() {
+        let (client, mut server) = tokio::io::duplex(1);
+        let stream = test_stream(client, None);
+        let expected_header = stream.build_handshake_header().to_vec();
+        let (mut reader, mut writer) = tokio::io::split(stream);
+        let payload = b"first application payload".to_vec();
+        let expected_payload = payload.clone();
+
+        let (start_server_tx, start_server_rx) = oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            start_server_rx.await.expect("start server");
+
+            let mut request_header = vec![0; expected_header.len()];
+            server
+                .read_exact(&mut request_header)
+                .await
+                .expect("request header");
+            assert_eq!(request_header, expected_header);
+
+            let mut received_payload = vec![0; expected_payload.len()];
+            server
+                .read_exact(&mut received_payload)
+                .await
+                .expect("first application payload");
+            assert_eq!(received_payload, expected_payload);
+
+            server
+                .write_all(&[0, 0])
+                .await
+                .expect("VLESS response header");
+            server
+                .write_all(b"SSH-2.0-test\r\n")
+                .await
+                .expect("server-first banner");
+        });
+
+        let (write_pending_tx, write_pending_rx) = oneshot::channel();
+        let writer_task = tokio::spawn(async move {
+            notify_when_pending(writer.write_all(&payload), write_pending_tx).await
+        });
+        tokio::time::timeout(Duration::from_secs(2), write_pending_rx)
+            .await
+            .expect("first write should wait on the small duplex buffer")
+            .expect("first write pending notification");
+
+        let (read_pending_tx, read_pending_rx) = oneshot::channel();
+        let reader_task = tokio::spawn(async move {
+            let mut banner = vec![0; b"SSH-2.0-test\r\n".len()];
+            notify_when_pending(reader.read_exact(&mut banner), read_pending_tx)
+                .await
+                .expect("server-first banner");
+            banner
+        });
+        tokio::time::timeout(Duration::from_secs(2), read_pending_rx)
+            .await
+            .expect("read should wait while the request header is blocked")
+            .expect("read pending notification");
+
+        start_server_tx.send(()).expect("start server task");
+        tokio::time::timeout(Duration::from_secs(2), writer_task)
+            .await
+            .expect("write should complete after the header and payload are sent")
+            .expect("writer task")
+            .expect("first write");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), reader_task)
+                .await
+                .expect("read should resume after the response")
+                .expect("reader task"),
+            b"SSH-2.0-test\r\n"
+        );
+        server_task.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn read_first_partial_handshake_allows_concurrent_first_write() {
+        let (client, mut server) = tokio::io::duplex(1);
+        let stream = test_stream(client, None);
+        let expected_header = stream.build_handshake_header().to_vec();
+        let (mut reader, mut writer) = tokio::io::split(stream);
+        let payload = b"first application payload".to_vec();
+        let expected_payload = payload.clone();
+
+        let (start_server_tx, start_server_rx) = oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            start_server_rx.await.expect("start server");
+
+            let mut request_header = vec![0; expected_header.len()];
+            server
+                .read_exact(&mut request_header)
+                .await
+                .expect("request header");
+            assert_eq!(request_header, expected_header);
+
+            let mut received_payload = vec![0; expected_payload.len()];
+            server
+                .read_exact(&mut received_payload)
+                .await
+                .expect("first application payload");
+            assert_eq!(received_payload, expected_payload);
+
+            server
+                .write_all(&[0, 0])
+                .await
+                .expect("VLESS response header");
+            server
+                .write_all(b"SSH-2.0-test\r\n")
+                .await
+                .expect("server-first banner");
+        });
+
+        let (read_pending_tx, read_pending_rx) = oneshot::channel();
+        let reader_task = tokio::spawn(async move {
+            let mut banner = vec![0; b"SSH-2.0-test\r\n".len()];
+            notify_when_pending(reader.read_exact(&mut banner), read_pending_tx)
+                .await
+                .expect("server-first banner");
+            banner
+        });
+        tokio::time::timeout(Duration::from_secs(2), read_pending_rx)
+            .await
+            .expect("read-first handshake should block on the small buffer")
+            .expect("read pending notification");
+
+        let (write_pending_tx, write_pending_rx) = oneshot::channel();
+        let writer_task = tokio::spawn(async move {
+            notify_when_pending(writer.write_all(&payload), write_pending_tx).await
+        });
+        tokio::time::timeout(Duration::from_secs(2), write_pending_rx)
+            .await
+            .expect("first write should wait for the partial handshake")
+            .expect("write pending notification");
+
+        start_server_tx.send(()).expect("start server task");
+        tokio::time::timeout(Duration::from_secs(2), writer_task)
+            .await
+            .expect("write should send its payload after the header")
+            .expect("writer task")
+            .expect("first write must not return WriteZero");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), reader_task)
+                .await
+                .expect("read should resume after the response")
+                .expect("reader task"),
+            b"SSH-2.0-test\r\n"
+        );
+        server_task.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn fragmented_response_header_is_resumed_without_losing_state() {
+        let (client, mut server) = tokio::io::duplex(1);
+        let mut stream = test_stream(client, None);
+        let payload = b"request";
+        let request_len = stream.build_handshake_header().len() + payload.len();
+
+        let server_task = tokio::spawn(async move {
+            let mut request = vec![0; request_len];
+            server.read_exact(&mut request).await.expect("request");
+            server.write_all(&[0]).await.expect("response version");
+            server.write_all(&[2]).await.expect("addon length");
+            server.write_all(&[0xaa]).await.expect("first addon byte");
+            server.write_all(&[0xbb]).await.expect("second addon byte");
+            server.write_all(b"response").await.expect("response body");
+        });
+
+        stream.write_all(payload).await.expect("request write");
+        let mut response = [0; 8];
+        stream
+            .read_exact(&mut response)
+            .await
+            .expect("response body");
+        assert_eq!(&response, b"response");
+        server_task.await.expect("server task");
+    }
+}

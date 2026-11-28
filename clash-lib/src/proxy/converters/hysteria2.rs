@@ -1,6 +1,6 @@
 use std::{
     net::{IpAddr, SocketAddr},
-    num::{NonZeroU16, ParseIntError},
+    num::{NonZeroU16, NonZeroUsize, ParseIntError},
     ops::RangeInclusive,
 };
 
@@ -12,6 +12,9 @@ use crate::{
     proxy::hysteria2::{Handler, HystOption, Obfs, SalamanderObfs},
     session::SocksAddr,
 };
+
+const DEFAULT_QUIC_CONNECTIONS: u8 = 1;
+const MAX_QUIC_CONNECTIONS: u8 = 8;
 
 #[derive(Clone)]
 pub struct PortGenerator {
@@ -85,6 +88,32 @@ impl TryFrom<OutboundHysteria2> for Handler {
     type Error = crate::Error;
 
     fn try_from(value: OutboundHysteria2) -> Result<Self, Self::Error> {
+        let quic_connections =
+            value.quic_connections.unwrap_or(DEFAULT_QUIC_CONNECTIONS);
+        if !(DEFAULT_QUIC_CONNECTIONS..=MAX_QUIC_CONNECTIONS)
+            .contains(&quic_connections)
+        {
+            return Err(crate::Error::InvalidConfig(format!(
+                "hysteria2 `quic-connections` must be between {DEFAULT_QUIC_CONNECTIONS} and {MAX_QUIC_CONNECTIONS}"
+            )));
+        }
+        let quic_connections = NonZeroUsize::new(quic_connections.into())
+            .ok_or_else(|| {
+                crate::Error::InvalidConfig(
+                    "hysteria2 `quic-connections` must be greater than zero"
+                        .to_owned(),
+                )
+            })?;
+        let udp_recv_buffer_size = value.udp_recv_buffer_size;
+        if udp_recv_buffer_size
+            .is_some_and(|size| size == 0 || size > i32::MAX as usize)
+        {
+            return Err(crate::Error::InvalidConfig(format!(
+                "hysteria2 `udp-recv-buffer-size` must be between 1 and {} bytes",
+                i32::MAX
+            )));
+        }
+
         if value
             .client_fingerprint
             .as_deref()
@@ -153,6 +182,8 @@ impl TryFrom<OutboundHysteria2> for Handler {
             down: value.down,
             cwnd: value.cwnd,
             udp_mtu: value.udp_mtu,
+            quic_connections,
+            udp_recv_buffer_size,
         }))
     }
 }
@@ -194,5 +225,84 @@ mod tests {
 
         let handler: Handler = config.try_into().expect("converter should succeed");
         assert_eq!(handler.name(), "hy2");
+    }
+
+    #[test]
+    fn convert_hysteria2_quic_connection_counts() {
+        crate::setup_default_crypto_provider();
+
+        for count in [1, 4, 8] {
+            let config = OutboundHysteria2 {
+                quic_connections: Some(count),
+                ..Default::default()
+            };
+            assert!(Handler::try_from(config).is_ok());
+        }
+
+        for count in [0, 9] {
+            let config = OutboundHysteria2 {
+                quic_connections: Some(count),
+                ..Default::default()
+            };
+            assert!(matches!(
+                Handler::try_from(config),
+                Err(crate::Error::InvalidConfig(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn parse_hysteria2_quic_connections_with_kebab_case_and_legacy_default() {
+        let legacy: OutboundHysteria2 = serde_yaml::from_str(
+            "name: hy2\nserver: example.com\nport: 443\npassword: secret\n",
+        )
+        .expect("legacy Hysteria2 config should remain valid");
+        assert_eq!(legacy.quic_connections, None);
+
+        let configured: OutboundHysteria2 = serde_yaml::from_str(
+            "name: hy2\nserver: example.com\nport: 443\npassword: secret\nquic-connections: 4\n",
+        )
+        .expect("quic-connections should parse from YAML");
+        assert_eq!(configured.quic_connections, Some(4));
+    }
+
+    #[test]
+    fn convert_hysteria2_udp_receive_buffer_size() {
+        crate::setup_default_crypto_provider();
+
+        for size in [1, 1024 * 1024, i32::MAX as usize] {
+            let config = OutboundHysteria2 {
+                udp_recv_buffer_size: Some(size),
+                ..Default::default()
+            };
+            assert!(Handler::try_from(config).is_ok());
+        }
+
+        let too_large = (i32::MAX as usize).saturating_add(1);
+        for size in [0, too_large] {
+            let config = OutboundHysteria2 {
+                udp_recv_buffer_size: Some(size),
+                ..Default::default()
+            };
+            assert!(matches!(
+                Handler::try_from(config),
+                Err(crate::Error::InvalidConfig(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn parse_hysteria2_udp_receive_buffer_size_with_kebab_case_and_legacy_default() {
+        let legacy: OutboundHysteria2 = serde_yaml::from_str(
+            "name: hy2\nserver: example.com\nport: 443\npassword: secret\n",
+        )
+        .expect("legacy Hysteria2 config should remain valid");
+        assert_eq!(legacy.udp_recv_buffer_size, None);
+
+        let configured: OutboundHysteria2 = serde_yaml::from_str(
+            "name: hy2\nserver: example.com\nport: 443\npassword: secret\nudp-recv-buffer-size: 1048576\n",
+        )
+        .expect("udp-recv-buffer-size should parse from YAML");
+        assert_eq!(configured.udp_recv_buffer_size, Some(1024 * 1024));
     }
 }
