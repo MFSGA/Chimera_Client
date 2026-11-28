@@ -14,6 +14,7 @@ configuration.
 | CLI plus | `cargo build -p clash-rs --features plus --locked` | Adds the `onion` compatibility feature to `standard`; the `onion` feature is empty and does not implement Tor. |
 | CLI Hysteria performance | `cargo build -p clash-rs --no-default-features --features hysteria-perf --locked` | Hysteria client profile with AWS-LC crypto and mixed port; excludes DNS DoH3, unrelated proxy protocols, and Dashboard. The Hysteria QUIC transport remains enabled. |
 | CLI REALITY performance | `cargo build -p clash-rs --no-default-features --features reality-perf --locked` | REALITY client profile with mixed port; excludes Hysteria, XHTTP/H3, and DNS DoH3. |
+| CLI Linux zero-copy experiment | `cargo build -p clash-rs --release --no-default-features --features reality,mixed_port,zero_copy --locked` | Explicitly enables the Linux TCP splice path for an isolated benchmark. This feature is opt-in and does not change the default or standard profile. |
 
 DNS server DoH3 is a separate `clash-dns` capability (`doh3-aws-lc-rs` or
 `doh3-ring`). The CLI's `aws-lc-rs` and `ring` aliases keep enabling the matching
@@ -57,6 +58,55 @@ VLESS encryption, which imply AWS-LC. A minimal `clash-lib --no-default-features
 build is supported as a compile boundary, but does not promise a useful
 standalone client configuration.
 
+## Benchmark-only protocol client packages
+
+The workspace includes runtime-front-end and direct-handler clients under
+`bench/minimal_transport_clients/`. Build one protocol profile per invocation
+so Cargo does not unify protocol features:
+
+```bash
+cargo build --release --locked -p chimera-hy2-perf-client \
+  --no-default-features --features hy2
+cargo build --release --locked -p chimera-reality-perf-client \
+  --no-default-features --features reality
+cargo build --release --locked -p chimera-hy2-core-perf-client \
+  --no-default-features --features hy2-core
+cargo build --release --locked -p chimera-reality-core-perf-client \
+  --no-default-features --features reality-core
+cargo build --release --locked -p chimera-hy2-protocol-perf-client \
+  --features aws-lc-rs
+cargo build --release --locked -p chimera-reality-protocol-perf-client
+cargo build --release --locked --no-default-features \
+  -p chimera-reality-protocol-perf-client
+```
+
+The four runtime-front-end and direct-handler packages disable `clash-lib`
+defaults and enable one protocol profile. The runtime-front-end clients call
+`clash_lib::start_scaffold` with a SOCKS
+listener and therefore start the shared resolver, DNS, routing, and
+configuration runtime. The direct-handler clients enable the
+`transport-bench-api` feature and call the production protocol handler through
+a numeric-only SOCKS5 test bridge; they skip the full runtime startup. Both are
+benchmark-only and are not product-supported build profiles. The direct API
+still builds `clash-lib` and measures the production handler without the full
+runtime. `chimera-hy2-protocol-perf-client` and
+`chimera-reality-protocol-perf-client` instead depend directly on the
+`chimera-hysteria2-core` and `chimera-reality-core` workspace crates; they skip
+Clash DNS, routing, configuration, and Controller dependencies. Both
+standalone clients use a TCP-only benchmark bridge in this slice; they do not
+cover product DNS, socket selection, TUN, routing, or UDP forwarding. Build and
+use details are in the
+[`minimal transport client notes`](../bench/minimal_transport_clients/README.md).
+Historical loopback results are in
+[`bench/minimal_transport_clients/RESULTS_LOCAL_LOOPBACK_2026-11-26.md`](../bench/minimal_transport_clients/RESULTS_LOCAL_LOOPBACK_2026-11-26.md).
+
+The standalone REALITY client's `vision` feature only adds Vision framing and
+stream processing; its REALITY and VLESS TCP code remains enabled in the
+`--no-default-features` profile. Its optional `--x25519mlkem768` runtime flag
+offers both X25519MLKEM768 and the associated X25519 share, then validates and
+uses the group selected by the server. A hybrid offer is not proof that the
+completed TLS handshake selected ML-KEM.
+
 ## Compile and compatibility profiles
 
 `ci/check-feature-profiles.sh` runs the following exact `cargo check` profiles:
@@ -84,6 +134,13 @@ that CLI feature aliases refer to existing core features. The `perf` CLI feature
 is an aggregate alias and does not enable jemalloc. Cross-target jobs that use
 `plus` verify compilation for those targets; they do not constitute real-device,
 TUN privilege, DNS, or network interoperability testing.
+
+The CLI `zero_copy` feature forwards to `clash-lib/zero_copy`. On Linux it allows
+the dispatcher to attempt TCP splice when both stream wrappers expose compatible
+raw TCP streams. Enabling the feature does not guarantee that a particular
+protocol path reaches that branch; verify the runtime trace before attributing
+a benchmark result to zero-copy. The benchmark profile above is for measurement
+and is not a change to the normal product defaults.
 
 ## Local validation record
 
