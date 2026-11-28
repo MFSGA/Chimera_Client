@@ -49,14 +49,25 @@ redir = ["clash-lib/redir"]
 http_port = ["clash-lib/http_port"]
 mixed_port = ["clash-lib/mixed_port"]
 zero_copy = ["clash-lib/zero_copy"]
-aws-lc-rs = ["dep:aws-lc-rs", "clash-lib/aws-lc-rs"]
-ring = ["clash-lib/ring"]
+aws-lc-rs-crypto = ["dep:aws-lc-rs", "clash-lib/aws-lc-rs"]
+aws-lc-rs = [
+    "aws-lc-rs-crypto",
+    "clash-lib/aws-lc-rs",
+    "clash-lib/dns-doh3-aws-lc-rs",
+]
+ring = ["clash-lib/ring", "clash-lib/dns-doh3-ring"]
+dns-doh3-aws-lc-rs = ["clash-lib/dns-doh3-aws-lc-rs"]
+dns-doh3-ring = ["clash-lib/dns-doh3-ring"]
 tracing = ["clash-lib/tracing"]
 extended-health-check = ["clash-lib/extended-health-check"]
 
 dashboard = ["clash-lib/dashboard"]
 
 perf = ["plus"]
+
+# Protocol-minimal release profiles used by bench/chimera_perf.
+hysteria-perf = ["hysteria", "aws-lc-rs-crypto", "mixed_port"]
+reality-perf = ["reality", "mixed_port"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

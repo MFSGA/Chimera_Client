@@ -22,6 +22,26 @@ use std::{
 use tracing::warn;
 use url::Url;
 
+#[cfg(not(any(feature = "dns-doh3-aws-lc-rs", feature = "dns-doh3-ring")))]
+pub(crate) fn validate_doh3_listener_feature(
+    has_doh3_listener: bool,
+) -> Result<(), Error> {
+    if has_doh3_listener {
+        return Err(Error::InvalidConfig(
+            "dns.listen.doh3 requires the dns-doh3-aws-lc-rs or dns-doh3-ring feature"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "dns-doh3-aws-lc-rs", feature = "dns-doh3-ring"))]
+pub(crate) fn validate_doh3_listener_feature(
+    _has_doh3_listener: bool,
+) -> Result<(), Error> {
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub struct NameServer {
     pub net: DNSNetMode,
@@ -764,6 +784,9 @@ impl TryFrom<&crate::config::def::Config> for Config {
     fn try_from(c: &crate::config::def::Config) -> Result<Self, Self::Error> {
         let dc = &c.dns;
         validate_fake_ip_filter_patterns(&dc.fake_ip_filter)?;
+        validate_doh3_listener_feature(dc.listen.as_ref().is_some_and(|listen| {
+            matches!(listen, DNSListen::Multiple(config) if config.doh3.is_some())
+        }))?;
         let compiled_policy = super::policy::CompiledDnsPolicy::compile(c)?;
         if dc.enable && dc.nameserver.is_empty() {
             return Err(Error::InvalidConfig(String::from(

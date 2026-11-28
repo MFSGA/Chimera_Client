@@ -18,5 +18,11 @@ run "Core default feature set" \
 run "CLI standard without Dashboard" \
   cargo check -p clash-rs --no-default-features \
     --features standard,aws-lc-rs --locked
+run "CLI Hysteria performance" \
+  cargo check -p clash-rs --no-default-features \
+    --features hysteria-perf --locked
+run "CLI REALITY performance" \
+  cargo check -p clash-rs --no-default-features \
+    --features reality-perf --locked
 run "CLI default with embedded Dashboard" \
   cargo check -p clash-rs --locked

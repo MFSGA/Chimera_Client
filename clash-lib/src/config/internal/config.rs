@@ -227,6 +227,7 @@ fn validate_macos_fake_ip_dns_egress(
 
 impl Config {
     pub fn validate(mut self) -> Result<Self, crate::Error> {
+        dns::config::validate_doh3_listener_feature(self.dns.listen.doh3.is_some())?;
         validate_default_nameserver_bootstrap(&self.dns.default_nameserver)?;
         dns::config::validate_fake_ip_filter_patterns(&self.dns.fake_ip_filter)?;
         self.dns.fallback_filter.domain =

@@ -164,6 +164,7 @@ default = [
     "zero_copy",
     "tls",
     "aws-lc-rs",
+    "dns-doh3-aws-lc-rs",
     "tun",
     "port",
     "reality",
@@ -201,6 +202,8 @@ ring = [
     "chimera-dns/ring",
     "boringtun?/ring",
 ]
+dns-doh3-aws-lc-rs = ["aws-lc-rs", "chimera-dns/doh3-aws-lc-rs"]
+dns-doh3-ring = ["ring", "chimera-dns/doh3-ring"]
 
 ws = ["tokio-tungstenite"]
 
