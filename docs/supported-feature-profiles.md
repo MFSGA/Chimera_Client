@@ -67,6 +67,10 @@ standalone client configuration.
    headless client profile.
 4. `clash-rs` defaults to verify the Dashboard-enabled client and embedded
    asset path.
+5. `clash-rs --no-default-features --features hysteria-perf` to verify the
+   minimal Hysteria client profile without DNS DoH3.
+6. `clash-rs --no-default-features --features reality-perf` to verify the
+   minimal REALITY client profile.
 
 CI runs this matrix on Linux after downloading the separately built Dashboard
 artifact. `cargo clippy -p clash-lib --all-targets --all-features` and the
