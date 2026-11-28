@@ -787,11 +787,10 @@ async fn failed_data_plane_reload_preserves_active_fake_ip_dns_owner() {
             .expect("failed to request data-plane reload")
     });
     // The replacement DNS listener can bind before the failing SOCKS
-    // listener completes its readiness timeout. During that window it must
-    // never serve the candidate's policy to clients of the old runtime.
+    // listener completes its readiness check. Sample that window when it
+    // exists; some platforms reject the occupied SOCKS bind immediately.
     let start = tokio::time::Instant::now();
     let mut probes = 0_usize;
-    let mut api_probes = 0_usize;
     let mut leaked_candidate_answer = false;
     let mut leaked_control_answer = false;
     while !reloading.is_finished() && start.elapsed() < Duration::from_secs(3) {
@@ -807,7 +806,6 @@ async fn failed_data_plane_reload_preserves_active_fake_ip_dns_owner() {
         // The replacement controller can be ready *before* the data plane.
         // Its /dns/query route must also reject unpublished resolver policy.
         if probes.is_multiple_of(3) {
-            api_probes += 1;
             let control_url: hyper::Uri = format!(
                 "http://127.0.0.1:{api_port}/dns/query?name=transient.reload.invalid&type=A"
             )
@@ -842,11 +840,6 @@ async fn failed_data_plane_reload_preserves_active_fake_ip_dns_owner() {
         http::StatusCode::INTERNAL_SERVER_ERROR,
         "occupied SOCKS port must fail replacement after preparation"
     );
-    assert!(probes >= 5, "failed reload was not probed in flight");
-    assert!(
-        api_probes > 0,
-        "candidate controller was not probed in flight"
-    );
     assert!(
         !leaked_candidate_answer,
         "candidate Fake-IP policy served a DNS answer before the failed reload rolled back"
@@ -854,6 +847,38 @@ async fn failed_data_plane_reload_preserves_active_fake_ip_dns_owner() {
     assert!(
         !leaked_control_answer,
         "candidate controller API returned its DNS policy before the failed reload rolled back"
+    );
+
+    // Even when the platform reports the bind failure before an in-flight
+    // probe can run, the restored controller must use the old Fake-IP owner.
+    let control_url: hyper::Uri = format!(
+        "http://127.0.0.1:{api_port}/dns/query?name=transient.reload.invalid&type=A"
+    )
+    .parse()
+    .unwrap();
+    let control_request = hyper::Request::builder()
+        .uri(&control_url)
+        .method(http::Method::GET)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let control_response = send_http_request(control_url, control_request)
+        .await
+        .expect("failed to query DNS through the restored controller");
+    assert_eq!(control_response.status(), http::StatusCode::OK);
+    let control_body = control_response
+        .into_body()
+        .collect()
+        .await
+        .expect("failed to read restored controller DNS response")
+        .to_bytes();
+    let control_body = String::from_utf8_lossy(&control_body);
+    assert!(
+        control_body.contains("198.18."),
+        "restored controller did not use the active Fake-IP owner: {control_body}"
+    );
+    assert!(
+        !control_body.contains("198.19."),
+        "failed reload left candidate Fake-IP policy in the controller: {control_body}"
     );
     wait_port_ready(api_port);
     wait_port_ready(socks_port);
