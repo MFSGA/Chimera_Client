@@ -12,6 +12,13 @@ RTO = "RTO"
 controllen = "controllen"
 # Intentional partial-read fixtures in Reality buffer tests.
 worl = "worl"
+# Deliberately misspelled YAML fields used by fail-closed configuration tests.
+polcy = "polcy"
+namserver = "namserver"
+policiy = "policiy"
+clinet = "clinet"
+addres = "addres"
+interfac = "interfac"
 
 [files]
 extend-exclude = [
