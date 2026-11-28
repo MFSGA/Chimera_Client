@@ -42,7 +42,7 @@ h3-quinn = { version = "0.0.10", optional = true }
 quinn-proto = { version = "0.11.14", default-features = false, optional = true }
 chimera-hysteria2-core = { path = "../crates/hysteria2-core", optional = true }
 chimera-reality-core = { path = "../crates/reality-core", default-features = false, features = ["vision"] }
-maxminddb = "0.32"
+maxminddb = "0.33"
 
 hickory-net = { version = "0.26", default-features = false }
 hickory-proto = { version = "0.26", default-features = false }
@@ -66,7 +66,7 @@ prost = "0.14"
 regex = "1"
 zstd = "0.14.3"
 filetime = "0.2"
-notify = "8"
+notify = "9"
 tempfile = "3.27"
 
 tracing = "0.1"
