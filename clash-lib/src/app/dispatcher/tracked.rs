@@ -31,7 +31,6 @@ impl Tracked {
     }
 
     #[allow(dead_code)]
-    #[allow(dead_code)]
     pub fn tracker_info(&self) -> Arc<TrackerInfo> {
         self.1.clone()
     }
