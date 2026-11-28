@@ -327,15 +327,8 @@ async fn connect(
             client.connect(socket, server, server_name).await
         }
         UdpSocketMode::Socket2AbstractSocket => {
-            let socket = socket2::Socket::new(
-                socket2::Domain::for_address(server),
-                socket2::Type::DGRAM,
-                None,
-            )?;
-            configure_udp_recv_buffer(&socket, udp_recv_buffer_bytes)?;
-            socket.set_broadcast(true)?;
-            socket.set_nonblocking(true)?;
-            let socket: std::net::UdpSocket = socket.into();
+            let socket =
+                socket2_udp_socket(server, local_bind, udp_recv_buffer_bytes)?;
             let socket = tokio::net::UdpSocket::from_std(socket)?;
             let socket = socket.into_std()?;
             let socket = quinn::TokioRuntime.wrap_udp_socket(socket)?;
@@ -361,21 +354,31 @@ async fn create_endpoint(
             client.new_endpoint(socket)
         }
         UdpSocketMode::Socket2AbstractSocket => {
-            let socket = socket2::Socket::new(
-                socket2::Domain::for_address(server),
-                socket2::Type::DGRAM,
-                None,
-            )?;
-            configure_udp_recv_buffer(&socket, udp_recv_buffer_bytes)?;
-            socket.set_broadcast(true)?;
-            socket.set_nonblocking(true)?;
-            let socket: std::net::UdpSocket = socket.into();
+            let socket =
+                socket2_udp_socket(server, local_bind, udp_recv_buffer_bytes)?;
             let socket = tokio::net::UdpSocket::from_std(socket)?;
             let socket = socket.into_std()?;
             let socket = quinn::TokioRuntime.wrap_udp_socket(socket)?;
             client.new_endpoint(socket)
         }
     }
+}
+
+fn socket2_udp_socket(
+    server: SocketAddr,
+    local_bind: SocketAddr,
+    udp_recv_buffer_bytes: Option<usize>,
+) -> anyhow::Result<std::net::UdpSocket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(server),
+        socket2::Type::DGRAM,
+        None,
+    )?;
+    configure_udp_recv_buffer(&socket, udp_recv_buffer_bytes)?;
+    socket.set_broadcast(true)?;
+    socket.bind(&local_bind.into())?;
+    socket.set_nonblocking(true)?;
+    Ok(socket.into())
 }
 
 fn configure_udp_recv_buffer(
@@ -559,7 +562,7 @@ async fn write_reply(stream: &mut TcpStream, reply: u8) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Arguments, EndpointMode, UdpSocketMode};
+    use super::{Arguments, EndpointMode, UdpSocketMode, socket2_udp_socket};
 
     fn parse(extra: &[&str]) -> anyhow::Result<Arguments> {
         let mut args = vec![
@@ -634,6 +637,18 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn socket2_udp_socket_binds_to_requested_local_address() {
+        let local_bind = "127.0.0.1:0".parse().unwrap();
+        let socket =
+            socket2_udp_socket("127.0.0.1:443".parse().unwrap(), local_bind, None)
+                .expect("create and bind socket2 UDP socket");
+
+        let actual = socket.local_addr().expect("read local socket address");
+        assert_eq!(actual.ip(), local_bind.ip());
+        assert_ne!(actual.port(), 0);
     }
 
     #[test]
