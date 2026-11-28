@@ -244,7 +244,8 @@ jobs:
 
       - name: Install cross-rs/cross
         if: matrix.tool == 'cross'
-        run: cargo install cross --git https://github.com/cross-rs/cross --rev "${CROSS_REF}" --locked
+        # The Cargo cache includes installed binaries, so replace a cached cross binary with the pinned revision.
+        run: cargo install cross --git https://github.com/cross-rs/cross --rev "${CROSS_REF}" --locked --force
 
       - name: Install Protoc
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
