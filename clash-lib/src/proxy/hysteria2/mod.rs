@@ -447,29 +447,49 @@ impl Handler {
             let requested_context =
                 connector.connection_pool_context(sess.iface.as_ref()).await;
             let destination = SocksAddr::Ip(server_socket_addr);
-            let (datagram, pool_context) = connector
-                .connect_datagram_with_pool_context(
-                    resolver,
+            let native_socket = connector
+                .connect_quinn_udp_socket_with_pool_context(
+                    resolver.clone(),
                     None,
-                    destination,
+                    destination.clone(),
                     sess.iface.as_ref(),
                     #[cfg(target_os = "linux")]
                     sess.so_mark,
-                    requested_context,
+                    requested_context.clone(),
                 )
                 .await?;
-            let socket = ConnectorUdpSocket::new(datagram, server_socket_addr);
-            let socket: Arc<dyn quinn::AsyncUdpSocket> =
-                if let Some(Obfs::Salamander(salamander_obfs)) =
-                    self.opts.obfs.as_ref()
-                {
-                    Arc::new(salamander::Salamander::with_inner(
-                        socket,
-                        salamander_obfs.key.to_vec(),
-                    ))
-                } else {
-                    socket
-                };
+            let (socket, pool_context): (
+                Arc<dyn quinn::AsyncUdpSocket>,
+                NetworkPoolContext,
+            ) = if let Some(native_socket) = native_socket {
+                native_socket
+            } else {
+                let (datagram, pool_context) = connector
+                    .connect_datagram_with_pool_context(
+                        resolver,
+                        None,
+                        destination,
+                        sess.iface.as_ref(),
+                        #[cfg(target_os = "linux")]
+                        sess.so_mark,
+                        requested_context,
+                    )
+                    .await?;
+                (
+                    ConnectorUdpSocket::new(datagram, server_socket_addr),
+                    pool_context,
+                )
+            };
+            let socket = if let Some(Obfs::Salamander(salamander_obfs)) =
+                self.opts.obfs.as_ref()
+            {
+                Arc::new(salamander::Salamander::with_inner(
+                    socket,
+                    salamander_obfs.key.to_vec(),
+                ))
+            } else {
+                socket
+            };
             (socket, pool_context)
         };
         pool_context.network_generation = pool_context

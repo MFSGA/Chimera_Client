@@ -354,6 +354,96 @@ fn observe_proxy_endpoint_datagram(
 }
 
 #[cfg(feature = "hysteria")]
+struct PathHealthQuinnSocket {
+    inner: Arc<dyn quinn::AsyncUdpSocket>,
+    proof: crate::app::runtime_state::TrafficProof,
+}
+
+#[cfg(feature = "hysteria")]
+impl std::fmt::Debug for PathHealthQuinnSocket {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PathHealthQuinnSocket")
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "hysteria")]
+impl quinn::AsyncUdpSocket for PathHealthQuinnSocket {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn quinn::UdpPoller>> {
+        self.inner.clone().create_io_poller()
+    }
+
+    fn try_send(&self, transmit: &quinn::udp::Transmit<'_>) -> std::io::Result<()> {
+        let result = self.inner.try_send(transmit);
+        if let Err(error) = &result
+            && error.kind() != std::io::ErrorKind::WouldBlock
+        {
+            self.proof.failed(error.kind());
+        }
+        result
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &mut [std::io::IoSliceMut<'_>],
+        meta: &mut [quinn::udp::RecvMeta],
+    ) -> Poll<std::io::Result<usize>> {
+        let result = self.inner.poll_recv(cx, bufs, meta);
+        match &result {
+            Poll::Ready(Ok(count)) if *count > 0 => {
+                let received_bytes =
+                    meta.iter().take(*count).map(|packet| packet.len).sum();
+                self.proof.received(received_bytes);
+            }
+            Poll::Ready(Err(error))
+                if error.kind() != std::io::ErrorKind::WouldBlock =>
+            {
+                self.proof.failed(error.kind());
+            }
+            _ => {}
+        }
+        result
+    }
+
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        self.inner.max_transmit_segments()
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        self.inner.max_receive_segments()
+    }
+
+    fn may_fragment(&self) -> bool {
+        self.inner.may_fragment()
+    }
+}
+
+#[cfg(feature = "hysteria")]
+pub(crate) fn observe_proxy_endpoint_quinn_socket(
+    socket: Arc<dyn quinn::AsyncUdpSocket>,
+    context: &NetworkPoolContext,
+    destination: &SocksAddr,
+) -> Arc<dyn quinn::AsyncUdpSocket> {
+    let Some(proof) = context.target_response_proof(
+        crate::app::runtime_state::TrafficKind::ProxyEndpointUdp,
+        destination,
+    ) else {
+        return socket;
+    };
+    Arc::new(PathHealthQuinnSocket {
+        inner: socket,
+        proof,
+    })
+}
+
+#[cfg(feature = "hysteria")]
 struct PathHealthTargetDatagram {
     inner: AnyOutboundDatagram,
     context: NetworkPoolContext,
@@ -614,6 +704,23 @@ pub trait RemoteConnector: Send + Sync + Debug {
             .await?;
         pool_context.path_id = None;
         Ok((datagram, pool_context))
+    }
+
+    /// Opt in when a connector can provide a Quinn socket without routing
+    /// packets through the generic `Stream + Sink` datagram adapter.
+    #[cfg(feature = "hysteria")]
+    #[doc(hidden)]
+    async fn connect_quinn_udp_socket_with_pool_context(
+        &self,
+        _resolver: ThreadSafeDNSResolver,
+        _src: Option<SocketAddr>,
+        _destination: SocksAddr,
+        _iface: Option<&OutboundInterface>,
+        #[cfg(target_os = "linux")] _packet_mark: Option<u32>,
+        _pool_context: NetworkPoolContext,
+    ) -> std::io::Result<Option<(Arc<dyn quinn::AsyncUdpSocket>, NetworkPoolContext)>>
+    {
+        Ok(None)
     }
 }
 
