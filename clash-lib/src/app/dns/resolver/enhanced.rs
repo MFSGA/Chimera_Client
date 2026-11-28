@@ -12563,7 +12563,7 @@ mod tests {
         );
         let mut config = make_proxy_nameserver_config();
         config.nameserver_policy.insert(
-            "PrOtEcTeD.ExAmPlE".to_owned(),
+            "pRoTeCtEd.ExAmPlE".to_owned(),
             vec![NameServer {
                 net: DNSNetMode::Udp,
                 host: url::Host::Ipv4("9.9.9.9".parse().unwrap()),
