@@ -140,7 +140,6 @@ impl InboundHandlerTrait for MixedInbound {
 
                 _ => {
                     let src = src_addr;
-                    let dispatcher = dispatcher.clone();
                     let authenticator = authenticator.clone();
                     tokio::spawn(async move {
                         http::handle_http(
