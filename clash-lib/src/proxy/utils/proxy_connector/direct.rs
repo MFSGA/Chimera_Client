@@ -649,6 +649,234 @@ fn uses_local_or_group_route(address: IpAddr) -> bool {
     address.is_loopback() || address.is_unspecified() || address.is_multicast()
 }
 
+impl DirectConnector {
+    async fn connect_proxy_endpoint_udp_socket(
+        &self,
+        resolver: &ThreadSafeDNSResolver,
+        src: Option<SocketAddr>,
+        destination: SocksAddr,
+        iface: Option<&OutboundInterface>,
+        #[cfg(target_os = "linux")] so_mark: Option<u32>,
+        mut pool_context: NetworkPoolContext,
+    ) -> std::io::Result<(tokio::net::UdpSocket, NetworkPoolContext)> {
+        let ipv6_enabled = resolver.ipv6();
+        let path_snapshot = if let Some(source) = self.path_source.as_ref() {
+            source
+                .snapshot()
+                .await
+                .filter(|(_, _, tun_enabled, _, _)| !tun_enabled)
+        } else {
+            None
+        };
+        let target = destination
+            .ip()
+            .map(|ip| SocketAddr::new(ip, destination.port()));
+        let generation_only_local_route = iface.is_none()
+            && target.is_some_and(|target| target.ip().is_loopback());
+        let check_epoch = requires_proxy_udp_generation_check(target, iface);
+        if check_epoch
+            && let Some((planned, _, _, status, _)) = path_snapshot.as_ref()
+        {
+            // A caller's pre-dial pool context is not a lease on an epoch.
+            // Reject an out-of-date context before trying any physical NIC.
+            if pool_context
+                .network_generation
+                .is_some_and(|value| value != *planned)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "proxy UDP pool context changed before socket creation",
+                ));
+            }
+            ensure_proxy_udp_generation(status, *planned).await?;
+        }
+        let mut selected_path = None;
+        let socket = if let (Some(path_snapshot), Some(target)) =
+            (path_snapshot.as_ref(), target)
+            && !uses_local_or_group_route(target.ip())
+        {
+            let (generation, observations, _, status, intent) = path_snapshot;
+            let (mut candidates, selected, rejected) =
+                Self::endpoint_paths_with_selection(
+                    iface,
+                    AddressFamily::from(target.ip()),
+                    observations,
+                    *generation,
+                    intent,
+                )?;
+            if iface.is_some() && selected.is_none() {
+                return Err(ProxyEndpointConnectError {
+                    kind: std::io::ErrorKind::NetworkUnreachable,
+                    message: format!(
+                        "required proxy UDP path unavailable for {:?}",
+                        AddressFamily::from(target.ip()),
+                    ),
+                    candidate_paths: candidates
+                        .iter()
+                        .map(|path| path.id.clone())
+                        .collect(),
+                    attempted_paths: Vec::new(),
+                    rejected,
+                }
+                .into_io_error());
+            }
+            let mut endpoint_rejected_paths = rejected;
+            if let Some(eligible) = pool_context.eligible_path_ids.as_ref() {
+                for path in candidates
+                    .iter()
+                    .filter(|path| !eligible.contains(&path.id))
+                {
+                    endpoint_rejected_paths.push(
+                        crate::app::flow::CandidateRejection {
+                            path: path.id.clone(),
+                            reason:
+                                crate::app::flow::PathRejectionReason::Unavailable,
+                            intent_index: None,
+                        },
+                    );
+                }
+                candidates.retain(|path| eligible.contains(&path.id));
+            }
+            candidates.truncate(PROXY_UDP_PATH_ATTEMPT_LIMIT);
+            let endpoint_candidate_paths =
+                candidates.iter().map(|path| path.id.clone()).collect();
+            let mut endpoint_attempted_paths = Vec::new();
+
+            let required = iface.is_some()
+                || intent
+                    .intents
+                    .iter()
+                    .any(|entry| entry.strength == IntentStrength::Require);
+            let mut errors = Vec::new();
+            let mut last_error_kind = None;
+            let mut selected_socket = None;
+            for path in candidates {
+                if !endpoint_attempted_paths.contains(&path.id) {
+                    endpoint_attempted_paths.push(path.id.clone());
+                }
+                let attempt = async {
+                    let selected_iface =
+                        crate::proxy::direct::outbound_interface_for_path(
+                            &path,
+                            iface,
+                        )?;
+                    let source =
+                        crate::proxy::direct::source_socket_addr(&path)?;
+                    let socket = new_protected_udp_socket(
+                        Some(source),
+                        Some(&selected_iface),
+                        #[cfg(target_os = "linux")]
+                        so_mark,
+                        Some(target),
+                        ipv6_enabled,
+                    )
+                    .await?;
+                    let local = socket.local_addr()?;
+                    if local.ip() != source.ip() {
+                        return Err(new_io_error(format!(
+                            "proxy UDP socket used unexpected local address {} (requested {})",
+                            local.ip(),
+                            source.ip()
+                        )));
+                    }
+                    ensure_proxy_udp_generation(status, *generation).await?;
+                    Ok::<_, std::io::Error>(socket)
+                }
+                .await;
+                match attempt {
+                    Ok(socket) => {
+                        selected_path = Some(path);
+                        selected_socket = Some(socket);
+                        break;
+                    }
+                    Err(error) => {
+                        ensure_proxy_udp_generation(status, *generation).await?;
+                        last_error_kind = Some(error.kind());
+                        if let Some(reporter) = pool_context.reporter.as_ref() {
+                            reporter
+                                .capture_scoped(
+                                    crate::app::runtime_state::TrafficKind::ProxyEndpointUdp,
+                                    Some(path.id.clone()),
+                                    Some(destination.clone()),
+                                )
+                                .failed(error.kind());
+                        }
+                        errors.push(error.to_string());
+                    }
+                }
+            }
+
+            if let Some(socket) = selected_socket {
+                socket
+            } else if required {
+                return Err(ProxyEndpointConnectError {
+                    kind: last_error_kind
+                        .unwrap_or(std::io::ErrorKind::NetworkUnreachable),
+                    message: format!(
+                        "required proxy UDP path unavailable after {} bounded attempts: {}",
+                        PROXY_UDP_PATH_ATTEMPT_LIMIT,
+                        errors.join("; ")
+                    ),
+                    candidate_paths: endpoint_candidate_paths,
+                    attempted_paths: endpoint_attempted_paths,
+                    rejected: endpoint_rejected_paths,
+                }
+                .into_io_error());
+            } else {
+                new_protected_udp_socket(
+                    src,
+                    iface,
+                    #[cfg(target_os = "linux")]
+                    so_mark,
+                    Some(target),
+                    ipv6_enabled,
+                )
+                .await
+                .map_err(|error| {
+                    ProxyEndpointConnectError {
+                        kind: error.kind(),
+                        message: format!(
+                            "proxy UDP system-route fallback failed: {error}"
+                        ),
+                        candidate_paths: endpoint_candidate_paths,
+                        attempted_paths: endpoint_attempted_paths,
+                        rejected: endpoint_rejected_paths,
+                    }
+                    .into_io_error()
+                })?
+            }
+        } else {
+            new_protected_udp_socket(
+                src,
+                iface,
+                #[cfg(target_os = "linux")]
+                so_mark,
+                target,
+                ipv6_enabled,
+            )
+            .await?
+        };
+        // The selected-socket attempt checks the epoch after bind, but a
+        // preference fallback, OS-routed socket or a failed candidate path
+        // can also span a network update. Fail closed *before* publishing
+        // either the datagram or its reported path identity.
+        if check_epoch
+            && let Some((planned, _, _, status, _)) = path_snapshot.as_ref()
+        {
+            ensure_proxy_udp_generation(status, *planned).await?;
+        }
+        pool_context.path_id = selected_path.as_ref().map(|path| path.id.clone());
+        pool_context.network_generation = selected_path
+            .as_ref()
+            .map(|path| path.id.network_generation)
+            .or_else(|| path_snapshot.as_ref().map(|(generation, ..)| *generation))
+            .or(pool_context.network_generation);
+        pool_context.generation_only_local_route = generation_only_local_route;
+        pool_context.direct_local_route_pooling_supported = true;
+        Ok((socket, pool_context))
+    }
+}
+
 #[async_trait]
 impl RemoteConnector for DirectConnector {
     fn supports_generation_only_local_route_pooling(&self) -> bool {
@@ -1126,233 +1354,66 @@ impl RemoteConnector for DirectConnector {
         destination: SocksAddr,
         iface: Option<&OutboundInterface>,
         #[cfg(target_os = "linux")] so_mark: Option<u32>,
-        mut pool_context: NetworkPoolContext,
+        pool_context: NetworkPoolContext,
     ) -> std::io::Result<(AnyOutboundDatagram, NetworkPoolContext)> {
-        let ipv6_enabled = resolver.ipv6();
-        let path_snapshot = if let Some(source) = self.path_source.as_ref() {
-            source
-                .snapshot()
-                .await
-                .filter(|(_, _, tun_enabled, _, _)| !tun_enabled)
-        } else {
-            None
-        };
-        let target = destination
-            .ip()
-            .map(|ip| SocketAddr::new(ip, destination.port()));
-        let generation_only_local_route = iface.is_none()
-            && target.is_some_and(|target| target.ip().is_loopback());
-        let check_epoch = requires_proxy_udp_generation_check(target, iface);
-        if check_epoch
-            && let Some((planned, _, _, status, _)) = path_snapshot.as_ref()
-        {
-            // A caller's pre-dial pool context is not a lease on an epoch.
-            // Reject an out-of-date context before trying any physical NIC.
-            if pool_context
-                .network_generation
-                .is_some_and(|value| value != *planned)
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    "proxy UDP pool context changed before socket creation",
-                ));
-            }
-            ensure_proxy_udp_generation(status, *planned).await?;
-        }
-        let mut selected_path = None;
-        let socket = if let (Some(path_snapshot), Some(target)) =
-            (path_snapshot.as_ref(), target)
-            && !uses_local_or_group_route(target.ip())
-        {
-            let (generation, observations, _, status, intent) = path_snapshot;
-            let (mut candidates, selected, rejected) =
-                Self::endpoint_paths_with_selection(
-                    iface,
-                    AddressFamily::from(target.ip()),
-                    observations,
-                    *generation,
-                    intent,
-                )?;
-            if iface.is_some() && selected.is_none() {
-                return Err(ProxyEndpointConnectError {
-                    kind: std::io::ErrorKind::NetworkUnreachable,
-                    message: format!(
-                        "required proxy UDP path unavailable for {:?}",
-                        AddressFamily::from(target.ip()),
-                    ),
-                    candidate_paths: candidates
-                        .iter()
-                        .map(|path| path.id.clone())
-                        .collect(),
-                    attempted_paths: Vec::new(),
-                    rejected,
-                }
-                .into_io_error());
-            }
-            let mut endpoint_rejected_paths = rejected;
-            if let Some(eligible) = pool_context.eligible_path_ids.as_ref() {
-                for path in candidates
-                    .iter()
-                    .filter(|path| !eligible.contains(&path.id))
-                {
-                    endpoint_rejected_paths.push(
-                        crate::app::flow::CandidateRejection {
-                            path: path.id.clone(),
-                            reason:
-                                crate::app::flow::PathRejectionReason::Unavailable,
-                            intent_index: None,
-                        },
-                    );
-                }
-                candidates.retain(|path| eligible.contains(&path.id));
-            }
-            candidates.truncate(PROXY_UDP_PATH_ATTEMPT_LIMIT);
-            let endpoint_candidate_paths =
-                candidates.iter().map(|path| path.id.clone()).collect();
-            let mut endpoint_attempted_paths = Vec::new();
-
-            let required = iface.is_some()
-                || intent
-                    .intents
-                    .iter()
-                    .any(|entry| entry.strength == IntentStrength::Require);
-            let mut errors = Vec::new();
-            let mut last_error_kind = None;
-            let mut selected_socket = None;
-            for path in candidates {
-                if !endpoint_attempted_paths.contains(&path.id) {
-                    endpoint_attempted_paths.push(path.id.clone());
-                }
-                let attempt = async {
-                    let selected_iface =
-                        crate::proxy::direct::outbound_interface_for_path(
-                            &path,
-                            iface,
-                        )?;
-                    let source =
-                        crate::proxy::direct::source_socket_addr(&path)?;
-                    let socket = new_protected_udp_socket(
-                        Some(source),
-                        Some(&selected_iface),
-                        #[cfg(target_os = "linux")]
-                        so_mark,
-                        Some(target),
-                        ipv6_enabled,
-                    )
-                    .await?;
-                    let local = socket.local_addr()?;
-                    if local.ip() != source.ip() {
-                        return Err(new_io_error(format!(
-                            "proxy UDP socket used unexpected local address {} (requested {})",
-                            local.ip(),
-                            source.ip()
-                        )));
-                    }
-                    ensure_proxy_udp_generation(status, *generation).await?;
-                    Ok::<_, std::io::Error>(socket)
-                }
-                .await;
-                match attempt {
-                    Ok(socket) => {
-                        selected_path = Some(path);
-                        selected_socket = Some(socket);
-                        break;
-                    }
-                    Err(error) => {
-                        ensure_proxy_udp_generation(status, *generation).await?;
-                        last_error_kind = Some(error.kind());
-                        if let Some(reporter) = pool_context.reporter.as_ref() {
-                            reporter
-                                .capture_scoped(
-                                    crate::app::runtime_state::TrafficKind::ProxyEndpointUdp,
-                                    Some(path.id.clone()),
-                                    Some(destination.clone()),
-                                )
-                                .failed(error.kind());
-                        }
-                        errors.push(error.to_string());
-                    }
-                }
-            }
-
-            if let Some(socket) = selected_socket {
-                socket
-            } else if required {
-                return Err(ProxyEndpointConnectError {
-                    kind: last_error_kind
-                        .unwrap_or(std::io::ErrorKind::NetworkUnreachable),
-                    message: format!(
-                        "required proxy UDP path unavailable after {} bounded attempts: {}",
-                        PROXY_UDP_PATH_ATTEMPT_LIMIT,
-                        errors.join("; ")
-                    ),
-                    candidate_paths: endpoint_candidate_paths,
-                    attempted_paths: endpoint_attempted_paths,
-                    rejected: endpoint_rejected_paths,
-                }
-                .into_io_error());
-            } else {
-                new_protected_udp_socket(
-                    src,
-                    iface,
-                    #[cfg(target_os = "linux")]
-                    so_mark,
-                    Some(target),
-                    ipv6_enabled,
-                )
-                .await
-                .map_err(|error| {
-                    ProxyEndpointConnectError {
-                        kind: error.kind(),
-                        message: format!(
-                            "proxy UDP system-route fallback failed: {error}"
-                        ),
-                        candidate_paths: endpoint_candidate_paths,
-                        attempted_paths: endpoint_attempted_paths,
-                        rejected: endpoint_rejected_paths,
-                    }
-                    .into_io_error()
-                })?
-            }
-        } else {
-            new_protected_udp_socket(
+        let observed_destination = destination.clone();
+        let (socket, pool_context) = self
+            .connect_proxy_endpoint_udp_socket(
+                &resolver,
                 src,
+                destination,
                 iface,
                 #[cfg(target_os = "linux")]
                 so_mark,
-                target,
-                ipv6_enabled,
+                pool_context,
             )
-            .await?
-        };
-        // The selected-socket attempt checks the epoch after bind, but a
-        // preference fallback, OS-routed socket or a failed candidate path
-        // can also span a network update. Fail closed *before* publishing
-        // either the datagram or its reported path identity.
-        if check_epoch
-            && let Some((planned, _, _, status, _)) = path_snapshot.as_ref()
-        {
-            ensure_proxy_udp_generation(status, *planned).await?;
-        }
-        let dgram = OutboundDatagramImpl::new(socket, resolver);
-        pool_context.path_id = selected_path.as_ref().map(|path| path.id.clone());
-        pool_context.network_generation = selected_path
-            .as_ref()
-            .map(|path| path.id.network_generation)
-            .or_else(|| path_snapshot.as_ref().map(|(generation, ..)| *generation))
-            .or(pool_context.network_generation);
-        pool_context.generation_only_local_route = generation_only_local_route;
-        pool_context.direct_local_route_pooling_supported = true;
-        let dgram = ChainedDatagramWrapper::new_with_network_path_id(
-            dgram,
+            .await?;
+        let datagram = OutboundDatagramImpl::new(socket, resolver);
+        let datagram = ChainedDatagramWrapper::new_with_network_path_id(
+            datagram,
             pool_context.path_id.clone(),
         );
-        let dgram = observe_proxy_endpoint_datagram(
-            Box::new(dgram),
+        let datagram = observe_proxy_endpoint_datagram(
+            Box::new(datagram),
             &pool_context,
-            &destination,
+            &observed_destination,
         );
-        Ok((dgram, pool_context))
+        Ok((datagram, pool_context))
+    }
+
+    #[cfg(feature = "hysteria")]
+    async fn connect_quinn_udp_socket_with_pool_context(
+        &self,
+        resolver: ThreadSafeDNSResolver,
+        src: Option<SocketAddr>,
+        destination: SocksAddr,
+        iface: Option<&OutboundInterface>,
+        #[cfg(target_os = "linux")] so_mark: Option<u32>,
+        pool_context: NetworkPoolContext,
+    ) -> std::io::Result<Option<(Arc<dyn quinn::AsyncUdpSocket>, NetworkPoolContext)>>
+    {
+        use quinn::Runtime;
+
+        let observed_destination = destination.clone();
+        let (socket, pool_context) = self
+            .connect_proxy_endpoint_udp_socket(
+                &resolver,
+                src,
+                destination,
+                iface,
+                #[cfg(target_os = "linux")]
+                so_mark,
+                pool_context,
+            )
+            .await?;
+        let socket = socket.into_std()?;
+        let socket = quinn::TokioRuntime.wrap_udp_socket(socket)?;
+        let socket = observe_proxy_endpoint_quinn_socket(
+            socket,
+            &pool_context,
+            &observed_destination,
+        );
+        Ok(Some((socket, pool_context)))
     }
 }
 
@@ -1405,6 +1466,24 @@ mod tests {
         },
         session::SocksAddr,
     };
+
+    #[cfg(feature = "hysteria")]
+    async fn send_quinn_datagram(
+        socket: &Arc<dyn quinn::AsyncUdpSocket>,
+        transmit: &quinn::udp::Transmit<'_>,
+    ) -> std::io::Result<()> {
+        let mut poller = socket.clone().create_io_poller();
+        loop {
+            match socket.try_send(transmit) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::future::poll_fn(|cx| poller.as_mut().poll_writable(cx))
+                        .await?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
 
     #[test]
     fn global_ipv6_filter_keeps_ipv4_and_rejects_ipv6_only_endpoints() {
@@ -2202,6 +2281,156 @@ mod tests {
                 .data,
             b"quic handshake"
         );
+        status.record_traffic(events.recv().await.unwrap());
+        let value = serde_json::to_value(status).unwrap();
+        assert_eq!(value["trafficEvidence"][0]["kind"], "proxyEndpointUdp");
+        assert_eq!(value["pathHealth"][0]["state"], "available");
+        assert_eq!(value["pathHealth"][0]["path"]["interface"]["name"], "wifi0");
+        assert_eq!(value["destinationPathHealth"][0]["family"], "ipv4");
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[tokio::test]
+    async fn direct_connector_native_quinn_socket_round_trips_loopback() {
+        use quinn::udp::Transmit;
+
+        let endpoint = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let endpoint_addr = endpoint.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buffer = [0; 64];
+            if let Ok((length, peer)) = endpoint.recv_from(&mut buffer).await {
+                let _ = endpoint.send_to(&buffer[..length], peer).await;
+            }
+        });
+
+        let mut resolver = MockClashResolver::new();
+        resolver.expect_ipv6().return_const(false);
+        let connector = DirectConnector::new();
+        let (socket, connected) = connector
+            .connect_quinn_udp_socket_with_pool_context(
+                Arc::new(resolver),
+                None,
+                SocksAddr::Ip(endpoint_addr),
+                None,
+                #[cfg(target_os = "linux")]
+                None,
+                NetworkPoolContext::default(),
+            )
+            .await
+            .unwrap()
+            .expect("direct connector should opt into the native Quinn socket");
+
+        assert_eq!(connected.path_id, None);
+        assert!(connected.generation_only_local_route);
+        assert!(connected.direct_local_route_pooling_supported);
+        send_quinn_datagram(
+            &socket,
+            &Transmit {
+                destination: endpoint_addr,
+                ecn: None,
+                contents: b"native-quinn-udp",
+                segment_size: None,
+                src_ip: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut received = [0; 64];
+        let mut meta = [quinn::udp::RecvMeta::default(); 1];
+        let count = {
+            let mut bufs = [std::io::IoSliceMut::new(&mut received)];
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                std::future::poll_fn(|cx| {
+                    socket.poll_recv(cx, &mut bufs, &mut meta)
+                }),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        };
+        assert_eq!(count, 1);
+        assert_eq!(&received[..meta[0].len], b"native-quinn-udp");
+        let local = socket.local_addr().unwrap();
+        assert_ne!(local.port(), 0);
+    }
+
+    #[cfg(feature = "hysteria")]
+    #[tokio::test]
+    async fn native_quinn_endpoint_response_reports_the_bound_path() {
+        use quinn::{Runtime, TokioRuntime, udp::Transmit};
+
+        let mut status = NetworkStatus::default();
+        status.lifecycle(Lifecycle::Running, "test");
+        let (tx, mut events) = mpsc::channel(1);
+        let reporter = status.traffic_reporter(tx);
+        let source = NetworkPathSource::default();
+        source.attach_traffic_reporter(reporter).await;
+        let path_id = NetworkPathId {
+            interface: InterfaceId {
+                name: "wifi0".to_owned(),
+                index: 4,
+            },
+            family: AddressFamily::Ipv4,
+            source_address: Some(Ipv4Addr::LOCALHOST.into()),
+            network_generation: 0,
+        };
+        let endpoint = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let endpoint_addr = endpoint.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buffer = [0; 32];
+            if let Ok((length, peer)) = endpoint.recv_from(&mut buffer).await {
+                let _ = endpoint.send_to(&buffer[..length], peer).await;
+            }
+        });
+        let context = NetworkPoolContext {
+            network_generation: Some(0),
+            path_id: Some(path_id),
+            eligible_path_ids: None,
+            generation_only_local_route: false,
+            direct_local_route_pooling_supported: false,
+            reporter: source.traffic_reporter().await,
+        };
+        let local = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let inner = TokioRuntime
+            .wrap_udp_socket(local.into_std().unwrap())
+            .unwrap();
+        let socket = super::observe_proxy_endpoint_quinn_socket(
+            inner,
+            &context,
+            &SocksAddr::Ip(endpoint_addr),
+        );
+        send_quinn_datagram(
+            &socket,
+            &Transmit {
+                destination: endpoint_addr,
+                ecn: None,
+                contents: b"quinn-proxy-handshake",
+                segment_size: None,
+                src_ip: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut received = [0; 64];
+        let mut meta = [quinn::udp::RecvMeta::default(); 1];
+        let count = {
+            let mut bufs = [std::io::IoSliceMut::new(&mut received)];
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                std::future::poll_fn(|cx| {
+                    socket.poll_recv(cx, &mut bufs, &mut meta)
+                }),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        };
+        assert_eq!(count, 1);
+        assert_eq!(&received[..meta[0].len], b"quinn-proxy-handshake");
+
         status.record_traffic(events.recv().await.unwrap());
         let value = serde_json::to_value(status).unwrap();
         assert_eq!(value["trafficEvidence"][0]["kind"], "proxyEndpointUdp");
