@@ -399,7 +399,7 @@ where
     }
 
     if let Some(c) = listen.doh3 {
-        #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+        #[cfg(any(feature = "doh3-aws-lc-rs", feature = "doh3-ring"))]
         {
             let started = UdpSocket::bind(c.addr)
                 .await
@@ -430,10 +430,10 @@ where
             has_server |= started;
             listener_failed |= !started;
         }
-        #[cfg(not(any(feature = "aws-lc-rs", feature = "ring")))]
+        #[cfg(not(any(feature = "doh3-aws-lc-rs", feature = "doh3-ring")))]
         {
             warn!(
-                "DoH3 listener {} ignored because chimera-dns was built without aws-lc-rs or ring",
+                "DoH3 listener {} requires the doh3-aws-lc-rs or doh3-ring feature",
                 c.addr
             );
             listener_failed = true;
@@ -781,16 +781,18 @@ mod plain_tests {
 
 #[cfg(all(test, any(feature = "aws-lc-rs", feature = "ring")))]
 mod tests {
+    use crate::DoH3Config;
     use crate::{
-        DNSListenAddr, DoH3Config, DoHConfig, DoTConfig, MockDnsMessageExchanger,
+        DNSListenAddr, DoHConfig, DoTConfig, MockDnsMessageExchanger,
         tests::setup_default_crypto_provider,
         tls::{self, global_root_store},
     };
     use futures::FutureExt;
+    #[cfg(any(feature = "doh3-aws-lc-rs", feature = "doh3-ring"))]
+    use hickory_net::h3::H3ClientStream;
     use hickory_net::{
         client::{Client, ClientHandle},
         h2::HttpsClientStream,
-        h3::H3ClientStream,
         runtime::TokioRuntimeProvider,
         tcp::TcpClientStream,
         tls::tls_client_connect,
@@ -939,9 +941,13 @@ mod tests {
         let doh_addr = doh_sock.local_addr()?;
         drop(doh_sock);
 
-        let doh3_sock = UdpSocket::bind("127.0.0.1:0").await?;
-        let doh3_addr = doh3_sock.local_addr()?;
-        drop(doh3_sock);
+        #[cfg(any(feature = "doh3-aws-lc-rs", feature = "doh3-ring"))]
+        let doh3_addr = {
+            let doh3_sock = UdpSocket::bind("127.0.0.1:0").await?;
+            let addr = doh3_sock.local_addr()?;
+            drop(doh3_sock);
+            addr
+        };
 
         let test_resources =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/resources");
@@ -968,12 +974,15 @@ mod tests {
                 ca_key: Some(test_key.clone()),
                 ca_cert: Some(test_cert.clone()),
             }),
+            #[cfg(any(feature = "doh3-aws-lc-rs", feature = "doh3-ring"))]
             doh3: Some(DoH3Config {
                 addr: doh3_addr,
                 hostname: Some("dns.example.com".to_string()),
-                ca_key: Some(test_key),
-                ca_cert: Some(test_cert),
+                ca_key: Some(test_key.clone()),
+                ca_cert: Some(test_cert.clone()),
             }),
+            #[cfg(not(any(feature = "doh3-aws-lc-rs", feature = "doh3-ring")))]
+            doh3: None,
         };
 
         let listener =
@@ -1042,22 +1051,47 @@ mod tests {
         tokio::spawn(bg);
         send_query(&mut client).await?;
 
-        let mut tls_config = ClientConfig::builder()
-            .with_root_certificates(global_root_store())
-            .with_no_client_auth();
-        tls_config.alpn_protocols = vec!["h3".into()];
-        tls_config
-            .dangerous()
-            .set_certificate_verifier(Arc::new(tls::DummyTlsVerifier::new()));
+        #[cfg(any(feature = "doh3-aws-lc-rs", feature = "doh3-ring"))]
+        {
+            let mut tls_config = ClientConfig::builder()
+                .with_root_certificates(global_root_store())
+                .with_no_client_auth();
+            tls_config.alpn_protocols = vec!["h3".into()];
+            tls_config
+                .dangerous()
+                .set_certificate_verifier(Arc::new(tls::DummyTlsVerifier::new()));
 
-        let stream = H3ClientStream::builder()
-            .crypto_config(tls_config)
-            .build(doh3_addr, "dns.example.com".into(), "/dns-query".into())
-            .await?;
-        let (mut client, bg) = Client::<TokioRuntimeProvider>::from_sender(stream);
-        tokio::spawn(bg);
-        send_query(&mut client).await?;
+            let stream = H3ClientStream::builder()
+                .crypto_config(tls_config)
+                .build(doh3_addr, "dns.example.com".into(), "/dns-query".into())
+                .await?;
+            let (mut client, bg) =
+                Client::<TokioRuntimeProvider>::from_sender(stream);
+            tokio::spawn(bg);
+            send_query(&mut client).await?;
+        }
 
         Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(not(any(feature = "doh3-aws-lc-rs", feature = "doh3-ring")))]
+    async fn doh3_listener_without_feature_is_rejected() {
+        let listener = super::get_dns_listener(
+            DNSListenAddr {
+                doh3: Some(DoH3Config {
+                    addr: "127.0.0.1:0".parse().unwrap(),
+                    ca_cert: None,
+                    ca_key: None,
+                    hostname: Some("dns.example.com".to_owned()),
+                }),
+                ..Default::default()
+            },
+            MockDnsMessageExchanger::new(),
+            std::path::Path::new("."),
+        )
+        .await;
+
+        assert!(listener.is_none());
     }
 }
