@@ -1,0 +1,19 @@
+[package]
+name = "chimera-transport-bench-bootstrap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+hysteria = ["clash-lib/hysteria"]
+
+[dependencies]
+anyhow = "1"
+clash-lib = { path = "../../../clash-lib", default-features = false, features = ["transport-bench-api"] }
+tokio = { version = "1", features = ["io-util", "net", "rt-multi-thread"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints]
+workspace = true

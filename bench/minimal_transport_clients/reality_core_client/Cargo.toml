@@ -1,0 +1,27 @@
+[package]
+name = "chimera-reality-core-perf-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+reality-core = [
+    "clash-lib/transport-bench-api",
+    "clash-lib/reality",
+]
+zero-copy = ["reality-core", "clash-lib/zero_copy"]
+splice-diagnostics = ["reality-core", "clash-lib/splice-diagnostics"]
+
+[dependencies]
+chimera-transport-bench-bootstrap = { path = "../core_bootstrap" }
+clash-lib = { path = "../../../clash-lib", default-features = false }
+
+[[bin]]
+name = "chimera-reality-core-perf-client"
+path = "src/main.rs"
+required-features = ["reality-core"]
+
+[lints]
+workspace = true

@@ -1,0 +1,28 @@
+[package]
+name = "chimera-hy2-core-perf-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+hy2-handler = [
+    "clash-lib/transport-bench-api",
+    "clash-lib/hysteria",
+    "chimera-transport-bench-bootstrap/hysteria",
+]
+hy2-core = ["hy2-handler", "clash-lib/aws-lc-rs"]
+hy2-core-ring = ["hy2-handler", "clash-lib/ring"]
+
+[dependencies]
+chimera-transport-bench-bootstrap = { path = "../core_bootstrap" }
+clash-lib = { path = "../../../clash-lib", default-features = false }
+
+[[bin]]
+name = "chimera-hy2-core-perf-client"
+path = "src/main.rs"
+required-features = ["hy2-handler"]
+
+[lints]
+workspace = true

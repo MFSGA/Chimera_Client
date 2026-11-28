@@ -1,0 +1,25 @@
+[package]
+name = "chimera-hy2-perf-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+hy2 = [
+    "clash-lib/hysteria",
+    "clash-lib/aws-lc-rs",
+]
+
+[dependencies]
+chimera-minimal-client-bootstrap = { path = "../bootstrap" }
+clash-lib = { path = "../../../clash-lib", default-features = false }
+
+[[bin]]
+name = "chimera-hy2-perf-client"
+path = "src/main.rs"
+required-features = ["hy2"]
+
+[lints]
+workspace = true
