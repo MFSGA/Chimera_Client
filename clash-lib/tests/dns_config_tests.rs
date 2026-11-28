@@ -1382,7 +1382,12 @@ fn enabled_redir_host_mode_is_rejected_as_unimplemented() {
 
 #[test]
 fn encrypted_dns_listeners_require_certificate_pairs() {
-    for protocol in ["doh", "dot", "doh3"] {
+    #[cfg(any(feature = "dns-doh3-aws-lc-rs", feature = "dns-doh3-ring"))]
+    let protocols = ["doh", "dot", "doh3"];
+    #[cfg(not(any(feature = "dns-doh3-aws-lc-rs", feature = "dns-doh3-ring")))]
+    let protocols = ["doh", "dot"];
+
+    for protocol in protocols {
         let listener =
             format!("  listen:\n    {protocol}:\n      addr: 127.0.0.1:8443\n");
         let listener_without_certificate = base_config(&format!(
@@ -1413,6 +1418,55 @@ fn encrypted_dns_listeners_require_certificate_pairs() {
             "\n  enable: true\n  nameserver:\n    - 1.1.1.1\n  default-nameserver:\n    - 223.5.5.5\n{listener}"
         )));
     }
+}
+
+#[cfg(not(any(feature = "dns-doh3-aws-lc-rs", feature = "dns-doh3-ring")))]
+#[test]
+fn configured_doh3_listener_requires_compiled_support() {
+    let yaml = base_config(
+        r#"
+  enable: true
+  nameserver:
+    - 1.1.1.1
+  default-nameserver:
+    - 223.5.5.5
+  listen:
+    doh3:
+      addr: 127.0.0.1:8443
+      ca-cert: server.crt
+      ca-key: server.key
+"#,
+    );
+
+    let err = parse_error(yaml);
+    assert!(
+        err.to_string().contains("dns.listen.doh3 requires the"),
+        "unexpected error: {err}"
+    );
+}
+
+#[cfg(not(any(feature = "dns-doh3-aws-lc-rs", feature = "dns-doh3-ring")))]
+#[test]
+fn internal_doh3_listener_requires_compiled_support_when_dns_is_disabled() {
+    let mut internal = Config::Str(base_config(""))
+        .try_parse()
+        .expect("valid base configuration");
+    internal.dns.enable = false;
+    internal.dns.listen.doh3 = Some(clash_lib::app::dns::config::DoH3Config {
+        addr: "127.0.0.1:8443".parse().unwrap(),
+        ca_cert: None,
+        ca_key: None,
+        hostname: Some("dns.example.com".to_owned()),
+    });
+
+    let error = match Config::Internal(internal).try_parse() {
+        Ok(_) => panic!("internal DNS must reject a listener without its feature"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        error.contains("dns.listen.doh3 requires the"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]

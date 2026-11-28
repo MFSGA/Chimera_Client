@@ -12,6 +12,15 @@ configuration.
 | CLI default | `cargo build -p clash-rs --locked` | Enables `standard`, `aws-lc-rs`, and `dashboard`; embeds the separately built `clash-dashboard/dist/` assets. |
 | CLI standard, headless | `cargo build -p clash-rs --no-default-features --features standard,aws-lc-rs --locked` | Enables the standard protocol and listener bundle with AWS-LC, without embedding the Dashboard or requiring Node.js. |
 | CLI plus | `cargo build -p clash-rs --features plus --locked` | Adds the `onion` compatibility feature to `standard`; the `onion` feature is empty and does not implement Tor. |
+| CLI Hysteria performance | `cargo build -p clash-rs --no-default-features --features hysteria-perf --locked` | Hysteria client profile with AWS-LC crypto and mixed port; excludes DNS DoH3, unrelated proxy protocols, and Dashboard. The Hysteria QUIC transport remains enabled. |
+| CLI REALITY performance | `cargo build -p clash-rs --no-default-features --features reality-perf --locked` | REALITY client profile with mixed port; excludes Hysteria, XHTTP/H3, and DNS DoH3. |
+
+DNS server DoH3 is a separate `clash-dns` capability (`doh3-aws-lc-rs` or
+`doh3-ring`). The CLI's `aws-lc-rs` and `ring` aliases keep enabling the matching
+DoH3 capability for compatibility; `aws-lc-rs-crypto` selects the AWS-LC crypto
+provider without DNS DoH3. The library default keeps AWS-LC DoH3 enabled. A
+reduced profile without a matching DoH3 feature rejects `dns.listen.doh3`
+during configuration conversion.
 
 ## Protocol coverage compared with the local reference
 

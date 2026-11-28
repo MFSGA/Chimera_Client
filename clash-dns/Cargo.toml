@@ -8,21 +8,27 @@ license = { workspace = true }
 # authors = { workspace = true }
 
 [features]
-default = ["aws-lc-rs"]
+default = ["aws-lc-rs", "doh3-aws-lc-rs"]
 aws-lc-rs = [
     "rustls/aws-lc-rs",
     "hickory-server/https-aws-lc-rs",
-    "hickory-server/h3-aws-lc-rs",
     "hickory-proto/dnssec-aws-lc-rs",
     "hickory-net/https-aws-lc-rs",
+]
+doh3-aws-lc-rs = [
+    "aws-lc-rs",
+    "hickory-server/h3-aws-lc-rs",
     "hickory-net/h3-aws-lc-rs",
 ]
 ring = [
     "rustls/ring",
     "hickory-server/https-ring",
-    "hickory-server/h3-ring",
     "hickory-proto/dnssec-ring",
     "hickory-net/https-ring",
+]
+doh3-ring = [
+    "ring",
+    "hickory-server/h3-ring",
     "hickory-net/h3-ring",
 ]
 
