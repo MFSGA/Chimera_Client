@@ -21,12 +21,12 @@ use crate::{
     impl_default_connector,
     proxy::vless::{
         datagram::OutboundDatagramVless,
-        vision::VisionStream,
         xudp::{OutboundDatagramXudp, global_id_for_session},
     },
     session::Session,
 };
 use async_trait::async_trait;
+use chimera_reality_core::{TargetAddr, VisionStream};
 use std::{io, sync::Arc};
 use tracing::debug;
 
@@ -35,13 +35,6 @@ pub(crate) mod encryption;
 #[cfg(feature = "vless-encryption")]
 mod encryption_stream;
 mod stream;
-mod tls_deframer;
-mod tls_fuzzy_deframer;
-mod tls_handshake_util;
-mod vision;
-mod vision_filter;
-mod vision_pad;
-mod vision_unpad;
 mod xudp;
 
 pub struct HandlerOptions {
@@ -116,18 +109,26 @@ impl Handler {
             s
         };
 
+        let destination = match &sess.destination {
+            crate::session::SocksAddr::Ip(address) => TargetAddr::Ip(*address),
+            crate::session::SocksAddr::Domain(domain, port) => {
+                TargetAddr::Domain(domain.clone(), *port)
+            }
+        };
+        let protocol_stream: chimera_reality_core::AnyStream = s;
+
         let vless_stream = if self.xudp && is_udp {
             VlessStream::new_xudp(
-                s,
+                protocol_stream,
                 &self.opts.uuid,
-                &sess.destination,
+                &destination,
                 self.opts.flow.clone(),
             )?
         } else {
             VlessStream::new(
-                s,
+                protocol_stream,
                 &self.opts.uuid,
-                &sess.destination,
+                &destination,
                 is_udp,
                 self.opts.flow.clone(),
             )?
@@ -1033,6 +1034,7 @@ mod path_health_tests {
         },
         session::{Session, SocksAddr},
     };
+    use chimera_reality_core::TargetAddr;
 
     const TEST_UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
 
@@ -1135,8 +1137,14 @@ mod path_health_tests {
             assert_eq!(request_header[17], 0, "request add-ons should be empty");
             assert_eq!(request_header[18], 1, "VLESS command must be TCP");
 
+            let protocol_target = match &server_target {
+                SocksAddr::Ip(address) => TargetAddr::Ip(*address),
+                SocksAddr::Domain(domain, port) => {
+                    TargetAddr::Domain(domain.clone(), *port)
+                }
+            };
             let mut expected_target = BytesMut::new();
-            server_target.write_to_buf_vmess(&mut expected_target);
+            protocol_target.write_to_vless_buffer(&mut expected_target);
             let mut encoded_target = vec![0; expected_target.len()];
             tls.read_exact(&mut encoded_target)
                 .await

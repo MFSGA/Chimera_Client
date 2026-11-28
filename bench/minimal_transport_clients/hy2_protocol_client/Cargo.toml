@@ -1,0 +1,25 @@
+[package]
+name = "chimera-hy2-protocol-perf-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+aws-lc-rs = ["rustls/aws_lc_rs", "chimera-hysteria2-core/aws-lc-rs"]
+
+[dependencies]
+anyhow = "1"
+chimera-hysteria2-core = { path = "../../../crates/hysteria2-core" }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
+rustls = { version = "0.23", default-features = false }
+rustls-pemfile = "2"
+socket2 = { version = "0.6", features = ["all"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+
+[[bin]]
+name = "chimera-hy2-protocol-perf-client"
+path = "src/main.rs"
+
+[lints]
+workspace = true

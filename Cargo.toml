@@ -9,7 +9,17 @@ members = [
     "clash-netstack",
     "vendor/boring-noise",
     "vendor/sock2proc",
-    "xhttp-h2-phaseb"
+    "xhttp-h2-phaseb",
+    "crates/hysteria2-core",
+    "crates/reality-core",
+    "bench/minimal_transport_clients/hy2_protocol_client",
+    "bench/minimal_transport_clients/reality_protocol_client",
+    "bench/minimal_transport_clients/bootstrap",
+    "bench/minimal_transport_clients/hy2_client",
+    "bench/minimal_transport_clients/reality_client",
+    "bench/minimal_transport_clients/core_bootstrap",
+    "bench/minimal_transport_clients/hy2_core_client",
+    "bench/minimal_transport_clients/reality_core_client",
 ]
 
 

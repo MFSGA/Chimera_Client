@@ -1,3 +1,10 @@
+mod tls_deframer;
+mod tls_fuzzy_deframer;
+mod tls_handshake_util;
+mod vision_filter;
+mod vision_pad;
+mod vision_unpad;
+
 use std::{
     io,
     pin::Pin,
@@ -12,9 +19,9 @@ use bytes::{Buf, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::{debug, error};
 
-use crate::proxy::{AnyStream, transport::VisionOptions};
+use crate::{AnyStream, VisionOptions};
 
-use super::{
+use self::{
     tls_fuzzy_deframer::{DeframeResult, FuzzyTlsDeframer},
     vision_filter::VisionFilter,
     vision_unpad::{UnpadCommand, VisionUnpadder},
@@ -64,6 +71,8 @@ pub struct VisionStream {
     read_unpadder: VisionUnpadder,
     read_splice_flag: Option<Arc<AtomicBool>>,
     write_splice_flag: Option<Arc<AtomicBool>>,
+    #[cfg(all(feature = "reality", feature = "splice-diagnostics"))]
+    last_splice_diagnostic_state: Option<u16>,
 }
 
 impl VisionStream {
@@ -98,17 +107,85 @@ impl VisionStream {
             read_unpadder: VisionUnpadder::new(uuid_bytes),
             read_splice_flag,
             write_splice_flag,
+            #[cfg(all(feature = "reality", feature = "splice-diagnostics"))]
+            last_splice_diagnostic_state: None,
         })
+    }
+
+    #[cfg(feature = "reality")]
+    pub fn raw_io_mut_for_splice(&mut self) -> Option<&mut AnyStream> {
+        if !self.raw_splice_state_ready() {
+            #[cfg(feature = "splice-diagnostics")]
+            {
+                let state = self.raw_splice_diagnostic_state();
+                if self.last_splice_diagnostic_state != Some(state) {
+                    tracing::trace!(
+                        read_direct_raw = state & (1 << 0) != 0,
+                        write_direct_raw = state & (1 << 1) != 0,
+                        write_switch_idle = state & (1 << 2) != 0,
+                        write_buffer_empty = state & (1 << 3) != 0,
+                        write_deframer_empty = state & (1 << 4) != 0,
+                        decoded_buffer_empty = state & (1 << 5) != 0,
+                        raw_buffer_empty = state & (1 << 6) != 0,
+                        response_received = state & (1 << 7) != 0,
+                        read_splice_flag = state & (1 << 8) != 0,
+                        write_splice_flag = state & (1 << 9) != 0,
+                        "Vision raw splice state is waiting for a drained direct boundary"
+                    );
+                    self.last_splice_diagnostic_state = Some(state);
+                }
+            }
+            return None;
+        }
+        let result = self
+            .inner
+            .as_mut()
+            .as_any_mut()
+            .downcast_mut::<crate::vless::VlessStream>()?
+            .raw_io_mut_for_vision();
+        #[cfg(feature = "splice-diagnostics")]
+        if result.is_none() {
+            tracing::trace!(
+                "Vision state is ready but VLESS or REALITY TLS has not exposed the TCP socket"
+            );
+        }
+        result
+    }
+
+    #[cfg(all(feature = "reality", feature = "splice-diagnostics"))]
+    fn raw_splice_diagnostic_state(&self) -> u16 {
+        u16::from(self.read_mode == ReadMode::DirectRaw)
+            | (u16::from(self.write_mode == WriteMode::DirectRaw) << 1)
+            | (u16::from(self.pending_write_switch == PendingWriteSwitch::None) << 2)
+            | (u16::from(self.write_buf.is_empty()) << 3)
+            | (u16::from(self.write_deframer.pending_bytes() == 0) << 4)
+            | (u16::from(self.decoded.is_empty()) << 5)
+            | (u16::from(self.raw.is_empty()) << 6)
+            | (u16::from(!self.vless_response_pending) << 7)
+            | (u16::from(self.read_splice_flag.is_some()) << 8)
+            | (u16::from(self.write_splice_flag.is_some()) << 9)
+    }
+
+    #[cfg(feature = "reality")]
+    fn raw_splice_state_ready(&self) -> bool {
+        self.read_mode == ReadMode::DirectRaw
+            && self.write_mode == WriteMode::DirectRaw
+            && self.pending_write_switch == PendingWriteSwitch::None
+            && self.write_buf.is_empty()
+            && self.write_deframer.pending_bytes() == 0
+            && self.decoded.is_empty()
+            && self.raw.is_empty()
+            && !self.vless_response_pending
+            && self.read_splice_flag.is_some()
+            && self.write_splice_flag.is_some()
     }
 
     fn pad_frame(&mut self, data: &[u8], command: u8, is_tls: bool) {
         debug_assert!(data.len() <= MAX_VISION_CONTENT_LEN);
         let frame = if let Some(uuid) = self.user_uuid.take() {
-            super::vision_pad::pad_with_uuid_and_command(
-                data, &uuid, command, is_tls,
-            )
+            vision_pad::pad_with_uuid_and_command(data, &uuid, command, is_tls)
         } else {
-            super::vision_pad::pad_with_command(data, command, is_tls)
+            vision_pad::pad_with_command(data, command, is_tls)
         };
         self.write_buf.extend_from_slice(&frame);
     }
@@ -777,6 +854,28 @@ mod tests {
 
         assert!(!vs.process_raw_read().unwrap());
         assert_eq!(vs.read_mode, ReadMode::Framed);
+    }
+
+    #[test]
+    fn raw_splice_requires_both_direct_modes_and_drained_buffers() {
+        let (mut stream, _) = make_vision_pair_with_splice_flags();
+        assert!(!stream.raw_splice_state_ready());
+
+        stream.read_mode = ReadMode::DirectRaw;
+        stream.write_mode = WriteMode::DirectRaw;
+        stream.vless_response_pending = false;
+        assert!(stream.raw_splice_state_ready());
+
+        stream.decoded.extend_from_slice(b"pending");
+        assert!(!stream.raw_splice_state_ready());
+        stream.decoded.clear();
+
+        stream.write_buf.extend_from_slice(b"pending");
+        assert!(!stream.raw_splice_state_ready());
+        stream.write_buf.clear();
+
+        stream.read_mode = ReadMode::DirectTls;
+        assert!(!stream.raw_splice_state_ready());
     }
 
     #[test]

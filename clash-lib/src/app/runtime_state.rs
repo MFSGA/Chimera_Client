@@ -1626,6 +1626,11 @@ impl TrafficProof {
         self.path_id = path_id;
     }
 
+    #[cfg(all(target_os = "linux", feature = "zero_copy", feature = "reality"))]
+    pub(crate) fn is_reported(&self) -> bool {
+        self.reported.load(Ordering::Relaxed)
+    }
+
     pub fn received(&self, bytes: usize) {
         if bytes == 0 || self.reported.swap(true, Ordering::Relaxed) {
             return;

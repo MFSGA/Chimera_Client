@@ -217,8 +217,8 @@ pub enum ConnectorType {
     None,
 }
 
-pub trait ProxyStream: AsyncRead + AsyncWrite + Send + Sync + Unpin {}
-impl<T> ProxyStream for T where T: AsyncRead + AsyncWrite + Send + Sync + Unpin {}
+pub trait ProxyStream: chimera_reality_core::ProxyStream {}
+impl<T> ProxyStream for T where T: chimera_reality_core::ProxyStream {}
 pub type AnyStream = Box<dyn ProxyStream>;
 
 pub trait ClientStream: Downcast + AsyncRead + AsyncWrite + Send + Unpin {}

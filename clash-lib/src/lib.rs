@@ -38,6 +38,8 @@ pub mod config;
 mod proxy;
 /// 5
 mod session;
+#[cfg(feature = "transport-bench-api")]
+pub mod transport_bench;
 
 mod runner;
 

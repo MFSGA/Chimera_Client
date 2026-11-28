@@ -17,7 +17,7 @@ use crate::{
     proxy::{
         converters::hysteria2::PortGenerator,
         transport::ConnectorUdpSocket,
-        utils::{NetworkPoolContext, RemoteConnector},
+        utils::{NetworkPoolContext, RemoteConnector, UdpSocketConnectOptions},
     },
     session::SocksAddr,
 };
@@ -34,6 +34,7 @@ pub(super) struct UdpHopOptions {
     pub(super) iface: Option<OutboundInterface>,
     #[cfg(target_os = "linux")]
     pub(super) so_mark: Option<u32>,
+    pub(super) udp_recv_buffer_size: Option<usize>,
     pub(super) requested_context: NetworkPoolContext,
     pub(super) connection_cancellation: tokio_util::sync::CancellationToken,
     pub(super) interval: Option<Duration>,
@@ -74,6 +75,7 @@ struct HopSocketDialer {
     iface: Option<OutboundInterface>,
     #[cfg(target_os = "linux")]
     so_mark: Option<u32>,
+    udp_recv_buffer_size: Option<usize>,
     pool_context: NetworkPoolContext,
     expected_path_id: Option<crate::app::flow::NetworkPathId>,
 }
@@ -82,14 +84,17 @@ impl HopSocketDialer {
     async fn connect(&self) -> io::Result<Arc<dyn AsyncUdpSocket>> {
         let (datagram, pool_context) = self
             .connector
-            .connect_datagram_with_pool_context(
+            .connect_datagram_with_recv_buffer_size_and_pool_context(
                 self.resolver.clone(),
                 None,
                 SocksAddr::Ip(self.endpoint),
                 self.iface.as_ref(),
                 #[cfg(target_os = "linux")]
                 self.so_mark,
-                self.pool_context.clone(),
+                UdpSocketConnectOptions {
+                    udp_recv_buffer_size: self.udp_recv_buffer_size,
+                    pool_context: self.pool_context.clone(),
+                },
             )
             .await?;
         if !hop_context_matches(
@@ -185,19 +190,23 @@ impl UdpHop {
             iface,
             #[cfg(target_os = "linux")]
             so_mark,
+            udp_recv_buffer_size,
             requested_context,
             connection_cancellation,
             interval,
         } = options;
         let (datagram, pool_context) = connector
-            .connect_datagram_with_pool_context(
+            .connect_datagram_with_recv_buffer_size_and_pool_context(
                 resolver.clone(),
                 None,
                 SocksAddr::Ip(server_addr),
                 iface.as_ref(),
                 #[cfg(target_os = "linux")]
                 so_mark,
-                requested_context,
+                UdpSocketConnectOptions {
+                    udp_recv_buffer_size,
+                    pool_context: requested_context,
+                },
             )
             .await?;
         let socket = ConnectorUdpSocket::new(datagram, server_addr);
@@ -213,6 +222,7 @@ impl UdpHop {
             iface,
             #[cfg(target_os = "linux")]
             so_mark,
+            udp_recv_buffer_size,
             pool_context: hop_context,
             expected_path_id,
         };

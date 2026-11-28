@@ -1,0 +1,22 @@
+[package]
+name = "chimera-reality-perf-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+reality = ["clash-lib/reality"]
+
+[dependencies]
+chimera-minimal-client-bootstrap = { path = "../bootstrap" }
+clash-lib = { path = "../../../clash-lib", default-features = false }
+
+[[bin]]
+name = "chimera-reality-perf-client"
+path = "src/main.rs"
+required-features = ["reality"]
+
+[lints]
+workspace = true

@@ -558,6 +558,7 @@ where
                             continue;
                         }
                         Poll::Ready(Err(err)) => {
+                            write_tracker.track(*count as _);
                             return Poll::Ready(Err(
                                 CopyBidirectionalError::LeftClosed(err),
                             ));
@@ -617,6 +618,7 @@ where
                             continue;
                         }
                         Poll::Ready(Err(err)) => {
+                            read_tracker.track(*count as _);
                             return Poll::Ready(Err(
                                 CopyBidirectionalError::RightClosed(err),
                             ));
@@ -638,5 +640,199 @@ where
             downloaded: *b_to_a_count,
             idle_timeout: *idle_timeout,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io,
+        os::fd::{AsRawFd, RawFd},
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll},
+        time::Duration,
+    };
+
+    use tokio::{
+        io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
+        net::{TcpListener, TcpStream},
+    };
+
+    use super::{
+        CopyBidirectionalError, Stream, TrackCopy, zero_copy_bidirectional,
+    };
+
+    struct FailingShutdownStream(TcpStream);
+
+    impl AsRawFd for FailingShutdownStream {
+        fn as_raw_fd(&self) -> RawFd {
+            self.0.as_raw_fd()
+        }
+    }
+
+    impl AsyncRead for FailingShutdownStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for FailingShutdownStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::other("injected shutdown failure")))
+        }
+    }
+
+    impl Stream for FailingShutdownStream {
+        fn poll_read_ready_n(
+            &self,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), CopyBidirectionalError>> {
+            self.0.poll_read_ready(cx).map_err(Into::into)
+        }
+
+        fn poll_write_ready_n(
+            &self,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), CopyBidirectionalError>> {
+            self.0.poll_write_ready(cx).map_err(Into::into)
+        }
+
+        fn try_io_n<R>(
+            &self,
+            interest: tokio::io::Interest,
+            f: impl FnOnce() -> io::Result<R>,
+        ) -> io::Result<R> {
+            self.0.try_io(interest, f)
+        }
+    }
+
+    #[derive(Default)]
+    struct ByteCounter(AtomicUsize);
+
+    impl TrackCopy for ByteCounter {
+        fn track(&self, total: usize) {
+            self.0.fetch_add(total, Ordering::Relaxed);
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_error_still_tracks_spliced_bytes() {
+        let a_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind left listener");
+        let mut a_peer = TcpStream::connect(a_listener.local_addr().unwrap())
+            .await
+            .expect("connect left peer");
+        let (mut a, _) = a_listener.accept().await.expect("accept left relay");
+
+        let b_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind right listener");
+        let _b_peer = TcpStream::connect(b_listener.local_addr().unwrap())
+            .await
+            .expect("connect right peer");
+        let (b, _) = b_listener.accept().await.expect("accept right relay");
+        let mut b = FailingShutdownStream(b);
+
+        a_peer
+            .write_all(b"payload")
+            .await
+            .expect("write left payload");
+        a_peer.shutdown().await.expect("half-close left peer");
+
+        let read_tracker = Arc::new(ByteCounter::default());
+        let write_tracker = Arc::new(ByteCounter::default());
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            zero_copy_bidirectional(
+                &mut a,
+                &mut b,
+                read_tracker.clone(),
+                write_tracker.clone(),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("splice relay completes");
+
+        assert!(matches!(result, Err(CopyBidirectionalError::LeftClosed(_))));
+        assert_eq!(write_tracker.0.load(Ordering::Relaxed), b"payload".len());
+        assert_eq!(read_tracker.0.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn reverse_shutdown_error_still_tracks_spliced_bytes() {
+        let a_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind left listener");
+        let _a_peer = TcpStream::connect(a_listener.local_addr().unwrap())
+            .await
+            .expect("connect left peer");
+        let (a, _) = a_listener.accept().await.expect("accept left relay");
+        let mut a = FailingShutdownStream(a);
+
+        let b_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind right listener");
+        let mut b_peer = TcpStream::connect(b_listener.local_addr().unwrap())
+            .await
+            .expect("connect right peer");
+        let (mut b, _) = b_listener.accept().await.expect("accept right relay");
+
+        b_peer
+            .write_all(b"payload")
+            .await
+            .expect("write right payload");
+        b_peer.shutdown().await.expect("half-close right peer");
+
+        let read_tracker = Arc::new(ByteCounter::default());
+        let write_tracker = Arc::new(ByteCounter::default());
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            zero_copy_bidirectional(
+                &mut a,
+                &mut b,
+                read_tracker.clone(),
+                write_tracker.clone(),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("splice relay completes");
+
+        assert!(matches!(
+            result,
+            Err(CopyBidirectionalError::RightClosed(_))
+        ));
+        assert_eq!(read_tracker.0.load(Ordering::Relaxed), b"payload".len());
+        assert_eq!(write_tracker.0.load(Ordering::Relaxed), 0);
     }
 }

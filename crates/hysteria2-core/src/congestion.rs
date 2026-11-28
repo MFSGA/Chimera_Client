@@ -3,7 +3,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use quinn_proto::congestion::{Bbr, BbrConfig, Controller, ControllerFactory};
+use quinn_proto::congestion::{
+    Bbr, BbrConfig, Controller, ControllerFactory, ControllerMetrics,
+};
 
 const DEFAULT_CWND_PACKETS: u64 = 32;
 
@@ -251,6 +253,13 @@ impl Controller for DynController {
             .window()
     }
 
+    fn metrics(&self) -> ControllerMetrics {
+        self.0
+            .read()
+            .expect("hysteria2 dyn controller lock poisoned")
+            .metrics()
+    }
+
     fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
         self.0
             .write()
@@ -317,6 +326,59 @@ impl Controller for DynController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct MetricsController;
+
+    impl Controller for MetricsController {
+        fn on_sent(&mut self, _now: Instant, _bytes: u64, _last_packet_number: u64) {
+        }
+
+        fn on_congestion_event(
+            &mut self,
+            _now: Instant,
+            _sent: Instant,
+            _is_persistent_congestion: bool,
+            _lost_bytes: u64,
+        ) {
+        }
+
+        fn on_mtu_update(&mut self, _new_mtu: u16) {}
+
+        fn window(&self) -> u64 {
+            123
+        }
+
+        fn metrics(&self) -> ControllerMetrics {
+            let mut metrics = ControllerMetrics::default();
+            metrics.congestion_window = 123;
+            metrics.ssthresh = Some(456);
+            metrics.pacing_rate = Some(789);
+            metrics
+        }
+
+        fn clone_box(&self) -> Box<dyn Controller> {
+            Box::new(self.clone())
+        }
+
+        fn initial_window(&self) -> u64 {
+            123
+        }
+
+        fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+            self
+        }
+    }
+
+    #[test]
+    fn dyn_controller_forwards_controller_metrics() {
+        let controller = DynController::new(Box::new(MetricsController));
+        let metrics = controller.metrics();
+
+        assert_eq!(metrics.congestion_window, 123);
+        assert_eq!(metrics.ssthresh, Some(456));
+        assert_eq!(metrics.pacing_rate, Some(789));
+    }
 
     #[test]
     fn brutal_records_acknowledged_and_lost_bytes_without_connection_stats() {
