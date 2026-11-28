@@ -25,14 +25,14 @@ during configuration conversion.
 ## Protocol coverage compared with the local reference
 
 This comparison uses the checked-out `ref/` snapshot at
-`39d06a49ccb5c812ed7cd70b3028f3efcebeae6b` (2026-09-21). It describes source
+`2f62452678211746348b97e72fee0e78b8dc1b40` (2026-11-14). It describes source
 and feature coverage, not interoperability or runtime support on every target.
 
 | Area | Chimera Client | Local `ref/` snapshot |
 | --- | --- | --- |
 | Always-present outbound variants | Direct, Reject, SOCKS5, and VLESS | Direct, Reject, SOCKS5, AnyTLS, Trojan, VMess, VLESS, and Hysteria2 |
 | CLI `standard` feature bundle | Adds Shadowsocks, WireGuard, Trojan, AnyTLS, Hysteria2, TUN, and listener features | Adds Shadowsocks, TUIC, SSH, ShadowQUIC, WireGuard, Tailscale, TUN, TProxy, and Redir |
-| Chimera transport features | WebSocket, Reality, VLESS encryption, and XHTTP/H3 | No matching Reality, VLESS encryption, or XHTTP/H3 feature in this snapshot |
+| Chimera transport features | WebSocket, Reality, VLESS encryption, and XHTTP/H3 | XHTTP over H2 is present; this snapshot has no matching XHTTP/H3, Reality, or VLESS encryption feature |
 | Additional reference protocols | — | Tor is enabled by `plus`; Tailscale, TUIC, SSH, and ShadowQUIC are feature-gated |
 | `onion` feature | Empty compatibility feature; no Tor implementation | Enables the Tor client dependencies |
 
