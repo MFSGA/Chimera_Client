@@ -44,11 +44,7 @@ pub use simple_obfs::{
 pub use sip003::Sip003Plugin;
 use splice_tls_rustls::{SplicableRustlsStream, TlsRecordBoundaryIo};
 
-#[derive(Clone, Debug, Default)]
-pub struct VisionOptions {
-    pub read_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    pub write_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
-}
+pub use chimera_reality_core::VisionOptions;
 #[cfg(feature = "ws")]
 #[allow(unused_imports)]
 pub use v2ray::{V2RayOBFSOption, V2rayWsClient};

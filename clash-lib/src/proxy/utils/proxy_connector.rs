@@ -185,6 +185,14 @@ impl NetworkPoolContext {
     }
 }
 
+/// Options shared by UDP connector paths that need the observed network path
+/// context and an optional socket receive-buffer request.
+#[derive(Clone, Debug)]
+pub struct UdpSocketConnectOptions {
+    pub udp_recv_buffer_size: Option<usize>,
+    pub pool_context: NetworkPoolContext,
+}
+
 #[derive(Clone)]
 struct DirectStreamAttempt {
     endpoint: SocketAddr,
@@ -194,6 +202,66 @@ struct DirectStreamAttempt {
 struct PathHealthStream {
     inner: AnyStream,
     proof: crate::app::runtime_state::TrafficProof,
+}
+
+#[cfg(all(target_os = "linux", feature = "zero_copy", feature = "reality"))]
+pub(crate) fn vision_spliced_tcp_stream_mut(
+    stream: &mut AnyStream,
+) -> Option<&mut tokio::net::TcpStream> {
+    vision_spliced_tcp_stream_any_mut(stream.as_mut().as_any_mut())
+}
+
+#[cfg(all(target_os = "linux", feature = "zero_copy", feature = "reality"))]
+fn vision_spliced_tcp_stream_any_mut(
+    stream: &mut dyn std::any::Any,
+) -> Option<&mut tokio::net::TcpStream> {
+    if stream.is::<PathHealthStream>() {
+        let observer = stream.downcast_mut::<PathHealthStream>()?;
+        // Keep the observer in the copy path until it has seen the first
+        // response. Once that one-shot proof is reported, bypassing its reads
+        // cannot suppress the path-health success event.
+        if !observer.proof.is_reported() {
+            #[cfg(feature = "splice-diagnostics")]
+            tracing::trace!(
+                "raw socket access is waiting for the outer PathHealth response proof"
+            );
+            return None;
+        }
+        return vision_spliced_tcp_stream_mut(&mut observer.inner);
+    }
+
+    if stream.is::<chimera_reality_core::VisionStream>() {
+        let vision = stream.downcast_mut::<chimera_reality_core::VisionStream>()?;
+        let raw = vision.raw_io_mut_for_splice();
+        #[cfg(feature = "splice-diagnostics")]
+        tracing::trace!(
+            raw_io_available = raw.is_some(),
+            "Vision splice accessor checked its REALITY/VLESS layers"
+        );
+        let raw = raw?;
+        return vision_spliced_tcp_stream_any_mut(raw.as_mut().as_any_mut());
+    }
+
+    if stream.is::<tokio::net::TcpStream>() {
+        return stream.downcast_mut::<tokio::net::TcpStream>();
+    }
+    #[cfg(feature = "splice-diagnostics")]
+    tracing::trace!(
+        stream_type_id = ?stream.type_id(),
+        "raw Vision I/O is neither a TcpStream, VisionStream, nor PathHealthStream"
+    );
+    None
+}
+
+#[cfg(all(target_os = "linux", feature = "zero_copy", feature = "reality"))]
+pub(crate) fn is_vision_splice_candidate(stream: &mut AnyStream) -> bool {
+    let stream = stream.as_mut();
+    if let Some(observer) = stream.as_any_mut().downcast_mut::<PathHealthStream>() {
+        return is_vision_splice_candidate(&mut observer.inner);
+    }
+    stream
+        .as_any_mut()
+        .is::<chimera_reality_core::VisionStream>()
 }
 
 impl AsyncRead for PathHealthStream {
@@ -706,6 +774,41 @@ pub trait RemoteConnector: Send + Sync + Debug {
         Ok((datagram, pool_context))
     }
 
+    /// Connect a datagram endpoint for Hysteria2 and optionally request an OS
+    /// receive buffer size. Connectors that cannot apply an explicit size
+    /// must return an error instead of silently ignoring the setting.
+    #[cfg(feature = "hysteria")]
+    async fn connect_datagram_with_recv_buffer_size_and_pool_context(
+        &self,
+        resolver: ThreadSafeDNSResolver,
+        src: Option<SocketAddr>,
+        destination: SocksAddr,
+        iface: Option<&OutboundInterface>,
+        #[cfg(target_os = "linux")] packet_mark: Option<u32>,
+        options: UdpSocketConnectOptions,
+    ) -> std::io::Result<(AnyOutboundDatagram, NetworkPoolContext)> {
+        let UdpSocketConnectOptions {
+            udp_recv_buffer_size,
+            pool_context,
+        } = options;
+        if udp_recv_buffer_size.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "connector cannot apply the configured Hysteria2 UDP receive buffer size",
+            ));
+        }
+        self.connect_datagram_with_pool_context(
+            resolver,
+            src,
+            destination,
+            iface,
+            #[cfg(target_os = "linux")]
+            packet_mark,
+            pool_context,
+        )
+        .await
+    }
+
     /// Opt in when a connector can provide a Quinn socket without routing
     /// packets through the generic `Stream + Sink` datagram adapter.
     #[cfg(feature = "hysteria")]
@@ -721,6 +824,43 @@ pub trait RemoteConnector: Send + Sync + Debug {
     ) -> std::io::Result<Option<(Arc<dyn quinn::AsyncUdpSocket>, NetworkPoolContext)>>
     {
         Ok(None)
+    }
+
+    /// Establish an optional Quinn socket while honoring an explicit HY2
+    /// receive buffer size. Keep the original method above for connector
+    /// implementations that predate this option.
+    #[cfg(feature = "hysteria")]
+    #[doc(hidden)]
+    async fn connect_quinn_udp_socket_with_recv_buffer_size_and_pool_context(
+        &self,
+        resolver: ThreadSafeDNSResolver,
+        src: Option<SocketAddr>,
+        destination: SocksAddr,
+        iface: Option<&OutboundInterface>,
+        #[cfg(target_os = "linux")] packet_mark: Option<u32>,
+        options: UdpSocketConnectOptions,
+    ) -> std::io::Result<Option<(Arc<dyn quinn::AsyncUdpSocket>, NetworkPoolContext)>>
+    {
+        let UdpSocketConnectOptions {
+            udp_recv_buffer_size,
+            pool_context,
+        } = options;
+        if udp_recv_buffer_size.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "connector cannot apply the configured Hysteria2 UDP receive buffer size",
+            ));
+        }
+        self.connect_quinn_udp_socket_with_pool_context(
+            resolver,
+            src,
+            destination,
+            iface,
+            #[cfg(target_os = "linux")]
+            packet_mark,
+            pool_context,
+        )
+        .await
     }
 }
 

@@ -69,10 +69,23 @@ pub struct BidirectionalCopyReport {
     pub idle_timeout: bool,
 }
 
+enum CopyBidirectionalOutcome {
+    Complete(BidirectionalCopyReport),
+    SpliceReady {
+        uploaded: u64,
+        downloaded: u64,
+        idle_timeout: bool,
+    },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShutdownMode {
     HalfClose,
     FlushOnly,
+}
+
+fn allows_zero_copy_for_shutdown_mode(shutdown_mode: ShutdownMode) -> bool {
+    shutdown_mode == ShutdownMode::HalfClose
 }
 
 #[derive(Debug)]
@@ -115,6 +128,10 @@ impl CopyBuffer {
 
     pub fn amount_transferred(&self) -> u64 {
         self.amt
+    }
+
+    fn is_drained_and_open(&self) -> bool {
+        self.pos == self.cap && !self.read_done
     }
 
     pub fn poll_copy<R, W>(
@@ -213,6 +230,7 @@ struct CopyBidirectional<'a, A: ?Sized, B: ?Sized> {
     b_to_a_timeout_duration: Duration,
     shutdown_mode: ShutdownMode,
     idle_timeout: bool,
+    splice_probe: Option<fn(&mut A, &mut B) -> bool>,
 }
 
 fn reset_idle_timeout(
@@ -229,7 +247,7 @@ where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
-    type Output = Result<BidirectionalCopyReport, CopyBidirectionalError>;
+    type Output = Result<CopyBidirectionalOutcome, CopyBidirectionalError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // Unpack self into mut refs to each field to avoid borrow check issues.
@@ -246,7 +264,34 @@ where
             b_to_a_timeout_duration,
             shutdown_mode,
             idle_timeout,
+            splice_probe,
         } = &mut *self;
+
+        let splice_counts = if allows_zero_copy_for_shutdown_mode(*shutdown_mode) {
+            match (&*a_to_b, &*b_to_a) {
+                (
+                    TransferState::Running(upload),
+                    TransferState::Running(download),
+                ) if upload.is_drained_and_open()
+                    && download.is_drained_and_open() =>
+                {
+                    Some((*a_to_b_count + upload.amt, *b_to_a_count + download.amt))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(probe) = splice_probe
+            && let Some((uploaded, downloaded)) = splice_counts
+            && probe(&mut **a, &mut **b)
+        {
+            return Poll::Ready(Ok(CopyBidirectionalOutcome::SpliceReady {
+                uploaded,
+                downloaded,
+                idle_timeout: *idle_timeout,
+            }));
+        }
 
         let mut a = Pin::new(a);
         let mut b = Pin::new(b);
@@ -390,11 +435,13 @@ where
             }
         }
 
-        Poll::Ready(Ok(BidirectionalCopyReport {
-            uploaded: *a_to_b_count,
-            downloaded: *b_to_a_count,
-            idle_timeout: *idle_timeout,
-        }))
+        Poll::Ready(Ok(CopyBidirectionalOutcome::Complete(
+            BidirectionalCopyReport {
+                uploaded: *a_to_b_count,
+                downloaded: *b_to_a_count,
+                idle_timeout: *idle_timeout,
+            },
+        )))
     }
 }
 
@@ -406,48 +453,105 @@ pub async fn copy_bidirectional_with_report(
     b_to_a_timeout_duration: Duration,
     shutdown_mode: ShutdownMode,
 ) -> Result<BidirectionalCopyReport, CopyBidirectionalError> {
-    // Borrow the tracked stream so the dispatcher can attach a terminal reason
-    // before Drop schedules its closed-history snapshot.
-    // zero copy is only available on linux
+    // Linux splice is only available when both ends are raw TCP streams.
     #[cfg(all(target_os = "linux", feature = "zero_copy"))]
     {
-        // for zero copy, we need to track the download and upload amount with the
-        // assistance of the tracker it's somehow ugly, but i could not
-        // figure out a better way
-        let (r_tracker, w_tracker) = b.trackers();
-        // for socks5 & http listener, a is a raw TcpStream
-        let a_raw = a.downcast_mut::<tokio::net::TcpStream>();
-        // for direct outbound handler **without further chains**, b is a chained
-        // stream wrapper over tcpstream
-        let b_raw = b
-            .inner_mut()
-            .downcast_mut::<crate::app::dispatcher::ChainedStreamWrapper<tokio::net::TcpStream>>();
-        match (a_raw, b_raw) {
-            // zero copy is only available when both streams are raw TcpStream
-            (Some(a), Some(wrapper)) => {
+        if allows_zero_copy_for_shutdown_mode(shutdown_mode)
+            && zero_copy_streams_mut(&mut a, b).is_some()
+        {
+            let (read_tracker, write_tracker) = b.trackers();
+            if let Some((a_raw, b_raw)) = zero_copy_streams_mut(&mut a, b) {
                 tracing::trace!("using zero copy for bidirectional copy");
-                zero_copy_bidirectional(
-                    a,
-                    wrapper.inner_mut(),
-                    r_tracker,
-                    w_tracker,
+                return zero_copy_bidirectional(
+                    a_raw,
+                    b_raw,
+                    read_tracker,
+                    write_tracker,
                     a_to_b_timeout_duration,
                     b_to_a_timeout_duration,
                 )
-                .await
+                .await;
             }
-            _ => {
-                copy_buf_bidirectional_with_report(
+        }
+
+        #[cfg(feature = "reality")]
+        let vision_splice_candidate =
+            allows_zero_copy_for_shutdown_mode(shutdown_mode)
+                && is_vision_splice_candidate(&mut a, b);
+        #[cfg(feature = "reality")]
+        tracing::debug!(
+            vision_splice_candidate,
+            "checked whether the outbound stream can use Vision splice"
+        );
+
+        #[cfg(feature = "reality")]
+        if vision_splice_candidate {
+            let mut uploaded_before_splice = 0;
+            let mut downloaded_before_splice = 0;
+            let mut idle_timeout_before_splice = false;
+
+            loop {
+                match copy_buf_bidirectional_with_probe(
                     &mut a,
                     b,
                     size,
                     a_to_b_timeout_duration,
                     b_to_a_timeout_duration,
                     shutdown_mode,
+                    Some(vision_splice_probe),
                 )
-                .await
+                .await?
+                {
+                    CopyBidirectionalOutcome::Complete(mut report) => {
+                        report.uploaded += uploaded_before_splice;
+                        report.downloaded += downloaded_before_splice;
+                        report.idle_timeout |= idle_timeout_before_splice;
+                        return Ok(report);
+                    }
+                    CopyBidirectionalOutcome::SpliceReady {
+                        uploaded,
+                        downloaded,
+                        idle_timeout,
+                    } => {
+                        uploaded_before_splice += uploaded;
+                        downloaded_before_splice += downloaded;
+                        idle_timeout_before_splice |= idle_timeout;
+
+                        let (read_tracker, write_tracker) = b.trackers();
+                        if let Some((a_raw, b_raw)) =
+                            zero_copy_streams_mut(&mut a, b)
+                        {
+                            tracing::trace!(
+                                "using zero copy for bidirectional copy after Vision raw switch"
+                            );
+                            let mut report = zero_copy_bidirectional(
+                                a_raw,
+                                b_raw,
+                                read_tracker,
+                                write_tracker,
+                                a_to_b_timeout_duration,
+                                b_to_a_timeout_duration,
+                            )
+                            .await?;
+                            report.uploaded += uploaded_before_splice;
+                            report.downloaded += downloaded_before_splice;
+                            report.idle_timeout |= idle_timeout_before_splice;
+                            return Ok(report);
+                        }
+                    }
+                }
             }
         }
+
+        copy_buf_bidirectional_with_report(
+            &mut a,
+            b,
+            size,
+            a_to_b_timeout_duration,
+            b_to_a_timeout_duration,
+            shutdown_mode,
+        )
+        .await
     }
     #[cfg(not(all(target_os = "linux", feature = "zero_copy")))]
     {
@@ -461,6 +565,63 @@ pub async fn copy_bidirectional_with_report(
         )
         .await
     }
+}
+
+#[cfg(all(target_os = "linux", feature = "zero_copy"))]
+fn zero_copy_streams_mut<'a>(
+    a: &'a mut Box<dyn ClientStream>,
+    b: &'a mut TrackedStream,
+) -> Option<(&'a mut tokio::net::TcpStream, &'a mut tokio::net::TcpStream)> {
+    let a_raw = a.downcast_mut::<tokio::net::TcpStream>()?;
+    let b_any =
+        chimera_reality_core::ProxyStream::as_any_mut(b.inner_mut().as_mut());
+    type DirectTcpStreamWrapper =
+        crate::app::dispatcher::ChainedStreamWrapper<tokio::net::TcpStream>;
+    let b_raw = if b_any.is::<DirectTcpStreamWrapper>() {
+        let wrapper = b_any.downcast_mut::<DirectTcpStreamWrapper>()?;
+        wrapper.inner_mut()
+    } else {
+        #[cfg(feature = "reality")]
+        {
+            type AnyStreamWrapper = crate::app::dispatcher::ChainedStreamWrapper<
+                crate::proxy::AnyStream,
+            >;
+            let wrapper = b_any.downcast_mut::<AnyStreamWrapper>()?;
+            crate::proxy::utils::vision_spliced_tcp_stream_mut(wrapper.inner_mut())?
+        }
+        #[cfg(not(feature = "reality"))]
+        {
+            return None;
+        }
+    };
+    Some((a_raw, b_raw))
+}
+
+#[cfg(all(target_os = "linux", feature = "zero_copy", feature = "reality"))]
+fn is_vision_splice_candidate(
+    a: &mut Box<dyn ClientStream>,
+    b: &mut TrackedStream,
+) -> bool {
+    if a.downcast_mut::<tokio::net::TcpStream>().is_none() {
+        return false;
+    }
+    let Some(wrapper) = b
+        .inner_mut()
+        .downcast_mut::<crate::app::dispatcher::ChainedStreamWrapper<
+            crate::proxy::AnyStream,
+        >>()
+    else {
+        return false;
+    };
+    crate::proxy::utils::is_vision_splice_candidate(wrapper.inner_mut())
+}
+
+#[cfg(all(target_os = "linux", feature = "zero_copy", feature = "reality"))]
+fn vision_splice_probe(
+    a: &mut Box<dyn ClientStream>,
+    b: &mut TrackedStream,
+) -> bool {
+    zero_copy_streams_mut(a, b).is_some()
 }
 
 #[cfg(test)]
@@ -500,6 +661,41 @@ where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
+    match copy_buf_bidirectional_with_probe(
+        a,
+        b,
+        size,
+        a_to_b_timeout_duration,
+        b_to_a_timeout_duration,
+        shutdown_mode,
+        None,
+    )
+    .await?
+    {
+        CopyBidirectionalOutcome::Complete(report) => Ok(report),
+        CopyBidirectionalOutcome::SpliceReady {
+            uploaded,
+            downloaded,
+            idle_timeout,
+        } => Err(CopyBidirectionalError::Other(io::Error::other(format!(
+            "copy completed with an unexpected splice handoff ({uploaded} uploaded, {downloaded} downloaded, idle_timeout={idle_timeout})"
+        )))),
+    }
+}
+
+async fn copy_buf_bidirectional_with_probe<A, B>(
+    a: &mut A,
+    b: &mut B,
+    size: usize,
+    a_to_b_timeout_duration: Duration,
+    b_to_a_timeout_duration: Duration,
+    shutdown_mode: ShutdownMode,
+    splice_probe: Option<fn(&mut A, &mut B) -> bool>,
+) -> Result<CopyBidirectionalOutcome, CopyBidirectionalError>
+where
+    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
     CopyBidirectional {
         a,
         b,
@@ -513,6 +709,7 @@ where
         b_to_a_timeout_duration,
         shutdown_mode,
         idle_timeout: false,
+        splice_probe,
     }
     .await
 }
@@ -521,6 +718,7 @@ where
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use std::{
+        future::Future,
         pin::Pin,
         task::{Context, Poll},
         time::Duration,
@@ -533,9 +731,100 @@ mod tests {
     };
 
     use super::{
-        ShutdownMode, copy_buf_bidirectional_with_report,
+        CopyBidirectional, CopyBidirectionalOutcome, CopyBuffer, ShutdownMode,
+        TransferState, copy_buf_bidirectional_with_report,
         copy_buf_bidirectional_with_timeout,
     };
+
+    fn splice_ready_for_duplex(
+        _a: &mut tokio::io::DuplexStream,
+        _b: &mut tokio::io::DuplexStream,
+    ) -> bool {
+        true
+    }
+
+    #[tokio::test]
+    async fn splice_handoff_waits_until_buffered_bytes_are_written() {
+        let (mut a, _a_peer) = duplex(16);
+        let (mut b, mut b_peer) = duplex(16);
+        let mut upload = CopyBuffer::new_with_capacity(8).unwrap();
+        upload.buf[..4].copy_from_slice(b"data");
+        upload.cap = 4;
+        let copy = CopyBidirectional {
+            a: &mut a,
+            b: &mut b,
+            a_to_b: TransferState::Running(upload),
+            b_to_a: TransferState::Running(
+                CopyBuffer::new_with_capacity(8).unwrap(),
+            ),
+            a_to_b_count: 0,
+            b_to_a_count: 0,
+            a_to_b_delay: None,
+            b_to_a_delay: None,
+            a_to_b_timeout_duration: Duration::from_secs(1),
+            b_to_a_timeout_duration: Duration::from_secs(1),
+            shutdown_mode: ShutdownMode::HalfClose,
+            idle_timeout: false,
+            splice_probe: Some(splice_ready_for_duplex),
+        };
+        let mut copy = Box::pin(copy);
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(
+            matches!(copy.as_mut().poll(&mut cx), Poll::Pending),
+            "handoff must wait while the copy buffer still contains payload"
+        );
+
+        let mut forwarded = [0; 4];
+        b_peer
+            .read_exact(&mut forwarded)
+            .await
+            .expect("buffered payload reaches the outbound stream before splice");
+        assert_eq!(&forwarded, b"data");
+
+        assert!(matches!(
+            copy.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(CopyBidirectionalOutcome::SpliceReady {
+                uploaded: 4,
+                downloaded: 0,
+                idle_timeout: false,
+            }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn flush_only_mode_does_not_enter_splice_handoff() {
+        let (mut a, _a_peer) = duplex(16);
+        let (mut b, _b_peer) = duplex(16);
+        let copy = CopyBidirectional {
+            a: &mut a,
+            b: &mut b,
+            a_to_b: TransferState::Running(
+                CopyBuffer::new_with_capacity(8).unwrap(),
+            ),
+            b_to_a: TransferState::Running(
+                CopyBuffer::new_with_capacity(8).unwrap(),
+            ),
+            a_to_b_count: 0,
+            b_to_a_count: 0,
+            a_to_b_delay: None,
+            b_to_a_delay: None,
+            a_to_b_timeout_duration: Duration::from_secs(1),
+            b_to_a_timeout_duration: Duration::from_secs(1),
+            shutdown_mode: ShutdownMode::FlushOnly,
+            idle_timeout: false,
+            splice_probe: Some(splice_ready_for_duplex),
+        };
+        let mut copy = Box::pin(copy);
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(
+            matches!(copy.as_mut().poll(&mut cx), Poll::Pending),
+            "FlushOnly mode must keep the buffered relay and skip splice"
+        );
+    }
 
     #[tokio::test]
     async fn reports_idle_guard_when_peer_leaves_a_half_closed_flow_open() {

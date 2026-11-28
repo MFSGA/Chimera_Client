@@ -1,194 +1,45 @@
-#![allow(dead_code)]
-
-use async_trait::async_trait;
 use std::{
     io,
     sync::{Arc, atomic::AtomicBool},
 };
 
-use super::Transport;
-use crate::proxy::transport::splice_tls::SplicableTlsStream;
-use crate::proxy::{AnyStream, transport::VisionOptions};
+use crate::proxy::{AnyStream, transport::splice_tls::SplicableTlsStream};
 
-mod buf_reader;
-mod common;
-mod crypto_connection;
-mod crypto_handshake;
-mod crypto_tls_stream;
-mod reality_aead;
-mod reality_auth;
-mod reality_cipher_suite;
-mod reality_client_connection;
-mod reality_client_verify;
-mod reality_hybrid;
-mod reality_io_state;
-mod reality_reader_writer;
-mod reality_records;
-mod reality_tls13_keys;
-mod reality_tls13_messages;
-mod reality_util;
-mod slide_buffer;
-mod sync_adapter;
-mod util;
+use super::{Transport, VisionOptions};
 
-pub use reality_cipher_suite::CipherSuite;
-pub use reality_util::{decode_public_key, decode_short_id};
+pub use chimera_reality_core::{
+    Client, DEFAULT_REALITY_SHORT_ID, decode_public_key, decode_short_id,
+};
 
-pub(crate) use crypto_connection::CryptoConnection;
-pub(crate) use crypto_handshake::perform_crypto_handshake;
-pub(crate) use crypto_tls_stream::CryptoTlsStream;
-
-pub const DEFAULT_REALITY_SHORT_ID: &str = "";
-
-#[derive(Clone, Debug)]
-pub struct Client {
-    public_key: [u8; 32],
-    short_id: Vec<u8>,
-    server_name: String,
-    cipher_suites: Vec<CipherSuite>,
-    alpn_protocols: Vec<String>,
-    support_x25519mlkem768: bool,
-}
-
-impl Client {
-    pub fn new(
-        public_key: [u8; 32],
-        short_id: Vec<u8>,
-        server_name: String,
-        cipher_suites: Vec<CipherSuite>,
-    ) -> Self {
-        Self::new_with_alpn(
-            public_key,
-            short_id,
-            server_name,
-            cipher_suites,
-            Vec::new(),
-        )
-    }
-
-    pub fn new_with_alpn(
-        public_key: [u8; 32],
-        short_id: Vec<u8>,
-        server_name: String,
-        cipher_suites: Vec<CipherSuite>,
-        alpn_protocols: Vec<String>,
-    ) -> Self {
-        Self {
-            public_key,
-            short_id,
-            server_name,
-            cipher_suites,
-            alpn_protocols,
-            support_x25519mlkem768: false,
-        }
-    }
-
-    /// Opt in to X25519MLKEM768 for this REALITY transport.
-    /// Classic X25519 remains the default for older REALITY servers.
-    #[must_use]
-    pub fn with_x25519mlkem768(mut self, enabled: bool) -> Self {
-        self.support_x25519mlkem768 = enabled;
-        self
-    }
-
-    #[cfg(test)]
-    pub(crate) fn offers_x25519mlkem768(&self) -> bool {
-        self.support_x25519mlkem768
-    }
-
-    pub async fn handshake_stream(
-        &self,
-        stream: AnyStream,
-    ) -> io::Result<CryptoTlsStream<AnyStream>> {
-        let config = reality_client_connection::RealityClientConfig {
-            public_key: self.public_key,
-            short_id: self.short_id.clone(),
-            server_name: self.server_name.clone(),
-            cipher_suites: self.cipher_suites.clone(),
-            alpn_protocols: self.alpn_protocols.clone(),
-            support_x25519mlkem768: self.support_x25519mlkem768,
-        };
-        let conn = reality_client_connection::RealityClientConnection::new(config)?;
-        let mut connection = CryptoConnection::new_reality_client(conn);
-        let mut stream = stream;
-        perform_crypto_handshake(
-            &mut connection,
-            &mut stream,
-            common::TLS_MAX_RECORD_SIZE,
-        )
-        .await?;
-        Ok(CryptoTlsStream::new(stream, connection))
-    }
-}
-
-#[async_trait]
+#[async_trait::async_trait]
 impl Transport for Client {
     async fn proxy_stream(&self, stream: AnyStream) -> io::Result<AnyStream> {
-        tracing::debug!(
-            "Starting Reality client handshake for server '{}'",
-            self.server_name
-        );
-        let tls_stream = self.handshake_stream(stream).await?;
-        Ok(Box::new(tls_stream))
+        Ok(Box::new(self.handshake_stream(stream).await?))
     }
 
-    /// Establish a Reality TLS connection and return the stream together with
-    /// `VisionOptions` (a pair of `Arc<AtomicBool>` splice flags) that allow
-    /// the upper `VisionStream` to signal this layer when XTLS-splice mode is
-    /// triggered.
-    ///
-    /// ## Layer stack
-    ///
-    /// ```text
-    ///  VisionStream          (owns VisionOptions – writes the flags)
-    ///    └─ VlessStream      (VLESS framing)
-    ///        └─ SplicableTlsStream  (reads the flags; bypasses TLS when set)
-    ///            └─ Reality TLS
-    ///                └─ TCP
-    /// ```
-    ///
-    /// ## Handshake / splice sequence
-    ///
-    /// ```text
-    ///  Client                                  Xray server
-    ///    |                                          |
-    ///    |---------- Reality TLS handshake -------->|
-    ///    |<--------- Reality TLS handshake ---------|
-    ///    |   (all traffic above is Reality-TLS encrypted)
-    ///    |                                          |
-    ///    |========== Vision framing mode ===========|
-    ///    |--[UUID][CMD=0x00][inner TLS ClientHello]->|  Vision-framed inner TLS
-    ///    |<-[UUID][CMD=0x00][inner TLS ServerHello]--|
-    ///    |<-[CMD=0x02][inner TLS AppData]------------|  server triggers splice
-    ///    |--[CMD=0x02][inner TLS AppData]----------->|  client triggers splice
-    ///    |                                          |
-    ///    |  (both sides received CMD_DIRECT)        |
-    ///    |                                          |
-    ///    |========== Splice mode (raw TCP) ==========|
-    ///    |--[raw inner-TLS AppData]----------------->|  no outer TLS encryption
-    ///    |<-[raw inner-TLS AppData]------------------|
-    /// ```
-    ///
-    /// On `CMD_PADDING_DIRECT` (0x02):
-    /// - `VisionStream` sets `read_flag` / `write_flag` to `true`.
-    /// - `SplicableTlsStream` detects the flags and bypasses Reality TLS,
-    ///   reading/writing raw bytes directly on the TCP socket.
     async fn proxy_stream_spliced(
         &self,
         stream: AnyStream,
     ) -> io::Result<(AnyStream, Option<VisionOptions>)> {
         let read_flag = Arc::new(AtomicBool::new(false));
         let write_flag = Arc::new(AtomicBool::new(false));
+        // Keep the REALITY I/O type consistent with VlessStream's downcast.
+        // Passing Clash's child trait object directly would make
+        // SplicableTlsStream<clash_lib::AnyStream>, which cannot be recovered
+        // as SplicableTlsStream<chimera_reality_core::AnyStream> later.
+        let stream: chimera_reality_core::AnyStream = stream;
         let tls_stream = self.handshake_stream(stream).await?;
-        let splittable = SplicableTlsStream::new(
+        let splicable = SplicableTlsStream::new(
             tls_stream,
             Arc::clone(&read_flag),
             Arc::clone(&write_flag),
         );
-        let opts = VisionOptions {
-            read_flag,
-            write_flag,
-        };
-        Ok((Box::new(splittable), Some(opts)))
+        Ok((
+            Box::new(splicable),
+            Some(VisionOptions {
+                read_flag,
+                write_flag,
+            }),
+        ))
     }
 }

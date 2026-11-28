@@ -912,6 +912,11 @@ pub struct OutboundHysteria2 {
     pub udp_mtu: Option<u32>,
     pub disable_mtu_discovery: Option<bool>,
     pub cwnd: Option<u64>,
+    #[serde(default)]
+    pub quic_connections: Option<u8>,
+    /// Optional OS UDP receive buffer size in bytes for HY2 endpoint sockets.
+    #[serde(default)]
+    pub udp_recv_buffer_size: Option<usize>,
 }
 
 #[cfg(feature = "hysteria")]

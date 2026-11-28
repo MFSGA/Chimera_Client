@@ -1,0 +1,42 @@
+[package]
+name = "chimera-reality-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+vless = ["dep:bytes", "dep:uuid"]
+vision = ["vless", "dep:rand"]
+splice-diagnostics = []
+reality = [
+    "dep:aws-lc-rs",
+    "aws-lc-rs/aws-lc-sys",
+    "dep:rand",
+    "dep:base64",
+    "dep:log",
+    "dep:subtle",
+    "dep:x509-parser",
+]
+
+[dependencies]
+bytes = { version = "1", optional = true }
+rand = { version = "0.10", optional = true }
+tokio = { version = "1", features = ["io-util"] }
+tracing = "0.1"
+uuid = { version = "1", default-features = false, features = ["std"], optional = true }
+
+aws-lc-rs = { version = "1", default-features = false, optional = true }
+base64 = { version = "0.23", optional = true }
+log = { version = "0.4", optional = true }
+subtle = { version = "2", optional = true }
+x509-parser = { version = "0.18", default-features = false, optional = true }
+
+[dev-dependencies]
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
+tokio = { version = "1", features = ["io-util", "macros", "rt", "rt-multi-thread", "sync", "time"] }
+
+[lints]
+workspace = true

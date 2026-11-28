@@ -657,8 +657,12 @@ impl DirectConnector {
         destination: SocksAddr,
         iface: Option<&OutboundInterface>,
         #[cfg(target_os = "linux")] so_mark: Option<u32>,
-        mut pool_context: NetworkPoolContext,
+        options: UdpSocketConnectOptions,
     ) -> std::io::Result<(tokio::net::UdpSocket, NetworkPoolContext)> {
+        let UdpSocketConnectOptions {
+            udp_recv_buffer_size,
+            mut pool_context,
+        } = options;
         let ipv6_enabled = resolver.ipv6();
         let path_snapshot = if let Some(source) = self.path_source.as_ref() {
             source
@@ -856,6 +860,9 @@ impl DirectConnector {
             )
             .await?
         };
+        if let Some(requested_bytes) = udp_recv_buffer_size {
+            set_udp_socket_receive_buffer_size(&socket, requested_bytes)?;
+        }
         // The selected-socket attempt checks the epoch after bind, but a
         // preference fallback, OS-routed socket or a failed candidate path
         // can also span a network update. Fail closed *before* publishing
@@ -875,6 +882,37 @@ impl DirectConnector {
         pool_context.direct_local_route_pooling_supported = true;
         Ok((socket, pool_context))
     }
+}
+
+fn set_udp_socket_receive_buffer_size(
+    socket: &tokio::net::UdpSocket,
+    requested_bytes: usize,
+) -> std::io::Result<usize> {
+    let socket_ref = socket2::SockRef::from(socket);
+    socket_ref
+        .set_recv_buffer_size(requested_bytes)
+        .map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to set Hysteria2 UDP receive buffer to {requested_bytes} bytes: {error}"
+                ),
+            )
+        })?;
+    let effective_bytes = socket_ref.recv_buffer_size().map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "failed to read Hysteria2 UDP receive buffer after requesting {requested_bytes} bytes: {error}"
+            ),
+        )
+    })?;
+    tracing::debug!(
+        requested_bytes,
+        effective_bytes,
+        "configured Hysteria2 UDP receive buffer"
+    );
+    Ok(effective_bytes)
 }
 
 #[async_trait]
@@ -1365,7 +1403,45 @@ impl RemoteConnector for DirectConnector {
                 iface,
                 #[cfg(target_os = "linux")]
                 so_mark,
-                pool_context,
+                UdpSocketConnectOptions {
+                    udp_recv_buffer_size: None,
+                    pool_context,
+                },
+            )
+            .await?;
+        let datagram = OutboundDatagramImpl::new(socket, resolver);
+        let datagram = ChainedDatagramWrapper::new_with_network_path_id(
+            datagram,
+            pool_context.path_id.clone(),
+        );
+        let datagram = observe_proxy_endpoint_datagram(
+            Box::new(datagram),
+            &pool_context,
+            &observed_destination,
+        );
+        Ok((datagram, pool_context))
+    }
+
+    #[cfg(feature = "hysteria")]
+    async fn connect_datagram_with_recv_buffer_size_and_pool_context(
+        &self,
+        resolver: ThreadSafeDNSResolver,
+        src: Option<SocketAddr>,
+        destination: SocksAddr,
+        iface: Option<&OutboundInterface>,
+        #[cfg(target_os = "linux")] so_mark: Option<u32>,
+        options: UdpSocketConnectOptions,
+    ) -> std::io::Result<(AnyOutboundDatagram, NetworkPoolContext)> {
+        let observed_destination = destination.clone();
+        let (socket, pool_context) = self
+            .connect_proxy_endpoint_udp_socket(
+                &resolver,
+                src,
+                destination,
+                iface,
+                #[cfg(target_os = "linux")]
+                so_mark,
+                options,
             )
             .await?;
         let datagram = OutboundDatagramImpl::new(socket, resolver);
@@ -1392,6 +1468,32 @@ impl RemoteConnector for DirectConnector {
         pool_context: NetworkPoolContext,
     ) -> std::io::Result<Option<(Arc<dyn quinn::AsyncUdpSocket>, NetworkPoolContext)>>
     {
+        self.connect_quinn_udp_socket_with_recv_buffer_size_and_pool_context(
+            resolver,
+            src,
+            destination,
+            iface,
+            #[cfg(target_os = "linux")]
+            so_mark,
+            UdpSocketConnectOptions {
+                udp_recv_buffer_size: None,
+                pool_context,
+            },
+        )
+        .await
+    }
+
+    #[cfg(feature = "hysteria")]
+    async fn connect_quinn_udp_socket_with_recv_buffer_size_and_pool_context(
+        &self,
+        resolver: ThreadSafeDNSResolver,
+        src: Option<SocketAddr>,
+        destination: SocksAddr,
+        iface: Option<&OutboundInterface>,
+        #[cfg(target_os = "linux")] so_mark: Option<u32>,
+        options: UdpSocketConnectOptions,
+    ) -> std::io::Result<Option<(Arc<dyn quinn::AsyncUdpSocket>, NetworkPoolContext)>>
+    {
         use quinn::Runtime;
 
         let observed_destination = destination.clone();
@@ -1403,7 +1505,7 @@ impl RemoteConnector for DirectConnector {
                 iface,
                 #[cfg(target_os = "linux")]
                 so_mark,
-                pool_context,
+                options,
             )
             .await?;
         let socket = socket.into_std()?;
@@ -1466,6 +1568,17 @@ mod tests {
         },
         session::SocksAddr,
     };
+
+    #[tokio::test]
+    async fn hysteria_udp_receive_buffer_is_set_and_read_back() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let effective =
+            super::set_udp_socket_receive_buffer_size(&socket, 1024 * 1024).unwrap();
+        let observed = socket2::SockRef::from(&socket).recv_buffer_size().unwrap();
+
+        assert_eq!(effective, observed);
+        assert!(effective > 0);
+    }
 
     #[cfg(feature = "hysteria")]
     async fn send_quinn_datagram(
