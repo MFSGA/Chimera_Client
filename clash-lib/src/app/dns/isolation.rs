@@ -562,7 +562,7 @@ impl StrictDnsCache {
                     .trim_end_matches('.')
                     .to_ascii_lowercase();
                 if proxy_host.as_deref() == Some(upstream_host.as_str()) {
-                    graph.require(proxy_node.clone(), upstream.clone());
+                    graph.require(proxy_node.clone(), upstream);
                 }
             }
         }
